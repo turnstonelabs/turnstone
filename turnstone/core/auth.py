@@ -33,11 +33,11 @@ if TYPE_CHECKING:
     from starlette.responses import JSONResponse, Response
     from starlette.types import ASGIApp, Receive, Scope, Send
 
-    from turnstone.core.oidc import OIDCConfig
+    from turnstone.core.oauth.oidc import OIDCConfig
 
 from turnstone.core.log import get_logger
 from turnstone.core.mcp_client import try_prime_user_pools
-from turnstone.core.oidc import (
+from turnstone.core.oauth.oidc import (
     OIDC_STATE_TTL_SECONDS,
     OIDCError,
     OIDCKeyNotFoundError,
@@ -46,9 +46,9 @@ from turnstone.core.oidc import (
     fetch_jwks,
     generate_pkce_verifier,
     maybe_rediscover_oidc,
-    provision_oidc_user,
     validate_id_token,
 )
+from turnstone.core.oidc import provision_oidc_user
 from turnstone.core.project_access import (
     decide_project_access,
     decide_project_management_access,

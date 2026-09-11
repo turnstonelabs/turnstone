@@ -11,7 +11,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
-from turnstone.core.oidc import OIDCConfig
+from turnstone.core.oauth.oidc import OIDCConfig
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -49,8 +49,8 @@ def mint_warn_state_reset() -> Iterator[None]:
     ``yield from mint_warn_state_reset()`` in an autouse fixture.
     """
     # Lazy import: non-mint consumers of this helper module (the write-
-    # validator suites) shouldn't pay the mcp_oauth import.
-    from turnstone.core.mcp_oauth import reset_model_mint_warn_state_for_tests
+    # validator suites) shouldn't load model mint orchestration.
+    from turnstone.core.model_oauth import reset_model_mint_warn_state_for_tests
 
     reset_model_mint_warn_state_for_tests()
     yield

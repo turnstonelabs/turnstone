@@ -56,7 +56,7 @@ from turnstone.core.mcp_oauth import get_obo_access_token_classified
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
-    from turnstone.core.oidc import OIDCConfig
+    from turnstone.core.oauth.oidc import OIDCConfig
     from turnstone.core.storage._sqlite import SQLiteBackend
 
 USER = "user-1"
@@ -501,7 +501,7 @@ class TestRfc8693Leg:
         expiry falls back to a bounded default so the row re-mints soon."""
         from datetime import datetime as _dt
 
-        from turnstone.core.mcp_oauth import _OBO_DEFAULT_TTL_SECONDS
+        from turnstone.core.oauth.tokens import _OBO_DEFAULT_TTL_SECONDS
 
         _seed_obo_server(storage)
         client = MagicMock(spec=httpx.AsyncClient)
@@ -826,7 +826,7 @@ class TestFailureHandling:
         over-sized CLIENT-error body is now classified AMBIGUOUS by status, so it
         still advances the ambiguous streak and escalates to the honest re-login
         / admin remedy after the threshold."""
-        from turnstone.core.mcp_oauth import _refresh_backoff_state
+        from turnstone.core.oauth.tokens import _refresh_backoff_state
 
         _seed_obo_server(storage)
         client = MagicMock(spec=httpx.AsyncClient)
@@ -925,7 +925,7 @@ class TestFailureHandling:
         _seed_credential(state)
         _seed_cache_row(state, expires_in_seconds=-1000, access_token="stale-at")  # forces a mint
 
-        from turnstone.core.mcp_oauth import _clear_refresh_backoff
+        from turnstone.core.oauth.tokens import _clear_refresh_backoff
 
         async def _run() -> None:
             # First dispatch: deletes the (stale) cache row + audits once.
@@ -951,7 +951,7 @@ class TestFailureHandling:
         can re-mint / pick up a cluster-mate's token) rather than fail transient."""
         import time
 
-        from turnstone.core.mcp_oauth import _refresh_backoff_state
+        from turnstone.core.oauth.tokens import _refresh_backoff_state
 
         _seed_obo_server(storage)
         client = MagicMock(spec=httpx.AsyncClient)
@@ -1082,7 +1082,7 @@ class TestFailureHandling:
 
     def test_rotation_persist_failure_does_not_break_the_mint(self, storage: SQLiteBackend) -> None:
         """Review finding: a storage error inside the rotation-persist callback
-        escaped the classified-result contract (only MCPOAuthRefreshFailed is
+        escaped the classified-result contract (only OAuthRefreshError is
         caught around mint()) and broke the in-flight dispatch — and on a
         strict-rotation IdP the consumed RT stayed stored either way. The
         persist is best-effort: the mint still returns its token (this
@@ -1151,7 +1151,7 @@ class TestFailureHandling:
         async def _fake_discover(cfg: Any, *, client: Any = None) -> Any:
             return healed
 
-        with patch("turnstone.core.oidc.discover_oidc", new=_fake_discover):
+        with patch("turnstone.core.oauth.oidc.discover_oidc", new=_fake_discover):
             result = _mint(state)
 
         assert result.kind == "token"
@@ -1163,10 +1163,10 @@ class TestFailureHandling:
     ) -> None:
         """Review finding (2099): an undecryptable captured credential (key
         rotated away) must return kind='decrypt_failure', not let
-        MCPTokenDecryptError escape the classified-result contract."""
+        TokenDecryptError escape the classified-result contract."""
         from unittest.mock import patch
 
-        from turnstone.core.mcp_crypto import MCPTokenDecryptError
+        from turnstone.core.token_store.crypto import TokenDecryptError
 
         _seed_obo_server(storage)
         client = MagicMock(spec=httpx.AsyncClient)
@@ -1177,7 +1177,7 @@ class TestFailureHandling:
         with patch.object(
             state.mcp_token_store,
             "get_oidc_credential",
-            side_effect=MCPTokenDecryptError("key unknown", key_fingerprints_attempted=("ab12",)),
+            side_effect=TokenDecryptError("key unknown", key_fingerprints_attempted=("ab12",)),
         ):
             result = _mint(state)
 

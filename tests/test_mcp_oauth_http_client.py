@@ -18,12 +18,8 @@ from types import SimpleNamespace
 import httpx
 
 from turnstone.core.mcp_client import MCPClientManager
-from turnstone.core.mcp_oauth import (
-    _enter_mint_client,
-    close_mcp_oauth_state,
-    initialize_mcp_oauth_state,
-    json_http_client,
-)
+from turnstone.core.mcp_oauth import close_mcp_oauth_state, initialize_mcp_oauth_state
+from turnstone.core.oauth.http import _enter_mint_client, json_http_client
 
 
 def _accept(client: httpx.AsyncClient, headers: dict[str, str] | None = None) -> str:

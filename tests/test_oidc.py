@@ -1,4 +1,4 @@
-"""Tests for turnstone.core.oidc — OIDC authentication support."""
+"""Tests for shared OAuth/OIDC protocol code and core.oidc account integration."""
 
 from __future__ import annotations
 
@@ -17,23 +17,21 @@ import jwt as pyjwt
 import pytest
 
 from tests.conftest import make_oidc_test_config as _make_config
-from turnstone.core.oidc import (
+from turnstone.core.oauth.oidc import (
     OIDCError,
     OIDCKeyNotFoundError,
-    _ensure_default_role,
     _sanitize_log_text,
-    apply_role_mapping,
     build_authorize_url,
     discover_oidc,
     exchange_code,
     generate_pkce_verifier,
     initialize_oidc_state,
     load_oidc_config,
-    provision_oidc_user,
     validate_discovered_endpoint,
     validate_id_token,
     validate_issuer_url,
 )
+from turnstone.core.oidc import _ensure_default_role, apply_role_mapping, provision_oidc_user
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -1562,7 +1560,7 @@ class TestFetchJWKS:
 
     def test_fetch_jwks_non_200_raises(self):
         """Non-2xx response (raise_for_status fires) -> OIDCError."""
-        from turnstone.core.oidc import fetch_jwks
+        from turnstone.core.oauth.oidc import fetch_jwks
 
         mock_response = MagicMock()
         mock_response.raise_for_status.side_effect = httpx.HTTPStatusError(
@@ -1584,7 +1582,7 @@ class TestFetchJWKS:
 
     def test_fetch_jwks_non_dict_body_raises(self):
         """Body decoded as a list rather than a JSON object -> OIDCError."""
-        from turnstone.core.oidc import fetch_jwks
+        from turnstone.core.oauth.oidc import fetch_jwks
 
         mock_response = MagicMock()
         mock_response.json.return_value = [1, 2, 3]
@@ -1605,7 +1603,7 @@ class TestFetchJWKS:
 
     def test_fetch_jwks_dict_missing_keys_raises(self):
         """Body is a dict but lacks the ``keys`` array -> OIDCError."""
-        from turnstone.core.oidc import fetch_jwks
+        from turnstone.core.oauth.oidc import fetch_jwks
 
         mock_response = MagicMock()
         mock_response.json.return_value = {"not_keys": []}
@@ -1626,7 +1624,7 @@ class TestFetchJWKS:
 
     def test_fetch_jwks_keys_not_a_list_raises(self):
         """``keys`` present but not a list -> OIDCError (not iterable type)."""
-        from turnstone.core.oidc import fetch_jwks
+        from turnstone.core.oauth.oidc import fetch_jwks
 
         mock_response = MagicMock()
         mock_response.json.return_value = {"keys": "definitely-not-a-list"}
@@ -1647,7 +1645,7 @@ class TestFetchJWKS:
 
     def test_fetch_jwks_network_error_raises(self):
         """``httpx.RequestError`` from the transport -> OIDCError."""
-        from turnstone.core.oidc import fetch_jwks
+        from turnstone.core.oauth.oidc import fetch_jwks
 
         async def _get(_url):
             raise httpx.ConnectError("connection refused")
@@ -2591,7 +2589,7 @@ class TestRuntimeRediscovery:
         or the recovered config never installs. An earlier version of this test
         mocked discover_oidc to return enabled=True and so masked exactly that
         dead-code bug."""
-        from turnstone.core.oidc import maybe_rediscover_oidc
+        from turnstone.core.oauth.oidc import maybe_rediscover_oidc
 
         state = self._disabled_retryable_state()  # issuer=https://idp.example.com
         discovery_doc = {
@@ -2628,7 +2626,7 @@ class TestRuntimeRediscovery:
         SSRF/same-origin) re-probes every cooldown window forever. Drives the
         real discover_oidc: the discovered token_endpoint is on a foreign host,
         so validation rejects it as a config error."""
-        from turnstone.core.oidc import maybe_rediscover_oidc
+        from turnstone.core.oauth.oidc import maybe_rediscover_oidc
 
         state = self._disabled_retryable_state()  # issuer=https://idp.example.com
         bad_doc = {
@@ -2669,12 +2667,12 @@ class TestRuntimeRediscovery:
         assert probes["n"] == 1
 
     def test_rediscover_cooldown_gates_repeat_probes(self):
-        from turnstone.core.oidc import maybe_rediscover_oidc
+        from turnstone.core.oauth.oidc import maybe_rediscover_oidc
 
         state = self._disabled_retryable_state()
         still_down = state.oidc_config  # discover keeps returning disabled
         with patch(
-            "turnstone.core.oidc.discover_oidc", new=AsyncMock(return_value=still_down)
+            "turnstone.core.oauth.oidc.discover_oidc", new=AsyncMock(return_value=still_down)
         ) as disc:
             asyncio.run(maybe_rediscover_oidc(state))
             asyncio.run(maybe_rediscover_oidc(state))
@@ -2684,7 +2682,7 @@ class TestRuntimeRediscovery:
         assert state.oidc_config.enabled is False
 
     def test_rediscover_noop_when_not_retryable_or_enabled(self):
-        from turnstone.core.oidc import maybe_rediscover_oidc
+        from turnstone.core.oauth.oidc import maybe_rediscover_oidc
 
         # Operator-disabled (retryable False): never probes.
         state = SimpleNamespace(
@@ -2696,12 +2694,12 @@ class TestRuntimeRediscovery:
                 jwks_uri="",
             )
         )
-        with patch("turnstone.core.oidc.discover_oidc", new=AsyncMock()) as disc:
+        with patch("turnstone.core.oauth.oidc.discover_oidc", new=AsyncMock()) as disc:
             asyncio.run(maybe_rediscover_oidc(state))
         disc.assert_not_awaited()
         # Already enabled: never probes.
         state2 = SimpleNamespace(oidc_config=_make_config(enabled=True))
-        with patch("turnstone.core.oidc.discover_oidc", new=AsyncMock()) as disc2:
+        with patch("turnstone.core.oauth.oidc.discover_oidc", new=AsyncMock()) as disc2:
             asyncio.run(maybe_rediscover_oidc(state2))
         disc2.assert_not_awaited()
 
@@ -2734,7 +2732,7 @@ class TestInitializeOIDCState:
         async def _boom(_cfg):
             raise RuntimeError("boom")
 
-        with patch("turnstone.core.oidc.discover_oidc", side_effect=_boom):
+        with patch("turnstone.core.oauth.oidc.discover_oidc", side_effect=_boom):
             asyncio.run(initialize_oidc_state(state))
 
         assert state.oidc_config.enabled is False
@@ -2754,7 +2752,7 @@ class TestInitializeOIDCState:
         async def _disabled(_cfg, *, client=None):
             return disabled_cfg
 
-        with patch("turnstone.core.oidc.discover_oidc", side_effect=_disabled):
+        with patch("turnstone.core.oauth.oidc.discover_oidc", side_effect=_disabled):
             asyncio.run(initialize_oidc_state(state))
 
         assert state.oidc_config is disabled_cfg
@@ -2773,9 +2771,9 @@ class TestInitializeOIDCState:
             raise AssertionError("fetch_jwks must not be called when redirect_base is empty")
 
         with (
-            patch("turnstone.core.oidc.discover_oidc", side_effect=_ok),
-            patch("turnstone.core.oidc.fetch_jwks", side_effect=_jwks_unexpected),
-            caplog.at_level("ERROR", logger="turnstone.core.oidc"),
+            patch("turnstone.core.oauth.oidc.discover_oidc", side_effect=_ok),
+            patch("turnstone.core.oauth.oidc.fetch_jwks", side_effect=_jwks_unexpected),
+            caplog.at_level("ERROR", logger="turnstone.core.oauth.oidc"),
         ):
             asyncio.run(initialize_oidc_state(state))
 
@@ -2795,8 +2793,8 @@ class TestInitializeOIDCState:
             raise OIDCError("jwks down")
 
         with (
-            patch("turnstone.core.oidc.discover_oidc", side_effect=_ok),
-            patch("turnstone.core.oidc.fetch_jwks", side_effect=_jwks_boom),
+            patch("turnstone.core.oauth.oidc.discover_oidc", side_effect=_ok),
+            patch("turnstone.core.oauth.oidc.fetch_jwks", side_effect=_jwks_boom),
         ):
             asyncio.run(initialize_oidc_state(state))
 
@@ -2818,8 +2816,8 @@ class TestInitializeOIDCState:
             return jwks
 
         with (
-            patch("turnstone.core.oidc.discover_oidc", side_effect=_ok),
-            patch("turnstone.core.oidc.fetch_jwks", side_effect=_jwks),
+            patch("turnstone.core.oauth.oidc.discover_oidc", side_effect=_ok),
+            patch("turnstone.core.oauth.oidc.fetch_jwks", side_effect=_jwks),
         ):
             asyncio.run(initialize_oidc_state(state))
 
@@ -2837,14 +2835,14 @@ async def _async_return(value):
 class TestCloseOIDCState:
     def test_close_when_never_initialised(self):
         """close_oidc_state on bare state must not raise."""
-        from turnstone.core.oidc import close_oidc_state
+        from turnstone.core.oauth.oidc import close_oidc_state
 
         state = types.SimpleNamespace()
         asyncio.run(close_oidc_state(state))
 
     def test_close_releases_long_lived_client(self):
         """The long-lived client installed by initialize_oidc_state is aclosed."""
-        from turnstone.core.oidc import close_oidc_state
+        from turnstone.core.oauth.oidc import close_oidc_state
 
         client = MagicMock()
 
@@ -2881,8 +2879,8 @@ class TestLongLivedHTTPClientPassthrough:
             return {"keys": [{"kid": "k1"}]}
 
         with (
-            patch("turnstone.core.oidc.discover_oidc", side_effect=_discover),
-            patch("turnstone.core.oidc.fetch_jwks", side_effect=_jwks),
+            patch("turnstone.core.oauth.oidc.discover_oidc", side_effect=_discover),
+            patch("turnstone.core.oauth.oidc.fetch_jwks", side_effect=_jwks),
         ):
             asyncio.run(initialize_oidc_state(state))
 
@@ -2904,7 +2902,7 @@ class TestLongLivedHTTPClientPassthrough:
         async def _boom(_cfg, *, client=None):
             raise RuntimeError("boom")
 
-        with patch("turnstone.core.oidc.discover_oidc", side_effect=_boom):
+        with patch("turnstone.core.oauth.oidc.discover_oidc", side_effect=_boom):
             asyncio.run(initialize_oidc_state(state))
 
         assert state.oidc_config.enabled is False
@@ -2919,7 +2917,7 @@ class TestLongLivedHTTPClientPassthrough:
         async def _discover(c, *, client=None):
             return c
 
-        with patch("turnstone.core.oidc.discover_oidc", side_effect=_discover):
+        with patch("turnstone.core.oauth.oidc.discover_oidc", side_effect=_discover):
             asyncio.run(initialize_oidc_state(state))
 
         assert state.oidc_config.enabled is False

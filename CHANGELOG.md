@@ -16,6 +16,8 @@ frozen.
 
 ### Changed
 
+- **Shared delegated-auth modules.** OAuth/OIDC protocol code, generic encrypted token storage,
+  and model-provider mint orchestration now have separate homes from MCP consent and transport.
 - **Python 3.13 minimum for Turnstone 1.9.** Python 3.11 and 3.12 are no longer supported; 1.8 is
   the last series that accepts them. Native installations must recreate their virtual environment
   with Python 3.13 or newer before upgrading. CI tests Python 3.13 and 3.14, and Docker images

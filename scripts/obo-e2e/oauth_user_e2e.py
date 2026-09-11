@@ -79,11 +79,7 @@ from starlette.routing import Mount, Route
 
 from turnstone.core.auth import AuthResult
 from turnstone.core.mcp_client import MCPClientManager, _validate_oauth_user_url
-from turnstone.core.mcp_crypto import (
-    MCPTokenCipher,
-    MCPTokenCipherConfig,
-    MCPTokenStore,
-)
+from turnstone.core.mcp_crypto import MCPTokenStore
 from turnstone.core.mcp_oauth import (
     canonical_resource,
     close_mcp_oauth_state,
@@ -94,8 +90,9 @@ from turnstone.core.mcp_oauth import (
     handle_mcp_oauth_revoke_connection,
     initialize_mcp_oauth_state,
 )
-from turnstone.core.oidc import OIDCConfig
+from turnstone.core.oauth.oidc import OIDCConfig
 from turnstone.core.storage._sqlite import SQLiteBackend
+from turnstone.core.token_store.crypto import TokenCipher, TokenCipherConfig
 
 if TYPE_CHECKING:
     from collections.abc import Coroutine
@@ -378,7 +375,7 @@ async def _run(cfg: dict[str, str]) -> None:
     storage = SQLiteBackend(db_path)
     storage.create_user(USER, USER, "E2E User", "hash")
     raw = base64.urlsafe_b64decode(Fernet.generate_key())
-    store = MCPTokenStore(storage, MCPTokenCipher(MCPTokenCipherConfig(keys=(raw,))), node_id="e2e")
+    store = MCPTokenStore(storage, TokenCipher(TokenCipherConfig(keys=(raw,))), node_id="e2e")
     app = _console_app(storage, store, redirect_base)
     await initialize_mcp_oauth_state(app.state)
     wire = _Wire(app.state.mcp_oauth_http_client)
@@ -537,7 +534,7 @@ async def _run(cfg: dict[str, str]) -> None:
         # C6 — refresh when the token enters the refresh window. The realm issues
         # short-lived tokens so the clock, not a forged row, crosses the
         # product's refresh-ahead window.
-        from turnstone.core.mcp_oauth import _ACCESS_TOKEN_REFRESH_SKEW_SECONDS
+        from turnstone.core.oauth.tokens import _ACCESS_TOKEN_REFRESH_SKEW_SECONDS
 
         due = datetime.strptime(str(plain["expires_at"]), "%Y-%m-%dT%H:%M:%S").replace(tzinfo=UTC)
         wait = (

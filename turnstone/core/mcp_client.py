@@ -53,17 +53,19 @@ from turnstone.core.mcp_http_parsers import (
     parse_www_authenticate_scope,
 )
 from turnstone.core.mcp_oauth import (
-    MintDispatchContractError,
     TokenLookupResult,
     emit_oauth_failure_audit,
     get_obo_access_token_classified,
     get_user_access_token_classified,
-    invalidate_model_mint_memo,
     is_user_scoped_auth,
-    json_http_client,
+)
+from turnstone.core.model_oauth import (
+    MintDispatchContractError,
+    invalidate_model_mint_memo,
     mint_app_access_token,
     mint_obo_access_token,
 )
+from turnstone.core.oauth.http import json_http_client
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Coroutine

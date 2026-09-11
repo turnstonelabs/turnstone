@@ -42,9 +42,10 @@ from tests._oidc_test_helpers import (
     mint_warn_state_reset,
 )
 from tests.conftest import make_mcp_token_cipher
+from turnstone.core import model_oauth
 from turnstone.core.judge import JudgeConfig
 from turnstone.core.mcp_crypto import MCPTokenStore
-from turnstone.core.mcp_oauth import mint_app_access_token, mint_obo_access_token
+from turnstone.core.model_oauth import mint_app_access_token, mint_obo_access_token
 from turnstone.core.model_registry import (
     ModelAuthConfigError,
     ModelConfig,
@@ -57,7 +58,7 @@ from turnstone.core.session import BackendAuthUnavailableError, ChatSession
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
-    from turnstone.core.oidc import OIDCConfig
+    from turnstone.core.oauth.oidc import OIDCConfig
     from turnstone.core.storage._sqlite import SQLiteBackend
 
 USER = "user-1"
@@ -557,10 +558,9 @@ class TestMintOboAccessToken:
         self, storage: SQLiteBackend, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """The missing-credential cause is deduped per (user, audience)."""
-        from turnstone.core import mcp_oauth as mcp_oauth_module
 
         warned: set[tuple[str, str]] = set()
-        monkeypatch.setattr(mcp_oauth_module, "_MODEL_OBO_MISSING_CRED_WARNED", warned)
+        monkeypatch.setattr(model_oauth, "_MODEL_OBO_MISSING_CRED_WARNED", warned)
         client = MagicMock(spec=httpx.AsyncClient)
         client.post = AsyncMock()
         state = _make_app_state(storage, http_client=client, oidc_config=make_oidc_config())
@@ -574,29 +574,28 @@ class TestMintOboAccessToken:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """The two dedup namespaces are independent by construction."""
-        from turnstone.core import mcp_oauth as mcp_oauth_module
 
         user_full = {(f"user-{i}", "api://aud") for i in range(512)}
         operator_fresh: set[str] = set()
-        monkeypatch.setattr(mcp_oauth_module, "_MODEL_OBO_MISSING_CRED_WARNED", user_full)
-        monkeypatch.setattr(mcp_oauth_module, "_MODEL_MINT_MISCONFIG_WARNED", operator_fresh)
-        mcp_oauth_module._warn_model_mint_misconfig_once(
+        monkeypatch.setattr(model_oauth, "_MODEL_OBO_MISSING_CRED_WARNED", user_full)
+        monkeypatch.setattr(model_oauth, "_MODEL_MINT_MISCONFIG_WARNED", operator_fresh)
+        model_oauth._warn_model_mint_misconfig_once(
             "model_obo.oidc_not_enabled", "api://aud", "u-any", cause_key="api://aud"
         )
         assert operator_fresh == {"model_obo.oidc_not_enabled:api://aud"}
 
         operator_full = {f"cause-{i}:api://aud" for i in range(512)}
         user_fresh: set[tuple[str, str]] = set()
-        monkeypatch.setattr(mcp_oauth_module, "_MODEL_MINT_MISCONFIG_WARNED", operator_full)
-        monkeypatch.setattr(mcp_oauth_module, "_MODEL_OBO_MISSING_CRED_WARNED", user_fresh)
-        mcp_oauth_module._warn_model_obo_missing_credential_once(
+        monkeypatch.setattr(model_oauth, "_MODEL_MINT_MISCONFIG_WARNED", operator_full)
+        monkeypatch.setattr(model_oauth, "_MODEL_OBO_MISSING_CRED_WARNED", user_fresh)
+        model_oauth._warn_model_obo_missing_credential_once(
             "api://aud", "u-new", cause_key="api://aud"
         )
         assert user_fresh == {("u-new", "api://aud")}
 
     def test_success_clears_only_the_minting_users_cause(self, storage: SQLiteBackend) -> None:
         """The last-cause record is keyed per (prefix, alias, user)."""
-        from turnstone.core.mcp_oauth import model_mint_refusal_cause, model_obo_cache_server
+        from turnstone.core.model_oauth import model_mint_refusal_cause, model_obo_cache_server
 
         client = MagicMock(spec=httpx.AsyncClient)
         client.post = AsyncMock(
@@ -629,7 +628,7 @@ class TestMintOboAccessToken:
     def test_cooldown_window_keeps_the_recorded_cause(self, storage: SQLiteBackend) -> None:
         """The record persists across cooldown short-circuits: only the
         recording user's successful mint clears a cause."""
-        from turnstone.core.mcp_oauth import model_mint_refusal_cause, model_obo_cache_server
+        from turnstone.core.model_oauth import model_mint_refusal_cause, model_obo_cache_server
 
         client = MagicMock(spec=httpx.AsyncClient)
         client.post = AsyncMock(
@@ -744,7 +743,7 @@ class TestMintOboAccessToken:
         scopes, the row keys on the OWNING ALIAS, and the requested scopes
         land in the row's legible ``scopes`` column for the freshness gate.
         """
-        from turnstone.core.mcp_oauth import model_obo_cache_server
+        from turnstone.core.model_oauth import model_obo_cache_server
 
         client = MagicMock(spec=httpx.AsyncClient)
         client.post = AsyncMock(
@@ -788,7 +787,7 @@ class TestMintOboAccessToken:
         superseded bearer — the next mint overwrites the SAME identity key
         in place, leaving no stranded row behind.
         """
-        from turnstone.core.mcp_oauth import model_obo_cache_server
+        from turnstone.core.model_oauth import model_obo_cache_server
 
         client = MagicMock(spec=httpx.AsyncClient)
         client.post = AsyncMock(
@@ -845,7 +844,7 @@ class TestMintOboAccessToken:
         """A mode's pinned leg contradicting the deployment profile refuses
         with the recorded cause and ZERO IdP traffic, in both directions.
         """
-        from turnstone.core.mcp_oauth import model_mint_refusal_cause, model_obo_cause_key
+        from turnstone.core.model_oauth import model_mint_refusal_cause, model_obo_cause_key
 
         client = MagicMock(spec=httpx.AsyncClient)
         client.post = AsyncMock()
@@ -882,12 +881,8 @@ class TestMintOboAccessToken:
         under the builder's OWN prefix, distinct per alias, and a control
         character can never forge the digest spelling's separator shape.
         """
-        from turnstone.core.mcp_oauth import (
-            MODEL_APP_CACHE_PREFIX,
-            MODEL_OBO_CACHE_PREFIX,
-            model_app_cache_server,
-            model_obo_cache_server,
-        )
+        from turnstone.core.model_oauth import model_app_cache_server, model_obo_cache_server
+        from turnstone.core.token_store.store import MODEL_APP_CACHE_PREFIX, MODEL_OBO_CACHE_PREFIX
 
         # The whole console-legal range keys literally.
         assert model_obo_cache_server("gw.model-1") == f"{MODEL_OBO_CACHE_PREFIX}gw.model-1"
@@ -936,7 +931,7 @@ class TestMintOboAccessToken:
         bug — raised as the dispatch contract error, never silently sliced
         into a narrower privilege request than the caller asked for.
         """
-        from turnstone.core.mcp_oauth import MintDispatchContractError
+        from turnstone.core.model_oauth import MintDispatchContractError
         from turnstone.core.model_registry import MODEL_AUTH_TEXT_MAX_LEN
 
         client = MagicMock(spec=httpx.AsyncClient)
@@ -955,7 +950,7 @@ class TestMintOboAccessToken:
         identities end to end: one's successful mint never clears — or
         overwrites — the other's recorded cause.
         """
-        from turnstone.core.mcp_oauth import model_mint_refusal_cause, model_obo_cause_key
+        from turnstone.core.model_oauth import model_mint_refusal_cause, model_obo_cause_key
 
         client = MagicMock(spec=httpx.AsyncClient)
         client.post = AsyncMock(
@@ -996,7 +991,7 @@ class TestMintOboAccessToken:
         mode-variants sharing an audience never overwrite each other's
         recorded cause — the leg axis of the scope-variant pin above.
         """
-        from turnstone.core.mcp_oauth import model_mint_refusal_cause, model_obo_cause_key
+        from turnstone.core.model_oauth import model_mint_refusal_cause, model_obo_cause_key
 
         client = MagicMock(spec=httpx.AsyncClient)
         client.post = AsyncMock(
@@ -1098,20 +1093,19 @@ class TestMintOboAccessToken:
         record (the one an operator is actively debugging) is evicted last,
         never first.
         """
-        from turnstone.core import mcp_oauth as mcp_oauth_module
 
-        for i in range(mcp_oauth_module._CAUSE_RECORD_CAP):
-            mcp_oauth_module._record_mint_refusal_cause("model_obo", f"k{i}", "u", "c")
-        assert len(mcp_oauth_module._MODEL_MINT_LAST_CAUSE) == mcp_oauth_module._CAUSE_RECORD_CAP
+        for i in range(model_oauth._CAUSE_RECORD_CAP):
+            model_oauth._record_mint_refusal_cause("model_obo", f"k{i}", "u", "c")
+        assert len(model_oauth._MODEL_MINT_LAST_CAUSE) == model_oauth._CAUSE_RECORD_CAP
         # Re-stamp the OLDEST record: dict overwrite alone would leave it at
         # its original insertion slot and the next eviction would hit it.
-        mcp_oauth_module._record_mint_refusal_cause("model_obo", "k0", "u", "hot")
-        mcp_oauth_module._record_mint_refusal_cause("model_obo", "k-new", "u", "newest")
-        assert len(mcp_oauth_module._MODEL_MINT_LAST_CAUSE) == mcp_oauth_module._CAUSE_RECORD_CAP
-        assert mcp_oauth_module.model_mint_refusal_cause("model_obo", "k-new", "u") == "newest"
+        model_oauth._record_mint_refusal_cause("model_obo", "k0", "u", "hot")
+        model_oauth._record_mint_refusal_cause("model_obo", "k-new", "u", "newest")
+        assert len(model_oauth._MODEL_MINT_LAST_CAUSE) == model_oauth._CAUSE_RECORD_CAP
+        assert model_oauth.model_mint_refusal_cause("model_obo", "k-new", "u") == "newest"
         # The re-stamped record survives; the least-recently-stamped (k1) went.
-        assert mcp_oauth_module.model_mint_refusal_cause("model_obo", "k0", "u") == "hot"
-        assert mcp_oauth_module.model_mint_refusal_cause("model_obo", "k1", "u") == ""
+        assert model_oauth.model_mint_refusal_cause("model_obo", "k0", "u") == "hot"
+        assert model_oauth.model_mint_refusal_cause("model_obo", "k1", "u") == ""
 
 
 # ---------------------------------------------------------------------------
@@ -1223,7 +1217,7 @@ class TestMintAppAccessToken:
         strip BEFORE the whitespace trim: the edge control below shields a
         space that the trim must still remove afterwards.
         """
-        from turnstone.core.mcp_oauth import model_app_cache_server
+        from turnstone.core.model_oauth import model_app_cache_server
 
         client = MagicMock(spec=httpx.AsyncClient)
         client.post = AsyncMock(
@@ -1424,7 +1418,7 @@ class TestModelOboToken:
         assert _mint(state, alias="tf", grant_leg="entra") is None
         assert client.post.call_count == 0  # refused before any IdP traffic
 
-        from turnstone.core.mcp_oauth import model_mint_refusal_cause, model_obo_cause_key
+        from turnstone.core.model_oauth import model_mint_refusal_cause, model_obo_cause_key
 
         assert (
             model_mint_refusal_cause(
@@ -1776,7 +1770,7 @@ class TestMintBridgeContractViolation:
         import threading
 
         from turnstone.core import mcp_client as mcp_client_module
-        from turnstone.core.mcp_oauth import MintDispatchContractError
+        from turnstone.core.model_oauth import MintDispatchContractError
 
         async def _raiser(**_kwargs: Any) -> str | None:
             raise MintDispatchContractError(

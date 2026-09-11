@@ -31,7 +31,7 @@ from turnstone.core.mcp_oauth import (
     handle_mcp_oauth_authorize,
     handle_mcp_oauth_callback,
 )
-from turnstone.core.oidc import OIDCConfig
+from turnstone.core.oauth.oidc import OIDCConfig
 
 if TYPE_CHECKING:
     from starlette.requests import Request

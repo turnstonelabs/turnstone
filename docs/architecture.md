@@ -41,6 +41,10 @@ turnstone/
     trajectory.py     Canonical provider-neutral Turn trajectory and effect metadata
     model_turn.py     ModelLane binding + the single lower/sample/re-ingest boundary
     model_backend_auth.py Per-call static/dynamic model-backend credential policy
+    model_oauth.py    Model token mints, alias cache keys, memoization, and refusal causes
+    oauth/            Shared OAuth grants, HTTP failures, OIDC, SSRF, locks, and token cache/backoff
+    token_store/      Generic encrypted token/credential storage and deployment keyring
+    oidc.py           OIDC account provisioning and role mapping
     state_writer.py   Incarnation-fenced write-behind workstream state persistence
     providers/        LLM provider adapters (pluggable backend layer)
       _protocol.py    LLMProvider protocol, ModelCapabilities, StreamChunk, CompletionResult
@@ -54,6 +58,8 @@ turnstone/
     workstream.py     Workstream runtime state and worker ownership (WorkstreamState, Workstream)
     tools.py          Tool schema loader (JSON -> OpenAI function-calling format)
     mcp_client.py     MCPClientManager — MCP server connections, tool discovery, dynamic refresh
+    mcp_oauth.py      MCP discovery, consent, classified token lookup, and OAuth routes
+    mcp_crypto.py     MCP client secrets, decrypt-failure audit subjects, and host keyring setup
     tool_search.py    Dynamic tool search — BM25 index, session-scoped tool visibility
     watch.py          WatchRunner daemon — periodic command polling, condition DSL, result dispatch
     judge.py          Intent validation — heuristic rules + LLM judge, advisory verdicts

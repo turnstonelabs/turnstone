@@ -55,17 +55,12 @@ if TYPE_CHECKING:
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from entra_spike import interactive_login, jwt_claims_unverified, redact  # noqa: E402
 
-from turnstone.core.mcp_crypto import (  # noqa: E402
-    MCPTokenCipher,
-    MCPTokenCipherConfig,
-    MCPTokenStore,
-)
-from turnstone.core.mcp_oauth import (  # noqa: E402
-    get_obo_access_token_classified,
-    json_http_client,
-)
-from turnstone.core.oidc import OIDCConfig  # noqa: E402
+from turnstone.core.mcp_crypto import MCPTokenStore
+from turnstone.core.mcp_oauth import get_obo_access_token_classified
+from turnstone.core.oauth.http import json_http_client
+from turnstone.core.oauth.oidc import OIDCConfig  # noqa: E402
 from turnstone.core.storage._sqlite import SQLiteBackend  # noqa: E402
+from turnstone.core.token_store.crypto import TokenCipher, TokenCipherConfig
 
 USER = "e2e-user"
 RESULTS: list[tuple[str, str]] = []
@@ -142,7 +137,7 @@ async def _run(cfg: dict[str, str], refresh_token: str) -> None:
     from cryptography.fernet import Fernet
 
     raw = base64.urlsafe_b64decode(Fernet.generate_key())
-    store = MCPTokenStore(storage, MCPTokenCipher(MCPTokenCipherConfig(keys=(raw,))), node_id="e2e")
+    store = MCPTokenStore(storage, TokenCipher(TokenCipherConfig(keys=(raw,))), node_id="e2e")
     oidc_config = OIDCConfig(
         enabled=True,
         issuer=issuer,

@@ -19,11 +19,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import httpx
 
 from turnstone.core.mcp_oauth import (
-    ASMetadata,
     MCPOAuthDiscoveryError,
     _attempt_upstream_revoke,
     revoke_token_at_as,
 )
+from turnstone.core.oauth.http import ASMetadata
 
 
 def _make_as_metadata(
@@ -316,7 +316,7 @@ class TestAttemptUpstreamRevokeNeverRaises:
     ``task.exception()``.
 
     The wrapper's narrow inner ``except`` clauses (``MCPOAuthDiscoveryError``,
-    ``MCPTokenDecryptError``) leave room for any other exception type
+    ``TokenDecryptError``) leave room for any other exception type
     raised by ``discover_authorization_server`` /
     ``storage.get_mcp_oauth_client_secret_ct`` / ``token_store.cipher.decrypt``
     to escape. The outer ``try/except Exception`` is what keeps the

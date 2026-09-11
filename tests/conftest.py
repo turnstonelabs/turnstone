@@ -143,9 +143,9 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from turnstone.core.mcp_client import MCPClientManager, StaticServerState
-    from turnstone.core.mcp_crypto import MCPTokenCipher
-    from turnstone.core.oidc import OIDCConfig
+    from turnstone.core.oauth.oidc import OIDCConfig
     from turnstone.core.storage._sqlite import SQLiteBackend
+    from turnstone.core.token_store.crypto import TokenCipher
 
 
 # A background daemon (e.g. title generation) can log into pytest's per-test
@@ -201,7 +201,7 @@ def _no_leaked_threads(request: pytest.FixtureRequest) -> Iterator[None]:
         )
 
 
-def make_mcp_token_cipher() -> MCPTokenCipher:
+def make_mcp_token_cipher() -> TokenCipher:
     """Build a single-key MCP token cipher for tests.
 
     Used by test files that need to exercise ``MCPTokenStore`` round-
@@ -212,10 +212,10 @@ def make_mcp_token_cipher() -> MCPTokenCipher:
 
     from cryptography.fernet import Fernet
 
-    from turnstone.core.mcp_crypto import MCPTokenCipher, MCPTokenCipherConfig
+    from turnstone.core.token_store.crypto import TokenCipher, TokenCipherConfig
 
     raw = base64.urlsafe_b64decode(Fernet.generate_key())
-    return MCPTokenCipher(MCPTokenCipherConfig(keys=(raw,)))
+    return TokenCipher(TokenCipherConfig(keys=(raw,)))
 
 
 def _seed_static_state(mgr: MCPClientManager, name: str, **overrides: Any) -> StaticServerState:
@@ -334,7 +334,7 @@ def make_oidc_test_config(**overrides: Any) -> OIDCConfig:
     Shared between ``test_oidc.py`` and ``test_oidc_handlers.py`` so the
     defaults (including the now-required ``redirect_base``) stay aligned.
     """
-    from turnstone.core.oidc import OIDCConfig
+    from turnstone.core.oauth.oidc import OIDCConfig
 
     defaults: dict[str, Any] = {
         "enabled": True,

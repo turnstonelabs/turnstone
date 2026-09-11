@@ -1,4 +1,4 @@
-"""Direct tests for the shared SSRF helpers in :mod:`turnstone.core.oauth_ssrf`.
+"""Direct tests for the shared SSRF helpers in :mod:`turnstone.core.oauth.ssrf`.
 
 The OIDC test suite already exercises these via the OIDC adapter
 (``OIDCError`` re-raises). This file pins the canonical
@@ -13,7 +13,7 @@ from unittest.mock import patch
 
 import pytest
 
-from turnstone.core.oauth_ssrf import (
+from turnstone.core.oauth.ssrf import (
     OAuthSSRFError,
     OAuthSSRFPrivateAddressError,
     effective_port,

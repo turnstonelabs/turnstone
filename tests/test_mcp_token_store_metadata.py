@@ -13,16 +13,13 @@ import base64
 import sqlalchemy as sa
 from cryptography.fernet import Fernet
 
-from turnstone.core.mcp_crypto import (
-    MCPTokenCipher,
-    MCPTokenCipherConfig,
-    MCPTokenStore,
-)
+from turnstone.core.mcp_crypto import MCPTokenStore
+from turnstone.core.token_store.crypto import TokenCipher, TokenCipherConfig
 
 
-def _make_cipher() -> MCPTokenCipher:
+def _make_cipher() -> TokenCipher:
     raw = base64.urlsafe_b64decode(Fernet.generate_key())
-    return MCPTokenCipher(MCPTokenCipherConfig(keys=(raw,)))
+    return TokenCipher(TokenCipherConfig(keys=(raw,)))
 
 
 def _make_store(backend) -> MCPTokenStore:

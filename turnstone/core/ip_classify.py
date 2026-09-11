@@ -1,7 +1,7 @@
 """Shared address classification for the tree's SSRF guards.
 
 Five guards screen outbound URLs, and their *policies* differ on purpose:
-:mod:`turnstone.core.oauth_ssrf` demands a globally routable endpoint unless the
+:mod:`turnstone.core.oauth.ssrf` demands a globally routable endpoint unless the
 operator opted in, :func:`turnstone.core.web.screen_url` (the ``web_fetch`` /
 ``open_preview`` tools) honours ``tools.allow_private_network``, and
 ``turnstone.channels._formatter._is_safe_image_url`` allows the LAN outright

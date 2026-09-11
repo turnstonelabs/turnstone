@@ -4946,7 +4946,7 @@ async def internal_model_auth_cache_invalidate(request: Request) -> JSONResponse
     if mcp_mgr is None:
         return JSONResponse({"status": "noop", "evicted": 0})
 
-    from turnstone.core.mcp_oauth import MODEL_OBO_CACHE_PREFIX
+    from turnstone.core.token_store.store import MODEL_OBO_CACHE_PREFIX
 
     evicted = mcp_mgr.invalidate_model_mint_memo_sync(
         user_id=user_id,
@@ -5339,7 +5339,7 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None]:
     # live in the per-node in-memory buffer with its own TTL eviction, so
     # there are no persisted reservations to reclaim.)
 
-    from turnstone.core.oidc import initialize_oidc_state
+    from turnstone.core.oauth.oidc import initialize_oidc_state
 
     await initialize_oidc_state(app.state)
 
@@ -5548,7 +5548,7 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None]:
     from turnstone.core.mcp_crypto import close_mcp_crypto_state
 
     close_mcp_crypto_state(app.state)
-    from turnstone.core.oidc import close_oidc_state
+    from turnstone.core.oauth.oidc import close_oidc_state
 
     await close_oidc_state(app.state)
     # Stop the lifespan daemon threads (#885).  Sessions are already
@@ -6017,7 +6017,7 @@ def create_app(
     app.state.login_limiter = LoginRateLimiter()
 
     # OIDC configuration (opt-in via env vars)
-    from turnstone.core.oidc import load_oidc_config
+    from turnstone.core.oauth.oidc import load_oidc_config
 
     oidc_config = load_oidc_config()
     app.state.oidc_config = oidc_config

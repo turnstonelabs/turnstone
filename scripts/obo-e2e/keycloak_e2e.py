@@ -48,21 +48,18 @@ from typing import Any
 
 import httpx
 
-from turnstone.core.mcp_crypto import (
-    MCPTokenCipher,
-    MCPTokenCipherConfig,
-    MCPTokenStore,
-)
-from turnstone.core.mcp_oauth import (
-    get_obo_access_token_classified,
-    json_http_client,
+from turnstone.core.mcp_crypto import MCPTokenStore
+from turnstone.core.mcp_oauth import get_obo_access_token_classified
+from turnstone.core.model_oauth import (
     mint_obo_access_token,
     model_mint_refusal_cause,
     model_obo_cache_server,
     model_obo_cause_key,
 )
-from turnstone.core.oidc import OIDCConfig
+from turnstone.core.oauth.http import json_http_client
+from turnstone.core.oauth.oidc import OIDCConfig
 from turnstone.core.storage._sqlite import SQLiteBackend
+from turnstone.core.token_store.crypto import TokenCipher, TokenCipherConfig
 
 USER = "e2e-user"
 RESULTS: list[tuple[str, str]] = []
@@ -138,7 +135,7 @@ async def _run(cfg: dict[str, str], refresh_token: str) -> None:
     from cryptography.fernet import Fernet
 
     raw = base64.urlsafe_b64decode(Fernet.generate_key())
-    store = MCPTokenStore(storage, MCPTokenCipher(MCPTokenCipherConfig(keys=(raw,))), node_id="e2e")
+    store = MCPTokenStore(storage, TokenCipher(TokenCipherConfig(keys=(raw,))), node_id="e2e")
     oidc_config = OIDCConfig(
         enabled=True,
         issuer=issuer,

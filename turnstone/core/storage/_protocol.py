@@ -200,7 +200,7 @@ class MCPUserTokenMetadataRow(TypedDict):
     Excludes ``access_token_ct`` and ``refresh_token_ct`` so the
     storage layer never materialises ciphertext for list queries that
     only need metadata. ``MCPTokenStore.list_user_token_metadata``
-    re-types these rows as ``MCPUserTokenMetadata`` (same field shape).
+    re-types these rows as ``UserTokenMetadata`` (same field shape).
     """
 
     user_id: str
@@ -2741,7 +2741,7 @@ class StorageBackend(Protocol):
         intentionally NOT loaded — the projection runs at the SQL boundary
         so the LargeBinary blobs never cross the wire for the list-view
         path. ``MCPTokenStore`` re-types the rows as
-        ``MCPUserTokenMetadata`` (same field shape) for the settings UI.
+        ``UserTokenMetadata`` (same field shape) for the settings UI.
         """
         ...
 

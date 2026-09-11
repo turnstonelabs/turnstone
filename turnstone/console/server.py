@@ -65,7 +65,7 @@ from turnstone.core.auth import (
     require_permission,
 )
 from turnstone.core.deadline import DeadlineExceededError, run_with_deadline
-from turnstone.core.mcp_crypto import STARTUP_KEY_REQUIRED_HINT, is_user_scoped_auth
+from turnstone.core.mcp_oauth import is_user_scoped_auth
 from turnstone.core.memory import get_workstream_display_names
 from turnstone.core.metacognition import field_str, sanitize_display
 from turnstone.core.model_registry import (
@@ -118,6 +118,7 @@ from turnstone.core.session_routes import (
 from turnstone.core.skill_field_validation import SKILL_RUNTIME_CONFIG_FIELDS
 from turnstone.core.skill_kind import SkillKind
 from turnstone.core.skill_parser import MAX_SKILL_DESCRIPTION_LEN
+from turnstone.core.token_store.crypto import STARTUP_KEY_REQUIRED_HINT
 from turnstone.core.web_helpers import (
     RevalidatingStaticFiles,
     is_safe_static_asset_path,
@@ -5868,7 +5869,7 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None]:
     scheduler = getattr(app.state, "scheduler", None)
     if scheduler is not None:
         scheduler.start()
-    from turnstone.core.oidc import initialize_oidc_state
+    from turnstone.core.oauth.oidc import initialize_oidc_state
 
     await initialize_oidc_state(app.state)
 
@@ -6123,7 +6124,7 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None]:
     from turnstone.core.mcp_crypto import close_mcp_crypto_state
 
     close_mcp_crypto_state(app.state)
-    from turnstone.core.oidc import close_oidc_state
+    from turnstone.core.oauth.oidc import close_oidc_state
 
     await close_oidc_state(app.state)
     app.state.collector.stop()
@@ -6588,7 +6589,7 @@ async def admin_delete_oidc_identity(request: Request) -> JSONResponse:
     """DELETE /v1/api/admin/oidc-identities?issuer=...&subject=... — unlink OIDC identity."""
     from turnstone.core.audit import record_audit
     from turnstone.core.auth import require_permission
-    from turnstone.core.mcp_oauth import MODEL_OBO_CACHE_PREFIX
+    from turnstone.core.token_store.store import MODEL_OBO_CACHE_PREFIX
     from turnstone.core.web_helpers import require_storage_or_503
 
     storage, err = require_storage_or_503(request)
@@ -10624,7 +10625,7 @@ def _purge_model_mint_cache(storage: Any, definition_id: str, alias: str) -> Non
     regardless — this purge is at-rest hygiene, the gate is the serving
     guarantee.
     """
-    from turnstone.core.mcp_oauth import model_app_cache_server, model_obo_cache_server
+    from turnstone.core.model_oauth import model_app_cache_server, model_obo_cache_server
 
     if not alias:
         return
@@ -10860,7 +10861,7 @@ def _enforce_oauth_obo_requirements(
                 },
                 status_code=400,
             )
-        from turnstone.core.mcp_oauth import OBO_GRANT_PROFILES
+        from turnstone.core.oauth.grants import OBO_GRANT_PROFILES
 
         if profile not in OBO_GRANT_PROFILES:
             return JSONResponse(
@@ -12888,10 +12889,8 @@ def _validate_dynamic_model_auth(
     # --- Deployment posture: pair chosen by this request, or re-arming -----
     if not posture_event:
         return None
-    # Function-local import, same as the MCP validator above: oidc and
-    # mcp_oauth reference each other lazily, so this stays off the module
-    # import graph.
-    from turnstone.core.mcp_oauth import OBO_GRANT_PROFILES
+    # Validate against the same shared grant registry as the MCP validator.
+    from turnstone.core.oauth.grants import OBO_GRANT_PROFILES
 
     # Check ORDER mirrors the MCP sibling: token store first, then
     # OIDC-configured, then profile semantics — so a no-SSO host is told
@@ -17120,7 +17119,7 @@ def create_app(
     app.state.login_limiter = LoginRateLimiter()
 
     # OIDC configuration (opt-in via env vars)
-    from turnstone.core.oidc import load_oidc_config
+    from turnstone.core.oauth.oidc import load_oidc_config
 
     oidc_config = load_oidc_config()
     app.state.oidc_config = oidc_config

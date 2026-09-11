@@ -32,7 +32,7 @@ from turnstone.core.auth import (
     handle_oidc_authorize,
     handle_oidc_callback,
 )
-from turnstone.core.oidc import OIDCConfig, OIDCError, OIDCKeyNotFoundError
+from turnstone.core.oauth.oidc import OIDCConfig, OIDCError, OIDCKeyNotFoundError
 
 if TYPE_CHECKING:
     from starlette.requests import Request

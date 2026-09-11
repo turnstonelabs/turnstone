@@ -1,8 +1,8 @@
 """Shared SSRF and same-origin validation for OAuth/OIDC endpoint URLs.
 
-Extracted from :mod:`turnstone.core.oidc` so the per-(user, server) MCP
-OAuth flow (see :mod:`turnstone.core.mcp_oauth`) can reuse the exact same
-guards without depending on the OIDC module.
+Shared by :mod:`turnstone.core.oauth.oidc` and :mod:`turnstone.core.mcp_oauth`
+so both consumers use the same guards without depending on each other's
+protocol or policy code.
 
 The canonical exception is :class:`OAuthSSRFError`. The OIDC module wraps
 calls to these helpers and re-raises ``OIDCError`` so its public API is

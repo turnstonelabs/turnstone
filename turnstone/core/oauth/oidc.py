@@ -1,0 +1,949 @@
+"""OIDC configuration, discovery, token validation, and protocol client state."""
+
+from __future__ import annotations
+
+import asyncio
+import base64
+import dataclasses
+import hashlib
+import os
+import secrets
+import threading
+import time
+import urllib.parse
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any
+
+import httpx
+
+from turnstone.core.log import get_logger
+from turnstone.core.oauth import grants as oauth_grants
+from turnstone.core.oauth import ssrf as oauth_ssrf
+from turnstone.core.oauth.ssrf import (
+    validate_discovered_endpoint as _ssrf_validate_discovered_endpoint,
+)
+from turnstone.core.oauth.ssrf import (
+    validate_url_no_ssrf as _ssrf_validate_url_no_ssrf,
+)
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping
+
+
+log = get_logger(__name__)
+
+# Lifetime of an OIDC authorization-flow pending-state row. Bounds the window
+# between /authorize and /callback; longer than typical IdP latency, shorter
+# than a stale browser tab.
+OIDC_STATE_TTL_SECONDS = 300
+
+
+# Asymmetric algorithms accepted for ID token signatures.
+# Symmetric (HMAC) algorithms are deliberately excluded to prevent
+# algorithm confusion attacks where the IdP's public key is used as
+# an HMAC secret.
+_ALLOWED_ID_TOKEN_ALGS = [
+    "RS256",
+    "RS384",
+    "RS512",
+    "ES256",
+    "ES384",
+    "ES512",
+    "PS256",
+    "PS384",
+    "PS512",
+]
+
+
+# ---------------------------------------------------------------------------
+# Exceptions
+# ---------------------------------------------------------------------------
+
+
+class OIDCError(Exception):
+    """Raised when an OIDC operation fails."""
+
+
+class OIDCKeyNotFoundError(OIDCError):
+    """Raised when an ID token's signing key is absent from the cached JWKS.
+
+    Distinguishing this from generic OIDCError lets the callback retry once
+    after re-fetching JWKS (key rotation), without depending on substring
+    matching of the error message.
+    """
+
+
+def _sanitize_log_text(s: str, limit: int) -> str:
+    """Legacy alias for the shared :func:`oauth_ssrf.sanitize_log_text`."""
+
+    return oauth_ssrf.sanitize_log_text(s, limit)
+
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class OIDCConfig:
+    """OIDC provider configuration -- immutable after startup.
+
+    The dataclass has a two-phase lifecycle:
+
+    Startup-config fields (set by :func:`load_oidc_config`):
+        ``enabled``, ``issuer``, ``client_id``, ``client_secret``, ``scopes``,
+        ``provider_name``, ``role_claim``, ``role_map``, ``password_enabled``,
+        ``redirect_base``, ``trusted_endpoint_hosts``, ``allow_private_network``,
+        ``capture_user_credential``, ``obo_grant_profile``.
+
+    Discovery-derived fields (set by :func:`discover_oidc`; empty before
+    discovery completes):
+        ``authorization_endpoint``, ``token_endpoint``, ``userinfo_endpoint``,
+        ``jwks_uri``.
+    """
+
+    enabled: bool = False
+    issuer: str = ""
+    client_id: str = ""
+    client_secret: str = ""
+    scopes: str = "openid email profile"
+    provider_name: str = "SSO"
+    role_claim: str = ""
+    role_map: dict[str, str] = field(default_factory=dict)
+    password_enabled: bool = True
+    redirect_base: str = ""
+    trusted_endpoint_hosts: tuple[str, ...] = ()
+    # Opt-in for self-hosted IdPs on internal networks: permit the issuer
+    # (and its same-origin discovered endpoints) to resolve to private
+    # addresses. Link-local/multicast/reserved stay refused regardless.
+    allow_private_network: bool = False
+    # Opt-in single-credential capture (issue #551): persist the user's IdP
+    # refresh token (encrypted) at login so `auth_type='oauth_obo'` MCP
+    # servers can mint per-server access tokens on demand.  Requires the
+    # [security] MCP token encryption key — enforced at startup.
+    capture_user_credential: bool = False
+    # Grant leg used to redeem the captured credential for per-server access
+    # tokens: "entra" (refresh-token redemption with scope=<audience>/.default)
+    # or "rfc8693" (refresh grant + standard token exchange).  The IdP
+    # determines the leg, so this is deployment-level, not per-server.
+    obo_grant_profile: str = "entra"
+    # Discovered from .well-known/openid-configuration
+    authorization_endpoint: str = ""
+    token_endpoint: str = ""
+    userinfo_endpoint: str = ""
+    jwks_uri: str = ""
+    # True when ``enabled`` was forced False by a discovery failure that a
+    # later retry could clear (IdP unreachable / bad gateway page at boot),
+    # as opposed to operator config problems (bad issuer URL, SSRF-rejected
+    # endpoints) where retrying is pointless. Consumed by
+    # :func:`maybe_rediscover_oidc` — without it a node that boots during a
+    # transient IdP outage can never mint oauth_obo tokens until restarted.
+    discovery_retryable: bool = False
+
+
+def _parse_role_map(raw: str) -> dict[str, str]:
+    """Parse ``"admin:builtin-admin,eng:builtin-operator"`` into a dict."""
+    result: dict[str, str] = {}
+    for pair in raw.split(","):
+        pair = pair.strip()
+        if ":" in pair:
+            k, v = pair.split(":", 1)
+            k, v = k.strip(), v.strip()
+            if k and v:
+                result[k] = v
+    return result
+
+
+def _parse_trusted_endpoint_hosts(raw: str) -> tuple[str, ...]:
+    """Parse a comma-separated host list into a normalised tuple."""
+    hosts: list[str] = []
+    for entry in raw.split(","):
+        host = entry.strip().lower()
+        if host:
+            hosts.append(host)
+    return tuple(hosts)
+
+
+def _env_or_cfg_str(env_name: str, cfg: Mapping[str, Any], key: str, default: str = "") -> str:
+    """Resolve a string field: env var (stripped, non-empty) wins, else config, else default."""
+    val = os.environ.get(env_name, "").strip()
+    if not val:
+        val = str(cfg.get(key, default)).strip()
+    return val
+
+
+def _env_or_cfg_bool(env_name: str, cfg: Mapping[str, Any], key: str, default: bool) -> bool:
+    """Resolve a boolean field: env var (stripped) wins when set, else config, else default."""
+    raw = os.environ.get(env_name, "").strip().lower()
+    if raw:
+        return raw in ("true", "1", "yes")
+    return bool(cfg.get(key, default))
+
+
+def load_oidc_config() -> OIDCConfig:
+    """Build :class:`OIDCConfig` from env vars with config.toml fallback.
+
+    Returns ``OIDCConfig(enabled=False)`` when the required fields
+    (issuer, client_id, client_secret) are not all present.
+    """
+    from turnstone.core.config import load_config
+
+    cfg = load_config("oidc")
+
+    issuer = _env_or_cfg_str("TURNSTONE_OIDC_ISSUER", cfg, "issuer")
+    client_id = _env_or_cfg_str("TURNSTONE_OIDC_CLIENT_ID", cfg, "client_id")
+    client_secret = _env_or_cfg_str("TURNSTONE_OIDC_CLIENT_SECRET", cfg, "client_secret")
+    scopes = _env_or_cfg_str("TURNSTONE_OIDC_SCOPES", cfg, "scopes", "openid email profile")
+    provider_name = _env_or_cfg_str("TURNSTONE_OIDC_PROVIDER_NAME", cfg, "provider_name", "SSO")
+    role_claim = _env_or_cfg_str("TURNSTONE_OIDC_ROLE_CLAIM", cfg, "role_claim")
+    password_enabled = _env_or_cfg_bool(
+        "TURNSTONE_OIDC_PASSWORD_ENABLED", cfg, "password_enabled", True
+    )
+    allow_private_network = _env_or_cfg_bool(
+        "TURNSTONE_OIDC_ALLOW_PRIVATE_NETWORK", cfg, "allow_private_network", False
+    )
+    capture_user_credential = _env_or_cfg_bool(
+        "TURNSTONE_OIDC_CAPTURE_USER_CREDENTIAL", cfg, "capture_user_credential", False
+    )
+    obo_grant_profile = _env_or_cfg_str(
+        "TURNSTONE_OIDC_OBO_GRANT_PROFILE", cfg, "obo_grant_profile", "entra"
+    ).strip()
+    # Validate against the shared grant registry, so a new leg needs no
+    # second edit here and protocol config stays independent of its consumers.
+    if obo_grant_profile not in oauth_grants.OBO_GRANT_PROFILES:
+        # Warn-only, deliberately: the raw value must survive so the write-time
+        # validators can echo the operator's actual typo back in their 400s,
+        # rather than a coerced value that turns a self-diagnosing message
+        # into a startup-log scavenger hunt. Runtime is already safe — the
+        # mint legs resolve by exact name, so an unknown profile never mints.
+        log.warning(
+            "oidc: unknown obo_grant_profile %r (expected one of %s) — "
+            "oauth_obo MCP servers and dynamic-auth model aliases will "
+            "not mint until this is fixed",
+            obo_grant_profile,
+            ", ".join(sorted(oauth_grants.OBO_GRANT_PROFILES)),
+        )
+    if capture_user_credential and "offline_access" not in scopes.split():
+        # The captured credential IS the offline_access refresh token; ask
+        # for it at login so operators don't have to edit two keys in step.
+        scopes = f"{scopes} offline_access".strip()
+        log.info("oidc.capture: appended offline_access to login scopes")
+
+    # Role map: env var is "admin:builtin-admin,eng:builtin-operator"
+    role_map_raw = os.environ.get("TURNSTONE_OIDC_ROLE_MAP", "").strip()
+    if role_map_raw:
+        role_map = _parse_role_map(role_map_raw)
+    else:
+        cfg_role_map = cfg.get("role_map", {})
+        role_map = dict(cfg_role_map) if isinstance(cfg_role_map, dict) else {}
+
+    trusted_hosts_raw = os.environ.get("TURNSTONE_OIDC_TRUSTED_ENDPOINT_HOSTS", "").strip()
+    if trusted_hosts_raw:
+        trusted_endpoint_hosts = _parse_trusted_endpoint_hosts(trusted_hosts_raw)
+    else:
+        cfg_trusted = cfg.get("trusted_endpoint_hosts", "")
+        if isinstance(cfg_trusted, list):
+            trusted_endpoint_hosts = _parse_trusted_endpoint_hosts(
+                ",".join(str(h) for h in cfg_trusted)
+            )
+        else:
+            trusted_endpoint_hosts = _parse_trusted_endpoint_hosts(str(cfg_trusted))
+
+    redirect_base = _env_or_cfg_str("TURNSTONE_OIDC_REDIRECT_BASE", cfg, "redirect_base").rstrip(
+        "/"
+    )
+    if redirect_base:
+        parsed = urllib.parse.urlparse(redirect_base)
+        if parsed.scheme not in ("https", "http"):
+            log.warning(
+                "TURNSTONE_OIDC_REDIRECT_BASE has invalid scheme, ignoring: %s",
+                redirect_base,
+            )
+            redirect_base = ""
+        elif not parsed.hostname:
+            log.warning(
+                "TURNSTONE_OIDC_REDIRECT_BASE missing hostname, ignoring: %s",
+                redirect_base,
+            )
+            redirect_base = ""
+        elif parsed.username or parsed.password:
+            log.warning(
+                "TURNSTONE_OIDC_REDIRECT_BASE must not contain userinfo, ignoring: %s",
+                redirect_base,
+            )
+            redirect_base = ""
+        elif parsed.path or parsed.query or parsed.fragment:
+            log.warning(
+                "TURNSTONE_OIDC_REDIRECT_BASE must be scheme://host[:port] only, ignoring: %s",
+                redirect_base,
+            )
+            redirect_base = ""
+        else:
+            # Validate port is numeric (urlparse accepts "host:abc" silently).
+            try:
+                parsed.port  # noqa: B018 — triggers ValueError on non-numeric port
+            except ValueError:
+                log.warning(
+                    "TURNSTONE_OIDC_REDIRECT_BASE has invalid port, ignoring: %s",
+                    redirect_base,
+                )
+                redirect_base = ""
+        if redirect_base and parsed.scheme != "https":
+            log.warning(
+                "TURNSTONE_OIDC_REDIRECT_BASE should use https:// in production: %s",
+                redirect_base,
+            )
+
+    # OIDC is enabled when all three required fields are non-empty.
+    enabled = bool(issuer and client_id and client_secret)
+
+    if enabled:
+        log.info(
+            "OIDC enabled: issuer=%s provider=%s%s",
+            issuer,
+            provider_name,
+            " (private-network IdP allowed)" if allow_private_network else "",
+        )
+    else:
+        log.debug("OIDC not configured (issuer/client_id/client_secret incomplete)")
+
+    return OIDCConfig(
+        enabled=enabled,
+        issuer=issuer,
+        client_id=client_id,
+        client_secret=client_secret,
+        scopes=scopes,
+        provider_name=provider_name,
+        role_claim=role_claim,
+        role_map=role_map,
+        password_enabled=password_enabled,
+        redirect_base=redirect_base,
+        trusted_endpoint_hosts=trusted_endpoint_hosts,
+        allow_private_network=allow_private_network,
+        capture_user_credential=capture_user_credential,
+        obo_grant_profile=obo_grant_profile,
+    )
+
+
+# ---------------------------------------------------------------------------
+# SSRF validation
+#
+# The actual checks live in :mod:`turnstone.core.oauth.ssrf` so the MCP OAuth
+# flow can reuse them. The wrappers below preserve OIDC's public API by
+# converting :class:`OAuthSSRFError` to :class:`OIDCError`.
+# ---------------------------------------------------------------------------
+
+# Appended to every private-address rejection in this module (issuer and
+# discovered endpoints alike): the login-flow URLs are operator-configured,
+# so pointing the operator at the opt-in is safe here. ``mcp_oauth`` has its
+# own opt-in (``mcp.oauth_allow_private_network``) scoped the same way: it
+# reaches the URLs an operator typed on the server row, never one that came
+# out of remote-server metadata, which stays strict however it is set.
+_PRIVATE_NETWORK_HINT = (
+    " — to allow a self-hosted IdP on a private network, set "
+    "allow_private_network = true in the [oidc] section of config.toml "
+    "(or TURNSTONE_OIDC_ALLOW_PRIVATE_NETWORK=true)"
+)
+
+
+def _validate_url_no_ssrf(
+    url: str, *, allow_http: bool, allow_private: bool = False
+) -> urllib.parse.ParseResult:
+    """OIDC-flavoured wrapper around :func:`oauth_ssrf.validate_url_no_ssrf`."""
+    try:
+        return _ssrf_validate_url_no_ssrf(url, allow_http=allow_http, allow_private=allow_private)
+    except oauth_ssrf.OAuthSSRFPrivateAddressError as exc:
+        raise OIDCError(f"{exc}{_PRIVATE_NETWORK_HINT}") from exc
+    except oauth_ssrf.OAuthSSRFError as exc:
+        raise OIDCError(str(exc)) from exc
+
+
+def validate_issuer_url(url: str, *, allow_private: bool = False) -> None:
+    """Validate an OIDC issuer URL to prevent SSRF.
+
+    Rejects:
+    - Non-HTTPS URLs (except localhost for development)
+    - URLs with embedded credentials (userinfo)
+    - Hostnames that resolve to private/internal/loopback IP addresses,
+      unless ``allow_private`` is set (the ``allow_private_network``
+      opt-in for self-hosted IdPs; link-local/multicast/reserved
+      addresses stay refused regardless)
+
+    Raises :class:`OIDCError` on validation failure.
+    """
+    _validate_url_no_ssrf(url, allow_http=True, allow_private=allow_private)
+
+
+def validate_discovered_endpoint(
+    url: str,
+    issuer_parsed: urllib.parse.ParseResult,
+    *,
+    allow_http: bool,
+    trusted_endpoint_hosts: frozenset[str],
+    allow_private: bool = False,
+) -> None:
+    """Validate an endpoint pulled from an IdP discovery document.
+
+    Applies the same scheme/userinfo/SSRF rules as :func:`validate_issuer_url`,
+    then constrains the host: by default the endpoint must share the issuer's
+    hostname. Strict equality is intentional — a hostile or compromised IdP
+    must not be able to redirect ``token_endpoint`` to a third-party host where
+    ``client_secret`` would leak. Multi-origin IdPs (e.g. Google) are
+    accommodated via :data:`turnstone.core.oauth.ssrf.KNOWN_TRUSTED_OAUTH_ENDPOINT_HOSTS`
+    plus an operator-configurable ``trusted_endpoint_hosts`` list.
+
+    The scheme must match the issuer's scheme, and the *effective* port (with
+    scheme defaults applied) must match — so ``https://host`` and
+    ``https://host:443`` are treated as identical.
+
+    ``allow_http`` should track whether the *issuer* URL was localhost, so the
+    whole flow is allowed to be HTTP only in dev mode.
+
+    Raises :class:`OIDCError` on validation failure.
+    """
+    try:
+        _ssrf_validate_discovered_endpoint(
+            url,
+            issuer_parsed,
+            allow_http=allow_http,
+            trusted_endpoint_hosts=trusted_endpoint_hosts,
+            allow_private=allow_private,
+        )
+    except oauth_ssrf.OAuthSSRFPrivateAddressError as exc:
+        # A discovered endpoint (or trusted host) resolving private is fixed
+        # by the same opt-in as the issuer — carry the hint here too.
+        raise OIDCError(f"{exc}{_PRIVATE_NETWORK_HINT}") from exc
+    except oauth_ssrf.OAuthSSRFError as exc:
+        raise OIDCError(str(exc)) from exc
+
+
+# ---------------------------------------------------------------------------
+# Discovery
+# ---------------------------------------------------------------------------
+
+
+async def discover_oidc(
+    config: OIDCConfig,
+    *,
+    client: httpx.AsyncClient | None = None,
+) -> OIDCConfig:
+    """Fetch OIDC discovery document and return updated config with endpoints.
+
+    On failure, logs a warning and returns config with ``enabled=False``.
+
+    A long-lived ``client`` may be supplied to amortise TLS / connection
+    setup across calls; when ``None`` a transient client is used (the
+    legacy shape, kept so tests don't need lifecycle management).
+    """
+    # Config-error branches force ``discovery_retryable=False`` (terminal): they
+    # reflect a bad CONFIG (no issuer, an SSRF-rejected URL), not a transient IdP
+    # outage, so a runtime re-probe would only fail identically forever. This is
+    # explicit rather than preserved-from-input because ``maybe_rediscover_oidc``
+    # probes with the retryable boot config (``discovery_retryable=True``); left
+    # preserved, a config-invalid IdP would re-probe every cooldown window.
+    if not config.issuer:
+        return dataclasses.replace(config, enabled=False, discovery_retryable=False)
+
+    try:
+        issuer_parsed = _validate_url_no_ssrf(
+            config.issuer, allow_http=True, allow_private=config.allow_private_network
+        )
+    except OIDCError as exc:
+        log.warning("OIDC issuer URL rejected: %s", exc)
+        return dataclasses.replace(config, enabled=False, discovery_retryable=False)
+
+    url = config.issuer.rstrip("/") + "/.well-known/openid-configuration"
+    try:
+        if client is not None:
+            resp = await client.get(url, timeout=10.0)
+            resp.raise_for_status()
+            doc = resp.json()
+        else:
+            async with httpx.AsyncClient(timeout=10.0) as transient:
+                resp = await transient.get(url)
+                resp.raise_for_status()
+                doc = resp.json()
+    except (httpx.HTTPError, ValueError, KeyError) as exc:
+        # ValueError covers json.JSONDecodeError (subclass). Retryable: the
+        # IdP being unreachable at boot says nothing about the config.
+        log.warning("OIDC discovery failed for %s: %s", config.issuer, exc, exc_info=True)
+        return dataclasses.replace(config, enabled=False, discovery_retryable=True)
+
+    if not isinstance(doc, dict):
+        # Retryable: a proxy/CDN error page in front of a healthy IdP.
+        log.warning(
+            "OIDC discovery document for %s is not a JSON object (got %s)",
+            config.issuer,
+            type(doc).__name__,
+        )
+        return dataclasses.replace(config, enabled=False, discovery_retryable=True)
+
+    authorization_endpoint = str(doc.get("authorization_endpoint", ""))
+    token_endpoint = str(doc.get("token_endpoint", ""))
+    userinfo_endpoint = str(doc.get("userinfo_endpoint", ""))
+    jwks_uri = str(doc.get("jwks_uri", ""))
+
+    if not authorization_endpoint or not token_endpoint or not jwks_uri:
+        # Retryable: could equally be a degraded IdP serving a partial
+        # document; a genuinely misconfigured IdP just re-warns once per cooldown.
+        log.warning(
+            "OIDC discovery document missing required endpoints for %s",
+            config.issuer,
+        )
+        return dataclasses.replace(config, enabled=False, discovery_retryable=True)
+
+    allow_http = oauth_ssrf.is_localhost(issuer_parsed.hostname or "")
+    trusted_hosts = frozenset(h.lower() for h in config.trusted_endpoint_hosts)
+    required = (
+        ("authorization_endpoint", authorization_endpoint),
+        ("token_endpoint", token_endpoint),
+        ("jwks_uri", jwks_uri),
+    )
+    for name, endpoint_url in required:
+        try:
+            validate_discovered_endpoint(
+                endpoint_url,
+                issuer_parsed,
+                allow_http=allow_http,
+                trusted_endpoint_hosts=trusted_hosts,
+                allow_private=config.allow_private_network,
+            )
+        except OIDCError as exc:
+            # Config error (discovered endpoint fails SSRF/validation), not a
+            # transient outage — latch terminal so rediscovery stops re-probing.
+            log.warning("OIDC discovered %s rejected (url=%s): %s", name, endpoint_url, exc)
+            return dataclasses.replace(config, enabled=False, discovery_retryable=False)
+
+    if userinfo_endpoint:
+        try:
+            validate_discovered_endpoint(
+                userinfo_endpoint,
+                issuer_parsed,
+                allow_http=allow_http,
+                trusted_endpoint_hosts=trusted_hosts,
+                allow_private=config.allow_private_network,
+            )
+        except OIDCError as exc:
+            log.warning(
+                "OIDC discovered userinfo_endpoint rejected (url=%s): %s",
+                userinfo_endpoint,
+                exc,
+            )
+            # Config error — latch terminal (see the issuer-rejection branch).
+            return dataclasses.replace(config, enabled=False, discovery_retryable=False)
+
+    log.info("OIDC discovery complete: %s", config.issuer)
+    return dataclasses.replace(
+        config,
+        authorization_endpoint=authorization_endpoint,
+        token_endpoint=token_endpoint,
+        userinfo_endpoint=userinfo_endpoint,
+        jwks_uri=jwks_uri,
+    )
+
+
+# ---------------------------------------------------------------------------
+# JWKS key management
+# ---------------------------------------------------------------------------
+
+
+async def fetch_jwks(
+    jwks_uri: str,
+    *,
+    client: httpx.AsyncClient | None = None,
+) -> dict[str, Any]:
+    """Fetch the JWKS key set from the IdP.
+
+    Returns the parsed JSON document (``{"keys": [...]}``) .  Called during
+    startup discovery and on-demand when an unknown ``kid`` is encountered
+    (key rotation).  Uses ``httpx.AsyncClient`` — never blocks the event loop.
+
+    A long-lived ``client`` may be supplied to share connection pooling;
+    when ``None`` a transient client is used.
+
+    Raises :class:`OIDCError` on HTTP error or malformed JSON.
+    """
+    try:
+        if client is not None:
+            resp = await client.get(jwks_uri, timeout=10.0)
+            resp.raise_for_status()
+            result: dict[str, Any] = resp.json()
+        else:
+            async with httpx.AsyncClient(timeout=10.0) as transient:
+                resp = await transient.get(jwks_uri)
+                resp.raise_for_status()
+                result = resp.json()
+    except (httpx.HTTPError, ValueError) as exc:
+        # ValueError covers json.JSONDecodeError (subclass).
+        raise OIDCError(f"JWKS fetch failed: {exc}") from exc
+    if not isinstance(result, dict):
+        raise OIDCError("JWKS document is not a JSON object")
+    if not isinstance(result.get("keys"), list):
+        raise OIDCError("JWKS document missing 'keys' array")
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Lifespan integration
+# ---------------------------------------------------------------------------
+
+
+async def initialize_oidc_state(app_state: Any) -> None:
+    """Run OIDC discovery + JWKS prefetch and stash results on ``app_state``.
+
+    Reads ``app_state.oidc_config`` (already set to a non-discovered config
+    by the lifespan), runs :func:`discover_oidc` and :func:`fetch_jwks`, and
+    writes back the populated ``oidc_config`` plus ``jwks_data``.
+
+    Post-conditions on ``app_state``:
+
+    - On disable (config flag off, discovery failure, discovery-returned-disabled,
+      missing ``redirect_base``): ``oidc_config.enabled is False``,
+      ``jwks_data is None``, ``oidc_http_client is None``.
+    - On JWKS-prefetch failure with otherwise-valid config: ``oidc_config.enabled``
+      stays ``True`` and ``jwks_data is None`` so the callback's lazy-fetch
+      retry path can recover from a transient IdP failure at startup. The
+      long-lived ``oidc_http_client`` stays open for that retry.
+    - On full success: ``oidc_config`` populated with discovered endpoints,
+      ``jwks_data`` populated, ``oidc_http_client`` open for the runtime
+      callback path. Pair with :func:`close_oidc_state` in lifespan teardown.
+    """
+    cfg: OIDCConfig = app_state.oidc_config
+    app_state.jwks_refetch_lock = asyncio.Lock()
+    if not cfg.enabled:
+        app_state.jwks_data = None
+        app_state.oidc_http_client = None
+        return
+
+    # Use a transient client for discovery so the long-lived client is only
+    # installed once we know OIDC will actually be enabled.  The disable
+    # branches below would otherwise leak sockets until shutdown.
+    async with httpx.AsyncClient(timeout=10.0) as transient_client:
+        # Discovery is operator-controlled config; any unexpected failure
+        # must disable OIDC rather than escape and bring down the service.
+        try:
+            cfg = await discover_oidc(cfg, client=transient_client)
+        except Exception:
+            log.warning("OIDC discovery failed -- OIDC login disabled", exc_info=True)
+            # Unexpected failure — allow the runtime retry path to probe it
+            # (cooldown-gated), matching the in-band transient branches.
+            app_state.oidc_config = dataclasses.replace(
+                cfg, enabled=False, discovery_retryable=True
+            )
+            app_state.jwks_data = None
+            app_state.oidc_http_client = None
+            return
+
+    if not cfg.enabled:
+        app_state.oidc_config = cfg
+        app_state.jwks_data = None
+        app_state.oidc_http_client = None
+        return
+
+    if not cfg.redirect_base:
+        log.error(
+            "OIDC enabled but TURNSTONE_OIDC_REDIRECT_BASE is unset. "
+            "This is required to prevent Host-header-derived redirect_uri spoofing. "
+            "Set it to your service's externally-visible URL "
+            "(e.g. https://idp.example.com). OIDC will be disabled."
+        )
+        app_state.oidc_config = dataclasses.replace(cfg, enabled=False)
+        app_state.jwks_data = None
+        app_state.oidc_http_client = None
+        return
+
+    http_client = httpx.AsyncClient(timeout=10.0)
+    app_state.oidc_http_client = http_client
+
+    try:
+        jwks_data = await fetch_jwks(cfg.jwks_uri, client=http_client)
+    except OIDCError:
+        # Keep enabled=True so the callback's lazy-fetch retry path can
+        # recover if the IdP transiently failed during startup. The
+        # http_client stays open for that retry.
+        log.warning("OIDC JWKS prefetch failed -- will retry on first login", exc_info=True)
+        app_state.oidc_config = cfg
+        app_state.jwks_data = None
+        return
+
+    app_state.oidc_config = cfg
+    app_state.jwks_data = jwks_data
+    log.info("OIDC enabled: %s (%s)", cfg.provider_name, cfg.issuer)
+
+
+#: Minimum spacing between runtime discovery retries — one probe GET to the
+#: IdP per node per window while it stays down, however many callers ask.
+_REDISCOVER_COOLDOWN_SECONDS = 60.0
+
+
+#: Guards lazy creation of the per-app-state gate below.
+_rediscover_create_lock = threading.Lock()
+
+
+def _rediscover_gate(app_state: Any) -> threading.Lock:
+    """Single-flight gate for runtime re-discovery, lazily created per app state.
+
+    A ``threading.Lock`` (not ``asyncio.Lock``) on purpose: callers live on
+    different event loops — OIDC login on the uvicorn loop, oauth_obo minting
+    on the MCP loop thread — and asyncio primitives are bound to the loop
+    that created them.
+    """
+    with _rediscover_create_lock:
+        gate = getattr(app_state, "oidc_rediscover_gate", None)
+        if gate is None:
+            gate = threading.Lock()
+            app_state.oidc_rediscover_gate = gate
+        return gate
+
+
+async def maybe_rediscover_oidc(app_state: Any) -> None:
+    """Retry OIDC discovery at runtime after a retryable boot-time failure.
+
+    A node that boots while the IdP is briefly unreachable comes up with
+    ``oidc_config.enabled=False`` and would otherwise stay that way until an
+    operator restarts it — OIDC login stays dark on the node and every
+    ``oauth_obo`` mint fails "transient" forever. This helper re-runs
+    :func:`discover_oidc` (cooldown-gated, single-flight across threads) and
+    swaps the recovered config onto *app_state* on success.
+
+    No-op when OIDC is operator-disabled, already enabled, or discovery
+    failed for a non-retryable configuration reason (``discovery_retryable``
+    False). Uses a transient HTTP client so it is safe to call from any
+    event loop; the recovered config leaves ``jwks_data`` unset — the login
+    path's existing lazy JWKS refetch fills it on first use.
+    """
+    cfg = getattr(app_state, "oidc_config", None)
+    if (
+        cfg is None
+        or getattr(cfg, "enabled", False)
+        or not getattr(cfg, "discovery_retryable", False)
+    ):
+        return
+    gate = _rediscover_gate(app_state)
+    if not gate.acquire(blocking=False):
+        # Another caller (possibly on another loop) is already probing; this
+        # caller proceeds on the still-disabled config and heals next tick.
+        return
+    try:
+        now = time.monotonic()
+        # ``None`` (not 0.0) means "never probed" — otherwise the first probe
+        # within ~60s of the monotonic reference (host boot) would be suppressed
+        # by the cooldown against a phantom probe at time 0.
+        last = getattr(app_state, "oidc_rediscover_last", None)
+        if last is not None and now - float(last) < _REDISCOVER_COOLDOWN_SECONDS:
+            return
+        app_state.oidc_rediscover_last = now
+        # Probe with enabled=True FORCED ON: discover_oidc PRESERVES the input's
+        # ``enabled`` on success (only ``load_oidc_config`` ever sets it True) and
+        # sets it False on any failure. Passing the disabled boot config verbatim
+        # would make a SUCCESSFUL rediscovery still return enabled=False, so the
+        # swap below would be unreachable and the feature inert. Forcing it True
+        # up front makes ``fresh.enabled`` a reliable success signal (a real
+        # failure clears it back to False).
+        #
+        # Wrapped in ``except Exception`` exactly like the boot path
+        # (initialize_oidc_state): discover_oidc catches httpx/ValueError/OIDC
+        # errors, but the runtime SSRF/DNS validation can raise something outside
+        # that set, and this runs inside get_obo_access_token_classified — which
+        # promises a TokenLookupResult, never a raise. An unexpected failure just
+        # leaves OIDC disabled for this probe (retry next window); it must not
+        # escape into the caller's classified-result contract.
+        try:
+            fresh = await discover_oidc(dataclasses.replace(cfg, enabled=True))
+        except Exception:
+            log.warning("OIDC runtime rediscovery raised unexpectedly", exc_info=True)
+            return
+        if not fresh.enabled:
+            if not fresh.discovery_retryable:
+                # Discovery now fails for a CONFIG reason (bad issuer, an
+                # SSRF-rejected endpoint), not a transient outage — latch that
+                # terminal config onto app_state so this node stops re-probing
+                # every cooldown window. Without installing it, app_state would
+                # keep the retryable flag and re-probe an IdP that can never heal.
+                app_state.oidc_config = fresh
+            return  # still disabled (transient → retry next window; terminal → latched)
+        app_state.oidc_config = dataclasses.replace(fresh, discovery_retryable=False)
+        log.info("OIDC discovery recovered at runtime: %s", fresh.issuer)
+    finally:
+        gate.release()
+
+
+async def close_oidc_state(app_state: Any) -> None:
+    """Close the long-lived OIDC HTTP client installed by :func:`initialize_oidc_state`.
+
+    Safe to call when OIDC was never enabled — does nothing.
+    """
+    client = getattr(app_state, "oidc_http_client", None)
+    if client is not None:
+        try:
+            await client.aclose()
+        except Exception:
+            log.debug("OIDC http client close failed", exc_info=True)
+        app_state.oidc_http_client = None
+
+
+# ---------------------------------------------------------------------------
+# PKCE helpers
+# ---------------------------------------------------------------------------
+
+
+def generate_pkce_verifier() -> str:
+    """Generate a PKCE code_verifier.
+
+    The matching code_challenge is recomputed from the verifier inside
+    :func:`build_authorize_url`, so callers that only need the verifier
+    (the value stored in pending state for the callback's token exchange)
+    don't have to discard a separately-returned challenge.
+    """
+    return secrets.token_urlsafe(48)
+
+
+# ---------------------------------------------------------------------------
+# Authorization URL
+# ---------------------------------------------------------------------------
+
+
+def build_authorize_url(
+    config: OIDCConfig,
+    redirect_uri: str,
+    state: str,
+    nonce: str,
+    code_verifier: str,
+) -> str:
+    """Build the OIDC authorization URL with PKCE."""
+    digest = hashlib.sha256(code_verifier.encode("ascii")).digest()
+    code_challenge = base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+
+    params = {
+        "response_type": "code",
+        "client_id": config.client_id,
+        "redirect_uri": redirect_uri,
+        "scope": config.scopes,
+        "state": state,
+        "nonce": nonce,
+        "code_challenge": code_challenge,
+        "code_challenge_method": "S256",
+    }
+    return config.authorization_endpoint + "?" + urllib.parse.urlencode(params)
+
+
+# ---------------------------------------------------------------------------
+# Token exchange
+# ---------------------------------------------------------------------------
+
+
+async def exchange_code(
+    config: OIDCConfig,
+    code: str,
+    redirect_uri: str,
+    code_verifier: str,
+    *,
+    client: httpx.AsyncClient | None = None,
+) -> dict[str, Any]:
+    """Exchange authorization code for tokens at the token endpoint.
+
+    A long-lived ``client`` may be supplied; when ``None`` a transient
+    client is used.
+
+    Raises :class:`OIDCError` on non-200 response.
+    """
+    data = {
+        "grant_type": "authorization_code",
+        "code": code,
+        "redirect_uri": redirect_uri,
+        "client_id": config.client_id,
+        "client_secret": config.client_secret,
+        "code_verifier": code_verifier,
+    }
+    try:
+        if client is not None:
+            resp = await client.post(config.token_endpoint, data=data, timeout=10.0)
+        else:
+            async with httpx.AsyncClient(timeout=10.0) as transient:
+                resp = await transient.post(config.token_endpoint, data=data)
+    except Exception as exc:
+        raise OIDCError(f"Token exchange request failed: {exc}") from exc
+
+    if resp.status_code != 200:
+        raise OIDCError(
+            f"Token endpoint returned {resp.status_code}: {_sanitize_log_text(resp.text, 500)}"
+        )
+
+    result = resp.json()
+    if not isinstance(result, dict):
+        raise OIDCError("Token endpoint returned non-dict body")
+    typed: dict[str, Any] = result
+    return typed
+
+
+# ---------------------------------------------------------------------------
+# ID token validation
+# ---------------------------------------------------------------------------
+
+
+def validate_id_token(
+    raw_token: str,
+    jwks_data: dict[str, Any],
+    config: OIDCConfig,
+    nonce: str,
+) -> dict[str, Any]:
+    """Validate and decode an OIDC ID token.  Returns decoded claims.
+
+    *jwks_data* is the pre-fetched JWKS document (the ``{"keys": [...]}``
+    dict).  No network I/O happens here — the signing key is resolved
+    locally from the cached key set.
+
+    Raises :class:`OIDCError` on validation failure.
+    """
+    import jwt
+    from jwt import PyJWK
+
+    # Extract kid from the token header to find the matching key.
+    try:
+        header = jwt.get_unverified_header(raw_token)
+    except jwt.DecodeError as exc:
+        raise OIDCError(f"Invalid ID token header: {exc}") from exc
+
+    kid = header.get("kid")  # None if absent, not ""
+
+    # Find matching key in the JWKS by kid.
+    # PyJWK infers the key's algorithm from the JWKS ``alg``/``kty``
+    # fields.  jwt.decode() requires the token header's ``alg`` to be in
+    # our _ALLOWED_ID_TOKEN_ALGS allowlist (asymmetric only) AND to match
+    # the key type — preventing algorithm confusion attacks.
+    signing_key = None
+    for key_dict in jwks_data.get("keys", []):
+        if kid is not None and key_dict.get("kid") == kid:
+            try:
+                signing_key = PyJWK(key_dict)
+            except Exception as exc:
+                raise OIDCError(f"Failed to parse signing key: {exc}") from exc
+            break
+
+    # Fallback: if token has no kid and JWKS has exactly one key, use it.
+    if signing_key is None and kid is None:
+        keys = jwks_data.get("keys", [])
+        if len(keys) == 1:
+            try:
+                signing_key = PyJWK(keys[0])
+            except Exception as exc:
+                raise OIDCError(f"Failed to parse signing key: {exc}") from exc
+
+    if signing_key is None:
+        raise OIDCKeyNotFoundError(f"Signing key '{kid}' not found in JWKS")
+
+    try:
+        claims: dict[str, Any] = jwt.decode(
+            raw_token,
+            signing_key.key,
+            algorithms=_ALLOWED_ID_TOKEN_ALGS,
+            audience=config.client_id,
+            issuer=config.issuer,
+        )
+    except jwt.InvalidTokenError as exc:
+        raise OIDCError(f"ID token validation failed: {exc}") from exc
+
+    if claims.get("nonce") != nonce:
+        raise OIDCError("ID token nonce mismatch")
+
+    return claims

@@ -25,12 +25,13 @@ import httpx
 import pytest
 
 from turnstone.core.mcp_oauth import (
-    ASMetadata,
     MCPOAuthDiscoveryError,
     _parse_prm_url_from_www_authenticate,
     canonical_resource,
     discover_authorization_server,
 )
+from turnstone.core.oauth import http as oauth_http
+from turnstone.core.oauth.http import ASMetadata
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -1638,7 +1639,7 @@ class TestASMetadataCandidates:
 
         with (
             patch("turnstone.core.mcp_oauth._DISCOVERY_TOTAL_BUDGET", 0.01),
-            patch("turnstone.core.mcp_oauth.validate_url_no_ssrf_async", _slow_validate),
+            patch("turnstone.core.oauth.ssrf.validate_url_no_ssrf_async", _slow_validate),
             pytest.raises(MCPOAuthDiscoveryError, match="exceeded its time budget"),
         ):
             asyncio.run(_run())
@@ -2164,7 +2165,7 @@ class TestPrivateNetworkOptIn:
 
         with (
             patch.object(mcp_oauth, "discover_authorization_server", _fake_discover),
-            pytest.raises(mcp_oauth.MCPOAuthRefreshFailed),
+            pytest.raises(oauth_http.OAuthRefreshError),
         ):
             asyncio.run(_run())
         assert seen["allow_private_network"] is True

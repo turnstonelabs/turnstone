@@ -31,7 +31,7 @@ from turnstone.core.mcp_oauth import (
     handle_mcp_oauth_list_connections,
     handle_mcp_oauth_revoke_connection,
 )
-from turnstone.core.oidc import OIDCConfig
+from turnstone.core.oauth.oidc import OIDCConfig
 
 if TYPE_CHECKING:
     from starlette.requests import Request
@@ -749,10 +749,7 @@ class TestRevokeConnection:
         detail records ``upstream_revoke_outcome="shed_by_cap"`` and
         the AS endpoint is never contacted.
         """
-        from turnstone.core.mcp_oauth import (
-            _REVOKE_UPSTREAM_TASKS_MAX,
-            _revoke_upstream_tasks,
-        )
+        from turnstone.core.mcp_oauth import _REVOKE_UPSTREAM_TASKS_MAX, _revoke_upstream_tasks
 
         _seed_oauth_user_server(storage)
         token_store = _make_token_store(storage)

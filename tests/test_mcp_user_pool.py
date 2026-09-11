@@ -1431,7 +1431,7 @@ class TestDispatchStateMachine:
     def test_decrypt_failure_does_not_emit_consent(
         self, running_loop_mgr, storage: SQLiteBackend
     ) -> None:
-        from turnstone.core.mcp_crypto import MCPTokenDecryptError
+        from turnstone.core.token_store.crypto import TokenDecryptError
 
         mgr, _loop, _ = running_loop_mgr
         cipher = make_mcp_token_cipher()
@@ -1440,7 +1440,7 @@ class TestDispatchStateMachine:
         state = self._wire_pool(mgr, storage, cipher)
 
         def _raise(*args, **kwargs):
-            raise MCPTokenDecryptError(
+            raise TokenDecryptError(
                 "no installed key can decrypt",
                 key_fingerprints_attempted=("aabbccdd",),
             )

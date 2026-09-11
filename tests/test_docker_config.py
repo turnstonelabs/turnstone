@@ -26,8 +26,8 @@ STACKS = (ROOT, ROOT / "turnstone/deploy")
 def test_generated_config_loads_in_runtime(tmp_path, monkeypatch, mode):
     from turnstone.console.server import create_app as create_console_app
     from turnstone.core import config
-    from turnstone.core.mcp_crypto import load_mcp_token_cipher_config
-    from turnstone.core.oidc import load_oidc_config
+    from turnstone.core.oauth.oidc import load_oidc_config
+    from turnstone.core.token_store.crypto import load_token_cipher_config
     from turnstone.server import create_app as create_server_app
 
     path = tmp_path / "config.toml"
@@ -54,7 +54,7 @@ def test_generated_config_loads_in_runtime(tmp_path, monkeypatch, mode):
     for key in os.environ:
         if key.startswith("TURNSTONE_OIDC_"):
             monkeypatch.delenv(key)
-    assert load_mcp_token_cipher_config() is not None
+    assert load_token_cipher_config() is not None
     oidc = load_oidc_config()
     assert oidc.redirect_base == "https://turnstone.example.com:8443"
     assert oidc.enabled is (mode != "local")

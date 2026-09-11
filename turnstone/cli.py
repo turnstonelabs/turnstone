@@ -1330,7 +1330,7 @@ def main() -> None:
             from types import SimpleNamespace
 
             from turnstone.core.mcp_crypto import initialize_mcp_crypto_state
-            from turnstone.core.oidc import (
+            from turnstone.core.oauth.oidc import (
                 close_oidc_state,
                 initialize_oidc_state,
                 load_oidc_config,

@@ -1706,20 +1706,19 @@ class TestPoolPrimingAndTokenRotation:
 
         from turnstone.core.mcp_oauth import (
             _AMBIGUOUS_ESCALATION_THRESHOLD,
-            MCPOAuthRefreshFailed,
-            _refresh_backoff_state,
-            _RefreshFailureClass,
             get_user_access_token_classified,
         )
+        from turnstone.core.oauth.http import OAuthRefreshError, RefreshFailureClass
+        from turnstone.core.oauth.tokens import _refresh_backoff_state
 
         cipher = make_mcp_token_cipher()
         _seed_oauth_server(storage, name="srv-oauth")
         state = _make_app_state(storage, cipher=cipher)
         store = MCPTokenStore(storage, cipher, node_id="test")
 
-        def _raiser(cls: _RefreshFailureClass) -> Any:
+        def _raiser(cls: RefreshFailureClass) -> Any:
             async def _f(**_kwargs: Any) -> tuple[str, str | None, str | None]:
-                raise MCPOAuthRefreshFailed("boom", failure_class=cls)
+                raise OAuthRefreshError("boom", failure_class=cls)
 
             return _f
 
@@ -1733,7 +1732,7 @@ class TestPoolPrimingAndTokenRotation:
         _seed("perm-user")
         with patch(
             "turnstone.core.mcp_oauth._refresh_and_persist",
-            side_effect=_raiser(_RefreshFailureClass.PERMANENT),
+            side_effect=_raiser(RefreshFailureClass.PERMANENT),
         ):
             perm = await get_user_access_token_classified(
                 app_state=state,
@@ -1753,7 +1752,7 @@ class TestPoolPrimingAndTokenRotation:
         )
         with patch(
             "turnstone.core.mcp_oauth._refresh_and_persist",
-            side_effect=_raiser(_RefreshFailureClass.AMBIGUOUS),
+            side_effect=_raiser(RefreshFailureClass.AMBIGUOUS),
         ):
             amb = await get_user_access_token_classified(
                 app_state=state,
@@ -1773,7 +1772,7 @@ class TestPoolPrimingAndTokenRotation:
         )
         with patch(
             "turnstone.core.mcp_oauth._refresh_and_persist",
-            side_effect=_raiser(_RefreshFailureClass.AMBIGUOUS),
+            side_effect=_raiser(RefreshFailureClass.AMBIGUOUS),
         ):
             lazy = await get_user_access_token_classified(
                 app_state=state,

@@ -12,20 +12,16 @@ import base64
 import pytest
 from cryptography.fernet import Fernet
 
-from turnstone.core.mcp_crypto import (
-    MCPTokenCipher,
-    MCPTokenCipherConfig,
-    MCPTokenDecryptError,
-    MCPTokenStore,
-)
+from turnstone.core.mcp_crypto import MCPTokenStore
+from turnstone.core.token_store.crypto import TokenCipher, TokenCipherConfig, TokenDecryptError
 
 
-def _make_cipher() -> MCPTokenCipher:
+def _make_cipher() -> TokenCipher:
     raw = base64.urlsafe_b64decode(Fernet.generate_key())
-    return MCPTokenCipher(MCPTokenCipherConfig(keys=(raw,)))
+    return TokenCipher(TokenCipherConfig(keys=(raw,)))
 
 
-def _make_store(backend, *, audit: bool = False) -> tuple[MCPTokenStore, MCPTokenCipher]:
+def _make_store(backend, *, audit: bool = False) -> tuple[MCPTokenStore, TokenCipher]:
     cipher = _make_cipher()
     store = MCPTokenStore(
         backend,
@@ -219,7 +215,7 @@ class TestDecryptFailureInvariant:
 
         # Read under cipher B (different key).
         store_b, cipher_b = _make_store(backend)
-        with pytest.raises(MCPTokenDecryptError) as exc_info:
+        with pytest.raises(TokenDecryptError) as exc_info:
             store_b.get_user_token("u1", "srv-a")
         # The exception carries the keys we tried — useful for audit.
         assert exc_info.value.key_fingerprints_attempted == cipher_b.key_fingerprints
@@ -245,7 +241,7 @@ class TestDecryptFailureInvariant:
         )
 
         store_b, cipher_b = _make_store(backend, audit=True)
-        with pytest.raises(MCPTokenDecryptError):
+        with pytest.raises(TokenDecryptError):
             store_b.get_user_token("u1", "srv-a")
 
         events = backend.list_audit_events(limit=10)
@@ -282,5 +278,5 @@ class TestClientSecretReader:
 
         # Cipher B has a different key — decrypt fails loudly.
         store_b, _ = _make_store(backend)
-        with pytest.raises(MCPTokenDecryptError):
+        with pytest.raises(TokenDecryptError):
             store_b.get_oauth_client_secret(server_id)

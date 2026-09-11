@@ -203,14 +203,11 @@ def _install_token_store(app, storage) -> None:
     the OAuth client-secret write path.  Uses a deterministic test key."""
     from cryptography.fernet import Fernet
 
-    from turnstone.core.mcp_crypto import (
-        MCPTokenCipher,
-        MCPTokenCipherConfig,
-        MCPTokenStore,
-    )
+    from turnstone.core.mcp_crypto import MCPTokenStore
+    from turnstone.core.token_store.crypto import TokenCipher, TokenCipherConfig
 
     raw_key = base64.urlsafe_b64decode(Fernet.generate_key())
-    cipher = MCPTokenCipher(MCPTokenCipherConfig(keys=(raw_key,)))
+    cipher = TokenCipher(TokenCipherConfig(keys=(raw_key,)))
     app.state.mcp_token_cipher = cipher
     app.state.mcp_token_store = MCPTokenStore(
         storage, cipher, node_id="test", audit_storage=storage

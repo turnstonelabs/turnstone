@@ -97,8 +97,8 @@ APP_IDENTITY_MODEL_AUTH_MODES = frozenset({"entra_app"})
 # Required ``[oidc] obo_grant_profile`` per dynamic mode — the type-pairing
 # the console validator enforces when a write CHOOSES a pair, and the grant
 # leg the session pins at mint time. Values are spelled as literals rather
-# than imported from mcp_oauth's OBO_GRANT_PROFILES: lightweight consumers
-# import this module and must not pull the mint stack with it; the
+# than imported from oauth.grants.OBO_GRANT_PROFILES: lightweight consumers
+# import this module and must not pull OAuth protocol dependencies with it; the
 # registry-vs-legs agreement (and full coverage of the dynamic set) is
 # pinned by test_model_auth_mode_profile_map_matches_mint_legs.
 MODEL_AUTH_MODE_PROFILES: Mapping[str, str] = MappingProxyType(
@@ -197,7 +197,7 @@ def dynamic_auth_key_error(models: Mapping[str, ModelConfig], app_state: Any) ->
     # Function-local: model_registry is imported by lightweight consumers
     # that never touch crypto; keep the cryptography dependency off this
     # module's import graph.
-    from turnstone.core.mcp_crypto import STARTUP_KEY_REQUIRED_HINT
+    from turnstone.core.token_store.crypto import STARTUP_KEY_REQUIRED_HINT
 
     # Mode list derived from the frozenset above, so a fourth dynamic mode
     # cannot make this refusal name only the modes it was written against.

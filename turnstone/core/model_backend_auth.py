@@ -34,12 +34,12 @@ def _mint_refusal_cause(
     grant_leg: str | None = None,
 ) -> str:
     """Return the mint layer's retained refusal cause for a warning."""
-    from turnstone.core.mcp_oauth import (
-        MODEL_APP_MINT_PRINCIPAL,
+    from turnstone.core.model_oauth import (
         model_app_cache_server,
         model_mint_refusal_cause,
         model_obo_cause_key,
     )
+    from turnstone.core.token_store.store import MODEL_APP_MINT_PRINCIPAL
 
     if prefix == "model_obo":
         return (

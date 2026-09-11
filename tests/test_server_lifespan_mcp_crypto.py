@@ -14,12 +14,8 @@ import pytest
 from cryptography.fernet import Fernet
 
 import turnstone.core.config as cfg_mod
-from turnstone.core.mcp_crypto import (
-    STARTUP_KEY_REQUIRED_HINT,
-    MCPTokenCipher,
-    MCPTokenStore,
-    initialize_mcp_crypto_state,
-)
+from turnstone.core.mcp_crypto import MCPTokenStore, initialize_mcp_crypto_state
+from turnstone.core.token_store.crypto import STARTUP_KEY_REQUIRED_HINT, TokenCipher
 
 
 def _patch_security(monkeypatch: pytest.MonkeyPatch, payload: dict) -> None:
@@ -69,7 +65,7 @@ class TestInitializeMcpCryptoState:
         state = types.SimpleNamespace()
         initialize_mcp_crypto_state(state, node_id="n1")
 
-        assert isinstance(state.mcp_token_cipher, MCPTokenCipher)
+        assert isinstance(state.mcp_token_cipher, TokenCipher)
         assert isinstance(state.mcp_token_store, MCPTokenStore)
 
     def test_startup_aborts_with_oauth_user_row_and_no_key(
@@ -195,5 +191,5 @@ class TestInitializeMcpCryptoState:
             )
         )
         initialize_mcp_crypto_state(state, node_id="n1")
-        assert isinstance(state.mcp_token_cipher, MCPTokenCipher)
+        assert isinstance(state.mcp_token_cipher, TokenCipher)
         assert isinstance(state.mcp_token_store, MCPTokenStore)

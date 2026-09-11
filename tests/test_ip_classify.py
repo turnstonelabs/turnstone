@@ -1,6 +1,6 @@
 """Cross-guard regression tests for SSRF address classification.
 
-Three guards screen outbound URLs — :func:`turnstone.core.oauth_ssrf.validate_url_no_ssrf`
+Three guards screen outbound URLs — :func:`turnstone.core.oauth.ssrf.validate_url_no_ssrf`
 (OAuth/OIDC endpoints), :func:`turnstone.core.web.screen_url` (the ``web_fetch`` /
 ``open_preview`` tools) and ``turnstone.channels._formatter._is_safe_image_url``
 (inline images). Each once hand-rolled its own normalization and its own policy
@@ -42,7 +42,7 @@ from turnstone.core.ip_classify import (
     embedded_ipv4,
     parse_resolved_address,
 )
-from turnstone.core.oauth_ssrf import OAuthSSRFError, validate_url_no_ssrf
+from turnstone.core.oauth.ssrf import OAuthSSRFError, validate_url_no_ssrf
 from turnstone.core.web import screen_url
 
 if TYPE_CHECKING:

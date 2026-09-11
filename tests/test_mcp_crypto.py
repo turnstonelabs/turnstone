@@ -10,14 +10,14 @@ import base64
 import pytest
 from cryptography.fernet import Fernet
 
-from turnstone.core.mcp_crypto import (
-    MCPTokenCipher,
-    MCPTokenCipherConfig,
-    MCPTokenDecryptError,
-    MCPTokenKeyConfigError,
+from turnstone.core.token_store.crypto import (
+    TokenCipher,
+    TokenCipherConfig,
+    TokenDecryptError,
+    TokenKeyConfigError,
     _key_fingerprint,
     _validate_key,
-    load_mcp_token_cipher_config,
+    load_token_cipher_config,
 )
 
 
@@ -33,14 +33,14 @@ def _new_raw_key() -> bytes:
 
 class TestCipherRoundTrip:
     def test_round_trip_single_key(self) -> None:
-        cipher = MCPTokenCipher(MCPTokenCipherConfig(keys=(_new_raw_key(),)))
+        cipher = TokenCipher(TokenCipherConfig(keys=(_new_raw_key(),)))
         plaintext = b"access_token_12345"
         ct = cipher.encrypt(plaintext)
         assert ct != plaintext
         assert cipher.decrypt(ct) == plaintext
 
     def test_round_trip_unicode_token(self) -> None:
-        cipher = MCPTokenCipher(MCPTokenCipherConfig(keys=(_new_raw_key(),)))
+        cipher = TokenCipher(TokenCipherConfig(keys=(_new_raw_key(),)))
         # Tokens may legitimately carry UTF-8 bytes (e.g. JWT with
         # non-ASCII claim values).  Round-trip a multi-byte sequence.
         plaintext = "tok_é中💯".encode()
@@ -48,10 +48,10 @@ class TestCipherRoundTrip:
         assert cipher.decrypt(ct) == plaintext
 
     def test_wrong_key_raises_decrypt_error(self) -> None:
-        cipher_a = MCPTokenCipher(MCPTokenCipherConfig(keys=(_new_raw_key(),)))
-        cipher_b = MCPTokenCipher(MCPTokenCipherConfig(keys=(_new_raw_key(),)))
+        cipher_a = TokenCipher(TokenCipherConfig(keys=(_new_raw_key(),)))
+        cipher_b = TokenCipher(TokenCipherConfig(keys=(_new_raw_key(),)))
         ct = cipher_a.encrypt(b"secret")
-        with pytest.raises(MCPTokenDecryptError) as exc_info:
+        with pytest.raises(TokenDecryptError) as exc_info:
             cipher_b.decrypt(ct)
         # Audit-trail correlation: error must carry the fingerprints of
         # the keys actually attempted, not a placeholder.
@@ -73,8 +73,8 @@ class TestRotation:
         """
         v1 = _new_raw_key()
         v2 = _new_raw_key()
-        new_only = MCPTokenCipher(MCPTokenCipherConfig(keys=(v2,)))
-        cluster = MCPTokenCipher(MCPTokenCipherConfig(keys=(v2, v1)))
+        new_only = TokenCipher(TokenCipherConfig(keys=(v2,)))
+        cluster = TokenCipher(TokenCipherConfig(keys=(v2, v1)))
         ct = new_only.encrypt(b"hello")
         assert cluster.decrypt(ct) == b"hello"
 
@@ -83,8 +83,8 @@ class TestRotation:
         rotation places v2 first and keeps v1 as fallback."""
         v1 = _new_raw_key()
         v2 = _new_raw_key()
-        old_only = MCPTokenCipher(MCPTokenCipherConfig(keys=(v1,)))
-        rotated = MCPTokenCipher(MCPTokenCipherConfig(keys=(v2, v1)))
+        old_only = TokenCipher(TokenCipherConfig(keys=(v1,)))
+        rotated = TokenCipher(TokenCipherConfig(keys=(v2, v1)))
         ct = old_only.encrypt(b"legacy")
         assert rotated.decrypt(ct) == b"legacy"
 
@@ -112,7 +112,7 @@ class TestLoadConfig:
     def test_load_singular_key(self, monkeypatch: pytest.MonkeyPatch) -> None:
         key = Fernet.generate_key().decode()
         _patch_load_config(monkeypatch, {"mcp_token_encryption_key": key})
-        cfg = load_mcp_token_cipher_config()
+        cfg = load_token_cipher_config()
         assert cfg is not None
         assert len(cfg.keys) == 1
 
@@ -125,13 +125,13 @@ class TestLoadConfig:
                 "mcp_token_encryption_key": Fernet.generate_key().decode(),
             },
         )
-        cfg = load_mcp_token_cipher_config()
+        cfg = load_token_cipher_config()
         assert cfg is not None
         assert len(cfg.keys) == 2  # plural wins, singular ignored
 
     def test_load_returns_none_when_absent(self, monkeypatch: pytest.MonkeyPatch) -> None:
         _patch_load_config(monkeypatch, {})
-        assert load_mcp_token_cipher_config() is None
+        assert load_token_cipher_config() is None
 
     def test_load_empty_plural_falls_through_to_singular(
         self, monkeypatch: pytest.MonkeyPatch
@@ -143,14 +143,14 @@ class TestLoadConfig:
             monkeypatch,
             {"mcp_token_encryption_keys": [], "mcp_token_encryption_key": key},
         )
-        cfg = load_mcp_token_cipher_config()
+        cfg = load_token_cipher_config()
         assert cfg is not None
         assert len(cfg.keys) == 1
 
     def test_load_invalid_base64_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
         _patch_load_config(monkeypatch, {"mcp_token_encryption_key": "###not-base64###"})
-        with pytest.raises(MCPTokenKeyConfigError) as exc_info:
-            load_mcp_token_cipher_config()
+        with pytest.raises(TokenKeyConfigError) as exc_info:
+            load_token_cipher_config()
         # Operator-facing hint is part of every error message.
         assert "regenerate with:" in str(exc_info.value)
 
@@ -158,20 +158,20 @@ class TestLoadConfig:
         # 24 raw bytes → 32 base64 chars; not 32 raw bytes after decode.
         short_key = base64.urlsafe_b64encode(b"\x00" * 24).decode()
         _patch_load_config(monkeypatch, {"mcp_token_encryption_key": short_key})
-        with pytest.raises(MCPTokenKeyConfigError) as exc_info:
-            load_mcp_token_cipher_config()
+        with pytest.raises(TokenKeyConfigError) as exc_info:
+            load_token_cipher_config()
         assert "32 bytes" in str(exc_info.value)
 
     def test_load_non_list_plural_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
         _patch_load_config(monkeypatch, {"mcp_token_encryption_keys": "single-string-not-list"})
-        with pytest.raises(MCPTokenKeyConfigError) as exc_info:
-            load_mcp_token_cipher_config()
+        with pytest.raises(TokenKeyConfigError) as exc_info:
+            load_token_cipher_config()
         assert "list" in str(exc_info.value).lower()
 
     def test_load_non_string_in_plural_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
         _patch_load_config(monkeypatch, {"mcp_token_encryption_keys": [12345]})
-        with pytest.raises(MCPTokenKeyConfigError):
-            load_mcp_token_cipher_config()
+        with pytest.raises(TokenKeyConfigError):
+            load_token_cipher_config()
 
 
 # ---------------------------------------------------------------------------
@@ -197,7 +197,7 @@ class TestFingerprint:
     def test_cipher_fingerprints_match_keys(self) -> None:
         v1 = _new_raw_key()
         v2 = _new_raw_key()
-        cipher = MCPTokenCipher(MCPTokenCipherConfig(keys=(v1, v2)))
+        cipher = TokenCipher(TokenCipherConfig(keys=(v1, v2)))
         assert cipher.key_fingerprints == (
             _key_fingerprint(v1),
             _key_fingerprint(v2),
@@ -211,25 +211,25 @@ class TestFingerprint:
 
 class TestValidateKey:
     def test_empty_string_rejected(self) -> None:
-        with pytest.raises(MCPTokenKeyConfigError):
+        with pytest.raises(TokenKeyConfigError):
             _validate_key("", label="x")
 
     def test_whitespace_only_rejected(self) -> None:
-        with pytest.raises(MCPTokenKeyConfigError):
+        with pytest.raises(TokenKeyConfigError):
             _validate_key("   ", label="x")
 
     def test_label_propagated_in_error(self) -> None:
-        with pytest.raises(MCPTokenKeyConfigError) as exc_info:
+        with pytest.raises(TokenKeyConfigError) as exc_info:
             _validate_key("###", label="my_label_42")
         assert "my_label_42" in str(exc_info.value)
 
 
 # ---------------------------------------------------------------------------
-# MCPTokenCipher constructor guard
+# TokenCipher constructor guard
 # ---------------------------------------------------------------------------
 
 
 class TestCipherConstructorGuard:
     def test_empty_keys_rejected(self) -> None:
-        with pytest.raises(MCPTokenKeyConfigError):
-            MCPTokenCipher(MCPTokenCipherConfig(keys=()))
+        with pytest.raises(TokenKeyConfigError):
+            TokenCipher(TokenCipherConfig(keys=()))

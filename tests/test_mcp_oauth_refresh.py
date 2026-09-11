@@ -34,8 +34,8 @@ from turnstone.core.mcp_oauth import (
     discover_authorization_server,
     get_user_access_token,
     get_user_access_token_classified,
-    json_http_client,
 )
+from turnstone.core.oauth.http import json_http_client
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -265,7 +265,7 @@ def test_refresh_discovery_and_post_stay_off_the_browser_loop(
                 if not injected_client:
                     del state.obo_http_client
                 assert state.mcp_oauth_metadata_cache == {}
-                with patch("turnstone.core.mcp_oauth.json_http_client", transient_client):
+                with patch("turnstone.core.oauth.http.json_http_client", transient_client):
                     result = await asyncio.wait_for(
                         asyncio.wrap_future(
                             asyncio.run_coroutine_threadsafe(
@@ -451,7 +451,7 @@ class TestRefreshFailureClassification:
         assert result.kind == "refresh_failed_transient"
         # Kept (TRANSIENT), not revoked — and the ambiguous streak did not advance.
         assert state.mcp_token_store.get_user_token("user-1", "srv-oauth") is not None
-        from turnstone.core.mcp_oauth import _refresh_backoff_state
+        from turnstone.core.oauth.tokens import _refresh_backoff_state
 
         assert _refresh_backoff_state(state, "user-1", "srv-oauth").ambiguous_streak == 0
 
@@ -590,7 +590,7 @@ class TestRefreshFailureClassification:
 
         with (
             patch("turnstone.core.mcp_oauth._AMBIGUOUS_ESCALATION_THRESHOLD", 3),
-            patch("turnstone.core.mcp_oauth._REFRESH_TRANSIENT_COOLDOWN_SECONDS", 0.0),
+            patch("turnstone.core.oauth.tokens._REFRESH_TRANSIENT_COOLDOWN_SECONDS", 0.0),
         ):
             # Below threshold: the token survives each attempt.
             for _ in range(2):
@@ -617,7 +617,7 @@ class TestRefreshFailureClassification:
 
         with (
             patch("turnstone.core.mcp_oauth._AMBIGUOUS_ESCALATION_THRESHOLD", 2),
-            patch("turnstone.core.mcp_oauth._REFRESH_TRANSIENT_COOLDOWN_SECONDS", 0.0),
+            patch("turnstone.core.oauth.tokens._REFRESH_TRANSIENT_COOLDOWN_SECONDS", 0.0),
         ):
             for _ in range(5):
                 assert self._lookup(state).kind == "refresh_failed_transient"
@@ -921,12 +921,12 @@ class TestUnchangedToken:
 
         When the operator rotates ``mcp_token_encryption_key`` and drops
         the prior key, every existing user-token row decrypts to
-        :class:`MCPTokenDecryptError`. ``get_user_access_token`` MUST
+        :class:`TokenDecryptError`. ``get_user_access_token`` MUST
         catch that and return ``None`` (forcing the user back through
         the consent flow) rather than propagating the exception up to
         the dispatch caller.
         """
-        from turnstone.core.mcp_crypto import MCPTokenDecryptError
+        from turnstone.core.token_store.crypto import TokenDecryptError
 
         _seed_server(storage)
         client = MagicMock(spec=httpx.AsyncClient)
@@ -938,7 +938,7 @@ class TestUnchangedToken:
         original_get = state.mcp_token_store.get_user_token
 
         def _raise_decrypt(*args, **kwargs):
-            raise MCPTokenDecryptError(
+            raise TokenDecryptError(
                 "no installed key can decrypt",
                 key_fingerprints_attempted=("aabbccdd",),
             )
@@ -1335,7 +1335,7 @@ class TestExpiresInParsing:
         assert token == "access-NEW"
 
     def test_expires_in_garbage_returns_none(self) -> None:
-        from turnstone.core.mcp_oauth import _expires_at_from_response
+        from turnstone.core.oauth.tokens import _expires_at_from_response
 
         assert _expires_at_from_response({}) is None
         assert _expires_at_from_response({"expires_in": "abc"}) is None
@@ -1431,7 +1431,7 @@ class TestPgRefreshLock:
         the same thread (psycopg2 thread-affinity) without globally
         serializing the spin loop.
         """
-        from turnstone.core.mcp_oauth import _PgRefreshLock
+        from turnstone.core.oauth.locking import _PgRefreshLock
 
         in_flight = 0
         max_in_flight = 0
@@ -1497,7 +1497,7 @@ class TestPgRefreshLock:
 
         Returns the single cm the factory created.
         """
-        from turnstone.core.mcp_oauth import _pg_refresh_drain_tasks, _PgRefreshLock
+        from turnstone.core.oauth.locking import _pg_refresh_drain_tasks, _PgRefreshLock
 
         enter_started = threading.Event()
         enter_release = threading.Event()
@@ -1644,8 +1644,8 @@ class TestClassifiedGetter:
         "row present but undecryptable" so it can avoid emitting fake
         ``mcp_consent_required`` events on every operator misconfig.
         """
-        from turnstone.core.mcp_crypto import MCPTokenDecryptError
         from turnstone.core.mcp_oauth import get_user_access_token_classified
+        from turnstone.core.token_store.crypto import TokenDecryptError
 
         _seed_server(storage)
         client = MagicMock(spec=httpx.AsyncClient)
@@ -1653,7 +1653,7 @@ class TestClassifiedGetter:
         _seed_token(state, expires_in_seconds=3600)
 
         def _raise_decrypt(*args, **kwargs):
-            raise MCPTokenDecryptError(
+            raise TokenDecryptError(
                 "no installed key can decrypt",
                 key_fingerprints_attempted=("aabbccdd",),
             )

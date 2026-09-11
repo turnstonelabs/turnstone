@@ -4486,7 +4486,7 @@ def test_model_auth_mode_profile_map_matches_mint_legs() -> None:
     literals to keep the mint stack off its import graph, so this is the
     seam that catches a rename or an unclassified mode.
     """
-    from turnstone.core.mcp_oauth import OBO_GRANT_PROFILES
+    from turnstone.core.oauth.grants import OBO_GRANT_PROFILES
 
     # Every dynamic mode names its required profile — a mode missing here is
     # never posture-approvable and never mints, which is fail-closed but
@@ -4512,7 +4512,7 @@ def test_obo_scopes_normalizers_agree_across_modules() -> None:
     delegate to ``sanitize_backend_auth_scopes``; this corpus pins the
     delegation and the per-layer policies wrapped around it.
     """
-    from turnstone.core.mcp_oauth import _normalized_mint_scopes
+    from turnstone.core.model_oauth import _normalized_mint_scopes
 
     corpus = [
         "",

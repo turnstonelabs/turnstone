@@ -1992,7 +1992,7 @@ def test_over_cap_residue_capped_rewrite_is_auth_gated(
     UNCAPPED sanitize, so over-cap residue never compares equal to any
     storable submission.
     """
-    from turnstone.core.mcp_oauth import model_obo_cache_server
+    from turnstone.core.model_oauth import model_obo_cache_server
 
     residue = "s" * 2100
     capped = "s" * 2048
@@ -2053,7 +2053,7 @@ def test_scopes_change_purges_the_alias_rows_never_a_siblings(
     definition is invisible to every other (the shared-key over-delete
     class is structurally closed).
     """
-    from turnstone.core.mcp_oauth import model_app_cache_server, model_obo_cache_server
+    from turnstone.core.model_oauth import model_app_cache_server, model_obo_cache_server
 
     _seed_model_def(
         storage,
@@ -2094,7 +2094,7 @@ def test_alias_rename_purges_the_old_alias_rows(
     would ever read or overwrite them again — so the update purges them,
     exactly as the MCP update purges rows keyed on a renamed server name.
     """
-    from turnstone.core.mcp_oauth import model_obo_cache_server
+    from turnstone.core.model_oauth import model_obo_cache_server
 
     _seed_model_def(
         storage,
@@ -2125,7 +2125,7 @@ def test_delete_purges_mint_cache_rows(
     """Deleting a definition purges its identity-keyed mint-cache rows —
     both prefixes — before the row goes away, like the MCP delete purges
     its server-name rows; a sibling definition's rows survive."""
-    from turnstone.core.mcp_oauth import model_app_cache_server, model_obo_cache_server
+    from turnstone.core.model_oauth import model_app_cache_server, model_obo_cache_server
 
     _seed_model_def(
         storage,
@@ -2160,7 +2160,7 @@ def test_purge_partial_failure_still_purges_the_other_prefix(
     delete (each prefix purges in its own best-effort arm).
     """
     from turnstone.console.server import _purge_model_mint_cache
-    from turnstone.core.mcp_oauth import model_app_cache_server, model_obo_cache_server
+    from turnstone.core.model_oauth import model_app_cache_server, model_obo_cache_server
 
     obo_key = model_obo_cache_server("local")
     app_key = model_app_cache_server("local")
