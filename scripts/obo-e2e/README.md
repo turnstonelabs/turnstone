@@ -96,7 +96,7 @@ registration), runs the harness, then tears down. The harness drives the REAL
 console OAuth surface — `handle_mcp_oauth_authorize` →
 `handle_mcp_oauth_callback` → `get_user_access_token_classified` →
 `handle_mcp_oauth_revoke_connection`, mounted on the console's own routes with
-the client `initialize_mcp_oauth_state` installs — so RFC 9728
+the browser client `initialize_mcp_oauth_state` installs — so RFC 9728
 protected-resource metadata, RFC 8414 authorization-server metadata for a
 path-bearing realm issuer, the PKCE code exchange, the refresh grant and RFC
 7009 revocation all happen on the wire. The "MCP server" is a local stub that
@@ -107,9 +107,25 @@ itself. Ports: Keycloak 8092, resource-server stubs 8093 (path-specific) and
 8094 (origin-level only), redirect base 8095 (8090 = the dev console, 8091 =
 the obo harness).
 
+Token lookups run on a real `MCPClientManager` loop with its own HTTP client.
+C6/C7 warm both clients on their owner loops before refreshing against Keycloak,
+then require the token POST to use the MCP client. D5 clears the metadata cache
+and requires both discovery and refresh to use that client. Request hooks also
+record each client's calling loop (L1), so wrong ownership remains detectable
+if a keepalive connection expires. The manager is shut down and its thread
+joined before closing the browser clients and token store.
+
 ```bash
 ./scripts/obo-e2e/oauth_user_e2e.sh
 ```
+
+Results — RUN 2026-09-10, 17 VERIFIED / 0 FAILED (exit 0) with the #963 refresh-client fix:
+C6/C7 refresh on the MCP loop; D5 covers uncached discovery; L1 checks client loop ownership.
+Restoring the original refresh helper in an isolated process reproduces
+`RuntimeError: ... is bound to a different event loop` at C6's token POST. A second control,
+leaving only discovery on the browser client, passes C6/C7 with cached metadata and reproduces
+the same error at D5's discovery GET. Both controls exit 1; each run removes its ephemeral
+container.
 
 Results — RUN 2026-09-06, 15 VERIFIED / 0 FAILED (exit 0) after the #1081 and #1082 fixes:
 D4 verifies that the second row persists its issuer when AS metadata is already cached. N2's callback

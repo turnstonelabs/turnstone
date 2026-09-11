@@ -239,7 +239,7 @@ def _make_app_state(storage: SQLiteBackend, *, cipher: Any) -> SimpleNamespace:
     return SimpleNamespace(
         auth_storage=storage,
         mcp_token_store=MCPTokenStore(storage, cipher, node_id="test"),
-        mcp_oauth_http_client=MagicMock(),
+        obo_http_client=MagicMock(),
         mcp_oauth_refresh_locks={},
         mcp_oauth_metadata_cache={},
     )

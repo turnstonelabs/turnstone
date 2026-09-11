@@ -141,7 +141,7 @@ def _wire_mgr(mgr: MCPClientManager, backend: Any) -> None:
     app_state = SimpleNamespace(
         auth_storage=backend,
         mcp_token_store=MCPTokenStore(backend, cipher, node_id="test"),
-        mcp_oauth_http_client=MagicMock(),
+        obo_http_client=MagicMock(),
         mcp_oauth_refresh_locks={},
         mcp_oauth_metadata_cache={},
     )

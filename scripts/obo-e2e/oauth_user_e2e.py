@@ -12,8 +12,10 @@ console's four OAuth routes mounted on a small Starlette app the way
 product installs (``initialize_mcp_oauth_state``) talking to a live realm.
 ``handle_mcp_oauth_authorize`` → headless login → ``handle_mcp_oauth_callback``
 → ``get_user_access_token_classified`` → ``handle_mcp_oauth_revoke_connection``.
-The "MCP server" is a local stub that serves only RFC 9728 protected-resource
-metadata; it never speaks MCP, because nothing under test does either.
+Browser routes run on the host loop; token lookups run on a real MCP manager's
+loop with its own HTTP client. The "MCP server" is a local stub that serves only
+RFC 9728 protected-resource metadata; it never speaks MCP, because nothing under
+test does either.
 
 Checks:
   D1 discovery: PRM read at the RFC 9728 path-specific location (origin never
@@ -27,9 +29,10 @@ Checks:
      request (the code exchange — issuer and metadata already cached)
   C4 cache hit: ZERO requests
   C5 callback replay refused (state is single-use), ZERO requests
-  C6 refresh after a real clock expiry: one token POST, no re-discovery,
+  C6 refresh on the MCP loop when the clock enters the refresh window:
+     warmed browser and MCP clients, one MCP-client token POST, no re-discovery,
      refresh-token rotation written back, the new token live
-  C7 force_refresh → one more token POST
+  C7 force_refresh on the MCP loop → one more token POST
   C8 connections list carries the row without secret material
   C9 revoke: 204, row gone, lookup → missing, RFC 7009 POST to the realm,
      and the refresh token is dead AT KEYCLOAK afterwards
@@ -41,6 +44,9 @@ Checks:
   D3 dynamic client registration (registration_mode=dcr) followed by consent
   D4 the resolved issuer is persisted on a row whose authorization server the
      in-process metadata cache already holds
+  D5 refresh with an empty metadata cache: real discovery and the token POST
+     both use the MCP client, while the warmed browser client stays idle
+  L1 browser and MCP clients stay on their separate owner loops
 
 Env (set by oauth_user_e2e.sh):
   KC_ISSUER, KC_CLIENT_ID, KC_NOAUD_CLIENT_ID, KC_USER, KC_PASSWORD,
@@ -72,7 +78,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.routing import Mount, Route
 
 from turnstone.core.auth import AuthResult
-from turnstone.core.mcp_client import _validate_oauth_user_url
+from turnstone.core.mcp_client import MCPClientManager, _validate_oauth_user_url
 from turnstone.core.mcp_crypto import (
     MCPTokenCipher,
     MCPTokenCipherConfig,
@@ -92,6 +98,8 @@ from turnstone.core.oidc import OIDCConfig
 from turnstone.core.storage._sqlite import SQLiteBackend
 
 if TYPE_CHECKING:
+    from collections.abc import Coroutine
+
     from starlette.requests import Request
     from starlette.responses import Response
 
@@ -178,16 +186,33 @@ class _PRMStub:
 class _Wire:
     """Every request the product's OAuth client sends, via httpx's request hook."""
 
-    def __init__(self, client: httpx.AsyncClient) -> None:
+    def __init__(
+        self, client: httpx.AsyncClient, *, loop: asyncio.AbstractEventLoop | None = None
+    ) -> None:
         self.calls: list[tuple[str, str]] = []
+        self.off_loop_calls: list[tuple[str, str]] = []
+        self.loop = loop if loop is not None else asyncio.get_running_loop()
         client.event_hooks["request"].append(self._seen)
 
     async def _seen(self, request: httpx.Request) -> None:
-        self.calls.append((request.method, str(request.url)))
+        call = (request.method, str(request.url))
+        self.calls.append(call)
+        if asyncio.get_running_loop() is not self.loop:
+            # Observe without raising: a negative control can still reproduce
+            # the real HTTP transport error, rather than failing in this hook.
+            self.off_loop_calls.append(call)
 
     def drain(self) -> list[tuple[str, str]]:
         calls, self.calls = self.calls, []
         return calls
+
+
+async def _on_mcp_loop[T](manager: MCPClientManager, coroutine: Coroutine[Any, Any, T]) -> T:
+    loop = manager._loop
+    assert loop is not None
+    return await asyncio.wait_for(
+        asyncio.wrap_future(asyncio.run_coroutine_threadsafe(coroutine, loop)), timeout=40.0
+    )
 
 
 class _Browser:
@@ -359,6 +384,12 @@ async def _run(cfg: dict[str, str]) -> None:
     wire = _Wire(app.state.mcp_oauth_http_client)
     console = httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url=redirect_base)
     kc = httpx.AsyncClient(timeout=20.0)
+    manager = MCPClientManager({})
+    # Drive lookups explicitly so a timer cannot consume the grant under test.
+    manager._user_token_sweep_s = 0
+    manager._static_health_check_s = 0
+    manager.set_storage(storage)
+    manager.set_app_state(app.state)
 
     async def userinfo(token: str) -> str | None:
         resp = await kc.get(
@@ -367,6 +398,20 @@ async def _run(cfg: dict[str, str]) -> None:
         return str(resp.json().get("preferred_username")) if resp.status_code == 200 else None
 
     try:
+        await asyncio.to_thread(manager.start)
+        assert manager._loop is not None
+        mint_client = app.state.obo_http_client
+        refresh_wire = _Wire(mint_client, loop=manager._loop)
+        want_document = issuer + "/.well-known/openid-configuration"
+
+        async def warm_clients() -> None:
+            # Keep actual Keycloak connections warm on BOTH loops immediately
+            # before refresh. These GETs do not fill the product metadata cache.
+            (await app.state.mcp_oauth_http_client.get(want_document)).raise_for_status()
+            (await _on_mcp_loop(manager, mint_client.get(want_document))).raise_for_status()
+            wire.drain()
+            refresh_wire.drain()
+
         # The row is admitted the way the console admits it: the https gate
         # (loopback exempt) and strict canonicalization at the write boundary.
         _validate_oauth_user_url(resource)
@@ -381,7 +426,6 @@ async def _run(cfg: dict[str, str]) -> None:
             record("FAILED", f"D1 authorize: HTTP {start.status_code} {start.text[:200]}")
             return
         row = storage.get_mcp_server_by_name("kc-mcp") or {}
-        want_document = issuer + "/.well-known/openid-configuration"
         as_probes = [url for url in gets if url.startswith(issuer.rsplit("/realms/", 1)[0])]
         d1_ok = (
             prm_hits == [f"{PRM}/mcp"]
@@ -463,10 +507,13 @@ async def _run(cfg: dict[str, str]) -> None:
         )
 
         # C4 — cache hit.
-        r4 = await get_user_access_token_classified(
-            app_state=app.state, user_id=USER, server_name="kc-mcp"
+        r4 = await _on_mcp_loop(
+            manager,
+            get_user_access_token_classified(
+                app_state=app.state, user_id=USER, server_name="kc-mcp"
+            ),
         )
-        calls = wire.drain()
+        calls = wire.drain() + refresh_wire.drain()
         record(
             "VERIFIED" if r4.kind == "token" and r4.token == access and not calls else "FAILED",
             f"C4 cache hit: kind={r4.kind} same_token={r4.token == access} requests={len(calls)} (want 0)",
@@ -487,7 +534,7 @@ async def _run(cfg: dict[str, str]) -> None:
             f"requests={len(calls)} (want 0) row_untouched={untouched}",
         )
 
-        # C6 — refresh after the token really expires. The realm issues
+        # C6 — refresh when the token enters the refresh window. The realm issues
         # short-lived tokens so the clock, not a forged row, crosses the
         # product's refresh-ahead window.
         from turnstone.core.mcp_oauth import _ACCESS_TOKEN_REFRESH_SKEW_SECONDS
@@ -498,10 +545,16 @@ async def _run(cfg: dict[str, str]) -> None:
         ).total_seconds()
         print(f"  waiting {max(wait, 0):.0f}s for the access token to enter the refresh window...")
         await asyncio.sleep(max(wait, 0))
-        r6 = await get_user_access_token_classified(
-            app_state=app.state, user_id=USER, server_name="kc-mcp"
+        await warm_clients()
+        print("  C6 refreshing on the MCP loop with warmed browser and MCP clients...")
+        r6 = await _on_mcp_loop(
+            manager,
+            get_user_access_token_classified(
+                app_state=app.state, user_id=USER, server_name="kc-mcp"
+            ),
         )
-        calls = wire.drain()
+        calls = refresh_wire.drain()
+        browser_calls = wire.drain()
         plain6 = store.get_user_token(USER, "kc-mcp")
         rotated = plain6 is not None and plain6["refresh_token"] not in (None, refresh)
         who6 = await userinfo(r6.token) if r6.token else None
@@ -510,13 +563,14 @@ async def _run(cfg: dict[str, str]) -> None:
             if r6.kind == "token"
             and r6.token != access
             and calls == [("POST", token_endpoint)]
+            and not browser_calls
             and rotated
             and plain6 is not None
             and plain6["last_refreshed"]
             and who6 == cfg["KC_USER"]
             else "FAILED",
-            f"C6 refresh after expiry: kind={r6.kind} new_token={r6.token != access} "
-            f"wire={calls} (want one token POST, no re-discovery) rotated={rotated} "
+            f"C6 MCP-loop refresh when due: kind={r6.kind} new_token={r6.token != access} "
+            f"mcp_wire={calls} (want one token POST) browser_wire={browser_calls} rotated={rotated} "
             f"last_refreshed={plain6['last_refreshed'] if plain6 else None} userinfo={who6!r}",
         )
 
@@ -525,15 +579,60 @@ async def _run(cfg: dict[str, str]) -> None:
         # token by design (second-precision last_refreshed is the contention
         # tiebreak), so the check first lets the second turn.
         await asyncio.sleep(1.05 - datetime.now(UTC).microsecond / 1_000_000)
-        r7 = await get_user_access_token_classified(
-            app_state=app.state, user_id=USER, server_name="kc-mcp", force_refresh=True
+        await warm_clients()
+        r7 = await _on_mcp_loop(
+            manager,
+            get_user_access_token_classified(
+                app_state=app.state, user_id=USER, server_name="kc-mcp", force_refresh=True
+            ),
         )
-        calls = wire.drain()
+        calls = refresh_wire.drain()
+        browser_calls = wire.drain()
         record(
             "VERIFIED"
-            if r7.kind == "token" and r7.token != r6.token and calls == [("POST", token_endpoint)]
+            if r7.kind == "token"
+            and r7.token != r6.token
+            and calls == [("POST", token_endpoint)]
+            and not browser_calls
             else "FAILED",
-            f"C7 force_refresh: kind={r7.kind} new_token={r7.token != r6.token} wire={calls}",
+            f"C7 MCP-loop force_refresh: kind={r7.kind} new_token={r7.token != r6.token} "
+            f"mcp_wire={calls} browser_wire={browser_calls}",
+        )
+
+        # D5 — a warm metadata cache can hide a discovery-only cross-loop bug.
+        # Force real Keycloak discovery while both clients have warm transports.
+        await asyncio.sleep(1.05 - datetime.now(UTC).microsecond / 1_000_000)
+        await warm_clients()
+        app.state.mcp_oauth_metadata_cache.clear()
+        before_discovery_refresh = store.get_user_token(USER, "kc-mcp")
+        stub.drain()
+        print("  D5 refreshing on the MCP loop with an empty metadata cache...")
+        r5 = await _on_mcp_loop(
+            manager,
+            get_user_access_token_classified(
+                app_state=app.state, user_id=USER, server_name="kc-mcp", force_refresh=True
+            ),
+        )
+        calls = refresh_wire.drain()
+        browser_calls = wire.drain()
+        plain5 = store.get_user_token(USER, "kc-mcp")
+        who5 = await userinfo(r5.token) if r5.token else None
+        record(
+            "VERIFIED"
+            if r5.kind == "token"
+            and r5.token != r7.token
+            and calls == [("GET", url) for url in as_probes] + [("POST", token_endpoint)]
+            and not browser_calls
+            and not stub.drain()
+            and issuer in app.state.mcp_oauth_metadata_cache
+            and plain5 is not None
+            and before_discovery_refresh is not None
+            and plain5["refresh_token"] not in (None, before_discovery_refresh["refresh_token"])
+            and plain5["access_token"] == r5.token
+            and who5 == cfg["KC_USER"]
+            else "FAILED",
+            f"D5 MCP-loop refresh rediscovery: kind={r5.kind} mcp_wire={calls} "
+            f"browser_wire={browser_calls} userinfo={who5!r}",
         )
 
         # C8 — the settings-page projection.
@@ -561,8 +660,11 @@ async def _run(cfg: dict[str, str]) -> None:
         await asyncio.gather(*_revoke_upstream_tasks)
         calls = wire.drain()
         gone = storage.get_mcp_user_token(USER, "kc-mcp") is None
-        r9 = await get_user_access_token_classified(
-            app_state=app.state, user_id=USER, server_name="kc-mcp"
+        r9 = await _on_mcp_loop(
+            manager,
+            get_user_access_token_classified(
+                app_state=app.state, user_id=USER, server_name="kc-mcp"
+            ),
         )
         dead = await kc.post(
             token_endpoint,
@@ -695,12 +797,27 @@ async def _run(cfg: dict[str, str]) -> None:
                 f"registration_wire={[(m, u) for m, u in calls if m == 'POST']} "
                 f"consent={done3.headers.get('location')} aud={aud3}",
             )
+        record(
+            "VERIFIED"
+            if wire.loop is not refresh_wire.loop
+            and app.state.mcp_oauth_http_client is not mint_client
+            and not wire.off_loop_calls
+            and not refresh_wire.off_loop_calls
+            else "FAILED",
+            f"L1 separate HTTP-client owner loops: browser_off_loop={wire.off_loop_calls} "
+            f"mcp_off_loop={refresh_wire.off_loop_calls}",
+        )
     finally:
+        thread = manager._thread
+        await asyncio.to_thread(manager.shutdown)
         await console.aclose()
         await kc.aclose()
         await close_mcp_oauth_state(app.state)
         stub.close()
         legacy.close()
+        storage.close()
+        if thread is not None and thread.is_alive():
+            raise RuntimeError("MCP harness loop thread survived shutdown")
 
 
 def main() -> int:

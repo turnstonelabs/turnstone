@@ -3297,11 +3297,10 @@ async def get_obo_access_token_classified(
         # client object and a pooled connection is bound to the loop that
         # created it, so sharing the login client here collides routinely —
         # the login exchange and the first mint hit the same IdP origin
-        # seconds apart by design. No long-lived mint client is kept: a fresh
-        # one is opened per mint below (mints are ~hourly per (user, server),
-        # not hot-path). ``obo_http_client`` is the loop-owned client the node
-        # installs at connect time and the injection seam for the e2e
-        # harnesses; when unset a per-mint client is created.
+        # seconds apart by design. ``obo_http_client`` is the long-lived,
+        # loop-owned client the manager installs at connect time and the
+        # injection seam for the e2e harnesses; when unset a transient client
+        # is created on the current loop.
         # One client for the whole mint: the rfc8693 leg makes TWO POSTs to the
         # same token endpoint, so a per-request transient would pay two TLS
         # handshakes. ``_enter_mint_client`` yields the installed client or a
@@ -3702,7 +3701,8 @@ async def _enter_mint_client(app_state: Any) -> Any:
 
     The node installs its loop-owned client at connect time and the e2e
     harnesses inject theirs; anything else gets a per-mint client from the
-    same factory, so every mint carries the module's JSON-preferring posture.
+    same factory, so every mint or per-user refresh carries the module's
+    JSON-preferring posture.
     """
     injected_client: httpx.AsyncClient | None = getattr(app_state, "obo_http_client", None)
     if injected_client is not None:
@@ -4414,10 +4414,6 @@ async def _refresh_and_persist(
     Returns ``(access_token, refresh_token_or_none, expires_at_or_none)``.
     Raises :class:`MCPOAuthRefreshFailed` on failure.
     """
-    http_client: httpx.AsyncClient | None = getattr(app_state, "mcp_oauth_http_client", None)
-    if http_client is None:
-        raise MCPOAuthRefreshFailed("mcp_oauth_http_client is not configured")
-
     server_id = str(server_row["server_id"])
     override_url = server_row.get("oauth_authorization_server_url") or None
     cached_issuer = server_row.get("oauth_as_issuer_cached") or None
@@ -4425,48 +4421,53 @@ async def _refresh_and_persist(
     if not isinstance(client_id, str) or not client_id:
         raise MCPOAuthRefreshFailed("server has no oauth_client_id")
     metadata_cache = getattr(app_state, "mcp_oauth_metadata_cache", None)
-    try:
-        server_url = _canonical_server_url(server_row)
-        as_metadata = await discover_authorization_server(
-            server_name=server_name,
-            server_url=server_url,
-            override_url=override_url if isinstance(override_url, str) else None,
-            cached_issuer=cached_issuer if isinstance(cached_issuer, str) else None,
-            http_client=http_client,
-            storage=storage,
-            server_id=server_id,
-            trusted_hosts=frozenset(),
-            metadata_cache=metadata_cache,
-            allow_private_network=oauth_allow_private_network(app_state),
-        )
-    except MCPOAuthDiscoveryError as exc:
-        raise MCPOAuthRefreshFailed(f"discovery failed during refresh: {exc}") from exc
-
-    client_secret: str | None = None
-    if token_store is not None:
+    # Refresh runs on the MCP loop, while browser handlers own the ASGI client.
+    # Discovery and the token POST must share the mint client's loop ownership.
+    async with _enter_mint_client(app_state) as http_client:
         try:
-            client_secret = await asyncio.to_thread(token_store.get_oauth_client_secret, server_id)
-        except Exception:
-            log.warning(
-                "mcp_server.oauth.client_secret_decrypt_failed",
+            server_url = _canonical_server_url(server_row)
+            as_metadata = await discover_authorization_server(
                 server_name=server_name,
-                exc_info=True,
+                server_url=server_url,
+                override_url=override_url if isinstance(override_url, str) else None,
+                cached_issuer=cached_issuer if isinstance(cached_issuer, str) else None,
+                http_client=http_client,
+                storage=storage,
+                server_id=server_id,
+                trusted_hosts=frozenset(),
+                metadata_cache=metadata_cache,
+                allow_private_network=oauth_allow_private_network(app_state),
             )
-            client_secret = None
+        except MCPOAuthDiscoveryError as exc:
+            raise MCPOAuthRefreshFailed(f"discovery failed during refresh: {exc}") from exc
 
-    # RFC 8707 ``resource=`` parameter is the canonical MCP server URL,
-    # not the audience. Audience (Auth0-style ``audience=``) is a
-    # separate concept — the authorize URL passes both, but the
-    # token-grant uses ``resource=`` only.
-    tokens = await refresh_token(
-        as_metadata=as_metadata,
-        refresh_token_value=refresh_value,
-        client_id=client_id,
-        client_secret=client_secret,
-        mcp_server_canonical_url=server_url,
-        scopes=existing_scopes,
-        http_client=http_client,
-    )
+        client_secret: str | None = None
+        if token_store is not None:
+            try:
+                client_secret = await asyncio.to_thread(
+                    token_store.get_oauth_client_secret, server_id
+                )
+            except Exception:
+                log.warning(
+                    "mcp_server.oauth.client_secret_decrypt_failed",
+                    server_name=server_name,
+                    exc_info=True,
+                )
+                client_secret = None
+
+        # RFC 8707 ``resource=`` parameter is the canonical MCP server URL,
+        # not the audience. Audience (Auth0-style ``audience=``) is a
+        # separate concept — the authorize URL passes both, but the
+        # token-grant uses ``resource=`` only.
+        tokens = await refresh_token(
+            as_metadata=as_metadata,
+            refresh_token_value=refresh_value,
+            client_id=client_id,
+            client_secret=client_secret,
+            mcp_server_canonical_url=server_url,
+            scopes=existing_scopes,
+            http_client=http_client,
+        )
 
     new_access = tokens.get("access_token")
     if not isinstance(new_access, str) or not new_access:

@@ -21,6 +21,11 @@ frozen.
   with Python 3.13 or newer before upgrading. CI tests Python 3.13 and 3.14, and Docker images
   already include Python 3.14.
 
+### Fixed
+
+- **Per-user MCP OAuth refresh.** Discovery and refresh requests now use the MCP loop's HTTP
+  client, preventing cross-loop failures after browser sign-in.
+
 ## [1.8.3]
 
 Turnstone 1.8.3 makes scheduled work easier to launch, keeps conversations and node placement intact

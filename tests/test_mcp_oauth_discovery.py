@@ -2141,7 +2141,7 @@ class TestPrivateNetworkOptIn:
         store = MagicMock()
         store.get.return_value = True
         state = SimpleNamespace(
-            mcp_oauth_http_client=MagicMock(spec=httpx.AsyncClient),
+            obo_http_client=MagicMock(spec=httpx.AsyncClient),
             mcp_oauth_metadata_cache=None,
             config_store=store,
         )

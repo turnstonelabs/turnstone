@@ -24,16 +24,22 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
+import sqlalchemy as sa
+from aiohttp import web
 
-from tests.conftest import make_mcp_token_cipher
+from tests.conftest import _run_on_loop, make_mcp_token_cipher
+from turnstone.core.mcp_client import MCPClientManager
 from turnstone.core.mcp_crypto import MCPTokenStore
 from turnstone.core.mcp_oauth import (
     discover_authorization_server,
     get_user_access_token,
     get_user_access_token_classified,
+    json_http_client,
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
+
     from turnstone.core.storage._sqlite import SQLiteBackend
 
 # Generous CI ceiling — cancel/drain is sub-millisecond on a healthy loop.
@@ -100,7 +106,7 @@ def _make_app_state(storage: SQLiteBackend, *, http_client: httpx.AsyncClient) -
     state = SimpleNamespace(
         auth_storage=storage,
         mcp_token_store=MCPTokenStore(storage, cipher, node_id="test"),
-        mcp_oauth_http_client=http_client,
+        obo_http_client=http_client,
         mcp_oauth_refresh_locks={},
         mcp_oauth_metadata_cache={},
     )
@@ -174,8 +180,190 @@ def _mk_response(status_code: int = 200, json_body: Any = None) -> MagicMock:
     return resp
 
 
-def _public_addr_patch():
+def _public_addr_patch() -> contextlib.AbstractContextManager[Any]:
     return patch("socket.getaddrinfo", return_value=[(2, 1, 6, "", ("93.184.216.34", 0))])
+
+
+@pytest.fixture
+def mint_manager() -> Iterator[MCPClientManager]:
+    manager = MCPClientManager({})
+    manager._user_token_sweep_s = 0
+    manager._static_health_check_s = 0
+    try:
+        manager.start()
+        yield manager
+    finally:
+        manager.shutdown()
+
+
+@pytest.mark.parametrize("injected_client", [True, False], ids=["manager", "transient"])
+def test_refresh_discovery_and_post_stay_off_the_browser_loop(
+    storage: SQLiteBackend, mint_manager: MCPClientManager, injected_client: bool
+) -> None:
+    """Warm real connections on both live loops; discover with an empty metadata cache."""
+    _seed_server(storage)
+
+    async def _run() -> None:
+        requests: list[tuple[str, httpx.AsyncClient, asyncio.AbstractEventLoop]] = []
+
+        def observe_client(client: httpx.AsyncClient) -> httpx.AsyncClient:
+            async def on_request(request: httpx.Request) -> None:
+                requests.append((request.url.path, client, asyncio.get_running_loop()))
+
+            client.event_hooks["request"].append(on_request)
+            return client
+
+        def transient_client(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
+            return observe_client(json_http_client(*args, **kwargs))
+
+        async def handle(request: web.Request) -> web.Response:
+            if request.path == "/.well-known/oauth-authorization-server":
+                metadata = _good_as_metadata_doc()
+                metadata.update(
+                    issuer=origin,
+                    authorization_endpoint=f"{origin}/authorize",
+                    token_endpoint=f"{origin}/token",
+                    jwks_uri=f"{origin}/jwks",
+                )
+                return web.json_response(metadata)
+            if request.path == "/token":
+                assert request.headers["Accept"] == "application/json"
+                assert (await request.post())["grant_type"] == "refresh_token"
+                return web.json_response(
+                    {
+                        "access_token": "fresh-bbb",
+                        "refresh_token": "refresh-rotated",
+                        "expires_in": 3600,
+                    }
+                )
+            assert request.path == "/warm"
+            return web.json_response({})
+
+        app = web.Application()
+        app.router.add_route("*", "/{path:.*}", handle)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        try:
+            await web.TCPSite(runner, "127.0.0.1", 0).start()
+            origin = f"http://127.0.0.1:{runner.addresses[0][1]}"
+            storage.update_mcp_server("srv-id", oauth_as_issuer_cached=origin)
+            async with httpx.AsyncClient() as browser_client:
+                observe_client(browser_client)
+                state = _make_app_state(storage, http_client=browser_client)
+                state.mcp_oauth_http_client = browser_client
+                _seed_token(state, expires_in_seconds=-1000)
+                mint_manager.set_app_state(state)
+                manager_client = observe_client(state.obo_http_client)
+                loop = mint_manager._loop
+                assert loop is not None
+                await browser_client.get(f"{origin}/warm")
+                await asyncio.wrap_future(
+                    asyncio.run_coroutine_threadsafe(
+                        state.obo_http_client.get(f"{origin}/warm"), loop
+                    )
+                )
+                if not injected_client:
+                    del state.obo_http_client
+                assert state.mcp_oauth_metadata_cache == {}
+                with patch("turnstone.core.mcp_oauth.json_http_client", transient_client):
+                    result = await asyncio.wait_for(
+                        asyncio.wrap_future(
+                            asyncio.run_coroutine_threadsafe(
+                                get_user_access_token_classified(
+                                    app_state=state, user_id="user-1", server_name="srv-oauth"
+                                ),
+                                loop,
+                            ),
+                        ),
+                        timeout=10,
+                    )
+
+                assert result.kind == "token", result
+                assert result.token == "fresh-bbb"
+                assert [path for path, _, _ in requests] == [
+                    "/warm",
+                    "/warm",
+                    "/.well-known/oauth-authorization-server",
+                    "/token",
+                ]
+                # Client identity survives keepalive expiry between requests.
+                discovery_client, token_client = (client for _, client, _ in requests[2:])
+                assert discovery_client is token_client
+                assert token_client is not browser_client
+                assert (token_client is manager_client) == injected_client
+                assert all(owner_loop is loop for _, _, owner_loop in requests[1:])
+                token = state.mcp_token_store.get_user_token("user-1", "srv-oauth")
+                assert token is not None
+                assert token["refresh_token"] == "refresh-rotated"
+                # The browser's own client remains usable on its original loop.
+                assert (await browser_client.get(f"{origin}/warm")).status_code == 200
+        finally:
+            await runner.cleanup()
+
+    asyncio.run(_run())
+
+
+@pytest.mark.parametrize("keepalive", [False, True], ids=["expiry", "keepalive"])
+@pytest.mark.parametrize(
+    "failure", [None, "invalid_grant", "temporarily_unavailable", "provider_error"]
+)
+def test_sweep_refreshes_with_no_browser_client(
+    storage: SQLiteBackend, mint_manager: MCPClientManager, keepalive: bool, failure: str | None
+) -> None:
+    """A real sweep needs no browser client and only observes failed grants."""
+    _seed_server(storage)
+    state = SimpleNamespace(
+        auth_storage=storage,
+        mcp_token_store=MCPTokenStore(storage, make_mcp_token_cipher(), node_id="test"),
+        mcp_oauth_refresh_locks={},
+        mcp_oauth_refresh_backoff={},
+    )
+    # Age the stored creation timestamp without aging the access-token expiry.
+    _seed_token(state, expires_in_seconds=3600 if keepalive else -1000)
+    with storage._engine.begin() as conn:
+        conn.execute(
+            sa.text(
+                "UPDATE mcp_user_tokens SET created = :created "
+                "WHERE user_id = :uid AND server_name = :sn"
+            ),
+            {
+                "created": (datetime.now(UTC) - timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%S"),
+                "uid": "user-1",
+                "sn": "srv-oauth",
+            },
+        )
+    mint_manager.set_storage(storage)
+    mint_manager.set_app_state(state)
+    mint_manager._oauth_user_server_names = {"srv-oauth"}
+    mint_manager._user_token_refresh_keepalive_s = 3600 if keepalive else 0
+    requests: list[str] = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        requests.append(request.method)
+        if request.method == "GET":
+            return httpx.Response(200, json=_good_as_metadata_doc())
+        assert request.method == "POST"
+        if failure:
+            # A 400 reaches the error-code classifier even for the transient code.
+            return httpx.Response(400, json={"error": failure})
+        return httpx.Response(200, json={"access_token": "fresh-bbb", "expires_in": 3600})
+
+    async def _tick() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
+            state.obo_http_client = client
+            with _public_addr_patch():
+                await mint_manager._sweep_user_token_freshness()
+
+    loop = mint_manager._loop
+    assert loop is not None
+    _run_on_loop(loop, _tick())
+    assert requests == ["GET", "POST"]
+    token = state.mcp_token_store.get_user_token("user-1", "srv-oauth")
+    assert token is not None
+    assert token["access_token"] == ("access-aaa" if failure else "fresh-bbb")
+    assert token["refresh_token"] == "refresh-rrr"
+    assert state.mcp_oauth_refresh_backoff == {}
+    assert bool(mint_manager._token_sweep_warned) == (failure == "invalid_grant")
 
 
 # ---------------------------------------------------------------------------

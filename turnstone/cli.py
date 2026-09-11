@@ -1316,6 +1316,9 @@ def main() -> None:
         getattr(args, "mcp_config", None),
         storage=_get_storage(),
         required=registry.has_dynamic_auth(),
+        # Nodes maintain web users' grants; CLI sessions must not become a
+        # second background refresher against a shared SQLite database.
+        user_token_sweep=False,
     )
     if mcp_client is not None:
         cli_auth_storage = _get_storage()

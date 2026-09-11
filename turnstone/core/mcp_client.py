@@ -925,9 +925,9 @@ class MCPClientManager:
         # asserts non-None when it actually runs, so static-only callers
         # never hit it.
         self._app_state: Any = None
-        # Long-lived HTTP client created and closed on the mcp-loop. Model-token
-        # mints run on that loop and must not borrow the lifespan-loop OAuth
-        # client or pay a DNS/TLS setup on every turn.
+        # Long-lived HTTP client created and closed on the mcp-loop. Token mints
+        # and per-user refreshes (including discovery) reuse its connections.
+        # The browser OAuth client belongs to the lifespan loop.
         self._model_auth_http_client: httpx.AsyncClient | None = None
 
         # In-memory cache of server names whose ``auth_type='oauth_user'``.
@@ -1049,11 +1049,12 @@ class MCPClientManager:
     def set_app_state(self, app_state: Any) -> None:
         """Wire the OAuth ``app.state`` into the manager.
 
-        Called from the lifespan after ``initialize_mcp_crypto_state`` and
-        ``initialize_mcp_oauth_state`` have populated the token store,
-        OAuth HTTP client, metadata cache, and refresh-lock map. Required
-        before any ``auth_type='oauth_user'`` dispatch; static-only
-        deployments may leave it unset.
+        Hosts supply the token store, OAuth configuration, metadata cache,
+        and refresh-lock state needed by their auth paths. The manager injects
+        its loop-owned ``obo_http_client`` for mints and per-user refreshes;
+        browser clients are not used on this loop. Required before any
+        ``auth_type='oauth_user'`` dispatch; static-only deployments may leave
+        it unset.
         """
         self._app_state = app_state
         if self._model_auth_http_client is not None:
@@ -9543,6 +9544,7 @@ def create_mcp_client(
     *,
     storage: Any = None,
     required: bool = False,
+    user_token_sweep: bool = True,
 ) -> MCPClientManager | None:
     """Create and start an MCP client manager.
 
@@ -9557,6 +9559,10 @@ def create_mcp_client(
     installs left the host managerless after every restart — no pools,
     no MCP — until the next admin MCP write or reload fan-out happened
     to lazy-construct one.)
+
+    Set ``user_token_sweep=False`` for hosts such as the CLI that must not
+    maintain web users' grants in the background. This disables the sweep
+    before the manager starts, without changing the configured node cadence.
     """
     # Check DB first to know which servers are DB-managed
     db_names: set[str] = set()
@@ -9583,5 +9589,7 @@ def create_mcp_client(
     mgr._db_managed = {name for name in servers if name in db_names}
     mgr._oauth_user_server_names = oauth_user_names
     mgr._obo_server_names = obo_names
+    if not user_token_sweep:
+        mgr._user_token_sweep_s = 0.0
     mgr.start()
     return mgr
