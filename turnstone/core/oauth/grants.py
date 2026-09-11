@@ -66,7 +66,7 @@ async def refresh_token(
 #              audience scopes)
 #
 # The minted token is cached in the existing per-(user, server)
-# mcp_user_tokens row with refresh_token_ct=NULL — cache, not custody.  A
+# oauth_tokens row with refresh_token_ct=NULL — cache, not custody.  A
 # permanent mint failure drops ONLY that cache row (re-consent UX for that
 # server); the shared credential is NEVER auto-deleted here — a missing
 # tenant grant for one server (AADSTS65001, verified) must not lock the user

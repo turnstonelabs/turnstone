@@ -34,7 +34,7 @@ Switching `auth_type` away from `oauth_user` / `oauth_obo` **deletes** that serv
 
 ## Prerequisites for `auth_type=oauth_user`
 
-1. **Encryption key**. Tokens are stored encrypted with Fernet. Set `[security] mcp_token_encryption_key` in `config.toml` (Turnstone won't start with an `oauth_user` row configured but no key installed). Rotate via `MultiFernet` — add the new key first, then later remove the old one once all rows have been re-encrypted.
+1. **Encryption key**. Tokens are stored encrypted with Fernet. Set `[security] mcp_token_encryption_key` in `config.toml` (Turnstone won't start with an `oauth_user` row configured but no key installed). Follow the [shared keyring and rotation procedure](oauth-storage.md#key-rotation) for every console and node that uses the database.
 
 2. **MCP server publishes RFC 9728 PRM and RFC 8414 AS metadata** *or* you configure the AS URL override on the server row. PKCE S256 is mandatory; Turnstone refuses to connect to authorization servers that don't advertise `code_challenge_methods_supported: ["S256"]`.
 
@@ -193,24 +193,11 @@ reachable.
 
 ### Encryption key
 
-```toml
-[security]
-mcp_token_encryption_key = "base64-fernet-key"
-# For rotation, list the keys in priority order — first is used for new
-# writes, all are tried for reads.
-# mcp_token_encryption_keys = ["new-key", "old-key"]
-```
-
-This key is accepted only from `config.toml`, not environment variables or
-DB-backed runtime settings. Use the same keyring on the console and all nodes
-sharing the database, and retain a private backup. Losing it makes stored
-tokens and client secrets undecryptable.
-
-File-backed storage avoids putting the key in inherited process environments.
-It does not isolate the key from a shell running as the same OS user: that
-shell can read the file too. A read-only Docker mount prevents changes, not
-reads. Keep the file outside the mounted workspace and use process/filesystem
-isolation when tools must not be able to access service credentials.
+MCP tokens and client secrets use the deployment keyring shared with model
+authentication. See [Shared OAuth storage](oauth-storage.md) for configuration,
+backup, rotation, and credential lifecycle. The existing
+`[security] mcp_token_encryption_key` / `mcp_token_encryption_keys` names remain
+unchanged and are read only from `config.toml`.
 
 ---
 
@@ -279,7 +266,7 @@ The captured credential is a single per-user secret that can mint for every `oau
 
 1. **First tool call** for a user against an `oauth_user` MCP server: pool dispatch finds no stored token, returns `mcp_consent_required` to the agent. Dashboard renders an inline "Connect" action card.
 
-2. **User clicks Connect**: opens `/v1/api/mcp/oauth/start?server=<name>` in a popup. Browser redirects through the AS authorize endpoint, user grants consent, AS redirects back to `/v1/api/mcp/oauth/callback`. Turnstone exchanges code → tokens via PKCE, validates audience, encrypts, persists in `mcp_user_tokens`, redirects user back to the originating URL.
+2. **User clicks Connect**: opens `/v1/api/mcp/oauth/start?server=<name>` in a popup. Browser redirects through the AS authorize endpoint, user grants consent, AS redirects back to `/v1/api/mcp/oauth/callback`. Turnstone exchanges code → tokens via PKCE, validates audience, encrypts, persists in `oauth_tokens`, redirects user back to the originating URL.
 
 3. **Subsequent tool calls** by the same user against the same server reuse the persisted token via the per-(user, server) session pool. Tokens auto-refresh via the refresh-token grant when expired; failed refresh emits `mcp_consent_required` to drive re-consent.
 
@@ -307,7 +294,7 @@ Additional indicators (circuit-breaker state, encryption-key mismatch) are expos
 | From | To | What happens |
 |---|---|---|
 | `none` / `static` → `oauth_user` | — | New code path activates for this server. Existing static headers (if any) are no longer sent. Users must authorize on first use. |
-| `oauth_user` → `none` / `static` | — | Existing `mcp_user_tokens` rows are **deleted**: the tokens are bound to the auth model + URL active at consent time, and rows left behind could silently rebind if a row with the old name/URL reappears. Switching back to `oauth_user` later starts clean — users re-consent on next use. This is **not reversible**; the AS-side grants are untouched (revoke upstream via the AS if needed). |
+| `oauth_user` → `none` / `static` | — | Existing `oauth_tokens` rows are **deleted**: the tokens are bound to the auth model + URL active at consent time, and rows left behind could silently rebind if a row with the old name/URL reappears. Switching back to `oauth_user` later starts clean — users re-consent on next use. This is **not reversible**; the AS-side grants are untouched (revoke upstream via the AS if needed). |
 | OAuth `client_id` or `client_secret` rotated | — | Existing tokens may stop refreshing if the AS treats them as bound to the previous client. Bulk-revoke after rotation. |
 | `oauth_user` ↔ `oauth_obo` | — | The per-user rows are **deleted** on the flip (they mean different things: per-server AS refresh tokens vs. minted cache). `oauth_audience` and `oauth_scopes` mean different things in each model (a resource indicator vs. an IdP app identifier; AS-consent scopes vs. an rfc8693 exchange scope), so on a flip they **never carry** — each is taken from the request for the target model or set NULL. The admin console clears these fields when you change the auth type, so re-enter the correct values for the new mode; via the API, supply them explicitly (a flip into `oauth_obo` with no `oauth_audience` is rejected, and a non-empty `oauth_scopes` under the `entra` profile is rejected since that leg pins `<audience>/.default`). |
 | `oauth_obo` → `none` / `static` | — | Minted cache rows are deleted. |
@@ -324,7 +311,7 @@ Every transition that changes what a stored row *means* deletes the rows outrigh
 | `MCP OAuth is not configured on this node.` / encryption-key configuration hint | Console or node did not load the shared TOML file | Check the read-only mount, `TURNSTONE_CONFIG`, file ownership, and the same key on every consumer; restart after TOML edits or recreate after changing Compose mounts/environment. |
 | OAuth start says the redirect base is not configured | Missing or invalid `[oidc] redirect_base` | Set the public HTTPS origin, with no path/query/fragment, even for local-auth installs; restart the console and nodes. |
 | `mcp_consent_required` even after consenting | Token persistence failed, or refresh-token rejected by AS | Check audit log for `mcp_server.oauth.persist_failed` or `mcp_server.oauth.token_revoked`. Re-consent via settings modal. |
-| `mcp_token_undecryptable_key_unknown` | Encryption key rotated without keeping the previous key in the keyring | Add the previous key back to `mcp_token_encryption_keys` until all rows have been re-encrypted, then drop. |
+| `mcp_token_undecryptable_key_unknown` | Encryption key rotated without keeping the previous key in the keyring | Restore the previous key in `mcp_token_encryption_keys` and follow the [key retirement guidance](oauth-storage.md#key-rotation). Reads do not re-encrypt old rows. |
 | `mcp_oauth_url_insecure` | MCP server URL is `http://` (not `https://`) on a non-loopback host | Use `https://`. Per-user bearers must not transit cleartext. |
 | `PRM resource identifier does not match the server URL` | The server's protected-resource metadata declares a different resource than the row's canonical Server URL (or, at the origin-level location, its origin) | Compare the Server URL path and spelling with what the server publishes at `/.well-known/oauth-protected-resource<path>`. |
 | `AS metadata returned HTTP 404` for an issuer with a path | None of the metadata locations answered | Set the Authorization Server URL override to the issuer exactly as the AS publishes it. A query string or fragment in the issuer is refused with its own message. |

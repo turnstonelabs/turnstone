@@ -51,6 +51,29 @@ def _structured_memory_indexes(inspector: sa.Inspector) -> dict[str, tuple[str, 
     return indexes
 
 
+def _assert_oauth_token_schema(inspector: sa.Inspector) -> None:
+    """Pin names as well as columns: a table rename alone leaves old PG names."""
+    from turnstone.core.storage._schema import oauth_tokens
+
+    assert "mcp_user_tokens" not in inspector.get_table_names()
+    assert {
+        column["name"]: column["nullable"] for column in inspector.get_columns("oauth_tokens")
+    } == {column.name: column.nullable for column in oauth_tokens.columns}
+    pk = inspector.get_pk_constraint("oauth_tokens")
+    assert pk["constrained_columns"] == ["user_id", "token_key"]
+    assert pk["name"] == (
+        "oauth_tokens_pkey" if inspector.bind.dialect.name == "postgresql" else None
+    )
+    # PostgreSQL reflection includes the backing PK index; SQLite excludes its
+    # unnamed autoindex. Compare the secondary indexes on both dialects.
+    indexes = {
+        index["name"]: (tuple(index["column_names"]), bool(index["unique"]))
+        for index in inspector.get_indexes("oauth_tokens")
+        if not index.get("duplicates_constraint")
+    }
+    assert indexes == {"idx_oauth_tokens_key": (("token_key", "expires_at"), False)}
+
+
 @pytest.fixture
 def sqlite_inspectors(tmp_path: Path) -> Iterator[tuple[sa.Inspector, sa.Inspector]]:
     """Inspect both schema paths while owning their connection pools."""
@@ -93,8 +116,8 @@ def test_create_all_matches_migrations(
                 "only_create_all": sorted(ec - mc),
             }
         # Named CHECK constraints only — unnamed ones reflect as backend noise.
-        mck = {c["name"] for c in mig.get_check_constraints(t) if c.get("name")}
-        eck = {c["name"] for c in meta.get_check_constraints(t) if c.get("name")}
+        mck = {name for c in mig.get_check_constraints(t) if (name := c["name"])}
+        eck = {name for c in meta.get_check_constraints(t) if (name := c["name"])}
         if mck != eck:
             check_drift[t] = {
                 "only_migrations": sorted(mck - eck),
@@ -105,9 +128,11 @@ def test_create_all_matches_migrations(
     assert not check_drift, f"check-constraint drift: {check_drift}"
     assert _structured_memory_indexes(mig) == _STRUCTURED_MEMORY_INDEXES
     assert _structured_memory_indexes(meta) == _STRUCTURED_MEMORY_INDEXES
+    _assert_oauth_token_schema(mig)
+    _assert_oauth_token_schema(meta)
 
 
-def test_postgresql_structured_memory_indexes_match_both_paths(
+def test_postgresql_selected_indexes_match_both_paths(
     fresh_pg_url: sa.URL,
 ) -> None:
     from turnstone.core.storage._schema import metadata
@@ -120,12 +145,14 @@ def test_postgresql_structured_memory_indexes_match_both_paths(
     engine = sa.create_engine(fresh_pg_url)
     try:
         migrated_indexes = _structured_memory_indexes(sa.inspect(engine))
+        _assert_oauth_token_schema(sa.inspect(engine))
 
         # The database is fixture-owned and disposable. Rebuild it through the
         # second schema path so PostgreSQL reflection covers both definitions.
         metadata.drop_all(engine)
         metadata.create_all(engine)
         create_all_indexes = _structured_memory_indexes(sa.inspect(engine))
+        _assert_oauth_token_schema(sa.inspect(engine))
     finally:
         engine.dispose()
 

@@ -34,6 +34,9 @@ package "turnstone/core/" <<Rectangle>> {
     component [lowering.py\nprovider-wire lowering] as lowering <<core>>
     component [state_writer.py\nordered durable state tail] as statewriter <<core>>
     component [model_backend_auth.py\nper-call backend credentials] as modelauth <<core>>
+    component [model_oauth.py\nModel mint orchestration] as modeloauth <<core>>
+    component [oauth/\nShared grants, HTTP, OIDC, coordination] as oauth <<core>>
+    component [token_store/\nEncrypted tokens + captured credentials] as tokenstore <<core>>
     component [providers/\nLLMProvider, OpenAI, Anthropic, Google] as providers <<core>>
     component [workstream.py\nWorkstream types + state] as workstream <<core>>
     component [tools.py\nTool loader] as tools <<core>>
@@ -48,6 +51,7 @@ package "turnstone/core/" <<Rectangle>> {
     component [healthcheck.py\nBackendHealthMonitor] as healthcheck <<core>>
     component [ratelimit.py\nRateLimiter] as ratelimit <<core>>
     component [mcp_client.py\nMCPClientManager\n(push + manual refresh)] as mcp <<core>>
+    component [mcp_oauth.py + mcp_crypto.py\nMCP consent, secrets, audit policy] as mcpauth <<core>>
     component [tool_search.py\nToolSearchManager, BM25] as toolsearch <<core>>
     component [model_registry.py\nModelRegistry] as registry <<core>>
 }
@@ -156,6 +160,14 @@ registry --> providers
 modelturn --> registry : coherent snapshot
 healthcheck --> metrics
 mcp --> config
+mcp --> mcpauth
+mcp --> modeloauth : mint bridge
+mcpauth --> oauth
+mcpauth --> tokenstore
+modeloauth --> oauth
+modeloauth --> tokenstore
+oauth --> tokenstore
+tokenstore --> storage
 registry --> config
 tools --> schemas
 

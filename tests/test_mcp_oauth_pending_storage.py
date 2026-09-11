@@ -1,25 +1,20 @@
-"""Smoke tests for the new OAuth-MCP storage tables.
-
-Phase 2 only adds the schema — token CRUD lands in Phase 3 and pending-
-state CRUD in Phase 4.  These tests verify the tables exist after
-``init_storage`` and accept the documented row shape via raw SQL.
-"""
+"""Schema checks for shared OAuth tokens and MCP browser authorization state."""
 
 from __future__ import annotations
 
 import sqlalchemy as sa
 
-from turnstone.core.storage._schema import mcp_oauth_pending, mcp_user_tokens
+from turnstone.core.storage._schema import mcp_oauth_pending, oauth_tokens
 
 
-class TestMcpUserTokensTable:
+class TestOAuthTokensTable:
     def test_table_exists_and_accepts_row(self, backend) -> None:
         with backend._engine.connect() as conn:
             conn.execute(
-                sa.insert(mcp_user_tokens),
+                sa.insert(oauth_tokens),
                 {
                     "user_id": "u1",
-                    "server_name": "srv-a",
+                    "token_key": "srv-a",
                     "access_token_ct": b"\x00ciphertext-a",
                     "refresh_token_ct": b"\x00ciphertext-r",
                     "expires_at": "2026-05-04T12:00:00",
@@ -32,8 +27,8 @@ class TestMcpUserTokensTable:
             )
             conn.commit()
             row = conn.execute(
-                sa.select(mcp_user_tokens).where(
-                    (mcp_user_tokens.c.user_id == "u1") & (mcp_user_tokens.c.server_name == "srv-a")
+                sa.select(oauth_tokens).where(
+                    (oauth_tokens.c.user_id == "u1") & (oauth_tokens.c.token_key == "srv-a")
                 )
             ).one()
         assert row.access_token_ct == b"\x00ciphertext-a"
@@ -41,15 +36,15 @@ class TestMcpUserTokensTable:
         assert row.scopes == "openid profile"
         assert row.audience == "https://mcp.example.com"
 
-    def test_composite_pk_distinguishes_user_server(self, backend) -> None:
+    def test_composite_pk_distinguishes_user_token_key(self, backend) -> None:
         """Same user, different server => two rows; same (user, server) => conflict."""
         with backend._engine.connect() as conn:
             conn.execute(
-                sa.insert(mcp_user_tokens),
+                sa.insert(oauth_tokens),
                 [
                     {
                         "user_id": "u1",
-                        "server_name": "srv-a",
+                        "token_key": "srv-a",
                         "access_token_ct": b"a",
                         "refresh_token_ct": None,
                         "expires_at": None,
@@ -61,7 +56,7 @@ class TestMcpUserTokensTable:
                     },
                     {
                         "user_id": "u1",
-                        "server_name": "srv-b",
+                        "token_key": "srv-b",
                         "access_token_ct": b"b",
                         "refresh_token_ct": None,
                         "expires_at": None,
@@ -74,7 +69,7 @@ class TestMcpUserTokensTable:
                 ],
             )
             conn.commit()
-            count = conn.execute(sa.select(sa.func.count()).select_from(mcp_user_tokens)).scalar()
+            count = conn.execute(sa.select(sa.func.count()).select_from(oauth_tokens)).scalar()
         assert count == 2
 
 

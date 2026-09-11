@@ -64,7 +64,7 @@ class TestUserTokenCRUD:
         plain = store.get_user_token("u1", "srv-a")
         assert plain is not None
         assert plain["user_id"] == "u1"
-        assert plain["server_name"] == "srv-a"
+        assert plain["token_key"] == "srv-a"
         assert plain["access_token"] == "access-aaa"
         assert plain["refresh_token"] == "refresh-bbb"
         assert plain["scopes"] == "openid profile"
@@ -209,7 +209,7 @@ class TestDecryptFailureInvariant:
             as_issuer="https://auth.example.com",
             audience="https://mcp.example.com",
         )
-        raw_before = backend.get_mcp_user_token("u1", "srv-a")
+        raw_before = backend.get_oauth_token("u1", "srv-a")
         assert raw_before is not None
         ct_before = bytes(raw_before["access_token_ct"])
 
@@ -221,7 +221,7 @@ class TestDecryptFailureInvariant:
         assert exc_info.value.key_fingerprints_attempted == cipher_b.key_fingerprints
 
         # Row MUST still exist with ciphertext intact.
-        raw_after = backend.get_mcp_user_token("u1", "srv-a")
+        raw_after = backend.get_oauth_token("u1", "srv-a")
         assert raw_after is not None
         assert bytes(raw_after["access_token_ct"]) == ct_before
 

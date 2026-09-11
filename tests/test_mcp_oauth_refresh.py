@@ -323,8 +323,8 @@ def test_sweep_refreshes_with_no_browser_client(
     with storage._engine.begin() as conn:
         conn.execute(
             sa.text(
-                "UPDATE mcp_user_tokens SET created = :created "
-                "WHERE user_id = :uid AND server_name = :sn"
+                "UPDATE oauth_tokens SET created = :created "
+                "WHERE user_id = :uid AND token_key = :sn"
             ),
             {
                 "created": (datetime.now(UTC) - timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%S"),

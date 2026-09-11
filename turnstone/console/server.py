@@ -6665,17 +6665,17 @@ async def admin_delete_oidc_identity(request: Request) -> JSONResponse:
                 exc_info=True,
             )
         for row in metadata:
-            server_name = str(row.get("server_name") or "")
-            if not server_name.startswith(MODEL_OBO_CACHE_PREFIX):
+            token_key = str(row.get("token_key") or "")
+            if not token_key.startswith(MODEL_OBO_CACHE_PREFIX):
                 continue
             try:
-                if token_store.delete_user_token(user_id, server_name):
+                if token_store.delete_user_token(user_id, token_key):
                     obo_cache_purged += 1
             except Exception:
                 log.warning(
                     "admin.oidc_identity.model_obo_cache_purge_failed user=%s server=%s",
                     user_id,
-                    server_name,
+                    token_key,
                     exc_info=True,
                 )
     # The console-hosted coordinator has its own manager/memo and is not in the
@@ -10634,7 +10634,7 @@ def _purge_model_mint_cache(storage: Any, definition_id: str, alias: str) -> Non
     # storage failure, each miss logged on its own.
     for server_key in (model_obo_cache_server(alias), model_app_cache_server(alias)):
         try:
-            storage.delete_mcp_oauth_rows_by_server_name(server_key)
+            storage.delete_oauth_tokens_by_key(server_key)
         except Exception:
             log.warning(
                 "admin.models.purge_mint_cache_failed definition_id=%s server=%s",
@@ -11169,7 +11169,7 @@ async def admin_list_mcp_servers(request: Request) -> JSONResponse:
     # entirely when no row is oauth_user so static-only installs
     # exercise zero new storage queries.
 
-    # Both pool-backed types populate mcp_user_tokens (oauth_user: consents;
+    # Both pool-backed types populate oauth_tokens (oauth_user: consents;
     # oauth_obo: minted cache), so run the count for either — it drives the
     # per-row pill: oauth_user's consented-users count and oauth_obo's
     # flush-cache action (gated on count>0 in the UI).
@@ -12295,7 +12295,7 @@ async def admin_mcp_bulk_revoke(request: Request) -> JSONResponse:
 
     Authoritative local delete via
     :meth:`StorageBackend.delete_mcp_oauth_rows_by_server_name` —
-    purges both ``mcp_user_tokens`` and ``mcp_oauth_pending`` rows for
+    purges both ``oauth_tokens`` and ``mcp_oauth_pending`` rows for
     the named server.  Upstream RFC 7009 revoke is intentionally NOT
     attempted in bulk (would require per-row decrypt + N upstream HTTP
     calls); operators who need upstream cleanup should use the per-
@@ -12330,7 +12330,7 @@ async def admin_mcp_bulk_revoke(request: Request) -> JSONResponse:
     existing = storage.get_mcp_server_by_name(name)
     if existing is None:
         return JSONResponse({"error": "No such server"}, status_code=404)
-    # Both pool-backed types populate mcp_user_tokens, but the semantics differ
+    # Both pool-backed types populate oauth_tokens, but the semantics differ
     # and must be honest (issue #551): for oauth_user, deleting the rows is a
     # durable REVOCATION — users lose access until they re-consent. For
     # oauth_obo, the per-server rows are a mint CACHE; the shared per-user

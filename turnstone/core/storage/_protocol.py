@@ -151,10 +151,9 @@ class OIDCUserCredential(TypedDict):
     """Row shape for the per-(user, issuer) captured IdP refresh token.
 
     ``refresh_token_ct`` is a Fernet ciphertext blob (same envelope as
-    ``mcp_user_tokens``); the storage layer returns it verbatim and
-    ``MCPTokenStore`` handles encrypt/decrypt.  One row per user per
-    issuer — the single credential that ``auth_type='oauth_obo'`` MCP
-    servers redeem on demand (issue #551).
+    ``oauth_tokens``); the storage layer returns it verbatim and
+    ``TokenStore`` handles encrypt/decrypt. One row per user per issuer —
+    the credential that delegated MCP and model consumers redeem on demand.
     """
 
     user_id: str
@@ -174,16 +173,17 @@ class OIDCPendingState(TypedDict):
     created_at: str
 
 
-class MCPUserToken(TypedDict):
-    """Row shape returned by per-(user, MCP server) OAuth token lookups.
+class OAuthToken(TypedDict):
+    """Row shape returned by per-(user, token key) OAuth token lookups.
 
     ``access_token_ct`` and ``refresh_token_ct`` are Fernet ciphertext
-    blobs; the storage layer returns them verbatim and ``MCPTokenStore``
-    handles encrypt/decrypt.
+    blobs; the storage layer returns them verbatim and ``TokenStore``
+    handles encrypt/decrypt. ``token_key`` is an opaque identity, separate
+    from the audience/resource URL, used by both MCP grants and mint caches.
     """
 
     user_id: str
-    server_name: str
+    token_key: str
     access_token_ct: bytes
     refresh_token_ct: bytes | None
     expires_at: str | None
@@ -194,17 +194,17 @@ class MCPUserToken(TypedDict):
     last_refreshed: str | None
 
 
-class MCPUserTokenMetadataRow(TypedDict):
-    """Non-secret projection of ``mcp_user_tokens`` for the settings UI.
+class OAuthTokenMetadataRow(TypedDict):
+    """Non-secret projection of ``oauth_tokens`` for metadata consumers.
 
     Excludes ``access_token_ct`` and ``refresh_token_ct`` so the
     storage layer never materialises ciphertext for list queries that
-    only need metadata. ``MCPTokenStore.list_user_token_metadata``
+    only need metadata. ``TokenStore.list_user_token_metadata``
     re-types these rows as ``UserTokenMetadata`` (same field shape).
     """
 
     user_id: str
-    server_name: str
+    token_key: str
     expires_at: str | None
     scopes: str | None
     as_issuer: str
@@ -2678,7 +2678,7 @@ class StorageBackend(Protocol):
         """Delete an MCP server definition. Returns True if existed."""
         ...
 
-    # -- MCP OAuth: client-secret + per-(user, server) tokens ------------------
+    # -- MCP OAuth client secret ---------------------------------------------
     #
     # ``oauth_client_secret_ct`` is intentionally absent from
     # ``MCP_SERVER_MUTABLE`` (see ``_utils.py``).  It has its own dedicated
@@ -2693,10 +2693,12 @@ class StorageBackend(Protocol):
         """
         ...
 
-    def create_mcp_user_token(
+    # -- Shared OAuth tokens -------------------------------------------------
+
+    def create_oauth_token(
         self,
         user_id: str,
-        server_name: str,
+        token_key: str,
         *,
         access_token_ct: bytes,
         refresh_token_ct: bytes | None,
@@ -2705,17 +2707,17 @@ class StorageBackend(Protocol):
         as_issuer: str,
         audience: str,
     ) -> None:
-        """Insert a new per-(user, server) token row. No-op on conflict."""
+        """Insert a new per-(user, token key) token row. No-op on conflict."""
         ...
 
-    def get_mcp_user_token(self, user_id: str, server_name: str) -> MCPUserToken | None:
-        """Return the per-(user, server) token row or None."""
+    def get_oauth_token(self, user_id: str, token_key: str) -> OAuthToken | None:
+        """Return the per-(user, token key) token row or None."""
         ...
 
-    def update_mcp_user_token_after_refresh(
+    def update_oauth_token_after_refresh(
         self,
         user_id: str,
-        server_name: str,
+        token_key: str,
         *,
         access_token_ct: bytes,
         refresh_token_ct: bytes | None,
@@ -2729,21 +2731,32 @@ class StorageBackend(Protocol):
         """
         ...
 
-    def delete_mcp_user_token(self, user_id: str, server_name: str) -> bool:
-        """Delete the per-(user, server) token row. Returns True if existed."""
+    def delete_oauth_token(self, user_id: str, token_key: str) -> bool:
+        """Delete the per-(user, token key) token row. Returns True if existed."""
         ...
 
-    def list_mcp_user_token_metadata_by_user(self, user_id: str) -> list[MCPUserTokenMetadataRow]:
+    def list_oauth_token_metadata_by_user(self, user_id: str) -> list[OAuthTokenMetadataRow]:
         """Return non-secret metadata for every token row owned by ``user_id``,
         ordered by ``created`` ASC.
 
         Empty list when the user has no rows. Ciphertext columns are
         intentionally NOT loaded — the projection runs at the SQL boundary
         so the LargeBinary blobs never cross the wire for the list-view
-        path. ``MCPTokenStore`` re-types the rows as
-        ``UserTokenMetadata`` (same field shape) for the settings UI.
+        path. ``TokenStore`` re-types the rows as
+        ``UserTokenMetadata`` (same field shape).
         """
         ...
+
+    def delete_oauth_tokens_by_key(self, token_key: str) -> int:
+        """Delete all users' token rows for an opaque key; return the row count.
+
+        Does not touch captured OIDC credentials, pending authorization
+        states, or pending consent. Model lifecycle purges use this helper;
+        MCP lifecycle uses its transactional composed purge below.
+        """
+        ...
+
+    # -- MCP-specific token queries and lifecycle ----------------------------
 
     def list_mcp_user_token_reconcile_targets(self) -> list[tuple[str, str, str | None]]:
         """Return ``(user_id, server_name, last_exercised_iso)`` for every MCP
@@ -2771,11 +2784,10 @@ class StorageBackend(Protocol):
         server with the same ``name``. Returns the total number of rows
         deleted across both tables.
 
-        Both ``mcp_user_tokens`` and ``mcp_oauth_pending`` are keyed on
-        the mutable ``server_name`` rather than the immutable
-        ``server_id``; until those tables migrate to a server_id FK with
-        ON DELETE CASCADE (a future schema migration), explicit purge on
-        rename/delete is the only safe path.
+        MCP uses the mutable server name as ``oauth_tokens.token_key``
+        and ``mcp_oauth_pending.server_name``, so rename/delete must purge
+        both in one transaction. The separate ``mcp_pending_consent``
+        table is untouched.
         """
         ...
 

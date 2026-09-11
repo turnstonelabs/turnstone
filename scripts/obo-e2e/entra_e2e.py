@@ -174,7 +174,7 @@ async def _run(cfg: dict[str, str], refresh_token: str) -> None:
         )
         if r.kind == "token" and r.token:
             ok, aud = aud_matches(r.token, aud_a)
-            row = storage.get_mcp_user_token(USER, "e2e-a")
+            row = storage.get_oauth_token(USER, "e2e-a")
             cache_ok = (
                 row is not None and row["refresh_token_ct"] is None and bool(row["expires_at"])
             )

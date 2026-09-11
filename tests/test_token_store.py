@@ -37,7 +37,7 @@ def test_generic_store_round_trip_and_decrypt_hook(
     credential = store.get_oidc_credential("u1", "https://idp.example.com")
     assert token is not None and token["access_token"] == "access"
     assert credential is not None and credential["refresh_token"] == "credential"
-    token_row = backend.get_mcp_user_token("u1", "generic-key")
+    token_row = backend.get_oauth_token("u1", "generic-key")
     credential_row = backend.get_oidc_user_credential("u1", "https://idp.example.com")
     assert token_row is not None and token_row["access_token_ct"] != b"access"
     assert credential_row is not None and credential_row["refresh_token_ct"] != b"credential"
@@ -57,5 +57,5 @@ def test_generic_store_round_trip_and_decrypt_hook(
         ("generic-key", wrong_cipher.key_fingerprints),
         ("oidc:https://idp.example.com", wrong_cipher.key_fingerprints),
     ]
-    assert backend.get_mcp_user_token("u1", "generic-key") == token_row
+    assert backend.get_oauth_token("u1", "generic-key") == token_row
     assert backend.get_oidc_user_credential("u1", "https://idp.example.com") == credential_row

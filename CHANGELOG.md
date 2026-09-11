@@ -14,10 +14,19 @@ frozen.
 
 ## [Unreleased]
 
+> **Before upgrading:** migration 077 renames `mcp_user_tokens` to `oauth_tokens` and its
+> `server_name` column to `token_key`, preserving existing keys and encrypted data. Processes
+> running older code cannot use this OAuth storage until their code is upgraded; OAuth operations
+> on those processes can fail between migration and replacement. MCP API fields and token-keyring
+> configuration names are unchanged. See [Shared OAuth storage](docs/oauth-storage.md).
+
 ### Changed
 
 - **Shared delegated-auth modules.** OAuth/OIDC protocol code, generic encrypted token storage,
   and model-provider mint orchestration now have separate homes from MCP consent and transport.
+- **Shared OAuth token storage.** MCP grants and model mint caches now use consumer-neutral
+  storage names, and model lifecycle purges delete only their token rows. Shared operator
+  guidance covers the deployment keyring, rotation, and credential lifecycle.
 - **Python 3.13 minimum for Turnstone 1.9.** Python 3.11 and 3.12 are no longer supported; 1.8 is
   the last series that accepts them. Native installations must recreate their virtual environment
   with Python 3.13 or newer before upgrading. CI tests Python 3.13 and 3.14, and Docker images

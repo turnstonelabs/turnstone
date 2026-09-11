@@ -31,8 +31,8 @@ from turnstone.core.storage._protocol import (
     ForkCloneSnapshot,
     MCPOAuthPendingState,
     MCPPendingConsentRow,
-    MCPUserToken,
-    MCPUserTokenMetadataRow,
+    OAuthToken,
+    OAuthTokenMetadataRow,
     OIDCIdentity,
     OIDCPendingState,
     OIDCUserCredential,
@@ -48,10 +48,10 @@ from turnstone.core.storage._schema import (
     mcp_oauth_pending,
     mcp_pending_consent,
     mcp_servers,
-    mcp_user_tokens,
     memory_index_snapshots,
     metadata,
     model_definitions,
+    oauth_tokens,
     oidc_identities,
     oidc_pending_states,
     oidc_user_credentials,
@@ -2245,7 +2245,7 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
             conn.execute(
                 sa.delete(oidc_user_credentials).where(oidc_user_credentials.c.user_id == user_id)
             )
-            conn.execute(sa.delete(mcp_user_tokens).where(mcp_user_tokens.c.user_id == user_id))
+            conn.execute(sa.delete(oauth_tokens).where(oauth_tokens.c.user_id == user_id))
             conn.execute(sa.delete(mcp_oauth_pending).where(mcp_oauth_pending.c.user_id == user_id))
             result = conn.execute(sa.delete(users).where(users.c.user_id == user_id))
             conn.commit()
@@ -5828,10 +5828,10 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
             conn.commit()
             return result.rowcount > 0
 
-    def create_mcp_user_token(
+    def create_oauth_token(
         self,
         user_id: str,
-        server_name: str,
+        token_key: str,
         *,
         access_token_ct: bytes,
         refresh_token_ct: bytes | None,
@@ -5840,14 +5840,14 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
         as_issuer: str,
         audience: str,
     ) -> None:
-        """Insert a new per-(user, server) token row. No-op on conflict."""
+        """Insert a new per-(user, token key) token row. No-op on conflict."""
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
         with self._conn() as conn:
             conn.execute(
-                sa.insert(mcp_user_tokens).prefix_with("OR IGNORE"),
+                sa.insert(oauth_tokens).prefix_with("OR IGNORE"),
                 {
                     "user_id": user_id,
-                    "server_name": server_name,
+                    "token_key": token_key,
                     "access_token_ct": access_token_ct,
                     "refresh_token_ct": refresh_token_ct,
                     "expires_at": expires_at,
@@ -5860,21 +5860,20 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
             )
             conn.commit()
 
-    def get_mcp_user_token(self, user_id: str, server_name: str) -> MCPUserToken | None:
-        """Return the per-(user, server) token row or None."""
+    def get_oauth_token(self, user_id: str, token_key: str) -> OAuthToken | None:
+        """Return the per-(user, token key) token row or None."""
         with self._conn() as conn:
             row = conn.execute(
-                sa.select(mcp_user_tokens).where(
-                    (mcp_user_tokens.c.user_id == user_id)
-                    & (mcp_user_tokens.c.server_name == server_name)
+                sa.select(oauth_tokens).where(
+                    (oauth_tokens.c.user_id == user_id) & (oauth_tokens.c.token_key == token_key)
                 )
             ).fetchone()
             if row is None:
                 return None
             m = row._mapping
-            return MCPUserToken(
+            return OAuthToken(
                 user_id=m["user_id"],
-                server_name=m["server_name"],
+                token_key=m["token_key"],
                 access_token_ct=bytes(m["access_token_ct"]),
                 refresh_token_ct=(
                     bytes(m["refresh_token_ct"]) if m["refresh_token_ct"] is not None else None
@@ -5887,10 +5886,10 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
                 last_refreshed=m["last_refreshed"],
             )
 
-    def update_mcp_user_token_after_refresh(
+    def update_oauth_token_after_refresh(
         self,
         user_id: str,
-        server_name: str,
+        token_key: str,
         *,
         access_token_ct: bytes,
         refresh_token_ct: bytes | None,
@@ -5905,10 +5904,9 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
         with self._conn() as conn:
             result = conn.execute(
-                sa.update(mcp_user_tokens)
+                sa.update(oauth_tokens)
                 .where(
-                    (mcp_user_tokens.c.user_id == user_id)
-                    & (mcp_user_tokens.c.server_name == server_name)
+                    (oauth_tokens.c.user_id == user_id) & (oauth_tokens.c.token_key == token_key)
                 )
                 .values(
                     access_token_ct=access_token_ct,
@@ -5920,19 +5918,18 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
             conn.commit()
             return result.rowcount > 0
 
-    def delete_mcp_user_token(self, user_id: str, server_name: str) -> bool:
-        """Delete the per-(user, server) token row. Returns True if existed."""
+    def delete_oauth_token(self, user_id: str, token_key: str) -> bool:
+        """Delete the per-(user, token key) token row. Returns True if existed."""
         with self._conn() as conn:
             result = conn.execute(
-                sa.delete(mcp_user_tokens).where(
-                    (mcp_user_tokens.c.user_id == user_id)
-                    & (mcp_user_tokens.c.server_name == server_name)
+                sa.delete(oauth_tokens).where(
+                    (oauth_tokens.c.user_id == user_id) & (oauth_tokens.c.token_key == token_key)
                 )
             )
             conn.commit()
             return result.rowcount > 0
 
-    def list_mcp_user_token_metadata_by_user(self, user_id: str) -> list[MCPUserTokenMetadataRow]:
+    def list_oauth_token_metadata_by_user(self, user_id: str) -> list[OAuthTokenMetadataRow]:
         """Return non-secret metadata rows for ``user_id``, ordered by ``created`` ASC.
 
         Projects metadata columns at the SQL boundary so ciphertext
@@ -5942,25 +5939,25 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
         with self._conn() as conn:
             rows = conn.execute(
                 sa.select(
-                    mcp_user_tokens.c.user_id,
-                    mcp_user_tokens.c.server_name,
-                    mcp_user_tokens.c.expires_at,
-                    mcp_user_tokens.c.scopes,
-                    mcp_user_tokens.c.as_issuer,
-                    mcp_user_tokens.c.audience,
-                    mcp_user_tokens.c.created,
-                    mcp_user_tokens.c.last_refreshed,
+                    oauth_tokens.c.user_id,
+                    oauth_tokens.c.token_key,
+                    oauth_tokens.c.expires_at,
+                    oauth_tokens.c.scopes,
+                    oauth_tokens.c.as_issuer,
+                    oauth_tokens.c.audience,
+                    oauth_tokens.c.created,
+                    oauth_tokens.c.last_refreshed,
                 )
-                .where(mcp_user_tokens.c.user_id == user_id)
-                .order_by(mcp_user_tokens.c.created)
+                .where(oauth_tokens.c.user_id == user_id)
+                .order_by(oauth_tokens.c.created)
             ).fetchall()
-            out: list[MCPUserTokenMetadataRow] = []
+            out: list[OAuthTokenMetadataRow] = []
             for row in rows:
                 m = row._mapping
                 out.append(
-                    MCPUserTokenMetadataRow(
+                    OAuthTokenMetadataRow(
                         user_id=m["user_id"],
-                        server_name=m["server_name"],
+                        token_key=m["token_key"],
                         expires_at=m["expires_at"],
                         scopes=m["scopes"],
                         as_issuer=m["as_issuer"],
@@ -5970,6 +5967,15 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
                     )
                 )
             return out
+
+    def delete_oauth_tokens_by_key(self, token_key: str) -> int:
+        """Delete token rows for *token_key* without touching other auth state."""
+        with self._conn() as conn:
+            result = conn.execute(
+                sa.delete(oauth_tokens).where(oauth_tokens.c.token_key == token_key)
+            )
+            conn.commit()
+            return int(result.rowcount or 0)
 
     def list_mcp_user_token_reconcile_targets(self) -> list[tuple[str, str, str | None]]:
         """Return ``(user_id, server_name, COALESCE(last_refreshed, created))`` per
@@ -5983,14 +5989,14 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
         with self._conn() as conn:
             rows = conn.execute(
                 sa.select(
-                    mcp_user_tokens.c.user_id,
-                    mcp_user_tokens.c.server_name,
-                    sa.func.coalesce(mcp_user_tokens.c.last_refreshed, mcp_user_tokens.c.created),
+                    oauth_tokens.c.user_id,
+                    oauth_tokens.c.token_key,
+                    sa.func.coalesce(oauth_tokens.c.last_refreshed, oauth_tokens.c.created),
                 )
                 .select_from(
-                    mcp_user_tokens.join(
+                    oauth_tokens.join(
                         mcp_servers,
-                        mcp_servers.c.name == mcp_user_tokens.c.server_name,
+                        mcp_servers.c.name == oauth_tokens.c.token_key,
                     )
                 )
                 .where(mcp_servers.c.auth_type == "oauth_user")
@@ -6001,7 +6007,7 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
         """Purge user tokens + pending OAuth state for *server_name*."""
         with self._conn() as conn:
             tokens_result = conn.execute(
-                sa.delete(mcp_user_tokens).where(mcp_user_tokens.c.server_name == server_name)
+                sa.delete(oauth_tokens).where(oauth_tokens.c.token_key == server_name)
             )
             pending_result = conn.execute(
                 sa.delete(mcp_oauth_pending).where(mcp_oauth_pending.c.server_name == server_name)
@@ -6175,12 +6181,12 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
         now_iso = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
         with self._conn() as conn:
             result = conn.execute(
-                sa.select(sa.func.count(sa.distinct(mcp_user_tokens.c.user_id)))
-                .where(mcp_user_tokens.c.server_name == server_name)
+                sa.select(sa.func.count(sa.distinct(oauth_tokens.c.user_id)))
+                .where(oauth_tokens.c.token_key == server_name)
                 .where(
                     sa.or_(
-                        mcp_user_tokens.c.expires_at.is_(None),
-                        mcp_user_tokens.c.expires_at > now_iso,
+                        oauth_tokens.c.expires_at.is_(None),
+                        oauth_tokens.c.expires_at > now_iso,
                     )
                 )
             ).scalar()
@@ -6191,16 +6197,16 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
         with self._conn() as conn:
             rows = conn.execute(
                 sa.select(
-                    mcp_user_tokens.c.server_name,
-                    sa.func.count(sa.distinct(mcp_user_tokens.c.user_id)),
+                    oauth_tokens.c.token_key,
+                    sa.func.count(sa.distinct(oauth_tokens.c.user_id)),
                 )
                 .where(
                     sa.or_(
-                        mcp_user_tokens.c.expires_at.is_(None),
-                        mcp_user_tokens.c.expires_at > now_iso,
+                        oauth_tokens.c.expires_at.is_(None),
+                        oauth_tokens.c.expires_at > now_iso,
                     )
                 )
-                .group_by(mcp_user_tokens.c.server_name)
+                .group_by(oauth_tokens.c.token_key)
             ).fetchall()
         return {row[0]: int(row[1] or 0) for row in rows}
 

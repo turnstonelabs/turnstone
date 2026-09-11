@@ -38,12 +38,12 @@ SYNTHETIC_TOKEN_PREFIXES = (MODEL_OBO_CACHE_PREFIX, MODEL_APP_CACHE_PREFIX)
 class UserTokenPlain(TypedDict):
     """Plaintext shape returned by ``TokenStore.get_user_token``.
 
-    Mirrors ``MCPUserToken`` (storage row shape) minus the ``_ct`` suffix
+    Mirrors ``OAuthToken`` (storage row shape) minus the ``_ct`` suffix
     on token columns and with plaintext bytes-decoded values.
     """
 
     user_id: str
-    server_name: str
+    token_key: str
     access_token: str
     refresh_token: str | None
     expires_at: str | None
@@ -78,7 +78,7 @@ class UserTokenMetadata(TypedDict):
     """
 
     user_id: str
-    server_name: str
+    token_key: str
     expires_at: str | None
     scopes: str | None
     as_issuer: str
@@ -91,7 +91,7 @@ class TokenStore:
     """Encrypt and decrypt token rows and captured OIDC credentials.
 
     Consumer-specific audit presentation is supplied through ``on_decrypt_failure``.
-    SQL row and column names retain their existing storage contract.
+    Token keys are opaque identities shared by custodial grants and mint caches.
     """
 
     def __init__(
@@ -119,7 +119,7 @@ class TokenStore:
     def create_user_token(
         self,
         user_id: str,
-        server_name: str,
+        token_key: str,
         *,
         access_token: str,
         refresh_token: str | None,
@@ -131,9 +131,9 @@ class TokenStore:
         """Encrypt the access (and optional refresh) token and persist."""
         access_ct = self._cipher.encrypt(access_token.encode("utf-8"))
         refresh_ct = self._cipher.encrypt(refresh_token.encode("utf-8")) if refresh_token else None
-        self._storage.create_mcp_user_token(
+        self._storage.create_oauth_token(
             user_id,
-            server_name,
+            token_key,
             access_token_ct=access_ct,
             refresh_token_ct=refresh_ct,
             expires_at=expires_at,
@@ -142,14 +142,14 @@ class TokenStore:
             audience=audience,
         )
 
-    def get_user_token(self, user_id: str, server_name: str) -> UserTokenPlain | None:
+    def get_user_token(self, user_id: str, token_key: str) -> UserTokenPlain | None:
         """Returns plaintext dict or None.
 
         Raises ``TokenDecryptError`` on key mismatch — caller MUST NOT
         auto-delete the row. The configured decrypt-failure hook receives the
         token identity and attempted key fingerprints.
         """
-        row = self._storage.get_mcp_user_token(user_id, server_name)
+        row = self._storage.get_oauth_token(user_id, token_key)
         if row is None:
             return None
         try:
@@ -160,11 +160,11 @@ class TokenStore:
             else:
                 refresh_pt = None
         except token_store_crypto.TokenDecryptError as exc:
-            self._decrypt_failure(server_name, exc.key_fingerprints_attempted)
+            self._decrypt_failure(token_key, exc.key_fingerprints_attempted)
             raise
         return UserTokenPlain(
             user_id=row["user_id"],
-            server_name=row["server_name"],
+            token_key=row["token_key"],
             access_token=access_pt,
             refresh_token=refresh_pt,
             expires_at=row["expires_at"],
@@ -178,7 +178,7 @@ class TokenStore:
     def update_user_token_after_refresh(
         self,
         user_id: str,
-        server_name: str,
+        token_key: str,
         *,
         access_token: str,
         refresh_token: str | None,
@@ -197,17 +197,17 @@ class TokenStore:
         """
         access_ct = self._cipher.encrypt(access_token.encode("utf-8"))
         refresh_ct = self._cipher.encrypt(refresh_token.encode("utf-8")) if refresh_token else None
-        return self._storage.update_mcp_user_token_after_refresh(
+        return self._storage.update_oauth_token_after_refresh(
             user_id,
-            server_name,
+            token_key,
             access_token_ct=access_ct,
             refresh_token_ct=refresh_ct,
             expires_at=expires_at,
         )
 
-    def delete_user_token(self, user_id: str, server_name: str) -> bool:
+    def delete_user_token(self, user_id: str, token_key: str) -> bool:
         """Delete the user-token row. Returns True if existed."""
-        return self._storage.delete_mcp_user_token(user_id, server_name)
+        return self._storage.delete_oauth_token(user_id, token_key)
 
     def upsert_oidc_credential(self, user_id: str, issuer: str, *, refresh_token: str) -> None:
         """Encrypt and create-or-replace the user's captured IdP refresh token."""
@@ -272,16 +272,16 @@ class TokenStore:
         """Return non-secret metadata for every token row owned by ``user_id``.
 
         Storage layer projects the metadata columns at the SQL boundary
-        (``list_mcp_user_token_metadata_by_user``) so ciphertext blobs
+        (``list_oauth_token_metadata_by_user``) so ciphertext blobs
         never cross the wire on this list-view path. Rows arrive in
         ``created`` ASC order. Decrypt is intentionally skipped — the
         list view has no need for the secret material.
         """
-        rows = self._storage.list_mcp_user_token_metadata_by_user(user_id)
+        rows = self._storage.list_oauth_token_metadata_by_user(user_id)
         return [
             UserTokenMetadata(
                 user_id=row["user_id"],
-                server_name=row["server_name"],
+                token_key=row["token_key"],
                 expires_at=row["expires_at"],
                 scopes=row["scopes"],
                 as_issuer=row["as_issuer"],

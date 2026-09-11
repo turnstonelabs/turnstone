@@ -193,6 +193,7 @@ UML diagrams in [`docs/diagrams/`](docs/diagrams/):
 | [Channels](docs/diagrams/png/16-channel-architecture.png) | Discord / Slack adapters + routing |
 | [Judge](docs/diagrams/png/22-judge-architecture.png) | Intent validation pipeline |
 | [OIDC](docs/diagrams/png/25-oidc-architecture.png) | SSO authorization code flow |
+| [OAuth Storage](docs/diagrams/png/28-oauth-storage-architecture.png) | Shared token store, captured credentials, and MCP state |
 
 ## Documentation
 

@@ -498,7 +498,7 @@ class TestMintOboAccessToken:
         # Persisted as a "cache, not custody" row (refresh_token NULL),
         # decodable, identity-keyed on the owning alias.
         cache_server = f"__model_obo__:{MODEL_ALIAS}"
-        raw = storage.get_mcp_user_token(USER, cache_server)
+        raw = storage.get_oauth_token(USER, cache_server)
         assert raw is not None and raw["refresh_token_ct"] is None
         plain = node_a.mcp_token_store.get_user_token(USER, cache_server)
         assert plain is not None
@@ -773,7 +773,7 @@ class TestMintOboAccessToken:
         assert plain["scopes"] == "aud-gw openid"
         assert plain["audience"] == AUDIENCE
         # Identity keys: another alias holds no row — one owner per key.
-        assert storage.get_mcp_user_token(USER, model_obo_cache_server("other-model")) is None
+        assert storage.get_oauth_token(USER, model_obo_cache_server("other-model")) is None
 
         # Warm re-mint with the same scopes serves the cache, zero IdP calls.
         assert _mint(state, scopes="aud-gw openid", grant_leg="rfc8693") == "exchanged-at"
@@ -1148,7 +1148,7 @@ class TestMintAppAccessToken:
         assert _mint_app(state) == "app-at"
         assert client.post.call_count == 1
         cache_server = f"__model_app__:{APP_ALIAS}"
-        raw = storage.get_mcp_user_token("__app__", cache_server)
+        raw = storage.get_oauth_token("__app__", cache_server)
         assert raw is not None and raw["refresh_token_ct"] is None
 
     def test_works_with_zero_user_credentials(self, storage: SQLiteBackend) -> None:
@@ -1232,7 +1232,7 @@ class TestMintAppAccessToken:
         assert client.post.call_args.kwargs["data"]["scope"] == f"{AUDIENCE}/.default"
         # The cache row lives under the stripped identity key with the
         # stripped audience column.
-        raw = storage.get_mcp_user_token("__app__", model_app_cache_server("gw-app"))
+        raw = storage.get_oauth_token("__app__", model_app_cache_server("gw-app"))
         assert raw is not None
         plain = state.mcp_token_store.get_user_token("__app__", model_app_cache_server("gw-app"))
         assert plain is not None and plain["audience"] == AUDIENCE

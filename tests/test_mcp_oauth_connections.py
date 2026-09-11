@@ -166,6 +166,56 @@ def _seed_user_token(
     )
 
 
+def test_connections_storage_projection_on_selected_backend(
+    backend: Any, http_client_mock: MagicMock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Exercise the real response on both CI backends, independent of SQLite fixtures."""
+    _seed_oauth_user_server(backend)
+    backend.create_mcp_server(
+        server_id="obo-id",
+        name="obo-server",
+        transport="streamable-http",
+        url="https://mcp.example.com/obo",
+        auth_type="oauth_obo",
+    )
+    store = _make_token_store(backend)
+    for user, key in (
+        ("user-1", "srv-oauth"),
+        ("user-2", "srv-oauth"),
+        ("user-1", "obo-server"),
+        ("user-1", "__model_obo__:gateway"),
+        ("user-1", "__model_app__:gateway"),
+        ("user-1", "__model_obo__:api://legacy"),
+    ):
+        _seed_user_token(store, user_id=user, server_name=key, refresh_token=None)
+    row = backend.get_oauth_token("user-1", "srv-oauth")
+    assert row is not None
+    assert row["token_key"] == "srv-oauth" and "server_name" not in row
+
+    def unexpected_decrypt(ciphertext: bytes) -> bytes:
+        pytest.fail("connections metadata decrypted a token")
+
+    monkeypatch.setattr(store.cipher, "decrypt", unexpected_decrypt)
+    app = _build_app(storage=backend, http_client=http_client_mock, token_store=store)
+    with TestClient(app) as client:
+        response = client.get("/v1/api/mcp/oauth/connections")
+    assert response.status_code == 200
+    assert response.json() == {
+        "connections": [
+            {
+                "user_id": "user-1",
+                "server_name": "srv-oauth",
+                "expires_at": "2099-12-31T00:00:00",
+                "scopes": "openid profile",
+                "as_issuer": "https://as.example.com",
+                "audience": "https://mcp.example.com",
+                "created": row["created"],
+                "last_refreshed": None,
+            }
+        ]
+    }
+
+
 def _good_as_metadata_doc(
     *, revocation_endpoint: str | None = "https://as.example.com/revoke"
 ) -> dict[str, Any]:

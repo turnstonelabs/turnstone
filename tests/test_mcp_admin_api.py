@@ -681,7 +681,7 @@ class TestUpdateMcpServer:
         """
         import sqlalchemy as sa
 
-        from turnstone.core.storage._schema import mcp_user_tokens
+        from turnstone.core.storage._schema import oauth_tokens
 
         # Seed an oauth_user row at URL_A.
         r = client.post(
@@ -699,10 +699,10 @@ class TestUpdateMcpServer:
         # Plant a per-user token row keyed on the server name.
         with storage._engine.connect() as conn:
             conn.execute(
-                sa.insert(mcp_user_tokens),
+                sa.insert(oauth_tokens),
                 {
                     "user_id": "u1",
-                    "server_name": "url-change-purge",
+                    "token_key": "url-change-purge",
                     "access_token_ct": b"\x00ciphertext-a",
                     "refresh_token_ct": b"\x00ciphertext-r",
                     "expires_at": "2026-12-31T00:00:00",
@@ -716,8 +716,8 @@ class TestUpdateMcpServer:
             conn.commit()
             count_before = conn.execute(
                 sa.select(sa.func.count())
-                .select_from(mcp_user_tokens)
-                .where(mcp_user_tokens.c.server_name == "url-change-purge")
+                .select_from(oauth_tokens)
+                .where(oauth_tokens.c.token_key == "url-change-purge")
             ).scalar()
         assert count_before == 1
 
@@ -736,8 +736,8 @@ class TestUpdateMcpServer:
         with storage._engine.connect() as conn:
             count_after = conn.execute(
                 sa.select(sa.func.count())
-                .select_from(mcp_user_tokens)
-                .where(mcp_user_tokens.c.server_name == "url-change-purge")
+                .select_from(oauth_tokens)
+                .where(oauth_tokens.c.token_key == "url-change-purge")
             ).scalar()
         assert count_after == 0, "URL change must purge per-user tokens"
 
@@ -1010,7 +1010,7 @@ class TestUpdateMcpServer:
         the mint cache invariant forbids)."""
         import sqlalchemy as sa
 
-        from turnstone.core.storage._schema import mcp_user_tokens
+        from turnstone.core.storage._schema import oauth_tokens
 
         r = client.post(
             "/v1/api/admin/mcp-servers",
@@ -1028,10 +1028,10 @@ class TestUpdateMcpServer:
 
         with storage._engine.connect() as conn:
             conn.execute(
-                sa.insert(mcp_user_tokens),
+                sa.insert(oauth_tokens),
                 {
                     "user_id": "u1",
-                    "server_name": "flip-to-obo",
+                    "token_key": "flip-to-obo",
                     "access_token_ct": b"\x00ct-a",
                     "refresh_token_ct": b"\x00ct-r",
                     "expires_at": "2026-12-31T00:00:00",
@@ -1058,8 +1058,8 @@ class TestUpdateMcpServer:
         with storage._engine.connect() as conn:
             remaining = conn.execute(
                 sa.select(sa.func.count())
-                .select_from(mcp_user_tokens)
-                .where(mcp_user_tokens.c.server_name == "flip-to-obo")
+                .select_from(oauth_tokens)
+                .where(oauth_tokens.c.token_key == "flip-to-obo")
             ).scalar()
         assert remaining == 0, "oauth_user→oauth_obo flip must purge stale per-user rows"
 
@@ -1195,7 +1195,7 @@ class TestUpdateMcpServer:
             oauth_audience="api://mcp-a",
         )
         for i in range(2):
-            storage.create_mcp_user_token(
+            storage.create_oauth_token(
                 f"u{i}",
                 "obo-count",
                 access_token_ct=b"\x00ct",
@@ -1219,7 +1219,7 @@ class TestUpdateMcpServer:
         tokens minted for the OLD audience (they are audience-bound)."""
         import sqlalchemy as sa
 
-        from turnstone.core.storage._schema import mcp_user_tokens
+        from turnstone.core.storage._schema import oauth_tokens
 
         r = client.post(
             "/v1/api/admin/mcp-servers",
@@ -1234,10 +1234,10 @@ class TestUpdateMcpServer:
         sid = r.json()["server_id"]
         with storage._engine.connect() as conn:
             conn.execute(
-                sa.insert(mcp_user_tokens),
+                sa.insert(oauth_tokens),
                 {
                     "user_id": "u1",
-                    "server_name": "aud-change",
+                    "token_key": "aud-change",
                     "access_token_ct": b"\x00ct",
                     "refresh_token_ct": None,
                     "expires_at": "2026-12-31T00:00:00",
@@ -1258,15 +1258,15 @@ class TestUpdateMcpServer:
         with storage._engine.connect() as conn:
             remaining = conn.execute(
                 sa.select(sa.func.count())
-                .select_from(mcp_user_tokens)
-                .where(mcp_user_tokens.c.server_name == "aud-change")
+                .select_from(oauth_tokens)
+                .where(oauth_tokens.c.token_key == "aud-change")
             ).scalar()
         assert remaining == 0, "audience change must purge old-audience cache rows"
 
     def _seed_obo_row_with_cache(self, client, storage, *, name: str, scopes: str | None) -> str:
         import sqlalchemy as sa
 
-        from turnstone.core.storage._schema import mcp_user_tokens
+        from turnstone.core.storage._schema import oauth_tokens
 
         r = client.post(
             "/v1/api/admin/mcp-servers",
@@ -1282,10 +1282,10 @@ class TestUpdateMcpServer:
         sid: str = r.json()["server_id"]
         with storage._engine.connect() as conn:
             conn.execute(
-                sa.insert(mcp_user_tokens),
+                sa.insert(oauth_tokens),
                 {
                     "user_id": "u1",
-                    "server_name": name,
+                    "token_key": name,
                     "access_token_ct": b"\x00ct",
                     "refresh_token_ct": None,
                     "expires_at": "2026-12-31T00:00:00",
@@ -1302,13 +1302,13 @@ class TestUpdateMcpServer:
     def _count_cache_rows(self, storage, name: str) -> int:
         import sqlalchemy as sa
 
-        from turnstone.core.storage._schema import mcp_user_tokens
+        from turnstone.core.storage._schema import oauth_tokens
 
         with storage._engine.connect() as conn:
             count = conn.execute(
                 sa.select(sa.func.count())
-                .select_from(mcp_user_tokens)
-                .where(mcp_user_tokens.c.server_name == name)
+                .select_from(oauth_tokens)
+                .where(oauth_tokens.c.token_key == name)
             ).scalar()
         return int(count or 0)
 

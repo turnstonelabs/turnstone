@@ -30,7 +30,7 @@ log = get_logger(__name__)
 # alias that points at it — not a per-server grant graph.  So this owns no
 # dead-grant classification or re-consent affordance.  It reuses the same mint
 # legs, credential store, RT-rotation CAS, cluster credential lock, AND the same
-# ``mcp_user_tokens`` mint-cache row the classified path uses (refresh_token=NULL,
+# ``oauth_tokens`` mint-cache row the classified path uses (refresh_token=NULL,
 # "cache, not custody") — keyed under a synthetic ``__model_obo__:<alias>``
 # server name. The DB row shares the token across workers; a loop-local memo
 # avoids a SQL read + decrypt on every warm model turn.
@@ -284,7 +284,7 @@ def _memoize_minted_token(
     now = datetime.now(UTC).replace(tzinfo=None).isoformat(timespec="seconds")
     _model_mint_memo(app_state)[(user_id, cache_server)] = {
         "user_id": user_id,
-        "server_name": cache_server,
+        "token_key": cache_server,
         "access_token": access_token,
         "refresh_token": None,
         "expires_at": expires_at,
@@ -308,7 +308,7 @@ def _memoize_minted_token(
 _SYNTHETIC_KEY_SEP = chr(0x1F)
 
 
-# Byte bound for the synthetic mint-cache keys: ``mcp_user_tokens.server_name``
+# Byte bound for the synthetic mint-cache keys: ``oauth_tokens.token_key``
 # is half the table's PRIMARY KEY and btree-indexed, and PostgreSQL's index
 # tuple limit is ~2704 bytes — a key at most 2600 UTF-8 bytes stays safely
 # under it. Console-written aliases are capped at 64 ASCII characters, so
@@ -372,7 +372,7 @@ def _normalized_mint_scopes(scopes: Any) -> str:
 
 
 def model_obo_cache_server(alias: str) -> str:
-    """Synthetic ``mcp_user_tokens`` server key for a model alias's mint-cache row.
+    """Synthetic ``oauth_tokens`` server key for a model alias's mint-cache row.
 
     Public: the session heartbeat and the e2e harness build the same key to
     read the per-alias refusal-cause record, which shares this key's
@@ -436,7 +436,7 @@ async def mint_obo_access_token(
     Redeems the user's captured refresh credential (``oidc_user_credentials``)
     for *audience* via the configured OBO grant profile, persists any rotated
     refresh token (value CAS, cluster-locked exactly like the MCP mint), and
-    caches the minted access token in an ``mcp_user_tokens`` mint-cache row
+    caches the minted access token in an ``oauth_tokens`` mint-cache row
     (``refresh_token=NULL``) keyed ``__model_obo__:<alias>`` — the same
     "cache, not custody" row the classified path uses — so the token is shared
     across worker nodes and inspectable, until shortly before expiry. The key
@@ -735,7 +735,7 @@ _APP_CACHE_USER = token_store_store.MODEL_APP_MINT_PRINCIPAL
 
 
 def model_app_cache_server(alias: str) -> str:
-    """Synthetic ``mcp_user_tokens`` key for an app-credential mint-cache row.
+    """Synthetic ``oauth_tokens`` key for an app-credential mint-cache row.
 
     App tokens carry no user, so they cache once per owning definition under
     the shared ``__app__`` pseudo-user; the ``__model_app__:`` prefix keeps
@@ -764,7 +764,7 @@ async def mint_app_access_token(
     Uses Turnstone's own SSO app registration (``[oidc]`` ``client_id`` +
     ``client_secret``) — no user, no captured refresh token, no rotation. One
     token per owning definition *alias*, shared by every caller and cached in
-    an ``mcp_user_tokens`` row under the synthetic ``__app__`` user until
+    an ``oauth_tokens`` row under the synthetic ``__app__`` user until
     shortly before expiry (identity-keyed like the OBO twin; the freshness
     gate compares the row's stored audience against the current one, so a
     re-aimed alias refuses its old row and overwrites it on the next mint).

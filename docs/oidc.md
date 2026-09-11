@@ -207,8 +207,9 @@ edit of a row saved before the pairing rule keeps working — and at runtime a
 mismatched legacy row refuses to mint with `cause=grant_profile_mismatch` and
 no IdP traffic. RFC 8693 client-credentials is not implemented.
 
-The delegated modes need the MCP encryption key, a credential captured for the
-driving user, and delegated/admin-consented permission to the audience.
+The delegated modes need the [shared token encryption key](oauth-storage.md),
+a credential captured for the driving user, and delegated/admin-consented
+permission to the audience.
 `rfc8693_obo` additionally carries `obo_scopes`, the space-separated scope
 list its exchange leg requests: exchange-capable IdPs that gate audiences
 behind optional scopes refuse the exchange without it ("Requested audience not
@@ -238,13 +239,10 @@ degrades loudly, with the reason visible mid-incident even after the
 once-per-process line has rotated out of retained logs, rather than silently
 swapping per-user attribution for the shared static key.
 
-The `[security]` token encryption key is deployment-wide, not per-host: rows are
-encrypted with `MultiFernet` and carry no key id, so every host that reads them
-needs the same keyring. That includes the console, which mints for
-coordinator-hosted sessions. A node that needs the key and lacks it refuses to
-start; the console starts but withholds its coordinator subsystem and shows
-the key requirement as the remediation error instead of failing silently at
-call time.
+The token keyring is shared by the console and every node that reads the
+database. See [Shared OAuth storage](oauth-storage.md) for bootstrap settings,
+startup requirements, key rotation, and the effect of identity unlink on
+delegated credentials and app-identity caches.
 
 ---
 

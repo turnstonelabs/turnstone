@@ -1944,6 +1944,33 @@ Turnstone supports three authentication mechanisms, unified behind an
    successful credential validation. Contain `sub` (user_id), `scopes`, and
    `src` (origin) in claims.
 
+### Shared OAuth Token Storage
+
+Outbound MCP and model authentication share `core/token_store/`. `TokenStore`
+encrypts access/refresh tokens and captured OIDC credentials; `crypto.py`
+supplies the cipher and deployment keyring loader. `core/oauth/` owns grant, HTTP, OIDC protocol,
+cache, and coordination primitives. Model mint policy stays in `model_oauth.py`,
+while MCP consent, server-secret integration, and audit presentation stay in
+`mcp_oauth.py` / `mcp_crypto.py`.
+
+`oauth_tokens` has a composite `(user_id, token_key)` primary key. The key is an
+opaque identity: MCP uses server names; models use reserved synthetic keys based
+on the owning alias. Audience/scopes remain freshness checks, independent of
+identity. `oidc_user_credentials` holds the shared per-user, per-issuer refresh
+credential. Both SQLite and PostgreSQL expose the same ciphertext-only storage
+API; metadata list queries omit the token columns at the SQL boundary.
+
+Model lifecycle uses token-only deletion by key. MCP's composed purge deletes
+tokens and `mcp_oauth_pending` browser authorization states in one transaction,
+leaving `mcp_pending_consent` untouched. The connections handler projects
+internal `token_key` back to the public `server_name` field and filters mint
+caches from the user's revocable connections.
+
+See [Shared OAuth storage](oauth-storage.md) for operator configuration and
+[OAuth storage diagram](diagrams/png/28-oauth-storage-architecture.png) for the
+consumer/storage boundary. Migration 077 renames the existing table and column
+without rewriting ciphertext or changing token identities.
+
 ### Scope Model
 
 Three hierarchical scopes control endpoint access:

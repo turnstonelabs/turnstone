@@ -129,7 +129,7 @@ def _create_user_token_row(
     backend,
     *,
     user_id: str,
-    server_name: str,
+    token_key: str,
     created: str,
 ) -> None:
     """Insert a token row + backdate ``created`` so ordering is deterministic.
@@ -138,9 +138,9 @@ def _create_user_token_row(
     multi-row ordering tests we backdate via raw SQL so the inserts stay
     independent of clock resolution.
     """
-    backend.create_mcp_user_token(
+    backend.create_oauth_token(
         user_id,
-        server_name,
+        token_key,
         access_token_ct=b"ct-access",
         refresh_token_ct=b"ct-refresh",
         expires_at="2026-05-04T12:00:00",
@@ -151,26 +151,26 @@ def _create_user_token_row(
     with backend._engine.connect() as conn:
         conn.execute(
             sa.text(
-                "UPDATE mcp_user_tokens SET created = :created "
-                "WHERE user_id = :uid AND server_name = :sn"
+                "UPDATE oauth_tokens SET created = :created "
+                "WHERE user_id = :uid AND token_key = :sn"
             ),
-            {"created": created, "uid": user_id, "sn": server_name},
+            {"created": created, "uid": user_id, "sn": token_key},
         )
         conn.commit()
 
 
-class TestListMCPUserTokenMetadataByUser:
-    def test_list_mcp_user_token_metadata_by_user_empty(self, backend) -> None:
-        assert backend.list_mcp_user_token_metadata_by_user("nobody") == []
+class TestListOAuthTokenMetadataByUser:
+    def test_list_oauth_token_metadata_by_user_empty(self, backend) -> None:
+        assert backend.list_oauth_token_metadata_by_user("nobody") == []
 
-    def test_list_mcp_user_token_metadata_by_user_single_server(self, backend) -> None:
+    def test_list_oauth_token_metadata_by_user_single_server(self, backend) -> None:
         _create_user_token_row(
-            backend, user_id="u1", server_name="srv-a", created="2026-05-01T00:00:00"
+            backend, user_id="u1", token_key="srv-a", created="2026-05-01T00:00:00"
         )
-        rows = backend.list_mcp_user_token_metadata_by_user("u1")
+        rows = backend.list_oauth_token_metadata_by_user("u1")
         assert len(rows) == 1
         assert rows[0]["user_id"] == "u1"
-        assert rows[0]["server_name"] == "srv-a"
+        assert rows[0]["token_key"] == "srv-a"
         assert rows[0]["as_issuer"] == "https://auth.example.com"
         assert rows[0]["audience"] == "https://mcp.example.com"
         assert rows[0]["scopes"] == "openid"
@@ -179,34 +179,34 @@ class TestListMCPUserTokenMetadataByUser:
         assert "access_token_ct" not in rows[0]
         assert "refresh_token_ct" not in rows[0]
 
-    def test_list_mcp_user_token_metadata_by_user_multiple_servers(self, backend) -> None:
+    def test_list_oauth_token_metadata_by_user_multiple_servers(self, backend) -> None:
         _create_user_token_row(
-            backend, user_id="u1", server_name="srv-c", created="2026-05-03T00:00:00"
+            backend, user_id="u1", token_key="srv-c", created="2026-05-03T00:00:00"
         )
         _create_user_token_row(
-            backend, user_id="u1", server_name="srv-a", created="2026-05-01T00:00:00"
+            backend, user_id="u1", token_key="srv-a", created="2026-05-01T00:00:00"
         )
         _create_user_token_row(
-            backend, user_id="u1", server_name="srv-b", created="2026-05-02T00:00:00"
+            backend, user_id="u1", token_key="srv-b", created="2026-05-02T00:00:00"
         )
-        rows = backend.list_mcp_user_token_metadata_by_user("u1")
-        assert [r["server_name"] for r in rows] == ["srv-a", "srv-b", "srv-c"]
+        rows = backend.list_oauth_token_metadata_by_user("u1")
+        assert [r["token_key"] for r in rows] == ["srv-a", "srv-b", "srv-c"]
 
-    def test_list_mcp_user_token_metadata_by_user_isolates_by_user(self, backend) -> None:
+    def test_list_oauth_token_metadata_by_user_isolates_by_user(self, backend) -> None:
         _create_user_token_row(
-            backend, user_id="user-a", server_name="srv-a", created="2026-05-01T00:00:00"
+            backend, user_id="user-a", token_key="srv-a", created="2026-05-01T00:00:00"
         )
         _create_user_token_row(
-            backend, user_id="user-a", server_name="srv-b", created="2026-05-02T00:00:00"
+            backend, user_id="user-a", token_key="srv-b", created="2026-05-02T00:00:00"
         )
         _create_user_token_row(
-            backend, user_id="user-b", server_name="srv-a", created="2026-05-03T00:00:00"
+            backend, user_id="user-b", token_key="srv-a", created="2026-05-03T00:00:00"
         )
-        rows_a = backend.list_mcp_user_token_metadata_by_user("user-a")
-        assert {r["server_name"] for r in rows_a} == {"srv-a", "srv-b"}
+        rows_a = backend.list_oauth_token_metadata_by_user("user-a")
+        assert {r["token_key"] for r in rows_a} == {"srv-a", "srv-b"}
         assert all(r["user_id"] == "user-a" for r in rows_a)
 
-        rows_b = backend.list_mcp_user_token_metadata_by_user("user-b")
+        rows_b = backend.list_oauth_token_metadata_by_user("user-b")
         assert len(rows_b) == 1
         assert rows_b[0]["user_id"] == "user-b"
-        assert rows_b[0]["server_name"] == "srv-a"
+        assert rows_b[0]["token_key"] == "srv-a"

@@ -150,7 +150,7 @@ class TestCountConsentedUsersByServer:
     def test_counts_distinct_non_expired_users(self, backend) -> None:
         self._seed_server(backend)
         future = "2099-01-01T00:00:00"
-        backend.create_mcp_user_token(
+        backend.create_oauth_token(
             "alice",
             "srv-x",
             access_token_ct=b"ct",
@@ -160,7 +160,7 @@ class TestCountConsentedUsersByServer:
             as_issuer="https://as.example.com",
             audience="https://example.com/mcp",
         )
-        backend.create_mcp_user_token(
+        backend.create_oauth_token(
             "bob",
             "srv-x",
             access_token_ct=b"ct",
@@ -172,7 +172,7 @@ class TestCountConsentedUsersByServer:
         )
         # Different server — must not count.
         self._seed_server(backend, name="srv-y")
-        backend.create_mcp_user_token(
+        backend.create_oauth_token(
             "carol",
             "srv-y",
             access_token_ct=b"ct",
@@ -187,7 +187,7 @@ class TestCountConsentedUsersByServer:
 
     def test_excludes_expired(self, backend) -> None:
         self._seed_server(backend)
-        backend.create_mcp_user_token(
+        backend.create_oauth_token(
             "alice",
             "srv-x",
             access_token_ct=b"ct",

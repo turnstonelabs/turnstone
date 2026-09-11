@@ -178,7 +178,7 @@ async def _run(cfg: dict[str, str], refresh_token: str) -> None:
         )
         if r.kind == "token" and r.token:
             ok, aud = aud_carries(r.token, cfg["AUD_A"])
-            row = storage.get_mcp_user_token(USER, "kc-a")
+            row = storage.get_oauth_token(USER, "kc-a")
             cache_ok = row is not None and row["refresh_token_ct"] is None
             record(
                 "VERIFIED" if ok and cache_ok else "FAILED",
@@ -299,7 +299,7 @@ async def _run(cfg: dict[str, str], refresh_token: str) -> None:
             scopes=cfg.get("SCOPE_A", ""),
             grant_leg="rfc8693",
         )
-        cache_row = storage.get_mcp_user_token(USER, model_obo_cache_server("model-a"))
+        cache_row = storage.get_oauth_token(USER, model_obo_cache_server("model-a"))
         if m1:
             record(
                 "VERIFIED"

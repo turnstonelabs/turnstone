@@ -1210,9 +1210,9 @@ class TestAdminOIDCIdentities:
         assert body["obo_cache_rows_purged"] == 2
         # Credential gone → no future mints; cache row gone → no live cached bearer.
         assert store.get_oidc_credential("user-x", issuer) is None
-        assert storage.get_mcp_user_token("user-x", "obo-srv") is None
-        assert storage.get_mcp_user_token("user-x", "__model_obo__:api://model-a") is None
-        assert storage.get_mcp_user_token("__app__", "__model_app__:api://model-a") is not None
+        assert storage.get_oauth_token("user-x", "obo-srv") is None
+        assert storage.get_oauth_token("user-x", "__model_obo__:api://model-a") is None
+        assert storage.get_oauth_token("__app__", "__model_app__:api://model-a") is not None
         app.state.mcp_client.invalidate_model_mint_memo_sync.assert_called_once_with(
             user_id="user-x",
             server_prefix="__model_obo__:",

@@ -2027,11 +2027,11 @@ def test_over_cap_residue_capped_rewrite_is_auth_gated(
 
     assert resp.status_code == 200, resp.text
     assert storage.get_model_definition("m1")["obo_scopes"] == capped
-    assert storage.get_mcp_user_token("alice", own_key) is None
+    assert storage.get_oauth_token("alice", own_key) is None
 
 
 def _seed_mint_cache_row(storage: SQLiteBackend, user: str, key: str) -> None:
-    storage.create_mcp_user_token(
+    storage.create_oauth_token(
         user,
         key,
         access_token_ct=b"ct",
@@ -2081,9 +2081,9 @@ def test_scopes_change_purges_the_alias_rows_never_a_siblings(
     )
 
     assert resp.status_code == 200, resp.text
-    assert storage.get_mcp_user_token("alice", own_obo) is None
-    assert storage.get_mcp_user_token("alice", own_app) is None
-    assert storage.get_mcp_user_token("alice", sibling) is not None
+    assert storage.get_oauth_token("alice", own_obo) is None
+    assert storage.get_oauth_token("alice", own_app) is None
+    assert storage.get_oauth_token("alice", sibling) is not None
 
 
 def test_alias_rename_purges_the_old_alias_rows(
@@ -2116,7 +2116,7 @@ def test_alias_rename_purges_the_old_alias_rows(
     resp = client.put("/v1/api/admin/model-definitions/m1", json={"alias": "renamed"})
 
     assert resp.status_code == 200, resp.text
-    assert storage.get_mcp_user_token("alice", old_key) is None
+    assert storage.get_oauth_token("alice", old_key) is None
 
 
 def test_delete_purges_mint_cache_rows(
@@ -2146,9 +2146,9 @@ def test_delete_purges_mint_cache_rows(
     resp = client.delete("/v1/api/admin/model-definitions/m1")
 
     assert resp.status_code == 200, resp.text
-    assert storage.get_mcp_user_token("alice", own_obo) is None
-    assert storage.get_mcp_user_token("alice", own_app) is None
-    assert storage.get_mcp_user_token("alice", sibling) is not None
+    assert storage.get_oauth_token("alice", own_obo) is None
+    assert storage.get_oauth_token("alice", own_app) is None
+    assert storage.get_oauth_token("alice", sibling) is not None
 
 
 def test_purge_partial_failure_still_purges_the_other_prefix(
@@ -2166,19 +2166,19 @@ def test_purge_partial_failure_still_purges_the_other_prefix(
     app_key = model_app_cache_server("local")
     for key in (obo_key, app_key):
         _seed_mint_cache_row(storage, "alice", key)
-    real_delete = storage.delete_mcp_oauth_rows_by_server_name
+    real_delete = storage.delete_oauth_tokens_by_key
 
     def flaky(server_name: str) -> int:
         if server_name == obo_key:
             raise RuntimeError("transient storage error")
         return real_delete(server_name)
 
-    monkeypatch.setattr(storage, "delete_mcp_oauth_rows_by_server_name", flaky)
+    monkeypatch.setattr(storage, "delete_oauth_tokens_by_key", flaky)
 
     _purge_model_mint_cache(storage, "m1", "local")
 
-    assert storage.get_mcp_user_token("alice", obo_key) is not None
-    assert storage.get_mcp_user_token("alice", app_key) is None
+    assert storage.get_oauth_token("alice", obo_key) is not None
+    assert storage.get_oauth_token("alice", app_key) is None
 
 
 def test_mode_flip_away_keeps_unchanged_scopes_residue(

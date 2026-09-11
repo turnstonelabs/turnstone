@@ -1043,16 +1043,17 @@ oidc_user_credentials = sa.Table(
 )
 
 # ---------------------------------------------------------------------------
-# MCP per-(user, server) OAuth tokens and pending authorization-flow state.
+# Shared per-(user, token key) OAuth tokens. Keys are opaque identities:
+# MCP uses server names; model consumers use reserved synthetic keys.
 # No FKs at the schema level (matches `oidc_*` tables; tests avoid orphan
 # rows via fixtures).
 # ---------------------------------------------------------------------------
 
-mcp_user_tokens = sa.Table(
-    "mcp_user_tokens",
+oauth_tokens = sa.Table(
+    "oauth_tokens",
     metadata,
     sa.Column("user_id", sa.Text, nullable=False),
-    sa.Column("server_name", sa.Text, nullable=False),
+    sa.Column("token_key", sa.Text, nullable=False),
     sa.Column("access_token_ct", sa.LargeBinary, nullable=False),
     sa.Column("refresh_token_ct", sa.LargeBinary, nullable=True),
     sa.Column("expires_at", sa.Text, nullable=True),
@@ -1061,18 +1062,19 @@ mcp_user_tokens = sa.Table(
     sa.Column("audience", sa.Text, nullable=False),
     sa.Column("created", sa.Text, nullable=False),
     sa.Column("last_refreshed", sa.Text, nullable=True),
-    sa.PrimaryKeyConstraint("user_id", "server_name"),
+    sa.PrimaryKeyConstraint("user_id", "token_key"),
 )
-# Phase 9: covers the ``WHERE server_name = ? AND (expires_at IS NULL
+# Phase 9: covers the ``WHERE token_key = ? AND (expires_at IS NULL
 # OR expires_at > now)`` shape used by ``count_mcp_consented_users_*``
 # for the admin status pill.  The composite PK can't satisfy filters
 # that don't lead with ``user_id``.
 sa.Index(
-    "idx_mcp_user_tokens_server",
-    mcp_user_tokens.c.server_name,
-    mcp_user_tokens.c.expires_at,
+    "idx_oauth_tokens_key",
+    oauth_tokens.c.token_key,
+    oauth_tokens.c.expires_at,
 )
 
+# MCP-specific pending authorization-flow state.
 mcp_oauth_pending = sa.Table(
     "mcp_oauth_pending",
     metadata,

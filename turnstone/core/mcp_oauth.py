@@ -3489,13 +3489,23 @@ async def _handle_mcp_oauth_list_connections_inner(request: Request) -> Response
             obo_names = await asyncio.to_thread(obo_server_names, storage)
         except Exception:
             obo_names = set()
+    # Keep the MCP API's server_name field at the boundary of the shared store.
     return JSONResponse(
         {
             "connections": [
-                r
+                {
+                    "user_id": r["user_id"],
+                    "server_name": r["token_key"],
+                    "expires_at": r["expires_at"],
+                    "scopes": r["scopes"],
+                    "as_issuer": r["as_issuer"],
+                    "audience": r["audience"],
+                    "created": r["created"],
+                    "last_refreshed": r["last_refreshed"],
+                }
                 for r in rows
-                if r["server_name"] not in obo_names
-                and not str(r["server_name"]).startswith(token_store_store.SYNTHETIC_TOKEN_PREFIXES)
+                if r["token_key"] not in obo_names
+                and not str(r["token_key"]).startswith(token_store_store.SYNTHETIC_TOKEN_PREFIXES)
             ]
         }
     )
@@ -3668,7 +3678,7 @@ async def _handle_mcp_oauth_revoke_connection_inner(request: Request) -> Respons
     # surfaces as 404 (with the same shape used for cross-user attempts
     # so existence is not leaked across tenants).
     if plain is None:
-        storage_row = await asyncio.to_thread(storage.get_mcp_user_token, user_id, server_name)
+        storage_row = await asyncio.to_thread(storage.get_oauth_token, user_id, server_name)
         if storage_row is None:
             return JSONResponse({"error": "No such connection"}, status_code=404)
 

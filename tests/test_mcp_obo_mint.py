@@ -17,7 +17,7 @@ call-counting):
 
 Semantics pinned here:
 
-- minted tokens cache in ``mcp_user_tokens`` with ``refresh_token_ct``
+- minted tokens cache in ``oauth_tokens`` with ``refresh_token_ct``
   NULL (cache, not custody);
 - rotation write-back persists the newest IdP refresh token on the
   shared credential;
@@ -147,16 +147,14 @@ def _seed_cache_row(
         # path need a row that is unambiguously from the past.
         import sqlalchemy as sa
 
-        from turnstone.core.storage._schema import mcp_user_tokens
+        from turnstone.core.storage._schema import oauth_tokens
 
         backdated = (datetime.now(UTC) - timedelta(seconds=created_seconds_ago)).strftime(_ISO)
         storage = state.auth_storage
         with storage._engine.connect() as conn:
             conn.execute(
-                sa.update(mcp_user_tokens)
-                .where(
-                    (mcp_user_tokens.c.user_id == USER) & (mcp_user_tokens.c.server_name == SERVER)
-                )
+                sa.update(oauth_tokens)
+                .where((oauth_tokens.c.user_id == USER) & (oauth_tokens.c.token_key == SERVER))
                 .values(created=backdated)
             )
             conn.commit()
@@ -193,7 +191,7 @@ def _mint(state: SimpleNamespace) -> Any:
 class TestEntraLeg:
     def test_happy_path_mints_with_default_scope_and_caches(self, storage: SQLiteBackend) -> None:
         """Case 1: one POST with the exact spike-verified Entra body; the mint
-        caches as a refresh-less ``mcp_user_tokens`` row with ``as_issuer`` /
+        caches as a refresh-less ``oauth_tokens`` row with ``as_issuer`` /
         ``audience`` populated and ``expires_at`` derived from ``expires_in``."""
         _seed_obo_server(storage)  # empty oauth_scopes → scope falls back to /.default
         client = MagicMock(spec=httpx.AsyncClient)
@@ -221,7 +219,7 @@ class TestEntraLeg:
             "scope": f"{AUDIENCE}/.default",
         }
         # Cache row: refresh-less (cache, not custody), issuer/audience stamped.
-        raw = storage.get_mcp_user_token(USER, SERVER)
+        raw = storage.get_oauth_token(USER, SERVER)
         assert raw is not None
         assert raw["refresh_token_ct"] is None
         assert raw["as_issuer"] == ISSUER
@@ -281,7 +279,7 @@ class TestEntraLeg:
         result = _mint(state)
         assert result.kind == "token"
         # The row records the effective (empty) scope, not "custom.scope".
-        row = storage.get_mcp_user_token(USER, SERVER)
+        row = storage.get_oauth_token(USER, SERVER)
         assert row is not None
         assert (row["scopes"] or "") == ""
 
@@ -315,7 +313,7 @@ class TestEntraLeg:
         assert cred is not None
         assert cred["refresh_token"] == "rt-2"
         # The rotated RT stays on the credential — the cache row is refresh-less.
-        raw = storage.get_mcp_user_token(USER, SERVER)
+        raw = storage.get_oauth_token(USER, SERVER)
         assert raw is not None
         assert raw["refresh_token_ct"] is None
 
@@ -513,7 +511,7 @@ class TestRfc8693Leg:
         result = _mint(state)
 
         assert result.kind == "token"
-        row = storage.get_mcp_user_token(USER, SERVER)
+        row = storage.get_oauth_token(USER, SERVER)
         assert row is not None
         # Not NULL — a bounded expiry within the default TTL window was stamped.
         assert row["expires_at"] is not None
@@ -568,7 +566,7 @@ class TestCacheAndCredentialLookup:
     def test_fresh_cache_row_returns_token_with_zero_http_calls(
         self, storage: SQLiteBackend
     ) -> None:
-        """Case 4: a fresh ``mcp_user_tokens`` row is served straight from the
+        """Case 4: a fresh ``oauth_tokens`` row is served straight from the
         cache — no IdP round-trip."""
         _seed_obo_server(storage)
         client = MagicMock(spec=httpx.AsyncClient)
@@ -622,7 +620,7 @@ class TestCacheAndCredentialLookup:
 
             res = asyncio.run(_go())
             # Clear the cache row so the next run mints again (independent count).
-            storage.delete_mcp_user_token(USER, SERVER)
+            storage.delete_oauth_token(USER, SERVER)
             return res, reads["n"]
 
         result_hint, reads_hint = _run_with_hint(True)
@@ -659,7 +657,7 @@ class TestCacheAndCredentialLookup:
         assert result.token == "reminted-at"
         assert client.post.call_count == 1
         # The cache row is now for the current audience.
-        row = storage.get_mcp_user_token(USER, SERVER)
+        row = storage.get_oauth_token(USER, SERVER)
         assert row is not None and row["audience"] == AUDIENCE
 
     def test_stale_scopes_cache_row_is_not_served_and_remints(self, storage: SQLiteBackend) -> None:
@@ -700,7 +698,7 @@ class TestCacheAndCredentialLookup:
         assert result.kind == "token"
         assert result.token == "reminted-narrow"
         assert client.post.call_count == 2
-        row = storage.get_mcp_user_token(USER, SERVER)
+        row = storage.get_oauth_token(USER, SERVER)
         assert row is not None and (row["scopes"] or "") == "api.read"
 
     def test_missing_credential_returns_missing_with_zero_http_calls(
@@ -757,7 +755,7 @@ class TestFailureHandling:
 
         assert result.kind == "refresh_failed"
         # Cache row GONE...
-        assert storage.get_mcp_user_token(USER, SERVER) is None
+        assert storage.get_oauth_token(USER, SERVER) is None
         # ...but the credential STILL EXISTS — never auto-deleted here.
         assert state.mcp_token_store.get_oidc_credential(USER, ISSUER) is not None
         # The revoke is audited through the shared choke point.
@@ -814,7 +812,7 @@ class TestFailureHandling:
         assert result.kind == "refresh_failed_transient"
         assert client.post.call_count == 1
         assert state.mcp_token_store.get_oidc_credential(USER, ISSUER) is not None
-        assert storage.get_mcp_user_token(USER, SERVER) is None  # nothing was cached
+        assert storage.get_oauth_token(USER, SERVER) is None  # nothing was cached
 
     def test_oversized_error_body_on_client_error_is_ambiguous_not_transient(
         self, storage: SQLiteBackend

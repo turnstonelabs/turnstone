@@ -31,13 +31,13 @@ def _seed_token(
     backend,
     *,
     user_id: str,
-    server_name: str,
+    token_key: str,
     created: str,
 ) -> None:
     """Create a token via the store and backdate ``created`` for ordering."""
     store.create_user_token(
         user_id,
-        server_name,
+        token_key,
         access_token="access-secret",
         refresh_token="refresh-secret",
         expires_at="2026-05-04T12:00:00",
@@ -48,10 +48,10 @@ def _seed_token(
     with backend._engine.connect() as conn:
         conn.execute(
             sa.text(
-                "UPDATE mcp_user_tokens SET created = :created "
-                "WHERE user_id = :uid AND server_name = :sn"
+                "UPDATE oauth_tokens SET created = :created "
+                "WHERE user_id = :uid AND token_key = :sn"
             ),
-            {"created": created, "uid": user_id, "sn": server_name},
+            {"created": created, "uid": user_id, "sn": token_key},
         )
         conn.commit()
 
@@ -59,9 +59,7 @@ def _seed_token(
 class TestListUserTokenMetadata:
     def test_list_user_token_metadata_returns_non_secret_fields_only(self, backend) -> None:
         store = _make_store(backend)
-        _seed_token(
-            store, backend, user_id="u1", server_name="srv-a", created="2026-05-01T00:00:00"
-        )
+        _seed_token(store, backend, user_id="u1", token_key="srv-a", created="2026-05-01T00:00:00")
         rows = store.list_user_token_metadata("u1")
         assert len(rows) == 1
         meta = rows[0]
@@ -72,7 +70,7 @@ class TestListUserTokenMetadata:
         assert "refresh_token_ct" not in meta
         # Non-secret columns surface verbatim.
         assert meta["user_id"] == "u1"
-        assert meta["server_name"] == "srv-a"
+        assert meta["token_key"] == "srv-a"
         assert meta["scopes"] == "openid profile"
         assert meta["as_issuer"] == "https://auth.example.com"
         assert meta["audience"] == "https://mcp.example.com"
@@ -86,17 +84,11 @@ class TestListUserTokenMetadata:
 
     def test_list_user_token_metadata_preserves_creation_order(self, backend) -> None:
         store = _make_store(backend)
-        _seed_token(
-            store, backend, user_id="u1", server_name="srv-c", created="2026-05-03T00:00:00"
-        )
-        _seed_token(
-            store, backend, user_id="u1", server_name="srv-a", created="2026-05-01T00:00:00"
-        )
-        _seed_token(
-            store, backend, user_id="u1", server_name="srv-b", created="2026-05-02T00:00:00"
-        )
+        _seed_token(store, backend, user_id="u1", token_key="srv-c", created="2026-05-03T00:00:00")
+        _seed_token(store, backend, user_id="u1", token_key="srv-a", created="2026-05-01T00:00:00")
+        _seed_token(store, backend, user_id="u1", token_key="srv-b", created="2026-05-02T00:00:00")
         rows = store.list_user_token_metadata("u1")
-        assert [r["server_name"] for r in rows] == ["srv-a", "srv-b", "srv-c"]
+        assert [r["token_key"] for r in rows] == ["srv-a", "srv-b", "srv-c"]
         assert [r["created"] for r in rows] == [
             "2026-05-01T00:00:00",
             "2026-05-02T00:00:00",

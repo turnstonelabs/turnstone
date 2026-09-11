@@ -1,0 +1,51 @@
+@startuml
+!theme plain
+title Turnstone — Shared OAuth Storage
+
+top to bottom direction
+skinparam componentStyle rectangle
+
+component "MCP authorization\nand lifecycle" as MCP #C8E6C9
+component "Model authentication\nand lifecycle" as Model #B3E5FC
+component "OIDC login\ncredential capture" as Login #FFE0B2
+component "core/oauth/\nGrants, HTTP, OIDC protocol, coordination" as OAuth #E8EAF6
+component "core/token_store/\nTokenStore + TokenCipher\nShared reserved key namespace" as Store #FFF9C4
+component "StorageBackend\nSQLite / PostgreSQL" as Storage #F3E5F5
+
+database "oauth_tokens" as Tokens {
+    card "PK (user_id, token_key)\naccess_token_ct / refresh_token_ct\naudience / scopes / issuer\nexpiry / created / last_refreshed" as TokenRow
+}
+database "oidc_user_credentials" as Credentials {
+    card "PK (user_id, issuer)\nrefresh_token_ct\ncreated / last_refreshed" as CredentialRow
+}
+database "MCP-specific state" as MCPState {
+    card "mcp_oauth_pending\nBrowser authorization state (10-minute TTL)" as Pending
+    card "mcp_pending_consent\nNon-interactive consent reminders" as Consent
+    card "mcp_servers.oauth_client_secret_ct\nEncrypted with the shared cipher" as Secrets
+}
+
+MCP --> OAuth
+Model --> OAuth
+Login --> OAuth
+OAuth --> Store : cache persistence
+MCP --> Store
+Model --> Store
+Login --> Store : captured credential
+Store --> Storage : ciphertext + metadata
+Storage --> Tokens
+Storage --> Credentials
+MCP --> MCPState : MCP-only APIs
+
+note bottom of Tokens
+  token_key is opaque; audience is a separate field.
+  MCP keys: server names.
+  Model keys: ~_~_model~_obo~_~_: / ~_~_model~_app~_~_: + alias.
+  App-identity rows belong to user ~_~_app~_~_.
+end note
+
+note bottom of MCPState
+  MCP purge: tokens + pending browser authorization
+  state in one transaction; pending consent is untouched.
+  Model purge: token rows only.
+end note
+@enduml

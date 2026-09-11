@@ -462,7 +462,7 @@ async def _run(cfg: dict[str, str]) -> None:
         state_ok = _query(callback_location).get("state") == authz.get("state")
         done = await console.get(callback_location)
         exchange = wire.drain()
-        ct_row = storage.get_mcp_user_token(USER, "kc-mcp")
+        ct_row = storage.get_oauth_token(USER, "kc-mcp")
         plain = store.get_user_token(USER, "kc-mcp")
         if done.status_code != 302 or plain is None or ct_row is None:
             record(
@@ -656,7 +656,7 @@ async def _run(cfg: dict[str, str]) -> None:
         revoked = await console.delete(f"{CONNECTIONS}/kc-mcp")
         await asyncio.gather(*_revoke_upstream_tasks)
         calls = wire.drain()
-        gone = storage.get_mcp_user_token(USER, "kc-mcp") is None
+        gone = storage.get_oauth_token(USER, "kc-mcp") is None
         r9 = await _on_mcp_loop(
             manager,
             get_user_access_token_classified(
@@ -718,7 +718,7 @@ async def _run(cfg: dict[str, str]) -> None:
                 await browser2.consent(start2.headers["location"], callback_url)
             )
             calls = wire.drain()
-            persisted = storage.get_mcp_user_token(USER, "kc-noaud") is not None
+            persisted = storage.get_oauth_token(USER, "kc-noaud") is not None
             record(
                 "VERIFIED"
                 if done2.status_code == 302

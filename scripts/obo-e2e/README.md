@@ -290,7 +290,7 @@ Findings that feed the design:
 1. **One per-user credential -> N audience tokens: VERIFIED on a second IdP.**
    The substrate is portable; only the grant leg differs per IdP.
 2. **Exchanged tokens are cache-shaped** (short TTL, no RT) — per-server
-   `mcp_user_tokens` rows as short-lived mint cache is the right model.
+   `oauth_tokens` rows as short-lived mint cache is the right model.
 3. **RT rotation happens here too** — newest-RT write-back on every redemption
    is a correctness requirement of the capture layer, not an Entra quirk.
 4. **The IdP-side "delegated grant" has a per-IdP shape**: Entra = API

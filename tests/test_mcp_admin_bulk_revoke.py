@@ -12,7 +12,7 @@ Coverage:
 - 200 + ``rows_deleted`` + ``consented_users_before`` on success.
 - Audit row written with
   ``upstream_revoke_outcome="bulk_admin_no_upstream"``.
-- Token rows are gone from ``mcp_user_tokens`` post-call.
+- Token rows are gone from ``oauth_tokens`` post-call.
 """
 
 from __future__ import annotations
@@ -116,7 +116,7 @@ def _seed_static_server(
 
 def _seed_user_tokens(backend: SQLiteBackend, server_name: str, users: int) -> None:
     for i in range(users):
-        backend.create_mcp_user_token(
+        backend.create_oauth_token(
             f"user-{i}",
             server_name,
             access_token_ct=b"ct",
@@ -159,7 +159,7 @@ def test_400_on_invalid_server_name(storage: SQLiteBackend) -> None:
 
 
 def test_200_on_oauth_obo_server(storage: SQLiteBackend) -> None:
-    """#551: bulk-revoke serves oauth_obo too (it populates mcp_user_tokens with
+    """#551: bulk-revoke serves oauth_obo too (it populates oauth_tokens with
     minted cache rows) — the documented remediation for stale rows after an
     oauth_user→oauth_obo flip."""
     storage.create_mcp_server(
