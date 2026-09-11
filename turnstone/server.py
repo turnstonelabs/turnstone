@@ -33,6 +33,10 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from turnstone.core.model_oauth import OAuthModelTokenClient, get_model_token_client
+from turnstone.core.oauth.context import OAuthContext, oauth_context
+from turnstone.core.oauth.runtime import shutdown_oauth_runtime
+
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable
 
@@ -1543,7 +1547,7 @@ def _audio_backend_auth_resolver(request: Request) -> Callable[[str, Any], str |
 
     principal_id = _auth_user_id(request).strip()
     config_store = getattr(request.app.state, "config_store", None)
-    mint_client = getattr(request.app.state, "mcp_client", None)
+    mint_client = get_model_token_client(request.app.state)
 
     def _resolve(alias: str, config: Any) -> str | None:
         return resolve_model_backend_auth_token(
@@ -4842,27 +4846,16 @@ def _internal_model_reload_locked(request: Request) -> JSONResponse:
     finally:
         new_registry.shutdown()
 
-    # A model may switch from static to dynamic auth while the node has no MCP
-    # servers. Ensure the dedicated mint loop exists after the registry reload;
-    # model auth must not depend on an unrelated MCP catalog being configured.
-    if registry.has_dynamic_auth() and getattr(request.app.state, "mcp_client", None) is None:
-        from turnstone.core.mcp_client import MCPClientManager
-
-        mcp_mgr = MCPClientManager({})
-        mcp_mgr.start()
-        mcp_mgr.set_storage(storage)
-        mcp_mgr.set_app_state(request.app.state)
-        request.app.state.mcp_client = mcp_mgr
-        mcp_ref = getattr(request.app.state, "mcp_ref", None)
-        if mcp_ref is not None:
-            mcp_ref[0] = mcp_mgr
-        workstreams = getattr(request.app.state, "workstreams", None)
-        if workstreams is not None:
-            with contextlib.suppress(Exception):
-                for ws in workstreams.list_all():
-                    session = getattr(ws, "session", None)
-                    if session is not None:
-                        session.set_model_mint_client(mcp_mgr)
+    # The process-owned model client survives registry changes, including
+    # enabling dynamic authentication on a host with no MCP manager.
+    model_client = get_model_token_client(request.app.state)
+    workstreams = getattr(request.app.state, "workstreams", None)
+    if workstreams is not None:
+        with contextlib.suppress(Exception):
+            for ws in workstreams.list_all():
+                session = getattr(ws, "session", None)
+                if session is not None:
+                    session.set_model_mint_client(model_client)
 
     # Ensure health trackers exist for any newly-added backends
     health_reg = getattr(request.app.state, "health_registry", None)
@@ -4942,13 +4935,13 @@ async def internal_model_auth_cache_invalidate(request: Request) -> JSONResponse
     ):
         return JSONResponse({"error": "Invalid user_id"}, status_code=400)
 
-    mcp_mgr = getattr(request.app.state, "mcp_client", None)
-    if mcp_mgr is None:
+    model_client = getattr(request.app.state, "model_token_client", None)
+    if model_client is None:
         return JSONResponse({"status": "noop", "evicted": 0})
 
     from turnstone.core.token_store.store import MODEL_OBO_CACHE_PREFIX
 
-    evicted = mcp_mgr.invalidate_model_mint_memo_sync(
+    evicted = model_client.invalidate_model_mint_memo_sync(
         user_id=user_id,
         server_prefix=MODEL_OBO_CACHE_PREFIX,
     )
@@ -5538,10 +5531,9 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None]:
         app.state.mcp_client.shutdown()
     if app.state.registry:
         app.state.registry.shutdown()
-    # Close in reverse order of initialization (mcp_oauth → mcp_crypto →
-    # oidc). The OAuth flow holds a long-lived httpx.AsyncClient that
-    # depends on no later-initialised state, but reversing init order
-    # is the conventional LIFO discipline.
+    # Callers and registries are quiescent before runtime workers release
+    # their token-store and OIDC dependencies.
+    await asyncio.to_thread(shutdown_oauth_runtime, app.state)
     from turnstone.core.mcp_oauth import close_mcp_oauth_state
 
     await close_mcp_oauth_state(app.state)
@@ -5616,6 +5608,8 @@ def create_app(
     rate_limiter: Any = None,
     mcp_client: Any = None,
     mcp_ref: list[Any] | None = None,
+    oauth: OAuthContext | None = None,
+    model_token_client: OAuthModelTokenClient | None = None,
     registry: Any = None,
     idle_timeout: int = 0,
     node_id: str = "",
@@ -6000,6 +5994,10 @@ def create_app(
     app.state.skip_permissions = skip_permissions
     app.state.jwt_secret = jwt_secret
     app.state.auth_storage = auth_storage
+    app.state.oauth_context = oauth if oauth is not None else OAuthContext(storage=auth_storage)
+    app.state.model_token_client = model_token_client or OAuthModelTokenClient(
+        app.state.oauth_context
+    )
     app.state.health_registry = health_registry
     app.state.rate_limiter = rate_limiter
     app.state.mcp_client = mcp_client
@@ -6020,7 +6018,7 @@ def create_app(
     from turnstone.core.oauth.oidc import load_oidc_config
 
     oidc_config = load_oidc_config()
-    app.state.oidc_config = oidc_config
+    oauth_context(app.state).oidc_config = oidc_config
     app.state.jwks_data = None  # populated after async discovery
 
     return app
@@ -6190,11 +6188,12 @@ def main() -> None:
     mcp_client = create_mcp_client(
         mcp_config_cli or config_store.get("mcp.config_path") or None,
         storage=_get_storage(),
-        required=registry.has_dynamic_auth(),
     )
     # Mutable ref so session_factory always sees the latest MCP client,
     # including ones created by internal_mcp_reload after startup.
     _mcp_ref: list[Any] = [mcp_client]
+    oauth = OAuthContext(storage=_get_storage())
+    model_token_client = OAuthModelTokenClient(oauth)
 
     # Per-backend passive health tracking (no active probes / circuit breakers)
     from turnstone.core.healthcheck import HealthTrackerRegistry
@@ -6386,6 +6385,7 @@ def main() -> None:
             agent_max_turns=config_store.get("tools.agent_max_turns"),
             tool_truncation=config_store.get("tools.truncation"),
             mcp_client=live_mcp_client,
+            model_token_client=model_token_client,
             registry=registry,
             model_alias=model_alias,
             registry_generation=registry_generation,
@@ -6691,6 +6691,8 @@ def main() -> None:
         rate_limiter=rate_limiter,
         mcp_client=mcp_client,
         mcp_ref=_mcp_ref,
+        oauth=oauth,
+        model_token_client=model_token_client,
         registry=registry,
         idle_timeout=config_store.get("server.workstream_idle_timeout"),
         node_id=_node_id,

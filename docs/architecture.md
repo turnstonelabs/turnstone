@@ -42,7 +42,7 @@ turnstone/
     model_turn.py     ModelLane binding + the single lower/sample/re-ingest boundary
     model_backend_auth.py Per-call static/dynamic model-backend credential policy
     model_oauth.py    Model token mints, alias cache keys, memoization, and refusal causes
-    oauth/            Shared OAuth grants, HTTP failures, OIDC, SSRF, locks, and token cache/backoff
+    oauth/            OAuth runtime/context, grants, HTTP, OIDC, SSRF, locks, and token helpers
     token_store/      Generic encrypted token/credential storage and deployment keyring
     oidc.py           OIDC account provisioning and role mapping
     state_writer.py   Incarnation-fenced write-behind workstream state persistence
@@ -1952,6 +1952,34 @@ supplies the cipher and deployment keyring loader. `core/oauth/` owns grant, HTT
 cache, and coordination primitives. Model mint policy stays in `model_oauth.py`,
 while MCP consent, server-secret integration, and audit presentation stay in
 `mcp_oauth.py` / `mcp_crypto.py`.
+
+Each host owns one `OAuthRuntime` with a dedicated event loop and HTTP client.
+`OAuthContext` holds the shared token store and current immutable OIDC configuration;
+browser rediscovery updates that same holder. Model callers use the independent
+`ModelTokenClient` interface, including model-only hosts and MCP-disabled personas.
+Registry reloads preserve the runtime and its memo and coordination state.
+Browser discovery and runtime refresh share the same metadata cache, so consent
+warms the first refresh; each loop still uses its own HTTP client.
+
+MCP retains per-server admission locks, backoff, pools and consent presentation on
+its own loop. A bounded async bridge submits protected refresh and mint operations
+to the OAuth runtime. Model alias locks and the shared per-user issuer lock live on
+the runtime loop; custodial MCP refreshes also take a runtime-local server lock.
+Local locks precede PostgreSQL advisory locks. SQLite relies on these runtime-local
+locks to serialize durable work across both consumers.
+
+The async bridge has a 60-second caller deadline, allowing for PostgreSQL's
+30-second advisory-lock wait followed by discovery and token requests. The
+synchronous model bridge retains its 20-second deadline. These bounds return a
+transient/unavailable outcome on expiry; they do not classify an IdP rejection.
+
+Cancellation releases the caller while started token/credential writes finish under
+their runtime and advisory locks. The runtime retains operation tasks and executor
+futures, including advisory acquire/release workers. Shutdown stops sessions, managers
+and registries before draining OAuth within explicit budgets and closing its HTTP
+client, then releases the token store and OIDC state. Budget exhaustion is logged;
+process teardown handles any remaining work. Browser OAuth/JWKS clients stay on the
+host loop. The CLI's background sweep of web-user grants remains disabled.
 
 `oauth_tokens` has a composite `(user_id, token_key)` primary key. The key is an
 opaque identity: MCP uses server names; models use reserved synthetic keys based

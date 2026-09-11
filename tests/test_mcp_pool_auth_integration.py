@@ -28,20 +28,28 @@ import logging
 import socket
 import threading
 import time
+import urllib.parse
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 from unittest.mock import MagicMock, patch
 
+import httpx
 import pytest
 import uvicorn
+from aiohttp import web
 from mcp.server.fastmcp import FastMCP
 from starlette.middleware.base import BaseHTTPMiddleware
 
+from tests._oauth_runtime_helpers import make_oauth_context
 from tests.conftest import make_mcp_token_cipher, serve_until_exit, stop_loop_thread
+from tests.test_mcp_oauth_handlers import _build_app
+from turnstone.core import mcp_oauth
 from turnstone.core.mcp_client import MCPClientManager
 from turnstone.core.mcp_crypto import MCPTokenStore
 from turnstone.core.mcp_oauth import TokenLookupResult
+from turnstone.core.oauth.context import TokenCoordination, oauth_context
+from turnstone.core.oauth.runtime import OAuthRuntime
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -292,11 +300,153 @@ def _seed_user_token(
 def _make_app_state(storage: SQLiteBackend, *, cipher: Any) -> SimpleNamespace:
     return SimpleNamespace(
         auth_storage=storage,
-        mcp_token_store=MCPTokenStore(storage, cipher, node_id="test"),
-        obo_http_client=MagicMock(),
-        mcp_oauth_refresh_locks={},
+        mcp_oauth_coordination=TokenCoordination(),
         mcp_oauth_metadata_cache={},
+        oauth_context=make_oauth_context(
+            token_store=MCPTokenStore(storage, cipher, node_id="test"),
+            http_client=MagicMock(spec=httpx.AsyncClient),
+        ),
     )
+
+
+def test_browser_consent_then_dispatch_refreshes_on_oauth_runtime(
+    upstream: Any, storage: SQLiteBackend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Real browser routes, HTTP connections and MCP dispatch share one consent."""
+    url, behaviour = upstream
+    storage.create_user("user-1", "user1", "User One", "hash")
+    _seed_oauth_server(storage, url=url)
+    store = MCPTokenStore(storage, make_mcp_token_cipher())
+    manager = MCPClientManager({})
+    manager._user_token_sweep_s = 0
+    manager._static_health_check_s = 0
+
+    async def run() -> None:
+        requests: list[tuple[str, httpx.AsyncClient, asyncio.AbstractEventLoop]] = []
+        grants: list[str] = []
+
+        def client() -> httpx.AsyncClient:
+            instance = httpx.AsyncClient()
+            owner = asyncio.get_running_loop()
+
+            async def observe(request: httpx.Request) -> None:
+                # Deterministic even if a slow runner expires a keepalive socket.
+                assert asyncio.get_running_loop() is owner
+                requests.append((request.url.path, instance, owner))
+
+            instance.event_hooks["request"].append(observe)
+            return instance
+
+        async def handle(request: web.Request) -> web.Response:
+            if request.path == "/.well-known/oauth-authorization-server":
+                return web.json_response(
+                    {
+                        "issuer": origin,
+                        "authorization_endpoint": f"{origin}/authorize",
+                        "token_endpoint": f"{origin}/token",
+                        "code_challenge_methods_supported": ["S256"],
+                        "token_endpoint_auth_methods_supported": ["none"],
+                    }
+                )
+            if request.path == "/token":
+                body = await request.post()
+                grant = str(body["grant_type"])
+                grants.append(grant)
+                if grant == "authorization_code":
+                    assert body["code"] == "browser-code" and body["code_verifier"]
+                    token, refresh = "consented-token", "consented-refresh"
+                else:
+                    assert grant == "refresh_token"
+                    assert body["refresh_token"] == "consented-refresh"
+                    token, refresh = "dispatch-token", "rotated-refresh"
+                return web.json_response(
+                    {"access_token": token, "refresh_token": refresh, "expires_in": 3600}
+                )
+            assert request.path == "/warm"
+            return web.json_response({})
+
+        provider = web.Application()
+        provider.router.add_route("*", "/{path:.*}", handle)
+        runner = web.AppRunner(provider)
+        await runner.setup()
+        runtime = None
+        try:
+            await web.TCPSite(runner, "127.0.0.1", 0).start()
+            origin = f"http://127.0.0.1:{runner.addresses[0][1]}"
+            storage.update_mcp_server("srv-pool", oauth_authorization_server_url=origin)
+            async with client() as browser_client:
+                app = _build_app(storage=storage, http_client=browser_client, token_store=store)
+                # Exercise the host initializer so this test catches cache splits.
+                with monkeypatch.context() as patch:
+                    patch.setattr(mcp_oauth.oauth_http, "json_http_client", lambda: browser_client)
+                    await mcp_oauth.initialize_mcp_oauth_state(app.state)
+                context = oauth_context(app.state)
+                runtime = OAuthRuntime(context, client_factory=client)
+                context.runtime = runtime
+                runtime.start()
+                manager.set_storage(storage)
+                manager.set_app_state(app.state)
+                await asyncio.to_thread(manager.start)
+                try:
+                    async with httpx.AsyncClient(
+                        transport=httpx.ASGITransport(app), base_url="https://testserver"
+                    ) as browser:
+                        start = await browser.get(
+                            "/v1/api/mcp/oauth/start", params={"server": "pool-srv"}
+                        )
+                        assert start.status_code == 302, start.text
+                        state = urllib.parse.parse_qs(
+                            urllib.parse.urlsplit(start.headers["location"]).query
+                        )["state"][0]
+                        callback = await browser.get(
+                            "/v1/api/mcp/oauth/callback",
+                            params={"state": state, "code": "browser-code"},
+                        )
+                        assert callback.status_code == 302, callback.text
+                    assert store.get_user_token("user-1", "pool-srv")["access_token"] == (
+                        "consented-token"
+                    )
+                    from sqlalchemy import text
+
+                    with storage._engine.begin() as connection:
+                        connection.execute(
+                            text("UPDATE oauth_tokens SET expires_at = :expired"),
+                            {"expired": "2000-01-01T00:00:00"},
+                        )
+                    await browser_client.get(f"{origin}/warm")
+                    runtime_client = context.http_client
+                    assert runtime_client is not None
+                    await runtime.call(lambda: runtime_client.get(f"{origin}/warm"))
+                    assert origin in context.metadata_cache
+                    requests.clear()
+                    result = await asyncio.to_thread(
+                        manager.call_tool_sync,
+                        "mcp__pool-srv__echo",
+                        {"payload": "consented"},
+                        user_id="user-1",
+                        timeout=15,
+                    )
+                    assert "echoed:consented" in result
+                    assert grants == ["authorization_code", "refresh_token"]
+                    assert [path for path, _, _ in requests] == ["/token"]
+                    assert all(
+                        used is runtime_client and loop is runtime._loop
+                        for _, used, loop in requests
+                    )
+                    assert runtime._loop is not manager._loop
+                    assert set(behaviour["post_auth_headers"]) == {"Bearer dispatch-token"}
+                    assert store.get_user_token("user-1", "pool-srv")["refresh_token"] == (
+                        "rotated-refresh"
+                    )
+                finally:
+                    await asyncio.to_thread(manager.shutdown)
+                    await asyncio.to_thread(runtime.shutdown)
+        finally:
+            if runtime is not None:
+                await asyncio.to_thread(runtime.shutdown)
+            await runner.cleanup()
+
+    asyncio.run(run())
 
 
 @pytest.fixture

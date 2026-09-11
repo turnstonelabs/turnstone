@@ -33,7 +33,6 @@ Semantics pinned here:
 
 from __future__ import annotations
 
-import asyncio
 import json
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
@@ -43,6 +42,7 @@ from unittest.mock import AsyncMock, MagicMock
 import httpx
 import pytest
 
+from tests._oauth_runtime_helpers import make_oauth_context, run_adapter
 from tests._oidc_test_helpers import (
     ISSUER,
     TOKEN_ENDPOINT,
@@ -52,6 +52,7 @@ from tests._oidc_test_helpers import (
 from tests.conftest import make_mcp_token_cipher
 from turnstone.core.mcp_crypto import MCPTokenStore
 from turnstone.core.mcp_oauth import get_obo_access_token_classified
+from turnstone.core.oauth.context import TokenCoordination, oauth_context
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -91,10 +92,12 @@ def _make_app_state(
 ) -> SimpleNamespace:
     return SimpleNamespace(
         auth_storage=storage,
-        mcp_token_store=MCPTokenStore(storage, make_mcp_token_cipher(), node_id="test"),
-        oidc_config=oidc_config,
-        obo_http_client=http_client,
-        mcp_oauth_refresh_locks={},
+        mcp_oauth_coordination=TokenCoordination(),
+        oauth_context=make_oauth_context(
+            token_store=MCPTokenStore(storage, make_mcp_token_cipher(), node_id="test"),
+            oidc_config=oidc_config,
+            http_client=http_client,
+        ),
     )
 
 
@@ -116,7 +119,9 @@ def _seed_obo_server(
 
 
 def _seed_credential(state: SimpleNamespace, *, refresh_token: str = "rt-1") -> None:
-    state.mcp_token_store.upsert_oidc_credential(USER, ISSUER, refresh_token=refresh_token)
+    oauth_context(state).token_store.upsert_oidc_credential(
+        USER, ISSUER, refresh_token=refresh_token
+    )
 
 
 def _seed_cache_row(
@@ -128,7 +133,7 @@ def _seed_cache_row(
     created_seconds_ago: int = 0,
 ) -> None:
     expires_at = (datetime.now(UTC) + timedelta(seconds=expires_in_seconds)).strftime(_ISO)
-    state.mcp_token_store.create_user_token(
+    oauth_context(state).token_store.create_user_token(
         USER,
         SERVER,
         access_token=access_token,
@@ -180,7 +185,7 @@ def _mint(state: SimpleNamespace) -> Any:
             app_state=state, user_id=USER, server_name=SERVER
         )
 
-    return asyncio.run(_run())
+    return run_adapter(_run())
 
 
 # ---------------------------------------------------------------------------
@@ -228,7 +233,7 @@ class TestEntraLeg:
         expires = datetime.strptime(raw["expires_at"], _ISO).replace(tzinfo=UTC)
         remaining = expires - before
         assert timedelta(seconds=3500) <= remaining <= timedelta(seconds=3601)
-        plain = state.mcp_token_store.get_user_token(USER, SERVER)
+        plain = oauth_context(state).token_store.get_user_token(USER, SERVER)
         assert plain is not None
         assert plain["access_token"] == "at-minted"
         assert plain["refresh_token"] is None
@@ -309,7 +314,7 @@ class TestEntraLeg:
         result = _mint(state)
 
         assert result.kind == "token"
-        cred = state.mcp_token_store.get_oidc_credential(USER, ISSUER)
+        cred = oauth_context(state).token_store.get_oidc_credential(USER, ISSUER)
         assert cred is not None
         assert cred["refresh_token"] == "rt-2"
         # The rotated RT stays on the credential — the cache row is refresh-less.
@@ -377,11 +382,11 @@ class TestRfc8693Leg:
             "audience": AUDIENCE,
         }
         # Rotation write-back from the FIRST leg persists on the credential.
-        cred = state.mcp_token_store.get_oidc_credential(USER, ISSUER)
+        cred = oauth_context(state).token_store.get_oidc_credential(USER, ISSUER)
         assert cred is not None
         assert cred["refresh_token"] == "rt-rotated"
         # Cached mint is the EXCHANGED token, refresh-less.
-        plain = state.mcp_token_store.get_user_token(USER, SERVER)
+        plain = oauth_context(state).token_store.get_user_token(USER, SERVER)
         assert plain is not None
         assert plain["access_token"] == "exchanged-at"
         assert plain["refresh_token"] is None
@@ -444,7 +449,7 @@ class TestRfc8693Leg:
 
         assert result.kind == "refresh_failed_transient"
         assert client.post.call_count == 1  # never reached the exchange leg
-        assert state.mcp_token_store.get_oidc_credential(USER, ISSUER) is not None
+        assert oauth_context(state).token_store.get_oidc_credential(USER, ISSUER) is not None
 
     def test_rotation_from_refresh_leg_survives_exchange_leg_failure(
         self, storage: SQLiteBackend
@@ -481,7 +486,7 @@ class TestRfc8693Leg:
 
         assert client.post.call_count == 2  # refresh leg + failed exchange
         # The rotated RT from the refresh leg is persisted despite the failure.
-        cred = state.mcp_token_store.get_oidc_credential(USER, ISSUER)
+        cred = oauth_context(state).token_store.get_oidc_credential(USER, ISSUER)
         assert cred is not None
         assert cred["refresh_token"] == "rt-rotated"
         # A 400 exchange with invalid_grant is a PERMANENT rejection for THIS
@@ -552,7 +557,7 @@ class TestRfc8693Leg:
         result = _mint(state)
 
         assert result.kind == "token"
-        cred = state.mcp_token_store.get_oidc_credential(USER, ISSUER)
+        cred = oauth_context(state).token_store.get_oidc_credential(USER, ISSUER)
         assert cred is not None
         assert cred["refresh_token"] == "rt-1"  # unchanged — NOT "audience-rt"
 
@@ -618,7 +623,7 @@ class TestCacheAndCredentialLookup:
                         credential_present=hint,
                     )
 
-            res = asyncio.run(_go())
+            res = run_adapter(_go())
             # Clear the cache row so the next run mints again (independent count).
             storage.delete_oauth_token(USER, SERVER)
             return res, reads["n"]
@@ -681,13 +686,13 @@ class TestCacheAndCredentialLookup:
         )
         _seed_credential(state)
         # Fresh, right-audience, refresh-less — but minted with the OLD wider scopes.
-        state.mcp_token_store.create_user_token(
+        oauth_context(state).token_store.create_user_token(
             USER,
             SERVER,
             access_token="wide-scope-at",
             refresh_token=None,
             expires_at=(datetime.now(UTC) + timedelta(seconds=3600)).strftime(_ISO),
-            scopes="api.read api.write",  # wider than the server's current api.read
+            scopes="api.read api.write",
             as_issuer=ISSUER,
             audience=AUDIENCE,
         )
@@ -757,7 +762,7 @@ class TestFailureHandling:
         # Cache row GONE...
         assert storage.get_oauth_token(USER, SERVER) is None
         # ...but the credential STILL EXISTS — never auto-deleted here.
-        assert state.mcp_token_store.get_oidc_credential(USER, ISSUER) is not None
+        assert oauth_context(state).token_store.get_oidc_credential(USER, ISSUER) is not None
         # The revoke is audited through the shared choke point.
         events = storage.list_audit_events(action="mcp_server.oauth.token_revoked")
         assert len(events) == 1
@@ -790,13 +795,13 @@ class TestFailureHandling:
             )
             return first, second
 
-        first, second = asyncio.run(_run())
+        first, second = run_adapter(_run())
 
         assert first.kind == "refresh_failed_transient"
         assert second.kind == "refresh_failed_transient"
         # Cooldown short-circuit: the second call never reached the IdP.
         assert client.post.call_count == 1
-        assert state.mcp_token_store.get_oidc_credential(USER, ISSUER) is not None
+        assert oauth_context(state).token_store.get_oidc_credential(USER, ISSUER) is not None
 
     def test_missing_access_token_in_200_body_is_transient(self, storage: SQLiteBackend) -> None:
         """Case 9: a 200 body without ``access_token`` is a malformed-IdP
@@ -811,7 +816,7 @@ class TestFailureHandling:
 
         assert result.kind == "refresh_failed_transient"
         assert client.post.call_count == 1
-        assert state.mcp_token_store.get_oidc_credential(USER, ISSUER) is not None
+        assert oauth_context(state).token_store.get_oidc_credential(USER, ISSUER) is not None
         assert storage.get_oauth_token(USER, SERVER) is None  # nothing was cached
 
     def test_oversized_error_body_on_client_error_is_ambiguous_not_transient(
@@ -841,7 +846,9 @@ class TestFailureHandling:
         # escalation threshold), but the AMBIGUOUS class advanced the streak —
         # the TRANSIENT default would have left it at 0 and never escalated.
         assert result.kind == "refresh_failed_transient"
-        assert _refresh_backoff_state(state, USER, SERVER).ambiguous_streak == 1
+        assert (
+            _refresh_backoff_state(state.mcp_oauth_coordination, USER, SERVER).ambiguous_streak == 1
+        )
 
     def test_permanent_rejection_logs_idp_error_text(self, storage: SQLiteBackend, caplog) -> None:
         """Review finding (2316): the permanent-rejection path must log the IdP
@@ -895,7 +902,7 @@ class TestFailureHandling:
             )
             return first, second
 
-        first, second = asyncio.run(_run())
+        first, second = run_adapter(_run())
 
         assert first.kind == "refresh_failed"
         # Terminal: the cooldown short-circuits the second dispatch — and reports
@@ -905,7 +912,7 @@ class TestFailureHandling:
         # No row was ever deleted → no bogus revoke audit.
         events = storage.list_audit_events(action="mcp_server.oauth.token_revoked")
         assert len(events) == 0
-        assert state.mcp_token_store.get_oidc_credential(USER, ISSUER) is not None
+        assert oauth_context(state).token_store.get_oidc_credential(USER, ISSUER) is not None
 
     def test_permanent_rejection_with_cache_row_audits_exactly_once(
         self, storage: SQLiteBackend
@@ -930,10 +937,10 @@ class TestFailureHandling:
             await get_obo_access_token_classified(app_state=state, user_id=USER, server_name=SERVER)
             # Clear the cooldown so the second dispatch actually re-mints (the
             # weekend-of-scheduled-runs scenario), then dispatch again.
-            _clear_refresh_backoff(state, USER, SERVER)
+            _clear_refresh_backoff(state.mcp_oauth_coordination, USER, SERVER)
             await get_obo_access_token_classified(app_state=state, user_id=USER, server_name=SERVER)
 
-        asyncio.run(_run())
+        run_adapter(_run())
 
         assert client.post.call_count == 2  # re-minted after the cooldown cleared
         # But only ONE revoke audit — the second doomed mint found no row.
@@ -968,14 +975,16 @@ class TestFailureHandling:
             created_seconds_ago=30,
         )
         # Arm the cooldown as if a prior mint just failed transiently.
-        _refresh_backoff_state(state, USER, SERVER).last_failure_monotonic = time.monotonic()
+        _refresh_backoff_state(
+            state.mcp_oauth_coordination, USER, SERVER
+        ).last_failure_monotonic = time.monotonic()
 
         async def _run() -> Any:
             return await get_obo_access_token_classified(
                 app_state=state, user_id=USER, server_name=SERVER, force_refresh=True
             )
 
-        result = asyncio.run(_run())
+        result = run_adapter(_run())
 
         # Fell through the cooldown and re-minted (unconditional gate would have
         # returned refresh_failed_transient with zero IdP calls).
@@ -1016,15 +1025,19 @@ class TestFailureHandling:
 
         # Pre-lock read returns the rejected token; the under-lock re-read returns
         # a DIFFERENT token (a concurrent waiter re-minted while we held-waited).
-        reads = [_fresh_row("rejected-at"), _fresh_row("peer-reminted-at")]
-        with patch.object(state.mcp_token_store, "get_user_token", side_effect=reads):
+        reads = [
+            _fresh_row("rejected-at"),
+            _fresh_row("peer-reminted-at"),
+            _fresh_row("peer-reminted-at"),
+        ]
+        with patch.object(oauth_context(state).token_store, "get_user_token", side_effect=reads):
 
             async def _run() -> Any:
                 return await get_obo_access_token_classified(
                     app_state=state, user_id=USER, server_name=SERVER, force_refresh=True
                 )
 
-            result = asyncio.run(_run())
+            result = run_adapter(_run())
 
         assert result.kind == "token"
         assert result.token == "peer-reminted-at"  # reused the peer's fresh token
@@ -1064,7 +1077,9 @@ class TestFailureHandling:
         }
         # Both the pre-lock and under-lock reads return the SAME (rejected) token.
         with patch.object(
-            state.mcp_token_store, "get_user_token", side_effect=[rejected, rejected]
+            oauth_context(state).token_store,
+            "get_user_token",
+            side_effect=[rejected, rejected, rejected],
         ):
 
             async def _run() -> Any:
@@ -1072,7 +1087,7 @@ class TestFailureHandling:
                     app_state=state, user_id=USER, server_name=SERVER, force_refresh=True
                 )
 
-            result = asyncio.run(_run())
+            result = run_adapter(_run())
 
         assert result.kind == "token"
         assert result.token == "genuinely-reminted"  # re-minted, NOT re-served
@@ -1111,7 +1126,7 @@ class TestFailureHandling:
         _seed_credential(state, refresh_token="rt-1")
 
         with patch.object(
-            state.mcp_token_store,
+            oauth_context(state).token_store,
             "update_oidc_credential_after_redeem",
             side_effect=RuntimeError("transient db blip"),
         ):
@@ -1121,7 +1136,7 @@ class TestFailureHandling:
         assert result.token == "exchanged-at"
         # The stored credential still holds the OLD RT — the failed persist is
         # logged, never raised.
-        cred = state.mcp_token_store.get_oidc_credential(USER, ISSUER)
+        cred = oauth_context(state).token_store.get_oidc_credential(USER, ISSUER)
         assert cred is not None
         assert cred["refresh_token"] == "rt-1"
 
@@ -1154,7 +1169,7 @@ class TestFailureHandling:
 
         assert result.kind == "token"
         assert result.token == "minted-at"
-        assert state.oidc_config.enabled is True
+        assert oauth_context(state).oidc_config.enabled is True
 
     def test_credential_decrypt_failure_is_classified_not_raised(
         self, storage: SQLiteBackend
@@ -1173,7 +1188,7 @@ class TestFailureHandling:
         _seed_credential(state)
 
         with patch.object(
-            state.mcp_token_store,
+            oauth_context(state).token_store,
             "get_oidc_credential",
             side_effect=TokenDecryptError("key unknown", key_fingerprints_attempted=("ab12",)),
         ):

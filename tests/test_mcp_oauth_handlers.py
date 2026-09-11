@@ -31,6 +31,7 @@ from turnstone.core.mcp_oauth import (
     handle_mcp_oauth_authorize,
     handle_mcp_oauth_callback,
 )
+from turnstone.core.oauth.context import TokenCoordination, oauth_context
 from turnstone.core.oauth.oidc import OIDCConfig
 
 if TYPE_CHECKING:
@@ -86,15 +87,15 @@ def _build_app(
         middleware=[Middleware(_InjectAuthMiddleware)],
     )
     app.state.auth_storage = storage
-    app.state.mcp_token_store = token_store
+    oauth_context(app.state).token_store = token_store
     app.state.mcp_oauth_http_client = http_client
-    app.state.mcp_oauth_refresh_locks = {}
+    app.state.mcp_oauth_coordination = TokenCoordination()
     app.state.mcp_oauth_dcr_locks = {}
-    app.state.mcp_oauth_metadata_cache = {}
+    app.state.mcp_oauth_metadata_cache = oauth_context(app.state).metadata_cache
     app.state.mcp_oauth_last_cleanup_monotonic = 0.0
     # Mirror the OIDC redirect_base contract — the MCP OAuth handlers
     # reuse it to pin the callback URL against Host-header injection.
-    app.state.oidc_config = OIDCConfig(
+    oauth_context(app.state).oidc_config = OIDCConfig(
         enabled=False,
         redirect_base=redirect_base,
     )
@@ -705,7 +706,7 @@ class TestCallback:
 
 
 # ---------------------------------------------------------------------------
-# 503 paths when mcp_token_store is None
+# 503 paths when OAuthContext.token_store is None
 # ---------------------------------------------------------------------------
 
 

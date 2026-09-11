@@ -38,6 +38,7 @@ if TYPE_CHECKING:
     from turnstone.console.coordinator_client import CoordinatorClient
     from turnstone.core.config_store import ConfigStore
     from turnstone.core.mcp_client import MCPClientManager
+    from turnstone.core.model_oauth import ModelTokenClient
     from turnstone.core.model_registry import ModelRegistry
     from turnstone.core.personas import PersonaSnapshot
     from turnstone.core.session import SessionUI
@@ -52,6 +53,7 @@ def build_console_session_factory(
     node_id: str,
     coord_client_factory: Callable[[str, str], CoordinatorClient],
     mcp_client_getter: Callable[[], MCPClientManager | None] | None = None,
+    model_token_client_getter: Callable[[], ModelTokenClient | None] | None = None,
 ) -> Callable[..., ChatSession]:
     """Return a session factory that builds coordinator-kind ChatSessions.
 
@@ -222,6 +224,7 @@ def build_console_session_factory(
             agent_max_turns=config_store.get("tools.agent_max_turns"),
             tool_truncation=config_store.get("tools.truncation"),
             mcp_client=live_mcp_client,
+            model_token_client=(model_token_client_getter() if model_token_client_getter else None),
             registry=registry,
             model_alias=effective_alias,
             registry_generation=registry_generation,

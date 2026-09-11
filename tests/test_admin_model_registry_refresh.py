@@ -46,6 +46,7 @@ from turnstone.core.model_registry import (
     ModelConfig,
     ModelRegistry,
 )
+from turnstone.core.oauth.context import OAuthContext, oauth_context
 
 if TYPE_CHECKING:
     from turnstone.core.storage._sqlite import SQLiteBackend
@@ -1026,8 +1027,8 @@ def _make_client(
     )
     # A full OIDC posture: the model-auth helpers read enabled,
     # discovery_retryable and obo_grant_profile, not just one field.
-    app.state.oidc_config = make_oidc_config()
-    app.state.mcp_token_store = MagicMock()
+    oauth_context(app.state).oidc_config = make_oidc_config()
+    oauth_context(app.state).token_store = MagicMock()
     client = TestClient(app)
     client.headers.update({"X-Test-User": "admin", "X-Test-Perms": perms})
     return client
@@ -1124,7 +1125,7 @@ def test_auth_constraints_profile_empty_when_oidc_unconfigured(
     client = _make_client(
         storage, _make_registry(alias="local", model="m"), perms="admin.models,admin.mcp"
     )
-    client.app.state.oidc_config = make_oidc_config(enabled=False)
+    oauth_context(client.app.state).oidc_config = make_oidc_config(enabled=False)
 
     resp = client.get("/v1/api/admin/model-definitions/auth-constraints")
 
@@ -1142,7 +1143,7 @@ def test_auth_constraints_profile_survives_transient_discovery_outage(
     client = _make_client(
         storage, _make_registry(alias="local", model="m"), perms="admin.models,admin.mcp"
     )
-    client.app.state.oidc_config = make_oidc_config(
+    oauth_context(client.app.state).oidc_config = make_oidc_config(
         enabled=False, discovery_retryable=True, token_endpoint=""
     )
 
@@ -1161,8 +1162,8 @@ def test_no_oidc_deployment_still_serves_and_writes_static_models(
     """
     _seed_model_def(storage, definition_id="m1", alias="local", model="m")
     client = _make_client(storage, _make_registry(alias="local", model="m"))
-    delattr(client.app.state, "oidc_config")
-    delattr(client.app.state, "mcp_token_store")
+    delattr(oauth_context(client.app.state), "oidc_config")
+    delattr(oauth_context(client.app.state), "token_store")
 
     listing = client.get("/v1/api/admin/model-definitions")
     assert listing.status_code == 200, listing.text
@@ -1209,7 +1210,7 @@ def test_entra_obo_allowed_without_user_credential_capture(
     client = _make_client(
         storage, _make_registry(alias="local", model="m"), perms="admin.models,admin.mcp"
     )
-    client.app.state.oidc_config = make_oidc_config(capture_user_credential=False)
+    oauth_context(client.app.state).oidc_config = make_oidc_config(capture_user_credential=False)
     _stub_console_mcp(monkeypatch)
 
     resp = _dynamic_create(client)
@@ -1227,7 +1228,7 @@ def test_entra_app_allowed_before_oidc_discovery(
     client = _make_client(
         storage, _make_registry(alias="local", model="m"), perms="admin.models,admin.mcp"
     )
-    client.app.state.oidc_config = make_oidc_config(token_endpoint="")
+    oauth_context(client.app.state).oidc_config = make_oidc_config(token_endpoint="")
     _stub_console_mcp(monkeypatch)
 
     resp = _dynamic_create(client, alias="app-alias", auth_mode="entra_app")
@@ -1246,7 +1247,7 @@ def test_dynamic_write_rejected_without_token_encryption_key(
     client = _make_client(
         storage, _make_registry(alias="local", model="m"), perms="admin.models,admin.mcp"
     )
-    client.app.state.mcp_token_store = None
+    oauth_context(client.app.state).token_store = None
 
     resp = _dynamic_create(client)
 
@@ -1274,7 +1275,7 @@ def test_base_url_edit_allowed_despite_typod_profile(
     client = _make_client(
         storage, _make_registry(alias="local", model="m"), perms="admin.models,admin.mcp"
     )
-    client.app.state.oidc_config = make_oidc_config(obo_grant_profile="entrra")
+    oauth_context(client.app.state).oidc_config = make_oidc_config(obo_grant_profile="entrra")
     _stub_console_mcp(monkeypatch)
 
     resp = client.put(
@@ -1305,7 +1306,7 @@ def test_base_url_edit_allowed_on_entra_app_after_profile_flip(
     client = _make_client(
         storage, _make_registry(alias="local", model="m"), perms="admin.models,admin.mcp"
     )
-    client.app.state.oidc_config = make_oidc_config(obo_grant_profile="rfc8693")
+    oauth_context(client.app.state).oidc_config = make_oidc_config(obo_grant_profile="rfc8693")
     _stub_console_mcp(monkeypatch)
 
     resp = client.put(
@@ -1349,8 +1350,8 @@ def test_model_crud_does_not_revive_keyless_coordinator(
             config_store=MagicMock(),
             collector=MagicMock(),
             console_metrics=MagicMock(),
-            mcp_token_store=None,
             coord_registry_error="dynamic model auth ... key missing (from boot)",
+            oauth_context=OAuthContext(token_store=None),
         )
     )
 
@@ -1368,7 +1369,7 @@ def test_dynamic_write_rejected_when_oidc_unconfigured(
     client = _make_client(
         storage, _make_registry(alias="local", model="m"), perms="admin.models,admin.mcp"
     )
-    client.app.state.oidc_config = make_oidc_config(
+    oauth_context(client.app.state).oidc_config = make_oidc_config(
         enabled=False, capture_user_credential=False, token_endpoint=""
     )
 
@@ -1389,7 +1390,7 @@ def test_dynamic_write_accepted_during_transient_discovery_outage(
     client = _make_client(
         storage, _make_registry(alias="local", model="m"), perms="admin.models,admin.mcp"
     )
-    client.app.state.oidc_config = make_oidc_config(
+    oauth_context(client.app.state).oidc_config = make_oidc_config(
         enabled=False, discovery_retryable=True, token_endpoint=""
     )
     _stub_console_mcp(monkeypatch)
@@ -1418,7 +1419,7 @@ def test_base_url_edit_skips_posture_on_unchanged_pair(
     client = _make_client(
         storage, _make_registry(alias="local", model="m"), perms="admin.models,admin.mcp"
     )
-    client.app.state.mcp_token_store = None
+    oauth_context(client.app.state).token_store = None
     _stub_console_mcp(monkeypatch)
 
     resp = client.put(
@@ -1490,7 +1491,9 @@ def test_console_bootstrap_refuses_dynamic_auth_without_key(
         "_bootstrap_coord_subsystem",
         lambda *_a, **_k: bootstrapped.append(True),
     )
-    app = SimpleNamespace(state=SimpleNamespace(mcp_token_store=None, coord_registry_error=""))
+    app = SimpleNamespace(
+        state=SimpleNamespace(coord_registry_error="", oauth_context=OAuthContext(token_store=None))
+    )
 
     with caplog.at_level("ERROR", logger="turnstone.console.server"):
         server_module._load_and_bootstrap_coord_subsystem(app, storage, MagicMock())
@@ -1522,7 +1525,9 @@ def test_console_bootstrap_proceeds_with_key_present(
         lambda *_a, **_k: bootstrapped.append(True),
     )
     app = SimpleNamespace(
-        state=SimpleNamespace(mcp_token_store=MagicMock(), coord_registry_error="")
+        state=SimpleNamespace(
+            coord_registry_error="", oauth_context=OAuthContext(token_store=MagicMock())
+        )
     )
 
     server_module._load_and_bootstrap_coord_subsystem(app, storage, MagicMock())
@@ -1541,7 +1546,7 @@ def test_unknown_grant_profile_echoed_in_rejection(
     client = _make_client(
         storage, _make_registry(alias="local", model="m"), perms="admin.models,admin.mcp"
     )
-    client.app.state.oidc_config = make_oidc_config(obo_grant_profile="entrra")
+    oauth_context(client.app.state).oidc_config = make_oidc_config(obo_grant_profile="entrra")
 
     resp = _dynamic_create(client)
 
@@ -1672,7 +1677,7 @@ def test_entra_app_create_rejects_non_entra_profile(
     client = _make_client(
         storage, _make_registry(alias="local", model="m"), perms="admin.models,admin.mcp"
     )
-    client.app.state.oidc_config = make_oidc_config(obo_grant_profile="rfc8693")
+    oauth_context(client.app.state).oidc_config = make_oidc_config(obo_grant_profile="rfc8693")
 
     resp = _dynamic_create(client, alias="gateway", auth_mode="entra_app")
 
@@ -1692,7 +1697,7 @@ def test_entra_obo_create_rejects_rfc8693_profile(
     client = _make_client(
         storage, _make_registry(alias="local", model="m"), perms="admin.models,admin.mcp"
     )
-    client.app.state.oidc_config = make_oidc_config(obo_grant_profile="rfc8693")
+    oauth_context(client.app.state).oidc_config = make_oidc_config(obo_grant_profile="rfc8693")
 
     resp = _dynamic_create(client, alias="gateway")
 
@@ -1751,7 +1756,7 @@ def test_rfc8693_obo_create_stores_scopes_on_matching_profile(
     client = _make_client(
         storage, _make_registry(alias="local", model="m"), perms="admin.models,admin.mcp"
     )
-    client.app.state.oidc_config = make_oidc_config(obo_grant_profile="rfc8693")
+    oauth_context(client.app.state).oidc_config = make_oidc_config(obo_grant_profile="rfc8693")
     _stub_console_mcp(monkeypatch)
 
     resp = _dynamic_create(
@@ -1785,7 +1790,7 @@ def test_base_url_edit_allowed_on_legacy_entra_obo_rfc8693_row(
     client = _make_client(
         storage, _make_registry(alias="local", model="m"), perms="admin.models,admin.mcp"
     )
-    client.app.state.oidc_config = make_oidc_config(obo_grant_profile="rfc8693")
+    oauth_context(client.app.state).oidc_config = make_oidc_config(obo_grant_profile="rfc8693")
     _stub_console_mcp(monkeypatch)
 
     resp = client.put(
@@ -1843,7 +1848,7 @@ def test_create_rejects_over_length_scopes(storage: SQLiteBackend) -> None:
     client = _make_client(
         storage, _make_registry(alias="local", model="m"), perms="admin.models,admin.mcp"
     )
-    client.app.state.oidc_config = make_oidc_config(obo_grant_profile="rfc8693")
+    oauth_context(client.app.state).oidc_config = make_oidc_config(obo_grant_profile="rfc8693")
 
     resp = _dynamic_create(client, alias="gateway", auth_mode="rfc8693_obo", obo_scopes="s" * 2100)
 
@@ -1870,7 +1875,7 @@ def test_update_rejects_over_length_scopes(storage: SQLiteBackend) -> None:
     client = _make_client(
         storage, _make_registry(alias="local", model="m"), perms="admin.models,admin.mcp"
     )
-    client.app.state.oidc_config = make_oidc_config(obo_grant_profile="rfc8693")
+    oauth_context(client.app.state).oidc_config = make_oidc_config(obo_grant_profile="rfc8693")
 
     resp = client.put(
         "/v1/api/admin/model-definitions/m1",
@@ -1972,7 +1977,7 @@ def test_over_length_paste_that_cleans_under_cap_is_accepted(
     client = _make_client(
         storage, _make_registry(alias="local", model="m"), perms="admin.models,admin.mcp"
     )
-    client.app.state.oidc_config = make_oidc_config(obo_grant_profile="rfc8693")
+    oauth_context(client.app.state).oidc_config = make_oidc_config(obo_grant_profile="rfc8693")
     _stub_console_mcp(monkeypatch)
 
     resp = _dynamic_create(client, alias="gateway", auth_mode="rfc8693_obo", obo_scopes=raw)
@@ -2021,7 +2026,7 @@ def test_over_cap_residue_capped_rewrite_is_auth_gated(
     gated = _make_client(
         storage, _make_registry(alias="local", model="m"), perms="admin.models,admin.mcp"
     )
-    gated.app.state.oidc_config = make_oidc_config(obo_grant_profile="rfc8693")
+    oauth_context(gated.app.state).oidc_config = make_oidc_config(obo_grant_profile="rfc8693")
 
     resp = gated.put("/v1/api/admin/model-definitions/m1", json={"obo_scopes": capped})
 
@@ -2072,7 +2077,7 @@ def test_scopes_change_purges_the_alias_rows_never_a_siblings(
     client = _make_client(
         storage, _make_registry(alias="local", model="m"), perms="admin.models,admin.mcp"
     )
-    client.app.state.oidc_config = make_oidc_config(obo_grant_profile="rfc8693")
+    oauth_context(client.app.state).oidc_config = make_oidc_config(obo_grant_profile="rfc8693")
     _stub_console_mcp(monkeypatch)
 
     resp = client.put(
@@ -2110,7 +2115,7 @@ def test_alias_rename_purges_the_old_alias_rows(
     client = _make_client(
         storage, _make_registry(alias="local", model="m"), perms="admin.models,admin.mcp"
     )
-    client.app.state.oidc_config = make_oidc_config(obo_grant_profile="rfc8693")
+    oauth_context(client.app.state).oidc_config = make_oidc_config(obo_grant_profile="rfc8693")
     _stub_console_mcp(monkeypatch)
 
     resp = client.put("/v1/api/admin/model-definitions/m1", json={"alias": "renamed"})
@@ -2236,7 +2241,7 @@ def test_create_normalizes_tab_separated_scopes(
     client = _make_client(
         storage, _make_registry(alias="local", model="m"), perms="admin.models,admin.mcp"
     )
-    client.app.state.oidc_config = make_oidc_config(obo_grant_profile="rfc8693")
+    oauth_context(client.app.state).oidc_config = make_oidc_config(obo_grant_profile="rfc8693")
     _stub_console_mcp(monkeypatch)
 
     resp = _dynamic_create(
@@ -2815,7 +2820,7 @@ def test_keyless_reenable_of_dynamic_row_returns_503(
     client = _make_client(
         storage, _make_registry(alias="gw", model="m"), perms="admin.models,admin.mcp"
     )
-    client.app.state.mcp_token_store = None
+    oauth_context(client.app.state).token_store = None
 
     resp = client.put("/v1/api/admin/model-definitions/m1", json={"enabled": True})
 
@@ -2845,7 +2850,7 @@ def test_legacy_cross_profile_row_reenables_unchanged(
     client = _make_client(
         storage, _make_registry(alias="gw", model="m"), perms="admin.models,admin.mcp"
     )
-    client.app.state.oidc_config = make_oidc_config(obo_grant_profile="rfc8693")
+    oauth_context(client.app.state).oidc_config = make_oidc_config(obo_grant_profile="rfc8693")
     _stub_console_mcp(monkeypatch)
 
     off = client.put("/v1/api/admin/model-definitions/m1", json={"enabled": False})
@@ -2870,7 +2875,7 @@ def test_keyless_pure_disable_still_succeeds(storage: SQLiteBackend) -> None:
         obo_audience="api://approved",
     )
     client = _make_client(storage, _make_registry(alias="gw", model="m"))
-    client.app.state.mcp_token_store = None
+    oauth_context(client.app.state).token_store = None
 
     resp = client.put("/v1/api/admin/model-definitions/m1", json={"enabled": False})
 
@@ -3535,7 +3540,7 @@ def test_write_response_carries_registry_warning_on_keyless_refusal(
     client = _make_client(
         storage, _make_registry(alias="local", model="m"), perms="admin.models,admin.mcp"
     )
-    client.app.state.mcp_token_store = None
+    oauth_context(client.app.state).token_store = None
 
     resp = client.put(
         "/v1/api/admin/model-definitions/m2",
@@ -3584,7 +3589,7 @@ def test_delete_response_carries_registry_warning_on_keyless_refusal(
     _seed_model_def(storage, definition_id="m3", alias="victim", model="v")
     registry = _make_registry(alias="local", model="m", extras={"victim": "v"})
     client = _make_client(storage, registry)
-    client.app.state.mcp_token_store = None
+    oauth_context(client.app.state).token_store = None
 
     resp = client.delete("/v1/api/admin/model-definitions/m3")
 
@@ -3622,7 +3627,7 @@ def test_reload_response_carries_registry_warning_on_keyless_refusal(
     monkeypatch.setattr("turnstone.console.server._notify_nodes_model_reload", _noop_notify)
     registry = _make_registry(alias="local", model="m")
     client = _make_client(storage, registry)
-    client.app.state.mcp_token_store = None
+    oauth_context(client.app.state).token_store = None
 
     resp = client.post("/v1/api/admin/model-definitions/reload")
 
@@ -3784,8 +3789,8 @@ def test_refresh_does_not_swap_dynamic_alias_into_keyless_console(
     registry = _make_registry(alias="local", model="m")
     app_state = SimpleNamespace(
         coord_registry=registry,
-        mcp_token_store=None,
         coord_registry_error="",
+        oauth_context=OAuthContext(token_store=None),
     )
 
     with caplog.at_level("ERROR", logger="turnstone.console.server"):
@@ -3815,8 +3820,8 @@ def test_refresh_swaps_dynamic_alias_with_key_present(
     registry = _make_registry(alias="local", model="m")
     app_state = SimpleNamespace(
         coord_registry=registry,
-        mcp_token_store=MagicMock(),
         coord_registry_error="",
+        oauth_context=OAuthContext(token_store=MagicMock()),
     )
 
     server_module._refresh_coord_registry(app_state, storage)
@@ -3824,6 +3829,106 @@ def test_refresh_swaps_dynamic_alias_with_key_present(
     assert registry.has_alias("gw")
     assert registry.has_dynamic_auth()
     assert app_state.coord_registry_error == ""
+
+
+@pytest.mark.parametrize("host", ["node", "console"])
+def test_hot_enable_model_auth_rebinds_sessions_and_preserves_runtime(
+    storage: SQLiteBackend, monkeypatch: pytest.MonkeyPatch, host: str
+) -> None:
+    """A static-only host can gain model auth without creating or replacing MCP."""
+    import asyncio
+
+    import httpx
+
+    from tests.conftest import make_mcp_token_cipher
+    from turnstone import server
+    from turnstone.core.model_oauth import get_model_token_client
+    from turnstone.core.oauth import http as oauth_http
+    from turnstone.core.personas import PersonaSnapshot
+    from turnstone.core.session import ChatSession
+    from turnstone.core.token_store.store import TokenStore
+
+    _seed_model_def(storage, definition_id="m1", alias="local", model="m")
+    registry = _make_registry(alias="local", model="m")
+    context = OAuthContext(
+        storage=storage,
+        token_store=TokenStore(storage, make_mcp_token_cipher()),
+        oidc_config=make_oidc_config(),
+    )
+    state = SimpleNamespace(
+        registry=registry,
+        coord_registry=registry,
+        coord_registry_error="",
+        oauth_context=context,
+        mcp_client=None,
+    )
+    model_client = get_model_token_client(state)
+    assert context.runtime is None
+    client, model, *_ = registry.resolve_binding("local")
+    session = ChatSession(
+        client,
+        model,
+        MagicMock(),
+        None,
+        None,
+        1024,
+        30,
+        registry=registry,
+        model_alias="local",
+        persona_snapshot=PersonaSnapshot("no-mcp", "Test", None, False, False),
+    )
+    sessions = SimpleNamespace(list_all=lambda: [SimpleNamespace(session=session)])
+    state.workstreams = state.coord_mgr = sessions
+    posts: list[asyncio.AbstractEventLoop] = []
+
+    def post(request: httpx.Request) -> httpx.Response:
+        posts.append(asyncio.get_running_loop())
+        return httpx.Response(200, json={"access_token": "hot-token", "expires_in": 3600})
+
+    monkeypatch.setattr(
+        oauth_http,
+        "json_http_client",
+        lambda: httpx.AsyncClient(transport=httpx.MockTransport(post)),
+    )
+    monkeypatch.setattr("turnstone.core.storage._registry.get_storage", lambda: storage)
+
+    def reload() -> None:
+        if host == "node":
+            response = server.internal_model_reload(
+                SimpleNamespace(app=SimpleNamespace(state=state))
+            )
+            assert response.status_code == 200
+        else:
+            _refresh_coord_registry(state, storage)
+            assert not state.coord_registry_error
+
+    try:
+        _seed_model_def(
+            storage,
+            definition_id="m2",
+            alias="gw",
+            model="m",
+            auth_mode="entra_app",
+            obo_audience="api://approved",
+        )
+        reload()
+        assert session._model_token_client is model_client
+        assert state.mcp_client is None and session._mcp_client is None
+        assert context.runtime is None  # reload does not itself start an OAuth loop
+        assert session._model_backend_auth_token("gw") == "hot-token"
+        runtime = context.runtime
+        assert runtime is not None and posts == [runtime._loop]
+        storage.update_model_definition("m2", model="updated-model")
+        reload()
+        assert context.runtime is runtime
+        assert session._model_token_client is model_client
+        assert session._model_backend_auth_token("gw") == "hot-token"
+        assert posts == [runtime._loop]  # alias cache survives the model-only edit
+    finally:
+        session.close()
+        registry.shutdown()
+        if context.runtime is not None:
+            context.runtime.shutdown()
 
 
 def test_refresh_clears_key_refusal_after_recovery(storage: SQLiteBackend) -> None:
@@ -3841,8 +3946,8 @@ def test_refresh_clears_key_refusal_after_recovery(storage: SQLiteBackend) -> No
     registry = _make_registry(alias="local", model="m")
     app_state = SimpleNamespace(
         coord_registry=registry,
-        mcp_token_store=None,
         coord_registry_error="",
+        oauth_context=OAuthContext(token_store=None),
     )
 
     server_module._refresh_coord_registry(app_state, storage)
@@ -3866,7 +3971,7 @@ def test_no_sso_posture_refusal_names_sso_not_profile(
     client = _make_client(
         storage, _make_registry(alias="local", model="m"), perms="admin.models,admin.mcp"
     )
-    client.app.state.oidc_config = None
+    oauth_context(client.app.state).oidc_config = None
 
     resp = _dynamic_create(client)
 

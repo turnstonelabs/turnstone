@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Any
 
 from turnstone.core.adapters.interactive_adapter import InteractiveAdapter
 from turnstone.core.judge import JudgeConfig
+from turnstone.core.oauth.context import OAuthContext
 from turnstone.core.session import ChatSession, SessionUI
 from turnstone.core.session_manager import SessionManager
 from turnstone.core.workstream import (
@@ -1315,44 +1316,38 @@ def main() -> None:
     mcp_client = create_mcp_client(
         getattr(args, "mcp_config", None),
         storage=_get_storage(),
-        required=registry.has_dynamic_auth(),
         # Nodes maintain web users' grants; CLI sessions must not become a
         # second background refresher against a shared SQLite database.
         user_token_sweep=False,
     )
+    from types import SimpleNamespace
+
+    from turnstone.core.mcp_crypto import close_mcp_crypto_state, initialize_mcp_crypto_state
+    from turnstone.core.model_oauth import OAuthModelTokenClient
+    from turnstone.core.oauth.oidc import close_oidc_state, initialize_oidc_state, load_oidc_config
+    from turnstone.core.oauth.runtime import shutdown_oauth_runtime
+
+    cli_auth_storage = _get_storage()
+    cli_auth_state = SimpleNamespace(
+        auth_storage=cli_auth_storage,
+        registry=registry,
+        oauth_context=OAuthContext(storage=cli_auth_storage),
+    )
+    model_token_client = OAuthModelTokenClient(cli_auth_state.oauth_context)
+    if registry.has_dynamic_auth():
+        cli_auth_state.oauth_context.oidc_config = load_oidc_config()
+
+        # CLI model authentication has its own runtime, including installations
+        # without MCP servers. Browser/JWKS clients have no CLI consumers.
+        async def _initialize_cli_auth_state() -> None:
+            await initialize_oidc_state(cli_auth_state)
+            await close_oidc_state(cli_auth_state)
+
+        asyncio.run(_initialize_cli_auth_state())
+        initialize_mcp_crypto_state(cli_auth_state, node_id="cli")
     if mcp_client is not None:
-        cli_auth_storage = _get_storage()
         mcp_client.set_storage(cli_auth_storage)
-        if registry.has_dynamic_auth():
-            # The CLI has no ASGI lifespan, but app-identity model auth needs
-            # the same discovered OIDC config and encrypted token store as the
-            # server hosts. The mint HTTP client itself belongs to mcp-loop.
-            from types import SimpleNamespace
-
-            from turnstone.core.mcp_crypto import initialize_mcp_crypto_state
-            from turnstone.core.oauth.oidc import (
-                close_oidc_state,
-                initialize_oidc_state,
-                load_oidc_config,
-            )
-
-            cli_auth_state = SimpleNamespace(
-                auth_storage=cli_auth_storage,
-                oidc_config=load_oidc_config(),
-                registry=registry,
-            )
-
-            async def _initialize_cli_auth_state() -> None:
-                await initialize_oidc_state(cli_auth_state)
-                # Login/JWKS callbacks do not exist in the CLI. Close their
-                # client while retaining the discovered token endpoint.
-                await close_oidc_state(cli_auth_state)
-
-            asyncio.run(_initialize_cli_auth_state())
-            initialize_mcp_crypto_state(cli_auth_state, node_id="cli")
-            cli_auth_state.mcp_oauth_refresh_locks = {}
-            cli_auth_state.mcp_oauth_refresh_backoff = {}
-            mcp_client.set_app_state(cli_auth_state)
+        mcp_client.set_app_state(cli_auth_state)
 
     # apply_config() merges [judge] config.toml values into args as
     # Output_guard and redact_secrets default to True, enabling the heuristic
@@ -1427,6 +1422,7 @@ def main() -> None:
             agent_max_turns=args.agent_max_turns,
             tool_truncation=args.tool_truncation,
             mcp_client=mcp_client,
+            model_token_client=model_token_client,
             registry=registry,
             registry_generation=registry_generation,
             model_alias=effective_alias,
@@ -1600,6 +1596,8 @@ def main() -> None:
     if mcp_client:
         mcp_client.shutdown()
     registry.shutdown()
+    shutdown_oauth_runtime(cli_auth_state)
+    close_mcp_crypto_state(cli_auth_state)
 
     print("Goodbye.")
 

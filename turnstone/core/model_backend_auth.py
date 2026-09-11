@@ -7,7 +7,7 @@ two inputs for every model-backed role without importing session lifecycle.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any
 
 from turnstone.core.log import get_logger
 from turnstone.core.model_registry import (
@@ -18,6 +18,7 @@ from turnstone.core.model_registry import (
 )
 
 if TYPE_CHECKING:
+    from turnstone.core.model_oauth import ModelTokenClient
     from turnstone.core.model_registry import ModelConfig
 
 log = get_logger(__name__)
@@ -58,7 +59,7 @@ def resolve_model_backend_auth_token(
     *,
     principal_id: str,
     config_store: Any | None,
-    mint_client: Any | None,
+    mint_client: ModelTokenClient | None,
 ) -> str | None:
     """Resolve the dynamic credential for one pinned alias/config/principal.
 
@@ -119,7 +120,7 @@ def resolve_model_backend_auth_token(
                     f"App backend authentication unavailable for model alias {alias!r}"
                 )
             return None
-        return cast("str", token)
+        return token
 
     mint_scopes = getattr(config, "obo_scopes", "") if mode in SCOPES_MODEL_AUTH_MODES else ""
     grant_leg = MODEL_AUTH_MODE_PROFILES.get(mode)
@@ -155,4 +156,4 @@ def resolve_model_backend_auth_token(
                 f"Delegated backend authentication unavailable for model alias {alias!r}"
             )
         return None
-    return cast("str", token)
+    return token

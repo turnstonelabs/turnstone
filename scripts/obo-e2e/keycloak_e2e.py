@@ -56,8 +56,10 @@ from turnstone.core.model_oauth import (
     model_obo_cache_server,
     model_obo_cause_key,
 )
+from turnstone.core.oauth.context import OAuthContext
 from turnstone.core.oauth.http import json_http_client
 from turnstone.core.oauth.oidc import OIDCConfig
+from turnstone.core.oauth.runtime import OAuthRuntime, shutdown_oauth_runtime
 from turnstone.core.storage._sqlite import SQLiteBackend
 from turnstone.core.token_store.crypto import TokenCipher, TokenCipherConfig
 
@@ -92,6 +94,13 @@ class _CountingClient:
     def __init__(self, inner: httpx.AsyncClient) -> None:
         self._inner = inner
         self.posts = 0
+
+    @property
+    def is_closed(self) -> bool:
+        return self._inner.is_closed
+
+    async def aclose(self) -> None:
+        await self._inner.aclose()
 
     async def post(self, *args: Any, **kwargs: Any) -> httpx.Response:
         self.posts += 1
@@ -161,16 +170,12 @@ async def _run(cfg: dict[str, str], refresh_token: str) -> None:
 
     # The production client factory, so the run proves the wire posture the
     # console and nodes actually use (JSON-preferring Accept) against a live IdP.
-    inner = json_http_client(20.0)
-    client = _CountingClient(inner)
-    app_state = SimpleNamespace(
-        auth_storage=storage,
-        mcp_token_store=store,
-        oidc_config=oidc_config,
-        obo_http_client=client,
-        mcp_oauth_refresh_locks={},
-        mcp_oauth_refresh_backoff={},
-    )
+    context = OAuthContext(storage=storage, token_store=store, oidc_config=oidc_config)
+    runtime = OAuthRuntime(context, client_factory=lambda: _CountingClient(json_http_client(20.0)))
+    context.runtime = runtime
+    runtime.start()
+    client = context.http_client
+    app_state = SimpleNamespace(auth_storage=storage, oauth_context=context)
     try:
         # E1 — rfc8693 mint (refresh grant → token exchange) for audience A.
         r = await get_obo_access_token_classified(
@@ -336,7 +341,7 @@ async def _run(cfg: dict[str, str], refresh_token: str) -> None:
             f"kc_calls={client.posts - posts_before} (want 0) cause={m3_cause!r}",
         )
     finally:
-        await inner.aclose()
+        await asyncio.to_thread(shutdown_oauth_runtime, app_state)
 
 
 class _RecordingGet:

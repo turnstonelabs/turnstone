@@ -15,6 +15,7 @@ from cryptography.fernet import Fernet
 
 import turnstone.core.config as cfg_mod
 from turnstone.core.mcp_crypto import MCPTokenStore, initialize_mcp_crypto_state
+from turnstone.core.oauth.context import OAuthContext, oauth_context
 from turnstone.core.token_store.crypto import STARTUP_KEY_REQUIRED_HINT, TokenCipher
 
 
@@ -39,8 +40,8 @@ class TestInitializeMcpCryptoState:
         state = types.SimpleNamespace()
         initialize_mcp_crypto_state(state, node_id="n1")
 
-        assert state.mcp_token_cipher is None
-        assert state.mcp_token_store is None
+        assert oauth_context(state).cipher is None
+        assert oauth_context(state).token_store is None
 
     def test_startup_succeeds_with_key_and_oauth_user_row(
         self, backend, monkeypatch: pytest.MonkeyPatch
@@ -65,8 +66,8 @@ class TestInitializeMcpCryptoState:
         state = types.SimpleNamespace()
         initialize_mcp_crypto_state(state, node_id="n1")
 
-        assert isinstance(state.mcp_token_cipher, TokenCipher)
-        assert isinstance(state.mcp_token_store, MCPTokenStore)
+        assert isinstance(oauth_context(state).cipher, TokenCipher)
+        assert isinstance(oauth_context(state).token_store, MCPTokenStore)
 
     def test_startup_aborts_with_oauth_user_row_and_no_key(
         self, backend, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
@@ -129,7 +130,7 @@ class TestInitializeMcpCryptoState:
         # Bare state — exactly what the console has when this guard runs.
         state = types.SimpleNamespace()
         initialize_mcp_crypto_state(state, node_id="console")
-        assert state.mcp_token_store is None
+        assert oauth_context(state).token_store is None
 
     def test_startup_aborts_with_invalid_key(
         self, backend, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
@@ -159,11 +160,13 @@ class TestInitializeMcpCryptoState:
         _patch_security(monkeypatch, {})  # no encryption key
         # enabled=False models a boot-time discovery failure; capture opt-in on.
         state = types.SimpleNamespace(
-            oidc_config=types.SimpleNamespace(
-                enabled=False,
-                issuer="https://idp.example.com",
-                capture_user_credential=True,
-                discovery_retryable=True,
+            oauth_context=OAuthContext(
+                oidc_config=types.SimpleNamespace(
+                    enabled=False,
+                    issuer="https://idp.example.com",
+                    capture_user_credential=True,
+                    discovery_retryable=True,
+                )
             )
         )
         with (
@@ -183,13 +186,15 @@ class TestInitializeMcpCryptoState:
         first capture has somewhere encrypted to persist."""
         _patch_security(monkeypatch, {"mcp_token_encryption_key": Fernet.generate_key().decode()})
         state = types.SimpleNamespace(
-            oidc_config=types.SimpleNamespace(
-                enabled=False,
-                issuer="https://idp.example.com",
-                capture_user_credential=True,
-                discovery_retryable=True,
+            oauth_context=OAuthContext(
+                oidc_config=types.SimpleNamespace(
+                    enabled=False,
+                    issuer="https://idp.example.com",
+                    capture_user_credential=True,
+                    discovery_retryable=True,
+                )
             )
         )
         initialize_mcp_crypto_state(state, node_id="n1")
-        assert isinstance(state.mcp_token_cipher, TokenCipher)
-        assert isinstance(state.mcp_token_store, MCPTokenStore)
+        assert isinstance(oauth_context(state).cipher, TokenCipher)
+        assert isinstance(oauth_context(state).token_store, MCPTokenStore)

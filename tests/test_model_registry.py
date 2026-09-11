@@ -27,6 +27,7 @@ from turnstone.core.model_registry import (
     load_model_registry,
 )
 from turnstone.core.model_turn import resolve_model_binding
+from turnstone.core.oauth.context import OAuthContext, oauth_context
 from turnstone.core.providers import list_known_models
 from turnstone.core.trajectory import Turn
 from turnstone.core.workstream import WorkstreamKind
@@ -1421,7 +1422,7 @@ class TestReloadKeyGuard:
 
     def test_reload_refuses_dynamic_auth_without_key(self) -> None:
         reg = ModelRegistry(models=self._static_models(), default="a")
-        keyless = SimpleNamespace(mcp_token_store=None)
+        keyless = SimpleNamespace(oauth_context=OAuthContext(token_store=None))
         with pytest.raises(DynamicAuthKeyError, match="dynamic model auth"):
             reg.reload(self._dynamic_models(), "a", app_state=keyless)
         # Refusal must not mutate: the old registry keeps serving.
@@ -1436,7 +1437,7 @@ class TestReloadKeyGuard:
     def test_reload_all_static_permitted_keyless(self) -> None:
         # The guard fires on dynamic auth being present, not on a missing key.
         reg = ModelRegistry(models=self._static_models(), default="a")
-        keyless = SimpleNamespace(mcp_token_store=None)
+        keyless = SimpleNamespace(oauth_context=OAuthContext(token_store=None))
         reg.reload({"b": ModelConfig("b", "http://y/v1", "key", "m")}, "b", app_state=keyless)
         assert reg.has_alias("b")
 
@@ -1517,7 +1518,9 @@ class TestProfileMismatchVisibility:
 
         reg = ModelRegistry(models={"a": ModelConfig("a", "http://x/v1", "key", "m")}, default="a")
         state = keyed_app_state()
-        state.oidc_config = SimpleNamespace(enabled=True, obo_grant_profile="rfc8693")
+        oauth_context(state).oidc_config = SimpleNamespace(
+            enabled=True, obo_grant_profile="rfc8693"
+        )
         models = {
             "gw-entra": ModelConfig(
                 "gw-entra",
@@ -1562,7 +1565,9 @@ class TestProfileMismatchVisibility:
         ):
             caplog.clear()
             with caplog.at_level(logging.WARNING):
-                warn_profile_mismatched_aliases(models, SimpleNamespace(oidc_config=oidc))
+                warn_profile_mismatched_aliases(
+                    models, SimpleNamespace(oauth_context=OAuthContext(oidc_config=oidc))
+                )
             assert not [r for r in caplog.records if "will not mint" in r.getMessage()]
 
     def test_mismatch_warning_names_the_mode_correct_cause(
@@ -1579,7 +1584,9 @@ class TestProfileMismatchVisibility:
         from turnstone.core.model_registry import warn_profile_mismatched_aliases
 
         state = SimpleNamespace(
-            oidc_config=SimpleNamespace(enabled=True, obo_grant_profile="rfc8693")
+            oauth_context=OAuthContext(
+                oidc_config=SimpleNamespace(enabled=True, obo_grant_profile="rfc8693")
+            )
         )
         with caplog.at_level(logging.WARNING):
             warn_profile_mismatched_aliases(self._mixed_models(), state)

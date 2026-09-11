@@ -23,9 +23,11 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import mcp.types as mcp_types
 import pytest
 
+from tests._oauth_runtime_helpers import make_oauth_context
 from tests.conftest import (
     _drain_background,
     _run_on_loop,
@@ -34,6 +36,7 @@ from tests.conftest import (
 )
 from turnstone.core.mcp_client import MCPClientManager, PoolEntryState
 from turnstone.core.mcp_crypto import MCPTokenStore
+from turnstone.core.oauth.context import OAuthContext, TokenCoordination, oauth_context
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -98,10 +101,12 @@ def _seed_user_token(
 def _make_app_state(storage: SQLiteBackend, *, cipher: Any) -> SimpleNamespace:
     return SimpleNamespace(
         auth_storage=storage,
-        mcp_token_store=MCPTokenStore(storage, cipher, node_id="test"),
-        obo_http_client=MagicMock(),
-        mcp_oauth_refresh_locks={},
+        mcp_oauth_coordination=TokenCoordination(),
         mcp_oauth_metadata_cache={},
+        oauth_context=make_oauth_context(
+            token_store=MCPTokenStore(storage, cipher, node_id="test"),
+            http_client=MagicMock(spec=httpx.AsyncClient),
+        ),
     )
 
 
@@ -713,7 +718,7 @@ class TestEviction:
         only a session that CHANGED since the observation (a later
         successful connect) proves the grant lives again."""
         mgr, loop, _ = running_loop_mgr
-        mgr._app_state = SimpleNamespace(mcp_token_store=object())
+        mgr._app_state = SimpleNamespace(oauth_context=OAuthContext(token_store=object()))
         mgr._storage = object()
         mgr._oauth_user_server_names = {"pool-srv"}
         key = ("u0", "pool-srv")
@@ -764,7 +769,7 @@ class TestEviction:
         no catalog — a catalog appearing later implies a lookup that
         succeeded after this one failed."""
         mgr, loop, _ = running_loop_mgr
-        mgr._app_state = SimpleNamespace(mcp_token_store=object())
+        mgr._app_state = SimpleNamespace(oauth_context=OAuthContext(token_store=object()))
         mgr._storage = object()
         dead = SimpleNamespace(kind="missing", token=None)
         key = ("u0", "pool-srv")
@@ -1091,7 +1096,7 @@ class TestEviction:
         # No app_state at all → not authoritative.
         assert mgr._lookup_grant_dead(missing) is False
         # Token store present but storage unwired → not authoritative.
-        mgr._app_state = SimpleNamespace(mcp_token_store=object())
+        mgr._app_state = SimpleNamespace(oauth_context=OAuthContext(token_store=object()))
         mgr._storage = None
         assert mgr._lookup_grant_dead(missing) is False
         # Fully wired → authoritative.
@@ -1106,7 +1111,7 @@ class TestEviction:
         )
         assert mgr._lookup_grant_dead(SimpleNamespace(kind="decrypt_failure", token=None)) is False
         # Token store unconfigured on a wired app_state → not authoritative.
-        mgr._app_state = SimpleNamespace(mcp_token_store=None)
+        mgr._app_state = SimpleNamespace(oauth_context=OAuthContext(token_store=None))
         assert mgr._lookup_grant_dead(missing) is False
 
     def test_status_reports_cooled_catalog_as_idle(self, running_loop_mgr) -> None:
@@ -1445,7 +1450,7 @@ class TestDispatchStateMachine:
                 key_fingerprints_attempted=("aabbccdd",),
             )
 
-        state.mcp_token_store.get_user_token = _raise
+        oauth_context(state).token_store.get_user_token = _raise
 
         with pytest.raises(RuntimeError) as exc_info:
             mgr.call_tool_sync(
@@ -1471,8 +1476,8 @@ class TestDispatchStateMachine:
         _seed_user_token(storage, cipher, expires_in_seconds=-1000)
         state = self._wire_pool(mgr, storage, cipher)
         # Drop the refresh token to force the no-refresh-token branch.
-        state.mcp_token_store.delete_user_token("user-1", "pool-srv")
-        state.mcp_token_store.create_user_token(
+        oauth_context(state).token_store.delete_user_token("user-1", "pool-srv")
+        oauth_context(state).token_store.create_user_token(
             "user-1",
             "pool-srv",
             access_token="access-aaa",
@@ -2021,7 +2026,7 @@ class TestOboPriming:
         # The priming pre-check reads oidc_config.issuer and requires a stored
         # credential row (existence only, no decrypt) before running any
         # per-server obo work.
-        app_state.oidc_config = SimpleNamespace(issuer="https://idp.example.com")
+        oauth_context(app_state).oidc_config = SimpleNamespace(issuer="https://idp.example.com")
         mgr.set_app_state(app_state)
         storage.upsert_oidc_user_credential(
             "user-1", "https://idp.example.com", refresh_token_ct=b"ct"
@@ -2163,7 +2168,7 @@ class TestOboPriming:
         cipher = make_mcp_token_cipher()
         mgr.set_storage(storage)
         app_state = _make_app_state(storage, cipher=cipher)
-        app_state.oidc_config = SimpleNamespace(issuer="https://idp.example.com")
+        oauth_context(app_state).oidc_config = SimpleNamespace(issuer="https://idp.example.com")
         mgr.set_app_state(app_state)
         storage.create_mcp_server(
             server_id="srv-obo",
@@ -2202,7 +2207,7 @@ class TestOboPriming:
         cipher = make_mcp_token_cipher()
         mgr.set_storage(storage)
         app_state = _make_app_state(storage, cipher=cipher)
-        app_state.oidc_config = SimpleNamespace(issuer="https://idp.example.com")
+        oauth_context(app_state).oidc_config = SimpleNamespace(issuer="https://idp.example.com")
         mgr.set_app_state(app_state)
         storage.create_mcp_server(
             server_id="srv-obo",
@@ -2250,7 +2255,7 @@ class TestOboPriming:
         cipher = make_mcp_token_cipher()
         mgr.set_storage(storage)
         app_state = _make_app_state(storage, cipher=cipher)
-        app_state.oidc_config = SimpleNamespace(issuer="https://idp.example.com")
+        oauth_context(app_state).oidc_config = SimpleNamespace(issuer="https://idp.example.com")
         mgr.set_app_state(app_state)
         storage.create_mcp_server(
             server_id="srv-obo",

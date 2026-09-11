@@ -201,6 +201,32 @@ def _no_leaked_threads(request: pytest.FixtureRequest) -> Iterator[None]:
         )
 
 
+@pytest.fixture(autouse=True)
+def _close_oauth_runtimes(
+    monkeypatch: pytest.MonkeyPatch, _no_leaked_threads: None
+) -> Iterator[None]:
+    """Own and join OAuth runtimes created by adapter fixtures or lazy startup."""
+    from tests._oauth_runtime_helpers import adapter_runner
+    from turnstone.core.oauth.runtime import OAuthRuntime
+
+    runtimes: list[OAuthRuntime] = []
+    start = OAuthRuntime.start
+
+    def tracked_start(runtime: OAuthRuntime) -> None:
+        if runtime not in runtimes:
+            runtimes.append(runtime)
+        start(runtime)
+
+    monkeypatch.setattr(OAuthRuntime, "start", tracked_start)
+    runner = asyncio.Runner()
+    token = adapter_runner.set(runner)
+    yield
+    for runtime in reversed(runtimes):
+        runtime.shutdown()
+    runner.close()
+    adapter_runner.reset(token)
+
+
 def make_mcp_token_cipher() -> TokenCipher:
     """Build a single-key MCP token cipher for tests.
 

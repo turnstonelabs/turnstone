@@ -21,8 +21,10 @@ import threading
 from typing import Any
 from unittest.mock import patch
 
+import httpx
 import pytest
 
+from tests._oauth_runtime_helpers import make_oauth_context
 from tests.conftest import make_mcp_token_cipher
 from turnstone.core.mcp_client import (
     _PENDING_CONSENT_PERSIST_CODES,
@@ -31,6 +33,7 @@ from turnstone.core.mcp_client import (
 )
 from turnstone.core.mcp_crypto import MCPTokenStore
 from turnstone.core.mcp_oauth import TokenLookupResult
+from turnstone.core.oauth.context import TokenCoordination
 
 # ---------------------------------------------------------------------------
 # Helper-level unit tests (cheap, no event loop)
@@ -140,10 +143,12 @@ def _wire_mgr(mgr: MCPClientManager, backend: Any) -> None:
 
     app_state = SimpleNamespace(
         auth_storage=backend,
-        mcp_token_store=MCPTokenStore(backend, cipher, node_id="test"),
-        obo_http_client=MagicMock(),
-        mcp_oauth_refresh_locks={},
+        mcp_oauth_coordination=TokenCoordination(),
         mcp_oauth_metadata_cache={},
+        oauth_context=make_oauth_context(
+            token_store=MCPTokenStore(backend, cipher, node_id="test"),
+            http_client=MagicMock(spec=httpx.AsyncClient),
+        ),
     )
     mgr.set_storage(backend)
     mgr.set_app_state(app_state)

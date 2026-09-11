@@ -310,6 +310,7 @@ if TYPE_CHECKING:
     from turnstone.core.healthcheck import BackendHealthTracker, HealthTrackerRegistry
     from turnstone.core.judge import IntentJudge, JudgeConfig
     from turnstone.core.mcp_client import MCPClientManager
+    from turnstone.core.model_oauth import ModelTokenClient
     from turnstone.core.model_registry import ModelConfig, ModelRegistry
     from turnstone.core.model_turn import (
         ModelCapabilities,
@@ -3084,6 +3085,7 @@ class ChatSession:
         agent_max_turns: int = -1,
         tool_truncation: int = 0,
         mcp_client: MCPClientManager | None = None,
+        model_token_client: ModelTokenClient | None = None,
         registry: ModelRegistry | None = None,
         model_alias: str | None = None,
         registry_generation: int | None = None,
@@ -3691,9 +3693,9 @@ class ChatSession:
         # refresh callbacks stay inert (they all guard on _mcp_client).
         # Task agents keep their native tools; only the MCP surface closes.
         # Model authentication is host infrastructure, not an MCP tool-surface
-        # capability. Preserve the raw manager even when the persona gate hides
-        # MCP tools, resources, and prompts or a resume drops that surface.
-        self._mcp_mint_client = mcp_client
+        # capability. Its independent client remains available when the persona
+        # hides MCP tools, resources and prompts or a resume drops that surface.
+        self._model_token_client = model_token_client
         self._mcp_client = mcp_client if self._persona_mcp else None
         # True when a real client was withheld by the persona gate (as
         # opposed to no MCP in the deployment at all).  Mid-session
@@ -5599,9 +5601,9 @@ class ChatSession:
             self._set_session_tools([])
             self._render_agent_tool_descriptions()
 
-    def set_model_mint_client(self, client: MCPClientManager | None) -> None:
-        """Update the ungated model-auth manager after a runtime registry reload."""
-        self._mcp_mint_client = client
+    def set_model_mint_client(self, client: ModelTokenClient | None) -> None:
+        """Update model authentication independently of the persona's MCP surface."""
+        self._model_token_client = client
 
     def _handle_mcp_refresh(self, arg: str) -> None:
         """Handle ``/mcp refresh [server]``."""
@@ -12231,7 +12233,7 @@ class ChatSession:
             cfg,
             principal_id=principal_id,
             config_store=self._config_store,
-            mint_client=self._mcp_mint_client,
+            mint_client=self._model_token_client,
         )
 
     def _tool_prepare_principal_id(self) -> str:

@@ -34,6 +34,7 @@ import sqlalchemy as sa
 from alembic import command
 from alembic.config import Config
 
+from tests._oauth_runtime_helpers import make_oauth_context
 from tests._oidc_test_helpers import (
     ISSUER,
     TOKEN_ENDPOINT,
@@ -53,6 +54,7 @@ from turnstone.core.model_registry import (
     load_model_registry,
 )
 from turnstone.core.model_turn import ModelLane, resolve_model_binding
+from turnstone.core.oauth.context import TokenCoordination, oauth_context
 from turnstone.core.session import BackendAuthUnavailableError, ChatSession
 
 if TYPE_CHECKING:
@@ -406,10 +408,12 @@ def _make_app_state(
 ) -> SimpleNamespace:
     return SimpleNamespace(
         auth_storage=storage,
-        mcp_token_store=MCPTokenStore(storage, make_mcp_token_cipher(), node_id="test"),
-        oidc_config=oidc_config,
-        obo_http_client=http_client,
-        mcp_oauth_refresh_locks={},
+        mcp_oauth_coordination=TokenCoordination(),
+        oauth_context=make_oauth_context(
+            token_store=MCPTokenStore(storage, make_mcp_token_cipher(), node_id="test"),
+            oidc_config=oidc_config,
+            http_client=http_client,
+        ),
     )
 
 
@@ -428,7 +432,9 @@ def _mk_response(status_code: int = 200, json_body: Any = None) -> MagicMock:
 
 
 def _seed_credential(state: SimpleNamespace, *, refresh_token: str = "rt-1") -> None:
-    state.mcp_token_store.upsert_oidc_credential(USER, ISSUER, refresh_token=refresh_token)
+    oauth_context(state).token_store.upsert_oidc_credential(
+        USER, ISSUER, refresh_token=refresh_token
+    )
 
 
 def _mint(state: SimpleNamespace, **kwargs: Any) -> Any:
@@ -449,8 +455,8 @@ class TestMintOboAccessToken:
         )
         state = _make_app_state(storage, http_client=client, oidc_config=make_oidc_config())
         _seed_credential(state)
-        state.mcp_token_store.get_user_token = MagicMock(  # type: ignore[method-assign]
-            wraps=state.mcp_token_store.get_user_token
+        oauth_context(state).token_store.get_user_token = MagicMock(
+            wraps=oauth_context(state).token_store.get_user_token
         )
 
         token = _mint(state)
@@ -467,12 +473,12 @@ class TestMintOboAccessToken:
             "client_secret": "csecret",
             "scope": f"{AUDIENCE}/.default",
         }
-        reads_after_mint = state.mcp_token_store.get_user_token.call_count
-        # Second call serves the mcp-loop memo — no DB decrypt or IdP trip.
+        reads_after_mint = oauth_context(state).token_store.get_user_token.call_count
+        # Second call serves the OAuth-loop memo — no DB decrypt or IdP trip.
         token2 = _mint(state)
         assert token2 == "at-minted"
         assert client.post.call_count == 1
-        assert state.mcp_token_store.get_user_token.call_count == reads_after_mint
+        assert oauth_context(state).token_store.get_user_token.call_count == reads_after_mint
 
     def test_minted_token_cached_in_db_and_shared_across_nodes(
         self, storage: SQLiteBackend
@@ -485,12 +491,14 @@ class TestMintOboAccessToken:
         )
         node_a = SimpleNamespace(
             auth_storage=storage,
-            mcp_token_store=MCPTokenStore(storage, cipher, node_id="A"),
-            oidc_config=make_oidc_config(),
-            obo_http_client=client,
-            mcp_oauth_refresh_locks={},
+            mcp_oauth_coordination=TokenCoordination(),
+            oauth_context=make_oauth_context(
+                token_store=MCPTokenStore(storage, cipher, node_id="A"),
+                oidc_config=make_oidc_config(),
+                http_client=client,
+            ),
         )
-        node_a.mcp_token_store.upsert_oidc_credential(USER, ISSUER, refresh_token="rt-1")
+        oauth_context(node_a).token_store.upsert_oidc_credential(USER, ISSUER, refresh_token="rt-1")
 
         assert _mint(node_a) == "at-minted"
         assert client.post.call_count == 1
@@ -500,7 +508,7 @@ class TestMintOboAccessToken:
         cache_server = f"__model_obo__:{MODEL_ALIAS}"
         raw = storage.get_oauth_token(USER, cache_server)
         assert raw is not None and raw["refresh_token_ct"] is None
-        plain = node_a.mcp_token_store.get_user_token(USER, cache_server)
+        plain = oauth_context(node_a).token_store.get_user_token(USER, cache_server)
         assert plain is not None
         assert plain["access_token"] == "at-minted"
         assert plain["audience"] == AUDIENCE
@@ -509,10 +517,12 @@ class TestMintOboAccessToken:
         # new IdP round-trip — no needless per-worker re-mint.
         node_b = SimpleNamespace(
             auth_storage=storage,
-            mcp_token_store=MCPTokenStore(storage, cipher, node_id="B"),
-            oidc_config=make_oidc_config(),
-            obo_http_client=client,
-            mcp_oauth_refresh_locks={},
+            mcp_oauth_coordination=TokenCoordination(),
+            oauth_context=make_oauth_context(
+                token_store=MCPTokenStore(storage, cipher, node_id="B"),
+                oidc_config=make_oidc_config(),
+                http_client=client,
+            ),
         )
         assert _mint(node_b) == "at-minted"
         assert client.post.call_count == 1
@@ -528,7 +538,7 @@ class TestMintOboAccessToken:
         _seed_credential(state, refresh_token="rt-1")
 
         assert _mint(state) == "at"
-        cred = state.mcp_token_store.get_oidc_credential(USER, ISSUER)
+        cred = oauth_context(state).token_store.get_oidc_credential(USER, ISSUER)
         assert cred is not None and cred["refresh_token"] == "rt-2"
 
     def test_force_refresh_bypasses_cache(self, storage: SQLiteBackend) -> None:
@@ -603,7 +613,9 @@ class TestMintOboAccessToken:
         )
         state = _make_app_state(storage, http_client=client, oidc_config=make_oidc_config())
         # bob has a captured credential; alice does not.
-        state.mcp_token_store.upsert_oidc_credential("bob", ISSUER, refresh_token="rt-bob")
+        oauth_context(state).token_store.upsert_oidc_credential(
+            "bob", ISSUER, refresh_token="rt-bob"
+        )
 
         async def _mint_as(user: str) -> Any:
             return await mint_obo_access_token(
@@ -635,7 +647,9 @@ class TestMintOboAccessToken:
             return_value=_mk_response(200, {"access_token": "at-bob", "expires_in": 3600})
         )
         state = _make_app_state(storage, http_client=client, oidc_config=make_oidc_config())
-        state.mcp_token_store.upsert_oidc_credential("bob", ISSUER, refresh_token="rt-bob")
+        oauth_context(state).token_store.upsert_oidc_credential(
+            "bob", ISSUER, refresh_token="rt-bob"
+        )
 
         async def _mint_as(user: str) -> Any:
             return await mint_obo_access_token(
@@ -697,7 +711,7 @@ class TestMintOboAccessToken:
         client = MagicMock(spec=httpx.AsyncClient)
         client.post = AsyncMock()
         state = _make_app_state(storage, http_client=client, oidc_config=make_oidc_config())
-        state.mcp_token_store = None
+        oauth_context(state).token_store = None
         with caplog.at_level(logging.WARNING):
             assert _mint(state) is None
         matching = [
@@ -733,7 +747,7 @@ class TestMintOboAccessToken:
         # A failed mint falls back to the static credential (None), and never
         # auto-deletes the shared credential.
         assert _mint(state) is None
-        assert state.mcp_token_store.get_oidc_credential(USER, ISSUER) is not None
+        assert oauth_context(state).token_store.get_oidc_credential(USER, ISSUER) is not None
         # The audience-scoped cooldown suppresses a dead-grant retry storm.
         assert _mint(state) is None
         assert client.post.call_count == 1
@@ -767,7 +781,9 @@ class TestMintOboAccessToken:
         assert exchange.kwargs["data"]["scope"] == "aud-gw openid"
         assert exchange.kwargs["data"]["audience"] == AUDIENCE
 
-        plain = state.mcp_token_store.get_user_token(USER, model_obo_cache_server(MODEL_ALIAS))
+        plain = oauth_context(state).token_store.get_user_token(
+            USER, model_obo_cache_server(MODEL_ALIAS)
+        )
         assert plain is not None
         assert plain["access_token"] == "exchanged-at"
         assert plain["scopes"] == "aud-gw openid"
@@ -811,7 +827,9 @@ class TestMintOboAccessToken:
         # one identity-keyed row now holds the narrow bearer.
         assert _mint(state, scopes="aud-gw", grant_leg="rfc8693") == "narrow-at"
         assert client.post.call_count == 4
-        plain = state.mcp_token_store.get_user_token(USER, model_obo_cache_server(MODEL_ALIAS))
+        plain = oauth_context(state).token_store.get_user_token(
+            USER, model_obo_cache_server(MODEL_ALIAS)
+        )
         assert plain is not None
         assert plain["access_token"] == "narrow-at"
         assert plain["scopes"] == "aud-gw"
@@ -1158,7 +1176,7 @@ class TestMintAppAccessToken:
         )
         state = _make_app_state(storage, http_client=client, oidc_config=make_oidc_config())
         # The credential store is empty; the app grant still succeeds.
-        assert state.mcp_token_store.get_oidc_credential(USER, ISSUER) is None
+        assert oauth_context(state).token_store.get_oidc_credential(USER, ISSUER) is None
         assert _mint_app(state) == "app-at"
 
     def test_oidc_disabled_returns_none_no_http(self, storage: SQLiteBackend) -> None:
@@ -1234,7 +1252,9 @@ class TestMintAppAccessToken:
         # stripped audience column.
         raw = storage.get_oauth_token("__app__", model_app_cache_server("gw-app"))
         assert raw is not None
-        plain = state.mcp_token_store.get_user_token("__app__", model_app_cache_server("gw-app"))
+        plain = oauth_context(state).token_store.get_user_token(
+            "__app__", model_app_cache_server("gw-app")
+        )
         assert plain is not None and plain["audience"] == AUDIENCE
 
 
@@ -1257,7 +1277,7 @@ def _fake_session(
     )
     return SimpleNamespace(
         _registry=registry,
-        _mcp_mint_client=mcp,
+        _model_token_client=mcp,
         _mcp_effective_user_id=user_id,
         _config_store=None,
     )
@@ -1295,7 +1315,7 @@ class TestModelOboToken:
         assert ChatSession._model_backend_auth_token(sess, "tf") == "minted-jwt"
         # The mode pins its grant leg; entra_obo never forwards scopes. The
         # owning alias rides along — the mint's cache and cause key.
-        sess._mcp_mint_client.mint_model_obo_token_sync.assert_called_once_with(
+        sess._model_token_client.mint_model_obo_token_sync.assert_called_once_with(
             user_id=USER, alias="tf", audience=AUDIENCE, scopes="", grant_leg="entra"
         )
 
@@ -1303,7 +1323,7 @@ class TestModelOboToken:
         cfg = self._obo_cfg(alias="tf-kc", auth_mode="rfc8693_obo", obo_scopes="aud-gw openid")
         sess = _fake_session(registry=_registry_with(cfg), user_id=USER, mint_token="minted-jwt")
         assert ChatSession._model_backend_auth_token(sess, "tf-kc") == "minted-jwt"
-        sess._mcp_mint_client.mint_model_obo_token_sync.assert_called_once_with(
+        sess._model_token_client.mint_model_obo_token_sync.assert_called_once_with(
             user_id=USER,
             alias="tf-kc",
             audience=AUDIENCE,
@@ -1318,7 +1338,7 @@ class TestModelOboToken:
         sess = _fake_session(registry=_registry_with(cfg), user_id=None, mint_token="never")
         with pytest.raises(BackendAuthUnavailableError):
             ChatSession._model_backend_auth_token(sess, "tf-kc")
-        sess._mcp_mint_client.mint_model_obo_token_sync.assert_not_called()
+        sess._model_token_client.mint_model_obo_token_sync.assert_not_called()
 
     def test_rfc8693_fallback_warn_reads_scoped_cause(
         self, storage: SQLiteBackend, caplog: pytest.LogCaptureFixture
@@ -1362,7 +1382,7 @@ class TestModelOboToken:
         cfg = self._obo_cfg(obo_scopes="stale-scope")
         sess = _fake_session(registry=_registry_with(cfg), user_id=USER, mint_token="minted-jwt")
         assert ChatSession._model_backend_auth_token(sess, "tf") == "minted-jwt"
-        sess._mcp_mint_client.mint_model_obo_token_sync.assert_called_once_with(
+        sess._model_token_client.mint_model_obo_token_sync.assert_called_once_with(
             user_id=USER, alias="tf", audience=AUDIENCE, scopes="", grant_leg="entra"
         )
 
@@ -1411,7 +1431,9 @@ class TestModelOboToken:
         client.post = AsyncMock()
         state = _make_app_state(storage, http_client=client, oidc_config=make_oidc_config())
         _seed_credential(state)
-        state.mcp_token_store = MCPTokenStore(storage, make_mcp_token_cipher(), node_id="B")
+        oauth_context(state).token_store = MCPTokenStore(
+            storage, make_mcp_token_cipher(), node_id="B"
+        )
 
         # Aliased and legged like the entra_obo dispatch below, so the
         # record lands on the key its heartbeat reads.
@@ -1491,7 +1513,7 @@ class TestModelOboToken:
             ),
             user_id=USER,
         )
-        session._mcp_mint_client = SimpleNamespace(
+        session._model_token_client = SimpleNamespace(
             mint_model_obo_token_sync=MagicMock(return_value="minted-jwt"),
             mint_app_token_sync=MagicMock(return_value="app-jwt"),
         )
@@ -1507,14 +1529,14 @@ class TestModelOboToken:
         assert output_resolver == session._model_backend_auth_token
         assert intent_resolver is not None
         assert intent_resolver("tf", intent_judge._lane.backend_auth_config) == "minted-jwt"
-        session._mcp_mint_client.mint_model_obo_token_sync.assert_called_once_with(
+        session._model_token_client.mint_model_obo_token_sync.assert_called_once_with(
             user_id=USER,
             alias="tf",
             audience=AUDIENCE,
             scopes="",
             grant_leg="entra",
         )
-        session._mcp_mint_client.mint_app_token_sync.assert_not_called()
+        session._model_token_client.mint_app_token_sync.assert_not_called()
 
     def test_main_lane_carries_backend_auth_resolver(self) -> None:
         """The main loop's lane wires the session's mint resolver; the
@@ -1621,14 +1643,14 @@ class TestModelOboToken:
         assert lane.backend_auth_resolver is not None
         assert lane.backend_auth_config is old_cfg
         assert lane.backend_auth_resolver(lane.alias, lane.backend_auth_config) == "old-jwt"
-        sess._mcp_mint_client.mint_model_obo_token_sync.assert_called_once_with(
+        sess._model_token_client.mint_model_obo_token_sync.assert_called_once_with(
             user_id=USER,
             alias="tf",
             audience="api://old-gateway",
             scopes="old.scope openid",
             grant_leg="rfc8693",
         )
-        sess._mcp_mint_client.mint_app_token_sync.assert_not_called()
+        sess._model_token_client.mint_app_token_sync.assert_not_called()
 
     def test_fail_closed_refusal_never_enters_model_fallback_chain(self) -> None:
         sess = MagicMock()
@@ -1656,14 +1678,14 @@ class TestModelOboToken:
         reg = _registry_with(static_cfg)
         sess = _fake_session(registry=reg, user_id=USER, mint_token="unused")
         assert ChatSession._model_backend_auth_token(sess, "plain") is None
-        sess._mcp_mint_client.mint_model_obo_token_sync.assert_not_called()
+        sess._model_token_client.mint_model_obo_token_sync.assert_not_called()
 
     def test_no_user_context_refuses_and_never_mints(self) -> None:
         reg = _registry_with(self._obo_cfg())
         sess = _fake_session(registry=reg, user_id="", mint_token="unused")
         with pytest.raises(BackendAuthUnavailableError):
             ChatSession._model_backend_auth_token(sess, "tf")
-        sess._mcp_mint_client.mint_model_obo_token_sync.assert_not_called()
+        sess._model_token_client.mint_model_obo_token_sync.assert_not_called()
 
     def test_failed_mint_falls_back_to_static(self) -> None:
         reg = _registry_with(self._obo_cfg())
@@ -1690,7 +1712,7 @@ class TestModelOboToken:
     def test_missing_mint_host_without_real_static_key_always_refuses(self) -> None:
         reg = _registry_with(self._obo_cfg(api_key=""))
         sess = _fake_session(registry=reg, user_id=USER, mint_token=None)
-        sess._mcp_mint_client = None
+        sess._model_token_client = None
 
         with pytest.raises(BackendAuthUnavailableError):
             ChatSession._model_backend_auth_token(sess, "tf")
@@ -1711,7 +1733,7 @@ class TestModelOboToken:
         sess = _fake_session(registry=reg, user_id=USER, mint_token="never")
         with pytest.raises(BackendAuthUnavailableError, match="grant-profile pairing"):
             ChatSession._model_backend_auth_token(sess, "tf")
-        sess._mcp_mint_client.mint_model_obo_token_sync.assert_not_called()
+        sess._model_token_client.mint_model_obo_token_sync.assert_not_called()
 
     # -- entra_app (app-identity / client-credentials) --------------------------
 
@@ -1732,10 +1754,10 @@ class TestModelOboToken:
         reg = _registry_with(self._app_cfg())
         sess = _fake_session(registry=reg, user_id="", mint_token=None, app_token="app-jwt")
         assert ChatSession._model_backend_auth_token(sess, "tf") == "app-jwt"
-        sess._mcp_mint_client.mint_app_token_sync.assert_called_once_with(
+        sess._model_token_client.mint_app_token_sync.assert_called_once_with(
             alias="tf", audience=AUDIENCE
         )
-        sess._mcp_mint_client.mint_model_obo_token_sync.assert_not_called()
+        sess._model_token_client.mint_model_obo_token_sync.assert_not_called()
 
     def test_app_alias_uses_app_identity_even_with_user(self) -> None:
         # A user is present, but entra_app deliberately uses the app identity,
@@ -1743,7 +1765,7 @@ class TestModelOboToken:
         reg = _registry_with(self._app_cfg())
         sess = _fake_session(registry=reg, user_id=USER, mint_token="obo-jwt", app_token="app-jwt")
         assert ChatSession._model_backend_auth_token(sess, "tf") == "app-jwt"
-        sess._mcp_mint_client.mint_model_obo_token_sync.assert_not_called()
+        sess._model_token_client.mint_model_obo_token_sync.assert_not_called()
 
     def test_app_failed_mint_falls_back_to_static(self) -> None:
         reg = _registry_with(self._app_cfg())
@@ -1767,31 +1789,24 @@ class TestMintBridgeContractViolation:
         without the exchange leg pinned) and must surface at ERROR — while
         still returning the fallback-eligible None."""
         import logging
-        import threading
 
-        from turnstone.core import mcp_client as mcp_client_module
-        from turnstone.core.model_oauth import MintDispatchContractError
+        from turnstone.core.model_oauth import MintDispatchContractError, OAuthModelTokenClient
+        from turnstone.core.oauth.context import OAuthContext
+        from turnstone.core.oauth.runtime import OAuthRuntime
 
         async def _raiser(**_kwargs: Any) -> str | None:
             raise MintDispatchContractError(
                 "mint_obo_access_token: scopes require grant_leg='rfc8693'"
             )
 
-        monkeypatch.setattr(mcp_client_module, "mint_obo_access_token", _raiser)
-
-        loop = asyncio.new_event_loop()
-        thread = threading.Thread(target=loop.run_forever, daemon=True)
-        thread.start()
-        try:
-            stub = SimpleNamespace(_loop=loop, _app_state=object())
-            with caplog.at_level(logging.DEBUG):
-                token = mcp_client_module.MCPClientManager.mint_model_obo_token_sync(
-                    stub, user_id=USER, alias=MODEL_ALIAS, audience=AUDIENCE, scopes="aud-gw"
-                )
-        finally:
-            loop.call_soon_threadsafe(loop.stop)
-            thread.join(timeout=5)
-            loop.close()
+        monkeypatch.setattr(model_oauth, "_mint_obo_access_token", _raiser)
+        context = OAuthContext()
+        context.runtime = OAuthRuntime(context)
+        context.runtime.start()
+        with caplog.at_level(logging.DEBUG):
+            token = OAuthModelTokenClient(context).mint_model_obo_token_sync(
+                user_id=USER, alias=MODEL_ALIAS, audience=AUDIENCE, scopes="aud-gw"
+            )
 
         assert token is None
         errors = [

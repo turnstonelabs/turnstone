@@ -34,6 +34,7 @@ from unittest.mock import AsyncMock, MagicMock
 import httpx
 import pytest
 
+from tests._oauth_runtime_helpers import make_oauth_context
 from tests.conftest import _run_on_loop, make_mcp_token_cipher, stop_loop_thread
 from turnstone.core.mcp_client import (
     MCPClientManager,
@@ -41,6 +42,7 @@ from turnstone.core.mcp_client import (
     _make_capturing_http_factory,
 )
 from turnstone.core.mcp_crypto import MCPTokenStore
+from turnstone.core.oauth.context import TokenCoordination
 
 if TYPE_CHECKING:
     from turnstone.core.storage._sqlite import SQLiteBackend
@@ -103,10 +105,12 @@ def _seed_user_token(
 def _make_app_state(storage: SQLiteBackend, *, cipher: Any) -> SimpleNamespace:
     return SimpleNamespace(
         auth_storage=storage,
-        mcp_token_store=MCPTokenStore(storage, cipher, node_id="test"),
-        obo_http_client=MagicMock(),
-        mcp_oauth_refresh_locks={},
+        mcp_oauth_coordination=TokenCoordination(),
         mcp_oauth_metadata_cache={},
+        oauth_context=make_oauth_context(
+            token_store=MCPTokenStore(storage, cipher, node_id="test"),
+            http_client=MagicMock(spec=httpx.AsyncClient),
+        ),
     )
 
 
@@ -1747,9 +1751,9 @@ class TestPoolPrimingAndTokenRotation:
 
         # (2) AMBIGUOUS escalation during prime → DEFERRED (token KEPT).
         _seed("amb-user")
-        _refresh_backoff_state(state, "amb-user", "srv-oauth").ambiguous_streak = (
-            _AMBIGUOUS_ESCALATION_THRESHOLD - 1
-        )
+        _refresh_backoff_state(
+            state.mcp_oauth_coordination, "amb-user", "srv-oauth"
+        ).ambiguous_streak = _AMBIGUOUS_ESCALATION_THRESHOLD - 1
         with patch(
             "turnstone.core.mcp_oauth._refresh_and_persist",
             side_effect=_raiser(RefreshFailureClass.AMBIGUOUS),
@@ -1767,9 +1771,9 @@ class TestPoolPrimingAndTokenRotation:
 
         # (3) Control: lazy dispatch (default) DOES escalate-revoke the same.
         _seed("amb-lazy")
-        _refresh_backoff_state(state, "amb-lazy", "srv-oauth").ambiguous_streak = (
-            _AMBIGUOUS_ESCALATION_THRESHOLD - 1
-        )
+        _refresh_backoff_state(
+            state.mcp_oauth_coordination, "amb-lazy", "srv-oauth"
+        ).ambiguous_streak = _AMBIGUOUS_ESCALATION_THRESHOLD - 1
         with patch(
             "turnstone.core.mcp_oauth._refresh_and_persist",
             side_effect=_raiser(RefreshFailureClass.AMBIGUOUS),

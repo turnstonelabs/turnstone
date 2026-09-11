@@ -17,6 +17,7 @@ import jwt as pyjwt
 import pytest
 
 from tests.conftest import make_oidc_test_config as _make_config
+from turnstone.core.oauth.context import OAuthContext, oauth_context
 from turnstone.core.oauth.oidc import (
     OIDCError,
     OIDCKeyNotFoundError,
@@ -2579,7 +2580,7 @@ class TestRuntimeRediscovery:
             jwks_uri="",
         )
         cfg = dataclasses.replace(cfg, discovery_retryable=True)
-        return SimpleNamespace(oidc_config=cfg)
+        return SimpleNamespace(oauth_context=OAuthContext(oidc_config=cfg))
 
     def test_rediscover_swaps_enabled_config_on_success(self):
         """Drives the REAL discover_oidc through a mocked HTTP discovery GET
@@ -2613,10 +2614,10 @@ class TestRuntimeRediscovery:
         asyncio.run(_run())
 
         # The real discover_oidc succeeded and the recovered config was installed.
-        assert state.oidc_config.enabled is True
-        assert state.oidc_config.token_endpoint == "https://idp.example.com/token"
+        assert oauth_context(state).oidc_config.enabled is True
+        assert oauth_context(state).oidc_config.token_endpoint == "https://idp.example.com/token"
         # The healed config no longer advertises a retryable failure.
-        assert state.oidc_config.discovery_retryable is False
+        assert oauth_context(state).oidc_config.discovery_retryable is False
 
     def test_rediscover_latches_terminal_on_config_error_and_stops_probing(self):
         """Review finding: probing with enabled forced True carries the
@@ -2656,21 +2657,21 @@ class TestRuntimeRediscovery:
                 await maybe_rediscover_oidc(state)
                 # Force the cooldown open — but the config is now terminal, so
                 # the retryable guard should short-circuit before any probe.
-                state.oidc_rediscover_last = None
+                oauth_context(state).rediscover_last = None
                 await maybe_rediscover_oidc(state)
 
         asyncio.run(_run())
 
         # Still disabled, but LATCHED terminal (not retryable) — one probe only.
-        assert state.oidc_config.enabled is False
-        assert state.oidc_config.discovery_retryable is False
+        assert oauth_context(state).oidc_config.enabled is False
+        assert oauth_context(state).oidc_config.discovery_retryable is False
         assert probes["n"] == 1
 
     def test_rediscover_cooldown_gates_repeat_probes(self):
         from turnstone.core.oauth.oidc import maybe_rediscover_oidc
 
         state = self._disabled_retryable_state()
-        still_down = state.oidc_config  # discover keeps returning disabled
+        still_down = oauth_context(state).oidc_config  # discover keeps returning disabled
         with patch(
             "turnstone.core.oauth.oidc.discover_oidc", new=AsyncMock(return_value=still_down)
         ) as disc:
@@ -2679,26 +2680,28 @@ class TestRuntimeRediscovery:
             asyncio.run(maybe_rediscover_oidc(state))
         # One IdP probe per cooldown window, however many callers ask.
         disc.assert_awaited_once()
-        assert state.oidc_config.enabled is False
+        assert oauth_context(state).oidc_config.enabled is False
 
     def test_rediscover_noop_when_not_retryable_or_enabled(self):
         from turnstone.core.oauth.oidc import maybe_rediscover_oidc
 
         # Operator-disabled (retryable False): never probes.
         state = SimpleNamespace(
-            oidc_config=_make_config(
-                enabled=False,
-                authorization_endpoint="",
-                token_endpoint="",
-                userinfo_endpoint="",
-                jwks_uri="",
+            oauth_context=OAuthContext(
+                oidc_config=_make_config(
+                    enabled=False,
+                    authorization_endpoint="",
+                    token_endpoint="",
+                    userinfo_endpoint="",
+                    jwks_uri="",
+                )
             )
         )
         with patch("turnstone.core.oauth.oidc.discover_oidc", new=AsyncMock()) as disc:
             asyncio.run(maybe_rediscover_oidc(state))
         disc.assert_not_awaited()
         # Already enabled: never probes.
-        state2 = SimpleNamespace(oidc_config=_make_config(enabled=True))
+        state2 = SimpleNamespace(oauth_context=OAuthContext(oidc_config=_make_config(enabled=True)))
         with patch("turnstone.core.oauth.oidc.discover_oidc", new=AsyncMock()) as disc2:
             asyncio.run(maybe_rediscover_oidc(state2))
         disc2.assert_not_awaited()
@@ -2713,11 +2716,13 @@ class TestInitializeOIDCState:
     def test_initialize_skips_when_disabled(self):
         """Disabled config: jwks_data set to None, oidc_config unchanged."""
         cfg = _make_config(enabled=False)
-        state = types.SimpleNamespace(oidc_config=cfg, jwks_data="stale")
+        state = types.SimpleNamespace(
+            jwks_data="stale", oauth_context=OAuthContext(oidc_config=cfg)
+        )
 
         asyncio.run(initialize_oidc_state(state))
 
-        assert state.oidc_config is cfg
+        assert oauth_context(state).oidc_config is cfg
         assert state.jwks_data is None
 
     def test_initialize_disables_on_discovery_exception(self):
@@ -2727,7 +2732,7 @@ class TestInitializeOIDCState:
             token_endpoint="",
             jwks_uri="",
         )
-        state = types.SimpleNamespace(oidc_config=cfg, jwks_data=None)
+        state = types.SimpleNamespace(jwks_data=None, oauth_context=OAuthContext(oidc_config=cfg))
 
         async def _boom(_cfg):
             raise RuntimeError("boom")
@@ -2735,7 +2740,7 @@ class TestInitializeOIDCState:
         with patch("turnstone.core.oauth.oidc.discover_oidc", side_effect=_boom):
             asyncio.run(initialize_oidc_state(state))
 
-        assert state.oidc_config.enabled is False
+        assert oauth_context(state).oidc_config.enabled is False
         assert state.jwks_data is None
 
     def test_initialize_disables_on_discovery_returning_disabled(self):
@@ -2745,7 +2750,7 @@ class TestInitializeOIDCState:
             token_endpoint="",
             jwks_uri="",
         )
-        state = types.SimpleNamespace(oidc_config=cfg, jwks_data=None)
+        state = types.SimpleNamespace(jwks_data=None, oauth_context=OAuthContext(oidc_config=cfg))
 
         disabled_cfg = dataclasses.replace(cfg, enabled=False)
 
@@ -2755,14 +2760,14 @@ class TestInitializeOIDCState:
         with patch("turnstone.core.oauth.oidc.discover_oidc", side_effect=_disabled):
             asyncio.run(initialize_oidc_state(state))
 
-        assert state.oidc_config is disabled_cfg
-        assert state.oidc_config.enabled is False
+        assert oauth_context(state).oidc_config is disabled_cfg
+        assert oauth_context(state).oidc_config.enabled is False
         assert state.jwks_data is None
 
     def test_initialize_disables_when_redirect_base_unset(self, caplog):
         """Discovery succeeds but redirect_base is empty -> disable + log error."""
         cfg = _make_config(redirect_base="")
-        state = types.SimpleNamespace(oidc_config=cfg, jwks_data=None)
+        state = types.SimpleNamespace(jwks_data=None, oauth_context=OAuthContext(oidc_config=cfg))
 
         async def _ok(c, *, client=None):
             return c
@@ -2777,14 +2782,14 @@ class TestInitializeOIDCState:
         ):
             asyncio.run(initialize_oidc_state(state))
 
-        assert state.oidc_config.enabled is False
+        assert oauth_context(state).oidc_config.enabled is False
         assert state.jwks_data is None
         assert any("TURNSTONE_OIDC_REDIRECT_BASE" in record.message for record in caplog.records)
 
     def test_initialize_keeps_enabled_but_no_jwks_on_jwks_failure(self):
         """JWKS fetch failure preserves enabled=True for lazy retry."""
         cfg = _make_config(redirect_base="https://app.example.com")
-        state = types.SimpleNamespace(oidc_config=cfg, jwks_data=None)
+        state = types.SimpleNamespace(jwks_data=None, oauth_context=OAuthContext(oidc_config=cfg))
 
         async def _ok(c, *, client=None):
             return c
@@ -2798,14 +2803,14 @@ class TestInitializeOIDCState:
         ):
             asyncio.run(initialize_oidc_state(state))
 
-        assert state.oidc_config.enabled is True
-        assert state.oidc_config is cfg
+        assert oauth_context(state).oidc_config.enabled is True
+        assert oauth_context(state).oidc_config is cfg
         assert state.jwks_data is None
 
     def test_initialize_success(self):
         """Both discovery and JWKS prefetch succeed."""
         cfg = _make_config(redirect_base="https://app.example.com")
-        state = types.SimpleNamespace(oidc_config=cfg, jwks_data=None)
+        state = types.SimpleNamespace(jwks_data=None, oauth_context=OAuthContext(oidc_config=cfg))
 
         jwks = {"keys": [{"kid": "k1", "kty": "RSA"}]}
 
@@ -2821,8 +2826,8 @@ class TestInitializeOIDCState:
         ):
             asyncio.run(initialize_oidc_state(state))
 
-        assert state.oidc_config is cfg
-        assert state.oidc_config.enabled is True
+        assert oauth_context(state).oidc_config is cfg
+        assert oauth_context(state).oidc_config.enabled is True
         assert state.jwks_data == jwks
         assert state.oidc_http_client is not None
 
@@ -2866,7 +2871,7 @@ class TestLongLivedHTTPClientPassthrough:
         post-condition contract on initialize_oidc_state.
         """
         cfg = _make_config(redirect_base="https://app.example.com")
-        state = types.SimpleNamespace(oidc_config=cfg, jwks_data=None)
+        state = types.SimpleNamespace(jwks_data=None, oauth_context=OAuthContext(oidc_config=cfg))
 
         seen_clients: list[Any] = []
 
@@ -2897,7 +2902,7 @@ class TestLongLivedHTTPClientPassthrough:
     def test_initialize_does_not_leak_client_on_discovery_failure(self):
         """Discovery exception path must close the transient and leave http_client None."""
         cfg = _make_config(redirect_base="https://app.example.com")
-        state = types.SimpleNamespace(oidc_config=cfg, jwks_data=None)
+        state = types.SimpleNamespace(jwks_data=None, oauth_context=OAuthContext(oidc_config=cfg))
 
         async def _boom(_cfg, *, client=None):
             raise RuntimeError("boom")
@@ -2905,14 +2910,14 @@ class TestLongLivedHTTPClientPassthrough:
         with patch("turnstone.core.oauth.oidc.discover_oidc", side_effect=_boom):
             asyncio.run(initialize_oidc_state(state))
 
-        assert state.oidc_config.enabled is False
+        assert oauth_context(state).oidc_config.enabled is False
         assert state.oidc_http_client is None
         assert state.jwks_data is None
 
     def test_initialize_does_not_leak_client_on_missing_redirect_base(self):
         """Missing redirect_base path returns before creating the long-lived client."""
         cfg = _make_config(redirect_base="")
-        state = types.SimpleNamespace(oidc_config=cfg, jwks_data=None)
+        state = types.SimpleNamespace(jwks_data=None, oauth_context=OAuthContext(oidc_config=cfg))
 
         async def _discover(c, *, client=None):
             return c
@@ -2920,6 +2925,6 @@ class TestLongLivedHTTPClientPassthrough:
         with patch("turnstone.core.oauth.oidc.discover_oidc", side_effect=_discover):
             asyncio.run(initialize_oidc_state(state))
 
-        assert state.oidc_config.enabled is False
+        assert oauth_context(state).oidc_config.enabled is False
         assert state.oidc_http_client is None
         assert state.jwks_data is None

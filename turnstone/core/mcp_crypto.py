@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 
 from turnstone.core.audit import record_audit
 from turnstone.core.log import get_logger
+from turnstone.core.oauth.context import oauth_context
 from turnstone.core.storage._protocol import USER_SCOPED_AUTH_TYPES
 from turnstone.core.token_store import crypto as token_store_crypto
 from turnstone.core.token_store.store import TokenStore
@@ -121,8 +122,8 @@ def initialize_mcp_crypto_state(app_state: object, *, node_id: str = "") -> None
        (``entra_obo``/``entra_app`` mint-cache rows are encrypted with
        the same cipher). The console's registry loads later; its
        equivalent check lives in the coordinator bootstrap.
-    3. On success, sets ``app_state.mcp_token_cipher`` and
-       ``app_state.mcp_token_store`` (both possibly ``None`` when no
+    3. On success, sets ``OAuthContext.cipher`` and
+       ``OAuthContext.token_store`` (both possibly ``None`` when no
        key + no user-scoped rows).
 
     The helper is shared by ``turnstone/server.py:_lifespan`` and
@@ -139,6 +140,7 @@ def initialize_mcp_crypto_state(app_state: object, *, node_id: str = "") -> None
         raise SystemExit(1) from exc
 
     storage = get_storage()
+    oauth_context(app_state).storage = storage
     # Both pool-backed types persist encrypted per-user rows (oauth_user:
     # tokens + refresh; oauth_obo: minted-token cache), so both force the
     # key requirement — USER_SCOPED_AUTH_TYPES is the single source of truth
@@ -185,8 +187,8 @@ def initialize_mcp_crypto_state(app_state: object, *, node_id: str = "") -> None
     # once OIDC heals. The opt-in flag is a static config value (preserved
     # across the discovery-failure ``dataclasses.replace``), so keying on it
     # makes the requirement independent of discovery state. Runs after OIDC
-    # init (see docstring), so app_state.oidc_config is set.
-    oidc_config = getattr(app_state, "oidc_config", None)
+    # init (see docstring), so OAuthContext.oidc_config is set.
+    oidc_config = oauth_context(app_state).oidc_config
     if (
         oidc_config is not None
         and getattr(oidc_config, "capture_user_credential", False)
@@ -201,14 +203,14 @@ def initialize_mcp_crypto_state(app_state: object, *, node_id: str = "") -> None
     if cipher_cfg is None:
         # No oauth_user rows + no key configured: zero new code paths
         # exercised; install None sentinels so callers can fast-path.
-        app_state.mcp_token_cipher = None  # type: ignore[attr-defined]
-        app_state.mcp_token_store = None  # type: ignore[attr-defined]
+        oauth_context(app_state).cipher = None
+        oauth_context(app_state).token_store = None
         log.debug("mcp_server.oauth.disabled (no key configured, no oauth_user rows)")
         return
 
     cipher = token_store_crypto.TokenCipher(cipher_cfg)
-    app_state.mcp_token_cipher = cipher  # type: ignore[attr-defined]
-    app_state.mcp_token_store = MCPTokenStore(  # type: ignore[attr-defined]
+    oauth_context(app_state).cipher = cipher
+    oauth_context(app_state).token_store = MCPTokenStore(
         storage,
         cipher,
         node_id=node_id,
@@ -228,7 +230,6 @@ def close_mcp_crypto_state(app_state: object) -> None:
     The cipher itself owns no network resources, so this is a simple
     attribute clear.
     """
-    if hasattr(app_state, "mcp_token_store"):
-        app_state.mcp_token_store = None
-    if hasattr(app_state, "mcp_token_cipher"):
-        app_state.mcp_token_cipher = None
+    context = oauth_context(app_state)
+    context.token_store = None
+    context.cipher = None

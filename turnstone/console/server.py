@@ -31,7 +31,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import httpx
 from sse_starlette import EventSourceResponse
@@ -68,6 +68,7 @@ from turnstone.core.deadline import DeadlineExceededError, run_with_deadline
 from turnstone.core.mcp_oauth import is_user_scoped_auth
 from turnstone.core.memory import get_workstream_display_names
 from turnstone.core.metacognition import field_str, sanitize_display
+from turnstone.core.model_oauth import get_model_token_client
 from turnstone.core.model_registry import (
     APP_IDENTITY_MODEL_AUTH_MODES,
     DYNAMIC_MODEL_AUTH_MODES,
@@ -82,6 +83,8 @@ from turnstone.core.model_registry import (
 )
 from turnstone.core.model_registry import MODEL_AUTH_MODES as _MODEL_AUTH_MODES
 from turnstone.core.node_affinity import NodeAffinityError, requested_node_requirement
+from turnstone.core.oauth.context import oauth_context
+from turnstone.core.oauth.runtime import shutdown_oauth_runtime
 from turnstone.core.project_access import fold_role_permissions
 from turnstone.core.rendezvous import NoAvailableNodeError, NodeRef
 from turnstone.core.rerank_calibrate import canonical_caps_value
@@ -138,6 +141,7 @@ if TYPE_CHECKING:
 
     from starlette.requests import Request
 
+    from turnstone.core.mcp_crypto import MCPTokenStore
     from turnstone.core.session import ChatSession
     from turnstone.core.session_manager import SessionManager
     from turnstone.core.storage._protocol import StorageBackend
@@ -5462,6 +5466,7 @@ def _bootstrap_coord_subsystem(
         # Getter, not the instance: the console MCP ensure-helper can
         # (re)construct the manager after this bootstrap (#725).
         mcp_client_getter=lambda: getattr(app.state, "mcp_client", None),
+        model_token_client_getter=lambda: get_model_token_client(app.state),
     )
     coord_adapter = CoordinatorAdapter(
         collector=app.state.collector,
@@ -5881,6 +5886,7 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None]:
     from turnstone.core.mcp_crypto import initialize_mcp_crypto_state
 
     initialize_mcp_crypto_state(app.state, node_id="console")
+    get_model_token_client(app.state)
 
     # Per-(user, server) OAuth flow state — long-lived HTTP client +
     # in-process refresh lock + metadata cache.
@@ -6011,9 +6017,6 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None]:
                 create_mcp_client,
                 config_store.get("mcp.config_path") or None,
                 storage=storage,
-                required=bool(
-                    app.state.coord_registry and app.state.coord_registry.has_dynamic_auth()
-                ),
             )
             if app.state.mcp_client is not None:
                 app.state.mcp_client.set_storage(storage)
@@ -6116,8 +6119,9 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None]:
             await asyncio.to_thread(_console_mcp_shutdown.shutdown)
         except Exception:
             log.debug("console.mcp_client_shutdown_failed", exc_info=True)
-    # Close in reverse order of initialization (mcp_oauth → mcp_crypto →
-    # oidc) per LIFO teardown discipline.
+    # Sessions, the coordinator registry and MCP manager have stopped. Drain
+    # OAuth before closing the token store and OIDC holder it depends on.
+    await asyncio.to_thread(shutdown_oauth_runtime, app.state)
     from turnstone.core.mcp_oauth import close_mcp_oauth_state
 
     await close_mcp_oauth_state(app.state)
@@ -6621,7 +6625,7 @@ async def admin_delete_oidc_identity(request: Request) -> JSONResponse:
     user_id = identity["user_id"]
     credential_revoked = False
     obo_cache_purged = 0
-    token_store = getattr(request.app.state, "mcp_token_store", None)
+    token_store = cast("MCPTokenStore | None", oauth_context(request.app.state).token_store)
     if token_store is not None:
         try:
             credential_revoked = bool(token_store.delete_oidc_credential(user_id, issuer))
@@ -6678,14 +6682,13 @@ async def admin_delete_oidc_identity(request: Request) -> JSONResponse:
                     token_key,
                     exc_info=True,
                 )
-    # The console-hosted coordinator has its own manager/memo and is not in the
-    # node collector, so invalidate it directly as well as fanning out below.
-    mcp_client = getattr(request.app.state, "mcp_client", None)
-    if mcp_client is not None and hasattr(mcp_client, "invalidate_model_mint_memo_sync"):
-        mcp_client.invalidate_model_mint_memo_sync(
-            user_id=user_id,
-            server_prefix=MODEL_OBO_CACHE_PREFIX,
-        )
+    # The console runtime is not in the node collector, so invalidate its
+    # memo directly as well as fanning out below.
+    model_client = get_model_token_client(request.app.state)
+    model_client.invalidate_model_mint_memo_sync(
+        user_id=user_id,
+        server_prefix=MODEL_OBO_CACHE_PREFIX,
+    )
     memo_nodes_invalidated, memo_nodes_failed = await _invalidate_model_auth_memos_cluster(
         request, user_id
     )
@@ -10737,7 +10740,7 @@ def _obo_profile(request: Request) -> str:
     One reader for the profile so the create handler, the update handler, and
     the write-time enforcement never diverge on how they resolve it.
     """
-    oidc_config = getattr(request.app.state, "oidc_config", None)
+    oidc_config = oauth_context(request.app.state).oidc_config
     return str(getattr(oidc_config, "obo_grant_profile", "") or "")
 
 
@@ -10822,9 +10825,9 @@ def _enforce_oauth_obo_requirements(
         return None
     profile = _obo_profile(request)
     if check_oidc_deployment:
-        if getattr(request.app.state, "mcp_token_store", None) is None:
+        if oauth_context(request.app.state).token_store is None:
             return JSONResponse({"error": _OAUTH_TOKEN_STORE_503_MSG}, status_code=503)
-        oidc_config = getattr(request.app.state, "oidc_config", None)
+        oidc_config = oauth_context(request.app.state).oidc_config
         # Accept a config that is enabled OR merely transiently un-discovered
         # (``discovery_retryable`` — the IdP was unreachable at this process's
         # boot). OIDC is still CONFIGURED there (issuer set); reject only a
@@ -10970,7 +10973,7 @@ def _require_token_store_for_oauth_secret(
             {"error": "oauth_client_secret must be a string or null"},
             status_code=400,
         )
-    if getattr(request.app.state, "mcp_token_store", None) is None:
+    if oauth_context(request.app.state).token_store is None:
         return JSONResponse({"error": _OAUTH_TOKEN_STORE_503_MSG}, status_code=503)
     return None
 
@@ -11014,7 +11017,7 @@ def _apply_oauth_client_secret(
             {"error": "oauth_client_secret must be 1024 characters or fewer"},
             status_code=400,
         )
-    token_store = getattr(request.app.state, "mcp_token_store", None)
+    token_store = cast("MCPTokenStore | None", oauth_context(request.app.state).token_store)
     if token_store is None:
         return None, JSONResponse({"error": _OAUTH_TOKEN_STORE_503_MSG}, status_code=503)
     secret_text = (secret_input or "").strip()
@@ -11764,7 +11767,7 @@ async def admin_update_mcp_server(request: Request) -> JSONResponse:
     # expect "disable OAuth" to revoke credentials; leaving stale ciphertext
     # that resurfaces if the row is flipped back is surprising and a footgun.
     if leaving_oauth_user:
-        token_store = getattr(request.app.state, "mcp_token_store", None)
+        token_store = cast("MCPTokenStore | None", oauth_context(request.app.state).token_store)
         if token_store is not None:
             token_store.set_oauth_client_secret(server_id, None)
             _audit_oauth_client_secret_set(
@@ -11932,27 +11935,13 @@ def _ensure_console_mcp_client(app: Any) -> dict[str, Any]:
 
             cs = getattr(app.state, "config_store", None)
             cfg_path = cs.get("mcp.config_path") if cs is not None else None
-            registry = getattr(app.state, "coord_registry", None)
-            mgr = create_mcp_client(
-                cfg_path or None,
-                storage=storage,
-                required=bool(registry and registry.has_dynamic_auth()),
-            )
+            mgr = create_mcp_client(cfg_path or None, storage=storage)
             if mgr is None:
                 return {"skipped": "no MCP servers configured"}
             app.state.mcp_client = mgr
             mgr.set_storage(storage)
             mgr.set_app_state(app.state)
         result = mgr.reconcile_sync(storage)
-        coord_mgr = getattr(app.state, "coord_mgr", None)
-        if coord_mgr is not None:
-            try:
-                for ws in coord_mgr.list_all():
-                    session = getattr(ws, "session", None)
-                    if session is not None:
-                        session.set_model_mint_client(mgr)
-            except Exception:
-                log.debug("console.model_mint_client_session_refresh_failed", exc_info=True)
         return result
 
 
@@ -12523,7 +12512,7 @@ def _oidc_configured_for_model_auth(request: Request) -> bool:
     during a transient IdP outage is ``discovery_retryable`` and heals on the
     next token validation, so it must not be refused config work meanwhile.
     """
-    oidc_config = getattr(request.app.state, "oidc_config", None)
+    oidc_config = oauth_context(request.app.state).oidc_config
     return bool(
         getattr(oidc_config, "enabled", False) or getattr(oidc_config, "discovery_retryable", False)
     )
@@ -12897,7 +12886,7 @@ def _validate_dynamic_model_auth(
     # "single sign-on is not set up" rather than being steered at a profile
     # knob whose emptiness is a symptom (pinned by
     # test_no_sso_posture_refusal_names_sso_not_profile).
-    if getattr(request.app.state, "mcp_token_store", None) is None:
+    if oauth_context(request.app.state).token_store is None:
         # 503, not 400: a missing encryption key is a deployment fault the
         # operator remedies and retries — the MCP sibling's classification
         # for the identical state (_OAUTH_TOKEN_STORE_503_MSG).
@@ -13150,6 +13139,13 @@ def _refresh_coord_registry_locked(app_state: Any, storage: Any) -> None:
         # as the refusal arm, in the recovery direction (pinned:
         # test_refresh_clears_key_refusal_after_recovery).
         app_state.coord_registry_error = ""
+        model_client = get_model_token_client(app_state)
+        coord_mgr = getattr(app_state, "coord_mgr", None)
+        if coord_mgr is not None:
+            for ws in coord_mgr.list_all():
+                session = getattr(ws, "session", None)
+                if session is not None:
+                    session.set_model_mint_client(model_client)
     finally:
         # Defensive — load_model_registry doesn't eagerly create clients
         # (ModelRegistry.__init__ leaves _clients/_providers empty; they
@@ -17122,7 +17118,7 @@ def create_app(
     from turnstone.core.oauth.oidc import load_oidc_config
 
     oidc_config = load_oidc_config()
-    app.state.oidc_config = oidc_config
+    oauth_context(app.state).oidc_config = oidc_config
     app.state.jwks_data = None  # populated after async discovery
 
     # Scheduler — start background thread if storage is available

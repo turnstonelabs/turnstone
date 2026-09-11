@@ -27,6 +27,7 @@ import pytest
 import sqlalchemy as sa
 from aiohttp import web
 
+from tests._oauth_runtime_helpers import make_oauth_context, run_adapter
 from tests.conftest import _run_on_loop, make_mcp_token_cipher
 from turnstone.core.mcp_client import MCPClientManager
 from turnstone.core.mcp_crypto import MCPTokenStore
@@ -35,7 +36,9 @@ from turnstone.core.mcp_oauth import (
     get_user_access_token,
     get_user_access_token_classified,
 )
+from turnstone.core.oauth.context import OAuthContext, TokenCoordination, oauth_context
 from turnstone.core.oauth.http import json_http_client
+from turnstone.core.oauth.runtime import OAuthRuntime
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -105,10 +108,11 @@ def _make_app_state(storage: SQLiteBackend, *, http_client: httpx.AsyncClient) -
     cipher = make_mcp_token_cipher()
     state = SimpleNamespace(
         auth_storage=storage,
-        mcp_token_store=MCPTokenStore(storage, cipher, node_id="test"),
-        obo_http_client=http_client,
-        mcp_oauth_refresh_locks={},
+        mcp_oauth_coordination=TokenCoordination(),
         mcp_oauth_metadata_cache={},
+        oauth_context=make_oauth_context(
+            token_store=MCPTokenStore(storage, cipher, node_id="test"), http_client=http_client
+        ),
     )
     return state
 
@@ -138,7 +142,7 @@ def _seed_token(
     expires_at = (datetime.now(UTC) + timedelta(seconds=expires_in_seconds)).strftime(
         "%Y-%m-%dT%H:%M:%S"
     )
-    state.mcp_token_store.create_user_token(
+    oauth_context(state).token_store.create_user_token(
         user_id,
         server_name,
         access_token="access-aaa",
@@ -196,9 +200,8 @@ def mint_manager() -> Iterator[MCPClientManager]:
         manager.shutdown()
 
 
-@pytest.mark.parametrize("injected_client", [True, False], ids=["manager", "transient"])
 def test_refresh_discovery_and_post_stay_off_the_browser_loop(
-    storage: SQLiteBackend, mint_manager: MCPClientManager, injected_client: bool
+    storage: SQLiteBackend, mint_manager: MCPClientManager
 ) -> None:
     """Warm real connections on both live loops; discover with an empty metadata cache."""
     _seed_server(storage)
@@ -249,21 +252,17 @@ def test_refresh_discovery_and_post_stay_off_the_browser_loop(
             storage.update_mcp_server("srv-id", oauth_as_issuer_cached=origin)
             async with httpx.AsyncClient() as browser_client:
                 observe_client(browser_client)
-                state = _make_app_state(storage, http_client=browser_client)
+                state = _make_app_state(storage, http_client=observe_client(json_http_client()))
                 state.mcp_oauth_http_client = browser_client
                 _seed_token(state, expires_in_seconds=-1000)
                 mint_manager.set_app_state(state)
-                manager_client = observe_client(state.obo_http_client)
+                runtime = oauth_context(state).runtime
+                assert runtime is not None
+                runtime_client = oauth_context(state).http_client
                 loop = mint_manager._loop
                 assert loop is not None
                 await browser_client.get(f"{origin}/warm")
-                await asyncio.wrap_future(
-                    asyncio.run_coroutine_threadsafe(
-                        state.obo_http_client.get(f"{origin}/warm"), loop
-                    )
-                )
-                if not injected_client:
-                    del state.obo_http_client
+                await runtime.call(lambda: runtime_client.get(f"{origin}/warm"))
                 assert state.mcp_oauth_metadata_cache == {}
                 with patch("turnstone.core.oauth.http.json_http_client", transient_client):
                     result = await asyncio.wait_for(
@@ -290,9 +289,9 @@ def test_refresh_discovery_and_post_stay_off_the_browser_loop(
                 discovery_client, token_client = (client for _, client, _ in requests[2:])
                 assert discovery_client is token_client
                 assert token_client is not browser_client
-                assert (token_client is manager_client) == injected_client
-                assert all(owner_loop is loop for _, _, owner_loop in requests[1:])
-                token = state.mcp_token_store.get_user_token("user-1", "srv-oauth")
+                assert token_client is runtime_client
+                assert all(owner_loop is runtime._loop for _, _, owner_loop in requests[1:])
+                token = oauth_context(state).token_store.get_user_token("user-1", "srv-oauth")
                 assert token is not None
                 assert token["refresh_token"] == "refresh-rotated"
                 # The browser's own client remains usable on its original loop.
@@ -300,7 +299,7 @@ def test_refresh_discovery_and_post_stay_off_the_browser_loop(
         finally:
             await runner.cleanup()
 
-    asyncio.run(_run())
+    run_adapter(_run())
 
 
 @pytest.mark.parametrize("keepalive", [False, True], ids=["expiry", "keepalive"])
@@ -314,9 +313,10 @@ def test_sweep_refreshes_with_no_browser_client(
     _seed_server(storage)
     state = SimpleNamespace(
         auth_storage=storage,
-        mcp_token_store=MCPTokenStore(storage, make_mcp_token_cipher(), node_id="test"),
-        mcp_oauth_refresh_locks={},
-        mcp_oauth_refresh_backoff={},
+        mcp_oauth_coordination=TokenCoordination(),
+        oauth_context=OAuthContext(
+            token_store=MCPTokenStore(storage, make_mcp_token_cipher(), node_id="test")
+        ),
     )
     # Age the stored creation timestamp without aging the access-token expiry.
     _seed_token(state, expires_in_seconds=3600 if keepalive else -1000)
@@ -348,21 +348,26 @@ def test_sweep_refreshes_with_no_browser_client(
             return httpx.Response(400, json={"error": failure})
         return httpx.Response(200, json={"access_token": "fresh-bbb", "expires_in": 3600})
 
+    context = oauth_context(state)
+    runtime = OAuthRuntime(
+        context, client_factory=lambda: httpx.AsyncClient(transport=httpx.MockTransport(handle))
+    )
+    context.runtime = runtime
+    runtime.start()
+
     async def _tick() -> None:
-        async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
-            state.obo_http_client = client
-            with _public_addr_patch():
-                await mint_manager._sweep_user_token_freshness()
+        with _public_addr_patch():
+            await mint_manager._sweep_user_token_freshness()
 
     loop = mint_manager._loop
     assert loop is not None
     _run_on_loop(loop, _tick())
     assert requests == ["GET", "POST"]
-    token = state.mcp_token_store.get_user_token("user-1", "srv-oauth")
+    token = oauth_context(state).token_store.get_user_token("user-1", "srv-oauth")
     assert token is not None
     assert token["access_token"] == ("access-aaa" if failure else "fresh-bbb")
     assert token["refresh_token"] == "refresh-rrr"
-    assert state.mcp_oauth_refresh_backoff == {}
+    assert state.mcp_oauth_coordination.backoff == {}
     assert bool(mint_manager._token_sweep_warned) == (failure == "invalid_grant")
 
 
@@ -392,7 +397,7 @@ class TestRefreshFailureClassification:
                     force_refresh=True,
                 )
 
-        return asyncio.run(_run())
+        return run_adapter(_run())
 
     def test_transient_503_keeps_token(self, storage: SQLiteBackend) -> None:
         """A 503 from the token endpoint is transient: keep the token, retryable kind."""
@@ -409,7 +414,7 @@ class TestRefreshFailureClassification:
 
         assert result.kind == "refresh_failed_transient"
         # Token survives a transient failure — no cluster-wide revoke; self-heals.
-        assert state.mcp_token_store.get_user_token("user-1", "srv-oauth") is not None
+        assert oauth_context(state).token_store.get_user_token("user-1", "srv-oauth") is not None
 
     def test_transient_network_error_keeps_token(self, storage: SQLiteBackend) -> None:
         """A network error (httpx.HTTPError) is transient: keep the token, retryable kind."""
@@ -424,7 +429,7 @@ class TestRefreshFailureClassification:
 
         assert result.kind == "refresh_failed_transient"
         # Token survives a transient failure — no cluster-wide revoke; self-heals.
-        assert state.mcp_token_store.get_user_token("user-1", "srv-oauth") is not None
+        assert oauth_context(state).token_store.get_user_token("user-1", "srv-oauth") is not None
 
     def test_oversized_error_body_stays_transient_for_oauth_user(
         self, storage: SQLiteBackend
@@ -450,10 +455,15 @@ class TestRefreshFailureClassification:
 
         assert result.kind == "refresh_failed_transient"
         # Kept (TRANSIENT), not revoked — and the ambiguous streak did not advance.
-        assert state.mcp_token_store.get_user_token("user-1", "srv-oauth") is not None
+        assert oauth_context(state).token_store.get_user_token("user-1", "srv-oauth") is not None
         from turnstone.core.oauth.tokens import _refresh_backoff_state
 
-        assert _refresh_backoff_state(state, "user-1", "srv-oauth").ambiguous_streak == 0
+        assert (
+            _refresh_backoff_state(
+                state.mcp_oauth_coordination, "user-1", "srv-oauth"
+            ).ambiguous_streak
+            == 0
+        )
 
     def test_permanent_invalid_grant_revokes(self, storage: SQLiteBackend) -> None:
         """Contrast: 400 invalid_grant IS permanent — deletion is correct and the
@@ -468,7 +478,7 @@ class TestRefreshFailureClassification:
         result = self._lookup(state)
 
         assert result.kind == "refresh_failed"
-        assert state.mcp_token_store.get_user_token("user-1", "srv-oauth") is None
+        assert oauth_context(state).token_store.get_user_token("user-1", "srv-oauth") is None
 
     def test_invalid_target_keeps_token(self, storage: SQLiteBackend) -> None:
         """``invalid_target`` (RFC 8707 §2.2) means the AS will not cover the
@@ -485,7 +495,7 @@ class TestRefreshFailureClassification:
         result = self._lookup(state)
 
         assert result.kind == "refresh_failed_transient"
-        assert state.mcp_token_store.get_user_token("user-1", "srv-oauth") is not None
+        assert oauth_context(state).token_store.get_user_token("user-1", "srv-oauth") is not None
 
     def test_permanent_revoke_audits_even_when_row_concurrently_deleted(
         self, storage: SQLiteBackend
@@ -506,7 +516,9 @@ class TestRefreshFailureClassification:
 
         # Simulate a concurrent external revoke: the dispatch-side delete finds
         # the row already gone (returns False).
-        with patch.object(state.mcp_token_store, "delete_user_token", return_value=False):
+        with patch.object(
+            oauth_context(state).token_store, "delete_user_token", return_value=False
+        ):
             result = self._lookup(state)
 
         assert result.kind == "refresh_failed"
@@ -528,7 +540,7 @@ class TestRefreshFailureClassification:
         result = self._lookup(state)
 
         assert result.kind == "refresh_failed_transient"
-        assert state.mcp_token_store.get_user_token("user-1", "srv-oauth") is not None
+        assert oauth_context(state).token_store.get_user_token("user-1", "srv-oauth") is not None
 
     def test_400_unrecognised_body_is_ambiguous_keeps_token(self, storage: SQLiteBackend) -> None:
         """A single 400 with a non-JSON / no-``error`` body is ambiguous: keep
@@ -544,7 +556,7 @@ class TestRefreshFailureClassification:
         result = self._lookup(state)
 
         assert result.kind == "refresh_failed_transient"
-        assert state.mcp_token_store.get_user_token("user-1", "srv-oauth") is not None
+        assert oauth_context(state).token_store.get_user_token("user-1", "srv-oauth") is not None
 
     def test_403_invalid_grant_revokes(self, storage: SQLiteBackend) -> None:
         """``invalid_grant`` is a dead grant at ANY client-error status, not just
@@ -559,7 +571,7 @@ class TestRefreshFailureClassification:
         result = self._lookup(state)
 
         assert result.kind == "refresh_failed"
-        assert state.mcp_token_store.get_user_token("user-1", "srv-oauth") is None
+        assert oauth_context(state).token_store.get_user_token("user-1", "srv-oauth") is None
 
     def test_interaction_required_revokes(self, storage: SQLiteBackend) -> None:
         """An OIDC interaction-required code (Entra surfaces these) means the user
@@ -574,7 +586,7 @@ class TestRefreshFailureClassification:
         result = self._lookup(state)
 
         assert result.kind == "refresh_failed"
-        assert state.mcp_token_store.get_user_token("user-1", "srv-oauth") is None
+        assert oauth_context(state).token_store.get_user_token("user-1", "srv-oauth") is None
 
     def test_ambiguous_streak_escalates_to_revoke(self, storage: SQLiteBackend) -> None:
         """A *sustained* run of unclassifiable 400s is treated as a dead grant in
@@ -595,12 +607,15 @@ class TestRefreshFailureClassification:
             # Below threshold: the token survives each attempt.
             for _ in range(2):
                 assert self._lookup(state).kind == "refresh_failed_transient"
-                assert state.mcp_token_store.get_user_token("user-1", "srv-oauth") is not None
+                assert (
+                    oauth_context(state).token_store.get_user_token("user-1", "srv-oauth")
+                    is not None
+                )
             # The threshold-crossing attempt escalates to a revoke.
             result = self._lookup(state)
 
         assert result.kind == "refresh_failed"
-        assert state.mcp_token_store.get_user_token("user-1", "srv-oauth") is None
+        assert oauth_context(state).token_store.get_user_token("user-1", "srv-oauth") is None
 
     def test_sustained_5xx_never_escalates(self, storage: SQLiteBackend) -> None:
         """Outage safety: infra failures (5xx) never feed the escalation counter,
@@ -621,7 +636,10 @@ class TestRefreshFailureClassification:
         ):
             for _ in range(5):
                 assert self._lookup(state).kind == "refresh_failed_transient"
-                assert state.mcp_token_store.get_user_token("user-1", "srv-oauth") is not None
+                assert (
+                    oauth_context(state).token_store.get_user_token("user-1", "srv-oauth")
+                    is not None
+                )
 
     def test_transient_cooldown_skips_as_roundtrip(self, storage: SQLiteBackend) -> None:
         """After a transient failure, a follow-up lookup inside the cooldown
@@ -662,16 +680,16 @@ class TestRefreshFailureClassification:
         # First lookup: a transient 503 records a backoff entry AND retains the
         # refresh lock (the keep-path must not drop it — bug-1).
         assert self._lookup(state).kind == "refresh_failed_transient"
-        assert ("user-1", "srv-oauth") in state.mcp_oauth_refresh_backoff
-        assert ("user-1", "srv-oauth") in state.mcp_oauth_refresh_locks
+        assert ("user-1", "srv-oauth") in state.mcp_oauth_coordination.backoff
+        assert ("user-1", "srv-oauth") in state.mcp_oauth_coordination.locks
 
         # Another node revokes the token cluster-wide (shared Postgres store).
-        state.mcp_token_store.delete_user_token("user-1", "srv-oauth")
+        oauth_context(state).token_store.delete_user_token("user-1", "srv-oauth")
 
         # Next lookup sees the row gone -> missing -> both stale entries cleared.
         assert self._lookup(state).kind == "missing"
-        assert ("user-1", "srv-oauth") not in state.mcp_oauth_refresh_backoff
-        assert ("user-1", "srv-oauth") not in state.mcp_oauth_refresh_locks
+        assert ("user-1", "srv-oauth") not in state.mcp_oauth_coordination.backoff
+        assert ("user-1", "srv-oauth") not in state.mcp_oauth_coordination.locks
 
 
 class TestObserveOnlyLookup:
@@ -694,7 +712,7 @@ class TestObserveOnlyLookup:
                     revoke_on_failure=False,
                 )
 
-        return asyncio.run(_run())
+        return run_adapter(_run())
 
     def test_permanent_invalid_grant_does_not_revoke(self, storage: SQLiteBackend) -> None:
         """The exact contrast to ``test_permanent_invalid_grant_revokes``: same
@@ -709,7 +727,7 @@ class TestObserveOnlyLookup:
         result = self._lookup(state)
 
         assert result.kind == "refresh_failed"
-        assert state.mcp_token_store.get_user_token("user-1", "srv-oauth") is not None
+        assert oauth_context(state).token_store.get_user_token("user-1", "srv-oauth") is not None
 
     def test_ambiguous_does_not_touch_shared_streak(self, storage: SQLiteBackend) -> None:
         """Repeated observe-mode ambiguous failures never bump the shared
@@ -726,10 +744,10 @@ class TestObserveOnlyLookup:
             for _ in range(5):
                 assert self._lookup(state).kind == "refresh_failed_transient"
 
-        backoff = getattr(state, "mcp_oauth_refresh_backoff", {})
+        backoff = state.mcp_oauth_coordination.backoff
         entry = backoff.get(("user-1", "srv-oauth"))
         assert entry is None or entry.ambiguous_streak == 0
-        assert state.mcp_token_store.get_user_token("user-1", "srv-oauth") is not None
+        assert oauth_context(state).token_store.get_user_token("user-1", "srv-oauth") is not None
 
     def test_expired_no_refresh_does_not_revoke(self, storage: SQLiteBackend) -> None:
         """An expired token with no refresh token surfaces as a dead grant but is
@@ -743,7 +761,7 @@ class TestObserveOnlyLookup:
         result = self._lookup(state)
 
         assert result.kind == "refresh_failed"
-        assert state.mcp_token_store.get_user_token("user-1", "srv-oauth") is not None
+        assert oauth_context(state).token_store.get_user_token("user-1", "srv-oauth") is not None
 
     def test_healthy_token_still_refreshes(self, storage: SQLiteBackend) -> None:
         """Observe mode is not read-only: a near-expiry token is still refreshed
@@ -852,7 +870,7 @@ def test_shared_issuer_refresh_survives_resource_metadata_outage(
                         storage=storage,
                         server_id=name,
                         trusted_hosts=frozenset(),
-                        metadata_cache=state.mcp_oauth_metadata_cache,
+                        metadata_cache=oauth_context(state).metadata_cache,
                     )
                 assert requests == [
                     ("GET", "https://first.example.com/.well-known/oauth-protected-resource/sse"),
@@ -861,7 +879,7 @@ def test_shared_issuer_refresh_survives_resource_metadata_outage(
                 ]
                 _seed_token(state, expires_in_seconds=-1000)
                 if clear_metadata_cache:
-                    state.mcp_oauth_metadata_cache.clear()
+                    oauth_context(state).metadata_cache.clear()
                 requests.clear()
                 prm_available = False
 
@@ -877,11 +895,11 @@ def test_shared_issuer_refresh_survives_resource_metadata_outage(
                     row = storage.get_mcp_server_by_name(name)
                     assert row is not None
                     assert row["oauth_as_issuer_cached"] == issuer
-                token = state.mcp_token_store.get_user_token("user-1", "srv-oauth")
+                token = oauth_context(state).token_store.get_user_token("user-1", "srv-oauth")
                 assert token is not None
                 assert token["refresh_token"] == "refresh-rotated"
 
-    asyncio.run(_run())
+    run_adapter(_run())
 
 
 class TestUnchangedToken:
@@ -898,7 +916,7 @@ class TestUnchangedToken:
                 app_state=state, user_id="user-1", server_name="srv-oauth"
             )
 
-        token = asyncio.run(_run())
+        token = run_adapter(_run())
         assert token == "access-aaa"
         # No AS calls were made.
         client.get.assert_not_called()
@@ -914,7 +932,7 @@ class TestUnchangedToken:
                 app_state=state, user_id="user-1", server_name="srv-oauth"
             )
 
-        assert asyncio.run(_run()) is None
+        assert run_adapter(_run()) is None
 
     def test_get_user_access_token_handles_decrypt_error(self, storage: SQLiteBackend) -> None:
         """A decrypt failure on the stored token must not crash dispatch.
@@ -935,7 +953,7 @@ class TestUnchangedToken:
 
         # Replace the get_user_token method on the store to raise the
         # canonical key-mismatch error.
-        original_get = state.mcp_token_store.get_user_token
+        original_get = oauth_context(state).token_store.get_user_token
 
         def _raise_decrypt(*args, **kwargs):
             raise TokenDecryptError(
@@ -943,7 +961,7 @@ class TestUnchangedToken:
                 key_fingerprints_attempted=("aabbccdd",),
             )
 
-        state.mcp_token_store.get_user_token = _raise_decrypt
+        oauth_context(state).token_store.get_user_token = _raise_decrypt
 
         try:
 
@@ -952,10 +970,10 @@ class TestUnchangedToken:
                     app_state=state, user_id="user-1", server_name="srv-oauth"
                 )
 
-            result = asyncio.run(_run())
+            result = run_adapter(_run())
             assert result is None
         finally:
-            state.mcp_token_store.get_user_token = original_get
+            oauth_context(state).token_store.get_user_token = original_get
 
 
 # ---------------------------------------------------------------------------
@@ -988,13 +1006,13 @@ class TestRefresh:
                     app_state=state, user_id="user-1", server_name="srv-oauth"
                 )
 
-        token = asyncio.run(_run())
+        token = run_adapter(_run())
         assert token == "access-NEW"
         # The refresh endpoint was hit exactly once.
         assert client.post.call_count == 1
         assert client.post.call_args.kwargs["data"]["resource"] == "https://mcp.example.com/sse"
         # Verify the new tokens were persisted.
-        plain = state.mcp_token_store.get_user_token("user-1", "srv-oauth")
+        plain = oauth_context(state).token_store.get_user_token("user-1", "srv-oauth")
         assert plain is not None
         assert plain["access_token"] == "access-NEW"
         assert plain["refresh_token"] == "refresh-NEW"
@@ -1033,10 +1051,10 @@ class TestRefresh:
                     app_state=state, user_id="user-1", server_name="srv-oauth"
                 )
 
-        result = asyncio.run(_run())
+        result = run_adapter(_run())
         assert result is None
         # Row was deleted.
-        assert state.mcp_token_store.get_user_token("user-1", "srv-oauth") is None
+        assert oauth_context(state).token_store.get_user_token("user-1", "srv-oauth") is None
         # Audit emitted the revoke event.
         assert "mcp_server.oauth.token_revoked" in emitted
 
@@ -1048,12 +1066,12 @@ class TestRefresh:
         _seed_server(storage)
 
         # Coordinate the AS POST so both callers race the lock.
-        post_started = asyncio.Event()
-        post_release = asyncio.Event()
+        post_started = threading.Event()
+        post_release = threading.Event()
 
         async def _post(url, *args, **kwargs):
             post_started.set()
-            await post_release.wait()
+            assert await asyncio.to_thread(post_release.wait, 5)
             return _mk_response(
                 200,
                 {
@@ -1078,7 +1096,7 @@ class TestRefresh:
                 )
                 # Wait for the first task to enter the AS POST so the
                 # second task is forced to take the lock contended.
-                await post_started.wait()
+                assert await asyncio.to_thread(post_started.wait, 5)
                 t2 = asyncio.create_task(
                     get_user_access_token(
                         app_state=state, user_id="user-1", server_name="srv-oauth"
@@ -1089,7 +1107,7 @@ class TestRefresh:
                 post_release.set()
                 return await asyncio.gather(t1, t2)
 
-        a, b = asyncio.run(_both())
+        a, b = run_adapter(_both())
         assert a == "access-ONE"
         assert b == "access-ONE"
         # Exactly one POST.
@@ -1127,9 +1145,9 @@ class TestRefresh:
                     app_state=state, user_id="user-1", server_name="srv-oauth"
                 )
 
-        token = asyncio.run(_run())
+        token = run_adapter(_run())
         assert token == "access-NEW"
-        plain = state.mcp_token_store.get_user_token("user-1", "srv-oauth")
+        plain = oauth_context(state).token_store.get_user_token("user-1", "srv-oauth")
         assert plain is not None
         # Refresh column was PRESERVED — the original refresh token is
         # still usable for the next refresh cycle.
@@ -1159,9 +1177,9 @@ class TestRefresh:
                     app_state=state, user_id="user-1", server_name="srv-oauth"
                 )
 
-        token = asyncio.run(_run())
+        token = run_adapter(_run())
         assert token == "access-NEW"
-        plain = state.mcp_token_store.get_user_token("user-1", "srv-oauth")
+        plain = oauth_context(state).token_store.get_user_token("user-1", "srv-oauth")
         assert plain is not None
         assert plain["refresh_token"] == "refresh-NEW"
 
@@ -1176,10 +1194,10 @@ class TestRefresh:
                 app_state=state, user_id="user-1", server_name="srv-oauth"
             )
 
-        result = asyncio.run(_run())
+        result = run_adapter(_run())
         assert result is None
         # Row was deleted (re-consent path).
-        assert state.mcp_token_store.get_user_token("user-1", "srv-oauth") is None
+        assert oauth_context(state).token_store.get_user_token("user-1", "srv-oauth") is None
 
     def test_refresh_grant_sends_server_url_as_resource_not_audience(
         self, storage: SQLiteBackend
@@ -1223,7 +1241,7 @@ class TestRefresh:
                     app_state=state, user_id="user-1", server_name="srv-oauth"
                 )
 
-        asyncio.run(_run())
+        run_adapter(_run())
         # The refresh POST was made; assert the form payload sent
         # ``resource=server_url`` not ``resource=audience``.
         assert client.post.call_count == 1
@@ -1271,9 +1289,9 @@ class TestExpiresInParsing:
                     app_state=state, user_id="user-1", server_name="srv-oauth"
                 )
 
-        token = asyncio.run(_run())
+        token = run_adapter(_run())
         assert token == "access-NEW"
-        plain = state.mcp_token_store.get_user_token("user-1", "srv-oauth")
+        plain = oauth_context(state).token_store.get_user_token("user-1", "srv-oauth")
         assert plain is not None
         # expires_at must be populated — a None value here means the
         # float was rejected and the next refresh cycle would skip it.
@@ -1302,9 +1320,9 @@ class TestExpiresInParsing:
                     app_state=state, user_id="user-1", server_name="srv-oauth"
                 )
 
-        token = asyncio.run(_run())
+        token = run_adapter(_run())
         assert token == "access-NEW"
-        plain = state.mcp_token_store.get_user_token("user-1", "srv-oauth")
+        plain = oauth_context(state).token_store.get_user_token("user-1", "srv-oauth")
         assert plain is not None
         assert plain["expires_at"] is not None
 
@@ -1331,7 +1349,7 @@ class TestExpiresInParsing:
                     app_state=state, user_id="user-1", server_name="srv-oauth"
                 )
 
-        token = asyncio.run(_run())
+        token = run_adapter(_run())
         assert token == "access-NEW"
 
     def test_expires_in_garbage_returns_none(self) -> None:
@@ -1390,7 +1408,7 @@ class TestAdvisoryLock:
                         app_state=state, user_id="user-1", server_name="srv-oauth"
                     )
 
-            asyncio.run(_run())
+            run_adapter(_run())
 
         assert keys_seen == ["mcp_refresh:user-1:srv-oauth"]
 
@@ -1432,6 +1450,7 @@ class TestPgRefreshLock:
         serializing the spin loop.
         """
         from turnstone.core.oauth.locking import _PgRefreshLock
+        from turnstone.core.oauth.work import OAuthWork
 
         in_flight = 0
         max_in_flight = 0
@@ -1456,13 +1475,13 @@ class TestPgRefreshLock:
         with patch.object(storage, "acquire_advisory_lock_sync", side_effect=_slow_lock_cm):
 
             async def _hold(key: str) -> None:
-                async with _PgRefreshLock(storage, key):
+                async with _PgRefreshLock(storage, key, work=OAuthWork(asyncio.get_running_loop())):
                     pass
 
             async def _two_concurrent() -> None:
                 await asyncio.gather(_hold("key-a"), _hold("key-b"))
 
-            asyncio.run(_two_concurrent())
+            run_adapter(_two_concurrent())
 
         assert max_in_flight == 2, (
             "_PgRefreshLock instances serialized through a shared executor: "
@@ -1482,7 +1501,7 @@ class TestPgRefreshLock:
         acquire on a task, waits for the worker to enter ``cm.__enter__``,
         cancels the task, then releases the worker to either succeed
         (default) or raise (``enter_raises``). Awaits in-flight drain
-        tasks via :data:`_pg_refresh_drain_tasks` so callers can inspect
+        tasks via the runtime-owned drain set so callers can inspect
         the cm deterministically.
 
         Test integrity:
@@ -1492,12 +1511,13 @@ class TestPgRefreshLock:
         * Strong ref via ``created_cms`` — keeps the cm alive past the
           test's awaits, so a no-op drain genuinely fails the assertion
           rather than papering over via GC finalization timing.
-        * Deterministic drain wait via :data:`_pg_refresh_drain_tasks` —
+        * Deterministic drain wait via the runtime-owned drain set —
           no fixed-duration sleeps.
 
         Returns the single cm the factory created.
         """
-        from turnstone.core.oauth.locking import _pg_refresh_drain_tasks, _PgRefreshLock
+        from turnstone.core.oauth.locking import _PgRefreshLock
+        from turnstone.core.oauth.work import OAuthWork
 
         enter_started = threading.Event()
         enter_release = threading.Event()
@@ -1515,7 +1535,9 @@ class TestPgRefreshLock:
         with patch.object(storage, "acquire_advisory_lock_sync", side_effect=_factory):
 
             async def _run() -> None:
-                lock = _PgRefreshLock(storage, "key-cancel")
+                lock = _PgRefreshLock(
+                    storage, "key-cancel", work=OAuthWork(asyncio.get_running_loop())
+                )
 
                 async def _attempt() -> None:
                     async with lock:
@@ -1531,11 +1553,12 @@ class TestPgRefreshLock:
                 # (``enter_raises`` set via factory closure).
                 enter_release.set()
                 # Wait deterministically for any in-flight drain task.
-                drains = list(_pg_refresh_drain_tasks)
+                assert lock._work is not None
+                drains = list(lock._work.drains)
                 if drains:
                     await asyncio.gather(*drains, return_exceptions=True)
 
-            asyncio.run(_run())
+            run_adapter(_run())
 
         assert len(created_cms) == 1, (
             f"factory was called {len(created_cms)} times — expected exactly 1"
@@ -1618,7 +1641,7 @@ class TestClassifiedGetter:
                 app_state=state, user_id="user-1", server_name="srv-oauth"
             )
 
-        result = asyncio.run(_run())
+        result = run_adapter(_run())
         assert result.kind == "token"
         assert result.token == "access-aaa"
 
@@ -1634,7 +1657,7 @@ class TestClassifiedGetter:
                 app_state=state, user_id="user-1", server_name="srv-oauth"
             )
 
-        result = asyncio.run(_run())
+        result = run_adapter(_run())
         assert result.kind == "missing"
 
     def test_decrypt_failure_returns_decrypt_failure(self, storage: SQLiteBackend) -> None:
@@ -1658,14 +1681,14 @@ class TestClassifiedGetter:
                 key_fingerprints_attempted=("aabbccdd",),
             )
 
-        state.mcp_token_store.get_user_token = _raise_decrypt
+        oauth_context(state).token_store.get_user_token = _raise_decrypt
 
         async def _run():
             return await get_user_access_token_classified(
                 app_state=state, user_id="user-1", server_name="srv-oauth"
             )
 
-        result = asyncio.run(_run())
+        result = run_adapter(_run())
         assert result.kind == "decrypt_failure"
         assert result.decrypt_fingerprints == ("aabbccdd",)
 
@@ -1685,10 +1708,10 @@ class TestClassifiedGetter:
                     app_state=state, user_id="user-1", server_name="srv-oauth"
                 )
 
-        result = asyncio.run(_run())
+        result = run_adapter(_run())
         assert result.kind == "refresh_failed"
         # Row was deleted (re-consent path).
-        assert state.mcp_token_store.get_user_token("user-1", "srv-oauth") is None
+        assert oauth_context(state).token_store.get_user_token("user-1", "srv-oauth") is None
 
     def test_no_refresh_token_returns_refresh_failed(self, storage: SQLiteBackend) -> None:
         from turnstone.core.mcp_oauth import get_user_access_token_classified
@@ -1703,7 +1726,7 @@ class TestClassifiedGetter:
                 app_state=state, user_id="user-1", server_name="srv-oauth"
             )
 
-        result = asyncio.run(_run())
+        result = run_adapter(_run())
         assert result.kind == "refresh_failed"
 
     def test_classified_does_not_break_legacy_helper(self, storage: SQLiteBackend) -> None:
@@ -1718,5 +1741,5 @@ class TestClassifiedGetter:
                 app_state=state, user_id="user-1", server_name="srv-oauth"
             )
 
-        token = asyncio.run(_run())
+        token = run_adapter(_run())
         assert token == "access-aaa"

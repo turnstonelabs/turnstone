@@ -20,6 +20,7 @@ from unittest.mock import MagicMock
 
 from turnstone.core.healthcheck import HealthTrackerRegistry
 from turnstone.core.model_registry import ModelConfig, ModelRegistry
+from turnstone.core.oauth.context import OAuthContext
 from turnstone.server import (
     _collect_node_models_metadata,
     _publish_models_metadata,
@@ -405,7 +406,7 @@ def test_model_reload_refuses_dynamic_auth_without_key(
         health_registry=HealthTrackerRegistry(),
         config_store=None,
         node_id="node-a",
-        mcp_token_store=None,
+        oauth_context=OAuthContext(token_store=None),
     )
     request = SimpleNamespace(app=SimpleNamespace(state=app_state))
 
@@ -512,9 +513,7 @@ def test_config_reload_maps_dynamic_auth_key_error_to_503(monkeypatch, tmp_path,
         "gw" if key == "model.default_alias" else default
     )
     app_state = SimpleNamespace(
-        registry=old_reg,
-        config_store=config_store,
-        mcp_token_store=None,
+        registry=old_reg, config_store=config_store, oauth_context=OAuthContext(token_store=None)
     )
     request = SimpleNamespace(app=SimpleNamespace(state=app_state))
 

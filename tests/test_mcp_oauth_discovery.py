@@ -24,13 +24,13 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import httpx
 import pytest
 
+from tests._oauth_runtime_helpers import make_oauth_context
 from turnstone.core.mcp_oauth import (
     MCPOAuthDiscoveryError,
     _parse_prm_url_from_www_authenticate,
     canonical_resource,
     discover_authorization_server,
 )
-from turnstone.core.oauth import http as oauth_http
 from turnstone.core.oauth.http import ASMetadata
 
 # ---------------------------------------------------------------------------
@@ -2126,50 +2126,60 @@ class TestPrivateNetworkOptIn:
                 f"silently fall back to strict:\n{body}"
             )
 
-    def test_refresh_reads_the_setting_from_app_state(self) -> None:
-        # The site that fails latest and loudest: a refresh runs long after
-        # consent, so a dropped read shows up as a dead grant.
+    def test_refresh_reads_the_setting_from_app_state(self, backend) -> None:
+        # The public MCP adapter snapshots the setting before crossing into
+        # the OAuth runtime; discovery must receive that exact value.
         from types import SimpleNamespace
 
+        from tests.conftest import make_mcp_token_cipher
         from turnstone.core import mcp_oauth
+        from turnstone.core.mcp_crypto import MCPTokenStore
 
         seen: dict[str, Any] = {}
 
-        async def _fake_discover(**kwargs: Any) -> ASMetadata:
+        async def discover(**kwargs: Any) -> ASMetadata:
             seen.update(kwargs)
             raise MCPOAuthDiscoveryError("stop here")
 
-        store = MagicMock()
-        store.get.return_value = True
-        state = SimpleNamespace(
-            obo_http_client=MagicMock(spec=httpx.AsyncClient),
-            mcp_oauth_metadata_cache=None,
-            config_store=store,
+        config_store = MagicMock()
+        config_store.get.return_value = True
+        store = MCPTokenStore(backend, make_mcp_token_cipher())
+        backend.create_mcp_server(
+            server_id="srv-id",
+            name="srv-x",
+            transport="streamable-http",
+            url=_SERVER,
+            auth_type="oauth_user",
+            oauth_client_id="cid",
         )
-
-        async def _run() -> None:
-            await mcp_oauth._refresh_and_persist(
-                app_state=state,
-                storage=MagicMock(),
-                token_store=MagicMock(),
-                user_id="u1",
-                server_name="srv-x",
-                server_row={
-                    "server_id": "srv-id",
-                    "url": _SERVER,
-                    "oauth_client_id": "cid",
-                },
-                refresh_value="rt",
-                existing_scopes="",
+        store.create_user_token(
+            "u1",
+            "srv-x",
+            access_token="old",
+            refresh_token="rt",
+            expires_at="2000-01-01T00:00:00",
+            scopes="",
+            as_issuer="https://as.example.com",
+            audience=_SERVER,
+        )
+        context = make_oauth_context(
+            storage=backend,
+            token_store=store,
+            http_client=MagicMock(spec=httpx.AsyncClient),
+        )
+        state = SimpleNamespace(config_store=config_store, oauth_context=context)
+        with patch.object(mcp_oauth, "discover_authorization_server", discover):
+            result = asyncio.run(
+                mcp_oauth.get_user_access_token_classified(
+                    app_state=state,
+                    user_id="u1",
+                    server_name="srv-x",
+                )
             )
-
-        with (
-            patch.object(mcp_oauth, "discover_authorization_server", _fake_discover),
-            pytest.raises(oauth_http.OAuthRefreshError),
-        ):
-            asyncio.run(_run())
+        assert result.kind == "refresh_failed_transient"
         assert seen["allow_private_network"] is True
-        store.get.assert_called_with("mcp.oauth_allow_private_network")
+        assert seen["http_client"] is context.http_client
+        config_store.get.assert_called_with("mcp.oauth_allow_private_network")
 
     @pytest.mark.parametrize(
         ("one", "other", "same"),

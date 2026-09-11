@@ -21,15 +21,18 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 from unittest.mock import MagicMock, patch
 
+import httpx
 import pytest
 import uvicorn
 from mcp.server.fastmcp import FastMCP
 from starlette.middleware.base import BaseHTTPMiddleware
 
+from tests._oauth_runtime_helpers import make_oauth_context
 from tests.conftest import make_mcp_token_cipher, serve_until_exit, stop_loop_thread
 from turnstone.core.mcp_client import MCPClientManager
 from turnstone.core.mcp_crypto import MCPTokenStore
 from turnstone.core.mcp_oauth import TokenLookupResult
+from turnstone.core.oauth.context import TokenCoordination
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -229,10 +232,12 @@ def _seed_user_token(
 def _make_app_state(storage: SQLiteBackend, *, cipher: Any) -> SimpleNamespace:
     return SimpleNamespace(
         auth_storage=storage,
-        mcp_token_store=MCPTokenStore(storage, cipher, node_id="test"),
-        obo_http_client=MagicMock(),
-        mcp_oauth_refresh_locks={},
+        mcp_oauth_coordination=TokenCoordination(),
         mcp_oauth_metadata_cache={},
+        oauth_context=make_oauth_context(
+            token_store=MCPTokenStore(storage, cipher, node_id="test"),
+            http_client=MagicMock(spec=httpx.AsyncClient),
+        ),
     )
 
 

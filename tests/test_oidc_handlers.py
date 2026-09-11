@@ -32,6 +32,7 @@ from turnstone.core.auth import (
     handle_oidc_authorize,
     handle_oidc_callback,
 )
+from turnstone.core.oauth.context import oauth_context
 from turnstone.core.oauth.oidc import OIDCConfig, OIDCError, OIDCKeyNotFoundError
 
 if TYPE_CHECKING:
@@ -111,7 +112,7 @@ def authorize_client(storage: SQLiteBackend, oidc_config: OIDCConfig) -> TestCli
             ),
         ],
     )
-    app.state.oidc_config = oidc_config
+    oauth_context(app.state).oidc_config = oidc_config
     app.state.auth_storage = storage
     app.state.jwt_secret = "test-jwt-secret-key-padded-32b!!"
     app.state.jwks_data = {"keys": []}
@@ -189,7 +190,7 @@ class TestOIDCAuthorize:
         app = Starlette(
             routes=[Mount("/v1", routes=[Route("/api/auth/oidc/authorize", _oidc_authorize)])]
         )
-        app.state.oidc_config = _make_oidc_config(enabled=False)
+        oauth_context(app.state).oidc_config = _make_oidc_config(enabled=False)
         app.state.auth_storage = storage
         client = TestClient(app, raise_server_exceptions=False)
         resp = client.get("/v1/api/auth/oidc/authorize")
@@ -205,7 +206,9 @@ class TestOIDCAuthorize:
         app = Starlette(
             routes=[Mount("/v1", routes=[Route("/api/auth/oidc/authorize", _oidc_authorize)])]
         )
-        app.state.oidc_config = _make_oidc_config(enabled=False, discovery_retryable=True)
+        oauth_context(app.state).oidc_config = _make_oidc_config(
+            enabled=False, discovery_retryable=True
+        )
         app.state.auth_storage = storage
         client = TestClient(app, raise_server_exceptions=False)
         with patch("turnstone.core.auth.maybe_rediscover_oidc", new=AsyncMock()) as heal:
@@ -216,7 +219,7 @@ class TestOIDCAuthorize:
         app = Starlette(
             routes=[Mount("/v1", routes=[Route("/api/auth/oidc/authorize", _oidc_authorize)])]
         )
-        app.state.oidc_config = _make_oidc_config()
+        oauth_context(app.state).oidc_config = _make_oidc_config()
         app.state.login_limiter = None
         # No auth_storage
         client = TestClient(app, raise_server_exceptions=False)
@@ -228,7 +231,7 @@ class TestOIDCAuthorize:
         app = Starlette(
             routes=[Mount("/v1", routes=[Route("/api/auth/oidc/authorize", _oidc_authorize)])]
         )
-        app.state.oidc_config = _make_oidc_config()
+        oauth_context(app.state).oidc_config = _make_oidc_config()
         app.state.auth_storage = backend
         app.state.login_limiter = None
         client = TestClient(app, raise_server_exceptions=False)
@@ -258,7 +261,7 @@ class TestOIDCAuthorize:
         app = Starlette(
             routes=[Mount("/v1", routes=[Route("/api/auth/oidc/authorize", _oidc_authorize)])]
         )
-        app.state.oidc_config = _make_oidc_config()
+        oauth_context(app.state).oidc_config = _make_oidc_config()
         app.state.auth_storage = storage
         limiter = LoginRateLimiter(max_attempts=1, window_seconds=300)
         # Exhaust the rate limit
@@ -519,7 +522,7 @@ class TestOIDCCallback:
         app = Starlette(
             routes=[Mount("/v1", routes=[Route("/api/auth/oidc/callback", _oidc_callback)])]
         )
-        app.state.oidc_config = _make_oidc_config()
+        oauth_context(app.state).oidc_config = _make_oidc_config()
         app.state.auth_storage = backend
         app.state.jwt_secret = "test-jwt-secret-key-padded-32b!!"
         app.state.jwks_data = {"keys": []}
@@ -543,7 +546,7 @@ class TestOIDCCallback:
         app = Starlette(
             routes=[Mount("/v1", routes=[Route("/api/auth/oidc/callback", _oidc_callback)])]
         )
-        app.state.oidc_config = _make_oidc_config()
+        oauth_context(app.state).oidc_config = _make_oidc_config()
         app.state.auth_storage = storage
         app.state.jwt_secret = "test-jwt-secret-key-padded-32b!!"
         app.state.jwks_data = {"keys": []}
@@ -679,7 +682,7 @@ class TestOIDCCallback:
         app = Starlette(
             routes=[Mount("/v1", routes=[Route("/api/auth/oidc/callback", _console_callback)])]
         )
-        app.state.oidc_config = _make_oidc_config()
+        oauth_context(app.state).oidc_config = _make_oidc_config()
         app.state.auth_storage = storage
         app.state.jwt_secret = jwt_secret
         app.state.jwks_data = {"keys": []}
@@ -778,13 +781,13 @@ class TestOIDCCallbackCapture:
                 Mount("/v1", routes=[Route("/api/auth/oidc/callback", _oidc_callback)]),
             ],
         )
-        app.state.oidc_config = cfg
+        oauth_context(app.state).oidc_config = cfg
         app.state.auth_storage = storage
         app.state.jwt_secret = "test-jwt-secret-key-padded-32b!!"
         app.state.jwks_data = {"keys": []}
         app.state.login_limiter = None
         store = MCPTokenStore(storage, make_mcp_token_cipher()) if with_store else None
-        app.state.mcp_token_store = store
+        oauth_context(app.state).token_store = store
         return TestClient(app, raise_server_exceptions=False), store, cfg
 
     def _login(
@@ -1127,8 +1130,10 @@ class TestAdminOIDCIdentities:
         credential AND purge the user's already-minted oauth_obo cache rows —
         deleting only the credential leaves live cached bearers authorizing
         dispatch until TTL. The response/audit report what was actually cut."""
+        from tests._oidc_test_helpers import make_oidc_config
         from tests.conftest import make_mcp_token_cipher
         from turnstone.core.mcp_crypto import MCPTokenStore
+        from turnstone.core.model_oauth import OAuthModelTokenClient
 
         issuer = "https://idp.example.com"
         store = MCPTokenStore(storage, make_mcp_token_cipher(), node_id="test")
@@ -1148,8 +1153,14 @@ class TestAdminOIDCIdentities:
             middleware=[Middleware(_InjectAuthMiddleware)],
         )
         app.state.auth_storage = storage
-        app.state.mcp_token_store = store
-        app.state.mcp_client = MagicMock()
+        oauth_context(app.state).token_store = store
+        context = oauth_context(app.state)
+        context.oidc_config = make_oidc_config(issuer=issuer)
+        model_client = OAuthModelTokenClient(context)
+        model_client.invalidate_model_mint_memo_sync = MagicMock(
+            wraps=model_client.invalidate_model_mint_memo_sync
+        )
+        app.state.model_token_client = model_client
         app.state.collector = MagicMock()
         app.state.collector.get_all_nodes.return_value = [
             {"node_id": "node-1", "server_url": "https://node-1.example"}
@@ -1203,6 +1214,19 @@ class TestAdminOIDCIdentities:
             audience="api://model-a",
         )
 
+        # Populate the real OAuth-loop memo through both public model bridges.
+        assert (
+            model_client.mint_model_obo_token_sync(
+                user_id="user-x", alias="api://model-a", audience="api://model-a"
+            )
+            == "model-at"
+        )
+        assert (
+            model_client.mint_app_token_sync(alias="api://model-a", audience="api://model-a")
+            == "app-at"
+        )
+        assert len(context.token_memo) == 2
+
         resp = client.delete(f"/v1/api/admin/oidc-identities?issuer={issuer}&subject=sub-1")
         assert resp.status_code == 200, resp.text
         body = resp.json()
@@ -1213,9 +1237,16 @@ class TestAdminOIDCIdentities:
         assert storage.get_oauth_token("user-x", "obo-srv") is None
         assert storage.get_oauth_token("user-x", "__model_obo__:api://model-a") is None
         assert storage.get_oauth_token("__app__", "__model_app__:api://model-a") is not None
-        app.state.mcp_client.invalidate_model_mint_memo_sync.assert_called_once_with(
+        app.state.model_token_client.invalidate_model_mint_memo_sync.assert_called_once_with(
             user_id="user-x",
             server_prefix="__model_obo__:",
+        )
+        assert set(context.token_memo) == {("__app__", "__model_app__:api://model-a")}
+        assert (
+            model_client.mint_model_obo_token_sync(
+                user_id="user-x", alias="api://model-a", audience="api://model-a"
+            )
+            is None
         )
         app.state.proxy_client.post.assert_awaited_once_with(
             "https://node-1.example/v1/api/_internal/model-auth-cache-invalidate",

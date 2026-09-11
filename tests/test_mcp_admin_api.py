@@ -18,6 +18,8 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.routing import Mount, Route
 from starlette.testclient import TestClient
 
+from turnstone.core.oauth.context import oauth_context
+
 if TYPE_CHECKING:
     from starlette.requests import Request
     from starlette.responses import Response
@@ -208,8 +210,8 @@ def _install_token_store(app, storage) -> None:
 
     raw_key = base64.urlsafe_b64decode(Fernet.generate_key())
     cipher = TokenCipher(TokenCipherConfig(keys=(raw_key,)))
-    app.state.mcp_token_cipher = cipher
-    app.state.mcp_token_store = MCPTokenStore(
+    oauth_context(app.state).cipher = cipher
+    oauth_context(app.state).token_store = MCPTokenStore(
         storage, cipher, node_id="test", audit_storage=storage
     )
 
@@ -242,7 +244,7 @@ def client(storage):
     # Default: OIDC enabled under the entra profile so oauth_obo writes pass the
     # requirement gate. Per-test overrides install rfc8693 / disabled / bad
     # profile as needed.
-    app.state.oidc_config = _enabled_oidc("entra")
+    oauth_context(app.state).oidc_config = _enabled_oidc("entra")
     return TestClient(app)
 
 
@@ -266,8 +268,8 @@ def client_no_token_store(storage):
         middleware=[Middleware(_InjectAuthMiddleware)],
     )
     app.state.auth_storage = storage
-    app.state.mcp_token_store = None
-    app.state.mcp_token_cipher = None
+    oauth_context(app.state).token_store = None
+    oauth_context(app.state).cipher = None
     return TestClient(app)
 
 
@@ -848,7 +850,7 @@ class TestUpdateMcpServer:
         credential, so with capture_user_credential off, login persists nothing
         and every dispatch returns kind='missing' with an unsatisfiable remedy.
         Reject at write time."""
-        client.app.state.oidc_config = SimpleNamespace(
+        oauth_context(client.app.state).oidc_config = SimpleNamespace(
             enabled=True,
             issuer="https://idp.example.com",
             obo_grant_profile="entra",
@@ -872,7 +874,9 @@ class TestUpdateMcpServer:
         install with OIDC disabled can NEVER mint. Reject at write time (a
         permanent misconfig otherwise surfaces per-dispatch as a retryable
         transient that never heals)."""
-        client.app.state.oidc_config = SimpleNamespace(enabled=False, obo_grant_profile="entra")
+        oauth_context(client.app.state).oidc_config = SimpleNamespace(
+            enabled=False, obo_grant_profile="entra"
+        )
         r = client.post(
             "/v1/api/admin/mcp-servers",
             json={
@@ -903,7 +907,7 @@ class TestUpdateMcpServer:
             oauth_audience="api://mcp-a",
         )
         # Console process booted while the IdP was briefly unreachable.
-        client.app.state.oidc_config = SimpleNamespace(
+        oauth_context(client.app.state).oidc_config = SimpleNamespace(
             enabled=False,
             issuer="https://idp.example.com",
             obo_grant_profile="entra",
@@ -922,7 +926,7 @@ class TestUpdateMcpServer:
         # edit of the EXISTING obo server is still allowed — the deployment
         # checks only fire on create / flip-into-obo, so an operator is never
         # locked out of disabling or editing a server (review finding R8-1).
-        client.app.state.oidc_config = SimpleNamespace(
+        oauth_context(client.app.state).oidc_config = SimpleNamespace(
             enabled=False,
             issuer="",
             obo_grant_profile="entra",
@@ -940,7 +944,7 @@ class TestUpdateMcpServer:
         fresh oauth_obo server (or flipping one into obo) while OIDC is fully
         operator-disabled is rejected — only same-type edits of an existing obo
         server skip the deployment checks."""
-        client.app.state.oidc_config = SimpleNamespace(
+        oauth_context(client.app.state).oidc_config = SimpleNamespace(
             enabled=False,
             issuer="",
             obo_grant_profile="entra",
@@ -964,7 +968,7 @@ class TestUpdateMcpServer:
         """Review finding: a typo'd deployment obo_grant_profile leaves the mint
         leg unresolved (obo_misconfigured per dispatch), so reject it at the
         write choke point rather than as a runtime transient."""
-        client.app.state.oidc_config = _enabled_oidc("bogus-profile")
+        oauth_context(client.app.state).oidc_config = _enabled_oidc("bogus-profile")
         r = client.post(
             "/v1/api/admin/mcp-servers",
             json={
@@ -1108,7 +1112,7 @@ class TestUpdateMcpServer:
         snap rather than a silent drop — while the console-realistic flip (the
         form clears the semantic field on the auth-type switch, so scopes is
         omitted/empty) succeeds with scopes NULL."""
-        client.app.state.oidc_config = _enabled_oidc("entra")
+        oauth_context(client.app.state).oidc_config = _enabled_oidc("entra")
         # Explicit non-empty scopes on the flip → 400 (they can't apply on entra).
         sid = self._create_oauth_user_row_with_scopes(client, "flip-resend-entra")
         rejected = client.put(
@@ -1136,7 +1140,7 @@ class TestUpdateMcpServer:
         Keycloak optional-audience scope can legitimately equal the old
         consent scope string) must NOT have it silently nulled; only an
         omitted field clears (previous test)."""
-        client.app.state.oidc_config = _enabled_oidc("rfc8693")
+        oauth_context(client.app.state).oidc_config = _enabled_oidc("rfc8693")
         sid = self._create_oauth_user_row_with_scopes(client, "flip-resend-rfc")
         r2 = client.put(
             f"/v1/api/admin/mcp-servers/{sid}",
@@ -1165,7 +1169,7 @@ class TestUpdateMcpServer:
             oauth_scopes="custom.scope",
         )
         # Now the deployment is on the entra profile.
-        client.app.state.oidc_config = _enabled_oidc("entra")
+        oauth_context(client.app.state).oidc_config = _enabled_oidc("entra")
 
         # An unrelated maintenance edit (disable) — does NOT touch scopes.
         r = client.put(
@@ -1317,7 +1321,7 @@ class TestUpdateMcpServer:
         bearer's privileges exactly like the audience does — narrowing
         oauth_scopes must purge cached rows or the reduction silently waits
         out the token TTL (inconsistent with the audience purge)."""
-        client.app.state.oidc_config = _enabled_oidc("rfc8693")
+        oauth_context(client.app.state).oidc_config = _enabled_oidc("rfc8693")
         sid = self._seed_obo_row_with_cache(
             client, storage, name="scope-change", scopes="api.read api.write"
         )
@@ -1334,7 +1338,7 @@ class TestUpdateMcpServer:
         """Review finding companion: the admin form re-submits the pre-filled
         scopes on every save — an EQUAL value is normalized out of the update
         and must not flush every user's minted tokens."""
-        client.app.state.oidc_config = _enabled_oidc("rfc8693")
+        oauth_context(client.app.state).oidc_config = _enabled_oidc("rfc8693")
         sid = self._seed_obo_row_with_cache(client, storage, name="scope-noop", scopes="api.read")
         r2 = client.put(
             f"/v1/api/admin/mcp-servers/{sid}",
@@ -1351,7 +1355,7 @@ class TestUpdateMcpServer:
         carried over, every consent yields a wrong-resource token that 401s
         with no visible cause. The flip must clear it (and the rfc8693
         exchange scopes) unless the request explicitly sets new values."""
-        client.app.state.oidc_config = _enabled_oidc("rfc8693")
+        oauth_context(client.app.state).oidc_config = _enabled_oidc("rfc8693")
         sid = self._seed_obo_row_with_cache(client, storage, name="flip-back", scopes="api.read")
         r2 = client.put(
             f"/v1/api/admin/mcp-servers/{sid}",
@@ -1373,11 +1377,11 @@ class TestUpdateMcpServer:
         # The legacy-scoped entra row arises from a deployment profile switch:
         # the row is created while the profile is rfc8693 (scopes accepted),
         # then the deployment flips to entra.
-        client.app.state.oidc_config = _enabled_oidc("rfc8693")
+        oauth_context(client.app.state).oidc_config = _enabled_oidc("rfc8693")
         sid = self._seed_obo_row_with_cache(
             client, storage, name="entra-resend", scopes="legacy.scope"
         )
-        client.app.state.oidc_config = _enabled_oidc("entra")
+        oauth_context(client.app.state).oidc_config = _enabled_oidc("entra")
         # Equal re-send + unrelated change → accepted, scopes untouched.
         r2 = client.put(
             f"/v1/api/admin/mcp-servers/{sid}",
@@ -1397,7 +1401,7 @@ class TestUpdateMcpServer:
         """#551 follow-up: oauth_scopes is meaningless for the entra grant leg
         (it mints <audience>/.default), so the write path rejects it rather than
         silently ignoring it at mint time."""
-        client.app.state.oidc_config = _enabled_oidc("entra")
+        oauth_context(client.app.state).oidc_config = _enabled_oidc("entra")
         r = client.post(
             "/v1/api/admin/mcp-servers",
             json={
@@ -2707,8 +2711,8 @@ class TestInternalModelAuthCacheInvalidateEndpoint:
             routes=_routes_with_internal(),
             middleware=[Middleware(_InjectServiceAuthMiddleware)],
         )
-        app.state.mcp_client = MagicMock()
-        app.state.mcp_client.invalidate_model_mint_memo_sync.return_value = 2
+        app.state.model_token_client = MagicMock()
+        app.state.model_token_client.invalidate_model_mint_memo_sync.return_value = 2
         client = TestClient(app, raise_server_exceptions=False)
 
         response = client.post(
@@ -2718,7 +2722,7 @@ class TestInternalModelAuthCacheInvalidateEndpoint:
 
         assert response.status_code == 200
         assert response.json() == {"status": "ok", "evicted": 2}
-        app.state.mcp_client.invalidate_model_mint_memo_sync.assert_called_once_with(
+        app.state.model_token_client.invalidate_model_mint_memo_sync.assert_called_once_with(
             user_id="user-x",
             server_prefix="__model_obo__:",
         )
@@ -2728,7 +2732,7 @@ class TestInternalModelAuthCacheInvalidateEndpoint:
             routes=_routes_with_internal(),
             middleware=[Middleware(_InjectAuthMiddleware)],
         )
-        app.state.mcp_client = MagicMock()
+        app.state.model_token_client = MagicMock()
         client = TestClient(app, raise_server_exceptions=False)
 
         response = client.post(
@@ -2737,7 +2741,7 @@ class TestInternalModelAuthCacheInvalidateEndpoint:
         )
 
         assert response.status_code == 403
-        app.state.mcp_client.invalidate_model_mint_memo_sync.assert_not_called()
+        app.state.model_token_client.invalidate_model_mint_memo_sync.assert_not_called()
 
     @pytest.mark.parametrize("body", [{}, {"user_id": ""}, {"user_id": "bad\nid"}])
     def test_invalid_user_id_is_rejected(self, body: dict[str, str]) -> None:
@@ -2745,7 +2749,7 @@ class TestInternalModelAuthCacheInvalidateEndpoint:
             routes=_routes_with_internal(),
             middleware=[Middleware(_InjectServiceAuthMiddleware)],
         )
-        app.state.mcp_client = MagicMock()
+        app.state.model_token_client = MagicMock()
         client = TestClient(app, raise_server_exceptions=False)
 
         response = client.post(
@@ -2754,7 +2758,7 @@ class TestInternalModelAuthCacheInvalidateEndpoint:
         )
 
         assert response.status_code == 400
-        app.state.mcp_client.invalidate_model_mint_memo_sync.assert_not_called()
+        app.state.model_token_client.invalidate_model_mint_memo_sync.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -3564,7 +3568,6 @@ class TestEnsureConsoleMcpClient:
             create.assert_called_once_with(
                 "/etc/turnstone/mcp.json",
                 storage=app.state.auth_storage,
-                required=False,
             )
             inst = create.return_value
             assert app.state.mcp_client is inst
@@ -3573,18 +3576,20 @@ class TestEnsureConsoleMcpClient:
             inst.reconcile_sync.assert_called_once_with(app.state.auth_storage)
             assert out is inst.reconcile_sync.return_value
 
-    def test_dynamic_model_auth_requires_manager_without_mcp_servers(self):
+    def test_dynamic_model_auth_does_not_require_an_mcp_manager(self):
         from unittest.mock import patch
 
-        with patch("turnstone.core.mcp_client.create_mcp_client") as create:
-            app = self._app(dynamic_model_auth=True)
-            _ensure_console_mcp_client(app)
+        from turnstone.core.model_oauth import get_model_token_client
 
-        create.assert_called_once_with(
-            None,
-            storage=app.state.auth_storage,
-            required=True,
-        )
+        with patch("turnstone.core.mcp_client.create_mcp_client", return_value=None) as create:
+            app = self._app(dynamic_model_auth=True)
+            client = get_model_token_client(app.state)
+            result = _ensure_console_mcp_client(app)
+
+        create.assert_called_once_with(None, storage=app.state.auth_storage)
+        assert result == {"skipped": "no MCP servers configured"}
+        assert getattr(app.state, "mcp_client", None) is None
+        assert get_model_token_client(app.state) is client
 
     def test_nothing_configured_skips(self):
         """create_mcp_client returning None (no DB rows, no file config)

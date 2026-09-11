@@ -11,6 +11,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
+from turnstone.core.oauth.context import OAuthContext
 from turnstone.core.oauth.oidc import OIDCConfig
 
 if TYPE_CHECKING:
@@ -39,7 +40,7 @@ def make_oidc_config(**overrides: Any) -> OIDCConfig:
 def keyed_app_state() -> SimpleNamespace:
     """App-state stub satisfying ``ModelRegistry.reload``'s dynamic-auth key
     guard, for suites exercising reload mechanics rather than key policy."""
-    return SimpleNamespace(mcp_token_store=object())
+    return SimpleNamespace(oauth_context=OAuthContext(token_store=object()))
 
 
 def mint_warn_state_reset() -> Iterator[None]:

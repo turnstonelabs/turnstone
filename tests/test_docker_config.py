@@ -16,6 +16,7 @@ import pytest
 import yaml
 from cryptography.fernet import Fernet
 
+from turnstone.core.oauth.context import oauth_context
 from turnstone.deploy.bootstrap_config import create_config
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -76,8 +77,8 @@ def test_generated_config_loads_in_runtime(tmp_path, monkeypatch, mode):
         skip_permissions=False,
     )
     console = create_console_app(collector=MagicMock())
-    assert node.state.oidc_config == oidc
-    assert console.state.oidc_config == oidc
+    assert oauth_context(node.state).oidc_config == oidc
+    assert oauth_context(console.state).oidc_config == oidc
 
 
 @pytest.mark.parametrize(

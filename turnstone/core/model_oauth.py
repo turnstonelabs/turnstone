@@ -5,7 +5,10 @@ from __future__ import annotations
 import asyncio
 import hashlib
 from datetime import UTC, datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any, Protocol
+
+if TYPE_CHECKING:
+    from collections.abc import Coroutine
 
 from turnstone.core.log import get_logger
 from turnstone.core.model_registry import (
@@ -17,6 +20,9 @@ from turnstone.core.oauth import grants as oauth_grants
 from turnstone.core.oauth import http as oauth_http
 from turnstone.core.oauth import locking as oauth_locking
 from turnstone.core.oauth import tokens as oauth_tokens
+from turnstone.core.oauth.context import OAuthContext, oauth_context
+from turnstone.core.oauth.runtime import ensure_oauth_runtime
+from turnstone.core.oauth.work import OAuthUnavailableError, durable_write
 from turnstone.core.token_store import crypto as token_store_crypto
 from turnstone.core.token_store import store as token_store_store
 
@@ -215,11 +221,11 @@ def _warn_mint_store_unavailable(
 
 
 def _model_mint_memo(app_state: Any) -> dict[tuple[str, str], token_store_store.UserTokenPlain]:
-    """Return the mcp-loop-owned model-token memo."""
-    memo = getattr(app_state, "model_auth_token_cache", None)
+    """Return the OAuth-loop-owned model-token memo."""
+    memo = oauth_context(app_state).token_memo
     if not isinstance(memo, dict):
         memo = {}
-        app_state.model_auth_token_cache = memo
+        oauth_context(app_state).token_memo = memo
     return memo
 
 
@@ -231,7 +237,7 @@ def invalidate_model_mint_memo(
 ) -> int:
     """Remove memo entries for one principal and synthetic-key prefix.
 
-    This must run on the manager's MCP loop. OIDC unlink schedules it there
+    This must run on the OAuth loop. OIDC unlink schedules it there
     alongside deleting the corresponding DB rows, so the in-process fast path
     cannot extend a revoked bearer beyond the purge.
     """
@@ -421,7 +427,7 @@ def model_obo_cause_key(alias: str, grant_leg: str | None = None) -> str:
     return key
 
 
-async def mint_obo_access_token(
+async def _mint_obo_access_token(
     *,
     app_state: Any,
     user_id: str,
@@ -509,11 +515,11 @@ async def mint_obo_access_token(
     # The caller's ``fallback_to_static`` is the DECISION layer and fires per
     # turn but names no cause; these branches are the CAUSE layer, deduped to
     # once per (cause, audience) per process.
-    oidc_config = getattr(app_state, "oidc_config", None)
+    oidc_config = oauth_context(app_state).oidc_config
     if oidc_config is None or not getattr(oidc_config, "enabled", False):
         _warn_mint_oidc_cause("model_obo", oidc_config, audience, user_id, cause_key=cause_key)
         return None
-    token_store: token_store_store.TokenStore | None = getattr(app_state, "mcp_token_store", None)
+    token_store: token_store_store.TokenStore | None = oauth_context(app_state).token_store
     storage = oauth_tokens._get_storage(app_state)
     if token_store is None or storage is None:
         _warn_mint_store_unavailable(
@@ -567,9 +573,13 @@ async def mint_obo_access_token(
         scopes=scopes,
     )
     if cached_token and not force_refresh:
-        oauth_tokens._clear_refresh_backoff(app_state, user_id, cooldown_key)
+        oauth_tokens._clear_refresh_backoff(
+            oauth_context(app_state).coordination, user_id, cooldown_key
+        )
         return cached_token
-    if not cached_token and oauth_tokens._refresh_in_cooldown(app_state, user_id, cooldown_key):
+    if not cached_token and oauth_tokens._refresh_in_cooldown(
+        oauth_context(app_state).coordination, user_id, cooldown_key
+    ):
         return None
 
     # Single-flight the mint: a per-(user, alias) asyncio lock for local
@@ -578,9 +588,13 @@ async def mint_obo_access_token(
     # mutable resource (rotation write-back), so a model mint and an MCP mint for
     # the same user serialise on it cluster-wide.  Order is always
     # audience → credential and nothing takes the reverse, so no deadlock.
-    lock = oauth_locking._refresh_lock_for(app_state, user_id, cache_server)
+    lock = oauth_locking._refresh_lock_for(
+        oauth_context(app_state).coordination, user_id, cache_server
+    )
     credential_key = f"__obo__:{issuer}"
-    credential_lock = oauth_locking._refresh_lock_for(app_state, user_id, credential_key)
+    credential_lock = oauth_locking._refresh_lock_for(
+        oauth_context(app_state).coordination, user_id, credential_key
+    )
     pg_lock = await oauth_locking._acquire_pg_refresh_lock(storage, user_id, credential_key)
     try:
         async with lock, credential_lock, pg_lock:
@@ -593,10 +607,12 @@ async def mint_obo_access_token(
                 scopes=scopes,
             )
             if cached_token and not force_refresh:
-                oauth_tokens._clear_refresh_backoff(app_state, user_id, cooldown_key)
+                oauth_tokens._clear_refresh_backoff(
+                    oauth_context(app_state).coordination, user_id, cooldown_key
+                )
                 return cached_token
             if not cached_token and oauth_tokens._refresh_in_cooldown(
-                app_state, user_id, cooldown_key
+                oauth_context(app_state).coordination, user_id, cooldown_key
             ):
                 return None
 
@@ -614,11 +630,15 @@ async def mint_obo_access_token(
                 _record_mint_refusal_cause(
                     "model_obo", cause_key, user_id, "credential_decrypt_failure"
                 )
-                oauth_tokens._arm_cooldown(app_state, user_id, cooldown_key)
+                oauth_tokens._arm_cooldown(
+                    oauth_context(app_state).coordination, user_id, cooldown_key
+                )
                 return None
             if credential is None:
                 _warn_model_obo_missing_credential_once(audience, user_id, cause_key=cause_key)
-                oauth_tokens._arm_cooldown(app_state, user_id, cooldown_key)
+                oauth_tokens._arm_cooldown(
+                    oauth_context(app_state).coordination, user_id, cooldown_key
+                )
                 return None
 
             async def _persist_rotation(new_credential_rt: str) -> None:
@@ -626,7 +646,7 @@ async def mint_obo_access_token(
                 # already produced a working token, so rotation write-back
                 # failure must not discard it.
                 try:
-                    await asyncio.to_thread(
+                    await durable_write(
                         token_store.update_oidc_credential_after_redeem,
                         user_id,
                         issuer,
@@ -652,7 +672,9 @@ async def mint_obo_access_token(
                         persist_rotation=_persist_rotation,
                     )
             except oauth_http.OAuthRefreshError:
-                oauth_tokens._arm_cooldown(app_state, user_id, cooldown_key)
+                oauth_tokens._arm_cooldown(
+                    oauth_context(app_state).coordination, user_id, cooldown_key
+                )
                 _record_mint_refusal_cause("model_obo", cause_key, user_id, "mint_failed")
                 log.warning(
                     "model_obo.mint_failed",
@@ -665,7 +687,9 @@ async def mint_obo_access_token(
 
             access_token = tokens.get("access_token")
             if not isinstance(access_token, str) or not access_token:
-                oauth_tokens._arm_cooldown(app_state, user_id, cooldown_key)
+                oauth_tokens._arm_cooldown(
+                    oauth_context(app_state).coordination, user_id, cooldown_key
+                )
                 _record_mint_refusal_cause(
                     "model_obo", cause_key, user_id, "mint_missing_access_token"
                 )
@@ -706,7 +730,9 @@ async def mint_obo_access_token(
                 issuer=issuer,
                 audience=audience,
             )
-            oauth_tokens._clear_refresh_backoff(app_state, user_id, cooldown_key)
+            oauth_tokens._clear_refresh_backoff(
+                oauth_context(app_state).coordination, user_id, cooldown_key
+            )
             _clear_mint_refusal_cause("model_obo", cause_key, user_id)
             log.info(
                 "model_obo.minted",
@@ -717,7 +743,9 @@ async def mint_obo_access_token(
             )
             return access_token
     finally:
-        oauth_locking._prune_token_lock_when_idle(app_state, user_id, cache_server, lock)
+        oauth_locking._prune_token_lock_when_idle(
+            oauth_context(app_state).coordination, user_id, cache_server, lock
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -752,7 +780,7 @@ def model_app_cache_server(alias: str) -> str:
     )
 
 
-async def mint_app_access_token(
+async def _mint_app_access_token(
     *,
     app_state: Any,
     alias: str,
@@ -789,7 +817,7 @@ async def mint_app_access_token(
     cause_key = model_app_cache_server(alias)
     # The CAUSE layer, as in mint_obo_access_token: same
     # once-per-(cause, audience) dedup.
-    oidc_config = getattr(app_state, "oidc_config", None)
+    oidc_config = oauth_context(app_state).oidc_config
     if oidc_config is None or not getattr(oidc_config, "enabled", False):
         _warn_mint_oidc_cause(
             "model_app", oidc_config, audience, _APP_CACHE_USER, cause_key=cause_key
@@ -809,7 +837,7 @@ async def mint_app_access_token(
     client_id = str(getattr(oidc_config, "client_id", "") or "")
     client_secret = str(getattr(oidc_config, "client_secret", "") or "")
     token_endpoint = str(getattr(oidc_config, "token_endpoint", "") or "")
-    token_store: token_store_store.TokenStore | None = getattr(app_state, "mcp_token_store", None)
+    token_store: token_store_store.TokenStore | None = oauth_context(app_state).token_store
     storage = oauth_tokens._get_storage(app_state)
     if token_store is None or storage is None:
         _warn_mint_store_unavailable(
@@ -832,14 +860,18 @@ async def mint_app_access_token(
         scopes="",
     )
     if cached_token and not force_refresh:
-        oauth_tokens._clear_refresh_backoff(app_state, _APP_CACHE_USER, cooldown_key)
+        oauth_tokens._clear_refresh_backoff(
+            oauth_context(app_state).coordination, _APP_CACHE_USER, cooldown_key
+        )
         return cached_token
     if not cached_token and oauth_tokens._refresh_in_cooldown(
-        app_state, _APP_CACHE_USER, cooldown_key
+        oauth_context(app_state).coordination, _APP_CACHE_USER, cooldown_key
     ):
         return None
     if not (client_id and client_secret and token_endpoint):
-        oauth_tokens._arm_cooldown(app_state, _APP_CACHE_USER, cooldown_key)
+        oauth_tokens._arm_cooldown(
+            oauth_context(app_state).coordination, _APP_CACHE_USER, cooldown_key
+        )
         _record_mint_refusal_cause(
             "model_app", cause_key, _APP_CACHE_USER, "credentials_unavailable"
         )
@@ -854,7 +886,9 @@ async def mint_app_access_token(
 
     # Single-flight the mint. No per-user credential to rotate, so only the
     # per-alias local + cluster lock is taken (no credential lock).
-    lock = oauth_locking._refresh_lock_for(app_state, _APP_CACHE_USER, cache_server)
+    lock = oauth_locking._refresh_lock_for(
+        oauth_context(app_state).coordination, _APP_CACHE_USER, cache_server
+    )
     pg_lock = await oauth_locking._acquire_pg_refresh_lock(storage, _APP_CACHE_USER, cache_server)
     try:
         async with lock, pg_lock:
@@ -867,10 +901,12 @@ async def mint_app_access_token(
                 scopes="",
             )
             if cached_token and not force_refresh:
-                oauth_tokens._clear_refresh_backoff(app_state, _APP_CACHE_USER, cooldown_key)
+                oauth_tokens._clear_refresh_backoff(
+                    oauth_context(app_state).coordination, _APP_CACHE_USER, cooldown_key
+                )
                 return cached_token
             if not cached_token and oauth_tokens._refresh_in_cooldown(
-                app_state, _APP_CACHE_USER, cooldown_key
+                oauth_context(app_state).coordination, _APP_CACHE_USER, cooldown_key
             ):
                 return None
 
@@ -884,14 +920,18 @@ async def mint_app_access_token(
                         http_client=mint_client,
                     )
             except oauth_http.OAuthRefreshError:
-                oauth_tokens._arm_cooldown(app_state, _APP_CACHE_USER, cooldown_key)
+                oauth_tokens._arm_cooldown(
+                    oauth_context(app_state).coordination, _APP_CACHE_USER, cooldown_key
+                )
                 _record_mint_refusal_cause("model_app", cause_key, _APP_CACHE_USER, "mint_failed")
                 log.warning("model_app.mint_failed", alias=alias, audience=audience, exc_info=True)
                 return None
 
             access_token = tokens.get("access_token")
             if not isinstance(access_token, str) or not access_token:
-                oauth_tokens._arm_cooldown(app_state, _APP_CACHE_USER, cooldown_key)
+                oauth_tokens._arm_cooldown(
+                    oauth_context(app_state).coordination, _APP_CACHE_USER, cooldown_key
+                )
                 _record_mint_refusal_cause(
                     "model_app", cause_key, _APP_CACHE_USER, "mint_missing_access_token"
                 )
@@ -923,9 +963,187 @@ async def mint_app_access_token(
                 issuer=issuer,
                 audience=audience,
             )
-            oauth_tokens._clear_refresh_backoff(app_state, _APP_CACHE_USER, cooldown_key)
+            oauth_tokens._clear_refresh_backoff(
+                oauth_context(app_state).coordination, _APP_CACHE_USER, cooldown_key
+            )
             _clear_mint_refusal_cause("model_app", cause_key, _APP_CACHE_USER)
             log.info("model_app.minted", alias=alias, audience=audience, cache_server=cache_server)
             return access_token
     finally:
-        oauth_locking._prune_token_lock_when_idle(app_state, _APP_CACHE_USER, cache_server, lock)
+        oauth_locking._prune_token_lock_when_idle(
+            oauth_context(app_state).coordination, _APP_CACHE_USER, cache_server, lock
+        )
+
+
+class ModelTokenClient(Protocol):
+    """Model-policy boundary, independent of MCP configuration and transports."""
+
+    def mint_model_obo_token_sync(
+        self,
+        *,
+        user_id: str,
+        alias: str,
+        audience: str,
+        scopes: str = "",
+        grant_leg: str | None = None,
+        timeout: float = 20.0,
+    ) -> str | None: ...
+
+    def mint_app_token_sync(
+        self, *, alias: str, audience: str, timeout: float = 20.0
+    ) -> str | None: ...
+
+    def invalidate_model_mint_memo_sync(
+        self, *, user_id: str, server_prefix: str, timeout: float = 5.0
+    ) -> int: ...
+
+
+class OAuthModelTokenClient:
+    """Synchronous model callers bridged onto their host's OAuth runtime."""
+
+    def __init__(self, context: OAuthContext) -> None:
+        self.context = context
+
+    def mint_model_obo_token_sync(
+        self,
+        *,
+        user_id: str,
+        alias: str,
+        audience: str,
+        scopes: str = "",
+        grant_leg: str | None = None,
+        timeout: float = 20.0,
+    ) -> str | None:
+        if not user_id or not alias or not audience:
+            return None
+        try:
+            runtime = ensure_oauth_runtime(self.context)
+            if runtime is None:
+                return None
+            return runtime.call_sync(
+                lambda: _mint_obo_access_token(
+                    app_state=self.context,
+                    user_id=user_id,
+                    alias=alias,
+                    audience=audience,
+                    scopes=scopes,
+                    grant_leg=grant_leg,
+                ),
+                timeout=timeout,
+            )
+        except MintDispatchContractError:
+            log.error(
+                "model obo token mint contract violation user=%s alias=%s audience=%s",
+                user_id,
+                alias,
+                audience,
+                exc_info=True,
+            )
+        except OAuthUnavailableError:
+            log.warning("model obo token mint unavailable user=%s alias=%s", user_id, alias)
+        except Exception:
+            log.debug("model obo token mint failed user=%s alias=%s", user_id, alias, exc_info=True)
+        return None
+
+    def mint_app_token_sync(
+        self, *, alias: str, audience: str, timeout: float = 20.0
+    ) -> str | None:
+        if not alias or not audience:
+            return None
+        try:
+            runtime = ensure_oauth_runtime(self.context)
+            if runtime is None:
+                return None
+            return runtime.call_sync(
+                lambda: _mint_app_access_token(
+                    app_state=self.context, alias=alias, audience=audience
+                ),
+                timeout=timeout,
+            )
+        except OAuthUnavailableError:
+            log.warning("model app token mint unavailable alias=%s", alias)
+        except Exception:
+            log.debug("model app token mint failed alias=%s", alias, exc_info=True)
+        return None
+
+    def invalidate_model_mint_memo_sync(
+        self, *, user_id: str, server_prefix: str, timeout: float = 5.0
+    ) -> int:
+        runtime = self.context.runtime
+        if runtime is None:
+            return 0
+
+        async def invalidate() -> int:
+            return invalidate_model_mint_memo(
+                self.context, user_id=user_id, server_prefix=server_prefix
+            )
+
+        try:
+            return runtime.call_sync(invalidate, timeout=timeout)
+        except Exception:
+            log.warning("model token memo invalidation failed user=%s", user_id, exc_info=True)
+            return 0
+
+
+def get_model_token_client(host: Any) -> ModelTokenClient:
+    """Return the host's model adapter without starting a loop or requiring MCP."""
+    client: ModelTokenClient | None = getattr(host, "model_token_client", None)
+    if client is None:
+        client = OAuthModelTokenClient(oauth_context(host))
+        host.model_token_client = client
+    return client
+
+
+async def mint_obo_access_token(
+    *,
+    app_state: Any,
+    user_id: str,
+    alias: str,
+    audience: str,
+    scopes: str = "",
+    grant_leg: str | None = None,
+    force_refresh: bool = False,
+) -> str | None:
+    """Async model-adapter entry point using the same process runtime as MCP."""
+    context = oauth_context(app_state)
+
+    def mint() -> Coroutine[Any, Any, str | None]:
+        return _mint_obo_access_token(
+            app_state=context,
+            user_id=user_id,
+            alias=alias,
+            audience=audience,
+            scopes=scopes,
+            grant_leg=grant_leg,
+            force_refresh=force_refresh,
+        )
+
+    try:
+        runtime = ensure_oauth_runtime(context)
+        if runtime is None:
+            # Preserve refusal diagnostics with no token store; this returns
+            # before coordination or durable work.
+            return await mint()
+        return await runtime.call(mint)
+    except OAuthUnavailableError:
+        return None
+
+
+async def mint_app_access_token(
+    *, app_state: Any, alias: str, audience: str, force_refresh: bool = False
+) -> str | None:
+    """Async application-token adapter, with the synchronous client's ownership."""
+    context = oauth_context(app_state)
+
+    def mint() -> Coroutine[Any, Any, str | None]:
+        return _mint_app_access_token(
+            app_state=context, alias=alias, audience=audience, force_refresh=force_refresh
+        )
+
+    try:
+        runtime = ensure_oauth_runtime(context)
+        if runtime is None:
+            return await mint()
+        return await runtime.call(mint)
+    except OAuthUnavailableError:
+        return None

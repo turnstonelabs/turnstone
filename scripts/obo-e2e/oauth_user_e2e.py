@@ -13,9 +13,9 @@ product installs (``initialize_mcp_oauth_state``) talking to a live realm.
 ``handle_mcp_oauth_authorize`` → headless login → ``handle_mcp_oauth_callback``
 → ``get_user_access_token_classified`` → ``handle_mcp_oauth_revoke_connection``.
 Browser routes run on the host loop; token lookups run on a real MCP manager's
-loop with its own HTTP client. The "MCP server" is a local stub that serves only
-RFC 9728 protected-resource metadata; it never speaks MCP, because nothing under
-test does either.
+loop and bridge to the OAuth runtime's loop and HTTP client. The "MCP server" is
+a local stub that serves only RFC 9728 protected-resource metadata; it never speaks
+MCP, because nothing under test does either.
 
 Checks:
   D1 discovery: PRM read at the RFC 9728 path-specific location (origin never
@@ -30,7 +30,7 @@ Checks:
   C4 cache hit: ZERO requests
   C5 callback replay refused (state is single-use), ZERO requests
   C6 refresh on the MCP loop when the clock enters the refresh window:
-     warmed browser and MCP clients, one MCP-client token POST, no re-discovery,
+     warmed browser and OAuth clients, one OAuth-client token POST, no re-discovery,
      refresh-token rotation written back, the new token live
   C7 force_refresh on the MCP loop → one more token POST
   C8 connections list carries the row without secret material
@@ -45,8 +45,8 @@ Checks:
   D4 the resolved issuer is persisted on a row whose authorization server the
      in-process metadata cache already holds
   D5 refresh with an empty metadata cache: real discovery and the token POST
-     both use the MCP client, while the warmed browser client stays idle
-  L1 browser and MCP clients stay on their separate owner loops
+     both use the OAuth client, while the warmed browser client stays idle
+  L1 browser and OAuth clients stay on their separate owner loops
 
 Env (set by oauth_user_e2e.sh):
   KC_ISSUER, KC_CLIENT_ID, KC_NOAUD_CLIENT_ID, KC_USER, KC_PASSWORD,
@@ -90,7 +90,9 @@ from turnstone.core.mcp_oauth import (
     handle_mcp_oauth_revoke_connection,
     initialize_mcp_oauth_state,
 )
+from turnstone.core.oauth.context import oauth_context
 from turnstone.core.oauth.oidc import OIDCConfig
+from turnstone.core.oauth.runtime import ensure_oauth_runtime, shutdown_oauth_runtime
 from turnstone.core.storage._sqlite import SQLiteBackend
 from turnstone.core.token_store.crypto import TokenCipher, TokenCipherConfig
 
@@ -306,8 +308,8 @@ def _console_app(storage: SQLiteBackend, store: MCPTokenStore, redirect_base: st
         middleware=[Middleware(_StampUser)],
     )
     app.state.auth_storage = storage
-    app.state.mcp_token_store = store
-    app.state.oidc_config = OIDCConfig(enabled=False, redirect_base=redirect_base)
+    oauth_context(app.state).token_store = store
+    oauth_context(app.state).oidc_config = OIDCConfig(enabled=False, redirect_base=redirect_base)
     return app
 
 
@@ -397,15 +399,22 @@ async def _run(cfg: dict[str, str]) -> None:
     try:
         await asyncio.to_thread(manager.start)
         assert manager._loop is not None
-        mint_client = app.state.obo_http_client
-        refresh_wire = _Wire(mint_client, loop=manager._loop)
+        runtime = ensure_oauth_runtime(app.state)
+        assert runtime is not None
+        mint_client = oauth_context(app.state).http_client
+        assert mint_client is not None
+        refresh_wire = _Wire(mint_client, loop=runtime._loop)
         want_document = issuer + "/.well-known/openid-configuration"
 
         async def warm_clients() -> None:
             # Keep actual Keycloak connections warm on BOTH loops immediately
             # before refresh. These GETs do not fill the product metadata cache.
             (await app.state.mcp_oauth_http_client.get(want_document)).raise_for_status()
-            (await _on_mcp_loop(manager, mint_client.get(want_document))).raise_for_status()
+
+            async def warm_runtime() -> None:
+                (await mint_client.get(want_document)).raise_for_status()
+
+            await runtime.call(warm_runtime)
             wire.drain()
             refresh_wire.drain()
 
@@ -543,7 +552,7 @@ async def _run(cfg: dict[str, str]) -> None:
         print(f"  waiting {max(wait, 0):.0f}s for the access token to enter the refresh window...")
         await asyncio.sleep(max(wait, 0))
         await warm_clients()
-        print("  C6 refreshing on the MCP loop with warmed browser and MCP clients...")
+        print("  C6 refreshing on the MCP loop with warmed browser and OAuth clients...")
         r6 = await _on_mcp_loop(
             manager,
             get_user_access_token_classified(
@@ -600,7 +609,11 @@ async def _run(cfg: dict[str, str]) -> None:
         # Force real Keycloak discovery while both clients have warm transports.
         await asyncio.sleep(1.05 - datetime.now(UTC).microsecond / 1_000_000)
         await warm_clients()
-        app.state.mcp_oauth_metadata_cache.clear()
+
+        async def clear_runtime_metadata() -> None:
+            oauth_context(app.state).metadata_cache.clear()
+
+        await runtime.call(clear_runtime_metadata)
         before_discovery_refresh = store.get_user_token(USER, "kc-mcp")
         stub.drain()
         print("  D5 refreshing on the MCP loop with an empty metadata cache...")
@@ -621,7 +634,7 @@ async def _run(cfg: dict[str, str]) -> None:
             and calls == [("GET", url) for url in as_probes] + [("POST", token_endpoint)]
             and not browser_calls
             and not stub.drain()
-            and issuer in app.state.mcp_oauth_metadata_cache
+            and issuer in oauth_context(app.state).metadata_cache
             and plain5 is not None
             and before_discovery_refresh is not None
             and plain5["refresh_token"] not in (None, before_discovery_refresh["refresh_token"])
@@ -802,11 +815,12 @@ async def _run(cfg: dict[str, str]) -> None:
             and not refresh_wire.off_loop_calls
             else "FAILED",
             f"L1 separate HTTP-client owner loops: browser_off_loop={wire.off_loop_calls} "
-            f"mcp_off_loop={refresh_wire.off_loop_calls}",
+            f"oauth_off_loop={refresh_wire.off_loop_calls}",
         )
     finally:
         thread = manager._thread
         await asyncio.to_thread(manager.shutdown)
+        await asyncio.to_thread(shutdown_oauth_runtime, app.state)
         await console.aclose()
         await kc.aclose()
         await close_mcp_oauth_state(app.state)

@@ -28,6 +28,8 @@ import uuid
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, NamedTuple
 
+from turnstone.core.oauth.context import oauth_context
+
 if TYPE_CHECKING:
     from starlette.requests import Request
     from starlette.responses import JSONResponse, Response
@@ -1730,7 +1732,7 @@ async def handle_auth_login(request: Request, audience: str, cookie_name: str) -
 
     if username and password and storage is not None:
         # Enforce OIDC-only mode: reject password login when disabled
-        oidc_config = getattr(request.app.state, "oidc_config", None)
+        oidc_config = oauth_context(request.app.state).oidc_config
         if oidc_config and oidc_config.enabled and not oidc_config.password_enabled:
             return JSONResponse(
                 {"error": "Password login is disabled — use SSO"},
@@ -1821,7 +1823,7 @@ async def handle_auth_status(request: Request) -> Response:
             log.warning("Failed to check user existence for auth status", exc_info=True)
 
     # OIDC configuration
-    oidc_config = getattr(request.app.state, "oidc_config", None)
+    oidc_config = oauth_context(request.app.state).oidc_config
     oidc_enabled = bool(oidc_config and oidc_config.enabled)
 
     resp: dict[str, Any] = {
@@ -2095,7 +2097,7 @@ async def handle_oidc_authorize(request: Request, audience: str) -> Response:
     """Shared ``GET /api/auth/oidc/authorize`` handler — redirect to IdP."""
     from starlette.responses import JSONResponse, RedirectResponse
 
-    oidc_config = getattr(request.app.state, "oidc_config", None)
+    oidc_config = oauth_context(request.app.state).oidc_config
     if oidc_config is not None and not oidc_config.enabled:
         # Self-heal a transient boot-time discovery outage: the LOGIN path is a
         # rediscovery trigger too, not just the obo mint path. Without this, a
@@ -2103,7 +2105,7 @@ async def handle_oidc_authorize(request: Request, audience: str) -> Response:
         # would keep login dark until an operator restart — the exact symptom
         # maybe_rediscover_oidc exists to fix. No-op unless discovery_retryable.
         await maybe_rediscover_oidc(request.app.state)
-        oidc_config = getattr(request.app.state, "oidc_config", None)
+        oidc_config = oauth_context(request.app.state).oidc_config
     if not oidc_config or not oidc_config.enabled:
         return JSONResponse({"error": "OIDC not configured"}, status_code=404)
 
@@ -2193,13 +2195,13 @@ async def handle_oidc_callback(request: Request, audience: str, cookie_name: str
     """Shared ``GET /api/auth/oidc/callback`` handler — exchange code, provision user, issue JWT."""
     from starlette.responses import JSONResponse, RedirectResponse
 
-    oidc_config = getattr(request.app.state, "oidc_config", None)
+    oidc_config = oauth_context(request.app.state).oidc_config
     if oidc_config is not None and not oidc_config.enabled:
         # Self-heal a transient boot-time discovery outage on the login path too
         # (see handle_oidc_authorize). A user mid-flow whose authorize landed on
         # a recovered node can still complete the callback here.
         await maybe_rediscover_oidc(request.app.state)
-        oidc_config = getattr(request.app.state, "oidc_config", None)
+        oidc_config = oauth_context(request.app.state).oidc_config
     if not oidc_config or not oidc_config.enabled:
         return JSONResponse({"error": "OIDC not configured"}, status_code=404)
 
@@ -2330,7 +2332,7 @@ async def handle_oidc_callback(request: Request, audience: str, cookie_name: str
     # the mint path surfaces a missing credential on the reconnect rail.
     if oidc_config.capture_user_credential:
         idp_refresh_token = tokens.get("refresh_token")
-        token_store = getattr(request.app.state, "mcp_token_store", None)
+        token_store = oauth_context(request.app.state).token_store
         if not isinstance(idp_refresh_token, str) or not idp_refresh_token:
             log.info(
                 "oidc.capture: no refresh_token in token response (user=%s) — "

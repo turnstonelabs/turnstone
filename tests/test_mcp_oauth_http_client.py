@@ -12,14 +12,19 @@ the merge is exercised on real clients through ``build_request``.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 from types import SimpleNamespace
+from typing import TYPE_CHECKING
 
-import httpx
+import pytest
 
-from turnstone.core.mcp_client import MCPClientManager
 from turnstone.core.mcp_oauth import close_mcp_oauth_state, initialize_mcp_oauth_state
+from turnstone.core.oauth.context import OAuthContext
 from turnstone.core.oauth.http import _enter_mint_client, json_http_client
+from turnstone.core.oauth.runtime import OAuthRuntime
+from turnstone.core.oauth.work import OAuthUnavailableError
+
+if TYPE_CHECKING:
+    import httpx
 
 
 def _accept(client: httpx.AsyncClient, headers: dict[str, str] | None = None) -> str:
@@ -59,43 +64,32 @@ class TestEveryClientGoesThroughTheFactory:
         async def _run() -> str:
             await initialize_mcp_oauth_state(state)
             try:
+                assert state.mcp_oauth_metadata_cache is state.oauth_context.metadata_cache
                 return _accept(state.mcp_oauth_http_client)
             finally:
                 await close_mcp_oauth_state(state)
 
         assert asyncio.run(_run()) == "application/json"
 
-    def test_enter_mint_client_yields_injected_client(self) -> None:
-        async def _run() -> bool:
-            async with httpx.AsyncClient() as injected:
-                state = SimpleNamespace(obo_http_client=injected)
-                async with _enter_mint_client(state) as client:
-                    return client is injected
+    def test_runtime_owns_json_client(self) -> None:
+        context = OAuthContext()
+        runtime = OAuthRuntime(context)
+        context.runtime = runtime
+        runtime.start()
 
-        assert asyncio.run(_run())
+        async def inspect() -> tuple[str, bool]:
+            async with _enter_mint_client(context) as client:
+                return _accept(client), asyncio.get_running_loop() is runtime._loop
 
-    def test_enter_mint_client_transient_is_json_client(self) -> None:
-        async def _run() -> str:
-            async with _enter_mint_client(SimpleNamespace()) as client:
-                return _accept(client)
+        assert runtime.call_sync(inspect) == ("application/json", True)
+        client = context.http_client
+        runtime.shutdown()
+        assert client is not None and client.is_closed
 
-        assert asyncio.run(_run()) == "application/json"
+    def test_unconfigured_runtime_client_is_unavailable(self) -> None:
+        async def run() -> None:
+            async with _enter_mint_client(OAuthContext()):
+                raise AssertionError("an unconfigured runtime supplied a client")
 
-    def test_mcp_client_connect_installs_json_client(self) -> None:
-        # The node's loop-owned client is what production OBO mints use, via
-        # ``app_state.obo_http_client``; it must carry the same posture.
-        mgr = MCPClientManager({})
-        loop = asyncio.new_event_loop()
-        try:
-            loop.run_until_complete(mgr._connect_all())
-            client = mgr._model_auth_http_client
-            assert client is not None
-            assert _accept(client) == "application/json"
-            for task in (mgr._user_token_sweep_task, mgr._static_health_task):
-                if task is not None:
-                    task.cancel()
-                    with contextlib.suppress(BaseException):
-                        loop.run_until_complete(task)
-            loop.run_until_complete(client.aclose())
-        finally:
-            loop.close()
+        with pytest.raises(OAuthUnavailableError):
+            asyncio.run(run())

@@ -5,12 +5,16 @@ from __future__ import annotations
 import contextlib
 import enum
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import httpx
 
 from turnstone.core.log import get_logger
 from turnstone.core.oauth import ssrf as oauth_ssrf
+from turnstone.core.oauth.work import OAuthUnavailableError
+
+if TYPE_CHECKING:
+    from turnstone.core.oauth.context import OAuthContext
 
 log = get_logger(__name__)
 
@@ -242,8 +246,15 @@ async def _hardened_token_post(
             data=data,
             timeout=_DEFAULT_HTTP_TIMEOUT,
         )
-    except httpx.HTTPError as exc:
+    except (httpx.HTTPError, RuntimeError) as exc:
+        if http_client.is_closed:
+            raise OAuthUnavailableError("OAuth HTTP client closed during shutdown") from exc
+        if isinstance(exc, RuntimeError):
+            raise
         raise OAuthRefreshError(f"{request_label} request failed: {exc}") from exc
+
+    if http_client.is_closed:
+        raise OAuthUnavailableError("OAuth HTTP client closed during request")
 
     if len(resp.content) > _MAX_TOKEN_BODY_BYTES:
         oversized_class = (
@@ -273,20 +284,12 @@ async def _hardened_token_post(
 
 
 @contextlib.asynccontextmanager
-async def _enter_mint_client(app_state: Any) -> Any:
-    """Yield the client installed as ``obo_http_client``, or a transient one.
-
-    The node installs its loop-owned client at connect time and the e2e
-    harnesses inject theirs; anything else gets a per-mint client from the
-    same factory, so every mint or per-user refresh carries the module's
-    JSON-preferring posture.
-    """
-    injected_client: httpx.AsyncClient | None = getattr(app_state, "obo_http_client", None)
-    if injected_client is not None:
-        yield injected_client
-        return
-    async with json_http_client() as mint_client:
-        yield mint_client
+async def _enter_mint_client(context: OAuthContext) -> Any:
+    """Yield the runtime's owner-loop client for discovery and token grants."""
+    client = context.http_client
+    if client is None or client.is_closed:
+        raise OAuthUnavailableError("OAuth runtime HTTP client is not configured")
+    yield client
 
 
 @dataclass(frozen=True)

@@ -22,6 +22,9 @@ frozen.
 
 ### Changed
 
+- **Independent OAuth runtime.** MCP and model authentication share a process-owned runtime
+  for token requests, credential rotation and durable writes. Model authentication works without
+  an MCP manager and stays available when a persona disables MCP tools.
 - **Shared delegated-auth modules.** OAuth/OIDC protocol code, generic encrypted token storage,
   and model-provider mint orchestration now have separate homes from MCP consent and transport.
 - **Shared OAuth token storage.** MCP grants and model mint caches now use consumer-neutral
@@ -34,8 +37,11 @@ frozen.
 
 ### Fixed
 
-- **Per-user MCP OAuth refresh.** Discovery and refresh requests now use the MCP loop's HTTP
+- **Per-user MCP OAuth refresh.** Discovery and refresh requests now use their owner's HTTP
   client, preventing cross-loop failures after browser sign-in.
+- **OAuth cancellation and shutdown.** Cancelled requests settle started token writes before
+  releasing their runtime locks. Bounded shutdown tracks advisory-lock workers, and unavailable
+  runtimes return transient/no-token results without revoking grants or changing backoff.
 
 ## [1.8.3]
 

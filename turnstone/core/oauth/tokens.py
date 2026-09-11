@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
-import asyncio
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
+
+from turnstone.core.oauth.context import TokenCoordination, oauth_context
+from turnstone.core.oauth.work import durable_write
 
 if TYPE_CHECKING:
     from turnstone.core.storage._protocol import StorageBackend
@@ -40,7 +42,7 @@ def _parse_iso_to_utc(value: str) -> datetime | None:
 
 
 # In-process (per-node) backoff bookkeeping for transient refresh failures,
-# keyed ``(user_id, server_name)`` on ``app_state.mcp_oauth_refresh_backoff``.
+# keyed ``(user_id, server_name)`` on the owning loop's ``TokenCoordination.backoff``.
 # The cooldown timer short-circuits the token-endpoint round-trip during a
 # sustained AS outage (perf); the ambiguous streak escalates an
 # unclassifiable-but-persistent rejection to re-consent so a dead grant in a
@@ -63,12 +65,11 @@ class _RefreshBackoffState:
     last_failure_permanent: bool = False
 
 
-def _refresh_backoff_state(app_state: Any, user_id: str, server_name: str) -> _RefreshBackoffState:
+def _refresh_backoff_state(
+    coordination: TokenCoordination, user_id: str, server_name: str
+) -> _RefreshBackoffState:
     """Return (creating if absent) the backoff state for ``(user_id, server_name)``."""
-    states = getattr(app_state, "mcp_oauth_refresh_backoff", None)
-    if states is None:
-        states = {}
-        app_state.mcp_oauth_refresh_backoff = states
+    states = coordination.backoff
     key = (user_id, server_name)
     state = states.get(key)
     if state is None:
@@ -78,7 +79,7 @@ def _refresh_backoff_state(app_state: Any, user_id: str, server_name: str) -> _R
 
 
 def _arm_cooldown(
-    app_state: Any, user_id: str, server_name: str, *, permanent: bool = False
+    coordination: TokenCoordination, user_id: str, server_name: str, *, permanent: bool = False
 ) -> _RefreshBackoffState:
     """Stamp the per-(user, server) transient-failure cooldown clock to now.
 
@@ -95,29 +96,25 @@ def _arm_cooldown(
     resets it to False so a later transient window can't inherit a stale
     permanent flag.
     """
-    state = _refresh_backoff_state(app_state, user_id, server_name)
+    state = _refresh_backoff_state(coordination, user_id, server_name)
     state.last_failure_monotonic = time.monotonic()
     state.last_failure_permanent = permanent
     return state
 
 
-def _clear_refresh_backoff(app_state: Any, user_id: str, server_name: str) -> None:
+def _clear_refresh_backoff(coordination: TokenCoordination, user_id: str, server_name: str) -> None:
     """Drop the backoff state for ``(user_id, server_name)``.
 
     Called whenever a usable token is returned or the token is revoked, so a
     healthy grant resets the cooldown timer + ambiguous streak and the dict
     stays bounded to live ``(user, server)`` pairs.
     """
-    states = getattr(app_state, "mcp_oauth_refresh_backoff", None)
-    if isinstance(states, dict):
-        states.pop((user_id, server_name), None)
+    coordination.backoff.pop((user_id, server_name), None)
 
 
-def _refresh_in_cooldown(app_state: Any, user_id: str, server_name: str) -> bool:
+def _refresh_in_cooldown(coordination: TokenCoordination, user_id: str, server_name: str) -> bool:
     """Return True while within the post-transient-failure cooldown window."""
-    states = getattr(app_state, "mcp_oauth_refresh_backoff", None)
-    if not isinstance(states, dict):
-        return False
+    states = coordination.backoff
     state: _RefreshBackoffState | None = states.get((user_id, server_name))
     if state is None or not state.last_failure_monotonic:
         return False
@@ -148,8 +145,8 @@ async def _persist_obo_cache_row(
     Runs under the per-(user, server) lock, so the delete/create can't race a
     concurrent mint for this pair.
     """
-    await asyncio.to_thread(token_store.delete_user_token, user_id, server_name)
-    await asyncio.to_thread(
+    await durable_write(token_store.delete_user_token, user_id, server_name)
+    await durable_write(
         token_store.create_user_token,
         user_id,
         server_name,
@@ -210,7 +207,8 @@ def _token_needs_refresh(expires_at: str | None) -> bool:
 
 def _get_storage(app_state: Any) -> StorageBackend | None:
     """Pull the storage backend off ``app_state``; tests stash it as ``auth_storage``."""
-    storage = getattr(app_state, "auth_storage", None)
+    context = oauth_context(app_state)
+    storage = context.storage
     if storage is None:
         from turnstone.core.storage import get_storage
 
@@ -218,6 +216,7 @@ def _get_storage(app_state: Any) -> StorageBackend | None:
             storage = get_storage()
         except Exception:
             return None
+        context.storage = storage
     return storage
 
 

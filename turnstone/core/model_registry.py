@@ -15,6 +15,8 @@ from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 
+from turnstone.core.oauth.context import oauth_context
+
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator, Mapping
 
@@ -192,7 +194,7 @@ def dynamic_auth_key_error(models: Mapping[str, ModelConfig], app_state: Any) ->
     """
     if not any(_is_dynamic_auth_mode(cfg.auth_mode) for cfg in models.values()):
         return ""
-    if getattr(app_state, "mcp_token_store", None) is not None:
+    if oauth_context(app_state).token_store is not None:
         return ""
     # Function-local: model_registry is imported by lightweight consumers
     # that never touch crypto; keep the cryptography dependency off this
@@ -247,7 +249,7 @@ def warn_profile_mismatched_aliases(models: Mapping[str, ModelConfig], app_state
     ``grant_profile_mismatch`` — so an operator can grep the runtime
     heartbeat for exactly the token this warning names.
     """
-    oidc_config = getattr(app_state, "oidc_config", None)
+    oidc_config = oauth_context(app_state).oidc_config
     if oidc_config is None or not getattr(oidc_config, "enabled", False):
         return
     profile = str(getattr(oidc_config, "obo_grant_profile", "") or "")

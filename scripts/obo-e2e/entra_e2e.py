@@ -48,6 +48,9 @@ import tempfile
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
+from turnstone.core.oauth.context import OAuthContext, oauth_context
+from turnstone.core.oauth.runtime import OAuthRuntime, shutdown_oauth_runtime
+
 if TYPE_CHECKING:
     import httpx
 
@@ -91,6 +94,13 @@ class _CountingClient:
         self._inner = inner
         self.posts = 0
 
+    @property
+    def is_closed(self) -> bool:
+        return self._inner.is_closed
+
+    async def aclose(self) -> None:
+        await self._inner.aclose()
+
     async def post(self, *args: Any, **kwargs: Any) -> httpx.Response:
         self.posts += 1
         return await self._inner.post(*args, **kwargs)
@@ -100,16 +110,12 @@ def _make_app_state(
     storage: SQLiteBackend,
     store: MCPTokenStore,
     oidc_config: OIDCConfig,
-    http_client: _CountingClient,
 ) -> SimpleNamespace:
-    return SimpleNamespace(
-        auth_storage=storage,
-        mcp_token_store=store,
-        oidc_config=oidc_config,
-        obo_http_client=http_client,
-        mcp_oauth_refresh_locks={},
-        mcp_oauth_refresh_backoff={},
-    )
+    context = OAuthContext(storage=storage, token_store=store, oidc_config=oidc_config)
+    runtime = OAuthRuntime(context, client_factory=lambda: _CountingClient(json_http_client(20.0)))
+    context.runtime = runtime
+    runtime.start()
+    return SimpleNamespace(auth_storage=storage, oauth_context=context)
 
 
 def _seed_obo_server(storage: SQLiteBackend, name: str, audience: str) -> None:
@@ -164,9 +170,8 @@ async def _run(cfg: dict[str, str], refresh_token: str) -> None:
 
     # The production client factory, so the run proves the wire posture the
     # console and nodes actually use (JSON-preferring Accept) against live Entra.
-    inner = json_http_client(20.0)
-    client = _CountingClient(inner)
-    app_state = _make_app_state(storage, store, oidc_config, client)
+    app_state = _make_app_state(storage, store, oidc_config)
+    client = oauth_context(app_state).http_client
     try:
         # E1 — real mint for audience A.
         r = await get_obo_access_token_classified(
@@ -251,7 +256,7 @@ async def _run(cfg: dict[str, str], refresh_token: str) -> None:
             f"E7 flush→re-mint: kind={r7.kind} entra_calls={client.posts - posts_before} (want >=1)",
         )
     finally:
-        await inner.aclose()
+        await asyncio.to_thread(shutdown_oauth_runtime, app_state)
 
 
 def main() -> int:

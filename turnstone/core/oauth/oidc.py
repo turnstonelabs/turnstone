@@ -8,7 +8,6 @@ import dataclasses
 import hashlib
 import os
 import secrets
-import threading
 import time
 import urllib.parse
 from dataclasses import dataclass, field
@@ -19,6 +18,7 @@ import httpx
 from turnstone.core.log import get_logger
 from turnstone.core.oauth import grants as oauth_grants
 from turnstone.core.oauth import ssrf as oauth_ssrf
+from turnstone.core.oauth.context import oauth_context
 from turnstone.core.oauth.ssrf import (
     validate_discovered_endpoint as _ssrf_validate_discovered_endpoint,
 )
@@ -591,7 +591,7 @@ async def fetch_jwks(
 async def initialize_oidc_state(app_state: Any) -> None:
     """Run OIDC discovery + JWKS prefetch and stash results on ``app_state``.
 
-    Reads ``app_state.oidc_config`` (already set to a non-discovered config
+    Reads ``OAuthContext.oidc_config`` (already set to a non-discovered config
     by the lifespan), runs :func:`discover_oidc` and :func:`fetch_jwks`, and
     writes back the populated ``oidc_config`` plus ``jwks_data``.
 
@@ -608,7 +608,9 @@ async def initialize_oidc_state(app_state: Any) -> None:
       ``jwks_data`` populated, ``oidc_http_client`` open for the runtime
       callback path. Pair with :func:`close_oidc_state` in lifespan teardown.
     """
-    cfg: OIDCConfig = app_state.oidc_config
+    cfg = oauth_context(app_state).oidc_config
+    if cfg is None:
+        raise ValueError("OIDC configuration must be installed before initialization")
     app_state.jwks_refetch_lock = asyncio.Lock()
     if not cfg.enabled:
         app_state.jwks_data = None
@@ -627,7 +629,7 @@ async def initialize_oidc_state(app_state: Any) -> None:
             log.warning("OIDC discovery failed -- OIDC login disabled", exc_info=True)
             # Unexpected failure — allow the runtime retry path to probe it
             # (cooldown-gated), matching the in-band transient branches.
-            app_state.oidc_config = dataclasses.replace(
+            oauth_context(app_state).oidc_config = dataclasses.replace(
                 cfg, enabled=False, discovery_retryable=True
             )
             app_state.jwks_data = None
@@ -635,7 +637,7 @@ async def initialize_oidc_state(app_state: Any) -> None:
             return
 
     if not cfg.enabled:
-        app_state.oidc_config = cfg
+        oauth_context(app_state).oidc_config = cfg
         app_state.jwks_data = None
         app_state.oidc_http_client = None
         return
@@ -647,7 +649,7 @@ async def initialize_oidc_state(app_state: Any) -> None:
             "Set it to your service's externally-visible URL "
             "(e.g. https://idp.example.com). OIDC will be disabled."
         )
-        app_state.oidc_config = dataclasses.replace(cfg, enabled=False)
+        oauth_context(app_state).oidc_config = dataclasses.replace(cfg, enabled=False)
         app_state.jwks_data = None
         app_state.oidc_http_client = None
         return
@@ -662,11 +664,11 @@ async def initialize_oidc_state(app_state: Any) -> None:
         # recover if the IdP transiently failed during startup. The
         # http_client stays open for that retry.
         log.warning("OIDC JWKS prefetch failed -- will retry on first login", exc_info=True)
-        app_state.oidc_config = cfg
+        oauth_context(app_state).oidc_config = cfg
         app_state.jwks_data = None
         return
 
-    app_state.oidc_config = cfg
+    oauth_context(app_state).oidc_config = cfg
     app_state.jwks_data = jwks_data
     log.info("OIDC enabled: %s (%s)", cfg.provider_name, cfg.issuer)
 
@@ -674,26 +676,6 @@ async def initialize_oidc_state(app_state: Any) -> None:
 #: Minimum spacing between runtime discovery retries — one probe GET to the
 #: IdP per node per window while it stays down, however many callers ask.
 _REDISCOVER_COOLDOWN_SECONDS = 60.0
-
-
-#: Guards lazy creation of the per-app-state gate below.
-_rediscover_create_lock = threading.Lock()
-
-
-def _rediscover_gate(app_state: Any) -> threading.Lock:
-    """Single-flight gate for runtime re-discovery, lazily created per app state.
-
-    A ``threading.Lock`` (not ``asyncio.Lock``) on purpose: callers live on
-    different event loops — OIDC login on the uvicorn loop, oauth_obo minting
-    on the MCP loop thread — and asyncio primitives are bound to the loop
-    that created them.
-    """
-    with _rediscover_create_lock:
-        gate = getattr(app_state, "oidc_rediscover_gate", None)
-        if gate is None:
-            gate = threading.Lock()
-            app_state.oidc_rediscover_gate = gate
-        return gate
 
 
 async def maybe_rediscover_oidc(app_state: Any) -> None:
@@ -712,14 +694,16 @@ async def maybe_rediscover_oidc(app_state: Any) -> None:
     event loop; the recovered config leaves ``jwks_data`` unset — the login
     path's existing lazy JWKS refetch fills it on first use.
     """
-    cfg = getattr(app_state, "oidc_config", None)
+    context = oauth_context(app_state)
+    cfg = context.oidc_config
     if (
         cfg is None
         or getattr(cfg, "enabled", False)
         or not getattr(cfg, "discovery_retryable", False)
     ):
         return
-    gate = _rediscover_gate(app_state)
+    # The context's thread lock coordinates rediscovery across host and OAuth loops.
+    gate = context.rediscover_gate
     if not gate.acquire(blocking=False):
         # Another caller (possibly on another loop) is already probing; this
         # caller proceeds on the still-disabled config and heals next tick.
@@ -729,10 +713,10 @@ async def maybe_rediscover_oidc(app_state: Any) -> None:
         # ``None`` (not 0.0) means "never probed" — otherwise the first probe
         # within ~60s of the monotonic reference (host boot) would be suppressed
         # by the cooldown against a phantom probe at time 0.
-        last = getattr(app_state, "oidc_rediscover_last", None)
+        last = context.rediscover_last
         if last is not None and now - float(last) < _REDISCOVER_COOLDOWN_SECONDS:
             return
-        app_state.oidc_rediscover_last = now
+        context.rediscover_last = now
         # Probe with enabled=True FORCED ON: discover_oidc PRESERVES the input's
         # ``enabled`` on success (only ``load_oidc_config`` ever sets it True) and
         # sets it False on any failure. Passing the disabled boot config verbatim
@@ -760,9 +744,9 @@ async def maybe_rediscover_oidc(app_state: Any) -> None:
                 # terminal config onto app_state so this node stops re-probing
                 # every cooldown window. Without installing it, app_state would
                 # keep the retryable flag and re-probe an IdP that can never heal.
-                app_state.oidc_config = fresh
+                context.oidc_config = fresh
             return  # still disabled (transient → retry next window; terminal → latched)
-        app_state.oidc_config = dataclasses.replace(fresh, discovery_retryable=False)
+        context.oidc_config = dataclasses.replace(fresh, discovery_retryable=False)
         log.info("OIDC discovery recovered at runtime: %s", fresh.issuer)
     finally:
         gate.release()

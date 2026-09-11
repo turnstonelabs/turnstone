@@ -1277,7 +1277,7 @@ class TestVoiceBackendAuth:
         )
         mint_client = MagicMock()
         mint_client.mint_model_obo_token_sync.return_value = "minted-token"
-        client.app.state.mcp_client = mint_client
+        client.app.state.model_token_client = mint_client
         mock_client.with_options.return_value = mock_client
 
         response = _voice_request(client, route, user_id="userB")
@@ -1311,7 +1311,7 @@ class TestVoiceBackendAuth:
         )
         mint_client = MagicMock()
         mint_client.mint_model_obo_token_sync.return_value = None
-        client.app.state.mcp_client = mint_client
+        client.app.state.model_token_client = mint_client
 
         response = _voice_request(client, route, user_id="userB")
 
