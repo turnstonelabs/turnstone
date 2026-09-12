@@ -37,6 +37,9 @@ frozen.
 
 ### Fixed
 
+- **MCP submissions during shutdown.** Pool priming, catalog eviction and static server
+  reconnection tolerate the loop closing between admission and scheduling. Rejected coroutines
+  are closed, and reconnection reports its normal failure instead of an internal attribute error.
 - **Per-user MCP OAuth refresh.** Discovery and refresh requests now use their owner's HTTP
   client, preventing cross-loop failures after browser sign-in.
 - **OAuth cancellation and shutdown.** Cancelled requests settle started token writes before

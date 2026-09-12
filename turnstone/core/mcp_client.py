@@ -3083,12 +3083,11 @@ class MCPClientManager:
             return
         cfg = _pool_cfg_from_row(server_row)
         key = (user_id, server_name)
+        coro = self._prime_user_server_logged(key, cfg, access_token, user_id, server_name)
         try:
-            asyncio.run_coroutine_threadsafe(
-                self._prime_user_server_logged(key, cfg, access_token, user_id, server_name),
-                loop,
-            )
+            asyncio.run_coroutine_threadsafe(coro, loop)
         except RuntimeError:
+            coro.close()
             # mcp-loop is shutting down — skip; lazy dispatch is the backstop.
             log.debug("mcp pool prime skipped: loop closed user=%s server=%s", user_id, server_name)
 
@@ -3129,7 +3128,8 @@ class MCPClientManager:
         token / captured credential for; skips servers already connected.
         Non-blocking: schedules onto the mcp-loop and returns immediately.
         """
-        if not user_id or self._loop is None:
+        loop = self._loop
+        if not user_id or loop is None:
             return
         if not self._oauth_user_server_names and not self._obo_server_names:
             return  # no pool-backed servers — nothing to prime (no set allocation)
@@ -3137,9 +3137,11 @@ class MCPClientManager:
             return
         # run_coroutine_threadsafe keeps the task referenced by the loop while
         # it runs, so no strong-ref bookkeeping is needed here.
+        coro = self._prime_user_pools(user_id)
         try:
-            asyncio.run_coroutine_threadsafe(self._prime_user_pools(user_id), self._loop)
+            asyncio.run_coroutine_threadsafe(coro, loop)
         except RuntimeError:
+            coro.close()
             # mcp-loop is shutting down — skip; lazy dispatch is the backstop.
             log.debug("mcp pool prime skipped: loop closed user=%s", user_id)
 
@@ -6866,7 +6868,8 @@ class MCPClientManager:
         recorded where it is observed.
         """
         cfg = self._server_configs.get(server_name)
-        if not cfg or self._loop is None:
+        loop = self._loop
+        if not cfg or loop is None:
             raise RuntimeError(f"MCP server '{server_name}' is not connected")
 
         async def _reconnect_for_dispatch() -> Any:
@@ -6878,7 +6881,12 @@ class MCPClientManager:
         # A fresh coroutine/task per attempt: a timed-out attempt is cancelled
         # below, and the next dispatch starts clean instead of re-entering a
         # half-cancelled anyio scope.
-        reconnect_future = asyncio.run_coroutine_threadsafe(_reconnect_for_dispatch(), self._loop)
+        coro = _reconnect_for_dispatch()
+        try:
+            reconnect_future = asyncio.run_coroutine_threadsafe(coro, loop)
+        except RuntimeError as exc:
+            coro.close()
+            raise RuntimeError(f"MCP server '{server_name}' reconnect failed: {exc}") from None
         try:
             session = reconnect_future.result(timeout=self._STATIC_RECONNECT_CALLER_TIMEOUT_S)
         except concurrent.futures.TimeoutError:
@@ -6917,7 +6925,7 @@ class MCPClientManager:
                     exc_info=True,
                 )
 
-        self._loop.call_soon_threadsafe(_schedule_refresh)
+        loop.call_soon_threadsafe(_schedule_refresh)
         return session
 
     def _record_and_evict_on_dead_transport(self, server_name: str, exc: BaseException) -> None:
@@ -8839,7 +8847,8 @@ class MCPClientManager:
         the future. Best-effort: a closed loop or scheduling failure
         logs at info level; never raises.
         """
-        if self._loop is None:
+        loop = self._loop
+        if loop is None:
             return
         key = (user_id, server_name)
 
@@ -8855,12 +8864,14 @@ class MCPClientManager:
                 f"revocation catalog drop for '{server_name}'",
             )
 
+        coro = _spawn_tracked()
         try:
             # Locked: an in-flight connect completing its discovery
             # after an unserialized drop would republish (resurrect)
             # the revoked catalog with nothing left to clear it.
-            asyncio.run_coroutine_threadsafe(_spawn_tracked(), self._loop)
+            asyncio.run_coroutine_threadsafe(coro, loop)
         except RuntimeError as exc:
+            coro.close()
             log.info(
                 "mcp_pool.evict_user_session_failed server=%s user=%s error=%s",
                 server_name,
