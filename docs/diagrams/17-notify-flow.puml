@@ -76,7 +76,7 @@ loop up to 3 attempts (retry delays: 1s, 3s)
 
                 Gateway -> Adapter : send(channel_id, content)
                 note right
-                  escape_mentions() applied
+                  Mentions allowed (Discord permissions apply)
                   Chunked for 2000-char limit
                 end note
                 Adapter -> Discord : POST message

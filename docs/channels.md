@@ -344,6 +344,11 @@ Two modes:
 - **Direct** — provide `channel_type` + `channel_id` to target a
   specific platform channel or user DM.
 
+Discord notifications support user mentions (`<@USER_ID>`), role mentions (`<@&ROLE_ID>`), `@everyone`,
+and `@here`. Mention syntax is preserved, and Discord's permissions and each recipient's notification
+settings determine whether a ping is delivered. To send a DM, use the user's Discord ID as `channel_id`;
+a separate server channel ID is not needed.
+
 ### Delivery Flow
 
 Notifications use direct HTTP for low latency. The server calls the channel
@@ -420,8 +425,8 @@ The `services` table schema:
   budget.
 - **SSRF protection** — only `http://` and `https://` service URLs are allowed. Other schemes are
   skipped with a warning.
-- **Mention sanitization** — `discord.utils.escape_mentions()` is
-  applied before sending, preventing `@everyone` / `@here` abuse.
+- **Discord mentions** — all bot messages allow user, role, `@everyone`, and `@here` mentions, subject
+  to Discord's permissions and the recipient's notification settings.
 - **Error redaction** — generic error messages are returned to the
   LLM. Internal details (service IDs, URLs, exception messages) are
   logged server-side only.

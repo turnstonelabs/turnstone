@@ -560,7 +560,7 @@ Send a notification to a user or channel on an external platform.
 
 | Parameter      | Type   | Required | Description |
 |----------------|--------|----------|-------------|
-| `message`      | string | yes      | Notification content (plain text, max 2000 chars). |
+| `message`      | string | yes      | Notification content (max 2000 chars; Discord mentions supported). |
 | `username`     | string | no       | Turnstone username — sends to all linked channels. |
 | `channel_type` | string | no       | Platform for direct targeting (`discord`). |
 | `channel_id`   | string | no       | Platform-specific channel or user ID for direct targeting. |
@@ -568,6 +568,10 @@ Send a notification to a user or channel on an external platform.
 
 Provide either `username` for user-based targeting or `channel_type` +
 `channel_id` for direct targeting. Do not combine both.
+
+Discord notifications support `<@USER_ID>`, `<@&ROLE_ID>`, `@everyone`, and `@here`, subject to Discord's
+permissions and the recipient's notification settings. For a DM, pass the user's Discord ID as
+`channel_id`; a separate server channel ID is not required.
 
 - **What it does**: Sends a notification via the channel gateway's HTTP endpoint (`POST /v1/api/notify`). The server queries the `services` table for healthy channel gateways, authenticates with a service JWT (`aud: turnstone-channel`), and delivers to the first healthy gateway. On failure, retries up to 2 additional times with backoff (1s, 3s). Rate-limited to 5 notifications per turn (counter only increments on success).
 - **Auto-approve**: Yes — notifications are time-sensitive and auto-approved so the model can alert users urgently.

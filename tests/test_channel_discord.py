@@ -161,17 +161,18 @@ def _make_real_bot():
 
 
 class TestAllowedMentions:
-    """Approval headers and previews carry user/model text verbatim, so the
-    client-level allowed_mentions default must suppress every mention
-    resolution (@everyone/@here, users, roles) on the wire."""
+    """All bot messages allow mentions, subject to Discord's permissions."""
 
-    def test_client_default_resolves_to_none(self):
+    def test_client_default_resolves_to_all(self):
         bot = _make_real_bot()
 
         am = bot._bot.allowed_mentions
         assert am is not None
         # AllowedMentions has no value equality — compare the wire form.
-        assert am.to_dict() == {"parse": []}
+        assert am.to_dict() == {
+            "parse": ["everyone", "users", "roles"],
+            "replied_user": True,
+        }
 
     def test_message_create_inherits_client_default(self):
         """A message create with no per-send override carries the default.
@@ -179,8 +180,7 @@ class TestAllowedMentions:
         ``abc.Messageable.send`` assembles its payload via
         ``handle_message_parameters(previous_allowed_mentions=state.allowed_mentions)``;
         drive the same assembly with the client's state value and assert
-        the wire payload pins ``allowed_mentions`` to parse-nothing while
-        the hostile text itself stays verbatim.
+        all mention types are allowed while the text stays verbatim.
         """
         from discord.http import handle_message_parameters
 
@@ -188,15 +188,103 @@ class TestAllowedMentions:
         state_default = bot._bot._connection.allowed_mentions
         assert state_default is not None
 
-        hostile = "@everyone @here <@123456789012345678> <@&987654321098765432>"
+        mentions = "@everyone @here <@123456789012345678> <@&987654321098765432>"
         with handle_message_parameters(
-            content=hostile,
+            content=mentions,
             previous_allowed_mentions=state_default,
         ) as params:
             payload = params.payload
             assert payload is not None
-            assert payload["allowed_mentions"] == {"parse": []}
-            assert payload["content"] == hostile
+            assert payload["allowed_mentions"] == {
+                "parse": ["everyone", "users", "roles"],
+                "replied_user": True,
+            }
+            assert payload["content"] == mentions
+
+
+@pytest.mark.parametrize("dm", [False, True], ids=["guild", "dm"])
+@pytest.mark.parametrize("ws_id", ["", "abcd1234"], ids=["send", "send_notification"])
+@pytest.mark.parametrize("chunked", [False, True], ids=["single", "chunked"])
+def test_notification_mentions_on_wire(dm, ws_id, chunked):
+    """The gateway preserves mention syntax and allows all mention types.
+
+    Exercise the real adapter and discord.py message assembly, intercepting
+    the HTTP transport so no messages reach Discord.
+    """
+    from starlette.testclient import TestClient
+
+    from turnstone.channels._http import create_channel_app
+    from turnstone.core.auth import JWT_AUD_CHANNEL, create_jwt
+
+    bot = _make_real_bot()
+    state = bot._bot._connection
+    channel = discord.PartialMessageable(state=state, id=123456789012345678)
+    user_id = 234567890123456789
+    user = MagicMock()
+    user.id = user_id
+    user.create_dm = AsyncMock(return_value=channel)
+    sent_msg = MagicMock()
+    sent_msg.id = 345678901234567890
+    payloads = []
+
+    async def capture_send(channel_id, *, params):
+        assert channel_id == channel.id
+        payloads.append(params.payload)
+        return {"id": str(sent_msg.id)}
+
+    mentions = f"<@{user_id}> <@!{user_id}> <@&456789012345678901> @everyone @here <#{channel.id}>"
+    prefix = "x" * (1999 - len(mentions)) + "\n" if chunked else ""
+    message = prefix + mentions
+    secret = "a" * 32
+    token = create_jwt(
+        user_id="system",
+        scopes=frozenset({"write"}),
+        source="service",
+        secret=secret,
+        audience=JWT_AUD_CHANNEL,
+    )
+    app = create_channel_app({"discord": bot}, MagicMock(), jwt_secret=secret)
+    with (
+        patch.object(bot._bot, "get_channel", return_value=None if dm else channel),
+        patch.object(bot._bot, "fetch_user", AsyncMock(return_value=user)),
+        patch.object(state.http, "send_message", AsyncMock(side_effect=capture_send)),
+        patch.object(state, "create_message", return_value=sent_msg),
+        TestClient(app) as client,
+    ):
+        response = client.post(
+            "/v1/api/notify",
+            json={
+                "target": {
+                    "channel_type": "discord",
+                    "channel_id": str(user_id if dm else channel.id),
+                },
+                "message": message,
+                "title": "Direct mention retry",
+                "ws_id": ws_id,
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert response.status_code == 200
+        assert response.json()["results"][0]["status"] == "sent"
+
+        # Ordinary bot messages inherit the same mention policy.
+        _run(channel.send(mentions))
+
+    notification_payloads = payloads[:-1]
+    assert len(notification_payloads) == (2 if chunked else 1)
+    assert "\n".join(p["content"] for p in notification_payloads) == (
+        f"**Direct mention retry**\n{message}"
+    )
+    for payload in payloads:
+        assert payload["allowed_mentions"] == {
+            "parse": ["everyone", "users", "roles"],
+            "replied_user": True,
+        }
+    assert payloads[-1]["content"] == mentions
+    if dm and ws_id:
+        assert bot._notify_ws_map[sent_msg.id] == (ws_id, str(user_id))
+    else:
+        assert not bot._notify_ws_map
 
 
 # ---------------------------------------------------------------------------
@@ -1506,7 +1594,11 @@ class TestToolInfoEvent:
         _bind_ws_event_handlers(bot, TurnstoneBot)
         return bot
 
-    def test_sends_per_item_embed(self):
+    @pytest.mark.parametrize(
+        "preview",
+        ["ls -la", "@everyone @here <@123456789012345678> <@&987654321098765432>"],
+    )
+    def test_sends_per_item_embed(self, preview):
         from turnstone.sdk.events import ToolInfoEvent
 
         bot = self._make_bot()
@@ -1514,16 +1606,16 @@ class TestToolInfoEvent:
         sent_msg = MagicMock()
         thread.send = AsyncMock(return_value=sent_msg)
 
-        items = [{"func_name": "bash", "preview": "ls -la", "needs_approval": False}]
+        items = [{"func_name": "bash", "preview": preview, "needs_approval": False}]
         event = ToolInfoEvent(ws_id="ws-1", items=items)
         _run(bot._on_ws_event("ws-1", thread, event))
 
         thread.send.assert_awaited_once()
         embed = thread.send.call_args[1]["embed"]
         assert embed.title == "bash"
-        assert embed.description == "ls -la"
+        assert embed.description == preview
         # Message tracked for later editing by ToolResultEvent.
-        assert bot._tool_info_msgs["ws-1"] == [("", "bash", "ls -la", sent_msg)]
+        assert bot._tool_info_msgs["ws-1"] == [("", "bash", preview, sent_msg)]
 
     def test_multiple_tools_send_multiple_embeds(self):
         from turnstone.sdk.events import ToolInfoEvent
