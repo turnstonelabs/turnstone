@@ -4486,8 +4486,18 @@ def config_reload(request: Request) -> JSONResponse:
 # -- internal MCP management -----------------------------------------------
 
 
+# Serialize manager construction and reconciliation on this node. Concurrent
+# reloads must share one manager and apply database snapshots in sequence.
+_MCP_RELOAD_LOCK = threading.Lock()
+
+
 def internal_mcp_reload(request: Request) -> JSONResponse:
     """POST /v1/api/_internal/mcp-reload — re-read mcp_servers table and reconcile."""
+    with _MCP_RELOAD_LOCK:
+        return _internal_mcp_reload_locked(request)
+
+
+def _internal_mcp_reload_locked(request: Request) -> JSONResponse:
     from turnstone.core.storage._registry import get_storage
 
     storage = get_storage()

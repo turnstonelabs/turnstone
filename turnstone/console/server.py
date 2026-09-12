@@ -11888,14 +11888,9 @@ async def admin_delete_mcp_server(request: Request) -> JSONResponse:
     return JSONResponse({"status": "ok"}, background=_schedule_mcp_reload(request))
 
 
-# Guards concurrent construction of the console's own MCP client manager
-# (lifespan boot racing an admin-write fan-out, or two rapid fan-outs
-# while ``app.state.mcp_client`` is still None).  Two winners would each
-# start an mcp-loop daemon thread and a static connection set; the second
-# assignment clobbers the first ref and the loser leaks both forever.
-# The node's ``internal_mcp_reload`` lazy-construct carries exactly this
-# latent race (turnstone/server.py internal_mcp_reload) — the console
-# does not replicate it.  Same shape as ``_COORD_BOOTSTRAP_LOCK``.
+# Guards construction and reconciliation of the console's MCP client manager. Overlapping
+# admin-write fan-outs must share one manager; creating two would leave an unreferenced
+# manager's event-loop thread and connections running.
 _CONSOLE_MCP_ENSURE_LOCK = threading.Lock()
 
 
@@ -11910,12 +11905,9 @@ def _ensure_console_mcp_client(app: Any) -> dict[str, Any]:
     the reconcile arm runs whenever a manager exists, so running
     coordinators track admin edits exactly like node sessions do.
 
-    This is the ONE lazy-construct/reconcile path for every post-boot
-    trigger — the admin-write reload fan-out and the operator
-    ``POST /reload`` — mirroring the node's ``internal_mcp_reload``.
-    Unlike the node's arm, the body holds a lock: two concurrent
-    triggers on a managerless console must not double-construct (the
-    node's unlocked equivalent is issue #873).
+    This is the ONE lazy-construct/reconcile path for every post-boot trigger — the admin-write
+    reload fan-out and the operator ``POST /reload`` — mirroring the node's ``internal_mcp_reload``.
+    Both hosts serialize construction and reconciliation so concurrent triggers share one manager.
 
     Plain SYNC function: construction connects to static servers and
     ``reconcile_sync`` performs bounded sync waits, so every caller

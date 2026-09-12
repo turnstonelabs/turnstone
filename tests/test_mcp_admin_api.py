@@ -3603,11 +3603,11 @@ class TestEnsureConsoleMcpClient:
         assert getattr(app.state, "mcp_client", None) is None
 
     def test_concurrent_triggers_construct_exactly_once(self):
-        """Two rapid triggers with no manager built must construct exactly
-        ONE manager — the module lock serializes them; the loser of an
-        unserialized race would leak its mcp-loop thread and connections
-        (the node's internal_mcp_reload has this latent race, #873; the
-        console must not)."""
+        """Two rapid triggers with no manager built must construct exactly one manager.
+
+        The module lock prevents an orphaned manager from leaking its event-loop thread and
+        connections.
+        """
         import time
         from concurrent.futures import ThreadPoolExecutor
         from unittest.mock import patch
