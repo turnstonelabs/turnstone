@@ -270,12 +270,8 @@ class TurnstoneBot:
             command_prefix="!ts ",
             intents=intents,
             help_command=None,
-            # Client-level default applied to every message create (plain
-            # sends, edits, embeds): approval headers, previews, and
-            # notification bodies carry user/model-authored text verbatim,
-            # so mention resolution (@everyone/@here, users, roles) is
-            # suppressed on the wire rather than by mutating the text.
-            allowed_mentions=discord.AllowedMentions.none(),
+            # Let Discord's permissions govern which mentions can ping.
+            allowed_mentions=discord.AllowedMentions.all(),
         )
 
         # Attach ourselves so cogs can access the TurnstoneBot instance.
@@ -603,9 +599,8 @@ class TurnstoneBot:
             raw_name = it.get("func_name") or it.get("approval_label") or "tool"
             display_name = discord.utils.escape_markdown(raw_name)
             raw_preview = it.get("preview", "")
-            # Escape backticks to prevent markdown breakout and strip @-mentions.
+            # Escape backticks to prevent markdown breakout.
             raw_preview = raw_preview.replace("`", "\\`")
-            raw_preview = discord.utils.escape_mentions(raw_preview)
             preview = truncate(raw_preview, max_length=120) or None
             embed = discord.Embed(
                 title=display_name,
@@ -925,7 +920,8 @@ class TurnstoneBot:
 
         Implements the :class:`ChannelAdapter` protocol.  Tries the ID as a
         channel first; if not found, attempts a user DM.  Long messages are
-        chunked via :func:`chunk_message`.
+        chunked via :func:`chunk_message`. Mentions are allowed, subject
+        to Discord's permissions and the recipient's notification settings.
         """
         import discord
 
@@ -938,7 +934,6 @@ class TurnstoneBot:
             except discord.NotFound as exc:
                 raise ValueError(f"Discord channel/user {channel_id} not found") from exc
 
-        content = discord.utils.escape_mentions(content)
         chunks = chunk_message(content, self.config.max_message_length)
         msg: discord.Message | None = None
         for chunk in chunks:
@@ -949,12 +944,11 @@ class TurnstoneBot:
     async def send_notification(self, channel_id: str, content: str, ws_id: str) -> str:
         """Send a notification and track the message for reply routing (DMs only).
 
-        Like :meth:`send` but, when the target resolves to a DM channel,
-        records a mapping from the outgoing Discord message ID to
-        ``(ws_id, user_id)`` so that the user's reply can be routed back
-        to the originating workstream.  Notifications delivered to guild
-        channels are NOT tracked — the reply-channel_id check would treat
-        the channel ID as a user ID and reject every legitimate reply.
+        Like :meth:`send`, allows mentions and, when the target resolves to a DM channel, records a
+        mapping from the outgoing Discord message ID to ``(ws_id, user_id)`` so that the user's reply
+        can be routed back to the originating workstream. Notifications delivered to guild channels
+        are NOT tracked — the reply-channel_id check would treat the channel ID as a user ID and
+        reject every legitimate reply.
         """
         import discord
 
@@ -969,7 +963,6 @@ class TurnstoneBot:
             except discord.NotFound as exc:
                 raise ValueError(f"Discord channel/user {channel_id} not found") from exc
 
-        content = discord.utils.escape_mentions(content)
         chunks = chunk_message(content, self.config.max_message_length)
         msg: discord.Message | None = None
         for chunk in chunks:

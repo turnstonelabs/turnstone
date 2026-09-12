@@ -6,7 +6,7 @@
     "properties": {
       "message": {
         "type": "string",
-        "description": "The notification content (plain text, max 2000 chars)."
+        "description": "The notification content (max 2000 chars). Discord mentions are supported: <@USER_ID>, <@&ROLE_ID>, @everyone, and @here, subject to Discord permissions."
       },
       "username": {
         "type": "string",

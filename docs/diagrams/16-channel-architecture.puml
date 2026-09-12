@@ -75,7 +75,7 @@ class "DiscordBot" as Bot <<service>> {
     Sends replies + embeds
     Creates threads for workstreams
     Renders approval buttons
-    escape_mentions() on send
+    Mentions follow Discord permissions
     --
     _notify_ws_map: msg_id -> (ws_id, user_id)
     _notify_reply_channels: ws_id -> (dm, user_id)
