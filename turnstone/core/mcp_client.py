@@ -693,7 +693,6 @@ class MCPClientManager:
         self._server_configs = server_configs
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
-        self._exit_stack: AsyncExitStack | None = None
 
         # Per-server state for auth_type ∈ {none, static}.  Each entry holds
         # session/owner-task/streams/catalog/capability flags for one
@@ -1065,9 +1064,6 @@ class MCPClientManager:
 
     async def _connect_all(self) -> None:
         """Connect to every configured server (runs on the background loop)."""
-        self._exit_stack = AsyncExitStack()
-        await self._exit_stack.__aenter__()
-
         for name, cfg in self._server_configs.items():
             try:
                 await self._connect_one(name, cfg)
@@ -5496,14 +5492,6 @@ class MCPClientManager:
                 future.result(timeout=12)
             except Exception:
                 log.debug("Error closing MCP sessions", exc_info=True)
-
-        # Close legacy shared stack (if any resources were registered on it)
-        if self._loop and self._exit_stack:
-            future = asyncio.run_coroutine_threadsafe(self._exit_stack.aclose(), self._loop)
-            try:
-                future.result(timeout=10)
-            except Exception:
-                log.debug("Error closing MCP exit stack", exc_info=True)
 
         if self._loop:
             self._loop.call_soon_threadsafe(self._loop.stop)

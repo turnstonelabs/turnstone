@@ -721,7 +721,6 @@ def _as_metadata_from_document(
     *,
     profile: str,
     issuer: str,
-    normalized_issuer: str,
 ) -> oauth_http.ASMetadata:
     """Validate one AS metadata document completely and build :class:`oauth_http.ASMetadata`.
 
@@ -939,7 +938,6 @@ async def _fetch_as_metadata(
                 doc,
                 profile=profile,
                 issuer=issuer,
-                normalized_issuer=normalized_issuer,
             )
         except _DiscoveryDocumentRejectedError as exc:
             document_error = document_error or exc

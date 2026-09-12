@@ -9,7 +9,7 @@ import inspect
 import json
 import threading
 import time
-from contextlib import AsyncExitStack, suppress
+from contextlib import suppress
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -944,9 +944,7 @@ class TestServerNameValidation:
 
         async def _run() -> None:
             mgr = MCPClientManager({"my__bad": {"command": "echo"}})
-            async with AsyncExitStack() as stack:
-                mgr._exit_stack = stack
-                await mgr._connect_one("my__bad", {"command": "echo"})
+            await mgr._connect_one("my__bad", {"command": "echo"})
             # Should not have connected
             assert "my__bad" not in mgr._static_servers
             assert mgr.get_tools() == []

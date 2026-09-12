@@ -6625,7 +6625,7 @@ async def admin_delete_oidc_identity(request: Request) -> JSONResponse:
     user_id = identity["user_id"]
     credential_revoked = False
     obo_cache_purged = 0
-    token_store = cast("MCPTokenStore | None", oauth_context(request.app.state).token_store)
+    token_store = oauth_context(request.app.state).token_store
     if token_store is not None:
         try:
             credential_revoked = bool(token_store.delete_oidc_credential(user_id, issuer))
