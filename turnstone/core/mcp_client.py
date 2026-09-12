@@ -9315,21 +9315,27 @@ def _db_servers_to_config(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any
 def load_mcp_config(
     config_path: str | None = None,
     storage: Any = None,
+    *,
+    db_rows: list[dict[str, Any]] | None = None,
 ) -> dict[str, dict[str, Any]]:
     """Load MCP server configurations.
 
     Sources (first match wins):
 
-    1. DB ``mcp_servers`` table (if *storage* provided and has enabled rows).
+    1. Enabled DB rows supplied in *db_rows* or read from *storage*.
     2. Explicit *config_path* (standard MCP JSON format).
     3. ``[mcp.servers.*]`` sections in ``config.toml``.
+
+    Supplying *db_rows* reuses an existing snapshot without reading *storage*.
+    An empty list permits file fallback; nonempty pool-only rows resolve to
+    an empty static config without falling back to files.
 
     Returns an empty dict if nothing is configured.
     """
     # 1. Database
-    if storage is not None:
+    if db_rows is not None or storage is not None:
         try:
-            rows = storage.list_mcp_servers(enabled_only=True)
+            rows = db_rows if db_rows is not None else storage.list_mcp_servers(enabled_only=True)
             if rows:
                 servers = _db_servers_to_config(rows)
                 log.info("Loaded MCP config from database (%d server(s))", len(servers))
@@ -9390,7 +9396,9 @@ def create_mcp_client(
     maintain web users' grants in the background. This disables the sweep
     before the manager starts, without changing the configured node cadence.
     """
-    # Check DB first to know which servers are DB-managed
+    # Share one enabled-row snapshot between ownership and config resolution.
+    # An empty snapshot after a failed read follows file fallback without retrying.
+    rows: list[dict[str, Any]] = []
     db_names: set[str] = set()
     oauth_user_names: set[str] = set()
     obo_names: set[str] = set()
@@ -9406,7 +9414,7 @@ def create_mcp_client(
         except Exception:
             log.warning("Failed to load DB-managed MCP servers", exc_info=True)
 
-    servers = load_mcp_config(config_path, storage=storage)
+    servers = load_mcp_config(config_path, storage=storage, db_rows=rows)
     if not servers and not oauth_user_names and not obo_names:
         return None
 
