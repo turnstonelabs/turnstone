@@ -2723,14 +2723,20 @@ def _validate_return_url(return_url: str, redirect_base: str) -> str | None:
         return None
     if "\\" in return_url or return_url.startswith("//"):
         return None
-    parsed = urllib.parse.urlparse(return_url)
-    # Allow path-only return URLs.
-    if not parsed.scheme and not parsed.netloc:
-        if parsed.path.startswith("/"):
-            return return_url
-        return None
-    base = urllib.parse.urlparse(redirect_base)
-    if _origin_tuple(parsed) != _origin_tuple(base):
+    try:
+        parsed = urllib.parse.urlparse(return_url)
+        # Like OIDC redirect-base validation, force the port check: urlparse
+        # accepts "host:abc" silently. Parsing itself rejects malformed brackets.
+        parsed.port  # noqa: B018 — triggers ValueError on an invalid port
+        # Allow path-only return URLs.
+        if not parsed.scheme and not parsed.netloc:
+            if parsed.path.startswith("/"):
+                return return_url
+            return None
+        base = urllib.parse.urlparse(redirect_base)
+        if _origin_tuple(parsed) != _origin_tuple(base):
+            return None
+    except ValueError:
         return None
     return return_url
 

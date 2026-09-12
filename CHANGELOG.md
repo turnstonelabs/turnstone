@@ -37,6 +37,8 @@ frozen.
 
 ### Fixed
 
+- **MCP OAuth consent return URLs.** Malformed URLs no longer abort consent; the callback
+  falls back to the home page when the return URL contains invalid ports or brackets.
 - **MCP submissions during shutdown.** Pool priming, catalog eviction and static server
   reconnection tolerate the loop closing between admission and scheduling. Rejected coroutines
   are closed, and reconnection reports its normal failure instead of an internal attribute error.

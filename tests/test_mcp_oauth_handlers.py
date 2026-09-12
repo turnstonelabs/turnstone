@@ -288,8 +288,18 @@ class TestAuthorize:
         assert pending["user_id"] == "user-1"
         assert pending["server_name"] == "srv-oauth"
 
-    def test_return_url_cross_origin_falls_back(
-        self, storage: SQLiteBackend, http_client_mock: MagicMock
+    @pytest.mark.parametrize(
+        "return_url",
+        [
+            "https://attacker.example.com/x",
+            "https://testserver:bad/x",
+            "https://testserver:65536/x",
+            "https://[broken/x",
+        ],
+        ids=["cross-origin", "non-numeric-port", "out-of-range-port", "malformed-bracket"],
+    )
+    def test_return_url_invalid_falls_back(
+        self, storage: SQLiteBackend, http_client_mock: MagicMock, return_url: str
     ) -> None:
         _seed_oauth_user_server(storage)
         token_store = _make_token_store(storage)
@@ -300,13 +310,14 @@ class TestAuthorize:
 
         with _public_addr_patch():
             resp = client.get(
-                "/v1/api/mcp/oauth/start"
-                "?server=srv-oauth&return_url=https://attacker.example.com/x",
+                "/v1/api/mcp/oauth/start",
+                params={"server": "srv-oauth", "return_url": return_url},
                 follow_redirects=False,
             )
 
         assert resp.status_code == 302
         location = resp.headers["location"]
+        assert location.startswith("https://as.example.com/authorize?")
         params = urllib.parse.parse_qs(urllib.parse.urlparse(location).query)
         # Pull pending and verify the return_url was sanitised to "/".
         pending = storage.pop_mcp_oauth_pending_state(params["state"][0])
