@@ -9,6 +9,7 @@ import contextvars
 import dataclasses
 import gc
 import inspect
+import ipaddress
 import subprocess
 import sys
 import textwrap
@@ -25,6 +26,7 @@ from tests._oauth_runtime_helpers import run_adapter
 from tests._oidc_test_helpers import make_oidc_config
 from tests.conftest import make_mcp_token_cipher
 from turnstone.core import mcp_oauth, model_oauth
+from turnstone.core.ip_classify import AddressLane
 from turnstone.core.mcp_crypto import MCPTokenStore
 from turnstone.core.model_backend_auth import (
     BackendAuthUnavailableError,
@@ -723,8 +725,10 @@ def test_shutdown_cancels_inflight_http_before_closing_client(
 
     monkeypatch.setattr(client, "aclose", observed_close)
     if path == "discovery":
+        # Leave PostgreSQL's localhost DNS intact while stubbing OAuth resolution.
         monkeypatch.setattr(
-            "socket.getaddrinfo", lambda *args, **kwargs: [(2, 1, 6, "", ("93.184.216.34", 0))]
+            "turnstone.core.oauth.ssrf.resolve_and_classify",
+            lambda _hostname: [(AddressLane.PUBLIC, ipaddress.ip_address("93.184.216.34"))],
         )
     elif path == "refresh":
         metadata = oauth_http.ASMetadata(
@@ -831,8 +835,10 @@ def test_client_closed_during_request_has_no_failure_disposition(
 
     runtime = _runtime(context, request)
     if path == "discovery":
+        # Leave PostgreSQL's localhost DNS intact while stubbing OAuth resolution.
         monkeypatch.setattr(
-            "socket.getaddrinfo", lambda *args, **kwargs: [(2, 1, 6, "", ("93.184.216.34", 0))]
+            "turnstone.core.oauth.ssrf.resolve_and_classify",
+            lambda _hostname: [(AddressLane.PUBLIC, ipaddress.ip_address("93.184.216.34"))],
         )
     elif path == "refresh":
         metadata = oauth_http.ASMetadata(

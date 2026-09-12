@@ -26,6 +26,27 @@ literal secret in the tree is the ephemeral Keycloak container's throwaway
 
 Not part of CI — run by hand when validating the feature against a live IdP.
 
+## Entra setup and reruns
+
+`./scripts/obo-e2e/entra_setup.sh setup` uses Python's standard library and an
+authenticated Azure CLI. It reuses existing registrations, scope IDs and the
+matching client secret saved in `.env`. It repairs stale A/B scope references,
+creates the delegated grants directly and verifies them before replacing `.env`.
+A rejected update or missing grant fails setup; the previous `.env` is preserved.
+Audience C must have no grant to the client so that it remains a useful control.
+
+If `.env` is missing or belongs to another client/tenant, setup adds a secret
+without removing existing credentials. Rerunning setup does not rotate a saved
+secret. An expired or invalid saved secret needs an explicit replacement in
+`.env`; changing credentials during a harness run can invalidate its configuration.
+
+Run setup, source the resulting `.env`, then run `entra_spike.py` and `entra_e2e.py`
+in sequence. Each script logs its checkout revision, dirty state and source hash.
+The product harness also identifies the loaded mint implementation. Token failures
+print HTTP status, OAuth error and numeric Entra codes, excluding response bodies
+and secrets. A transient product result with zero token requests points to failure
+before the token POST; a logged HTTP error identifies the upstream rejection.
+
 ## `entra_e2e.py` — end-to-end product exercise (post-implementation)
 
 `entra_spike.py` verified the raw OAuth WIRE (before code existed). `entra_e2e.py`

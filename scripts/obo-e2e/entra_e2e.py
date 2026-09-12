@@ -46,7 +46,7 @@ import os
 import sys
 import tempfile
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from turnstone.core.oauth.context import OAuthContext, oauth_context
 from turnstone.core.oauth.runtime import OAuthRuntime, shutdown_oauth_runtime
@@ -56,6 +56,7 @@ if TYPE_CHECKING:
 
 # Reuse the verified interactive-login machinery from the wire spike.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from entra_diagnostics import failure_summary, report_source  # noqa: E402
 from entra_spike import interactive_login, jwt_claims_unverified, redact  # noqa: E402
 
 from turnstone.core.mcp_crypto import MCPTokenStore
@@ -103,7 +104,20 @@ class _CountingClient:
 
     async def post(self, *args: Any, **kwargs: Any) -> httpx.Response:
         self.posts += 1
-        return await self._inner.post(*args, **kwargs)
+        try:
+            response = await self._inner.post(*args, **kwargs)
+        except Exception as exc:
+            print(f"[HTTP] token request {self.posts}: exception={type(exc).__name__}")
+            raise
+        if response.status_code != 200:
+            try:
+                body = response.json()
+            except ValueError:
+                body = None
+            print(
+                f"[HTTP] token request {self.posts}: {failure_summary(response.status_code, body)}"
+            )
+        return response
 
 
 def _make_app_state(
@@ -112,7 +126,10 @@ def _make_app_state(
     oidc_config: OIDCConfig,
 ) -> SimpleNamespace:
     context = OAuthContext(storage=storage, token_store=store, oidc_config=oidc_config)
-    runtime = OAuthRuntime(context, client_factory=lambda: _CountingClient(json_http_client(20.0)))
+    runtime = OAuthRuntime(
+        context,
+        client_factory=lambda: cast("httpx.AsyncClient", _CountingClient(json_http_client(20.0))),
+    )
     context.runtime = runtime
     runtime.start()
     return SimpleNamespace(auth_storage=storage, oauth_context=context)
@@ -173,6 +190,8 @@ async def _run(cfg: dict[str, str], refresh_token: str) -> None:
     app_state = _make_app_state(storage, store, oidc_config)
     client = oauth_context(app_state).http_client
     try:
+        if not isinstance(client, _CountingClient):
+            raise RuntimeError("The OAuth runtime did not initialize its HTTP client")
         # E1 — real mint for audience A.
         r = await get_obo_access_token_classified(
             app_state=app_state, user_id=USER, server_name="e2e-a"
@@ -188,7 +207,10 @@ async def _run(cfg: dict[str, str], refresh_token: str) -> None:
                 f"E1 mint A: kind=token aud={aud} want={aud_a} cache_row_refreshless={cache_ok}",
             )
         else:
-            record("FAILED", f"E1 mint A: kind={r.kind} (expected token)")
+            record(
+                "FAILED",
+                f"E1 mint A: kind={r.kind} (expected token); token_requests={client.posts}",
+            )
             return
 
         # E2 — cache hit issues zero Entra calls.
@@ -257,6 +279,7 @@ async def _run(cfg: dict[str, str], refresh_token: str) -> None:
         )
     finally:
         await asyncio.to_thread(shutdown_oauth_runtime, app_state)
+        storage.close()
 
 
 def main() -> int:
@@ -273,6 +296,8 @@ def main() -> int:
         print(f"Missing env: {', '.join(missing)} — did you `source scripts/obo-e2e/.env`?")
         return 2
 
+    report_source(__file__)
+    print(f"[SOURCE] mint implementation: {get_obo_access_token_classified.__code__.co_filename}")
     print("Signing in to Entra (this is the login the feature captures)...")
     tokens = interactive_login(cfg)
     refresh_token = tokens.get("refresh_token")

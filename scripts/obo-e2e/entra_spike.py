@@ -46,6 +46,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any
 
 import httpx
+from entra_diagnostics import failure_summary, report_source
 
 RESULTS: list[tuple[str, str, str]] = []  # (check, status, evidence)
 
@@ -82,8 +83,8 @@ class _CodeCatcher(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:  # noqa: N802 - stdlib API name
         q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
-        _CodeCatcher.code = (q.get("code") or [None])[0]
-        _CodeCatcher.state = (q.get("state") or [None])[0]
+        _CodeCatcher.code = next(iter(q.get("code", [])), None)
+        _CodeCatcher.state = next(iter(q.get("state", [])), None)
         body = b"Spike login captured - return to the terminal."
         if q.get("error"):
             body = f"IdP error: {q}".encode()
@@ -151,8 +152,8 @@ def interactive_login(cfg: dict[str, str]) -> dict[str, Any]:
                 pasted = ""
             if "?" in pasted:
                 q = urllib.parse.parse_qs(urllib.parse.urlparse(pasted).query)
-                _CodeCatcher.code = (q.get("code") or [None])[0]
-                _CodeCatcher.state = (q.get("state") or [None])[0]
+                _CodeCatcher.code = next(iter(q.get("code", [])), None)
+                _CodeCatcher.state = next(iter(q.get("state", [])), None)
                 _CodeCatcher.event.set()
                 return
             _time.sleep(1.0)
@@ -182,7 +183,7 @@ def interactive_login(cfg: dict[str, str]) -> dict[str, Any]:
     )
     tokens: dict[str, Any] = resp.json()
     if resp.status_code != 200:
-        raise SystemExit(f"code exchange failed: {json.dumps(tokens, indent=2)[:800]}")
+        raise SystemExit(f"code exchange failed: {failure_summary(resp.status_code, tokens)}")
     return tokens
 
 
@@ -224,7 +225,7 @@ def obo_exchange(cfg: dict[str, str], assertion: str, scope: str) -> tuple[int, 
 def check_aud(label: str, status: int, body: dict[str, Any], want_aud: str) -> str | None:
     """Common V2/V3 assertion: 200 + aud matches. Returns the new RT if any."""
     if status != 200:
-        record(label, "FAILED", f"HTTP {status}: {json.dumps(body)[:300]}")
+        record(label, "FAILED", failure_summary(status, body))
         return None
     claims = jwt_claims_unverified(body.get("access_token", ""))
     aud = str(claims.get("aud", "<none>"))
@@ -256,6 +257,7 @@ def main() -> int:
         if opt in os.environ:
             cfg[opt] = os.environ[opt]
 
+    report_source(__file__)
     # V1 - capture
     tokens = interactive_login(cfg)
     rt0 = tokens.get("refresh_token")
@@ -276,7 +278,9 @@ def main() -> int:
     check_aud("V3 mint audience B from SAME RT", s3, b3, b)
 
     # V4 - rotation semantics
-    if rt_after_a and rt_after_a != rt0:
+    if s2 != 200:
+        record("V4 rotation", "SKIPPED", "audience A redemption failed; rotation was not exercised")
+    elif rt_after_a and rt_after_a != rt0:
         s4, _ = redeem(cfg, rt0, f"{a}/.default")
         record(
             "V4 rotation (new RT returned; old still valid?)",
@@ -318,7 +322,7 @@ def main() -> int:
             record(
                 "V6 OBO jwt-bearer variant",
                 "FAILED",
-                f"could not mint self-audience assertion: HTTP {s6a}",
+                f"could not mint self-audience assertion: {failure_summary(s6a, b6a)}",
             )
     else:
         record("V6 OBO jwt-bearer variant", "SKIPPED", "SPIKE_RUN_OBO != 1")
