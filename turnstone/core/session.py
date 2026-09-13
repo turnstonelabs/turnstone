@@ -2585,6 +2585,13 @@ _BACKEND_KNOWN_EXC_NAMES: frozenset[str] = (
     | _BACKEND_TRANSIENT_EXC_NAMES
     | _BACKEND_STREAM_EXC_NAMES
 )
+# The adapter-raised overflow: a SUCCESSFUL response whose stop reason says
+# the context window filled (``providers.ContextWindowExceededError``, raised
+# by the Anthropic adapter on ``model_context_window_exceeded``).  By name,
+# like the sets above, so this helper stays free of provider imports; kept
+# OUT of ``_BACKEND_KNOWN_EXC_NAMES`` because ``_is_ctx_overflow`` must say
+# yes to it, not skip it as an already-classified error.
+_CTX_OVERFLOW_EXC_NAMES: frozenset[str] = frozenset({"ContextWindowExceededError"})
 
 
 def _non_blank_or(text: str | None, fallback: str) -> str:
@@ -2618,7 +2625,13 @@ def _is_ctx_overflow(exc: BaseException) -> bool:
     (OpenAI/vLLM "maximum context length"; Anthropic "exceed context limit,
     decrease input length"; Google/Gemini "exceeds the maximum number of tokens
     allowed").
+
+    An adapter's own ``ContextWindowExceededError`` — a SUCCESSFUL response whose
+    stop reason says the window filled — is recognized by class name, so the
+    stop-reason path and the rejection path are one overflow to every caller.
     """
+    if type(exc).__name__ in _CTX_OVERFLOW_EXC_NAMES:
+        return True
     if type(exc).__name__ in _BACKEND_KNOWN_EXC_NAMES:
         return False
     text = str(exc).lower()

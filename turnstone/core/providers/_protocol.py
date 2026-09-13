@@ -148,6 +148,22 @@ class CompletionResult:
     reasoning: str = ""
 
 
+class ContextWindowExceededError(RuntimeError):
+    """The model stopped because the request filled its context window.
+
+    Raised by an adapter when a SUCCESSFUL response ends with a stop reason
+    that means the context window, not the output budget, ran out
+    (Anthropic's ``model_context_window_exceeded``).  Typed and worded as the same
+    context overflow a 400 rejection produces, so every consumer of the
+    overflow predicate — the send loop's compact-and-retry arm, the
+    task_agent loop's compact-and-retry, the retry gates, the fatal
+    formatter — routes it to compaction and a fresh, complete answer
+    instead of the drain gate blessing a cut-off one as a clean turn.
+    Deliberately NOT in any provider's retryable set: re-issuing the same
+    prompt cannot help.
+    """
+
+
 class IncompleteStreamError(RuntimeError):
     """The stream ended without any terminal/finish signal.
 

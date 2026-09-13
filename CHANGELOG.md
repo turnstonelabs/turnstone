@@ -63,6 +63,10 @@ frozen.
 
 ### Fixed
 
+- **Context-window stop reason.** A response that ends with Anthropic's
+  `model_context_window_exceeded` stop reason was persisted as a clean completion, with no warning
+  and no compaction. It now surfaces as the same context overflow an over-long request already
+  produces, so the conversation is compacted and the turn retried for a complete answer.
 - **Console forms on narrow panes.** The rule that collapses two-column form rows to one column
   on a narrow pane never applied: it was declared above the base rule it needed to override, and a
   container query adds no specificity. It now sits after it, so a tight split or a phone-width

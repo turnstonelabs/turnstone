@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Any
 from turnstone.core.attachments import safe_attachment_label
 from turnstone.core.providers._protocol import (
     EFFORT_TEMPLATE_FALLBACK_PARAM,
+    ContextWindowExceededError,
     ModelCapabilities,
     ProviderRequestMetrics,
     StreamChunk,
@@ -1063,6 +1064,7 @@ class AnthropicProvider:
         saw_text_block = False
         emitted_finish = False
         delivered_output = False
+        window_exceeded = False
 
         def _attach_terminal_blocks(chunk: StreamChunk) -> None:
             # Every terminal path (message_delta stop_reason, message_stop
@@ -1241,30 +1243,46 @@ class AnthropicProvider:
                     )
                 if hasattr(event.delta, "stop_reason") and event.delta.stop_reason:
                     raw_stop = event.delta.stop_reason
-                    sc.finish_reason = _normalize_finish_reason(raw_stop)
-                    if raw_stop == "refusal":
-                        # Normalization is lossy and this is the only site that
-                        # still holds the provider's own word: a safety-classifier
-                        # decline is indistinguishable from an ordinary content
-                        # filter once collapsed onto "content_filter".  Record it
-                        # here rather than plumb a raw field through StreamChunk
-                        # for a consumer that does not exist yet.  Gate on the RAW
-                        # value, not on (normalized != raw) — normalization
-                        # rewrites end_turn and tool_use too, so an inequality
-                        # test fires on every ordinary turn in every lane.
-                        # ``stop_details`` rides the same event and is populated
-                        # exactly when the stop reason is a refusal; its
-                        # ``category`` is the one distinction an operator acts
-                        # on.  ``getattr`` keeps this floor-safe on SDKs that
-                        # predate the field.
-                        details = getattr(event.delta, "stop_details", None)
-                        log.info(
-                            "anthropic.refusal: classifier declined the turn (category=%s)",
-                            getattr(details, "category", None),
-                        )
-                    emitted_finish = True
-                    # Emit all raw content blocks for multi-turn preservation
-                    _attach_terminal_blocks(sc)
+                    if raw_stop == "model_context_window_exceeded":
+                        # The request filled the model's context window: an
+                        # HTTP 200 whose content stops where the window ended.
+                        # Not a truncation a bigger max_tokens could fix — the
+                        # context window, not the output budget, is what ran
+                        # out — so it surfaces as the same overflow a 400
+                        # rejection produces and the compact-and-retry arms
+                        # recover the turn with a complete answer.  Normalizing
+                        # it onto a finish reason instead would let the drain
+                        # gate bless the cut-off text as a clean completion.
+                        # The chunk built above still carries this event's
+                        # usage, so the raise waits until the loop bottom has
+                        # yielded it: the failed attempt's spend is billed and
+                        # must reach accounting before the turn is retried.
+                        window_exceeded = True
+                    else:
+                        sc.finish_reason = _normalize_finish_reason(raw_stop)
+                        if raw_stop == "refusal":
+                            # Normalization is lossy and this is the only site that
+                            # still holds the provider's own word: a safety-classifier
+                            # decline is indistinguishable from an ordinary content
+                            # filter once collapsed onto "content_filter".  Record it
+                            # here rather than plumb a raw field through StreamChunk
+                            # for a consumer that does not exist yet.  Gate on the RAW
+                            # value, not on (normalized != raw) — normalization
+                            # rewrites end_turn and tool_use too, so an inequality
+                            # test fires on every ordinary turn in every lane.
+                            # ``stop_details`` rides the same event and is populated
+                            # exactly when the stop reason is a refusal; its
+                            # ``category`` is the one distinction an operator acts
+                            # on.  ``getattr`` keeps this floor-safe on SDKs that
+                            # predate the field.
+                            details = getattr(event.delta, "stop_details", None)
+                            log.info(
+                                "anthropic.refusal: classifier declined the turn (category=%s)",
+                                getattr(details, "category", None),
+                            )
+                        emitted_finish = True
+                        # Emit all raw content blocks for multi-turn preservation
+                        _attach_terminal_blocks(sc)
 
             elif event_type == "message_stop":
                 # Terminal marker: the message completed even if the compat
@@ -1302,6 +1320,11 @@ class AnthropicProvider:
 
             if has_content or sc.finish_reason or sc.usage or sc.info_delta:
                 yield sc
+            if window_exceeded:
+                raise ContextWindowExceededError(
+                    "model stopped: context window exceeded "
+                    "(stop_reason=model_context_window_exceeded)"
+                )
 
         # Terminal-signal-less lax-gateway tolerance, armed ONLY by the
         # operator-declared ``finish_reason_optional`` capability: a
@@ -1383,7 +1406,12 @@ def _merge_extra_headers(wire: dict[str, str] | None, caller: dict[str, str]) ->
 
 
 def _normalize_finish_reason(reason: str) -> str:
-    """Normalize Anthropic stop reasons to OpenAI-compatible strings."""
+    """Normalize Anthropic stop reasons to OpenAI-compatible strings.
+
+    ``model_context_window_exceeded`` never reaches here: the ``message_delta``
+    handler raises ``ContextWindowExceededError`` before this call, because
+    normalizing it onto any finish reason would bless a cut-off turn (#1162).
+    """
     if reason == "end_turn":
         return "stop"
     if reason == "tool_use":

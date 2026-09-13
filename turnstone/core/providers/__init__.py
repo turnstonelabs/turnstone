@@ -11,6 +11,7 @@ from turnstone.core.providers._openai_chat import OpenAIChatCompletionsProvider
 from turnstone.core.providers._openai_responses import OpenAIResponsesProvider
 from turnstone.core.providers._protocol import (
     CompletionResult,
+    ContextWindowExceededError,
     IncompleteStreamError,
     LLMProvider,
     ModelCapabilities,
@@ -29,6 +30,7 @@ from turnstone.core.providers._xai import XAI_DEFAULT_BASE_URL, XAIProvider
 __all__ = [
     "ANTHROPIC_WORKSPACE_HEADER",
     "CompletionResult",
+    "ContextWindowExceededError",
     "IncompleteStreamError",
     "LLMProvider",
     "ModelCapabilities",
