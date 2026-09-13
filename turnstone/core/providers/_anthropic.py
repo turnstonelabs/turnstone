@@ -1390,6 +1390,11 @@ def _normalize_finish_reason(reason: str) -> str:
         return "tool_calls"
     if reason == "max_tokens":
         return "length"
+    if reason == "model_context_window_exceeded":
+        # Anthropic returns this as a successful response when the prompt fills
+        # the context window. Reuse the existing truncation path so it cannot
+        # be persisted as a clean completion.
+        return "length"
     if reason == "refusal":
         # A safety classifier declined the request.  This arrives as a
         # SUCCESSFUL HTTP 200 with content empty (declined before any

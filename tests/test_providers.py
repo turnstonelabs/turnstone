@@ -1478,6 +1478,7 @@ class TestAnthropicProvider:
         assert _normalize_finish_reason("end_turn") == "stop"
         assert _normalize_finish_reason("tool_use") == "tool_calls"
         assert _normalize_finish_reason("max_tokens") == "length"
+        assert _normalize_finish_reason("model_context_window_exceeded") == "length"
         assert _normalize_finish_reason("other_reason") == "other_reason"
 
     def test_refusal_normalized_to_content_filter(self) -> None:
