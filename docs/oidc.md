@@ -172,8 +172,12 @@ loopback addresses. Link-local, multicast, reserved ranges and known
 cloud-metadata endpoints stay refused even with the opt-in — no
 legitimate IdP lives there. An address is judged by what it actually
 reaches, so an IPv6 transition address (NAT64, 6to4, Teredo) wrapping
-an internal IPv4 is treated exactly as that IPv4 would be. The HTTPS
-requirement and the same-origin endpoint checks are unaffected.
+an internal IPv4 is treated as an internal destination. A local-use
+NAT64 wrapper in `64:ff9b:1::/48` is refused when any valid layout
+decodes into a refused range, even if its actual IPv4 destination is
+public; the private-network opt-in cannot restore access. The standard
+`64:ff9b::/96` DNS64 prefix still admits public IPv4 destinations. The
+HTTPS requirement and the same-origin endpoint checks are unaffected.
 
 This knob only affects the login-flow IdP configured here. OAuth endpoints
 advertised by remote MCP servers use the separate runtime setting

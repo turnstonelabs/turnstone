@@ -65,8 +65,13 @@ def _nat64_wkp(v4: str) -> str:
 
 
 def _nat64_local_use(v4: str) -> str:
-    """RFC 8215 local-use translation prefix 64:ff9b:1::/48."""
-    base = int(ipaddress.IPv6Address("64:ff9b:1::"))
+    """RFC 6052 §2.2 /96 carve-out of 64:ff9b:1::/48, IPv4 in the low 32 bits.
+
+    The /48, /56 and /64 layouts decode to 1.1.1.1, 1.1.1.0 and 1.1.0.X,
+    where X is the destination's first octet. Those are all public, so only
+    the /96 destination decides the lane in the shared wrapper matrix.
+    """
+    base = int(ipaddress.IPv6Address("64:ff9b:1:101:1:100::"))
     return str(ipaddress.IPv6Address(base | int(ipaddress.IPv4Address(v4))))
 
 
@@ -110,6 +115,7 @@ WRAPPERS: dict[str, Callable[[str], str]] = {
     "teredo": _teredo,
 }
 WRAPPER_IDS = sorted(WRAPPERS)
+MULTI_LAYOUT_WRAPPER_IDS = frozenset({"nat64-local-use"})
 
 PUBLIC_CAPABLE_WRAPPER_IDS = WRAPPER_IDS
 
@@ -186,7 +192,10 @@ class TestEmbeddedIPv4:
             if name in ("plain", "teredo"):
                 continue
             addr = ipaddress.ip_address(wrap(PUBLIC))
-            assert embedded_ipv4(addr) == (ipaddress.IPv4Address(PUBLIC),), name
+            if name in MULTI_LAYOUT_WRAPPER_IDS:
+                assert ipaddress.IPv4Address(PUBLIC) in embedded_ipv4(addr)
+            else:
+                assert embedded_ipv4(addr) == (ipaddress.IPv4Address(PUBLIC),), name
 
     def test_plain_addresses_are_not_wrappers(self) -> None:
         for a in ("93.184.216.34", "2606:4700:4700::1111", "fd00::1", "fe80::1"):
@@ -197,13 +206,22 @@ class TestEmbeddedIPv4:
         assert embedded_ipv4(ipaddress.ip_address("::1")) == ()
         assert embedded_ipv4(ipaddress.ip_address("::")) == ()
 
-    def test_floor_declines_to_unwrap_unroutable_embeddings(self) -> None:
-        """The 0.0.0.0/8 floor applies inside real wrapper prefixes too.
+    @pytest.mark.parametrize("target", ["127.0.0.1", "0.0.0.0"])
+    def test_mapped_loopback_and_unspecified_are_unwrapped(self, target: str) -> None:
+        addr = ipaddress.ip_address(_ipv4_mapped(target))
+        assert effective_addresses(addr) == (ipaddress.IPv4Address(target),)
 
-        Without this, ``64:ff9b::1`` would unwrap to 0.0.0.1 and be judged on a
-        meaningless address; with it, the wrapper itself is classified.
-        """
-        for a in ("64:ff9b::1", "::5", "64:ff9b:1::1"):
+    @pytest.mark.parametrize(
+        "target,embedded",
+        [("64:ff9b::1", "0.0.0.1"), ("::5", "0.0.0.5"), ("64:ff9b:1::1", "0.0.0.1")],
+    )
+    def test_nonzero_reserved_embeddings_are_retained(self, target: str, embedded: str) -> None:
+        addr = ipaddress.ip_address(target)
+        assert ipaddress.IPv4Address(embedded) in embedded_ipv4(addr)
+        assert classify_address(addr) is AddressLane.NEVER
+
+    def test_all_zero_embeddings_do_not_make_an_unspecified_host_routable(self) -> None:
+        for a in ("64:ff9b::", "64:ff9b:1::"):
             assert embedded_ipv4(ipaddress.ip_address(a)) == (), a
             assert classify_address(ipaddress.ip_address(a)) is AddressLane.NEVER, a
 
@@ -240,6 +258,11 @@ class TestEffectiveAddresses:
 class TestDescribeAddress:
     def test_names_what_a_wrapper_reaches(self) -> None:
         assert METADATA in describe_address(ipaddress.ip_address(_nat64_wkp(METADATA)))
+
+    @pytest.mark.parametrize("target", ["127.0.0.1", "0.0.0.0"])
+    def test_names_mapped_loopback_and_unspecified_destinations(self, target: str) -> None:
+        addr = ipaddress.ip_address(_ipv4_mapped(target))
+        assert describe_address(addr) == f"{addr} (routes to {target})"
 
     def test_plain_address_renders_bare(self) -> None:
         assert describe_address(ipaddress.ip_address(PUBLIC)) == PUBLIC
@@ -278,6 +301,53 @@ class TestLaneAssignment:
         addr = ipaddress.ip_address("fd00:ec2::254")
         assert addr.is_private and not addr.is_reserved, "precondition: only ULA"
         assert classify_address(addr) is AddressLane.NEVER
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        "0.0.0.1",
+        "0.1.2.3",
+        "0.255.255.255",
+        "64:ff9b::1",
+        "64:ff9b::1:203",
+        "::1:203",
+        "::ffff:0.1.2.3",
+        "2002:1:203::",
+        _teredo("0.1.2.3"),
+        "64:ff9b:1:1:2:300::",  # /48: 0.1.2.3
+        "64:ff9b:1:100:1:203::",  # /56: 0.1.2.3
+        "64:ff9b:1:101:0:102:300:0",  # /64: 0.1.2.3
+        "64:ff9b:1:101:1:100:1:203",  # /96: 0.1.2.3
+        "64:ff9b:1::5db8:d822",  # /96: public; /64: 0.0.0.93
+        "2001:db8::1",
+        "3fff::1",
+        "3fff:fff:ffff:ffff:ffff:ffff:ffff:ffff",
+    ],
+)
+def test_non_destination_addresses_are_refused_by_every_guard(target: str) -> None:
+    assert classify_address(ipaddress.ip_address(target)) is AddressLane.NEVER
+    assert not _oauth_allows(target)
+    assert not _oauth_allows(target, allow_private=True)
+    assert _web_lane(target) is AddressLane.NEVER
+    err, private_origin, _block = _screen_tool(target, allow_private_network=True)
+    assert err is not None and not private_origin
+    assert not _image_allows(target)
+
+
+@pytest.mark.parametrize("target", ["2001:db8::1", "3fff::1"])
+@pytest.mark.parametrize("is_global", [False, True])
+def test_documentation_ranges_do_not_depend_on_stdlib_global_classification(
+    monkeypatch: pytest.MonkeyPatch, target: str, is_global: bool
+) -> None:
+    # Older supported CPython releases reported 3fff::/20 as global.
+    monkeypatch.setattr(ipaddress.IPv6Address, "is_global", property(lambda _addr: is_global))
+    assert classify_address(ipaddress.ip_address(target)) is AddressLane.NEVER
+
+
+@pytest.mark.parametrize("target", ["3ffe:ffff::1", "3fff:1000::1"])
+def test_adjacent_global_ipv6_ranges_remain_public(target: str) -> None:
+    assert classify_address(ipaddress.ip_address(target)) is AddressLane.PUBLIC
 
 
 # ---------------------------------------------------------------------------
@@ -382,10 +452,10 @@ class TestLocalUseNAT64:
     """RFC 8215 64:ff9b:1::/48 — a fixed prefix, not the §3.2 NSP residual.
 
     RFC 6052 §2.2 puts the embedded IPv4 at a position that depends on the
-    prefix length, and deployments carve /96s out of this /48, so both layouts
-    are decoded. Getting this wrong in either direction is costly: too strict
-    and an IPv6-only node cannot browse at all, too loose and a NAT64 gateway
-    translates the guard's blessing straight to the metadata service.
+    prefix length, and deployments carve /96s out of this /48, so every valid
+    layout is decoded. Refusing any unsafe decoding also refuses some public
+    /96 destinations; guessing which layout applies could instead admit a
+    gateway's route to metadata or other refused space.
     """
 
     def test_96_layout_wrapping_metadata_is_never(self) -> None:
@@ -397,10 +467,18 @@ class TestLocalUseNAT64:
         assert not _oauth_allows(_nat64_local_use_48(METADATA), allow_private=True)
 
     def test_96_layout_wrapping_public_stays_public(self) -> None:
-        """A DNS64 node must reach IPv4-only sites without any opt-in."""
+        """A /96 destination stays reachable when every alternate layout is public."""
         addr = _nat64_local_use(PUBLIC)
         assert _web_lane(addr) is AddressLane.PUBLIC
         assert _oauth_allows(addr)
+
+    @pytest.mark.parametrize("addr", ["64:ff9b:1::5db8:d822", "64:ff9b:1:abcd::5db8:d822"])
+    def test_public_96_destination_with_refused_alternate_layout_is_never(self, addr: str) -> None:
+        embedded = embedded_ipv4(ipaddress.ip_address(addr))
+        assert ipaddress.IPv4Address(PUBLIC) in embedded
+        assert ipaddress.IPv4Address("0.0.0.93") in embedded
+        assert _web_lane(addr) is AddressLane.NEVER
+        assert not _oauth_allows(addr, allow_private=True)
 
     def test_48_layout_wrapping_public_stays_public(self) -> None:
         addr = _nat64_local_use_48(PUBLIC)
@@ -420,8 +498,12 @@ class TestLocalUseNAT64:
         """
         addr = "64:ff9b:1:100:a:0:700:0"
         assert ipaddress.IPv4Address("10.0.0.7") in embedded_ipv4(ipaddress.ip_address(addr))
-        assert _web_lane(addr) is AddressLane.PRIVATE
+        # The /56 layout also reaches 0.10.0.0; opting into private networks
+        # cannot make that reserved destination safe.
+        assert ipaddress.IPv4Address("0.10.0.0") in embedded_ipv4(ipaddress.ip_address(addr))
+        assert _web_lane(addr) is AddressLane.NEVER
         assert not _oauth_allows(addr)
+        assert not _oauth_allows(addr, allow_private=True)
 
     def test_non_zero_u_octet_is_not_a_48_layout(self) -> None:
         """RFC 6052 reserves bits 64-71; a non-zero value there rules the layout out."""
@@ -536,6 +618,15 @@ class TestSiteLocalAndVendorMetadata:
         assert _oauth_allows("fec0::1", allow_private=True)
 
 
+OFF_HOST_LOOPBACK_TARGETS = [
+    "64:ff9b::7f00:1",  # NAT64 well-known prefix
+    # The nonzero u octet rules out /48, /56 and /64, leaving only 127.0.0.1.
+    "64:ff9b:1:abcd:100:0:7f00:1",  # NAT64 local-use /96
+    "2002:7f00:1::",  # 6to4
+    "2001:0:7f00:1::80ff:fffe",  # Teredo with both server and client loopback
+]
+
+
 class TestCleartextRequiresProvenLoopback:
     """``http://`` is for a real local dev server, and only that.
 
@@ -551,10 +642,20 @@ class TestCleartextRequiresProvenLoopback:
         with _resolving_to("10.0.0.1"), pytest.raises(OAuthSSRFError):
             validate_url_no_ssrf("http://evil.localhost/token", allow_http=True)
 
-    def test_genuine_loopback_is_allowed(self) -> None:
-        for addr in ("127.0.0.1", "::1"):
-            with _resolving_to(addr):
-                validate_url_no_ssrf("http://localhost:8080/x", allow_http=True)
+    @pytest.mark.parametrize("addr", ["127.0.0.1", "::1", "::7f00:1", "::ffff:127.0.0.1"])
+    def test_genuine_loopback_is_allowed(self, addr: str) -> None:
+        with _resolving_to(addr):
+            validate_url_no_ssrf("http://localhost:8080/x", allow_http=True)
+
+    @pytest.mark.parametrize("addr", OFF_HOST_LOOPBACK_TARGETS)
+    @pytest.mark.parametrize("allow_private", [False, True])
+    def test_off_host_wrapper_cannot_prove_loopback(self, addr: str, allow_private: bool) -> None:
+        # These are all PRIVATE, so only the cleartext gate can refuse an opt-in.
+        assert classify_address(ipaddress.ip_address(addr)) is AddressLane.PRIVATE
+        with _resolving_to(addr), pytest.raises(OAuthSSRFError, match="HTTPS"):
+            validate_url_no_ssrf(
+                "http://idp.localhost/token", allow_http=True, allow_private=allow_private
+            )
 
     def test_transition_wrapper_of_loopback_counts_as_loopback(self) -> None:
         """``::7f00:1`` reaches 127.0.0.1, so the classifier and this lane must agree."""
@@ -593,6 +694,14 @@ class TestLocalhostNameIsNotEvidence:
         """The dev lane must survive: real localhost resolves to loopback."""
         assert self._validate("localhost", "127.0.0.1", allow_http=True)
         assert self._validate("localhost", "::1", allow_http=True)
+
+    @pytest.mark.parametrize("addr", OFF_HOST_LOOPBACK_TARGETS)
+    def test_off_host_wrapper_requires_private_opt_in_over_https(self, addr: str) -> None:
+        assert not self._validate("idp.localhost", addr)
+        with _resolving_to(addr):
+            validate_url_no_ssrf(
+                "https://idp.localhost/token", allow_http=False, allow_private=True
+            )
 
 
 class TestMalformedInput:

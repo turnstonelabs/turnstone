@@ -20,13 +20,20 @@ import asyncio
 import gc
 import signal
 import textwrap
-import time
+from types import SimpleNamespace
 from typing import TYPE_CHECKING
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
-from tests.conftest import _free_port, _popen_mcp_server, _wait_session_live, _wait_tcp_ready
+from tests import conftest
+from tests.conftest import (
+    _free_port,
+    _poll_until,
+    _popen_mcp_server,
+    _wait_session_live,
+    _wait_tcp_ready,
+)
 from turnstone.core.mcp_client import MCPClientManager
 
 if TYPE_CHECKING:
@@ -86,6 +93,28 @@ async def _live_owner_count() -> int:
     )
 
 
+def test_restart_readiness_waits_for_delayed_session_replacement(monkeypatch: pytest.MonkeyPatch):
+    old_session, new_session = object(), object()
+    state = SimpleNamespace(session=old_session)
+    mgr = MagicMock(spec=MCPClientManager)
+    mgr._static_servers = {"flaky": state}
+    observed = []
+
+    def delayed_reconnect(predicate, timeout):
+        # Hold the stale session through multiple polls, then expose the
+        # teardown gap and finally the replacement. No timing assumption.
+        observed.extend([predicate(), predicate()])
+        state.session = None
+        observed.append(predicate())
+        state.session = new_session
+        observed.append(predicate())
+        return observed[-1]
+
+    monkeypatch.setattr(conftest, "_poll_until", delayed_reconnect)
+    assert _wait_session_live(mgr, "flaky", 10.0, previous_session=old_session)
+    assert observed == [False, False, False, True]
+
+
 class TestFlakyServerNoSpin:
     def test_sigkill_flap_cycle_no_armed_scopes_and_recovers(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -134,24 +163,33 @@ class TestFlakyServerNoSpin:
             assert _wait_session_live(mgr, "flaky", 8.0), "initial connect failed"
 
             for _cycle in range(3):
+                previous_session = mgr._static_servers["flaky"].session
+                assert previous_session is not None
                 proc.send_signal(signal.SIGKILL)
                 proc.wait()
-                time.sleep(0.6)  # dead window: health loop sees the corpse
                 proc = _spawn_server()
-                assert _wait_session_live(mgr, "flaky", 10.0), (
-                    f"no reconnect after flap cycle {_cycle}"
+                assert _wait_session_live(mgr, "flaky", 10.0, previous_session=previous_session), (
+                    f"no fresh session after flap cycle {_cycle}"
                 )
-
-            # Let in-flight teardown/backoff machinery fully settle.
-            time.sleep(1.5)
+                assert "42" in mgr.call_tool_sync("mcp__flaky__ping_me", {"x": 41}, timeout=10)
 
             assert mgr._loop is not None
-            armed = asyncio.run_coroutine_threadsafe(_armed_scope_count(), mgr._loop).result(
-                timeout=10
-            )
-            owners = asyncio.run_coroutine_threadsafe(_live_owner_count(), mgr._loop).result(
-                timeout=10
-            )
+            armed, owners = -1, -1
+
+            def _settled() -> bool:
+                nonlocal armed, owners
+                armed = asyncio.run_coroutine_threadsafe(_armed_scope_count(), mgr._loop).result(
+                    timeout=10
+                )
+                owners = asyncio.run_coroutine_threadsafe(_live_owner_count(), mgr._loop).result(
+                    timeout=10
+                )
+                return armed == 0 and owners == 1
+
+            # A completed call can still have SDK cancellation cleanup in
+            # flight. Wait for the actual invariants, with a deadline that
+            # leaves a persistent scope/owner leak visible to the assertions.
+            _poll_until(_settled, 5.0, interval=0.5)
             health = mgr._static_health_task
 
             # The production failure signature: one armed scope per flap cycle.

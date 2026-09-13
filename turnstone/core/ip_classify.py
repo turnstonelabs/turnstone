@@ -27,10 +27,12 @@ is *replaced* by what it routes to — never merely added alongside, since
 wrapper would refuse every NAT64 address including the ones DNS64 synthesizes
 for ordinary IPv4-only websites.
 
-*Vendor metadata prefixes* that the stdlib has no opinion about (AWS Nitro IMDS
-over IPv6 at ``fd00:ec2::/32``) are ULA — ``is_private`` and nothing else — so
-without an explicit entry they would land in the operator-approvable lane and a
-home-lab opt-in would expose instance credentials.
+*Explicitly refused networks* cover vendor metadata the stdlib does not
+recognize and IANA non-destination space whose classification varies across
+CPython releases. AWS Nitro IMDS over IPv6 at ``fd00:ec2::/32``, for example,
+is ULA — ``is_private`` and nothing else — so without an explicit entry it
+would land in the operator-approvable lane and a home-lab opt-in would expose
+instance credentials.
 
 Residual, deliberately not addressed: a NAT64 Network-Specific Prefix
 (RFC 6052 §3.2) is built from the operator's own global prefix, so it is
@@ -63,26 +65,19 @@ class AddressLane(enum.IntEnum):
     NEVER = 2
     """Refused regardless of any opt-in — link-local (cloud metadata at
     169.254.169.254 is the canonical SSRF target), multicast, unspecified,
-    reserved, and known vendor metadata prefixes. No legitimate IdP, home-lab
-    dashboard, or media server lives in these."""
+    reserved, vendor metadata and IANA non-destination prefixes. No legitimate
+    IdP, home-lab dashboard, or media server lives in these."""
 
 
-# Translation prefixes carrying an embedded IPv4:
-#   64:ff9b::/96    RFC 6052 §3.1 well-known prefix. A compliant NAT64 gateway
-#                   MUST NOT use it for non-global IPv4, but a misconfigured
-#                   one will — so decode and re-classify rather than trusting
-#                   the RFC to hold.
-#   64:ff9b:1::/48  RFC 8215 local-use translation prefix.
-#   ::/96           RFC 4291 §2.5.5.1 IPv4-compatible (deprecated). ``::`` and
-#                   ``::1`` sit inside it but are the unspecified and loopback
-#                   addresses, not wrappers — the floor below excludes them
-#                   along with every other embedding no host would route.
-_LOWEST_ROUTABLE_V4 = ipaddress.IPv4Address("1.0.0.0")
-
-# Metadata endpoints the stdlib does not flag. The 169.254.169.254 most vendors
-# use is caught by ``is_link_local``; these are not. Add new vendor prefixes
-# here — this is the single list, shared by every guard.
-_VENDOR_METADATA: tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...] = (
+# Non-destination and metadata ranges need explicit policy: the stdlib's
+# special-purpose tables vary across supported CPython patch releases.
+# IANA lists both IPv6 documentation prefixes as non-destination space.
+# Nonzero 0/8 addresses are ordinary unicast on Linux despite their reserved
+# status, so they must stay refused even with the private-network opt-in.
+_NEVER_NETWORKS: tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...] = (
+    ipaddress.IPv4Network("0.0.0.0/8"),
+    ipaddress.IPv6Network("2001:db8::/32"),  # RFC 3849 documentation
+    ipaddress.IPv6Network("3fff::/20"),  # RFC 9637 documentation
     ipaddress.IPv6Network("fd00:ec2::/32"),  # AWS Nitro IMDS / ECS task metadata
     # Alibaba's sits in CGNAT, so it would land in the operator-approvable
     # lane; Azure's and Oracle's are ordinary global unicast, so without an
@@ -103,10 +98,29 @@ _VENDOR_METADATA: tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...] = (
 # possible — RFC 8215 defines the local-use prefix as a /48, so a /32 or /40
 # "layout" would overlap the prefix bits and decode pure garbage.
 _RFC6052_LOCAL_USE_LENGTHS = (48, 56, 64, 96)
+
+# Translation prefixes carrying an embedded IPv4:
+#   64:ff9b::/96    RFC 6052 §3.1 well-known prefix. A compliant NAT64 gateway
+#                   MUST NOT use it for non-global IPv4, but a misconfigured
+#                   one will — so decode and re-classify rather than trusting
+#                   the RFC to hold.
+#   64:ff9b:1::/48  RFC 8215 local-use translation prefix.
+#   ::/96           RFC 4291 §2.5.5.1 IPv4-compatible (deprecated). ``::`` and
+#                   ``::1`` sit inside it but are the unspecified and loopback
+#                   addresses, not wrappers; exclude them explicitly.
 _TRANSLATION_PREFIXES: tuple[tuple[ipaddress.IPv6Network, tuple[int, ...]], ...] = (
     (ipaddress.IPv6Network("64:ff9b::/96"), (96,)),
     (ipaddress.IPv6Network("64:ff9b:1::/48"), _RFC6052_LOCAL_USE_LENGTHS),
     (ipaddress.IPv6Network("::/96"), (96,)),
+)
+
+# These wrappers reach a translator or tunnel endpoint on the network. An
+# embedded loopback destination cannot prove that the traffic stays local.
+_OFF_HOST_TRANSITION_NETWORKS = (
+    ipaddress.IPv6Network("64:ff9b::/96"),
+    ipaddress.IPv6Network("64:ff9b:1::/48"),
+    ipaddress.IPv6Network("2002::/16"),
+    ipaddress.IPv6Network("2001::/32"),
 )
 
 
@@ -159,13 +173,17 @@ def embedded_ipv4(addr: IPAddress) -> tuple[ipaddress.IPv4Address, ...]:
     for network, lengths in _TRANSLATION_PREFIXES:
         if addr not in network:
             continue
+        if addr.is_unspecified or addr.is_loopback:
+            return ()
         decoded = tuple(
             item
             for item in (_rfc6052_ipv4(addr, length) for length in lengths)
-            if item is not None and item >= _LOWEST_ROUTABLE_V4
+            if item is not None and not item.is_unspecified
         )
         # Several layouts can decode at once; the worst-lane fold in
-        # ``classify_address`` then judges the address by all of them.
+        # ``classify_address`` judges every nonzero destination. Only the
+        # all-zero address is padding, not a routable IPv4 host. Retain the
+        # rest of 0/8: an alternate decoding can reach those hosts on Linux.
         return tuple(dict.fromkeys(decoded))
     return ()
 
@@ -193,7 +211,7 @@ def _classify_one(addr: IPAddress) -> AddressLane:
         or addr.is_multicast
         or addr.is_unspecified
         or addr.is_reserved
-        or any(addr in net for net in _VENDOR_METADATA)
+        or any(addr in net for net in _NEVER_NETWORKS)
     ):
         return AddressLane.NEVER
     # Deprecated IPv6 site-local (RFC 3879). CPython reports is_global True and
@@ -217,13 +235,17 @@ def classify_address(addr: IPAddress) -> AddressLane:
 
 
 def reaches_only_loopback(addr: IPAddress) -> bool:
-    """True when every address *addr* routes to is loopback.
+    """True when *addr* proves traffic stays on loopback.
 
-    One spelling of the predicate, because two spellings is how the cleartext
-    gate and the localhost development lane ended up disagreeing: a Teredo
-    address carries two IPv4s, so ``any`` and ``all`` give opposite answers for
-    a wrapper whose server half is loopback and whose client half is not.
+    NAT64, 6to4 and Teredo use a network translator or tunnel endpoint even
+    when their IPv4 payload is loopback. They cannot authorize cleartext or
+    the localhost development exception. IPv4-mapped and IPv4-compatible
+    loopback spellings retain the same treatment as their IPv4 destination.
     """
+    if isinstance(addr, ipaddress.IPv6Address) and any(
+        addr in network for network in _OFF_HOST_TRANSITION_NETWORKS
+    ):
+        return False
     return all(item.is_loopback for item in effective_addresses(addr))
 
 

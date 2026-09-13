@@ -1871,6 +1871,32 @@ class TestPrivateNetworkOptIn:
             asyncio.run(_run())
         client.get.assert_not_called()
 
+    @pytest.mark.parametrize("address", ["64:ff9b:1:1:2:300::", "3fff::1"])
+    @pytest.mark.parametrize("allow_private_network", [False, True])
+    def test_non_destination_address_never_reaches_http(
+        self, address: str, allow_private_network: bool
+    ) -> None:
+        client = MagicMock(spec=httpx.AsyncClient)
+        client.get = AsyncMock()
+
+        async def _run() -> None:
+            with patch("socket.getaddrinfo", return_value=[(10, 1, 6, "", (address, 443, 0, 0))]):
+                await discover_authorization_server(
+                    server_name="srv-x",
+                    server_url=_SERVER,
+                    override_url=None,
+                    cached_issuer=None,
+                    http_client=client,
+                    storage=_mk_storage_mock(),
+                    server_id="srv-id",
+                    trusted_hosts=frozenset({"mcp.example.com"}),
+                    allow_private_network=allow_private_network,
+                )
+
+        with pytest.raises(MCPOAuthDiscoveryError):
+            asyncio.run(_run())
+        client.get.assert_not_called()
+
     def test_setting_on_reaches_the_typed_server_and_override(self) -> None:
         meta, client = _discover_private(
             _SERVER,

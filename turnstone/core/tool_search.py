@@ -79,14 +79,15 @@ def _status_reason(status: dict[str, Any]) -> str:
     """
     if status.get("circuit_open"):
         return "circuit breaker open"
-    # The provider is injectable, so enforce the single-line output contract
-    # at the rendering boundary even though MCPClientManager also sanitizes.
-    err = str(status.get("error") or "").replace("\n", " ").replace("\r", "").strip()
+    # Recorded exceptions can contain instructions supplied by the server.
+    # Keep their details in operator status; model-facing advisories use only
+    # fixed categories, including when a caller injects the status provider.
+    err = str(status.get("error") or "").strip()
     if err:
-        return f"error: {err[:120]}"
-    disc = str(status.get("discovery_error") or "").replace("\n", " ").replace("\r", "").strip()
+        return "server error"
+    disc = str(status.get("discovery_error") or "").strip()
     if disc and not status.get("connected"):
-        return f"tool discovery failed: {disc[:120]}"
+        return "tool discovery failed"
     return ""
 
 

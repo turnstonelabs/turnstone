@@ -155,18 +155,19 @@ def validate_url_no_ssrf(
     operator's network. The tools opt-in refuses the same shape at its
     approval boundary.
 
-    Both knobs judge an IPv6 transition address (NAT64, 6to4, Teredo,
-    IPv4-mapped, IPv4-compatible) by the IPv4 address it routes to rather
-    than by the wrapper — see :mod:`turnstone.core.ip_classify`. A NAT64
-    address embedding 192.168.1.5 is therefore treated exactly as
-    192.168.1.5 would be: allowed under ``allow_private``, refused
-    without it.
+    The private-network knob judges an IPv6 transition address (NAT64,
+    6to4, Teredo, IPv4-mapped, IPv4-compatible) by its IPv4 destinations
+    rather than by the wrapper — see :mod:`turnstone.core.ip_classify`.
+    For local-use NAT64, every valid layout is checked; any destination
+    in a refused range rules out the opt-in.
 
     ``http://`` on a localhost hostname additionally requires every resolved
-    address to *be* loopback. ``*.localhost`` is ordinary DNS, so a hostile
-    authority can point it anywhere; the name alone is not evidence, and
-    accepting it would put an OIDC token exchange — ``client_secret`` and
-    authorization code included — on the wire in the clear.
+    address to stay on loopback. NAT64, 6to4 and Teredo wrappers cannot prove
+    this even when their IPv4 payload is loopback. ``*.localhost`` is ordinary
+    DNS, so a hostile authority can point it anywhere; the name alone is not
+    evidence, and accepting it would put an OIDC token exchange —
+    ``client_secret`` and authorization code included — on the wire in the
+    clear.
     """
     try:
         parsed = urllib.parse.urlparse(url)

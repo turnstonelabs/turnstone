@@ -573,20 +573,35 @@ def test_close_is_time_bounded_with_pipe_holding_escapee(registry, tmp_path):
         assert _wait_until(lambda: not any(t.is_alive() for t in shell._threads))
 
 
-def test_exited_records_are_pruned_at_cap():
+def test_exited_records_are_pruned_at_cap(monkeypatch):
     reg = BackgroundShellRegistry(max_exited_records=2)
+    release_first = threading.Event()
+    wait_for_exit = reg._wait_for_exit
+
+    def reordered_waiter(shell, out_thread, err_thread):
+        if shell.command == "echo job-0":
+            release_first.wait()
+        wait_for_exit(shell, out_thread, err_thread)
+
+    monkeypatch.setattr(reg, "_wait_for_exit", reordered_waiter)
     try:
         shells = [reg.spawn(f"echo job-{i}") for i in range(3)]
-        for s in shells:
-            assert _wait_status(s, "completed")
-        # Eviction happens on each exit; poll until the oldest is gone
-        # (waiter threads race, prune runs per-exit).
-        assert _wait_until(lambda: not reg.has(shells[0].shell_id))
-        assert reg.has(shells[1].shell_id)
-        assert reg.has(shells[2].shell_id)
+        for shell in shells[1:]:
+            assert _wait_until(lambda shell=shell: shell._exit_seq is not None)
+        assert shells[0]._exit_seq is None
+        release_first.set()
+        assert _wait_until(lambda: shells[0]._exit_seq is not None)
+
+        # The first shell spawned is deliberately the last to record exit.
+        # Status becomes completed before its exit sequence is assigned.
+        oldest, *retained = sorted(shells, key=lambda shell: shell._exit_seq)
+        assert oldest is not shells[0]
+        assert _wait_until(lambda: not reg.has(oldest.shell_id))
+        assert all(reg.has(shell.shell_id) for shell in retained)
         with pytest.raises(UnknownShellError):
-            reg.read(shells[0].shell_id)
+            reg.read(oldest.shell_id)
     finally:
+        release_first.set()
         reg.close()
 
 

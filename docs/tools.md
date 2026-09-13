@@ -355,7 +355,11 @@ Fetch a web page or PDF and extract specific information from it.
   with the opt-in enabled, including as a redirect target from a private address
   you approved. An address is judged by what it actually reaches, so an IPv6
   transition address (NAT64, 6to4, Teredo) wrapping an internal IPv4 is treated
-  exactly as that IPv4 would be.
+  as an internal destination. A local-use NAT64 wrapper in `64:ff9b:1::/48`
+  is refused when any valid layout decodes into a refused range, even if its
+  actual IPv4 destination is public; the private-network opt-in cannot restore
+  access. The standard `64:ff9b::/96` DNS64 prefix still admits public IPv4
+  destinations.
 - **Deployment requirements for local PDF processing**: The bounded PDF worker
   needs a writable temporary directory (`/tmp`, or the directory selected by
   `TMPDIR`) and permission to create one child process and lower its own resource

@@ -328,12 +328,19 @@ def _wait_tcp_ready(port: int, timeout: float) -> bool:
     return _poll_until(lambda: _tcp_accepts(port), timeout)
 
 
-def _wait_session_live(mgr: MCPClientManager, name: str, timeout: float) -> bool:
-    """Poll until static server *name* has a live session (live tests)."""
+def _wait_session_live(
+    mgr: MCPClientManager, name: str, timeout: float, *, previous_session: object | None = None
+) -> bool:
+    """Poll for an initialized session other than *previous_session*.
+
+    After a server restart the old session can remain installed until its
+    asynchronous teardown finishes; its presence is not proof of recovery.
+    """
 
     def _live() -> bool:
         state = mgr._static_servers.get(name)
-        return state is not None and state.session is not None
+        session = state.session if state is not None else None
+        return session is not None and session is not previous_session
 
     return _poll_until(_live, timeout)
 

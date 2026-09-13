@@ -179,6 +179,20 @@ protected-resource metadata fetch. Enable **`mcp.oauth_allow_private_network`**
   trusts — a local CA in the container trust store, or a TLS sidecar in front
   of the MCP server.
 
+The shared URL guards also refuse IPv4 `0.0.0.0/8` and the IPv6 documentation
+ranges `2001:db8::/32` and `3fff::/20`, regardless of the Python version or
+private-network setting. Local-use NAT64 addresses in `64:ff9b:1::/48` can
+encode different destinations depending on the gateway's prefix length. If
+any nonzero decoding reaches a refused range, the address is refused. This
+also refuses a local-use NAT64 wrapper of a **public IPv4 destination** when
+another valid layout reaches a refused range. For example,
+`64:ff9b:1::5db8:d822` and `64:ff9b:1:abcd::5db8:d822` both embed the public
+destination `93.184.216.34`, but another layout reaches `0.0.0.93`. An
+IPv6-only deployment using these local-use layouts loses access to affected
+IPv4-only sites through the URL guards; the private-network setting cannot
+restore it. The standard `64:ff9b::/96` DNS64 prefix has a single layout and
+continues to admit public IPv4 destinations.
+
 The setting is read per attempt, so flipping it takes effect on the next
 discovery with no restart. It is deployment-wide: it relaxes the address
 check for every `oauth_user` row, including a third-party server whose
