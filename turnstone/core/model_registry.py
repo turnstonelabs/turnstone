@@ -69,6 +69,32 @@ MODEL_AUTH_MODES = frozenset({"static", "entra_obo", "entra_app", "rfc8693_obo"}
 # drift into "console stores it, registry refuses to load it".
 MODEL_AUTH_TEXT_MAX_LEN = 2048
 
+# ``server_compat.anthropic_workspace_id`` becomes the ``anthropic-workspace-id``
+# request header on every call the alias makes, so its bound and character
+# rule are shared with the console write path (one rule, two layers) the same
+# way MODEL_AUTH_TEXT_MAX_LEN is.
+ANTHROPIC_WORKSPACE_ID_MAX_LEN = 128
+
+# Providers whose wire protocol is Anthropic's Messages API — the only lanes on
+# which ``server_compat.anthropic_workspace_id`` is ever sent.
+ANTHROPIC_PROTOCOL_PROVIDERS: frozenset[str] = frozenset({"anthropic", "anthropic-compatible"})
+
+
+def anthropic_workspace_id_error(value: str) -> str | None:
+    """Why *value* cannot be sent as the workspace header, or ``None`` if it can.
+
+    A header value must not carry control characters, whitespace or non-ASCII;
+    a bounded visible-ASCII token is the whole contract.  The API's own ids are
+    ``wrkspc_`` followed by alphanumerics, which this deliberately does not
+    hard-code.
+    """
+    if len(value) > ANTHROPIC_WORKSPACE_ID_MAX_LEN:
+        return f"longer than {ANTHROPIC_WORKSPACE_ID_MAX_LEN} characters"
+    if any(not (0x21 <= ord(ch) <= 0x7E) for ch in value):
+        return "contains whitespace, control or non-ASCII characters"
+    return None
+
+
 # ``model_definitions.max_concurrency`` is an ``INTEGER`` on both supported
 # databases.  Keep the public/config/API bound aligned with PostgreSQL's
 # signed 32-bit representation so a value accepted on SQLite cannot fail when
@@ -389,6 +415,52 @@ def _check_auth_text(alias: str, field: str, value: str) -> None:
         )
 
 
+def _normalize_workspace_id(
+    alias: str, server_compat: dict[str, Any], provider: str
+) -> dict[str, Any]:
+    """Refuse an unsendable ``anthropic_workspace_id`` at load; drop an inert one.
+
+    The registry's REFUSE policy for header-bound text, twin of
+    :func:`_check_auth_text`: the console refuses on write, this layer refuses
+    what the console would have, so DB-direct or config.toml garbage fails
+    loud instead of loading a header the API rejects on every call.  A scope
+    on a provider outside :data:`ANTHROPIC_PROTOCOL_PROVIDERS` is inert (no
+    client ever sends it): the console refuses NEW staging, but an already
+    stored value must not make the alias unloadable, so it is dropped with a
+    warning — the same tolerance a stale audience gets on a static row.
+    """
+    raw = server_compat.get("anthropic_workspace_id")
+    if raw is None or raw == "":
+        if "anthropic_workspace_id" in server_compat:
+            return {k: v for k, v in server_compat.items() if k != "anthropic_workspace_id"}
+        return server_compat
+    if provider not in ANTHROPIC_PROTOCOL_PROVIDERS:
+        # Dropped before any shape check: a value no client will ever send
+        # cannot be allowed to take the whole registry load down.
+        log.warning(
+            "Model '%s' has anthropic_workspace_id but provider %s never sends it; ignoring",
+            alias,
+            provider,
+        )
+        return {k: v for k, v in server_compat.items() if k != "anthropic_workspace_id"}
+    if not isinstance(raw, str):
+        raise ModelAuthConfigError(f"Model '{alias}' anthropic_workspace_id must be a string")
+    reason = anthropic_workspace_id_error(raw)
+    if reason:
+        raise ModelAuthConfigError(f"Model '{alias}' anthropic_workspace_id {reason}")
+    return server_compat
+
+
+def _anthropic_workspace_id_of(cfg: ModelConfig) -> str:
+    """The definition's Anthropic workspace scope, or ``""`` when unscoped.
+
+    Read from ``server_compat`` (an endpoint property, like ``api_surface``);
+    the loader has already refused anything the header cannot carry.
+    """
+    raw = cfg.server_compat.get("anthropic_workspace_id")
+    return raw if isinstance(raw, str) else ""
+
+
 def _normalize_auth_mode(
     alias: str, mode: Any, audience: Any, scopes: Any = ""
 ) -> tuple[str, str, str]:
@@ -604,7 +676,10 @@ class ModelRegistry:
                 client_key = "backend-auth-placeholder-unused"
             try:
                 self._clients[alias] = create_client(
-                    cfg.provider, base_url=cfg.base_url, api_key=client_key
+                    cfg.provider,
+                    base_url=cfg.base_url,
+                    api_key=client_key,
+                    workspace_id=_anthropic_workspace_id_of(cfg),
                 )
             except ValueError as exc:
                 # create_client's own misconfig errors already carry
@@ -951,9 +1026,10 @@ class ModelRegistry:
             # split old and new work across two independent limits.
             # Selective teardown — close + drop only clients whose
             # construction/connection target changed (alias removed, or
-            # base_url / api_key / provider / auth_mode differs). Keeps connection
-            # pools warm for the common admin-edit case where only
-            # ``model`` / ``temperature`` / ``context_window`` changed.
+            # base_url / api_key / provider / auth_mode / workspace scope
+            # differs). Keeps connection pools warm for the common admin-edit
+            # case where only ``model`` / ``temperature`` / ``context_window``
+            # changed.
             for alias, client in list(self._clients.items()):
                 old_cfg = old_models.get(alias)
                 new_cfg = self._models.get(alias)
@@ -964,6 +1040,7 @@ class ModelRegistry:
                     or old_cfg.api_key != new_cfg.api_key
                     or old_cfg.provider != new_cfg.provider
                     or old_cfg.auth_mode != new_cfg.auth_mode
+                    or _anthropic_workspace_id_of(old_cfg) != _anthropic_workspace_id_of(new_cfg)
                 ):
                     if hasattr(client, "close"):
                         client.close()
@@ -1074,6 +1151,7 @@ def _probe_context_window(cfg: ModelConfig) -> tuple[int | None, str]:
                 target_model=cfg.model,
                 static_table=False,
                 timeout=_LOADER_PROBE_TIMEOUT,
+                workspace_id=_anthropic_workspace_id_of(cfg),
             ),
             timeout=_LOADER_PROBE_TIMEOUT + 1.0,
             poll=0.05,
@@ -1100,10 +1178,13 @@ def _probe_context_window(cfg: ModelConfig) -> tuple[int | None, str]:
 
 
 def _same_endpoint(a: ModelConfig, b: ModelConfig) -> bool:
-    return (a.provider, a.base_url.rstrip("/"), a.model) == (
+    """Same provider, host, model and workspace scope — a different scope may
+    be served by a different backend, so a detected window never crosses it."""
+    return (a.provider, a.base_url.rstrip("/"), a.model, _anthropic_workspace_id_of(a)) == (
         b.provider,
         b.base_url.rstrip("/"),
         b.model,
+        _anthropic_workspace_id_of(b),
     )
 
 
@@ -1180,14 +1261,21 @@ def _resolve_context_windows(
     if to_probe:
         from concurrent.futures import ThreadPoolExecutor
 
-        # Identical definitions (same endpoint, credential and model) share
-        # one round trip; each worker only waits on its own deadline-bounded
-        # daemon thread, so the pool drains within a few probe budgets
-        # however many endpoints are down.
-        by_identity: dict[tuple[str, str, str, str, str], list[str]] = {}
+        # Identical definitions (same endpoint, credential, workspace scope
+        # and model) share one round trip; each worker only waits on its own
+        # deadline-bounded daemon thread, so the pool drains within a few
+        # probe budgets however many endpoints are down.
+        by_identity: dict[tuple[str, str, str, str, str, str], list[str]] = {}
         for alias in to_probe:
             cfg = configs[alias]
-            key = (cfg.provider, cfg.base_url.rstrip("/"), cfg.api_key, cfg.auth_mode, cfg.model)
+            key = (
+                cfg.provider,
+                cfg.base_url.rstrip("/"),
+                cfg.api_key,
+                cfg.auth_mode,
+                cfg.model,
+                _anthropic_workspace_id_of(cfg),
+            )
             by_identity.setdefault(key, []).append(alias)
         groups = list(by_identity.values())
         with ThreadPoolExecutor(
@@ -1335,6 +1423,7 @@ def load_model_registry(
                     )
                     continue
                 row_provider = _resolve_openai_provider(row.get("provider", "openai"), row_base_url)
+                row_server_compat = _normalize_workspace_id(alias, row_server_compat, row_provider)
                 if row_provider in LOCAL_PROVIDERS and not row_base_url:
                     # The console refuses this at save time; a row that predates
                     # that check would only fail on a user's first turn.
@@ -1469,6 +1558,7 @@ def load_model_registry(
         if not isinstance(entry_server_compat, dict):
             entry_server_compat = {}
         entry_provider = _resolve_openai_provider(entry.get("provider", "openai"), entry_base_url)
+        entry_server_compat = _normalize_workspace_id(alias, entry_server_compat, entry_provider)
         if entry_provider in LOCAL_PROVIDERS and not entry_base_url:
             log.warning(
                 "Model '%s' is a %s entry without a base_url — set it on the "
@@ -1834,6 +1924,7 @@ def probe_model_endpoint(
     *,
     static_table: bool = True,
     timeout: float = 10.0,
+    workspace_id: str = "",
 ) -> dict[str, Any]:
     """Stateless probe of a model endpoint.
 
@@ -1860,7 +1951,9 @@ def probe_model_endpoint(
     }
     client = None
     try:
-        client = create_client(provider, base_url=base_url, api_key=api_key)
+        client = create_client(
+            provider, base_url=base_url, api_key=api_key, workspace_id=workspace_id
+        )
         fast = client.with_options(timeout=timeout, max_retries=0)
         models = fast.models.list()
         if not models.data:

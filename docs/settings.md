@@ -196,6 +196,23 @@ each. Environment-variable expansion is deliberately not applied, so the
 allow-list decision cannot vary by node or expand beyond the persisted
 boundary.
 
+### Anthropic workspace scoping
+
+An organization-level Anthropic API key in an organization with several
+workspaces is refused by the API until each request names the workspace it acts
+in. Set the definition's **Workspace ID** (stored as
+`capabilities.server_compat.anthropic_workspace_id`) and Turnstone sends it as
+the `anthropic-workspace-id` header on every request the alias makes: model
+turns, the Detect probe, and the doctor's connection check, including calls
+issued with a delegated credential. Workspace-scoped keys need nothing; leave the
+field empty. The value is a header, so it must be visible ASCII of at most 128
+characters with no whitespace; the field only appears for the `anthropic` and
+`anthropic-compatible` providers, the console refuses it elsewhere (including a
+provider switch that would strand a stored value), and a value that still sits
+on another provider's definition is ignored at load with a warning. Changing it
+rebuilds the alias's client on the next registry reload, and context-window
+auto-detection treats each workspace as its own endpoint.
+
 ### Responses output controls (per-model)
 
 Models whose capability table declares Responses output controls expose two

@@ -1029,3 +1029,30 @@ class TestInlineReasoningSeam:
         v = judge.evaluate("tool output", func_name="bash", call_id="c1")
         assert not v.succeeded
         assert v.error == "empty_response"
+
+
+class TestWorkspaceScopeSurvivesClientRebuild:
+    def test_cached_client_carries_the_pinned_workspace_header(self) -> None:
+        """The guard's cached SDK client is rebuilt from the lane's client; the
+        workspace scope the registry pinned as a default header must ride that
+        rebuild, or an organization-level key is refused on every guard call."""
+        from turnstone.core.providers import create_client, create_provider
+
+        lane_client = create_client(
+            "anthropic", base_url="", api_key="k", workspace_id="wrkspc_01ABC"
+        )
+        try:
+            guard = OutputGuardJudge(
+                config=JudgeConfig(output_guard_llm=True),
+                session_binding=_binding(
+                    create_provider("anthropic"), lane_client, "claude-sonnet-4-6"
+                ),
+            )
+            try:
+                assert guard._client_factory_args["workspace_id"] == "wrkspc_01ABC"
+                rebuilt = guard._create_client()
+                assert rebuilt.default_headers["anthropic-workspace-id"] == "wrkspc_01ABC"
+            finally:
+                guard.close()
+        finally:
+            lane_client.close()

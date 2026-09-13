@@ -1767,6 +1767,29 @@
                 </div>
               </div>
               <div class="field-pair">
+                <!-- Anthropic-protocol lanes only: an organization-level key in a
+                     multi-workspace organization needs the workspace it acts in.
+                     Hidden, the concurrency field auto-places into the first
+                     column, so every other provider keeps its layout. No
+                     maxlength: a truncated id is a valid-looking wrong one, so
+                     over-length is refused visibly on save instead. -->
+                <div id="model-workspace-row" hidden>
+                  <label for="model-anthropic-workspace-id"
+                    >Workspace ID
+                    <span class="label-hint"
+                      >empty unless this key is organization-wide</span
+                    ></label
+                  >
+                  <input
+                    type="text"
+                    id="model-anthropic-workspace-id"
+                    class="sh-mono"
+                    placeholder="wrkspc_01ABC…"
+                    autocomplete="off"
+                    autocapitalize="none"
+                    spellcheck="false"
+                  />
+                </div>
                 <div>
                   <label for="model-max-concurrency"
                     >Max concurrent generations
@@ -1783,6 +1806,12 @@
                   />
                 </div>
               </div>
+              <!-- Shown when a Workspace ID is filled in but the chosen provider
+                   never sends one: the save path drops it, so say so first. -->
+              <p class="sh-callout" id="model-workspace-drop-note" hidden>
+                This provider does not use a Workspace ID. Saving removes the
+                stored value.
+              </p>
               <!-- Hidden outright on a deployment that cannot mint any dynamic
                    credential and whose row is not already using one; same
                    treatment the Roles sub-tab gets when its scope is missing. -->

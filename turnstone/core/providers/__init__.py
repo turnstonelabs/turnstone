@@ -27,6 +27,7 @@ from turnstone.core.providers._protocol import (
 from turnstone.core.providers._xai import XAI_DEFAULT_BASE_URL, XAIProvider
 
 __all__ = [
+    "ANTHROPIC_WORKSPACE_HEADER",
     "CompletionResult",
     "IncompleteStreamError",
     "LLMProvider",
@@ -153,7 +154,17 @@ LOCAL_PROVIDERS: frozenset[str] = frozenset({"openai-compatible", "anthropic-com
 LOCAL_PLACEHOLDER_API_KEY = "dummy"
 
 
-def create_client(provider_name: str, *, base_url: str, api_key: str) -> Any:
+# Header that scopes an organization-level Anthropic API key to one workspace.
+# The SDK treats it as a client-level header: set once via ``default_headers``
+# it rides every request the client (and every ``with_options`` copy of it)
+# makes — messages, model listing, the doctor probe — and survives the SDK's
+# per-request header merge.
+ANTHROPIC_WORKSPACE_HEADER = "anthropic-workspace-id"
+
+
+def create_client(
+    provider_name: str, *, base_url: str, api_key: str, workspace_id: str = ""
+) -> Any:
     """Create an SDK client for the given provider.
 
     An empty *api_key* is converted to ``None`` so that the underlying
@@ -165,6 +176,12 @@ def create_client(provider_name: str, *, base_url: str, api_key: str) -> Any:
     A local provider with neither a key nor the env var gets
     :data:`LOCAL_PLACEHOLDER_API_KEY` so the client still constructs; a
     commercial provider in that state fails the way the SDK dictates.
+
+    *workspace_id* (the definition's ``server_compat.anthropic_workspace_id``)
+    pins the :data:`ANTHROPIC_WORKSPACE_HEADER` on the Anthropic-protocol
+    lanes; an organization-level key in a multi-workspace organization is
+    refused by the API without it.  Ignored for every other provider — the
+    console refuses to store it there.
     """
     resolved_key: str | None = api_key if api_key else None
     if resolved_key is None and provider_name in LOCAL_PROVIDERS:
@@ -198,9 +215,11 @@ def create_client(provider_name: str, *, base_url: str, api_key: str) -> Any:
         from turnstone.core.providers._anthropic import _ensure_anthropic
 
         anthropic = _ensure_anthropic()
-        kwargs: dict[str, str] = {}
+        kwargs: dict[str, Any] = {}
         if resolved_key is not None:
             kwargs["api_key"] = resolved_key
+        if workspace_id:
+            kwargs["default_headers"] = {ANTHROPIC_WORKSPACE_HEADER: workspace_id}
         if provider_name == "anthropic-compatible":
             # The lane targets local /v1/messages servers; without a
             # base_url the SDK would default to https://api.anthropic.com

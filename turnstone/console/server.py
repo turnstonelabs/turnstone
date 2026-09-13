@@ -12988,6 +12988,65 @@ def _validate_api_surface(caps: Any) -> str | None:
     return None
 
 
+def _validate_anthropic_workspace_id(caps: Any, provider: str) -> str | None:
+    """Return an error message if ``caps["server_compat"]["anthropic_workspace_id"]`` is invalid.
+
+    The value becomes an HTTP header on every request the alias makes, so the
+    write path refuses anything a header must not carry (control characters,
+    whitespace, non-ASCII) instead of trusting the transport to reject it, and
+    bounds the length with the registry (:data:`ANTHROPIC_WORKSPACE_ID_MAX_LEN`)
+    so the two layers cannot drift into "console stores it, registry refuses to
+    load it".  Refused outright on providers that do not speak the Anthropic
+    protocol: the console hides the field there, so a stored value could only
+    come from a direct API call and would be silently inert.
+    """
+    from turnstone.core.model_registry import (
+        ANTHROPIC_PROTOCOL_PROVIDERS,
+        ANTHROPIC_WORKSPACE_ID_MAX_LEN,
+        anthropic_workspace_id_error,
+    )
+
+    if not isinstance(caps, dict):
+        return None
+    sc = caps.get("server_compat")
+    if not isinstance(sc, dict):
+        return None
+    raw = sc.get("anthropic_workspace_id")
+    if raw is None or raw == "":
+        return None
+    # Messages lead with the label the operator saw in the editor and keep
+    # the JSON path for direct API callers.
+    if not isinstance(raw, str):
+        return "Workspace ID (server_compat.anthropic_workspace_id) must be a string"
+    reason = anthropic_workspace_id_error(raw)
+    if reason:
+        return (
+            f"Workspace ID (server_compat.anthropic_workspace_id) {reason}; use one "
+            f"unbroken token of at most {ANTHROPIC_WORKSPACE_ID_MAX_LEN} visible ASCII characters"
+        )
+    if provider not in ANTHROPIC_PROTOCOL_PROVIDERS:
+        return (
+            "Workspace ID (server_compat.anthropic_workspace_id) applies only to the "
+            f"anthropic and anthropic-compatible providers, not {provider!r}"
+        )
+    return None
+
+
+def _stored_workspace_id(row: dict[str, Any], provider: str) -> str:
+    """A definition row's Anthropic workspace scope, when *provider* sends it."""
+    from turnstone.core.model_registry import ANTHROPIC_PROTOCOL_PROVIDERS
+
+    if provider not in ANTHROPIC_PROTOCOL_PROVIDERS:
+        return ""
+    try:
+        caps = json.loads(row.get("capabilities") or "{}")
+    except (json.JSONDecodeError, TypeError):
+        return ""
+    sc = caps.get("server_compat") if isinstance(caps, dict) else None
+    raw = sc.get("anthropic_workspace_id") if isinstance(sc, dict) else None
+    return raw if isinstance(raw, str) else ""
+
+
 # Keep in sync with turnstone.core.providers._google.GOOGLE_DEFAULT_BASE_URL
 _PROVIDER_DEFAULT_URLS: dict[str, str] = {
     "openai": "https://api.openai.com/v1",
@@ -13490,7 +13549,7 @@ async def admin_create_model_definition(request: Request) -> JSONResponse:
             {"error": "capabilities must be an object; omit for defaults"},
             status_code=400,
         )
-    err_msg = _validate_api_surface(caps)
+    err_msg = _validate_api_surface(caps) or _validate_anthropic_workspace_id(caps, provider)
     if err_msg:
         return JSONResponse({"error": err_msg}, status_code=400)
     capabilities = json.dumps(caps)
@@ -13760,10 +13819,27 @@ async def admin_update_model_definition(request: Request) -> JSONResponse:
                 {"error": "capabilities must be an object; omit to leave unchanged"},
                 status_code=400,
             )
-        err_msg = _validate_api_surface(caps)
+        err_msg = _validate_api_surface(caps) or _validate_anthropic_workspace_id(
+            caps, str(updates.get("provider", existing.get("provider", "openai")))
+        )
         if err_msg:
             return JSONResponse({"error": err_msg}, status_code=400)
         updates["capabilities"] = json.dumps(caps)
+    if "provider" in updates and "capabilities" not in updates:
+        # A provider switch that leaves the stored capabilities in place must
+        # still satisfy their provider-gated keys: a workspace scope on a row
+        # that no longer speaks the Anthropic protocol would be inert yet
+        # impossible to re-save, so the switch is refused until it is cleared.
+        try:
+            stored_caps = json.loads(existing.get("capabilities") or "{}")
+        except (json.JSONDecodeError, TypeError):
+            stored_caps = {}
+        err_msg = _validate_anthropic_workspace_id(stored_caps, str(updates["provider"]))
+        if err_msg:
+            return JSONResponse(
+                {"error": f"{err_msg}; clear it before switching the provider"},
+                status_code=400,
+            )
     if "enabled" in body:
         updates["enabled"] = bool(body["enabled"])
 
@@ -14074,9 +14150,31 @@ async def admin_detect_model(request: Request) -> JSONResponse:
     api_key = str(body.get("api_key", "")).strip()
     model = str(body.get("model", "")).strip()
     definition_id = str(body.get("definition_id", "")).strip()
+    # The probe lists /v1/models with the operator's key, so an
+    # organization-level Anthropic key needs its workspace here as well.
+    workspace_id = str(body.get("anthropic_workspace_id", "")).strip()
 
     if provider not in _MODEL_PROVIDERS:
         return JSONResponse({"error": f"Unknown provider: {provider!r}"}, status_code=400)
+    if workspace_id:
+        from turnstone.core.model_registry import (
+            ANTHROPIC_PROTOCOL_PROVIDERS,
+            anthropic_workspace_id_error,
+        )
+
+        reason = anthropic_workspace_id_error(workspace_id)
+        if reason:
+            return JSONResponse(
+                {"error": f"Workspace ID (anthropic_workspace_id) {reason}"}, status_code=400
+            )
+        if provider not in ANTHROPIC_PROTOCOL_PROVIDERS:
+            return JSONResponse(
+                {
+                    "error": "Workspace ID (anthropic_workspace_id) applies only to the "
+                    f"anthropic and anthropic-compatible providers, not {provider!r}"
+                },
+                status_code=400,
+            )
 
     # Resolve api_key from DB when the UI sends the masked sentinel
     if (not api_key or api_key == "***") and definition_id:
@@ -14085,6 +14183,13 @@ async def admin_detect_model(request: Request) -> JSONResponse:
             api_key = row.get("api_key", "")
             if not base_url:
                 base_url = row.get("base_url", "")
+            if "anthropic_workspace_id" not in body:
+                # The stored scope belongs with the stored key: a client that
+                # probes by definition_id alone must not lose it.  Keyed on
+                # ABSENCE — the console sends "" for a cleared field, and a
+                # cleared field must probe unscoped, exactly as the save that
+                # follows will run.
+                workspace_id = _stored_workspace_id(row, provider)
 
     # Reranker endpoints speak the Cohere/Jina ``POST <url>`` protocol, not
     # ``/v1/models`` — their base_url is the full rerank path, which the OpenAI
@@ -14176,6 +14281,7 @@ async def admin_detect_model(request: Request) -> JSONResponse:
             # (and then saved with) that model's commercial window; the
             # registry loader applies the same rule.
             static_table=provider not in LOCAL_PROVIDERS,
+            workspace_id=workspace_id,
         ),
     )
     if result.get("reachable") and result.get("context_window") is None:

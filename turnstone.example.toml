@@ -59,6 +59,9 @@
 # model = "claude-opus-4-8"
 # provider = "anthropic"       # context_window omitted = provider capability table
 #                              # (Anthropic, OpenAI, xAI; Google needs a value)
+# [models.claude.capabilities.server_compat]
+# anthropic_workspace_id = "wrkspc_..."  # organization-level keys only: sent as the
+#                                        # anthropic-workspace-id header on every request
 
 # --- Database (turnstone, node, console) ---
 

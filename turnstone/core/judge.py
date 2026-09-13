@@ -1332,9 +1332,22 @@ class IntentJudge:
     @staticmethod
     def _extract_client_config(client: Any, provider_name: str) -> dict[str, str]:
         """Extract connection config from an existing SDK client for re-creation."""
+        from turnstone.core.providers import ANTHROPIC_WORKSPACE_HEADER
+
         base_url = str(getattr(client, "base_url", getattr(client, "_base_url", "")))
         api_key = getattr(client, "api_key", "") or ""
-        return {"provider_name": provider_name, "base_url": base_url, "api_key": api_key}
+        # The registry pins an Anthropic workspace scope as a client-level
+        # default header; a rebuilt client must carry it or an organization-
+        # level key is refused on every judge call.  Read the one header, never
+        # the whole map (it also carries the credential).
+        headers = getattr(client, "default_headers", None)
+        scope = headers.get(ANTHROPIC_WORKSPACE_HEADER, "") if isinstance(headers, dict) else ""
+        return {
+            "provider_name": provider_name,
+            "base_url": base_url,
+            "api_key": api_key,
+            "workspace_id": scope if isinstance(scope, str) else "",
+        }
 
     def _create_client(self) -> Any:
         """Create a fresh HTTP client for a judge evaluation run."""

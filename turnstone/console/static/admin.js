@@ -7258,6 +7258,14 @@ function _renderModels(items) {
           ? "auth=deployment"
           : "auth=per-user",
       );
+    // A workspace scope changes which organization workspace the calls act
+    // and bill in — the same class of fact as the auth badge; two aliases
+    // differing only by workspace would otherwise be indistinguishable.
+    const wsScope = _isPlainObject(displayCaps.server_compat)
+      ? displayCaps.server_compat.anthropic_workspace_id
+      : "";
+    if (typeof wsScope === "string" && wsScope)
+      overrides.push("workspace=" + wsScope);
     if (overrides.length) {
       const ovrSpan = document.createElement("span");
       ovrSpan.className = "model-overrides-hint";
@@ -7445,6 +7453,7 @@ function showCreateModelModal() {
   document.getElementById("model-reasoning-effort").value = "";
   document.getElementById("model-server-type").value = "";
   document.getElementById("model-api-surface").value = "";
+  document.getElementById("model-anthropic-workspace-id").value = "";
   document.getElementById("model-thinking-mode").value = "";
   document.getElementById("model-thinking-param").value = "";
   document.getElementById("model-thinking-param-row").hidden = true;
@@ -7618,6 +7627,8 @@ function showEditModelModal(definitionId) {
       // Server compat: server_type, api_surface, and extra_body workarounds
       document.getElementById("model-server-type").value = sc.server_type || "";
       document.getElementById("model-api-surface").value = sc.api_surface || "";
+      document.getElementById("model-anthropic-workspace-id").value =
+        sc.anthropic_workspace_id || "";
       const eb = sc.extra_body || {};
       const ebText = JSON.stringify(eb, null, 2);
       document.getElementById("model-extra-body").value =
@@ -7744,6 +7755,16 @@ function submitCreateModel() {
 
   const providerVal = document.getElementById("model-provider").value;
 
+  if (providerVal === "anthropic" || providerVal === "anthropic-compatible") {
+    const wsEl = document.getElementById("model-anthropic-workspace-id");
+    const wsProblem = _workspaceIdProblem(wsEl.value.trim());
+    if (wsProblem) {
+      _showModelError(wsProblem);
+      wsEl.focus();
+      return;
+    }
+  }
+
   // Thinking mode → capabilities.  thinking_mode round-trips through the
   // dropdown for every provider, including anthropic-compatible (where
   // manual mode maps the session effort knob onto the template's
@@ -7807,6 +7828,16 @@ function submitCreateModel() {
         return;
       }
     }
+  }
+  // Anthropic workspace scoping is an endpoint property too, so it rides
+  // server_compat.  Gated on the Anthropic-protocol lanes for the same
+  // reason as the block above: the field is hidden elsewhere, and a value
+  // lingering from a provider switch must never persist.
+  if (providerVal === "anthropic" || providerVal === "anthropic-compatible") {
+    const workspaceId = document
+      .getElementById("model-anthropic-workspace-id")
+      .value.trim();
+    if (workspaceId) serverCompat.anthropic_workspace_id = workspaceId;
   }
   if (Object.keys(serverCompat).length > 0) {
     caps.server_compat = serverCompat;
@@ -8007,9 +8038,7 @@ function _modelSaveToast(isEdit, body) {
 }
 
 function _showModelError(msg) {
-  const e = document.getElementById("model-create-error");
-  e.textContent = msg;
-  e.classList.add("is-visible");
+  _showModalError(document.getElementById("model-create-error"), msg);
 }
 
 function _detectResultLine(text, color) {
@@ -8085,6 +8114,16 @@ function detectModel() {
   const btn = document.getElementById("model-detect-btn");
   const resultDiv = document.getElementById("model-detect-result");
   const isReranker = _editingReranker();
+  const detectProvider = document.getElementById("model-provider").value;
+  if (detectProvider === "anthropic" || detectProvider === "anthropic-compatible") {
+    const wsEl = document.getElementById("model-anthropic-workspace-id");
+    const wsProblem = _workspaceIdProblem(wsEl.value.trim());
+    if (wsProblem) {
+      _showModelError(wsProblem);
+      wsEl.focus();
+      return;
+    }
+  }
   btn.disabled = true;
   btn.setAttribute("aria-busy", "true");
   // Calibrate-on-detect adds a ~20s endpoint probe, so signal it.
@@ -8101,6 +8140,18 @@ function detectModel() {
   if (apiKey) form.api_key = apiKey;
   const editId = document.getElementById("model-edit-id").value;
   if (editId) form.definition_id = editId;
+  // The probe lists /v1/models with the same key, so an organization-level
+  // key needs its workspace on the probe as well — under the same provider
+  // gate as the save path, so a value lingering from a provider switch never
+  // rides a probe for an endpoint that does not read it.  Always sent on
+  // these lanes, "" included: the server falls back to the stored scope only
+  // when the key is ABSENT, so a cleared field probes unscoped, exactly as
+  // the save that follows will run.
+  if (form.provider === "anthropic" || form.provider === "anthropic-compatible") {
+    form.anthropic_workspace_id = document
+      .getElementById("model-anthropic-workspace-id")
+      .value.trim();
+  }
   // Tell the server to also calibrate when this is a reranker.
   if (isReranker) form.supports_rerank = true;
 
@@ -8118,6 +8169,9 @@ function detectModel() {
     })
     .then(function (d) {
       resultDiv.hidden = false;
+      // The result panel is the last element of the scrolling body while
+      // the Detect button sits in the sticky foot: bring it into view.
+      if (resultDiv.scrollIntoView) resultDiv.scrollIntoView({ block: "nearest" });
       resultDiv.textContent = "";
       if (d.error && !d.reachable) {
         resultDiv.appendChild(
@@ -8591,6 +8645,21 @@ const _providerDefaults = {
   },
 };
 
+/* The console half of the server's Workspace ID rule (one unbroken token of
+   visible ASCII, at most 128 characters): the operator-facing problem, or ""
+   when the value can be sent. Refused here so a paste with a stray space or a
+   smart quote never costs a round trip, and never truncated — a shortened id
+   is a valid-looking wrong one. */
+function _workspaceIdProblem(value) {
+  if (value.length > 128) return "Workspace ID is longer than 128 characters";
+  if (value && !/^[!-~]+$/.test(value))
+    return (
+      "Workspace ID must be one unbroken token: no spaces, accents or " +
+      "other non-ASCII characters"
+    );
+  return "";
+}
+
 /* Update placeholders when provider changes. */
 function _applyProviderDefaults() {
   const provider = document.getElementById("model-provider").value;
@@ -8614,6 +8683,23 @@ function _applyProviderDefaults() {
   const serverFieldsRow = document.getElementById("model-server-fields-row");
   if (serverFieldsRow) {
     serverFieldsRow.hidden = provider === "anthropic-compatible";
+  }
+  // Workspace scoping exists only on the Anthropic protocol (the native
+  // lane, or a proxy in front of it configured as anthropic-compatible).
+  const workspaceRow = document.getElementById("model-workspace-row");
+  if (workspaceRow) {
+    workspaceRow.hidden =
+      provider !== "anthropic" && provider !== "anthropic-compatible";
+  }
+  // A filled-in scope is dropped by the save path once the row is hidden
+  // (the key persists only on the Anthropic lanes); warn before the save
+  // instead of reporting success over a silent deletion.
+  const dropNote = document.getElementById("model-workspace-drop-note");
+  if (dropNote && workspaceRow) {
+    const typed = document
+      .getElementById("model-anthropic-workspace-id")
+      .value.trim();
+    dropNote.hidden = !workspaceRow.hidden || !typed;
   }
   _updateModelResponseControls();
 }

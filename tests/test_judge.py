@@ -2646,3 +2646,30 @@ class TestInlineReasoningSeam:
             client=MagicMock(),
         )
         assert result is None
+
+
+class TestWorkspaceScopeSurvivesClientRebuild:
+    def test_rebuilt_client_carries_the_pinned_workspace_header(self) -> None:
+        """The judge rebuilds its own SDK client from the lane's client; the
+        workspace scope the registry pinned as a default header must ride that
+        rebuild, or an organization-level key is refused on every verdict."""
+        from turnstone.core.providers import create_client, create_provider
+
+        lane_client = create_client(
+            "anthropic", base_url="", api_key="k", workspace_id="wrkspc_01ABC"
+        )
+        try:
+            judge = IntentJudge(
+                config=JudgeConfig(enabled=True, read_only_tools=False),
+                session_binding=_binding(
+                    create_provider("anthropic"), lane_client, "claude-sonnet-4-6"
+                ),
+            )
+            assert judge._client_factory_args["workspace_id"] == "wrkspc_01ABC"
+            rebuilt = judge._create_client()
+            try:
+                assert rebuilt.default_headers["anthropic-workspace-id"] == "wrkspc_01ABC"
+            finally:
+                rebuilt.close()
+        finally:
+            lane_client.close()

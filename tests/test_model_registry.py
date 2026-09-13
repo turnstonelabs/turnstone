@@ -4723,6 +4723,7 @@ class TestContextWindowAutoDetect:
             target_model="local-model",
             static_table=False,
             timeout=mr_module._LOADER_PROBE_TIMEOUT,
+            workspace_id="",
         )
         assert reg.get_config("local").context_window == 262144
 
@@ -5121,7 +5122,7 @@ class TestLocalProviderPlaceholderKey:
         with patch("turnstone.core.model_registry.create_client") as cc:
             reg.get_client("m")
         cc.assert_called_once_with(
-            "openai-compatible", base_url="http://localhost:8000/v1", api_key=""
+            "openai-compatible", base_url="http://localhost:8000/v1", api_key="", workspace_id=""
         )
 
 
@@ -5404,3 +5405,286 @@ def test_unknown_provider_does_not_crash_the_load(caplog: pytest.LogCaptureFixtu
         reg = load_model_registry(detect_context_windows=True)
     assert reg.get_config("typo").context_window == mr_module.FALLBACK_CONTEXT_WINDOW
     assert any("not recognised" in _rendered(r) for r in caplog.records)
+
+
+class TestAnthropicWorkspaceId:
+    """``server_compat.anthropic_workspace_id`` → the ``anthropic-workspace-id``
+    header on every request the alias's client makes."""
+
+    @staticmethod
+    def _probe(client: Any) -> dict[str, Any]:
+        """Issue one Messages call and one model listing through a real
+        HTTPX2 mock transport; return the workspace header each carried."""
+        import httpx2
+
+        seen: dict[str, Any] = {}
+
+        def handler(request: httpx2.Request) -> httpx2.Response:
+            seen[request.url.path] = request.headers.get("anthropic-workspace-id")
+            if request.url.path.endswith("/models"):
+                return httpx2.Response(
+                    200,
+                    json={"data": [], "has_more": False, "first_id": None, "last_id": None},
+                    request=request,
+                )
+            return httpx2.Response(
+                200,
+                json={
+                    "id": "m",
+                    "type": "message",
+                    "role": "assistant",
+                    "model": "m",
+                    "content": [],
+                    "stop_reason": "end_turn",
+                    "stop_sequence": None,
+                    "usage": {"input_tokens": 1, "output_tokens": 0},
+                },
+                request=request,
+            )
+
+        wired = client.with_options(
+            http_client=httpx2.Client(transport=httpx2.MockTransport(handler)), max_retries=0
+        )
+        wired.messages.create(model="m", max_tokens=8, messages=[{"role": "user", "content": "hi"}])
+        wired.models.list()
+        return seen
+
+    @pytest.mark.parametrize(
+        ("provider", "base_url"),
+        [("anthropic", ""), ("anthropic-compatible", "http://localhost:8000")],
+    )
+    def test_create_client_pins_the_header_on_anthropic_protocol_lanes(
+        self, provider: str, base_url: str
+    ) -> None:
+        from turnstone.core.providers import create_client
+
+        client = create_client(
+            provider, base_url=base_url, api_key="k", workspace_id="wrkspc_01ABC"
+        )
+        try:
+            seen = self._probe(client)
+        finally:
+            client.close()
+        assert seen == {"/v1/messages": "wrkspc_01ABC", "/v1/models": "wrkspc_01ABC"}
+
+    def test_create_client_without_a_workspace_sends_no_header(self) -> None:
+        from turnstone.core.providers import create_client
+
+        client = create_client("anthropic", base_url="", api_key="k")
+        try:
+            seen = self._probe(client)
+        finally:
+            client.close()
+        assert seen == {"/v1/messages": None, "/v1/models": None}
+
+    def test_header_survives_the_minted_credential_copy(self) -> None:
+        """The OBO path issues calls on ``with_options(api_key=...)``; the
+        client-level header must ride that copy too."""
+        from turnstone.core.providers import create_client
+
+        client = create_client("anthropic", base_url="", api_key="k", workspace_id="wrkspc_01ABC")
+        try:
+            seen = self._probe(client.with_options(api_key="minted"))
+        finally:
+            client.close()
+        assert seen == {"/v1/messages": "wrkspc_01ABC", "/v1/models": "wrkspc_01ABC"}
+
+    def test_openai_lanes_ignore_the_keyword(self) -> None:
+        from turnstone.core.providers import create_client
+
+        client = create_client(
+            "openai",
+            base_url="https://api.openai.example/v1",
+            api_key="k",
+            workspace_id="wrkspc_01ABC",
+        )
+        try:
+            assert "anthropic-workspace-id" not in client.default_headers
+        finally:
+            client.close()
+
+    def test_registry_passes_the_scope_from_server_compat(self) -> None:
+        cfg = ModelConfig(
+            alias="a",
+            base_url="",
+            api_key="k",
+            model="m",
+            provider="anthropic",
+            server_compat={"anthropic_workspace_id": "wrkspc_01ABC"},
+        )
+        reg = ModelRegistry(models={"a": cfg}, default="a")
+        with patch("turnstone.core.model_registry.create_client") as factory:
+            reg.get_client("a")
+        factory.assert_called_once_with(
+            "anthropic", base_url="", api_key="k", workspace_id="wrkspc_01ABC"
+        )
+
+    def test_reload_rebuilds_the_client_when_the_scope_changes(self) -> None:
+        """A workspace edit changes what every request carries, so the cached
+        client (and its pinned default header) must be retired like a key or
+        base_url change."""
+        models = {"a": ModelConfig("a", "", "key", "m", provider="anthropic")}
+        reg = ModelRegistry(models=models, default="a")
+        reg.get_client("a")
+
+        scoped = ModelConfig(
+            "a",
+            "",
+            "key",
+            "m",
+            provider="anthropic",
+            server_compat={"anthropic_workspace_id": "wrkspc_01ABC"},
+        )
+        reg.reload({"a": scoped}, "a", app_state=_KEYED_STATE)
+
+        assert "a" not in reg._clients
+
+    @pytest.mark.parametrize(
+        ("value", "reason"),
+        [
+            ("wrkspc_01ABC", None),
+            ("x" * 128, None),
+            ("x" * 129, "longer than 128 characters"),
+            ("wrkspc 01", "contains whitespace, control or non-ASCII characters"),
+            ("wrkspc\t01", "contains whitespace, control or non-ASCII characters"),
+            ("wrkspc_é", "contains whitespace, control or non-ASCII characters"),
+        ],
+    )
+    def test_workspace_id_error_is_the_header_rule(self, value: str, reason: str | None) -> None:
+        from turnstone.core.model_registry import anthropic_workspace_id_error
+
+        assert anthropic_workspace_id_error(value) == reason
+
+    def test_loader_refuses_an_unsendable_scope_and_drops_an_empty_one(self) -> None:
+        from turnstone.core.model_registry import ModelAuthConfigError
+
+        def cfg_with(scope: Any) -> dict[str, Any]:
+            return {
+                "models": {
+                    "claude": {
+                        "model": "claude-sonnet-4-6",
+                        "provider": "anthropic",
+                        "api_key": "k",
+                        "capabilities": {"server_compat": {"anthropic_workspace_id": scope}},
+                    }
+                },
+                "model": {"default": "claude"},
+            }
+
+        with (
+            patch("turnstone.core.model_registry.load_config", return_value=cfg_with("bad id")),
+            pytest.raises(ModelAuthConfigError, match="anthropic_workspace_id contains"),
+        ):
+            load_model_registry(base_url="", api_key="", model="")
+
+        with patch("turnstone.core.model_registry.load_config", return_value=cfg_with("")):
+            reg = load_model_registry(base_url="", api_key="", model="")
+        _, _, cfg, _ = reg.resolve()
+        assert cfg.server_compat == {}
+
+        with patch(
+            "turnstone.core.model_registry.load_config", return_value=cfg_with("wrkspc_01ABC")
+        ):
+            reg = load_model_registry(base_url="", api_key="", model="")
+        _, _, cfg, _ = reg.resolve()
+        assert cfg.server_compat == {"anthropic_workspace_id": "wrkspc_01ABC"}
+
+    def test_loader_drops_a_scope_the_provider_never_sends(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A stored scope on a non-Anthropic provider is inert: the console
+        refuses new staging, but an already-stored value must not make the
+        alias unloadable, so the loader drops it with a warning (the same
+        tolerance a stale audience gets on a static row)."""
+        fake_cfg: dict[str, Any] = {
+            "models": {
+                "gpt": {
+                    "model": "gpt-5",
+                    "provider": "openai",
+                    "api_key": "k",
+                    "capabilities": {"server_compat": {"anthropic_workspace_id": "wrkspc_01ABC"}},
+                }
+            },
+            "model": {"default": "gpt"},
+        }
+        with (
+            patch("turnstone.core.model_registry.load_config", return_value=fake_cfg),
+            caplog.at_level(logging.WARNING),
+        ):
+            reg = load_model_registry(base_url="", api_key="", model="")
+        _, _, cfg, _ = reg.resolve()
+        assert cfg.server_compat == {}
+        warned = [r for r in caplog.records if "anthropic_workspace_id" in r.getMessage()]
+        assert len(warned) == 1
+
+        # Dropped before any shape check: a value no client sends must not be
+        # able to take every other alias down with a load-time refusal.
+        fake_cfg["models"]["gpt"]["capabilities"]["server_compat"]["anthropic_workspace_id"] = (
+            "my workspace"
+        )
+        with patch("turnstone.core.model_registry.load_config", return_value=fake_cfg):
+            reg = load_model_registry(base_url="", api_key="", model="")
+        _, _, cfg, _ = reg.resolve()
+        assert cfg.server_compat == {}
+
+    @staticmethod
+    def _scoped_entry(scope: str) -> dict[str, Any]:
+        return {
+            "base_url": "http://localhost:8000",
+            "provider": "anthropic-compatible",
+            "model": "m",
+            "context_window": 0,
+            "capabilities": {"server_compat": {"anthropic_workspace_id": scope}},
+        }
+
+    def test_auto_detect_probes_each_workspace_separately(self) -> None:
+        """Two definitions that differ only by workspace may be served by
+        different backends behind one gateway, so the probe identity includes
+        the scope and each alias gets its own detected window."""
+        fake_cfg = {
+            "models": {
+                "ws-a": self._scoped_entry("wrkspc_A"),
+                "ws-b": self._scoped_entry("wrkspc_B"),
+            }
+        }
+        windows = {"wrkspc_A": 65536, "wrkspc_B": 8192}
+
+        def probe(*_args: Any, **kwargs: Any) -> dict[str, Any]:
+            return _probe_result(context_window=windows[kwargs["workspace_id"]])
+
+        with (
+            patch("turnstone.core.model_registry.load_config", return_value=fake_cfg),
+            patch("turnstone.core.model_registry.probe_model_endpoint", side_effect=probe) as spy,
+        ):
+            reg = load_model_registry(detect_context_windows=True)
+        assert spy.call_count == 2
+        assert reg.get_config("ws-a").context_window == 65536
+        assert reg.get_config("ws-b").context_window == 8192
+
+    def test_reload_carry_over_never_crosses_a_workspace(self) -> None:
+        """The detected-window carry-over is keyed on the endpoint identity;
+        a definition whose scope changed is a different endpoint, so a probe
+        miss falls back instead of inheriting the previous workspace's window."""
+        running = ModelConfig(
+            alias="ws",
+            base_url="http://localhost:8000",
+            api_key="",
+            model="m",
+            provider="anthropic-compatible",
+            context_window=65536,
+            context_window_detected=True,
+            server_compat={"anthropic_workspace_id": "wrkspc_A"},
+        )
+        down = _probe_result(reachable=False, context_window=None, error="connection refused")
+
+        def load(scope: str) -> int:
+            fake_cfg = {"models": {"ws": self._scoped_entry(scope)}}
+            with (
+                patch("turnstone.core.model_registry.load_config", return_value=fake_cfg),
+                patch("turnstone.core.model_registry.probe_model_endpoint", return_value=down),
+            ):
+                reg = load_model_registry(detect_context_windows=True, prior={"ws": running})
+            return reg.get_config("ws").context_window
+
+        assert load("wrkspc_A") == 65536  # same scope: the detected window is kept
+        assert load("wrkspc_B") == mr_module.FALLBACK_CONTEXT_WINDOW

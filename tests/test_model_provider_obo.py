@@ -359,7 +359,7 @@ class TestGetClientKeyInjection:
     def _seen_api_key(self, cfg: ModelConfig, monkeypatch: Any) -> str:
         seen: dict[str, Any] = {}
 
-        def _spy(provider: str, *, base_url: str, api_key: str) -> object:
+        def _spy(provider: str, *, base_url: str, api_key: str, workspace_id: str = "") -> object:
             seen["api_key"] = api_key
             return object()
 

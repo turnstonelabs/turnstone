@@ -2673,6 +2673,212 @@ def test_update_rejects_invalid_api_surface(storage: SQLiteBackend) -> None:
     assert "api_surface" in resp.json()["error"]
 
 
+_SCOPED_CAPS = {"server_compat": {"anthropic_workspace_id": "wrkspc_01ABC"}}
+
+
+def _create_anthropic_alias(client: TestClient, alias: str, caps: dict[str, object]) -> object:
+    return client.post(
+        "/v1/api/admin/model-definitions",
+        json={
+            "alias": alias,
+            "model": "claude-sonnet-4-6",
+            "provider": "anthropic",
+            "base_url": "",
+            "api_key": "sk-x",
+            "capabilities": caps,
+        },
+    )
+
+
+def test_create_accepts_an_anthropic_workspace_id(storage: SQLiteBackend) -> None:
+    """The Workspace ID field persists inside ``server_compat`` (an endpoint
+    property, like ``api_surface``) and loads into the registry's config."""
+    _seed_model_def(storage, definition_id="m1", alias="local", model="m")
+    registry = _make_registry(alias="local", model="m")
+    client = _make_client(storage, registry)
+
+    resp = _create_anthropic_alias(client, "scoped", _SCOPED_CAPS)
+    assert resp.status_code == 200, resp.text
+    row = storage.get_model_definition_by_alias("scoped")
+    assert json.loads(row["capabilities"]) == _SCOPED_CAPS
+    assert registry.get_config("scoped").server_compat == _SCOPED_CAPS["server_compat"]
+
+
+@pytest.mark.parametrize(
+    "bad", ["wrkspc 01", "wrkspc\t01", "x" * 129, "wrkspc_\u00e9", 42], ids=repr
+)
+def test_create_rejects_an_unsendable_workspace_id(storage: SQLiteBackend, bad: object) -> None:
+    """The value becomes an HTTP header: whitespace, control characters,
+    non-ASCII, over-length and non-strings are refused at write time instead
+    of failing every later request."""
+    _seed_model_def(storage, definition_id="m1", alias="local", model="m")
+    registry = _make_registry(alias="local", model="m")
+    client = _make_client(storage, registry)
+
+    resp = _create_anthropic_alias(
+        client, "scoped", {"server_compat": {"anthropic_workspace_id": bad}}
+    )
+    assert resp.status_code == 400, resp.text
+    assert "anthropic_workspace_id" in resp.json()["error"]
+    assert not registry.has_alias("scoped")
+
+
+def test_create_refuses_a_workspace_id_off_the_anthropic_protocol(storage: SQLiteBackend) -> None:
+    """The console hides the field for other providers, so a stored value there
+    could only arrive by direct API call and would be silently inert."""
+    _seed_model_def(storage, definition_id="m1", alias="local", model="m")
+    registry = _make_registry(alias="local", model="m")
+    client = _make_client(storage, registry)
+
+    resp = client.post(
+        "/v1/api/admin/model-definitions",
+        json={
+            "alias": "scoped",
+            "model": "x",
+            "provider": "openai-compatible",
+            "base_url": "http://localhost:9000/v1",
+            "api_key": "sk-x",
+            "capabilities": _SCOPED_CAPS,
+        },
+    )
+    assert resp.status_code == 400, resp.text
+    assert "openai-compatible" in resp.json()["error"]
+    assert not registry.has_alias("scoped")
+
+
+def test_update_gates_the_workspace_id_on_the_effective_provider(storage: SQLiteBackend) -> None:
+    """PUT validates against the provider the row will have after the update,
+    so a scope cannot ride a provider switch away from the Anthropic protocol."""
+    _seed_model_def(storage, definition_id="m1", alias="local", model="m")
+    registry = _make_registry(alias="local", model="m")
+    client = _make_client(storage, registry)
+    assert _create_anthropic_alias(client, "scoped", {}).status_code == 200
+    definition_id = storage.get_model_definition_by_alias("scoped")["definition_id"]
+
+    ok = client.put(
+        f"/v1/api/admin/model-definitions/{definition_id}", json={"capabilities": _SCOPED_CAPS}
+    )
+    assert ok.status_code == 200, ok.text
+    stored = json.loads(storage.get_model_definition_by_alias("scoped")["capabilities"])
+    assert stored == _SCOPED_CAPS
+
+    bad_value = client.put(
+        f"/v1/api/admin/model-definitions/{definition_id}",
+        json={"capabilities": {"server_compat": {"anthropic_workspace_id": "no spaces"}}},
+    )
+    assert bad_value.status_code == 400, bad_value.text
+
+    switched = client.put(
+        f"/v1/api/admin/model-definitions/{definition_id}",
+        json={
+            "provider": "openai-compatible",
+            "base_url": "http://localhost:9000/v1",
+            "capabilities": _SCOPED_CAPS,
+        },
+    )
+    assert switched.status_code == 400, switched.text
+    assert "openai-compatible" in switched.json()["error"]
+
+    # A provider-only switch leaves the stored capabilities in place, so the
+    # stored scope is re-validated against the new provider and the switch is
+    # refused until the operator clears it — never a 200 that strands a value
+    # the next save would reject.
+    provider_only = client.put(
+        f"/v1/api/admin/model-definitions/{definition_id}",
+        json={"provider": "openai-compatible", "base_url": "http://localhost:9000/v1"},
+    )
+    assert provider_only.status_code == 400, provider_only.text
+    assert "clear it before switching the provider" in provider_only.json()["error"]
+    assert storage.get_model_definition_by_alias("scoped")["provider"] == "anthropic"
+
+    cleared = client.put(
+        f"/v1/api/admin/model-definitions/{definition_id}",
+        json={
+            "provider": "openai-compatible",
+            "base_url": "http://localhost:9000/v1",
+            "capabilities": {"server_compat": {}},
+        },
+    )
+    assert cleared.status_code == 200, cleared.text
+    assert storage.get_model_definition_by_alias("scoped")["provider"] == "openai-compatible"
+
+
+def test_detect_forwards_the_workspace_id_to_the_probe(
+    storage: SQLiteBackend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Detect lists /v1/models with the operator's key, so an organization-level
+    key needs its workspace on the probe as well; an unsendable value is
+    refused before any probe runs."""
+    _seed_model_def(storage, definition_id="m1", alias="seed", model="m")
+    client = _make_client(storage, _make_registry(alias="seed", model="m"))
+    seen: dict[str, object] = {}
+
+    def fake_probe(*args: object, **kwargs: object) -> dict[str, object]:
+        seen.update(kwargs)
+        return {"reachable": True, "model_found": True, "context_window": 200000}
+
+    monkeypatch.setattr("turnstone.core.model_registry.probe_model_endpoint", fake_probe)
+
+    resp = client.post(
+        "/v1/api/admin/model-definitions/detect",
+        json={"provider": "anthropic", "api_key": "k", "anthropic_workspace_id": "wrkspc_01ABC"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert seen["workspace_id"] == "wrkspc_01ABC"
+
+    seen.clear()
+    resp = client.post(
+        "/v1/api/admin/model-definitions/detect",
+        json={"provider": "anthropic", "api_key": "k", "anthropic_workspace_id": "no spaces"},
+    )
+    assert resp.status_code == 400, resp.text
+    assert seen == {}
+
+    # The provider gate the create/update paths enforce applies to the probe.
+    resp = client.post(
+        "/v1/api/admin/model-definitions/detect",
+        json={
+            "provider": "openai-compatible",
+            "base_url": "http://vllm.example:8000/v1",
+            "anthropic_workspace_id": "wrkspc_01ABC",
+        },
+    )
+    assert resp.status_code == 400, resp.text
+    assert "openai-compatible" in resp.json()["error"]
+    assert seen == {}
+
+    # Probing by definition_id with the masked key reuses the stored scope
+    # along with the stored key.
+    assert _create_anthropic_alias(client, "scoped", _SCOPED_CAPS).status_code == 200
+    definition_id = storage.get_model_definition_by_alias("scoped")["definition_id"]
+    resp = client.post(
+        "/v1/api/admin/model-definitions/detect",
+        json={"provider": "anthropic", "api_key": "***", "definition_id": definition_id},
+    )
+    assert resp.status_code == 200, resp.text
+    assert seen["workspace_id"] == "wrkspc_01ABC"
+
+    # A cleared field is sent as "" and must probe unscoped — the fallback is
+    # keyed on the key being absent, never on the value being empty.
+    resp = client.post(
+        "/v1/api/admin/model-definitions/detect",
+        json={
+            "provider": "anthropic",
+            "api_key": "***",
+            "definition_id": definition_id,
+            "anthropic_workspace_id": "",
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    assert seen["workspace_id"] == ""
+
+    # The published request contract carries the field the handler reads.
+    from turnstone.api.console_schemas import DetectModelRequest
+
+    parsed = DetectModelRequest(anthropic_workspace_id="wrkspc_01ABC")
+    assert parsed.anthropic_workspace_id == "wrkspc_01ABC"
+
+
 def test_delete_endpoint_refreshes_registry(storage: SQLiteBackend) -> None:
     """DELETE drops the alias from the in-process registry too — a
     coord session that tried to resolve the deleted alias would

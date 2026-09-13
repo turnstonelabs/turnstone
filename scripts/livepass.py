@@ -24,8 +24,11 @@ the reduced-motion flag is REQUIRED, entrance animations race the capture):
 UI harness (?open=): new-ws · new-ws-fork · edit-title · delete-ws ·
   revoke-mcp · ws-delete · ws-delete-results   (+ &theme=light, &busy=1)
 Console harness (?open=): schedule-create · schedule-edit · model-create ·
-  model-edit · model-save (drives a Save click; document.title becomes
-  PUT-OK-<n> on success) · policy · confirm · token
+  model-edit (stamps EDIT-OK-ws-<workspace field>-row-<shown|hidden>-note-
+  <shown|hidden>, the note being the "saving removes it" warning;
+  &provider=<id> switches the provider first) · model-save (drives a Save
+  click; document.title becomes PUT-OK-<n>-ws-<saved workspace> on success)
+  · policy · confirm · token
   Plus &tall=1 (90-row users panel — the .admin-content scroll state; the
   synthetic rows wrap to two lines, so judge overflow geometry, not row
   cadence) · &scrolled=1 lands mid-list, &scrolled=bottom shows the 24px
@@ -463,7 +466,10 @@ CONSOLE_TEMPLATE = """<!doctype html>
         var MODEL = {
           definition_id: "def1", alias: "fable-5", model: "claude-fable-5",
           provider: "anthropic", base_url: "", context_window: 200000,
-          capabilities: JSON.stringify({ supports_vision: true }),
+          capabilities: JSON.stringify({
+            supports_vision: true,
+            server_compat: { anthropic_workspace_id: "wrkspc_01LIVEPASS" },
+          }),
           enabled: true, temperature: null, max_tokens: null,
           reasoning_effort: null, surface_persisted_reasoning: true,
           replay_reasoning_to_model: false,
@@ -479,7 +485,18 @@ CONSOLE_TEMPLATE = """<!doctype html>
           var method = (opts && opts.method) || "GET";
           if (method === "PUT" && url.indexOf("/model-definitions/def1") >= 0) {
             window.__putCount++;
-            document.title = "PUT-OK-" + window.__putCount;
+            // Stamp what the save path serialized for the Anthropic
+            // workspace scope so a headless drive can assert the wire shape.
+            var putBody = {};
+            try {
+              putBody = JSON.parse((opts && opts.body) || "{}");
+            } catch (e) {
+              /* keep empty */
+            }
+            var putCompat = (putBody.capabilities || {}).server_compat || {};
+            document.title =
+              "PUT-OK-" + window.__putCount +
+              "-ws-" + (putCompat.anthropic_workspace_id || "none");
             return reply({ ok: true });
           }
           if (url.indexOf("/schedules/preview") >= 0)
@@ -622,6 +639,25 @@ CONSOLE_TEMPLATE = """<!doctype html>
             setTimeout(function () {
               document.getElementById("model-create-submit").click();
             }, 900);
+          // model-edit stamps the Anthropic workspace field's state after the
+          // row populated; &provider=<id> first switches the provider select
+          // (firing change) so the visibility rule is driven, not assumed.
+          if (open === "model-edit")
+            setTimeout(function () {
+              var prov = q.get("provider");
+              var sel = document.getElementById("model-provider");
+              if (prov && sel) {
+                sel.value = prov;
+                sel.dispatchEvent(new Event("change"));
+              }
+              var row = document.getElementById("model-workspace-row");
+              var field = document.getElementById("model-anthropic-workspace-id");
+              var note = document.getElementById("model-workspace-drop-note");
+              document.title =
+                "EDIT-OK-ws-" + ((field && field.value) || "none") +
+                "-row-" + (row && row.hidden ? "hidden" : "shown") +
+                "-note-" + (note && !note.hidden ? "shown" : "hidden");
+            }, 500);
           if (q.get("busy"))
             setTimeout(function () {
               var d = document.querySelector("dialog[open]");

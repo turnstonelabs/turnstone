@@ -20,6 +20,16 @@ frozen.
 > on those processes can fail between migration and replacement. MCP API fields and token-keyring
 > configuration names are unchanged. See [Shared OAuth storage](docs/oauth-storage.md).
 
+### Added
+
+- **Anthropic workspace scoping per model definition.** An organization-level Anthropic API key
+  in a multi-workspace organization needs the `anthropic-workspace-id` header on every request.
+  The model editor gains a Workspace ID field for the `anthropic` and `anthropic-compatible`
+  providers, stored as `capabilities.server_compat.anthropic_workspace_id`; the registry pins it
+  on the alias's client so model turns, the Detect probe, the doctor check, and delegated-credential
+  calls all carry it. Values must be visible ASCII of at most 128 characters; the console refuses
+  anything else, or a value on a provider that does not speak the Anthropic protocol.
+
 ### Changed
 
 - **Independent OAuth runtime.** MCP and model authentication share a process-owned runtime

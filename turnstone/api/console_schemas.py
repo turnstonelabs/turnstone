@@ -1371,6 +1371,10 @@ class DetectModelRequest(BaseModel):
     # runs calibrate-on-detect against the /rerank endpoint and returns the
     # calibration fields under ``capabilities``.
     supports_rerank: bool = False
+    # Anthropic-protocol providers only: the workspace an organization-level key
+    # acts in, sent as the ``anthropic-workspace-id`` header on the probe. Falls
+    # back to the definition's stored scope when ``definition_id`` is given.
+    anthropic_workspace_id: str = ""
 
 
 class DetectModelResponse(BaseModel):
