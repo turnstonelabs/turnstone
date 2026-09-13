@@ -991,6 +991,10 @@ class MCPClientManager:
         # as "Task exception was never retrieved" at GC time instead of
         # being logged where it happened.  See ``_spawn_background``.
         self._background_tasks: set[asyncio.Task[Any]] = set()
+        # Serialize prime submission with shutdown admission. The loop
+        # callback allocates the coroutine only if shutdown has not begun.
+        self._prime_submission_lock = threading.Lock()
+        self._accepting_primes = True
 
     def _ensure_static_state(self, name: str) -> StaticServerState:
         """Get or create the StaticServerState for ``name``.
@@ -1049,6 +1053,7 @@ class MCPClientManager:
 
     def start(self) -> None:
         """Launch background event loop and connect to all configured servers."""
+        self._accepting_primes = True
         self._loop = asyncio.new_event_loop()
         self._thread = threading.Thread(target=self._loop.run_forever, daemon=True, name="mcp-loop")
         self._thread.start()
@@ -3067,25 +3072,42 @@ class MCPClientManager:
         OAuth consent — so the user's tool catalog populates immediately WITHOUT
         holding the consent redirect on a slow/unreachable MCP server.
 
-        No-op for non-``oauth_user`` servers, before the mcp-loop is running, or
-        with no token. Schedules the connect onto the mcp-loop and returns at
-        once; the per-user tool listeners deliver the catalog to live sessions
-        when the prime completes, and lazy dispatch remains the backstop.
+        No-op for non-``oauth_user`` servers, before the mcp-loop is running,
+        with no token, or once shutdown closes prime admission. Schedules the
+        connect onto the mcp-loop and returns at once; the per-user tool
+        listeners deliver the catalog to live sessions when the prime
+        completes, and lazy dispatch remains the backstop.
         """
         if server_name not in self._oauth_user_server_names:
             return
-        loop = self._loop
-        if loop is None or not access_token:
+        if self._loop is None or not access_token:
             return
         cfg = _pool_cfg_from_row(server_row)
         key = (user_id, server_name)
-        coro = self._prime_user_server_logged(key, cfg, access_token, user_id, server_name)
-        try:
-            asyncio.run_coroutine_threadsafe(coro, loop)
-        except RuntimeError:
-            coro.close()
-            # mcp-loop is shutting down — skip; lazy dispatch is the backstop.
-            log.debug("mcp pool prime skipped: loop closed user=%s server=%s", user_id, server_name)
+        self._submit_prime(
+            lambda: self._prime_user_server_logged(key, cfg, access_token, user_id, server_name),
+            f"pool prime user={user_id} server={server_name}",
+        )
+
+    def _submit_prime(self, factory: Callable[[], Coroutine[Any, Any, None]], label: str) -> None:
+        """Admit a prime before shutdown and track it on the owning loop."""
+
+        def spawn() -> None:
+            if not self._accepting_primes:
+                log.debug("MCP %s skipped: shutting down", label)
+                return
+            self._spawn_background(factory(), label)
+
+        with self._prime_submission_lock:
+            loop = self._loop
+            if loop is None or not self._accepting_primes:
+                log.debug("MCP %s skipped: shutting down", label)
+                return
+            try:
+                loop.call_soon_threadsafe(spawn)
+            except RuntimeError:
+                # No coroutine was allocated; lazy dispatch is the backstop.
+                log.debug("MCP %s skipped: loop closed", label)
 
     async def _prime_user_server_logged(
         self,
@@ -3103,7 +3125,7 @@ class MCPClientManager:
         try:
             count = await self._prime_user_server(key, cfg, access_token)
             log.info("mcp pool primed user=%s server=%s tools=%d", user_id, server_name, count)
-        except Exception:
+        except (Exception, BaseExceptionGroup):
             log.warning(
                 "mcp pool prime failed user=%s server=%s",
                 user_id,
@@ -3124,22 +3146,13 @@ class MCPClientManager:
         token / captured credential for; skips servers already connected.
         Non-blocking: schedules onto the mcp-loop and returns immediately.
         """
-        loop = self._loop
-        if not user_id or loop is None:
+        if not user_id or self._loop is None:
             return
         if not self._oauth_user_server_names and not self._obo_server_names:
             return  # no pool-backed servers — nothing to prime (no set allocation)
         if self._app_state is None or self._storage is None:
             return
-        # run_coroutine_threadsafe keeps the task referenced by the loop while
-        # it runs, so no strong-ref bookkeeping is needed here.
-        coro = self._prime_user_pools(user_id)
-        try:
-            asyncio.run_coroutine_threadsafe(coro, loop)
-        except RuntimeError:
-            coro.close()
-            # mcp-loop is shutting down — skip; lazy dispatch is the backstop.
-            log.debug("mcp pool prime skipped: loop closed user=%s", user_id)
+        self._submit_prime(lambda: self._prime_user_pools(user_id), f"pool prime user={user_id}")
 
     async def _prime_user_pools(self, user_id: str) -> None:
         """Warm THIS user's pool-backed servers — oauth_user AND oauth_obo (runs on the mcp-loop).
@@ -3250,7 +3263,7 @@ class MCPClientManager:
                             user_id,
                             server_name,
                         )
-                    except Exception as exc:
+                    except (Exception, BaseExceptionGroup) as exc:
                         # Record the discovery failure so it is visible via
                         # THIS user's server status (and their tool_search
                         # unavailable-server advisory) instead of being
@@ -5349,6 +5362,8 @@ class MCPClientManager:
 
     def shutdown(self) -> None:
         """Close all MCP sessions and stop the background loop."""
+        with self._prime_submission_lock:
+            self._accepting_primes = False
         # Cancel tracked background tasks (catalog refreshes etc.) FIRST —
         # they are pure auxiliaries, and draining them up front means the
         # stack teardown below can't race an in-flight refresh.  Submitted

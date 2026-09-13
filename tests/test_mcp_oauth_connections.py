@@ -270,14 +270,14 @@ def _drain_revoke_upstream_tasks(client: TestClient, timeout: float = 2.0) -> No
     against the upstream POST must call this helper before the
     assertion.
     """
-    from turnstone.core.mcp_oauth import _revoke_upstream_tasks
+    from turnstone.core.mcp_oauth import _upstream_revocations
 
     portal = getattr(client, "portal", None)
     if portal is None:
         return
 
     async def _drain() -> None:
-        pending = list(_revoke_upstream_tasks)
+        pending = list(_upstream_revocations(client.app.state).tasks)
         if pending:
             async with asyncio.timeout(timeout):
                 await asyncio.gather(*pending, return_exceptions=True)
@@ -785,30 +785,31 @@ class TestRevokeConnection:
         # in flight.
         assert token_store.get_user_token("user-1", "srv-oauth") is None
         # Cancel any in-flight tasks so the test client can exit cleanly.
-        from turnstone.core.mcp_oauth import _revoke_upstream_tasks
+        from turnstone.core.mcp_oauth import _upstream_revocations
 
         portal = getattr(client, "portal", None)
         if portal is not None:
-            for task in list(_revoke_upstream_tasks):
+            for task in list(_upstream_revocations(app.state).tasks):
                 portal.call(task.cancel)
 
     def test_revoke_connection_sheds_upstream_when_task_set_full(
         self, storage: SQLiteBackend, http_client_mock: MagicMock
     ) -> None:
-        """Round-2 q-2 regression: the soft cap on ``_revoke_upstream_tasks``
+        """Round-2 q-2 regression: the per-host soft cap on upstream revokes
         is the only protection against unbounded background-task pile-up
         under a coordinated mass-revoke. When the set is full, the local
         delete still runs but no upstream task is scheduled; the audit
         detail records ``upstream_revoke_outcome="shed_by_cap"`` and
         the AS endpoint is never contacted.
         """
-        from turnstone.core.mcp_oauth import _REVOKE_UPSTREAM_TASKS_MAX, _revoke_upstream_tasks
+        from turnstone.core.mcp_oauth import _REVOKE_UPSTREAM_TASKS_MAX, _upstream_revocations
 
         _seed_oauth_user_server(storage)
         token_store = _make_token_store(storage)
         _seed_user_token(token_store, refresh_token="refresh-secret")
 
         app = _build_app(storage=storage, http_client=http_client_mock, token_store=token_store)
+        revocations = _upstream_revocations(app.state)
         sentinel_event_holder: dict[str, asyncio.Event] = {}
 
         # Use ``with TestClient(...)`` so the portal stays alive — we
@@ -835,12 +836,13 @@ class TestRevokeConnection:
                 tasks: list[asyncio.Task[None]] = []
                 for _ in range(_REVOKE_UPSTREAM_TASKS_MAX):
                     t = asyncio.create_task(_wait_on_event())
-                    _revoke_upstream_tasks.add(t)
+                    revocations.tasks.add(t)
+                    t.add_done_callback(revocations.tasks.discard)
                     tasks.append(t)
                 return tasks
 
             sentinels = portal.call(_fill_task_set)
-            assert len(_revoke_upstream_tasks) >= _REVOKE_UPSTREAM_TASKS_MAX
+            assert len(revocations.tasks) >= _REVOKE_UPSTREAM_TASKS_MAX
 
             try:
                 resp = client.delete("/v1/api/mcp/oauth/connections/srv-oauth")

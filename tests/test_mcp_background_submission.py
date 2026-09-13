@@ -12,6 +12,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from tests._proc_helpers import poll_until
 from turnstone.core import mcp_client
 
 if TYPE_CHECKING:
@@ -22,6 +23,7 @@ _BODIES = {
     "schedule_prime_user_server": "_prime_user_server_logged",
     "evict_user_session": "_drop_catalog_locked",
 }
+_PRIMES = {"prime_user_pools", "schedule_prime_user_server"}
 
 
 class _SubmissionProbe:
@@ -135,8 +137,12 @@ def test_closed_loop_closes_rejected_coroutine(
                 _invoke(manager, bridge)
         else:
             assert _invoke(manager, bridge) is None
-        assert len(probe.coroutines) == 1
-        assert inspect.getcoroutinestate(probe.coroutines[0]) == inspect.CORO_CLOSED
+        if bridge in _PRIMES:
+            assert probe.coroutines == []
+            getattr(manager, _BODIES[bridge]).assert_not_called()
+        else:
+            assert len(probe.coroutines) == 1
+            assert inspect.getcoroutinestate(probe.coroutines[0]) == inspect.CORO_CLOSED
         assert probe.futures == []
         _assert_no_body_ran(manager)
     finally:
@@ -160,13 +166,16 @@ def test_successful_submission_runs_on_manager_loop(
     getattr(manager, _BODIES[bridge]).side_effect = body
     assert _invoke(manager, bridge) is None
     assert ran.wait(5)
-    assert len(probe.futures) == 1
-    probe.futures[0].result(timeout=5)
+    if bridge in _PRIMES:
+        assert probe.futures == []
+    else:
+        assert len(probe.futures) == 1
+        probe.futures[0].result(timeout=5)
     getattr(manager, _BODIES[bridge]).assert_awaited_once()
     assert loops == [manager._loop]
 
 
-@pytest.mark.parametrize("bridge", [*_BODIES, "_cb_auto_reconnect"])
+@pytest.mark.parametrize("bridge", [*sorted(_BODIES.keys() - _PRIMES), "_cb_auto_reconnect"])
 def test_shutdown_between_admission_and_submission(
     manager: mcp_client.MCPClientManager, probe: _SubmissionProbe, bridge: str
 ) -> None:
@@ -213,3 +222,67 @@ def test_shutdown_between_admission_and_submission(
     assert inspect.getcoroutinestate(probe.coroutines[0]) == inspect.CORO_CLOSED
     assert probe.futures == []
     _assert_no_body_ran(manager)
+
+
+@pytest.mark.parametrize("bridge", sorted(_PRIMES))
+def test_shutdown_rejects_queued_and_late_primes(
+    manager: mcp_client.MCPClientManager, bridge: str
+) -> None:
+    manager.start()
+    loop = manager._loop
+    assert loop is not None
+    parked, release = threading.Event(), threading.Event()
+
+    def park_loop() -> None:
+        parked.set()
+        assert release.wait(5)
+
+    loop.call_soon_threadsafe(park_loop)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        try:
+            assert parked.wait(5)
+            _invoke(manager, bridge)  # accepted callback, not executed yet
+            shutdown = executor.submit(manager.shutdown)
+            assert poll_until(lambda: not manager._accepting_primes)
+            _invoke(manager, bridge)  # loop still exists, admission is closed
+        finally:
+            release.set()
+        shutdown.result(timeout=5)
+    getattr(manager, _BODIES[bridge]).assert_not_called()
+    assert loop.is_closed()
+
+
+@pytest.mark.parametrize("bridge", sorted(_PRIMES))
+def test_shutdown_drains_accepted_prime_before_loop_close(
+    manager: mcp_client.MCPClientManager, bridge: str
+) -> None:
+    manager.start()
+    loop = manager._loop
+    assert loop is not None
+    entered, cancelled = threading.Event(), threading.Event()
+    release = asyncio.Event()
+
+    async def body(*args: Any) -> None:
+        entered.set()
+        try:
+            await asyncio.Future()
+        finally:
+            cancelled.set()
+            await release.wait()
+
+    getattr(manager, _BODIES[bridge]).side_effect = body
+    _invoke(manager, bridge)
+    assert entered.wait(5)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        shutdown = executor.submit(manager.shutdown)
+        try:
+            assert cancelled.wait(5)
+            assert not shutdown.done()
+            assert not loop.is_closed()
+            _invoke(manager, bridge)
+        finally:
+            loop.call_soon_threadsafe(release.set)
+        shutdown.result(timeout=5)
+    getattr(manager, _BODIES[bridge]).assert_awaited_once()
+    assert loop.is_closed()
+    assert not asyncio.all_tasks(loop)

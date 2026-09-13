@@ -5538,7 +5538,7 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None]:
             await asyncio.to_thread(_close_loaded)
     # health_registry is stateless (no background threads) — nothing to stop
     if app.state.mcp_client:
-        app.state.mcp_client.shutdown()
+        await asyncio.to_thread(app.state.mcp_client.shutdown)
     if app.state.registry:
         app.state.registry.shutdown()
     # Callers and registries are quiescent before runtime workers release

@@ -662,12 +662,12 @@ async def _run(cfg: dict[str, str]) -> None:
 
         # C9 — revoke. The upstream RFC 7009 call is fire-and-forget by design,
         # so the harness waits on the task set before judging the wire.
-        from turnstone.core.mcp_oauth import _revoke_upstream_tasks
+        from turnstone.core.mcp_oauth import _upstream_revocations
 
         before = store.get_user_token(USER, "kc-mcp")
         rt_before = before["refresh_token"] if before else None
         revoked = await console.delete(f"{CONNECTIONS}/kc-mcp")
-        await asyncio.gather(*_revoke_upstream_tasks)
+        await asyncio.gather(*_upstream_revocations(app.state).tasks, return_exceptions=True)
         calls = wire.drain()
         gone = storage.get_oauth_token(USER, "kc-mcp") is None
         r9 = await _on_mcp_loop(

@@ -3375,8 +3375,8 @@ async def _handle_mcp_oauth_list_connections_inner(request: Request) -> Response
 async def handle_mcp_oauth_revoke_connection(request: Request) -> Response:
     """``DELETE /v1/api/mcp/oauth/connections/{server_name}``.
 
-    Best-effort RFC 7009 upstream revoke followed by the authoritative
-    local delete. Cross-user attempts return 404 with the same body
+    Authoritative local delete followed by a best-effort RFC 7009
+    upstream revoke. Cross-user attempts return 404 with the same body
     shape as a never-existed row to avoid leaking tenant existence.
     Pool sessions for the (user, server) pair are evicted so any
     in-flight dispatch reconnects with a fresh token at next call.
@@ -3384,23 +3384,38 @@ async def handle_mcp_oauth_revoke_connection(request: Request) -> Response:
     return _apply_security_headers(await _handle_mcp_oauth_revoke_connection_inner(request))
 
 
-# Strong refs to in-flight upstream-revoke tasks. asyncio holds tasks via
-# a WeakSet; a fire-and-forget ``loop.create_task`` whose handle isn't
-# stored can be GC'd before the AS round-trip completes. Tasks register
-# here on creation and discard themselves on completion via
-# ``add_done_callback`` — same pattern as ``_pg_refresh_drain_tasks``.
-_revoke_upstream_tasks: set[asyncio.Task[None]] = set()
+@dataclass
+class _UpstreamRevocations:
+    """Browser-loop work owned by the host whose HTTP client it uses."""
+
+    tasks: set[asyncio.Task[None]] = field(default_factory=set)
+    closing: bool = False
 
 
-# Soft cap on concurrent in-flight upstream revokes. A coordinated mass
-# revoke (admin sweep, scripted cleanup, compromised account) could pile
-# up arbitrarily many tasks each pinning storage / token_store / server_row
-# / refresh-token plaintext until the AS round-trip completes (~30s
-# worst case). When the set is full, the local delete still runs and
-# the audit row records ``upstream_revoke_outcome="shed_by_cap"``; the
-# operator can re-run revokes against any straggling AS-side tokens once
-# the queue drains.
+def _upstream_revocations(app_state: Any) -> _UpstreamRevocations:
+    """Get or create host state so teardown is safe before initialisation."""
+    state = getattr(app_state, "mcp_oauth_upstream_revocations", None)
+    if not isinstance(state, _UpstreamRevocations):
+        state = _UpstreamRevocations()
+        app_state.mcp_oauth_upstream_revocations = state
+    return state
+
+
+# Per-host soft cap on concurrent in-flight upstream revokes. A
+# coordinated mass revoke (admin sweep, scripted cleanup, compromised
+# account) could pile up arbitrarily many tasks each pinning storage /
+# token_store / server_row / refresh-token plaintext until the AS
+# round-trip completes (~30s worst case). When the set is full, the
+# local delete still runs and the audit row records
+# ``upstream_revoke_outcome="shed_by_cap"``; the operator can re-run
+# revokes against any straggling AS-side tokens once the queue drains.
 _REVOKE_UPSTREAM_TASKS_MAX = 256
+
+# Shutdown grace for pending AS requests, followed by a bounded wait for
+# cancellation cleanup. If cleanup exceeds its budget, close the client
+# anyway and log upstream_revoke_shutdown_timeout.
+_REVOKE_UPSTREAM_DRAIN_TIMEOUT = 5.0
+_REVOKE_UPSTREAM_CANCEL_TIMEOUT = 1.0
 
 
 async def _attempt_upstream_revoke(
@@ -3422,8 +3437,9 @@ async def _attempt_upstream_revoke(
     Designed to be fired from :func:`asyncio.create_task` so the caller's
     204 isn't gated on the AS round-trip — the local delete is
     authoritative for this deployment, and the AS-side state is best-
-    effort. Never raises. Each terminal state emits a structured log so
-    operators can audit AS-side outcomes without parsing exception text:
+    effort. Only cancellation propagates. Each terminal state emits a
+    structured log so operators can audit AS-side outcomes without
+    parsing exception text:
     ``revoke_token_at_as`` logs ``revocation_succeeded`` /
     ``revocation_failed`` / ``revocation_unsupported`` on its branches;
     discovery failures emit ``upstream_revoke_discovery_failed``; an
@@ -3431,8 +3447,8 @@ async def _attempt_upstream_revoke(
     ``upstream_revoke_failed``.
 
     The outer ``try/except Exception`` is load-bearing: this helper is
-    fired as a background task whose handle goes into ``_revoke_upstream_tasks``
-    with a ``set.discard`` done-callback that does NOT consume
+    fired as a background task whose handle goes into the host's revoke
+    task set with a ``set.discard`` done-callback that does NOT consume
     ``task.exception()``. An unhandled exception here would surface as
     ``Task exception was never retrieved`` from asyncio's default handler.
     Catching at the outer boundary keeps the helper's contract honest.
@@ -3485,6 +3501,9 @@ async def _attempt_upstream_revoke(
             client_id=client_id,
             client_secret=client_secret,
         )
+    except asyncio.CancelledError:
+        log.info("mcp_server.oauth.upstream_revoke_cancelled", server_name=server_name)
+        raise
     except Exception as exc:
         log.info(
             "mcp_server.oauth.upstream_revoke_failed",
@@ -3595,24 +3614,26 @@ async def _handle_mcp_oauth_revoke_connection_inner(request: Request) -> Respons
 
     # Schedule the upstream RFC 7009 revoke as a fire-and-forget task so
     # the response isn't gated on the AS round-trip. ``upstream_revoke_outcome``
-    # is the categorical audit field — operators can distinguish the
-    # four terminal states (scheduled, no_refresh_token, no_http_client,
-    # shed_by_cap) without parsing log streams.
+    # records whether the attempt was scheduled or skipped, without making
+    # the local disconnect depend on the remote outcome.
     refresh_token_for_revoke: str | None = plain.get("refresh_token") if plain is not None else None
     if not refresh_token_for_revoke or server_row is None:
         upstream_revoke_outcome = "no_refresh_token"
     else:
         http_client = getattr(request.app.state, "mcp_oauth_http_client", None)
-        if http_client is None:
+        revocations = _upstream_revocations(request.app.state)
+        if revocations.closing:
+            upstream_revoke_outcome = "shutting_down"
+        elif http_client is None:
             upstream_revoke_outcome = "no_http_client"
-        elif len(_revoke_upstream_tasks) >= _REVOKE_UPSTREAM_TASKS_MAX:
+        elif len(revocations.tasks) >= _REVOKE_UPSTREAM_TASKS_MAX:
             # Soft-cap shed: the local delete already ran (authoritative);
             # surface the dropped attempt in the audit detail so an
             # operator can re-run revokes once the queue drains.
             log.info(
                 "mcp_server.oauth.upstream_revoke_shed",
                 server_name=server_name,
-                in_flight=len(_revoke_upstream_tasks),
+                in_flight=len(revocations.tasks),
                 cap=_REVOKE_UPSTREAM_TASKS_MAX,
             )
             upstream_revoke_outcome = "shed_by_cap"
@@ -3632,8 +3653,8 @@ async def _handle_mcp_oauth_revoke_connection_inner(request: Request) -> Respons
                 ),
                 name="mcp-oauth-upstream-revoke",
             )
-            _revoke_upstream_tasks.add(task)
-            task.add_done_callback(_revoke_upstream_tasks.discard)
+            revocations.tasks.add(task)
+            task.add_done_callback(revocations.tasks.discard)
             upstream_revoke_outcome = "scheduled"
 
     await _audit_event(
@@ -3813,6 +3834,7 @@ async def initialize_mcp_oauth_state(app_state: Any) -> None:
     is None).
     """
     app_state.mcp_oauth_http_client = oauth_http.json_http_client()
+    app_state.mcp_oauth_upstream_revocations = _UpstreamRevocations()
     app_state.mcp_oauth_coordination = TokenCoordination()
     app_state.mcp_oauth_dcr_locks = {}
     # Metadata is immutable data shared across loops; only HTTP clients are
@@ -3822,17 +3844,37 @@ async def initialize_mcp_oauth_state(app_state: Any) -> None:
 
 
 async def close_mcp_oauth_state(app_state: Any) -> None:
-    """Close the long-lived HTTP client. Safe to call when never initialised."""
-    client = getattr(app_state, "mcp_oauth_http_client", None)
-    if client is not None:
-        try:
-            await client.aclose()
-        except Exception:
-            log.debug("mcp_server.oauth.http_client_close_failed", exc_info=True)
-        app_state.mcp_oauth_http_client = None
-    if hasattr(app_state, "mcp_oauth_coordination"):
-        app_state.mcp_oauth_coordination = TokenCoordination()
-    if hasattr(app_state, "mcp_oauth_dcr_locks"):
-        app_state.mcp_oauth_dcr_locks = {}
-    if hasattr(app_state, "mcp_oauth_metadata_cache"):
-        app_state.mcp_oauth_metadata_cache.clear()
+    """Drain this host's revocations before closing their HTTP client.
+
+    Safe to call when never initialised.
+    """
+    revocations = _upstream_revocations(app_state)
+    revocations.closing = True
+    tasks = set(revocations.tasks)
+    try:
+        if tasks:
+            _, pending = await asyncio.wait(tasks, timeout=_REVOKE_UPSTREAM_DRAIN_TIMEOUT)
+            for task in pending:
+                task.cancel()
+            if pending:
+                _, pending = await asyncio.wait(pending, timeout=_REVOKE_UPSTREAM_CANCEL_TIMEOUT)
+                if pending:
+                    log.warning(
+                        "mcp_server.oauth.upstream_revoke_shutdown_timeout", pending=len(pending)
+                    )
+    finally:
+        # Keep revocations.closing latched so late disconnects still report
+        # shutting_down. Only initialize_mcp_oauth_state reopens admission.
+        client = getattr(app_state, "mcp_oauth_http_client", None)
+        if client is not None:
+            try:
+                await client.aclose()
+            except Exception:
+                log.debug("mcp_server.oauth.http_client_close_failed", exc_info=True)
+            app_state.mcp_oauth_http_client = None
+        if hasattr(app_state, "mcp_oauth_coordination"):
+            app_state.mcp_oauth_coordination = TokenCoordination()
+        if hasattr(app_state, "mcp_oauth_dcr_locks"):
+            app_state.mcp_oauth_dcr_locks = {}
+        if hasattr(app_state, "mcp_oauth_metadata_cache"):
+            app_state.mcp_oauth_metadata_cache.clear()
