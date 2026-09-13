@@ -615,26 +615,35 @@ CONSOLE_TEMPLATE = """<!doctype html>
                 : content.scrollHeight / 2; // land mid-list
         }
         setTimeout(function () {
-          if (open === "schedule-create") showCreateScheduleModal();
-          else if (open === "schedule-edit") showEditScheduleModal("t1");
-          else if (open === "model-create") showCreateModelModal();
-          else if (open === "model-edit" || open === "model-save")
-            showEditModelModal("def1");
-          else if (open === "policy") {
-            window._govPolicies && _govPolicies.length === 0 &&
-              loadGovPolicies && loadGovPolicies();
-            showCreatePolicyModal();
-          } else if (open === "confirm")
-            showConfirmModal(
-              "Delete schedule",
-              "Delete nightly-digest? Its run history is removed with it. This cannot be undone.",
-              "Delete",
-              function () {},
-            );
-          else if (open === "token")
-            showTokenCreatedModal(
-              "tsk_9f2e41c7a8b35d60e1f4a2b89c7d3e5f6a1b0c9d8e7f6a5b4c3d2e1f0a9b8c7d",
-            );
+          // A driver that throws must still fail LOUDLY: the OPEN-FAILED
+          // check registered further down would otherwise never be armed and
+          // the page would screenshot as a quietly dialog-less admin panel.
+          try {
+            if (open === "schedule-create") showCreateScheduleModal();
+            else if (open === "schedule-edit") showEditScheduleModal("t1");
+            else if (open === "model-create") showCreateModelModal();
+            else if (open === "model-edit" || open === "model-save")
+              showEditModelModal("def1");
+            else if (open === "policy") {
+              window._govPolicies && _govPolicies.length === 0 &&
+                loadGovPolicies && loadGovPolicies();
+              showCreatePolicyModal();
+            } else if (open === "confirm")
+              showConfirmModal(
+                "Delete schedule",
+                "Delete nightly-digest? Its run history is removed with it. This cannot be undone.",
+                "Delete",
+                function () {},
+              );
+            else if (open === "token")
+              showTokenCreatedModal(
+                "tsk_9f2e41c7a8b35d60e1f4a2b89c7d3e5f6a1b0c9d8e7f6a5b4c3d2e1f0a9b8c7d",
+              );
+          } catch (err) {
+            document.title =
+              "OPEN-FAILED-" + open + "-" + ((err && err.name) || "error");
+            return;
+          }
           if (open === "model-save")
             setTimeout(function () {
               document.getElementById("model-create-submit").click();

@@ -149,10 +149,6 @@
   .hatch--shelf[open] {
     animation: shelf-in-sheet 0.2s cubic-bezier(0.2, 0.9, 0.3, 1);
   }
-  .field-pair,
-  .capgrid {
-    grid-template-columns: 1fr;
-  }
 }
 @keyframes shelf-in-sheet {
   from {
@@ -433,15 +429,26 @@
   --field-font: var(--font-mono);
   font-family: var(--font-mono);
 }
+/* Undimmed on purpose: the hint reads fg-dim at 10px, and any opacity below
+   1 compounds it under 4.5:1 on the dark shelf ground (0.8 measured 4.00:1;
+   undimmed 5.47:1). Case and letter-spacing already set it apart from the
+   label. */
 .label-hint {
   font-weight: 400;
   text-transform: none;
   letter-spacing: 0;
-  /* 0.65 over fg-dim compounded below 4.5:1 at 10px on dark */
-  opacity: 0.8;
 }
-[data-theme="light"] .label-hint {
-  opacity: 1;
+/* A hint that is its own block — an explanatory <p>, an aria-describedby
+   span — sits in the body flow and would inherit the 14px body cadence
+   instead of the 10px fg-dim label cadence an inline hint gets from
+   `.sh-body label`; without the old opacity it out-ranked the labels it
+   explained. Size and colour, not opacity, so the contrast stays measurable
+   (fg-dim on the dark shelf ground is 5.47:1). */
+.label-hint.hint-block {
+  display: block;
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: var(--fg-dim);
 }
 .sh-body input:not([type="checkbox"]):not([type="radio"]),
 .sh-body select,
@@ -908,6 +915,39 @@
   grid-template-columns: 1fr 1fr;
   gap: 6px 14px;
   margin-top: 8px;
+}
+/* Narrow pane: two-up form rows collapse to one column. Declared AFTER the
+   base .field-pair rule on purpose — a container query adds no specificity,
+   so an earlier declaration loses to the base rule and the collapse never
+   happens (it sat above the base rules as dead code until 2026-09). The
+   capability tiles stay two-up: a 6px LED plus a short label fits a 436px
+   body, and one-up would stack thirteen tiles into a long scroll. */
+@container pane (max-width: 700px) {
+  .field-pair {
+    grid-template-columns: 1fr;
+  }
+  /* One column makes every cell a form row of its own, so its label needs
+     the shelf's 14px cadence back — `.sh-body label:first-child` suppresses
+     it for the two-up layout, where the columns must align at the row top.
+     Without this a toggle cell and the next label touch at 0px. */
+  .sh-body .field-pair label:first-child {
+    margin-top: 14px;
+  }
+  /* Three flex items in a narrow body each wrap internally, shredding the
+     provenance sentence into ragged columns and breaking the mono model id
+     mid-token; one text flow wraps as prose instead. */
+  .autofill {
+    display: block;
+  }
+  .autofill::before {
+    margin-right: 6px;
+  }
+  .autofill .src {
+    margin-left: 4px;
+  }
+  .autofill .mono {
+    white-space: nowrap;
+  }
 }
 .sh-body label.cap {
   /* The containing block for the visually-hidden abspos input below: without

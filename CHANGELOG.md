@@ -63,6 +63,14 @@ frozen.
 
 ### Fixed
 
+- **Console forms on narrow panes.** The rule that collapses two-column form rows to one column
+  on a narrow pane never applied: it was declared above the base rule it needed to override, and a
+  container query adds no specificity. It now sits after it, so a tight split or a phone-width
+  pane gets one column with an even rhythm between fields, and the model editor's provenance line
+  wraps as a sentence instead of shredding the model id. Capability tiles stay two-up.
+- **Label hints in the dark theme.** The small hint next to a form label was dimmed below the
+  4.5:1 contrast floor; it now renders at full opacity in both themes, and the explanatory notes
+  that stand on their own keep a subordinate size and colour instead of inheriting body text.
 - **MCP OAuth consent return URLs.** Malformed URLs no longer abort consent; the callback
   falls back to the home page when the return URL contains invalid ports or brackets.
 - **MCP submissions during shutdown.** Pool priming, catalog eviction and static server
