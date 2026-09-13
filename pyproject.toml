@@ -25,19 +25,20 @@ dependencies = [
     # Version 3 moves the default transport to HTTPX2. Keep major upgrades
     # deliberate because the stream retry boundary depends on that contract.
     "openai>=3,<4",
-    # 0.117 tracks the release current at Claude Opus 5 onboarding; the hard runtime
-    # floor remains 0.105 (mid-conversation system blocks). Opus 5 itself needs no new
-    # SDK surface: model IDs are opaque strings, and "refusal" has been in StopReason
-    # since about 0.95. Raise the floor when adopting fast mode, server-side fallbacks,
-    # advisor, or mid-conversation tool changes, which need newer typed parameters.
-    # Version 1 moves to HTTPX2 and removes Messages sampling kwargs, so migrate the
-    # provider boundary before removing the cap. Claude Fable 5.1 needs nothing typed
-    # either: its thinking block-binding control is typed only in the 1.x beta
-    # namespace and rides the plain thinking dict (verified on 0.116).
-    "anthropic>=0.117,<1",
+    # Version 1 moves the SDK onto HTTPX2 and removes the Messages sampling kwargs
+    # (temperature / top_p / top_k): the provider boundary injects HTTPX2 objects only
+    # and carries capability-gated temperature through ``extra_body``. Nothing above
+    # 1.0 is required — model IDs are opaque strings, the thinking block-binding
+    # control rides the plain thinking dict, and refusal ``stop_details`` is read with
+    # getattr — so the floor is the major. Raise it when adopting fast mode,
+    # server-side fallbacks, advisor, or mid-conversation tool changes, which need
+    # newer typed parameters. Keep major upgrades deliberate: the stream retry
+    # boundary depends on the transport contract.
+    "anthropic>=1,<2",
     "httpx>=0.28",
-    # Direct because the provider boundary catches this exception family;
-    # OpenAI v3's transitive dependency alone is not an import contract.
+    # Direct because the provider boundary catches this exception family and the
+    # Anthropic tests inject HTTPX2 clients; the OpenAI v3 / Anthropic v1 transitive
+    # dependency alone is not an import contract.
     "httpx2>=2.7,<3",
     "mcp>=1.27,<2",  # v2 is a breaking rewrite (2.0.0a1 live 2026-06-11; stable ~2026-07-27) — streamablehttp_client removed, 2-tuple transport, snake_case types; migrate deliberately
     "starlette>=1.3.1",  # CVE-2026-54282 (path->authority host spoof) + CVE-2026-54283 (url-encoded form DoS); supersedes the PYSEC-2026-161 host-header path-injection floor

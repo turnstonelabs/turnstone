@@ -2,6 +2,9 @@
   "cache_control": {
     "type": "ephemeral"
   },
+  "extra_body": {
+    "temperature": 1.0
+  },
   "max_tokens": 4096,
   "messages": [
     {
@@ -36,7 +39,6 @@
   ],
   "model": "claude-sonnet-4-6",
   "system": "Output-guard: deploy output looked clean.",
-  "temperature": 1.0,
   "thinking": {
     "type": "adaptive"
   },

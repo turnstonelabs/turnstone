@@ -33,6 +33,7 @@ from turnstone.core.providers._protocol import (
     finish_shim_due,
     merge_reasoning_template_kwargs,
     refuse_aborted_request,
+    refuse_credential_headers,
     request_uses_native_tools,
     serialized_tool_chars,
 )
@@ -330,6 +331,7 @@ class OpenAIChatCompletionsProvider:
         if extra_body:
             kwargs["extra_body"] = extra_body
         if extra_headers:
+            refuse_credential_headers(extra_headers)
             kwargs["extra_headers"] = extra_headers
 
         refuse_aborted_request(cancel_ref)

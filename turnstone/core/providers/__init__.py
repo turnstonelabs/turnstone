@@ -20,6 +20,7 @@ from turnstone.core.providers._protocol import (
     accumulate_tool_call_delta,
     drain_stream,
     merge_usage,
+    refuse_credential_headers,
     thinking_off_template_kwargs,
     transport_guarded,
 )
@@ -44,6 +45,7 @@ __all__ = [
     "list_known_models",
     "lookup_model_capabilities",
     "merge_usage",
+    "refuse_credential_headers",
     "thinking_off_template_kwargs",
     "transport_guarded",
 ]

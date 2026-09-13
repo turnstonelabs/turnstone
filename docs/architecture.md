@@ -989,6 +989,21 @@ reduction on cache hits, 1.25x write on first turn). Cache metrics
 the stream's usage events. The `anthropic` SDK is a core
 dependency — the Anthropic provider is first-class alongside OpenAI.
 
+The Anthropic provider requires SDK v1 (`anthropic>=1,<2`). Its default
+client runs on HTTPX2, so a mid-body connection death escapes
+`messages.stream()` as an `httpx2` transport error and `transport_guarded`
+normalizes it into the retryable `IncompleteStreamError` exactly as for the
+OpenAI v3 lanes; anything handed to the client (`http_client`, timeouts,
+transports) must be an `httpx2` object — the SDK rejects the legacy `httpx`
+family at construction. SDK v1 also removed the typed `temperature` /
+`top_p` / `top_k` parameters, so the capability-gated temperature rides the
+request's `extra_body` (None still omits the field; enabled thinking still
+forces 1.0), and an operator `server_compat.extra_body` pin of the same key
+wins over the session value. Credentials never ride `extra_headers` on any
+lane: both SDKs merge caller headers over their own credential header, so
+every adapter refuses `x-api-key` / `Authorization` entries at request
+assembly, and a delegated credential rides `client.with_options(api_key=...)`.
+
 **GoogleProvider** (`_google.py`): extends `OpenAIChatCompletionsProvider` for
 the Gemini `/v1beta/openai/` endpoint. Uses a single default
 `ModelCapabilities` (2M context window, 65K max output tokens,

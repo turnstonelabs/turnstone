@@ -4681,9 +4681,11 @@ class TestAnthropicPromptCaching:
             tools=None,
         )
         assert "temperature" not in kwargs
+        assert "extra_body" not in kwargs
 
     def test_opus_4_6_still_has_temperature(self) -> None:
-        """Opus 4.6 must still send temperature (regression guard)."""
+        """Opus 4.6 must still send temperature (regression guard) — through
+        ``extra_body``, since SDK v1 removed the typed sampling kwargs."""
         caps = self.provider.get_capabilities("claude-opus-4-6")
         kwargs = self.provider._build_thinking_and_kwargs(
             caps=caps,
@@ -4696,8 +4698,8 @@ class TestAnthropicPromptCaching:
             model="claude-opus-4-6",
             tools=None,
         )
-        assert "temperature" in kwargs
-        assert kwargs["temperature"] == 1.0  # forced for adaptive thinking
+        assert "temperature" not in kwargs  # a typed kwarg is a TypeError on SDK v1
+        assert kwargs["extra_body"] == {"temperature": 1.0}  # forced for adaptive thinking
 
     def test_opus_4_7_thinking_display_summarized(self) -> None:
         """Opus 4.7 must opt in to thinking display with 'summarized'."""
@@ -4770,8 +4772,10 @@ class TestAnthropicPromptCaching:
         assert kwargs["thinking"] == {"type": "adaptive", "display": "summarized"}
         assert kwargs["output_config"] == {"effort": "max"}
         # Sampling params are a 400 on this model — the row declares
-        # supports_temperature=False, so temperature must not reach the wire.
+        # supports_temperature=False, so temperature must not reach the wire
+        # by either channel.
         assert "temperature" not in kwargs
+        assert "extra_body" not in kwargs
 
     def test_xhigh_effort_snaps_to_max_on_opus_4_6(self) -> None:
         """Opus 4.6 declares (low, medium, high, max) — a knob of xhigh
@@ -6583,34 +6587,10 @@ class TestAnthropicThinkingPrefixBinding:
         """Drive the real SDK: the untyped control must reach the HTTP body
         verbatim and the beta must land as a request header (the SDK
         floor is below the release that types ``block_binding``)."""
-        import anthropic
-        import httpx
+        from tests._wire_capture import anthropic_body_capture_client
 
         captured: dict[str, Any] = {}
-
-        def handler(request: httpx.Request) -> httpx.Response:
-            captured["beta"] = request.headers.get("anthropic-beta")
-            captured["body"] = json.loads(request.content)
-            sse = (
-                "event: message_start\n"
-                'data: {"type":"message_start","message":{"id":"m","type":"message",'
-                '"role":"assistant","model":"claude-fable-5-1","content":[],'
-                '"stop_reason":null,"stop_sequence":null,'
-                '"usage":{"input_tokens":1,"output_tokens":0}}}\n\n'
-                "event: message_delta\n"
-                'data: {"type":"message_delta","delta":{"stop_reason":"end_turn",'
-                '"stop_sequence":null},"usage":{"output_tokens":1}}\n\n'
-                "event: message_stop\n"
-                'data: {"type":"message_stop"}\n\n'
-            )
-            return httpx.Response(
-                200, headers={"content-type": "text/event-stream"}, content=sse.encode()
-            )
-
-        client = anthropic.Anthropic(
-            api_key="test-key",
-            http_client=httpx.Client(transport=httpx.MockTransport(handler)),
-        )
+        client = anthropic_body_capture_client(captured)
         try:
             chunks = list(
                 self.provider.create_streaming(
@@ -6622,7 +6602,8 @@ class TestAnthropicThinkingPrefixBinding:
             )
         finally:
             client.close()
-        assert captured["beta"] == self._BETA
+        beta = captured["headers"].get("anthropic-beta")
+        assert beta == self._BETA
         assert captured["body"]["thinking"] == {
             "type": "adaptive",
             "display": "summarized",

@@ -34,6 +34,22 @@ frozen.
   the last series that accepts them. Native installations must recreate their virtual environment
   with Python 3.13 or newer before upgrading. CI tests Python 3.13 and 3.14, and Docker images
   already include Python 3.14.
+- **Anthropic SDK v1 and its HTTPX2 transport are now required (#1050).** The dependency is
+  `anthropic>=1,<2`; the temporary `<1` cap is gone. Native Anthropic and anthropic-compatible
+  streams normalize the SDK's HTTPX2 connection deaths through the same retry boundary as the
+  OpenAI lanes, including a wire failure observed after a model-registry reload closed the client
+  from another thread. SDK v1 removed the `temperature`, `top_p`, and `top_k` request parameters, so
+  capability-gated temperature now reaches the wire through the request's `extra_body` with
+  unchanged send/omit semantics, and an operator `server_compat.extra_body` pin of the same key
+  keeps precedence over the session value. Anthropic connections follow HTTPX2's operating-system
+  trust store by default, as OpenAI connections already do; deployments that relied on a modified
+  `certifi` bundle must install that CA in the system store or set `SSL_CERT_FILE` /
+  `SSL_CERT_DIR`.
+- **Credential headers are refused in `extra_headers`.** Both SDKs merge caller headers over
+  their own credential header case-insensitively, even over a `with_options(api_key=...)`
+  delegated credential, so an injected `x-api-key` or `Authorization` header would silently
+  replace it. Every provider adapter now raises at request assembly instead; delegated
+  credentials ride `with_options(api_key=...)` only.
 
 ### Fixed
 

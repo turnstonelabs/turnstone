@@ -1,6 +1,6 @@
 """Offline pins of SDK boundary behaviors used by stream error handling.
 
-Six facts, each probed against the REAL SDKs over mock/loopback
+Eight facts, each probed against the REAL SDKs over mock/loopback
 transports (no network, no live backend):
 
 1. OpenAI v3's ``max_retries`` covers request time only — a mid-BODY death
@@ -8,17 +8,27 @@ transports (no network, no live backend):
    Completions and Responses chunk iterators unwrapped.
 2. OpenAI v3's runtime-only legacy-client path preserves the old ``httpx``
    exception family when an application explicitly injects that client.
-3. The Anthropic ``messages.stream()`` helper propagates the ``httpx`` shape.
-4. Closing an OpenAI v3 default client from another thread while a read is
-   blocked (the ``ModelRegistry.reload()`` shape) completes safely; a later
-   wire release surfaces as an ``httpx2.TransportError`` on the blocked
-   ``next()``. The production ``transport_guarded`` seam must normalize it
-   before the retry gate.
+3. Anthropic v1's ``messages.stream()`` helper propagates the ``httpx2``
+   shape unwrapped with no SDK re-request, and the client rejects an injected
+   legacy ``httpx.Client`` at construction — the tests inject HTTPX2 objects.
+4. Closing an OpenAI v3 or Anthropic v1 default client from another thread
+   while a read is blocked (the ``ModelRegistry.reload()`` shape) completes
+   safely; a later wire release surfaces as an ``httpx2.TransportError`` on
+   the blocked ``next()``. The production ``transport_guarded`` seam must
+   normalize it before the retry gate.
 5. OpenAI v3 raises real HTTP errors before returning a stream, while an HTTP
    200 ``application/json`` response becomes an empty iterator unless the
    adapter rejects it before arming the stream.
 6. Refusal text is visible without inventing an early terminal signal, and
    neither structured-output judge interprets a filtered response as a verdict.
+7. Anthropic v1 removed ``temperature`` / ``top_p`` / ``top_k`` from the
+   Messages signatures (a typed kwarg is a ``TypeError``): the adapter's
+   capability-gated temperature reaches the request body through
+   ``extra_body`` with unchanged send/omit semantics, and an operator
+   ``server_compat`` pin of the same key wins.
+8. Both SDKs merge caller ``extra_headers`` over their own credential header
+   case-insensitively, even over ``with_options(api_key=...)``, so every
+   adapter refuses credential names in ``extra_headers`` before the call.
 
 If an SDK/httpx upgrade changes any of these, the provider boundary and
 ``transport_guarded`` conversion (including the retry gate consuming it) must
@@ -33,6 +43,7 @@ import socket
 import threading
 import time
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import patch
 
 import anthropic
@@ -41,6 +52,7 @@ import httpx2
 import openai
 import pytest
 
+from tests._wire_capture import RecordingClient, anthropic_body_capture_client
 from turnstone.core.providers._openai_common import (
     UpstreamRateLimitError,
     UpstreamResponseError,
@@ -753,12 +765,12 @@ def test_openai_v3_legacy_httpx_midbody_death_keeps_legacy_error_family():
     assert len(requests) == 1
 
 
-def test_anthropic_midbody_death_is_unwrapped_readerror_and_no_rerequest():
+def test_anthropic_midbody_death_is_unwrapped_httpx2_error_and_no_rerequest():
     requests: list = []
     client = anthropic.Anthropic(
         api_key="probe",
         base_url="http://probe.invalid",
-        http_client=httpx.Client(transport=_dying_transport(ANTHROPIC_EVENTS, requests)),
+        http_client=httpx2.Client(transport=_httpx2_dying_transport(ANTHROPIC_EVENTS, requests)),
         max_retries=2,
     )
     texts = []
@@ -768,7 +780,7 @@ def test_anthropic_midbody_death_is_unwrapped_readerror_and_no_rerequest():
         client.messages.stream(
             model="m", max_tokens=64, messages=[{"role": "user", "content": "hi"}]
         ) as stream,
-        pytest.raises(httpx.ReadError) as excinfo,
+        pytest.raises(httpx2.ReadError) as excinfo,
     ):
         for event in stream:
             if getattr(event, "type", "") == "content_block_delta":
@@ -776,9 +788,21 @@ def test_anthropic_midbody_death_is_unwrapped_readerror_and_no_rerequest():
                 if getattr(delta, "type", "") == "text_delta":
                     texts.append(delta.text)
     assert type(excinfo.value).__name__ == "ReadError"
-    assert isinstance(excinfo.value, httpx.TransportError)
+    assert isinstance(excinfo.value, httpx2.TransportError)
     assert texts == ["hello"]
     assert len(requests) == 1
+
+
+def test_anthropic_v1_rejects_legacy_httpx_client_at_construction():
+    """Why every Anthropic boundary test injects HTTPX2 objects: the SDK
+    refuses the old family up front, so a legacy client cannot slip a
+    different exception family past ``transport_guarded`` unnoticed."""
+    legacy = httpx.Client()
+    try:
+        with pytest.raises(TypeError, match="httpx2"):
+            anthropic.Anthropic(api_key="probe", http_client=legacy)  # type: ignore[arg-type]
+    finally:
+        legacy.close()
 
 
 @pytest.mark.parametrize("surface", ["chat", "responses"])
@@ -814,23 +838,41 @@ def test_closed_v3_default_client_creation_stays_sdk_wrapped_and_unarmed(surface
     assert type(excinfo.value.__cause__) is RuntimeError
 
 
+def _loopback_lane(lane: str, port: int) -> tuple[Any, Any]:
+    """Real SDK client + provider for one streaming lane on a loopback server.
+
+    The Anthropic SDK appends ``/v1/messages`` to ``base_url`` itself; the
+    OpenAI SDK expects the ``/v1`` root.
+    """
+    from turnstone.core.providers import create_provider
+
+    if lane == "anthropic":
+        client = anthropic.Anthropic(
+            api_key="probe", base_url=f"http://127.0.0.1:{port}", max_retries=0, timeout=5.0
+        )
+        return client, create_provider("anthropic")
+    client = openai.OpenAI(
+        api_key="probe", base_url=f"http://127.0.0.1:{port}/v1", max_retries=0, timeout=5.0
+    )
+    return client, create_provider("openai-compatible", api_surface=lane)
+
+
 @pytest.mark.parametrize(
-    ("surface", "payload"),
-    [("chat", CHAT_CHUNK), ("responses", RESPONSES_EVENT)],
+    ("lane", "payload"),
+    [("chat", CHAT_CHUNK), ("responses", RESPONSES_EVENT), ("anthropic", ANTHROPIC_EVENTS)],
 )
-def test_cross_thread_v3_default_client_close_then_wire_release_is_normalized(
-    surface: str, payload: str
-):
+def test_cross_thread_default_client_close_then_wire_release_is_normalized(lane: str, payload: str):
     """The ``ModelRegistry.reload()`` shape stays safe at the retry seam.
 
-    OpenAI v3's synchronous HTTPX2 client does not promise that cross-thread
-    ``close()`` itself interrupts a blocked body read. Pin the behavior
-    Turnstone needs instead: closing from the admin thread completes safely
-    while a worker is in ``next()``, and the subsequent wire release reaches
-    ``transport_guarded`` as a provider-retryable ``IncompleteStreamError``
-    for both OpenAI streaming adapters.
+    Neither OpenAI v3's nor Anthropic v1's synchronous HTTPX2 client promises
+    that cross-thread ``close()`` itself interrupts a blocked body read. Pin
+    the behavior Turnstone needs instead: closing from the admin thread
+    completes safely while a worker is in ``next()``, and the subsequent wire
+    release reaches ``transport_guarded`` as a provider-retryable
+    ``IncompleteStreamError`` for both OpenAI streaming adapters and the
+    Anthropic adapter.
     """
-    from turnstone.core.providers import create_provider, transport_guarded
+    from turnstone.core.providers import transport_guarded
     from turnstone.core.providers._protocol import IncompleteStreamError
 
     body = f"{len(payload):x}" + CRLF + payload + CRLF
@@ -868,23 +910,22 @@ def test_cross_thread_v3_default_client_close_then_wire_release_is_normalized(
         except BaseException as exc:
             server_errors.append(exc)
 
-    client = openai.OpenAI(
-        api_key="probe",
-        base_url=f"http://127.0.0.1:{port}/v1",
-        max_retries=0,
-        timeout=5.0,
-    )
+    client, provider = _loopback_lane(lane, port)
 
     def read_stream() -> None:
         try:
-            provider = create_provider("openai-compatible", api_surface=surface)
             chunks = provider.create_streaming(
                 client=client,
                 model="m",
                 messages=[{"role": "user", "content": "hi"}],
             )
             it = transport_guarded(chunks)
-            first_content.append(next(it).content_delta)
+            # The Anthropic adapter yields a usage-only chunk for
+            # ``message_start`` ahead of the first text delta.
+            for sc in it:
+                if sc.content_delta:
+                    first_content.append(sc.content_delta)
+                    break
             reader_blocked.set()
             next(it)
         except BaseException as exc:
@@ -994,7 +1035,195 @@ class TestEagerAppendContract:
         requests: list = []
         client = anthropic.Anthropic(
             api_key="probe",
-            http_client=httpx.Client(transport=_dying_transport(ANTHROPIC_EVENTS, requests)),
+            http_client=httpx2.Client(
+                transport=_httpx2_dying_transport(ANTHROPIC_EVENTS, requests)
+            ),
         )
         self._armed_at_return(AnthropicProvider(), client)
         assert len(requests) == 1
+
+
+# ---------------------------------------------------------------------------
+# 7. Anthropic v1 sampling: extra_body carries capability-gated temperature
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("kwarg", ["temperature", "top_p", "top_k"])
+def test_anthropic_v1_rejects_typed_sampling_kwargs(kwarg: str):
+    """The SDK half of fact 7: the sampling kwargs are gone from the Messages
+    signatures, so an adapter that regressed to a typed kwarg would fail
+    every real-SDK test before issuing a request.  Binding fails before any
+    transport is touched, so no mock is needed."""
+    client = anthropic.Anthropic(api_key="probe")
+    try:
+        with pytest.raises(TypeError, match=kwarg):
+            client.messages.stream(
+                model="m",
+                max_tokens=16,
+                messages=[{"role": "user", "content": "hi"}],
+                **{kwarg: 0.5},
+            )
+    finally:
+        client.close()
+
+
+_COMPAT_TEMPLATE = {"enable_thinking": False}
+# A row expects this when the key must not be in the body at all: it is the
+# ``.get`` default, so a literal ``null`` on the wire cannot pass as absence.
+_ABSENT = "<absent>"
+
+
+@pytest.mark.parametrize(
+    (
+        "provider_name",
+        "model",
+        "call_temperature",
+        "extra_params",
+        "wire_temperature",
+        "wire_template",
+    ),
+    [
+        # Adaptive thinking on a sampling-capable row forces the API-required 1.0.
+        ("anthropic", "claude-sonnet-4-6", 0.5, None, 1.0, _ABSENT),
+        # Thinking off (no effort knob) on a manual-mode row: the resolved value verbatim.
+        ("anthropic", "claude-haiku-4-5", 0.5, None, 0.5, _ABSENT),
+        # No operator value resolved: None is never written (house rule: no code pins).
+        ("anthropic", "claude-haiku-4-5", None, None, _ABSENT, _ABSENT),
+        # supports_temperature=False: the field never reaches the body.
+        ("anthropic", "claude-opus-4-8", 0.5, None, _ABSENT, _ABSENT),
+        # Compat lane: the knob rides beside the operator's chat_template_kwargs.
+        (
+            "anthropic-compatible",
+            "qwen3.6-27b",
+            0.5,
+            {"chat_template_kwargs": _COMPAT_TEMPLATE},
+            0.5,
+            _COMPAT_TEMPLATE,
+        ),
+        # An operator server_compat pin of the same key wins over the knob.
+        (
+            "anthropic-compatible",
+            "qwen3.6-27b",
+            0.5,
+            {"temperature": 0.3, "chat_template_kwargs": _COMPAT_TEMPLATE},
+            0.3,
+            _COMPAT_TEMPLATE,
+        ),
+    ],
+)
+def test_anthropic_v1_temperature_rides_extra_body_to_the_wire(
+    provider_name: str,
+    model: str,
+    call_temperature: float | None,
+    extra_params: dict[str, Any] | None,
+    wire_temperature: Any,
+    wire_template: Any,
+):
+    """The adapter half of fact 7: the same send/omit semantics as the typed
+    kwarg had, now through ``extra_body``, with an operator ``server_compat``
+    pin keeping precedence over the resolved knob.  Driven through the real
+    SDK so the merge into the JSON body is what is pinned, not the kwargs
+    dict; absence is pinned as absence (see ``_ABSENT``)."""
+    from turnstone.core.providers import create_provider
+
+    captured: dict[str, Any] = {}
+    client = anthropic_body_capture_client(captured)
+    try:
+        chunks = list(
+            create_provider(provider_name).create_streaming(
+                client=client,
+                model=model,
+                messages=[{"role": "user", "content": "hi"}],
+                temperature=call_temperature,
+                extra_params=extra_params,
+            )
+        )
+    finally:
+        client.close()
+    body = captured["body"]
+    assert body.get("temperature", _ABSENT) == wire_temperature
+    assert body.get("chat_template_kwargs", _ABSENT) == wire_template
+    finishes = [sc.finish_reason for sc in chunks if sc.finish_reason]
+    assert finishes == ["stop"]
+
+
+# ---------------------------------------------------------------------------
+# 8. Credential headers: the SDKs let a caller header replace the credential
+# ---------------------------------------------------------------------------
+
+
+def test_anthropic_extra_headers_replace_the_credential_header():
+    """The SDK half of fact 8 (Anthropic): a caller ``X-Api-Key`` replaces the
+    key the SDK emits, even the one minted via ``with_options`` — the reason
+    the adapters refuse credential names before the call."""
+    captured: dict[str, Any] = {}
+    client = anthropic_body_capture_client(captured)
+    try:
+        with client.with_options(api_key="minted").messages.stream(
+            model="m",
+            max_tokens=8,
+            messages=[{"role": "user", "content": "hi"}],
+            extra_headers={"X-Api-Key": "injected"},
+        ) as stream:
+            for _ in stream:
+                pass
+    finally:
+        client.close()
+    assert captured["headers"].get("x-api-key") == "injected"
+
+
+def test_openai_extra_headers_replace_the_credential_header():
+    """The SDK half of fact 8 (OpenAI v3): a caller ``Authorization`` replaces
+    the bearer the SDK emits for a ``with_options``-minted key."""
+    seen: dict[str, Any] = {}
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        seen["authorization"] = request.headers.get("authorization")
+        return httpx2.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=("data: [DONE]" + LF + LF).encode(),
+            request=request,
+        )
+
+    client = openai.OpenAI(
+        api_key="static",
+        base_url="http://probe.invalid/v1",
+        http_client=httpx2.Client(transport=httpx2.MockTransport(handler)),
+        max_retries=0,
+    )
+    try:
+        stream = client.with_options(api_key="minted").chat.completions.create(
+            model="m",
+            messages=[{"role": "user", "content": "hi"}],
+            stream=True,
+            extra_headers={"Authorization": "Bearer injected"},
+        )
+        list(stream)
+    finally:
+        client.close()
+    assert seen["authorization"] == "Bearer injected"
+
+
+@pytest.mark.parametrize("header", ["x-api-key", "X-Api-Key", "Authorization"])
+@pytest.mark.parametrize(
+    ("provider_name", "api_surface"),
+    [("anthropic", None), ("openai-compatible", "chat"), ("openai-compatible", "responses")],
+)
+def test_adapters_refuse_credential_headers_before_the_sdk_call(
+    provider_name: str, api_surface: str | None, header: str
+):
+    """The Turnstone half of fact 8: request assembly raises before any SDK
+    call, so ``with_options(api_key=...)`` stays the only credential path."""
+    from turnstone.core.providers import create_provider
+
+    client = RecordingClient()
+    provider = create_provider(provider_name, api_surface=api_surface)
+    with pytest.raises(ValueError, match="with_options"):
+        provider.create_streaming(
+            client=client,
+            model="m",
+            messages=[{"role": "user", "content": "hi"}],
+            extra_headers={header: "injected"},
+        )
+    assert "payload" not in client.captured

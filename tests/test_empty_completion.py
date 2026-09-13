@@ -6,7 +6,6 @@ from dataclasses import replace
 from unittest.mock import patch
 
 import anthropic
-import httpx
 import httpx2
 import pytest
 from openai import APIConnectionError, OpenAI
@@ -195,7 +194,6 @@ def _session(
     family="openai-compatible",
 ):
     requests = []
-    http = httpx if family == "anthropic-compatible" else httpx2
     client_type = anthropic.Anthropic if family == "anthropic-compatible" else OpenAI
 
     def respond(request):
@@ -208,7 +206,7 @@ def _session(
         requests.append(json.loads(request.content))
         index = len(requests) - 1
         assert index < len(shapes), "unexpected additional provider request"
-        return http.Response(
+        return httpx2.Response(
             200,
             headers={"content-type": "text/event-stream"},
             text=(
@@ -226,7 +224,7 @@ def _session(
             if family == "anthropic-compatible"
             else "https://provider.example.com/v1"
         ),
-        http_client=http.Client(transport=http.MockTransport(respond)),
+        http_client=httpx2.Client(transport=httpx2.MockTransport(respond)),
         max_retries=0,
     ) as client:
         session = make_registered_session(ui=ui, user_id="empty-response-user", kind=kind)

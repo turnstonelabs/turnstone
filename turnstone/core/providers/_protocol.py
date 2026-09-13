@@ -92,6 +92,31 @@ def refuse_aborted_request(cancel_ref: Any) -> None:
         raise DeadlineCancelledError("cancel_ref aborted before dispatch")
 
 
+# Request headers that carry the backend credential.  Each SDK emits its own
+# from the client's key — ``x-api-key`` (Anthropic) or ``Authorization:
+# Bearer`` (OpenAI-style) — and a minted delegated credential rides
+# ``client.with_options(api_key=...)``.  Both SDKs merge ``extra_headers``
+# over their own headers case-insensitively, so a caller header of the same
+# name would silently replace the credential (even over ``with_options``):
+# the adapters refuse these names at request assembly instead.
+CREDENTIAL_HEADER_NAMES: frozenset[str] = frozenset({"x-api-key", "authorization"})
+
+
+def refuse_credential_headers(extra_headers: dict[str, str] | None) -> None:
+    """Raise ``ValueError`` when *extra_headers* names a credential header.
+
+    Every adapter calls this before its SDK call, so the credential path
+    stays ``with_options(api_key=...)`` alone.  ``ValueError`` is not a
+    retryable error name, so the request fails once, before any wire traffic.
+    """
+    for name in extra_headers or ():
+        if name.lower() in CREDENTIAL_HEADER_NAMES:
+            raise ValueError(
+                f"extra_headers must not carry the backend credential ({name!r}); "
+                "a delegated credential rides client.with_options(api_key=...)"
+            )
+
+
 @dataclass
 class StreamChunk:
     """Normalized streaming chunk, provider-agnostic."""
@@ -253,12 +278,12 @@ def transport_guarded(chunks: Iterator[StreamChunk]) -> Iterator[StreamChunk]:
     ``APIConnectionError``-wrapped request into raw iteration, so a
     mid-body wire death (connection drop, TLS record failure, read
     timeout) surfaces as a bare transport error no retry predicate
-    recognizes.  OpenAI v3's default client raises ``httpx2`` errors;
-    Anthropic, Turnstone's own HTTP clients, and the OpenAI v3 legacy-client
-    escape hatch raise ``httpx`` errors.  This wrapper is the one conversion
-    rule for both families, reusable by consumers that keep streaming
-    semantics (the interactive loop); :func:`drain_stream` applies it for
-    the single-shot lanes.
+    recognizes.  The OpenAI v3 and Anthropic v1 default clients raise
+    ``httpx2`` errors; Turnstone's own HTTP clients and the OpenAI v3
+    legacy-client escape hatch raise ``httpx`` errors.  This wrapper is
+    the one conversion rule for both families, reusable by consumers
+    that keep streaming semantics (the interactive loop);
+    :func:`drain_stream` applies it for the single-shot lanes.
 
     - A ``TransportError`` BEFORE any finish reason re-raises (chained)
       as the retryable :class:`IncompleteStreamError`.
@@ -271,7 +296,7 @@ def transport_guarded(chunks: Iterator[StreamChunk]) -> Iterator[StreamChunk]:
     """
     # Both libraries are heavyweight; keep them off this module's dataclass-
     # only import path. ``httpx`` remains Turnstone's application transport,
-    # while ``httpx2`` is the OpenAI v3 default transport.
+    # while ``httpx2`` is the OpenAI v3 and Anthropic v1 default transport.
     import httpx  # noqa: PLC0415
     import httpx2  # noqa: PLC0415
 

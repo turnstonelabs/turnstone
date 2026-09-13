@@ -25,6 +25,7 @@ from turnstone.core.providers._protocol import (
     finish_shim_due,
     merge_reasoning_template_kwargs,
     refuse_aborted_request,
+    refuse_credential_headers,
     request_uses_native_tools,
     serialized_tool_chars,
     snap_reasoning_effort,
@@ -537,11 +538,6 @@ class AnthropicProvider:
             # 90% input cost reduction on cache hits; 1.25x write on first turn.
             "cache_control": {"type": "ephemeral"},
         }
-        # None temperature is never written — the request omits the field so
-        # the server default applies (house rule: no code pins).  The
-        # thinking branches above still force 1.0 where the API requires it.
-        if caps.supports_temperature and temperature is not None:
-            kwargs["temperature"] = temperature
         if system_prompt:
             kwargs["system"] = system_prompt
         if tools:
@@ -560,12 +556,30 @@ class AnthropicProvider:
             if effort:
                 kwargs["output_config"] = {"effort": effort}
 
-        # Operator server_compat extra_body overrides (e.g. chat_template_kwargs
-        # for anthropic-compatible local servers) ride the SDK's extra_body.
+        # ``extra_body`` is merged into the request JSON on top of the typed
+        # kwargs (SDK 1.x: an ``extra_body`` key replaces a typed one of the
+        # same name).  Two sources share it:
+        #
+        # * Temperature.  SDK 1.x removed the sampling kwargs from the
+        #   Messages signatures (a typed ``temperature=`` is a TypeError),
+        #   so the capability-gated value rides here with the same
+        #   semantics as before: None is never written — the request omits
+        #   the field so the server default applies (house rule: no code
+        #   pins) — and the thinking branches above still force 1.0 where
+        #   the API requires it.
+        # * Operator server_compat overrides (e.g. chat_template_kwargs for
+        #   anthropic-compatible local servers).  Applied last, so an
+        #   operator pin of ``temperature`` beats the resolved knob — the
+        #   precedence the OpenAI lanes already give a server_compat pin.
+        extra_body: dict[str, Any] = {}
+        if caps.supports_temperature and temperature is not None:
+            extra_body["temperature"] = temperature
         if extra_params:
-            wire_extra = {k: v for k, v in extra_params.items() if k not in _INTERNAL_EXTRA_PARAMS}
-            if wire_extra:
-                kwargs["extra_body"] = wire_extra
+            extra_body.update(
+                (k, v) for k, v in extra_params.items() if k not in _INTERNAL_EXTRA_PARAMS
+            )
+        if extra_body:
+            kwargs["extra_body"] = extra_body
 
         if "block_binding" in thinking_params.get("thinking", {}):
             kwargs["extra_headers"] = {"anthropic-beta": _THINKING_BINDING_BETA}
@@ -982,6 +996,7 @@ class AnthropicProvider:
             deferred_names,
         )
         if extra_headers:
+            refuse_credential_headers(extra_headers)
             kwargs["extra_headers"] = _merge_extra_headers(
                 kwargs.get("extra_headers"), extra_headers
             )

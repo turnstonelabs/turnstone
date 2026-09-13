@@ -123,7 +123,7 @@ class TestCompatWireShape:
             }
         ]
         assert all(t.get("type") != "web_search_20250305" for t in sent_tools)
-        assert kwargs["temperature"] == 0.6
+        assert kwargs["extra_body"] == {"temperature": 0.6}
         assert "thinking" not in kwargs
         assert "max_tokens" in kwargs
         assert "max_completion_tokens" not in kwargs
@@ -149,11 +149,13 @@ class TestCompatWireShape:
 
         ``thinking_budget_tokens`` is consumed by ``_reasoning_params`` and
         must never surface as wire ``extra_body`` — a leaked key would change
-        every real-Anthropic request that threads a thinking override.
-        Negative-tested: fails when the ``_INTERNAL_EXTRA_PARAMS`` exclusion
-        is removed from ``_build_thinking_and_kwargs``.  The effort knob is
-        explicit: unset effort means thinking OFF (the budget override
-        modifies a thinking block, it never creates one).
+        every real-Anthropic request that threads a thinking override.  The
+        only ``extra_body`` entry is the temperature the enabled thinking
+        block forces (SDK v1 carries sampling there).  Negative-tested: fails
+        when the ``_INTERNAL_EXTRA_PARAMS`` exclusion is removed from
+        ``_build_thinking_and_kwargs``.  The effort knob is explicit: unset
+        effort means thinking OFF (the budget override modifies a thinking
+        block, it never creates one).
         """
         provider = AnthropicProvider()
         client = _capture_client()
@@ -167,7 +169,7 @@ class TestCompatWireShape:
             )
         )
         kwargs = client.messages.stream.call_args[1]
-        assert "extra_body" not in kwargs
+        assert kwargs["extra_body"] == {"temperature": 1.0}
         assert kwargs["thinking"] == {"type": "enabled", "budget_tokens": 2048}
 
 
@@ -226,16 +228,19 @@ class TestCompatReasoningControl:
         ignores it."""
         kwargs = self._stream_kwargs(self._MANUAL_CAPS, "medium")
         assert kwargs["extra_body"] == {
-            "chat_template_kwargs": {"enable_thinking": True, "reasoning_effort": "medium"}
+            "chat_template_kwargs": {"enable_thinking": True, "reasoning_effort": "medium"},
+            "temperature": 0.6,  # never forced to 1.0 on compat
         }
         assert "thinking" not in kwargs
-        assert kwargs["temperature"] == 0.6  # never forced to 1.0 on compat
 
     def test_manual_toggle_explicit_off(self) -> None:
         """The explicit "none" knob disables thinking — native manual-mode
         parity; no effort key rides when thinking is off."""
         kwargs = self._stream_kwargs(self._MANUAL_CAPS, "none")
-        assert kwargs["extra_body"] == {"chat_template_kwargs": {"enable_thinking": False}}
+        assert kwargs["extra_body"] == {
+            "chat_template_kwargs": {"enable_thinking": False},
+            "temperature": 0.6,
+        }
         assert "thinking" not in kwargs
 
     def test_manual_unset_injects_nothing(self) -> None:
@@ -244,7 +249,7 @@ class TestCompatReasoningControl:
         rules, matching "if not set, we don't send it".  Distinct from
         the explicit "none" off-switch above."""
         kwargs = self._stream_kwargs(self._MANUAL_CAPS, "")
-        assert "extra_body" not in kwargs
+        assert kwargs["extra_body"] == {"temperature": 0.6}  # no toggle injected
         assert "thinking" not in kwargs
 
     def test_adaptive_always_on(self) -> None:
@@ -253,19 +258,21 @@ class TestCompatReasoningControl:
         caps = dataclasses.replace(self._MANUAL_CAPS, thinking_mode="adaptive")
         kwargs = self._stream_kwargs(caps, "high")
         assert kwargs["extra_body"] == {
-            "chat_template_kwargs": {"enable_thinking": True, "reasoning_effort": "high"}
+            "chat_template_kwargs": {"enable_thinking": True, "reasoning_effort": "high"},
+            "temperature": 0.6,
         }
         assert "thinking" not in kwargs
-        assert kwargs["temperature"] == 0.6
         kwargs = self._stream_kwargs(caps, "none")
-        assert kwargs["extra_body"] == {"chat_template_kwargs": {"enable_thinking": True}}
+        assert kwargs["extra_body"] == {
+            "chat_template_kwargs": {"enable_thinking": True},
+            "temperature": 0.6,
+        }
         assert "thinking" not in kwargs
-        assert kwargs["temperature"] == 0.6
 
     def test_default_caps_inject_nothing(self) -> None:
         """Untouched compat defaults (thinking_mode=none) keep today's wire."""
         kwargs = self._stream_kwargs(None, "medium")
-        assert "extra_body" not in kwargs
+        assert kwargs["extra_body"] == {"temperature": 0.6}  # nothing injected
         assert "thinking" not in kwargs
 
     def test_effort_param_validated_against_values(self) -> None:
@@ -279,7 +286,8 @@ class TestCompatReasoningControl:
         )
         kwargs = self._stream_kwargs(caps, "xhigh")
         assert kwargs["extra_body"] == {
-            "chat_template_kwargs": {"enable_thinking": True, "reasoning_effort": "high"}
+            "chat_template_kwargs": {"enable_thinking": True, "reasoning_effort": "high"},
+            "temperature": 0.6,
         }
 
     def test_effort_param_freeform_without_values(self) -> None:
@@ -289,7 +297,10 @@ class TestCompatReasoningControl:
             effort_param="reasoning_effort",
         )
         kwargs = self._stream_kwargs(caps, "xhigh")
-        assert kwargs["extra_body"] == {"chat_template_kwargs": {"reasoning_effort": "xhigh"}}
+        assert kwargs["extra_body"] == {
+            "chat_template_kwargs": {"reasoning_effort": "xhigh"},
+            "temperature": 0.6,
+        }
 
     def test_effort_param_omitted_on_none(self) -> None:
         """Knob "none" sends no effort key (and toggles thinking off)."""
@@ -299,7 +310,10 @@ class TestCompatReasoningControl:
             reasoning_effort_values=("low", "medium", "high"),
         )
         kwargs = self._stream_kwargs(caps, "none")
-        assert kwargs["extra_body"] == {"chat_template_kwargs": {"enable_thinking": False}}
+        assert kwargs["extra_body"] == {
+            "chat_template_kwargs": {"enable_thinking": False},
+            "temperature": 0.6,
+        }
 
     def test_operator_override_wins(self) -> None:
         """server_compat chat_template_kwargs entries beat the knob mapping."""
@@ -311,6 +325,22 @@ class TestCompatReasoningControl:
         assert kwargs["extra_body"] == {
             "chat_template_kwargs": {"enable_thinking": True},
             "foo": 1,
+            "temperature": 0.6,
+        }
+
+    def test_operator_temperature_pin_wins_over_knob(self) -> None:
+        """A ``server_compat.extra_body`` temperature is an endpoint fact:
+        it beats the session knob (0.6 here) instead of being overwritten
+        by it — the same precedence the OpenAI lanes give a server_compat
+        pin, where the SDK merges ``extra_body`` over the typed kwarg."""
+        kwargs = self._stream_kwargs(
+            self._MANUAL_CAPS,
+            "none",
+            extra_params={"temperature": 0.3, "chat_template_kwargs": {"enable_thinking": True}},
+        )
+        assert kwargs["extra_body"] == {
+            "chat_template_kwargs": {"enable_thinking": True},
+            "temperature": 0.3,
         }
 
     def test_utility_pin_survives_adaptive_injection(self) -> None:
@@ -342,7 +372,8 @@ class TestCompatReasoningControl:
         kwargs = self._stream_kwargs(caps, "high")
         assert "output_config" not in kwargs
         assert kwargs["extra_body"] == {
-            "chat_template_kwargs": {"enable_thinking": True, "reasoning_effort": "high"}
+            "chat_template_kwargs": {"enable_thinking": True, "reasoning_effort": "high"},
+            "temperature": 0.6,
         }
 
     def test_create_streaming_same_injection(self) -> None:

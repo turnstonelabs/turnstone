@@ -43,6 +43,7 @@ from turnstone.core.providers._protocol import (
     finish_shim_due,
     folds_trailing_info,
     refuse_aborted_request,
+    refuse_credential_headers,
     request_uses_native_tools,
     resolve_reasoning_effort,
     serialized_tool_chars,
@@ -524,6 +525,7 @@ class OpenAIResponsesProvider:
         )
         kwargs["stream"] = True
         if extra_headers:
+            refuse_credential_headers(extra_headers)
             kwargs["extra_headers"] = extra_headers
 
         refuse_aborted_request(cancel_ref)
