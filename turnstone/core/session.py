@@ -14846,11 +14846,11 @@ class ChatSession:
                         # Creation-phase failure: the walk already ran its full
                         # ladder + fallbacks.  Mid re-issue it must not MASK
                         # the original stream death (a closed-client re-create
-                        # surfaces as a retryable APIConnectionError and would
-                        # replace the operator-actionable wording). An empty
-                        # completion does not explain a failed re-create, so
-                        # its replacement error surfaces as itself. Also exempt
-                        # the classes carrying their own remediation: an
+                        # raises RuntimeError and would replace the
+                        # operator-actionable wording). An empty completion
+                        # does not explain a failed re-create, so its replacement
+                        # error surfaces as itself. Also exempt the classes
+                        # carrying their own remediation: an
                         # overflow surfaces as ITSELF so send()'s
                         # compact-and-retry arm can recover the turn, and an
                         # auth refusal or wire-preparation fault surfaces as

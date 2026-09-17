@@ -22,9 +22,9 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
-    # Version 3 moves the default transport to HTTPX2. Keep major upgrades
-    # deliberate because the stream retry boundary depends on that contract.
-    "openai>=3,<4",
+    # 3.14 wraps stream transport failures in SDK errors; 3.14.1 leaves
+    # application errors unwrapped. The stream boundary tests pin this contract.
+    "openai>=3.14.1,<4",
     # Version 1 moves the SDK onto HTTPX2 and removes the Messages sampling kwargs
     # (temperature / top_p / top_k): the provider boundary injects HTTPX2 objects only
     # and carries capability-gated temperature through ``extra_body``. Nothing above

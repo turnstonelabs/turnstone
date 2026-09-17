@@ -3,19 +3,21 @@
 Eight facts, each probed against the REAL SDKs over mock/loopback
 transports (no network, no live backend):
 
-1. OpenAI v3's ``max_retries`` covers request time only — a mid-BODY death
-   produces no re-request, and the raw ``httpx2.ReadError`` escapes both Chat
-   Completions and Responses chunk iterators unwrapped.
+1. OpenAI's ``max_retries`` covers request time only — a mid-BODY death
+   produces no re-request. The supported SDK (>=3.14.1) wraps ``httpx2``
+   transport errors in ``APIConnectionError`` or its ``APITimeoutError``
+   subclass, retaining the transport cause.
 2. OpenAI v3's runtime-only legacy-client path preserves the old ``httpx``
-   exception family when an application explicitly injects that client.
+   exception family as the SDK error's cause when an application explicitly
+   injects that client.
 3. Anthropic v1's ``messages.stream()`` helper propagates the ``httpx2``
    shape unwrapped with no SDK re-request, and the client rejects an injected
    legacy ``httpx.Client`` at construction — the tests inject HTTPX2 objects.
 4. Closing an OpenAI v3 or Anthropic v1 default client from another thread
    while a read is blocked (the ``ModelRegistry.reload()`` shape) completes
-   safely; a later wire release surfaces as an ``httpx2.TransportError`` on
-   the blocked ``next()``. The production ``transport_guarded`` seam must
-   normalize it before the retry gate.
+   safely; a later wire release surfaces as a raw or SDK-wrapped
+   ``httpx2.TransportError`` on the blocked ``next()``. The production
+   ``transport_guarded`` seam must normalize it before the retry gate.
 5. OpenAI v3 raises real HTTP errors before returning a stream, while an HTTP
    200 ``application/json`` response becomes an empty iterator unless the
    adapter rejects it before arming the stream.
@@ -360,23 +362,25 @@ def test_judges_reject_chat_refusals_before_parsing_or_reprompting(
 class _DyingStream(httpx.SyncByteStream):
     """Response body: one valid SSE payload, then a mid-read wire death."""
 
-    def __init__(self, payload: bytes) -> None:
+    def __init__(self, payload: bytes, error: httpx.TransportError | None = None) -> None:
         self._payload = payload
+        self._error = error or httpx.ReadError("[SSL] record layer failure (_ssl.c:2590)")
 
     def __iter__(self):
         yield self._payload
-        raise httpx.ReadError("[SSL] record layer failure (_ssl.c:2590)")
+        raise self._error
 
 
 class _Httpx2DyingStream(httpx2.SyncByteStream):
     """HTTPX2 response body: one SSE payload, then a wire death."""
 
-    def __init__(self, payload: bytes) -> None:
+    def __init__(self, payload: bytes, error: httpx2.TransportError | None = None) -> None:
         self._payload = payload
+        self._error = error or httpx2.ReadError("[SSL] record layer failure (_ssl.c:2590)")
 
     def __iter__(self):
         yield self._payload
-        raise httpx2.ReadError("[SSL] record layer failure (_ssl.c:2590)")
+        raise self._error
 
 
 class _BlockingJsonStream(httpx2.SyncByteStream):
@@ -698,7 +702,7 @@ def test_non_stream_json_body_read_is_cancellable_without_arming(surface: str):
     assert isinstance(errors[0], IncompleteStreamError)
 
 
-def test_openai_v3_chat_midbody_death_is_unwrapped_httpx2_error_and_no_rerequest():
+def test_openai_v3_chat_midbody_death_preserves_transport_cause_and_no_rerequest():
     requests: list = []
     client = openai.OpenAI(
         api_key="probe",
@@ -710,19 +714,17 @@ def test_openai_v3_chat_midbody_death_is_unwrapped_httpx2_error_and_no_rerequest
         model="m", messages=[{"role": "user", "content": "hi"}], stream=True
     )
     texts = []
-    with pytest.raises(httpx2.ReadError) as excinfo:
+    with pytest.raises(openai.APIConnectionError) as excinfo:
         for chunk in stream:
             if chunk.choices and chunk.choices[0].delta.content:
                 texts.append(chunk.choices[0].delta.content)
-    # The retry gate matches on the class NAME; pin the exact identity the
-    # SDK lets escape, and that it is the HTTPX2 transport family.
-    assert type(excinfo.value).__name__ == "ReadError"
-    assert isinstance(excinfo.value, httpx2.TransportError)
+    assert type(excinfo.value) is openai.APIConnectionError
+    assert type(excinfo.value.__cause__) is httpx2.ReadError
     assert texts == ["hello"]  # the request succeeded; the BODY died
     assert len(requests) == 1  # max_retries never re-requested mid-body
 
 
-def test_openai_v3_responses_midbody_death_is_unwrapped_httpx2_error_and_no_rerequest():
+def test_openai_v3_responses_midbody_death_preserves_transport_cause_and_no_rerequest():
     requests: list = []
     client = openai.OpenAI(
         api_key="probe",
@@ -732,12 +734,12 @@ def test_openai_v3_responses_midbody_death_is_unwrapped_httpx2_error_and_no_rere
     )
     stream = client.responses.create(model="m", input="hi", stream=True)
     texts = []
-    with pytest.raises(httpx2.ReadError) as excinfo:
+    with pytest.raises(openai.APIConnectionError) as excinfo:
         for event in stream:
             if event.type == "response.output_text.delta":
                 texts.append(event.delta)
-    assert type(excinfo.value).__name__ == "ReadError"
-    assert isinstance(excinfo.value, httpx2.TransportError)
+    assert type(excinfo.value) is openai.APIConnectionError
+    assert type(excinfo.value.__cause__) is httpx2.ReadError
     assert texts == ["hello"]
     assert len(requests) == 1
 
@@ -755,13 +757,95 @@ def test_openai_v3_legacy_httpx_midbody_death_keeps_legacy_error_family():
         model="m", messages=[{"role": "user", "content": "hi"}], stream=True
     )
     texts = []
-    with pytest.raises(httpx.ReadError) as excinfo:
+    with pytest.raises(openai.APIConnectionError) as excinfo:
         for chunk in stream:
             if chunk.choices and chunk.choices[0].delta.content:
                 texts.append(chunk.choices[0].delta.content)
-    assert type(excinfo.value).__name__ == "ReadError"
-    assert isinstance(excinfo.value, httpx.TransportError)
+    assert type(excinfo.value) is openai.APIConnectionError
+    assert type(excinfo.value.__cause__) is httpx.ReadError
     assert texts == ["hello"]
+    assert len(requests) == 1
+
+
+@pytest.mark.parametrize("surface", ["chat", "responses"])
+@pytest.mark.parametrize("http_module", [httpx, httpx2], ids=["httpx", "httpx2"])
+@pytest.mark.parametrize(
+    ("error_name", "sdk_error_cls"),
+    [("ReadError", openai.APIConnectionError), ("ReadTimeout", openai.APITimeoutError)],
+)
+@pytest.mark.parametrize("finished", [False, True])
+def test_openai_stream_transport_error_preserves_finish_semantics(
+    surface, http_module, error_name, sdk_error_cls, finished, caplog
+):
+    """Exercise SDK wrapping, adapter iteration, and the shared drain together."""
+    from turnstone.core.providers import (
+        IncompleteStreamError,
+        create_provider,
+        drain_stream,
+    )
+
+    requests: list = []
+    error = getattr(http_module, error_name)("wire died")
+    body_cls = _DyingStream if http_module is httpx else _Httpx2DyingStream
+    payload = CHAT_CHUNK if surface == "chat" else RESPONSES_EVENT
+    if finished:
+        terminal = (
+            {
+                "id": "x",
+                "object": "chat.completion.chunk",
+                "created": 0,
+                "model": "m",
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+            }
+            if surface == "chat"
+            else {
+                "type": "response.completed",
+                "sequence_number": 1,
+                "response": {"id": "x", "status": "completed", "output": []},
+            }
+        )
+        payload += "data: " + json.dumps(terminal) + LF + LF
+
+    def handler(request):
+        requests.append(request)
+        return http_module.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            stream=body_cls(payload.encode(), error),
+        )
+
+    with openai.OpenAI(
+        api_key="probe",
+        base_url="http://probe.invalid/v1",
+        http_client=http_module.Client(transport=http_module.MockTransport(handler)),
+        max_retries=2,
+    ) as client:
+        provider = create_provider("openai-compatible", api_surface=surface)
+        cancel_ref: list = []
+        chunks = provider.create_streaming(
+            client=client,
+            model="m",
+            messages=[{"role": "user", "content": "hi"}],
+            cancel_ref=cancel_ref,
+        )
+        assert len(cancel_ref) == 1
+        if finished:
+            result = drain_stream(chunks)
+            assert result.content == "hello"
+            assert result.finish_reason == "stop"
+            assert result.usage is None
+            blips = [r.message for r in caplog.records if "stream.post_finish_blip" in r.message]
+            assert len(blips) == 1
+            assert error_name in blips[0]
+            assert "usage_captured" in blips[0] and "False" in blips[0]
+        else:
+            with pytest.raises(IncompleteStreamError, match=error_name) as excinfo:
+                drain_stream(chunks)
+            assert excinfo.value.__cause__ is error
+            sdk_error = excinfo.value.__context__
+            assert type(sdk_error) is sdk_error_cls
+            assert sdk_error.__cause__ is error
+            assert type(excinfo.value).__name__ in provider.retryable_error_names
     assert len(requests) == 1
 
 
@@ -806,13 +890,12 @@ def test_anthropic_v1_rejects_legacy_httpx_client_at_construction():
 
 
 @pytest.mark.parametrize("surface", ["chat", "responses"])
-def test_closed_v3_default_client_creation_stays_sdk_wrapped_and_unarmed(surface: str):
+def test_closed_v3_default_client_creation_stays_unarmed(surface: str):
     """A re-create on the client closed by reload is still a creation error.
 
-    OpenAI v3 must wrap the default HTTPX2 client's ``RuntimeError`` as its
-    retryable ``APIConnectionError`` before either adapter can arm the stream.
-    This preserves the creation-vs-mid-stream classifier while the original
-    normalized stream death remains available to the outer re-issue ladder.
+    OpenAI >=3.14.1 propagates the HTTPX2 client's ``RuntimeError`` without
+    retrying or wrapping it. It stays outside body iteration; the session's
+    re-create failure path preserves the original normalized stream death.
     """
     from turnstone.core.providers import create_provider
 
@@ -825,7 +908,7 @@ def test_closed_v3_default_client_creation_stays_sdk_wrapped_and_unarmed(surface
     cancel_ref: list = []
     provider = create_provider("openai-compatible", api_surface=surface)
 
-    with pytest.raises(openai.APIConnectionError) as excinfo:
+    with pytest.raises(RuntimeError, match="client has been closed") as excinfo:
         provider.create_streaming(
             client=client,
             model="m",
@@ -834,8 +917,8 @@ def test_closed_v3_default_client_creation_stays_sdk_wrapped_and_unarmed(surface
         )
 
     assert cancel_ref == []
-    assert type(excinfo.value).__name__ in provider.retryable_error_names
-    assert type(excinfo.value.__cause__) is RuntimeError
+    assert type(excinfo.value) is RuntimeError
+    assert type(excinfo.value).__name__ not in provider.retryable_error_names
 
 
 def _loopback_lane(lane: str, port: int) -> tuple[Any, Any]:

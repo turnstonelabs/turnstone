@@ -290,16 +290,15 @@ def has_reasoning_bearing_block(blocks: list[dict[str, Any]]) -> bool:
 def transport_guarded(chunks: Iterator[StreamChunk]) -> Iterator[StreamChunk]:
     """Normalize mid-body transport deaths on a ``create_streaming`` iterator.
 
-    Streaming moves the body read out of the SDK's
-    ``APIConnectionError``-wrapped request into raw iteration, so a
-    mid-body wire death (connection drop, TLS record failure, read
-    timeout) surfaces as a bare transport error no retry predicate
-    recognizes.  The OpenAI v3 and Anthropic v1 default clients raise
-    ``httpx2`` errors; Turnstone's own HTTP clients and the OpenAI v3
-    legacy-client escape hatch raise ``httpx`` errors.  This wrapper is
-    the one conversion rule for both families, reusable by consumers
-    that keep streaming semantics (the interactive loop);
-    :func:`drain_stream` applies it for the single-shot lanes.
+    A mid-body wire death (connection drop, TLS record failure, read
+    timeout) surfaces as a bare transport error or an OpenAI
+    ``APIConnectionError`` / ``APITimeoutError`` chained from it.  The
+    OpenAI v3 and Anthropic v1 default clients use ``httpx2``; Turnstone's
+    own HTTP clients and OpenAI's legacy-client escape hatch use ``httpx``.
+    This wrapper is the one conversion rule for both families and SDK
+    shapes, reusable by consumers that keep streaming semantics (the
+    interactive loop); :func:`drain_stream` applies it for the single-shot
+    lanes.
 
     - A ``TransportError`` BEFORE any finish reason re-raises (chained)
       as the retryable :class:`IncompleteStreamError`.
@@ -310,11 +309,10 @@ def transport_guarded(chunks: Iterator[StreamChunk]) -> Iterator[StreamChunk]:
     - Everything else — chunks, exhaustion, non-transport exceptions —
       passes through untouched.
     """
-    # Both libraries are heavyweight; keep them off this module's dataclass-
-    # only import path. ``httpx`` remains Turnstone's application transport,
-    # while ``httpx2`` is the OpenAI v3 and Anthropic v1 default transport.
+    # Keep the transport libraries and SDK off the dataclass-only import path.
     import httpx  # noqa: PLC0415
     import httpx2  # noqa: PLC0415
+    import openai  # noqa: PLC0415
 
     finish_seen = False
     usage_seen = False
@@ -324,7 +322,14 @@ def transport_guarded(chunks: Iterator[StreamChunk]) -> Iterator[StreamChunk]:
             sc = next(iterator)
         except StopIteration:
             return
-        except (httpx.TransportError, httpx2.TransportError) as exc:
+        except (httpx.TransportError, httpx2.TransportError, openai.APIConnectionError) as exc:
+            transport_exc = exc
+            if isinstance(exc, openai.APIConnectionError):
+                # APITimeoutError is a subclass. Only a proven transport cause
+                # gets post-finish tolerance; other SDK failures pass through.
+                if not isinstance(exc.__cause__, (httpx.TransportError, httpx2.TransportError)):
+                    raise
+                transport_exc = exc.__cause__
             if finish_seen:
                 # usage_captured distinguishes "completed result kept but
                 # its spend went missing from usage accounting" (the chat
@@ -333,13 +338,16 @@ def transport_guarded(chunks: Iterator[StreamChunk]) -> Iterator[StreamChunk]:
                 # missing-spend incident be attributed afterward.
                 _logger().warning(
                     "stream.post_finish_blip",
-                    error_type=type(exc).__name__,
+                    error_type=type(transport_exc).__name__,
                     usage_captured=usage_seen,
                 )
                 return
+            # Keep the transport cause direct: retry logs and UI notices use
+            # its class name, and the message retains its diagnostic detail.
             raise IncompleteStreamError(
-                f"stream transport failed mid-response ({type(exc).__name__}: {exc})"
-            ) from exc
+                f"stream transport failed mid-response ({type(transport_exc).__name__}: "
+                f"{transport_exc})"
+            ) from transport_exc
         if sc.finish_reason:
             finish_seen = True
         if sc.usage is not None:

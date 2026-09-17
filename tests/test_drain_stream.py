@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import httpx
 import httpx2
+import openai
 import pytest
 
 from turnstone.core.providers import (
@@ -510,6 +511,23 @@ class TestTransportGuarded:
         assert next(it).content_delta == "x"
         with pytest.raises(ValueError, match="upstream broke"):
             next(it)
+
+    @pytest.mark.parametrize("finished", [False, True])
+    @pytest.mark.parametrize(
+        "cause",
+        [None, ValueError("bad application state"), httpx2.DecodingError("invalid encoding")],
+    )
+    def test_sdk_connection_error_without_transport_cause_propagates(self, finished, cause):
+        error = openai.APIConnectionError(request=httpx2.Request("POST", "https://example.com"))
+
+        def chunks():
+            yield StreamChunk(content_delta="answer", finish_reason="stop" if finished else None)
+            raise error from cause
+
+        with pytest.raises(openai.APIConnectionError) as excinfo:
+            list(transport_guarded(chunks()))
+        assert excinfo.value is error
+        assert excinfo.value.__cause__ is cause
 
 
 class TestErrorPropagation:
