@@ -19,8 +19,9 @@ from unittest.mock import patch
 import pytest
 
 from tests._session_helpers import RecordingUI, make_session, provider_shell
+from turnstone.core.completion_recovery import CompletionRecoveryError
 from turnstone.core.model_turn import ModelLane
-from turnstone.core.providers import ModelCapabilities
+from turnstone.core.providers import ContextWindowExceededError, ModelCapabilities
 from turnstone.core.session import ChatSession
 
 
@@ -62,6 +63,19 @@ def _format(stub: Any, exc: BaseException) -> str | None:
     """Invoke the method as if on a real session — ``__func__`` skips
     the descriptor protocol so we can pass any object as ``self``."""
     return ChatSession._format_backend_error(stub, exc)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("native", [True, None, False])
+def test_accepted_overflow_formats_as_context_overflow_at_any_tool_posture(native):
+    failure = CompletionRecoveryError(
+        "Model response failed",
+        native_tools_enabled=native,
+        error=ContextWindowExceededError("model stopped"),
+    )
+    message = _format(_stub(), failure)
+    assert message is not None
+    assert "Context window exceeded" in message
+    assert "compaction could not reduce" in message
 
 
 # ---------------------------------------------------------------------------
@@ -334,7 +348,7 @@ def test_http_200_json_error_is_rendered_as_context_overflow():
 
 
 def _stream_death_exemplars() -> list[BaseException]:
-    """One realistic instance per name in ``_BACKEND_STREAM_EXC_NAMES``:
+    """One realistic instance per name in ``BACKEND_STREAM_EXC_NAMES``:
     the normalized shape the guarded iterators raise, plus the raw HTTPX-family
     names for any future unguarded path."""
     from turnstone.core.providers import IncompleteStreamError
@@ -398,8 +412,8 @@ def test_registry_diagnosed_binding_outranks_stream_death():
 
 
 def test_stream_death_with_overflow_phrasing_stays_stream_death():
-    """Joining the stream names into ``_BACKEND_KNOWN_EXC_NAMES`` removes them
-    from ``_is_ctx_overflow``'s text-detection eligibility (its class
+    """Joining the stream names into ``BACKEND_KNOWN_EXC_NAMES`` removes them
+    from ``is_context_overflow``'s text-detection eligibility (its class
     self-gate) — deliberate: transport/SSL texts never carry real overflow
     phrases, and a stream death must never be misfiled as a deterministic
     overflow (which callers route to a non-retryable compaction path)."""

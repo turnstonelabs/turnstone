@@ -16,6 +16,7 @@ from tests._session_helpers import (
     make_registered_session,
     replace_session_lane,
 )
+from turnstone.core.completion_recovery import ModelTurnLocalError
 from turnstone.core.memory import load_last_error
 from turnstone.core.providers import create_provider
 from turnstone.core.session import ConversationPersistenceError, GenerationCancelled
@@ -529,7 +530,11 @@ def test_rejected_usage_callback_failure_finalizes_then_reraises(tmp_db, error_t
 
         with patch.object(ui, "on_status", fail_status), pytest.raises(error_type) as caught:
             session.send("Continue the requested work.")
-    assert caught.value is error
+    if isinstance(error, Exception):
+        assert isinstance(caught.value, ModelTurnLocalError)
+        assert caught.value.__cause__ is error
+    else:
+        assert caught.value is error
     assert len(requests) == 1
     assert ui.kinds().count("stream_end") == 1
     assert ui.kinds().count("stream_discarded") == 1
@@ -554,20 +559,32 @@ def test_rejected_usage_failure_cannot_finalize_a_successor(tmp_db, invalidate):
 
         with patch.object(ui, "on_status", fail_status), pytest.raises(RuntimeError) as caught:
             session._stream_response(1)
-    assert caught.value is error
+    assert isinstance(caught.value, ModelTurnLocalError)
+    assert caught.value.__cause__ is error
     assert len(requests) == 1
     assert ui.events == at_invalidation
     assert session._cancelled_partial_msg is None
 
 
-def test_rejected_usage_preserves_conversation_persistence_failure(tmp_db):
+@pytest.mark.parametrize("cleanup_fault", [None, "on_stream_end", "on_stream_discarded"])
+def test_rejected_usage_preserves_conversation_persistence_failure(tmp_db, cleanup_fault):
     ui = _CounterUI()
     with _session(WorkstreamKind.INTERACTIVE, ["separate"], ui=ui) as (session, _, requests):
         error = ConversationPersistenceError("unresolved conversation boundary")
         remember = session._remember_serving_failure_context
+        queued = "Keep this queued until storage recovers."
+        if cleanup_fault is not None:
+            original_callback = getattr(ui, cleanup_fault)
+
+            def fail_cleanup():
+                original_callback()
+                raise ValueError("private display state")
+
+            setattr(ui, cleanup_fault, fail_cleanup)
 
         def poison_at_rejection(exc, lane):
             remember(exc, lane)
+            session.queue_message(queued)
             session._conversation_persistence_error = error
 
         with (
@@ -578,9 +595,15 @@ def test_rejected_usage_preserves_conversation_persistence_failure(tmp_db):
     assert caught.value is error
     assert session._conversation_persistence_error is error
     assert len(requests) == 1
-    assert ui.stream_ends == ui.stream_discards == 1
+    assert ui.stream_ends == 1
+    assert ui.stream_discards == (0 if cleanup_fault == "on_stream_end" else 1)
     assert not [turn for turn in session.messages if turn.role == "assistant"]
     assert session._cancelled_partial_msg is None
+    assert queued not in [turn.text for turn in session.messages]
+    assert len(session._queued_messages) == 1
+    assert not session._pending_conversation_commits
+    assert session.conversation_persistence_fatal_revision() == 1
+    assert load_last_error(session._ws_id) == f"ConversationPersistenceError: {error}"
 
 
 @pytest.mark.parametrize("kind", _KINDS)

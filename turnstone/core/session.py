@@ -73,8 +73,27 @@ from turnstone.core.compaction import (
     SummaryRuntime,
     calibrated_chars_per_token,
 )
+from turnstone.core.completion_recovery import (
+    BACKEND_AUTH_EXC_NAMES,
+    BACKEND_CONNECT_EXC_NAMES,
+    BACKEND_KNOWN_EXC_NAMES,
+    BACKEND_NOT_FOUND_EXC_NAMES,
+    BACKEND_RATE_LIMIT_EXC_NAMES,
+    BACKEND_REPORTED_EXC_NAMES,
+    BACKEND_STREAM_EXC_NAMES,
+    BACKEND_TIMEOUT_EXC_NAMES,
+    BACKEND_TRANSIENT_EXC_NAMES,
+    MAX_COMPLETION_REISSUES,
+    CompletionRecovery,
+    CompletionRecoveryError,
+    EmptyCompletionError,
+    ModelTurnLocalError,
+    completion_cause,
+    is_context_overflow,
+    local_model_call,
+)
 from turnstone.core.config import get_searxng_engines, get_searxng_url, get_workspace_dir
-from turnstone.core.deadline import StreamAbortRef
+from turnstone.core.deadline import DeadlineCancelledError, StreamAbortRef
 from turnstone.core.edit import find_occurrences, pick_nearest
 from turnstone.core.ip_classify import AddressLane
 from turnstone.core.log import get_logger
@@ -171,7 +190,6 @@ from turnstone.core.model_turn import (
     create_provider,
     finalize_provider_blocks,
     folds_trailing_info,
-    is_empty_completion,
     lane_diagnostics,
     lane_error_is_retryable,
     lane_matches_explicit_handles,
@@ -390,17 +408,6 @@ class _MalformedToolBatchError(RuntimeError):
     """Provider tool calls cannot be executed without unambiguous identities."""
 
 
-class _EmptyCompletionError(RuntimeError):
-    """A completed response rejected by the conversation's structural policy."""
-
-    def __init__(self, result: ModelTurnResult) -> None:
-        self.result = result
-        message = "Model returned no answer or tool call. Retry the turn or choose another model."
-        if result.native_tools_enabled is not False:
-            message += " Automatic retry was skipped because the request may run server-side tools."
-        super().__init__(message)
-
-
 _CONVERSATION_PERSISTENCE_RETRY_BASE_SECONDS = 1.0
 _CONVERSATION_PERSISTENCE_RETRY_CAP_SECONDS = 60.0
 _SOFT_CLOSE_STRUCTURAL_WAIT_SECONDS = 1.0
@@ -607,7 +614,15 @@ class _CancelRef(list[Any]):
             # The hook owns its own generation publication because a claim can
             # linearize after registration but before this callback.  The
             # handle itself is already visible to cancel()'s atomic snapshot.
-            self._on_first_append()
+            try:
+                with local_model_call("stream admission"):
+                    self._on_first_append()
+            except BaseException:
+                # The adapter has not returned its iterator yet, so the drain
+                # cannot close this accepted response when local admission fails.
+                with contextlib.suppress(Exception):
+                    stream.close()
+                raise
         # If cancel was requested before the first chunk arrived (the worker
         # thread is blocked inside the provider generator waiting for the HTTP
         # response), close the stream immediately to unblock it.  Same for a
@@ -2522,133 +2537,10 @@ def _substitute_skill_args(
 # ---------------------------------------------------------------------------
 
 
-# ---------------------------------------------------------------------------
-# Backend boundary exception classification
-# ---------------------------------------------------------------------------
-#
-# ``_record_fatal_error`` routes a fatal exception through
-# ``_format_backend_error`` (defined on :class:`ChatSession`) which
-# matches the exception's class name against the sets below.  Matching
-# by name keeps the helper free of httpx / openai / anthropic imports —
-# the three SDKs each define their own subclasses, but the names
-# (``ReadTimeout``, ``APITimeoutError``, …) are stable across them and
-# the OpenAI and Anthropic SDKs use the same names.
-#
-# Lifted to module scope (rather than ``ClassVar`` constants on
-# ``ChatSession``) so the test suite can bind ``_format_backend_error``
-# to lightweight stubs that don't subclass the session — keeping the
-# helper testable without the full ChatSession construction surface
-# (storage init, prompt composition, registry plumbing).
-
-_BACKEND_TIMEOUT_EXC_NAMES: frozenset[str] = frozenset(
-    {"ReadTimeout", "WriteTimeout", "PoolTimeout", "APITimeoutError"}
-)
-_BACKEND_CONNECT_EXC_NAMES: frozenset[str] = frozenset(
-    {"ConnectTimeout", "ConnectError", "APIConnectionError"}
-)
-_BACKEND_NOT_FOUND_EXC_NAMES: frozenset[str] = frozenset({"NotFoundError"})
-_BACKEND_AUTH_EXC_NAMES: frozenset[str] = frozenset(
-    {"AuthenticationError", "PermissionDeniedError"}
-)
-_BACKEND_RATE_LIMIT_EXC_NAMES: frozenset[str] = frozenset(
-    {"RateLimitError", "UpstreamRateLimitError"}
-)
-_BACKEND_TRANSIENT_EXC_NAMES: frozenset[str] = frozenset({"UpstreamTransientError"})
-# Backend-reported stream errors stay OUT of ``_BACKEND_KNOWN_EXC_NAMES``:
-# their messages can carry a real context-window rejection, which
-# ``_is_ctx_overflow`` must see before the formatter categorizes them.  The
-# OpenAI SDK raises ``APIError`` for an in-band SSE error object;
-# ``UpstreamResponseError`` is Turnstone's equivalent for a compatibility
-# proxy that returns the same error as an HTTP-200 JSON body.  Its classified
-# rate-limit and transient subclasses stay IN the known set above so their
-# token-quota wording cannot be mistaken for context overflow.
-_BACKEND_REPORTED_EXC_NAMES: frozenset[str] = frozenset({"APIError", "UpstreamResponseError"})
-# Mid-response stream deaths: the normalized shape every guarded iterator
-# raises (``IncompleteStreamError`` from ``drain_stream`` /
-# ``transport_guarded``) plus the raw HTTPX/HTTPX2 names for any future
-# unguarded path (defense in depth).  Unioning them into
-# ``_BACKEND_KNOWN_EXC_NAMES`` is required — ``_format_backend_error`` gates
-# on that set before the branch lookups — and makes these three names
-# ineligible for ``_is_ctx_overflow``'s text-based overflow detection (its class
-# self-gate): harmless, since their texts are fixed transport/SSL strings
-# that never carry overflow phrases.
-_BACKEND_STREAM_EXC_NAMES: frozenset[str] = frozenset(
-    {"IncompleteStreamError", "ReadError", "RemoteProtocolError"}
-)
-
-_BACKEND_KNOWN_EXC_NAMES: frozenset[str] = (
-    _BACKEND_TIMEOUT_EXC_NAMES
-    | _BACKEND_CONNECT_EXC_NAMES
-    | _BACKEND_NOT_FOUND_EXC_NAMES
-    | _BACKEND_AUTH_EXC_NAMES
-    | _BACKEND_RATE_LIMIT_EXC_NAMES
-    | _BACKEND_TRANSIENT_EXC_NAMES
-    | _BACKEND_STREAM_EXC_NAMES
-)
-# The adapter-raised overflow: a SUCCESSFUL response whose stop reason says
-# the context window filled (``providers.ContextWindowExceededError``, raised
-# by the Anthropic adapter on ``model_context_window_exceeded``).  By name,
-# like the sets above, so this helper stays free of provider imports; kept
-# OUT of ``_BACKEND_KNOWN_EXC_NAMES`` because ``_is_ctx_overflow`` must say
-# yes to it, not skip it as an already-classified error.
-_CTX_OVERFLOW_EXC_NAMES: frozenset[str] = frozenset({"ContextWindowExceededError"})
-
-
 def _non_blank_or(text: str | None, fallback: str) -> str:
     """*text* when it has any non-whitespace, else *fallback* — the
     campaign-wide blankness doctrine for drained no-answer fallbacks."""
     return text if text is not None and text.strip() else fallback
-
-
-def _is_ctx_overflow(exc: BaseException) -> bool:
-    """True when *exc* looks like a context-window overflow from any backend.
-
-    Detection is by message *text* AMONG classes that aren't already a recognized
-    backend error: vLLM surfaces the SAME overflow as HTTP 400 ``BadRequestError``
-    on the OpenAI endpoint but HTTP 500 ``InternalServerError`` on the Anthropic
-    (``/v1/messages``) endpoint — neither is in ``_BACKEND_KNOWN_EXC_NAMES`` — so
-    text matching is what unifies them.  The class gate is the safety rail: an
-    overflow is never a recognized error, so excluding known classes can't suppress
-    a real overflow, but it keeps a retryable 429 ``RateLimitError`` — whose
-    token-quota text can read "… maximum number of tokens allowed per minute …" —
-    from being misread as a deterministic overflow.  That matters because EVERY
-    caller (the retry gates via ``_stop_retrying``, the send-loop recovery, the
-    chunker, the task_agent loop, the fatal-error formatter) routes an overflow to
-    a non-retryable / compaction path; a false positive on a 429 would turn a
-    transient rate-limit into a hard failure.  Centralizing the gate here keeps all
-    those callers consistent without each re-checking the class.
-
-    A free function (not a method) so the fatal-error formatter — unit-tested with
-    a stand-in ``self`` — and the other callers can share one definition.
-
-    The phrases are deliberately overflow-specific and cover the core providers
-    (OpenAI/vLLM "maximum context length"; Anthropic "exceed context limit,
-    decrease input length"; Google/Gemini "exceeds the maximum number of tokens
-    allowed").
-
-    An adapter's own ``ContextWindowExceededError`` — a SUCCESSFUL response whose
-    stop reason says the window filled — is recognized by class name, so the
-    stop-reason path and the rejection path are one overflow to every caller.
-    """
-    if type(exc).__name__ in _CTX_OVERFLOW_EXC_NAMES:
-        return True
-    if type(exc).__name__ in _BACKEND_KNOWN_EXC_NAMES:
-        return False
-    text = str(exc).lower()
-    return any(
-        s in text
-        for s in (
-            "context length",
-            "maximum context",
-            "available context size",
-            "context window",
-            "context limit",
-            "prompt is too long",
-            "input is too long",
-            "reduce the length of the input",
-            "maximum number of tokens",
-        )
-    )
 
 
 def _coerce_event_id(value: Any) -> int | None:
@@ -2710,8 +2602,7 @@ class SessionUI(Protocol):
 
         ``payload["phase"]`` is ``"start"`` (fields: ``trigger`` =
         ``"manual"``/``"auto"``, and for auto ``where``/``pct``),
-        ``"progress"`` (``part``/``total``/``depth``, or ``retry_in``/
-        ``error`` for a retry wait), or ``"end"`` (``ok``, and either
+        ``"progress"`` (``part``/``total``/``depth``), or ``"end"`` (``ok``, and either
         ``before_tokens``/``after_tokens``/``summary`` or ``reason``/
         ``message``).  Returns the UI event id when the transport
         assigns one (see :meth:`on_system_turn`) so the persisted
@@ -3002,6 +2893,7 @@ def _tool_turn_meta(
 # (Walk policy stays per-class — an auth refusal aborts the walk, a
 # wire-preparation fault continues it — only the mask reads this set.)
 _SELF_SURFACING_ERRORS: tuple[type[Exception], ...] = (
+    ModelTurnLocalError,
     BackendAuthUnavailableError,
     ModelAdmissionError,
     ModelContextLimitError,
@@ -3012,6 +2904,7 @@ _SELF_SURFACING_ERRORS: tuple[type[Exception], ...] = (
 # materialized-context validation, or caller lowering refused the request.
 # Recording them would paint a cluster-wide outage over one session's input.
 _NON_BACKEND_ERRORS: tuple[type[Exception], ...] = (
+    ModelTurnLocalError,
     ModelAdmissionError,
     ModelContextLimitError,
     WirePreparationError,
@@ -6602,24 +6495,29 @@ class ChatSession:
                     captured_principal
                 ),
             )
-            result = self._utility_completion(
-                [
-                    Turn.system(
-                        "# Instructions\n\n"
-                        "You are a conversation title generator. "
-                        "The user will show you the opening of a conversation. "
-                        "Respond with ONLY a short title of AT MOST 3 words — "
-                        "this is a hard rule; 2-3 words is ideal. "
-                        "Do NOT answer the conversation. Do NOT explain. "
-                        "Output ONLY the title text, nothing else."
-                    ),
-                    Turn.user(snippet),
-                ],
-                max_tokens=_TITLE_MAX_TOKENS,
-                lane=title_lane,
-                principal_id=captured_principal,
-            )
-            raw = result.content or ""
+            try:
+                result = self._utility_completion(
+                    [
+                        Turn.system(
+                            "# Instructions\n\n"
+                            "You are a conversation title generator. "
+                            "The user will show you the opening of a conversation. "
+                            "Respond with ONLY a short title of AT MOST 3 words — "
+                            "this is a hard rule; 2-3 words is ideal. "
+                            "Do NOT answer the conversation. Do NOT explain. "
+                            "Output ONLY the title text, nothing else."
+                        ),
+                        Turn.user(snippet),
+                    ],
+                    max_tokens=_TITLE_MAX_TOKENS,
+                    lane=title_lane,
+                    principal_id=captured_principal,
+                )
+                raw = result.content or ""
+            except EmptyCompletionError:
+                # Recovery exhausted without a title. Preserve the caller's
+                # latch and settle through the normal blank-title UI path.
+                raw = ""
             log.info("ws.title.llm_response", ws_id=ws_id[:8], raw=raw[:200])
             # ``content`` arrives with balanced/unterminated inline reasoning
             # already segregated at the drain seam (``split_inline_reasoning``).
@@ -9237,7 +9135,8 @@ class ChatSession:
         caller falls back to the bare ``f"{type(exc).__name__}: {exc}"``
         shape.  A context-window overflow is matched first by message *text* (it
         can arrive as several exception classes); everything else is matched by
-        class name (see the ``_BACKEND_*_EXC_NAMES`` sets above) so the same
+        class name (see the ``BACKEND_*_EXC_NAMES`` sets in
+        :mod:`turnstone.core.completion_recovery`) so the same
         helper covers
         HTTPX/HTTPX2 ``ReadTimeout`` / ``ConnectError``, OpenAI SDK
         ``APITimeoutError`` / ``APIConnectionError`` /
@@ -9272,6 +9171,12 @@ class ChatSession:
             model_label = f"{alias} (id={backend_id})"
         else:
             model_label = alias or backend_id or "?"
+        if isinstance(exc, ModelTurnLocalError):
+            if isinstance(exc.__cause__, _MemoryIndexContextError):
+                return str(exc.__cause__)
+            return str(exc)
+        context_overflow = is_context_overflow(exc)
+        exc = completion_cause(exc)
         raw_msg = str(exc).strip()
         raw_tail = f" raw={raw_msg!r}" if raw_msg else ""
 
@@ -9304,10 +9209,10 @@ class ChatSession:
         # Context overflow — matched by text, because it arrives as BadRequestError
         # (OpenAI 400) OR InternalServerError (Anthropic-compat 500), which would
         # otherwise render as an opaque class name with no hint that the prompt was
-        # simply too large.  _is_ctx_overflow self-gates on "not a known class", so a
+        # simply too large.  is_context_overflow self-gates on "not a known class", so a
         # recognized error (e.g. a RateLimitError whose quota text mentions a token
         # maximum) returns False here and falls through to its own specific message.
-        if _is_ctx_overflow(exc):
+        if context_overflow:
             return (
                 f"Context window exceeded for model={model_label}: the conversation "
                 f"is too large to send. Auto-compaction should shrink it and retry; "
@@ -9373,8 +9278,8 @@ class ChatSession:
             and 400 <= status_code <= 599
         )
         if (
-            name not in _BACKEND_KNOWN_EXC_NAMES
-            and name not in _BACKEND_REPORTED_EXC_NAMES
+            name not in BACKEND_KNOWN_EXC_NAMES
+            and name not in BACKEND_REPORTED_EXC_NAMES
             and not is_http_status_error
         ):
             return None
@@ -9394,21 +9299,21 @@ class ChatSession:
                 provider_label = diagnostics.provider_name or diagnostics.provider_type
             except Exception:
                 log.debug("session.fatal.lane_diagnostics_failed", exc_info=True)
-        if name in _BACKEND_TIMEOUT_EXC_NAMES:
+        if name in BACKEND_TIMEOUT_EXC_NAMES:
             return (
                 f"Backend timeout ({name}): no response from {provider_label} "
                 f"at {base_url} for model={model_label}. "
                 f"The model server may be wedged — check it's accepting completion requests."
                 f"{raw_tail}"
             )
-        if name in _BACKEND_CONNECT_EXC_NAMES:
+        if name in BACKEND_CONNECT_EXC_NAMES:
             return (
                 f"Backend unreachable ({name}): cannot reach {provider_label} "
                 f"at {base_url} for model={model_label}. "
                 f"Check the URL, that the server is running, and that this host can reach it."
                 f"{raw_tail}"
             )
-        if name in _BACKEND_NOT_FOUND_EXC_NAMES:
+        if name in BACKEND_NOT_FOUND_EXC_NAMES:
             return (
                 f"Backend reports model not loaded ({name}): {provider_label} "
                 f"at {base_url} has no model named '{model_label}'. "
@@ -9416,26 +9321,26 @@ class ChatSession:
                 f"(GET /v1/models on the backend lists what it actually has)."
                 f"{raw_tail}"
             )
-        if name in _BACKEND_AUTH_EXC_NAMES:
+        if name in BACKEND_AUTH_EXC_NAMES:
             return (
                 f"Backend rejected credentials ({name}): {provider_label} "
                 f"at {base_url} (model={model_label}). "
                 f"Check the API key configured for this model alias."
                 f"{raw_tail}"
             )
-        if name in _BACKEND_RATE_LIMIT_EXC_NAMES:
+        if name in BACKEND_RATE_LIMIT_EXC_NAMES:
             return (
                 f"Backend rate-limited ({name}): {provider_label} "
                 f"at {base_url} (model={model_label})."
                 f"{raw_tail}"
             )
-        if name in _BACKEND_TRANSIENT_EXC_NAMES:
+        if name in BACKEND_TRANSIENT_EXC_NAMES:
             return (
                 f"Backend returned a transient application error ({name}): "
                 f"{provider_label} at {base_url} (model={model_label}); retries "
                 f"did not recover it.{raw_tail}"
             )
-        if name in _BACKEND_REPORTED_EXC_NAMES:
+        if name in BACKEND_REPORTED_EXC_NAMES:
             return (
                 f"Backend returned an error instead of a usable stream ({name}): "
                 f"{provider_label} at {base_url} (model={model_label})."
@@ -9454,7 +9359,7 @@ class ChatSession:
                 f"at {base_url} (model={model_label}). The upstream server returned "
                 f"an application error before generation started.{raw_tail}"
             )
-        if name in _BACKEND_STREAM_EXC_NAMES:
+        if name in BACKEND_STREAM_EXC_NAMES:
             # First sentence kept short so Discord's message[:500] cut keeps
             # the identity even when it loses the raw tail.
             return (
@@ -9463,7 +9368,7 @@ class ChatSession:
                 f"was generating; retries did not recover it. Check "
                 f"network-path/TLS stability to the endpoint.{raw_tail}"
             )
-        return None  # unreachable — `name` is in _BACKEND_KNOWN_EXC_NAMES by construction
+        return None  # unreachable — `name` is in BACKEND_KNOWN_EXC_NAMES by construction
 
     def _utility_completion(
         self,
@@ -9556,9 +9461,11 @@ class ChatSession:
         clamped = min(max_tokens, caps.max_output_tokens) if caps.max_output_tokens else max_tokens
         suppress_reasoning = lane_thinking_suppressed(lane)
         lane = lane_without_thinking(lane)
-        result = model_turn(
+        return model_turn(
             lane,
             turns,
+            product_recovery=True,
+            on_completed=lambda usage: self._record_aux_usage(usage, model=lane.model),
             max_tokens=clamped,
             temperature=(
                 self.temperature if temperature is None and use_session_temperature else temperature
@@ -9575,11 +9482,6 @@ class ChatSession:
             resolve_attachments=resolve_attachments,
             validate_wire=validate_wire,
         )
-        # Utility completions (title gen, compaction, web-fetch extraction)
-        # bypass the streaming on_status path — record their usage so the
-        # governance dashboard reflects this spend.
-        self._record_aux_usage(result.usage, model=lane.model)
-        return result
 
     def _record_aux_usage(self, usage: UsageInfo | None, *, model: str | None = None) -> None:
         """Persist token usage for a non-streaming auxiliary completion.
@@ -9768,7 +9670,7 @@ class ChatSession:
     # body iteration (see _stream_response) — the consumer-side twin of
     # model_turn's _DRAIN_RETRIES, distinct from the creation-time
     # _MAX_RETRIES above.
-    _MID_STREAM_RETRIES = 2
+    _MID_STREAM_RETRIES = MAX_COMPLETION_REISSUES
     _RETRY_BASE_DELAY = 1.0  # seconds
 
     def _get_health_tracker(self) -> BackendHealthTracker | None:
@@ -9811,13 +9713,12 @@ class ChatSession:
         """Run one plant call with lane-swap fallback: one ``model_turn``
         ladder per lane.
 
-        Success records at the request-accepted instant (the consumer's
-        ``on_stream_armed`` hook), failure records HERE once per lane's
-        whole ladder, and an ARMED death records neither — a mid-stream
-        death is not a creation-health signal, and it re-raises to the
-        re-issue ladder in ``_stream_response`` rather than being
-        swallowed into try-the-next-alias, which would double-render the
-        turn.
+        Success records at stream admission (the consumer's ``on_stream_armed``
+        hook); creation-ladder exhaustion records failure HERE, once per lane.
+        An ARMED death records neither: it re-raises to the visible-stream
+        owner in ``_stream_response`` instead of streaming another alias over
+        displayed content. An accepted response that shared recovery rejected
+        (an empty completion) is that owner's business too, never the walk's.
         """
         tracker = self._get_health_tracker()
         primary_lane = self._primary_lane()
@@ -9830,9 +9731,9 @@ class ChatSession:
                 my_generation,
                 principal_id=principal_id,
             )
-        except BackendAuthUnavailableError:
-            # Explicit fail-closed policy: never reinterpret an authentication
-            # refusal as backend health and never route it to a static fallback.
+        except (BackendAuthUnavailableError, ModelTurnLocalError, CompletionRecoveryError):
+            # Authentication and local faults stop here; accepted responses
+            # belong to shared recovery.
             raise
         except Exception as primary_err:
             if consumer.attempt_armed:
@@ -9844,41 +9745,26 @@ class ChatSession:
             # (fold posture follows lane.capabilities), so another lane's
             # posture may serve a turn the primary's could not.
             if tracker and _speaks_for_backend(primary_err):
-                tracker.record_failure()
+                with local_model_call("backend health"):
+                    tracker.record_failure()
             if not self._registry or not self._registry.fallback:
                 raise
-            # Try each fallback model.  Prefer non-degraded backends first,
-            # but still try degraded ones as a last resort.
-            degraded_fallbacks: list[str] = []
+            # Try each fallback model: healthy backends first, degraded ones as
+            # a last resort, configured order within each tier.
+            candidates: list[tuple[str, bool]] = []
             for alias in self._registry.fallback:
                 if alias == self._model_alias:
                     continue
-                # Skip degraded backends on the first pass
+                degraded = False
                 if self._health_registry:
                     fb_tracker = self._health_registry.get_tracker_for_alias(self._registry, alias)
-                    if fb_tracker and fb_tracker.is_degraded:
-                        degraded_fallbacks.append(alias)
-                        continue
-                result = self._try_fallback_lane(
-                    alias,
-                    consumer,
-                    prepare_wire,
-                    my_generation,
-                    principal_id=principal_id,
-                )
-                if result is not None:
-                    return result
-            # Second pass: try degraded backends as last resort
-            for alias in degraded_fallbacks:
-                if not self._publish_for_generation(
-                    my_generation,
-                    functools.partial(
-                        self.ui.on_info,
-                        f"[Fallback {alias} is degraded, trying anyway]",
-                    ),
-                    allow_cancelled=False,
-                ):
-                    raise GenerationCancelled() from None
+                    degraded = bool(fb_tracker and fb_tracker.is_degraded)
+                candidates.append((alias, degraded))
+            for alias, degraded in sorted(candidates, key=lambda candidate: candidate[1]):
+                if degraded:
+                    self._publish_fallback_notice(
+                        my_generation, f"[Fallback {alias} is degraded, trying anyway]"
+                    )
                 result = self._try_fallback_lane(
                     alias,
                     consumer,
@@ -9889,6 +9775,17 @@ class ChatSession:
                 if result is not None:
                     return result
             raise primary_err
+
+    def _publish_fallback_notice(self, my_generation: int, message: str) -> None:
+        """Publish one fallback-walk notice, or stop the walk for a superseded owner."""
+        with local_model_call("fallback publication"):
+            published = self._publish_for_generation(
+                my_generation,
+                functools.partial(self.ui.on_info, message),
+                allow_cancelled=False,
+            )
+        if not published:
+            raise GenerationCancelled() from None
 
     def _try_fallback_lane(
         self,
@@ -9901,10 +9798,10 @@ class ChatSession:
     ) -> ModelTurnResult | None:
         """Attempt a single fallback lane.  Returns the result or ``None``.
 
-        Records failure on the fallback's health tracker (success records
-        via the armed hook) so the two-pass ordering learns across request
-        cycles.  An ARMED death re-raises rather than returning ``None`` —
-        its tokens are on screen; the next alias must not stream over them.
+        Records failure on the fallback's health tracker (success records via the armed
+        hook) so health ordering learns across requests. An ARMED death re-raises rather
+        than returning ``None``: its tokens may be on screen, and the next alias must not
+        stream over them.
 
         Caller must ensure ``self._registry`` is not ``None``.
         """
@@ -9929,15 +9826,9 @@ class ChatSession:
                 backend_auth_resolver=backend_auth_resolver,
             )
             fb_lane = self._build_main_lane(binding.lane)
-            if not self._publish_for_generation(
-                my_generation,
-                functools.partial(
-                    self.ui.on_info,
-                    f"[Primary model failed, falling back to {alias}]",
-                ),
-                allow_cancelled=False,
-            ):
-                raise GenerationCancelled() from None
+            self._publish_fallback_notice(
+                my_generation, f"[Primary model failed, falling back to {alias}]"
+            )
             return self._model_turn_with_retry(
                 fb_lane,
                 fb_tracker,
@@ -9946,8 +9837,8 @@ class ChatSession:
                 my_generation,
                 principal_id=principal_id,
             )
-        except BackendAuthUnavailableError:
-            # Fail-closed policy — never another lane's business.
+        except (BackendAuthUnavailableError, ModelTurnLocalError, CompletionRecoveryError):
+            # Local policy and accepted responses are never another lane's business.
             raise
         except Exception as fb_err:
             if consumer.attempt_armed:
@@ -9956,7 +9847,8 @@ class ChatSession:
             # and it must not abort the walk: prepare is lane-variant, so
             # the next alias may still serve the turn.
             if fb_tracker and _speaks_for_backend(fb_err):
-                fb_tracker.record_failure()
+                with local_model_call("backend health"):
+                    fb_tracker.record_failure()
             # Class name only in the UI line: a ConnectError's text can
             # carry a credential-bearing base_url, and this string lands in
             # the browser transcript and the persisted event stream.
@@ -9966,15 +9858,9 @@ class ChatSession:
                 error_type=type(fb_err).__name__,
             )
             log.debug("fallback failure detail", exc_info=True)
-            if not self._publish_for_generation(
-                my_generation,
-                functools.partial(
-                    self.ui.on_info,
-                    f"[Fallback {alias} also failed: {type(fb_err).__name__}]",
-                ),
-                allow_cancelled=False,
-            ):
-                raise GenerationCancelled() from None
+            self._publish_fallback_notice(
+                my_generation, f"[Fallback {alias} also failed: {type(fb_err).__name__}]"
+            )
             return None
 
     def _stop_retrying(
@@ -9982,16 +9868,14 @@ class ChatSession:
         exc: BaseException,
         attempt: int,
         lane: ModelLane,
-        max_retries: int | None = None,
     ) -> bool:
-        """Terminal-retry predicate shared by every API retry loop (stream
-        creation, summary, task_agent, mid-stream re-issue): stop on a
-        non-retryable error class, a deterministic context-overflow (retrying
-        an identical oversized payload is pointless), or ladder exhaustion.
-        *max_retries* overrides the creation ladder's ``_MAX_RETRIES`` for
-        loops with their own cap (``_MID_STREAM_RETRIES``)."""
-        cap = self._MAX_RETRIES if max_retries is None else max_retries
-        return not lane_error_is_retryable(lane, exc) or _is_ctx_overflow(exc) or attempt == cap
+        """Stop the main lane's creation ladder on a permanent error,
+        deterministic context overflow, or exhausted allowance."""
+        return (
+            not lane_error_is_retryable(lane, exc)
+            or is_context_overflow(exc)
+            or attempt == self._MAX_RETRIES
+        )
 
     def _model_turn_with_retry(
         self,
@@ -10009,10 +9893,11 @@ class ChatSession:
         ``on_first_append`` hook marks the request-accepted instant, which
         classifies creation vs mid-stream: an ARMED attempt's death
         re-raises to the re-issue ladder (its tokens may be on screen, and
-        a silent same-lane retry would double-render), while an unarmed
-        failure is a creation failure and retries here.  Generation-scoping
-        makes an orphan's ref read ``aborted`` via supersession, so
-        ``model_turn`` refuses dispatch for it.
+        a silent same-lane retry would double-render). An unarmed failure is
+        a creation failure and retries here, including a JSON error body the
+        adapter rejected before any stream existed.
+        Generation-scoping makes an orphan's ref read ``aborted`` via
+        supersession, so ``model_turn`` refuses dispatch for it.
 
         Sampling knobs ride the lane (see ``_build_main_lane``); the
         credential resolves INSIDE ``model_turn`` per attempt, after its
@@ -10090,6 +9975,7 @@ class ChatSession:
                     cancel_ref=ref,
                     acting_principal_id=principal_id or "",
                     on_chunk=consumer,
+                    product_recovery=True,
                 )
             except Exception as e:
                 # A Stop — or supersession — is never a backend failure, so
@@ -10097,10 +9983,14 @@ class ChatSession:
                 # pre-dispatch DeadlineCancelledError, a post-``cancel()``
                 # transport death, and an orphan's error into
                 # ``GenerationCancelled``.
-                self._check_cancelled(my_generation)
-                if consumer.attempt_armed:
-                    # The re-issue ladder owns armed deaths (UI finalize →
-                    # notice → backoff → discard → full re-create).
+                if not isinstance(e, EmptyCompletionError):
+                    self._check_cancelled(my_generation)
+                if isinstance(e, (ModelTurnLocalError, CompletionRecoveryError)) or (
+                    consumer.attempt_armed
+                ):
+                    # Shared recovery owns accepted responses; the re-issue
+                    # ladder owns armed deaths (UI finalize → notice →
+                    # backoff → discard → full re-create).
                     raise
                 ename = type(e).__name__
                 cause_name = (
@@ -12738,7 +12628,7 @@ class ChatSession:
                             # Context overflow recovery: if the API rejects the
                             # request due to exceeding the context window, compact
                             # the conversation and retry once.
-                            if not _is_ctx_overflow(ctx_err):
+                            if not is_context_overflow(ctx_err):
                                 raise
                             log.warning(
                                 "Context overflow detected (%s), compacting and retrying",
@@ -12768,6 +12658,8 @@ class ChatSession:
                                 # a newer one — the same race every other compaction
                                 # site already guards.
                                 self._compact_messages(auto=True, my_generation=my_generation)
+                            except ModelTurnLocalError:
+                                raise
                             except Exception:
                                 # RECOVERY-machinery failure: the overflow error
                                 # is still the actionable one, and its wording
@@ -12788,7 +12680,7 @@ class ChatSession:
                                 result = self._stream_response(my_generation)
                             except Exception as retry_err:
                                 recovered_failures.append(retry_err)
-                                if not _is_ctx_overflow(retry_err):
+                                if not is_context_overflow(retry_err):
                                     # A post-compaction failure that is NOT a
                                     # recurring overflow surfaces as ITSELF
                                     # (implicitly chained to ctx_err): masking
@@ -14629,14 +14521,12 @@ class ChatSession:
         whole turn (the APIs cannot resume a generation) up to
         ``_MID_STREAM_RETRIES`` times.
 
-        Ladder stacking: a 3-way stack — each re-issue runs the full
-        creation walk, itself the ``_MAX_RETRIES`` loop times the
-        fallback-chain passes, so a persistently transient-shaped failure
-        burns (_MID_STREAM_RETRIES + 1) x ((_MAX_RETRIES + 1) + fallback
-        passes) calls before the terminal error surfaces.  Both inner
-        layers are the creation path's own ladders (task_agent's
-        ``_api_call`` documents the equivalent 2-way stack); every layer
-        stops immediately on a non-retryable class.
+        Empty ordinary stops share that allowance with stream deaths. Both
+        require an accepted request known to disable native tools. A JSON
+        error body rejected before any stream exists is a creation failure
+        and belongs to the lane's creation ladder and fallback walk. Each
+        reissue retains that walk; it cannot reset the accepted-attempt
+        allowance.
         """
         # Reject an orphan before any provider-bound work. Prefix refresh and
         # first-index capture run at the request-admission boundary below, after
@@ -14645,7 +14535,7 @@ class ChatSession:
         # the immutable snapshot.
         self._check_generation_admission(my_generation)
         principal_id = self._generation_principals.get(my_generation)
-        attempt = 0
+        recovery = CompletionRecovery(max_reissues=self._MID_STREAM_RETRIES)
         # The latest non-empty dead attempt's flushed text.  Wrapper-LOCAL
         # (read off the frame's consumer, never a session slot), so an
         # orphaned generation cannot poison a live one's preservation.
@@ -14728,8 +14618,9 @@ class ChatSession:
 
         def _discard_failed_stream() -> None:
             """Finalize rejected display state while the caller owns its generation."""
-            self.ui.on_stream_end()
-            self._ui_stream_discarded()
+            with local_model_call("stream discard"):
+                self.ui.on_stream_end()
+                self._ui_stream_discarded()
 
         with self._recovered_serving_failures() as recovered_failures:
             while True:
@@ -14745,9 +14636,8 @@ class ChatSession:
                     # ended it CLEANLY, so without this re-check the turn
                     # commits as complete and its tool calls execute.
                     self._check_cancelled(my_generation)
-                    consumer.finish_stream()
-                    if is_empty_completion(result):
-                        raise _EmptyCompletionError(result)
+                    with local_model_call("stream finalization"):
+                        consumer.finish_stream()
                     # Finalization emits terminal warnings/stream_end and may
                     # legalize a truncated result.  Keep that complete policy step
                     # on the same owner rail as the carry flush above so a force
@@ -14760,7 +14650,8 @@ class ChatSession:
                             self, my_generation
                         ):
                             raise GenerationCancelled()
-                        return self._finalize_stream_result(result)
+                        with local_model_call("result publication"):
+                            return self._finalize_stream_result(result)
                 except GenerationCancelled:
                     # A Stop during an attempt (incl. the re-create/TTFT window
                     # after a death) — finalize the streamed display if the
@@ -14778,6 +14669,10 @@ class ChatSession:
                         self.ui.on_stream_end,
                         allow_cancelled=True,
                     )
+                    raise
+                except ModelTurnLocalError:
+                    if consumer.attempt_armed:
+                        self._publish_for_generation(my_generation, _discard_failed_stream)
                     raise
                 except Exception as e:
                     attempt_provenance = None
@@ -14797,7 +14692,7 @@ class ChatSession:
                     dead_partial = new_dead or dead_partial
                     if attempt_provenance is not None and (new_dead or dead_provenance is None):
                         dead_provenance = attempt_provenance
-                    if isinstance(e, _EmptyCompletionError) and failed_lane is not None:
+                    if isinstance(e, EmptyCompletionError) and failed_lane is not None:
                         # This call completed and was billed. A same-generation
                         # Stop still accounts for it, like an accepted result;
                         # supersession and shutdown remain fenced. Budget checks
@@ -14819,13 +14714,29 @@ class ChatSession:
                         except GenerationCancelled:
                             _promote_dead_partial()
                             raise
-                        except BaseException:
+                        except BaseException as error:
                             # Usage storage already logs its own failures. A UI
                             # callback failure or conversation-persistence poison
                             # must finalize display and remain fatal, including
                             # when Stop races the failed commit. Never publish
                             # over a successor or turn this into a cancel marker.
-                            self._publish_for_generation(my_generation, _discard_failed_stream)
+                            try:
+                                self._publish_for_generation(my_generation, _discard_failed_stream)
+                            except Exception:
+                                # The failed commit is the actionable fault: a
+                                # display callback that also fails must neither
+                                # mask it nor divert persistence poison into
+                                # generic queued-message cleanup.
+                                log.debug(
+                                    "stream.rejected_usage.discard_failed",
+                                    exc_info=True,
+                                )
+                            if isinstance(error, Exception) and not isinstance(
+                                error, (ModelTurnLocalError, ConversationPersistenceError)
+                            ):
+                                raise ModelTurnLocalError(
+                                    error, stage="usage publication"
+                                ) from error
                             raise
                         if not usage_committed:
                             _promote_dead_partial()
@@ -14842,6 +14753,16 @@ class ChatSession:
                         # has no reader even though its exception escapes.
                         self._forget_serving_failure_context(e)
                         raise
+                    if isinstance(e, EmptyCompletionError):
+                        try:
+                            with local_model_call("empty-result finalization"):
+                                consumer.finish_stream()
+                        except GenerationCancelled:
+                            _promote_dead_partial()
+                            raise
+                        except Exception:
+                            self._publish_for_generation(my_generation, _discard_failed_stream)
+                            raise
                     if not armed:
                         # Creation-phase failure: the walk already ran its full
                         # ladder + fallbacks.  Mid re-issue it must not MASK
@@ -14860,9 +14781,9 @@ class ChatSession:
                         # base_url verbatim.
                         if (
                             last_stream_death is None
-                            or isinstance(last_stream_death, _EmptyCompletionError)
+                            or isinstance(last_stream_death, EmptyCompletionError)
                             or isinstance(e, _SELF_SURFACING_ERRORS)
-                            or _is_ctx_overflow(e)
+                            or is_context_overflow(e)
                         ):
                             raise
                         log.warning(
@@ -14870,31 +14791,17 @@ class ChatSession:
                             error_type=type(e).__name__,
                         )
                         raise last_stream_death from None
-                    # Transport failures use the shared _stop_retrying,
-                    # capped at _MID_STREAM_RETRIES, judged by the lane that
-                    # ACTUALLY armed this stream (a fallback's retryable set
-                    # can differ, e.g. ResponsesStreamFailedError).  The
-                    # overflow arm applies here too — an overflow can surface
-                    # mid-consumption (error-frame lanes), and it must fall
-                    # through to send()'s compact-and-retry arm rather than
-                    # burn re-issues on a deterministic failure.
+                    # The shared controller judges the lane that accepted the
+                    # request. An overflow bypasses identical replay and
+                    # reaches send()'s compact-and-retry path.
                     serving_lane = consumer.lane
                     if serving_lane is None:
                         raise RuntimeError("armed stream has no serving model lane") from e
-                    if isinstance(e, _EmptyCompletionError):
-                        # Share the two-reissue budget with transport failures.
-                        # Each reissue resends the full context and can repeat
-                        # its latency/cost; this caps attempts, not wall time.
-                        # Reasoning followed by stop does not establish refusal.
-                        terminal = (
-                            attempt >= self._MID_STREAM_RETRIES
-                            or e.result.native_tools_enabled is not False
-                            or self._budget_exhausted
-                        )
-                    else:
-                        terminal = self._stop_retrying(
-                            e, attempt, serving_lane, max_retries=self._MID_STREAM_RETRIES
-                        )
+                    terminal = not recovery.consume_reissue(
+                        e,
+                        retryable=lane_error_is_retryable(serving_lane, e),
+                        stopped=self._budget_exhausted,
+                    )
                     if terminal:
                         # Terminal: finalize AND discard, exactly like the
                         # retry arm.  Keeping the buffers bought nothing — the
@@ -14920,15 +14827,17 @@ class ChatSession:
                     # per attempt.
                     self._forget_serving_failure_context(last_stream_death)
                     last_stream_death = e
-                    # Delay from the PRE-increment attempt index — the same
-                    # convention as the sibling ladders' range loops.
-                    delay = self._RETRY_BASE_DELAY * (2**attempt)
-                    attempt += 1
-                    cause = type(e.__cause__).__name__ if e.__cause__ else type(e).__name__
+                    delay = self._RETRY_BASE_DELAY * (2 ** (recovery.reissues - 1))
+                    provider_failure = completion_cause(e)
+                    cause = (
+                        type(provider_failure.__cause__).__name__
+                        if provider_failure.__cause__
+                        else type(provider_failure).__name__
+                    )
                     log.warning(
                         "stream.retry",
                         error_type=cause,
-                        attempt=attempt,
+                        attempt=recovery.reissues,
                         model=serving_lane.model,
                         alias=serving_lane.alias,
                         registry_generation=serving_lane.registry_generation,
@@ -14963,16 +14872,17 @@ class ChatSession:
                         ):
                             _promote_dead_partial()
                             raise GenerationCancelled() from None
-                        self.ui.on_stream_end()
                         notice = (
                             "model returned no answer"
-                            if isinstance(e, _EmptyCompletionError)
+                            if isinstance(e, EmptyCompletionError)
                             else f"stream died mid-response ({cause})"
                         )
-                        self.ui.on_info(
-                            f"[{notice} — retrying in "
-                            f"{delay:.0f}s ({attempt}/{self._MID_STREAM_RETRIES})]"
-                        )
+                        with local_model_call("retry publication"):
+                            self.ui.on_stream_end()
+                            self.ui.on_info(
+                                f"[{notice} — retrying in "
+                                f"{delay:.0f}s ({recovery.reissues}/{self._MID_STREAM_RETRIES})]"
+                            )
                     # Keep the consumer armed until its stream_end is emitted:
                     # Stop during rejection/usage publication must still flush
                     # and finalize it. Backoff and re-creation have no live attempt.
@@ -14997,14 +14907,11 @@ class ChatSession:
                             # source) and reset the inflight snapshot BEFORE any
                             # retried token lands, or every consumer appends the
                             # retried text onto the dead attempt's.
-                            self._ui_stream_discarded()
-                            # Spinner for the recreate+TTFT window, and the fresh
-                            # segment watermark — AFTER the truncate, so a later
-                            # discard cannot resurrect this dead segment.  A
-                            # pre-first-token death leaves the spinner RUNNING
-                            # (_stop_spinner_once never fired) — on_thinking_start
-                            # is idempotent at the callee.
-                            self.ui.on_thinking_start()
+                            with local_model_call("retry preparation"):
+                                self._ui_stream_discarded()
+                                # Reset the spinner and segment watermark only
+                                # after discarding the rejected attempt.
+                                self.ui.on_thinking_start()
                             self._cancel_stream = None  # drop the dead SDK handle
                         # A concurrent ModelRegistry.reload() closes cached
                         # clients whose connection config changed — the
@@ -15377,7 +15284,6 @@ class ChatSession:
         reasoning_effort: str | None = None,
         cancel_ref_factory: Callable[[], list[Any]] | None = None,
         check_cancelled: Callable[[], None] | None = None,
-        backoff_or_cancelled: Callable[[float], None] | None = None,
         on_progress: Callable[[dict[str, Any]], None] | None = None,
         use_session_temperature: bool = True,
     ) -> SummaryRuntime:
@@ -15425,21 +15331,13 @@ class ChatSession:
                 else continuation_overhead_tokens
             ),
             complete=_complete,
-            stop_retrying=lambda error, attempt: self._stop_retrying(error, attempt, lane),
-            is_context_overflow=_is_ctx_overflow,
+            is_context_overflow=is_context_overflow,
             check_cancelled=(
                 check_cancelled
                 if check_cancelled is not None
                 else lambda: self._check_cancelled(my_generation)
             ),
-            backoff_or_cancelled=(
-                backoff_or_cancelled
-                if backoff_or_cancelled is not None
-                else lambda delay: self._backoff_or_cancelled(delay, my_generation)
-            ),
             on_progress=progress,
-            max_retries=self._MAX_RETRIES,
-            retry_base_delay=self._RETRY_BASE_DELAY,
         )
 
     # -- Coordinator handles across a compaction --------------------------------
@@ -16081,6 +15979,8 @@ class ChatSession:
                 my_generation=my_generation,
                 compaction_id=compaction_id,
             )
+        except ModelTurnLocalError:
+            raise
         except Exception as e:
             return self._compaction_bailed(
                 "error",
@@ -17569,22 +17469,29 @@ class ChatSession:
         llm_judge = self._ensure_output_guard_judge()
         if llm_judge is None:
             return None
+
+        def _retired(cancel_event: threading.Event | None) -> bool:
+            # Both callers hold the generation lock. The captured event fences
+            # an evaluation whose judge was retired while its first call ran.
+            return (
+                (cancel_ref is not None and cancel_ref.aborted)
+                or self._cancel_event.is_set()
+                or _generation_superseded(self, my_generation)
+                or self._output_guard_judge is not llm_judge
+                or (cancel_event is not None and cancel_event.is_set())
+            )
+
         # Validate and snapshot the complete generation atomically.  A model
         # reload or live guard-alias edit may have replaced ``llm_judge`` after
         # ensure returned; falling back to the heuristic tier is safer than
         # pairing it with the replacement's budget or cancel event.
         with self._output_guard_judge_lock:
-            if (
-                (cancel_ref is not None and cancel_ref.aborted)
-                or self._cancel_event.is_set()
-                or _generation_superseded(self, my_generation)
-                or self._output_guard_judge is not llm_judge
-            ):
+            cancel_event = self._output_guard_judge_cancel
+            if _retired(cancel_event):
                 if cancel_ref is not None and cancel_ref.aborted:
                     raise GenerationCancelled()
                 return None
             limiter = self._output_guard_judge_rl
-            cancel_event = self._output_guard_judge_cancel
             allowed = limiter.consume()
         if not allowed:
             log.info(
@@ -17593,6 +17500,20 @@ class ChatSession:
                 func_name=func_name,
             )
             return None
+
+        def _admit_reissue() -> None:
+            with self._output_guard_judge_lock:
+                if _retired(cancel_event):
+                    raise DeadlineCancelledError("output judge retired before reissue")
+                allowed = limiter.consume()
+            if not allowed:
+                log.info(
+                    "output_guard_judge.rate_limited",
+                    call_id=call_id,
+                    func_name=func_name,
+                )
+                raise ModelAdmissionError("Output judge request limit reached.")
+
         try:
             return llm_judge.evaluate(
                 output,
@@ -17604,6 +17525,7 @@ class ChatSession:
                 heuristic_flags=heuristic_flags,
                 heuristic_annotations=heuristic_annotations,
                 cancel_event=cancel_event,
+                admit_reissue=_admit_reissue,
                 backend_auth_resolver=self._model_backend_auth_resolver_for_principal(principal_id),
             )
         except Exception:
@@ -25496,94 +25418,62 @@ class ChatSession:
             turns: list[Turn],
             _tools: list[dict[str, Any]] | None = tools,
         ) -> ModelTurnResult:
-            # One plant call per attempt through ``model_turn`` — the seam
-            # passes (sanitize, minted-id restore, Phase 5 reasoning attach)
-            # and the native-lane re-ingest live there now, shared with every
-            # lane (#827).  Retry policy at THIS layer stays here: the
-            # sub-harness owns its backoff and salvage semantics.
-            # ``model_turn`` itself re-issues only drain-time mid-stream
-            # deaths (2 attempts, its own short backoff — the request-level
-            # retry the SDK gave the retired non-streaming transport), so
-            # the two ladders stack multiplicatively on transient-shaped
-            # failures; both are short, and a deterministic failure (e.g. a
-            # server that never sends finish reasons) burns
-            # (_MAX_RETRIES+1) x (drain attempts) calls before the
-            # remediation error surfaces.  Re-lowering per attempt is fine —
-            # the passes are deterministic and ``turns``/``wire_id_map`` are
-            # invariant across attempts (the retry path only sleeps and
-            # re-sends).
-            last_err: Exception | None = None
-            for attempt in range(self._MAX_RETRIES + 1):
-                try:
-                    cancel_scope.check()
-                    agent_result = model_turn(
-                        lane,
-                        turns,
-                        tools=_tools,
-                        max_tokens=self.max_tokens,
-                        temperature=self.temperature if same_lane else None,
-                        reasoning_effort=agent_reasoning_effort,
-                        mint=mint,
-                        wire_id_map=wire_id_map,
-                        cancel_ref=cancel_scope.cancel_ref,
-                        acting_principal_id=agent_principal,
-                        prepare_wire=lambda wire, serving_lane: self._prepare_lowered_wire_messages(
-                            wire,
-                            caps=require_lane_capabilities(serving_lane),
-                        ),
+            cancel_scope.check()
+            try:
+                agent_result = model_turn(
+                    lane,
+                    turns,
+                    tools=_tools,
+                    product_recovery=True,
+                    on_completed=lambda usage: self._record_aux_usage(usage, model=lane.model),
+                    max_tokens=self.max_tokens,
+                    temperature=self.temperature if same_lane else None,
+                    reasoning_effort=agent_reasoning_effort,
+                    mint=mint,
+                    wire_id_map=wire_id_map,
+                    cancel_ref=cancel_scope.cancel_ref,
+                    acting_principal_id=agent_principal,
+                    prepare_wire=lambda wire, serving_lane: self._prepare_lowered_wire_messages(
+                        wire,
+                        caps=require_lane_capabilities(serving_lane),
+                    ),
+                )
+            except Exception:
+                cancel_scope.check()
+                raise
+            try:
+                # Stop wins over a result arriving in the same scheduling
+                # window: never append or accept a stale child response
+                # after its originating run was cancelled.
+                cancel_scope.check()
+                agent_usage = agent_result.usage
+                if agent_usage is not None:
+                    context_estimator.observe(
+                        prompt_tokens=agent_usage.prompt_tokens,
+                        messages=turns,
+                        wire_messages=agent_result.wire_msgs,
+                        tool_def_chars=agent_result.tool_def_chars,
                     )
-                    # Sub-agent turns bypass on_status — record per-turn so
-                    # task-agent spend is visible in the dashboard, attributed
-                    # to the agent's own model.  Account before the cancellation
-                    # read: a completed request spent its tokens even when Stop
-                    # wins the race and rejects its content.
-                    self._record_aux_usage(agent_result.usage, model=lane.model)
-                    # Stop wins over a result arriving in the same scheduling
-                    # window: never append or accept a stale child response
-                    # after its originating run was cancelled.
-                    cancel_scope.check()
-                    agent_usage = agent_result.usage
-                    if agent_usage is not None:
-                        context_estimator.observe(
-                            prompt_tokens=agent_usage.prompt_tokens,
-                            messages=turns,
-                            wire_messages=agent_result.wire_msgs,
-                            tool_def_chars=agent_result.tool_def_chars,
-                        )
-                    if agent_usage is not None and parent_call_id:
-                        published = self._publish_for_generation(
-                            origin_generation,
-                            functools.partial(
-                                self._paint_agent_context,
-                                parent_call_id,
-                                agent_usage.prompt_tokens,
-                                agent_context_window,
-                                generation=origin_generation,
-                            ),
-                            allow_cancelled=False,
-                        )
-                        if not published:
-                            raise GenerationCancelled()
-                    return agent_result
-                except Exception as e:
-                    # Closing a provider stream commonly surfaces as an
-                    # ordinary transport exception.  Translate cancellation
-                    # before retry classification or partial-result salvage.
-                    cancel_scope.check()
-                    ename = type(e).__name__
-                    if self._stop_retrying(e, attempt, lane):
-                        # Overflow is deterministic — raise straight to the
-                        # context-limit handler below, no backoff.
-                        raise
-                    last_err = e
-                    delay = self._RETRY_BASE_DELAY * (2**attempt)
-                    self.ui.on_info(f"[{label} retrying in {delay:.0f}s: {ename}]")
-                    # Cancel-aware backoff: a Stop mid-agent-retry aborts
-                    # the run instead of burning the delay + one more call.
-                    cancel_scope.backoff_or_cancelled(delay)
-            if last_err is None:
-                raise RuntimeError("agent retry ladder exhausted without a recorded error")
-            raise last_err
+                if agent_usage is not None and parent_call_id:
+                    published = self._publish_for_generation(
+                        origin_generation,
+                        functools.partial(
+                            self._paint_agent_context,
+                            parent_call_id,
+                            agent_usage.prompt_tokens,
+                            agent_context_window,
+                            generation=origin_generation,
+                        ),
+                        allow_cancelled=False,
+                    )
+                    if not published:
+                        raise GenerationCancelled()
+                return agent_result
+            except Exception as error:
+                cancel_scope.check()
+                if isinstance(error, (ModelTurnLocalError, DeadlineCancelledError)):
+                    raise
+                raise ModelTurnLocalError(error, stage="task result publication") from error
 
         def _execute_agent_tool(
             prepared: dict[str, Any],
@@ -25682,7 +25572,6 @@ class ChatSession:
                 reasoning_effort=agent_reasoning_effort,
                 cancel_ref_factory=lambda: cancel_scope.cancel_ref,
                 check_cancelled=cancel_scope.check,
-                backoff_or_cancelled=cancel_scope.backoff_or_cancelled,
                 on_progress=functools.partial(_task_compaction_event, compaction_id),
                 use_session_temperature=same_lane,
             )
@@ -25877,6 +25766,8 @@ class ChatSession:
                     where=where,
                     error_type=type(error).__name__,
                 )
+                if isinstance(error, ModelTurnLocalError):
+                    raise
                 return False
             except BaseException:
                 _settle(
@@ -25914,14 +25805,34 @@ class ChatSession:
             _tools: list[dict[str, Any]] | None = tools,
         ) -> ModelTurnResult:
             try:
-                return _api_call(context_turns, _tools=_tools)
-            except Exception as error:
-                if _is_ctx_overflow(error) and _compact_agent_context(
-                    "context overflow",
-                    next_tool_def_chars=serialized_tool_chars(_tools or []),
-                ):
+                try:
                     return _api_call(context_turns, _tools=_tools)
+                except ModelTurnLocalError:
+                    raise
+                except Exception as error:
+                    cancel_scope.check()
+                    if is_context_overflow(error) and _compact_agent_context(
+                        "context overflow",
+                        next_tool_def_chars=serialized_tool_chars(_tools or []),
+                    ):
+                        return _api_call(context_turns, _tools=_tools)
+                    raise
+            except ModelTurnLocalError:
                 raise
+            except Exception as error:
+                cancel_scope.check()
+                salvage = execution_journal.latest_assistant_text
+                if not salvage:
+                    raise
+                cause = completion_cause(error)
+                message = (
+                    str(error)
+                    if isinstance(error, EmptyCompletionError)
+                    else f"Task could not complete ({type(cause).__name__})."
+                )
+                guarded = _finish_synthesis(salvage)
+                message += f"\n\nIncomplete task; earlier partial work:\n{guarded}"
+                raise RuntimeError(message) from error
 
         turn = 0
         # Mint tags for sub-tool ids.  ``run_seq`` is session-unique per
@@ -25979,32 +25890,7 @@ class ChatSession:
         while max_tool_turns < 0 or turn < max_tool_turns:
             cancel_scope.check()
             _maybe_compact_agent_context()
-            try:
-                result = _api_call_with_compaction()
-            except Exception as e:
-                # Terminal API error: overflow, or any non-retryable error that
-                # escaped the retry loop above.  Salvage the sub-agent's partial work
-                # rather than crash the whole task — losing a substantial synthesis to
-                # a late failure is worse than returning it with a note.  (This must
-                # NOT be narrowed to overflow only: a non-overflow terminal error used
-                # to be salvaged too, via the old "context"/"token" text gate, and
-                # narrowing it discarded partial work on e.g. a persistent timeout.)
-                # GenerationCancelled is a BaseException, so a real cancel still
-                # propagates past this ``except Exception``.
-                overflow = _is_ctx_overflow(e)
-                note = "context limit reached" if overflow else f"error ({type(e).__name__})"
-                salvage = execution_journal.latest_assistant_text
-                if salvage:
-                    self.ui.on_info(f"[{label}] {note}, returning partial work")
-                    return _finish_synthesis(salvage)
-                # No partial work to salvage: surface overflow as a calm stop message,
-                # but re-raise any other terminal error so the real failure isn't
-                # masked as an empty success.
-                if overflow:
-                    self.ui.on_info(f"[{label}] context limit reached, stopping early")
-                    cancel_scope.check()
-                    return f"({label} stopped: context limit exceeded)"
-                raise
+            result = _api_call_with_compaction()
 
             # Handle truncation or content filter — stop agent early
             if result.finish_reason == "length":
@@ -26324,7 +26210,11 @@ class ChatSession:
         context_turns.append(synthesis_turn)
         result = _api_call_with_compaction(_tools=[])
         cancel_scope.check()
-        content = _non_blank_or(result.content, "(no output)")
+        fallback = {
+            "length": "(truncated)",
+            "content_filter": "(content filter)",
+        }.get(result.finish_reason, "(no output)")
+        content = _non_blank_or(result.content, fallback)
         self.ui.on_info(f"[{label} done] {len(content)} chars")
         return _finish_synthesis(content)
 

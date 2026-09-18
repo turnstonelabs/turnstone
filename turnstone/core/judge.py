@@ -1751,7 +1751,6 @@ class IntentJudge:
 
         # Multi-turn judge loop
         result = None  # will hold the last ModelTurnResult
-        empty_retries = 0  # track consecutive empty responses for retry
         turn = 0
 
         while turn < _JUDGE_MAX_TURNS:
@@ -1806,6 +1805,7 @@ class IntentJudge:
                         judge_turns,
                         tools=_tools,
                         max_tokens=2048,
+                        product_recovery=True,
                         cancel_ref=ref,
                     )
 
@@ -1853,10 +1853,6 @@ class IntentJudge:
             if result.finish_reason in ("content_filter", "length"):
                 log.info("judge.turn.stopped", finish_reason=result.finish_reason, turn=turn + 1)
                 return None
-
-            # Reset empty-response counter after any non-empty response
-            if result.content or result.tool_calls:
-                empty_retries = 0
 
             # Check for tool calls
             if result.tool_calls:
@@ -1919,20 +1915,8 @@ class IntentJudge:
                 turn += 1
                 continue
 
-            # Transient empty response — retry up to 3 times without
-            # consuming the turn budget.
-            empty_retries += 1
-            if empty_retries <= 3:
-                log.info("judge.empty_response.retry", retry=empty_retries, max_retries=3)
-                judge_turns.append(
-                    Turn.user(
-                        "You returned an empty response. "
-                        "Please analyze the tool call and respond with "
-                        "the JSON verdict object."
-                    )
-                )
-                continue
-            log.info("judge.empty_response.giving_up", retries=empty_retries)
+            # A meaningful native result can still contain no verdict text.
+            # Structural empty recovery has already completed inside model_turn.
             return None
 
         # Max turns reached without a final verdict

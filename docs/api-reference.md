@@ -659,8 +659,7 @@ context-overflow retry path compacts without a `pct` since no threshold was
 evaluated).
 `phase: "progress"` reports chunked summarization (`part`/`total`/`depth`,
 where depth 0 summarizes transcript batches and deeper levels merge partial
-summaries), a transient-error retry wait (`retry_in` seconds + `error`), or
-`warning: "summary_truncated"`. `phase: "end"` settles it: `ok: true`
+summaries), or `warning: "summary_truncated"`. `phase: "end"` settles it: `ok: true`
 carries `before_tokens`/`after_tokens`; workstream ends also carry the produced
 `summary`, while task-agent ends deliberately omit it because that summary is
 private transient model context;

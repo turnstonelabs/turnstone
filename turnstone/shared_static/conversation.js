@@ -164,9 +164,8 @@ export function buildCompactionProgressCard(isAuto, target) {
 // an over-window depth-0 batch subdivides mid-loop (emitting depth>0 events
 // between depth-0 parts), so any width a merge event wrote would snap
 // backwards when the outer loop resumed.  The depth-0 width itself is
-// monotonic (max with the current fill) for the same reason.  A retry wait
-// ({retry_in, error}) and the truncated-summary warning annotate the note
-// without touching the bar.
+// monotonic (max with the current fill) for the same reason. The truncated-summary
+// warning annotates the note without touching the bar.
 export function updateCompactionProgress(el, evt) {
   const bar = el.querySelector(".msg-compaction-bar");
   const fill = el.querySelector(".msg-compaction-bar-fill");
@@ -174,19 +173,6 @@ export function updateCompactionProgress(el, evt) {
   if (!bar || !fill || !note) return;
   if (evt.warning === "summary_truncated") {
     note.textContent = "summary was truncated — continuing…";
-    return;
-  }
-  if (evt.retry_in != null) {
-    // retry_in is a server-emitted backoff (seconds) coerced with Number();
-    // validate it the way part/total below are, so a malformed value can't
-    // render "retrying in NaNs".  The error text is the load-bearing half —
-    // keep it whether or not the duration parses.
-    const secs = Number(evt.retry_in);
-    const err = String(evt.error || "error");
-    note.textContent =
-      Number.isFinite(secs) && secs >= 0
-        ? "retrying in " + Math.round(secs) + "s (" + err + ")…"
-        : "retrying (" + err + ")…";
     return;
   }
   const part = Number(evt.part);

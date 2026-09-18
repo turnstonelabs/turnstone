@@ -5,8 +5,8 @@ can't be shown a degraded-but-native form either (a non-vision model can't read
 rasterized PDF pages) — a separately-configured "perception" model perceives the
 attachment and its description/transcript is sent as a text part.  This mirrors
 the speech-to-text fallback in :mod:`turnstone.core.audio`: a model-role alias
-(``perception.model_alias``) plus a module-level memo so the perceive call — an
-extra LLM round-trip — runs once per attachment, not once per conversation turn.
+(``perception.model_alias``) plus a module-level memo so useful descriptions are
+reused across conversation turns, while failures receive a short cooldown.
 
 It is a *bottom-tier, universal* safety net:
 
@@ -31,8 +31,11 @@ wire path.
 from __future__ import annotations
 
 import threading
+from dataclasses import dataclass
+from time import monotonic
 from typing import Any
 
+from turnstone.core.completion_recovery import EmptyCompletionError, ModelTurnLocalError
 from turnstone.core.deadline import DeadlineCancelledError
 from turnstone.core.log import get_logger
 from turnstone.core.model_turn import ModelLane, ResolvedModelBinding, model_turn
@@ -85,8 +88,10 @@ def describe(
 
     ``lane`` is the caller's already-resolved binding snapshot, so the
     modality gate and the plant call cannot observe different registry
-    generations.  Raises
-    :class:`PerceptionBackendError` if the backend call fails.  Never
+    generations.  Returns ``""`` when the model produced no usable
+    description even after shared empty-completion recovery: that outcome is
+    deterministic for this binding and content, so the memo may keep it.
+    Raises :class:`PerceptionBackendError` if the backend call fails.  Never
     caches — see :func:`describe_cached`.
     """
     if not parts:
@@ -106,11 +111,14 @@ def describe(
             lane,
             turns,
             max_tokens=4096,
+            product_recovery=True,
             resolve_attachments=lambda _ids: {_PERCEPTION_REF_ID: parts},
             cancel_ref=cancel_ref,
         )
-    except DeadlineCancelledError:
+    except (DeadlineCancelledError, ModelTurnLocalError):
         raise
+    except EmptyCompletionError:
+        return ""
     except Exception as exc:
         raise PerceptionBackendError(f"perception backend failed: {exc}") from exc
     return (result.content or "").strip()
@@ -122,8 +130,16 @@ def describe(
 # in a conversation would be re-perceived (an extra LLM round-trip) on every
 # subsequent turn.
 _CACHE_MAX = 256
+_FAILURE_COOLDOWN_SECONDS = 60.0
+
+
+@dataclass(frozen=True)
+class _FailureCooldown:
+    retry_after: float
+
+
 _cache_lock = threading.Lock()
-_cache: dict[tuple[str, str, int, str], str] = {}
+_cache: dict[tuple[str, str, int, str], str | _FailureCooldown] = {}
 
 
 def _cache_key(
@@ -163,16 +179,15 @@ def describe_cached(
     lookup inseparable.  Principal partitioning prevents one user's OBO result
     from reaching another, while generation partitioning prevents an alias
     reload from reusing output produced by an older backend/auth policy. Returns
-    ``""`` on a backend failure (a placeholder is rendered upstream) and does
-    *not* cache failures. Cancellation propagates as control flow so Stop can
-    abort the parent turn. A nonempty ``result_suffix`` is appended to a
-    successful description before memoization; PDF rasterization uses this to
-    preserve its deterministic cutoff notice on later cache hits.
-    A completed-but-EMPTY description memoizes like any other result — one
-    perceive per key, ever (an all-reasoning pass pins the placeholder; the
-    remediation is server-side: a reasoning parser or the template thinking
-    toggle on the perception alias) — under one guard: an empty result NEVER
-    overwrites a concurrently memoized real description.
+    ``""`` when the model produced no usable description (memoized for this
+    key like any other result, since the outcome is deterministic) and on a
+    backend or local child failure (a placeholder is rendered upstream, with a
+    60-second cooldown before another attempt). Cancellation propagates as
+    control flow so Stop can abort the parent turn and is never memoized. A
+    nonempty ``result_suffix`` is appended to a successful description before
+    memoization; PDF rasterization uses this to preserve its deterministic
+    cutoff notice on later cache hits. Failure cooldowns expire without a
+    registry reload, so a recovered backend can be tried again.
     """
     refuse_aborted_request(cancel_ref)
     lane = binding.lane
@@ -181,12 +196,15 @@ def describe_cached(
         binding=binding,
         content_hash=content_hash,
     )
-    with _cache_lock:
-        cached = _cache.get(key)
-        cache_hit = key in _cache
-    if cache_hit:
+    cached = describe_peek(
+        principal_id=principal_id,
+        binding=binding,
+        content_hash=content_hash,
+    )
+    if cached is not None:
         refuse_aborted_request(cancel_ref)
-        return cached or ""
+        return cached
+    failed = False
     try:
         text = describe(
             lane=lane,
@@ -194,26 +212,31 @@ def describe_cached(
             prompt=prompt,
             cancel_ref=cancel_ref,
         )
-    except PerceptionBackendError as exc:
+    except (PerceptionBackendError, ModelTurnLocalError) as exc:
         refuse_aborted_request(cancel_ref)
-        log.warning("perception fallback failed (alias=%s): %s", lane.alias, exc)
-        return ""
+        if isinstance(exc, ModelTurnLocalError):
+            log.warning(
+                "perception local processing failed (alias=%s, error_type=%s)",
+                lane.alias,
+                type(exc.__cause__ or exc).__name__,
+            )
+        else:
+            log.warning("perception fallback failed (alias=%s): %s", lane.alias, exc)
+        text = ""
+        failed = True
     refuse_aborted_request(cancel_ref)
     if text and result_suffix and result_suffix not in text:
         text = f"{text}\n\n{result_suffix}"
     with _cache_lock:
         refuse_aborted_request(cancel_ref)
-        # Re-check under the lock: the describe call ran unlocked, and a
-        # concurrent racer may have memoized a REAL description — an empty
-        # result must never clobber it (the memo has no invalidation
-        # path, so a clobber would pin the placeholder despite a billed,
-        # successful perceive).
+        # The describe call ran unlocked. A concurrent useful description
+        # always wins; a memoized empty result yields only to a useful one.
         existing = _cache.get(key)
-        if existing:
+        if isinstance(existing, str) and (existing or not text):
             return existing
         if key not in _cache and len(_cache) >= _CACHE_MAX:
             _cache.pop(next(iter(_cache)), None)
-        _cache[key] = text
+        _cache[key] = _FailureCooldown(monotonic() + _FAILURE_COOLDOWN_SECONDS) if failed else text
     return text
 
 
@@ -223,17 +246,24 @@ def describe_peek(
     binding: ResolvedModelBinding,
     content_hash: str,
 ) -> str | None:
-    """Return the principal-and-binding-scoped memo without computing.
+    """Return the principal-and-binding-scoped memo without a model call.
 
-    Lets the wire resolver skip the expensive parts build (a PDF rasterize) when
-    the description is already memoized from an earlier send — :func:`describe_cached`
-    ignores ``parts`` on a hit, so building them first would be pure waste.
+    Returns the memoized description (``""`` for a model that produced none),
+    ``""`` during a failure cooldown, and ``None`` after the cooldown expires,
+    dropping the expired entry on that read so the next call re-perceives.
+    The wire resolver can skip expensive parts construction (a PDF rasterize)
+    for a memo hit and while a failure is cooling down.
     """
+    key = _cache_key(
+        principal_id=principal_id,
+        binding=binding,
+        content_hash=content_hash,
+    )
     with _cache_lock:
-        return _cache.get(
-            _cache_key(
-                principal_id=principal_id,
-                binding=binding,
-                content_hash=content_hash,
-            )
-        )
+        cached = _cache.get(key)
+        if isinstance(cached, _FailureCooldown):
+            if monotonic() < cached.retry_after:
+                return ""
+            del _cache[key]
+            return None
+        return cached

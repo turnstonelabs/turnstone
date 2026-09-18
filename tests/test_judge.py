@@ -505,10 +505,15 @@ class TestCancelEventSemantics:
             yield from ()
             raise IncompleteStreamError("retry after admission")
 
-        provider.create_streaming.side_effect = [
-            _incomplete_stream(),
-            as_stream(_mock_result(_good_verdict_json())),
-        ]
+        from turnstone.core.providers._protocol import ProviderRequestMetrics
+
+        streams = iter([_incomplete_stream(), as_stream(_mock_result(_good_verdict_json()))])
+
+        def dispatch(**kwargs):
+            kwargs["request_metrics_ref"].append(ProviderRequestMetrics(native_tools_enabled=False))
+            return next(streams)
+
+        provider.create_streaming.side_effect = dispatch
         judge = _make_judge(provider)
         admission = ModelAdmission("judge", 1)
         auth_config = MagicMock(name="pinned-auth-config")

@@ -19,6 +19,7 @@ from turnstone.core.lowering import CANCELLED_TOOL_RESULT
 from turnstone.core.providers._protocol import (
     IncompleteStreamError,
     ModelCapabilities,
+    ProviderResponseError,
     UsageInfo,
     _lookup_capabilities,
     flat_effort_suppressed,
@@ -43,7 +44,7 @@ _UPSTREAM_TRANSIENT_CODES = frozenset(
 )
 
 
-class UpstreamResponseError(RuntimeError):
+class UpstreamResponseError(ProviderResponseError):
     """An OpenAI-compatible endpoint returned JSON instead of an SSE stream."""
 
     def __init__(

@@ -212,7 +212,7 @@ export interface CancelledEvent {
 /**
  * Context-compaction lifecycle. `start` carries `trigger` ("manual"/"auto";
  * auto adds `where` + `pct`); `progress` carries chunked-summarization
- * `part`/`total`/`depth` (or `retry_in`/`error` for a retry wait); `end`
+ * `part`/`total`/`depth` or `warning: "summary_truncated"`; `end`
  * carries `ok` plus either `before_tokens`/`after_tokens`/`summary` or the
  * failure `reason`/`message`. `target: "workstream"` owns the transcript and
  * durable marker. `target: "task_agent"` carries `parent_call_id`, is
@@ -247,7 +247,9 @@ export interface CompactionEvent {
   part?: number;
   total?: number;
   depth?: number;
+  /** Legacy field; current progress events do not emit it. */
   retry_in?: number;
+  /** Legacy field; current progress events do not emit it. */
   error?: string;
   warning?: string;
   ok?: boolean;

@@ -17,11 +17,15 @@ Fixture note: tests zero ``_RETRY_BASE_DELAY`` per instance (else each
 retry pays real exponential backoff).
 """
 
+import json
 import logging
+from contextlib import contextmanager
 from unittest.mock import MagicMock, patch
 
 import httpx
+import httpx2
 import pytest
+from openai import OpenAI
 
 from tests._session_helpers import (
     NullUI,
@@ -30,10 +34,25 @@ from tests._session_helpers import (
     make_session,
     replace_session_lane,
 )
+from tests.test_empty_completion import _wire
+from turnstone.core.completion_recovery import (
+    CompletionRecoveryError,
+    ModelTurnLocalError,
+    completion_cause,
+)
+from turnstone.core.judge import JudgeConfig
 from turnstone.core.memory import load_last_error
 from turnstone.core.model_turn import WirePreparationError
 from turnstone.core.providers import IncompleteStreamError, StreamChunk, UsageInfo
-from turnstone.core.session import BackendAuthUnavailableError, GenerationCancelled
+from turnstone.core.providers._openai_chat import OpenAIChatCompletionsProvider
+from turnstone.core.providers._protocol import ProviderRequestMetrics
+from turnstone.core.session import (
+    BackendAuthUnavailableError,
+    ChatSession,
+    GenerationCancelled,
+    _StreamTurnConsumer,
+)
+from turnstone.core.storage import get_storage
 from turnstone.core.streaming_text import ThinkTagSplitter
 from turnstone.core.trajectory import Turn, dicts_from_turns
 
@@ -88,6 +107,60 @@ def _good_stream(text):
 
 def _assistant_msgs(session):
     return [m for m in dicts_from_turns(session.messages) if m["role"] == "assistant"]
+
+
+@contextmanager
+def _sdk_response_session(replies):
+    """Script real SDK creation and drain failures without network retries."""
+    requests = []
+    responses = []
+
+    def handle(request):
+        assert request.url.path == "/v1/chat/completions"
+        index = len(requests)
+        requests.append(json.loads(request.content))
+        assert index < len(replies), "unexpected additional provider request"
+        reply = replies[index]
+        if reply == "connect":
+            raise httpx2.ConnectError("client is closed", request=request)
+        if reply == "json":
+            response = httpx2.Response(
+                200,
+                headers={"content-type": "application/json"},
+                json={"error": {"type": "overloaded_error", "message": "gateway overloaded"}},
+                request=request,
+            )
+        else:
+            response = httpx2.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                text=_wire(reply),
+                request=request,
+            )
+        responses.append(response)
+        return response
+
+    with OpenAI(
+        api_key="offline-test-only",
+        base_url="https://provider.invalid/v1",
+        max_retries=0,
+        http_client=httpx2.Client(transport=httpx2.MockTransport(handle)),
+    ) as client:
+        ui = RecordingUI()
+        session = _make_session(
+            ui,
+            client=client,
+            context_window=100_000,
+            max_tokens=256,
+            judge_config=JudgeConfig(enabled=False, output_guard=False),
+        )
+        replace_session_lane(
+            session, provider=OpenAIChatCompletionsProvider(), client=client, model="initial-model"
+        )
+        yield session, ui, requests
+        assert len(requests) == len(replies)
+        # Assert before client teardown can hide a leaked accepted response.
+        assert all(response.is_closed for response in responses)
 
 
 class TestMidStreamRetry:
@@ -153,7 +226,7 @@ class TestMidStreamRetry:
         create = arm_session(session, *streams).create_streaming
         with (
             caplog.at_level(logging.INFO, logger="turnstone.core.session"),
-            pytest.raises(IncompleteStreamError, match="ReadError"),
+            pytest.raises(CompletionRecoveryError, match="ReadError"),
         ):
             session.send("test")
 
@@ -665,7 +738,7 @@ class TestMidStreamRetry:
         ).create_streaming
         with (
             caplog.at_level(logging.WARNING, logger="turnstone.core.session"),
-            pytest.raises(IncompleteStreamError, match="ReadError"),
+            pytest.raises(CompletionRecoveryError, match="ReadError"),
         ):
             session.send("test")
 
@@ -778,7 +851,7 @@ class TestRecreateWindowClassification:
 
         with (
             patch.object(session, "_get_health_tracker", side_effect=tracker_then_boom),
-            pytest.raises(IncompleteStreamError, match="ReadError"),
+            pytest.raises(CompletionRecoveryError, match="ReadError"),
         ):
             session.send("test")
 
@@ -819,6 +892,7 @@ class TestRecreateWindowClassification:
         ]
 
         def create_no_arm(**kwargs):
+            kwargs["request_metrics_ref"].append(ProviderRequestMetrics(native_tools_enabled=False))
             assert scripts, "script exhausted"
             return scripts.pop(0)
 
@@ -935,6 +1009,111 @@ class TestRecreateWindowClassification:
         assert out is None
         fb_tracker.record_failure.assert_not_called()
         assert any("Fallback fb also failed: WirePreparationError" in i for i in ui.of("info"))
+
+
+class TestAcceptedResponseWindow:
+    """A JSON error body during re-creation is a creation failure: it retries
+    on the lane's ladder and can never erase an earlier displayed attempt."""
+
+    @pytest.mark.parametrize("armed", [False, True], ids=["before-dispatch", "stream-admission"])
+    def test_local_failure_discards_only_an_armed_stream(self, tmp_db, armed):
+        with _sdk_response_session(["answer"] if armed else []) as (session, ui, _requests):
+            target = _StreamTurnConsumer if armed else session
+            hook = "on_stream_armed" if armed else "_admit_memory_index_request"
+            with (
+                patch.object(target, hook, side_effect=RuntimeError("local admission failed")),
+                pytest.raises(ModelTurnLocalError),
+            ):
+                session.send("test")
+
+            assert ui.kinds().count("stream_end") == int(armed)
+            assert ui.kinds().count("stream_discarded") == int(armed)
+            assert not _assistant_msgs(session)
+            assert ("state", "error") in ui.events
+            assert "Local model-call" in load_last_error(session.ws_id)
+            assert session._serving_failure_contexts == {}
+
+    @pytest.mark.parametrize(
+        "replies",
+        [
+            ["death", "json", *(["connect"] * ChatSession._MAX_RETRIES)],
+            ["json", "death", *(["connect"] * (ChatSession._MAX_RETRIES + 1))],
+        ],
+        ids=["death-then-json", "json-then-death"],
+    )
+    def test_json_rejection_during_recreation_preserves_the_armed_death(self, tmp_db, replies):
+        # A JSON error body is a creation failure: the lane's ladder retries it
+        # and, once the ladder is exhausted, the ARMED death it was trying to
+        # recover from surfaces, never the replacement creation error.
+        with _sdk_response_session(replies) as (session, ui, requests):
+            original_backoff = session._backoff_or_cancelled
+            snapshots = []
+
+            def record_backoff(delay, my_generation=0):
+                snapshots.append(list(session._serving_failure_contexts.values()))
+                return original_backoff(delay, my_generation)
+
+            with (
+                patch.object(session, "_backoff_or_cancelled", side_effect=record_backoff),
+                pytest.raises(CompletionRecoveryError) as excinfo,
+            ):
+                session.send("test")
+
+            assert isinstance(completion_cause(excinfo.value), IncompleteStreamError)
+            # Only the armed death ever owns a serving snapshot: creation
+            # failures record health, not a serving context. The same object
+            # must escape for fatal publication.
+            assert all(len(snapshot) <= 1 for snapshot in snapshots)
+            assert any(snapshot and snapshot[0][0] is excinfo.value for snapshot in snapshots)
+            assert [request["model"] for request in requests] == ["initial-model"] * len(replies)
+            persisted = load_last_error(session.ws_id)
+            assert "Backend stream died mid-response" in persisted
+            assert "model=initial-model" in persisted
+            assert "Backend unreachable" not in persisted
+            assert ui.of("error")[-1] == persisted
+            assert not _assistant_msgs(session)
+            assert session._serving_failure_contexts == {}
+
+    @pytest.mark.parametrize(
+        "prior_stream", [False, True], ids=["json-only", "reasoning-then-json"]
+    )
+    def test_stop_after_json_preserves_only_an_armed_turn(self, tmp_db, prior_stream):
+        replies = ["death", "json"] if prior_stream else ["json"]
+        with _sdk_response_session(replies) as (session, ui, _requests):
+            original_backoff = session._backoff_or_cancelled
+            backoffs = 0
+
+            def stop_after_json(delay, my_generation=0):
+                nonlocal backoffs
+                backoffs += 1
+                if backoffs == len(replies):
+                    session.cancel()
+                return original_backoff(delay, my_generation)
+
+            with patch.object(session, "_backoff_or_cancelled", side_effect=stop_after_json):
+                session.send("test")
+
+            expected = ["[generation cancelled before completion]"] if prior_stream else []
+            assert [message["content"] for message in _assistant_msgs(session)] == expected
+            persisted = get_storage().load_messages(session.ws_id)
+            assert [row["content"] for row in persisted if row["role"] == "assistant"] == expected
+            assert not ui.of("content")
+            assert ui.kinds().count("stream_end") == int(prior_stream)
+            assert ui.kinds().count("stream_discarded") == int(prior_stream)
+            assert ("state", "idle") in ui.events
+            assert not ui.of("error")
+            assert not load_last_error(session.ws_id)
+            assert session._serving_failure_contexts == {}
+
+    def test_success_after_json_releases_the_earlier_stream_failure(self, tmp_db):
+        with _sdk_response_session(["death", "json", "answer"]) as (session, ui, _requests):
+            session.send("test")
+
+            assert [message["content"] for message in _assistant_msgs(session)] == [
+                "The work is complete."
+            ]
+            assert not ui.of("error")
+            assert session._serving_failure_contexts == {}
 
 
 class TestGenerationFencedCreationNotices:

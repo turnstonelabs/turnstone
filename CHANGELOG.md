@@ -32,6 +32,15 @@ frozen.
 
 ### Changed
 
+- **Shared model completion recovery.** Conversations, task agents, summaries, utilities,
+  judges, and perception share a bounded retry allowance for empty responses and transient
+  response failures. Task, summary, utility, judge, and perception calls also spend it on
+  compatible gateways returning transient JSON errors with HTTP 200; the conversation loop treats those
+  as ordinary creation failures with its existing retry, health, and fallback handling. Task
+  and summary calls no longer multiply retries through additional caller loops. Accepted
+  responses that may run server-side tools are never automatically replayed; compaction after
+  a context overflow is not a replay and still runs. Direct eval and optimizer sampling keep
+  their existing behavior.
 - **Independent OAuth runtime.** MCP and model authentication share a process-owned runtime
   for token requests, credential rotation and durable writes. Model authentication works without
   an MCP manager and stays available when a persona disables MCP tools.
@@ -63,6 +72,11 @@ frozen.
 
 ### Fixed
 
+- **Incomplete task results and perception fallback.** Failed task completions now report an
+  error, with any earlier partial work explicitly labelled incomplete. Optional perception
+  memoizes a model that produces no description for the same binding generation and gives
+  backend or local failures a 60-second cooldown, so neither repeats attachment processing on
+  each send while a failed backend can still recover afterward.
 - **Context-window stop reason.** A response that ends with Anthropic's
   `model_context_window_exceeded` stop reason was persisted as a clean completion, with no warning
   and no compaction. It now surfaces as the same context overflow an over-long request already

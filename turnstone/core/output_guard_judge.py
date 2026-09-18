@@ -44,6 +44,11 @@ from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 
 from turnstone.core import fence
+from turnstone.core.completion_recovery import (
+    EmptyCompletionError,
+    ModelTurnLocalError,
+    completion_cause,
+)
 from turnstone.core.deadline import (
     DeadlineCancelledError,
     DeadlineExceededError,
@@ -59,6 +64,7 @@ from turnstone.core.judge import (
 from turnstone.core.log import get_logger
 from turnstone.core.model_registry import ModelClientConstructionError
 from turnstone.core.model_turn import (
+    ModelAdmissionError,
     ResolvedModelBinding,
     model_turn,
     require_lane_capabilities,
@@ -530,6 +536,7 @@ class OutputGuardJudge:
         heuristic_annotations: tuple[str, ...] | list[str] = (),
         cancel_event: threading.Event | None = None,
         backend_auth_resolver: Callable[[str, ModelConfig | None], str | None] | None = None,
+        admit_reissue: Callable[[], None] | None = None,
     ) -> OutputJudgeVerdict:
         """Evaluate ``output`` and return a verdict.
 
@@ -573,6 +580,7 @@ class OutputGuardJudge:
                 heuristic_annotations=heuristic_annotations,
                 cancel_event=cancel_event,
                 backend_auth_resolver=backend_auth_resolver,
+                admit_reissue=admit_reissue,
                 start=start,
                 verdict_id=verdict_id,
             )
@@ -592,6 +600,7 @@ class OutputGuardJudge:
         heuristic_annotations: tuple[str, ...] | list[str],
         cancel_event: threading.Event | None,
         backend_auth_resolver: Callable[[str, ModelConfig | None], str | None] | None,
+        admit_reissue: Callable[[], None] | None,
         start: float,
         verdict_id: str,
     ) -> OutputJudgeVerdict:
@@ -698,6 +707,8 @@ class OutputGuardJudge:
                     judge_turns,
                     tools=None,
                     max_tokens=512,
+                    product_recovery=True,
+                    admit_reissue=admit_reissue,
                     cancel_ref=ref,
                 )
             finally:
@@ -714,12 +725,21 @@ class OutputGuardJudge:
             return self._error_verdict(verdict_id, call_id, start, "cancelled")
         except DeadlineExceededError:
             return self._error_verdict(verdict_id, call_id, start, "timeout")
+        except EmptyCompletionError:
+            return self._error_verdict(verdict_id, call_id, start, "empty_response")
+        except ModelTurnLocalError as e:
+            reason = (
+                "admission_denied"
+                if isinstance(e.__cause__, ModelAdmissionError)
+                else "local_call_error"
+            )
+            return self._error_verdict(verdict_id, call_id, start, reason)
         except Exception as e:
             # Provider exceptions are released by the worker's ``finally``;
             # this idempotent call also covers a failure to start that worker.
             _release_worker()
             return self._error_verdict(
-                verdict_id, call_id, start, f"provider_error: {type(e).__name__}"
+                verdict_id, call_id, start, f"provider_error: {type(completion_cause(e)).__name__}"
             )
 
         # A refusal, including one cut off by the output limit, may quote valid

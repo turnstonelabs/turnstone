@@ -2869,7 +2869,7 @@ class TestGetCapabilitiesOverride:
 
 
 class TestTitleRetry:
-    """_generate_title resets _title_generated on failure."""
+    """Title errors can retry; completed empty titles preserve their caller's latch."""
 
     def test_delayed_title_uses_scheduling_principal(self, tmp_db) -> None:
         """A shared-workstream handoff cannot lend B's OBO token to A's title."""
@@ -2914,9 +2914,12 @@ class TestTitleRetry:
             principal_id="user-a",
         )
 
-    def test_title_generated_reset_on_failure(self, tmp_db):
+    @pytest.mark.parametrize("failure", ["creation", "stream_death"])
+    def test_title_generated_reset_on_failure(self, tmp_db, monkeypatch, failure):
+        from tests._session_helpers import scripted_provider
         from turnstone.core.providers._protocol import ModelCapabilities
 
+        monkeypatch.setattr("turnstone.core.model_turn._DRAIN_RETRY_BASE_DELAY", 0.0)
         session = _make_session()
         _bind_mock_storage(session)
         session._title_generated = True
@@ -2926,13 +2929,102 @@ class TestTitleRetry:
                 {"role": "assistant", "content": "Hi there"},
             ]
         )
-        # Mock provider to raise
-        provider = MagicMock()
-        provider.create_streaming.side_effect = RuntimeError("API error")
+        if failure == "stream_death":
+            # An accepted stream without a finish marker exhausts the shared
+            # allowance and raises CompletionRecoveryError, not an empty stop.
+            provider = scripted_provider([])
+        else:
+            provider = MagicMock()
+            provider.create_streaming.side_effect = RuntimeError("API error")
         replace_session_lane(session, provider=provider, capabilities=ModelCapabilities())
 
         session._generate_title()
 
+        assert session._title_generated is False
+        assert provider.create_streaming.call_count == (3 if failure == "stream_death" else 1)
+
+    def test_empty_title_exhaustion_does_not_schedule_again_on_next_send(self, tmp_db, monkeypatch):
+        from tests.test_empty_completion import _session
+        from turnstone.core.workstream import WorkstreamKind
+
+        monkeypatch.setattr("turnstone.core.model_turn._DRAIN_RETRY_BASE_DELAY", 0.0)
+        with _session(WorkstreamKind.INTERACTIVE, ["empty"] * 3) as (session, _ui, requests):
+            session.messages = [Turn.user("Review the parser.")]
+            session._title_generated = True  # Armed by the first send's title gate.
+            session._generate_title()
+
+            assert len(requests) == 3
+            assert session._title_generated is True
+            capture_cls, started = _capturing_thread_cls()
+            with (
+                _send_with_mocks(session, [make_result("Done.")], MagicMock()),
+                patch("turnstone.core.session.threading.Thread", capture_cls),
+            ):
+                session.send("Continue the review.")
+
+            assert session._generate_title not in started
+            assert session._title_generated is True
+            assert len(requests) == 3
+
+    @pytest.mark.parametrize("latched", [False, True])
+    def test_empty_title_refresh_preserves_latch_and_rebroadcasts_current_title(
+        self, tmp_db, monkeypatch, latched
+    ):
+        from tests.test_empty_completion import _session
+        from turnstone.core.workstream import WorkstreamKind
+
+        monkeypatch.setattr("turnstone.core.model_turn._DRAIN_RETRY_BASE_DELAY", 0.0)
+        with _session(WorkstreamKind.INTERACTIVE, ["empty"] * 3) as (session, ui, requests):
+            session.messages = [Turn.user("Review the parser.")]
+            # request_title_refresh clears this latch before launching. Other
+            # callers can already be latched; neither state changes on blank.
+            session._title_generated = latched
+            with (
+                patch.object(ui, "on_rename") as rename,
+                patch("turnstone.core.session.update_workstream_title") as update,
+            ):
+                session._generate_title(current_title="Existing Title")
+
+            assert len(requests) == 3
+            assert session._title_generated is latched
+            rename.assert_called_once_with("Existing Title")
+            update.assert_not_called()
+
+    def test_empty_title_from_retired_generation_cannot_rename_or_relaunch(self, tmp_db):
+        from turnstone.core.completion_recovery import EmptyCompletionError
+
+        session = _make_session()
+        storage = _bind_mock_storage(session)
+        session.messages = [Turn.user("Review the parser.")]
+        origin_generation = session._claim_generation()
+        session._title_generated = True
+
+        def complete_after_successor(*_args, **_kwargs):
+            session._claim_generation()
+            raise EmptyCompletionError(make_result(""))
+
+        with (
+            patch.object(
+                session, "_utility_completion", side_effect=complete_after_successor
+            ) as title,
+            patch.object(session.ui, "on_rename") as rename,
+            patch.object(storage, "update_workstream_title") as update,
+        ):
+            session._generate_title(
+                current_title="Existing Title",
+                origin_generation=origin_generation,
+            )
+            assert session._title_generated is False
+            # The same retired job cannot become a fresh request on re-entry.
+            session._generate_title(
+                current_title="Existing Title",
+                origin_generation=origin_generation,
+            )
+
+        title.assert_called_once()
+        rename.assert_not_called()
+        update.assert_not_called()
+        assert session._generation != origin_generation
         assert session._title_generated is False
 
     def test_title_generated_stays_true_on_success(self, tmp_db):
@@ -4014,15 +4106,13 @@ class TestAgentOutputGuard:
             assert args[2] == "task_agent_synthesis"
 
     def test_context_limit_recovery_path_is_guarded(self):
-        """When the API raises a context-limit error, the last prior assistant
-        content is returned via the guard."""
+        """When the API raises a context-limit error, the task fails and the last
+        prior assistant content is guarded and embedded in the raised error."""
         from turnstone.core.judge import JudgeConfig
         from turnstone.core.providers._openai_chat import OpenAIChatCompletionsProvider
 
         session = _make_session(judge_config=JudgeConfig(output_guard=True))
         client = replace_session_lane(session, provider=OpenAIChatCompletionsProvider()).client
-        # Force the retry loop to fail fast — no exponential backoff during the test.
-        session._MAX_RETRIES = 0
 
         prior = "Prior assistant synthesis before the context blew up."
 
@@ -4036,16 +4126,17 @@ class TestAgentOutputGuard:
                 raise RuntimeError("context length exceeded")
 
             client.chat.completions.create = fake_create
-            result = session._run_agent(
-                [
-                    Turn.user("test"),
-                    Turn.assistant(prior),
-                ],
-                tools=[{"type": "function", "function": {"name": "read_file"}}],
-                label="plan",
-            )
+            with pytest.raises(RuntimeError, match="Incomplete task") as failure:
+                session._run_agent(
+                    [
+                        Turn.user("test"),
+                        Turn.assistant(prior),
+                    ],
+                    tools=[{"type": "function", "function": {"name": "read_file"}}],
+                    label="plan",
+                )
 
-            assert result == prior
+            assert prior in str(failure.value)
             mock_eval.assert_called_once()
             args = mock_eval.call_args[0]
             assert args[0].startswith("agent_synth_plan_")
@@ -4062,7 +4153,6 @@ class TestAgentOutputGuard:
 
         session = _make_session(judge_config=JudgeConfig(output_guard=True))
         client = replace_session_lane(session, provider=OpenAIChatCompletionsProvider()).client
-        session._MAX_RETRIES = 0  # fail fast, no backoff
 
         prior = "Substantial partial synthesis before the backend died."
 
@@ -4076,13 +4166,14 @@ class TestAgentOutputGuard:
                 raise RuntimeError("upstream connect error or disconnect/reset (503)")
 
             client.chat.completions.create = fake_create
-            result = session._run_agent(
-                [Turn.user("test"), Turn.assistant(prior)],
-                tools=[{"type": "function", "function": {"name": "read_file"}}],
-                label="task",
-            )
+            with pytest.raises(RuntimeError, match="Incomplete task") as failure:
+                session._run_agent(
+                    [Turn.user("test"), Turn.assistant(prior)],
+                    tools=[{"type": "function", "function": {"name": "read_file"}}],
+                    label="task",
+                )
 
-            assert result == prior  # partial work salvaged, not discarded
+            assert prior in str(failure.value)
             mock_eval.assert_called_once()
             assert mock_eval.call_args[0][1] == prior
 
@@ -4094,7 +4185,6 @@ class TestAgentOutputGuard:
 
         session = _make_session()
         client = replace_session_lane(session, provider=OpenAIChatCompletionsProvider()).client
-        session._MAX_RETRIES = 0
 
         def fake_create(**_kwargs):
             raise RuntimeError("upstream connect error or disconnect/reset (503)")
@@ -8257,9 +8347,9 @@ class TestMemoryIndexSnapshotLifecycle:
 
     def test_small_context_refuses_without_dispatch_or_snapshot_then_retries(self, tmp_db):
         from turnstone.core.attachments import Attachment
+        from turnstone.core.completion_recovery import ModelTurnLocalError
         from turnstone.core.memory import delete_structured_memory_returning_strict
         from turnstone.core.memory_relevance import MemoryConfig
-        from turnstone.core.model_turn import ModelAdmissionError
         from turnstone.core.personas import PersonaSnapshot
         from turnstone.core.storage import get_storage
 
@@ -8300,7 +8390,7 @@ class TestMemoryIndexSnapshotLifecycle:
 
         with (
             patch.object(session, "_resolve_attachments", resolve_attachments),
-            pytest.raises(ModelAdmissionError) as raised,
+            pytest.raises(ModelTurnLocalError) as raised,
         ):
             session.send(
                 "Use the available context.",
@@ -13903,7 +13993,8 @@ class TestInlineReasoningSeamLanes:
         call_id, answer = session._exec_web_fetch(
             {"call_id": "wf2", "url": "https://example.com/x", "question": "What is HRW?"}
         )
-        assert answer == "Error: extraction returned no answer"
+        assert answer.startswith("Extraction failed")
+        assert "no answer" in answer
 
     def test_task_agent_synthesis_is_clean(self, tmp_db):
         # The audit's unverified sibling, scripted: a sub-agent turn wrapped
@@ -13926,7 +14017,7 @@ class TestInlineReasoningSeamLanes:
         )
         assert out == "Sub-agent findings."
 
-    def test_task_agent_think_only_turn_reports_no_output(self, tmp_db):
+    def test_task_agent_think_only_turn_fails_without_output(self, tmp_db):
         from turnstone.core.trajectory import Turn
 
         session = _make_session()
@@ -13934,31 +14025,31 @@ class TestInlineReasoningSeamLanes:
             session,
             provider=seam_provider("<think>nothing but reasoning</think>", provider_name="openai"),
         )
-        out = session._run_agent(
-            [Turn.system("You are a test agent."), Turn.user("Report findings.")],
-            label="task",
-            tools=[],
-            auto_tools=set(),
-        )
-        assert out == "(no output)"
+        with pytest.raises(RuntimeError, match="no answer"):
+            session._run_agent(
+                [Turn.system("You are a test agent."), Turn.user("Report findings.")],
+                label="task",
+                tools=[],
+                auto_tools=set(),
+            )
 
 
 class TestWhitespaceOnlyBlanknessGates:
     """Whitespace-only drained content takes the no-answer fallbacks —
     blankness, not truthiness, campaign-wide."""
 
-    def test_task_agent_whitespace_only_turn_reports_no_output(self, tmp_db):
+    def test_task_agent_whitespace_only_turn_fails_without_output(self, tmp_db):
         from turnstone.core.trajectory import Turn
 
         session = _make_session()
         replace_session_lane(session, provider=seam_provider("\n\n", provider_name="openai"))
-        out = session._run_agent(
-            [Turn.system("You are a test agent."), Turn.user("Report findings.")],
-            label="task",
-            tools=[],
-            auto_tools=set(),
-        )
-        assert out == "(no output)"
+        with pytest.raises(RuntimeError, match="no answer"):
+            session._run_agent(
+                [Turn.system("You are a test agent."), Turn.user("Report findings.")],
+                label="task",
+                tools=[],
+                auto_tools=set(),
+            )
 
     def test_web_fetch_whitespace_only_extraction_is_honest_error(self, monkeypatch, tmp_db):
         session = _make_session()
@@ -13970,7 +14061,8 @@ class TestWhitespaceOnlyBlanknessGates:
         call_id, answer = session._exec_web_fetch(
             {"call_id": "wf3", "url": "https://example.com/x", "question": "What?"}
         )
-        assert answer == "Error: extraction returned no answer"
+        assert answer.startswith("Extraction failed")
+        assert "no answer" in answer
 
 
 class TestResumeQueuesNoWakeEligibleNudge:

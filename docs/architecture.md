@@ -1789,45 +1789,54 @@ runs, grace-gated).
 
 ### API Retry
 
-Every model call streams (#831); retry lives at two stacked layers:
+Every model call streams (#831). Product callers opt into one completion recovery policy through
+`model_turn(product_recovery=True)`; `ModelLane` retains provider configuration and request posture.
 
-- **Empty completed responses** — interactive and coordinator conversations
-  share the mid-stream retry budget (at most 2 re-issues) for an ordinary
-  `stop` with no answer or tool call, including reasoning-only output.
-  Each re-issue resends the full context and can repeat its latency and cost;
-  the shared limit bounds attempts, not elapsed time.
-  Automatic recovery requires the prepared request to have no server-side
-  tools; otherwise the conversation enters error immediately. Each completed
-  attempt reports usage, including a same-generation Stop after completion.
-  Rejected usage also updates the existing token-budget checks; exhaustion
-  stops recovery and requires approval on the next send. Discarded reasoning
-  stays out of saved history, and retry exhaustion enters error instead of
-  silently becoming idle. Refusals, output limits, native activity, and
-  continuation signals are excluded.
-- **Caller ladders** — `ChatSession._model_turn_with_retry()` (chat
-  loop, one ladder per lane) and the agent `_api_call()` (drained via
-  `model_turn`) use the same pattern: 4 total attempts (1 initial + 3 retries,
-  `_MAX_RETRIES = 3`), exponential backoff base 1 second
-  (`delay = 1s * 2^attempt`), `ui.on_info()` on retry, exception
-  propagates on final failure. `CompactionEngine.summarize_once()` owns the
-  equivalent cancellable retry ladder for summary calls; its owner-supplied
-  `SummaryRuntime` provides retry classification and backoff while routing
-  progress to the foreground or task-agent lifecycle owner.
-- **`model_turn`'s drain ladder** — inside every single-shot call,
-  mid-stream deaths (errors raised while draining, e.g.
-  `IncompleteStreamError`) are re-issued up to 2 more times with a
-  0.5s-base exponential backoff (±50% jitter); request-time failures
-  keep the SDK's own retry policy. The two ladders stack
-  multiplicatively on transient-shaped failures.
-- **Retryable errors** are matched by class name against each
-  provider's `retryable_error_names` (avoids importing
-  backend-specific exception hierarchies): `RateLimitError`,
-  `APITimeoutError`, `APIConnectionError`, `InternalServerError`,
-  `ServiceUnavailableError`, `APIError`, plus the drained-transport
-  errors `IncompleteStreamError` (stream ended with no terminal
-  signal — for servers that never send one, declare
-  `finish_reason_optional` in the model's capabilities JSON) and
-  `ResponsesStreamFailedError` (transient in-band Responses failure).
+- **Shared response recovery** — conversations, task agents, summaries, utilities, both judges,
+  and perception share at most two reissues per logical model call. Ordinary empty stops,
+  including reasoning-only output, share this allowance with transient stream deaths and, for
+  every product caller except the conversation loop, with transient HTTP-200 JSON error bodies
+  (those the provider's `retryable_error_names` recognizes; an unclassified body is terminal on
+  its first attempt): those arrive after SDK creation succeeds, so the SDK's retries do not cover
+  them, and because no generation ran they carry no replay hazard. Each reissue resends the
+  context and can repeat
+  latency and cost; the allowance bounds attempts, not elapsed time. Refusals, output limits,
+  native activity, and continuation signals are excluded from empty-result recovery.
+- **Replay safety and compaction** — an accepted response permits automatic reissue only when
+  the adapter reports that the final request disables provider-managed tools. Unknown posture
+  also stops recovery. Compaction is not a replay: an accepted overflow, like a request-time
+  context rejection, compacts and retries at any tool posture, because the next request is a
+  different, smaller one. One overflow classifier serves every shrink site. Empty summary
+  exhaustion fails compaction while preserving the existing context.
+- **Retry ownership** — SDK creation retries remain unchanged. The main conversation retains
+  its creation retry/fallback walk, which also owns an HTTP-200 JSON error body: it is a
+  rejected request, retried on the primary lane's ladder, recorded as a health failure, and
+  walked to the fallbacks like any other creation failure. Armed failures remain with the
+  visible-stream owner, which finalizes display and applies the shared controller. Other
+  product callers recover within `model_turn`, with 0.5-second exponential backoff and ±50%
+  jitter; task and summary wrappers add no retry ladder.
+  Raw callers, including direct eval/optimizer sampling, retain their existing empty-result
+  behavior and drain retries. Product tools invoked from eval inherit product behavior.
+- **Accounting and lifecycle** — completed attempts reach their existing usage owner before
+  rejection, including empty attempts. Main recovery respects token-budget exhaustion and
+  generation ownership; discarded reasoning never enters saved history. Judges retain their
+  original deadline and fallback policy, and each output-judge reissue charges its captured
+  rate limiter. Local publication, ingestion, and accounting failures do not drive provider
+  retries, fallback, or compaction; diagnostics identify the stage and exception type without
+  exposing local exception text. A failed task reports failure, with any earlier partial work
+  guarded and explicitly labelled incomplete. Empty title exhaustion preserves the existing
+  title and scheduling latch, so later sends do not repeatedly relaunch automatic titling.
+- **Optional perception** — a failed child description uses the existing parent placeholder.
+  Useful results are cached by principal, model binding, and content. A model that produces no
+  description after recovery memoizes that empty result for the same binding generation, so
+  later sends neither rebuild parts nor re-perceive; backend and local failures instead
+  receive a 60-second cooldown in the same bounded cache, during which later sends skip
+  attachment preparation and inference. Cooldown expiry permits recovery without a registry
+  reload. Cancellation propagates and is never memoized.
+- **Error classification** — transient errors use the provider's `retryable_error_names`,
+  including `IncompleteStreamError` for a stream without a terminal signal and
+  `ResponsesStreamFailedError` for transient Responses failures. Servers that intentionally
+  omit finish signals must declare `finish_reason_optional` in their model capabilities.
 
 ### Finish Reason Handling
 
@@ -1909,16 +1918,15 @@ healthy  ──(failure_threshold consecutive failures)──>  degraded
 degraded ──(any success)───────────────────────────>  healthy
 ```
 
-- `record_success()` fires at the request-accepted instant: the streaming
-  consumer's `on_stream_armed` hook, driven by the eager `cancel_ref` append
-  every adapter performs at HTTP-response time.
-- `record_failure()` fires once per lane's whole creation ladder, in
-  `ChatSession._model_turn_with_fallback` / `_try_fallback_lane`. A mid-stream
-  death (the stream armed, then died) records neither — it belongs to the
-  re-issue ladder, not the fallback walk. `BackendAuthUnavailableError` and
-  `WirePreparationError` also record nothing: an auth refusal is fail-closed
-  configuration policy and a wire-preparation fault is session data — neither
-  says anything about the backend.
+- `record_success()` fires at stream admission: the streaming consumer's
+  `on_stream_armed` hook, driven by the eager `cancel_ref` append after the adapter accepts
+  a streaming response.
+- `record_failure()` fires on a lane's exhausted creation ladder, in
+  `ChatSession._model_turn_with_fallback` / `_try_fallback_lane`; an HTTP-200 JSON error body
+  is one of those creation failures. A mid-stream death records neither: the stream already
+  armed, and its visible owner controls recovery. `BackendAuthUnavailableError`,
+  `WirePreparationError`, and local consumer faults record nothing because they say nothing
+  about backend health.
 - `is_degraded` is advisory ordering, not admission: the fallback walk tries
   non-degraded aliases first and degraded ones as a last resort, and the
   primary lane is always dialed.

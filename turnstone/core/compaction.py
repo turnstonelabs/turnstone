@@ -16,6 +16,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
+from turnstone.core.completion_recovery import EmptyCompletionError
 from turnstone.core.model_turn import ModelTurnResult
 from turnstone.core.trajectory import Turn, TurnProvenance
 from turnstone.core.truncation import truncate_text
@@ -213,13 +214,9 @@ class SummaryRuntime:
     lane_max_output_tokens: int | None
     continuation_overhead_tokens: int
     complete: SummaryCompletion
-    stop_retrying: Callable[[BaseException, int], bool]
     is_context_overflow: Callable[[BaseException], bool]
     check_cancelled: Callable[[], None]
-    backoff_or_cancelled: Callable[[float], None]
     on_progress: Callable[[dict[str, Any]], None] = _ignore_progress
-    max_retries: int = 3
-    retry_base_delay: float = 1.0
 
 
 class CompactionEngine:
@@ -463,38 +460,27 @@ class CompactionEngine:
         body: str,
         runtime: SummaryRuntime,
     ) -> SummaryResult:
-        """Run one complete-or-error summary call with cancellable retries.
+        """Sample once through the common completion recovery operation.
 
-        Deterministic context overflow escapes immediately for subdivision by
-        :meth:`summarize_batch`; other retryable failures report their backoff.
-        The lifecycle owner's cancellation check runs before classification so
-        a transport closed by Stop is never mislabeled as a summary failure.
+        Cancellation retains the lifecycle owner's vocabulary. Genuine context
+        overflow escapes for subdivision by ``summarize_batch``. A model that
+        produced no summary even after shared empty-completion recovery yields
+        an empty result: the lifecycle owner reports that as ``empty_summary``
+        and keeps its history, never as a compaction error.
         """
-
-        result: ModelTurnResult | None = None
-        for attempt in range(runtime.max_retries + 1):
-            try:
-                result = runtime.complete(
-                    system_prompt,
-                    self.COMPACT_USER_PREFIX + body,
-                    self.summary_output_tokens(runtime),
-                )
-                break
-            except Exception as error:
-                runtime.check_cancelled()
-                if runtime.stop_retrying(error, attempt):
-                    raise
-                delay = runtime.retry_base_delay * (2**attempt)
-                runtime.on_progress(
-                    {
-                        "phase": "progress",
-                        "retry_in": delay,
-                        "error": type(error).__name__,
-                    }
-                )
-                runtime.backoff_or_cancelled(delay)
-        if result is None:
-            raise RuntimeError("summary retry ladder exhausted without a result")
+        runtime.check_cancelled()
+        try:
+            result = runtime.complete(
+                system_prompt,
+                self.COMPACT_USER_PREFIX + body,
+                self.summary_output_tokens(runtime),
+            )
+        except EmptyCompletionError as error:
+            runtime.check_cancelled()
+            result = error.result
+        except Exception:
+            runtime.check_cancelled()
+            raise
         summary = (result.content or "").strip()
         if result.finish_reason == "length":
             runtime.on_progress({"phase": "progress", "warning": "summary_truncated"})

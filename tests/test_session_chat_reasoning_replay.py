@@ -443,7 +443,7 @@ class TestCallSitesInvokeMaybeAttach:
 
         def capture_streaming(**kwargs: Any) -> Any:
             captured.update(kwargs)
-            return as_stream(mock_completion_result(""))
+            return as_stream(mock_completion_result("Utility response"))
 
         provider = OpenAIChatCompletionsProvider()
         provider.create_streaming = capture_streaming  # type: ignore[method-assign]

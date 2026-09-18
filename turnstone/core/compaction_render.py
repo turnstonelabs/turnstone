@@ -43,10 +43,8 @@ def render_compaction_event_as_info(
     elif phase == "progress":
         if payload.get("warning") == "summary_truncated":
             on_info("[Warning: compaction summary was truncated]")
-        elif payload.get("retry_in") is not None:
-            on_info(f"[Compact retrying in {payload['retry_in']:.0f}s: {payload.get('error', '')}]")
-        else:
-            on_info(f"[compacting part {payload.get('part')}/{payload.get('total')}…]")
+        elif payload.get("part") is not None and payload.get("total") is not None:
+            on_info(f"[compacting part {payload['part']}/{payload['total']}…]")
     elif phase == "end":
         if payload.get("ok"):
             before = payload.get("before_tokens", 0)
@@ -62,8 +60,6 @@ def render_compaction_event_as_info(
             # The emitter stamps ``notice`` on failed ends (suppressing
             # error-reason ends — already printed red through on_error —
             # plus superseded and cancelled-auto ends).  A payload without
-            # the field (an event replayed from an older node) stays
-            # silent: these notices are informational, and re-deriving the
-            # suppression here is the cross-runtime drift trap the stamp
-            # exists to kill.
+            # the field stays silent: these notices are informational, and
+            # re-deriving suppression here would let consumers disagree.
             on_info(str(payload.get("message") or ""))

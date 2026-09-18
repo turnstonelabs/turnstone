@@ -148,23 +148,34 @@ class CompletionResult:
     reasoning: str = ""
 
 
-class ContextWindowExceededError(RuntimeError):
+class ProviderResponseError(RuntimeError):
+    """A response failed after SDK creation retries had finished.
+
+    Adapters may raise this before returning an iterator, for example when an
+    HTTP-200 response carries a JSON error body. That is a rejected request:
+    no generation ran, so it carries no replay hazard. Nonstreaming product
+    callers spend their shared recovery allowance on a transient one (a class
+    in the provider's ``retryable_error_names``; an unclassified body is
+    terminal on its first attempt), and the streaming owner handles it with
+    its ordinary creation ladder and fallback walk.
+    """
+
+
+class ContextWindowExceededError(ProviderResponseError):
     """The model stopped because the request filled its context window.
 
     Raised by an adapter when a SUCCESSFUL response ends with a stop reason
     that means the context window, not the output budget, ran out
-    (Anthropic's ``model_context_window_exceeded``).  Typed and worded as the same
-    context overflow a 400 rejection produces, so every consumer of the
-    overflow predicate — the send loop's compact-and-retry arm, the
-    task_agent loop's compact-and-retry, the retry gates, the fatal
-    formatter — routes it to compaction and a fresh, complete answer
-    instead of the drain gate blessing a cut-off one as a clean turn.
+    (Anthropic's ``model_context_window_exceeded``). Typed and worded as the same
+    overflow a 400 rejection produces. Product recovery compacts and requests
+    another answer at any tool posture, since shrinking the next request is
+    not a replay; a cut-off response is never accepted as a clean turn.
     Deliberately NOT in any provider's retryable set: re-issuing the same
     prompt cannot help.
     """
 
 
-class IncompleteStreamError(RuntimeError):
+class IncompleteStreamError(ProviderResponseError):
     """The stream ended without any terminal/finish signal.
 
     Every adapter emits a finish reason on a healthy stream (Chat

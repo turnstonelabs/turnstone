@@ -12,17 +12,11 @@ list is empty.
 
 Contract, held deliberately narrow:
 
-* **Policy-free.**  No retry, no deadline, no tool execution, no usage
-  recording inside — those belong to each caller.  The callers are
-  different organs (a judge is not a sub-agent is not a title generator);
-  the plant call is the one thing they share.  Three carve-outs, each
-  about a call that is already dead rather than about policy: the
-  drain-retry loop re-issues a mid-stream death; an aborted
-  ``cancel_ref`` raises ``DeadlineCancelledError`` rather than dispatch,
-  refusing to spend on an abandoned call while the caller keeps the
-  deadline; and ``on_chunk`` DISABLES that drain retry, because only the
-  streaming caller can finalize a display per attempt (see ``Raises`` on
-  :func:`model_turn`).
+* **Product recovery.** ``product_recovery=True`` selects one bounded recovery
+  policy for empty completions and accepted stream deaths. Eval/optimizer keep
+  the raw default. Deadlines, tool execution, usage sinks, and publication belong
+  to callers. ``on_chunk`` leaves reissue execution with the streaming owner so
+  it can finalize visible attempts before applying the shared controller.
 * **Providers stay codegen.**  The provider boundary keeps taking lowered
   wire dicts; Turn IR does not enter the provider Protocol, and
   ``lowering.py`` remains the only wire-mutation owner.  This module
@@ -52,6 +46,16 @@ if TYPE_CHECKING:
     from turnstone.core.model_registry import ModelConfig, ModelRegistry
 
 from turnstone.core.admission import ModelAdmission
+from turnstone.core.completion_recovery import (
+    MAX_COMPLETION_REISSUES,
+    CompletionRecovery,
+    CompletionRecoveryError,
+    EmptyCompletionError,
+    ModelTurnLocalError,
+    completion_cause,
+    is_context_overflow,
+    local_model_call,
+)
 from turnstone.core.deadline import DeadlineCancelledError
 from turnstone.core.history_decoration import attach_vllm_chat_reasoning_field
 from turnstone.core.log import get_logger
@@ -66,6 +70,8 @@ from turnstone.core.lowering import (
 from turnstone.core.providers import create_provider as create_provider
 from turnstone.core.providers._protocol import (
     REASONING_BEARING_BLOCK_TYPES,
+    CompletionResult,
+    ProviderResponseError,
     drain_stream,
     has_reasoning_bearing_block,
     thinking_off_template_kwargs,
@@ -119,10 +125,9 @@ from turnstone.core.trajectory import (
 
 log = get_logger(__name__)
 
-# Mid-stream death re-issue budget — parity with the SDK request-level
-# retry (openai/anthropic default ``max_retries=2``) that covered the
-# whole body read on the retired non-streaming transport.
-_DRAIN_RETRIES = 2
+# Product response recovery allowance; raw callers use it only for drain
+# failures, retaining parity with the retired non-streaming SDK transport.
+_DRAIN_RETRIES = MAX_COMPLETION_REISSUES
 # Base for the exponential inter-attempt delay (0.5s → 1s, ±50% jitter) —
 # the SDK retry's pacing, minus Retry-After (an in-band stream failure
 # carries no header to honor).  An instant re-issue is guaranteed to
@@ -577,7 +582,7 @@ def lane_diagnostics(lane: ModelLane) -> ModelLaneDiagnostics:
 
 def lane_error_is_retryable(lane: ModelLane, exc: BaseException) -> bool:
     """Whether *exc* is retryable according to the lane that raised it."""
-    return type(exc).__name__ in lane.provider.retryable_error_names
+    return type(completion_cause(exc)).__name__ in lane.provider.retryable_error_names
 
 
 def same_model_lane_binding(left: ModelLane, right: ModelLane) -> bool:
@@ -1010,6 +1015,8 @@ class ModelTurnResult:
     tool_def_chars: int | None = None
     # None means the adapter did not report its final request's tool posture.
     native_tools_enabled: bool | None = None
+    reasoning_chars: int = 0
+    native_reasoning: bool = False
 
     @property
     def content(self) -> str:
@@ -1074,6 +1081,8 @@ def cap_tool_calls(result: ModelTurnResult, max_calls: int) -> tuple[list[dict[s
 def _tee_chunks(
     chunks: Iterator[StreamChunk],
     on_chunk: Callable[[StreamChunk], None],
+    *,
+    protect_local_errors: bool = False,
 ) -> Iterator[StreamChunk]:
     """Surface each chunk to *on_chunk* before the drain accumulates it.
 
@@ -1082,26 +1091,34 @@ def _tee_chunks(
     more (a transport death raises at ``next()`` and never reaches the
     callback) and no fewer (a callback raise at chunk N — the
     cancellation path — discards N from display and assembly alike).
-    Callback exceptions propagate untouched; ``GenerationCancelled`` is a
-    ``BaseException`` and so invisible to the drain-retry arm.
+    Product callback faults are wrapped before transport normalization can
+    mistake them for a provider failure. Cancellation passes through untouched.
     """
     for sc in chunks:
-        on_chunk(sc)
+        try:
+            on_chunk(sc)
+        except Exception as error:
+            if protect_local_errors and not isinstance(
+                error, (ModelTurnLocalError, DeadlineCancelledError)
+            ):
+                raise ModelTurnLocalError(error, stage="stream callback") from error
+            raise
         yield sc
 
 
 def _raise_if_aborted(cancel_ref: Any, lane: ModelLane) -> None:
     """Refuse to go on with a call whose caller has already gone away (#972).
 
-    Duck-typed on the same ``aborted`` predicate the drain-retry gate
-    reads, so a ``None`` ref — most lanes — and a plain-list ref stay
-    legal.  One definition, three call sites in :func:`model_turn`: entry,
-    after deterministic lowering but before credential resolution, and
-    immediately before ``create_streaming``.  Nothing interrupts a mint
-    already under way; the last read turns an abort during that mint into a
-    skipped request rather than a sent one.
+    Duck-typed on the same ``aborted`` predicate the recovery gate reads, so
+    a ``None`` ref — most lanes — and a plain-list ref stay legal.  One
+    definition, read at every point in :func:`model_turn` that could spend
+    on an abandoned call: entry, after each lowering and admission step,
+    immediately before ``create_streaming``, after an accepted result, and
+    on every tick of a recovery backoff.  Nothing interrupts a mint already
+    under way; the read before dispatch turns an abort during that mint into
+    a skipped request rather than a sent one.
 
-    The raised message is control flow, not prose.  ``_is_ctx_overflow``
+    The raised message is control flow, not prose.  ``is_context_overflow``
     classifies an exception class it does not recognize by TEXT, so
     context-window vocabulary here would read downstream as a real
     overflow and send the compaction lane subdividing.
@@ -1167,6 +1184,8 @@ def _prepare_wire_for_lane(
     if prepare_wire is not None:
         try:
             prepared = prepare_wire(prepared, lane)
+        except (ModelTurnLocalError, DeadlineCancelledError):
+            raise
         except Exception as prep_err:
             raise WirePreparationError(type(prep_err).__name__) from prep_err
     return maybe_attach_vllm_chat_reasoning(
@@ -1175,6 +1194,101 @@ def _prepare_wire_for_lane(
         lane.registry,
         lane.alias,
         cfg=cfg,
+    )
+
+
+def _ingest_completion(
+    result: CompletionResult,
+    lane: ModelLane,
+    *,
+    mint: Callable[[str], str] | None,
+    wire_id_map: dict[str, str] | None,
+    acting_principal_id: str,
+    cfg: Any | None,
+    wire_msgs: list[dict[str, Any]],
+    request_metrics: ProviderRequestMetrics | None,
+    tools: list[dict[str, Any]] | None,
+) -> ModelTurnResult:
+    """Build the canonical turn from a completed provider attempt."""
+    raw_calls: list[dict[str, Any]] = list(result.tool_calls or [])
+    # Record blanks BEFORE the uuid back-fill: a back-filled id exists only
+    # in the tool_calls mirror until the pairwise native repair below runs.
+    had_blank_ids = any(not tc.get("id") for tc in raw_calls)
+    ensure_tool_call_ids(raw_calls)
+    if had_blank_ids and backfill_blank_native_tool_ids(result.provider_blocks, raw_calls):
+        # The native client blocks now carry the manufactured ids — the
+        # mirror, the native lane, and (via the map-restored wire) the tool
+        # results agree again, so the lane can be kept: thought_signature
+        # survives on Google's blank-id compat responses instead of the
+        # turn degrading to loose reasoning text.
+        had_blank_ids = False
+    if mint is not None:
+        if wire_id_map is None:
+            raise ModelLaneInvariantError("tool-call id minting requires an id recovery map")
+        for tc in raw_calls:
+            original_id = tc["id"]
+            minted = mint(original_id)
+            if minted != original_id:
+                tc["id"] = minted
+                # Recovery is by MAP ONLY — never string-split the mint
+                # (parent and original are provider-controlled strings
+                # that may themselves contain the delimiter).
+                wire_id_map[minted] = original_id
+
+    tool_calls = tuple(
+        ToolCall(
+            id=tc["id"],
+            name=tc.get("function", {}).get("name", ""),
+            arguments=tc.get("function", {}).get("arguments", ""),
+        )
+        for tc in raw_calls
+    )
+    # Carry the provider-native lane (thinking blocks, signatures, Responses
+    # reasoning items, synthesized ``reasoning_text``) so a multi-turn caller
+    # keeps its reasoning continuity instead of re-reasoning each turn.
+    # ``producer`` is the lane's own provider: a loop is pinned to one
+    # provider, so blocks always replay to the backend that produced them
+    # (translators' per-block shape filters drop anything foreign).
+    native_reasoning = has_reasoning_bearing_block(result.provider_blocks)
+    native_blocks = finalize_provider_blocks(
+        result.provider_blocks,
+        [result.reasoning],
+        has_tool_calls=bool(raw_calls),
+        had_blank_ids=had_blank_ids,
+        registry=lane.registry,
+        alias=lane.alias,
+        cfg=cfg,
+    )
+    native = (
+        ProviderNative(producer=lane.provider.provider_name, blocks=tuple(native_blocks))
+        if native_blocks
+        else None
+    )
+    provenance = TurnProvenance(
+        model_alias=lane.alias,
+        backend_model_id=lane.model,
+        registry_generation=lane.registry_generation,
+        acting_principal_id=acting_principal_id,
+    )
+    turn = Turn.assistant(result.content or "", tool_calls=tool_calls, native=native)
+    turn.meta.extra[PROVENANCE_META_KEY] = provenance.to_meta()
+    return ModelTurnResult(
+        turn=turn,
+        finish_reason=result.finish_reason,
+        usage=result.usage,
+        tool_calls=raw_calls,
+        provenance=provenance,
+        wire_msgs=wire_msgs,
+        producer=lane.provider.provider_name,
+        serving_model=lane.model,
+        tool_def_chars=(
+            request_metrics.serialized_tool_chars
+            if request_metrics
+            else serialized_tool_chars(tools)
+        ),
+        native_tools_enabled=request_metrics.native_tools_enabled if request_metrics else None,
+        reasoning_chars=len(result.reasoning or ""),
+        native_reasoning=native_reasoning,
     )
 
 
@@ -1197,6 +1311,9 @@ def model_turn(
     admit_request: Callable[[ModelLane], None] | None = None,
     validate_wire: Callable[[list[dict[str, Any]], ModelLane], None] | None = None,
     on_chunk: Callable[[StreamChunk], None] | None = None,
+    product_recovery: bool = False,
+    on_completed: Callable[[UsageInfo | None], None] | None = None,
+    admit_reissue: Callable[[], None] | None = None,
 ) -> ModelTurnResult:
     """Advance a trajectory by one model turn: lower, sample, re-ingest.
 
@@ -1304,30 +1421,29 @@ def model_turn(
     assembler consumes — and the assembled result is returned as usual.
     Chunk→UI translation is the caller's business; the canonical Turn
     always comes from the drain's assembly, never from anything the
-    callback accumulated.  A callback raise aborts the call with that
-    exception; ``GenerationCancelled``, being a ``BaseException``, passes
-    the retry arm untouched.  **With *on_chunk* present the mid-stream
-    drain retry below is DISABLED** — the third policy carve-out: a
-    partially-surfaced stream must not be silently re-issued behind a UI
-    that already rendered its tokens, so the streaming caller owns
-    re-issue.
+    callback accumulated. With *on_chunk*, the streaming caller owns reissue
+    so it can finalize visible attempts before replay. Product callback
+    failures become :class:`ModelTurnLocalError`; cancellation exceptions
+    pass through unchanged.
 
-    Raises whatever the provider raises — retry/deadline/fallback policy
-    is the caller's — EXCEPT transient mid-stream deaths: a failure the
-    provider's own ``retryable_error_names`` recognizes, raised while
-    DRAINING (``IncompleteStreamError`` and friends), is re-issued in
-    place up to ``_DRAIN_RETRIES`` times (zero with *on_chunk*, above).
-    The retired non-streaming transport read the whole body inside the
-    SDK's retried request, so single-shot callers never saw a mid-body
-    wire blip; this loop is that retry's new home (request-time failures
-    still get the SDK's own policy inside ``create_streaming`` and
-    propagate unchanged).  A *prepare_wire* raise is the one re-typed
-    exception, surfacing as :class:`WirePreparationError` with the
-    original as ``__cause__``.  An aborted *cancel_ref* suppresses
-    retries — a deadline that closed the stream must not have the request
-    resurrected behind its back — and, read before each dispatch, raises
-    :class:`~turnstone.core.deadline.DeadlineCancelledError` instead of
-    issuing the request at all (see *cancel_ref* above).
+    Product callers set *product_recovery*: ordinary empty stops and transient
+    response failures share two reissues, each requiring the adapter's final
+    request posture to explicitly disable native tools. A JSON error body the
+    adapter rejects before returning an iterator is a rejected request, not an
+    accepted response: nonstreaming callers spend the same allowance on a
+    transient one (an unclassified body is terminal) with no replay hazard,
+    while with *on_chunk* it propagates raw so the streaming owner's creation
+    ladder handles it. Other typed attempt failures escape to
+    the streaming owner. The raw default preserves eval/optimizer's
+    empty-result and drain-retry contract. SDK creation failures retain their
+    existing retry policy and propagate unchanged. An aborted *cancel_ref*
+    prevents another dispatch.
+
+    *on_completed* observes the usage of every completed provider attempt
+    after capacity release, before canonical ingestion, rejection, or
+    cancellation; its errors are local and terminal.
+    *admit_reissue* runs before each additional dispatch so an owner can
+    charge its existing request limit without renewing deadlines.
 
     *backend_auth_token* is a delegated-user or app-identity credential for a
     dynamically authenticated backend. When set, the call is issued on
@@ -1369,7 +1485,13 @@ def model_turn(
     if admit_request is not None:
         try:
             admit_request(lane)
+        except (ModelTurnLocalError, DeadlineCancelledError):
+            raise
         except Exception as admission_err:
+            if product_recovery:
+                raise ModelTurnLocalError(
+                    admission_err, stage="request admission"
+                ) from admission_err
             raise ModelAdmissionError(type(admission_err).__name__) from admission_err
         _raise_if_aborted(cancel_ref, lane)
     else:
@@ -1398,14 +1520,19 @@ def model_turn(
     # sampling. A context-first refusal above performs none of it. A successful
     # request completes it before taking the outer alias's admission slot so a
     # cap of one cannot deadlock on a nested call that needs the same alias.
-    served_wire = materialize_attachments(wire, resolve_attachments)
+    with local_model_call(
+        "attachment materialization",
+        enabled=product_recovery,
+        passthrough=(ModelContextLimitError,),
+    ):
+        served_wire = materialize_attachments(wire, resolve_attachments)
     dispatched_wire = served_wire
     # A partially-surfaced stream is never silently re-issued — the
     # streaming caller owns re-issue.
-    drain_retries = 0 if on_chunk is not None else _DRAIN_RETRIES
-    attempt = 0
-    request_metrics: list[ProviderRequestMetrics] = []
+    max_reissues = 0 if on_chunk is not None else _DRAIN_RETRIES
+    recovery = CompletionRecovery(max_reissues=max_reissues)
     while True:
+        request_metrics: list[ProviderRequestMetrics] = []
         _raise_if_aborted(cancel_ref, lane)
         if admit_request is not None:
             # Preserve the established per-transport-attempt lowering cadence,
@@ -1422,10 +1549,18 @@ def model_turn(
         else:
             dispatched_wire = served_wire
         if validate_wire is not None:
-            validate_wire(dispatched_wire, lane)
+            with local_model_call(
+                "input validation", enabled=product_recovery, passthrough=(ModelContextLimitError,)
+            ):
+                validate_wire(dispatched_wire, lane)
+            _raise_if_aborted(cancel_ref, lane)
+        if recovery.reissues and admit_reissue is not None:
+            with local_model_call("reissue admission"):
+                admit_reissue()
             _raise_if_aborted(cancel_ref, lane)
         lease = lane.admission.acquire(cancel_ref=cancel_ref) if lane.admission else None
-        drain_error: Exception | None = None
+        response_error: Exception | None = None
+        rejected_request = False
         with lease if lease is not None else contextlib.nullcontext():
             # Dynamic credential mint and the full create+drain remain inside
             # the hold; local request admission completed before this slot was
@@ -1436,149 +1571,155 @@ def model_turn(
                 cancel_ref=cancel_ref,
             )
             _raise_if_aborted(cancel_ref, lane)
-            _raise_if_aborted(cancel_ref, lane)
             mark_dispatch = getattr(cancel_ref, "mark_dispatch", None)
             if callable(mark_dispatch):
                 with contextlib.suppress(Exception):
                     mark_dispatch()
-            # ``create_streaming`` stays OUTSIDE the drain-error catch: every
-            # adapter issues eagerly in its body, so a request-time failure has
-            # already received the SDK's own retries and propagates unchanged.
-            chunks = lane.provider.create_streaming(
-                client=call_client,
-                model=lane.model,
-                messages=dispatched_wire,
-                tools=tools,
-                max_tokens=max_tokens,
-                temperature=temperature if temperature is not None else lane.temperature,
-                reasoning_effort=effective_effort,
-                extra_params=lane.extra_params,
-                deferred_names=deferred_names,
-                cancel_ref=cancel_ref,
-                capabilities=lane.capabilities,
-                replay_reasoning_to_model=resolve_replay_reasoning_to_model(
-                    lane.registry, lane.alias, caps=lane.capabilities, cfg=cfg
-                ),
-                # Already materialized above after request admission; provider
-                # translators retain their no-op fallback for direct callers.
-                resolve_attachments=None,
-                request_metrics_ref=request_metrics,
-            )
+            # SDK creation errors retain the SDK's retry policy. An adapter can
+            # also reject a response before returning an iterator (an HTTP-200
+            # JSON error body): nothing ran, so it is a rejected request.
+            # Nonstreaming product callers spend their shared allowance on it;
+            # the streaming owner keeps its own creation ladder for it.
             try:
-                result = drain_stream(
-                    _tee_chunks(chunks, on_chunk) if on_chunk else chunks,
-                    scan_inline_reasoning=lane_scans_inline_reasoning(lane),
+                chunks = lane.provider.create_streaming(
+                    client=call_client,
+                    model=lane.model,
+                    messages=dispatched_wire,
+                    tools=tools,
+                    max_tokens=max_tokens,
+                    temperature=temperature if temperature is not None else lane.temperature,
+                    reasoning_effort=effective_effort,
+                    extra_params=lane.extra_params,
+                    deferred_names=deferred_names,
+                    cancel_ref=cancel_ref,
+                    capabilities=lane.capabilities,
+                    replay_reasoning_to_model=resolve_replay_reasoning_to_model(
+                        lane.registry, lane.alias, caps=lane.capabilities, cfg=cfg
+                    ),
+                    # Already materialized above after request admission; provider
+                    # translators retain their no-op fallback for direct callers.
+                    resolve_attachments=None,
+                    request_metrics_ref=request_metrics,
                 )
-            except Exception as exc:
-                drain_error = exc
-            finally:
-                close = getattr(chunks, "close", None)
-                if callable(close):
-                    with contextlib.suppress(Exception):
-                        close()
+            except ProviderResponseError as exc:
+                if not product_recovery or on_chunk is not None:
+                    raise
+                response_error = exc
+                rejected_request = True
+            else:
+                try:
+                    result = drain_stream(
+                        _tee_chunks(chunks, on_chunk, protect_local_errors=product_recovery)
+                        if on_chunk
+                        else chunks,
+                        scan_inline_reasoning=lane_scans_inline_reasoning(lane),
+                    )
+                except Exception as exc:
+                    response_error = exc
+                finally:
+                    close = getattr(chunks, "close", None)
+                    if callable(close):
+                        with contextlib.suppress(Exception):
+                            close()
 
-        if drain_error is None:
-            break
-        attempt += 1
-        if (
-            attempt > drain_retries
-            or bool(getattr(cancel_ref, "aborted", False))
-            or type(drain_error).__name__ not in lane.provider.retryable_error_names
-        ):
-            raise drain_error
-        delay = _DRAIN_RETRY_BASE_DELAY * (2 ** (attempt - 1)) * (0.5 + random.random())
+        if response_error is None and on_completed is not None:
+            with local_model_call("completion accounting"):
+                on_completed(result.usage)
+
+        if response_error is not None:
+            if isinstance(response_error, (ModelTurnLocalError, DeadlineCancelledError)):
+                raise response_error
+            failure: Exception = response_error
+            if product_recovery and (
+                isinstance(response_error, ProviderResponseError)
+                or lane_error_is_retryable(lane, response_error)
+                or is_context_overflow(response_error)
+            ):
+                cause = response_error.__cause__ or response_error
+                failure = CompletionRecoveryError(
+                    f"Model response failed ({type(response_error).__name__}: {type(cause).__name__}).",
+                    # A rejected request executed nothing, so it carries no
+                    # replay hazard whatever the request's tool posture was.
+                    native_tools_enabled=(
+                        False
+                        if rejected_request
+                        else (request_metrics[-1].native_tools_enabled if request_metrics else None)
+                    ),
+                    error=response_error,
+                )
+                failure.__cause__ = response_error
+        else:
+            with local_model_call("completion ingestion", enabled=product_recovery):
+                completed = _ingest_completion(
+                    result,
+                    lane,
+                    mint=mint,
+                    wire_id_map=wire_id_map,
+                    acting_principal_id=acting_principal_id,
+                    cfg=cfg,
+                    wire_msgs=dispatched_wire,
+                    request_metrics=request_metrics[-1] if request_metrics else None,
+                    tools=tools,
+                )
+            if not product_recovery:
+                return completed
+            empty = is_empty_completion(completed)
+            log.info(
+                "model_turn.completed",
+                model=lane.model,
+                alias=lane.alias,
+                attempt=recovery.reissues + 1,
+                finish_reason=completed.finish_reason,
+                content_chars=len(completed.content),
+                reasoning_chars=completed.reasoning_chars,
+                native_reasoning=completed.native_reasoning,
+                native_tools_enabled=completed.native_tools_enabled,
+                usage=vars(completed.usage) if completed.usage is not None else None,
+                disposition="empty" if empty else "accepted",
+            )
+            if not empty:
+                _raise_if_aborted(cancel_ref, lane)
+                return completed
+            failure = EmptyCompletionError(completed)
+
+        # The visible-stream owner retains its existing cancellation and billed
+        # empty accounting fences. Nonstreaming owners were observed above.
+        if product_recovery and on_chunk is None:
+            _raise_if_aborted(cancel_ref, lane)
+        retry = recovery.consume_reissue(
+            failure,
+            retryable=lane_error_is_retryable(lane, failure),
+            stopped=bool(getattr(cancel_ref, "aborted", False)),
+            require_safe_replay=product_recovery,
+        )
+        if not retry:
+            if product_recovery:
+                log.warning(
+                    "model_turn.recovery_stopped",
+                    model=lane.model,
+                    alias=lane.alias,
+                    error_type=type(completion_cause(failure)).__name__,
+                    reissues=recovery.reissues,
+                    external=on_chunk is not None,
+                )
+            raise failure
+        delay = _DRAIN_RETRY_BASE_DELAY * (2 ** (recovery.reissues - 1)) * (0.5 + random.random())
         log.warning(
-            "model_turn.drain_retry",
-            error_type=type(drain_error).__name__,
-            attempt=attempt,
+            "model_turn.completion_retry" if product_recovery else "model_turn.drain_retry",
+            error_type=type(completion_cause(failure)).__name__,
+            attempt=recovery.reissues,
             model=lane.model,
             alias=lane.alias,
             registry_generation=lane.registry_generation,
             retry_in=round(delay, 2),
         )
-        if delay > 0:
+        if product_recovery and cancel_ref is not None:
+            retry_at = time.monotonic() + delay
+            while (remaining := retry_at - time.monotonic()) > 0:
+                _raise_if_aborted(cancel_ref, lane)
+                time.sleep(min(remaining, 0.05))
+            _raise_if_aborted(cancel_ref, lane)
+        elif delay > 0:
             time.sleep(delay)
         if bool(getattr(cancel_ref, "aborted", False)):
-            # The deadline abandoned this worker while it was backing off.
-            # The loop-top read would stop the re-issue anyway; this arm
-            # exists to die with the ORIGINAL transport failure rather than
-            # the abandonment error, so the cause of the death survives.
-            raise drain_error
-
-    raw_calls: list[dict[str, Any]] = list(result.tool_calls or [])
-    # Record blanks BEFORE the uuid back-fill: a back-filled id exists only
-    # in the tool_calls mirror until the pairwise native repair below runs.
-    had_blank_ids = any(not tc.get("id") for tc in raw_calls)
-    ensure_tool_call_ids(raw_calls)
-    if had_blank_ids and backfill_blank_native_tool_ids(result.provider_blocks, raw_calls):
-        # The native client blocks now carry the manufactured ids — the
-        # mirror, the native lane, and (via the map-restored wire) the tool
-        # results agree again, so the lane can be kept: thought_signature
-        # survives on Google's blank-id compat responses instead of the
-        # turn degrading to loose reasoning text.
-        had_blank_ids = False
-    if mint is not None:
-        if wire_id_map is None:
-            raise ModelLaneInvariantError("tool-call id minting requires an id recovery map")
-        for tc in raw_calls:
-            original_id = tc["id"]
-            minted = mint(original_id)
-            if minted != original_id:
-                tc["id"] = minted
-                # Recovery is by MAP ONLY — never string-split the mint
-                # (parent and original are provider-controlled strings
-                # that may themselves contain the delimiter).
-                wire_id_map[minted] = original_id
-
-    tool_calls = tuple(
-        ToolCall(
-            id=tc["id"],
-            name=tc.get("function", {}).get("name", ""),
-            arguments=tc.get("function", {}).get("arguments", ""),
-        )
-        for tc in raw_calls
-    )
-    # Carry the provider-native lane (thinking blocks, signatures, Responses
-    # reasoning items, synthesized ``reasoning_text``) so a multi-turn caller
-    # keeps its reasoning continuity instead of re-reasoning each turn.
-    # ``producer`` is the lane's own provider: a loop is pinned to one
-    # provider, so blocks always replay to the backend that produced them
-    # (translators' per-block shape filters drop anything foreign).
-    native_blocks = finalize_provider_blocks(
-        result.provider_blocks,
-        [result.reasoning],
-        has_tool_calls=bool(raw_calls),
-        had_blank_ids=had_blank_ids,
-        registry=lane.registry,
-        alias=lane.alias,
-        cfg=cfg,
-    )
-    native = (
-        ProviderNative(producer=lane.provider.provider_name, blocks=tuple(native_blocks))
-        if native_blocks
-        else None
-    )
-    provenance = TurnProvenance(
-        model_alias=lane.alias,
-        backend_model_id=lane.model,
-        registry_generation=lane.registry_generation,
-        acting_principal_id=acting_principal_id,
-    )
-    turn = Turn.assistant(result.content or "", tool_calls=tool_calls, native=native)
-    turn.meta.extra[PROVENANCE_META_KEY] = provenance.to_meta()
-    return ModelTurnResult(
-        turn=turn,
-        finish_reason=result.finish_reason,
-        usage=result.usage,
-        tool_calls=raw_calls,
-        provenance=provenance,
-        wire_msgs=dispatched_wire,
-        producer=lane.provider.provider_name,
-        serving_model=lane.model,
-        tool_def_chars=(
-            request_metrics[-1].serialized_tool_chars
-            if request_metrics
-            else serialized_tool_chars(tools)
-        ),
-        native_tools_enabled=request_metrics[-1].native_tools_enabled if request_metrics else None,
-    )
+            raise failure

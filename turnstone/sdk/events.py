@@ -359,8 +359,7 @@ class CompactionEvent(ServerEvent):
 
     ``start`` carries ``trigger`` (``"manual"`` / ``"auto"``; auto adds
     ``where`` + ``pct``); ``progress`` carries chunked-summarization
-    ``part``/``total``/``depth`` (or ``retry_in``/``error`` for a retry
-    wait); ``end`` carries ``ok`` plus either the result
+    ``part``/``total``/``depth``; ``end`` carries ``ok`` plus either the result
     (``before_tokens``/``after_tokens``/``summary``) or the failure
     ``reason``/``message`` — failure ends carry ``trigger`` too.  The
     ``target`` is ``"workstream"`` when the lifecycle owns the transcript
@@ -395,8 +394,8 @@ class CompactionEvent(ServerEvent):
     part: int | None = None
     total: int | None = None
     depth: int | None = None
-    retry_in: float | None = None
-    error: str = ""
+    retry_in: float | None = None  # Legacy field; current progress events do not emit it.
+    error: str = ""  # Legacy field; current progress events do not emit it.
     warning: str = ""
     ok: bool | None = None
     reason: str = ""

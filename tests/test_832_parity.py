@@ -71,7 +71,8 @@ def _apply_ruled_deltas(name: str, baseline: dict[str, Any]) -> dict[str, Any]:
         # The re-issue ladder finalizes the display and re-drives the turn
         # (_MID_STREAM_RETRIES times), then the terminal arm
         # finalizes+discards and the retryable error surfaces.
-        expected["raised"] = "IncompleteStreamError"
+        # #1169 retains the accepted request posture alongside that cause.
+        expected["raised"] = "CompletionRecoveryError"
         expected["result"] = None
         retry_theater = []
         for attempt in (1, 2):
@@ -91,12 +92,20 @@ def _apply_ruled_deltas(name: str, baseline: dict[str, Any]) -> dict[str, Any]:
         )
 
     elif name == "finish_only_no_content":
-        # #1070: an ordinary completed response with no answer is rejected.
-        # This scripted adapter reports no prepared-request tool facts, so
-        # the conversation cannot safely reissue it and fails immediately.
-        expected["raised"] = "_EmptyCompletionError"
+        # #1169: ordinary empty stops use the shared error and allowance.
+        # The scripted adapter now explicitly reports native tools disabled,
+        # so its replay is safe and receives the two bounded reissues.
+        expected["raised"] = "EmptyCompletionError"
         expected["result"] = None
-        expected["ui_events"] = [["stream_end", ""], ["stream_discarded", ""]]
+        expected["ui_events"] = []
+        for attempt in (1, 2):
+            expected["ui_events"] += [
+                ["stream_end", ""],
+                ["info", f"[model returned no answer — retrying in 0s ({attempt}/2)]"],
+                ["stream_discarded", ""],
+                ["thinking_start", ""],
+            ]
+        expected["ui_events"] += [["stream_end", ""], ["stream_discarded", ""]]
 
     elif name == "think_tags_split_across_chunks":
         # RULED (#832): the COMMITTED content takes the drain's single

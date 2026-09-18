@@ -27,11 +27,11 @@ from turnstone.core.compaction import (
     SummaryResult,
     SummaryRuntime,
 )
+from turnstone.core.completion_recovery import is_context_overflow
 from turnstone.core.session import (
     COMPACTION_SOURCE,
     COMPACTION_SUMMARY_LABEL,
     GenerationCancelled,
-    _is_ctx_overflow,
 )
 from turnstone.core.storage import get_storage
 from turnstone.core.trajectory import dicts_from_turns, turns_from_dicts
@@ -1298,31 +1298,31 @@ def test_is_ctx_overflow_detection(message, expected):
     """Overflow is detected by text, not exception class: vLLM returns the same
     condition as a 400 ``BadRequestError`` on /v1/chat/completions but a 500
     ``InternalServerError`` on /v1/messages."""
-    assert _is_ctx_overflow(RuntimeError(message)) is expected
+    assert is_context_overflow(RuntimeError(message)) is expected
 
 
 def test_is_ctx_overflow_excludes_recognized_rate_limit_class():
     """A 429 RateLimitError whose token-quota text contains an overflow phrase must
-    NOT be classified as overflow.  _stop_retrying calls _is_ctx_overflow with no
+    NOT be classified as overflow.  _stop_retrying calls is_context_overflow with no
     class gate of its own, so without this a retryable rate-limit ("… maximum number
     of tokens allowed per minute …") would be made non-retryable.  The SAME text in
     an unrecognized class is still overflow — proving it's the class gate at work."""
 
-    class RateLimitError(Exception):  # name is in _BACKEND_RATE_LIMIT_EXC_NAMES
+    class RateLimitError(Exception):  # name is in BACKEND_RATE_LIMIT_EXC_NAMES
         pass
 
     msg = "exceeds the maximum number of tokens allowed per minute"
-    assert _is_ctx_overflow(RateLimitError(msg)) is False  # retryable, not overflow
-    assert _is_ctx_overflow(RuntimeError(msg)) is True  # unknown class → text decides
+    assert is_context_overflow(RateLimitError(msg)) is False  # retryable, not overflow
+    assert is_context_overflow(RuntimeError(msg)) is True  # unknown class → text decides
 
 
 def test_format_backend_error_renders_overflow(session):
     """The text-first overflow branch in _format_backend_error renders a clear
     "Context window exceeded" message (with a raw tail) for an exception class
-    OUTSIDE _BACKEND_KNOWN_EXC_NAMES — the anthropic-compat 500 case — and a
+    OUTSIDE BACKEND_KNOWN_EXC_NAMES — the anthropic-compat 500 case — and a
     non-overflow unknown class still falls through to None."""
 
-    class InternalServerError(Exception):  # not in _BACKEND_KNOWN_EXC_NAMES
+    class InternalServerError(Exception):  # not in BACKEND_KNOWN_EXC_NAMES
         pass
 
     msg = session._format_backend_error(
@@ -2616,6 +2616,7 @@ class TestPreHookUICompat:
             0, {"phase": "start", "trigger": "auto", "where": "mid-turn", "pct": 80}
         )
         session._compaction_event(0, {"phase": "progress", "part": 1, "total": 2, "depth": 0})
+        session._compaction_event(0, {"phase": "progress", "warning": "summary_truncated"})
         session._compaction_event(
             0,
             {
@@ -2629,8 +2630,18 @@ class TestPreHookUICompat:
         )
         assert any("Auto-compacting mid-turn" in m and "80%" in m for m in infos)
         assert any("compacting part 1/2" in m for m in infos)
+        assert "[Warning: compaction summary was truncated]" in infos
         assert any("compacted: ~900 -> ~100 tokens" in m for m in infos)
         assert any("dense" in m for m in infos)
+
+    @pytest.mark.parametrize(
+        "fields",
+        [{}, {"part": 1}, {"total": 2}, {"part": None, "total": 2}, {"part": 1, "total": None}],
+    )
+    def test_pre_hook_ui_ignores_progress_without_complete_part_counts(self, session, fields):
+        session.ui, infos = self._duck_ui_with_info()
+        session._compaction_event(0, {"phase": "progress", **fields})
+        assert infos == []
 
     def test_pre_hook_fallback_consumes_notice_not_policy(self, session):
         """Failed-end display rides the emitter's ``notice`` stamp: a
@@ -3010,17 +3021,33 @@ class TestOrphanedCompactionRetirement:
             _summarize_blocks(session, ["block-a"], my_generation=4)
         uc.assert_not_called()  # retired BEFORE spending another model call
 
-    def test_cancel_during_retry_backoff_aborts_immediately(self, session):
-        """The backoff waits on the cancel event, not time.sleep — a Stop
-        during the (possibly minutes-long) wait aborts without burning the
-        delay plus one more model call."""
+    def test_cancel_before_or_during_the_summary_call_aborts_without_retrying(self, session):
+        """The summarizer checks the owner's cancel event before dispatching
+        and again when the call fails, so a Stop never spends another model
+        call, and a transport closed by Stop is reported as cancellation
+        rather than as a summary failure."""
         session._cancel_event.set()
         with (
-            patch.object(session, "_utility_completion", side_effect=RuntimeError("transient")),
-            patch.object(session, "_stop_retrying", return_value=False),
+            patch.object(
+                session, "_utility_completion", side_effect=RuntimeError("transient")
+            ) as uc,
             pytest.raises(GenerationCancelled),
         ):
             _summarize_once(session, "sys", "body")
+        uc.assert_not_called()
+
+        session._cancel_event.clear()
+
+        def cancel_mid_call(*_args, **_kwargs):
+            session._cancel_event.set()
+            raise RuntimeError("stream closed by Stop")
+
+        with (
+            patch.object(session, "_utility_completion", side_effect=cancel_mid_call) as uc,
+            pytest.raises(GenerationCancelled),
+        ):
+            _summarize_once(session, "sys", "body")
+        uc.assert_called_once()
 
     def test_summary_call_registers_abortable_stream(self, session):
         """Each summary attempt passes a fresh _CancelRef so cancel() can

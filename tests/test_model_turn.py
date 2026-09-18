@@ -1018,12 +1018,12 @@ def test_pre_dispatch_abort_does_not_read_as_a_context_overflow() -> None:
     # A latent coupling, pinned deliberately rather than a live path: today
     # compaction's ``except`` arm re-checks the session first and raises
     # GenerationCancelled, and ``_stop_retrying`` short-circuits on the class
-    # gate, so this message never reaches ``_is_ctx_overflow``.  It would the
-    # moment either shortcut moves — and ``_is_ctx_overflow`` classifies an
+    # gate, so this message never reaches ``is_context_overflow``.  It would the
+    # moment either shortcut moves — and ``is_context_overflow`` classifies an
     # unrecognized class by TEXT, so an overflow reading would send the
     # compaction lane subdividing.  The message is a wire contract; pin it.
+    from turnstone.core.completion_recovery import is_context_overflow
     from turnstone.core.deadline import DeadlineCancelledError, StreamAbortRef
-    from turnstone.core.session import _is_ctx_overflow
 
     provider = _FakeProvider([CompletionResult(content="never")])
     lane = ModelLane(provider=provider, client=object(), model="m")
@@ -1033,7 +1033,7 @@ def test_pre_dispatch_abort_does_not_read_as_a_context_overflow() -> None:
     with pytest.raises(DeadlineCancelledError) as excinfo:
         model_turn(lane, [Turn.user("x")], cancel_ref=ref)
 
-    assert not _is_ctx_overflow(excinfo.value)
+    assert not is_context_overflow(excinfo.value)
 
 
 def _real_semantics_store(**stored: Any) -> SimpleNamespace:

@@ -23,6 +23,7 @@ from unittest.mock import MagicMock
 
 from turnstone.core.model_turn import ModelTurnResult, resolve_model_binding
 from turnstone.core.providers import ModelCapabilities, StreamChunk, ToolCallDelta, UsageInfo
+from turnstone.core.providers._protocol import ProviderRequestMetrics, serialized_tool_chars
 from turnstone.core.session import ChatSession
 from turnstone.core.session_ui_base import SessionUIBase
 from turnstone.core.trajectory import ProviderNative, ToolCall, Turn
@@ -700,6 +701,14 @@ def arm_session(
         nxt = remaining.pop(0)
         if isinstance(nxt, BaseException):
             raise nxt
+        metrics = kwargs.get("request_metrics_ref")
+        if metrics is not None:
+            metrics.append(
+                ProviderRequestMetrics(
+                    serialized_tool_chars=serialized_tool_chars(kwargs.get("tools")),
+                    native_tools_enabled=False,
+                )
+            )
         ref = kwargs.get("cancel_ref")
         if ref is not None:
             handle = ArmedHandle()
@@ -725,6 +734,14 @@ def scripted_provider(chunks: list[StreamChunk]) -> MagicMock:
     provider = provider_shell()
 
     def _create(**kwargs: Any):
+        metrics = kwargs.get("request_metrics_ref")
+        if metrics is not None:
+            metrics.append(
+                ProviderRequestMetrics(
+                    serialized_tool_chars=serialized_tool_chars(kwargs.get("tools")),
+                    native_tools_enabled=False,
+                )
+            )
         ref = kwargs.get("cancel_ref")
         if ref is not None:
             ref.append(ArmedHandle())

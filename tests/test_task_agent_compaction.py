@@ -531,17 +531,21 @@ def test_provider_overflow_compacts_once_and_retries_same_step():
     ]
 
 
-def test_second_overflow_returns_partial_execution_without_retry_storm():
+def test_second_overflow_fails_with_partial_execution_without_retry_storm():
     session = make_session(auto_compact_pct=0.8)
     ledger = [Turn.user("delegated contract")]
     overflow = RuntimeError("maximum context length exceeded")
+    contexts = []
 
-    with patch.object(
-        session._compaction_engine,
-        "summarize_blocks",
-        return_value=SummaryResult(text="overflow summary", producer="summary-kernel"),
-    ) as summarize:
-        output, contexts = _run_script(
+    with (
+        patch.object(
+            session._compaction_engine,
+            "summarize_blocks",
+            return_value=SummaryResult(text="overflow summary", producer="summary-kernel"),
+        ) as summarize,
+        pytest.raises(RuntimeError, match="Incomplete task") as failure,
+    ):
+        _run_script(
             session,
             ledger,
             [
@@ -549,11 +553,12 @@ def test_second_overflow_returns_partial_execution_without_retry_storm():
                 overflow,
                 overflow,
             ],
+            on_call=lambda _number, turns: contexts.append(turns),
         )
 
-    assert output == "useful partial analysis"
-    summarize.assert_called_once()
+    assert "useful partial analysis" in str(failure.value)
     assert len(contexts) == 3
+    summarize.assert_called_once()
 
 
 def test_turn_limit_compacts_before_forced_synthesis():
@@ -711,7 +716,6 @@ def test_closed_summary_stream_uses_task_scope_cancellation_without_retrying():
 
     with (
         patch.object(session, "_utility_completion", side_effect=cancelled_summary) as complete,
-        patch.object(session, "_stop_retrying", return_value=True),
         patch.object(
             session.ui,
             "on_compaction",
@@ -729,7 +733,6 @@ def test_closed_summary_stream_uses_task_scope_cancellation_without_retrying():
     events = [call.args[0] for call in on_compaction.call_args_list]
     assert events[0]["phase"] == "start"
     assert events[-1]["phase"] == "end"
-    assert not any("retry_in" in event for event in events)
     assert events[-1]["reason"] == "cancelled"
     assert events[-1]["notice"] is False
     assert [turn.role for turn in ledger] == [Role.USER, Role.ASSISTANT, Role.TOOL]
@@ -751,30 +754,33 @@ def test_failed_compaction_is_not_retried_without_new_context():
     session = make_session(auto_compact_pct=0.8)
     ledger = [Turn.user("delegated contract")]
     overflow = RuntimeError("maximum context length exceeded")
-    failure = RuntimeError("summary backend unavailable")
+    summary_failure = RuntimeError("summary backend unavailable")
+    contexts = []
 
     with (
         patch.object(
             session._compaction_engine,
             "summarize_blocks",
-            side_effect=failure,
+            side_effect=summary_failure,
         ) as summarize,
-        patch.object(session, "_stop_retrying", return_value=True),
         patch.object(session.ui, "on_compaction", wraps=session.ui.on_compaction) as lifecycle,
         patch.object(session.ui, "on_error", wraps=session.ui.on_error) as on_error,
+        pytest.raises(RuntimeError, match="Incomplete task") as failure,
     ):
-        output, contexts = _run_script(
+        _run_script(
             session,
             ledger,
             [
                 _tool_result(prompt_tokens=92, content="partial before failure"),
                 overflow,
             ],
+            on_call=lambda _number, turns: contexts.append(turns),
         )
 
-    assert output == "partial before failure"
-    summarize.assert_called_once()
+    assert "partial before failure" in str(failure.value)
     assert len(contexts) == 2
+    summarize.assert_called_once()
+
     events = [call.args[0] for call in lifecycle.call_args_list]
     assert [event["phase"] for event in events] == ["start", "end"]
     assert events[-1]["reason"] == "error"
