@@ -16,7 +16,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
-from turnstone.core.completion_recovery import EmptyCompletionError
+from turnstone.core.completion_recovery import EmptyCompletionError, is_context_overflow
 from turnstone.core.model_turn import ModelTurnResult
 from turnstone.core.trajectory import Turn, TurnProvenance
 from turnstone.core.truncation import truncate_text
@@ -206,7 +206,13 @@ def _ignore_progress(_payload: dict[str, Any]) -> None:
 
 @dataclass(frozen=True, slots=True)
 class SummaryRuntime:
-    """All mutable-world dependencies required by one summary transaction."""
+    """All mutable-world dependencies required by one summary transaction.
+
+    The scalars are the owner's sizing; the callables are the owner's
+    behavior: how a summary is sampled, how the owner reports cancellation,
+    and where progress goes. Overflow classification does not vary by owner;
+    the engine consults the shared classifier directly.
+    """
 
     context_window: int
     chars_per_token: float
@@ -214,7 +220,6 @@ class SummaryRuntime:
     lane_max_output_tokens: int | None
     continuation_overhead_tokens: int
     complete: SummaryCompletion
-    is_context_overflow: Callable[[BaseException], bool]
     check_cancelled: Callable[[], None]
     on_progress: Callable[[dict[str, Any]], None] = _ignore_progress
 
@@ -548,7 +553,7 @@ class CompactionEngine:
         try:
             return self.summarize_once(system_prompt, "\n\n".join(batch), runtime)
         except Exception as error:
-            if not runtime.is_context_overflow(error):
+            if not is_context_overflow(error):
                 raise
             if len(batch) > 1:
                 midpoint = len(batch) // 2
@@ -568,7 +573,7 @@ class CompactionEngine:
                         runtime,
                     )
                 except Exception as retry_error:
-                    if not runtime.is_context_overflow(retry_error):
+                    if not is_context_overflow(retry_error):
                         raise
                     if budget <= self.MIN_SUMMARY_BUDGET_CHARS:
                         raise CompactionIrreducibleError from retry_error

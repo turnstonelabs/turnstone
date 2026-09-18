@@ -15331,7 +15331,6 @@ class ChatSession:
                 else continuation_overhead_tokens
             ),
             complete=_complete,
-            is_context_overflow=is_context_overflow,
             check_cancelled=(
                 check_cancelled
                 if check_cancelled is not None
