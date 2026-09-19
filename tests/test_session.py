@@ -10841,15 +10841,20 @@ class TestUpdateTokenTableMsgsParam:
         primary_tools.assert_not_called()
         assert session._chars_per_token == (message_chars + served_tool_chars) / 100
 
-    def test_served_prompt_tokens_calibrate_while_prompt_tokens_anchor(self, tmp_db):
-        """After a server-side tool loop the provider's context outgrows what the
-        request carried: the ratio divides the served characters by the served
-        count, while the anchor keeps the context the next request carries."""
+    def test_cumulative_usage_with_served_figure_calibrates_and_anchors(self, tmp_db):
+        """Anthropic shape after a server-side tool loop: the raw prompt count is
+        a billing total; the request carried 23,881 and the server appended
+        29,910 that the next request replays.  The ratio divides the served
+        characters by 23,881, the anchor is 53,791, and the slot the status
+        line reads is rewritten to it beside the billed cache counter."""
         session = _make_session()
         session._last_usage = {
-            "prompt_tokens": 53_791,
+            "prompt_tokens": 77_668,
             "completion_tokens": 772,
+            "cache_read_tokens": 47_622,
             "served_prompt_tokens": 23_881,
+            "appended_prompt_tokens": 29_910,
+            "prompt_tokens_cumulative": True,
         }
         served_msgs = [{"role": "user", "content": "hello"}]
         message_chars, _images, _documents = session._msg_text_chars(served_msgs[0])
@@ -10860,6 +10865,75 @@ class TestUpdateTokenTableMsgsParam:
         key = session._active_token_calibration_key
         assert key is not None
         assert session._token_calibrations[key].prompt_tokens == 53_791
+        assert session._last_usage["prompt_tokens"] == 53_791
+        assert session._last_usage["total_tokens"] == 53_791 + 772
+        assert session._last_usage["cache_read_tokens"] == 47_622
+        # The billed total survives beside the context, and the resolution
+        # facts are consumed: the slot now resolves to itself.
+        from turnstone.core.compaction import resolve_context_usage
+
+        assert session._last_usage["billed_prompt_tokens"] == 77_668
+        assert session._last_usage["prompt_tokens_cumulative"] is False
+        assert session._last_usage["appended_prompt_tokens"] == 0
+        again = session._usage_from_slot(session._last_usage)
+        assert resolve_context_usage(again, local_request_estimate=lambda: 0).anchor == 53_791
+
+    def test_token_budget_charges_the_billed_total_when_the_slot_carries_one(self, tmp_db):
+        """The budget meters consumption: after a server-side tool loop it must
+        trip on what the provider billed, not on the smaller context figure."""
+        session = _make_session()
+        session._token_budget = 60_000
+        session._last_usage = {
+            "prompt_tokens": 53_791,
+            "completion_tokens": 772,
+            "billed_prompt_tokens": 77_668,
+        }
+
+        session._update_token_budget()
+
+        assert session._budget_exhausted is True
+
+    def test_usage_from_slot_round_trips_every_usage_field(self, tmp_db):
+        """Drift guard: a field added to the usage record must reach the rebuild."""
+        import dataclasses
+
+        from turnstone.core.providers import UsageInfo
+
+        sample = {
+            field.name: True if field.name == "prompt_tokens_cumulative" else index + 1
+            for index, field in enumerate(dataclasses.fields(UsageInfo))
+        }
+
+        rebuilt = dataclasses.asdict(ChatSession._usage_from_slot(sample))
+
+        assert rebuilt == sample
+
+    def test_cumulative_usage_without_served_figure_keeps_ratio_and_local_anchor(self, tmp_db):
+        """OpenAI Responses shape: cumulative counters and no single-pass figure.
+        The session's own pre-call estimate becomes the anchor, the ratio is
+        untouched, and the slot is rewritten so the gauge shows the estimate
+        rather than the billing total."""
+        session = _make_session()
+        session.messages.append(turn_from_dict({"role": "user", "content": "hi"}))
+        ratio_before = session._chars_per_token
+        # The request's own tool schema sizes the estimate, never the primary lane's.
+        local_before = session._estimated_prompt_tokens(tool_def_chars=37)
+        session._last_usage = {
+            "prompt_tokens": 22_508,
+            "completion_tokens": 624,
+            "cache_read_tokens": 10_391,
+            "prompt_tokens_cumulative": True,
+        }
+
+        session._update_token_table(msgs=[{"role": "user", "content": "hi"}], tool_def_chars=37)
+
+        assert session._chars_per_token == ratio_before
+        key = session._active_token_calibration_key
+        assert key is not None
+        assert session._token_calibrations[key].prompt_tokens == local_before
+        assert session._last_usage["prompt_tokens"] == local_before
+        assert session._last_usage["total_tokens"] == local_before + 624
+        assert session._last_usage["cache_read_tokens"] == 10_391
 
     def test_fallback_tool_size_uses_the_shared_compact_encoding(self) -> None:
         session = _make_session()

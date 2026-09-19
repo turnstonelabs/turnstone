@@ -14,12 +14,15 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from turnstone.core.completion_recovery import EmptyCompletionError, is_context_overflow
 from turnstone.core.model_turn import ModelTurnResult
 from turnstone.core.trajectory import Turn, TurnProvenance
 from turnstone.core.truncation import truncate_text
+
+if TYPE_CHECKING:
+    from turnstone.core.providers._protocol import UsageInfo
 
 
 def _compaction_marker(_omitted: int, original: int, _limit: int) -> str:
@@ -97,6 +100,50 @@ def calibrated_chars_per_token(
     return text_chars / text_prompt_tokens
 
 
+@dataclass(frozen=True, slots=True)
+class ContextUsage:
+    """The two context figures one completed call yields.
+
+    ``anchor`` is the context the next request will carry, before the assistant turn is
+    appended.  ``served`` is what this request carried, the denominator for the chars-per-token
+    calibration, or ``None`` when the provider gave no single-pass figure and the caller's own
+    estimate stood in, which teaches the ratio nothing.
+    """
+
+    anchor: int
+    served: int | None
+
+
+def resolve_context_usage(
+    usage: UsageInfo, *, local_request_estimate: Callable[[], int]
+) -> ContextUsage:
+    """Turn one call's reported usage into the context anchor and the calibration denominator.
+
+    A plain response reports one sampling pass, so ``prompt_tokens`` is both figures.  A response
+    in which the provider ran its own tool loop reports billing totals summed across passes
+    (``prompt_tokens_cumulative``); the request's own size is then the provider's single-pass
+    figure when it gave one (``served_prompt_tokens``), else the caller's local estimate of what
+    it sent, and the anchor adds whatever the provider appended that the next request replays
+    (``appended_prompt_tokens``).  ``local_request_estimate`` is called only when the provider
+    left that size unknown, so callers pay for the estimate, and touch the state it reads, only
+    then.  One rule for every lane and every consumer: the session's calibration, the task-agent
+    estimator, and the agent context badge all read this.
+    """
+
+    if not usage.prompt_tokens_cumulative:
+        return ContextUsage(
+            anchor=usage.prompt_tokens,
+            served=usage.served_prompt_tokens or usage.prompt_tokens,
+        )
+    if usage.served_prompt_tokens > 0:
+        served = usage.served_prompt_tokens
+        return ContextUsage(anchor=served + usage.appended_prompt_tokens, served=served)
+    return ContextUsage(
+        anchor=max(0, local_request_estimate()) + usage.appended_prompt_tokens,
+        served=None,
+    )
+
+
 @dataclass(slots=True)
 class PromptTokenEstimator:
     """One immutable-lane trajectory's provider-anchored prompt estimate.
@@ -156,35 +203,39 @@ class PromptTokenEstimator:
     def observe(
         self,
         *,
-        prompt_tokens: int,
+        usage: UsageInfo,
         messages: Sequence[dict[str, Any] | Turn],
         wire_messages: Sequence[dict[str, Any]] | None = None,
         tool_def_chars: int | None = None,
-        served_prompt_tokens: int = 0,
-    ) -> None:
+    ) -> int:
         """Anchor to one successful call before its assistant turn is appended.
 
-        ``prompt_tokens`` is the context the next request will carry and becomes the anchor.
-        ``served_prompt_tokens`` is what this request itself carried; after a server-side tool
-        loop it is smaller, and the chars-per-token ratio must divide the measured characters by
-        it.  0 means the two are the same.
+        The call's usage goes through :func:`resolve_context_usage` with this estimator's own
+        pre-call estimate of ``messages`` standing in when the provider reported only cumulative
+        totals; the ratio is recalibrated only when the provider said what the request carried.
+        Returns the anchor so the caller paints the same figure it anchors on.
         """
 
         if tool_def_chars is not None:
             self.tool_def_chars = tool_def_chars
-        measured_messages: Sequence[dict[str, Any] | Turn] = (
-            wire_messages if wire_messages is not None else messages
+        context = resolve_context_usage(
+            usage, local_request_estimate=lambda: self.estimate(messages)
         )
-        self.chars_per_token = calibrated_chars_per_token(
-            prompt_tokens=served_prompt_tokens or prompt_tokens,
-            messages=measured_messages,
-            tool_def_chars=self.tool_def_chars,
-            measure=self.measure,
-            fallback=self.chars_per_token,
-            image_tokens=self.image_tokens,
-        )
-        self._prompt_tokens = prompt_tokens
+        if context.served is not None:
+            measured_messages: Sequence[dict[str, Any] | Turn] = (
+                wire_messages if wire_messages is not None else messages
+            )
+            self.chars_per_token = calibrated_chars_per_token(
+                prompt_tokens=context.served,
+                messages=measured_messages,
+                tool_def_chars=self.tool_def_chars,
+                measure=self.measure,
+                fallback=self.chars_per_token,
+                image_tokens=self.image_tokens,
+            )
+        self._prompt_tokens = context.anchor
         self._prefix_ids = tuple(id(message) for message in messages)
+        return context.anchor
 
     def append_exact(self, message: dict[str, Any] | Turn, tokens: int) -> None:
         """Extend a live provider anchor with one accepted completion turn."""

@@ -11,6 +11,7 @@ from unittest.mock import MagicMock, PropertyMock, patch
 import pytest
 
 from tests._session_helpers import fake_anthropic_stream, fake_chat_stream
+from turnstone.core.compaction import resolve_context_usage
 from turnstone.core.deadline import DeadlineCancelledError, StreamAbortRef
 from turnstone.core.lowering import repair_wire_messages
 from turnstone.core.providers import create_provider
@@ -5017,15 +5018,21 @@ class TestAnthropicPromptCaching:
                 (4, 132, 23_745), (6, 30_040, 47_622), output_tokens=772, server_tool=True
             )
         )
-        # opening total 23,881 + new input 2 + new cache creation 29,908
-        assert usage.prompt_tokens == 53_791
-        assert usage.total_tokens == 53_791 + 772
+        # The provider's counters ride through as reported ...
+        assert usage.prompt_tokens == 77_668
+        assert usage.total_tokens == 77_668 + 772
         assert usage.completion_tokens == 772
-        # The calibration divides sent characters by what the request carried.
-        assert usage.served_prompt_tokens == 23_881
-        # Cost accounting keeps the reported billing counters verbatim.
         assert usage.cache_read_tokens == 47_622
         assert usage.cache_creation_tokens == 30_040
+        # ... with the facts that say what they mean: the opening pass is what
+        # the request carried, the growth since it (new input 2 + new cache
+        # creation 29,908) is what the server appended, and the sum is flagged.
+        assert usage.served_prompt_tokens == 23_881
+        assert usage.appended_prompt_tokens == 29_910
+        assert usage.prompt_tokens_cumulative is True
+        context = resolve_context_usage(usage, local_request_estimate=lambda: 0)
+        assert context.anchor == 53_791
+        assert context.served == 23_881
 
     @patch("turnstone.core.providers._anthropic._ensure_anthropic")
     def test_server_tool_loop_uncached_usage_keeps_closing_input(
@@ -5038,6 +5045,9 @@ class TestAnthropicPromptCaching:
         )
         assert usage.prompt_tokens == 35_546
         assert usage.served_prompt_tokens == 2_820
+        assert usage.appended_prompt_tokens == 32_726
+        assert usage.prompt_tokens_cumulative is True
+        assert resolve_context_usage(usage, local_request_estimate=lambda: 0).anchor == 35_546
 
     @patch("turnstone.core.providers._anthropic._ensure_anthropic")
     def test_plain_closing_usage_repeating_the_opening_is_not_doubled(
@@ -5050,6 +5060,9 @@ class TestAnthropicPromptCaching:
         assert usage.prompt_tokens == 23_836
         assert usage.served_prompt_tokens == 23_836
         assert usage.cache_read_tokens == 23_745
+        assert usage.prompt_tokens_cumulative is False
+        context = resolve_context_usage(usage, local_request_estimate=lambda: 0)
+        assert (context.anchor, context.served) == (23_836, 23_836)
 
     @patch("turnstone.core.providers._anthropic._ensure_anthropic")
     def test_without_a_server_tool_the_closing_fold_stands(self, mock_ensure: MagicMock) -> None:
@@ -5061,60 +5074,74 @@ class TestAnthropicPromptCaching:
         )
         assert usage.prompt_tokens == 20_050
         assert usage.served_prompt_tokens == 20_050
+        assert usage.prompt_tokens_cumulative is False
+        assert resolve_context_usage(usage, local_request_estimate=lambda: 0).anchor == 20_050
 
     @patch("turnstone.core.providers._anthropic._ensure_anthropic")
     def test_server_tool_closing_without_input_counts_keeps_opening_total(
         self, mock_ensure: MagicMock
     ) -> None:
         """A gateway whose closing usage carries only output keeps the opening
-        context.  The per-field max merge holds this at the opening total on its
-        own; the clamps are pinned by the two tests that follow."""
+        context: nothing was appended, so the anchor is the opening total.  The
+        clamps are pinned by the two tests that follow."""
         usage = self._drained_usage(
             self._usage_stream((100, 0, 0), (0, 0, 0), output_tokens=5, server_tool=True)
         )
         assert usage.prompt_tokens == 100
         assert usage.completion_tokens == 5
+        assert usage.appended_prompt_tokens == 0
+        assert resolve_context_usage(usage, local_request_estimate=lambda: 0).anchor == 100
 
     @patch("turnstone.core.providers._anthropic._ensure_anthropic")
     def test_server_tool_input_delta_clamps_at_zero(self, mock_ensure: MagicMock) -> None:
-        """A closing input below the opening input must not subtract: 600 with
-        the clamp, 500 without, and both exceed the opening total the merge
-        could otherwise floor to."""
+        """A closing input below the opening input must not subtract from what
+        the server appended: 500 appended with the clamp, 400 without."""
         usage = self._drained_usage(
             self._usage_stream((100, 0, 0), (0, 500, 0), output_tokens=5, server_tool=True)
         )
-        assert usage.prompt_tokens == 600
+        assert usage.appended_prompt_tokens == 500
+        assert resolve_context_usage(usage, local_request_estimate=lambda: 0).anchor == 600
 
     @patch("turnstone.core.providers._anthropic._ensure_anthropic")
     def test_server_tool_cache_creation_delta_clamps_at_zero(self, mock_ensure: MagicMock) -> None:
-        """Same pin for the cache-creation delta: 600 clamped, 500 unclamped."""
+        """Same pin for the cache-creation delta: 500 appended clamped, 400 unclamped."""
         usage = self._drained_usage(
             self._usage_stream((0, 100, 0), (500, 0, 0), output_tokens=5, server_tool=True)
         )
-        assert usage.prompt_tokens == 600
+        assert usage.appended_prompt_tokens == 500
+        assert resolve_context_usage(usage, local_request_estimate=lambda: 0).anchor == 600
 
     @patch("turnstone.core.providers._anthropic._ensure_anthropic")
     def test_empty_opening_usage_falls_back_to_closing_totals(self, mock_ensure: MagicMock) -> None:
-        """An all-zero opening usage is no anchor: the closing counts fold as
-        before, cache read included, even after a server tool block."""
+        """An all-zero opening usage is no single-pass figure: after a server
+        tool block the closing counts are still reported whole, cache read
+        included, but flagged cumulative with nothing served, so the consumer's
+        own estimate of what it sent stands in for the anchor."""
         usage = self._drained_usage(
             self._usage_stream((0, 0, 0), (50, 0, 20), output_tokens=5, server_tool=True)
         )
         assert usage.prompt_tokens == 70
         assert usage.cache_read_tokens == 20
+        assert usage.served_prompt_tokens == 0
+        assert usage.prompt_tokens_cumulative is True
+        context = resolve_context_usage(usage, local_request_estimate=lambda: 1_234)
+        assert (context.anchor, context.served) == (1_234, None)
 
     @patch("turnstone.core.providers._anthropic._ensure_anthropic")
     def test_missing_opening_event_falls_back_to_closing_totals(
         self, mock_ensure: MagicMock
     ) -> None:
-        """A gateway that reports usage only at the end has nothing to anchor
-        on: the closing counts fold as before."""
+        """A gateway that reports usage only at the end gives no single-pass
+        figure: the closing counts are reported whole and flagged cumulative
+        with nothing served, so the consumer's own estimate stands in."""
         usage = self._drained_usage(
             self._usage_stream(None, (50, 0, 20), output_tokens=5, server_tool=True)
         )
         assert usage.prompt_tokens == 70
-        assert usage.served_prompt_tokens == 70
         assert usage.cache_read_tokens == 20
+        assert usage.served_prompt_tokens == 0
+        assert usage.prompt_tokens_cumulative is True
+        assert resolve_context_usage(usage, local_request_estimate=lambda: 1_234).anchor == 1_234
 
 
 class TestOpenAIPromptCaching:
@@ -5367,6 +5394,65 @@ class TestOpenAIResponsesProvider:
             )
 
         client.responses.create.assert_not_called()
+
+    @staticmethod
+    def _completed_with_items(items: list[dict[str, Any]], usage: SimpleNamespace) -> list[Any]:
+        """Scripted stream: each item announced done, then the completed event with usage."""
+        done_items = [
+            SimpleNamespace(type=d["type"], model_dump=lambda d=d: dict(d)) for d in items
+        ]
+        events: list[Any] = [
+            SimpleNamespace(type="response.output_item.done", item=item) for item in done_items
+        ]
+        events.append(
+            SimpleNamespace(
+                type="response.completed",
+                response=SimpleNamespace(status="completed", usage=usage, output=done_items),
+            )
+        )
+        return events
+
+    def test_hosted_search_flags_usage_cumulative(self) -> None:
+        """Live shape (2026-09-19): three hosted searches reported 22,508 input
+        tokens where the next request carried 11,052.  Only the completed event
+        carries usage, so the adapter cannot derive the context; it flags the
+        counters and the shared rule falls back to the caller's own estimate."""
+        usage = SimpleNamespace(
+            input_tokens=22_508,
+            output_tokens=624,
+            total_tokens=23_132,
+            input_tokens_details=SimpleNamespace(cached_tokens=10_391),
+        )
+        items = [{"type": "web_search_call", "id": "ws_1", "status": "completed"}] * 3 + [
+            {"type": "message", "id": "msg_1", "role": "assistant", "content": []}
+        ]
+        result = drain_stream(
+            self.provider._iter_stream(iter(self._completed_with_items(items, usage)))
+        )
+        assert result.usage is not None
+        assert result.usage.prompt_tokens == 22_508
+        assert result.usage.cache_read_tokens == 10_391
+        assert result.usage.prompt_tokens_cumulative is True
+        context = resolve_context_usage(result.usage, local_request_estimate=lambda: 11_000)
+        assert context.anchor == 11_000
+        assert context.served is None
+
+    def test_plain_response_usage_is_not_cumulative(self) -> None:
+        usage = SimpleNamespace(
+            input_tokens=10_474,
+            output_tokens=5,
+            total_tokens=10_479,
+            input_tokens_details=SimpleNamespace(cached_tokens=0),
+        )
+        items = [{"type": "message", "id": "msg_1", "role": "assistant", "content": []}]
+        result = drain_stream(
+            self.provider._iter_stream(iter(self._completed_with_items(items, usage)))
+        )
+        assert result.usage is not None
+        assert result.usage.prompt_tokens_cumulative is False
+        assert (
+            resolve_context_usage(result.usage, local_request_estimate=lambda: 0).anchor == 10_474
+        )
 
     def test_get_capabilities(self) -> None:
         caps = self.provider.get_capabilities("gpt-5.4")

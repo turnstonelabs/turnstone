@@ -72,13 +72,16 @@ frozen.
 
 ### Fixed
 
-- **Context gauge after native web search.** When the model ran several web searches inside one
-  response, the provider's closing usage counted the cached prefix once per search pass, and the
-  session took that billing total as its context size: the status bar showed three times the real
-  figure, the token estimate was calibrated on it, a tool result was dropped for an exhausted
-  budget, and a two-message conversation was compacted. The context size is now the opening pass
-  plus the new content each pass added, the estimate is calibrated on the tokens the request
-  itself carried, and the reported cache reads still feed the usage records.
+- **Context gauge after a server-side tool loop.** When the model ran several web searches inside
+  one response, the provider's closing usage reported billing totals summed across its sampling
+  passes, and the session took them as its context size. On the Anthropic lane a four-search turn
+  reported three times the real figure: the status bar showed it, the token estimate was
+  calibrated on it, a tool result was dropped for an exhausted budget, and a two-message
+  conversation was compacted. On the OpenAI Responses lane hosted search reported twice the real
+  figure. Adapters now report what the request carried and what the server appended, and flag
+  cumulative counters; one shared rule turns that into the context anchor and the calibration
+  denominator for the session, task agents, and the agent context badge. Reported cache reads
+  still feed the usage records, and the operator token budget is charged the billed total.
 - **Incomplete task results and perception fallback.** Failed task completions now report an
   error, with any earlier partial work explicitly labelled incomplete. Optional perception
   memoizes a model that produces no description for the same binding generation and gives

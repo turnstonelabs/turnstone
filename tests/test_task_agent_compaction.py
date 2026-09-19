@@ -19,7 +19,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
 from tests._session_helpers import make_result, make_session
-from turnstone.core.compaction import CompactionEngine, SummaryResult
+from turnstone.core.compaction import CompactionEngine, PromptTokenEstimator, SummaryResult
 from turnstone.core.metacognition import (
     NUDGE_TASK_COMPACTION_RESUME,
     format_nudge,
@@ -69,6 +69,60 @@ def _tool_result(*, prompt_tokens: int, content: str = "working"):
         finish_reason="tool_calls",
         usage=_usage(prompt_tokens),
     )
+
+
+def _text_measure(message: dict[str, Any] | Turn) -> tuple[int, int, int]:
+    content = message["content"] if isinstance(message, dict) else message.text
+    return len(str(content)), 0, 0
+
+
+def test_estimator_observe_anchors_on_served_plus_appended_and_recalibrates() -> None:
+    """Anthropic shape after a server-side tool loop: the request carried 23,881
+    tokens and the server appended 29,910 that the next request replays.  The
+    anchor is their sum, the ratio recalibrates against the served figure, and
+    the returned anchor is what the agent badge paints."""
+    estimator = PromptTokenEstimator(measure=_text_measure, tool_def_chars=0, chars_per_token=4.0)
+    messages = [{"role": "user", "content": "x" * 400}]
+    usage = UsageInfo(
+        prompt_tokens=77_668,
+        completion_tokens=772,
+        total_tokens=78_440,
+        cache_read_tokens=47_622,
+        served_prompt_tokens=23_881,
+        appended_prompt_tokens=29_910,
+        prompt_tokens_cumulative=True,
+    )
+
+    anchor = estimator.observe(usage=usage, messages=messages)
+
+    assert anchor == 53_791
+    assert estimator.chars_per_token == 400 / 23_881
+    assert estimator.estimate(messages) == 53_791
+
+
+def test_estimator_observe_without_served_figure_keeps_ratio_and_own_estimate() -> None:
+    """OpenAI Responses shape: cumulative counters, no single-pass figure.  The
+    estimator's own pre-call estimate becomes the anchor, not the raw prompt
+    count, and the ratio is untouched because a local estimate teaches it
+    nothing."""
+    estimator = PromptTokenEstimator(measure=_text_measure, tool_def_chars=40, chars_per_token=4.0)
+    messages = [{"role": "user", "content": "x" * 400}]
+    # Snapshot before observe: it rebinds the anchor and the prefix.
+    own_estimate = estimator.estimate(messages)
+    usage = UsageInfo(
+        prompt_tokens=22_508,
+        completion_tokens=624,
+        total_tokens=23_132,
+        cache_read_tokens=10_391,
+        prompt_tokens_cumulative=True,
+    )
+
+    anchor = estimator.observe(usage=usage, messages=messages)
+
+    assert anchor == own_estimate
+    assert anchor != 22_508
+    assert estimator.chars_per_token == 4.0
+    assert estimator.estimate(messages) == own_estimate
 
 
 def _prepared_tool(tool_call: dict[str, Any], _principal: str):

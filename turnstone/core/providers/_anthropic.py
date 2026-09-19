@@ -1070,12 +1070,14 @@ class AnthropicProvider:
         # describes the whole message, and when the server ran its own tool
         # loop (native web search) its cache-read count is the SUM of every
         # pass's prefix re-read — a billing total, not a context size — so the
-        # closing chunk derives the context from this opening pass instead.
-        # ``None`` until an opening usage with a positive total lands.
+        # closing chunk reports this opening pass as what the request carried
+        # and the growth since it as what the server appended.  ``None`` until
+        # an opening usage with a positive total lands.
         opening_input: tuple[int, int, int] | None = None
         # Whether a ``server_tool_use`` block appeared: the only evidence that
-        # the server sampled more than once, and the gate on that derivation.
-        # ``server_tool_blocks`` cannot serve — it is popped at block stop.
+        # the server sampled more than once, and the gate on flagging the
+        # closing counts cumulative.  ``server_tool_blocks`` cannot serve — it
+        # is popped at block stop.
         saw_server_tool = False
 
         def _attach_terminal_blocks(chunk: StreamChunk) -> None:
@@ -1244,33 +1246,46 @@ class AnthropicProvider:
                     out = getattr(u, "output_tokens", 0) or 0
                     cc = getattr(u, "cache_creation_input_tokens", 0) or 0
                     cr = getattr(u, "cache_read_input_tokens", 0) or 0
-                    # ``prompt_tokens`` is the context the next request will
-                    # carry (non-cached + cached), matching OpenAI semantics.
-                    # A plain response repeats the opening counts here.  A
+                    # ``prompt_tokens`` carries the provider's total input
+                    # (non-cached + cached) as reported, matching the OpenAI
+                    # lanes; what it means for the context is resolved once,
+                    # downstream, by ``resolve_context_usage``.  A plain
+                    # response repeats the opening counts here.  A
                     # server-side tool loop (native web search) samples
                     # several times inside one message: ``input_tokens`` and
                     # ``cache_creation_input_tokens`` then cover the NEW
                     # content of every pass (search results are cached
                     # server-side), while ``cache_read_input_tokens`` sums
-                    # the prefix re-read on every pass.  Folding that sum in
-                    # reported over three times the real context on a
-                    # four-search turn; the session calibrated on it, dropped
-                    # a tool result against it, and compacted for it.  So
-                    # once a server tool block has appeared, the context is
-                    # the opening total plus the new content since the
-                    # opening pass, and ``served_prompt_tokens`` keeps the
-                    # opening total for the chars-per-token calibration,
-                    # which measures only what the request carried.  Every
-                    # other stream keeps the plain fold, whatever its
-                    # gateway's reporting habits.  The reported cache read
-                    # still rides ``cache_read_tokens`` for cost accounting.
-                    if opening_input is not None and saw_server_tool:
+                    # the prefix re-read on every pass.  Taking that sum as
+                    # the context reported over three times the real figure
+                    # on a four-search turn; the session calibrated on it,
+                    # dropped a tool result against it, and compacted for
+                    # it.  So once a server tool block has appeared the
+                    # closing counts are flagged cumulative, the opening
+                    # total rides ``served_prompt_tokens`` (what the request
+                    # carried) and the growth since the opening pass rides
+                    # ``appended_prompt_tokens`` (the results the next request
+                    # replays).  Every other stream reports plain counts,
+                    # whatever its gateway's reporting habits.
+                    total_input = inp + cc + cr
+                    served = total_input
+                    appended = 0
+                    if saw_server_tool and opening_input is not None:
                         o_inp, o_cc, o_cr = opening_input
                         served = o_inp + o_cc + o_cr
-                        total_input = served + max(0, inp - o_inp) + max(0, cc - o_cc)
-                    else:
-                        total_input = inp + cc + cr
-                        served = total_input
+                        appended = max(0, inp - o_inp) + max(0, cc - o_cc)
+                    elif saw_server_tool:
+                        # No single-pass figure at all (a gateway reporting usage
+                        # only at the end): the consumer's own estimate of what it
+                        # sent stands in, and the appended results are reported as
+                        # 0 rather than guessed.  Closing cache creation is no floor
+                        # for them — on an uncached prefix it holds the whole prefix
+                        # too (a live run: 54,209 created for a 54,780 context) and
+                        # would restore the over-count this branch removes.  The
+                        # estimate then misses the replayed result blocks until the
+                        # next call re-anchors, the opaque-block gap tracked as
+                        # #1188; compact-and-retry is the backstop meanwhile.
+                        served = 0
                     sc.usage = UsageInfo(
                         prompt_tokens=total_input,
                         completion_tokens=out,
@@ -1278,6 +1293,8 @@ class AnthropicProvider:
                         cache_creation_tokens=cc,
                         cache_read_tokens=cr,
                         served_prompt_tokens=served,
+                        appended_prompt_tokens=appended,
+                        prompt_tokens_cumulative=saw_server_tool,
                     )
                 if hasattr(event.delta, "stop_reason") and event.delta.stop_reason:
                     raw_stop = event.delta.stop_reason

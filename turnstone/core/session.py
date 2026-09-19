@@ -72,6 +72,7 @@ from turnstone.core.compaction import (
     PromptTokenEstimator,
     SummaryRuntime,
     calibrated_chars_per_token,
+    resolve_context_usage,
 )
 from turnstone.core.completion_recovery import (
     BACKEND_AUTH_EXC_NAMES,
@@ -185,6 +186,7 @@ from turnstone.core.model_turn import (
     ModelLane,
     ModelTurnResult,
     ResolvedModelBinding,
+    UsageInfo,
     WirePreparationError,
     caps_scan_inline_reasoning,
     create_provider,
@@ -333,7 +335,6 @@ if TYPE_CHECKING:
     from turnstone.core.model_turn import (
         ModelCapabilities,
         StreamChunk,
-        UsageInfo,
     )
     from turnstone.core.output_guard import OutputAssessment
     from turnstone.core.output_guard_judge import OutputGuardJudge, OutputJudgeVerdict
@@ -5960,16 +5961,23 @@ class ChatSession:
         self._last_usage_calibration_key = None
         self._calibrated_msg_count = 0
 
-    def _estimated_prompt_tokens(self) -> int:
+    def _estimated_prompt_tokens(
+        self, *, use_usage_slot: bool = True, tool_def_chars: int | None = None
+    ) -> int:
         """Best estimate of the current prompt size, in tokens.
 
-        Anchors to the provider-reported ``prompt_tokens`` from the last API call — which already
-        includes tool-definition tokens and the cached prefix (providers fold cached + non-cached
-        into one count at the API boundary; after a server-side tool loop the Anthropic adapter
-        reports the opening pass plus the new content each later pass added, never the summed
-        prefix re-reads — see ``_anthropic.py`` ``_iter_anthropic_stream``) — and adds a local
-        estimate for only the messages appended since calibration.  Falls back to a pure local
-        estimate before the first API call.
+        Anchors to the context the last API call established — the provider-reported
+        ``prompt_tokens`` (which already includes tool-definition tokens and the cached prefix, as
+        providers fold cached + non-cached into one count at the API boundary) resolved through
+        ``resolve_context_usage`` in :meth:`_update_token_table`, so a server-side tool loop's
+        summed counters never anchor — and adds a local estimate for only the messages appended
+        since calibration.  Falls back to a pure local estimate before the first API call.
+
+        ``use_usage_slot=False`` skips the compatibility read of ``_last_usage`` below:
+        :meth:`_update_token_table` needs the estimate of the request it just sent while that slot
+        already holds the call's own, possibly cumulative, counters.  ``tool_def_chars`` sizes the
+        tool definitions of THAT request for the anchor-less fallback, so a call served on a
+        fallback lane is never paired with the primary lane's tool schema.
 
         Single source of truth for "how full is the context": tool-output
         truncation (via :meth:`_remaining_token_budget`) and the
@@ -5981,7 +5989,7 @@ class ChatSession:
         if calibration is not None and self._calibration_anchor_valid(calibration):
             start = len(calibration.message_prefix_ids)
             return int(calibration.prompt_tokens or 0) + sum(self._msg_tokens[start:])
-        if self._last_usage and self._last_usage_calibration_key is None:
+        if use_usage_slot and self._last_usage and self._last_usage_calibration_key is None:
             # Compatibility for direct seam callers/tests that populate the
             # legacy usage slot without going through _update_token_table.
             start = min(self._calibrated_msg_count, len(self._msg_tokens))
@@ -5991,7 +5999,11 @@ class ChatSession:
         # on every request and folded into the provider's prompt_tokens above.
         # Omitting them here made a resumed session undercount and skip proactive
         # compaction until the first reply re-anchored the estimate.
-        tool_def_tokens = self._tool_def_tokens()
+        tool_def_tokens = (
+            self._tool_def_tokens()
+            if tool_def_chars is None
+            else int(tool_def_chars / self._chars_per_token)
+        )
         return self._system_tokens + sum(self._msg_tokens) + tool_def_tokens
 
     def _remaining_token_budget(self) -> int:
@@ -15162,6 +15174,56 @@ class ChatSession:
         text_chars, images, doc_chars = self._msg_text_chars(msg)
         return text_chars + doc_chars + int(images * self._IMAGE_TOKENS * self._chars_per_token)
 
+    @staticmethod
+    def _usage_from_slot(slot: Mapping[str, int]) -> UsageInfo:
+        """Rebuild the merged ``UsageInfo`` from the ``_last_usage`` dict.
+
+        The slot is the stream consumer's ``asdict`` projection, but the compaction rewrite and
+        direct callers store partial dicts, so every field defaults.
+        """
+        prompt = int(slot.get("prompt_tokens", 0) or 0)
+        completion = int(slot.get("completion_tokens", 0) or 0)
+        return UsageInfo(
+            prompt_tokens=prompt,
+            completion_tokens=completion,
+            total_tokens=int(slot.get("total_tokens", prompt + completion) or 0),
+            cache_creation_tokens=int(slot.get("cache_creation_tokens", 0) or 0),
+            cache_read_tokens=int(slot.get("cache_read_tokens", 0) or 0),
+            served_prompt_tokens=int(slot.get("served_prompt_tokens", 0) or 0),
+            appended_prompt_tokens=int(slot.get("appended_prompt_tokens", 0) or 0),
+            prompt_tokens_cumulative=bool(slot.get("prompt_tokens_cumulative", False)),
+        )
+
+    def _rewrite_usage_slot(
+        self,
+        prompt_tokens: int,
+        *,
+        total_tokens: int | None = None,
+        billed_prompt_tokens: int | None = None,
+    ) -> None:
+        """Publish a resolved context figure into ``_last_usage``.
+
+        The slot's ``prompt_tokens`` means the context the next request carries, for every reader:
+        the status line, the replay preamble, the usage row (whose latest value doubles as the
+        saved-list occupancy figure), and the estimate's compatibility branch.  The provider's
+        billed input survives beside it as ``billed_prompt_tokens`` for the spend readers (the
+        token budget here; the ledger column is #1189), and the three resolution facts are cleared
+        so the slot is a self-consistent record that resolves to itself: no later reader can
+        re-derive an anchor from facts about a call the slot no longer describes.
+        """
+        if not self._last_usage:
+            return
+        slot = dict(self._last_usage)
+        completion = int(slot.get("completion_tokens", 0) or 0)
+        slot["prompt_tokens"] = prompt_tokens
+        slot["total_tokens"] = prompt_tokens + completion if total_tokens is None else total_tokens
+        slot["served_prompt_tokens"] = 0
+        slot["appended_prompt_tokens"] = 0
+        slot["prompt_tokens_cumulative"] = False
+        if billed_prompt_tokens is not None:
+            slot["billed_prompt_tokens"] = billed_prompt_tokens
+        self._last_usage = slot
+
     def _update_token_table(
         self,
         *,
@@ -15180,8 +15242,8 @@ class ChatSession:
         if not self._last_usage:
             return
 
-        prompt_tok = self._last_usage["prompt_tokens"]
-        compl_tok = self._last_usage["completion_tokens"]
+        usage = self._usage_from_slot(self._last_usage)
+        compl_tok = usage.completion_tokens
 
         # Calibrate chars_per_token ratio from actual usage.
         # Images get a fixed token budget (subtracted).  Documents
@@ -15197,20 +15259,34 @@ class ChatSession:
         served_tool_def_chars = (
             tool_def_chars if tool_def_chars is not None else self._tool_def_chars()
         )
-        # The ratio divides the characters the request carried by the tokens the provider counted
-        # for them.  After a server-side tool loop ``prompt_tokens`` also holds the results the
-        # server appended, which never crossed the wire as characters, so the adapter reports the
-        # request's own count separately; the anchor below keeps ``prompt_tok``, the context the
-        # next request carries.  Absent (0, or a partial dict) means the two are the same.
-        served_prompt_tok = self._last_usage.get("served_prompt_tokens") or prompt_tok
-        self._chars_per_token = calibrated_chars_per_token(
-            prompt_tokens=served_prompt_tok,
-            messages=all_msgs,
-            tool_def_chars=served_tool_def_chars,
-            measure=self._msg_text_chars,
-            fallback=self._chars_per_token,
-            image_tokens=self._IMAGE_TOKENS,
+        # One rule for what a call's usage says about the context, shared with the task-agent
+        # estimator (``resolve_context_usage``): the anchor is the context the next request
+        # carries; the served figure, what this request carried, is the calibration denominator.
+        # After a server-side tool loop the provider's counters are billing totals summed across
+        # its passes.  The request's own size is then the provider's single-pass figure when it
+        # gave one, else this session's estimate of what it just sent, which teaches the ratio
+        # nothing, so the ratio stands.
+        context = resolve_context_usage(
+            usage,
+            local_request_estimate=lambda: self._estimated_prompt_tokens(
+                use_usage_slot=False, tool_def_chars=served_tool_def_chars
+            ),
         )
+        if context.served is not None:
+            self._chars_per_token = calibrated_chars_per_token(
+                prompt_tokens=context.served,
+                messages=all_msgs,
+                tool_def_chars=served_tool_def_chars,
+                measure=self._msg_text_chars,
+                fallback=self._chars_per_token,
+                image_tokens=self._IMAGE_TOKENS,
+            )
+        prompt_tok = context.anchor
+        if usage.prompt_tokens_cumulative or prompt_tok != usage.prompt_tokens:
+            # Consume the resolution facts: publish the context the readers of this slot expect,
+            # keep the billed total beside it for the spend readers, and clear the facts so they
+            # never outlive the resolution that read them.
+            self._rewrite_usage_slot(prompt_tok, billed_prompt_tokens=usage.prompt_tokens)
 
         calibration_key = (
             self._provenance_calibration_key(provenance)
@@ -15247,7 +15323,10 @@ class ChatSession:
         """Apply the per-completion budget to accepted and rejected responses."""
         if not self._last_usage or self._token_budget <= 0:
             return
-        total = self._last_usage["prompt_tokens"] + self._last_usage["completion_tokens"]
+        # The budget meters consumption, so it charges what the provider billed when the slot
+        # carries that beside the context figure (a server-side tool loop's summed passes).
+        billed = self._last_usage.get("billed_prompt_tokens", self._last_usage["prompt_tokens"])
+        total = billed + self._last_usage["completion_tokens"]
         if not self._budget_warned and total >= self._token_budget * 0.8:
             self._budget_warned = True
             self.ui.on_info(f"Token budget 80% consumed ({total:,}/{self._token_budget:,})")
@@ -16153,13 +16232,10 @@ class ChatSession:
             self._msg_tokens = compacted_tokens
             self._calibrated_msg_count = len(compacted_messages)
 
-            # Update usage estimate so the status bar reflects post-compaction state.
-            if self._last_usage:
-                self._last_usage = {
-                    **self._last_usage,
-                    "prompt_tokens": after_tokens,
-                    "total_tokens": after_tokens,
-                }
+            # Update usage estimate so the status bar reflects post-compaction state.  The
+            # shared rewrite also clears the resolution facts of the call the slot described
+            # before compaction, so nothing can re-derive that call's anchor over this one.
+            self._rewrite_usage_slot(after_tokens, total_tokens=after_tokens)
             active_key = self._active_token_calibration_key
             if active_key is not None:
                 active = self._token_calibrations.get(active_key)
@@ -25453,21 +25529,23 @@ class ChatSession:
                 # after its originating run was cancelled.
                 cancel_scope.check()
                 agent_usage = agent_result.usage
+                agent_context_tokens: int | None = None
                 if agent_usage is not None:
-                    context_estimator.observe(
-                        prompt_tokens=agent_usage.prompt_tokens,
-                        served_prompt_tokens=agent_usage.served_prompt_tokens,
+                    # One resolution serves both the anchor and the badge, so
+                    # the card never shows a figure the estimator did not use.
+                    agent_context_tokens = context_estimator.observe(
+                        usage=agent_usage,
                         messages=turns,
                         wire_messages=agent_result.wire_msgs,
                         tool_def_chars=agent_result.tool_def_chars,
                     )
-                if agent_usage is not None and parent_call_id:
+                if agent_context_tokens is not None and parent_call_id:
                     published = self._publish_for_generation(
                         origin_generation,
                         functools.partial(
                             self._paint_agent_context,
                             parent_call_id,
-                            agent_usage.prompt_tokens,
+                            agent_context_tokens,
                             agent_context_window,
                             generation=origin_generation,
                         ),

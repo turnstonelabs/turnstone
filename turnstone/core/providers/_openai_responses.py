@@ -8,6 +8,7 @@ of the Chat Completions endpoint.
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, NoReturn
 
@@ -57,6 +58,13 @@ log = structlog.get_logger(__name__)
 # condition — the only ones worth retrying (the API's other codes are
 # deterministic request rejections).
 _TRANSIENT_FAILURE_CODES = frozenset({"server_error", "rate_limit_exceeded"})
+
+# Output item types that mean the server ran its own tool loop inside the
+# response, sampling more than once, so the reported ``input_tokens`` is a sum
+# across passes rather than the next request's context.  Hosted web search is
+# the measured member (2.04x on a three-search turn) and the only server tool
+# the session injects; the other hosted tools' usage shapes are #1194.
+_SERVER_EXECUTED_ITEM_TYPES = frozenset({"web_search_call"})
 
 
 def _extend_message_annotations(item: Any, annotations: list[Any]) -> None:
@@ -782,6 +790,20 @@ class OpenAIResponsesProvider:
                             tc_chunk.is_first = True
                             first = False
                         yield tc_chunk
+                if usage is not None and any(
+                    isinstance(block, dict) and block.get("type") in _SERVER_EXECUTED_ITEM_TYPES
+                    for block in provider_blocks
+                ):
+                    # The hosted tool loop sampled more than once inside this
+                    # response and ``input_tokens`` sums every pass (measured
+                    # at 2.04x the next request's real input on a three-search
+                    # turn), while ``cached_tokens`` counts one read and the
+                    # search results are never replayed.  Only the completed
+                    # event carries usage, so there is no opening pass to
+                    # derive from: flag the counters cumulative and let
+                    # ``resolve_context_usage`` fall back to the consumer's own
+                    # estimate of what it sent.
+                    usage = replace(usage, prompt_tokens_cumulative=True)
                 sc = StreamChunk(
                     finish_reason=last_finish,
                     usage=usage,

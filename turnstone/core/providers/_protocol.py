@@ -35,7 +35,15 @@ class ToolCallDelta:
 
 @dataclass
 class UsageInfo:
-    """Normalized token usage."""
+    """Normalized token usage.
+
+    The provider's counters ride ``prompt_tokens`` / ``completion_tokens`` /
+    ``total_tokens`` and the cache fields as reported.  Three more fields say
+    what those counters mean for the CONTEXT, resolved in one place for every
+    lane and consumer (:func:`turnstone.core.compaction.resolve_context_usage`):
+    a server-side tool loop samples several times inside one response and
+    reports billing totals, not the size of the next request.
+    """
 
     prompt_tokens: int
     completion_tokens: int
@@ -43,13 +51,17 @@ class UsageInfo:
     # Prompt caching metrics (provider-specific; 0 when not available)
     cache_creation_tokens: int = 0
     cache_read_tokens: int = 0
-    # Tokens the request itself carried, when that differs from
-    # ``prompt_tokens``.  A server-side tool loop appends its own results to
-    # the context inside one message, so ``prompt_tokens`` (the context the
-    # next request will carry) outgrows what this request sent, and the
-    # chars-per-token calibration must divide sent characters by this figure
-    # instead.  0 means "same as prompt_tokens" (every lane without such loops).
+    # Tokens this request itself carried, when the provider reported a
+    # single-pass figure for it (the Anthropic opening ``message_start``).
+    # 0 means unknown, or simply the same as ``prompt_tokens``.
     served_prompt_tokens: int = 0
+    # Tokens the provider appended to the context inside this response that
+    # the NEXT request will carry (server-side search results replayed as
+    # native blocks).  0 when nothing was appended or nothing is replayed.
+    appended_prompt_tokens: int = 0
+    # ``prompt_tokens`` sums the input of every server-side sampling pass and
+    # must not anchor the context estimate.  Set when a server tool ran.
+    prompt_tokens_cumulative: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -223,6 +235,10 @@ def merge_usage(acc: UsageInfo | None, new: UsageInfo) -> UsageInfo:
         cache_creation_tokens=max(acc.cache_creation_tokens, new.cache_creation_tokens),
         cache_read_tokens=max(acc.cache_read_tokens, new.cache_read_tokens),
         served_prompt_tokens=max(acc.served_prompt_tokens, new.served_prompt_tokens),
+        appended_prompt_tokens=max(acc.appended_prompt_tokens, new.appended_prompt_tokens),
+        # A flag, not a count: once any chunk says the counters are cumulative
+        # they stay cumulative for the whole message.
+        prompt_tokens_cumulative=acc.prompt_tokens_cumulative or new.prompt_tokens_cumulative,
     )
 
 
