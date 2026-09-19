@@ -84,6 +84,11 @@ def _title(harness: str, query: str, tmp_path: Path) -> str:
             "--no-sandbox",
             "--no-first-run",
             f"--user-data-dir={profile}",
+            # Chrome initializes its encrypted stores through the desktop
+            # keyring on startup; with the keyring locked (a reboot before
+            # anyone logs in) every navigation blocks until the timeout kills
+            # it.  A headless test run has no use for the keyring.
+            "--password-store=basic",
             "--hide-scrollbars",
             "--force-prefers-reduced-motion",
             "--window-size=1440,900",

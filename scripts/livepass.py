@@ -2315,6 +2315,9 @@ def _perf_run_one(
         "--hide-scrollbars",
         "--window-size=1440,900",
         "--no-first-run",
+        # A locked desktop keyring blocks every navigation at startup; a
+        # headless measurement run has no use for it.
+        "--password-store=basic",
         "--disable-extensions",
         # Throttled timers/rAF in a backgrounded renderer would corrupt the
         # measurement — pin the renderer foreground-scheduled.
