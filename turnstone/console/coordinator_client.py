@@ -2152,7 +2152,7 @@ class CoordinatorClient:
 
 
 _PROVIDER_FIDELITY_KEYS: frozenset[str] = frozenset({"_provider_content", "provider_blocks"})
-_PRIVATE_MESSAGE_KEYS: frozenset[str] = frozenset({"_commit_key", "_provenance"})
+_PRIVATE_MESSAGE_KEYS: frozenset[str] = frozenset({"_commit_key", "_provenance", "_native_tokens"})
 
 
 def _serialize_messages(

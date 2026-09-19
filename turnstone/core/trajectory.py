@@ -84,6 +84,32 @@ ContentBlock = TextBlock | AttachmentRef
 
 
 PROVENANCE_META_KEY = "provenance"
+# The provider-native lane's replay cost, in tokens: what the producing provider
+# appended inside one response (server-side search results) that the next request
+# carries back verbatim with the blocks.  The chars-per-token measure cannot see
+# those blocks, so the turn records the provider's own count
+# (``UsageInfo.appended_prompt_tokens``) and the estimators charge it like the
+# fixed image charge.  Lane-aware at the reader: only the producing provider
+# replays the lane, so only a request to that provider carries the cost.
+NATIVE_TOKENS_META_KEY = "native_tokens"
+# No response appends more than a context window holds, and the largest window today is
+# about two million tokens.  A count above this is a broken or hostile usage report, and the
+# one decoder below refuses it, so it can neither be persisted with the turn nor reach the
+# estimators' arithmetic.
+NATIVE_TOKENS_CAP = 1 << 21
+
+
+def native_tokens_from(raw: object) -> int:
+    """Read a stored, reported or projected native-lane token count leniently.
+
+    A positive ``int`` no larger than :data:`NATIVE_TOKENS_CAP` is the count; anything else
+    (absent, corrupt, a bool, zero, an implausible magnitude) is 0, mirroring the other meta
+    decoders' degrade-not-crash posture.  Every writer and reader of the count goes through
+    this one function.
+    """
+    if isinstance(raw, int) and not isinstance(raw, bool) and 0 < raw <= NATIVE_TOKENS_CAP:
+        return raw
+    return 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -186,7 +212,9 @@ class TurnMeta:
     ``conversations.meta`` column, surfaced to the FE for per-kind rendering) and
     ``"attachments_meta"`` (display metadata for by-reference attachments) and
     ``"provenance"`` (the immutable model alias / backend id / registry
-    generation / acting-principal tuple captured by the successful attempt).
+    generation / acting-principal tuple captured by the successful attempt) and, on
+    ASSISTANT turns, ``"native_tokens"`` (the provider-native lane's replay cost, see
+    :data:`NATIVE_TOKENS_META_KEY`).
     Storage-backed canonical loads also carry ``"storage_attachment_ids"`` (the
     raw ordered row ref-list used only to make fork retention fail-closed) and,
     on TOOL turns, ``"acting_principal"`` (the principal whose turn executed
@@ -248,6 +276,19 @@ class Turn:
             # non-string value (e.g. a dict survived into the meta). Mirror the
             # meta decoders and degrade to None rather than crash a consumer.
             return None
+
+    @property
+    def native_tokens(self) -> int:
+        """Tokens the provider-native lane costs when replayed to its producer, or 0.
+
+        Recorded by the producing call from the provider's own count of what it appended
+        inside the response (``UsageInfo.appended_prompt_tokens``).  A turn without a native
+        lane replays nothing, whatever its metadata says (a length-truncated turn keeps its
+        metadata after its lane is dropped).  Lenient on a corrupt stored value, like the other
+        meta readers."""
+        if self.native is None:
+            return 0
+        return native_tokens_from(self.meta.extra.get(NATIVE_TOKENS_META_KEY))
 
     # -- construction helpers (blunt the wrapping cost of uniform block content) --
     @classmethod
@@ -423,6 +464,9 @@ def turn_from_dict(msg: dict[str, Any]) -> Turn:
     provenance = TurnProvenance.from_meta(msg.get("_provenance"))
     if provenance is not None:
         meta.extra[PROVENANCE_META_KEY] = provenance.to_meta()
+    native_tokens = native_tokens_from(msg.get("_native_tokens"))
+    if native_tokens:
+        meta.extra[NATIVE_TOKENS_META_KEY] = native_tokens
 
     return Turn(
         role=role,
@@ -434,6 +478,22 @@ def turn_from_dict(msg: dict[str, Any]) -> Turn:
         native=native,
         meta=meta,
     )
+
+
+def assistant_meta_envelope(turn: Turn) -> dict[str, Any]:
+    """The well-known keys an ASSISTANT turn persists in its row's ``meta`` column.
+
+    The producing call's provenance and the native lane's replay cost travel together: the
+    one builder every writer uses (the live save path, the atomic fork clone), mirrored on
+    the read side by the storage decoder, so a key added here reaches every copy of the row.
+    """
+    envelope: dict[str, Any] = {}
+    provenance = TurnProvenance.from_meta(turn.meta.extra.get(PROVENANCE_META_KEY))
+    if provenance is not None:
+        envelope[PROVENANCE_META_KEY] = provenance.to_meta()
+    if turn.native_tokens:
+        envelope[NATIVE_TOKENS_META_KEY] = turn.native_tokens
+    return envelope
 
 
 def turn_to_dict(turn: Turn) -> dict[str, Any]:
@@ -483,6 +543,8 @@ def turn_to_dict(turn: Turn) -> dict[str, Any]:
     provenance = TurnProvenance.from_meta(turn.meta.extra.get(PROVENANCE_META_KEY))
     if provenance is not None:
         msg["_provenance"] = provenance.to_meta()
+    if turn.native_tokens:
+        msg["_native_tokens"] = turn.native_tokens
     return msg
 
 

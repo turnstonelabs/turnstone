@@ -480,7 +480,7 @@ class TestTokenAccounting:
             ],
             "_attachments_meta": meta,
         }
-        _t, _i, doc_chars = ChatSession._msg_text_chars(by_ref)
+        _t, _i, doc_chars = ChatSession._msg_text_chars(by_ref, replay_producer=None)
         assert doc_chars == 4000  # was 0 before the fix
 
         # A materialized inline document that still carries meta must count ONCE,
@@ -492,7 +492,7 @@ class TestTokenAccounting:
             ],
             "_attachments_meta": meta,
         }
-        _t2, _i2, doc2 = ChatSession._msg_text_chars(inline_plus_meta)
+        _t2, _i2, doc2 = ChatSession._msg_text_chars(inline_plus_meta, replay_producer=None)
         assert doc2 == 4000
 
 
@@ -1088,7 +1088,7 @@ class TestByReferenceMediaBudget:
                 {"kind": "image", "size_bytes": 99},
             ],
         }
-        _text, images, doc_chars = ChatSession._msg_text_chars(msg)
+        _text, images, doc_chars = ChatSession._msg_text_chars(msg, replay_producer=None)
         # pdf + audio each capped at 16_000; text counted in full; image excluded
         # (a real by-reference image is charged a fixed image budget in the
         # content loop, so counting it here too would double-charge).
@@ -1116,7 +1116,7 @@ class TestByReferenceMediaBudget:
         }
 
         projected = ChatSession._without_consumed_media_reference_estimates([msg])[0]
-        _text, _images, doc_chars = ChatSession._msg_text_chars(projected)
+        _text, _images, doc_chars = ChatSession._msg_text_chars(projected, replay_producer=None)
 
         inline_chars = sum(len(value) for value in document.values())
         assert doc_chars == inline_chars + 16_000
@@ -1141,7 +1141,9 @@ class TestByReferenceMediaBudget:
         }
 
         projected = ChatSession._without_consumed_media_reference_estimates([msg])[0]
-        text_chars, _images, doc_chars = ChatSession._msg_text_chars(projected)
+        text_chars, _images, doc_chars = ChatSession._msg_text_chars(
+            projected, replay_producer=None
+        )
 
         assert "_attachments_meta" not in projected
         assert text_chars == len("user") + len(fallback)

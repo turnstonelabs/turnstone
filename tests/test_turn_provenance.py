@@ -5,7 +5,6 @@ from __future__ import annotations
 import dataclasses
 import json
 import logging
-import re
 from typing import TYPE_CHECKING, Any
 from unittest.mock import MagicMock, patch
 
@@ -15,6 +14,7 @@ import pytest
 from tests._session_helpers import (
     RecordingUI,
     arm_session,
+    log_has_field,
     make_registered_session,
     make_session,
     replace_session_lane,
@@ -30,8 +30,10 @@ from turnstone.core.providers import ModelCapabilities, StreamChunk, UsageInfo
 from turnstone.core.session import ConversationPersistenceError, GenerationCancelled
 from turnstone.core.storage._utils import _fork_turn_insert_row
 from turnstone.core.trajectory import (
+    NATIVE_TOKENS_META_KEY,
     PROVENANCE_META_KEY,
     EffectStatus,
+    ProviderNative,
     Turn,
     TurnProvenance,
     turn_from_dict,
@@ -65,24 +67,7 @@ def _provenance(turn: Turn) -> dict[str, str | int]:
     return raw
 
 
-def _log_has_field(record: logging.LogRecord, key: str, value: str | int) -> bool:
-    """Accept either the console or JSON/dict structlog renderer.
-
-    Logging configuration is process-global, so a full-suite predecessor may
-    select a different renderer than this file sees in isolation — including
-    the colored console renderer, whose ANSI escapes would otherwise split
-    ``key=value``. The event fields are the contract; their presentation
-    (renderer AND styling) is not.
-    """
-    message = re.sub(r"\x1b\[[0-9;]*m", "", record.getMessage())
-    return any(
-        candidate in message
-        for candidate in (
-            f"{key}={value}",
-            f"'{key}': {value!r}",
-            f'"{key}": {json.dumps(value)}',
-        )
-    )
+_log_has_field = log_has_field
 
 
 def test_model_turn_stamps_one_immutable_serving_identity() -> None:
@@ -377,6 +362,7 @@ def test_token_calibration_isolated_across_primary_fallback_primary() -> None:
     session._update_token_table(
         msgs=[{"role": "user", "content": "a" * 246}],
         tool_def_chars=0,
+        native_tokens=0,
         provenance=TurnProvenance(
             model_alias=primary.alias,
             backend_model_id=primary.model,
@@ -397,6 +383,7 @@ def test_token_calibration_isolated_across_primary_fallback_primary() -> None:
     session._update_token_table(
         msgs=[{"role": "user", "content": "b" * 46}],
         tool_def_chars=0,
+        native_tokens=0,
         provenance=TurnProvenance(
             model_alias=fallback.alias,
             backend_model_id=fallback.model,
@@ -716,15 +703,23 @@ def test_public_and_model_facing_projections_do_not_expose_principal() -> None:
         registry_generation=8,
         acting_principal_id="private-user-id",
     )
-    turn = Turn.assistant("accepted")
+    # A search turn's recorded lane cost is an estimator input, never display metadata: it
+    # rides the internal dict beside the provenance and both scrubs strip it.
+    turn = Turn.assistant(
+        "accepted",
+        native=ProviderNative(producer="anthropic", blocks=({"type": "text", "text": "accepted"},)),
+    )
     turn.meta.extra[PROVENANCE_META_KEY] = provenance.to_meta()
+    turn.meta.extra[NATIVE_TOKENS_META_KEY] = 4321
     internal = turn_to_dict(turn)
+    assert internal["_native_tokens"] == 4321
 
     history = project_history_messages([internal])
     assert history == [{"role": "assistant", "content": "accepted"}]
     assert "private-user-id" not in json.dumps(history)
-    assert "_provenance" not in _serialize_messages([internal])[0]
-    assert "_provenance" not in _serialize_messages([internal], include_provider_content=True)[0]
+    for private_key in ("_provenance", "_native_tokens"):
+        assert private_key not in _serialize_messages([internal])[0]
+        assert private_key not in _serialize_messages([internal], include_provider_content=True)[0]
 
     storage = MagicMock()
     storage.get_workstream.return_value = {"state": "idle"}
@@ -818,5 +813,6 @@ def test_history_projection_failure_returns_503_without_private_row_fields(
             "_producer",
             "_provenance",
             "_commit_key",
+            "_native_tokens",
         ):
             assert private_value not in response.text

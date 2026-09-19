@@ -8752,6 +8752,7 @@ class TestMemoryIndexSnapshotLifecycle:
         session._update_token_table(
             msgs=[{"role": "user", "content": "x" * 3600}],
             tool_def_chars=0,
+            native_tokens=0,
             provenance=TurnProvenance(
                 model_alias=lane.alias,
                 backend_model_id=lane.model,
@@ -10803,7 +10804,7 @@ class TestUpdateTokenTableMsgsParam:
         ) as m_prep:
             pre_built = session._prepare_wire_messages(session._full_messages())
             calls_after_prebuild = m_prep.call_count
-            session._update_token_table(msgs=pre_built)
+            session._update_token_table(msgs=pre_built, native_tokens=0)
             # Calibration must not have re-folded.
             assert m_prep.call_count == calls_after_prebuild
 
@@ -10820,7 +10821,7 @@ class TestUpdateTokenTableMsgsParam:
             "_prepare_wire_messages",
             wraps=session._prepare_wire_messages,
         ) as m_prep:
-            session._update_token_table(msgs=make_result("ok").wire_msgs)
+            session._update_token_table(msgs=make_result("ok").wire_msgs, native_tokens=0)
             # Fallback path folds on the fly.
             assert m_prep.call_count == 1
 
@@ -10830,12 +10831,15 @@ class TestUpdateTokenTableMsgsParam:
         session._last_usage = {"prompt_tokens": 100, "completion_tokens": 10}
         served_msgs = [{"role": "user", "content": "hello"}]
         served_tool_chars = 37
-        message_chars, _images, _documents = session._msg_text_chars(served_msgs[0])
+        message_chars, _images, _documents = session._msg_text_chars(
+            served_msgs[0], replay_producer=None
+        )
 
         with patch.object(session, "_tool_def_chars", return_value=10_000) as primary_tools:
             session._update_token_table(
                 msgs=served_msgs,
                 tool_def_chars=served_tool_chars,
+                native_tokens=0,
             )
 
         primary_tools.assert_not_called()
@@ -10845,8 +10849,10 @@ class TestUpdateTokenTableMsgsParam:
         """Anthropic shape after a server-side tool loop: the raw prompt count is
         a billing total; the request carried 23,881 and the server appended
         29,910 that the next request replays.  The ratio divides the served
-        characters by 23,881, the anchor is 53,791, and the slot the status
-        line reads is rewritten to it beside the billed cache counter."""
+        characters by 23,881, the calibration anchors on 23,881 (the appended
+        results are the assistant turn's own cost), and the slot the status
+        line reads shows the next request's context, 53,791, beside the billed
+        cache counter."""
         session = _make_session()
         session._last_usage = {
             "prompt_tokens": 77_668,
@@ -10857,14 +10863,17 @@ class TestUpdateTokenTableMsgsParam:
             "prompt_tokens_cumulative": True,
         }
         served_msgs = [{"role": "user", "content": "hello"}]
-        message_chars, _images, _documents = session._msg_text_chars(served_msgs[0])
+        message_chars, _images, _documents = session._msg_text_chars(
+            served_msgs[0], replay_producer=None
+        )
 
-        session._update_token_table(msgs=served_msgs, tool_def_chars=37)
+        # The accepted turn carries the 29,910 the server appended; the slot adds it.
+        session._update_token_table(msgs=served_msgs, tool_def_chars=37, native_tokens=29_910)
 
         assert session._chars_per_token == (message_chars + 37) / 23_881
         key = session._active_token_calibration_key
         assert key is not None
-        assert session._token_calibrations[key].prompt_tokens == 53_791
+        assert session._token_calibrations[key].prompt_tokens == 23_881
         assert session._last_usage["prompt_tokens"] == 53_791
         assert session._last_usage["total_tokens"] == 53_791 + 772
         assert session._last_usage["cache_read_tokens"] == 47_622
@@ -10925,7 +10934,9 @@ class TestUpdateTokenTableMsgsParam:
             "prompt_tokens_cumulative": True,
         }
 
-        session._update_token_table(msgs=[{"role": "user", "content": "hi"}], tool_def_chars=37)
+        session._update_token_table(
+            msgs=[{"role": "user", "content": "hi"}], tool_def_chars=37, native_tokens=0
+        )
 
         assert session._chars_per_token == ratio_before
         key = session._active_token_calibration_key
@@ -12541,7 +12552,7 @@ def test_attachment_pdf_budget_fits_repeated_final_extracted_documents(
     lane = session._primary_lane()
     caps = ModelCapabilities()
     budget = session._utility_budget_snapshot(lane)
-    prefix_cap = session._attachment_pdf_text_budget_chars(caps, [], budget)
+    prefix_cap = session._attachment_pdf_text_budget_chars(caps, [], budget, replay_producer=None)
 
     # Deliberately violate the low-level mock's raw-prefix contract. The
     # materializer must still cap the exact post-neutralization wire form.
@@ -12605,12 +12616,14 @@ def test_final_pdf_validation_does_not_double_count_audio_fallback() -> None:
         pdf_only_projection,
         chars_per_token=budget.chars_per_token,
         tools=None,
+        replay_producer=None,
     )
     final_projection = session._without_consumed_media_reference_estimates(wire)
     final_used = session._estimate_wire_prompt_tokens(
         final_projection,
         chars_per_token=budget.chars_per_token,
         tools=None,
+        replay_producer=None,
     )
 
     assert old_used > capacity >= final_used
@@ -12632,6 +12645,7 @@ def test_attachment_pdf_text_budget_yields_to_existing_prompt() -> None:
         session._get_capabilities(),
         [],
         session._utility_budget_snapshot(lane),
+        replay_producer=None,
     )
 
     assert budget == 0

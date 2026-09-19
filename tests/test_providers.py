@@ -5030,9 +5030,10 @@ class TestAnthropicPromptCaching:
         assert usage.served_prompt_tokens == 23_881
         assert usage.appended_prompt_tokens == 29_910
         assert usage.prompt_tokens_cumulative is True
+        # The shared rule anchors on what the request carried and reports the
+        # appended results beside it: the assistant turn's own cost.
         context = resolve_context_usage(usage, local_request_estimate=lambda: 0)
-        assert context.anchor == 53_791
-        assert context.served == 23_881
+        assert (context.anchor, context.served) == (23_881, 23_881)
 
     @patch("turnstone.core.providers._anthropic._ensure_anthropic")
     def test_server_tool_loop_uncached_usage_keeps_closing_input(
@@ -5047,7 +5048,8 @@ class TestAnthropicPromptCaching:
         assert usage.served_prompt_tokens == 2_820
         assert usage.appended_prompt_tokens == 32_726
         assert usage.prompt_tokens_cumulative is True
-        assert resolve_context_usage(usage, local_request_estimate=lambda: 0).anchor == 35_546
+        context = resolve_context_usage(usage, local_request_estimate=lambda: 0)
+        assert context.anchor == 2_820
 
     @patch("turnstone.core.providers._anthropic._ensure_anthropic")
     def test_plain_closing_usage_repeating_the_opening_is_not_doubled(
@@ -5100,7 +5102,7 @@ class TestAnthropicPromptCaching:
             self._usage_stream((100, 0, 0), (0, 500, 0), output_tokens=5, server_tool=True)
         )
         assert usage.appended_prompt_tokens == 500
-        assert resolve_context_usage(usage, local_request_estimate=lambda: 0).anchor == 600
+        assert resolve_context_usage(usage, local_request_estimate=lambda: 0).anchor == 100
 
     @patch("turnstone.core.providers._anthropic._ensure_anthropic")
     def test_server_tool_cache_creation_delta_clamps_at_zero(self, mock_ensure: MagicMock) -> None:
@@ -5109,7 +5111,7 @@ class TestAnthropicPromptCaching:
             self._usage_stream((0, 100, 0), (500, 0, 0), output_tokens=5, server_tool=True)
         )
         assert usage.appended_prompt_tokens == 500
-        assert resolve_context_usage(usage, local_request_estimate=lambda: 0).anchor == 600
+        assert resolve_context_usage(usage, local_request_estimate=lambda: 0).anchor == 100
 
     @patch("turnstone.core.providers._anthropic._ensure_anthropic")
     def test_empty_opening_usage_falls_back_to_closing_totals(self, mock_ensure: MagicMock) -> None:
@@ -5434,8 +5436,7 @@ class TestOpenAIResponsesProvider:
         assert result.usage.cache_read_tokens == 10_391
         assert result.usage.prompt_tokens_cumulative is True
         context = resolve_context_usage(result.usage, local_request_estimate=lambda: 11_000)
-        assert context.anchor == 11_000
-        assert context.served is None
+        assert (context.anchor, context.served) == (11_000, None)
 
     def test_plain_response_usage_is_not_cumulative(self) -> None:
         usage = SimpleNamespace(

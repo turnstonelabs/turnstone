@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 from turnstone.core.completion_recovery import EmptyCompletionError, is_context_overflow
 from turnstone.core.model_turn import ModelTurnResult
@@ -68,7 +68,36 @@ class CompactionPolicy:
         return self.over_hard(used) or (self.over_soft(used) and advised)
 
 
+# One message's ``(text_chars, fixed_tokens, document_chars)``: the characters the
+# chars-per-token ratio converts, the tokens already known exactly that the ratio
+# must neither learn from nor re-estimate (the fixed image charge, the provider's
+# own count of a replayed native lane), and the document characters that budget
+# without teaching the text ratio.
 MessageMeasure = Callable[[dict[str, Any] | Turn], tuple[int, int, int]]
+
+# A message's replayed native-lane cost toward one provider, 0 for any other message: the part
+# of the measure's fixed bucket that is a provider's reported figure rather than this process's
+# own exact count.
+LaneMeasure = Callable[[dict[str, Any] | Turn], int]
+
+
+class BoundMeasure(NamedTuple):
+    """A measure and its lane reader bound to one replay producer in one expression."""
+
+    measure: MessageMeasure
+    lane: LaneMeasure
+
+
+def no_lane_tokens(message: dict[str, Any] | Turn) -> int:
+    """The lane reader of an estimator whose messages replay no native lane."""
+    return 0
+
+
+# The least share of a provider's prompt count that must be text for the count to calibrate
+# the text ratio.  Requests are almost entirely text; a request whose reported lane charge
+# leaves less than this is not a calibration sample.  Exact local charges (an image's fixed
+# figure) are exempt: a request that is mostly images calibrates as it always did.
+CALIBRATION_MIN_TEXT_SHARE = 0.05
 
 
 def calibrated_chars_per_token(
@@ -78,24 +107,38 @@ def calibrated_chars_per_token(
     tool_def_chars: int,
     measure: MessageMeasure,
     fallback: float,
-    image_tokens: int = 1000,
+    lane_tokens: int = 0,
 ) -> float:
     """Return a provider-anchored text chars/token ratio.
 
-    Images receive a fixed token charge and documents contribute to budgeting
+    Fixed token charges (images, a replayed native lane) are subtracted from the
+    provider's count before dividing, and documents contribute to budgeting
     without polluting the text ratio, matching the foreground estimator's
     established accounting.  If the provider count cannot yield a positive text
-    denominator, retain ``fallback``.
+    denominator, retain ``fallback``.  ``lane_tokens`` is the part of those fixed
+    charges that is a provider's reported figure (the replayed lanes' counts, summed
+    over ``messages``); the text floor below judges the share such a figure leaves,
+    never what this process's own exact charges leave.
     """
 
     text_chars = tool_def_chars
-    image_count = 0
+    fixed_tokens = 0
     for message in messages:
-        message_text, images, _document_chars = measure(message)
+        message_text, message_fixed, _document_chars = measure(message)
         text_chars += message_text
-        image_count += images
-    text_prompt_tokens = prompt_tokens - image_count * image_tokens
+        fixed_tokens += message_fixed
+    text_prompt_tokens = prompt_tokens - fixed_tokens
     if text_prompt_tokens <= 0 or text_chars <= 0:
+        return fallback
+    # The exact local charges come off before the share is judged: only a reported figure can
+    # be wrong, so only the reported lane charge can make the text remainder untrustworthy.
+    reported_tokens = prompt_tokens - (fixed_tokens - lane_tokens)
+    if text_prompt_tokens < reported_tokens * CALIBRATION_MIN_TEXT_SHARE:
+        # The reported lane charge all but exhausts the provider's count: the text left to
+        # divide by is too small a sample to teach the ratio anything, and a misreported
+        # count (a provider's own figure, not this process's) would otherwise collapse the
+        # denominator toward one and send the ratio, and with it the tool-result ceiling,
+        # orders of magnitude off.
         return fallback
     return text_chars / text_prompt_tokens
 
@@ -104,30 +147,75 @@ def calibrated_chars_per_token(
 class ContextUsage:
     """The two context figures one completed call yields.
 
-    ``anchor`` is the context the next request will carry, before the assistant turn is
-    appended.  ``served`` is what this request carried, the denominator for the chars-per-token
-    calibration, or ``None`` when the provider gave no single-pass figure and the caller's own
-    estimate stood in, which teaches the ratio nothing.
+    ``anchor`` is what this request carried: the prefix count the estimators anchor on before
+    the assistant turn is appended.  ``served`` is the same figure when the provider reported
+    it, the denominator for the chars-per-token calibration, or ``None`` when the provider gave
+    no single-pass figure and the caller's own estimate stood in, which teaches the ratio
+    nothing.  What the provider appended inside the response is not a context figure of the
+    request: it is the assistant turn's own cost, recorded on that turn by the completion
+    builder (:data:`turnstone.core.trajectory.NATIVE_TOKENS_META_KEY`), so the next request's
+    context is the anchor plus the accepted turn's charge.
     """
 
     anchor: int
     served: int | None
 
 
+def accepted_turn_tokens(
+    turn: dict[str, Any] | Turn,
+    *,
+    completion_tokens: int | None,
+    measure: MessageMeasure,
+    chars_per_token: float,
+) -> int:
+    """The tokens one accepted assistant turn adds to the next request.
+
+    The provider's completion count is exact for a turn made of text.  A turn that carries a
+    replayed native lane is charged from the measure instead: its text from characters and the
+    lane from the recorded count.  Adding the completion count to the lane would double-charge
+    the model's pre-search output, which the provider counts once as output and once more, fed
+    back into its own next pass, as appended input.  The measure is also what every re-estimate
+    applies, so the exact path and the re-estimate agree.  A missing or zero completion count
+    (no usage, or a gateway that reports none) charges from the measure as well.
+    """
+    text_chars, fixed_tokens, document_chars = measure(turn)
+    if not completion_tokens or fixed_tokens:
+        return measured_tokens(
+            text_chars, fixed_tokens, document_chars, chars_per_token=chars_per_token
+        )
+    return max(1, completion_tokens)
+
+
+def measured_tokens(
+    text_chars: int, fixed_tokens: int, document_chars: int, *, chars_per_token: float
+) -> int:
+    """One message's token estimate from its measure: the characters at the ratio, plus the
+    fixed tokens as they are, never below one.  The arithmetic :func:`accepted_turn_tokens` and
+    :meth:`PromptTokenEstimator._message_tokens` share, so the accepted charge and the
+    estimator's re-estimate cannot drift apart.  The session's own per-message re-estimate
+    converts fixed tokens to characters at the ratio and divides them back out, which can land
+    one token under this figure at ratios other than the default.
+    """
+    return max(1, int((text_chars + document_chars) / chars_per_token) + fixed_tokens)
+
+
 def resolve_context_usage(
     usage: UsageInfo, *, local_request_estimate: Callable[[], int]
 ) -> ContextUsage:
-    """Turn one call's reported usage into the context anchor and the calibration denominator.
+    """Turn one call's reported usage into the anchor and the calibration denominator.
 
-    A plain response reports one sampling pass, so ``prompt_tokens`` is both figures.  A response
-    in which the provider ran its own tool loop reports billing totals summed across passes
-    (``prompt_tokens_cumulative``); the request's own size is then the provider's single-pass
-    figure when it gave one (``served_prompt_tokens``), else the caller's local estimate of what
-    it sent, and the anchor adds whatever the provider appended that the next request replays
-    (``appended_prompt_tokens``).  ``local_request_estimate`` is called only when the provider
-    left that size unknown, so callers pay for the estimate, and touch the state it reads, only
-    then.  One rule for every lane and every consumer: the session's calibration, the task-agent
-    estimator, and the agent context badge all read this.
+    A plain response reports one sampling pass, so ``prompt_tokens`` is both the anchor and the
+    denominator.  A response in which the provider ran its own tool loop reports billing totals
+    summed across passes (``prompt_tokens_cumulative``); the request's own size is then the
+    provider's single-pass figure when it gave one (``served_prompt_tokens``), else the caller's
+    local estimate of what it sent.  What the provider appended that the next request replays
+    (``appended_prompt_tokens``) is never folded into the anchor: it is the assistant turn's
+    cost, recorded on the turn by the completion builder, and charging it there keeps the
+    anchored estimate and the re-estimate from characters equal.  ``local_request_estimate`` is
+    called only when the provider left the request's size unknown, so callers pay for the
+    estimate, and touch the state it reads, only then.  One rule for every lane and every
+    consumer: the session's calibration, the task-agent estimator, and the agent context badge
+    all read this.
     """
 
     if not usage.prompt_tokens_cumulative:
@@ -137,11 +225,8 @@ def resolve_context_usage(
         )
     if usage.served_prompt_tokens > 0:
         served = usage.served_prompt_tokens
-        return ContextUsage(anchor=served + usage.appended_prompt_tokens, served=served)
-    return ContextUsage(
-        anchor=max(0, local_request_estimate()) + usage.appended_prompt_tokens,
-        served=None,
-    )
+        return ContextUsage(anchor=served, served=served)
+    return ContextUsage(anchor=max(0, local_request_estimate()), served=None)
 
 
 @dataclass(slots=True)
@@ -157,14 +242,12 @@ class PromptTokenEstimator:
     measure: MessageMeasure
     tool_def_chars: int
     chars_per_token: float = 4.0
-    image_tokens: int = 1000
+    lane_measure: LaneMeasure = no_lane_tokens
     _prompt_tokens: int | None = None
     _prefix_ids: tuple[int, ...] = ()
 
     def _message_tokens(self, message: dict[str, Any] | Turn) -> int:
-        text_chars, images, document_chars = self.measure(message)
-        text_tokens = int((text_chars + document_chars) / self.chars_per_token)
-        return max(1, text_tokens + images * self.image_tokens)
+        return measured_tokens(*self.measure(message), chars_per_token=self.chars_per_token)
 
     def estimate(self, messages: Sequence[dict[str, Any] | Turn]) -> int:
         prefix_len = len(self._prefix_ids)
@@ -213,7 +296,11 @@ class PromptTokenEstimator:
         The call's usage goes through :func:`resolve_context_usage` with this estimator's own
         pre-call estimate of ``messages`` standing in when the provider reported only cumulative
         totals; the ratio is recalibrated only when the provider said what the request carried.
-        Returns the anchor so the caller paints the same figure it anchors on.
+        The anchor covers exactly ``messages``; what the provider appended is the assistant
+        turn's cost and reaches the estimate through :meth:`append_accepted`.  Returns the
+        anchor it installs, so a caller paints the figure the estimator uses; the accepted
+        turn's replay charge is that turn's own cost, which the caller adds for the badge and
+        :meth:`append_accepted` adds for the estimate.
         """
 
         if tool_def_chars is not None:
@@ -231,7 +318,7 @@ class PromptTokenEstimator:
                 tool_def_chars=self.tool_def_chars,
                 measure=self.measure,
                 fallback=self.chars_per_token,
-                image_tokens=self.image_tokens,
+                lane_tokens=sum(self.lane_measure(message) for message in measured_messages),
             )
         self._prompt_tokens = context.anchor
         self._prefix_ids = tuple(id(message) for message in messages)
@@ -244,6 +331,21 @@ class PromptTokenEstimator:
             return
         self._prompt_tokens += max(1, tokens)
         self._prefix_ids += (id(message),)
+
+    def append_accepted(self, turn: dict[str, Any] | Turn, completion_tokens: int | None) -> int:
+        """Extend the anchor with one accepted turn charged by :func:`accepted_turn_tokens`.
+
+        Returns the charge so the caller can paint or assert the same figure.
+        """
+
+        tokens = accepted_turn_tokens(
+            turn,
+            completion_tokens=completion_tokens,
+            measure=self.measure,
+            chars_per_token=self.chars_per_token,
+        )
+        self.append_exact(turn, tokens)
+        return tokens
 
     def invalidate(self) -> None:
         self._prompt_tokens = None

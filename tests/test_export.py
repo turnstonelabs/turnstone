@@ -22,6 +22,7 @@ from turnstone.core.export import (
     _build_openai_json,
     export_workstream,
 )
+from turnstone.core.trajectory import dicts_from_turns
 
 USER = "u1"
 
@@ -97,7 +98,18 @@ def test_reasoning_content_present_responses(backend):
 def test_no_underscore_keys_leak(backend):
     pc = [{"type": "thinking", "thinking": "R1", "signature": "sig"}]
     _seed_interactive_turn(backend, "ws1")
-    backend.save_message("ws1", "assistant", "more", provider_data=json.dumps(pc))
+    # A search turn's recorded lane cost is an underscore sibling too: present on the loaded
+    # row, absent from the export because the sanitizer runs last.
+    backend.save_message(
+        "ws1",
+        "assistant",
+        "more",
+        provider_data=json.dumps(pc),
+        producer="anthropic",
+        meta=json.dumps({"native_tokens": 4321}),
+    )
+    loaded = dicts_from_turns(backend.load_message_turns("ws1", checkpointed=False))
+    assert any(m.get("_native_tokens") == 4321 for m in loaded)
 
     messages = _parse_messages(export_workstream(backend, "ws1").data)
     leaked = sorted({k for m in messages for k in m if isinstance(k, str) and k.startswith("_")})

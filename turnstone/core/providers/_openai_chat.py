@@ -538,12 +538,12 @@ class OpenAIChatCompletionsProvider:
 
     # -- reasoning extraction ------------------------------------------------
 
-    def extract_reasoning_text(
+    def reasoning_text_parts(
         self,
         provider_blocks: list[dict[str, Any]] | None,
-    ) -> str:
+    ) -> list[str]:
         """Walk synthetic ``reasoning_text`` blocks (Phase 3 path-3
-        capture) and return the concatenated reasoning text.
+        capture) and return their texts.
 
         OpenAI Chat Completions has no native reasoning shape on the
         wire — vLLM ``--reasoning-parser``, llama.cpp
@@ -555,7 +555,7 @@ class OpenAIChatCompletionsProvider:
         emitted.  This extractor unwraps those for UI rehydration.
         """
         if not isinstance(provider_blocks, list):
-            return ""
+            return []
         parts: list[str] = []
         for block in provider_blocks:
             if not isinstance(block, dict):
@@ -565,4 +565,10 @@ class OpenAIChatCompletionsProvider:
             text = block.get("text")
             if isinstance(text, str) and text:
                 parts.append(text)
-        return _join_reasoning_with_cap(parts)
+        return parts
+
+    def extract_reasoning_text(
+        self,
+        provider_blocks: list[dict[str, Any]] | None,
+    ) -> str:
+        return _join_reasoning_with_cap(self.reasoning_text_parts(provider_blocks))

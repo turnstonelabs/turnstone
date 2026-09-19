@@ -18,8 +18,16 @@ import pytest
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+    from turnstone.core.model_turn import ModelTurnResult
+
 from tests._session_helpers import make_result, make_session
-from turnstone.core.compaction import CompactionEngine, PromptTokenEstimator, SummaryResult
+from turnstone.core.compaction import (
+    CALIBRATION_MIN_TEXT_SHARE,
+    CompactionEngine,
+    PromptTokenEstimator,
+    SummaryResult,
+    calibrated_chars_per_token,
+)
 from turnstone.core.metacognition import (
     NUDGE_TASK_COMPACTION_RESUME,
     format_nudge,
@@ -30,7 +38,14 @@ from turnstone.core.session import (
     _active_read_files,
     _TaskExecutionJournal,
 )
-from turnstone.core.trajectory import EffectStatus, Role, ToolCall, Turn
+from turnstone.core.trajectory import (
+    NATIVE_TOKENS_META_KEY,
+    EffectStatus,
+    ProviderNative,
+    Role,
+    ToolCall,
+    Turn,
+)
 
 TOOL_NAME = "search"
 TOOL_CALL = {
@@ -76,11 +91,14 @@ def _text_measure(message: dict[str, Any] | Turn) -> tuple[int, int, int]:
     return len(str(content)), 0, 0
 
 
-def test_estimator_observe_anchors_on_served_plus_appended_and_recalibrates() -> None:
+def test_estimator_observe_anchors_on_served_and_returns_the_anchor() -> None:
     """Anthropic shape after a server-side tool loop: the request carried 23,881
     tokens and the server appended 29,910 that the next request replays.  The
-    anchor is their sum, the ratio recalibrates against the served figure, and
-    the returned anchor is what the agent badge paints."""
+    estimator anchors on what the request carried, the ratio recalibrates
+    against that figure, and the return is the anchor it installs, so a caller
+    paints the figure the estimator uses; the accepted turn's replay charge is
+    that turn's own cost.  An exact append then extends the anchor by exactly
+    what it is given."""
     estimator = PromptTokenEstimator(measure=_text_measure, tool_def_chars=0, chars_per_token=4.0)
     messages = [{"role": "user", "content": "x" * 400}]
     usage = UsageInfo(
@@ -95,9 +113,207 @@ def test_estimator_observe_anchors_on_served_plus_appended_and_recalibrates() ->
 
     anchor = estimator.observe(usage=usage, messages=messages)
 
-    assert anchor == 53_791
+    assert anchor == 23_881
     assert estimator.chars_per_token == 400 / 23_881
-    assert estimator.estimate(messages) == 53_791
+    assert estimator.estimate(messages) == 23_881
+    assistant = {"role": "assistant", "content": "found it"}
+    estimator.append_exact(assistant, 772)
+    assert estimator.estimate([*messages, assistant]) == 23_881 + 772
+
+
+@pytest.mark.parametrize("native_tokens", [0, 80])
+def test_agent_badge_paints_the_anchor_plus_the_accepted_turn_charge(native_tokens: int) -> None:
+    """The badge figure is the next request's context before the turn's text: the anchor
+    the estimator installs plus the replay charge the accepted turn carries toward the
+    agent's own lane.  A turn that kept no cost adds nothing.  One model call and a wide
+    window, so the snapshot holds that call's figure and nothing compacted in between."""
+    session = make_session(auto_compact_pct=0.8)
+    producer = session._model_binding.lane.provider.provider_name
+    reply = make_result(
+        "found it",
+        usage=_usage(10),
+        native_blocks=[
+            {"type": "server_tool_use", "id": "srvtoolu_1", "name": "web_search", "input": {}},
+            {"type": "text", "text": "found it"},
+        ],
+        producer=producer,
+    )
+    if native_tokens:
+        reply.turn.meta.extra[NATIVE_TOKENS_META_KEY] = native_tokens
+
+    output, _contexts = _run_script(
+        session,
+        [Turn.system("immutable task identity"), Turn.user("delegated contract")],
+        [reply],
+        window=100_000,
+    )
+
+    assert output == "found it"
+    [context] = session.ui._snapshot_agent_contexts()
+    assert context["prompt_tokens"] == 10 + native_tokens
+
+
+def test_estimator_charges_fixed_tokens_the_measure_reports() -> None:
+    """The measure's middle figure is tokens already known exactly (an image's
+    fixed charge, a replayed native lane's provider count): a re-estimate from
+    characters adds them as they are, and the calibration subtracts them from the
+    provider's count before dividing, so they neither teach nor skew the ratio."""
+
+    def measure(message: dict[str, Any] | Turn) -> tuple[int, int, int]:
+        assert isinstance(message, dict)
+        return len(str(message["content"])), int(message.get("_fixed", 0)), 0
+
+    estimator = PromptTokenEstimator(measure=measure, tool_def_chars=0, chars_per_token=4.0)
+    plain = {"role": "user", "content": "x" * 400}
+    charged = {"role": "assistant", "content": "y" * 400, "_fixed": 29_910}
+
+    assert estimator.tokens_for([plain, charged]) == 100 + 100 + 29_910
+
+    usage = UsageInfo(prompt_tokens=30_110, completion_tokens=5, total_tokens=30_115)
+    estimator.observe(usage=usage, messages=[plain, charged])
+
+    # (400 + 400) chars over (30,110 - 29,910) text tokens.
+    assert estimator.chars_per_token == 800 / 200
+
+
+def test_calibration_refuses_a_count_the_fixed_charges_all_but_exhaust() -> None:
+    """A lane count is the provider's own figure, not this process's count.  When it
+    leaves less than the minimum text share of the prompt count, the sample teaches the
+    ratio nothing and a misreported figure would collapse the denominator toward one, so
+    the calibration keeps its fallback."""
+
+    def measure(message: dict[str, Any] | Turn) -> tuple[int, int, int]:
+        assert isinstance(message, dict)
+        return len(str(message["content"])), int(message.get("_fixed", 0)), 0
+
+    messages = [{"role": "assistant", "content": "y" * 4_000, "_fixed": 29_999}]
+    collapsed = calibrated_chars_per_token(
+        prompt_tokens=30_000,
+        messages=messages,
+        tool_def_chars=0,
+        measure=measure,
+        fallback=4.0,
+        lane_tokens=29_999,
+    )
+    assert collapsed == 4.0
+
+    # At the floor the sample counts: 4,000 chars over 1,500 text tokens.
+    floor = int(30_000 * CALIBRATION_MIN_TEXT_SHARE)
+    messages = [{"role": "assistant", "content": "y" * 4_000, "_fixed": 30_000 - floor}]
+    assert (
+        calibrated_chars_per_token(
+            prompt_tokens=30_000,
+            messages=messages,
+            tool_def_chars=0,
+            measure=measure,
+            fallback=4.0,
+            lane_tokens=30_000 - floor,
+        )
+        == 4_000 / floor
+    )
+
+
+def test_calibration_exempts_exact_local_charges_from_the_text_floor() -> None:
+    """An image's fixed figure is this process's own exact count, not a reported one, so a
+    request whose images outweigh its text still calibrates as it always did: three images
+    and 404 characters against a provider count of 3,101 divide to 4.0, and the floor judges
+    only the share a reported lane charge leaves."""
+
+    def measure(message: dict[str, Any] | Turn) -> tuple[int, int, int]:
+        assert isinstance(message, dict)
+        return len(str(message["content"])), int(message.get("_fixed", 0)), 0
+
+    messages = [{"role": "user", "content": "x" * 404, "_fixed": 3_000}]
+    assert (
+        calibrated_chars_per_token(
+            prompt_tokens=3_101, messages=messages, tool_def_chars=0, measure=measure, fallback=3.0
+        )
+        == 4.0
+    )
+
+
+def _search_result(
+    native_tokens: int, producer: str, *, prompt_tokens: int = 10
+) -> ModelTurnResult:
+    """A tool-calling reply whose turn carries a replayed native lane costing *native_tokens*."""
+    result = make_result(
+        "found it",
+        tool_calls=[TOOL_CALL],
+        finish_reason="tool_calls",
+        usage=_usage(prompt_tokens, completion_tokens=2),
+        native_blocks=[
+            {"type": "server_tool_use", "id": "srvtoolu_1", "name": "web_search", "input": {}},
+            {"type": "text", "text": "found it"},
+        ],
+        producer=producer,
+    )
+    if native_tokens:
+        result.turn.meta.extra[NATIVE_TOKENS_META_KEY] = native_tokens
+    return result
+
+
+@pytest.mark.parametrize("native_tokens", [0, 80])
+def test_agent_estimate_charges_the_native_lane_on_its_turn(native_tokens: int) -> None:
+    """The task agent's estimate charges a search turn's replayed lane on the turn
+    itself: with the charge the context crosses the hard ceiling of a 100-token
+    window after one reply and the agent compacts before its next call; without it
+    the same script never compacts."""
+    session = make_session(auto_compact_pct=0.8)
+    producer = session._model_binding.lane.provider.provider_name
+    ledger = [Turn.system("immutable task identity"), Turn.user("delegated contract")]
+
+    with patch.object(
+        session._compaction_engine,
+        "summarize_blocks",
+        return_value=SummaryResult(text="dense", producer=None),
+    ) as summarize:
+        output, contexts = _run_script(
+            session,
+            ledger,
+            [
+                _search_result(native_tokens, producer),
+                make_result("done", usage=_usage(30)),
+            ],
+        )
+
+    assert output == "done"
+    assert summarize.call_count == (1 if native_tokens else 0)
+    if native_tokens:
+        assert "[Conversation summary]" in _texts(contexts[1])
+
+
+def test_agent_measure_bound_to_its_lane_agrees_with_the_exact_charge() -> None:
+    """The exact charge on append and the character re-estimate charge the same lane:
+    both read the turn's recorded cost, one directly and one through the measure bound
+    to the agent lane's provider.  A measure bound to another provider charges nothing,
+    because that provider rebuilds the turn from its text."""
+    session = make_session()
+    bound = session._message_measure("anthropic")
+    estimator = PromptTokenEstimator(
+        measure=bound.measure, lane_measure=bound.lane, tool_def_chars=0, chars_per_token=4.0
+    )
+    request = [Turn.user("x" * 4_000)]
+    estimator.observe(
+        usage=UsageInfo(prompt_tokens=1_000, completion_tokens=2, total_tokens=1_002),
+        messages=request,
+    )
+    turn = Turn.assistant(
+        "found it", native=ProviderNative(producer="anthropic", blocks=({"type": "text"},))
+    )
+    turn.meta.extra[NATIVE_TOKENS_META_KEY] = 29_910
+    charged = estimator.append_accepted(turn, 2)
+    # Text from characters plus the lane, not the completion count plus the lane.
+    assert charged == int((len("found it") + len("assistant")) / 4.0) + 29_910
+    anchored = estimator.estimate([*request, turn])
+    assert anchored == 1_000 + charged
+
+    estimator.invalidate()
+    assert estimator.estimate([*request, turn]) == anchored
+
+    foreign = PromptTokenEstimator(
+        measure=session._message_measure("openai").measure, tool_def_chars=0, chars_per_token=4.0
+    )
+    assert foreign.tokens_for([turn]) < 29_910
 
 
 def test_estimator_observe_without_served_figure_keeps_ratio_and_own_estimate() -> None:

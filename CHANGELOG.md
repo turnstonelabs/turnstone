@@ -82,6 +82,24 @@ frozen.
   cumulative counters; one shared rule turns that into the context anchor and the calibration
   denominator for the session, task agents, and the agent context badge. Reported cache reads
   still feed the usage records, and the operator token budget is charged the billed total.
+- **Context estimate on the turns after a server-side search.** The search results the provider
+  appends to a response are replayed to it on every later request as opaque blocks the character
+  measure cannot see, so from the next turn on the estimate was calibrated about 2.3 times low: new
+  text and tool results were over-estimated by that factor, tool results were cut at less than half
+  the intended ceiling, and the shrinkage lasted until compaction removed the results. The assistant
+  turn now records the provider's own count of what it appended, the estimate charges it like the
+  fixed image charge, and the calibration subtracts it, only toward the provider that replays the
+  lane; a model switch to another provider, which rebuilds the turn from its text, charges nothing.
+  The count is persisted with the turn and survives reopen and fork; it is refused above the lane's
+  own window and clamped to that window, a lane whose window nothing names records nothing, and,
+  when reasoning replay is off, it is discounted for the thinking the wire never carries, so a
+  broken usage report cannot poison a workstream and thinking is not charged twice. A compaction
+  whose estimate did not shrink is logged with both figures and the ratio, beside the marker the
+  card already shows.
+- **Task-agent reply with no output count.** A task agent's reply whose provider reported no output
+  token count is now charged from its text, the rule the session's own accepted turn already
+  applied, instead of a single token, so the agent's context estimate no longer runs low after such
+  a reply.
 - **Incomplete task results and perception fallback.** Failed task completions now report an
   error, with any earlier partial work explicitly labelled incomplete. Optional perception
   memoizes a model that produces no description for the same binding generation and gives

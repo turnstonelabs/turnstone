@@ -17,8 +17,9 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import re
 from types import SimpleNamespace
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from unittest.mock import MagicMock
 
 from turnstone.core.model_turn import ModelTurnResult, resolve_model_binding
@@ -28,6 +29,9 @@ from turnstone.core.session import ChatSession
 from turnstone.core.session_ui_base import SessionUIBase
 from turnstone.core.trajectory import ProviderNative, ToolCall, Turn
 from turnstone.core.workstream import WorkstreamKind
+
+if TYPE_CHECKING:
+    import logging
 
 
 class NullUI(SessionUIBase):
@@ -76,6 +80,26 @@ def replace_session_lane(
     )
     session._model_binding = dataclasses.replace(binding, lane=lane)
     return lane
+
+
+def log_has_field(record: logging.LogRecord, key: str, value: str | int | float) -> bool:
+    """Accept either the console or JSON/dict structlog renderer.
+
+    Logging configuration is process-global, so a full-suite predecessor may
+    select a different renderer than a file sees in isolation, including the
+    colored console renderer, whose ANSI escapes would otherwise split
+    ``key=value``.  The event fields are the contract; their presentation
+    (renderer AND styling) is not.
+    """
+    message = re.sub(r"\x1b\[[0-9;]*m", "", record.getMessage())
+    return any(
+        candidate in message
+        for candidate in (
+            f"{key}={value}",
+            f"'{key}': {value!r}",
+            f'"{key}": {json.dumps(value)}',
+        )
+    )
 
 
 def make_session(**kwargs: Any) -> ChatSession:

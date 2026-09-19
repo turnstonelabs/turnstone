@@ -308,6 +308,16 @@ REASONING_BEARING_BLOCK_TYPES: frozenset[str] = frozenset(
     {"thinking", "redacted_thinking", "reasoning", "reasoning_text"}
 )
 
+# The blocks a provider's own tool loop appends to a response: the point up to
+# which the model's earlier output was fed back into the provider's next
+# sampling pass.  Anthropic emits ``web_search_tool_result`` (the only lane
+# that reports an appended count today); OpenAI Responses emits
+# ``web_search_call``.  The union of the per-provider sets: the Responses
+# adapter's own ``_SERVER_EXECUTED_ITEM_TYPES`` is a deliberately narrow subset
+# of this one (a test pins the relation).  Read by the completion builder to
+# scope the reasoning discount to the passes the provider actually fed back.
+SERVER_RESULT_BLOCK_TYPES: frozenset[str] = frozenset({"web_search_tool_result", "web_search_call"})
+
 
 def has_reasoning_bearing_block(blocks: list[dict[str, Any]]) -> bool:
     """True when any block carries model reasoning natively.
@@ -1106,13 +1116,26 @@ class LLMProvider(Protocol):
         """Exception class names that should trigger retry."""
         ...
 
+    def reasoning_text_parts(
+        self,
+        provider_blocks: list[dict[str, Any]] | None,
+    ) -> list[str]:
+        """Return the reasoning text of the blocks this provider owns, one string per block.
+
+        The uncapped walk behind :meth:`extract_reasoning_text`: the display path joins and
+        caps these parts, the estimators size them.  Returns ``[]`` for missing, non-list or
+        unrecognised input.
+        """
+        ...
+
     def extract_reasoning_text(
         self,
         provider_blocks: list[dict[str, Any]] | None,
     ) -> str:
-        """Return concatenated reasoning text from stored ``provider_blocks``.
+        """Return the joined, display-capped reasoning text of stored ``provider_blocks``.
 
-        Each provider walks the block types it owns:
+        The capped join over :meth:`reasoning_text_parts`, the walk a provider owns; that walk
+        covers the block types each provider recognises:
 
         * ``AnthropicProvider`` — ``thinking`` blocks (concatenated
           ``thinking`` text).

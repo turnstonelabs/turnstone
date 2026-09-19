@@ -23,7 +23,7 @@ from turnstone.core import session as session_module
 from turnstone.core.attachments import Attachment
 from turnstone.core.history_decoration import project_history_messages
 from turnstone.core.session_routes import SessionEndpointConfig, _make_dispatch_attempt
-from turnstone.core.trajectory import EffectStatus, dicts_from_turns
+from turnstone.core.trajectory import NATIVE_TOKENS_META_KEY, EffectStatus, dicts_from_turns
 from turnstone.core.workstream import Workstream
 
 if TYPE_CHECKING:
@@ -1871,11 +1871,18 @@ def test_history_load_failure_rejects_pending_only_handoff_until_durable_prefix_
     ws.session = session
     ws.ui = session.ui
     store = _ConversationStore(ambiguous_assistant_ack=True)
+    # The pending row is the turn's own dict, so a recorded lane cost rides it into the
+    # handler and the projection must strip it like every other private sibling.
+    pending = make_result(
+        "pending while durable history is unavailable",
+        native_blocks=[{"type": "text", "text": "pending while durable history is unavailable"}],
+    )
+    pending.turn.meta.extra[NATIVE_TOKENS_META_KEY] = 4321
 
     with (
         _send_environment(
             session,
-            [make_result("pending while durable history is unavailable")],
+            [pending],
             store,
             MagicMock(return_value=([], None)),
         ),
@@ -1907,6 +1914,7 @@ def test_history_load_failure_rejects_pending_only_handoff_until_durable_prefix_
         "pending while durable history is unavailable"
     ]
     assert "_commit_key" not in assistants[0]
+    assert "_native_tokens" not in assistants[0]
     assert "_pending_durability" not in assistants[0]
     assert session.has_unresolved_conversation_persistence() is True
 

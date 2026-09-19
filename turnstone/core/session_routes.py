@@ -4742,10 +4742,14 @@ def make_history_handler(cfg: SessionEndpointConfig) -> Handler:
         # scrub remains defense in depth for any future canonical projection
         # that preserves an input mapping. Provenance can carry an acting
         # principal id, so that key must always fail closed.
+        # The native lane's replay cost is an estimator input the projection
+        # already leaves out; the pop keeps this list honest for the same
+        # future-projection case.
         for message in messages:
             message.pop("_commit_key", None)
             message.pop("_pending_durability", None)
             message.pop("_provenance", None)
+            message.pop("_native_tokens", None)
         return messages, cursor, load_failed, handoff_token, storage_fallback
 
     return history

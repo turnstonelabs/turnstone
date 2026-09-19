@@ -66,11 +66,13 @@ from turnstone.core.background_shells import (
     spawn_group_leader,
 )
 from turnstone.core.compaction import (
+    BoundMeasure,
     CompactionEngine,
     CompactionIrreducibleError,
     CompactionPolicy,
     PromptTokenEstimator,
     SummaryRuntime,
+    accepted_turn_tokens,
     calibrated_chars_per_token,
     resolve_context_usage,
 )
@@ -195,6 +197,7 @@ from turnstone.core.model_turn import (
     lane_diagnostics,
     lane_error_is_retryable,
     lane_matches_explicit_handles,
+    lane_producer,
     lane_scans_inline_reasoning,
     lane_thinking_suppressed,
     lane_without_thinking,
@@ -286,8 +289,10 @@ from turnstone.core.trajectory import (
     TextBlock,
     Turn,
     TurnProvenance,
+    assistant_meta_envelope,
     dicts_from_turns,
     last_assistant_text,
+    native_tokens_from,
     turn_from_dict,
     turn_to_dict,
     turns_from_dicts,
@@ -3166,6 +3171,10 @@ class ChatSession:
         self._compaction_advised = False
         self.agent_max_turns = agent_max_turns
         self._chars_per_token = 4.0  # calibrated from API usage
+        # The provider a request from this session replays native lanes to: the
+        # active lane's provider, refreshed at every calibration activation.  A
+        # turn's recorded native-lane cost counts only toward that provider.
+        self._active_replay_producer = lane_producer(self._model_binding.lane)
         # Tool output truncation: 0 keeps the automatic ceiling of one fifth of
         # the context window; the result fold further narrows automatic
         # results to one fifth of its remaining input allowance. A positive
@@ -5691,11 +5700,19 @@ class ChatSession:
         *,
         chars_per_token: float,
         tools: list[dict[str, Any]] | None,
+        replay_producer: str | None,
     ) -> int:
-        """Estimate one fully prepared wire using the foreground accounting."""
+        """Estimate one fully prepared wire using the foreground accounting.
+
+        ``replay_producer`` names the provider the wire goes to, so a native lane
+        it replays is charged; a caller sizing a utility wire built from fresh
+        text says ``None`` explicitly, because such a wire carries no lane.
+        """
         total = int(serialized_tool_chars(tools) / chars_per_token) if tools else 0
         for message in messages:
-            text_chars, images, document_chars = self._msg_text_chars(message)
+            text_chars, fixed_tokens, document_chars = self._msg_text_chars(
+                message, replay_producer=replay_producer
+            )
             content = message.get("content")
             if isinstance(content, list):
                 for part in content:
@@ -5719,7 +5736,7 @@ class ChatSession:
                         document_chars -= len(data)
                         document_chars += min(len(data), _DOC_BUDGET_CHAR_CAP)
             message_chars = text_chars + document_chars
-            message_chars += int(images * self._IMAGE_TOKENS * chars_per_token)
+            message_chars += int(fixed_tokens * chars_per_token)
             total += max(1, int(message_chars / chars_per_token))
         return total
 
@@ -5811,8 +5828,14 @@ class ChatSession:
         caps: ModelCapabilities,
         tools: list[dict[str, Any]] | None,
         budget: _UtilityBudgetSnapshot,
+        *,
+        replay_producer: str | None,
     ) -> int:
-        """Fit extracted text per emitted PDF occurrence around other input."""
+        """Fit extracted text per emitted PDF occurrence around other input.
+
+        ``replay_producer`` names the serving provider so a native lane the wire
+        replays counts against the allowance like every other input.
+        """
         prefix = self._system_messages_for_lane(caps)
         lowered = sanitize_tool_call_arguments(dicts_from_turns(self.messages))
         prepared = self._prepare_lowered_wire_messages([*prefix, *lowered], caps=caps)
@@ -5821,6 +5844,7 @@ class ChatSession:
             non_pdf_wire,
             chars_per_token=budget.chars_per_token,
             tools=tools,
+            replay_producer=replay_producer,
         )
         reserved_tokens += max(
             1,
@@ -5873,7 +5897,7 @@ class ChatSession:
     def _validate_model_input_budget(
         self,
         wire: list[dict[str, Any]],
-        _lane: ModelLane,
+        lane: ModelLane,
         *,
         tools: list[dict[str, Any]] | None,
         max_tokens: int,
@@ -5889,6 +5913,7 @@ class ChatSession:
             wire,
             chars_per_token=budget.chars_per_token,
             tools=tools,
+            replay_producer=lane_producer(lane),
         )
         input_capacity = _usable_input_capacity(budget.context_window, max_tokens)
         if used_tokens > input_capacity:
@@ -5927,6 +5952,7 @@ class ChatSession:
         exact completion-token counts already appended by the usage path.
         """
         key = self._token_calibration_key(lane)
+        self._active_replay_producer = lane_producer(lane)
         calibration = self._token_calibrations.get(key)
         ratio = calibration.chars_per_token if calibration is not None else 4.0
         identity_changed = (
@@ -6107,6 +6133,28 @@ class ChatSession:
         if not self._commit_for_generation(my_generation, _commit_status, allow_cancelled=False):
             raise GenerationCancelled()
         return compacted
+
+    def _note_compaction_estimate(self, *, before_tokens: int, after_tokens: int) -> None:
+        """Log a committed workstream compaction whose estimate did not shrink.
+
+        A summary that did not bring the estimate below what it replaced says the
+        local estimate is unreliable: a miscalibrated ratio, or nothing left to
+        fold.  The compaction stands and its marker records both figures, so the
+        card shows the shape to the operator; this puts the same shape, with the
+        ratio, in the operator's logs.  Nothing else acts on it: the tool-result
+        drain already allows one estimate-driven compaction per batch, the next
+        accepted reply re-anchors the estimate on the provider's count, and the
+        task-agent loop refuses to compact twice without tool progress.
+        """
+        if after_tokens >= before_tokens:
+            log.warning(
+                "compaction.estimate_not_reduced",
+                ws_id=self._ws_id[:8],
+                target="workstream",
+                before_tokens=before_tokens,
+                after_tokens=after_tokens,
+                chars_per_token=round(self._chars_per_token, 3),
+            )
 
     def _tool_result_truncation_limit(self, *, batch_budget_tokens: int) -> int:
         """Return the pre-context cap for one main-session tool result.
@@ -9968,6 +10016,7 @@ class ChatSession:
                                 caps,
                                 active_tools,
                                 lane_budget,
+                                replay_producer=lane_producer(lane),
                             )
                             if has_pdf_attachments
                             else None
@@ -12752,10 +12801,18 @@ class ChatSession:
                     # result: a mid-retry rebind re-prepared it inside the
                     # streaming wrapper, invisibly to this frame.  A fake
                     # result without it re-folds inside _update_token_table.
+                    # The native lane's replay cost the accepted turn carries
+                    # toward the provider the next request goes to: the slot's
+                    # context figure and the turn's own estimate below read the
+                    # same value, so they cannot disagree.
+                    bound = self._message_measure(completed_result.producer)
+                    replayed_native_tokens = bound.lane(completed_result.turn)
                     self._update_token_table(
                         msgs=completed_result.wire_msgs,
                         tool_def_chars=completed_result.tool_def_chars,
                         provenance=completed_result.provenance,
+                        producer=completed_result.producer,
+                        native_tokens=replayed_native_tokens,
                     )
                     # Report usage for every completed API call that this
                     # generation still owns.
@@ -12774,9 +12831,15 @@ class ChatSession:
                         call.id for call in completed_result.turn.tool_calls if call.id
                     )
 
-                    assistant_token_estimate = self._assistant_pending_tokens or max(
-                        1,
-                        int(self._msg_char_count(completed_result.turn) / self._chars_per_token),
+                    # The turn's cost toward the next request: the exact completion
+                    # count for a text turn, or text from characters plus the lane
+                    # from the recorded count for a turn that replays one (the one
+                    # rule the task-agent estimator applies too).
+                    assistant_token_estimate = accepted_turn_tokens(
+                        completed_result.turn,
+                        completion_tokens=self._assistant_pending_tokens,
+                        measure=bound.measure,
+                        chars_per_token=self._chars_per_token,
                     )
                     # Save assistant message atomically (content + tool_calls
                     # in one row).  The persisted mirror and executed call list
@@ -12788,13 +12851,12 @@ class ChatSession:
                     ):
                         persist_ws_id = self._ws_id
                         persist_producer = completed_result.producer or None
-                        provenance = TurnProvenance.from_meta(
-                            completed_result.turn.meta.extra.get(PROVENANCE_META_KEY)
-                        )
+                        # Provenance and the native lane's replay cost ride the
+                        # row together (one builder, shared with the fork clone),
+                        # so a resumed session charges the lane without the usage.
+                        persist_meta_envelope = assistant_meta_envelope(completed_result.turn)
                         persist_meta = (
-                            json.dumps({PROVENANCE_META_KEY: provenance.to_meta()})
-                            if provenance is not None
-                            else None
+                            json.dumps(persist_meta_envelope) if persist_meta_envelope else None
                         )
                         commit_key = uuid.uuid4().hex
                         # The journal takes the one isolating copy and stamps
@@ -15089,15 +15151,26 @@ class ChatSession:
 
     # Fixed token count per image (provider-agnostic average).
     _IMAGE_TOKENS = 1000
+    # Token-accounting state the constructor sets; the class default keeps a
+    # session assembled without it (tests build one with ``__new__``) coherent:
+    # no provider is named, so no native lane is charged.
+    _active_replay_producer: str | None = None
 
     @staticmethod
-    def _msg_text_chars(msg: dict[str, Any] | Turn) -> tuple[int, int, int]:
-        """Return ``(text_chars, image_count, doc_chars)`` for a message.
+    def _msg_text_chars(
+        msg: dict[str, Any] | Turn, *, replay_producer: str | None
+    ) -> tuple[int, int, int]:
+        """Return ``(text_chars, fixed_tokens, doc_chars)`` for a message.
 
         Counts textual content + structural overhead (role, tool_call
-        IDs, tool call names/arguments).  Images are counted separately
-        so the calibration can subtract their fixed token cost from
-        prompt_tokens.  Document-part content (``data`` + ``name`` +
+        IDs, tool call names/arguments).  ``fixed_tokens`` are the tokens
+        already known exactly, which the calibration subtracts from
+        prompt_tokens and the estimates add as they are: the fixed charge
+        per image, and the provider's own count of a replayed native lane
+        (``_native_tokens``, recorded on a server-side search turn) when
+        ``replay_producer`` names the provider that produced it, since only
+        the producing provider replays the lane and any other rebuilds the
+        turn from its text.  Document-part content (``data`` + ``name`` +
         ``media_type``) is counted in a third bucket so it contributes
         to the token budget without polluting the ``chars_per_token``
         calibration — provider-native document blocks (Anthropic) and
@@ -15162,17 +15235,55 @@ class ChatSession:
         # Structural overhead: role, tool_call_id
         n += len(msg.get("role", ""))
         n += len(msg.get("tool_call_id", ""))
-        return n, images, doc_chars
+        fixed_tokens = images * ChatSession._IMAGE_TOKENS
+        fixed_tokens += ChatSession._lane_tokens(msg, replay_producer=replay_producer)
+        return n, fixed_tokens, doc_chars
 
     def _msg_char_count(self, msg: dict[str, Any] | Turn) -> int:
         """Count characters in a message, including structural overhead.
 
-        Includes role markers, tool_call IDs, image placeholders, and
-        document-part characters so that the budget estimate reflects
-        the full payload the provider sees.  Accepts a wire dict or a ``Turn``.
+        Includes role markers, tool_call IDs, document-part characters, and
+        the fixed token charges (images, a native lane the active provider
+        replays) converted at the current ratio, so that the budget estimate
+        reflects the full payload the provider sees.  Accepts a wire dict or a
+        ``Turn``.
         """
-        text_chars, images, doc_chars = self._msg_text_chars(msg)
-        return text_chars + doc_chars + int(images * self._IMAGE_TOKENS * self._chars_per_token)
+        text_chars, fixed_tokens, doc_chars = self._msg_text_chars(
+            msg, replay_producer=self._active_replay_producer
+        )
+        return text_chars + doc_chars + int(fixed_tokens * self._chars_per_token)
+
+    def _message_measure(self, replay_producer: str | None) -> BoundMeasure:
+        """Bind the measure and the lane reader to the provider one request replays lanes to.
+
+        One binding for both, so the fixed bucket the calibration subtracts and the lane share
+        it exempts from the text floor can never name different providers.
+        """
+        return BoundMeasure(
+            measure=functools.partial(self._msg_text_chars, replay_producer=replay_producer),
+            lane=functools.partial(self._lane_tokens, replay_producer=replay_producer),
+        )
+
+    @staticmethod
+    def _lane_tokens(msg: dict[str, Any] | Turn, *, replay_producer: str | None) -> int:
+        """The message's native-lane cost when *replay_producer* replays that lane, else 0.
+
+        The one reader of the producer match for both message forms: a wire dict carries
+        ``_native_tokens`` beside ``_producer`` (stamped only when a lane exists), a ``Turn``
+        carries the count in its meta beside its lane.  Only the producing provider replays the
+        lane; any other rebuilds the turn from its text and pays nothing for it.  At the
+        accepted-turn site *replay_producer* is the result's own serving producer, the value the
+        calibration measure is bound to.
+        """
+        if replay_producer is None:
+            return 0
+        if isinstance(msg, Turn):
+            if msg.native is None or msg.native.producer != replay_producer:
+                return 0
+            return msg.native_tokens
+        if msg.get("_producer") != replay_producer:
+            return 0
+        return native_tokens_from(msg.get("_native_tokens"))
 
     @staticmethod
     def _usage_from_slot(slot: Mapping[str, int]) -> UsageInfo:
@@ -15230,14 +15341,21 @@ class ChatSession:
         msgs: list[dict[str, Any]] | None = None,
         tool_def_chars: int | None = None,
         provenance: TurnProvenance | None = None,
+        producer: str | None = None,
+        native_tokens: int,
     ) -> None:
         """Update per-message token estimates using API usage data.
 
-        *msgs* and *tool_def_chars* are the as-served wire facts carried by
-        ``ModelTurnResult``.  Passing both avoids a redundant preparation walk
-        and keeps fallback calibration on the lane the provider actually
-        counted.  Missing values (fake results and direct calls) fall back to
-        the primary session posture.
+        *msgs*, *tool_def_chars* and *producer* are the as-served wire facts
+        carried by ``ModelTurnResult``.  Passing them avoids a redundant
+        preparation walk and keeps fallback calibration on the lane the
+        provider actually counted: *producer* is the serving provider, the one
+        whose native lanes the wire replayed and so the one whose recorded
+        lane costs the calibration subtracts.  *native_tokens* is the replay
+        cost the accepted turn actually carries toward the next request (0
+        when no native lane survived); the slot's context figure adds it.
+        Missing wire facts (fake results and direct calls) fall back to the
+        primary session posture.
         """
         if not self._last_usage:
             return
@@ -15259,9 +15377,13 @@ class ChatSession:
         served_tool_def_chars = (
             tool_def_chars if tool_def_chars is not None else self._tool_def_chars()
         )
+        bound = self._message_measure(
+            producer if producer is not None else self._active_replay_producer
+        )
         # One rule for what a call's usage says about the context, shared with the task-agent
-        # estimator (``resolve_context_usage``): the anchor is the context the next request
-        # carries; the served figure, what this request carried, is the calibration denominator.
+        # estimator (``resolve_context_usage``): the anchor is what this request carried, the
+        # prefix the estimate builds on; the served figure is the calibration denominator; the
+        # appended figure is the assistant turn's own cost, recorded on that turn.
         # After a server-side tool loop the provider's counters are billing totals summed across
         # its passes.  The request's own size is then the provider's single-pass figure when it
         # gave one, else this session's estimate of what it just sent, which teaches the ratio
@@ -15277,16 +15399,20 @@ class ChatSession:
                 prompt_tokens=context.served,
                 messages=all_msgs,
                 tool_def_chars=served_tool_def_chars,
-                measure=self._msg_text_chars,
+                measure=bound.measure,
                 fallback=self._chars_per_token,
-                image_tokens=self._IMAGE_TOKENS,
+                lane_tokens=sum(bound.lane(message) for message in all_msgs),
             )
-        prompt_tok = context.anchor
-        if usage.prompt_tokens_cumulative or prompt_tok != usage.prompt_tokens:
+        # The anchor covers exactly the messages this request carried; what the provider
+        # appended is the assistant turn's cost, charged when that turn is appended, so the two
+        # never double up.  The slot shows the context the next request carries.
+        anchor_tokens = context.anchor
+        next_request_tokens = context.anchor + native_tokens
+        if usage.prompt_tokens_cumulative or next_request_tokens != usage.prompt_tokens:
             # Consume the resolution facts: publish the context the readers of this slot expect,
             # keep the billed total beside it for the spend readers, and clear the facts so they
             # never outlive the resolution that read them.
-            self._rewrite_usage_slot(prompt_tok, billed_prompt_tokens=usage.prompt_tokens)
+            self._rewrite_usage_slot(next_request_tokens, billed_prompt_tokens=usage.prompt_tokens)
 
         calibration_key = (
             self._provenance_calibration_key(provenance)
@@ -15297,7 +15423,7 @@ class ChatSession:
         self._last_usage_calibration_key = calibration_key
         self._token_calibrations[calibration_key] = _TokenCalibration(
             chars_per_token=self._chars_per_token,
-            prompt_tokens=prompt_tok,
+            prompt_tokens=anchor_tokens,
             message_prefix_ids=tuple(id(message) for message in self.messages),
         )
 
@@ -16236,6 +16362,7 @@ class ChatSession:
             # shared rewrite also clears the resolution facts of the call the slot described
             # before compaction, so nothing can re-derive that call's anchor over this one.
             self._rewrite_usage_slot(after_tokens, total_tokens=after_tokens)
+            self._note_compaction_estimate(before_tokens=before_tokens, after_tokens=after_tokens)
             active_key = self._active_token_calibration_key
             if active_key is not None:
                 active = self._token_calibrations.get(active_key)
@@ -25489,10 +25616,11 @@ class ChatSession:
         cancel_scope.check()
         lane = self._lane_for_backend_auth_principal(lane, agent_principal)
         agent_context_window = self._context_window_for_lane(lane)
+        bound_measure = self._message_measure(lane_producer(lane))
         context_estimator = PromptTokenEstimator(
-            measure=self._msg_text_chars,
+            measure=bound_measure.measure,
+            lane_measure=bound_measure.lane,
             tool_def_chars=serialized_tool_chars(tools),
-            image_tokens=self._IMAGE_TOKENS,
         )
         compaction_policy = self._compaction_policy(agent_context_window)
 
@@ -25531,14 +25659,16 @@ class ChatSession:
                 agent_usage = agent_result.usage
                 agent_context_tokens: int | None = None
                 if agent_usage is not None:
-                    # One resolution serves both the anchor and the badge, so
-                    # the card never shows a figure the estimator did not use.
+                    # The badge paints the context the next request carries
+                    # before the turn's text: the anchor the estimator installs
+                    # plus the accepted turn's replay charge, the figure
+                    # append_accepted charges when the turn lands.
                     agent_context_tokens = context_estimator.observe(
                         usage=agent_usage,
                         messages=turns,
                         wire_messages=agent_result.wire_msgs,
                         tool_def_chars=agent_result.tool_def_chars,
-                    )
+                    ) + bound_measure.lane(agent_result.turn)
                 if agent_context_tokens is not None and parent_call_id:
                     published = self._publish_for_generation(
                         origin_generation,
@@ -25996,10 +26126,10 @@ class ChatSession:
             context_turns.append(result.turn)
             execution_journal.record_assistant(result.turn)
             if result.usage is not None:
-                context_estimator.append_exact(
-                    result.turn,
-                    result.usage.completion_tokens,
-                )
+                # The turn's cost toward the next request, by the shared rule: the
+                # exact completion count for a text turn, text from characters
+                # plus the lane's recorded count for a turn that replays one.
+                context_estimator.append_accepted(result.turn, result.usage.completion_tokens)
 
             if not result.tool_calls:
                 if compaction_advised and _compact_agent_context(
@@ -27663,10 +27793,12 @@ class ChatSession:
                     ),
                 ),
             ]
+            # A utility wire built from fresh turns: no native lane to replay.
             fixed_input_tokens = self._estimate_wire_prompt_tokens(
                 dicts_from_turns(pdf_turns),
                 chars_per_token=budget.chars_per_token,
                 tools=None,
+                replay_producer=None,
             )
             fixed_input_tokens += max(
                 1,
@@ -27768,6 +27900,7 @@ class ChatSession:
             ),
             chars_per_token=budget.chars_per_token,
             tools=None,
+            replay_producer=None,
         )
         fixed_input_tokens += max(
             1,

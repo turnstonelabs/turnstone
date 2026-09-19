@@ -42,6 +42,7 @@ from turnstone.core.storage._schema import (
     workstreams,
 )
 from turnstone.core.trajectory import (
+    NATIVE_TOKENS_META_KEY,
     PROVENANCE_META_KEY,
     AttachmentRef,
     ContentBlock,
@@ -52,7 +53,9 @@ from turnstone.core.trajectory import (
     Turn,
     TurnMeta,
     TurnProvenance,
+    assistant_meta_envelope,
     dicts_from_turns,
+    native_tokens_from,
     resolve_attachment_parts,
     sanitize_client_send_ids,
     turn_to_dict,
@@ -2088,6 +2091,11 @@ def reconstruct_turns(
                 provenance = TurnProvenance.from_meta(assistant_meta.pop(PROVENANCE_META_KEY, None))
                 if provenance is not None:
                     meta.extra[PROVENANCE_META_KEY] = provenance.to_meta()
+                # The native lane's replay cost is an estimator input, not
+                # display metadata: route it out of the public source_meta.
+                native_tokens = native_tokens_from(assistant_meta.pop(NATIVE_TOKENS_META_KEY, None))
+                if native_tokens:
+                    meta.extra[NATIVE_TOKENS_META_KEY] = native_tokens
                 # A compaction marker carries checkpoint metadata beside the
                 # producing model's provenance. Preserve both envelopes.
                 if assistant_meta:
@@ -2624,9 +2632,7 @@ def _fork_turn_insert_row(
         source_meta = turn.meta.extra.get("source_meta")
         if isinstance(source_meta, dict) and source_meta:
             meta_envelope.update(source_meta)
-        provenance = TurnProvenance.from_meta(turn.meta.extra.get(PROVENANCE_META_KEY))
-        if provenance is not None:
-            meta_envelope[PROVENANCE_META_KEY] = provenance.to_meta()
+        meta_envelope.update(assistant_meta_envelope(turn))
     elif turn.role is Role.TOOL:
         if turn.effect_status is not None:
             meta_envelope["effect_status"] = turn.effect_status.value
