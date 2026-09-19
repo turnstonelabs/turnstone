@@ -5963,12 +5963,13 @@ class ChatSession:
     def _estimated_prompt_tokens(self) -> int:
         """Best estimate of the current prompt size, in tokens.
 
-        Anchors to the provider-reported ``prompt_tokens`` from the last API
-        call — which already includes tool-definition tokens and the cached
-        prefix (providers fold cached + non-cached into one count at the API
-        boundary; see ``_anthropic.py`` ``total_input``) — and adds a local
-        estimate for only the messages appended since calibration.  Falls
-        back to a pure local estimate before the first API call.
+        Anchors to the provider-reported ``prompt_tokens`` from the last API call — which already
+        includes tool-definition tokens and the cached prefix (providers fold cached + non-cached
+        into one count at the API boundary; after a server-side tool loop the Anthropic adapter
+        reports the opening pass plus the new content each later pass added, never the summed
+        prefix re-reads — see ``_anthropic.py`` ``_iter_anthropic_stream``) — and adds a local
+        estimate for only the messages appended since calibration.  Falls back to a pure local
+        estimate before the first API call.
 
         Single source of truth for "how full is the context": tool-output
         truncation (via :meth:`_remaining_token_budget`) and the
@@ -15196,8 +15197,14 @@ class ChatSession:
         served_tool_def_chars = (
             tool_def_chars if tool_def_chars is not None else self._tool_def_chars()
         )
+        # The ratio divides the characters the request carried by the tokens the provider counted
+        # for them.  After a server-side tool loop ``prompt_tokens`` also holds the results the
+        # server appended, which never crossed the wire as characters, so the adapter reports the
+        # request's own count separately; the anchor below keeps ``prompt_tok``, the context the
+        # next request carries.  Absent (0, or a partial dict) means the two are the same.
+        served_prompt_tok = self._last_usage.get("served_prompt_tokens") or prompt_tok
         self._chars_per_token = calibrated_chars_per_token(
-            prompt_tokens=prompt_tok,
+            prompt_tokens=served_prompt_tok,
             messages=all_msgs,
             tool_def_chars=served_tool_def_chars,
             measure=self._msg_text_chars,
@@ -25449,6 +25456,7 @@ class ChatSession:
                 if agent_usage is not None:
                     context_estimator.observe(
                         prompt_tokens=agent_usage.prompt_tokens,
+                        served_prompt_tokens=agent_usage.served_prompt_tokens,
                         messages=turns,
                         wire_messages=agent_result.wire_msgs,
                         tool_def_chars=agent_result.tool_def_chars,

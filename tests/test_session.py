@@ -10841,6 +10841,26 @@ class TestUpdateTokenTableMsgsParam:
         primary_tools.assert_not_called()
         assert session._chars_per_token == (message_chars + served_tool_chars) / 100
 
+    def test_served_prompt_tokens_calibrate_while_prompt_tokens_anchor(self, tmp_db):
+        """After a server-side tool loop the provider's context outgrows what the
+        request carried: the ratio divides the served characters by the served
+        count, while the anchor keeps the context the next request carries."""
+        session = _make_session()
+        session._last_usage = {
+            "prompt_tokens": 53_791,
+            "completion_tokens": 772,
+            "served_prompt_tokens": 23_881,
+        }
+        served_msgs = [{"role": "user", "content": "hello"}]
+        message_chars, _images, _documents = session._msg_text_chars(served_msgs[0])
+
+        session._update_token_table(msgs=served_msgs, tool_def_chars=37)
+
+        assert session._chars_per_token == (message_chars + 37) / 23_881
+        key = session._active_token_calibration_key
+        assert key is not None
+        assert session._token_calibrations[key].prompt_tokens == 53_791
+
     def test_fallback_tool_size_uses_the_shared_compact_encoding(self) -> None:
         session = _make_session()
         tools = [

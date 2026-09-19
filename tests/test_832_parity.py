@@ -50,6 +50,15 @@ def _apply_ruled_deltas(name: str, baseline: dict[str, Any]) -> dict[str, Any]:
     """
     expected = json.loads(json.dumps(baseline))  # deep copy
 
+    # RULED (server-tool usage, 2026-09-18): ``UsageInfo`` gained
+    # ``served_prompt_tokens`` — the tokens a request itself carried, which a
+    # server-side tool loop leaves below ``prompt_tokens`` — so the mid-stream
+    # usage projection carries one more key.  Scripted chunks set none of it,
+    # and 0 means "same as prompt_tokens"; every scenario's old-world record
+    # gains the key with that value.
+    if isinstance(expected.get("last_usage"), dict):
+        expected["last_usage"]["served_prompt_tokens"] = 0
+
     if name == "info_postfinish_footer":
         # RULED (#832): the trailing citations footer enters the COMMITTED
         # content (conditional fold: non-blank answer, "\n\n" separator —

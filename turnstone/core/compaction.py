@@ -160,8 +160,15 @@ class PromptTokenEstimator:
         messages: Sequence[dict[str, Any] | Turn],
         wire_messages: Sequence[dict[str, Any]] | None = None,
         tool_def_chars: int | None = None,
+        served_prompt_tokens: int = 0,
     ) -> None:
-        """Anchor to one successful call before its assistant turn is appended."""
+        """Anchor to one successful call before its assistant turn is appended.
+
+        ``prompt_tokens`` is the context the next request will carry and becomes the anchor.
+        ``served_prompt_tokens`` is what this request itself carried; after a server-side tool
+        loop it is smaller, and the chars-per-token ratio must divide the measured characters by
+        it.  0 means the two are the same.
+        """
 
         if tool_def_chars is not None:
             self.tool_def_chars = tool_def_chars
@@ -169,7 +176,7 @@ class PromptTokenEstimator:
             wire_messages if wire_messages is not None else messages
         )
         self.chars_per_token = calibrated_chars_per_token(
-            prompt_tokens=prompt_tokens,
+            prompt_tokens=served_prompt_tokens or prompt_tokens,
             messages=measured_messages,
             tool_def_chars=self.tool_def_chars,
             measure=self.measure,

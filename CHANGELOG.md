@@ -72,6 +72,13 @@ frozen.
 
 ### Fixed
 
+- **Context gauge after native web search.** When the model ran several web searches inside one
+  response, the provider's closing usage counted the cached prefix once per search pass, and the
+  session took that billing total as its context size: the status bar showed three times the real
+  figure, the token estimate was calibrated on it, a tool result was dropped for an exhausted
+  budget, and a two-message conversation was compacted. The context size is now the opening pass
+  plus the new content each pass added, the estimate is calibrated on the tokens the request
+  itself carried, and the reported cache reads still feed the usage records.
 - **Incomplete task results and perception fallback.** Failed task completions now report an
   error, with any earlier partial work explicitly labelled incomplete. Optional perception
   memoizes a model that produces no description for the same binding generation and gives

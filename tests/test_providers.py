@@ -4930,6 +4930,192 @@ class TestAnthropicPromptCaching:
         assert u.cache_creation_tokens == 0
         assert u.cache_read_tokens == 0
 
+    @staticmethod
+    def _usage_stream(
+        opening: tuple[int, int, int] | None,
+        closing: tuple[int, int, int],
+        *,
+        output_tokens: int,
+        server_tool: bool = False,
+    ) -> MagicMock:
+        """Scripted stream: opening usage, optional server tool block, one text
+        delta, closing usage + end_turn.
+
+        Both usages are ``(input, cache_creation, cache_read)``; ``opening=None``
+        omits the ``message_start`` event altogether.  ``server_tool`` scripts a
+        ``server_tool_use`` block, the adapter's evidence that the server ran
+        its own sampling loop inside the message.
+        """
+        events: list[Any] = []
+        if opening is not None:
+            msg_start = MagicMock()
+            msg_start.type = "message_start"
+            msg_start.message = MagicMock()
+            msg_start.message.usage = SimpleNamespace(
+                input_tokens=opening[0],
+                cache_creation_input_tokens=opening[1],
+                cache_read_input_tokens=opening[2],
+            )
+            events.append(msg_start)
+        if server_tool:
+            events.append(
+                _anthropic_event(
+                    "content_block_start",
+                    block_type="server_tool_use",
+                    block_id="srvtoolu_1",
+                    block_name="web_search",
+                    index=0,
+                )
+            )
+            events.append(_anthropic_event("content_block_stop", index=0))
+        events.append(
+            _anthropic_event("content_block_delta", delta_type="text_delta", text="Hi", index=1)
+        )
+        delta_event = MagicMock()
+        delta_event.type = "message_delta"
+        delta_event.usage = SimpleNamespace(
+            input_tokens=closing[0],
+            output_tokens=output_tokens,
+            cache_creation_input_tokens=closing[1],
+            cache_read_input_tokens=closing[2],
+        )
+        delta_event.delta = MagicMock()
+        delta_event.delta.stop_reason = "end_turn"
+        events.append(delta_event)
+        stream_ctx = MagicMock()
+        stream_ctx.__enter__ = MagicMock(return_value=iter(events))
+        stream_ctx.__exit__ = MagicMock(return_value=False)
+        return stream_ctx
+
+    def _drained_usage(self, stream_ctx: MagicMock) -> UsageInfo:
+        client = MagicMock()
+        client.messages.stream.return_value = stream_ctx
+        result = drain_stream(
+            self.provider.create_streaming(
+                client=client,
+                model="claude-sonnet-4-6",
+                messages=[{"role": "user", "content": "hi"}],
+            )
+        )
+        assert result.usage is not None
+        return result.usage
+
+    @patch("turnstone.core.providers._anthropic._ensure_anthropic")
+    def test_server_tool_loop_cached_usage_reports_context_not_billing(
+        self, mock_ensure: MagicMock
+    ) -> None:
+        """Live shape (2026-09-18): three native searches on a cached prefix.
+
+        The opening pass read the 23,745-token prefix; the closing usage
+        summed a prefix re-read per pass into ``cache_read`` (47,622) while
+        ``cache_creation`` grew by the server-cached search results.  A real
+        follow-up request measured the next context at 54,392, so folding
+        every closing field (77,668) yields a billing total, not a context.
+        """
+        usage = self._drained_usage(
+            self._usage_stream(
+                (4, 132, 23_745), (6, 30_040, 47_622), output_tokens=772, server_tool=True
+            )
+        )
+        # opening total 23,881 + new input 2 + new cache creation 29,908
+        assert usage.prompt_tokens == 53_791
+        assert usage.total_tokens == 53_791 + 772
+        assert usage.completion_tokens == 772
+        # The calibration divides sent characters by what the request carried.
+        assert usage.served_prompt_tokens == 23_881
+        # Cost accounting keeps the reported billing counters verbatim.
+        assert usage.cache_read_tokens == 47_622
+        assert usage.cache_creation_tokens == 30_040
+
+    @patch("turnstone.core.providers._anthropic._ensure_anthropic")
+    def test_server_tool_loop_uncached_usage_keeps_closing_input(
+        self, mock_ensure: MagicMock
+    ) -> None:
+        """Without caching there are no summed re-reads: the closing input
+        already approximates the next context (35,546 vs 33,083 measured)."""
+        usage = self._drained_usage(
+            self._usage_stream((2_820, 0, 0), (35_546, 0, 0), output_tokens=598, server_tool=True)
+        )
+        assert usage.prompt_tokens == 35_546
+        assert usage.served_prompt_tokens == 2_820
+
+    @patch("turnstone.core.providers._anthropic._ensure_anthropic")
+    def test_plain_closing_usage_repeating_the_opening_is_not_doubled(
+        self, mock_ensure: MagicMock
+    ) -> None:
+        """A plain response repeats the opening counts in the closing event."""
+        usage = self._drained_usage(
+            self._usage_stream((4, 87, 23_745), (4, 87, 23_745), output_tokens=4)
+        )
+        assert usage.prompt_tokens == 23_836
+        assert usage.served_prompt_tokens == 23_836
+        assert usage.cache_read_tokens == 23_745
+
+    @patch("turnstone.core.providers._anthropic._ensure_anthropic")
+    def test_without_a_server_tool_the_closing_fold_stands(self, mock_ensure: MagicMock) -> None:
+        """No server tool block, no derivation: a closing event that outgrows the
+        opening (a gateway reporting its cache read late) is folded whole, cache
+        read included, exactly as before."""
+        usage = self._drained_usage(
+            self._usage_stream((50, 0, 0), (50, 0, 20_000), output_tokens=5)
+        )
+        assert usage.prompt_tokens == 20_050
+        assert usage.served_prompt_tokens == 20_050
+
+    @patch("turnstone.core.providers._anthropic._ensure_anthropic")
+    def test_server_tool_closing_without_input_counts_keeps_opening_total(
+        self, mock_ensure: MagicMock
+    ) -> None:
+        """A gateway whose closing usage carries only output keeps the opening
+        context.  The per-field max merge holds this at the opening total on its
+        own; the clamps are pinned by the two tests that follow."""
+        usage = self._drained_usage(
+            self._usage_stream((100, 0, 0), (0, 0, 0), output_tokens=5, server_tool=True)
+        )
+        assert usage.prompt_tokens == 100
+        assert usage.completion_tokens == 5
+
+    @patch("turnstone.core.providers._anthropic._ensure_anthropic")
+    def test_server_tool_input_delta_clamps_at_zero(self, mock_ensure: MagicMock) -> None:
+        """A closing input below the opening input must not subtract: 600 with
+        the clamp, 500 without, and both exceed the opening total the merge
+        could otherwise floor to."""
+        usage = self._drained_usage(
+            self._usage_stream((100, 0, 0), (0, 500, 0), output_tokens=5, server_tool=True)
+        )
+        assert usage.prompt_tokens == 600
+
+    @patch("turnstone.core.providers._anthropic._ensure_anthropic")
+    def test_server_tool_cache_creation_delta_clamps_at_zero(self, mock_ensure: MagicMock) -> None:
+        """Same pin for the cache-creation delta: 600 clamped, 500 unclamped."""
+        usage = self._drained_usage(
+            self._usage_stream((0, 100, 0), (500, 0, 0), output_tokens=5, server_tool=True)
+        )
+        assert usage.prompt_tokens == 600
+
+    @patch("turnstone.core.providers._anthropic._ensure_anthropic")
+    def test_empty_opening_usage_falls_back_to_closing_totals(self, mock_ensure: MagicMock) -> None:
+        """An all-zero opening usage is no anchor: the closing counts fold as
+        before, cache read included, even after a server tool block."""
+        usage = self._drained_usage(
+            self._usage_stream((0, 0, 0), (50, 0, 20), output_tokens=5, server_tool=True)
+        )
+        assert usage.prompt_tokens == 70
+        assert usage.cache_read_tokens == 20
+
+    @patch("turnstone.core.providers._anthropic._ensure_anthropic")
+    def test_missing_opening_event_falls_back_to_closing_totals(
+        self, mock_ensure: MagicMock
+    ) -> None:
+        """A gateway that reports usage only at the end has nothing to anchor
+        on: the closing counts fold as before."""
+        usage = self._drained_usage(
+            self._usage_stream(None, (50, 0, 20), output_tokens=5, server_tool=True)
+        )
+        assert usage.prompt_tokens == 70
+        assert usage.served_prompt_tokens == 70
+        assert usage.cache_read_tokens == 20
+
 
 class TestOpenAIPromptCaching:
     """Tests for OpenAI prompt caching (automatic + extended retention)."""

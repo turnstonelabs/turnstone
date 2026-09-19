@@ -43,6 +43,13 @@ class UsageInfo:
     # Prompt caching metrics (provider-specific; 0 when not available)
     cache_creation_tokens: int = 0
     cache_read_tokens: int = 0
+    # Tokens the request itself carried, when that differs from
+    # ``prompt_tokens``.  A server-side tool loop appends its own results to
+    # the context inside one message, so ``prompt_tokens`` (the context the
+    # next request will carry) outgrows what this request sent, and the
+    # chars-per-token calibration must divide sent characters by this figure
+    # instead.  0 means "same as prompt_tokens" (every lane without such loops).
+    served_prompt_tokens: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -215,6 +222,7 @@ def merge_usage(acc: UsageInfo | None, new: UsageInfo) -> UsageInfo:
         total_tokens=prompt + completion,
         cache_creation_tokens=max(acc.cache_creation_tokens, new.cache_creation_tokens),
         cache_read_tokens=max(acc.cache_read_tokens, new.cache_read_tokens),
+        served_prompt_tokens=max(acc.served_prompt_tokens, new.served_prompt_tokens),
     )
 
 

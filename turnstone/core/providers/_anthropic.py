@@ -1065,6 +1065,18 @@ class AnthropicProvider:
         emitted_finish = False
         delivered_output = False
         window_exceeded = False
+        # The opening ``message_start`` usage: the first sampling pass, as
+        # (input, cache_creation, cache_read).  The closing ``message_delta``
+        # describes the whole message, and when the server ran its own tool
+        # loop (native web search) its cache-read count is the SUM of every
+        # pass's prefix re-read — a billing total, not a context size — so the
+        # closing chunk derives the context from this opening pass instead.
+        # ``None`` until an opening usage with a positive total lands.
+        opening_input: tuple[int, int, int] | None = None
+        # Whether a ``server_tool_use`` block appeared: the only evidence that
+        # the server sampled more than once, and the gate on that derivation.
+        # ``server_tool_blocks`` cannot serve — it is popped at block stop.
+        saw_server_tool = False
 
         def _attach_terminal_blocks(chunk: StreamChunk) -> None:
             # Every terminal path (message_delta stop_reason, message_stop
@@ -1131,6 +1143,7 @@ class AnthropicProvider:
                     sc.tool_call_deltas.append(tcd)
                 elif block.type == "server_tool_use":
                     # Server-side tool (web search) — track for query accumulation
+                    saw_server_tool = True
                     server_tool_blocks[event.index] = {
                         "name": getattr(block, "name", ""),
                         "input_json": "",
@@ -1231,15 +1244,40 @@ class AnthropicProvider:
                     out = getattr(u, "output_tokens", 0) or 0
                     cc = getattr(u, "cache_creation_input_tokens", 0) or 0
                     cr = getattr(u, "cache_read_input_tokens", 0) or 0
-                    # prompt_tokens = total input (non-cached + cached) so
-                    # context-window tracking matches OpenAI semantics.
-                    total_input = inp + cc + cr
+                    # ``prompt_tokens`` is the context the next request will
+                    # carry (non-cached + cached), matching OpenAI semantics.
+                    # A plain response repeats the opening counts here.  A
+                    # server-side tool loop (native web search) samples
+                    # several times inside one message: ``input_tokens`` and
+                    # ``cache_creation_input_tokens`` then cover the NEW
+                    # content of every pass (search results are cached
+                    # server-side), while ``cache_read_input_tokens`` sums
+                    # the prefix re-read on every pass.  Folding that sum in
+                    # reported over three times the real context on a
+                    # four-search turn; the session calibrated on it, dropped
+                    # a tool result against it, and compacted for it.  So
+                    # once a server tool block has appeared, the context is
+                    # the opening total plus the new content since the
+                    # opening pass, and ``served_prompt_tokens`` keeps the
+                    # opening total for the chars-per-token calibration,
+                    # which measures only what the request carried.  Every
+                    # other stream keeps the plain fold, whatever its
+                    # gateway's reporting habits.  The reported cache read
+                    # still rides ``cache_read_tokens`` for cost accounting.
+                    if opening_input is not None and saw_server_tool:
+                        o_inp, o_cc, o_cr = opening_input
+                        served = o_inp + o_cc + o_cr
+                        total_input = served + max(0, inp - o_inp) + max(0, cc - o_cc)
+                    else:
+                        total_input = inp + cc + cr
+                        served = total_input
                     sc.usage = UsageInfo(
                         prompt_tokens=total_input,
                         completion_tokens=out,
                         total_tokens=total_input + out,
                         cache_creation_tokens=cc,
                         cache_read_tokens=cr,
+                        served_prompt_tokens=served,
                     )
                 if hasattr(event.delta, "stop_reason") and event.delta.stop_reason:
                     raw_stop = event.delta.stop_reason
@@ -1303,12 +1341,15 @@ class AnthropicProvider:
                     cc = getattr(u, "cache_creation_input_tokens", 0) or 0
                     cr = getattr(u, "cache_read_input_tokens", 0) or 0
                     total_input = inp + cc + cr
+                    if total_input > 0:
+                        opening_input = (inp, cc, cr)
                     sc.usage = UsageInfo(
                         prompt_tokens=total_input,
                         completion_tokens=0,
                         total_tokens=total_input,
                         cache_creation_tokens=cc,
                         cache_read_tokens=cr,
+                        served_prompt_tokens=total_input,
                     )
 
             has_content = sc.content_delta or sc.reasoning_delta or sc.tool_call_deltas
