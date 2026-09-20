@@ -20,7 +20,7 @@ from turnstone.core.output_guard_judge import (
     OutputJudgeVerdict,
     _extract_json,
 )
-from turnstone.core.providers._protocol import ModelCapabilities
+from turnstone.core.providers._protocol import ModelCapabilities, UsageInfo
 
 
 class _VersionedConfigStore:
@@ -49,6 +49,7 @@ def _make_provider(
     release: threading.Event | None = None,
     started: threading.Event | None = None,
     raises: Exception | None = None,
+    usage: UsageInfo | None = None,
 ) -> Any:
     """Build a mock LLMProvider whose create_streaming returns the given content."""
     provider = MagicMock()
@@ -68,7 +69,9 @@ def _make_provider(
             release.wait(5.0)
         if raises is not None:
             raise raises
-        return as_stream(_mock_result(content))
+        result = _mock_result(content)
+        result.usage = usage
+        return as_stream(result)
 
     provider.create_streaming = _create_streaming
     return provider
@@ -111,13 +114,15 @@ def _make_judge(
     release: threading.Event | None = None,
     started: threading.Event | None = None,
     raises: Exception | None = None,
+    usage: UsageInfo | None = None,
+    record_usage: Any | None = None,
 ) -> OutputGuardJudge:
     """Construct an OutputGuardJudge wired to a mock provider.
 
     Patches ``_create_client`` on the instance so the lazy-init path
     returns the in-memory mock without hitting the real client factory.
     """
-    provider = _make_provider(content, release=release, started=started, raises=raises)
+    provider = _make_provider(content, release=release, started=started, raises=raises, usage=usage)
     config = JudgeConfig(output_guard_llm=True, output_guard_llm_timeout=timeout)
     client = MagicMock()
     client.base_url = "http://test"
@@ -125,6 +130,7 @@ def _make_judge(
     judge = OutputGuardJudge(
         config=config,
         session_binding=_binding(provider, client, "test-model"),
+        record_usage=record_usage,
     )
     judge._create_client = lambda: client  # type: ignore[method-assign]
     return judge
@@ -1056,3 +1062,122 @@ class TestWorkspaceScopeSurvivesClientRebuild:
                 guard.close()
         finally:
             lane_client.close()
+
+
+class TestUsageAccounting:
+    """Every guard model call reaches the session's auxiliary usage sink,
+    attributed to the judge's own model.  The guard runs outside the main
+    loop's ``on_status`` accounting, so this sink is its only route to the
+    usage rows and the node token counters.
+
+    The sink is never invoked on the ``output-guard-judge`` deadline worker
+    while ``evaluate`` is waiting on it: a storage write there would charge its
+    latency to the verdict's time budget.  A worker the caller already gave up
+    on records its own late completion instead, so that spend is not lost."""
+
+    @staticmethod
+    def _recorder(
+        arrived: threading.Event | None = None,
+    ) -> tuple[list[tuple[UsageInfo | None, str, str]], Any]:
+        """Records (usage, model, recording thread name); sets ``arrived`` per row."""
+        records: list[tuple[UsageInfo | None, str, str]] = []
+
+        def record(usage: UsageInfo | None, *, model: str) -> None:
+            records.append((usage, model, threading.current_thread().name))
+            if arrived is not None:
+                arrived.set()
+
+        return records, record
+
+    @staticmethod
+    def _rows(records: list[tuple[UsageInfo | None, str, str]]) -> list[tuple[int, int, str]]:
+        return [
+            (usage.prompt_tokens, usage.completion_tokens, model)
+            for usage, model, _thread in records
+            if usage is not None
+        ]
+
+    def test_evaluate_records_usage_under_the_judge_model(self) -> None:
+        records, record = self._recorder()
+        judge = _make_judge(
+            content='{"risk_level": "none", "flags": [], "reasoning": ""}',
+            usage=UsageInfo(prompt_tokens=640, completion_tokens=32, total_tokens=672),
+            record_usage=record,
+        )
+
+        v = judge.evaluate("payload", func_name="web_fetch", call_id="c1")
+
+        assert v.succeeded
+        assert self._rows(records) == [(640, 32, "test-model")]
+        # Written by the caller after the deadline call returned, not by the
+        # deadline worker while the caller was waiting on it.
+        assert [thread for _usage, _model, thread in records] == [threading.current_thread().name]
+
+    def test_cancelled_evaluation_still_records_the_workers_late_completion(self) -> None:
+        """The caller is cancelled while the call is in flight and moves on; the
+        abandoned worker finishes later and records its own spend, once, since
+        nothing waits on it.  Cancelling only after the provider call started
+        keeps the ordering independent of wall-clock budgets."""
+        release = threading.Event()
+        started = threading.Event()
+        arrived = threading.Event()
+        cancel = threading.Event()
+        records, record = self._recorder(arrived)
+        judge = _make_judge(
+            content='{"risk_level": "low", "flags": [], "reasoning": ""}',
+            release=release,
+            started=started,
+            usage=UsageInfo(prompt_tokens=77, completion_tokens=7, total_tokens=84),
+            record_usage=record,
+        )
+
+        def _cancel_once_dispatched() -> None:
+            started.wait(5.0)
+            cancel.set()
+
+        threading.Thread(target=_cancel_once_dispatched, name="test-cancel").start()
+        try:
+            v = judge.evaluate("payload", call_id="c1", cancel_event=cancel)
+            assert started.is_set()
+            assert not v.succeeded
+            assert v.error == "cancelled"
+            assert records == []
+        finally:
+            release.set()
+
+        assert arrived.wait(5.0)
+        assert self._rows(records) == [(77, 7, "test-model")]
+        assert [thread for _usage, _model, thread in records] == ["output-guard-judge"]
+        # Let the abandoned worker exit before the thread-leak guard looks.
+        for thread in threading.enumerate():
+            if thread.name == "output-guard-judge":
+                thread.join(timeout=5.0)
+
+    def test_empty_output_records_nothing(self) -> None:
+        """No model call, no row: the empty-output short circuit stays free."""
+        records, record = self._recorder()
+        judge = _make_judge(
+            content="UNUSED",
+            usage=UsageInfo(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+            record_usage=record,
+        )
+
+        v = judge.evaluate("", call_id="c1")
+
+        assert v.succeeded
+        assert records == []
+
+    def test_sink_failure_never_costs_a_verdict(self) -> None:
+        def record(usage: UsageInfo | None, *, model: str) -> None:
+            raise RuntimeError("usage sink down")
+
+        judge = _make_judge(
+            content='{"risk_level": "low", "flags": [], "reasoning": ""}',
+            usage=UsageInfo(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+            record_usage=record,
+        )
+
+        v = judge.evaluate("payload", call_id="c1")
+
+        assert v.succeeded
+        assert v.risk_level == "low"

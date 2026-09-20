@@ -5688,3 +5688,38 @@ class TestAnthropicWorkspaceId:
 
         assert load("wrkspc_A") == 65536  # same scope: the detected window is kept
         assert load("wrkspc_B") == mr_module.FALLBACK_CONTEXT_WINDOW
+
+
+def test_session_built_judges_carry_the_session_usage_recorder() -> None:
+    """Judges the session constructs record through ``_record_aux_usage``:
+    both ``_ensure_judge`` and ``_ensure_output_guard_judge`` hand the sink
+    over, so judge spend reaches the usage rows the way sub-agent spend does,
+    attributed to each judge's own alias model rather than the session model."""
+    from turnstone.core.judge import JudgeConfig
+
+    reg = ModelRegistry(
+        models={
+            "gw": ModelConfig("gw", "http://primary.example/v1", "k", "primary-model"),
+            "intent": ModelConfig("intent", "http://intent.example/v1", "k", "intent-model"),
+        },
+        default="gw",
+    )
+    session = _make_session(
+        registry=reg,
+        model_alias="gw",
+        judge_config=JudgeConfig(
+            model="intent",
+            output_guard_llm=True,
+            output_guard_model="intent",
+        ),
+    )
+
+    intent = session._ensure_judge()
+    guard = session._ensure_output_guard_judge()
+
+    assert intent is not None
+    assert guard is not None
+    assert intent._record_usage == session._record_aux_usage
+    assert guard._record_usage == session._record_aux_usage
+    assert intent._model == "intent-model"
+    assert guard._model == "intent-model"

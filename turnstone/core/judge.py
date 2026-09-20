@@ -19,7 +19,7 @@ import time
 import uuid
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Protocol
 
 from turnstone.core.deadline import (
     DeadlineCancelledError,
@@ -47,8 +47,93 @@ if TYPE_CHECKING:
     from turnstone.core.deadline import StreamAbortRef
     from turnstone.core.model_registry import ModelConfig
     from turnstone.core.model_turn import ModelTurnResult
+    from turnstone.core.providers._protocol import UsageInfo
 
 log = get_logger(__name__)
+
+
+class UsageRecorder(Protocol):
+    """Sink for one completed judge model call's usage, attributed to ``model``.
+
+    The session's auxiliary usage recorder has this shape.  It is called on
+    whichever thread finished the call: a judge evaluation worker, the guard's
+    caller (which may be the session's main loop), or an abandoned deadline
+    worker recording its own late completion, possibly several at once under
+    ``parallel_evaluations``, so implementations must be thread-safe.  It is
+    never called on the thread a deadline-bounded caller is waiting on.  Judges
+    hold the callable so they depend on nothing of the session beyond this
+    shape.
+    """
+
+    def __call__(self, usage: UsageInfo | None, *, model: str) -> None: ...
+
+
+class _UsageHandoff:
+    """Record one deadline-bounded judge call's usage, off the measured worker.
+
+    Judge calls run through ``model_turn`` outside the main loop's
+    ``on_status`` accounting, like titles, compaction and sub-agents, so
+    without a sink their spend reaches neither the usage rows nor the node
+    token counters.  The row is attributed to the judge's own model, which
+    differs from the session model when the judge alias names one.  A sink
+    failure is logged and swallowed: accounting never costs a verdict.
+
+    Both judges run their model call on a worker thread under
+    ``run_abortable_with_deadline``, and ``model_turn`` invokes ``on_completed``
+    on that thread before the result is handed back, so a sink that writes a
+    usage row there would charge storage latency to the verdict's time budget.
+    ``capture`` is the ``on_completed`` hook: while the caller is still waiting
+    on the worker it only queues the usage; ``flush`` records what was queued
+    from the caller's thread after the deadline call returned, on the success
+    path and the timeout and cancel paths alike.  A worker the caller has
+    already abandoned records for itself, so a call that completed after its
+    deadline still reaches the ledger, and nothing is waiting on that thread.
+    In the intent judge's batch lane that late path is best-effort: the
+    evaluation worker closes its client once its queue drains, which can cut an
+    abandoned call short before its usage is reported.
+
+    One handoff serves one deadline-bounded call.  ``flush`` is a one-shot
+    latch, so a later capture through a flushed handoff would go straight back
+    to a write inside the measured window.
+    """
+
+    def __init__(
+        self,
+        record_usage: UsageRecorder | None,
+        *,
+        model: str,
+        source: str,
+    ) -> None:
+        self._record_usage = record_usage
+        self._model = model
+        self._source = source
+        self._lock = threading.Lock()
+        self._pending: list[UsageInfo | None] = []
+        self._released = False
+
+    def _note(self, usage: UsageInfo | None) -> None:
+        if self._record_usage is None:
+            return
+        try:
+            self._record_usage(usage, model=self._model)
+        except Exception:
+            log.warning("judge.usage_record_failed", source=self._source, exc_info=True)
+
+    def capture(self, usage: UsageInfo | None) -> None:
+        with self._lock:
+            if not self._released:
+                self._pending.append(usage)
+                return
+        self._note(usage)
+
+    def flush(self) -> None:
+        with self._lock:
+            self._released = True
+            pending = self._pending
+            self._pending = []
+        for usage in pending:
+            self._note(usage)
+
 
 _MAX_PARALLEL_EVALUATIONS = 16
 _JUDGE_READ_LIMIT = 32_768
@@ -1209,10 +1294,13 @@ class IntentJudge:
         session_binding: ResolvedModelBinding,
         rule_registry: Any | None = None,
         config_store: Any | None = None,
+        *,
+        record_usage: UsageRecorder | None = None,
     ) -> None:
         self._config = config
         self._config_fingerprint = self._fingerprint_config(config)
         self._rule_registry = rule_registry
+        self._record_usage = record_usage
         session_caps = require_lane_capabilities(session_binding.lane)
         session_window = _positive_window(
             getattr(session_binding.config, "context_window", None),
@@ -1780,6 +1868,7 @@ class IntentJudge:
             # Per-turn timeout: each turn gets a fresh budget so local
             # models aren't penalised for slow earlier turns.
             per_call_timeout = max(self._config.timeout, 5.0)  # at least 5s
+            handoff = _UsageHandoff(self._record_usage, model=self._model, source="intent")
             try:
                 # Each turn runs on its own daemon worker (1s cancel polling).
                 # A timeout or cancel abandons the call without pinning a
@@ -1794,11 +1883,13 @@ class IntentJudge:
                 # configuration beats a hard determinism pin.
                 turn_tools = None if is_last_turn else tools
 
-                # Bound default: the call runs synchronously within this
-                # iteration; the binding makes the per-turn capture explicit
-                # (and satisfies B023 in the loop).
+                # Bound defaults: the call runs synchronously within this
+                # iteration; the bindings make the per-turn capture explicit
+                # (and satisfy B023 in the loop).
                 def _sample(
-                    ref: StreamAbortRef, _tools: list[dict[str, Any]] | None = turn_tools
+                    ref: StreamAbortRef,
+                    _tools: list[dict[str, Any]] | None = turn_tools,
+                    _capture: Callable[[UsageInfo | None], None] = handoff.capture,
                 ) -> ModelTurnResult:
                     return model_turn(
                         lane,
@@ -1806,6 +1897,7 @@ class IntentJudge:
                         tools=_tools,
                         max_tokens=2048,
                         product_recovery=True,
+                        on_completed=_capture,
                         cancel_ref=ref,
                     )
 
@@ -1838,6 +1930,10 @@ class IntentJudge:
             except Exception as e:
                 log.info("judge.turn.failed", turn=turn + 1, error=str(e))
                 return None
+            finally:
+                # Off the measured window: whatever the worker captured before
+                # this thread moved on is written here, on the evaluation thread.
+                handoff.flush()
 
             turn_elapsed = time.monotonic() - turn_start
             log.info(

@@ -129,6 +129,12 @@ frozen.
 - **OAuth cancellation and shutdown.** Cancelled requests settle started token writes before
   releasing their runtime locks. Bounded shutdown tracks advisory-lock workers, and unavailable
   runtimes return transient/no-token results without revoking grants or changing backoff.
+- **Judge spend in the usage records.** The intent judge and the output-guard judge ran their
+  model calls outside the auxiliary accounting that titles, compaction summaries, web-fetch
+  extraction, and task agents use, so their tokens reached neither the usage records nor the
+  node token metrics. Both judges now record every completed model call under the judge's own
+  model, which is the configured judge alias's model when one is set. Like the other auxiliary
+  calls, judge calls do not move the live context gauge of the workstream they run for.
 
 ## [1.8.3]
 

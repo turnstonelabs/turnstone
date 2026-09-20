@@ -19,7 +19,7 @@ from turnstone.core.judge import IntentJudge, IntentVerdict, JudgeConfig, evalua
 from turnstone.core.model_backend_auth import BackendAuthUnavailableError
 from turnstone.core.model_registry import ModelConfig
 from turnstone.core.model_turn import ModelLane, ResolvedModelBinding
-from turnstone.core.providers._protocol import IncompleteStreamError, ModelCapabilities
+from turnstone.core.providers._protocol import IncompleteStreamError, ModelCapabilities, UsageInfo
 from turnstone.core.trajectory import Role
 
 # ---------------------------------------------------------------------------
@@ -113,6 +113,7 @@ def _make_judge(
     read_only_tools: bool = True,
     timeout: float = 60.0,
     parallel_evaluations: int = 1,
+    record_usage: Any | None = None,
 ) -> IntentJudge:
     """Create a judge with a mock provider."""
     if provider is None:
@@ -136,7 +137,41 @@ def _make_judge(
             "test-model",
             capabilities=ModelCapabilities(context_window=100_000),
         ),
+        record_usage=record_usage,
     )
+
+
+def _make_alias_registry(
+    alias: str,
+    alias_provider: MagicMock,
+    alias_client: MagicMock,
+    underlying_model: str,
+    *,
+    capabilities: dict[str, Any] | None = None,
+) -> MagicMock:
+    """A registry that resolves ``alias`` to the given provider, client and model."""
+    registry = MagicMock()
+    cfg = MagicMock()
+    cfg.context_window = 50_000
+    cfg.capabilities = capabilities if capabilities is not None else {}
+    # Judges inherit the alias's configured temperature (house rule: no
+    # code pins) — give the mock config a real value so the lane
+    # resolution path is exercised, not a MagicMock leak.
+    cfg.temperature = 0.3
+    registry.has_alias.side_effect = lambda a: a == alias
+    # One locked snapshot: resolve_binding binds client + config +
+    # provider together, never a pair a reload could tear.
+    registry.resolve_binding.return_value = (
+        alias_client,
+        underlying_model,
+        cfg,
+        alias_provider,
+        0,
+    )
+    # The unified lane resolver (model_turn.resolve_capabilities) fetches
+    # the config itself rather than taking the resolve copy.
+    registry.get_config.return_value = cfg
+    return registry
 
 
 def _make_item(**overrides: Any) -> dict[str, Any]:
@@ -2055,38 +2090,6 @@ class TestModelAliasResolution:
     verdict come back ``llm_fallback / "did not return a verdict"``.
     """
 
-    def _make_alias_registry(
-        self,
-        alias: str,
-        alias_provider: MagicMock,
-        alias_client: MagicMock,
-        underlying_model: str,
-        *,
-        capabilities: dict[str, Any] | None = None,
-    ) -> MagicMock:
-        registry = MagicMock()
-        cfg = MagicMock()
-        cfg.context_window = 50_000
-        cfg.capabilities = capabilities if capabilities is not None else {}
-        # Judges inherit the alias's configured temperature (house rule: no
-        # code pins) — give the mock config a real value so the lane
-        # resolution path is exercised, not a MagicMock leak.
-        cfg.temperature = 0.3
-        registry.has_alias.side_effect = lambda a: a == alias
-        # One locked snapshot: resolve_binding binds client + config +
-        # provider together, never a pair a reload could tear.
-        registry.resolve_binding.return_value = (
-            alias_client,
-            underlying_model,
-            cfg,
-            alias_provider,
-            0,
-        )
-        # The unified lane resolver (model_turn.resolve_capabilities) fetches
-        # the config itself rather than taking the resolve copy.
-        registry.get_config.return_value = cfg
-        return registry
-
     def test_alias_capabilities_merged_and_threaded_to_wire(self):
         """#823: a judge alias's model-definition ``capabilities`` are merged
         onto the provider base AND passed to ``create_streaming`` — the same
@@ -2099,7 +2102,7 @@ class TestModelAliasResolution:
         base = ModelCapabilities(supports_tools=True, effort_passthrough=False)
         alias_provider = _make_mock_provider(response_content=_good_verdict_json())
         alias_provider.get_capabilities = MagicMock(return_value=base)
-        registry = self._make_alias_registry(
+        registry = _make_alias_registry(
             "judge-mini",
             alias_provider,
             MagicMock(base_url="https://a/v1", api_key="k"),
@@ -2142,7 +2145,7 @@ class TestModelAliasResolution:
         cannot bind the resolved client/window to a different capability
         generation."""
         alias_provider = _make_mock_provider(response_content=_good_verdict_json())
-        registry = self._make_alias_registry(
+        registry = _make_alias_registry(
             "judge-mini",
             alias_provider,
             MagicMock(base_url="https://a/v1", api_key="k"),
@@ -2209,7 +2212,7 @@ class TestModelAliasResolution:
         alias_client.base_url = "https://alias.example/v1"
         alias_client.api_key = "alias-key"
 
-        registry = self._make_alias_registry(
+        registry = _make_alias_registry(
             "judge-mini", alias_provider, alias_client, "gpt-5-mini-resolved"
         )
 
@@ -2242,7 +2245,7 @@ class TestModelAliasResolution:
         # If the code (wrongly) consulted caps, it'd read this fictitious 200k.
         alias_provider.get_capabilities = MagicMock(return_value=MagicMock(context_window=200_000))
         alias_client = MagicMock(base_url="https://alias/v1", api_key="k")
-        registry = self._make_alias_registry("judge-mini", alias_provider, alias_client, "local-9b")
+        registry = _make_alias_registry("judge-mini", alias_provider, alias_client, "local-9b")
         session_provider = _make_mock_provider()
         judge = IntentJudge(
             config=JudgeConfig(enabled=True, model="judge-mini"),
@@ -2678,3 +2681,247 @@ class TestWorkspaceScopeSurvivesClientRebuild:
                 rebuilt.close()
         finally:
             lane_client.close()
+
+
+# ---------------------------------------------------------------------------
+# Usage accounting
+# ---------------------------------------------------------------------------
+
+
+_UsageRecord = tuple[UsageInfo | None, str, str]
+"""One recorded call: the usage, the attributed model, and the recording thread's name."""
+
+
+def _usage_recorder(
+    arrived: threading.Event | None = None,
+) -> tuple[list[_UsageRecord], Any]:
+    """A thread-safe sink shaped like the session's auxiliary usage recorder.
+
+    ``arrived`` is set after each row lands, for tests that wait on a row
+    written by a thread they do not join.
+    """
+    records: list[_UsageRecord] = []
+    lock = threading.Lock()
+
+    def record(usage: UsageInfo | None, *, model: str) -> None:
+        with lock:
+            records.append((usage, model, threading.current_thread().name))
+        if arrived is not None:
+            arrived.set()
+
+    return records, record
+
+
+def _verdict_result(prompt_tokens: int, completion_tokens: int) -> MagicMock:
+    """A verdict-shaped provider result that reports the given usage."""
+    result = _mock_result(_good_verdict_json())
+    result.usage = UsageInfo(
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        total_tokens=prompt_tokens + completion_tokens,
+    )
+    return result
+
+
+def _recorded(records: list[_UsageRecord]) -> list[tuple[int, int, str]]:
+    return [
+        (usage.prompt_tokens, usage.completion_tokens, model)
+        for usage, model, _thread in records
+        if usage is not None
+    ]
+
+
+def _recording_threads(records: list[_UsageRecord]) -> set[str]:
+    return {thread for _usage, _model, thread in records}
+
+
+class TestUsageAccounting:
+    """Every judge model call reaches the session's auxiliary usage sink,
+    attributed to the judge's own model.  Judges run outside the main loop's
+    ``on_status`` accounting, so this sink is their only route to the usage
+    rows and the node token counters; before it existed judge spend was
+    invisible to both.
+
+    The sink is never invoked on the ``judge-api`` deadline worker while the
+    evaluation thread is waiting on it: a storage write there would charge its
+    latency to the verdict's time budget.  Each test asserts the row content
+    and count first, so the thread assertion cannot pass vacuously."""
+
+    def test_single_evaluation_records_usage_under_the_judge_model(self) -> None:
+        provider = _make_mock_provider()
+        provider.create_streaming.return_value = as_stream(_verdict_result(321, 45))
+        records, record = _usage_recorder()
+        judge = _make_judge(provider, record_usage=record)
+
+        verdict = judge._evaluate_single(
+            _make_item(),
+            [{"role": "user", "content": "x"}],
+            cancel_event=None,
+            client=MagicMock(),
+        )
+
+        assert verdict is not None
+        assert verdict.tier == "llm"
+        assert _recorded(records) == [(321, 45, "test-model")]
+        assert _recording_threads(records) == {threading.current_thread().name}
+
+    def test_multi_turn_evaluation_records_one_row_per_model_call(self) -> None:
+        """A tool-using evaluation makes two provider calls; each is a row."""
+        provider = _make_mock_provider()
+        tool_turn = _mock_result(
+            "",
+            [
+                {
+                    "id": "tc_judge_1",
+                    "function": {
+                        "name": "read_file",
+                        "arguments": json.dumps({"path": "/nonexistent/file.txt"}),
+                    },
+                }
+            ],
+        )
+        tool_turn.usage = UsageInfo(prompt_tokens=100, completion_tokens=10, total_tokens=110)
+        provider.create_streaming.side_effect = [
+            as_stream(tool_turn),
+            as_stream(_verdict_result(200, 20)),
+        ]
+        records, record = _usage_recorder()
+        judge = _make_judge(provider, record_usage=record)
+
+        verdict = judge._evaluate_single(
+            _make_item(),
+            [{"role": "user", "content": "x"}],
+            cancel_event=None,
+            client=MagicMock(),
+        )
+
+        assert verdict is not None
+        assert provider.create_streaming.call_count == 2
+        assert _recorded(records) == [(100, 10, "test-model"), (200, 20, "test-model")]
+        assert _recording_threads(records) == {threading.current_thread().name}
+
+    def test_parallel_evaluations_record_one_row_per_call(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        provider = _make_mock_provider()
+        provider.create_streaming.return_value = as_stream(_verdict_result(50, 5))
+        records, record = _usage_recorder()
+        judge = _make_judge(provider, parallel_evaluations=3, record_usage=record)
+        _tracking_client_factory(judge, monkeypatch)
+        items = [_make_item(call_id=f"tc_{idx}") for idx in range(5)]
+        done = threading.Event()
+        results: list[IntentVerdict] = []
+
+        judge.evaluate(
+            items,
+            [{"role": "user", "content": "test"}],
+            results.append,
+            done_callback=done.set,
+        )
+
+        assert done.wait(5.0)
+        assert len(results) == 5
+        assert all(verdict.tier == "llm" for verdict in results)
+        assert _recorded(records) == [(50, 5, "test-model")] * 5
+        # Written by the evaluation workers after each deadline call returned,
+        # never by the deadline worker itself.
+        assert "judge-api" not in _recording_threads(records)
+        assert all(
+            thread.startswith("intent-judge-eval-") for thread in _recording_threads(records)
+        )
+
+    def test_alias_judge_attributes_rows_to_its_own_model(self) -> None:
+        """``judge.model`` names an alias: rows carry that alias's model, not
+        the session model the judge would otherwise have inherited."""
+        alias_provider = _make_mock_provider()
+        alias_provider.create_streaming.return_value = as_stream(_verdict_result(80, 8))
+        registry = _make_alias_registry(
+            "judge-mini",
+            alias_provider,
+            MagicMock(base_url="https://judge.example/v1", api_key="k"),
+            "local-9b",
+        )
+        records, record = _usage_recorder()
+        judge = IntentJudge(
+            config=JudgeConfig(enabled=True, model="judge-mini"),
+            session_binding=_binding(
+                _make_mock_provider(),
+                MagicMock(base_url="https://session.example/v1", api_key="s"),
+                "session-model",
+                capabilities=ModelCapabilities(context_window=100_000),
+                registry=registry,
+                alias="session",
+            ),
+            record_usage=record,
+        )
+
+        judge._evaluate_single(
+            _make_item(),
+            [{"role": "user", "content": "x"}],
+            cancel_event=None,
+            client=MagicMock(),
+        )
+
+        assert _recorded(records) == [(80, 8, "local-9b")]
+
+    def test_cancelled_evaluation_still_records_the_workers_late_completion(self) -> None:
+        """The caller is cancelled while the call is in flight and moves on; the
+        abandoned ``judge-api`` worker finishes later and records its own spend,
+        once, since nothing waits on it.  This is the released branch of the
+        handoff, reached only because the caller's ``finally`` flushed it."""
+        release = threading.Event()
+        started = threading.Event()
+        arrived = threading.Event()
+        cancel = threading.Event()
+        provider = _make_mock_provider()
+
+        def _blocking_stream(**_kwargs: Any) -> Any:
+            started.set()
+            # Dispatch has happened; the caller gives up while the call is in flight.
+            cancel.set()
+            release.wait(5.0)
+            return as_stream(_verdict_result(77, 7))
+
+        provider.create_streaming.side_effect = _blocking_stream
+        records, record = _usage_recorder(arrived)
+        judge = _make_judge(provider, record_usage=record)
+        try:
+            verdict = judge._evaluate_single(
+                _make_item(),
+                [{"role": "user", "content": "x"}],
+                cancel_event=cancel,
+                client=MagicMock(),
+            )
+            assert started.is_set()
+            assert verdict is None
+            assert records == []
+        finally:
+            release.set()
+
+        assert arrived.wait(5.0)
+        assert _recorded(records) == [(77, 7, "test-model")]
+        assert _recording_threads(records) == {"judge-api"}
+        # Let the abandoned worker exit before the thread-leak guard looks.
+        for thread in threading.enumerate():
+            if thread.name == "judge-api":
+                thread.join(timeout=5.0)
+
+    def test_sink_failure_never_costs_a_verdict(self) -> None:
+        provider = _make_mock_provider()
+        provider.create_streaming.return_value = as_stream(_verdict_result(1, 1))
+
+        def record(usage: UsageInfo | None, *, model: str) -> None:
+            raise RuntimeError("usage sink down")
+
+        judge = _make_judge(provider, record_usage=record)
+
+        verdict = judge._evaluate_single(
+            _make_item(),
+            [{"role": "user", "content": "x"}],
+            cancel_event=None,
+            client=MagicMock(),
+        )
+
+        assert verdict is not None
+        assert verdict.tier == "llm"

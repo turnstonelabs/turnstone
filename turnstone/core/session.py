@@ -9549,16 +9549,16 @@ class ChatSession:
     def _record_aux_usage(self, usage: UsageInfo | None, *, model: str | None = None) -> None:
         """Persist token usage for a non-streaming auxiliary completion.
 
-        Title generation, compaction, web-fetch summarisation, and
-        task sub-agents all run outside the streaming ``on_status``
-        accounting path; without this their spend never reaches the
-        usage dashboard. Delegates to the UI's ``on_aux_usage`` hook
-        (which owns the storage write + any node metrics), mirroring how
-        ``_print_status_line`` routes main-loop usage through
-        ``on_status``.
+        Title generation, compaction, web-fetch summarisation, task
+        sub-agents, and the intent and output-guard judges all run outside
+        the streaming ``on_status`` accounting path; without this their
+        spend never reaches the usage dashboard. Delegates to the UI's
+        ``on_aux_usage`` hook (which owns the storage write + any node
+        metrics), mirroring how ``_print_status_line`` routes main-loop
+        usage through ``on_status``.
 
         ``model`` defaults to the session model (utility calls share it);
-        sub-agent callers pass the agent's own model so per-model
+        sub-agent and judge callers pass their own model so per-model
         attribution stays accurate. The hook is looked up defensively —
         minimal UI stubs (some tests, replay shims) predate it and should
         skip recording rather than crash a title-gen or sub-agent turn.
@@ -16588,6 +16588,7 @@ class ChatSession:
                     session_binding=observed_binding,
                     rule_registry=self._rule_registry,
                     config_store=self._config_store,
+                    record_usage=self._record_aux_usage,
                 )
             except Exception:
                 log.warning("judge.init_failed", exc_info=True)
@@ -16711,6 +16712,7 @@ class ChatSession:
                         config=jc,
                         session_binding=self._model_binding,
                         config_store=self._config_store,
+                        record_usage=self._record_aux_usage,
                     )
                 except Exception:
                     log.warning("output_guard_judge.init_failed", exc_info=True)

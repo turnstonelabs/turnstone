@@ -56,10 +56,12 @@ from turnstone.core.deadline import (
 )
 from turnstone.core.judge import (
     _CHARS_PER_TOKEN,
+    UsageRecorder,
     _config_store_version,
     _judge_binding_from_session,
     _JudgeBindingState,
     _positive_window,
+    _UsageHandoff,
 )
 from turnstone.core.log import get_logger
 from turnstone.core.model_registry import ModelClientConstructionError
@@ -282,9 +284,12 @@ class OutputGuardJudge:
         config: JudgeConfig,
         session_binding: ResolvedModelBinding,
         config_store: Any | None = None,
+        *,
+        record_usage: UsageRecorder | None = None,
     ) -> None:
         self._config = config
         self._config_fingerprint = self._fingerprint_config(config)
+        self._record_usage = record_usage
         session_caps = require_lane_capabilities(session_binding.lane)
         session_window = _positive_window(
             getattr(session_binding.config, "context_window", None),
@@ -700,6 +705,8 @@ class OutputGuardJudge:
                 worker_released = True
             self._end_evaluation()
 
+        handoff = _UsageHandoff(self._record_usage, model=self._model, source="output_guard")
+
         def _run_model_turn(ref: Any) -> Any:
             try:
                 return model_turn(
@@ -709,6 +716,7 @@ class OutputGuardJudge:
                     max_tokens=512,
                     product_recovery=True,
                     admit_reissue=admit_reissue,
+                    on_completed=handoff.capture,
                     cancel_ref=ref,
                 )
             finally:
@@ -741,6 +749,10 @@ class OutputGuardJudge:
             return self._error_verdict(
                 verdict_id, call_id, start, f"provider_error: {type(completion_cause(e)).__name__}"
             )
+        finally:
+            # Off the measured window: whatever the worker captured before this
+            # thread moved on is written here, on the caller's thread.
+            handoff.flush()
 
         # A refusal, including one cut off by the output limit, may quote valid
         # verdict JSON without endorsing it. Keep the heuristic disposition.
