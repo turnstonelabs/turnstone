@@ -203,6 +203,7 @@ from turnstone.core.model_turn import (
     lane_without_thinking,
     merge_usage,
     model_turn,
+    replay_family,
     require_lane_capabilities,
     resolve_effort_setting,
     resolve_lane,
@@ -331,6 +332,7 @@ log = get_logger(__name__)
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Iterator, Mapping
 
+    from turnstone.core.compaction import MessageMeasure
     from turnstone.core.config_store import ConfigStore
     from turnstone.core.healthcheck import BackendHealthTracker, HealthTrackerRegistry
     from turnstone.core.judge import IntentJudge, JudgeConfig
@@ -12801,17 +12803,21 @@ class ChatSession:
                     # result: a mid-retry rebind re-prepared it inside the
                     # streaming wrapper, invisibly to this frame.  A fake
                     # result without it re-folds inside _update_token_table.
-                    # The native lane's replay cost the accepted turn carries
-                    # toward the provider the next request goes to: the slot's
-                    # context figure and the turn's own estimate below read the
-                    # same value, so they cannot disagree.
-                    bound = self._message_measure(completed_result.producer)
+                    # One binding of the measure and the lane reader to the
+                    # serving provider (a result with no producer name falls
+                    # back to the active lane, the emptiness test the persisted
+                    # producer below uses too): the slot's context figure, the
+                    # calibration and the turn's own estimate all read it, so
+                    # they cannot disagree.
+                    bound = self._message_measure(
+                        completed_result.producer or self._active_replay_producer
+                    )
                     replayed_native_tokens = bound.lane(completed_result.turn)
                     self._update_token_table(
                         msgs=completed_result.wire_msgs,
                         tool_def_chars=completed_result.tool_def_chars,
                         provenance=completed_result.provenance,
-                        producer=completed_result.producer,
+                        bound=bound,
                         native_tokens=replayed_native_tokens,
                     )
                     # Report usage for every completed API call that this
@@ -12832,9 +12838,9 @@ class ChatSession:
                     )
 
                     # The turn's cost toward the next request: the exact completion
-                    # count for a text turn, or text from characters plus the lane
-                    # from the recorded count for a turn that replays one (the one
-                    # rule the task-agent estimator applies too).
+                    # count plus the lane's recorded count toward the provider the
+                    # next request goes to (the one rule the task-agent estimator
+                    # applies too).
                     assistant_token_estimate = accepted_turn_tokens(
                         completed_result.turn,
                         completion_tokens=self._assistant_pending_tokens,
@@ -15164,13 +15170,14 @@ class ChatSession:
 
         Counts textual content + structural overhead (role, tool_call
         IDs, tool call names/arguments).  ``fixed_tokens`` are the tokens
-        already known exactly, which the calibration subtracts from
-        prompt_tokens and the estimates add as they are: the fixed charge
-        per image, and the provider's own count of a replayed native lane
-        (``_native_tokens``, recorded on a server-side search turn) when
-        ``replay_producer`` names the provider that produced it, since only
-        the producing provider replays the lane and any other rebuilds the
-        turn from its text.  Document-part content (``data`` + ``name`` +
+        the estimates add as they are: the fixed charge per image, this
+        process's own exact figure, which the calibration also subtracts
+        from prompt_tokens; and the provider's own count of a replayed
+        native lane (``_native_tokens``, recorded on a server-side search
+        turn) when ``replay_producer`` shares the producer's replay family,
+        since only that family replays the lane and any other rebuilds the
+        turn from its text.  A request that carries such a count is not a
+        calibration sample.  Document-part content (``data`` + ``name`` +
         ``media_type``) is counted in a third bucket so it contributes
         to the token budget without polluting the ``chars_per_token``
         calibration — provider-native document blocks (Anthropic) and
@@ -15239,25 +15246,28 @@ class ChatSession:
         fixed_tokens += ChatSession._lane_tokens(msg, replay_producer=replay_producer)
         return n, fixed_tokens, doc_chars
 
-    def _msg_char_count(self, msg: dict[str, Any] | Turn) -> int:
+    def _msg_char_count(
+        self, msg: dict[str, Any] | Turn, *, measure: MessageMeasure | None = None
+    ) -> int:
         """Count characters in a message, including structural overhead.
 
         Includes role markers, tool_call IDs, document-part characters, and
-        the fixed token charges (images, a native lane the active provider
-        replays) converted at the current ratio, so that the budget estimate
-        reflects the full payload the provider sees.  Accepts a wire dict or a
-        ``Turn``.
+        the fixed token charges (images, a native lane the replaying provider
+        charges) converted at the current ratio, so that the budget estimate
+        reflects the full payload the provider sees.  *measure* is the bound
+        measure to read through; the default is the active lane's.  Accepts a
+        wire dict or a ``Turn``.
         """
-        text_chars, fixed_tokens, doc_chars = self._msg_text_chars(
-            msg, replay_producer=self._active_replay_producer
-        )
+        if measure is None:
+            measure = self._message_measure(self._active_replay_producer).measure
+        text_chars, fixed_tokens, doc_chars = measure(msg)
         return text_chars + doc_chars + int(fixed_tokens * self._chars_per_token)
 
     def _message_measure(self, replay_producer: str | None) -> BoundMeasure:
         """Bind the measure and the lane reader to the provider one request replays lanes to.
 
-        One binding for both, so the fixed bucket the calibration subtracts and the lane share
-        it exempts from the text floor can never name different providers.
+        One binding for both, so the fixed bucket the estimates add and the lane sum that
+        disqualifies a request as a calibration sample can never name different providers.
         """
         return BoundMeasure(
             measure=functools.partial(self._msg_text_chars, replay_producer=replay_producer),
@@ -15270,18 +15280,22 @@ class ChatSession:
 
         The one reader of the producer match for both message forms: a wire dict carries
         ``_native_tokens`` beside ``_producer`` (stamped only when a lane exists), a ``Turn``
-        carries the count in its meta beside its lane.  Only the producing provider replays the
-        lane; any other rebuilds the turn from its text and pays nothing for it.  At the
-        accepted-turn site *replay_producer* is the result's own serving producer, the value the
-        calibration measure is bound to.
+        carries the count in its meta beside its lane.  The match is by replay family
+        (:func:`replay_family`), not by name: the converter replays the lane, and the two
+        Anthropic-protocol names share one, so a turn produced under either is replayed, and
+        charged, toward both.  A provider of another family rebuilds the turn from its text and
+        pays nothing for it.  At the accepted-turn site *replay_producer* is the result's own
+        serving producer, the value the calibration measure is bound to.
         """
         if replay_producer is None:
             return 0
+        family = replay_family(replay_producer)
         if isinstance(msg, Turn):
-            if msg.native is None or msg.native.producer != replay_producer:
+            if msg.native is None or replay_family(msg.native.producer) != family:
                 return 0
             return msg.native_tokens
-        if msg.get("_producer") != replay_producer:
+        producer = msg.get("_producer")
+        if not isinstance(producer, str) or replay_family(producer) != family:
             return 0
         return native_tokens_from(msg.get("_native_tokens"))
 
@@ -15341,21 +15355,23 @@ class ChatSession:
         msgs: list[dict[str, Any]] | None = None,
         tool_def_chars: int | None = None,
         provenance: TurnProvenance | None = None,
-        producer: str | None = None,
+        bound: BoundMeasure | None = None,
         native_tokens: int,
     ) -> None:
         """Update per-message token estimates using API usage data.
 
-        *msgs*, *tool_def_chars* and *producer* are the as-served wire facts
-        carried by ``ModelTurnResult``.  Passing them avoids a redundant
-        preparation walk and keeps fallback calibration on the lane the
-        provider actually counted: *producer* is the serving provider, the one
-        whose native lanes the wire replayed and so the one whose recorded
-        lane costs the calibration subtracts.  *native_tokens* is the replay
-        cost the accepted turn actually carries toward the next request (0
-        when no native lane survived); the slot's context figure adds it.
-        Missing wire facts (fake results and direct calls) fall back to the
-        primary session posture.
+        *msgs* and *tool_def_chars* are the as-served wire facts carried by
+        ``ModelTurnResult``; passing them avoids a redundant preparation walk.
+        *bound* is the measure and lane reader already bound to the serving
+        provider, the one whose native lanes the wire replayed, so a request
+        that carries one is not a calibration sample; the caller built it
+        once and reads the same binding for the slot's lane figure and the
+        turn's own charge, and this method re-estimates every message through
+        it too, so none of the four can disagree.  *native_tokens* is
+        the replay cost the accepted turn actually carries toward the next
+        request (0 when no native lane survived); the slot's context figure
+        adds it.  Missing wire facts (fake results and direct calls) fall back
+        to the primary session posture: the active lane's binding.
         """
         if not self._last_usage:
             return
@@ -15377,9 +15393,8 @@ class ChatSession:
         served_tool_def_chars = (
             tool_def_chars if tool_def_chars is not None else self._tool_def_chars()
         )
-        bound = self._message_measure(
-            producer if producer is not None else self._active_replay_producer
-        )
+        if bound is None:
+            bound = self._message_measure(self._active_replay_producer)
         # One rule for what a call's usage says about the context, shared with the task-agent
         # estimator (``resolve_context_usage``): the anchor is what this request carried, the
         # prefix the estimate builds on; the served figure is the calibration denominator; the
@@ -15428,12 +15443,16 @@ class ChatSession:
         )
 
         # Compute system_tokens (stable after first call)
-        sys_chars = sum(self._msg_char_count(m) for m in self.system_messages)
+        sys_chars = sum(
+            self._msg_char_count(m, measure=bound.measure) for m in self.system_messages
+        )
         self._system_tokens = max(1, int(sys_chars / self._chars_per_token))
 
-        # Re-estimate all message token counts with calibrated ratio
+        # Re-estimate all message token counts with the calibrated ratio, through
+        # the same binding the calibration and the slot read.
         self._msg_tokens = [
-            max(1, int(self._msg_char_count(m) / self._chars_per_token)) for m in self.messages
+            max(1, int(self._msg_char_count(m, measure=bound.measure) / self._chars_per_token))
+            for m in self.messages
         ]
 
         # Stash completion_tokens for the assistant message about to be appended
@@ -26127,8 +26146,8 @@ class ChatSession:
             execution_journal.record_assistant(result.turn)
             if result.usage is not None:
                 # The turn's cost toward the next request, by the shared rule: the
-                # exact completion count for a text turn, text from characters
-                # plus the lane's recorded count for a turn that replays one.
+                # exact completion count plus the lane's recorded count for a turn
+                # that replays one.
                 context_estimator.append_accepted(result.turn, result.usage.completion_tokens)
 
             if not result.tool_calls:

@@ -10831,7 +10831,7 @@ class TestUpdateTokenTableMsgsParam:
         session._last_usage = {"prompt_tokens": 100, "completion_tokens": 10}
         served_msgs = [{"role": "user", "content": "hello"}]
         served_tool_chars = 37
-        message_chars, _images, _documents = session._msg_text_chars(
+        message_chars, _fixed_tokens, _documents = session._msg_text_chars(
             served_msgs[0], replay_producer=None
         )
 
@@ -10863,7 +10863,7 @@ class TestUpdateTokenTableMsgsParam:
             "prompt_tokens_cumulative": True,
         }
         served_msgs = [{"role": "user", "content": "hello"}]
-        message_chars, _images, _documents = session._msg_text_chars(
+        message_chars, _fixed_tokens, _documents = session._msg_text_chars(
             served_msgs[0], replay_producer=None
         )
 

@@ -57,10 +57,7 @@ from turnstone.core.completion_recovery import (
     local_model_call,
 )
 from turnstone.core.deadline import DeadlineCancelledError
-from turnstone.core.history_decoration import (
-    attach_vllm_chat_reasoning_field,
-    reasoning_text_chars,
-)
+from turnstone.core.history_decoration import attach_vllm_chat_reasoning_field
 from turnstone.core.log import get_logger
 from turnstone.core.lowering import (
     restore_provider_tool_ids,
@@ -71,9 +68,9 @@ from turnstone.core.lowering import (
 # default construction is the only provider-construction site outside the
 # registry — so the provider package stays a plant-layer-only import.
 from turnstone.core.providers import create_provider as create_provider
+from turnstone.core.providers import replay_family as replay_family
 from turnstone.core.providers._protocol import (
     REASONING_BEARING_BLOCK_TYPES,
-    SERVER_RESULT_BLOCK_TYPES,
     CompletionResult,
     ProviderResponseError,
     drain_stream,
@@ -117,6 +114,7 @@ from turnstone.core.storage._utils import (
     strip_orphan_client_tool_blocks,
 )
 from turnstone.core.trajectory import (
+    NATIVE_TOKENS_CAP,
     NATIVE_TOKENS_META_KEY,
     PROVENANCE_META_KEY,
     ProviderNative,
@@ -572,12 +570,6 @@ def require_lane_capabilities(lane: ModelLane) -> ModelCapabilities:
     return caps
 
 
-# Nominal size of a token in characters, for sizing the blocks of the model's own output
-# that the appended count contains or omits.  An estimate: the provider reports the appended
-# count whole, never per block.
-_NOMINAL_CHARS_PER_TOKEN = 4
-
-
 def _lane_window(lane: ModelLane, cfg: Any | None) -> int:
     """The largest window this lane is known to serve, or 0 when neither source names one.
 
@@ -593,69 +585,39 @@ def _lane_window(lane: ModelLane, cfg: Any | None) -> int:
     return max(int(table), int(row))
 
 
-def _text_block_chars(blocks: list[dict[str, Any]]) -> int:
-    return sum(
-        len(block["text"])
-        for block in blocks
-        if isinstance(block, dict)
-        and block.get("type") == "text"
-        and isinstance(block.get("text"), str)
-    )
+def replayed_lane_tokens(appended: int, lane: ModelLane, *, cfg: Any | None) -> int:
+    """The provider's appended count as the turn records it, or 0 when the count is refused.
 
+    A count larger than the lane's own window (:func:`_lane_window`), held under the decoder's
+    cap (:data:`turnstone.core.trajectory.NATIVE_TOKENS_CAP`, no context window holds more), is
+    a broken report and is refused through one logged warning carrying the bound applied and
+    the lane's window, so an operator can tell a broken provider from a window mismatch.  A lane
+    whose window neither source names (0) records nothing: the same warning, carrying the 0
+    window, says why.
 
-def replayed_lane_tokens(
-    appended: int,
-    blocks: list[dict[str, Any]],
-    lane: ModelLane,
-    *,
-    cfg: Any | None,
-) -> int:
-    """Bound the provider's appended count to what the next request actually replays.
-
-    Through the one decoder (:func:`turnstone.core.trajectory.native_tokens_from`): a count no
-    context window could hold is refused outright, and so is one larger than the lane's own
-    window (:func:`_lane_window`), a broken report, logged so an operator can tell a broken
-    provider from a window mismatch.  A lane whose window neither source names (0) records
-    nothing: the same warning, carrying the 0 window, says why.
-
-    The appended count is the input growth across the provider's own sampling passes: the
-    model's output before the last server result block, fed back into the next pass, plus the
-    results.  Two of its parts are charged elsewhere or never replayed, and the final pass adds
-    one the count omits, all sized from the blocks at a nominal four characters per token:
-    the fed-back text blocks are already in the turn's content, measured from characters, so
-    they come off; when the operator keeps reasoning out of replays (``replay_reasoning_to_model``
-    off, the default) the fed-back thinking never reaches the wire, so it comes off too; when
-    reasoning is replayed, the final pass's thinking is replayed as well and counted by no other
-    term, so it goes on.  ``redacted_thinking`` blocks are stripped with the rest of the
-    reasoning when replay is off, but their token share is unknowable here, so it stays charged:
-    such a turn is over-charged by that share.  A lane with no server result block fed nothing
-    back and carries the count as reported.  The total is clamped to the window.
+    The count is the input growth across the provider's own sampling passes: the output it fed
+    back into its next pass plus the results, taken as reported, with no discount and no
+    addition.  The fed-back output is also inside the completion count, so a turn is
+    over-charged by that share, bounded by its completion count.  The accepted-turn charge
+    (:func:`turnstone.core.compaction.accepted_turn_tokens`: the completion count plus this
+    count) reads neither the blocks nor the reasoning-replay posture, which keeps the recorded
+    count posture-independent: toggling the replay setting, or moving to a same-provider alias
+    with the other setting, changes nothing about a turn already recorded.
     """
     if appended <= 0:
         return 0
-    window = _lane_window(lane, cfg)
+    lane_window = _lane_window(lane, cfg)
+    window = min(lane_window, NATIVE_TOKENS_CAP)
     if appended > window:
         log.warning(
             "native_lane.count_refused",
             alias=lane.alias,
             appended=appended,
             context_window=window,
+            lane_window=lane_window,
         )
         return 0
-    last_result: int | None = None
-    for index, block in enumerate(blocks):
-        if isinstance(block, dict) and block.get("type") in SERVER_RESULT_BLOCK_TYPES:
-            last_result = index
-    if last_result is not None:
-        fed_back = blocks[:last_result]
-        appended -= _text_block_chars(fed_back) // _NOMINAL_CHARS_PER_TOKEN
-        caps = lane.capabilities
-        if resolve_replay_reasoning_to_model(lane.registry, lane.alias, caps=caps, cfg=cfg):
-            appended += reasoning_text_chars(blocks[last_result + 1 :]) // _NOMINAL_CHARS_PER_TOKEN
-        else:
-            appended -= reasoning_text_chars(fed_back) // _NOMINAL_CHARS_PER_TOKEN
-        appended = max(0, appended)
-    return native_tokens_from(min(appended, window))
+    return native_tokens_from(appended)
 
 
 def lane_producer(lane: ModelLane) -> str:
@@ -663,8 +625,9 @@ def lane_producer(lane: ModelLane) -> str:
 
     The one spelling of that identity: the completion builder stamps it on the turn
     (``ProviderNative.producer``, ``ModelTurnResult.producer``) and the session's estimators
-    compare a turn's producer against the serving lane's to decide whether the provider
-    replays the turn's native lane.  The session never reaches into ``lane.provider`` itself.
+    compare the replay family of a turn's producer (:func:`replay_family`) against the serving
+    lane's to decide whether the provider replays the turn's native lane.  The session never
+    reaches into ``lane.provider`` itself.
     """
     return lane.provider.provider_name
 
@@ -1064,6 +1027,8 @@ def finalize_provider_blocks(
     if not provider_blocks:
         return provider_blocks
     if had_blank_ids:
+        # The completion builder charges the lane off this flag: a collapsed lane records no
+        # appended count, because the blocks that count paid for are dropped right here.
         return [
             b for b in provider_blocks if isinstance(b, dict) and b.get("type") == "reasoning_text"
         ]
@@ -1379,11 +1344,11 @@ def _ingest_completion(
     # back with the blocks.  The chars-per-token measure cannot see those
     # blocks, so the turn keeps the provider's own count for the estimators,
     # bounded to what the next request can actually replay.  Recorded only
-    # when a lane survives to be replayed.
-    if native is not None and result.usage is not None:
-        native_tokens = replayed_lane_tokens(
-            result.usage.appended_prompt_tokens, native_blocks, lane, cfg=cfg
-        )
+    # when a lane survives to be replayed: a collapse on unpairable blank ids
+    # keeps only the synthesized reasoning block, none of which the count
+    # paid for.
+    if native is not None and not had_blank_ids and result.usage is not None:
+        native_tokens = replayed_lane_tokens(result.usage.appended_prompt_tokens, lane, cfg=cfg)
         if native_tokens:
             turn.meta.extra[NATIVE_TOKENS_META_KEY] = native_tokens
     return ModelTurnResult(

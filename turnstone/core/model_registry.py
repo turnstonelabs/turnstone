@@ -26,6 +26,9 @@ from turnstone.core.admission import ModelAdmission
 from turnstone.core.config import load_config
 from turnstone.core.log import get_logger
 from turnstone.core.providers import (
+    ANTHROPIC_PROTOCOL_PROVIDERS as ANTHROPIC_PROTOCOL_PROVIDERS,
+)
+from turnstone.core.providers import (
     LOCAL_PROVIDERS,
     LLMProvider,
     create_client,
@@ -75,9 +78,9 @@ MODEL_AUTH_TEXT_MAX_LEN = 2048
 # way MODEL_AUTH_TEXT_MAX_LEN is.
 ANTHROPIC_WORKSPACE_ID_MAX_LEN = 128
 
-# Providers whose wire protocol is Anthropic's Messages API — the only lanes on
-# which ``server_compat.anthropic_workspace_id`` is ever sent.
-ANTHROPIC_PROTOCOL_PROVIDERS: frozenset[str] = frozenset({"anthropic", "anthropic-compatible"})
+# ``ANTHROPIC_PROTOCOL_PROVIDERS`` (the Messages-API lanes, the only ones on which
+# ``server_compat.anthropic_workspace_id`` is ever sent) lives in the provider package, where
+# the replay-family rule reads it; it is imported above and the console imports it from here.
 
 
 def anthropic_workspace_id_error(value: str) -> str | None:

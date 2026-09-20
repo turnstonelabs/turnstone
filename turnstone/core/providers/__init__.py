@@ -28,6 +28,7 @@ from turnstone.core.providers._protocol import (
 from turnstone.core.providers._xai import XAI_DEFAULT_BASE_URL, XAIProvider
 
 __all__ = [
+    "ANTHROPIC_PROTOCOL_PROVIDERS",
     "ANTHROPIC_WORKSPACE_HEADER",
     "CompletionResult",
     "ContextWindowExceededError",
@@ -148,6 +149,26 @@ def create_provider(
 # Providers whose models live on an operator-run server: no capability
 # table, the window comes from the endpoint, and a bearer is optional.
 LOCAL_PROVIDERS: frozenset[str] = frozenset({"openai-compatible", "anthropic-compatible"})
+
+
+# Providers whose wire protocol is the Messages API: one provider class under two names (its
+# ``provider_name`` is only its compat flag) with one converter, so a native lane produced under
+# either name replays, verbatim, to a lane under the other; also the only lanes on which
+# ``server_compat.anthropic_workspace_id`` is ever sent.  The model registry re-exports this
+# for the console.
+ANTHROPIC_PROTOCOL_PROVIDERS: frozenset[str] = frozenset({"anthropic", "anthropic-compatible"})
+
+
+def replay_family(producer: str) -> str:
+    """The provider class that replays a native lane produced under *producer*'s name.
+
+    The members of :data:`ANTHROPIC_PROTOCOL_PROVIDERS` are one family: a match on the name
+    alone would drop a lane's charge to zero across a switch between them while the payload
+    stayed the same.  The estimators compare families, not names.  Every other name is its own
+    family.
+    """
+    return "anthropic" if producer in ANTHROPIC_PROTOCOL_PROVIDERS else producer
+
 
 # Bearer an SDK client is built with for a local provider when the
 # definition has no key and the SDK's environment variable is unset. vLLM /

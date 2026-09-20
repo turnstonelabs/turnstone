@@ -1426,12 +1426,12 @@ class AnthropicProvider:
 
     # -- reasoning extraction ------------------------------------------------
 
-    def reasoning_text_parts(
+    def extract_reasoning_text(
         self,
         provider_blocks: list[dict[str, Any]] | None,
-    ) -> list[str]:
+    ) -> str:
         if not isinstance(provider_blocks, list):
-            return []
+            return ""
         parts: list[str] = []
         for block in provider_blocks:
             if not isinstance(block, dict):
@@ -1441,13 +1441,7 @@ class AnthropicProvider:
             text = block.get("thinking")
             if isinstance(text, str) and text:
                 parts.append(text)
-        return parts
-
-    def extract_reasoning_text(
-        self,
-        provider_blocks: list[dict[str, Any]] | None,
-    ) -> str:
-        return _join_reasoning_with_cap(self.reasoning_text_parts(provider_blocks))
+        return _join_reasoning_with_cap(parts)
 
 
 def _merge_extra_headers(wire: dict[str, str] | None, caller: dict[str, str]) -> dict[str, str]:

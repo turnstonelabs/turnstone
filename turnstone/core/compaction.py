@@ -93,13 +93,6 @@ def no_lane_tokens(message: dict[str, Any] | Turn) -> int:
     return 0
 
 
-# The least share of a provider's prompt count that must be text for the count to calibrate
-# the text ratio.  Requests are almost entirely text; a request whose reported lane charge
-# leaves less than this is not a calibration sample.  Exact local charges (an image's fixed
-# figure) are exempt: a request that is mostly images calibrates as it always did.
-CALIBRATION_MIN_TEXT_SHARE = 0.05
-
-
 def calibrated_chars_per_token(
     *,
     prompt_tokens: int,
@@ -111,16 +104,24 @@ def calibrated_chars_per_token(
 ) -> float:
     """Return a provider-anchored text chars/token ratio.
 
-    Fixed token charges (images, a replayed native lane) are subtracted from the
-    provider's count before dividing, and documents contribute to budgeting
-    without polluting the text ratio, matching the foreground estimator's
-    established accounting.  If the provider count cannot yield a positive text
-    denominator, retain ``fallback``.  ``lane_tokens`` is the part of those fixed
-    charges that is a provider's reported figure (the replayed lanes' counts, summed
-    over ``messages``); the text floor below judges the share such a figure leaves,
-    never what this process's own exact charges leave.
+    Fixed token charges (an image's exact figure) are subtracted from the provider's
+    count before dividing, and documents contribute to budgeting without polluting
+    the text ratio, matching the foreground estimator's established accounting.  If
+    the provider count cannot yield a positive text denominator, retain ``fallback``.
+    ``lane_tokens`` is the part of the fixed charges that is a provider's reported
+    figure (the replayed lanes' counts, summed over ``messages``): a request that
+    carries one is not a calibration sample and returns ``fallback`` unchanged.  The
+    count is not this process's, and under reasoning replay off it holds thinking the
+    request never carried, so subtracting it as exact would leave too small a text
+    remainder and send the ratio, and every later estimate, far off.  The ratio keeps
+    its value, which is the default when nothing had calibrated it yet (a reopened or
+    forked workstream whose live history holds a search turn, a task agent whose first
+    reply is one), until compaction removes the lane from the history or a request is
+    served by another replay family.
     """
 
+    if lane_tokens:
+        return fallback
     text_chars = tool_def_chars
     fixed_tokens = 0
     for message in messages:
@@ -129,16 +130,6 @@ def calibrated_chars_per_token(
         fixed_tokens += message_fixed
     text_prompt_tokens = prompt_tokens - fixed_tokens
     if text_prompt_tokens <= 0 or text_chars <= 0:
-        return fallback
-    # The exact local charges come off before the share is judged: only a reported figure can
-    # be wrong, so only the reported lane charge can make the text remainder untrustworthy.
-    reported_tokens = prompt_tokens - (fixed_tokens - lane_tokens)
-    if text_prompt_tokens < reported_tokens * CALIBRATION_MIN_TEXT_SHARE:
-        # The reported lane charge all but exhausts the provider's count: the text left to
-        # divide by is too small a sample to teach the ratio anything, and a misreported
-        # count (a provider's own figure, not this process's) would otherwise collapse the
-        # denominator toward one and send the ratio, and with it the tool-result ceiling,
-        # orders of magnitude off.
         return fallback
     return text_chars / text_prompt_tokens
 
@@ -170,31 +161,32 @@ def accepted_turn_tokens(
 ) -> int:
     """The tokens one accepted assistant turn adds to the next request.
 
-    The provider's completion count is exact for a turn made of text.  A turn that carries a
-    replayed native lane is charged from the measure instead: its text from characters and the
-    lane from the recorded count.  Adding the completion count to the lane would double-charge
-    the model's pre-search output, which the provider counts once as output and once more, fed
-    back into its own next pass, as appended input.  The measure is also what every re-estimate
-    applies, so the exact path and the re-estimate agree.  A missing or zero completion count
-    (no usage, or a gateway that reports none) charges from the measure as well.
+    The provider's completion count covers the turn's text and its thinking under either replay
+    posture.  The measure's fixed bucket is the lane: the provider's own count of what it
+    appended inside the response, charged toward the provider that replays it and 0 toward any
+    other.  The charge is their sum.  The pre-search output the provider fed back into its own
+    next pass sits in both counts, so such a turn is over-charged by that share, bounded by the
+    completion count.  A missing or zero completion count (no usage, or a gateway that reports
+    none) charges from the measure instead: the text from characters plus the fixed tokens.
     """
     text_chars, fixed_tokens, document_chars = measure(turn)
-    if not completion_tokens or fixed_tokens:
+    if not completion_tokens:
         return measured_tokens(
             text_chars, fixed_tokens, document_chars, chars_per_token=chars_per_token
         )
-    return max(1, completion_tokens)
+    return max(1, completion_tokens) + fixed_tokens
 
 
 def measured_tokens(
     text_chars: int, fixed_tokens: int, document_chars: int, *, chars_per_token: float
 ) -> int:
     """One message's token estimate from its measure: the characters at the ratio, plus the
-    fixed tokens as they are, never below one.  The arithmetic :func:`accepted_turn_tokens` and
-    :meth:`PromptTokenEstimator._message_tokens` share, so the accepted charge and the
-    estimator's re-estimate cannot drift apart.  The session's own per-message re-estimate
-    converts fixed tokens to characters at the ratio and divides them back out, which can land
-    one token under this figure at ratios other than the default.
+    fixed tokens as they are, never below one.  The arithmetic
+    :meth:`PromptTokenEstimator._message_tokens` applies to every message and
+    :func:`accepted_turn_tokens` applies to a turn with no completion count, so that fallback
+    charge and the estimator's re-estimate cannot drift apart.  The session's own per-message
+    re-estimate converts fixed tokens to characters at the ratio and divides them back out,
+    which can land one token under this figure at ratios other than the default.
     """
     return max(1, int((text_chars + document_chars) / chars_per_token) + fixed_tokens)
 

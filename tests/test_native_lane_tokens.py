@@ -3,8 +3,9 @@
 A server-side search turn appends result blocks the chars-per-token measure cannot see.  The
 producing call records the provider's own count of what it appended on the assistant turn
 (``native_tokens``), and every estimator charges it like the fixed image charge, only toward the
-provider that replays the lane.  The calibration subtracts it from the served count, so the ratio
-stays honest on every later turn of the workstream.
+provider that replays the lane.  A request that carries such a charge is not a calibration
+sample: the count is the provider's, not this process's, so the ratio keeps its value and stays
+honest on every later turn of the workstream.
 """
 
 from __future__ import annotations
@@ -34,7 +35,6 @@ from tests.test_session import NullUI as SendPathUI
 from turnstone.core.compaction import (
     SummaryResult,
     accepted_turn_tokens,
-    calibrated_chars_per_token,
 )
 from turnstone.core.model_turn import (
     ModelContextLimitError,
@@ -44,9 +44,13 @@ from turnstone.core.model_turn import (
     apply_capability_overrides,
     require_lane_capabilities,
 )
-from turnstone.core.providers import CompletionResult, ModelCapabilities, StreamChunk, UsageInfo
-from turnstone.core.providers._openai_responses import _SERVER_EXECUTED_ITEM_TYPES
-from turnstone.core.providers._protocol import SERVER_RESULT_BLOCK_TYPES
+from turnstone.core.providers import (
+    CompletionResult,
+    ModelCapabilities,
+    StreamChunk,
+    UsageInfo,
+    replay_family,
+)
 from turnstone.core.session import ChatSession
 from turnstone.core.storage import get_storage
 from turnstone.core.storage._utils import _fork_turn_insert_row
@@ -181,182 +185,45 @@ def test_completion_builder_records_nothing_without_an_appended_cost_or_a_lane()
     assert NATIVE_TOKENS_META_KEY not in unbounded.turn.meta.extra
 
 
-def test_completion_builder_discounts_reasoning_the_replay_strips() -> None:
-    """The server feeds the model's pre-search thinking back into its own next pass, so the
-    appended count includes it; with reasoning replay off (the default) the converter never
-    puts those blocks on the wire, so their share, sized from their text at four characters a
-    token, comes off the recorded cost.  With replay on, the whole count stands."""
-    thinking = {"type": "thinking", "thinking": "t" * 4_000, "signature": "sig"}
-    blocks = [thinking, *SEARCH_BLOCKS]
-
-    stripped = _ingest(
-        CompletionResult(content="found it", usage=SEARCH_USAGE, provider_blocks=blocks), _lane()
-    )
-    assert stripped.turn.native_tokens == APPENDED - 1_000
-
-    replayed = _ingest(
-        CompletionResult(content="found it", usage=SEARCH_USAGE, provider_blocks=blocks),
-        _lane(capabilities=ModelCapabilities(supports_reasoning_replay=True)),
-        cfg=SimpleNamespace(replay_reasoning_to_model=True),
-    )
-    assert replayed.turn.native_tokens == APPENDED
-
-
-def test_completion_builder_discounts_only_the_reasoning_the_server_fed_back() -> None:
-    """Only the passes before the last server result were fed back as input, so only the
-    thinking emitted before that block is in the appended count.  Thinking after it is the
-    final pass's output and must not be discounted; with two search rounds the thinking before
-    each result block counts, the trailing block does not."""
+def test_completion_builder_records_the_raw_count_in_either_replay_posture() -> None:
+    """The count is the provider's own, taken as reported.  The thinking and text the model
+    emitted before the search, which the provider fed back into its own next pass, are neither
+    discounted nor added, and the reasoning-replay posture never enters: a recorded turn stays
+    right when the operator toggles the setting or moves to a same-provider alias with the other
+    one.  The accepted turn is charged this count beside its completion count; the fed-back
+    output sits in both, so the turn is over-charged by that share, bounded by its completion
+    count.  A count at the lane's window is kept whole: the refusal above it is the only bound."""
     early = {"type": "thinking", "thinking": "a" * 4_000, "signature": "s1"}
-    middle = {"type": "thinking", "thinking": "b" * 2_000, "signature": "s2"}
-    late = {"type": "thinking", "thinking": "c" * 40_000, "signature": "s3"}
-    result_block = SEARCH_BLOCKS[1]
-    call_block = SEARCH_BLOCKS[0]
-    text = SEARCH_BLOCKS[2]
-
-    trailing = _ingest(
-        CompletionResult(
-            content="found it",
-            usage=SEARCH_USAGE,
-            provider_blocks=[early, call_block, result_block, late, text],
-        ),
-        _lane(),
-    )
-    assert trailing.turn.native_tokens == APPENDED - 1_000
-
-    two_rounds = _ingest(
-        CompletionResult(
-            content="found it",
-            usage=SEARCH_USAGE,
-            provider_blocks=[
-                early,
-                call_block,
-                result_block,
-                middle,
-                call_block,
-                result_block,
-                late,
-                text,
-            ],
-        ),
-        _lane(),
-    )
-    assert two_rounds.turn.native_tokens == APPENDED - 1_000 - 500
-
-    # A response with no server result block fed nothing back: no discount at all.
-    no_results = _ingest(
-        CompletionResult(content="found it", usage=SEARCH_USAGE, provider_blocks=[late, text]),
-        _lane(),
-    )
-    assert no_results.turn.native_tokens == APPENDED
-
-    # A result block at index 0 has nothing before it: nothing to discount.
-    leading_result = _ingest(
-        CompletionResult(
-            content="found it",
-            usage=SEARCH_USAGE,
-            provider_blocks=[result_block, late, text],
-        ),
-        _lane(),
-    )
-    assert leading_result.turn.native_tokens == APPENDED
-
-
-def test_completion_builder_adds_replayed_trailing_reasoning() -> None:
-    """With reasoning replay on, the final pass's thinking is replayed too, and no other
-    term counts it (the appended count omits final-pass output; the accepted turn's charge
-    reads text from characters): it goes on to the recorded cost.  Without a server result
-    block nothing was fed back and nothing is added, and the total is clamped to the window."""
-    replay_on = _lane(capabilities=ModelCapabilities(supports_reasoning_replay=True))
-    cfg = SimpleNamespace(replay_reasoning_to_model=True)
-    late = {"type": "thinking", "thinking": "c" * 40_000, "signature": "s3"}
-    call_block, result_block, text = SEARCH_BLOCKS
-
-    trailing = _ingest(
-        CompletionResult(
-            content="found it",
-            usage=SEARCH_USAGE,
-            provider_blocks=[call_block, result_block, late, text],
-        ),
-        replay_on,
-        cfg=cfg,
-    )
-    assert trailing.turn.native_tokens == APPENDED + 10_000
-
-    no_results = _ingest(
-        CompletionResult(content="found it", usage=SEARCH_USAGE, provider_blocks=[late, text]),
-        replay_on,
-        cfg=cfg,
-    )
-    assert no_results.turn.native_tokens == APPENDED
-
-    near_window = UsageInfo(
-        prompt_tokens=200_000,
-        completion_tokens=5,
-        total_tokens=200_005,
-        served_prompt_tokens=5_000,
-        appended_prompt_tokens=195_000,
-        prompt_tokens_cumulative=True,
-    )
-    clamped = _ingest(
-        CompletionResult(
-            content="found it",
-            usage=near_window,
-            provider_blocks=[call_block, result_block, late, text],
-        ),
-        _lane(
-            capabilities=ModelCapabilities(context_window=200_000, supports_reasoning_replay=True)
-        ),
-        cfg=cfg,
-    )
-    assert clamped.turn.native_tokens == 200_000
-
-
-def test_completion_builder_discounts_text_the_model_emitted_before_the_search() -> None:
-    """Text before the last server result is in the turn's content, measured from characters,
-    and inside the appended count, which the provider fed back: it comes off the recorded
-    cost in both replay postures."""
     preface = {"type": "text", "text": "p" * 40}
     call_block, result_block, text = SEARCH_BLOCKS
-    blocks = [preface, call_block, result_block, text]
+    late = {"type": "thinking", "thinking": "c" * 40_000, "signature": "s3"}
+    blocks = [early, preface, call_block, result_block, late, text]
 
     replay_off = _ingest(
         CompletionResult(content="found it", usage=SEARCH_USAGE, provider_blocks=blocks), _lane()
     )
-    assert replay_off.turn.native_tokens == APPENDED - 10
+    assert replay_off.turn.native_tokens == APPENDED
 
     replay_on = _ingest(
         CompletionResult(content="found it", usage=SEARCH_USAGE, provider_blocks=blocks),
         _lane(capabilities=ModelCapabilities(supports_reasoning_replay=True)),
         cfg=SimpleNamespace(replay_reasoning_to_model=True),
     )
-    assert replay_on.turn.native_tokens == APPENDED - 10
+    assert replay_on.turn.native_tokens == APPENDED
 
-
-def test_server_result_block_types_cover_the_responses_adapter_set() -> None:
-    """The completion builder scopes its discount by the shared set; the Responses adapter
-    flags cumulative usage by its own, deliberately narrow, set.  An item the adapter flags
-    but the builder does not recognise would be charged whole with no discount."""
-    assert _SERVER_EXECUTED_ITEM_TYPES <= SERVER_RESULT_BLOCK_TYPES
-
-
-def test_completion_builder_sizes_the_discount_uncapped() -> None:
-    """The discount is sized from the raw blocks, not the display extractor, whose output is
-    capped for the UI: a thinking body far beyond the display cap is discounted whole."""
-    huge = {"type": "thinking", "thinking": "t" * 400_000, "signature": "sig"}
-    usage = UsageInfo(
-        prompt_tokens=200_000,
+    at_window = UsageInfo(
+        prompt_tokens=205_000,
         completion_tokens=5,
-        total_tokens=200_005,
-        served_prompt_tokens=20_000,
-        appended_prompt_tokens=110_000,
+        total_tokens=205_005,
+        served_prompt_tokens=5_000,
+        appended_prompt_tokens=200_000,
         prompt_tokens_cumulative=True,
     )
-    result = _ingest(
-        CompletionResult(content="found it", usage=usage, provider_blocks=[huge, *SEARCH_BLOCKS]),
-        _lane(),
+    kept = _ingest(
+        CompletionResult(content="found it", usage=at_window, provider_blocks=blocks),
+        _lane(capabilities=ModelCapabilities(context_window=200_000)),
     )
-    assert result.turn.native_tokens == 110_000 - 100_000
+    assert kept.turn.native_tokens == 200_000
 
 
 def test_completion_builder_refuses_a_count_above_the_lane_window() -> None:
@@ -432,6 +299,33 @@ def test_completion_builder_logs_a_refused_count(caplog: pytest.LogCaptureFixtur
     assert log_has_field(record, "alias", "fable")
 
 
+def test_completion_builder_holds_the_lane_window_under_the_decoder_cap(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An operator row can name a window above the decoder's cap; a count between the two is
+    refused through the same logged warning, carrying the cap as the bound applied and the
+    row's window beside it, instead of being dropped silently by the decoder."""
+    between = UsageInfo(
+        prompt_tokens=NATIVE_TOKENS_CAP + 60_000,
+        completion_tokens=5,
+        total_tokens=NATIVE_TOKENS_CAP + 60_005,
+        served_prompt_tokens=50_000,
+        appended_prompt_tokens=NATIVE_TOKENS_CAP + 10_000,
+        prompt_tokens_cumulative=True,
+    )
+    row_window = NATIVE_TOKENS_CAP + 1_000_000
+    with caplog.at_level(logging.WARNING):
+        result = _ingest(
+            CompletionResult(content="ok", usage=between, provider_blocks=SEARCH_BLOCKS),
+            _lane(capabilities=ModelCapabilities(context_window=200_000)),
+            cfg=SimpleNamespace(context_window=row_window, replay_reasoning_to_model=False),
+        )
+    assert NATIVE_TOKENS_META_KEY not in result.turn.meta.extra
+    record = next(r for r in caplog.records if "native_lane.count_refused" in r.getMessage())
+    assert log_has_field(record, "context_window", NATIVE_TOKENS_CAP)
+    assert log_has_field(record, "lane_window", row_window)
+
+
 def test_completion_builder_records_nothing_on_a_lane_with_no_known_window(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -449,6 +343,44 @@ def test_completion_builder_records_nothing_on_a_lane_with_no_known_window(
     assert NATIVE_TOKENS_META_KEY not in result.turn.meta.extra
     record = next(r for r in caplog.records if "native_lane.count_refused" in r.getMessage())
     assert log_has_field(record, "context_window", 0)
+
+
+def test_completion_builder_records_nothing_when_the_blank_id_collapse_drops_the_lane() -> None:
+    """A client tool call with a blank id that cannot be paired collapses the lane to the
+    synthesized reasoning block: the search blocks the appended count paid for are dropped and
+    nothing of that lane is replayed, so no count is recorded.  The same completion with a
+    pairable mirror keeps the search blocks and the count."""
+    search_and_tool = [*SEARCH_BLOCKS, {"type": "tool_use", "id": "", "name": "bash", "input": {}}]
+    blank_call = {"id": "", "type": "function", "function": {"name": "bash", "arguments": "{}"}}
+
+    collapsed = _ingest(
+        CompletionResult(
+            content="ok",
+            tool_calls=[blank_call, dict(blank_call)],
+            usage=SEARCH_USAGE,
+            provider_blocks=[dict(b) for b in search_and_tool],
+            reasoning="thinking it over",
+        ),
+        _lane(),
+    )
+    assert collapsed.turn.native is not None
+    assert [b["type"] for b in collapsed.turn.native.blocks] == ["reasoning_text"]
+    assert NATIVE_TOKENS_META_KEY not in collapsed.turn.meta.extra
+    assert collapsed.turn.native_tokens == 0
+
+    paired = _ingest(
+        CompletionResult(
+            content="ok",
+            tool_calls=[blank_call],
+            usage=SEARCH_USAGE,
+            provider_blocks=[dict(b) for b in search_and_tool],
+            reasoning="thinking it over",
+        ),
+        _lane(),
+    )
+    assert paired.turn.native is not None
+    assert any(b["type"] == "web_search_tool_result" for b in paired.turn.native.blocks)
+    assert paired.turn.native_tokens == APPENDED
 
 
 def test_turn_that_lost_its_lane_carries_no_cost() -> None:
@@ -592,6 +524,30 @@ def test_session_char_count_follows_the_active_provider() -> None:
     assert session._msg_char_count(turn) == text_chars
 
 
+@pytest.mark.parametrize(
+    ("producer", "replay_producer"),
+    [("anthropic", "anthropic-compatible"), ("anthropic-compatible", "anthropic")],
+)
+def test_lane_charge_follows_the_replay_family(producer: str, replay_producer: str) -> None:
+    """The two Anthropic-protocol names are one provider class with one converter, which
+    replays a stored lane by block shape: a turn produced under either name is replayed, and
+    charged, toward both, in both message forms.  Toward a provider of another family the turn
+    is rebuilt from its text and charges nothing."""
+    assert replay_family(producer) == replay_family(replay_producer) == "anthropic"
+    assert replay_family("openai") == "openai"
+    turn = _search_turn(producer=producer)
+    msg = turn_to_dict(turn)
+
+    assert ChatSession._lane_tokens(turn, replay_producer=replay_producer) == APPENDED
+    assert ChatSession._lane_tokens(msg, replay_producer=replay_producer) == APPENDED
+    assert ChatSession._lane_tokens(turn, replay_producer=producer) == APPENDED
+    assert ChatSession._msg_text_chars(msg, replay_producer=replay_producer)[1] == APPENDED
+
+    assert ChatSession._lane_tokens(turn, replay_producer="openai") == 0
+    assert ChatSession._lane_tokens(msg, replay_producer="openai") == 0
+    assert ChatSession._lane_tokens({"role": "assistant", "content": "x"}, replay_producer="x") == 0
+
+
 def test_activating_a_lane_names_its_provider_for_the_charge() -> None:
     session = make_session()
     session._active_replay_producer = None
@@ -619,8 +575,12 @@ def test_wire_preparation_keeps_the_lane_cost_on_the_assistant_dict() -> None:
     assert assistant["_producer"] == "anthropic"
 
 
-def test_calibration_subtracts_the_replayed_lane_for_the_serving_provider() -> None:
+def test_calibration_skips_a_request_replaying_a_lane_toward_the_serving_provider() -> None:
+    """Toward the provider that replays the lane the request carries a charged lane and is
+    not a calibration sample; toward another provider the lane is not charged and the
+    request calibrates as any text request does."""
     session = make_session()
+    ratio_before = session._chars_per_token
     served_msgs = [
         {"role": "user", "content": "search for it"},
         turn_to_dict(_search_turn()),
@@ -631,14 +591,20 @@ def test_calibration_subtracts_the_replayed_lane_for_the_serving_provider() -> N
 
     session._last_usage = {"prompt_tokens": 54_000, "completion_tokens": 10}
     session._update_token_table(
-        msgs=served_msgs, tool_def_chars=tool_chars, producer="anthropic", native_tokens=0
+        msgs=served_msgs,
+        tool_def_chars=tool_chars,
+        bound=session._message_measure("anthropic"),
+        native_tokens=0,
     )
-    assert session._chars_per_token == (served_chars + tool_chars) / (54_000 - APPENDED)
+    assert session._chars_per_token == ratio_before
 
     # Another provider rebuilds the turn from its text and never sends the blocks.
     session._last_usage = {"prompt_tokens": 54_000, "completion_tokens": 10}
     session._update_token_table(
-        msgs=served_msgs, tool_def_chars=tool_chars, producer="openai", native_tokens=0
+        msgs=served_msgs,
+        tool_def_chars=tool_chars,
+        bound=session._message_measure("openai"),
+        native_tokens=0,
     )
     assert session._chars_per_token == (served_chars + tool_chars) / 54_000
 
@@ -646,7 +612,8 @@ def test_calibration_subtracts_the_replayed_lane_for_the_serving_provider() -> N
 def test_anchor_covers_the_request_and_the_turn_carries_the_appended_cost() -> None:
     """The live shape end to end inside the session: the calibration anchors on what
     the request carried, the slot shows the next request's context, and the assistant
-    turn's estimate is its text plus the lane, so the anchored estimate equals the sum."""
+    turn's estimate is its completion count plus the lane, so the anchored estimate equals
+    the sum."""
     session = make_session()
     session._active_replay_producer = "anthropic"
     session._last_usage = {
@@ -660,7 +627,10 @@ def test_anchor_covers_the_request_and_the_turn_carries_the_appended_cost() -> N
     # (95,483 + len("user") + 37) / 23,881.
     served = [{"role": "user", "content": "x" * 95_483}]
     session._update_token_table(
-        msgs=served, tool_def_chars=37, producer="anthropic", native_tokens=APPENDED
+        msgs=served,
+        tool_def_chars=37,
+        bound=session._message_measure("anthropic"),
+        native_tokens=APPENDED,
     )
 
     assert session._chars_per_token == 4.0
@@ -672,25 +642,25 @@ def test_anchor_covers_the_request_and_the_turn_carries_the_appended_cost() -> N
     assert session._last_usage["billed_prompt_tokens"] == SEARCH_USAGE.prompt_tokens
     assert session._assistant_pending_tokens == COMPLETION
 
-    # The accepted turn is charged its text from characters plus the lane from the
-    # recorded count, not the completion count plus the lane: the completion count
-    # also holds the pre-search output the provider fed back as appended input.
+    # The accepted turn is charged its completion count plus the lane's recorded count:
+    # the completion count holds the turn's text and thinking, the lane the results and
+    # the output the provider fed back into its own next pass.
     turn = _search_turn()
-    text_tokens = int((len("found it") + len("assistant")) / 4.0)
     charge = accepted_turn_tokens(
         turn,
         completion_tokens=session._assistant_pending_tokens,
         measure=session._message_measure("anthropic").measure,
         chars_per_token=session._chars_per_token,
     )
-    assert charge == text_tokens + APPENDED
-    assert charge < COMPLETION + APPENDED
+    assert charge == COMPLETION + APPENDED
     session.messages.append(turn)
     session._msg_tokens.append(charge)
     assert session._estimated_prompt_tokens() == SERVED + charge
 
-    # A re-estimate from characters (a lane switch and back) lands on the same figure.
-    assert int(session._msg_char_count(turn) / session._chars_per_token) == charge
+    # A re-estimate from characters (a lane switch and back) charges the same lane, with
+    # the text at the ratio standing in for the completion count.
+    text_tokens = int((len("found it") + len("assistant")) / 4.0)
+    assert int(session._msg_char_count(turn) / session._chars_per_token) == text_tokens + APPENDED
 
 
 def test_slot_adds_the_charge_the_accepted_turn_carries() -> None:
@@ -709,7 +679,7 @@ def test_slot_adds_the_charge_the_accepted_turn_carries() -> None:
     session._update_token_table(
         msgs=[{"role": "user", "content": "search for it"}],
         tool_def_chars=37,
-        producer="anthropic",
+        bound=session._message_measure("anthropic"),
         native_tokens=0,
     )
     assert session._last_usage["prompt_tokens"] == SERVED
@@ -724,8 +694,10 @@ def test_slot_adds_the_charge_the_accepted_turn_carries() -> None:
 
 def test_run_loop_charges_and_persists_the_lane(tmp_db: Any) -> None:
     """One accepted search turn through the real seam: the completion builder records
-    the cost, the append charges text plus lane, the slot shows the next request's
-    context, and the row carries the cost for a resume."""
+    the cost, the append charges the completion count plus the lane, the slot shows the
+    next request's context, and the row carries the cost for a resume.  The next request
+    goes to the other Anthropic-protocol name, one replay family with the producer, so the
+    lane is charged toward it and the request that carries it is not a calibration sample."""
     session = make_registered_session(ui=SendPathUI(), context_window=200_000)
     session._title_generated = True
     provider = scripted_provider(
@@ -738,13 +710,14 @@ def test_run_loop_charges_and_persists_the_lane(tmp_db: Any) -> None:
             )
         ]
     )
+    provider.provider_name = "anthropic"
     replace_session_lane(session, provider=provider, capabilities=ModelCapabilities())
 
     session.send("search for it")
 
     turn = session.messages[-1]
     assert turn.native is not None
-    assert turn.native.producer == provider.provider_name
+    assert turn.native.producer == "anthropic"
     assert turn.native_tokens == APPENDED
     charge = accepted_turn_tokens(
         turn,
@@ -752,7 +725,7 @@ def test_run_loop_charges_and_persists_the_lane(tmp_db: Any) -> None:
         measure=session._message_measure(provider.provider_name).measure,
         chars_per_token=session._chars_per_token,
     )
-    assert APPENDED < charge < APPENDED + COMPLETION
+    assert charge == COMPLETION + APPENDED
     assert session._msg_tokens[-1] == charge
     assert session._last_usage is not None
     assert session._last_usage["prompt_tokens"] == SERVED + APPENDED
@@ -764,9 +737,10 @@ def test_run_loop_charges_and_persists_the_lane(tmp_db: Any) -> None:
     rows = get_storage().load_message_turns(session._ws_id)
     assert rows[-1].native_tokens == APPENDED
 
-    # The next request replays the lane.  Its plain usage counts the whole
-    # context, and the calibration on that served wire divides the wire's
-    # characters by the count minus the lane, not by the whole count.
+    # The next request replays the lane, served under the other name of the same
+    # family.  Its plain usage counts the whole context, and the calibration on that
+    # served wire divides the wire's characters by the count minus the lane, not by
+    # the whole count.
     next_prompt = SERVED + COMPLETION + APPENDED + 50
     plain = scripted_provider(
         [
@@ -779,35 +753,29 @@ def test_run_loop_charges_and_persists_the_lane(tmp_db: Any) -> None:
             )
         ]
     )
+    plain.provider_name = "anthropic-compatible"
     replace_session_lane(session, provider=plain, capabilities=ModelCapabilities())
 
+    ratio_before = session._chars_per_token
     session.send("and now?")
 
+    assert session._lane_tokens(turn, replay_producer=plain.provider_name) == APPENDED
+
+    # The request that replays the lane carried a charged lane, so it was not a calibration
+    # sample: the ratio keeps its value.
     served_wire = session._prepare_wire_messages(
         session.system_messages + dicts_from_turns(session.messages[:-1])
     )
-    with_lane = calibrated_chars_per_token(
-        prompt_tokens=next_prompt,
-        messages=served_wire,
-        tool_def_chars=session._tool_def_chars(),
-        measure=session._message_measure(plain.provider_name).measure,
-        fallback=-1.0,
-    )
-    without_lane = calibrated_chars_per_token(
-        prompt_tokens=next_prompt,
-        messages=served_wire,
-        tool_def_chars=session._tool_def_chars(),
-        measure=session._message_measure(None).measure,
-        fallback=-1.0,
-    )
-    assert with_lane != without_lane
-    assert session._chars_per_token == with_lane
+    bound = session._message_measure(plain.provider_name)
+    assert sum(bound.lane(message) for message in served_wire) == APPENDED
+    assert session._chars_per_token == ratio_before
 
 
 def test_accepted_turn_charge_rule() -> None:
-    """One rule for the session and the task-agent estimator: a text turn costs its exact
-    completion count; a turn that replays a native lane costs its text from characters plus
-    the lane's recorded count; no completion count at all falls back to characters."""
+    """One rule for the session and the task-agent estimator: a turn costs its exact
+    completion count plus the lane's recorded count toward the provider that replays the
+    lane (0 for a text turn); no completion count at all falls back to characters plus the
+    lane."""
     session = make_session()
     measure = session._message_measure("anthropic").measure
     plain = Turn.assistant("just text")
@@ -823,6 +791,10 @@ def test_accepted_turn_charge_rule() -> None:
         accepted_turn_tokens(
             search, completion_tokens=COMPLETION, measure=measure, chars_per_token=4.0
         )
+        == COMPLETION + APPENDED
+    )
+    assert (
+        accepted_turn_tokens(search, completion_tokens=0, measure=measure, chars_per_token=4.0)
         == int((len("found it") + len("assistant")) / 4.0) + APPENDED
     )
     # Toward a provider that does not replay the lane, the turn is text only.

@@ -22,7 +22,6 @@ if TYPE_CHECKING:
 
 from tests._session_helpers import make_result, make_session
 from turnstone.core.compaction import (
-    CALIBRATION_MIN_TEXT_SHARE,
     CompactionEngine,
     PromptTokenEstimator,
     SummaryResult,
@@ -154,10 +153,11 @@ def test_agent_badge_paints_the_anchor_plus_the_accepted_turn_charge(native_toke
 
 
 def test_estimator_charges_fixed_tokens_the_measure_reports() -> None:
-    """The measure's middle figure is tokens already known exactly (an image's
-    fixed charge, a replayed native lane's provider count): a re-estimate from
-    characters adds them as they are, and the calibration subtracts them from the
-    provider's count before dividing, so they neither teach nor skew the ratio."""
+    """The measure's middle figure is fixed tokens (an image's exact charge, a replayed
+    native lane's provider count): a re-estimate from characters adds them as they are,
+    and the calibration subtracts the exact charges from the provider's count before
+    dividing, so they neither teach nor skew the ratio (a lane charge, reported to the
+    estimator through its lane reader, disqualifies the sample instead)."""
 
     def measure(message: dict[str, Any] | Turn) -> tuple[int, int, int]:
         assert isinstance(message, dict)
@@ -176,48 +176,39 @@ def test_estimator_charges_fixed_tokens_the_measure_reports() -> None:
     assert estimator.chars_per_token == 800 / 200
 
 
-def test_calibration_refuses_a_count_the_fixed_charges_all_but_exhaust() -> None:
-    """A lane count is the provider's own figure, not this process's count.  When it
-    leaves less than the minimum text share of the prompt count, the sample teaches the
-    ratio nothing and a misreported figure would collapse the denominator toward one, so
-    the calibration keeps its fallback."""
+def test_calibration_skips_a_request_that_carries_a_charged_lane() -> None:
+    """A lane count is the provider's own figure, not this process's count, and under
+    reasoning replay off it holds thinking the request never carried.  Subtracting it as
+    exact would leave too small a text remainder and send the ratio, and every later
+    estimate, far off, so a request that carries one teaches the ratio nothing: the
+    calibration keeps its fallback, whatever share of the count the lane is.  This pins
+    the current rule, not an invariant: a later rule that knows a lane replays whole may
+    calibrate such a request."""
 
     def measure(message: dict[str, Any] | Turn) -> tuple[int, int, int]:
         assert isinstance(message, dict)
         return len(str(message["content"])), int(message.get("_fixed", 0)), 0
 
-    messages = [{"role": "assistant", "content": "y" * 4_000, "_fixed": 29_999}]
-    collapsed = calibrated_chars_per_token(
-        prompt_tokens=30_000,
-        messages=messages,
-        tool_def_chars=0,
-        measure=measure,
-        fallback=4.0,
-        lane_tokens=29_999,
-    )
-    assert collapsed == 4.0
-
-    # At the floor the sample counts: 4,000 chars over 1,500 text tokens.
-    floor = int(30_000 * CALIBRATION_MIN_TEXT_SHARE)
-    messages = [{"role": "assistant", "content": "y" * 4_000, "_fixed": 30_000 - floor}]
-    assert (
-        calibrated_chars_per_token(
-            prompt_tokens=30_000,
-            messages=messages,
-            tool_def_chars=0,
-            measure=measure,
-            fallback=4.0,
-            lane_tokens=30_000 - floor,
+    for lane in (29_999, 500):
+        messages = [{"role": "assistant", "content": "y" * 4_000, "_fixed": lane}]
+        assert (
+            calibrated_chars_per_token(
+                prompt_tokens=30_000,
+                messages=messages,
+                tool_def_chars=0,
+                measure=measure,
+                fallback=4.0,
+                lane_tokens=lane,
+            )
+            == 4.0
         )
-        == 4_000 / floor
-    )
 
 
-def test_calibration_exempts_exact_local_charges_from_the_text_floor() -> None:
+def test_calibration_uses_exact_local_charges_as_they_are() -> None:
     """An image's fixed figure is this process's own exact count, not a reported one, so a
     request whose images outweigh its text still calibrates as it always did: three images
-    and 404 characters against a provider count of 3,101 divide to 4.0, and the floor judges
-    only the share a reported lane charge leaves."""
+    and 404 characters against a provider count of 3,101 divide to 4.0.  Only a reported
+    lane charge makes a request unusable as a sample."""
 
     def measure(message: dict[str, Any] | Turn) -> tuple[int, int, int]:
         assert isinstance(message, dict)
@@ -284,9 +275,9 @@ def test_agent_estimate_charges_the_native_lane_on_its_turn(native_tokens: int) 
 
 def test_agent_measure_bound_to_its_lane_agrees_with_the_exact_charge() -> None:
     """The exact charge on append and the character re-estimate charge the same lane:
-    both read the turn's recorded cost, one directly and one through the measure bound
-    to the agent lane's provider.  A measure bound to another provider charges nothing,
-    because that provider rebuilds the turn from its text."""
+    both read the turn's recorded cost, one beside the completion count and one through
+    the measure bound to the agent lane's provider.  A measure bound to another provider
+    charges nothing, because that provider rebuilds the turn from its text."""
     session = make_session()
     bound = session._message_measure("anthropic")
     estimator = PromptTokenEstimator(
@@ -302,13 +293,18 @@ def test_agent_measure_bound_to_its_lane_agrees_with_the_exact_charge() -> None:
     )
     turn.meta.extra[NATIVE_TOKENS_META_KEY] = 29_910
     charged = estimator.append_accepted(turn, 2)
-    # Text from characters plus the lane, not the completion count plus the lane.
-    assert charged == int((len("found it") + len("assistant")) / 4.0) + 29_910
+    # The completion count plus the lane's recorded count, as it is.
+    assert charged == 2 + 29_910
     anchored = estimator.estimate([*request, turn])
     assert anchored == 1_000 + charged
 
     estimator.invalidate()
-    assert estimator.estimate([*request, turn]) == anchored
+    # The re-estimate from characters charges the same lane; only the text term differs,
+    # the characters at the ratio standing in for the completion count.
+    text_tokens = int((len("found it") + len("assistant")) / estimator.chars_per_token)
+    assert estimator.tokens_for([turn]) == text_tokens + 29_910
+    re_estimated = estimator.estimate([*request, turn])
+    assert re_estimated == estimator.estimate(request) + text_tokens + 29_910
 
     foreign = PromptTokenEstimator(
         measure=session._message_measure("openai").measure, tool_def_chars=0, chars_per_token=4.0

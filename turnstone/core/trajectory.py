@@ -484,8 +484,10 @@ def assistant_meta_envelope(turn: Turn) -> dict[str, Any]:
     """The well-known keys an ASSISTANT turn persists in its row's ``meta`` column.
 
     The producing call's provenance and the native lane's replay cost travel together: the
-    one builder every writer uses (the live save path, the atomic fork clone), mirrored on
-    the read side by the storage decoder, so a key added here reaches every copy of the row.
+    builder the live save path and the atomic fork clone use, mirrored on the read side by
+    the storage decoder, so a key added here reaches both copies of a turn's row.  Rows
+    written without a native lane by construction (a cancelled partial reply, a compaction
+    summary marker) persist their provenance by hand and do not pass through here.
     """
     envelope: dict[str, Any] = {}
     provenance = TurnProvenance.from_meta(turn.meta.extra.get(PROVENANCE_META_KEY))

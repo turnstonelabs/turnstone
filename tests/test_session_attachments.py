@@ -1088,12 +1088,13 @@ class TestByReferenceMediaBudget:
                 {"kind": "image", "size_bytes": 99},
             ],
         }
-        _text, images, doc_chars = ChatSession._msg_text_chars(msg, replay_producer=None)
-        # pdf + audio each capped at 16_000; text counted in full; image excluded
-        # (a real by-reference image is charged a fixed image budget in the
-        # content loop, so counting it here too would double-charge).
+        _text, fixed_tokens, doc_chars = ChatSession._msg_text_chars(msg, replay_producer=None)
+        # pdf + audio each capped at 16_000; text counted in full; the by-reference
+        # image adds neither document characters nor a fixed charge here (the content
+        # loop charges a real image part its fixed budget, so charging it here too
+        # would double-charge).
         assert doc_chars == 16_000 + 16_000 + 500
-        assert images == 0
+        assert fixed_tokens == 0
 
     def test_inline_document_keeps_sibling_audio_charge(self):
         document = {

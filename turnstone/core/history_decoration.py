@@ -309,20 +309,8 @@ def extract_reasoning_text_from_provider_content(provider_content: Any) -> str:
     this directly.  See ``_BLOCK_TYPE_PROVIDER_FACTORY`` above for the
     recognised block types and the providers that own them.
     """
-    provider = _owning_provider(provider_content)
-    return "" if provider is None else provider.extract_reasoning_text(provider_content)
-
-
-def _owning_provider(provider_content: Any) -> LLMProvider | None:
-    """The provider whose reasoning block type appears first in ``provider_content``.
-
-    The one scan behind both reasoning readers: it walks the whole list rather than inspecting
-    the first block, because the OpenAI Responses streaming layer captures every
-    ``output_item.done`` item into ``provider_blocks`` and the order is not guaranteed.  ``None``
-    for empty, missing or unrecognised input.
-    """
     if not isinstance(provider_content, list) or not provider_content:
-        return None
+        return ""
     for block in provider_content:
         if not isinstance(block, dict):
             continue
@@ -331,22 +319,8 @@ def _owning_provider(provider_content: Any) -> LLMProvider | None:
             continue
         factory = _BLOCK_TYPE_PROVIDER_FACTORY.get(block_type)
         if factory is not None:
-            return factory()
-    return None
-
-
-def reasoning_text_chars(provider_content: Any) -> int:
-    """Size the reasoning text in ``provider_content``, uncapped, for token arithmetic.
-
-    Same dispatch as :func:`extract_reasoning_text_from_provider_content`, but sums the
-    owning provider's raw parts instead of joining and capping them for display, so a large
-    thinking body is measured whole and no omission marker is counted.  Separators between
-    parts are not counted.  ``0`` for empty, missing or unrecognised input.
-    """
-    provider = _owning_provider(provider_content)
-    if provider is None:
-        return 0
-    return sum(len(part) for part in provider.reasoning_text_parts(provider_content))
+            return factory().extract_reasoning_text(provider_content)
+    return ""
 
 
 def extract_reasoning_for_history(

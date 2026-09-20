@@ -45,9 +45,6 @@ class _StubProvider:
     def convert_tools(self, tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
         return tools
 
-    def reasoning_text_parts(self, provider_blocks: list[dict[str, Any]] | None) -> list[str]:
-        return []
-
     def extract_reasoning_text(self, provider_blocks: list[dict[str, Any]] | None) -> str:
         return ""
 
