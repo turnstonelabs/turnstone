@@ -48,6 +48,16 @@ var ATTACH_DEFAULT_ACCEPT =
 
 var AUTO_RESIZE_MAX_PX = 200;
 
+// Engines with CSS field-sizing fit the textarea to its content natively
+// (chat.css .composer-input--autosize).  Elsewhere autoResize measures: it
+// collapses the field to height:auto and reads scrollHeight, a forced
+// synchronous layout on every keystroke that also re-lays out the pane's
+// message list whenever the collapse moves the composer (a multi-line draft).
+var NATIVE_FIELD_SIZING =
+  typeof CSS !== "undefined" &&
+  typeof CSS.supports === "function" &&
+  CSS.supports("field-sizing", "content");
+
 function isTouchDevice() {
   return window.matchMedia("(hover: none) and (pointer: coarse)").matches;
 }
@@ -297,6 +307,12 @@ Composer.prototype._buildInput = function (row, opts) {
   this.inputEl = document.createElement("textarea");
   this.inputEl.className = "composer-input";
   this.inputEl.rows = opts.rows && opts.rows > 0 ? opts.rows : 1;
+  // Content sizing ignores `rows`, so only a one-row field sizes natively; a
+  // taller one keeps the measuring path, whose collapse floors at its rows.
+  this._fitsNatively =
+    this._autoResizeEnabled && NATIVE_FIELD_SIZING && this.inputEl.rows === 1;
+  if (this._fitsNatively)
+    this.inputEl.classList.add("composer-input--autosize");
   var defaultPlaceholder = this._isTouch
     ? "Type a message\u2026"
     : "Type a message\u2026 (Shift+Enter for newline)";
@@ -633,6 +649,12 @@ Composer.prototype._fireSend = function () {
 
 Composer.prototype.autoResize = function () {
   if (!this._autoResizeEnabled) return;
+  if (this._fitsNatively) {
+    // CSS sizes the field.  Only drop an inline height a drag-resize left
+    // behind, so the next edit re-fits the content as the measuring path does.
+    if (this.inputEl.style.height) this.inputEl.style.height = "";
+    return;
+  }
   this.inputEl.style.height = "auto";
   this.inputEl.style.height =
     Math.min(this.inputEl.scrollHeight, AUTO_RESIZE_MAX_PX) + "px";
