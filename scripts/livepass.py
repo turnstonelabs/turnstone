@@ -134,22 +134,19 @@ Copy harness (/copy/livepass.html): the copy-to-clipboard affordances — the
   and light theme paints) — judge the dark floating button from &bare=1
   and the ✓ state from the light shot.  &stepmax=N bisects a paint
   regression to the interaction that triggers it.
-Perf harness (/perf/livepass.html): long-session performance baseline for the
-  interactive pane — mounts the REAL InteractivePane at real scroll geometry
-  (fixed-height mount, production CSS chain) and drives production-shaped
-  events through pane.handleEvent/replayHistory with rAF yields, measuring:
-  replayHistory wall time at N messages, live event-storm cost per turn on top
-  of that transcript (reasoning/content deltas + tool batches + task_agent
-  cards), tool_output_chunk throughput, busy/idle churn, heap + node count +
-  _agentCards size across repeated replay cycles (leak probe), and longtask
-  counts.  Query params: ?n= (history size) &turns= &chunks= &cycles= &idle=
-  &post=1 (POST the JSON report to /perf/report — the --perf runner captures
-  it).  Results land in <pre id="perf-json"> and document.title stamps
-  PERF-READY-<n> / PERF-FAILED-<phase>.  MEASUREMENT RULES: never run with
-  --virtual-time-budget (it corrupts performance.now) and never pass
-  --force-prefers-reduced-motion (it disables the animations whose cost we
-  measure); the --perf runner passes --js-flags=--expose-gc and
-  --enable-precise-memory-info so heap numbers are stable and real.
+Perf harness (/perf/livepass.html): long-session performance baseline for the interactive pane —
+  mounts the REAL InteractivePane inside the production shell chain (grids, CSS) and drives
+  production-shaped events through pane.handleEvent/replayHistory with rAF yields, measuring:
+  replayHistory wall time at N messages, composer keystroke cost on a one- and a four-line draft
+  over that transcript, live event-storm cost per turn on top of that transcript (reasoning/content
+  deltas + tool batches + task_agent cards), tool_output_chunk throughput, busy/idle churn, heap +
+  node count + _agentCards size across repeated replay cycles (leak probe), and longtask counts.
+  Query params: ?n= (history size) &turns= &chunks= &cycles= &idle= &post=1 (POST the JSON report to
+  /perf/report — the --perf runner captures it).  Results land in <pre id="perf-json"> and
+  document.title stamps PERF-READY-<n> / PERF-FAILED-<phase>.  MEASUREMENT RULES: never run with
+  --virtual-time-budget (it corrupts performance.now) and never pass --force-prefers-reduced-motion
+  (it disables the animations whose cost we measure); the --perf runner passes
+  --js-flags=--expose-gc and --enable-precise-memory-info so heap numbers are stable and real.
 
     python3 scripts/livepass.py --perf                  # 300 and 3000 msgs
     python3 scripts/livepass.py --perf --perf-n 5000    # match the field run
@@ -1695,13 +1692,14 @@ COPY_TEMPLATE = (
 
 # --------------------------------------------------------------------------
 # Perf harness — long-session performance baseline for the interactive pane.
-# Mounts the REAL InteractivePane (production DOM via _createDOM, production
-# CSS chain) in a fixed-height mount so .pane-messages has REAL scroll
-# geometry — the forced-layout costs under measurement (isNearBottom /
-# scrollToBottom / chunk-append scroll pins) only exist against live layout,
-# which is why nothing here stubs scroll/geometry the way the task-agent
-# harness does.  All timing is real time (see MEASUREMENT RULES in the module
-# docstring).  Workload is deterministic (seeded LCG) so runs are comparable.
+# Mounts the REAL InteractivePane (production DOM via _createDOM, production CSS chain) inside the
+# shell's own layout chain (.app grid > .panes grid > section.pane > .pane-body, as shell.js and
+# pane.js build it) so .pane-messages has REAL scroll geometry AND real layout ancestry — the
+# forced-layout costs under measurement (isNearBottom / scrollToBottom / chunk-append scroll pins,
+# composer keystrokes) only exist against live layout, and the shell grids' row sizing decides
+# whether a layout pass re-measures the whole transcript.  That is why nothing here stubs
+# scroll/geometry the way the task-agent harness does.  All timing is real time (see MEASUREMENT
+# RULES in the module docstring).  Workload is deterministic (seeded LCG) so runs are comparable.
 # --------------------------------------------------------------------------
 PERF_TEMPLATE = """<!doctype html>
 <html lang="en">
@@ -1715,18 +1713,26 @@ PERF_TEMPLATE = """<!doctype html>
     <link rel="stylesheet" href="shared/conversation.css" />
     <link rel="stylesheet" href="shared/cards.css" />
     <link rel="stylesheet" href="static/style.css" />
+    <link rel="stylesheet" href="shared/shell.css" />
     <link rel="stylesheet" href="shared/interactive.css" />
     <style>
-      /* Harness-only framing (NOT under review): a fixed-height mount so the
-         pane's .pane-messages scroller has real production geometry. */
+      /* Harness-only (NOT under review): the report sits below the shell. */
       body { margin: 0; background: var(--bg); color: var(--fg); }
-      #mount { height: 720px; width: 920px; display: flex; overflow: hidden; }
-      #mount > .pane { flex: 1; display: flex; flex-direction: column; min-height: 0; }
       #perf-json { font: 11px monospace; white-space: pre-wrap; padding: 12px; }
     </style>
   </head>
   <body>
-    <div id="mount"></div>
+    <!-- The shell's layout chain around one pane, as shell.js + pane.js
+         build it; the pane mounts into the .pane-body. -->
+    <div class="app">
+      <aside class="rail"></aside>
+      <main class="content">
+        <div class="tabbar"></div>
+        <div class="panes">
+          <section class="pane"><div class="pane-body" id="mount"></div></section>
+        </div>
+      </main>
+    </div>
     <pre id="perf-json">running…</pre>
     <script>
       window.toast = { error: function (m) { console.log("toast:", m); } };
@@ -1939,6 +1945,54 @@ PERF_TEMPLATE = """<!doctype html>
         report.replay_ms = Math.round(performance.now() - t0);
         await tick();
         report.nodes_after_replay = pane.messagesEl.querySelectorAll("*").length;
+        // Every timing depends on the pane's size: record it with the numbers.
+        report.geometry = {
+          viewport: [window.innerWidth, window.innerHeight],
+          messages: [pane.messagesEl.clientWidth, pane.messagesEl.clientHeight],
+        };
+
+        // Median synchronous cost of one keystroke over the transcript: the
+        // editing command a real keystroke runs (so the composer's input
+        // handlers fire) plus the layout it forces or leaves dirty; the next
+        // frame's rendering and observer callbacks are not counted.  The
+        // four-line draft is the case where a measuring resize moves the
+        // composer's height.
+        phase = "typing";
+        // Resolves after a frame has rendered, so a timed keystroke never starts
+        // with that frame's pending style and layout still to flush.
+        const settled = () =>
+          new Promise((r) => requestAnimationFrame(() => setTimeout(r, 0)));
+        async function typeKeys(prefill) {
+          const ta = pane.inputEl;
+          ta.focus();
+          ta.select();
+          document.execCommand("delete");
+          if (prefill) document.execCommand("insertText", false, prefill);
+          await tick();
+          const ms = [];
+          const before = ta.value.length;
+          for (let k = 0; k < 30; k++) {
+            await settled();
+            const t = performance.now();
+            document.execCommand("insertText", false, k % 6 === 5 ? " " : "x");
+            void document.documentElement.offsetHeight;
+            ms.push(performance.now() - t);
+          }
+          // A disabled or unfocused field makes each command a cheap no-op.
+          if (ta.value.length !== before + 30) {
+            throw new Error("keystrokes did not reach the composer");
+          }
+          ta.select();
+          document.execCommand("delete");
+          ta.blur();
+          ms.sort((a, b) => a - b);
+          const mid = ms.length >> 1;
+          const median = ms.length % 2 ? ms[mid] : (ms[mid - 1] + ms[mid]) / 2;
+          return Math.round(median * 10) / 10;
+        }
+        report.type_ms = await typeKeys("");
+        report.type_multi_ms = await typeKeys("one\\ntwo\\nthree\\nfour ");
+        await tick();
 
         phase = "storm";
         t0 = performance.now();
@@ -2362,29 +2416,47 @@ def _print_perf_table(reports: dict[int, dict[str, object]]) -> None:
     def mb(value: object) -> str:
         return f"{value / 1048576:.1f}MB" if isinstance(value, (int, float)) else "—"
 
+    box: list[str] = []
+    heap: list[str] = []
+    longtasks: list[str] = []
+    cycle_ms: list[str] = []
+    agent_cards: list[str] = []
+    for n in sizes:
+        rep = reports[n]
+        geometry = rep.get("geometry")
+        messages = geometry.get("messages") if isinstance(geometry, dict) else None
+        box.append(
+            f"{messages[0]}×{messages[1]}"
+            if isinstance(messages, list) and len(messages) == 2
+            else "—"
+        )
+        heap.append(f"{mb(rep.get('heap_start'))} → {mb(rep.get('heap_end'))}")
+        lt = rep.get("longtasks")
+        longtasks.append(f"{lt.get('count')}/{lt.get('max_ms')}" if isinstance(lt, dict) else "—")
+        cycles = rep.get("cycle_stats")
+        if isinstance(cycles, list) and cycles:
+            cycle_ms.append(",".join(str(c.get("replay_ms", "?")) for c in cycles))
+            agent_cards.append(str(cycles[-1].get("agent_cards", "?")))
+        else:
+            cycle_ms.append("—")
+            agent_cards.append("—")
+
     rows: list[tuple[str, list[str]]] = [
+        ("messages box px (w×h)", box),
         ("replay_ms (full history build)", [cell(n, "replay_ms") for n in sizes]),
         ("nodes after replay", [cell(n, "nodes_after_replay") for n in sizes]),
+        (
+            "keystroke ms, sync (1-line / 4-line draft)",
+            [f"{cell(n, 'type_ms')} / {cell(n, 'type_multi_ms')}" for n in sizes],
+        ),
         ("storm ms/turn (live mix)", [cell(n, "storm_ms_per_turn") for n in sizes]),
         ("chunk_ms (output chunks)", [cell(n, "chunk_ms") for n in sizes]),
         ("idle_ms (busy/idle churn)", [cell(n, "idle_ms") for n in sizes]),
-        ("heap start → end", []),
-        ("longtasks count/max_ms", []),
-        ("replay cycles ms", []),
-        ("agent_cards after cycles", []),
+        ("heap start → end", heap),
+        ("longtasks count/max_ms", longtasks),
+        ("replay cycles ms", cycle_ms),
+        ("agent_cards after cycles", agent_cards),
     ]
-    for n in sizes:
-        rep = reports[n]
-        rows[5][1].append(f"{mb(rep.get('heap_start'))} → {mb(rep.get('heap_end'))}")
-        lt = rep.get("longtasks")
-        rows[6][1].append(f"{lt.get('count')}/{lt.get('max_ms')}" if isinstance(lt, dict) else "—")
-        cycles = rep.get("cycle_stats")
-        if isinstance(cycles, list) and cycles:
-            rows[7][1].append(",".join(str(c.get("replay_ms", "?")) for c in cycles))
-            rows[8][1].append(str(cycles[-1].get("agent_cards", "?")))
-        else:
-            rows[7][1].append("—")
-            rows[8][1].append("—")
 
     label_w = max(len(label) for label, _ in rows)
     col_w = max(14, *(len(f"n={n}") for n in sizes))
