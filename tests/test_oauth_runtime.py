@@ -42,7 +42,7 @@ from turnstone.core.oauth.runtime import (
     ensure_oauth_runtime,
     shutdown_oauth_runtime,
 )
-from turnstone.core.oauth.work import OAuthUnavailableError, durable_write
+from turnstone.core.oauth.work import OAuthUnavailableError, current_work, durable_write
 
 if TYPE_CHECKING:
     from turnstone.core.storage._protocol import StorageBackend
@@ -468,7 +468,7 @@ def test_abandoned_operation_exception_is_reported(
 def test_shutdown_retrieves_worker_failure_after_cancellation(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """A failed worker is reported once, including the extra drain-phase waiter."""
+    """A failed worker is reported once, and each of its waiters retrieves the failure."""
     runtime = _runtime(OAuthContext())
     runtime.OPERATION_DRAIN_TIMEOUT = 0.01
     entered, release = threading.Event(), threading.Event()
@@ -485,8 +485,7 @@ def test_shutdown_retrieves_worker_failure_after_cancellation(
     def release_in_worker_phase(phase: str) -> None:
         warn(phase)
         if phase == "operations":
-            # The drain installs its worker waiter before this queued release
-            # can run. No timing guess decides which waiter sees the failure.
+            # Release once the drain waits on the worker's waiters, so the failure lands mid-drain.
             asyncio.get_running_loop().call_soon(release.set)
 
     monkeypatch.setattr(runtime, "_warn_outstanding", release_in_worker_phase)
@@ -515,7 +514,98 @@ def test_shutdown_retrieves_worker_failure_after_cancellation(
         == 1
     )
     assert not runtime._thread.is_alive()
-    assert not runtime._work.workers and not runtime._operations
+    assert not runtime._work.workers and not runtime._work.waiters and not runtime._operations
+
+
+def test_shutdown_drains_waiters_until_they_receive_a_worker_failure() -> None:
+    """Shutdown waits for the owner-loop waiters, not just the workers' own futures.
+
+    A waiter receives its worker's outcome one loop hop after the worker's future completes; the
+    worker thread queues that hop. If the loop stops as the hop lands, the waiter's failure is set
+    but its retrieval, one hop further, never runs, and the failure is reported as never retrieved.
+    Hold the hop open: shutdown must keep draining.
+    """
+    runtime = _runtime(OAuthContext())
+    runtime.OPERATION_DRAIN_TIMEOUT = 0.01
+    # Held well inside this budget, the hop must be waited for, not timed out.
+    runtime.WORKER_DRAIN_TIMEOUT = 5.0
+    loop_errors: list[dict[str, Any]] = []
+
+    async def observe_errors() -> None:
+        asyncio.get_running_loop().set_exception_handler(
+            lambda loop, context: loop_errors.append(context)
+        )
+
+    runtime.call_sync(observe_errors)
+    go, held, release = threading.Event(), threading.Event(), threading.Event()
+    observed: list[asyncio.Future[None]] = []
+
+    def hold_waiters(_future: concurrent.futures.Future[None]) -> None:
+        # Worker thread, future done: hops for waiters chained after this wait until it returns.
+        held.set()
+        release.wait(5)
+
+    def failed_write() -> None:
+        assert go.wait(5)
+        raise ValueError("worker failed while draining")
+
+    async def operation() -> None:
+        work = current_work()
+        future = work.submit(work.executor, failed_write)
+        future.add_done_callback(hold_waiters)
+        # Chained after the hold like the operation's own waiter; kept to observe its outcome.
+        observed.append(work.wrap(future))
+        go.set()
+        await work.wait(future)
+
+    runtime._submit(operation)
+    assert held.wait(5)
+    stopper = threading.Thread(target=runtime.shutdown, name="oauth-shutdown")
+    stopper.start()
+    try:
+        stopper.join(0.3)
+        assert stopper.is_alive(), "shutdown stopped the loop before its waiters' hop landed"
+    finally:
+        release.set()
+        stopper.join(10)
+    assert not stopper.is_alive()
+    # Retired, so retrieved: each waiter left the set only through its retrieving callback.
+    assert not runtime._work.waiters and not runtime._work.workers
+    (waiter,) = observed
+    assert waiter.done() and not waiter.cancelled()
+    assert isinstance(waiter.exception(), ValueError)
+    observed.clear()
+    del waiter
+    gc.collect()
+    assert not loop_errors, [context.get("message") for context in loop_errors]
+
+
+def test_shutdown_drains_a_worker_nobody_waits_on() -> None:
+    """Submission gives every worker a waiter, so shutdown drains even an unawaited one."""
+    runtime = _runtime(OAuthContext())
+    runtime.WORKER_DRAIN_TIMEOUT = 5.0
+    entered, release = threading.Event(), threading.Event()
+
+    def blocked_write() -> None:
+        entered.set()
+        assert release.wait(5)
+
+    async def operation() -> None:
+        work = current_work()
+        work.submit(work.executor, blocked_write)
+
+    runtime.call_sync(operation)
+    assert entered.wait(5)
+    stopper = threading.Thread(target=runtime.shutdown, name="oauth-shutdown")
+    stopper.start()
+    try:
+        stopper.join(0.3)
+        assert stopper.is_alive(), "shutdown stopped the loop under a running worker"
+    finally:
+        release.set()
+        stopper.join(10)
+    assert not stopper.is_alive()
+    assert not runtime._work.waiters and not runtime._work.workers
 
 
 @pytest.mark.parametrize("phase", ["acquire", "write", "release", "queued-release"])

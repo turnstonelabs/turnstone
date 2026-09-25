@@ -26,11 +26,12 @@ class OAuthUnavailableError(Exception):
 
 
 class OAuthWork:
-    """Worker futures and orphan drains owned by one OAuth runtime."""
+    """Worker futures, their owner-loop waiters and orphan drains owned by one OAuth runtime."""
 
     def __init__(self, loop: asyncio.AbstractEventLoop) -> None:
         self.loop = loop
         self.workers: set[concurrent.futures.Future[Any]] = set()
+        self.waiters: set[asyncio.Future[Any]] = set()
         self.drains: set[asyncio.Task[None]] = set()
         self.executor = concurrent.futures.ThreadPoolExecutor(thread_name_prefix="oauth-store")
 
@@ -41,7 +42,11 @@ class OAuthWork:
         *args: Any,
         **kwargs: Any,
     ) -> concurrent.futures.Future[T]:
-        """Retain the real future and preserve the submitting context in its worker."""
+        """Retain the real future and preserve the submitting context in its worker.
+
+        Called on the owner loop. Every worker gets an owner-loop waiter here, so shutdown can drain
+        each worker's outcome through ``waiters``.
+        """
         context = contextvars.copy_context()
         call = functools.partial(function, *args, **kwargs)
         future = executor.submit(context.run, call)
@@ -52,13 +57,25 @@ class OAuthWork:
                 self.loop.call_soon_threadsafe(self.workers.discard, done)
 
         future.add_done_callback(completed)
+        self.wrap(future)
         return future
 
     def wrap[T](self, future: concurrent.futures.Future[T]) -> asyncio.Future[T]:
-        """Create a fresh owner-loop waiter and retrieve abandoned waiter failures."""
+        """Create a fresh owner-loop waiter and retrieve abandoned waiter failures.
+
+        A waiter receives its worker's outcome one loop hop after the worker's own future completes,
+        so it stays in ``waiters`` until that hop has landed and been retrieved. Shutdown drains
+        waiters for that reason: a stop in between would leave the failure set and never retrieved.
+        """
         wrapped = asyncio.wrap_future(future, loop=self.loop)
-        wrapped.add_done_callback(lambda done: None if done.cancelled() else done.exception())
+        self.waiters.add(wrapped)
+        wrapped.add_done_callback(self._retire_waiter)
         return wrapped
+
+    def _retire_waiter(self, waiter: asyncio.Future[Any]) -> None:
+        self.waiters.discard(waiter)
+        if not waiter.cancelled():
+            waiter.exception()
 
     async def wait[T](
         self, future: concurrent.futures.Future[T], *, settle_on_cancel: bool = True

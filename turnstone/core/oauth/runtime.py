@@ -158,12 +158,13 @@ class OAuthRuntime:
     def _warn_outstanding(self, phase: str) -> None:
         work = self._work
         log.warning(
-            "OAuth shutdown %s budget exhausted: %d operations, %d drains, %d workers; "
-            "cleanup left to process teardown",
+            "OAuth shutdown %s budget exhausted: %d operations, %d drains, %d workers, "
+            "%d waiters; cleanup left to process teardown",
             phase,
             sum(not task.done() for task in tuple(self._operations)),
             sum(not task.done() for task in tuple(work.drains)) if work is not None else 0,
             sum(not future.done() for future in tuple(work.workers)) if work is not None else 0,
+            sum(not waiter.done() for waiter in tuple(work.waiters)) if work is not None else 0,
         )
 
     async def _drain(self) -> None:
@@ -182,9 +183,9 @@ class OAuthRuntime:
                 pending_work: list[asyncio.Future[Any]] = [
                     task for task in (*self._operations, *work.drains) if not task.done()
                 ]
-                pending_work.extend(
-                    work.wrap(future) for future in work.workers if not future.done()
-                )
+                # Settle on waiters, not the workers' own futures: every worker has one from
+                # submission, and it receives the outcome a loop hop later.
+                pending_work.extend(waiter for waiter in tuple(work.waiters) if not waiter.done())
                 if not pending_work:
                     break
                 remaining = deadline - asyncio.get_running_loop().time()
