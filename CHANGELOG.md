@@ -12,6 +12,24 @@ that minor, so the current stable line never has two independently writable
 branches. Earlier stable lines (`stable/1.7`, `stable/1.6`, `stable/1.5`) are
 frozen.
 
+## [1.8.5]
+
+### Fixed
+
+- **Typing and streaming in long conversations (#1205).** The composer, live output, and tool
+  output no longer slow down as a conversation grows. The grids around each pane stopped
+  re-measuring the whole transcript on every layout pass, and the composer sizes itself with the
+  browser's native field sizing where available. At 3,000 messages a keystroke dropped from about
+  50 ms to under 1 ms. In Firefox, typing a multi-line draft no longer switches automatic
+  scrolling off.
+- **Discord mentions (#1151).** Discord notifications keep user, role, `@everyone`, and `@here`
+  mentions intact instead of escaping them, and those mentions now ping according to the server's
+  Discord permissions.
+- **OpenAI SDK compatibility.** OpenAI SDK 3.14 and later wrap a network failure in the middle of
+  a response in their own error type, which this release line's stream retry does not recognize:
+  a connection dropped mid-response was not retried, and a blip after a response had finished
+  could fail it. Installs now stay on SDK releases before 3.14.
+
 ## [1.8.4]
 
 ### Fixed
