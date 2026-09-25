@@ -295,13 +295,26 @@
   border: 1px solid var(--border-strong);
   border-radius: var(--radius-sm);
   padding: 6px 10px;
-  /* resize: none — max-height + auto-resize handlers in app.js /
-     coordinator.js cap growth; letting the user drag-resize pushes
-     the messages pane off-screen on small viewports. */
+  /* resize: none — max-height caps composer.js's auto-resize, and a drag
+     here pushes the messages pane off-screen on small viewports.  The
+     stacked layout re-enables vertical resize; the next edit re-fits it. */
   resize: none;
   transition:
     border-color 0.15s,
     box-shadow 0.15s;
+}
+/* Content-fit height where the engine supports field-sizing (composer.js adds
+   the class to one-row fields only there; elsewhere its autoResize measures
+   scrollHeight).  An empty field fits its current placeholder (idle, busy or a
+   send-blocked hint).  The measuring path fitted it too, but only when it
+   measured (at a send), so a later, longer placeholder clipped behind a
+   scrollbar; this fit follows every placeholder change, deliberately, and never
+   collapses the field to measure it (a collapse moves the transcript and, in
+   some engines, knocks the pane out of autoscroll).  Only a pane narrow enough
+   to wrap a placeholder sees the height change, including when the first
+   keystroke replaces the placeholder. */
+.composer-input--autosize {
+  field-sizing: content;
 }
 .composer-input:focus-visible {
   outline: none;
