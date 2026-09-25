@@ -1375,6 +1375,55 @@ def test_mobile_drawer_off_canvas() -> None:
     )
 
 
+def test_shell_grid_rows_are_definite() -> None:
+    """Typing lag in long sessions: an implicit auto row on the shell grids asks for the content's
+    max-content height, so every layout pass under it (each composer keystroke, each streamed
+    token) re-measured the whole transcript through the pane's nested flex columns — ~54ms per
+    keystroke at 3,000 messages in the perf harness.  Both grids need the definite row; fixing
+    only one leaves the cost in place, and so would a later rule in any stylesheet (a media
+    query, a modifier) handing either grid a content-sized row again."""
+    css = re.sub(r"/\*.*?\*/", "", _SHELL_CSS.read_text(encoding="utf-8"), flags=re.S)
+    for selector in (".app", ".panes"):
+        rule = re.search(rf"(?m)^{re.escape(selector)} \{{([^}}]*)\}}", css)
+        assert rule, f"shell.css must carry the top-level {selector} rule"
+        assert "grid-template-rows: minmax(0, 1fr)" in rule.group(1), (
+            f"{selector} must size its row from the container, never from content"
+        )
+
+    def sizes_a_shell_grid(selectors: str) -> bool:
+        # The rule's subject (its last compound) must be one of the two grids; a
+        # descendant such as `.app.rail-collapsed .cluster` sizes a grid of its own.
+        # `.panes--split` is left out: its cells are absolutely positioned, so its
+        # rows size nothing.
+        return any(
+            re.search(r"\.(?:app|panes)(?![\w-])", re.split(r"[\s>+~]+", sel.strip())[-1])
+            for sel in selectors.split(",")
+        )
+
+    # Any first-party sheet the pages load can override the grids, not just this one.
+    sheets = [
+        path
+        for root in (_SHARED, _ROOT / "turnstone/console/static", _ROOT / "turnstone/ui/static")
+        for path in sorted(root.rglob("*.css"))
+        if not path.name.endswith(".min.css")
+    ]
+    assert _SHELL_CSS in sheets
+    for sheet in sheets:
+        text = re.sub(r"/\*.*?\*/", "", sheet.read_text(encoding="utf-8"), flags=re.S)
+        for selectors, body in re.findall(r"([^{}]+)\{([^{}]*)\}", text):
+            if not sizes_a_shell_grid(selectors):
+                continue
+            # The shorthands set the rows too: their rows are the part before the slash.
+            for prop, value in re.findall(
+                r"(?<![\w-])(grid-template-rows|grid-template|grid)\s*:\s*([^;]+);", body
+            ):
+                rows = value if prop == "grid-template-rows" else value.split("/")[0]
+                assert rows.strip() == "minmax(0, 1fr)", (
+                    f"{sheet.name}: {selectors.strip()} must keep a definite row, "
+                    f"not {prop}: {value.strip()}"
+                )
+
+
 def test_popup_menu_shared_helper() -> None:
     """One popup-menu chrome: pane.js exports openPopupMenu (items,
     positioning with flip+clamp, dismissal, aria-expanded mirroring, arrow

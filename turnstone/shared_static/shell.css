@@ -17,6 +17,13 @@
 .app {
   display: grid;
   grid-template-columns: 266px 1fr;
+  /* A definite row, not the implicit auto one: sizing an auto row asks for the
+     content's max-content height, so every layout pass under it (a keystroke in
+     the composer, a streamed token) re-measured the whole transcript through the
+     pane's nested flex columns — tens of milliseconds per pass at a few thousand
+     messages.  `.panes` needs the same row; fixing only one of the two leaves
+     the cost in place. */
+  grid-template-rows: minmax(0, 1fr);
   height: 100vh;
   overflow: hidden;
 }
@@ -799,6 +806,9 @@
   flex: 1;
   display: grid;
   grid-template-columns: 1fr;
+  /* Definite, like .app's row (see there): an auto row here re-measured the
+     visible pane's content on every layout pass. */
+  grid-template-rows: minmax(0, 1fr);
   min-height: 0;
 }
 .pane {
