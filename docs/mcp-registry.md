@@ -7,6 +7,9 @@ see [MCP authentication and OAuth setup](mcp-oauth.md), including a remote
 Docker/GitHub walkthrough. Installing a registry entry does not authorize each
 user's account.
 
+For image-returning tools, model compatibility and the expandable tool-result
+viewer, see [MCP image results](mcp-images.md).
+
 ## Overview
 
 The MCP Registry is maintained by the [Agentic AI Foundation](https://www.linuxfoundation.org/press/linux-foundation-announces-the-formation-of-the-agentic-ai-foundation) (Linux Foundation) and serves as the canonical discovery layer for MCP servers. Turnstone queries its REST API (v0.1) for server metadata and provides a one-click install flow.
