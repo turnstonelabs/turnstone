@@ -103,7 +103,7 @@ _SECRET_CONFIG_KEYS: frozenset[str] = frozenset(
 
 # Model providers doctor's built-in _DoctorLLM can drive, grouped by wire family.
 _ANTHROPIC_PROVIDERS: frozenset[str] = frozenset({"anthropic", "anthropic-compatible"})
-_OPENAI_PROVIDERS: frozenset[str] = frozenset({"openai", "openai-compatible", "xai"})
+_OPENAI_PROVIDERS: frozenset[str] = frozenset({"openai", "openai-compatible", "switchyard", "xai"})
 
 # read_file refuses to dump raw key/cert material outright, and caps large reads
 # so a big log can't flood the model's context.
@@ -1198,7 +1198,7 @@ TOOLS: list[dict[str, Any]] = [
                 "properties": {
                     "provider": {
                         "type": "string",
-                        "description": "openai | anthropic | openai-compatible | google | xai.",
+                        "description": "openai | anthropic | openai-compatible | switchyard | google | xai.",
                     },
                     "base_url": {"type": "string", "description": "Endpoint base URL."},
                     "api_key": {"type": "string", "description": "Optional API key."},

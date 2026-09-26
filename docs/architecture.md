@@ -1052,7 +1052,29 @@ agent_model = "claude"
 
 Each `[models.*]` entry produces a `ModelConfig` with a `provider` field
 (default: `"openai"`). Supported values: `"openai"`, `"anthropic"`, `"google"`,
-`"openai-compatible"`, and `"anthropic-compatible"`.
+`"openai-compatible"`, `"anthropic-compatible"`, `"switchyard"`, and `"xai"`.
+
+`"switchyard"` is the adapter for a Switchyard gateway: the row names the
+gateway's `base_url` (required — an empty value fails at client construction
+rather than falling back to the commercial endpoint) and a route id as the
+model. The adapter owns no routing decision; it lowers the session ledger onto
+the surface the gateway serves and reports what the crossing cost. A Switchyard
+lane is one provider boundary, so an item that lane's own surface returned is
+that provider's object and crosses back whole — its `id` and its encrypted
+payload are the provider's own replay state, resolvable only at the endpoints
+behind that boundary — while an item recorded by another producer does not cross
+as native and is reported as dropped rather than forwarded carrying a foreign
+binding. What the boundary does with the rest depends on the surface, because the
+two surfaces do not represent reasoning the same way: a Responses surface carries
+the reasoning item itself and its parent builds one only from what the item
+already holds, so a native item passes through with nothing removed and a block
+no item can be built from is reported as dropped; a Chat surface carries the
+readable text in the canonical message field and never projects the private block
+list, so the text still crosses and a binding it could never carry costs nothing.
+What crossed, what was dropped, and the observed loss classes are reported on
+`last_reasoning_transfer`. `api_surface` selects chat or responses exactly as it
+does for `"openai-compatible"`, and `provider_name` reports `"switchyard"`, so a
+lane can tell which adapter served it.
 
 **Atomic bindings and reloads:** `ModelConfig` is frozen. Registry
 `resolve_binding()` acquires the registry lock once and returns the client,

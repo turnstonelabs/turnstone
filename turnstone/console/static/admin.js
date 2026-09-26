@@ -6222,11 +6222,28 @@ let _modelResponseCurrentIdentity = "";
 let _modelResponseCaptured = {};
 let _modelResponseDirty = {};
 
+/* Providers whose client is an OpenAI-protocol adapter reached over a
+   caller-supplied base_url: the generic compatibility lane and the Switchyard
+   gateway adapter (turnstone/core/providers/_switchyard.py, which subclasses the
+   OpenAI chat provider). They own the "Server compatibility" knobs — API surface
+   in particular, since it decides chat vs responses on the wire — and have no
+   upstream known-model table. Mirrors the OpenAI branch of create_client() in
+   turnstone/core/providers/__init__.py. */
+const _OPENAI_ADAPTER_PROVIDERS = ["openai-compatible", "switchyard"];
+
+function _isOpenAIAdapter(provider) {
+  return _OPENAI_ADAPTER_PROVIDERS.includes(provider);
+}
+
+/* The two surface predicates below keep the provider names literal instead of
+   calling _isOpenAIAdapter: tests/test_app_js.py slices exactly these functions
+   and pins those literals, and the behavioural coverage of the gate lives in
+   tests/test_provider_switchyard_wiring.py. */
 function _modelIdentity() {
   const provider = document.getElementById("model-provider").value;
   const model = document.getElementById("model-name").value.trim();
   const surface =
-    provider === "openai-compatible"
+    provider === "openai-compatible" || provider === "switchyard"
       ? document.getElementById("model-api-surface").value
       : "";
   return provider + "\n" + model + "\n" + surface;
@@ -6236,7 +6253,7 @@ function _modelUsesResponsesSurface() {
   const provider = document.getElementById("model-provider").value;
   if (provider === "openai") return true;
   return (
-    provider === "openai-compatible" &&
+    (provider === "openai-compatible" || provider === "switchyard") &&
     document.getElementById("model-api-surface").value === "responses"
   );
 }
@@ -6452,7 +6469,9 @@ const AUDIO_MODEL_HINTS = {
 // Providers whose client speaks the OpenAI-SDK audio surface. Mirror
 // _AUDIO_SDK_PROVIDERS / _provider_carries_audio in turnstone/core/audio.py:
 // anthropic(-compatible) has no audio content block, so it can't serve the
-// voice roles regardless of capability flags.
+// voice roles regardless of capability flags.  "switchyard" is deliberately
+// absent from this list — the gateway adapter is a text boundary with no media
+// lane, so a switchyard row can never carry an stt/tts role.
 function _providerCarriesAudio(provider) {
   return (
     provider === "openai" ||
@@ -7680,7 +7699,7 @@ function showEditModelModal(definitionId) {
       // hidden and the save path never writes it, so deleting it here
       // would silently drop a stored key on an unrelated edit-save.
       if (
-        m.provider === "openai-compatible" ||
+        _isOpenAIAdapter(m.provider) ||
         m.provider === "anthropic-compatible"
       ) {
         delete capsObj.effort_param;
@@ -7785,7 +7804,7 @@ function submitCreateModel() {
   // below): the field is hidden for other providers, so a lingering
   // value from a provider switch must never persist.
   if (
-    providerVal === "openai-compatible" ||
+    _isOpenAIAdapter(providerVal) ||
     providerVal === "anthropic-compatible"
   ) {
     const effortParam = document
@@ -7795,19 +7814,20 @@ function submitCreateModel() {
   }
 
   // Build server_compat from structured fields.  Only meaningful for the
-  // compat lanes (openai-compatible: all fields; anthropic-compatible: the
-  // extra-body JSON only) — for other providers the section is hidden
-  // but the form values can linger after a provider switch, so gate the
-  // whole block on the active provider to keep persisted state honest.
+  // compat lanes (openai-compatible and switchyard: all fields;
+  // anthropic-compatible: the extra-body JSON only) — for other providers the
+  // section is hidden but the form values can linger after a provider switch,
+  // so gate the whole block on the active provider to keep persisted state
+  // honest.
   const serverCompat = {};
   const ebEl = document.getElementById("model-extra-body");
   ebEl.removeAttribute("aria-invalid");
   ebEl.style.borderColor = "";
   if (
-    providerVal === "openai-compatible" ||
+    _isOpenAIAdapter(providerVal) ||
     providerVal === "anthropic-compatible"
   ) {
-    if (providerVal === "openai-compatible") {
+    if (_isOpenAIAdapter(providerVal)) {
       const serverType = document.getElementById("model-server-type").value;
       if (serverType) serverCompat.server_type = serverType;
       const apiSurface = document.getElementById("model-api-surface").value;
@@ -8575,7 +8595,7 @@ function _modelCapsRefreshBaseline() {
   const seq = ++_modelCapsSeq;
   if (
     !modelName ||
-    provider === "openai-compatible" ||
+    _isOpenAIAdapter(provider) ||
     provider === "anthropic-compatible"
   ) {
     _modelCapsBaseline = {};
@@ -8639,6 +8659,11 @@ const _providerDefaults = {
     urlPlaceholder: "e.g. https://your-provider.com/v1",
     modelPlaceholder: "GLM5",
   },
+  switchyard: {
+    // A route id is the model name on the wire; the gateway listens on :4000.
+    urlPlaceholder: "e.g. http://your-switchyard-host:4000/v1",
+    modelPlaceholder: "sw-openai-gpt-6-luna",
+  },
   "anthropic-compatible": {
     urlPlaceholder: "e.g. http://your-vllm-host:8000",
     modelPlaceholder: "deepseek-ai/DeepSeek-V4-Flash",
@@ -8673,9 +8698,9 @@ function _applyProviderDefaults() {
     // hidden attr, not style.display — `.hatch [hidden]` is !important and
     // an inline display can never un-hide it.
     scSection.hidden =
-      provider !== "openai-compatible" && provider !== "anthropic-compatible";
+      !_isOpenAIAdapter(provider) && provider !== "anthropic-compatible";
   }
-  // Within the section, server type / API surface are openai-compatible
+  // Within the section, server type / API surface are OpenAI-adapter
   // knobs (Detect heuristics + chat-vs-responses surface pick) and stay
   // hidden on the anthropic-compatible lane.  Thinking mode applies to
   // BOTH compat lanes: on anthropic-compatible it opts the model into
