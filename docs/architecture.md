@@ -922,11 +922,11 @@ remains an isolated one-shot client and always closes it after the probe.
 
 **OpenAIResponsesProvider** (`_openai_responses.py`): the commercial `openai` lane always uses
 `/v1/responses`, translating the neutral message projection into Responses input items. The
-capability table covers GPT-5.4, GPT-5.5, GPT-5.6, GPT-6 Astra, search models, and audio roles.
-Captured reasoning items can be replayed when the operator enables reasoning replay. Native
-search replaces a visible client `web_search` tool on search-capable models; citations from
+capability table covers GPT-5.4, GPT-5.5, GPT-5.6, GPT-6 Astra, Sol and Luna, search models, and
+audio roles. Captured reasoning items can be replayed when the operator enables reasoning replay.
+Native search replaces a visible client `web_search` tool on search-capable models; citations from
 `url_citation` annotations are formatted as footnotes. Pre-5.6 GPT-5 models request extended
-prompt-cache retention (`prompt_cache_retention: "24h"`); GPT-5.6 and Astra use
+prompt-cache retention (`prompt_cache_retention: "24h"`); GPT-5.6 and the GPT-6 tiers use
 `prompt_cache_options.ttl: "30m"`. Cache reads and writes are extracted from `cached_tokens` and
 `cache_write_tokens`. Unknown models get generic defaults with `supports_vision=False` and use
 client-side web search.
@@ -952,6 +952,14 @@ later messages keep their role and position in `input`. The canonical Turn IR is
 tool execution, WebSocket steering, and `configuration_update` reasoning changes are not enabled.
 See the [OpenAI model guide](https://developers.openai.com/api/docs/guides/latest-model) and
 [model card](https://developers.openai.com/api/docs/models/gpt-6-astra).
+
+GPT-6 Sol (`gpt-6-sol`) and Luna (`gpt-6-luna`) share Astra's limits but follow the GPT-5.6
+effort contract: levels `none` through `max`, server default `medium`, and temperature only when
+the effort is explicitly `none`. Vision, native PDF input, tool search, reasoning replay,
+verbosity, and pro mode use the existing Responses paths. Native mid-conversation system messages
+are not enabled for either tier, so operator turns use the fold path. See the
+[Sol](https://developers.openai.com/api/docs/models/gpt-6-sol) and
+[Luna](https://developers.openai.com/api/docs/models/gpt-6-luna) model cards.
 
 The `openai-compatible` lane never consults the commercial table on either API surface. Chat
 Completions uses `OpenAIChatCompletionsProvider`; the Responses pin uses

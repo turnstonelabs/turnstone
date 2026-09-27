@@ -363,6 +363,8 @@ def test_instruction_position_and_content_parts(role, native):
     [
         ("openai", "gpt-6-astra", True),
         ("openai", "gpt-5.6-sol", False),
+        ("openai", "gpt-6-sol", False),
+        ("openai", "gpt-6-luna", False),
         ("openai-compatible", "gpt-6-astra", False),
     ],
 )
