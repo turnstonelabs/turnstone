@@ -197,6 +197,37 @@ _ANTHROPIC_CAPABILITIES: dict[str, ModelCapabilities] = {
         supports_reasoning_replay=True,
         supports_mid_conversation_system=True,
     ),
+    # Opus 5.5: the opus-5 surface (below) plus four documented breaking
+    # changes, of which only the third reaches this lane:
+    #   * thinking cannot be disabled at any effort -- the adaptive branch
+    #     never emits "disabled" or a budget, so unreachable.
+    #   * forced tool choice (``tool_choice`` any/tool) is a 400 -- this lane
+    #     never sends ``tool_choice``.
+    #   * thinking blocks are bound to the producing model and to the
+    #     conversation prefix -- model binding is a server-side unbilled
+    #     drop (replay stays verbatim); prefix binding is the fable-5-1
+    #     posture, so the row opts into drop_block via
+    #     ``thinking_prefix_bound``.
+    #   * the older computer-use tool is a 400 -- this lane sends none.
+    # The API default effort is medium (opus-5: high); an unset knob still
+    # omits ``output_config.effort`` rather than pinning a level.
+    "claude-opus-5-5": ModelCapabilities(
+        context_window=1000000,
+        max_output_tokens=128000,
+        token_param="max_tokens",
+        thinking_mode="adaptive",
+        supports_effort=True,
+        effort_levels=("low", "medium", "high", "xhigh", "max"),
+        supports_web_search=True,
+        supports_tool_search=True,
+        supports_vision=True,
+        supports_pdf=True,
+        supports_temperature=False,
+        thinking_display="summarized",
+        supports_reasoning_replay=True,
+        supports_mid_conversation_system=True,
+        thinking_prefix_bound=True,
+    ),
     # Opus 5: same wire surface as opus-4-8.  Two of this model's documented
     # breaking changes are unreachable from this lane, and stay that way only
     # while thinking_mode is "adaptive":
