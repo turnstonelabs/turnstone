@@ -72,6 +72,13 @@ frozen.
 
 ### Fixed
 
+- **Claude Opus 5.5 requests failing after a history edit.** `claude-opus-5-5` had no capability row
+  and resolved to the Opus 5 row, so its requests never opted into the degrade mode for thinking
+  bound to the conversation prefix. On Anthropic organizations created on or after 2026-08-31, a
+  replayed thinking block whose earlier conversation had since changed, for example after
+  compaction, failed the whole request with a 400, and retries failed the same way. The model now
+  has its own row and sends the binding control, so such blocks are dropped server-side, unbilled,
+  and the request proceeds.
 - **Context gauge after a server-side tool loop.** When the model ran several web searches inside
   one response, the provider's closing usage reported billing totals summed across its sampling
   passes, and the session took them as its context size. On the Anthropic lane a four-search turn
