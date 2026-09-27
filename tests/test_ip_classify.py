@@ -174,11 +174,20 @@ def _image_allows(addr: str) -> bool:
 
 
 def _screen_tool(*addrs: str, allow_private_network: bool) -> tuple[str | None, bool, bool]:
-    """Drive the REAL consumer of the lane contract, not just the guard."""
-    from turnstone.core.session import _screen_tool_url
+    """Drive the REAL consumer of the lane contract, not just the guard.
+
+    A tool target's hostname is judged once its call is approved: the tool's
+    verdict over the resolving screen (``_screen_tool_url`` runs before
+    approval and leaves a hostname unresolved).
+    """
+    from turnstone.core.session import _tool_url_verdict
 
     with _resolving_to(*addrs):
-        return _screen_tool_url("http://target.example/x", allow_private_network)
+        return _tool_url_verdict(screen_url("http://target.example/x"), allow_private_network)
+
+
+def _literal_url(addr: str) -> str:
+    return f"http://[{addr}]/x" if ":" in addr else f"http://{addr}/x"
 
 
 # ---------------------------------------------------------------------------
@@ -333,6 +342,38 @@ def test_non_destination_addresses_are_refused_by_every_guard(target: str) -> No
     err, private_origin, _block = _screen_tool(target, allow_private_network=True)
     assert err is not None and not private_origin
     assert not _image_allows(target)
+    # The literal itself is refused before approval, with no lookup to make.
+    from turnstone.core.session import _screen_tool_url
+
+    err, private_origin, _block = _screen_tool_url(_literal_url(target), True)
+    assert err is not None and not private_origin
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        PUBLIC,
+        METADATA,
+        *PRIVATE_TARGETS,
+        *PRIVATE_V6_TARGETS,
+        *NEVER_V6_TARGETS,
+        _nat64_wkp(METADATA),
+        _teredo("10.0.0.1"),
+        "127.1",
+        "2130706433",
+        "0x7f000001",
+        "0177.0.0.1",
+        "2852039166",
+        "0",
+        "fe80::1%1",
+    ],
+)
+def test_pre_approval_screen_gives_a_literal_the_resolving_verdict(target: str) -> None:
+    """A literal needs no lookup, so screening it before approval changes nothing."""
+    from turnstone.core.web import screen_url_offline
+
+    url = _literal_url(target)
+    assert screen_url_offline(url) == screen_url(url)
 
 
 @pytest.mark.parametrize("target", ["2001:db8::1", "3fff::1"])
@@ -551,10 +592,12 @@ class TestResolutionFailureFailsClosed:
         assert screen.error is not None
 
     def test_tool_screen_refuses_even_with_the_opt_in(self) -> None:
-        from turnstone.core.session import _screen_tool_url
+        from turnstone.core.session import _tool_url_verdict
 
         with patch("socket.getaddrinfo", side_effect=socket.gaierror("SERVFAIL")):
-            err, private_origin, _block = _screen_tool_url("http://evil.example/x", True)
+            err, private_origin, _block = _tool_url_verdict(
+                screen_url("http://evil.example/x"), True
+            )
         assert err is not None and private_origin is False
 
 

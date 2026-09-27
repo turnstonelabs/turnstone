@@ -1785,6 +1785,43 @@ class TestTaskAgentStreamAbort:
 
         assert provider.create_streaming.call_count == 1
 
+    @pytest.mark.parametrize("url", ["http://10.0.0.5/x", "http://lan.example/x"])
+    def test_private_agent_web_fetch_requires_approval(self, tmp_db, url):
+        session = _make_session()
+        session.agent_max_turns = 1
+        session._private_url_hosts.add("lan.example")
+        stream = [
+            StreamChunk(tool_call_deltas=[ToolCallDelta(index=0, id="web-1", name="web_fetch")]),
+            StreamChunk(
+                tool_call_deltas=[
+                    ToolCallDelta(
+                        index=0,
+                        arguments_delta=json.dumps({"url": url, "question": "what?"}),
+                    )
+                ],
+                finish_reason="tool_calls",
+            ),
+        ]
+        arm_session(session, stream, [StreamChunk(content_delta="denied", finish_reason="stop")])
+        with (
+            patch.object(session, "_allow_private_network", return_value=True),
+            patch.object(session, "_evaluate_intent", return_value=None),
+            patch.object(session.ui, "approve_tools", return_value=(False, None)) as approve,
+            patch.object(session, "_exec_web_fetch", return_value=("web-1", "fetched")) as execute,
+        ):
+            session._run_agent(
+                [Turn.user("fetch the page")],
+                label="task",
+                tools=[{"type": "function", "function": {"name": "web_fetch"}}],
+                auto_tools={"web_fetch"},
+            )
+
+        approve.assert_called_once()
+        item = approve.call_args.args[0][0]
+        assert "(private network)" in item["header"]
+        assert item["allow_private_origin"] is True
+        execute.assert_not_called()
+
     def test_cancel_during_agent_web_fetch_skips_extraction_after_successor_claim(self, tmp_db):
         session = _make_session()
         session.agent_max_turns = 1

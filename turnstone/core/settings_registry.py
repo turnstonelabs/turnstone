@@ -262,12 +262,21 @@ def _build_registry() -> dict[str, SettingDef]:
             help="When enabled, a fetch or preview whose URL points at a private or "
             "internal address (a home-lab service, an internal dashboard, localhost) "
             "can be approved instead of being refused outright — the approval prompt "
-            "marks it as a private-network request. A public site that redirects into "
-            "your private network is still refused either way: that address never "
-            "appeared in the approval prompt, so it is never fetched. Cloud metadata "
-            "endpoints and link-local, multicast and reserved addresses stay refused "
-            "even with this on, including as a redirect target from a private address "
-            "you approved — no legitimate service of yours lives there.",
+            "marks it as a private-network request. A host name is looked up only "
+            "after its request is approved, so the first request to a private host "
+            "name is refused and the model is asked to repeat it; the repeat is the "
+            "one marked. Task agents use the same approval gate for marked requests. "
+            "Each fetch hop connects only to its screened addresses, keeping the "
+            "hostname for HTTP routing and TLS verification. Proxy-routed requests "
+            "are refused; hosts excluded by NO_PROXY can connect directly. "
+            "If a marked hostname no longer resolves wholly private, the request is "
+            "refused and the mark is forgotten; a now-public hostname can be retried "
+            "as an ordinary request. A public site that redirects into your private network is "
+            "still refused either way: that address never appeared in the approval "
+            "prompt, so it is never fetched. Cloud metadata endpoints and link-local, "
+            "multicast and reserved addresses stay refused even with this on, "
+            "including as a redirect target from a private address you approved — no "
+            "legitimate service of yours lives there.",
         ),
         SettingDef(
             "tools.search",

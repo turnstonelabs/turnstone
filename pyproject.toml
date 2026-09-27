@@ -36,6 +36,8 @@ dependencies = [
     # boundary depends on the transport contract.
     "anthropic>=1,<2",
     "httpx>=0.28",
+    # The guarded URL transport supplies a backend that dials screened addresses.
+    "httpcore>=1.0.9,<2",
     # Direct because the provider boundary catches this exception family and the
     # Anthropic tests inject HTTPX2 clients; the OpenAI v3 / Anthropic v1 transitive
     # dependency alone is not an import contract.

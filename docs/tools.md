@@ -344,12 +344,20 @@ Fetch a web page or PDF and extract specific information from it.
   host-safety ceiling. Rasterization supplies at most ten pages and explicitly
   tells the model when later pages were omitted; that notice survives the
   perception cache. Fetched PDFs are request-local and are not added to
-  conversation history or attachment storage. Every redirect hop is
-  SSRF-screened before it is requested.
+  conversation history or attachment storage. Every hop, the URL itself
+  included, is SSRF-screened before it is requested, and a hostname is looked
+  up only once its call is approved, so a denied call makes no DNS query.
   Private/internal addresses are refused by default; enable
-  `tools.allow_private_network` (console Settings → Tools)
-  to make them approvable for self-hosted setups whose services live on the
-  local network. The approval prompt marks such requests, and a public site
+  `tools.allow_private_network` (console Settings → Tools) to make them
+  approvable for self-hosted setups whose services live on the local network.
+  The approval prompt marks such requests. A private IP address is marked from
+  the first request; a hostname is marked after an executed request has found
+  it private, which refuses that request and asks the model to repeat the
+  call, so the repeat is approved as a private-network request. Task agents
+  also send these tagged requests through the approval gate, including its
+  configured approval policies. If a remembered hostname no longer resolves
+  wholly private, that request is refused and its private tag is forgotten;
+  a now-public hostname can be retried as an ordinary request. A public site
   redirecting into private space is refused regardless. Cloud metadata
   endpoints and link-local, multicast and reserved addresses are refused even
   with the opt-in enabled, including as a redirect target from a private address
@@ -359,7 +367,12 @@ Fetch a web page or PDF and extract specific information from it.
   is refused when any valid layout decodes into a refused range, even if its
   actual IPv4 destination is public; the private-network opt-in cannot restore
   access. The standard `64:ff9b::/96` DNS64 prefix still admits public IPv4
-  destinations.
+  destinations. Each hop connects only to the addresses returned by its
+  screen, without another hostname lookup. The original hostname is kept for
+  HTTP routing, TLS SNI, and certificate verification. A redirect gets a fresh
+  screen and connection. Requests routed through `HTTP_PROXY`, `HTTPS_PROXY`,
+  or `ALL_PROXY` are refused because a proxy could resolve the destination
+  independently. Hosts excluded by `NO_PROXY` can connect directly.
 - **Deployment requirements for local PDF processing**: The bounded PDF worker
   needs a writable temporary directory (`/tmp`, or the directory selected by
   `TMPDIR`) and permission to create one child process and lower its own resource

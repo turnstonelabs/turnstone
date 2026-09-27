@@ -165,6 +165,25 @@ frozen.
   model, which is the configured judge alias's model when one is set. Like the other auxiliary
   calls, judge calls do not move the live context gauge of the workstream they run for.
 
+### Security
+
+- **URL tools look up a hostname only after approval.** `web_fetch` and `open_preview` screened
+  their target while preparing the call, and the screen resolved the hostname. A denied or
+  cancelled call had already sent that name to DNS, and a private or unresolvable answer was
+  returned to the model without any approval. Preparation now judges only what needs no lookup:
+  malformed URLs, metadata hostnames, and IP literals, which keep their current refusals and
+  private-network marking. A hostname is resolved and screened when the approved request is made,
+  and refusals keep their wording. With `tools.allow_private_network` on, a hostname that turns
+  out to be private is refused once with a request to repeat the call; the repeat is marked as
+  a private-network request, and approving it grants access. Tagged requests in task agents
+  now use the same approval gate and policies as the conversation. A granted hostname that
+  no longer answers wholly private is refused and forgotten; if it now answers only public
+  addresses, a retry can be approved as an ordinary request. The grant recheck and first fetch
+  hop share one DNS answer. Each hop connects only to its screened addresses, closing the
+  screen-to-connect rebinding gap while preserving the hostname for HTTP routing, TLS SNI,
+  and certificate verification. Proxy-routed requests are refused because a proxy could
+  resolve the destination independently; `NO_PROXY` exclusions can connect directly.
+
 ## [1.8.3]
 
 Turnstone 1.8.3 makes scheduled work easier to launch, keeps conversations and node placement intact

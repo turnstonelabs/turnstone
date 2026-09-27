@@ -311,7 +311,14 @@ from turnstone.core.truncation import (
     truncate_text,
 )
 from turnstone.core.watch import WATCH_REMINDER_OPTIONAL_KEYS
-from turnstone.core.web import fetch_with_ssrf_guard, screen_url, strip_html
+from turnstone.core.web import (
+    UrlBlockedError,
+    UrlScreen,
+    fetch_with_ssrf_guard,
+    screen_url,
+    screen_url_offline,
+    strip_html,
+)
 from turnstone.core.workstream import (
     INTERJECTION_CAP_CHARS,
     PENDING_SENDS_MAX,
@@ -2778,11 +2785,32 @@ def _notify_delivery_statuses(results: Any) -> list[str]:
 
 
 def _screen_tool_url(url: str, allow_private_network: bool) -> tuple[str | None, bool, bool]:
-    """SSRF-screen a tool's target URL under the operator's private-network opt-in.
+    """SSRF-screen a tool's target URL before approval, without a DNS lookup.
 
     ``allow_private_network`` is the live ``tools.allow_private_network``
     setting (admin Settings → Tools; DB-backed, hot-toggleable — the caller
-    reads it per prepare).  Returns ``(error, private_origin, private_block)``.
+    reads it per prepare).  Returns ``(error, private_origin, private_block)``
+    as :func:`_tool_url_verdict` does.
+
+    Preparation runs for every proposed call, including the ones the approval
+    gate goes on to deny, and a lookup sends the hostname to the resolver.  So
+    only what is decidable locally is judged here — a malformed URL, a
+    metadata hostname, an IP literal — and a hostname passes with no verdict.
+    It is judged when the approved request is made, where a refusal of the
+    target reads as it would have here (see ``ChatSession._record_url_refusal``).
+    """
+    screen = screen_url_offline(url)
+    if screen is None:
+        return None, False, False
+    return _tool_url_verdict(screen, allow_private_network)
+
+
+def _tool_url_verdict(
+    screen: UrlScreen, allow_private_network: bool
+) -> tuple[str | None, bool, bool]:
+    """Judge a URL tool's screened target under the operator's private-network opt-in.
+
+    Returns ``(error, private_origin, private_block)``.
 
     ``error`` is the rejection text, or ``None`` to proceed.  A private-address
     rejection names the setting so a self-hosted operator learns the knob from
@@ -2806,7 +2834,6 @@ def _screen_tool_url(url: str, allow_private_network: bool) -> tuple[str | None,
     it revokes private-hop permission after any hop that is not wholly private
     and needs no notion of an "approved host".
     """
-    screen = screen_url(url)
     if screen.error is None:
         return None, False, False
     # The LANE is the contract, not the wording. Substring-matching the refusal
@@ -3447,6 +3474,12 @@ class ChatSession:
         # descriptor lands on the tool turn's meta and the blob persists
         # content-addressed against the turn; same lifecycle as the two above.
         self._tool_previews: dict[str, tuple[dict[str, Any], Attachment]] = {}
+        # Hostnames an executed web_fetch / open_preview request found wholly
+        # private under the private-network opt-in.  Preparation must not
+        # resolve a hostname, so this is what lets the repeat that refusal asks
+        # for carry the "(private network)" tag (see ``_record_url_refusal``).
+        # Only an executed request adds a name, which bounds its growth.
+        self._private_url_hosts: set[str] = set()
         # Cooperative cancellation: set from outside to stop generation.
         # No long-lived cancel REF: every model-call site builds its own
         # per-attempt, generation-scoped _CancelRef, and this slot is only
@@ -19877,6 +19910,86 @@ class ChatSession:
             return False
         return bool(cs.get("tools.allow_private_network"))
 
+    def _screen_url_for_approval(self, url: str) -> tuple[str | None, bool, bool]:
+        """Pre-approval screen of a URL tool's target, as ``_screen_tool_url`` returns it.
+
+        A hostname cannot be classified without resolving it, so under the
+        private-network opt-in it is tagged, and granted, only after an
+        executed request in this session found it wholly private (see
+        ``_record_url_refusal``): the repeat that refusal asks for is then
+        approved as what it is.
+        """
+        from urllib.parse import urlparse
+
+        allow_private_network = self._allow_private_network()
+        error, private_origin, private_block = _screen_tool_url(url, allow_private_network)
+        if (
+            error is None
+            and not private_origin
+            and allow_private_network
+            and urlparse(url).hostname in self._private_url_hosts
+        ):
+            return None, True, True
+        return error, private_origin, private_block
+
+    def _recheck_url_grant(self, item: dict[str, Any]) -> tuple[str | None, UrlScreen | None]:
+        """Recheck a private grant and return its refusal and first-hop screen.
+
+        A private-network grant on a hostname rests on an earlier answer (see
+        ``_screen_url_for_approval``), so the approved request screens the
+        target again. If it is no longer wholly private, forget the host and
+        refuse this request. Otherwise the guard reuses this verdict for its
+        first hop and connects to its addresses, so the grant and the fetch
+        use the same DNS answer.
+        """
+        from urllib.parse import urlparse
+
+        if not item.get("allow_private_origin"):
+            return None, None
+        url = item["url"]
+        screen = screen_url_offline(url) or screen_url(url)
+        error, private_origin, _private_block = _tool_url_verdict(screen, True)
+        if not private_origin:
+            hostname = urlparse(url).hostname
+            if hostname:
+                self._private_url_hosts.discard(hostname)
+            if error is None:
+                error = (
+                    "Error: URL no longer resolves to a private address; call again with"
+                    " the same URL to approve it as an ordinary request."
+                )
+        return error, screen
+
+    def _record_url_refusal(self, exc: UrlBlockedError, url: str, tool_name: str) -> str:
+        """Word a fetch refusal and remember a private host for a tagged retry.
+
+        A redirect target keeps the fetch-failed wording, since the approval
+        never named it.  The requested URL itself (for a hostname, this is its
+        first lookup; see ``_screen_tool_url``) gets the refusal preparation
+        would have given it, with one exception: under the private-network
+        opt-in, a wholly private hostname was approved without the
+        "(private network)" tag, so that approval did not grant private
+        access.  It is refused and remembered, and the repeat the refusal asks
+        for is approved as a private-network request.
+        """
+        from urllib.parse import urlparse
+
+        if exc.hop:
+            return f"Error: fetch failed: {exc}"
+        error, private_origin, _private_block = _tool_url_verdict(
+            exc.screen, self._allow_private_network()
+        )
+        if not private_origin:
+            return error or f"Error: fetch failed: {exc}"
+        hostname = urlparse(url).hostname
+        if hostname:
+            self._private_url_hosts.add(hostname)
+        return (
+            f"Error: {exc}. Private-network access needs its own approval: call {tool_name}"
+            " again with the same URL, and the approval prompt will mark it as a"
+            " private-network request."
+        )
+
     def _prepare_web_fetch(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
         url = args.get("url", "").strip()
         question = args.get("question", "").strip()
@@ -19907,12 +20020,11 @@ class ChatSession:
                 "needs_approval": False,
                 "error": f"Error: URL must start with http:// or https:// (got {url!r})",
             }
-        # SSRF screen \u2014 a NAMED private address is approvable under the
+        # SSRF screen, without a lookup: a hostname is resolved only once the
+        # call is approved.  A NAMED private address is approvable under the
         # tools.allow_private_network opt-in (the header tags it so the
         # operator approves it as what it is).
-        screen_err, private_origin, private_block = _screen_tool_url(
-            url, self._allow_private_network()
-        )
+        screen_err, private_origin, private_block = self._screen_url_for_approval(url)
         if screen_err:
             return {
                 "call_id": call_id,
@@ -19947,9 +20059,10 @@ class ChatSession:
         The target decides the approval posture: an http(s) URL is network
         egress and gates like ``web_fetch``; a file path or an
         ``attachment:<id>`` reference is a local read and runs unprompted like
-        ``read_file``.  SSRF screening happens here (pre-approval) so a
-        blocked target never even reaches the approval card, and again on the
-        post-redirect URL at execution.
+        ``read_file``.  What the SSRF screen can judge without a lookup is
+        judged here (pre-approval), so a blocked IP literal never even reaches
+        the approval card; a hostname is resolved and screened only once the
+        call is approved, and every redirect hop again at execution.
         """
         target = str(args.get("target") or "").strip()
         kind = args.get("kind")
@@ -19982,12 +20095,10 @@ class ChatSession:
             "title": str(title).strip() if title else None,
         }
         if target.startswith(("http://", "https://")):
-            # Same opt-in lane as web_fetch: a named private address is
-            # approvable under tools.allow_private_network, tagged so the
+            # Same screen and opt-in lane as web_fetch: a named private address
+            # is approvable under tools.allow_private_network, tagged so the
             # operator approves it as what it is.
-            screen_err, private_origin, private_block = _screen_tool_url(
-                target, self._allow_private_network()
-            )
+            screen_err, private_origin, private_block = self._screen_url_for_approval(target)
             if screen_err:
                 return {
                     "call_id": call_id,
@@ -26257,7 +26368,7 @@ class ChatSession:
                         is_tool_error = True
                         child_effect_status = EffectStatus.NONE
                     # Auto-execute tools in the auto_tools set.
-                    elif tool_name in auto_tools:
+                    elif tool_name in auto_tools and not prepared.get("allow_private_origin"):
                         # Paint the step pending under the task card before it
                         # runs (web) / print the leg (CLI) — the typed successor
                         # to the old on_info turn-leg.  Approval-gated tools
@@ -26265,7 +26376,7 @@ class ChatSession:
                         self._paint_agent_step(parent_call_id, prepared)
                         _, output = _execute_agent_tool(prepared, tool_name)
                         is_tool_error = self._tool_error_flags.pop(tc_dict["id"], False)
-                    # Tools not in auto_tools require user approval.
+                    # Other tools and private-network grants use the approval gate.
                     elif "execute" in prepared:
                         # Run the SAME intent-validation pipeline the main
                         # loop runs (issue: sub-agent calls previously hit
@@ -27765,9 +27876,14 @@ class ChatSession:
 
         _check_fetch_cancelled()
 
-        # Phase 1: fetch the URL.  The guarded fetch SSRF-screens every
-        # redirect hop before requesting it (the prepare-time check covers
-        # only the URL the model named, not where it 302s).
+        refusal, first_hop_screen = self._recheck_url_grant(item)
+        if refusal is not None:
+            _report_fetch_result(refusal, is_error=True)
+            return call_id, refusal
+
+        # Phase 1: fetch the URL.  The guarded fetch SSRF-screens every hop
+        # before requesting it: the URL the model named, which the prepare-time
+        # check could not resolve if it names a host, and wherever it 302s.
         pdf_data: bytes | None = None
         text = ""
         try:
@@ -27775,6 +27891,7 @@ class ChatSession:
                 url,
                 timeout=self.tool_timeout,
                 allow_private_origin=item.get("allow_private_origin", False),
+                first_hop_screen=first_hop_screen,
             )
             resp.raise_for_status()
             body = resp.content
@@ -27788,6 +27905,10 @@ class ChatSession:
 
         except httpx.HTTPStatusError as e:
             msg = f"Error: fetch failed: HTTP {e.response.status_code}"
+            _report_fetch_result(msg, is_error=True)
+            return call_id, msg
+        except UrlBlockedError as e:
+            msg = self._record_url_refusal(e, url, "web_fetch")
             _report_fetch_result(msg, is_error=True)
             return call_id, msg
         except (httpx.RequestError, ValueError) as e:
@@ -28057,21 +28178,28 @@ class ChatSession:
         body: bytes
         if target_kind == "url":
             url = item["url"]
+            refusal, first_hop_screen = self._recheck_url_grant(item)
+            if refusal is not None:
+                return _fail(refusal)
             try:
-                # Every redirect hop is SSRF-screened BEFORE its request goes
-                # out — the pre-approval screen covers only the URL the model
-                # named, not where it 302s.  The fetch ceiling tracks the most
-                # permissive kind cap (like the path lane's stat pre-check);
-                # the per-kind cap after resolution is the authority.
+                # Every hop is SSRF-screened BEFORE its request goes out: the
+                # URL the model named, which the pre-approval screen could not
+                # resolve if it names a host, and wherever it 302s.  The fetch
+                # ceiling tracks the most permissive kind cap (like the path
+                # lane's stat pre-check); the per-kind cap after resolution is
+                # the authority.
                 resp = fetch_with_ssrf_guard(
                     url,
                     timeout=self.tool_timeout,
                     allow_private_origin=item.get("allow_private_origin", False),
+                    first_hop_screen=first_hop_screen,
                     max_bytes=max(PREVIEW_SIZE_CAPS.values()),
                 )
                 resp.raise_for_status()
             except httpx.HTTPStatusError as e:
                 return _fail(f"Error: fetch failed: HTTP {e.response.status_code}")
+            except UrlBlockedError as e:
+                return _fail(self._record_url_refusal(e, url, "open_preview"))
             except (httpx.RequestError, ValueError) as e:
                 return _fail(f"Error: fetch failed: {e}")
             final_url = str(resp.url)

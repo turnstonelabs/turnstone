@@ -253,7 +253,9 @@ class ResolutionError(Exception):
     """A hostname could not be resolved to any address the guards can judge."""
 
 
-def resolve_and_classify(hostname: str, port: int = 0) -> list[tuple[AddressLane, IPAddress]]:
+def resolve_and_classify(
+    hostname: str, port: int = 0, *, numeric_only: bool = False
+) -> list[tuple[AddressLane, IPAddress]]:
     """Resolve *hostname* and classify every address it answers with.
 
     The single resolution path for every guard in the tree. Each guard used to
@@ -265,10 +267,16 @@ def resolve_and_classify(hostname: str, port: int = 0) -> list[tuple[AddressLane
 
     Raises :class:`ResolutionError` when the name yields nothing usable —
     including an empty answer list, which a caller looping over results would
-    otherwise treat as "no objections found".
+    otherwise treat as "no objections found". With ``numeric_only``, only
+    numeric address spellings are accepted and no DNS query is made.
     """
     try:
-        infos = socket.getaddrinfo(hostname, port or None, proto=socket.IPPROTO_TCP)
+        infos = socket.getaddrinfo(
+            hostname,
+            port or None,
+            proto=socket.IPPROTO_TCP,
+            flags=socket.AI_NUMERICHOST if numeric_only else 0,
+        )
     except (OSError, ValueError) as exc:
         raise ResolutionError(f"hostname cannot be resolved ({hostname})") from exc
 

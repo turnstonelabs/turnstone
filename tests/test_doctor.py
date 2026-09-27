@@ -322,6 +322,33 @@ class TestDiagnosticToolsReadOnly:
 
 
 class TestHttpGetJsonSafety:
+    @pytest.mark.parametrize("host", ["straße.example", "ς.example"])
+    def test_fetch_uses_the_screened_hostname(self, monkeypatch, host):
+        import socket
+        import urllib.parse
+
+        import httpx
+
+        from tests.test_open_preview_tool import _resolver
+
+        url = f"http://{host}/health"
+        dialed_host = httpx.URL(url).raw_host.decode("ascii")
+        resolver_host = host.encode("idna").decode("ascii")
+        looked_up = _resolver(
+            monkeypatch,
+            {resolver_host: ["93.184.216.34"], dialed_host: ["93.184.216.34"]},
+        )
+
+        def _urlopen(req, **kwargs):
+            socket.getaddrinfo(urllib.parse.urlsplit(req.full_url).hostname, 80)
+            response = MagicMock()
+            response.__enter__.return_value.read.return_value = b'{"ok": true}'
+            return response
+
+        monkeypatch.setattr("urllib.request.urlopen", _urlopen)
+        assert _http_get_json(url) == {"ok": True}
+        assert looked_up == [dialed_host, dialed_host]
+
     def test_rejects_file_scheme(self) -> None:
         with pytest.raises(ValueError, match="non-http"):
             _http_get_json("file:///etc/passwd")

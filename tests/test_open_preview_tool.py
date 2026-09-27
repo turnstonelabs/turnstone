@@ -26,6 +26,12 @@ PNG_1x1 = (
 )
 
 
+@pytest.fixture(autouse=True)
+def _no_environment_proxies(monkeypatch):
+    """Mocked fetches must not inherit the machine's proxy configuration."""
+    monkeypatch.setattr("turnstone.core._web_transport.getproxies", dict)
+
+
 class _RecordingUI:
     """SessionUI double that records tool_result calls (kwargs included)."""
 
@@ -41,46 +47,6 @@ class _RecordingUI:
 
     def on_tool_result(self, call_id, name, output, **kwargs):
         self.tool_results.append((call_id, name, output, kwargs))
-
-
-@pytest.fixture
-def _no_network_screen(monkeypatch):
-    """Keep prepare-time SSRF screening off the network.
-
-    Opt-in, NOT autouse: as a module-wide fixture it also stubbed the tests
-    whose whole point is the screen, so ``test_screen_public_url_passes``
-    asserted on the stub and would have passed even if screen_url refused
-    every hostname. Request it only where the hostname is incidental.
-
-    Screening fails closed on a resolution failure, so a test naming a
-    third-party host (``example.com``) would otherwise depend on live public
-    DNS and break on an isolated CI runner. IP literals are passed through to
-    the real screen — they resolve locally, and the tests that exercise the
-    private/never lanes are written with literals precisely so they exercise
-    the real classifier.
-    """
-    import ipaddress
-    from urllib.parse import urlparse
-
-    from turnstone.core import web
-
-    real = web.screen_url
-    permissive = _screen_stub()
-
-    def _screen(url):
-        try:
-            host = urlparse(url).hostname or ""
-        except ValueError:
-            return real(url)
-        if not host:
-            return real(url)  # malformed URLs are the real screen's business
-        try:
-            ipaddress.ip_address(host)
-        except ValueError:
-            return permissive(url)
-        return real(url)
-
-    monkeypatch.setattr("turnstone.core.session.screen_url", _screen)
 
 
 def _make_session(**kwargs):
@@ -126,7 +92,7 @@ class TestPrepareOpenPreview:
         item = s._prepare_open_preview("c1", {"target": "a.txt", "kind": "hologram"})
         assert "kind must be one of" in item["error"]
 
-    def test_url_target_needs_approval(self, _no_network_screen):
+    def test_url_target_needs_approval(self):
         s = _make_session()
         item = s._prepare_open_preview("c1", {"target": "https://example.com/x"})
         assert item["needs_approval"] is True
@@ -163,7 +129,7 @@ class TestPrepareOpenPreview:
 
 
 class TestExecOpenPreview:
-    def test_url_html_builds_web_descriptor(self, _no_network_screen, monkeypatch):
+    def test_url_html_builds_web_descriptor(self, monkeypatch):
         s = _make_session()
         body = b"<html><head><title>Acme Pricing</title></head><body>x</body></html>"
         monkeypatch.setattr(
@@ -187,7 +153,7 @@ class TestExecOpenPreview:
         results = s.ui.tool_results
         assert results and results[-1][3].get("preview") == descriptor
 
-    def test_url_filename_strips_nul_before_persistence(self, _no_network_screen, monkeypatch):
+    def test_url_filename_strips_nul_before_persistence(self, monkeypatch):
         s = _make_session()
         url = "https://example.com/report%00.pdf"
         body = b"%PDF-1.4 preview"
@@ -204,7 +170,7 @@ class TestExecOpenPreview:
         assert descriptor["source"] == url
         assert descriptor["title"] == "Quarterly report"
 
-    def test_url_userinfo_stripped_from_descriptor(self, _no_network_screen, monkeypatch):
+    def test_url_userinfo_stripped_from_descriptor(self, monkeypatch):
         s = _make_session()
         body = b"<html><head></head><body>x</body></html>"
         monkeypatch.setattr(
@@ -218,7 +184,7 @@ class TestExecOpenPreview:
         assert "sekret" not in descriptor["title"]
         assert b"sekret" not in att.content  # the injected <base href>
 
-    def test_redirect_into_private_space_blocked(self, _no_network_screen, monkeypatch):
+    def test_redirect_into_private_space_blocked(self, monkeypatch):
         s = _make_session()
 
         # The guarded fetch raises BEFORE requesting a private hop — the
@@ -227,16 +193,12 @@ class TestExecOpenPreview:
             raise ValueError("Blocked: URL resolves to private/internal address (169.254.169.254)")
 
         monkeypatch.setattr("turnstone.core.session.fetch_with_ssrf_guard", _blocked)
-        # The prepare-time screen fails closed on an unresolvable host, and
-        # innocent.example does not resolve — stub it so this test exercises
-        # the executor's ValueError lane rather than the screen.
-        monkeypatch.setattr("turnstone.core.session.screen_url", _screen_stub())
         item = s._prepare_open_preview("c1", {"target": "https://innocent.example/"})
         _, msg = s._exec_open_preview(item)
         assert msg.startswith("Error: fetch failed: Blocked")
         assert "c1" not in s._tool_previews
 
-    def test_oversized_web_content_errors(self, _no_network_screen, monkeypatch):
+    def test_oversized_web_content_errors(self, monkeypatch):
         s = _make_session()
         big = b"<html>" + b"x" * (4 * 1024 * 1024 + 16) + b"</html>"
         monkeypatch.setattr(
@@ -248,7 +210,7 @@ class TestExecOpenPreview:
         assert msg.startswith("Error:")
         assert "too large" in msg
 
-    def test_url_pdf_over_10mb_previews_to_kind_cap(self, _no_network_screen, monkeypatch):
+    def test_url_pdf_over_10mb_previews_to_kind_cap(self, monkeypatch):
         # Review finding (PR #800): a flat 10 MB URL pre-check rejected PDFs
         # the 32 MiB pdf kind cap allows — the fetch ceiling must track the
         # widest kind cap and leave the per-kind caps as the authority.
@@ -570,6 +532,10 @@ def _screen_stub(blocked=None):
     Patches what the guard actually calls. Patching a function the guard has
     stopped calling would leave the test green while screening nothing.
     """
+    import ipaddress
+
+    import httpx
+
     from turnstone.core.ip_classify import AddressLane
     from turnstone.core.web import UrlScreen
 
@@ -578,7 +544,13 @@ def _screen_stub(blocked=None):
     def _screen(url):
         err = table.get(url)
         if err is None:
-            return UrlScreen(AddressLane.PUBLIC, None, False)
+            return UrlScreen(
+                AddressLane.PUBLIC,
+                None,
+                False,
+                (ipaddress.ip_address("93.184.216.34"),),
+                httpx.URL(url).raw_host.decode("ascii"),
+            )
         return UrlScreen(AddressLane.NEVER, err, False)
 
     return _screen
@@ -988,7 +960,15 @@ class TestAllowPrivateNetwork:
         def _screen(url):
             if "mixed.example" in url:
                 # Worst lane PRIVATE, but not wholly private.
-                return UrlScreen(AddressLane.PRIVATE, "Blocked: private/internal", False)
+                import ipaddress
+
+                return UrlScreen(
+                    AddressLane.PRIVATE,
+                    "Blocked: private/internal",
+                    False,
+                    (ipaddress.ip_address("10.0.0.5"), ipaddress.ip_address("93.184.216.34")),
+                    "mixed.example",
+                )
             return real(url)
 
         monkeypatch.setattr("turnstone.core.web.screen_url", _screen)
@@ -1052,3 +1032,335 @@ class TestAllowPrivateNetwork:
         assert d.default is False
         assert d.section == "tools"
         assert d.help  # the admin form renders this — it must explain the caveat
+
+
+# ---------------------------------------------------------------------------
+# No lookup before approval — a hostname is resolved only for an approved call
+# ---------------------------------------------------------------------------
+
+
+def _resolver(monkeypatch, answers):
+    """Patch the resolver every screen goes through; return the names it was asked.
+
+    *answers* maps a hostname to its IPv4 addresses and may be edited between
+    calls. A name missing from it fails the way an unknown host does.
+    """
+    import socket
+
+    looked_up: list[str] = []
+    real_getaddrinfo = socket.getaddrinfo
+
+    def _getaddrinfo(host, port=None, *args, **kwargs):
+        if kwargs.get("flags", 0) & socket.AI_NUMERICHOST:
+            return real_getaddrinfo(host, port, *args, **kwargs)
+        host = host.encode("idna").decode("ascii")
+        looked_up.append(host)
+        if host not in answers:
+            raise socket.gaierror(socket.EAI_NONAME, "Name or service not known")
+        return [
+            (socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", (ip, 0))
+            for ip in answers[host]
+        ]
+
+    monkeypatch.setattr("socket.getaddrinfo", _getaddrinfo)
+    return looked_up
+
+
+def _prepare_url_tool(session, tool, url):
+    if tool == "web_fetch":
+        return session._prepare_web_fetch("c1", {"url": url, "question": "what is shown?"})
+    return session._prepare_open_preview("c1", {"target": url})
+
+
+class TestNoLookupBeforeApproval:
+    """A URL tool's hostname reaches the resolver only once its call is approved.
+
+    A lookup is outbound traffic that carries the name, so a call that is denied
+    must not have made one. Literal addresses and metadata hostnames are still
+    judged before approval, which needs no lookup.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _no_http(self, monkeypatch):
+        _FakeClient.calls = []
+        _FakeClient.table = {}
+        monkeypatch.setattr("turnstone.core.web.httpx.Client", _FakeClient)
+
+    @pytest.mark.parametrize("opted_in", [False, True])
+    @pytest.mark.parametrize("tool", ["web_fetch", "open_preview"])
+    def test_prepare_leaves_a_hostname_unresolved(self, monkeypatch, tool, opted_in):
+        looked_up = _resolver(monkeypatch, {"dashboard.lan.example": ["10.0.0.5"]})
+        monkeypatch.setattr(ChatSession, "_allow_private_network", lambda self: opted_in)
+        item = _prepare_url_tool(_make_session(), tool, "http://dashboard.lan.example/d")
+        assert looked_up == []
+        assert "error" not in item
+        assert item["needs_approval"] is True
+        # Unknown is not private: the tag is for a target known to be private.
+        assert "(private network)" not in item["header"]
+        assert item["allow_private_origin"] is False
+
+    @pytest.mark.parametrize(
+        ("tool", "args"),
+        [
+            ("web_fetch", {"url": "https://docs.example.com/x", "question": "q"}),
+            ("open_preview", {"target": "https://docs.example.com/x"}),
+        ],
+    )
+    def test_denied_call_never_reaches_the_resolver(self, tmp_db, monkeypatch, tool, args):
+        import json
+        from unittest.mock import patch
+
+        looked_up = _resolver(monkeypatch, {"docs.example.com": ["93.184.216.34"]})
+
+        class _DenyingUI(_RecordingUI):
+            def approve_tools(self, items):
+                return False, None
+
+        s = _make_session(ui=_DenyingUI())
+        generation = s._claim_generation()
+        calls = [{"id": "c1", "function": {"name": tool, "arguments": json.dumps(args)}}]
+        with patch.object(s, "_evaluate_intent", return_value=None):
+            results, _feedback = s._execute_tools(calls, my_generation=generation)
+        assert [call_id for call_id, _ in results] == ["c1"]
+        assert "denied" in str(results[0][1]).lower()
+        assert looked_up == []
+        assert _FakeClient.calls == []
+
+    def test_local_verdicts_still_come_before_approval(self, monkeypatch):
+        from turnstone.core.ip_classify import BLOCKED_HOSTNAMES
+
+        looked_up = _resolver(monkeypatch, {})
+        metadata_host = sorted(BLOCKED_HOSTNAMES)[0]
+        s = _make_session()
+        for target in (
+            "http://169.254.169.254/latest",
+            "http://10.0.0.7/x",
+            "http://[::1]:8080/x",
+            f"http://{metadata_host}/x",
+            "http://",
+        ):
+            item = s._prepare_open_preview("c1", {"target": target})
+            assert "error" in item, target
+            assert item["needs_approval"] is False
+        monkeypatch.setattr(ChatSession, "_allow_private_network", lambda self: True)
+        item = s._prepare_web_fetch("c1", {"url": "http://192.168.1.50:3000/d", "question": "q"})
+        assert "(private network)" in item["header"]
+        assert item["allow_private_origin"] is True
+        assert looked_up == []
+
+    def test_approved_public_hostname_is_fetched(self, monkeypatch):
+        looked_up = _resolver(monkeypatch, {"docs.example.com": ["93.184.216.34"]})
+        _FakeClient.table = {
+            "https://docs.example.com/x": _FakeHop(
+                200, {"content-type": "text/plain"}, body=b"hello"
+            ),
+        }
+        s = _make_session()
+        item = s._prepare_open_preview("c1", {"target": "https://docs.example.com/x"})
+        assert looked_up == []
+        _call_id, output = s._exec_open_preview(item)
+        assert not output.startswith("Error"), output
+        assert looked_up == ["docs.example.com"]
+        assert _FakeClient.calls == ["https://docs.example.com/x"]
+
+    @pytest.mark.parametrize("tool", ["web_fetch", "open_preview"])
+    def test_approved_private_hostname_is_refused_with_the_opt_in_hint(self, monkeypatch, tool):
+        _resolver(monkeypatch, {"dashboard.lan.example": ["10.0.0.5"]})
+        s = _make_session()
+        item = _prepare_url_tool(s, tool, "http://dashboard.lan.example/d")
+        _call_id, output = item["execute"](item)
+        assert output.startswith(
+            "Error: Blocked: URL resolves to private/internal address (10.0.0.5)."
+        )
+        assert "tools.allow_private_network" in output
+        assert _FakeClient.calls == []
+        # Refused while the opt-in was off, so enabling it later tags nothing.
+        monkeypatch.setattr(ChatSession, "_allow_private_network", lambda self: True)
+        again = _prepare_url_tool(s, tool, "http://dashboard.lan.example/d")
+        assert "(private network)" not in again["header"]
+
+    @pytest.mark.parametrize("tool", ["web_fetch", "open_preview"])
+    def test_private_hostname_under_the_opt_in_is_asked_for_again(self, monkeypatch, tool):
+        _resolver(monkeypatch, {"dashboard.lan.example": ["10.0.0.5"]})
+        monkeypatch.setattr(ChatSession, "_allow_private_network", lambda self: True)
+        s = _make_session()
+        first = _prepare_url_tool(s, tool, "http://dashboard.lan.example/d")
+        _call_id, output = first["execute"](first)
+        assert "(10.0.0.5)" in output
+        assert f"call {tool} again with the same URL" in output
+        assert _FakeClient.calls == []
+
+        # The repeat is approved as what it is, and that approval grants access.
+        second = _prepare_url_tool(s, tool, "http://dashboard.lan.example/d")
+        assert "(private network)" in second["header"]
+        assert second["allow_private_origin"] is True
+        url = "http://dashboard.lan.example/d"
+        _FakeClient.table = {url: _FakeHop(404, {})}
+        _call_id, output = second["execute"](second)
+        assert output == "Error: fetch failed: HTTP 404"
+        assert _FakeClient.calls == [url]
+
+    @pytest.mark.parametrize("tool", ["web_fetch", "open_preview"])
+    def test_disabling_opt_in_revokes_a_remembered_hostname(self, monkeypatch, tool):
+        _resolver(monkeypatch, {"dashboard.lan.example": ["10.0.0.5"]})
+        monkeypatch.setattr(ChatSession, "_allow_private_network", lambda self: True)
+        s = _make_session()
+        url = "http://dashboard.lan.example/d"
+        first = _prepare_url_tool(s, tool, url)
+        first["execute"](first)
+        assert s._private_url_hosts == {"dashboard.lan.example"}
+
+        monkeypatch.setattr(ChatSession, "_allow_private_network", lambda self: False)
+        second = _prepare_url_tool(s, tool, url)
+        assert "(private network)" not in second["header"]
+        assert second["allow_private_origin"] is False
+        _call_id, output = second["execute"](second)
+        assert "tools.allow_private_network" in output
+        assert _FakeClient.calls == []
+
+    @pytest.mark.parametrize("opted_in", [False, True])
+    @pytest.mark.parametrize("tool", ["web_fetch", "open_preview"])
+    def test_redirect_refusal_never_grants_the_origin(self, monkeypatch, tool, opted_in):
+        _resolver(
+            monkeypatch,
+            {"docs.example.com": ["93.184.216.34"], "lan.example": ["10.0.0.5"]},
+        )
+        monkeypatch.setattr(ChatSession, "_allow_private_network", lambda self: opted_in)
+        url = "https://docs.example.com/x"
+        _FakeClient.table = {url: _FakeHop(302, {"location": "http://lan.example/"})}
+        s = _make_session()
+        item = _prepare_url_tool(s, tool, url)
+        _call_id, output = item["execute"](item)
+        assert output.startswith("Error: fetch failed: Blocked")
+        assert "allow_private_network" not in output
+        assert s._private_url_hosts == set()
+        again = _prepare_url_tool(s, tool, url)
+        assert "(private network)" not in again["header"]
+        assert again["allow_private_origin"] is False
+        assert _FakeClient.calls == [url]
+
+    @pytest.mark.parametrize("tool", ["web_fetch", "open_preview"])
+    @pytest.mark.parametrize(
+        ("addresses", "message"),
+        [
+            (["93.184.216.34"], "no longer resolves to a private address"),
+            (["10.0.0.5", "93.184.216.34"], "also resolves to a public address"),
+            (["169.254.169.254"], "metadata address"),
+        ],
+    )
+    def test_changed_grant_is_refused_and_forgotten(self, monkeypatch, tool, addresses, message):
+        answers = {"dashboard.lan.example": ["10.0.0.5"]}
+        _resolver(monkeypatch, answers)
+        monkeypatch.setattr(ChatSession, "_allow_private_network", lambda self: True)
+        s = _make_session()
+        url = "http://dashboard.lan.example/d"
+        first = _prepare_url_tool(s, tool, url)
+        first["execute"](first)
+        second = _prepare_url_tool(s, tool, url)
+        assert second["allow_private_origin"] is True
+        answers["dashboard.lan.example"] = addresses
+        _FakeClient.table = {url: _FakeHop(404, {})}
+
+        _call_id, output = second["execute"](second)
+        assert message in output
+        assert s._private_url_hosts == set()
+        again = _prepare_url_tool(s, tool, url)
+        assert "(private network)" not in again["header"]
+        assert again["allow_private_origin"] is False
+        assert _FakeClient.calls == []
+
+    @pytest.mark.parametrize("tool", ["web_fetch", "open_preview"])
+    def test_granted_hostname_is_resolved_once_before_connect(self, monkeypatch, tool):
+        import socket
+
+        answers = {"dashboard.lan.example": ["10.0.0.5"]}
+        looked_up = _resolver(monkeypatch, answers)
+        resolver = socket.getaddrinfo
+
+        def _changing_answer(host, *args, **kwargs):
+            result = resolver(host, *args, **kwargs)
+            if not kwargs.get("flags", 0) & socket.AI_NUMERICHOST:
+                answers[host] = ["10.0.0.5", "93.184.216.34"]
+            return result
+
+        monkeypatch.setattr(ChatSession, "_allow_private_network", lambda self: True)
+        s = _make_session()
+        url = "http://dashboard.lan.example/d"
+        first = _prepare_url_tool(s, tool, url)
+        first["execute"](first)
+        second = _prepare_url_tool(s, tool, url)
+        looked_up.clear()
+        monkeypatch.setattr("socket.getaddrinfo", _changing_answer)
+        _FakeClient.table = {url: _FakeHop(404, {})}
+        _call_id, output = second["execute"](second)
+        assert output == "Error: fetch failed: HTTP 404"
+        assert looked_up == ["dashboard.lan.example"]
+        assert _FakeClient.calls == [url]
+
+    def test_refused_origin_does_not_build_a_client(self, monkeypatch):
+        from turnstone.core.web import UrlBlockedError, fetch_with_ssrf_guard
+
+        _resolver(monkeypatch, {"lan.example": ["10.0.0.5"]})
+        client = MagicMock(side_effect=AssertionError("refused origin built a client"))
+        monkeypatch.setattr("turnstone.core.web.httpx.Client", client)
+        with pytest.raises(UrlBlockedError, match="private/internal"):
+            fetch_with_ssrf_guard("http://lan.example/", timeout=5)
+        client.assert_not_called()
+
+    @pytest.mark.parametrize("tool", ["web_fetch", "open_preview"])
+    @pytest.mark.parametrize("host", ["straße.example", "ς.example"])
+    def test_screen_uses_the_hostname_the_client_dials(self, monkeypatch, tool, host):
+        import httpx
+
+        url = f"http://{host}/x"
+        dialed_host = httpx.URL(url).raw_host.decode("ascii")
+        resolver_host = host.encode("idna").decode("ascii")
+        assert dialed_host != resolver_host
+        looked_up = _resolver(
+            monkeypatch,
+            {resolver_host: ["93.184.216.34"], dialed_host: ["169.254.169.254"]},
+        )
+        _FakeClient.table = {url: _FakeHop(404, {})}
+        s = _make_session()
+        item = _prepare_url_tool(s, tool, url)
+        assert looked_up == []
+        _call_id, output = item["execute"](item)
+        assert "metadata address" in output
+        assert looked_up == [dialed_host]
+        assert _FakeClient.calls == []
+
+    @pytest.mark.parametrize("tool", ["web_fetch", "open_preview"])
+    def test_granted_hostname_answering_mixed_records_is_refused(self, monkeypatch, tool):
+        answers = {"dashboard.lan.example": ["10.0.0.5"]}
+        _resolver(monkeypatch, answers)
+        monkeypatch.setattr(ChatSession, "_allow_private_network", lambda self: True)
+        s = _make_session()
+        first = _prepare_url_tool(s, tool, "http://dashboard.lan.example/d")
+        first["execute"](first)
+        second = _prepare_url_tool(s, tool, "http://dashboard.lan.example/d")
+        assert second["allow_private_origin"] is True
+        answers["dashboard.lan.example"] = ["10.0.0.5", "93.184.216.34"]
+        _call_id, output = second["execute"](second)
+        assert "also resolves to a public address" in output
+        assert _FakeClient.calls == []
+
+    def test_mixed_answer_is_refused_and_not_remembered(self, monkeypatch):
+        _resolver(monkeypatch, {"dashboard.lan.example": ["10.0.0.5", "93.184.216.34"]})
+        monkeypatch.setattr(ChatSession, "_allow_private_network", lambda self: True)
+        s = _make_session()
+        item = s._prepare_open_preview("c1", {"target": "http://dashboard.lan.example/d"})
+        _call_id, output = s._exec_open_preview(item)
+        assert "also resolves to a public address" in output
+        assert _FakeClient.calls == []
+        again = s._prepare_open_preview("c1", {"target": "http://dashboard.lan.example/d"})
+        assert "(private network)" not in again["header"]
+
+    def test_unresolvable_hostname_is_refused_after_approval(self, monkeypatch):
+        looked_up = _resolver(monkeypatch, {})
+        s = _make_session()
+        item = s._prepare_open_preview("c1", {"target": "https://nowhere.example/x"})
+        assert "error" not in item
+        assert looked_up == []
+        _call_id, output = s._exec_open_preview(item)
+        assert output == "Error: Blocked: hostname cannot be resolved (nowhere.example)."
+        assert _FakeClient.calls == []

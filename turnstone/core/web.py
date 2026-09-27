@@ -2,14 +2,17 @@
 
 import dataclasses
 import re
+from contextlib import ExitStack
 from html import unescape as _html_unescape
 from urllib.parse import urlparse
 
 import httpx
 
+from turnstone.core._web_transport import PinnedTransport, proxy_required
 from turnstone.core.ip_classify import (
     BLOCKED_HOSTNAMES,
     AddressLane,
+    IPAddress,
     ResolutionError,
     describe_address,
     resolve_and_classify,
@@ -114,6 +117,10 @@ class UrlScreen:
     connection may land on the public record, so the approval the operator gave
     does not describe where the fetch actually goes.
     """
+    addresses: tuple[IPAddress, ...] = ()
+    """The classified addresses, in resolver order, retained for the connection."""
+    hostname: str = ""
+    """The encoded hostname these addresses were screened for."""
 
 
 def screen_url(url: str) -> UrlScreen:
@@ -132,23 +139,53 @@ def screen_url(url: str) -> UrlScreen:
     see the approvable lane, and under the operator opt-in the whole hostname —
     including the record it never looked at — would be fetched.
 
-    Fails closed. A resolution failure is a refusal, not a pass: the fetch that
-    follows resolves again, so an authority that answers the guard's query with
-    SERVFAIL and the fetch's query with an internal address would otherwise
-    turn the guard off for that hop. Malformed URLs are refusals too — every
-    exception path returns a verdict rather than raising, because the callers
-    screen model-supplied URLs and one of them prepares tools outside any
-    ``try``.
+    Fails closed: a resolution failure leaves no addresses the caller can
+    safely contact. Malformed URLs are refusals too — every exception path
+    returns a verdict rather than raising, because the callers screen
+    model-supplied URLs and one of them prepares tools outside any ``try``.
     """
+    hostname = _screened_hostname(url)
+    if isinstance(hostname, UrlScreen):
+        return hostname
+    try:
+        classified = resolve_and_classify(hostname)
+    except ResolutionError as exc:
+        return UrlScreen(AddressLane.NEVER, f"Blocked: {exc}", False)
+    return _worst_lane(classified, hostname)
+
+
+def screen_url_offline(url: str) -> UrlScreen | None:
+    """Screen *url* as far as it can be without a DNS lookup, else ``None``.
+
+    A lookup is itself outbound traffic: the query carries the hostname to the
+    resolver and on to whoever serves that name, so a check that runs before a
+    request is approved must not make one. What is decidable locally gets the
+    verdict :func:`screen_url` gives it: a malformed URL, a metadata hostname,
+    an IP literal. A hostname gets ``None`` rather than a PUBLIC verdict, since
+    its lane is unknown until :func:`fetch_with_ssrf_guard` resolves it for the
+    approved request.
+    """
+    hostname = _screened_hostname(url)
+    if isinstance(hostname, UrlScreen):
+        return hostname
+    try:
+        classified = resolve_and_classify(hostname, numeric_only=True)
+    except ResolutionError:
+        return None
+    return _worst_lane(classified, hostname)
+
+
+def _screened_hostname(url: str) -> str | UrlScreen:
+    """Return the hostname *url* names, or the verdict refusing it unresolved."""
     try:
         parsed = urlparse(url)
-        hostname = parsed.hostname
+        hostname = httpx.URL(url).raw_host.decode("ascii")
         # Touched, not used: ``urlsplit.port`` parses lazily and raises for an
         # out-of-range value, which must become a refusal rather than escape.
         # It is not passed to resolution — a numeric service does not change
         # which addresses come back, and classification looks only at those.
         _ = parsed.port
-    except ValueError:
+    except (ValueError, httpx.InvalidURL):
         return UrlScreen(AddressLane.NEVER, f"Blocked: malformed URL ({url})", False)
     if not hostname:
         return UrlScreen(AddressLane.NEVER, "Invalid URL: no hostname", False)
@@ -156,28 +193,32 @@ def screen_url(url: str) -> UrlScreen:
         return UrlScreen(
             AddressLane.NEVER, f"Blocked: URL names a metadata host ({hostname})", False
         )
+    return hostname
 
-    try:
-        classified = resolve_and_classify(hostname)
-    except ResolutionError as exc:
-        return UrlScreen(AddressLane.NEVER, f"Blocked: {exc}", False)
 
+def _worst_lane(classified: list[tuple[AddressLane, IPAddress]], hostname: str) -> UrlScreen:
+    """Fold classified addresses into one verdict: the worst lane and its refusal."""
     worst, offender = max(classified, key=lambda item: item[0])
     all_private = all(lane is AddressLane.PRIVATE for lane, _ in classified)
+    addresses = tuple(dict.fromkeys(addr for _lane, addr in classified))
 
     if worst is AddressLane.PUBLIC:
-        return UrlScreen(AddressLane.PUBLIC, None, False)
+        return UrlScreen(AddressLane.PUBLIC, None, False, addresses, hostname)
     if worst is AddressLane.NEVER:
         return UrlScreen(
             worst,
             "Blocked: URL resolves to a link-local/multicast/unspecified/"
             f"reserved/metadata address ({describe_address(offender)})",
             all_private,
+            addresses,
+            hostname,
         )
     return UrlScreen(
         worst,
         f"Blocked: URL resolves to private/internal address ({describe_address(offender)})",
         all_private,
+        addresses,
+        hostname,
     )
 
 
@@ -188,6 +229,22 @@ _REDIRECT_STATUSES = (301, 302, 303, 307, 308)
 _STALE_FRAMING_HEADERS = frozenset({"content-encoding", "content-length", "transfer-encoding"})
 
 
+class UrlBlockedError(ValueError):
+    """A guarded fetch refused a hop before requesting it.
+
+    Still a ``ValueError``, so a caller that routes blocked hops to its
+    fetch-failed lane keeps working. ``screen`` is the verdict and ``hop`` its
+    place in the chain: 0 is the URL the caller asked for, 1 and up are
+    redirect targets. A caller can then word a refusal of its own target the
+    way it would have before approval, and a redirect's as a failed fetch.
+    """
+
+    def __init__(self, screen: UrlScreen, hop: int) -> None:
+        super().__init__(screen.error)
+        self.screen = screen
+        self.hop = hop
+
+
 def fetch_with_ssrf_guard(
     url: str,
     *,
@@ -196,6 +253,7 @@ def fetch_with_ssrf_guard(
     max_redirects: int = 5,
     allow_private_origin: bool = False,
     max_bytes: int = FETCH_BYTE_CEILING,
+    first_hop_screen: UrlScreen | None = None,
 ) -> httpx.Response:
     """GET *url* following redirects manually, SSRF-screening EVERY hop.
 
@@ -205,11 +263,22 @@ def fetch_with_ssrf_guard(
     executing the private-network request even if the response is later
     discarded.  Here each hop's URL is screened BEFORE its request is issued.
 
-    EVERY hop is screened, in every mode.  ``allow_private_origin`` widens
-    which lanes are acceptable, it does not turn screening off: the caller
-    sets it only when the operator opted in AND the original target itself
-    named a private address, so the approval gate saw and approved that
+    EVERY hop is screened, in every mode, the first included: a screen run
+    before approval must not resolve a hostname (see
+    :func:`screen_url_offline`), so this is where a hostname target is first
+    looked up.  ``allow_private_origin`` widens which lanes are acceptable,
+    it does not turn screening off: the caller sets it only when the operator
+    opted in AND the approval prompt marked the original target as a
+    private-network request, so the approval gate saw and approved that
     private URL.
+
+    ``first_hop_screen`` may supply the caller's execution-time verdict on
+    this exact URL, so a private-grant recheck and hop 0 use the same answer.
+    Redirects are always screened afresh. The transport connects only to the
+    screened addresses, retaining the original hostname for HTTP routing and
+    TLS verification. It never resolves that hostname again to connect.
+    Proxy-routed requests are refused because a proxy could resolve the
+    destination independently; ``NO_PROXY`` exclusions can connect directly.
 
     The permission is also revoked the moment the chain leaves that network.
     Once any hop resolves PUBLIC, private hops are refused for the rest of the
@@ -229,25 +298,37 @@ def fetch_with_ssrf_guard(
     headers (content-encoding / content-length / transfer-encoding) that no
     longer describe the decoded content it carries.
 
-    Raises ``ValueError`` for a blocked hop, an over-budget body, or a
-    redirect chain past *max_redirects* (callers already route
-    ``ValueError`` to their fetch-failed lane), and lets ``httpx``
-    transport errors propagate unchanged.  ``resp.raise_for_status()``
-    stays the caller's call.
+    Raises :class:`UrlBlockedError` (a ``ValueError``) for a blocked hop and
+    ``ValueError`` for an over-budget body or a redirect chain past
+    *max_redirects* (callers already route ``ValueError`` to their
+    fetch-failed lane), and lets ``httpx`` transport errors propagate
+    unchanged.  ``resp.raise_for_status()`` stays the caller's call.
     """
     current = url
     private_allowed = allow_private_origin
-    with httpx.Client(
-        headers={"User-Agent": user_agent},
-        timeout=timeout,
-        follow_redirects=False,
-    ) as client:
-        for _hop in range(max_redirects + 1):
-            screen = screen_url(current)
+    with ExitStack() as stack:
+        client = None
+        transport = None
+        for hop in range(max_redirects + 1):
+            try:
+                parsed = httpx.URL(current)
+            except httpx.InvalidURL:
+                screen = UrlScreen(AddressLane.NEVER, f"Blocked: malformed URL ({current})", False)
+                raise UrlBlockedError(screen, hop) from None
+            if proxy_required(parsed):
+                raise ValueError(
+                    "Blocked: URL fetches cannot use a proxy because the connection must use"
+                    " the screened addresses. Configure NO_PROXY for this host to connect directly."
+                )
+            screen = (
+                first_hop_screen
+                if hop == 0 and first_hop_screen is not None
+                else screen_url(current)
+            )
             if screen.lane is AddressLane.NEVER:
-                raise ValueError(screen.error)
+                raise UrlBlockedError(screen, hop)
             if screen.lane is AddressLane.PRIVATE and not private_allowed:
-                raise ValueError(screen.error)
+                raise UrlBlockedError(screen, hop)
             if not screen.all_private:
                 # The chain can no longer be shown to be inside the operator's
                 # network, so private hops stop being allowed from here on.
@@ -259,6 +340,19 @@ def fetch_with_ssrf_guard(
                 # outright instead, so a chain that gets here wholly private
                 # stays that way or ends.
                 private_allowed = False
+            if client is None:
+                transport = PinnedTransport()
+                client = stack.enter_context(
+                    httpx.Client(
+                        headers={"User-Agent": user_agent},
+                        timeout=timeout,
+                        follow_redirects=False,
+                        transport=transport,
+                        trust_env=False,
+                    )
+                )
+            assert transport is not None
+            transport.pin(current, screen.hostname, screen.addresses)
             with client.stream("GET", current) as resp:
                 if resp.status_code in _REDIRECT_STATUSES:
                     location = resp.headers.get("location")
