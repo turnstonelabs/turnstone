@@ -72,6 +72,13 @@ frozen.
 
 ### Fixed
 
+- **GPT-6 Sol and Luna requests built from generic defaults.** `gpt-6-sol` and `gpt-6-luna` had no
+  capability rows and fell through to the default OpenAI row: a configured reasoning effort was
+  dropped, a configured temperature was sent while reasoning ran at the server default, which the
+  models' guide says to remove, the context window and output cap were taken as 200K and 64K instead
+  of 1.05M and 128K, and image attachments were withheld as unsupported. Both models now have rows
+  with the documented `none` through `max` effort ladder, temperature only at effort `none`, vision,
+  PDF input, tool search, and the 30-minute `prompt_cache_options` lifetime.
 - **Claude Opus 5.5 requests failing after a history edit.** `claude-opus-5-5` had no capability row
   and resolved to the Opus 5 row, so its requests never opted into the degrade mode for thinking
   bound to the conversation prefix. On Anthropic organizations created on or after 2026-08-31, a
