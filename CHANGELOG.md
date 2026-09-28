@@ -79,6 +79,23 @@ frozen.
 
 ### Fixed
 
+- **Native mid-conversation system messages rejected after a wake or approval feedback.** On Claude
+  models that take operator notes as native mid-conversation system messages (Opus 4.8, Opus 5 and
+  5.5, Fable 5 and 5.1), an idle wake, such as a finished watch, background shell or child, sent its
+  note right after the assistant's turn, and feedback typed with an approval after an advisory put a
+  user message right after the note. The API rejects both with a 400, and because the note stays in
+  the history, every later request in the workstream failed the same way. The Anthropic request now
+  places such a note after the user turn that follows it, or behind a short placeholder user turn
+  when it would otherwise follow the assistant's turn.
+- **Claude Sonnet 5.5 requests failing after a history edit.** `claude-sonnet-5-5` had no capability
+  row and resolved to the Sonnet 5 row, so its requests never opted into the degrade mode for
+  thinking bound to the conversation prefix. With reasoning replay enabled for the model, on
+  Anthropic organizations created on or after 2026-08-31, a replayed thinking block whose earlier
+  conversation had since changed, for example after compaction, failed the whole request with a 400,
+  and retries failed the same way. The model now has its own row and sends the binding control, so
+  such blocks are dropped server-side, unbilled, and the request proceeds. Unlike Sonnet 5, and like
+  Opus 5.5 and Fable 5.1, it also receives operator notes, such as nudges and messages the user
+  queues mid-turn, as native mid-conversation system messages.
 - **Small models looking for an attached file on disk.** A text attachment reached the model as
   a bare document block after the user's message, with nothing saying it was the file the user
   named or that it was not in the workspace. Small local models answered "summarize notes.md" by

@@ -1370,6 +1370,11 @@ class TestAnthropicProvider:
         assert [m["role"] for m in converted] == ["user"]
 
     def test_mid_conversation_system_inline_when_native(self) -> None:
+        # The API rejects a system message right after an ordinary assistant
+        # turn (an idle wake leaves one there), so the converter keeps it inline
+        # behind a placeholder user turn.
+        from turnstone.core.providers._anthropic import _ANCHOR_USER_TEXT
+
         messages = [
             {"role": "user", "content": "review this"},
             {"role": "assistant", "content": "done"},
@@ -1379,7 +1384,8 @@ class TestAnthropicProvider:
             messages, supports_mid_conversation_system=True
         )
         assert system == ""  # nothing leading to hoist
-        assert [m["role"] for m in converted] == ["user", "assistant", "system"]
+        assert [m["role"] for m in converted] == ["user", "assistant", "user", "system"]
+        assert converted[2]["content"] == _ANCHOR_USER_TEXT
         assert converted[-1]["content"] == "from now on, add type hints"
 
     def test_leading_empty_assistant_then_system_hoists_when_native(self) -> None:
@@ -1446,6 +1452,176 @@ class TestAnthropicProvider:
         assert roles[-1] == "system"
         assert roles[-2] == "user"  # the packed tool_result turn
         assert converted[-1]["content"] == "user said: also update changelog"
+
+    @staticmethod
+    def _assert_system_placement_legal(converted: list[dict[str, Any]]) -> None:
+        """Every inline system message follows a user turn and precedes an
+        assistant turn or ends the array, as the Messages API requires."""
+        for i, msg in enumerate(converted):
+            if msg["role"] != "system":
+                continue
+            assert i > 0 and converted[i - 1]["role"] == "user", converted
+            assert i == len(converted) - 1 or converted[i + 1]["role"] == "assistant", converted
+
+    def test_system_before_user_turn_moves_after_it_when_native(self) -> None:
+        # Approval feedback appended after an advisory would put a user turn
+        # right after the system message, which the API rejects: the operator
+        # turn moves after the feedback and the two user turns merge, tool
+        # results first.
+        messages = [
+            {"role": "user", "content": "run it"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "c1",
+                        "type": "function",
+                        "function": {"name": "run", "arguments": "{}"},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "c1", "content": "exit 1"},
+            {"role": "system", "content": "the tool failed"},
+            {"role": "user", "content": "approved; also check y"},
+        ]
+        _, converted = self.provider._convert_messages(
+            messages, supports_mid_conversation_system=True
+        )
+        assert [m["role"] for m in converted] == ["user", "assistant", "user", "system"]
+        blocks = converted[2]["content"]
+        assert [b["type"] for b in blocks] == ["tool_result", "text"]
+        assert blocks[1]["text"] == "approved; also check y"
+        assert converted[3]["content"] == "the tool failed"
+        self._assert_system_placement_legal(converted)
+
+    def test_system_left_by_failed_wake_moves_after_next_user_turn_when_native(self) -> None:
+        # A wake whose request failed leaves its operator turn right after the
+        # assistant turn; the user's next message then lands after it.  The
+        # operator turn moves after that message, so no placeholder is needed.
+        messages = [
+            {"role": "user", "content": "start the job"},
+            {"role": "assistant", "content": "started"},
+            {"role": "system", "content": "the job finished"},
+            {"role": "user", "content": "status?"},
+        ]
+        _, converted = self.provider._convert_messages(
+            messages, supports_mid_conversation_system=True
+        )
+        assert [m["role"] for m in converted] == ["user", "assistant", "user", "system"]
+        assert converted[2]["content"] == "status?"
+        assert converted[3]["content"] == "the job finished"
+        self._assert_system_placement_legal(converted)
+
+    def test_system_after_server_tool_result_keeps_position_when_native(self) -> None:
+        # The API also accepts a system message after an assistant turn that
+        # ends in a server tool result, so no placeholder goes there.
+        messages = [
+            {"role": "user", "content": "search"},
+            {
+                "role": "assistant",
+                "content": "",
+                "_provider_content": [
+                    {
+                        "type": "server_tool_use",
+                        "id": "srvtoolu_1",
+                        "name": "web_search",
+                        "input": {"query": "q"},
+                    },
+                    {
+                        "type": "web_search_tool_result",
+                        "tool_use_id": "srvtoolu_1",
+                        "content": [],
+                    },
+                ],
+            },
+            {"role": "system", "content": "note"},
+        ]
+        _, converted = self.provider._convert_messages(
+            messages, supports_mid_conversation_system=True
+        )
+        assert [m["role"] for m in converted] == ["user", "assistant", "system"]
+
+    def test_system_after_web_search_answer_gets_placeholder_when_native(self) -> None:
+        # A web-search turn usually ends in the model's text rather than the
+        # tool result, so a system message after it still needs the placeholder.
+        from turnstone.core.providers._anthropic import _ANCHOR_USER_TEXT
+
+        messages = [
+            {"role": "user", "content": "search"},
+            {
+                "role": "assistant",
+                "content": "",
+                "_provider_content": [
+                    {
+                        "type": "server_tool_use",
+                        "id": "srvtoolu_1",
+                        "name": "web_search",
+                        "input": {"query": "q"},
+                    },
+                    {
+                        "type": "web_search_tool_result",
+                        "tool_use_id": "srvtoolu_1",
+                        "content": [],
+                    },
+                    {"type": "text", "text": "found it"},
+                ],
+            },
+            {"role": "system", "content": "note"},
+        ]
+        _, converted = self.provider._convert_messages(
+            messages, supports_mid_conversation_system=True
+        )
+        assert [m["role"] for m in converted] == ["user", "assistant", "user", "system"]
+        assert converted[2]["content"] == _ANCHOR_USER_TEXT
+
+    @pytest.mark.parametrize(
+        "history",
+        [
+            [
+                {"role": "user", "content": "start the job"},
+                {"role": "assistant", "content": "started"},
+                {"role": "system", "content": "the job finished"},
+            ],
+            [
+                {"role": "user", "content": "run it"},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "c1",
+                            "type": "function",
+                            "function": {"name": "run", "arguments": "{}"},
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "c1", "content": "exit 1"},
+                {"role": "system", "content": "the tool failed"},
+                {"role": "user", "content": "approved; also check y"},
+            ],
+        ],
+        ids=["wake", "approval_feedback"],
+    )
+    def test_system_placement_keeps_wire_prefix_as_history_grows_when_native(
+        self, history: list[dict[str, Any]]
+    ) -> None:
+        # Preserved thinking binds each thinking block to the wire prefix before
+        # it, so moving system messages must not change the wire before an
+        # assistant turn as later turns (the reply, then the next user message)
+        # are appended.
+        reply = {"role": "assistant", "content": "reply"}
+        _, before = self.provider._convert_messages(history, supports_mid_conversation_system=True)
+        _, after_reply = self.provider._convert_messages(
+            [*history, reply], supports_mid_conversation_system=True
+        )
+        _, after_next = self.provider._convert_messages(
+            [*history, reply, {"role": "user", "content": "next"}],
+            supports_mid_conversation_system=True,
+        )
+        assert after_reply[: len(before)] == before
+        assert after_next[: len(after_reply)] == after_reply
+        self._assert_system_placement_legal(after_next)
 
     def test_reasoning_params_mapping(self) -> None:
         assert self.provider._reasoning_params("low", None, max_tokens=32768) == {
@@ -2209,6 +2385,58 @@ class TestAnthropicHelpers:
         assert caps.context_window == 1000000
         assert caps.supports_temperature is False
         assert caps.thinking_display == "summarized"
+        assert caps.thinking_prefix_bound is True
+
+    def test_capabilities_sonnet_5(self) -> None:
+        from turnstone.core.providers._anthropic import AnthropicProvider
+
+        provider = AnthropicProvider()
+        caps = provider.get_capabilities("claude-sonnet-5")
+        assert caps.context_window == 1000000
+        assert caps.thinking_mode == "adaptive"
+        assert caps.supports_mid_conversation_system is False
+        assert caps.thinking_prefix_bound is False
+
+    def test_capabilities_sonnet_5_dated(self) -> None:
+        from turnstone.core.providers._anthropic import AnthropicProvider
+
+        provider = AnthropicProvider()
+        caps = provider.get_capabilities("claude-sonnet-5-20260601")
+        assert caps.context_window == 1000000
+        assert caps.supports_temperature is False
+        # A dated sonnet-5 snapshot must not slide onto the sonnet-5-5 row.
+        assert caps.supports_mid_conversation_system is False
+        assert caps.thinking_prefix_bound is False
+
+    def test_capabilities_sonnet_5_5(self) -> None:
+        from turnstone.core.providers._anthropic import AnthropicProvider
+
+        provider = AnthropicProvider()
+        caps = provider.get_capabilities("claude-sonnet-5-5")
+        assert caps.context_window == 1000000
+        assert caps.max_output_tokens == 128000
+        assert caps.thinking_mode == "adaptive"
+        assert caps.supports_effort is True
+        assert caps.effort_levels == ("low", "medium", "high", "xhigh", "max")
+        assert caps.supports_temperature is False
+        assert caps.thinking_display == "summarized"
+        assert caps.supports_web_search is True
+        assert caps.supports_tool_search is True
+        assert caps.supports_vision is True
+        assert caps.supports_pdf is True
+        assert caps.supports_reasoning_replay is True
+        assert caps.supports_mid_conversation_system is True
+        assert caps.thinking_prefix_bound is True
+
+    def test_capabilities_sonnet_5_5_dated(self) -> None:
+        from turnstone.core.providers._anthropic import AnthropicProvider
+
+        provider = AnthropicProvider()
+        caps = provider.get_capabilities("claude-sonnet-5-5-20260928")
+        assert caps.context_window == 1000000
+        assert caps.supports_temperature is False
+        assert caps.thinking_display == "summarized"
+        assert caps.supports_mid_conversation_system is True
         assert caps.thinking_prefix_bound is True
 
     def test_capabilities_opus_4_8(self) -> None:
@@ -4555,7 +4783,7 @@ class TestModelCapabilitiesToolSearch:
 
 
 class TestMidConversationSystemCapability:
-    """supports_mid_conversation_system — NextOpus (claude-opus-4-8) only."""
+    """supports_mid_conversation_system: set on rows whose model accepts it."""
 
     def test_default_is_false(self) -> None:
         from turnstone.core.providers._protocol import ModelCapabilities
@@ -4572,7 +4800,7 @@ class TestMidConversationSystemCapability:
             assert caps.supports_mid_conversation_system is True, model
 
     def test_other_claude_models_do_not(self) -> None:
-        """Only NextOpus has it; older/other Claude models and the default off."""
+        """Older Claude rows and the Anthropic default leave it off."""
         from turnstone.core.providers._anthropic import AnthropicProvider
 
         provider = AnthropicProvider()
@@ -6918,6 +7146,20 @@ class TestAnthropicThinkingPrefixBinding:
         assert kwargs["thinking"] == {"type": "adaptive", "display": "summarized"}
         assert "extra_headers" not in kwargs
 
+    def test_sonnet_5_5_sends_drop_block_and_beta(self) -> None:
+        kwargs = self._kwargs("claude-sonnet-5-5")
+        assert kwargs["thinking"] == {
+            "type": "adaptive",
+            "display": "summarized",
+            "block_binding": {"prefix_mismatch_behavior": "drop_block"},
+        }
+        assert kwargs["extra_headers"] == {"anthropic-beta": self._BETA}
+
+    def test_sonnet_5_sends_neither(self) -> None:
+        kwargs = self._kwargs("claude-sonnet-5")
+        assert kwargs["thinking"] == {"type": "adaptive", "display": "summarized"}
+        assert "extra_headers" not in kwargs
+
     def test_caller_beta_header_is_joined_not_replaced(self) -> None:
         from tests._wire_capture import RecordingClient
 
@@ -6967,8 +7209,9 @@ class TestAnthropicThinkingPrefixBinding:
 
     def test_real_sdk_puts_control_on_the_wire(self) -> None:
         """Drive the real SDK: the untyped control must reach the HTTP body
-        verbatim and the beta must land as a request header (the SDK
-        floor is below the release that types ``block_binding``)."""
+        verbatim and the beta must land as a request header (the SDK types
+        ``block_binding`` only in its beta namespace, and this lane calls the
+        non-beta Messages resource)."""
         from tests._wire_capture import anthropic_body_capture_client
 
         captured: dict[str, Any] = {}

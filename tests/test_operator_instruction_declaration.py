@@ -371,6 +371,30 @@ class TestEmptyUserTurnDrop:
         # The nudge survives inline as a real system turn.
         assert any(m.get("role") == "system" and m.get("_source") == "idle_children" for m in out)
 
+    def test_native_wake_reaches_the_wire_behind_an_anchor(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # With the empty wake turn dropped, the nudge follows the assistant's
+        # turn, where the Messages API rejects a system message; the Anthropic
+        # converter puts a placeholder user turn ahead of it.
+        from turnstone.core.providers._anthropic import _ANCHOR_USER_TEXT
+
+        s = make_session()
+        native = ModelCapabilities(supports_mid_conversation_system=True)
+        monkeypatch.setattr(s, "_get_capabilities", lambda *a, **k: native)
+        msgs = [
+            {"role": "user", "content": "start the job"},
+            {"role": "assistant", "content": "ok"},
+            {"role": "user", "content": "", "_source": "system_nudge"},
+            {"role": "system", "_source": "idle_children", "content": "child done"},
+        ]
+        _, wire = AnthropicProvider()._convert_messages(
+            s._prepare_wire_messages(msgs), supports_mid_conversation_system=True
+        )
+        assert [m["role"] for m in wire] == ["user", "assistant", "user", "system"]
+        assert wire[2]["content"] == _ANCHOR_USER_TEXT
+        assert wire[3]["content"] == "child done"
+
     def test_fold_path_wake_turn_survives(self) -> None:
         # Fold path: the nudge folds INTO the empty wake user turn, filling it,
         # so it is NOT dropped (the drop runs after the fold).

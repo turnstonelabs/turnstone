@@ -76,6 +76,67 @@ def _merge_consecutive(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return merged
 
 
+# Placeholder user turn put ahead of an inline system message that would
+# otherwise follow an ordinary assistant turn (see _place_system_messages).
+_ANCHOR_USER_TEXT = "(No new user message.)"
+
+
+def _ends_in_server_tool_result(msg: dict[str, Any]) -> bool:
+    """True for an assistant turn whose last block is a server tool result."""
+    content = msg.get("content")
+    if not isinstance(content, list) or not content:
+        return False
+    last = content[-1]
+    return isinstance(last, dict) and str(last.get("type", "")).endswith("_tool_result")
+
+
+def _place_system_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Move inline ``system`` messages to positions the Messages API accepts.
+
+    A mid-conversation system message must come right after a ``user`` turn
+    (or an assistant turn ending in a server tool result) and right before an
+    ``assistant`` turn or at the end of the array; any other position is a
+    400.  Operator turns can land elsewhere: approval feedback or a queued
+    message appended after an advisory puts a user turn right after it, and an
+    idle wake, whose empty user turn is dropped, leaves one right after the
+    assistant's turn.  A system message followed by user turns moves after
+    them (``_merge_consecutive`` then joins the user turns, tool results
+    first); one that would follow an ordinary assistant turn gets
+    :data:`_ANCHOR_USER_TEXT` as a user turn ahead of it.  Held system
+    messages are released no later than the next assistant turn, so the wire
+    before each assistant turn depends only on the messages before it and
+    stays fixed as later turns are appended, which preserved thinking relies
+    on.  Only a trailing system message can still move, when a user turn
+    follows it (as after a failed wake).
+    """
+    placed: list[dict[str, Any]] = []
+    held: list[dict[str, Any]] = []
+
+    def release() -> None:
+        if not held:
+            return
+        prev = placed[-1] if placed else None
+        if (
+            prev is not None
+            and prev["role"] == "assistant"
+            and not _ends_in_server_tool_result(prev)
+        ):
+            placed.append({"role": "user", "content": _ANCHOR_USER_TEXT})
+        placed.extend(held)
+        held.clear()
+
+    for msg in messages:
+        if msg["role"] == "system":
+            held.append(msg)
+        elif msg["role"] == "user":
+            placed.append(msg)
+        else:
+            release()
+            placed.append(msg)
+    release()
+    return placed
+
+
 # Tool version for Anthropic's server-side web search (update when new version ships)
 _WEB_SEARCH_TOOL_TYPE = "web_search_20250305"
 
@@ -303,6 +364,42 @@ _ANTHROPIC_CAPABILITIES: dict[str, ModelCapabilities] = {
         supports_vision=True,
         supports_pdf=True,
         supports_reasoning_replay=True,
+    ),
+    # Sonnet 5.5: the sonnet-5 surface (below) plus mid-conversation system
+    # messages, which sonnet-5 does not accept.  Of its five documented
+    # breaking changes only the third reaches this lane:
+    #   * thinking={"type": "disabled"} is a 400 (the off switch is
+    #     "between_tools") -- the adaptive branch emits neither, so
+    #     unreachable.
+    #   * forced tool choice (``tool_choice`` any/tool) is a 400 -- this lane
+    #     never sends ``tool_choice``.
+    #   * thinking blocks are bound to the producing model and to the
+    #     conversation prefix -- model binding is a server-side unbilled
+    #     drop (replay stays verbatim); prefix binding is the fable-5-1
+    #     posture, so the row opts into drop_block via
+    #     ``thinking_prefix_bound``.  The API accepts ``block_binding`` only
+    #     with adaptive thinking, the only mode this row sends.
+    #   * the older computer-use tool is a 400 -- this lane sends none.
+    #   * the advisor tool rejects some advisor models -- this lane sends none.
+    # The API default effort stays high (levels recalibrated from sonnet-5);
+    # an unset knob still omits ``output_config.effort`` rather than pinning
+    # a level.
+    "claude-sonnet-5-5": ModelCapabilities(
+        context_window=1000000,
+        max_output_tokens=128000,
+        token_param="max_tokens",
+        thinking_mode="adaptive",
+        supports_effort=True,
+        effort_levels=("low", "medium", "high", "xhigh", "max"),
+        supports_web_search=True,
+        supports_tool_search=True,
+        supports_vision=True,
+        supports_pdf=True,
+        supports_temperature=False,
+        thinking_display="summarized",
+        supports_reasoning_replay=True,
+        supports_mid_conversation_system=True,
+        thinking_prefix_bound=True,
     ),
     # Sonnet 5: adaptive thinking is on by default (explicit adaptive config
     # accepted; manual budget_tokens is a 400); unlike Fable 5, an explicit
@@ -646,15 +743,16 @@ class AnthropicProvider:
         (``model_turn`` — every lane, the interactive loop included)
         always pass the resolved flag explicitly.
 
-        ``supports_mid_conversation_system`` (claude-opus-4-8,
-        claude-fable-5) makes the
+        ``supports_mid_conversation_system`` (set on the rows whose
+        model accepts mid-conversation system messages) makes the
         system-role handling position-aware: leading system/developer
         messages (the base prompt) still hoist into the top-level
         ``system`` param, but a system message appearing AFTER a
         non-system turn is a mid-conversation operator turn (see
         ``lowering.fold_system_turns``) and is emitted inline as a
-        ``{"role": "system"}`` message so it keeps its trajectory
-        position.  When False (every other model) all system messages
+        ``{"role": "system"}`` message at or just after its trajectory
+        position (``_place_system_messages`` moves it to a slot the API
+        accepts).  When False (every other row) all system messages
         hoist, as before — the fold pass has already removed any
         mid-conversation operator turns for those models.
 
@@ -684,18 +782,20 @@ class AnthropicProvider:
             if role in ("system", "developer"):
                 content = msg.get("content")
                 if supports_mid_conversation_system and seen_non_system and converted:
-                    # Mid-conversation operator turn → keep inline so it holds
-                    # its trajectory position.  Adjacent ones coalesce via
-                    # _merge_consecutive below (the API forbids consecutive
-                    # system messages).  Producers place these after a complete
-                    # tool block, never between a tool_use and its tool_result.
-                    # The ``converted`` guard matters because ``seen_non_system``
-                    # is set even when the preceding non-system message converted
-                    # to nothing (e.g. an assistant turn with only stripped
-                    # reasoning).  Without it, the first real wire entry could be
-                    # a ``system`` message — which the API rejects (messages[0]
-                    # must be ``user``).  ``converted`` only ever gains a system
-                    # entry once it already holds a non-system one, so a non-empty
+                    # Mid-conversation operator turn → keep inline;
+                    # ``_place_system_messages`` (below) moves it to a slot the API
+                    # accepts, after any user turns that follow it or behind a
+                    # placeholder user turn, and ``_merge_consecutive`` joins system
+                    # turns that end up adjacent (the API forbids consecutive system
+                    # messages).  Producers place these after a complete tool block,
+                    # never between a tool_use and its tool_result.  The
+                    # ``converted`` guard matters because ``seen_non_system`` is set
+                    # even when the preceding non-system message converted to
+                    # nothing (e.g. an assistant turn with only stripped reasoning).
+                    # Without it, the first real wire entry could be a ``system``
+                    # message — which the API rejects (messages[0] must be
+                    # ``user``).  ``converted`` only ever gains a system entry once
+                    # it already holds a non-system one, so a non-empty
                     # ``converted`` guarantees ``converted[0]`` is non-system;
                     # otherwise the turn hoists into ``system`` below.
                     if content:
@@ -848,6 +948,8 @@ class AnthropicProvider:
             converted.append({"role": "user", "content": str(msg.get("content", ""))})
             i += 1
 
+        if supports_mid_conversation_system:
+            converted = _place_system_messages(converted)
         return "\n\n".join(system_parts), _merge_consecutive(converted)
 
     @staticmethod

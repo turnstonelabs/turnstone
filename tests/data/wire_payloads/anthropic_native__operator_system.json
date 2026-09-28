@@ -25,6 +25,10 @@
           "content": "deployed",
           "tool_use_id": "call_1",
           "type": "tool_result"
+        },
+        {
+          "text": "Great, what's next?",
+          "type": "text"
         }
       ],
       "role": "user"
@@ -32,10 +36,6 @@
     {
       "content": "Output-guard: deploy output looked clean.",
       "role": "system"
-    },
-    {
-      "content": "Great, what's next?",
-      "role": "user"
     }
   ],
   "model": "claude-opus-4-8",

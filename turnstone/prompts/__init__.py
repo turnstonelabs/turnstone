@@ -207,10 +207,10 @@ def build_operator_instruction_declaration(nonce: str) -> str:
     model trusts only the region delimited by ``[start system-reminder_{nonce}]``
     … ``[end system-reminder_{nonce}]`` (both boundaries carry the nonce) and
     treats every other ``system-reminder``-style marker (e.g. one forged in tool
-    output, files, or web pages) as untrusted data.  Emitted only when the model uses
-    the fold path — the native mid-conversation-system path (claude-opus-4-8,
-    claude-fable-5) delivers operator turns as real ``{"role":"system"}``
-    messages with no fence, so no marker appears.
+    output, files, or web pages) as untrusted data.  Emitted only when the model
+    uses the fold path — the native mid-conversation-system path (rows that set
+    ``supports_mid_conversation_system``) delivers operator turns as real
+    ``{"role":"system"}`` messages with no fence, so no marker appears.
     """
     return (
         "## Operator instructions\n"

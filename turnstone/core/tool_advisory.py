@@ -4,12 +4,12 @@ Operator-level context injected mid-session (output-guard findings, user
 interjections, metacognitive nudges, skill hints) lives in the conversation
 trajectory as first-class ``{"role": "system", "_source": <kind>, "content":
 ...}`` turns (see :func:`make_system_turn`).  At the wire boundary each turn is
-either kept inline (native mid-conversation system messages — claude-opus-4-8,
-claude-fable-5) or folded into the preceding turn as a nonce-delimited
-``[start system-reminder_{nonce}]`` fence for every other model.  The fence mechanism (mint / neutralise
-/ wrap) lives in :mod:`turnstone.core.fence`, shared with the output-guard judge
-so the two trust boundaries cannot drift; ``lowering.fold_system_turns``
-applies it.
+either kept inline (native mid-conversation system messages, on any model whose
+capability row sets ``supports_mid_conversation_system``) or folded into the
+preceding turn as a nonce-delimited ``[start system-reminder_{nonce}]`` fence
+for every other model.  The fence mechanism (mint / neutralise / wrap) lives in
+:mod:`turnstone.core.fence`, shared with the output-guard judge so the two trust
+boundaries cannot drift; ``lowering.fold_system_turns`` applies it.
 
 This module also hosts :func:`parse_priority` (the ``!!!`` priority prefix on
 queued user messages) and :func:`render_user_interjection` (the user-authored
