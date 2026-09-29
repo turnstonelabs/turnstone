@@ -369,10 +369,14 @@ Fetch a web page or PDF and extract specific information from it.
   access. The standard `64:ff9b::/96` DNS64 prefix still admits public IPv4
   destinations. Each hop connects only to the addresses returned by its
   screen, without another hostname lookup. The original hostname is kept for
-  HTTP routing, TLS SNI, and certificate verification. A redirect gets a fresh
-  screen and connection. Requests routed through `HTTP_PROXY`, `HTTPS_PROXY`,
-  or `ALL_PROXY` are refused because a proxy could resolve the destination
-  independently. Hosts excluded by `NO_PROXY` can connect directly.
+  HTTP routing, TLS SNI, and certificate verification. Certificates are
+  verified against the operating system's trust store; `SSL_CERT_FILE` or
+  `SSL_CERT_DIR` replaces it with a custom CA bundle for the whole process, so
+  that bundle must also hold any public roots other connections need. A
+  redirect gets a fresh screen and connection. Requests routed through
+  `HTTP_PROXY`, `HTTPS_PROXY`, or `ALL_PROXY` are refused because a proxy could
+  resolve the destination independently. Hosts excluded by `NO_PROXY` can
+  connect directly.
 - **Deployment requirements for local PDF processing**: The bounded PDF worker
   needs a writable temporary directory (`/tmp`, or the directory selected by
   `TMPDIR`) and permission to create one child process and lower its own resource

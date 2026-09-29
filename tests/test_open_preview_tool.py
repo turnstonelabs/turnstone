@@ -1,7 +1,7 @@
 """End-to-end coverage for the ``open_preview`` tool wiring.
 
 Spans the seams the preview descriptor rides: preparer validation +
-approval posture, executor target resolution (mocked ``httpx`` for URLs,
+approval posture, executor target resolution (mocked ``httpx2`` for URLs,
 tmp files for paths, monkeypatched storage for attachments), the
 ``_tool_previews`` side channel + live SSE event, the ``Turn.meta``
 round-trip, the ``/history`` projection, the storage reconstruct routing,
@@ -64,11 +64,11 @@ def _make_session(**kwargs):
 
 
 def _fake_response(url, body, content_type):
-    import httpx
+    import httpx2
 
     resp = SimpleNamespace()
-    # A real httpx.URL so the executor's userinfo-strip path runs unmocked.
-    resp.url = httpx.URL(url)
+    # A real httpx2.URL so the executor's userinfo-strip path runs unmocked.
+    resp.url = httpx2.URL(url)
     resp.content = body
     resp.text = body.decode("utf-8", errors="replace")
     resp.headers = {"content-type": content_type}
@@ -507,7 +507,7 @@ class _FakeHop:
 
 
 class _FakeClient:
-    """httpx.Client double: serves a scripted {url: response} table."""
+    """httpx2.Client double: serves a scripted {url: response} table."""
 
     calls: list[str] = []
     table: dict[str, _FakeHop] = {}
@@ -534,7 +534,7 @@ def _screen_stub(blocked=None):
     """
     import ipaddress
 
-    import httpx
+    import httpx2
 
     from turnstone.core.ip_classify import AddressLane
     from turnstone.core.web import UrlScreen
@@ -549,7 +549,7 @@ def _screen_stub(blocked=None):
                 None,
                 False,
                 (ipaddress.ip_address("93.184.216.34"),),
-                httpx.URL(url).raw_host.decode("ascii"),
+                httpx2.URL(url).raw_host.decode("ascii"),
             )
         return UrlScreen(AddressLane.NEVER, err, False)
 
@@ -560,7 +560,7 @@ class TestFetchWithSsrfGuard:
     def _wire(self, monkeypatch, table, blocked=None):
         _FakeClient.calls = []
         _FakeClient.table = table
-        monkeypatch.setattr("turnstone.core.web.httpx.Client", _FakeClient)
+        monkeypatch.setattr("turnstone.core.web.httpx2.Client", _FakeClient)
         monkeypatch.setattr("turnstone.core.web.screen_url", _screen_stub(blocked))
 
     def test_follows_public_redirect_chain(self, monkeypatch):
@@ -849,7 +849,7 @@ class TestAllowPrivateNetwork:
             "http://10.0.0.7/a": _FakeHop(302, {"location": "http://10.0.0.8/b"}),
             "http://10.0.0.8/b": _FakeHop(200, {}),
         }
-        monkeypatch.setattr("turnstone.core.web.httpx.Client", _FakeClient)
+        monkeypatch.setattr("turnstone.core.web.httpx2.Client", _FakeClient)
         resp = fetch_with_ssrf_guard("http://10.0.0.7/a", timeout=5, allow_private_origin=True)
         assert resp.status_code == 200
         assert _FakeClient.calls == ["http://10.0.0.7/a", "http://10.0.0.8/b"]
@@ -861,7 +861,7 @@ class TestAllowPrivateNetwork:
 
         _FakeClient.calls = []
         _FakeClient.table = {"http://10.0.0.7/a": _FakeHop(200, {})}
-        monkeypatch.setattr("turnstone.core.web.httpx.Client", _FakeClient)
+        monkeypatch.setattr("turnstone.core.web.httpx2.Client", _FakeClient)
         with pytest.raises(ValueError, match="private/internal"):
             fetch_with_ssrf_guard("http://10.0.0.7/a", timeout=5)
         assert _FakeClient.calls == []
@@ -887,7 +887,7 @@ class TestAllowPrivateNetwork:
             "http://attacker.example/": _FakeHop(302, {"location": "http://home.example/admin"}),
             "http://home.example/admin": _FakeHop(200, {}),
         }
-        monkeypatch.setattr("turnstone.core.web.httpx.Client", _FakeClient)
+        monkeypatch.setattr("turnstone.core.web.httpx2.Client", _FakeClient)
 
         def _resolve(host, port=None, *a, **kw):
             if host == "home.example":
@@ -923,7 +923,7 @@ class TestAllowPrivateNetwork:
             "http://grafana.home.arpa/": _FakeHop(302, {"location": "http://10.0.0.1/admin"}),
             "http://10.0.0.1/admin": _FakeHop(200, {}),
         }
-        monkeypatch.setattr("turnstone.core.web.httpx.Client", _FakeClient)
+        monkeypatch.setattr("turnstone.core.web.httpx2.Client", _FakeClient)
         infos = [
             (socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("10.0.0.5", 0)),
             (socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("93.184.216.34", 0)),
@@ -953,7 +953,7 @@ class TestAllowPrivateNetwork:
             "http://mixed.example/b": _FakeHop(302, {"location": "http://10.0.0.1/admin"}),
             "http://10.0.0.1/admin": _FakeHop(200, {}),
         }
-        monkeypatch.setattr("turnstone.core.web.httpx.Client", _FakeClient)
+        monkeypatch.setattr("turnstone.core.web.httpx2.Client", _FakeClient)
 
         real = web.screen_url
 
@@ -994,7 +994,7 @@ class TestAllowPrivateNetwork:
             "http://93.184.216.34/": _FakeHop(302, {"location": "http://10.0.0.1/admin"}),
             "http://10.0.0.1/admin": _FakeHop(200, {}),
         }
-        monkeypatch.setattr("turnstone.core.web.httpx.Client", _FakeClient)
+        monkeypatch.setattr("turnstone.core.web.httpx2.Client", _FakeClient)
         with pytest.raises(ValueError, match="private/internal"):
             fetch_with_ssrf_guard("http://10.0.0.7/wiki", timeout=5, allow_private_origin=True)
         assert _FakeClient.calls == ["http://10.0.0.7/wiki", "http://93.184.216.34/"]
@@ -1018,7 +1018,7 @@ class TestAllowPrivateNetwork:
             ),
             "http://169.254.169.254/latest/meta-data/": _FakeHop(200, {}),
         }
-        monkeypatch.setattr("turnstone.core.web.httpx.Client", _FakeClient)
+        monkeypatch.setattr("turnstone.core.web.httpx2.Client", _FakeClient)
 
         with pytest.raises(ValueError, match="link-local"):
             fetch_with_ssrf_guard("http://10.0.0.7/a", timeout=5, allow_private_origin=True)
@@ -1084,7 +1084,7 @@ class TestNoLookupBeforeApproval:
     def _no_http(self, monkeypatch):
         _FakeClient.calls = []
         _FakeClient.table = {}
-        monkeypatch.setattr("turnstone.core.web.httpx.Client", _FakeClient)
+        monkeypatch.setattr("turnstone.core.web.httpx2.Client", _FakeClient)
 
     @pytest.mark.parametrize("opted_in", [False, True])
     @pytest.mark.parametrize("tool", ["web_fetch", "open_preview"])
@@ -1302,7 +1302,7 @@ class TestNoLookupBeforeApproval:
 
         _resolver(monkeypatch, {"lan.example": ["10.0.0.5"]})
         client = MagicMock(side_effect=AssertionError("refused origin built a client"))
-        monkeypatch.setattr("turnstone.core.web.httpx.Client", client)
+        monkeypatch.setattr("turnstone.core.web.httpx2.Client", client)
         with pytest.raises(UrlBlockedError, match="private/internal"):
             fetch_with_ssrf_guard("http://lan.example/", timeout=5)
         client.assert_not_called()
@@ -1310,10 +1310,10 @@ class TestNoLookupBeforeApproval:
     @pytest.mark.parametrize("tool", ["web_fetch", "open_preview"])
     @pytest.mark.parametrize("host", ["straße.example", "ς.example"])
     def test_screen_uses_the_hostname_the_client_dials(self, monkeypatch, tool, host):
-        import httpx
+        import httpx2
 
         url = f"http://{host}/x"
-        dialed_host = httpx.URL(url).raw_host.decode("ascii")
+        dialed_host = httpx2.URL(url).raw_host.decode("ascii")
         resolver_host = host.encode("idna").decode("ascii")
         assert dialed_host != resolver_host
         looked_up = _resolver(

@@ -68,8 +68,33 @@ class TestConfigureLogging:
 
     def test_quiet_third_party(self):
         configure_logging(level="DEBUG", json_output=False)
-        for name in ("httpx", "httpcore", "openai", "anthropic", "uvicorn.access"):
+        for name in (
+            "httpx",
+            "httpcore",
+            "httpx2",
+            "httpcore2",
+            "openai",
+            "anthropic",
+            "uvicorn.access",
+        ):
             assert logging.getLogger(name).level == logging.WARNING
+
+    def test_guarded_fetch_urls_stay_out_of_info_logs(self, monkeypatch, capsys):
+        from tests.test_web_transport import _PUBLIC, _Network, _response
+        from turnstone.core.web import fetch_with_ssrf_guard
+
+        for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY"):
+            monkeypatch.delenv(name, raising=False)
+            monkeypatch.delenv(name.lower(), raising=False)
+        _Network(monkeypatch, {"service.example": [[_PUBLIC]]}, [[_response()]])
+        configure_logging(level="INFO", json_output=False)
+        logging.getLogger("test.fetch_probe").info("probe line")
+
+        fetch_with_ssrf_guard("http://user:secret@service.example/x?token=abc", timeout=5)
+
+        err = capsys.readouterr().err
+        assert "probe line" in err
+        assert "service.example" not in err
 
     def test_replaces_existing_handlers(self):
         root = logging.getLogger()

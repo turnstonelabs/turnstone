@@ -36,12 +36,15 @@ dependencies = [
     # boundary depends on the transport contract.
     "anthropic>=1,<2",
     "httpx>=0.28",
+    # Direct because the provider boundary catches this exception family, the
+    # Anthropic tests inject HTTPX2 clients, and the guarded URL fetch is built on
+    # it; the OpenAI v3 / Anthropic v1 transitive dependency alone is not an import
+    # contract. 2.12 decodes compressed bodies in bounded pieces, which keeps the
+    # guarded fetch's decoded-byte limit a memory bound as well.
+    "httpx2>=2.12,<3",
     # The guarded URL transport supplies a backend that dials screened addresses.
-    "httpcore>=1.0.9,<2",
-    # Direct because the provider boundary catches this exception family and the
-    # Anthropic tests inject HTTPX2 clients; the OpenAI v3 / Anthropic v1 transitive
-    # dependency alone is not an import contract.
-    "httpx2>=2.7,<3",
+    # Released in lockstep with httpx2, which pins the matching version.
+    "httpcore2>=2.12,<3",
     "mcp>=1.27,<2",  # v2 is a breaking rewrite (2.0.0a1 live 2026-06-11; stable ~2026-07-27) — streamablehttp_client removed, 2-tuple transport, snake_case types; migrate deliberately
     "starlette>=1.3.1",  # CVE-2026-54282 (path->authority host spoof) + CVE-2026-54283 (url-encoded form DoS); supersedes the PYSEC-2026-161 host-header path-injection floor
     "uvicorn>=0.34",

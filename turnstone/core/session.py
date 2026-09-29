@@ -40,6 +40,7 @@ from html import escape as _html_escape
 from typing import TYPE_CHECKING, Any, ClassVar, Literal, Protocol, cast
 
 import httpx
+import httpx2
 
 from turnstone.core import fence
 from turnstone.core.attachment_buffer import get_attachment_buffer
@@ -27903,7 +27904,7 @@ class ChatSession:
                 if "html" in ct:
                     text = strip_html(text)
 
-        except httpx.HTTPStatusError as e:
+        except httpx2.HTTPStatusError as e:
             msg = f"Error: fetch failed: HTTP {e.response.status_code}"
             _report_fetch_result(msg, is_error=True)
             return call_id, msg
@@ -27911,7 +27912,7 @@ class ChatSession:
             msg = self._record_url_refusal(e, url, "web_fetch")
             _report_fetch_result(msg, is_error=True)
             return call_id, msg
-        except (httpx.RequestError, ValueError) as e:
+        except (httpx2.RequestError, ValueError) as e:
             msg = f"Error: fetch failed: {e}"
             _report_fetch_result(msg, is_error=True)
             return call_id, msg
@@ -28196,11 +28197,11 @@ class ChatSession:
                     max_bytes=max(PREVIEW_SIZE_CAPS.values()),
                 )
                 resp.raise_for_status()
-            except httpx.HTTPStatusError as e:
+            except httpx2.HTTPStatusError as e:
                 return _fail(f"Error: fetch failed: HTTP {e.response.status_code}")
             except UrlBlockedError as e:
                 return _fail(self._record_url_refusal(e, url, "open_preview"))
-            except (httpx.RequestError, ValueError) as e:
+            except (httpx2.RequestError, ValueError) as e:
                 return _fail(f"Error: fetch failed: {e}")
             final_url = str(resp.url)
             # The final URL feeds the descriptor (displayed, persisted) and

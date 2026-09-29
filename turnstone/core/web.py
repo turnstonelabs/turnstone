@@ -6,7 +6,7 @@ from contextlib import ExitStack
 from html import unescape as _html_unescape
 from urllib.parse import urlparse
 
-import httpx
+import httpx2
 
 from turnstone.core._web_transport import PinnedTransport, proxy_required
 from turnstone.core.ip_classify import (
@@ -179,13 +179,13 @@ def _screened_hostname(url: str) -> str | UrlScreen:
     """Return the hostname *url* names, or the verdict refusing it unresolved."""
     try:
         parsed = urlparse(url)
-        hostname = httpx.URL(url).raw_host.decode("ascii")
+        hostname = httpx2.URL(url).raw_host.decode("ascii")
         # Touched, not used: ``urlsplit.port`` parses lazily and raises for an
         # out-of-range value, which must become a refusal rather than escape.
         # It is not passed to resolution — a numeric service does not change
         # which addresses come back, and classification looks only at those.
         _ = parsed.port
-    except (ValueError, httpx.InvalidURL):
+    except (ValueError, httpx2.InvalidURL):
         return UrlScreen(AddressLane.NEVER, f"Blocked: malformed URL ({url})", False)
     if not hostname:
         return UrlScreen(AddressLane.NEVER, "Invalid URL: no hostname", False)
@@ -254,10 +254,10 @@ def fetch_with_ssrf_guard(
     allow_private_origin: bool = False,
     max_bytes: int = FETCH_BYTE_CEILING,
     first_hop_screen: UrlScreen | None = None,
-) -> httpx.Response:
+) -> httpx2.Response:
     """GET *url* following redirects manually, SSRF-screening EVERY hop.
 
-    ``httpx.get(follow_redirects=True)`` checks nothing between hops — a
+    ``httpx2.get(follow_redirects=True)`` checks nothing between hops — a
     public URL that 302s into private address space (cloud metadata, an
     internal admin endpoint) would be fetched before any post-hoc check runs,
     executing the private-network request even if the response is later
@@ -291,17 +291,17 @@ def fetch_with_ssrf_guard(
     The body is streamed under a *max_bytes* budget rather than buffered
     blind — ``client.get()`` would read an unbounded body into memory before
     any caller-side size cap could run.  The budget counts DECODED bytes
-    (``iter_bytes`` runs after content-decoding), so a small gzip body cannot
-    expand past it, and redirect-hop bodies are never read at all.  Callers
-    keep their own tighter product caps; this ceiling only bounds a hostile
-    or runaway response.  The realized response drops the wire-framing
-    headers (content-encoding / content-length / transfer-encoding) that no
-    longer describe the decoded content it carries.
+    (``iter_bytes`` runs after content-decoding, which yields bounded pieces),
+    so a small compressed body cannot expand past it, and redirect-hop bodies
+    are never read at all.  Callers keep their own tighter product caps; this
+    ceiling only bounds a hostile or runaway response.  The realized response
+    drops the wire-framing headers (content-encoding / content-length /
+    transfer-encoding) that no longer describe the decoded content it carries.
 
     Raises :class:`UrlBlockedError` (a ``ValueError``) for a blocked hop and
     ``ValueError`` for an over-budget body or a redirect chain past
     *max_redirects* (callers already route ``ValueError`` to their
-    fetch-failed lane), and lets ``httpx`` transport errors propagate
+    fetch-failed lane), and lets ``httpx2`` transport errors propagate
     unchanged.  ``resp.raise_for_status()`` stays the caller's call.
     """
     current = url
@@ -311,8 +311,8 @@ def fetch_with_ssrf_guard(
         transport = None
         for hop in range(max_redirects + 1):
             try:
-                parsed = httpx.URL(current)
-            except httpx.InvalidURL:
+                parsed = httpx2.URL(current)
+            except httpx2.InvalidURL:
                 screen = UrlScreen(AddressLane.NEVER, f"Blocked: malformed URL ({current})", False)
                 raise UrlBlockedError(screen, hop) from None
             if proxy_required(parsed):
@@ -343,7 +343,7 @@ def fetch_with_ssrf_guard(
             if client is None:
                 transport = PinnedTransport()
                 client = stack.enter_context(
-                    httpx.Client(
+                    httpx2.Client(
                         headers={"User-Agent": user_agent},
                         timeout=timeout,
                         follow_redirects=False,
@@ -357,7 +357,7 @@ def fetch_with_ssrf_guard(
                 if resp.status_code in _REDIRECT_STATUSES:
                     location = resp.headers.get("location")
                     if location:
-                        current = str(httpx.URL(current).join(location))
+                        current = str(httpx2.URL(current).join(location))
                         continue  # leaves the with-block: hop body never read
                 chunks: list[bytes] = []
                 total = 0
@@ -373,10 +373,10 @@ def fetch_with_ssrf_guard(
                     for k, v in resp.headers.items()
                     if k.lower() not in _STALE_FRAMING_HEADERS
                 ]
-                return httpx.Response(
+                return httpx2.Response(
                     status_code=resp.status_code,
                     headers=headers,
                     content=b"".join(chunks),
-                    request=httpx.Request("GET", current),
+                    request=httpx2.Request("GET", current),
                 )
     raise ValueError(f"Blocked: more than {max_redirects} redirects")

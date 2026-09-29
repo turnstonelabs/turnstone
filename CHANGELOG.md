@@ -76,6 +76,17 @@ frozen.
   delegated credential, so an injected `x-api-key` or `Authorization` header would silently
   replace it. Every provider adapter now raises at request assembly instead; delegated
   credentials ride `with_options(api_key=...)` only.
+- **URL fetches use HTTPX2.** `web_fetch` and URL targets of `open_preview` now run on HTTPX2 and
+  its connection layer, with the same per-hop address screening, pinned connections, manual
+  redirects, and decoded-size ceiling. Compressed bodies are decoded in bounded pieces, so a small
+  compressed response can no longer expand in memory before the ceiling applies, and where zstd
+  support is available (the Python 3.14 standard library, or `backports.zstd` on 3.13) fetches also
+  accept zstd-compressed responses. Certificates are verified against the operating system's trust
+  store instead of the `certifi` bundle; deployments that trusted a private CA through a modified
+  `certifi` bundle must install it in the system store or set `SSL_CERT_FILE` / `SSL_CERT_DIR`,
+  which apply to the whole process. HTTPX2 and its connection layer log at `WARNING` and above,
+  as HTTPX did, so fetched URLs stay out of `INFO` logs. The `httpx2` minimum is now 2.12, and
+  `httpcore2` replaces `httpcore` as a direct dependency.
 
 ### Fixed
 

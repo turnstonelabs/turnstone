@@ -28,7 +28,15 @@ _CONTEXT_VARS: list[tuple[ContextVar[str], str]] = [
 ]
 
 # Third-party loggers that are noisy at INFO level.
-_QUIET_LOGGERS = ("httpx", "httpcore", "openai", "anthropic", "uvicorn.access")
+_QUIET_LOGGERS = (
+    "httpx",
+    "httpcore",
+    "httpx2",
+    "httpcore2",
+    "openai",
+    "anthropic",
+    "uvicorn.access",
+)
 
 
 # ---------------------------------------------------------------------------

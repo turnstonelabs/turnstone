@@ -4,9 +4,12 @@ import gzip
 import ipaddress
 import socket
 import ssl
+import sys
+import tracemalloc
+import zlib
 
-import httpcore
-import httpx
+import httpcore2
+import httpx2
 import pytest
 
 from turnstone.core.web import UrlBlockedError, fetch_with_ssrf_guard
@@ -23,7 +26,14 @@ def _response(status=200, headers=(), body=b"ok"):
     return _CRLF.join([*lines, b"", body])
 
 
-class _Stream(httpcore.MockStream):
+def _request_headers(stream):
+    """Parse the header block of the one request written to *stream*."""
+    head = bytes(stream.written).split(_CRLF * 2, 1)[0]
+    fields = (line.partition(b":") for line in head.split(_CRLF)[1:])
+    return {name.decode().lower(): value.decode().strip() for name, _sep, value in fields}
+
+
+class _Stream(httpcore2.MockStream):
     def __init__(self, responses):
         super().__init__(responses)
         self.written = bytearray()
@@ -92,7 +102,7 @@ class _Network:
             return stream
 
         monkeypatch.setattr(socket, "getaddrinfo", resolve)
-        monkeypatch.setattr(httpcore.SyncBackend, "connect_tcp", connect)
+        monkeypatch.setattr(httpcore2.SyncBackend, "connect_tcp", connect)
 
 
 @pytest.fixture(autouse=True)
@@ -119,7 +129,7 @@ def _no_external_network(monkeypatch):
     ],
 )
 def test_screened_address_is_used_without_changing_the_hostname(monkeypatch, url):
-    parsed = httpx.URL(url)
+    parsed = httpx2.URL(url)
     hostname = parsed.raw_host.decode("ascii")
     net = _Network(monkeypatch, {hostname: [[_PUBLIC], ["10.0.0.5"]]}, [[_response()]])
 
@@ -155,6 +165,70 @@ def test_private_grant_passes_its_resolved_addresses_to_the_connection(monkeypat
     assert output == "Error: fetch failed: HTTP 404"
     assert net.lookups == [host, host]
     assert [attempt[0] for attempt in net.attempts] == ["10.0.0.5"]
+
+
+@pytest.mark.parametrize("tool", ["web_fetch", "open_preview"])
+@pytest.mark.parametrize(
+    ("failure", "expected"),
+    [
+        ("status", "Error: fetch failed: HTTP 503"),
+        ("connect", "Error: fetch failed: connection refused"),
+        ("read", "Error: fetch failed: body stalled"),
+    ],
+    ids=["status", "connect", "read"],
+)
+def test_http_failures_become_fetch_errors_in_both_tools(monkeypatch, tool, failure, expected):
+    from tests.test_open_preview_tool import _make_session, _prepare_url_tool
+
+    scripts = {
+        "status": [[_response(503)]],
+        "connect": [],
+        "read": [
+            [
+                _CRLF.join([b"HTTP/1.1 200 OK", b"Content-Length: 5", b"", b"a"]),
+                httpcore2.ReadTimeout("body stalled"),
+            ]
+        ],
+    }
+    net = _Network(monkeypatch, {"service.example": [[_PUBLIC]]}, scripts[failure])
+    if failure == "connect":
+        net.failures[_PUBLIC] = httpcore2.ConnectError("connection refused")
+    item = _prepare_url_tool(_make_session(), tool, "http://service.example/x")
+
+    _call_id, output = item["execute"](item)
+
+    assert output == expected
+    assert [attempt[0] for attempt in net.attempts] == [_PUBLIC]
+
+
+@pytest.mark.parametrize(
+    ("content_type", "body", "kind"),
+    [
+        ("application/pdf", b"%PDF-1.4 preview", "pdf"),
+        ("image/png", None, "image"),
+        ("application/json", b'[{"a": 1, "b": 2}]', "table"),
+        ("text/csv", b"a,b\n1,2\n", "table"),
+    ],
+)
+def test_url_previews_classify_fetched_content(monkeypatch, content_type, body, kind):
+    from tests.test_open_preview_tool import PNG_1x1, _make_session, _prepare_url_tool
+
+    body = PNG_1x1 if body is None else body
+    _Network(
+        monkeypatch,
+        {"service.example": [[_PUBLIC]]},
+        [[_response(headers=[("Content-Type", content_type)], body=body)]],
+    )
+    session = _make_session()
+    item = _prepare_url_tool(session, "open_preview", "https://user:pw@service.example/data")
+
+    _call_id, output = item["execute"](item)
+
+    assert not output.startswith("Error"), output
+    descriptor, attachment = session._tool_previews["c1"]
+    assert descriptor["kind"] == kind
+    assert descriptor["source"] == "https://service.example/data"
+    assert attachment.content == body
 
 
 def test_redirect_with_a_changed_address_reconnects_and_preserves_cookies(monkeypatch):
@@ -214,7 +288,7 @@ def test_connection_fallback_uses_only_the_screened_addresses(monkeypatch):
         {"service.example": [[_PUBLIC_V6, _PUBLIC], ["10.0.0.5"]]},
         [[_response()]],
     )
-    net.failures[_PUBLIC_V6] = httpcore.ConnectError("IPv6 unavailable")
+    net.failures[_PUBLIC_V6] = httpcore2.ConnectError("IPv6 unavailable")
 
     response = fetch_with_ssrf_guard("https://service.example/x", timeout=5)
 
@@ -230,11 +304,11 @@ def test_exhausted_addresses_fail_without_another_hostname_lookup(monkeypatch):
         [],
     )
     net.failures = {
-        _PUBLIC: httpcore.ConnectError("first unavailable"),
-        _OTHER_PUBLIC: httpcore.ConnectError("second unavailable"),
+        _PUBLIC: httpcore2.ConnectError("first unavailable"),
+        _OTHER_PUBLIC: httpcore2.ConnectError("second unavailable"),
     }
 
-    with pytest.raises(httpx.ConnectError, match="second unavailable"):
+    with pytest.raises(httpx2.ConnectError, match="second unavailable"):
         fetch_with_ssrf_guard("http://service.example/x", timeout=5)
 
     assert net.lookups == ["service.example"]
@@ -248,12 +322,12 @@ def test_stream_errors_keep_the_http_exception_type(monkeypatch):
         [
             [
                 _CRLF.join([b"HTTP/1.1 200 OK", b"Content-Length: 5", b"", b"a"]),
-                httpcore.ReadTimeout("body stalled"),
+                httpcore2.ReadTimeout("body stalled"),
             ]
         ],
     )
 
-    with pytest.raises(httpx.ReadTimeout, match="body stalled"):
+    with pytest.raises(httpx2.ReadTimeout, match="body stalled"):
         fetch_with_ssrf_guard("http://service.example/x", timeout=5)
 
     assert net.streams[0]._closed
@@ -301,7 +375,7 @@ def test_no_proxy_targets_can_connect_directly(monkeypatch, no_proxy):
     ],
 )
 def test_proxy_exclusions_match_the_url(monkeypatch, no_proxy, url, bypass):
-    hostname = httpx.URL(url).raw_host.decode("ascii")
+    hostname = httpx2.URL(url).raw_host.decode("ascii")
     net = _Network(monkeypatch, {hostname: [[_PUBLIC]]}, [[_response()]])
     monkeypatch.setenv("ALL_PROXY", "http://proxy.example:8080")
     monkeypatch.setenv("NO_PROXY", no_proxy)
@@ -328,18 +402,67 @@ def test_malformed_urls_keep_the_blocked_error_type(monkeypatch, url):
     assert net.attempts == []
 
 
-def test_compressed_response_obeys_the_decoded_byte_limit(monkeypatch):
-    body = gzip.compress(b"a" * 101)
+def _compressor(coding):
+    if coding == "gzip":
+        return gzip.compress
+    if coding == "deflate":
+        return zlib.compress
+    if coding == "zstd":
+        module = "compression.zstd" if sys.version_info >= (3, 14) else "backports.zstd"
+        return pytest.importorskip(module).compress
+    return pytest.importorskip("brotli").compress
+
+
+@pytest.mark.parametrize("coding", ["gzip", "deflate", "zstd", "br"])
+def test_advertised_encodings_obey_the_decoded_byte_limit(monkeypatch, coding):
+    compress = _compressor(coding)
     net = _Network(
+        monkeypatch,
+        {"service.example": [[_PUBLIC]]},
+        [
+            [_response(headers=[("Content-Encoding", coding)], body=compress(b"a" * 100))],
+            [_response(headers=[("Content-Encoding", coding)], body=compress(b"a" * 101))],
+        ],
+    )
+
+    response = fetch_with_ssrf_guard("http://service.example/x", timeout=5, max_bytes=100)
+    advertised = _request_headers(net.streams[0])["accept-encoding"]
+    if coding not in advertised.split(", "):
+        pytest.skip(f"{coding} is not advertised here ({advertised})")
+    with pytest.raises(ValueError, match="exceeded the 100-byte fetch limit"):
+        fetch_with_ssrf_guard("http://service.example/x", timeout=5, max_bytes=100)
+
+    assert response.content == b"a" * 100
+    assert "content-encoding" not in response.headers
+    assert response.headers["content-length"] == "100"
+    assert net.streams[0]._closed
+    assert net.streams[1]._closed
+
+
+def test_compressed_body_is_decoded_in_bounded_pieces(monkeypatch):
+    compressor = zlib.compressobj(wbits=31)
+    zeros = bytes(1024 * 1024)
+    body = b"".join(compressor.compress(zeros) for _ in range(64)) + compressor.flush()
+    _Network(
         monkeypatch,
         {"service.example": [[_PUBLIC]]},
         [[_response(headers=[("Content-Encoding", "gzip")], body=body)]],
     )
 
-    with pytest.raises(ValueError, match="exceeded the 100-byte fetch limit"):
-        fetch_with_ssrf_guard("http://service.example/x", timeout=5, max_bytes=100)
+    was_tracing = tracemalloc.is_tracing()
+    if not was_tracing:
+        tracemalloc.start()
+    tracemalloc.reset_peak()
+    before, _peak = tracemalloc.get_traced_memory()
+    try:
+        with pytest.raises(ValueError, match="fetch limit"):
+            fetch_with_ssrf_guard("http://service.example/x", timeout=5, max_bytes=1024 * 1024)
+        _current, peak = tracemalloc.get_traced_memory()
+    finally:
+        if not was_tracing:
+            tracemalloc.stop()
 
-    assert net.streams[0]._closed
+    assert peak - before < 16 * 1024 * 1024
 
 
 def test_fallback_shares_one_connect_timeout(monkeypatch):
@@ -350,7 +473,7 @@ def test_fallback_shares_one_connect_timeout(monkeypatch):
         {"service.example": [[_PUBLIC, _OTHER_PUBLIC]]},
         [[_response()]],
     )
-    net.failures[_PUBLIC] = httpcore.ConnectError("unavailable")
+    net.failures[_PUBLIC] = httpcore2.ConnectError("unavailable")
     times = iter([100, 100, 103])
     monkeypatch.setattr(_web_transport, "monotonic", lambda: next(times))
 
@@ -364,11 +487,11 @@ def test_expired_connect_timeout_does_not_try_another_address(monkeypatch):
     from turnstone.core import _web_transport
 
     net = _Network(monkeypatch, {"service.example": [[_PUBLIC, _OTHER_PUBLIC]]}, [])
-    net.failures[_PUBLIC] = httpcore.ConnectTimeout("unavailable")
+    net.failures[_PUBLIC] = httpcore2.ConnectTimeout("unavailable")
     times = iter([100, 100, 106])
     monkeypatch.setattr(_web_transport, "monotonic", lambda: next(times))
 
-    with pytest.raises(httpx.ConnectTimeout, match="Timed out connecting"):
+    with pytest.raises(httpx2.ConnectTimeout, match="Timed out connecting"):
         fetch_with_ssrf_guard("http://service.example/x", timeout=5)
 
     assert net.attempts == [(_PUBLIC, _PUBLIC, 80, 5)]

@@ -6,30 +6,30 @@ from ipaddress import ip_address
 from time import monotonic
 from urllib.request import getproxies
 
-import httpcore
-import httpx
+import httpcore2
+import httpx2
 
 from turnstone.core.ip_classify import IPAddress
 
-_HTTP_ERRORS: dict[type[Exception], type[httpx.TransportError]] = {
-    httpcore.ConnectTimeout: httpx.ConnectTimeout,
-    httpcore.ReadTimeout: httpx.ReadTimeout,
-    httpcore.WriteTimeout: httpx.WriteTimeout,
-    httpcore.PoolTimeout: httpx.PoolTimeout,
-    httpcore.ConnectError: httpx.ConnectError,
-    httpcore.ReadError: httpx.ReadError,
-    httpcore.WriteError: httpx.WriteError,
-    httpcore.LocalProtocolError: httpx.LocalProtocolError,
-    httpcore.RemoteProtocolError: httpx.RemoteProtocolError,
-    httpcore.ProxyError: httpx.ProxyError,
-    httpcore.UnsupportedProtocol: httpx.UnsupportedProtocol,
-    httpcore.TimeoutException: httpx.TimeoutException,
-    httpcore.NetworkError: httpx.NetworkError,
-    httpcore.ProtocolError: httpx.ProtocolError,
+_HTTP_ERRORS: dict[type[Exception], type[httpx2.TransportError]] = {
+    httpcore2.ConnectTimeout: httpx2.ConnectTimeout,
+    httpcore2.ReadTimeout: httpx2.ReadTimeout,
+    httpcore2.WriteTimeout: httpx2.WriteTimeout,
+    httpcore2.PoolTimeout: httpx2.PoolTimeout,
+    httpcore2.ConnectError: httpx2.ConnectError,
+    httpcore2.ReadError: httpx2.ReadError,
+    httpcore2.WriteError: httpx2.WriteError,
+    httpcore2.LocalProtocolError: httpx2.LocalProtocolError,
+    httpcore2.RemoteProtocolError: httpx2.RemoteProtocolError,
+    httpcore2.ProxyError: httpx2.ProxyError,
+    httpcore2.UnsupportedProtocol: httpx2.UnsupportedProtocol,
+    httpcore2.TimeoutException: httpx2.TimeoutException,
+    httpcore2.NetworkError: httpx2.NetworkError,
+    httpcore2.ProtocolError: httpx2.ProtocolError,
 }
 
 
-def proxy_required(url: httpx.URL) -> bool:
+def proxy_required(url: httpx2.URL) -> bool:
     """Check proxy settings without resolving a name or creating a transport.
 
     Match the client's exclusions: a plain domain includes its subdomains,
@@ -53,8 +53,8 @@ def proxy_required(url: httpx.URL) -> bool:
             else:
                 entry = "all://" + (f"[{entry}]" if address.version == 6 else entry)
         try:
-            exclusion = httpx.URL(entry)
-        except httpx.InvalidURL:
+            exclusion = httpx2.URL(entry)
+        except httpx2.InvalidURL:
             continue
         if exclusion.scheme not in ("", "all", url.scheme):
             continue
@@ -86,12 +86,12 @@ def _map_errors() -> Iterator[None]:
         raise
 
 
-class _PinnedBackend(httpcore.NetworkBackend):
+class _PinnedBackend(httpcore2.NetworkBackend):
     def __init__(self, hostname: str, port: int, addresses: tuple[IPAddress, ...]) -> None:
         self._hostname = hostname
         self._port = port
         self._addresses = addresses
-        self._backend = httpcore.SyncBackend()
+        self._backend = httpcore2.SyncBackend()
 
     def connect_tcp(
         self,
@@ -99,18 +99,18 @@ class _PinnedBackend(httpcore.NetworkBackend):
         port: int,
         timeout: float | None = None,
         local_address: str | None = None,
-        socket_options: Iterable[httpcore.SOCKET_OPTION] | None = None,
-    ) -> httpcore.NetworkStream:
+        socket_options: Iterable[httpcore2.SOCKET_OPTION] | None = None,
+    ) -> httpcore2.NetworkStream:
         if host != self._hostname or port != self._port:
-            raise httpcore.ConnectError("Connection target has no matching address screen")
+            raise httpcore2.ConnectError("Connection target has no matching address screen")
         deadline = None if timeout is None else monotonic() + timeout
-        error: httpcore.ConnectError | httpcore.ConnectTimeout = httpcore.ConnectError(
+        error: httpcore2.ConnectError | httpcore2.ConnectTimeout = httpcore2.ConnectError(
             "No screened addresses are available"
         )
         for address in self._addresses:
             remaining = None if deadline is None else deadline - monotonic()
             if remaining is not None and remaining <= 0:
-                raise httpcore.ConnectTimeout(
+                raise httpcore2.ConnectTimeout(
                     "Timed out connecting to screened addresses"
                 ) from error
             target = str(address)
@@ -126,13 +126,13 @@ class _PinnedBackend(httpcore.NetworkBackend):
                     local_address=local_address,
                     socket_options=socket_options,
                 )
-            except (httpcore.ConnectError, httpcore.ConnectTimeout) as exc:
+            except (httpcore2.ConnectError, httpcore2.ConnectTimeout) as exc:
                 error = exc
         raise error
 
 
-class _ResponseStream(httpx.SyncByteStream):
-    def __init__(self, response: httpcore.Response) -> None:
+class _ResponseStream(httpx2.SyncByteStream):
+    def __init__(self, response: httpcore2.Response) -> None:
         self._response = response
 
     def __iter__(self) -> Iterator[bytes]:
@@ -144,39 +144,42 @@ class _ResponseStream(httpx.SyncByteStream):
             self._response.close()
 
 
-class PinnedTransport(httpx.BaseTransport):
+class PinnedTransport(httpx2.BaseTransport):
     """Keep HTTP/TLS identity on the URL and pin only the socket destination.
 
     One fetch owns this transport and updates its target between redirect
     hops, after the prior response is closed. Each hop gets a fresh pool so
     an older connection cannot bypass its current address screen. The client
     retains its cookie jar across hops.
+
+    Certificates are verified against the operating system's trust store.
+    ``SSL_CERT_FILE`` or ``SSL_CERT_DIR`` replaces it with a custom CA bundle.
     """
 
     def __init__(self) -> None:
-        self._ssl_context = httpx.create_ssl_context()
-        self._pool: httpcore.ConnectionPool | None = None
-        self._url: httpx.URL | None = None
+        self._ssl_context = httpx2.create_ssl_context()
+        self._pool: httpcore2.ConnectionPool | None = None
+        self._url: httpx2.URL | None = None
 
     def pin(self, url: str, hostname: str, addresses: tuple[IPAddress, ...]) -> None:
-        parsed = httpx.URL(url)
+        parsed = httpx2.URL(url)
         if not addresses or hostname != parsed.raw_host.decode("ascii"):
             raise ValueError("Blocked: URL has no matching screened addresses")
         self.close()
         self._url = parsed
         port = parsed.port or (443 if parsed.scheme == "https" else 80)
-        self._pool = httpcore.ConnectionPool(
+        self._pool = httpcore2.ConnectionPool(
             ssl_context=self._ssl_context,
             network_backend=_PinnedBackend(hostname, port, addresses),
         )
 
-    def handle_request(self, request: httpx.Request) -> httpx.Response:
+    def handle_request(self, request: httpx2.Request) -> httpx2.Response:
         if self._pool is None or request.url != self._url:
-            raise httpx.ConnectError("Request has no matching address screen")
-        assert isinstance(request.stream, httpx.SyncByteStream)
-        core_request = httpcore.Request(
+            raise httpx2.ConnectError("Request has no matching address screen")
+        assert isinstance(request.stream, httpx2.SyncByteStream)
+        core_request = httpcore2.Request(
             method=request.method,
-            url=httpcore.URL(
+            url=httpcore2.URL(
                 scheme=request.url.raw_scheme,
                 host=request.url.raw_host,
                 port=request.url.port,
@@ -188,7 +191,7 @@ class PinnedTransport(httpx.BaseTransport):
         )
         with _map_errors():
             response = self._pool.handle_request(core_request)
-        return httpx.Response(
+        return httpx2.Response(
             status_code=response.status,
             headers=response.headers,
             stream=_ResponseStream(response),
