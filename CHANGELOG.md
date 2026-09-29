@@ -246,6 +246,14 @@ frozen.
   redaction now end a URL's password where another connection string could begin, which keeps the
   scan linear and still redacts a password of any length, `/` and `://` included, unless the
   password itself contains one of the recognised schemes, such as `https://`.
+- **The web UIs no longer fetch fonts from a third-party host.** The node UI, console and
+  coordinator pages loaded their two typefaces from an external font service on every page load.
+  Each load sent that service the viewer's IP address, user agent and the deployment's origin,
+  and the page stayed blank until the request finished or failed, which takes the full connection
+  timeout where outbound traffic is silently dropped. The same font files now ship in the package
+  (`shared_static/inter-4.001/`, `shared_static/jetbrains-mono-2.211/`) and are cached like the
+  other version-named vendor assets. Pages look the same where the service was reachable; where
+  it was blocked, they now get the intended typefaces instead of system fonts.
 
 ## [1.8.3]
 

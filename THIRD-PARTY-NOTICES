@@ -114,3 +114,25 @@ distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
+
+================================================================================
+
+Inter 4.001
+https://github.com/rsms/inter
+
+Copyright 2020 The Inter Project Authors (https://github.com/rsms/inter)
+
+Licensed under the SIL Open Font License, Version 1.1. The license text ships
+with the font files in turnstone/shared_static/inter-4.001/LICENSE and is
+available with a FAQ at https://openfontlicense.org
+
+================================================================================
+
+JetBrains Mono 2.211
+https://github.com/JetBrains/JetBrainsMono
+
+Copyright 2020 The JetBrains Mono Project Authors (https://github.com/JetBrains/JetBrainsMono)
+
+Licensed under the SIL Open Font License, Version 1.1. The license text ships
+with the font files in turnstone/shared_static/jetbrains-mono-2.211/LICENSE and
+is available with a FAQ at https://openfontlicense.org

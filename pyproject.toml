@@ -114,6 +114,8 @@ include = [
   "turnstone/shared_static/hljs-11.12.0/**/*",
   "turnstone/shared_static/mermaid-12.0.0/**/*",
   "turnstone/shared_static/hls-1.7.3/**/*",
+  "turnstone/shared_static/inter-4.001/**/*",
+  "turnstone/shared_static/jetbrains-mono-2.211/**/*",
   "turnstone/sdk/py.typed",
   "turnstone/deploy/*.yaml",
   "turnstone/deploy/Caddyfile",
