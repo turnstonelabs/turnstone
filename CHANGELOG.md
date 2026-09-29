@@ -87,6 +87,15 @@ frozen.
   which apply to the whole process. HTTPX2 and its connection layer log at `WARNING` and above,
   as HTTPX did, so fetched URLs stay out of `INFO` logs. The `httpx2` minimum is now 2.12, and
   `httpcore2` replaces `httpcore` as a direct dependency.
+- **URL fetches ask for web pages.** `web_fetch` and URL targets of `open_preview` send
+  `Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8` and
+  `Accept-Language: en-US,en;q=0.9` on the first request and every redirect. Hops to https URLs and
+  loopback hosts also send navigation metadata (`Sec-Fetch-Dest: document`,
+  `Sec-Fetch-Mode: navigate`, `Sec-Fetch-Site: none`), which browsers omit on plain http. The
+  `User-Agent` is still `turnstone/1.0`. Other content types remain acceptable, but an endpoint that
+  negotiates content may now return HTML where it previously returned JSON or CSV, and some image
+  hosts (for example `i.imgur.com`, `i.redd.it`) redirect a direct image link to their HTML page,
+  which a preview shows without its scripts.
 
 ### Fixed
 

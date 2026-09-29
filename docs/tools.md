@@ -377,6 +377,15 @@ Fetch a web page or PDF and extract specific information from it.
   `HTTP_PROXY`, `HTTPS_PROXY`, or `ALL_PROXY` are refused because a proxy could
   resolve the destination independently. Hosts excluded by `NO_PROXY` can
   connect directly.
+- **Request headers**: Every request, redirects included, identifies as
+  `User-Agent: turnstone/1.0` and prefers HTML and English (`Accept`,
+  `Accept-Language`). As in browsers, requests to https URLs and loopback hosts
+  also carry top-level navigation metadata (`Sec-Fetch-Dest: document`,
+  `Sec-Fetch-Mode: navigate`, `Sec-Fetch-Site: none`), judged per hop, so a
+  redirect to plain http sends none. Other content types remain acceptable, but
+  an endpoint that negotiates content may return HTML rather than JSON or CSV,
+  and some image hosts redirect a direct image link to their HTML page. URL
+  targets of `open_preview` send the same headers.
 - **Deployment requirements for local PDF processing**: The bounded PDF worker
   needs a writable temporary directory (`/tmp`, or the directory selected by
   `TMPDIR`) and permission to create one child process and lower its own resource

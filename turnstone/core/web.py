@@ -4,6 +4,7 @@ import dataclasses
 import re
 from contextlib import ExitStack
 from html import unescape as _html_unescape
+from ipaddress import ip_address
 from urllib.parse import urlparse
 
 import httpx2
@@ -227,6 +228,46 @@ FETCH_BYTE_CEILING = 32 * 1024 * 1024
 
 _REDIRECT_STATUSES = (301, 302, 303, 307, 308)
 _STALE_FRAMING_HEADERS = frozenset({"content-encoding", "content-length", "transfer-encoding"})
+_REQUEST_HEADERS = {
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+"""Headers every hop of a guarded fetch sends alongside its User-Agent.
+
+``Accept`` prefers HTML while still accepting any other type, and
+``Accept-Language`` prefers English.
+"""
+_FETCH_METADATA = {
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+}
+"""Navigation metadata for hops to potentially trustworthy URLs.
+
+It describes a top-level navigation, a compatibility choice for a server-side
+fetcher; the User-Agent still identifies Turnstone. As in browsers, each hop is
+judged by its own URL, so an https page redirecting to plain http sends none on
+the http hop. ``Sec-Fetch-User`` stays unset: ``?1`` asserts a user-activated
+navigation, and this fetcher cannot tell whether a person approved the call
+(task agents and auto-approval run it unattended).
+"""
+
+
+def _potentially_trustworthy(url: httpx2.URL) -> bool:
+    """Return whether browsers would send Fetch Metadata to *url*.
+
+    That is https, or a loopback host: a ``localhost`` name or a loopback
+    address. Other schemes never reach the guarded fetch's client.
+    """
+    if url.scheme == "https":
+        return True
+    host = url.host.lower()
+    if host == "localhost" or host.endswith(".localhost"):
+        return True
+    try:
+        return ip_address(host).is_loopback
+    except ValueError:
+        return False
 
 
 class UrlBlockedError(ValueError):
@@ -344,7 +385,7 @@ def fetch_with_ssrf_guard(
                 transport = PinnedTransport()
                 client = stack.enter_context(
                     httpx2.Client(
-                        headers={"User-Agent": user_agent},
+                        headers={**_REQUEST_HEADERS, "User-Agent": user_agent},
                         timeout=timeout,
                         follow_redirects=False,
                         transport=transport,
@@ -353,7 +394,8 @@ def fetch_with_ssrf_guard(
                 )
             assert transport is not None
             transport.pin(current, screen.hostname, screen.addresses)
-            with client.stream("GET", current) as resp:
+            metadata = _FETCH_METADATA if _potentially_trustworthy(parsed) else None
+            with client.stream("GET", current, headers=metadata) as resp:
                 if resp.status_code in _REDIRECT_STATUSES:
                     location = resp.headers.get("location")
                     if location:

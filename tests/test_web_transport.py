@@ -265,6 +265,82 @@ def test_redirect_to_the_same_host_is_screened_again(monkeypatch):
     assert all(stream._closed for stream in net.streams)
 
 
+@pytest.mark.parametrize(
+    ("kwargs", "user_agent"),
+    [({}, "turnstone/1.0"), ({"user_agent": "custom-agent/2.0"}, "custom-agent/2.0")],
+    ids=["default", "custom"],
+)
+def test_request_headers_reach_every_hop(monkeypatch, kwargs, user_agent):
+    net = _Network(
+        monkeypatch,
+        {"service.example": [[_PUBLIC]], "other.example": [[_OTHER_PUBLIC]]},
+        [
+            [_response(302, [("Location", "https://other.example/next")])],
+            [_response()],
+        ],
+    )
+
+    response = fetch_with_ssrf_guard("https://service.example/start", timeout=5, **kwargs)
+
+    expected = {
+        "user-agent": user_agent,
+        "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "accept-language": "en-US,en;q=0.9",
+        "sec-fetch-dest": "document",
+        "sec-fetch-mode": "navigate",
+        "sec-fetch-site": "none",
+        "sec-fetch-user": None,
+    }
+    sent = [_request_headers(stream) for stream in net.streams]
+    hops = [{name: headers.get(name) for name in expected} for headers in sent]
+    assert response.content == b"ok"
+    assert hops == [expected, expected]
+
+
+def test_fetch_metadata_follows_each_hops_trustworthiness(monkeypatch):
+    net = _Network(
+        monkeypatch,
+        {"service.example": [[_PUBLIC]], "other.example": [[_OTHER_PUBLIC]]},
+        [
+            [_response(302, [("Location", "http://other.example/plain")])],
+            [_response(302, [("Location", "https://service.example/back")])],
+            [_response()],
+        ],
+    )
+
+    fetch_with_ssrf_guard("https://service.example/start", timeout=5)
+
+    names = ("accept", "sec-fetch-dest", "sec-fetch-mode", "sec-fetch-site")
+    sent = [_request_headers(stream) for stream in net.streams]
+    hops = [tuple(headers.get(name) for name in names) for headers in sent]
+    accept = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+    navigation = (accept, "document", "navigate", "none")
+    assert hops == [navigation, (accept, None, None, None), navigation]
+
+
+@pytest.mark.parametrize(
+    ("url", "metadata"),
+    [
+        ("http://service.example/x", False),
+        ("http://127.0.0.1/x", True),
+        ("http://[::1]/x", True),
+        ("http://app.localhost/x", True),
+    ],
+)
+def test_fetch_metadata_on_plain_http_only_for_loopback(monkeypatch, url, metadata):
+    net = _Network(
+        monkeypatch,
+        {"service.example": [[_PUBLIC]], "app.localhost": [["127.0.0.1"]]},
+        [[_response()]],
+    )
+
+    fetch_with_ssrf_guard(url, timeout=5, allow_private_origin=True)
+
+    headers = _request_headers(net.streams[0])
+    assert headers["accept-language"] == "en-US,en;q=0.9"
+    assert ("sec-fetch-mode" in headers) is metadata
+
+
 @pytest.mark.parametrize("target", ["10.0.0.5", "169.254.169.254"])
 def test_redirect_to_a_blocked_address_never_connects(monkeypatch, target):
     net = _Network(

@@ -521,7 +521,7 @@ class _FakeClient:
     def __exit__(self, *a):
         return False
 
-    def stream(self, method, url):
+    def stream(self, method, url, **kwargs):
         _FakeClient.calls.append(url)
         return _FakeClient.table[url]
 
