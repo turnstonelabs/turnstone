@@ -40,8 +40,9 @@ dependencies = [
     # Anthropic tests inject HTTPX2 clients, and the guarded URL fetch is built on
     # it; the OpenAI v3 / Anthropic v1 transitive dependency alone is not an import
     # contract. 2.12 decodes compressed bodies in bounded pieces, which keeps the
-    # guarded fetch's decoded-byte limit a memory bound as well.
-    "httpx2>=2.12,<3",
+    # guarded fetch's decoded-byte limit a memory bound as well. The extras let
+    # fetches accept brotli and zstd (backports.zstd before Python 3.14).
+    "httpx2[brotli,zstd]>=2.12,<3",
     # The guarded URL transport supplies a backend that dials screened addresses.
     # Released in lockstep with httpx2, which pins the matching version.
     "httpcore2>=2.12,<3",
