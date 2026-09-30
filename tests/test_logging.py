@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 
+import pytest
 import structlog
 
 from turnstone.core.log import (
@@ -95,6 +96,90 @@ class TestConfigureLogging:
         err = capsys.readouterr().err
         assert "probe line" in err
         assert "service.example" not in err
+
+    def test_httpx2_records_are_redacted_when_its_level_is_lowered(self, monkeypatch, capsys):
+        # ANTHROPIC_LOG=info makes the SDK set the httpx2 logger to INFO on import.
+        from tests.test_web_transport import _PUBLIC, _Network, _response
+        from turnstone.core.web import fetch_with_ssrf_guard
+
+        for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY"):
+            monkeypatch.delenv(name, raising=False)
+            monkeypatch.delenv(name.lower(), raising=False)
+        _Network(monkeypatch, {"service.example": [[_PUBLIC]]}, [[_response()]])
+        configure_logging(level="INFO", json_output=False)
+        httpx2_logger = logging.getLogger("httpx2")
+        previous = httpx2_logger.level
+        httpx2_logger.setLevel(logging.INFO)
+        try:
+            fetch_with_ssrf_guard(
+                "http://user:s3cretpass@service.example/x?password=hunter2&page=2#frag",
+                timeout=5,
+            )
+        finally:
+            httpx2_logger.setLevel(previous)
+
+        err = capsys.readouterr().err
+        assert 'HTTP Request: GET http://service.example "HTTP/1.1 200 Test"' in err
+        assert "s3cretpass" not in err
+        assert "hunter2" not in err
+
+    @pytest.mark.parametrize(
+        ("url", "origin"),
+        [
+            ("https://u:pw@h.example:8443/p?sig=abc#frag", "https://h.example:8443"),
+            (
+                "https://hooks.chat.example/services/T0/B0/XyZsEcReTwEbHoOk",
+                "https://hooks.chat.example",
+            ),
+            ("http://[::1]:8080/p#frag", "http://[::1]:8080"),
+            # Rebuilding this URL re-checked its 66 KB percent-encoded path and raised.
+            ("http://h.example/" + chr(0xE9) * 11000, "http://h.example"),
+        ],
+    )
+    def test_request_url_argument_is_cut_to_its_origin(self, url, origin):
+        import httpx2
+
+        from turnstone.core.log import _RedactCredentialsFilter
+
+        args = ("GET", httpx2.URL(url), "HTTP/1.1", 200, "OK")
+        record = logging.LogRecord(
+            "httpx2", logging.INFO, __file__, 1, 'HTTP Request: %s %s "%s %d %s"', args, None
+        )
+
+        assert _RedactCredentialsFilter().filter(record)
+
+        assert record.getMessage() == f'HTTP Request: GET {origin} "HTTP/1.1 200 OK"'
+
+    def test_every_url_argument_is_cut_to_its_origin(self):
+        import httpx2
+
+        from turnstone.core.log import _RedactCredentialsFilter
+
+        url = httpx2.URL("https://hooks.chat.example/services/T0/B0/XyZsEcReTwEbHoOk")
+        record = logging.LogRecord(
+            "httpx2", logging.INFO, __file__, 1, "%s after %s", (url, url), None
+        )
+
+        _RedactCredentialsFilter().filter(record)
+
+        origin = "https://hooks.chat.example"
+        assert record.getMessage() == f"{origin} after {origin}"
+
+    def test_filter_is_linear_in_nested_schemes(self):
+        # Every nested "https://" once rescanned the rest of the line for a
+        # connection string's "@" (seconds at 64 KB).
+        import time
+
+        from turnstone.core.log import _RedactCredentialsFilter
+
+        # No "@" anywhere, so every candidate start fails and none may rescan.
+        message = "HTTP Request: GET https://h.example/" + "https://" * 8000 + " x"
+        record = logging.LogRecord("httpx2", logging.INFO, __file__, 1, message, None, None)
+        start = time.perf_counter()
+        _RedactCredentialsFilter().filter(record)
+        elapsed = time.perf_counter() - start
+        assert record.getMessage() == message
+        assert elapsed < 2.0
 
     def test_replaces_existing_handlers(self):
         root = logging.getLogger()

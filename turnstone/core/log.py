@@ -39,6 +39,56 @@ _QUIET_LOGGERS = (
 )
 
 
+def _request_origin(url: Any) -> str:
+    """Render an httpx2 request URL as its scheme, host and port."""
+    return f"{url.scheme}://{url.netloc.decode('ascii', 'replace')}"
+
+
+class _RedactCredentialsFilter(logging.Filter):
+    """Cut httpx2's request URLs to their origin and redact the rest of each record.
+
+    httpx2 logs every request's full URL at INFO. Its logger is held at WARNING
+    above, but importing the Anthropic SDK with ``ANTHROPIC_LOG`` set lowers it
+    again, which would print the URLs of guarded fetches and provider requests.
+    A model-chosen URL can carry a secret anywhere after its host (userinfo, a
+    query or fragment parameter, a webhook's path), so every URL among a
+    record's arguments, where httpx2 puts the request URL, is replaced by its
+    scheme, host and port. They are read from the URL's attributes, so
+    rendering them cannot fail. The formatted message then passes through the
+    output guard's credential redactor. Only httpx2's own records pass through
+    this filter: the SDKs' debug loggers enabled by ``ANTHROPIC_LOG=debug`` are
+    outside it, and so is the ``httpx`` logger of Turnstone's other clients,
+    which no installed SDK lowers from WARNING. A record that cannot be
+    formatted passes unchanged, so logging never breaks the request that
+    emitted it.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        import httpx2
+
+        from turnstone.core.output_guard import redact_credentials
+
+        if isinstance(record.args, tuple):
+            record.args = tuple(
+                _request_origin(arg) if isinstance(arg, httpx2.URL) else arg for arg in record.args
+            )
+        try:
+            message = record.getMessage()
+        except Exception:
+            return True
+        redacted = redact_credentials(message)
+        if redacted != message:
+            record.msg = redacted
+            record.args = None
+        return True
+
+
+# Attached at import rather than in configure_logging(): the level can be
+# lowered by code that never calls it, and a logger filter survives handler
+# replacement.
+logging.getLogger("httpx2").addFilter(_RedactCredentialsFilter())
+
+
 # ---------------------------------------------------------------------------
 # Processors
 # ---------------------------------------------------------------------------

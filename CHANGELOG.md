@@ -84,9 +84,14 @@ frozen.
   accept zstd-compressed responses. Certificates are verified against the operating system's trust
   store instead of the `certifi` bundle; deployments that trusted a private CA through a modified
   `certifi` bundle must install it in the system store or set `SSL_CERT_FILE` / `SSL_CERT_DIR`,
-  which apply to the whole process. HTTPX2 and its connection layer log at `WARNING` and above,
-  as HTTPX did, so fetched URLs stay out of `INFO` logs. The `httpx2` minimum is now 2.12, and
-  `httpcore2` replaces `httpcore` as a direct dependency.
+  which apply to the whole process. HTTPX2 and its connection layer log at `WARNING` and above, as
+  HTTPX did, so fetched URLs stay out of `INFO` logs; if something lowers that level (for example
+  `ANTHROPIC_LOG=info`), HTTPX2 request lines show only each URL's scheme, host, and port, since a
+  fetched URL can carry a secret anywhere after its host, and the rest of each line passes through
+  the output guard's credential redaction. This also removes the OpenAI SDK's per-request
+  `HTTP Request:` lines logged at `INFO` since 1.8.0; model calls are still logged as
+  `model_turn.completed`. The `httpx2` minimum is now 2.12, and `httpcore2` replaces `httpcore` as a
+  direct dependency.
 - **URL fetches ask for web pages.** `web_fetch` and URL targets of `open_preview` send
   `Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8` and
   `Accept-Language: en-US,en;q=0.9` on the first request and every redirect. Hops to https URLs and
