@@ -441,7 +441,7 @@ from the output before it enters the conversation.
 | Priority | Category | Risk | Examples |
 |----------|----------|------|----------|
 | 1 | Prompt injection | high | Override phrases, role injection (`{"role":"system"}`), instruction override markers |
-| 2 | Credential leakage | high | API keys, private key blocks, connection strings, `.env` format secrets, JSON secrets (`"api_key": "..."`, `"password": "..."`, etc.) |
+| 2 | Credential leakage | high | API keys, JSON Web Tokens, private key blocks, connection strings, credential-named URL query parameters (`?token=...`, `&api_key=...`, `?password=...`, etc.), `.env` format secrets, JSON secrets (`"api_key": "..."`, `"password": "..."`, etc.) |
 | 3 | Encoded payloads | medium | Script data URIs, hex shellcode sequences |
 | 4 | Adversarial URLs | medium | Cloud metadata endpoints, credential-bearing query parameters |
 | 5 | System info disclosure | low | Private IP addresses, sensitive file paths |
@@ -452,6 +452,28 @@ When `redact_secrets` is enabled (default), detected credentials in tool output
 are replaced with `[REDACTED:<type>]` markers before the output enters the
 conversation. The original unredacted output is never shown to the model.
 Redaction types: `api_key`, `private_key`, `password`, `secret`.
+
+A URL query or fragment parameter named `token`, `access_token`,
+`refresh_token`, `id_token`, `auth_token`, `api_token`, `session_token`,
+`bearer_token` or `secret_token` (also without the underscore, as in
+`accessToken`), `api_key` (also `apikey`, `api-key`), `secret`, `client_secret`,
+`password` or `passwd` is redacted to the end of its value when the value is at
+least 8 characters, so short placeholders and ordinary parameters stay readable.
+The value is its letters, digits and `. _ ~ + / = % ! * $ @ : -`; any other
+character, such as whitespace, a quote, bracket, parenthesis, comma or
+semicolon, ends it, and so does an encoded `&` or `#` (`%26`, `%23`) after an
+encoded `=` (`%3D`), as in a URL nested inside another. A URL in quotes,
+brackets or a list therefore keeps its surroundings, but text joined to the
+value by one of its own characters, such as `:`, is redacted with it. The
+parameter may follow `?`, `&`, `#`, an escaped `&amp;` or `\u0026`, or their
+percent-encoded forms inside another URL (`%3F`, `%26`, `%23`, with `%3D` for
+`=`). Bare `key` and `auth` are not treated as credential names because they
+name many ordinary parameters. A JSON Web Token is redacted whole where it
+stands on its own, and also right after a percent-escape or a `\u`, `\n`, `\r`
+or `\t` escape, as inside an encoded URL or an escaped string. Both rules run
+before the rules that recognise a key by its prefix, so a value or token that
+starts with such a key is still redacted whole. The browser's display redaction
+applies these rules too.
 
 ### Configuration
 

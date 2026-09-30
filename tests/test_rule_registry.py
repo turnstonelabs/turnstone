@@ -52,7 +52,7 @@ class TestBuiltinsOnly:
     def test_builtin_output_patterns_loaded(self) -> None:
         reg = RuleRegistry(storage=None)
         total = sum(len(pats) for pats in reg.output_patterns.values())
-        assert total == 19
+        assert total == 21
         assert len(reg.output_patterns) == 5
 
     def test_heuristic_rules_sorted_by_tier(self) -> None:
@@ -236,7 +236,7 @@ class TestOutputPatternMerge:
         assert "custom-ssn" in names
 
         total = sum(len(pats) for pats in reg.output_patterns.values())
-        assert total == 20
+        assert total == 22
 
     def test_builtin_output_pattern_disabled(self) -> None:
         storage = _MockStorage(
@@ -254,7 +254,7 @@ class TestOutputPatternMerge:
         assert "override_phrases" not in names
 
         total = sum(len(pats) for pats in reg.output_patterns.values())
-        assert total == 18
+        assert total == 20
 
     def test_invalid_regex_skipped(self) -> None:
         storage = _MockStorage(
@@ -280,7 +280,7 @@ class TestOutputPatternMerge:
         assert "bad-regex" not in all_names
         # Built-ins intact
         total = sum(len(pats) for pats in reg.output_patterns.values())
-        assert total == 19
+        assert total == 21
 
 
 # ---------------------------------------------------------------------------
@@ -294,7 +294,7 @@ class TestEdgeCases:
         reg = RuleRegistry(storage=storage)
         assert len(reg.heuristic_rules) == 36
         total = sum(len(pats) for pats in reg.output_patterns.values())
-        assert total == 19
+        assert total == 21
 
     def test_empty_storage_equals_builtins(self) -> None:
         no_storage = RuleRegistry(storage=None)

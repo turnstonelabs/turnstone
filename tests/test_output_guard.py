@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from turnstone.core.output_guard import (
     evaluate_output,
     merge_guard_display_payload,
@@ -275,6 +277,224 @@ class TestCredentialLeakage:
             out = redact_credentials(f"{prefix}={secret}")
             assert secret not in out, (prefix, out)
             assert out == "[REDACTED:api_key]", (prefix, out)
+
+
+_JWT = (
+    "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0"
+    ".dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U"
+)
+
+
+def _builtin_registry_patterns():
+    from turnstone.core.rule_registry import RuleRegistry
+
+    return RuleRegistry(storage=None).output_patterns
+
+
+@pytest.mark.parametrize("mode", ["builtin", "configurable"])
+class TestJwtAndQueryCredentials:
+    """JWTs and credential-named query parameters redact whole in both modes."""
+
+    @pytest.mark.parametrize(
+        ("text", "expected"),
+        [
+            (f"session {_JWT} ok", "session [REDACTED:api_key] ok"),
+            (
+                f"https://x.example/cb?access_token={_JWT}&x=1",
+                "https://x.example/cb?access_token=[REDACTED:api_key]&x=1",
+            ),
+            (
+                "https://x.example/f?access_token=ya29.a0AfH6SMBx3kQ9zTy&alt=json",
+                "https://x.example/f?[REDACTED:secret]&alt=json",
+            ),
+            (
+                "https://x.example/f?token=AbCdEfGhIjKlMnOpQrStUv-wxyz_123&x=1",
+                "https://x.example/f?[REDACTED:secret]&x=1",
+            ),
+            (
+                "GET http://svc.example/x?token=abc123xyz789 200",
+                "GET http://svc.example/x?[REDACTED:secret] 200",
+            ),
+            (
+                "https://x.example/cb?client_secret=s3cr3t-v4lue&password=hunter2hunter2",
+                "https://x.example/cb?[REDACTED:secret]&[REDACTED:secret]",
+            ),
+            (
+                "[next](https://x.example/p?api-key=abcd1234efgh)",
+                "[next](https://x.example/p?[REDACTED:secret])",
+            ),
+            (
+                "https://x.example/f?session_token=abcd/efgh+ijkl1234567890&x=1",
+                "https://x.example/f?[REDACTED:secret]&x=1",
+            ),
+            ("https://x.example/f?api_token=abcdefghij12", "https://x.example/f?[REDACTED:secret]"),
+            (
+                "https://x.example/f?a=1&accessToken=abcdefgh12",
+                "https://x.example/f?a=1&[REDACTED:secret]",
+            ),
+            (
+                "https://x.example/v1?api_key=sk-proj-AbCdEfGhIjKlMnOpQrStUv_WxYz0123456789TAIL&x=1",
+                "https://x.example/v1?[REDACTED:secret]&x=1",
+            ),
+            (
+                "jwt eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0."
+                "ab-sk-ABCDEFGHIJKLMNOPQRSTUVWXYZabcd_efgh ok",
+                "jwt [REDACTED:api_key] ok",
+            ),
+            (
+                "https://x.example/login?password=P%26ssw0rd!2024&y=1",
+                "https://x.example/login?[REDACTED:secret]&y=1",
+            ),
+            (
+                "https://x.example/login?password=Sup3r!S3cr*t$@:x&y=1",
+                "https://x.example/login?[REDACTED:secret]&y=1",
+            ),
+            # Delimiters of the surrounding text end the value: nothing after it is lost.
+            (
+                "['https://a.example/x?token=abcdefgh','https://b.example/y?page=2']",
+                "['https://a.example/x?[REDACTED:secret]','https://b.example/y?page=2']",
+            ),
+            (
+                "(https://a.example/x?token=abcdefgh),next(foo);https://a.example/?id=1",
+                "(https://a.example/x?[REDACTED:secret]),next(foo);https://a.example/?id=1",
+            ),
+            (
+                "https://a.example/x?token=abcdefgh,field2,field3",
+                "https://a.example/x?[REDACTED:secret],field2,field3",
+            ),
+            (
+                "redirect_uri=https%3A%2F%2Fb.example%2Fz%3Ftoken%3Dabcdefghij%26page%3D2",
+                "redirect_uri=https%3A%2F%2Fb.example%2Fz%3F[REDACTED:secret]%26page%3D2",
+            ),
+            (
+                "(see https://x.example/p?token=abcdefgh12).",
+                "(see https://x.example/p?[REDACTED:secret]).",
+            ),
+            (
+                "https://idp.example/l?redirect_uri=https%3A%2F%2Fapp.example%2Fcb"
+                "%3Faccess_token%3Dya29.a0AfH6SMBx3kQ9zTy&s=1",
+                "https://idp.example/l?redirect_uri=https%3A%2F%2Fapp.example%2Fcb"
+                "%3F[REDACTED:secret]&s=1",
+            ),
+            (
+                "https://app.example/cb#access_token=ya29.a0AfH6SMBx3kQ9zTy&token_type=Bearer",
+                "https://app.example/cb#[REDACTED:secret]&token_type=Bearer",
+            ),
+            (
+                '<a href="https://x.example/f?a=1&amp;access_token=ya29.a0AfH6SMBx3kQ9zTy">',
+                '<a href="https://x.example/f?a=1&amp;[REDACTED:secret]">',
+            ),
+            (
+                '"https://x.example/?a=1\\u0026access_token=ya29.a0AfH6SMBx3kQ9zTy"',
+                '"https://x.example/?a=1\\u0026[REDACTED:secret]"',
+            ),
+            (
+                "https://idp.example/login?redirect_uri=https%3A%2F%2Fapp.example%2Fcb"
+                f"%3Fid_token%3D{_JWT}&state=1",
+                "https://idp.example/login?redirect_uri=https%3A%2F%2Fapp.example%2Fcb"
+                "%3Fid_token%3D[REDACTED:api_key]&state=1",
+            ),
+            (f"id:\\u0022{_JWT}\\u0022", "id:\\u0022[REDACTED:api_key]\\u0022"),
+            (f"line one\\n{_JWT}", "line one\\n[REDACTED:api_key]"),
+        ],
+    )
+    def test_redacted(self, mode, text, expected) -> None:
+        patterns = _builtin_registry_patterns() if mode == "configurable" else None
+        r = evaluate_output(text, patterns=patterns)
+        assert "credential_leak" in r.flags
+        assert r.sanitized == expected
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            # Bare key= names too many innocent query parameters.
+            "https://x.example/f?key=abcdefghijklmnop",
+            # Below the 8-character floor, and not a credential-named parameter.
+            "https://x.example/f?token=short12&auth=google-oauth2&page_token=abcdefghijk",
+            # Assignments in code are not query parameters.
+            "client = Client(token=load_token_from_env(), password=prompt())",
+        ],
+    )
+    def test_not_redacted(self, mode, text) -> None:
+        patterns = _builtin_registry_patterns() if mode == "configurable" else None
+        r = evaluate_output(text, patterns=patterns)
+        assert "credential_leak" not in r.flags
+        assert r.sanitized is None
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "eyJ" * 100_000,
+        "%3DeyJ" * 50_000,
+        "\\u0022eyJ" * 30_000,
+        "https://h.example/" + "https://" * 32_000,
+        "http+abcde://" * 20_000,
+        ("http+" + "a" * 25 + "://") * 4_000,
+        "https://u:" + "pa://" * 40_000,
+    ],
+    ids=[
+        "run",
+        "percent-escaped",
+        "json-escaped",
+        "nested-schemes",
+        "suffixed-schemes",
+        "long-suffixed-schemes",
+        "password-separators",
+    ],
+)
+def test_redaction_is_linear_in_a_long_run(text) -> None:
+    # Base64 of JSON repeats "eyJ" inside one long run of token characters.
+    # A JWT match allowed to start at each one rescans the rest of the run
+    # every time, which is quadratic: the first input took 46 seconds that way.
+    # Escaped starts are allowed only after a character that ends the run.
+    # Likewise every scheme in nested "https://" rescanned the rest of the run
+    # for a connection string's "@" until each userinfo part stopped at the
+    # next "/".
+    import time
+
+    start = time.perf_counter()
+    redacted = redact_credentials(text)
+    elapsed = time.perf_counter() - start
+    assert redacted == text
+    assert elapsed < 2.0
+
+
+def test_builtin_credential_order_matches_the_registry_priorities() -> None:
+    # The built-in list and the configurable built-ins must redact in the same
+    # order, or the two modes produce different output for the same text.
+    from turnstone.core.output_guard import _BUILTIN_OG_PATTERNS, _CREDENTIAL_PATTERNS
+
+    builtin = [(pattern.pattern, pattern.flags, label) for pattern, label in _CREDENTIAL_PATTERNS]
+    registry = sorted(
+        (d for d in _BUILTIN_OG_PATTERNS if d.category == "credentials"),
+        key=lambda d: -d.priority,
+    )
+    configurable = [(d.compiled.pattern, d.compiled.flags, d.redact_label) for d in registry]
+    assert builtin == configurable
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        (
+            "postgresql://user:" + "A" * 300 + "@db/x",
+            "postgresql://user:[REDACTED:password]@db/x",
+        ),
+        ("postgresql://user:ab/cd@db/app", "postgresql://user:[REDACTED:password]@db/app"),
+        ("postgresql://user:pa://ss@host/db", "postgresql://user:[REDACTED:password]@host/db"),
+        (
+            "postgresql://u:" + "a/" * 200 + "@host/db",
+            "postgresql://u:[REDACTED:password]@host/db",
+        ),
+        (
+            "https://h.example/x https://u:s3cret@h.example/y",
+            "https://h.example/x https://u:[REDACTED:password]@h.example/y",
+        ),
+    ],
+)
+def test_connection_string_password_redacts_at_any_length(text, expected) -> None:
+    assert redact_credentials(text) == expected
 
 
 class TestEncodedPayloads:
