@@ -2,6 +2,7 @@
 
 import dataclasses
 import re
+import socket
 from contextlib import ExitStack
 from html import unescape as _html_unescape
 from ipaddress import ip_address
@@ -256,17 +257,27 @@ navigation, and this fetcher cannot tell whether a person approved the call
 def _potentially_trustworthy(url: httpx2.URL) -> bool:
     """Return whether browsers would send Fetch Metadata to *url*.
 
-    That is https, or a loopback host: a ``localhost`` name or a loopback
-    address. Other schemes never reach the guarded fetch's client.
+    That is https, or a loopback host: a ``localhost`` name (a trailing dot
+    included) or a loopback address. IPv4 shorthand such as ``127.1`` counts as
+    the address it resolves to, the form a browser's URL parser would have
+    produced. Other schemes never reach the guarded fetch's client.
     """
     if url.scheme == "https":
         return True
-    host = url.host.lower()
+    host = url.host.lower().rstrip(".")
     if host == "localhost" or host.endswith(".localhost"):
         return True
     try:
-        return ip_address(host).is_loopback
+        address = ip_address(host)
     except ValueError:
+        pass
+    else:
+        # The spec counts 127.0.0.0/8 and ::1 as loopback. Python also counts an
+        # IPv4-mapped address such as ::ffff:127.0.0.1, which falls outside both.
+        return address.is_loopback and not getattr(address, "ipv4_mapped", None)
+    try:
+        return ip_address(socket.inet_aton(host)).is_loopback
+    except OSError:
         return False
 
 
@@ -340,10 +351,11 @@ def fetch_with_ssrf_guard(
     transfer-encoding) that no longer describe the decoded content it carries.
 
     Raises :class:`UrlBlockedError` (a ``ValueError``) for a blocked hop and
-    ``ValueError`` for an over-budget body or a redirect chain past
-    *max_redirects* (callers already route ``ValueError`` to their
-    fetch-failed lane), and lets ``httpx2`` transport errors propagate
-    unchanged.  ``resp.raise_for_status()`` stays the caller's call.
+    ``ValueError`` for an over-budget body, a redirect chain past
+    *max_redirects* or a redirect ``Location`` that cannot be resolved
+    (callers already route ``ValueError`` to their fetch-failed lane), and
+    lets ``httpx2`` transport errors propagate unchanged.
+    ``resp.raise_for_status()`` stays the caller's call.
     """
     current = url
     private_allowed = allow_private_origin
@@ -395,30 +407,37 @@ def fetch_with_ssrf_guard(
             assert transport is not None
             transport.pin(current, screen.hostname, screen.addresses)
             metadata = _FETCH_METADATA if _potentially_trustworthy(parsed) else None
-            with client.stream("GET", current, headers=metadata) as resp:
-                if resp.status_code in _REDIRECT_STATUSES:
-                    location = resp.headers.get("location")
-                    if location:
-                        current = str(httpx2.URL(current).join(location))
-                        continue  # leaves the with-block: hop body never read
-                chunks: list[bytes] = []
-                total = 0
-                for chunk in resp.iter_bytes():
-                    total += len(chunk)
-                    if total > max_bytes:
-                        raise ValueError(
-                            f"Blocked: response body exceeded the {max_bytes:,}-byte fetch limit"
-                        )
-                    chunks.append(chunk)
-                headers = [
-                    (k, v)
-                    for k, v in resp.headers.items()
-                    if k.lower() not in _STALE_FRAMING_HEADERS
-                ]
-                return httpx2.Response(
-                    status_code=resp.status_code,
-                    headers=headers,
-                    content=b"".join(chunks),
-                    request=httpx2.Request("GET", current),
-                )
+            try:
+                with client.stream("GET", current, headers=metadata) as resp:
+                    if resp.status_code in _REDIRECT_STATUSES:
+                        location = resp.headers.get("location")
+                        if location:
+                            current = str(parsed.join(location))
+                            continue  # leaves the with-block: hop body never read
+                    chunks: list[bytes] = []
+                    total = 0
+                    for chunk in resp.iter_bytes():
+                        total += len(chunk)
+                        if total > max_bytes:
+                            raise ValueError(
+                                "Blocked: response body exceeded the "
+                                f"{max_bytes:,}-byte fetch limit"
+                            )
+                        chunks.append(chunk)
+                    headers = [
+                        (k, v)
+                        for k, v in resp.headers.items()
+                        if k.lower() not in _STALE_FRAMING_HEADERS
+                    ]
+                    return httpx2.Response(
+                        status_code=resp.status_code,
+                        headers=headers,
+                        content=b"".join(chunks),
+                        request=httpx2.Request("GET", current),
+                    )
+            except httpx2.InvalidURL as exc:
+                # httpx2 resolves every redirect's Location while building the
+                # response, even one it will not follow, and a Location such as
+                # "http:foo" fails there with InvalidURL, which is not a RequestError.
+                raise ValueError(f"Invalid URL in location header: {exc}.") from None
     raise ValueError(f"Blocked: more than {max_redirects} redirects")

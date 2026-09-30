@@ -323,14 +323,22 @@ def test_fetch_metadata_follows_each_hops_trustworthiness(monkeypatch):
     [
         ("http://service.example/x", False),
         ("http://127.0.0.1/x", True),
+        ("http://127.1/x", True),
         ("http://[::1]/x", True),
         ("http://app.localhost/x", True),
+        ("http://localhost./x", True),
+        ("http://[::ffff:127.0.0.1]/x", False),
     ],
 )
 def test_fetch_metadata_on_plain_http_only_for_loopback(monkeypatch, url, metadata):
     net = _Network(
         monkeypatch,
-        {"service.example": [[_PUBLIC]], "app.localhost": [["127.0.0.1"]]},
+        {
+            "service.example": [[_PUBLIC]],
+            "app.localhost": [["127.0.0.1"]],
+            "localhost.": [["127.0.0.1"]],
+            "127.1": [["127.0.0.1"]],
+        },
         [[_response()]],
     )
 
@@ -339,6 +347,37 @@ def test_fetch_metadata_on_plain_http_only_for_loopback(monkeypatch, url, metada
     headers = _request_headers(net.streams[0])
     assert headers["accept-language"] == "en-US,en;q=0.9"
     assert ("sec-fetch-mode" in headers) is metadata
+
+
+@pytest.mark.parametrize("tool", ["web_fetch", "open_preview"])
+@pytest.mark.parametrize(
+    ("location", "reason"),
+    [
+        # httpx2 rejects this Location as a RemoteProtocolError (a RequestError).
+        ("http://[::1/x", "Invalid port: ':1'"),
+        # httpx2 parses this one, then fails to resolve it with a bare InvalidURL.
+        ("http:foo", "For absolute URLs, path must be empty or begin with '/'"),
+    ],
+)
+def test_malformed_redirect_location_is_a_fetch_error_in_both_tools(
+    monkeypatch, tool, location, reason
+):
+    # Both failures happen while httpx2 builds the response, before the guard
+    # joins the Location.
+    from tests.test_open_preview_tool import _make_session, _prepare_url_tool
+
+    net = _Network(
+        monkeypatch,
+        {"service.example": [[_PUBLIC]]},
+        [[_response(302, [("Location", location)])]],
+    )
+    item = _prepare_url_tool(_make_session(), tool, "http://service.example/x")
+
+    _call_id, output = item["execute"](item)
+
+    assert output == f"Error: fetch failed: Invalid URL in location header: {reason}."
+    assert len(net.attempts) == 1
+    assert net.streams[0]._closed
 
 
 @pytest.mark.parametrize("target", ["10.0.0.5", "169.254.169.254"])
