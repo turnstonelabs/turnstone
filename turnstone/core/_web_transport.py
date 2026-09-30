@@ -157,6 +157,10 @@ class PinnedTransport(httpx2.BaseTransport):
     """
 
     def __init__(self) -> None:
+        # One context per fetch, as before the move to httpx2. With the OS trust
+        # store it costs well under a millisecond (an SSL_CERT_FILE bundle costs
+        # more, as certifi's did), and truststore reloads the store on every
+        # handshake whether or not a context is shared.
         self._ssl_context = httpx2.create_ssl_context()
         self._pool: httpcore2.ConnectionPool | None = None
         self._url: httpx2.URL | None = None

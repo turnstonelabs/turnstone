@@ -236,7 +236,9 @@ _REQUEST_HEADERS = {
 """Headers every hop of a guarded fetch sends alongside its User-Agent.
 
 ``Accept`` prefers HTML while still accepting any other type, and
-``Accept-Language`` prefers English.
+``Accept-Language`` prefers English. URL targets of open_preview send them
+too: the tool mostly shows the model's own files, and the docs note that an
+image host may answer this ``Accept`` with its HTML page.
 """
 _FETCH_METADATA = {
     "Sec-Fetch-Dest": "document",
@@ -250,7 +252,11 @@ fetcher; the User-Agent still identifies Turnstone. As in browsers, each hop is
 judged by its own URL, so an https page redirecting to plain http sends none on
 the http hop. ``Sec-Fetch-User`` stays unset: ``?1`` asserts a user-activated
 navigation, and this fetcher cannot tell whether a person approved the call
-(task agents and auto-approval run it unattended).
+(task agents and auto-approval run it unattended). ``Sec-Fetch-Site: none``
+says no site initiated the request, which holds for a tool call, and
+resource-isolation policies, as usually written, admit a request without
+Fetch Metadata as well, so the header grants nothing that omitting it would
+not.
 """
 
 
