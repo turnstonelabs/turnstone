@@ -12,7 +12,8 @@
 //   1. PEM private key blocks        → [REDACTED:private_key]
 //   2. Connection strings            → user:[REDACTED:password]@host
 //   3. Well-known API key formats    → [REDACTED:api_key]
-//      (sk-proj-, sk-, ghp_, gho_, AKIA, AIza, Bearer token, token=, key=)
+//      (sk-proj-, sk-, ghp_, gho_, AKIA, AIza, Bearer token, JWT,
+//      credential-named query parameters, token=, key=)
 //   4. Query-string api_key/token    → key=***  (backward compat)
 //   5. JSON-style key/value          → "key": "***"  (backward compat)
 //   6. JSON secret keys              → "secret": "[REDACTED:secret]"
@@ -40,8 +41,18 @@ const _RE_PRIVATE_KEY_BLOCK =
 // shape isn't.  Schemes are case-insensitive per RFC 3986 (/i):
 // POSTGRESQL:// leaks the same password postgresql:// does.
 // ---------------------------------------------------------------------------
-const _RE_CONNECTION_STRING =
-  /(?:postgresql|mysql|mongodb|rediss?|amqps?|sqlite|https?)(?:\+[a-z0-9]*)?:\/\/[^:@\s]+:[^@\s]+@/gi;
+// The password stops where another connection string could start; scanning
+// on to the next "@" rescanned a long run of nested "https://" once per
+// scheme (quadratic).  A password of any length, "/" and "://" included, is
+// still matched unless it holds one of these schemes itself, and the user
+// part already stops at the ":" every scheme contains.  The driver suffix is
+// bounded so that every place a match can start also ends a password.
+const _CONNECTION_SCHEME =
+  "(?:postgresql|mysql|mongodb|rediss?|amqps?|sqlite|https?)(?:\\+[a-z0-9]{0,20})?:\\/\\/";
+const _RE_CONNECTION_STRING = new RegExp(
+  _CONNECTION_SCHEME + "[^:@\\s]+:(?:(?!" + _CONNECTION_SCHEME + ")[^@\\s])+@",
+  "gi",
+);
 
 const _RE_CONN_USERINFO = /:\/\/([^:@\s]+):([^@\s]+)@/;
 
@@ -53,6 +64,34 @@ function _redactConnPassword(match) {
 // Well-known API key / token formats (ordered most-specific first)
 // ---------------------------------------------------------------------------
 const _CREDENTIAL_REPLACEMENTS = [
+  // JSON Web Tokens: base64url header and payload (both JSON objects, so both
+  // start "eyJ") and a signature, empty for an unsigned token.  Runs first,
+  // with the query rule below: the key-prefix rules after them recognise only a
+  // key's start and would redact just the start of a longer value, and the
+  // token=/key= values stop at the first dot.  The match must start a run of
+  // token characters: base64 of JSON repeats "eyJ" inside one long run, and
+  // letting each start a match rescans the run every time (quadratic).  A
+  // percent-escape (%3D), a JSON \u escape or a \n-style escape may also
+  // precede it; each begins outside the run, so the scan stays linear.
+  [
+    /(?:(?<![a-zA-Z0-9_\-])|(?<=%[0-9A-Fa-f]{2})|(?<=\\u[0-9A-Fa-f]{4})|(?<=\\[nrt]))eyJ[a-zA-Z0-9_\-]{10,}\.eyJ[a-zA-Z0-9_\-]{5,}\.[a-zA-Z0-9_\-]*/g,
+    "[REDACTED:api_key]",
+  ],
+  // Credential-named URL query or fragment parameters (?token=, &api_key=,
+  // #access_token=, ...) anchored to the ?, & or # that starts them, to an
+  // escaped & (&amp;, \u0026), or to a percent-encoded ?, & or # (%3F, %26,
+  // %23, with %3D for =).  8+ chars, like the JSON secret keys; the value is
+  // its token characters and a password's common punctuation (! * $ @ :); after
+  // %3D it also ends at an encoded & or # (%26, %23), which are data in a plain
+  // query.  Any other character ends it, so a URL in quotes, brackets or a list
+  // keeps its surroundings, and an earlier rule's [REDACTED:...] marker is not
+  // redacted again.  The token names follow the token= rule below, plus id,
+  // with or without the underscore.  Bare key= is left out, as in
+  // _RE_QUERY_CRED below.
+  [
+    /(?:(?<=[?&#])|(?<=&amp;)|(?<=\\u0026)|(?<=%3F)|(?<=%2[36]))(?:(?:(?:access|refresh|id|auth|api|session|bearer|secret)_?)?token|api[_-]?key|(?:client_)?secret|passw(?:or)?d)(?:=[a-zA-Z0-9._~+/=%!*$@:\-]{8,}|%3D(?:(?!%2[36])[a-zA-Z0-9._~+/=%!*$@:\-]){8,})/gi,
+    "[REDACTED:secret]",
+  ],
   // OpenAI project-scoped keys   sk-proj-xxxxxxxxxx...
   [/sk-proj-[a-zA-Z0-9\-]{20,}/g, "[REDACTED:api_key]"],
   // OpenAI standard keys          sk-xxxxxxxxxx...
@@ -91,8 +130,12 @@ const _CREDENTIAL_REPLACEMENTS = [
 //   ?api_key=abc123   →   ?api_key=***   (legacy _redactApiKeys compat)
 //   &secret=value     →   &secret=***
 // ---------------------------------------------------------------------------
+// A value an earlier pattern replaced whole keeps its [REDACTED:...] marker when
+// &, whitespace, a quote or the end follows it, so the display matches the
+// backend's redaction; anything else after the marker, a secret's tail
+// included, is masked along with it.
 const _RE_QUERY_CRED =
-  /(?:api_key|apiKey|api-key|(?<![a-zA-Z0-9_])token|secret|password|auth)=[^&\s"]+/g;
+  /(?:api_key|apiKey|api-key|(?<![a-zA-Z0-9_])token|secret|password|auth)=(?!\[REDACTED:[a-z_]+\](?:[&\s"]|$))[^&\s"]+/g;
 
 // ---------------------------------------------------------------------------
 // JSON-style simple redaction (legacy _redactApiKeys compat)
@@ -147,11 +190,13 @@ function _redactEnvLine(match) {
 //   sk- ghp_ gho_ AKIA AIza bearer   well-known key prefixes ("bearer" is
 //               case-insensitive per RFC 7235; /i over-approximates the
 //               case-sensitive prefixes, which only costs a full scan)
+//   eyJ         JSON Web Tokens (no = or quote need appear around one)
+//   %3D         percent-encoded credential query parameters (%3Ftoken%3D...)
 // Adding a pattern above without an anchor here is a SILENT REDACTION
 // BYPASS — extend this regex and the runtime smoke test together
 // (tests/test_app_js.py::test_redact_credentials_runtime_smoke).
 // ---------------------------------------------------------------------------
-const _RE_PREFILTER = /[='"@]|-----BEGIN|sk-|ghp_|gho_|AKIA|AIza|bearer/i;
+const _RE_PREFILTER = /[='"@]|-----BEGIN|sk-|ghp_|gho_|AKIA|AIza|bearer|eyJ|%3D/i;
 
 // ---------------------------------------------------------------------------
 // Public API

@@ -100,9 +100,18 @@ _RE_PRIVATE_KEY_BLOCK = re.compile(
 # enumerating drivers is a losing game, the suffix shape isn't.
 # Schemes are case-insensitive per RFC 3986, hence IGNORECASE:
 # ``POSTGRESQL://`` leaks the same password ``postgresql://`` does.
+# The password stops where another connection string could start: scanning
+# on to the next "@" made every scheme in a long run of nested "https://"
+# rescan the rest of the run, which was quadratic (8.5 seconds for 128 KB of
+# tool output). A password of any length, "/" and "://" included, is still
+# matched unless it holds one of these schemes itself, and the user part
+# already stops at the ":" every scheme contains. The driver suffix is
+# bounded so that every place a match can start also ends a password.
+_CONNECTION_SCHEME = (
+    r"(?:postgresql|mysql|mongodb|rediss?|amqps?|sqlite|https?)(?:\+[a-z0-9]{0,20})?://"
+)
 _RE_CONNECTION_STRING = re.compile(
-    r"(?:postgresql|mysql|mongodb|rediss?|amqps?|sqlite|https?)(?:\+[a-z0-9]*)?"
-    r"://[^:@\s]+:[^@\s]+@",
+    _CONNECTION_SCHEME + r"[^:@\s]+:(?:(?!" + _CONNECTION_SCHEME + r")[^@\s])+@",
     re.IGNORECASE,
 )
 _RE_ENV_SECRET_LINE = re.compile(r"[A-Z][A-Z_0-9]+=\S+")
@@ -132,8 +141,53 @@ _RE_JSON_SECRET_SQ = re.compile(
     re.IGNORECASE,
 )
 
+# A JSON Web Token: base64url header and payload, both JSON objects (so both
+# start "eyJ"), and a signature that is empty for an unsigned token. It must
+# start a run of token characters: base64 of JSON repeats "eyJ" inside one
+# long run, and letting each of those start a match rescans the rest of the
+# run every time, which is quadratic in the run's length. A percent-escape
+# (%3D), a JSON \u escape or a \n-style escape may also precede it, as in a
+# token inside an encoded redirect_uri or an escaped string; each of those
+# begins with a character outside the run, so the scan stays linear.
+_RE_JWT = re.compile(
+    r"(?:(?<![a-zA-Z0-9_\-])|(?<=%[0-9A-Fa-f]{2})|(?<=\\u[0-9A-Fa-f]{4})|(?<=\\[nrt]))"
+    r"eyJ[a-zA-Z0-9_\-]{10,}\.eyJ[a-zA-Z0-9_\-]{5,}\.[a-zA-Z0-9_\-]*"
+)
+
+# A URL query or fragment parameter whose name says it carries a credential,
+# anchored to the ?, & or # that starts it, to an HTML- or JSON-escaped &
+# (&amp;, \u0026), or to a percent-encoded ?, & or # (%3F, %26, %23, with %3D
+# for =) inside another URL. The name is evidence enough for the JSON-secret
+# 8-character floor. The value is its token characters (base64, base64url,
+# percent-encoding) and the punctuation a password commonly carries
+# (! * $ @ :). After an encoded = (%3D) it also ends at an encoded & or # (%26,
+# %23), which separate the parameters of an encoded URL but are data in a plain
+# query. Quotes, brackets, parentheses, commas and semicolons end it: they
+# delimit the text around a URL far more often than they appear in a secret,
+# and a value that ran through them would delete the data that follows, such as
+# the next URL in a list. Text joined to the value by one of its own
+# characters, such as ":", is redacted with it. An earlier rule's
+# [REDACTED:...] marker is not redacted again. The token names are the token=
+# rule's credential prefixes below, plus id, with or without the underscore
+# (accessToken); a pagination cursor such as page_token is not one. Bare "key"
+# is left out, as in the client mirror: it names too many innocent query
+# parameters. One level of percent-encoding is recognised.
+_RE_QUERY_SECRET = re.compile(
+    r"(?:(?<=[?&#])|(?<=&amp;)|(?<=\\u0026)|(?<=%3F)|(?<=%2[36]))"
+    r"(?:(?:(?:access|refresh|id|auth|api|session|bearer|secret)_?)?token"
+    r"|api[_-]?key|(?:client_)?secret|passw(?:or)?d)"
+    r"(?:=[a-zA-Z0-9._~+/=%!*$@:\-]{8,}|%3D(?:(?!%2[36])[a-zA-Z0-9._~+/=%!*$@:\-]){8,})",
+    re.IGNORECASE,
+)
+
 # (pattern, redact_label) — ordered most-specific first for redaction.
 _CREDENTIAL_PATTERNS: list[tuple[re.Pattern[str], str]] = [
+    # First, the rules that know a value's whole extent. The prefix rules below
+    # recognise only a key's start and would redact just the start of a longer
+    # value, such as a JWT whose signature holds "sk-" or a query value that
+    # begins with a key; the key=/token= values also stop at the first dot.
+    (_RE_JWT, "api_key"),
+    (_RE_QUERY_SECRET, "secret"),
     (re.compile(r"sk-proj-[a-zA-Z0-9\-]{20,}"), "api_key"),
     (re.compile(r"sk-[a-zA-Z0-9]{20,}"), "api_key"),
     (re.compile(r"ghp_[a-zA-Z0-9]{36}"), "api_key"),
@@ -147,7 +201,16 @@ _CREDENTIAL_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     # NOT matching innocent identifiers like monkey=, turkey=, over_tokenized=.
     # The trailing _? allows both snake_case and compact forms (api_key / apikey).
     # Bare key=/token= are included as alternatives so standalone assignments like
-    # key=<20+ chars> still match.
+    # key=<20+ chars> still match. Same order as the configurable built-ins:
+    # token= (priority 20) before key= (priority 10).
+    (
+        re.compile(
+            r"(?:(?:access|refresh|auth|api|session|bearer|secret)_?token|"
+            r"(?<![a-zA-Z0-9_])token)="
+            r"[a-zA-Z0-9]{20,}"
+        ),
+        "api_key",
+    ),
     # Multi-segment keys like secret_access_key and aws_secret_access_key are
     # included explicitly so the prefix doesn't leak as "secret_".
     (
@@ -155,14 +218,6 @@ _CREDENTIAL_PATTERNS: list[tuple[re.Pattern[str], str]] = [
             r"(?:(?:api|secret|session|auth|encryption|signing|private|public|access|"
             r"secret_access|aws_secret_access)_?key|"
             r"(?<![a-zA-Z0-9_])key)="
-            r"[a-zA-Z0-9]{20,}"
-        ),
-        "api_key",
-    ),
-    (
-        re.compile(
-            r"(?:(?:access|refresh|auth|api|session|bearer|secret)_?token|"
-            r"(?<![a-zA-Z0-9_])token)="
             r"[a-zA-Z0-9]{20,}"
         ),
         "api_key",
@@ -461,6 +516,28 @@ _BUILTIN_OG_PATTERNS: list[OutputGuardPatternDef] = [
         is_credential=True,
         redact_label="api_key",
         priority=30,
+    ),
+    OutputGuardPatternDef(
+        name="credential_jwt",
+        category="credentials",
+        risk_level="high",
+        compiled=_RE_JWT,
+        flag_name="credential_leak",
+        annotation="Output contains what appears to be an API key or token.",
+        is_credential=True,
+        redact_label="api_key",
+        priority=100,
+    ),
+    OutputGuardPatternDef(
+        name="credential_query_param",
+        category="credentials",
+        risk_level="high",
+        compiled=_RE_QUERY_SECRET,
+        flag_name="credential_leak",
+        annotation="Output contains a URL query parameter carrying a credential.",
+        is_credential=True,
+        redact_label="secret",
+        priority=95,
     ),
     OutputGuardPatternDef(
         name="credential_token_param",

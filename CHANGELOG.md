@@ -203,6 +203,27 @@ frozen.
   screen-to-connect rebinding gap while preserving the hostname for HTTP routing, TLS SNI,
   and certificate verification. Proxy-routed requests are refused because a proxy could
   resolve the destination independently; `NO_PROXY` exclusions can connect directly.
+- **Credential redaction covers JSON Web Tokens and credential query parameters.** A JWT after
+  `token=` or `access_token=` lost only its header to redaction, leaving its payload and signature,
+  and a query parameter such as `?access_token=ya29.…`, `?client_secret=…` or `?password=…` was not
+  redacted unless its value was 20 or more letters and digits. The output guard, its configurable
+  built-in rules (`credential_jwt`, `credential_query_param`), and the browser's display redaction
+  now redact a JWT whole where it stands on its own, also right after a percent-escape or a `\u`,
+  `\n`, `\r`, or `\t` escape, as inside an encoded URL or an escaped string, and a query or fragment
+  parameter named `token`, `access_token`, `refresh_token`, `id_token`, `auth_token`, `api_token`,
+  `session_token`, `bearer_token`, or `secret_token` (also without the underscore), `api_key`,
+  `secret`, `client_secret`, `password`, or `passwd` to the end of its value once it is at least 8
+  characters, also after an escaped `&amp;` or `\u0026` or percent-encoded inside another URL. Both
+  run before the key-prefix rules, so a token or query value that starts with a recognisable key is
+  still redacted whole. Bare `key` and `auth` parameters are still left alone, and a pagination
+  cursor passed as `?token=` is now redacted from tool output too. Audit details, persisted errors,
+  and tool-argument previews use the same redaction.
+- **Connection-string redaction stays fast on nested URLs.** Every `https://` in a long run of
+  nested URLs rescanned the rest of the run for an `@`, so redacting 128 KB of such tool output took
+  8.5 seconds, and the time grew with the square of the size. The output guard and the browser's
+  redaction now end a URL's password where another connection string could begin, which keeps the
+  scan linear and still redacts a password of any length, `/` and `://` included, unless the
+  password itself contains one of the recognised schemes, such as `https://`.
 
 ## [1.8.3]
 
