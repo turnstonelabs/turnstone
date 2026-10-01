@@ -240,6 +240,17 @@ class TestClassifyUpload:
         assert kind is None
         assert rej is not None and rej.code == "unsupported" and rej.status == 400
 
+    def test_gif_rejected(self) -> None:
+        # Vision providers do not all accept GIF, and an image a provider
+        # rejects fails every later request that carries it.
+        kind, _mime, rej = classify_upload("anim.gif", "image/gif", b"GIF89a" + bytes(10))
+        assert kind is None
+        assert rej is not None and (rej.message, rej.code, rej.status) == (
+            "GIF images are not supported. Use PNG, JPEG or WebP.",
+            "unsupported",
+            400,
+        )
+
     def test_oversize_rejected(self) -> None:
         big = PNG + b"\x00" * IMAGE_SIZE_CAP  # > image cap
         kind, _mime, rej = classify_upload("big.png", "image/png", big)

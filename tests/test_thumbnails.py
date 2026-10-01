@@ -66,6 +66,24 @@ class TestMakeThumbnail:
     def test_garbage_image_returns_none(self) -> None:
         assert make_thumbnail(b"not an image", "image") is None
 
+    def test_other_decoders_are_never_offered_the_bytes(self, monkeypatch) -> None:
+        # read_file once stored any bytes behind an image extension, and
+        # Pillow's EPS decoder runs Ghostscript on what it is given.
+        eps_plugin = pytest.importorskip("PIL.EpsImagePlugin")
+        monkeypatch.setattr(
+            eps_plugin.EpsImageFile, "load", lambda *a, **k: pytest.fail("EPS was decoded")
+        )
+        eps = b"%!PS-Adobe-3.0 EPSF-3.0\n%%BoundingBox: 0 0 8 8\n%%EndComments\nshowpage\n"
+        assert make_thumbnail(eps, "image") is None
+
+    @pytest.mark.parametrize("fmt", ["GIF", "TIFF", "BMP", "ICO"])
+    def test_formats_stored_before_still_render(self, fmt: str) -> None:
+        pil = pytest.importorskip("PIL.Image")
+        buf = BytesIO()
+        pil.new("RGB", (16, 16), "red").save(buf, format=fmt)
+        out = make_thumbnail(buf.getvalue(), "image")
+        assert out is not None and out[:8] == _PNG_MAGIC
+
     @pytest.mark.filterwarnings("ignore::PIL.Image.DecompressionBombWarning")
     def test_oversized_image_rejected(self, monkeypatch) -> None:
         # An image past the pixel cap must be rejected WITHOUT decoding it.  Use a

@@ -238,7 +238,7 @@ base64-encoded image data for supported image formats.
 | `offset`  | integer | no       | Line number to start from (1-based, default: 1). Text files only. |
 | `limit`   | integer | no       | Maximum number of lines to read. Omit for full file. Text files only. |
 
-- **What it does**: For text files, reads and returns content with line numbers. For image files (PNG, JPEG, GIF, WebP, BMP, TIFF, ICO), returns image data as multi-part content when the model supports vision, or a text description when it does not. SVG files are read as text. Images larger than 4 MB are rejected. Must be called before `edit_file` on the same path (the session tracks which files have been read).
+- **What it does**: For text files, reads and returns content with line numbers. For PNG, JPEG and WebP images, returns image data as multi-part content when the model supports vision, or a text description when it does not. The image type comes from the file's content, not its extension, and only those three formats are sent, since vision providers do not all accept others: a GIF, BMP, TIFF or ICO file, or any other content under an image extension, returns an error. SVG files are read as text. Images larger than 4 MB are rejected, as are paths that are not regular files. Must be called before `edit_file` on the same path (the session tracks which files have been read).
 - **Vision support**: Controlled by `ModelCapabilities.supports_vision`. All commercial OpenAI and Anthropic models have vision enabled. Local models (vLLM, llama.cpp, NIM) default to off — enable via `[models.*.capabilities] supports_vision = true` in config.toml.
 - **Auto-approve**: Yes.
 - **Agent availability**: `task_agent`.

@@ -40,7 +40,7 @@
 import { pasteTextToFile } from "./composer_paste_text.js";
 
 var ATTACH_DEFAULT_ACCEPT =
-  "image/png,image/jpeg,image/gif,image/webp,application/pdf,text/*," +
+  "image/png,image/jpeg,image/webp,application/pdf,text/*," +
   "audio/wav,audio/mpeg,audio/ogg,audio/flac,audio/mp4,audio/aac,audio/webm," +
   ".md,.py,.js,.ts,.tsx,.jsx,.json,.yaml,.yml,.toml,.html,.css,.sh," +
   ".rs,.go,.java,.c,.cpp,.h,.hpp,.sql,.xml,.ini,.conf," +

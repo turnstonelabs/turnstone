@@ -1480,12 +1480,7 @@ let _homeStagedFiles = [];
 const _HOME_IMAGE_CAP = 4 * 1024 * 1024;
 const _HOME_TEXT_CAP = 512 * 1024;
 const _HOME_MAX_FILES = 10;
-const _HOME_IMAGE_MIMES = [
-  "image/png",
-  "image/jpeg",
-  "image/gif",
-  "image/webp",
-];
+const _HOME_IMAGE_MIMES = ["image/png", "image/jpeg", "image/webp"];
 const _HOME_TEXT_APP_MIMES = [
   "application/json",
   "application/xml",

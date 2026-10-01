@@ -39,6 +39,13 @@ ALLOWED_IMAGE_MIMES: frozenset[str] = frozenset(
     {"image/png", "image/jpeg", "image/gif", "image/webp"}
 )
 
+# The image types sent to a model: the ones the vision providers have in
+# common.  A provider rejects the whole request over an image type it does not
+# take, and a stored image goes out with every later request too.  GIF stays
+# out because provider support for it differs; it remains in
+# ALLOWED_IMAGE_MIMES for previews and for displaying GIFs already stored.
+MODEL_IMAGE_MIMES: frozenset[str] = frozenset({"image/png", "image/jpeg", "image/webp"})
+
 # Audio MIMEs accepted as chat attachments (sniffed by magic bytes; the
 # client-claimed Content-Type is never trusted alone).  ``AUDIO_MIME_TO_FORMAT``
 # maps each to the OpenAI ``input_audio.format`` token the wire builder emits.
@@ -140,6 +147,8 @@ def sniff_image_mime(data: bytes) -> str | None:
 
     Returns ``None`` if the bytes don't match any supported image
     format. Do not trust the client-provided ``Content-Type`` alone.
+    The result can be GIF, which models are not sent: check it against
+    :data:`MODEL_IMAGE_MIMES` before sending it as a provider media type.
     """
     if len(data) < 12:
         return None
@@ -267,6 +276,17 @@ def classify_upload(
     """
     sniffed_image = sniff_image_mime(data)
     if sniffed_image is not None:
+        if sniffed_image not in MODEL_IMAGE_MIMES:
+            label = sniffed_image.split("/", 1)[1].upper()
+            return (
+                None,
+                None,
+                UploadRejection(
+                    f"{label} images are not supported. Use PNG, JPEG or WebP.",
+                    "unsupported",
+                    400,
+                ),
+            )
         if len(data) > IMAGE_SIZE_CAP:
             return None, None, _too_large("Image", len(data), IMAGE_SIZE_CAP)
         return "image", sniffed_image, None

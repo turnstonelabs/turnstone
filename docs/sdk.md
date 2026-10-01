@@ -306,7 +306,7 @@ with open("notes.txt", "rb") as f:
     )
 ```
 
-Limits: images ≤ 4 MiB (png/jpeg/gif/webp), text ≤ 512 KiB (UTF-8),
+Limits: images ≤ 4 MiB (png/jpeg/webp), text ≤ 512 KiB (UTF-8),
 10 pending per (workstream, user). The SDK auto-generates `ws_id` on the
 client so cluster-routed callers bind attachments to the owning node
 before the request lands.

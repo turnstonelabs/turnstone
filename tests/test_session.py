@@ -3,6 +3,7 @@
 import base64
 import contextlib
 import json
+import os
 import subprocess
 import threading
 import time
@@ -2836,6 +2837,108 @@ class TestExecReadImage:
         call_id, output = session._exec_read_file(item)
         assert isinstance(output, str)
         assert "<svg" in output  # Read as text
+
+    @staticmethod
+    def _vision_session() -> Any:
+        session = _make_session()
+        mock_caps = MagicMock()
+        mock_caps.supports_vision = True
+        replace_session_lane(session, capabilities=mock_caps)
+        return session
+
+    @classmethod
+    def _read_with_vision(cls, path: Any) -> str | list[dict[str, Any]]:
+        item = {"call_id": "c6", "path": str(path), "offset": None, "limit": None}
+        return cls._vision_session()._exec_read_file(item)[1]
+
+    @staticmethod
+    def _not_an_image(path: Any) -> str:
+        return (
+            f"Error: {path} is not a PNG, JPEG or WebP image, the image formats read_file can send."
+        )
+
+    @pytest.mark.parametrize(
+        ("ext", "fmt", "mime"),
+        [
+            (".png", "PNG", "image/png"),
+            (".jpg", "JPEG", "image/jpeg"),
+            (".jpeg", "JPEG", "image/jpeg"),
+            (".webp", "WEBP", "image/webp"),
+        ],
+    )
+    def test_wire_format_images_reach_anthropic_with_their_media_type(
+        self, tmp_db, tmp_path, ext, fmt, mime
+    ):
+        from PIL import Image
+
+        from turnstone.core.providers._anthropic import AnthropicProvider
+
+        img = tmp_path / f"scan{ext}"
+        Image.new("RGB", (16, 16), "red").save(img, format=fmt)
+
+        output = self._read_with_vision(img)
+        assert isinstance(output, list)
+        blocks = AnthropicProvider._convert_content_parts(output)
+        assert blocks[1]["type"] == "image"
+        assert blocks[1]["source"]["media_type"] == mime
+
+    @pytest.mark.parametrize(
+        ("ext", "fmt"),
+        [(".gif", "GIF"), (".bmp", "BMP"), (".ico", "ICO"), (".tif", "TIFF"), (".tiff", "TIFF")],
+    )
+    def test_other_image_formats_return_an_error(self, tmp_db, tmp_path, ext, fmt):
+        """A TIFF read went out typed image/tiff, which providers reject, and
+        the stored tool result then failed every later request too."""
+        from PIL import Image
+
+        img = tmp_path / f"scan{ext}"
+        Image.new("RGB", (16, 16), "red").save(img, format=fmt)
+
+        assert self._read_with_vision(img) == self._not_an_image(img)
+
+    def test_media_type_follows_the_content_not_the_extension(self, tmp_db, tmp_path):
+        from PIL import Image
+
+        img = tmp_path / "photo.png"
+        Image.new("RGB", (8, 8), "red").save(img, format="JPEG")
+
+        output = self._read_with_vision(img)
+        assert isinstance(output, list)
+        url = output[1]["image_url"]["url"]
+        assert url.startswith("data:image/jpeg;base64,")
+        assert base64.b64decode(url.split(",", 1)[1]) == img.read_bytes()
+
+    def test_non_image_content_returns_error(self, tmp_db, tmp_path):
+        """A failed download saved under an image name is not sent as an image."""
+        page = tmp_path / "chart.png"
+        page.write_text("<html><body>404 Not Found</body></html>")
+
+        assert self._read_with_vision(page) == self._not_an_image(page)
+
+    def test_a_device_is_not_read(self, tmp_db, tmp_path):
+        """A link to /dev/zero never reaches end of file."""
+        if not os.path.exists("/dev/zero"):
+            pytest.skip("needs /dev/zero")
+        link = tmp_path / "diagram.png"
+        link.symlink_to("/dev/zero")
+        assert self._read_with_vision(link) == f"Error: {link} is not a regular file."
+
+    @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="needs FIFOs")
+    def test_a_fifo_is_not_opened(self, tmp_db, tmp_path):
+        """Opening a FIFO blocks until a writer appears."""
+        fifo = tmp_path / "chart.png"
+        os.mkfifo(fifo)
+        session = self._vision_session()
+        item = {"call_id": "c7", "path": str(fifo), "offset": None, "limit": None}
+        result: list[Any] = []
+        reader = threading.Thread(target=lambda: result.append(session._exec_read_file(item)[1]))
+        reader.start()
+        reader.join(timeout=10)
+        if reader.is_alive():  # it opened the FIFO: write nothing so the read ends
+            with open(fifo, "wb"):
+                pass
+            reader.join()
+        assert result == [f"Error: {fifo} is not a regular file."]
 
 
 class TestReadFileAttachedFileNote:

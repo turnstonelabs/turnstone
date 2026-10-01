@@ -1531,8 +1531,9 @@ history is discarded; retry the close after storage recovers.
 Upload an image or text document and attach it to the caller's next user
 turn on this workstream.
 
-- Images (png/jpeg/gif/webp) are capped at **4 MiB** and validated via
-  magic-byte sniff on upload.
+- Images (png/jpeg/webp) are capped at **4 MiB** and validated via
+  magic-byte sniff on upload. GIF is refused, since vision providers do not
+  all accept it.
 - Text documents (any `text/*` MIME, allow-listed application MIMEs, or
   known text extensions) are capped at **512 KiB** and must be UTF-8.
 - Per-(workstream, user) pending cap is **10** attachments.

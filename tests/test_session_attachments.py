@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+from io import BytesIO
 from unittest.mock import MagicMock
 
 import pytest
+from PIL import Image
 
 from tests._session_helpers import as_stream, mock_completion_result
 from turnstone.core import fence, perception
@@ -26,6 +28,12 @@ PNG_1x1 = (
     b"\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\rIDATx\x9cc\xfc\xcf"
     b"\xc0\xc0\xc0\x00\x00\x00\x05\x00\x01\xa5\xf6E@\x00\x00\x00\x00IEND\xaeB`\x82"
 )
+
+
+def _encoded_image(fmt: str) -> bytes:
+    buf = BytesIO()
+    Image.new("RGB", (4, 4), "red").save(buf, format=fmt)
+    return buf.getvalue()
 
 
 def _make_session(mock_client, user_id: str = "u1") -> ChatSession:
@@ -352,6 +360,28 @@ class TestProviderIntegration:
         assert content[3]["source"]["media_type"] == "text/plain"
         assert content[3]["title"] == "notes.md (text/markdown)"
         assert content[3]["source"]["data"] == "# hi\n"
+
+    def test_anthropic_receives_a_placeholder_for_a_stored_tiff_image(
+        self, tmp_db, mock_openai_client
+    ):
+        # read_file once stored TIFF images typed image/tiff.  Providers reject
+        # that media type, so one such image failed every later request of the
+        # workstream until the stored image became a placeholder on the way out.
+        from turnstone.core.providers._anthropic import AnthropicProvider
+
+        s = _make_session(mock_openai_client)
+        tiff = Attachment("t1", "scan.tiff", "image/tiff", "image", _encoded_image("TIFF"))
+        _run_send(s, "look", attachments=[tiff])
+        stored = get_attachment("t1")
+        assert stored is not None
+        assert stored["mime_type"] == "image/tiff"
+
+        _, converted = AnthropicProvider()._convert_messages(
+            materialize_attachments(dicts_from_turns([s.messages[-1]]), s._resolve_attachments)
+        )
+        assert converted[0]["content"][1:] == [
+            {"type": "text", "text": "[unreadable attachment: scan.tiff]"}
+        ]
 
     def test_live_send_stashes_attachments_meta_sibling(self, tmp_db, mock_openai_client):
         # Filenames can't be recovered from an image_url data URI, so
@@ -770,6 +800,25 @@ class TestPerceptionFallback:
         assert "image attachment 'i.png'" in part["text"]
         prov.create_streaming.assert_called_once()
 
+    @pytest.mark.parametrize(
+        ("content", "fn", "mime"),
+        [(b"<html>404</html>", "chart.png", "image/png"), (None, "scan.tiff", "image/tiff")],
+    )
+    def test_stored_non_wire_image_skips_perception(
+        self, tmp_db, mock_openai_client, content, fn, mime
+    ):
+        # A failed download or a TIFF that read_file stored as an image before
+        # it checked content: the primary gets the placeholder, with no
+        # perception call spent on it.
+        s = _make_session(mock_openai_client)
+        prov = self._with_perception(s, perc_caps=ModelCapabilities(supports_vision=True))
+        part = s._wire_content_part(
+            self._att("image", content or _encoded_image("TIFF"), fn, mime),
+            ModelCapabilities(),
+        )
+        assert part == {"type": "text", "text": f"[unreadable attachment: {fn}]"}
+        prov.create_streaming.assert_not_called()
+
     def test_perception_pins_cache_and_backend_auth_to_same_principal(
         self,
         tmp_db,
@@ -897,6 +946,44 @@ class TestPerceptionFallback:
         assert part["type"] == "text"
         assert "no transcription backend" in part["text"]
         prov.create_streaming.assert_not_called()
+
+
+class TestWireImageFormats:
+    """Stored images reach a model typed by their content, and only as PNG,
+    JPEG or WebP (anything else becomes a placeholder): read_file once stored
+    images typed by file name, and a type the provider rejects failed every
+    later request of the workstream."""
+
+    def _att(self, content: bytes, mime: str) -> dict:
+        return {
+            "attachment_id": "aW",
+            "filename": "x",
+            "mime_type": mime,
+            "kind": "image",
+            "content": content,
+        }
+
+    def test_stored_image_type_follows_its_content(self, tmp_db, mock_openai_client):
+        s = _make_session(mock_openai_client)
+        part = s._wire_content_part(
+            self._att(_encoded_image("JPEG"), "image/png"),
+            ModelCapabilities(supports_vision=True),
+        )
+        assert part["image_url"]["url"].startswith("data:image/jpeg;base64,")
+
+    @pytest.mark.parametrize(
+        ("content", "mime"), [(b"<html>404</html>", "image/png"), (None, "image/gif")]
+    )
+    def test_stored_image_models_are_not_sent_is_a_placeholder(
+        self, tmp_db, mock_openai_client, content, mime
+    ):
+        # Bytes that are no image, or a GIF uploaded before GIFs were refused.
+        s = _make_session(mock_openai_client)
+        part = s._wire_content_part(
+            self._att(content or _encoded_image("GIF"), mime),
+            ModelCapabilities(supports_vision=True),
+        )
+        assert part == {"type": "text", "text": "[unreadable attachment: x]"}
 
 
 class TestResolveAttachmentsCapsThreading:

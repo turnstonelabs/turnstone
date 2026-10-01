@@ -275,12 +275,7 @@ function _newWsRenderChips() {
 // text/* MIMEs, allowlisted application/* MIMEs, and known text extensions.
 // Surfaces unsupported types client-side so the user sees a clear error
 // instead of a generic create failure after the server rejects.
-const _ATTACH_IMAGE_MIMES = [
-  "image/png",
-  "image/jpeg",
-  "image/gif",
-  "image/webp",
-];
+const _ATTACH_IMAGE_MIMES = ["image/png", "image/jpeg", "image/webp"];
 const _ATTACH_TEXT_APP_MIMES = [
   "application/json",
   "application/xml",

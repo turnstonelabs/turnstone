@@ -28,6 +28,7 @@ import re
 import shlex
 import shutil
 import signal
+import stat
 import subprocess
 import tempfile
 import textwrap
@@ -48,12 +49,14 @@ from turnstone.core.attachments import (
     IMAGE_SIZE_CAP as _ATTACH_IMAGE_SIZE_CAP,
 )
 from turnstone.core.attachments import (
+    MODEL_IMAGE_MIMES,
     PDF_SIZE_CAP,
     Attachment,
     attached_file_label,
     neutralize_attachment_part,
     neutralize_untrusted_fences,
     safe_attachment_label,
+    sniff_image_mime,
     sniff_pdf_mime,
     unreadable_placeholder,
 )
@@ -1122,7 +1125,9 @@ class _StreamTurnConsumer:
         )
 
 
-# Image extensions handled as vision content (SVG excluded — it's XML text)
+# Image extensions read_file handles as images (SVG excluded — it's XML text).
+# Only PNG, JPEG and WebP content is sent (MODEL_IMAGE_MIMES); a GIF, BMP, TIFF
+# or ICO file gets an error.
 _IMAGE_EXTENSIONS: frozenset[str] = frozenset(
     {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff", ".tif", ".ico"}
 )
@@ -8278,7 +8283,8 @@ class ChatSession:
         supported, else the fallback ladder for a kind it can't read.
 
         PDF → rasterized page images (vision primary) → perception → extracted
-        text → placeholder.  Image → native image_url, or perception first when
+        text → placeholder.  Image → image_url typed by its content (a
+        placeholder unless it is PNG, JPEG or WebP), or perception first when
         the primary has no vision.  Audio → STT transcript → perception →
         placeholder.  Perception (the ``perception.model_alias`` role) is the
         universal bottom tier: it engages only when the primary can't handle the
@@ -8294,6 +8300,22 @@ class ChatSession:
                 principal_id=principal_id,
             )
             return materialized.content if materialized is not None else None
+        raw = att.get("content")
+        if kind == "image" and isinstance(raw, bytes):
+            # read_file once stored images typed by file name, so a row can hold
+            # a type providers reject (image/tiff) or bytes that are no image,
+            # and one such image in history failed every later request.  Send
+            # the type the bytes carry, or a placeholder when models are not
+            # sent that type (GIF uploads were accepted before, too).  Wire
+            # only: the display and export resolvers stay native.
+            mime = sniff_image_mime(raw)
+            if mime not in MODEL_IMAGE_MIMES:
+                log.warning(
+                    "attachment id=%s stored as image but not PNG, JPEG or WebP",
+                    att.get("attachment_id"),
+                )
+                return unreadable_placeholder(att.get("filename") or "")
+            att = {**att, "mime_type": mime}
         if kind == "image" and not caps.supports_vision:
             perceived = self._perception_fallback_part(
                 att,
@@ -25223,9 +25245,14 @@ class ChatSession:
                 "Current model does not support vision."
             )
 
+        # The path can name a device (a link to /dev/zero never ends) or a FIFO
+        # (the read blocks), so read only a regular file, and never past the cap.
         try:
-            with open(resolved, "rb") as f:
-                raw = f.read()
+            st = os.stat(resolved)
+            raw = b""
+            if stat.S_ISREG(st.st_mode) and st.st_size <= _IMAGE_SIZE_CAP:
+                with open(resolved, "rb") as f:
+                    raw = f.read(_IMAGE_SIZE_CAP + 1)
         except FileNotFoundError:
             self._current_read_files.discard(resolved)
             msg = f"Error: {path} not found" + self._attached_file_note(path)
@@ -25237,9 +25264,16 @@ class ChatSession:
             self._report_tool_result(call_id, "read_file", msg, is_error=True)
             return call_id, msg
 
-        if len(raw) > _IMAGE_SIZE_CAP:
+        if not stat.S_ISREG(st.st_mode):
             self._current_read_files.discard(resolved)
-            size_mb = len(raw) / (1024 * 1024)
+            msg = f"Error: {path} is not a regular file."
+            self._report_tool_result(call_id, "read_file", msg, is_error=True)
+            return call_id, msg
+
+        size = max(st.st_size, len(raw))  # the file may have grown since the stat
+        if size > _IMAGE_SIZE_CAP:
+            self._current_read_files.discard(resolved)
+            size_mb = size / (1024 * 1024)
             cap_mb = _IMAGE_SIZE_CAP / (1024 * 1024)
             msg = (
                 f"Error: image {path} is {size_mb:.1f} MB, "
@@ -25248,11 +25282,20 @@ class ChatSession:
             self._report_tool_result(call_id, "read_file", msg, is_error=True)
             return call_id, msg
 
-        self._current_read_files.add(resolved)
-        mime, _ = mimetypes.guess_type(path)
-        if not mime:
-            mime = "image/png"
+        # Type the image by its bytes, not its name, and send only the types
+        # every vision provider takes: an image of another type fails the
+        # request, and every later request once the result is stored.
+        mime = sniff_image_mime(raw)
+        if mime not in MODEL_IMAGE_MIMES:
+            self._current_read_files.discard(resolved)
+            msg = (
+                f"Error: {path} is not a PNG, JPEG or WebP image, the image formats "
+                "read_file can send."
+            )
+            self._report_tool_result(call_id, "read_file", msg, is_error=True)
+            return call_id, msg
 
+        self._current_read_files.add(resolved)
         content_parts: list[dict[str, Any]] = [
             {"type": "text", "text": f"Image file: {path} ({len(raw):,} bytes)"},
             {"type": "image_url", "image_url": {"url": _encode_image_data_uri(raw, mime)}},

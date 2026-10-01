@@ -20,6 +20,13 @@ _THUMB_MAX_PX = 160
 # Tighten it so a malicious upload can't OOM the node while we build a thumbnail.
 _MAX_IMAGE_PIXELS = 40_000_000
 
+# The formats a stored image can be.  Uploads and read_file results are PNG,
+# JPEG or WebP, but uploads once included GIF, and read_file once stored
+# whatever bytes a file with an image extension held, TIFF, BMP and ICO
+# included.  Pillow is offered nothing else: its EPS decoder runs Ghostscript
+# on the bytes.
+_IMAGE_FORMATS = ("PNG", "JPEG", "GIF", "WEBP", "TIFF", "BMP", "ICO")
+
 
 def make_thumbnail(data: bytes, kind: str, *, max_px: int = _THUMB_MAX_PX) -> bytes | None:
     """Return a small PNG thumbnail for an ``image``/``pdf`` blob, else ``None``."""
@@ -41,7 +48,7 @@ def make_thumbnail(data: bytes, kind: str, *, max_px: int = _THUMB_MAX_PX) -> by
                 return None
             img = Image.open(BytesIO(pages[0]))
         elif kind == "image":
-            img = Image.open(BytesIO(data))
+            img = Image.open(BytesIO(data), formats=_IMAGE_FORMATS)
         else:
             return None
         # Reject oversized images explicitly before any decode.  Pillow's
