@@ -184,6 +184,12 @@ SHAPES: tuple[Shape, ...] = (
         create_provider("openai").get_capabilities("gpt-6-sol"),
         model="gpt-6-sol",
     ),
+    Shape(
+        "openai-gpt-6.1-sol",
+        "openai",
+        create_provider("openai").get_capabilities("gpt-6.1-sol"),
+        model="gpt-6.1-sol",
+    ),
     Shape("google-default", "google", _GEMINI_CAPS, model="gemini-3-flash"),
     Shape(
         # GoogleProvider subclasses the chat provider, so a template

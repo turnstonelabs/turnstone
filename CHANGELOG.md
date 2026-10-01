@@ -104,6 +104,17 @@ frozen.
 
 ### Fixed
 
+- **GPT-6.1 Sol requests built from generic defaults.** `gpt-6.1-sol` had no capability row, and its
+  dotted version matched none of the GPT-6 rows, so it fell through to the default OpenAI row: a
+  configured reasoning effort was dropped, a configured temperature was sent although the model
+  always reasons and its guide says to remove sampling parameters, a model definition left on
+  auto-detect ran with the 32,768-token fallback context window instead of 1.05M, output was capped
+  at 64K instead of 128K, and the model was treated as unable to see images. It now has a row with
+  the documented `low` through `max` effort ladder (no `none`) and default `medium`, no temperature
+  at any effort, vision, PDF input, and tool search, and the 30-minute `prompt_cache_options`
+  lifetime now covers GPT-6 point releases as well. A GPT-6 model definition whose window was saved
+  as 32,768 from the Models tab's Detect result keeps that value until it is set to 0 (auto-detect)
+  or 1,050,000.
 - **Native mid-conversation system messages rejected after a wake or approval feedback.** On Claude
   models that take operator notes as native mid-conversation system messages (Opus 4.8, Opus 5 and
   5.5, Fable 5 and 5.1), an idle wake, such as a finished watch, background shell or child, sent its
@@ -132,10 +143,11 @@ frozen.
 - **GPT-6 Sol and Luna requests built from generic defaults.** `gpt-6-sol` and `gpt-6-luna` had no
   capability rows and fell through to the default OpenAI row: a configured reasoning effort was
   dropped, a configured temperature was sent while reasoning ran at the server default, which the
-  models' guide says to remove, the context window and output cap were taken as 200K and 64K instead
-  of 1.05M and 128K, and image attachments were withheld as unsupported. Both models now have rows
-  with the documented `none` through `max` effort ladder, temperature only at effort `none`, vision,
-  PDF input, tool search, and the 30-minute `prompt_cache_options` lifetime.
+  models' guide says to remove, a model definition left on auto-detect ran with the 32,768-token
+  fallback context window instead of 1.05M, output was capped at 64K instead of 128K, and the models
+  were treated as unable to see images. Both models now have rows with the documented `none` through
+  `max` effort ladder, temperature only at effort `none`, vision, PDF input, tool search, and the
+  30-minute `prompt_cache_options` lifetime.
 - **Claude Opus 5.5 requests failing after a history edit.** `claude-opus-5-5` had no capability row
   and resolved to the Opus 5 row, so its requests never opted into the degrade mode for thinking
   bound to the conversation prefix. On Anthropic organizations created on or after 2026-08-31, a

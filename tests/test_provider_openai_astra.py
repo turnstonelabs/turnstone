@@ -127,24 +127,36 @@ def _prepare(messages, lane):
     )
 
 
+@pytest.mark.parametrize("model,unset_effort", [("gpt-6-astra", None), ("gpt-6.1-sol", "medium")])
 @pytest.mark.parametrize(
     "effort", [None, "none", "minimal", "low", "medium", "high", "xhigh", "max"]
 )
-def test_sampling_on_real_responses_sdk(sdk_boundary, effort):
+def test_sampling_on_real_responses_sdk(sdk_boundary, model, unset_effort, effort):
+    # Neither model has a "none" level, so the knob's none is omitted and
+    # minimal snaps to low.  An unset knob falls to the row's default effort:
+    # Astra's row declares no default (the server picks), while GPT-6.1 Sol's
+    # row declares the documented medium.
     client, requests, _ = sdk_boundary
     provider = create_provider("openai", api_surface="chat")
-    caps = provider.get_capabilities("gpt-6-astra")
-    lane = ModelLane(provider, client, "gpt-6-astra", capabilities=caps)
+    caps = provider.get_capabilities(model)
+    lane = ModelLane(provider, client, model, capabilities=caps)
 
     result = model_turn(lane, [Turn.user("Hello")], temperature=0.7, reasoning_effort=effort)
 
     sent = requests[0]
     assert result.turn.text == "ok"
+    assert sent["model"] == model
     assert not {"temperature", "top_p", "top_logprobs", "reasoning_effort"} & sent.keys()
-    if effort in (None, "none"):
+    if effort is None:
+        expected = unset_effort
+    elif effort == "none":
+        expected = None
+    else:
+        expected = "low" if effort == "minimal" else effort
+    if expected is None:
         assert "reasoning" not in sent
     else:
-        assert sent["reasoning"] == {"effort": "low" if effort == "minimal" else effort}
+        assert sent["reasoning"] == {"effort": expected}
     assert sent["store"] is False
     assert sent["prompt_cache_options"] == {"ttl": "30m"}
     assert "prompt_cache_retention" not in sent
@@ -365,6 +377,7 @@ def test_instruction_position_and_content_parts(role, native):
         ("openai", "gpt-5.6-sol", False),
         ("openai", "gpt-6-sol", False),
         ("openai", "gpt-6-luna", False),
+        ("openai", "gpt-6.1-sol", False),
         ("openai-compatible", "gpt-6-astra", False),
     ],
 )
