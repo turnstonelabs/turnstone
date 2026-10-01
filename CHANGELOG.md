@@ -104,6 +104,15 @@ frozen.
 
 ### Fixed
 
+- **`THIRD-PARTY-NOTICES` lists the versions the package ships.** Its KaTeX, highlight.js, Mermaid
+  and hls.js sections named older versions than the vendored files, because the update script
+  rewrote version references only in source files and every bump left the notices behind. The
+  headers now read KaTeX 0.18.10, highlight.js 11.12.0, Mermaid 12.0.0 and hls.js 1.7.3, and each
+  section reproduces the license file shipped with the library, which restores the Brightcove
+  copyright notice that the hls.js license carries for code derived from videojs-contrib-hls. The
+  update script now rewrites the notices header on each bump, and tests fail when any
+  version-named directory under `shared_static/`, fonts included, lacks a section whose header
+  names its version and which reproduces or names its `LICENSE` file.
 - **GPT-6.1 Sol requests built from generic defaults.** `gpt-6.1-sol` had no capability row, and its
   dotted version matched none of the GPT-6 rows, so it fell through to the default OpenAI row: a
   configured reasoning effort was dropped, a configured temperature was sent although the model

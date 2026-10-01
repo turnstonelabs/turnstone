@@ -10,12 +10,13 @@
 # This script:
 #   1. Downloads the new version from CDN
 #   2. Creates the new versioned directory
-#   3. Updates all version references in source files
+#   3. Updates all version references in source files and THIRD-PARTY-NOTICES
 #   4. Removes the old versioned directory
 
 set -euo pipefail
 
 STATIC_DIR="turnstone/shared_static"
+NOTICES="THIRD-PARTY-NOTICES"
 CDN="https://cdn.jsdelivr.net/npm"
 
 usage() {
@@ -73,6 +74,26 @@ check_same_version() {
         exit 1
     fi
 }
+
+# The library's section in THIRD-PARTY-NOTICES opens with "<name> <version>",
+# e.g. "KaTeX 0.16.38". update_refs misses it: the file has no extension, and
+# the header separates name and version with a space. Check for the header
+# before anything changes, so a missing one cannot leave a half-done update.
+case "$LIB" in
+    katex) NOTICE_NAME="KaTeX" ;;
+    hljs) NOTICE_NAME="highlight.js" ;;
+    mermaid) NOTICE_NAME="Mermaid" ;;
+    hls) NOTICE_NAME="hls.js" ;;
+    *)
+        echo "Unknown library: ${LIB}"
+        usage
+        ;;
+esac
+NOTICE_HEADER_RE="^${NOTICE_NAME//./[.]} [0-9][0-9.]*\$"
+if ! grep -qE "$NOTICE_HEADER_RE" "$NOTICES"; then
+    echo "ERROR: ${NOTICES} has no \"${NOTICE_NAME} <version>\" header line."
+    exit 1
+fi
 
 case "$LIB" in
     katex)
@@ -176,17 +197,19 @@ case "$LIB" in
         rm -rf "${OLD_DIR}"
         echo "Done. Old directory removed: ${OLD_DIR}"
         ;;
-
-    *)
-        echo "Unknown library: ${LIB}"
-        usage
-        ;;
 esac
+
+# Any version is replaced, so a header left behind by an earlier update is
+# corrected too.
+sed -i -E "s/${NOTICE_HEADER_RE}/${NOTICE_NAME} ${VERSION}/" "$NOTICES"
+echo "Updated ${NOTICES}"
 
 echo ""
 echo "NOTE: If you added a NEW library (not just updating a version), also update"
 echo "  _VERSIONED_VENDOR_DIR in turnstone/core/web_helpers.py — it controls both"
-echo "  HTML version rewriting and immutable static-response caching."
+echo "  HTML version rewriting and immutable static-response caching. Add its"
+echo "  license to ${NOTICES} and its header name to _NOTICE_NAMES in"
+echo "  tests/test_third_party_notices.py."
 echo ""
 echo "Verify the update:"
 echo "  git diff --stat"
