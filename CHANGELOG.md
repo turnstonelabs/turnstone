@@ -104,6 +104,12 @@ frozen.
 
 ### Fixed
 
+- **GPT-6 effort changes preserve the cached prompt prefix (#1246).** Supported standard
+  Responses requests keep request-level effort at its initial value and replay later changes
+  as `configuration_update` input items. Accepted turns record their resolved effort, so
+  resume and fork preserve update positions; compaction starts a new baseline. Pro mode,
+  requests with sampling parameters, compatible endpoints, and a return to an unknown server
+  default retain request-level effort.
 - **`THIRD-PARTY-NOTICES` lists the versions the package ships.** Its KaTeX, highlight.js, Mermaid
   and hls.js sections named older versions than the vendored files, because the update script
   rewrote version references only in source files and every bump left the notices behind. The

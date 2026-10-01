@@ -747,6 +747,10 @@ class ModelCapabilities:
     # ``test_real_sdk_puts_control_on_the_wire`` pins that wire shape
     # through the real SDK.  Never set on a compat lane.
     thinking_prefix_bound: bool = False
+    # Responses input configuration updates preserve the request-level effort and
+    # cached prefix when effort changes. Standard single-agent requests only;
+    # pro mode and requests with sampling parameters retain request-level reasoning.
+    supports_reasoning_config_updates: bool = False
 
 
 # The session effort knob is ORDINAL — snapping must respect this order.

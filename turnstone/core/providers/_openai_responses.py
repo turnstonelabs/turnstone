@@ -66,6 +66,10 @@ _TRANSIENT_FAILURE_CODES = frozenset({"server_error", "rate_limit_exceeded"})
 # the session injects; the other hosted tools' usage shapes are #1194.
 _SERVER_EXECUTED_ITEM_TYPES = frozenset({"web_search_call"})
 
+# Adapter-owned replay metadata on the first native output item. The generic
+# trajectory and storage preserve it opaquely; input projection never sends it.
+_REASONING_CONFIG_KEY = "_reasoning_config"
+
 
 def _extend_message_annotations(item: Any, annotations: list[Any]) -> None:
     """Collect url_citation annotations off a message output item's text
@@ -160,6 +164,84 @@ def convert_content_parts(parts: list[Any]) -> list[dict[str, Any]]:
     return converted
 
 
+def _replay_reasoning_config(
+    messages: list[dict[str, Any]],
+    input_items: list[dict[str, Any]],
+    assistant_item_ends: list[int],
+    *,
+    producer: str,
+    model: str,
+    effort: str | None,
+    effort_values: tuple[str, ...],
+) -> tuple[str | None, list[dict[str, Any]]]:
+    """Rebuild updates at response boundaries from the accepted effort history.
+
+    Unrecorded, foreign and corrupt assistant turns start a new baseline; a
+    compaction summary is naturally such a boundary. An omitted effort also
+    resets the baseline: the API cannot express an unknown server default as
+    an update. Current omission therefore uses ordinary request-level reasoning.
+    """
+    if effort is None:
+        return effort, input_items
+    assistants = [msg for msg in messages if msg.get("role") == "assistant"]
+    if len(assistants) != len(assistant_item_ends):
+        return effort, input_items
+    history: list[tuple[int, str | None]] = []
+    for ordinal, msg in enumerate(assistants):
+        blocks = msg.get("_provider_content")
+        config = (
+            blocks[0].get(_REASONING_CONFIG_KEY)
+            if isinstance(blocks, list) and blocks and isinstance(blocks[0], dict)
+            else None
+        )
+        if (
+            msg.get("_producer") != producer
+            or not isinstance(config, dict)
+            or config.get("model") != model
+            or "effort" not in config
+            or (config["effort"] is not None and config["effort"] not in effort_values)
+        ):
+            history.clear()
+        else:
+            if config["effort"] is None:
+                history.clear()
+            history.append((ordinal, config["effort"]))
+    if not history:
+        return effort, input_items
+
+    initial_effort = previous_effort = history[0][1]
+    updates: dict[int, str] = {}
+    for ordinal, recorded_effort in history[1:]:
+        if recorded_effort != previous_effort and recorded_effort is not None:
+            updates[assistant_item_ends[ordinal - 1]] = recorded_effort
+        previous_effort = recorded_effort
+    if effort != previous_effort:
+        updates[assistant_item_ends[-1]] = effort
+    if not updates:
+        return initial_effort, input_items
+
+    # An assistant with only unreplayed reasoning can emit no input items.
+    # Coalesce updates at the same item boundary so they can never be adjacent.
+    replayed: list[dict[str, Any]] = []
+    for index in range(len(input_items) + 1):
+        if index in updates:
+            replayed.append(
+                {"type": "configuration_update", "reasoning": {"effort": updates[index]}}
+            )
+        if index < len(input_items):
+            replayed.append(input_items[index])
+    return initial_effort, replayed
+
+
+def _record_reasoning_config(
+    blocks: list[dict[str, Any]], config: dict[str, Any] | None
+) -> list[dict[str, Any]]:
+    """Keep request state with real output, so it cannot make an empty reply usable."""
+    if not blocks or config is None:
+        return blocks
+    return [{**blocks[0], _REASONING_CONFIG_KEY: config}, *blocks[1:]]
+
+
 class OpenAIResponsesProvider:
     """Provider for the Responses API — commercial OpenAI, plus the
     ``openai-compatible`` lane pinned to ``api_surface="responses"``.
@@ -197,6 +279,7 @@ class OpenAIResponsesProvider:
         replay_reasoning_to_model: bool = False,
         supports_mid_conversation_system: bool = False,
         native_producer: str = "openai",
+        assistant_item_ends: list[int] | None = None,
     ) -> tuple[str | None, list[dict[str, Any]]]:
         """Convert Chat Completions messages to Responses API input items.
 
@@ -211,6 +294,9 @@ class OpenAIResponsesProvider:
         only when *replay_reasoning_to_model* is True; phase is independent of
         that toggle. Explicitly foreign producer metadata is ignored, while
         untagged legacy native blocks retain shape-based replay.
+
+        ``assistant_item_ends`` records the converted end of each response so effort
+        updates can be inserted before that response's subsequent user or tool input.
         """
         # Save native blocks before sanitization strips private fields. Key by
         # assistant ordinal: sanitizer repair inserts/drops tool results, so raw
@@ -281,6 +367,8 @@ class OpenAIResponsesProvider:
                     )
                 )
                 assistant_ordinal_post += 1
+                if assistant_item_ends is not None:
+                    assistant_item_ends.append(len(items))
 
             elif role == "tool":
                 # Tool result → function_call_output
@@ -393,11 +481,13 @@ class OpenAIResponsesProvider:
         """
         caps = capabilities or self.get_capabilities(model)
 
+        assistant_item_ends: list[int] = []
         instructions, input_items = self._convert_messages(
             messages,
             replay_reasoning_to_model=replay_reasoning_to_model,
             supports_mid_conversation_system=caps.supports_mid_conversation_system,
             native_producer=self.provider_name,
+            assistant_item_ends=assistant_item_ends,
         )
         tools = apply_tool_search(caps, tools, deferred_names)
         converted_tools = self._convert_tools(tools, caps)
@@ -479,6 +569,20 @@ class OpenAIResponsesProvider:
                     value=caps.reasoning_mode,
                     expected=sorted(REASONING_MODES),
                 )
+        if self._uses_reasoning_config_updates(caps, kwargs, reasoning):
+            initial_effort, kwargs["input"] = _replay_reasoning_config(
+                messages,
+                input_items,
+                assistant_item_ends,
+                producer=self.provider_name,
+                model=model,
+                effort=effort,
+                effort_values=caps.reasoning_effort_values,
+            )
+            if initial_effort is None:
+                reasoning.pop("effort", None)
+            else:
+                reasoning["effort"] = initial_effort
         if reasoning:
             kwargs["reasoning"] = reasoning
 
@@ -486,6 +590,23 @@ class OpenAIResponsesProvider:
         if not self._compat:
             apply_cache_retention(kwargs, model)
         return kwargs
+
+    def _uses_reasoning_config_updates(
+        self, caps: ModelCapabilities, kwargs: dict[str, Any], reasoning: dict[str, Any]
+    ) -> bool:
+        """Only standard Responses requests use the configuration-update contract.
+
+        This adapter never sends native multi-agent, automatic compaction or truncation
+        parameters. Compatible endpoints keep their existing wire shape. Sampling
+        parameters keep request-level effort so their acceptance still follows the
+        request's explicit no-reasoning setting.
+        """
+        return (
+            not self._compat
+            and caps.supports_reasoning_config_updates
+            and reasoning.get("mode") != "pro"
+            and "temperature" not in kwargs
+        )
 
     # -- streaming -----------------------------------------------------------
 
@@ -554,15 +675,38 @@ class OpenAIResponsesProvider:
             tool_count=len(kwargs.get("tools", [])),
         )
 
+        reasoning_config = (
+            {
+                "model": model,
+                "effort": next(
+                    (
+                        item["reasoning"]["effort"]
+                        for item in reversed(kwargs["input"])
+                        if item.get("type") == "configuration_update"
+                    ),
+                    kwargs.get("reasoning", {}).get("effort"),
+                ),
+            }
+            if self._uses_reasoning_config_updates(caps, kwargs, kwargs.get("reasoning", {}))
+            else None
+        )
         refuse_aborted_request(cancel_ref)
         stream = client.responses.create(**kwargs)
         reject_non_stream_response(stream, cancel_ref=cancel_ref)
         if cancel_ref is not None:
             cancel_ref.append(stream)
-        return self._iter_stream(stream, finish_reason_optional=caps.finish_reason_optional)
+        return self._iter_stream(
+            stream,
+            finish_reason_optional=caps.finish_reason_optional,
+            reasoning_config=reasoning_config,
+        )
 
     def _iter_stream(
-        self, stream: Any, *, finish_reason_optional: bool = False
+        self,
+        stream: Any,
+        *,
+        finish_reason_optional: bool = False,
+        reasoning_config: dict[str, Any] | None = None,
     ) -> Iterator[StreamChunk]:
         """Convert Responses API stream events to StreamChunks.
 
@@ -809,7 +953,7 @@ class OpenAIResponsesProvider:
                     usage=usage,
                 )
                 if provider_blocks:
-                    sc.provider_blocks = provider_blocks
+                    sc.provider_blocks = _record_reasoning_config(provider_blocks, reasoning_config)
                 yield sc
                 continue
 
@@ -865,7 +1009,7 @@ class OpenAIResponsesProvider:
             last_finish = "stop"
             sc = StreamChunk(finish_reason="stop")
             if provider_blocks:
-                sc.provider_blocks = provider_blocks
+                sc.provider_blocks = _record_reasoning_config(provider_blocks, reasoning_config)
             yield sc
 
         log.debug(
