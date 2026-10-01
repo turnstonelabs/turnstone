@@ -1,0 +1,154 @@
+{{- if .Values.disruptionGuard.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "turnstone.fullname" . }}-disruption-guard
+  labels:
+    {{- include "turnstone.labels" . | nindent 4 }}
+    app.kubernetes.io/component: disruption-guard
+data:
+  guard.py: |
+    """Toggle karpenter.sh/do-not-disrupt on Turnstone server pods by live state.
+
+    Runs as a CronJob. For every server pod in this release it decides "busy"
+    from the shared database and sets or removes the annotation so Karpenter
+    waits for busy nodes (consolidation, drift, expiry) without pinning idle
+    ones forever. Mapping node -> pod: primary key is TURNSTONE_NODE_ID == pod
+    name (the chart sets it from the downward API); fallback is the pod IP in
+    the node's registered advertise URL (services.url). A pod matching neither
+    is left untouched and logged.
+
+    Fail-safe: any database error exits non-zero before touching the API.
+    Stdlib + psycopg only (both present in the Turnstone image).
+    """
+
+    import datetime as dt
+    import json
+    import os
+    import ssl
+    import sys
+    import urllib.error
+    import urllib.parse
+    import urllib.request
+
+    import psycopg
+
+    ANNOTATION = os.environ.get("GUARD_ANNOTATION", "karpenter.sh/do-not-disrupt")
+    STAMP = "turnstone.io/disruption-guard-changed"
+    BUSY_STATES = {s.strip() for s in os.environ.get("GUARD_BUSY_STATES", "thinking,running,attention").split(",") if s.strip()}
+    IDLE_GRACE = dt.timedelta(minutes=int(os.environ.get("GUARD_IDLE_GRACE_MINUTES", "10")))
+    NAMESPACE = os.environ["POD_NAMESPACE"]
+    SELECTOR = os.environ["POD_LABEL_SELECTOR"]
+    SA_DIR = "/var/run/secrets/kubernetes.io/serviceaccount"
+
+
+    def log(msg: str) -> None:
+        print(f"[disruption-guard] {msg}", file=sys.stderr, flush=True)
+
+
+    def parse_ts(raw: str) -> dt.datetime | None:
+        if not raw:
+            return None
+        try:
+            ts = dt.datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        return ts if ts.tzinfo else ts.replace(tzinfo=dt.timezone.utc)
+
+
+    def busy_nodes() -> tuple[set[str], dict[str, str]]:
+        """Return (busy node ids, {advertise-host: node id}) from the database."""
+        url = os.environ["TURNSTONE_DB_URL"].replace("postgresql+psycopg://", "postgresql://", 1)
+        now = dt.datetime.now(dt.timezone.utc)
+        busy: set[str] = set()
+        hosts: dict[str, str] = {}
+        with psycopg.connect(url, connect_timeout=10) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT node_id, state, updated FROM workstreams "
+                    "WHERE node_id IS NOT NULL AND state <> 'closed'"
+                )
+                for node_id, state, updated in cur.fetchall():
+                    if state in BUSY_STATES:
+                        busy.add(node_id)
+                    elif state == "idle":
+                        ts = parse_ts(updated)
+                        if ts is not None and now - ts <= IDLE_GRACE:
+                            busy.add(node_id)
+                cur.execute("SELECT service_id, url FROM services WHERE service_type = 'server'")
+                for service_id, svc_url in cur.fetchall():
+                    host = urllib.parse.urlsplit(svc_url).hostname
+                    if host:
+                        hosts[host] = service_id
+        return busy, hosts
+
+
+    class K8s:
+        def __init__(self) -> None:
+            host = os.environ["KUBERNETES_SERVICE_HOST"]
+            port = os.environ.get("KUBERNETES_SERVICE_PORT", "443")
+            self.base = f"https://{host}:{port}"
+            with open(f"{SA_DIR}/token", encoding="utf-8") as fh:
+                self.token = fh.read().strip()
+            self.ctx = ssl.create_default_context(cafile=f"{SA_DIR}/ca.crt")
+
+        def _call(self, method: str, path: str, body: dict | None = None, content_type: str = "application/json") -> dict:
+            data = json.dumps(body).encode() if body is not None else None
+            req = urllib.request.Request(self.base + path, data=data, method=method)
+            req.add_header("Authorization", f"Bearer {self.token}")
+            req.add_header("Accept", "application/json")
+            if data is not None:
+                req.add_header("Content-Type", content_type)
+            with urllib.request.urlopen(req, timeout=15, context=self.ctx) as resp:
+                return json.loads(resp.read().decode())
+
+        def list_pods(self) -> list[dict]:
+            qs = urllib.parse.urlencode({"labelSelector": SELECTOR})
+            return self._call("GET", f"/api/v1/namespaces/{NAMESPACE}/pods?{qs}").get("items", [])
+
+        def set_annotations(self, pod: str, annotations: dict[str, str | None]) -> None:
+            self._call(
+                "PATCH",
+                f"/api/v1/namespaces/{NAMESPACE}/pods/{pod}",
+                {"metadata": {"annotations": annotations}},
+                content_type="application/merge-patch+json",
+            )
+
+
+    def main() -> int:
+        try:
+            busy, hosts = busy_nodes()
+        except Exception as exc:  # noqa: BLE001 - fail safe, touch nothing
+            log(f"database unavailable, leaving annotations unchanged: {exc}")
+            return 1
+
+        k8s = K8s()
+        pods = k8s.list_pods()
+        now = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+        changed = 0
+        for pod in pods:
+            meta = pod.get("metadata", {})
+            name = meta.get("name", "")
+            pod_ip = pod.get("status", {}).get("podIP")
+            annotations = meta.get("annotations") or {}
+            if name in hosts.values() or name in busy:
+                node_id = name
+            elif pod_ip and pod_ip in hosts:
+                node_id = hosts[pod_ip]
+            else:
+                log(f"{name}: no registered node matches by name or pod IP; skipping")
+                continue
+            want = node_id in busy
+            have = annotations.get(ANNOTATION) == "true"
+            if want == have:
+                continue
+            k8s.set_annotations(name, {ANNOTATION: "true" if want else None, STAMP: now})
+            changed += 1
+            log(f"{name} (node {node_id}): {'protected' if want else 'released'}")
+        log(f"{len(pods)} pod(s), {len(busy)} busy node(s), {changed} change(s)")
+        return 0
+
+
+    if __name__ == "__main__":
+        sys.exit(main())
+{{- end }}

@@ -1,0 +1,44 @@
+{{- if .Values.httpRoute.enabled }}
+{{- if not .Values.httpRoute.parentRefs }}
+{{- fail "httpRoute.enabled requires at least one entry in httpRoute.parentRefs" }}
+{{- end }}
+# Gateway API route to the console. Browsers need only the console: it
+# serves the dashboard and reverse-proxies every server node's UI, API and
+# SSE streams at /node/{id}/. TLS and HTTP/2 to the browser are the parent
+# Gateway's job (upstream's compose stack uses Caddy for the same purpose).
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: {{ include "turnstone.fullname" . }}
+  labels:
+    {{- include "turnstone.labels" . | nindent 4 }}
+  {{- with .Values.httpRoute.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  parentRefs:
+    {{- range .Values.httpRoute.parentRefs }}
+    - group: gateway.networking.k8s.io
+      kind: Gateway
+      name: {{ .name }}
+      {{- with .namespace }}
+      namespace: {{ . }}
+      {{- end }}
+      {{- with .sectionName }}
+      sectionName: {{ . }}
+      {{- end }}
+    {{- end }}
+  {{- with .Values.httpRoute.hostnames }}
+  hostnames:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      backendRefs:
+        - name: {{ include "turnstone.fullname" . }}-console
+          port: {{ .Values.console.service.port }}
+{{- end }}

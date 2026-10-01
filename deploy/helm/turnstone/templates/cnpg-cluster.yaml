@@ -1,0 +1,45 @@
+{{- if .Values.cnpg.enabled }}
+# Dedicated CloudNativePG cluster for this release. CNPG creates the
+# database and owner role from initdb and writes the owner's credentials to
+# the `<name>-app` Secret (kubernetes.io/basic-auth, keys username/password),
+# which the workloads read via turnstone.db.externalSecret. No out-of-band
+# database Secret is needed.
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: {{ include "turnstone.cnpg.clusterName" . }}
+  labels:
+    {{- include "turnstone.labels" . | nindent 4 }}
+    app.kubernetes.io/component: database
+  annotations:
+    # Let GitOps tools that honour sync waves create the database first.
+    argocd.argoproj.io/sync-wave: "-10"
+spec:
+  instances: {{ .Values.cnpg.instances }}
+  imageName: {{ .Values.cnpg.imageName }}
+  primaryUpdateStrategy: {{ .Values.cnpg.primaryUpdateStrategy }}
+  primaryUpdateMethod: {{ .Values.cnpg.primaryUpdateMethod }}
+  enableSuperuserAccess: false
+  enablePDB: {{ .Values.cnpg.enablePDB }}
+  bootstrap:
+    initdb:
+      database: {{ .Values.database.external.database }}
+      owner: {{ .Values.database.external.username }}
+      encoding: UTF8
+      localeCollate: C
+      localeCType: C
+  storage:
+    size: {{ .Values.cnpg.storage.size }}
+    {{- with .Values.cnpg.storage.storageClass }}
+    storageClass: {{ . }}
+    {{- end }}
+    resizeInUseVolumes: {{ .Values.cnpg.storage.resizeInUseVolumes }}
+  resources:
+    {{- toYaml .Values.cnpg.resources | nindent 4 }}
+  postgresql:
+    parameters:
+      {{- toYaml .Values.cnpg.parameters | nindent 6 }}
+  {{- with .Values.cnpg.extraSpec }}
+  {{- toYaml . | nindent 2 }}
+  {{- end }}
+{{- end }}

@@ -1,0 +1,37 @@
+{{- if and .Values.httpRoute.enabled .Values.httpRoute.istioDenyPaths.enabled }}
+{{- $parent := index .Values.httpRoute.parentRefs 0 }}
+{{- if not .Values.httpRoute.hostnames }}
+{{- fail "httpRoute.istioDenyPaths requires httpRoute.hostnames (the deny is scoped to them)" }}
+{{- end }}
+# Edge block for paths Turnstone serves without authentication (its /metrics
+# is public by design, and the console proxies each node's /metrics at
+# /node/{id}/metrics). Enforced in the Istio gateway's Envoy, before the
+# request reaches the console, and scoped to this chart's hostnames only so
+# other routes on the shared Gateway are untouched. Lives in the Gateway's
+# namespace because Istio evaluates a Gateway-targeted policy there.
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: {{ include "turnstone.fullname" . }}-deny-paths
+  namespace: {{ .Values.httpRoute.istioDenyPaths.namespace | default ($parent.namespace | default .Release.Namespace) }}
+  labels:
+    {{- include "turnstone.labels" . | nindent 4 }}
+spec:
+  targetRefs:
+    - group: gateway.networking.k8s.io
+      kind: Gateway
+      name: {{ $parent.name }}
+  action: DENY
+  rules:
+    - to:
+        - operation:
+            hosts:
+              {{- range .Values.httpRoute.hostnames }}
+              - {{ . | quote }}
+              - {{ printf "%s:*" . | quote }}
+              {{- end }}
+            paths:
+              {{- range .Values.httpRoute.istioDenyPaths.paths }}
+              - {{ . | quote }}
+              {{- end }}
+{{- end }}

@@ -1,38 +1,143 @@
-# -- Container image settings
+# -- Container image settings. Pin `tag` to an immutable release; `latest`,
+# `stable` and `experimental` move under a sync with no manifest change.
 image:
   repository: ghcr.io/turnstonelabs/turnstone
   tag: ""
   pullPolicy: IfNotPresent
+imagePullSecrets: []
 
-# -- Database configuration
+nameOverride: ""
+fullnameOverride: ""
+
+# -- Pod-level security defaults applied to every Turnstone workload. The
+# image runs as the `turnstone` user created by `useradd` (uid/gid 1000);
+# `runAsNonRoot` needs the numeric id because the image's USER is a name.
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  runAsGroup: 1000
+  fsGroup: 1000
+  seccompProfile:
+    type: RuntimeDefault
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop: ["ALL"]
+  # The server's shell/file tools write under /data and /workspace (both
+  # mounted volumes) and TLS material under /tmp; keep the root FS writable
+  # unless you have verified your tool set against a read-only root.
+  readOnlyRootFilesystem: false
+
+# -- Database configuration. Two supported shapes:
+#   1. cnpg.enabled: true  -- the chart creates a CloudNativePG Cluster in the
+#      release namespace (the operator must already be installed). host and
+#      existingSecret below may stay empty: they default to the cluster's
+#      `-rw` Service and the `<cluster>-app` basic-auth Secret CNPG generates
+#      for the initdb owner.
+#   2. cnpg.enabled: false -- point `external` at any existing PostgreSQL.
 database:
-  # Backend type (postgresql)
   backend: postgresql
-  # External database settings (used when postgresql.enabled is false)
   external:
     host: ""
     port: 5432
     database: turnstone
     username: turnstone
-    # Secret holding the password for `username`. Leave empty to supply
-    # `password` inline below instead.
+    # Secret holding the password for `username`. Leave empty with
+    # cnpg.enabled (CNPG's generated Secret is used) or to supply `password`
+    # inline instead.
     existingSecret: ""
-    # Key within existingSecret holding the password. CloudNativePG
-    # generates "password"; other operators differ.
     existingSecretPasswordKey: password
     password: ""
-    sslmode: prefer
+    # `require`, not `verify-full`: CNPG serves TLS with its own internal CA,
+    # which this pod does not carry a bundle for.
+    sslmode: require
 
-# -- Bitnami PostgreSQL subchart
+# -- Chart-managed CloudNativePG Cluster (requires the CNPG operator and its
+# CRDs on the cluster). One instance, dedicated to this release; initdb
+# creates database.external.database owned by database.external.username.
+cnpg:
+  enabled: false
+  # Cluster name; default <fullname>-db. Its Services are <name>-rw / -ro / -r.
+  name: ""
+  instances: 1
+  # Pin exactly; CNPG performs a rolling update when this changes.
+  imageName: ghcr.io/cloudnative-pg/postgresql:17.7-system-trixie
+  storage:
+    size: 20Gi
+    storageClass: ""
+    resizeInUseVolumes: true
+  resources:
+    requests:
+      cpu: 250m
+      memory: 1Gi
+    limits:
+      cpu: "2"
+      memory: 2Gi
+  # postgresql.conf parameters merged over CNPG's defaults.
+  parameters:
+    max_connections: "200"
+    shared_buffers: "256MB"
+  enablePDB: true
+  primaryUpdateStrategy: unsupervised
+  primaryUpdateMethod: restart
+  # Optional extra spec fields merged verbatim (backup, monitoring, affinity).
+  extraSpec: {}
+
+# -- Bitnami subchart, removed from Chart.yaml. Kept here at `false` so
+# upstream's helpers (which branch on .Values.postgresql.enabled) keep
+# working unchanged. templates/guard.yaml hard-fails if it is flipped on.
 postgresql:
-  enabled: true
+  enabled: false
   auth:
     database: turnstone
     username: turnstone
 
-# -- Turnstone server (main API + web UI)
+# -- Shared bootstrap config.toml (OIDC, [security] encryption key,
+# [models.*]). Mounted read-only into the console and every server node and
+# selected with TURNSTONE_CONFIG. The Secret is created out-of-band; see
+# docs/docker.md "Shared bootstrap config" for its contents.
+config:
+  existingSecret: ""
+  key: config.toml
+  mountPath: /run/turnstone/config.toml
+
+# -- Turnstone server (main API + web UI). Each replica is one node in the
+# rendezvous ring and advertises its pod IP.
 server:
+  # Deployment (upstream default) or StatefulSet. A StatefulSet gives each
+  # node a stable name (turnstone-server-0..N-1) that survives restarts, so a
+  # returning node re-registers under the same id and workstreams pinned with
+  # "Specific node" affinity stay valid. Deployments mint a new node id on
+  # every pod replacement.
+  workloadKind: Deployment
   replicas: 1
+  # Set TURNSTONE_NODE_ID to the pod name (downward API). Without it the
+  # server derives `{hostname}_{4hex}` with a fresh suffix on every start,
+  # which nothing outside the pod can map back to it.
+  nodeIdFromPodName: true
+  # Seconds the kubelet waits for in-flight tool calls and HTTP requests
+  # after SIGTERM. Turnstone has no drain mode; this only bounds the wait.
+  terminationGracePeriodSeconds: 60
+  priorityClassName: ""
+  podAnnotations: {}
+  podLabels: {}
+  extraEnv: []
+  # Rollout strategy. For a Deployment `maxUnavailable: 0, maxSurge: 1`
+  # registers the new node before the old one leaves. StatefulSets roll
+  # ordered, one at a time, and ignore maxSurge.
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  # Writable scratch space. /data is the process working directory (SQLite
+  # fallback and local state), /workspace is what the model sees as its
+  # workspace. emptyDir: contents do not survive the pod.
+  persistence:
+    data:
+      sizeLimit: 5Gi
+    workspace:
+      sizeLimit: 10Gi
   resources:
     requests:
       cpu: 500m
@@ -43,14 +148,22 @@ server:
   service:
     type: ClusterIP
     port: 8080
-  # -- Node scheduling constraints
   nodeSelector: {}
   affinity: {}
   tolerations: []
 
-# -- Turnstone console (cluster dashboard)
+# -- Turnstone console (cluster dashboard + routing proxy). Browsers reach
+# only this component; it proxies every server node at /node/{id}/.
 console:
   replicas: 1
+  terminationGracePeriodSeconds: 30
+  priorityClassName: ""
+  podAnnotations: {}
+  podLabels: {}
+  extraEnv: []
+  persistence:
+    data:
+      sizeLimit: 1Gi
   resources:
     requests:
       cpu: 250m
@@ -61,21 +174,121 @@ console:
   service:
     type: ClusterIP
     port: 8090
-  # -- Node scheduling constraints
   nodeSelector: {}
   affinity: {}
   tolerations: []
 
-# -- Database migration Job (post-install/pre-upgrade hook)
+# -- Channel gateway (Discord / Slack adapters). Off by default; runs
+# HTTP-only with no adapters until a token is present in `existingSecret`
+# (keys: TURNSTONE_DISCORD_TOKEN, TURNSTONE_SLACK_TOKEN,
+# TURNSTONE_SLACK_APP_TOKEN). Server nodes call back to it, so it must
+# advertise its Service DNS name, not its pod hostname -- the chart sets
+# TURNSTONE_CHANNEL_ADVERTISE_URL accordingly.
+channel:
+  enabled: false
+  replicas: 1
+  port: 8091
+  existingSecret: ""
+  discordGuild: "0"
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: "1"
+      memory: 512Mi
+  nodeSelector: {}
+  affinity: {}
+  tolerations: []
+
+# -- SearXNG, the web_search backend for local / OpenAI-compatible models.
+# Upstream ships it in the compose stack only; without it every agent
+# web_search call fails on DNS because Turnstone's registry default for
+# tools.searxng_url is http://searxng:8080. The Service name below is fixed
+# to `searxng` (not release-prefixed) so that default resolves with zero
+# Turnstone-side configuration. Consequence: one SearXNG per namespace.
+# Public SearXNG instances are not a substitute: they disable or rate-limit
+# the JSON API, and the tool decodes JSON only.
+searxng:
+  enabled: false
+  serviceName: searxng
+  replicas: 1
+  image:
+    repository: searxng/searxng
+    # Immutable date tag; SearXNG publishes date-stamped tags, `latest` moves.
+    tag: ""
+    pullPolicy: IfNotPresent
+  port: 8080
+  # Flask session-signing key for SearXNG's HTML UI. Not a credential: it
+  # signs cookies for a UI no human uses here and the JSON API ignores it, so
+  # it lives in the ConfigMap rather than a Secret.
+  secretKey: "turnstone-searxng-session-key"
+  # URL SearXNG uses for its own links/redirects. Matches the Service name.
+  baseUrl: "http://searxng:8080"
+  defaultLang: "en"
+  # Extra settings.yml content merged under `use_default_settings: true`.
+  extraSettings: {}
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: "1"
+      memory: 512Mi
+  nodeSelector: {}
+  affinity: {}
+  tolerations: []
+
+# -- Disruption guard. A CronJob that annotates server pods with
+# `karpenter.sh/do-not-disrupt: "true"` while they have active workstreams
+# and removes it when they go idle, so Karpenter consolidation, drift and
+# expiry drains wait for busy nodes without pinning idle ones forever.
+# Runs in its own pod with its own ServiceAccount (get/list/patch pods in
+# this namespace only); server pods never hold a token that can patch pods.
+disruptionGuard:
+  enabled: false
+  schedule: "* * * * *"
+  annotation: karpenter.sh/do-not-disrupt
+  # Workstream states that count as busy.
+  busyStates: ["thinking", "running", "attention"]
+  # An `idle` workstream updated within this many minutes also counts as
+  # busy, so a user who just paused does not lose the node.
+  idleGraceMinutes: 10
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 256Mi
+  nodeSelector: {}
+  tolerations: []
+
+# -- PodDisruptionBudget for server pods.
+pdb:
+  enabled: false
+  maxUnavailable: 1
+
+# -- PriorityClass for server pods (cluster-scoped; name derived from the
+# release). Non-preempting: it protects server pods from being preempted
+# without letting them preempt anything else.
+priorityClass:
+  enabled: false
+  value: 100000
+  preemptionPolicy: Never
+
+# -- Database migration Job (post-install/pre-upgrade hook). The image's
+# entrypoint also runs migrations on every container start, so this Job is
+# a convenience that lands schema changes before new code rolls.
 migrate:
-  # -- Node scheduling constraints
+  enabled: true
   nodeSelector: {}
   affinity: {}
   tolerations: []
 
 # -- LLM API key (optional). Model backends are defined in the console
-# Models tab; a definition that leaves api_key empty falls back to the
-# OPENAI_API_KEY this feeds (a local server needs none).
+# Models tab or [models.*] in config.toml; a definition that leaves api_key
+# empty falls back to the OPENAI_API_KEY this feeds.
 llm:
   apiKey: ""
   existingSecret: ""
@@ -85,7 +298,31 @@ auth:
   jwtSecret: ""
   existingSecret: ""
 
-# -- Ingress configuration
+# -- Gateway API HTTPRoute to the console (preferred over `ingress` on
+# clusters with a shared Gateway). Each parentRef is a Gateway; the route
+# forwards every path to the console Service.
+httpRoute:
+  enabled: false
+  annotations: {}
+  parentRefs: []
+  #  - name: rp-ingress
+  #    namespace: istio-ingress
+  hostnames: []
+  #  - turnstone.example.com
+  # Block unauthenticated paths at the edge with an Istio AuthorizationPolicy
+  # attached to the first parentRef Gateway (Istio-managed Gateways only).
+  # Scoped to `hostnames`, so other routes on a shared Gateway are untouched.
+  # Turnstone's /metrics is public by design; the console also proxies each
+  # node's /metrics at /node/{id}/metrics.
+  istioDenyPaths:
+    enabled: false
+    paths:
+      - /metrics
+      - /node/*/metrics
+    # Namespace for the policy; defaults to the parentRef's namespace.
+    namespace: ""
+
+# -- Classic Ingress (upstream). Leave disabled when httpRoute is used.
 ingress:
   enabled: false
   className: ""
@@ -95,7 +332,7 @@ ingress:
   #    paths:
   #      - path: /
   #        pathType: Prefix
-  #        service: server
+  #        service: console
   tls: []
   #  - secretName: turnstone-tls
   #    hosts:

@@ -1,0 +1,22 @@
+{{- if eq (.Values.server.workloadKind | default "Deployment") "StatefulSet" }}
+# Governing Service for the server StatefulSet (required by the API). Not used
+# for traffic: the console reaches nodes by pod IP via TURNSTONE_ADVERTISE_URL.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "turnstone.server.headlessServiceName" . }}
+  labels:
+    {{- include "turnstone.labels" . | nindent 4 }}
+    app.kubernetes.io/component: server
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  ports:
+    - port: {{ .Values.server.service.port }}
+      targetPort: http
+      protocol: TCP
+      name: http
+  selector:
+    {{- include "turnstone.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: server
+{{- end }}

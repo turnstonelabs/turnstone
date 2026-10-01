@@ -2,11 +2,22 @@ apiVersion: v2
 name: turnstone
 description: Multi-node AI orchestration platform with tool use, agent routing, and cluster simulation
 type: application
-version: 0.2.0
-appVersion: "0.3.0"
+version: 0.3.0
+appVersion: "1.8.5"
 
-dependencies:
-  - name: postgresql
-    version: ~18.8.0
-    repository: https://charts.bitnami.com/bitnami
-    condition: postgresql.enabled
+# NO `dependencies:` -- deliberately.
+#
+# Upstream declares a Bitnami `postgresql` subchart gated on
+# `postgresql.enabled`. It is removed here for two reasons:
+#
+#   1. The target platform runs CloudNativePG; Turnstone is a consumer of a
+#      shared `pg` Cluster via `database.external` (see values.yaml).
+#   2. A `dependencies:` stanza makes ArgoCD's repo-server run
+#      `helm dependency build` on every render, which needs egress to
+#      charts.bitnami.com. Bitnami's public catalog is being restricted, and a
+#      conditioned-off subchart is still resolved -- a render failure for a
+#      subchart this platform will never deploy.
+#
+# `postgresql.enabled` survives in values.yaml as `false` with a hard `fail`
+# guard (templates/guard.yaml) so upstream's helpers that branch on it keep
+# working unchanged and a copy-pasted upstream values file fails loudly.

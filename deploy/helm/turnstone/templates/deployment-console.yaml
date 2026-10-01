@@ -27,8 +27,28 @@ spec:
       labels:
         {{- include "turnstone.selectorLabels" . | nindent 8 }}
         app.kubernetes.io/component: console
+        {{- with .Values.console.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.console.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
     spec:
       serviceAccountName: {{ include "turnstone.serviceAccountName" . }}
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: {{ .Values.console.terminationGracePeriodSeconds }}
+      {{- with .Values.console.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       {{- with .Values.console.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
@@ -45,6 +65,10 @@ spec:
         - name: console
           image: {{ include "turnstone.image" . }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- with .Values.containerSecurityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
           command:
             - turnstone-console
             - --host=0.0.0.0
@@ -63,20 +87,19 @@ spec:
             {{- include "turnstone.db.env" . | nindent 12 }}
             # Self-registration URL for the service registry. Unlike a
             # server node the console is one logical endpoint behind its
-            # Service, so the Service DNS name is correct here. Without
-            # it the console registers gethostname() (its pod name),
-            # which no server node can resolve. Stops at ".svc" rather
-            # than assuming a "cluster.local" DNS domain, which is
-            # configurable per cluster.
+            # Service, so the Service DNS name is correct here. Stops at
+            # ".svc" rather than assuming a "cluster.local" DNS domain.
             - name: TURNSTONE_CONSOLE_URL
               value: "http://{{ include "turnstone.fullname" . }}-console.{{ .Release.Namespace }}.svc:{{ .Values.console.service.port }}"
-          {{- if or .Values.auth.existingSecret .Values.auth.jwtSecret }}
-            - name: TURNSTONE_JWT_SECRET
-              valueFrom:
-                secretKeyRef:
-                  name: {{ include "turnstone.auth.secretName" . }}
-                  key: TURNSTONE_JWT_SECRET
-          {{- end }}
+            {{- include "turnstone.jwt.env" . | nindent 12 }}
+            {{- include "turnstone.config.env" . | nindent 12 }}
+            {{- with .Values.console.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            {{- include "turnstone.config.mount" . | nindent 12 }}
           readinessProbe:
             httpGet:
               path: /health
@@ -91,3 +114,10 @@ spec:
             periodSeconds: 20
           resources:
             {{- toYaml .Values.console.resources | nindent 12 }}
+      volumes:
+        - name: data
+          emptyDir:
+            {{- with .Values.console.persistence.data.sizeLimit }}
+            sizeLimit: {{ . }}
+            {{- end }}
+        {{- include "turnstone.config.volume" . | nindent 8 }}

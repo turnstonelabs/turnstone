@@ -1,0 +1,38 @@
+{{- if .Values.searxng.enabled }}
+# Derived from turnstone/deploy/searxng/settings.yml (the compose stack's
+# bundled config). `use_default_settings: true` keeps SearXNG's full default
+# engine mix; only what Turnstone needs is overridden: the JSON API format
+# (a stock SearXNG returns 403 for format=json), the limiter off (it needs a
+# Valkey/Redis and would 429 Turnstone's own calls), and a fixed, non-secret
+# session key for a UI nobody uses.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "turnstone.fullname" . }}-searxng
+  labels:
+    {{- include "turnstone.labels" . | nindent 4 }}
+    app.kubernetes.io/component: searxng
+data:
+  settings.yml: |
+    use_default_settings: true
+    general:
+      instance_name: "turnstone-searxng"
+      enable_metrics: false
+    server:
+      base_url: {{ .Values.searxng.baseUrl | quote }}
+      secret_key: {{ .Values.searxng.secretKey | quote }}
+      limiter: false
+      public_instance: false
+      image_proxy: false
+    search:
+      safe_search: 0
+      default_lang: {{ .Values.searxng.defaultLang | quote }}
+      formats:
+        - html
+        - json
+    ui:
+      static_use_hash: true
+    {{- with .Values.searxng.extraSettings }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+{{- end }}

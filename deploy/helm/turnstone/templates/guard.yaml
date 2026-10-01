@@ -1,0 +1,15 @@
+{{- /*
+Rendered template that emits nothing; it exists only to fail fast. (Not an
+underscore-prefixed partial: Helm never executes those at top level.)
+
+Hard guard: the Bitnami PostgreSQL subchart is not a dependency of this chart
+(see Chart.yaml). `postgresql.enabled` is kept in values only so upstream's
+helpers keep working; flipping it on would render workloads that point at a
+Service nothing creates. Fail at render time instead.
+*/ -}}
+{{- if .Values.postgresql.enabled }}
+{{- fail "postgresql.enabled=true is not supported: this chart has no PostgreSQL subchart. Point database.external at an existing PostgreSQL (e.g. a CloudNativePG cluster) and keep postgresql.enabled=false." }}
+{{- end }}
+{{- if and (not .Values.postgresql.enabled) (not .Values.cnpg.enabled) (not .Values.database.external.host) }}
+{{- fail "database.external.host is required (or set cnpg.enabled=true to let the chart create a CloudNativePG Cluster; this chart ships no bundled PostgreSQL)." }}
+{{- end }}

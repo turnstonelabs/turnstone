@@ -1,0 +1,19 @@
+{{- if .Values.channel.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "turnstone.fullname" . }}-channel
+  labels:
+    {{- include "turnstone.labels" . | nindent 4 }}
+    app.kubernetes.io/component: channel
+spec:
+  type: ClusterIP
+  ports:
+    - port: {{ .Values.channel.port }}
+      targetPort: http
+      protocol: TCP
+      name: http
+  selector:
+    {{- include "turnstone.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: channel
+{{- end }}

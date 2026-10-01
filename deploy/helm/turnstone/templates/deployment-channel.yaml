@@ -1,0 +1,101 @@
+{{- if .Values.channel.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "turnstone.fullname" . }}-channel
+  labels:
+    {{- include "turnstone.labels" . | nindent 4 }}
+    app.kubernetes.io/component: channel
+spec:
+  replicas: {{ .Values.channel.replicas }}
+  # Like the console, the gateway registers under a fixed service id;
+  # Recreate keeps the registry row consistent across restarts.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "turnstone.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: channel
+  template:
+    metadata:
+      labels:
+        {{- include "turnstone.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: channel
+    spec:
+      serviceAccountName: {{ include "turnstone.serviceAccountName" . }}
+      automountServiceAccountToken: false
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.channel.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.channel.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.channel.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: channel
+          image: {{ include "turnstone.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- with .Values.containerSecurityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          command:
+            - turnstone-channel
+            - --http-host=0.0.0.0
+            - --http-port={{ .Values.channel.port }}
+            {{- if ne (toString .Values.channel.discordGuild) "0" }}
+            - --discord-guild
+            - {{ .Values.channel.discordGuild | quote }}
+            {{- end }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.channel.port }}
+              protocol: TCP
+          envFrom:
+            {{- with .Values.channel.existingSecret }}
+            - secretRef:
+                name: {{ . }}
+            {{- end }}
+          env:
+            {{- include "turnstone.db.env" . | nindent 12 }}
+            # Server nodes call back to the gateway for notifications. The
+            # default advertise URL is the pod hostname, which nothing can
+            # resolve; the Service DNS name is the one logical endpoint.
+            - name: TURNSTONE_CHANNEL_ADVERTISE_URL
+              value: "http://{{ include "turnstone.fullname" . }}-channel.{{ .Release.Namespace }}.svc:{{ .Values.channel.port }}"
+            {{- include "turnstone.jwt.env" . | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          resources:
+            {{- toYaml .Values.channel.resources | nindent 12 }}
+      volumes:
+        - name: data
+          emptyDir:
+            sizeLimit: 1Gi
+{{- end }}

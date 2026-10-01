@@ -1,0 +1,84 @@
+{{- if .Values.disruptionGuard.enabled }}
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "turnstone.fullname" . }}-disruption-guard
+  labels:
+    {{- include "turnstone.labels" . | nindent 4 }}
+    app.kubernetes.io/component: disruption-guard
+spec:
+  schedule: {{ .Values.disruptionGuard.schedule | quote }}
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 30
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    metadata:
+      labels:
+        {{- include "turnstone.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: disruption-guard
+    spec:
+      backoffLimit: 0
+      activeDeadlineSeconds: 50
+      template:
+        metadata:
+          labels:
+            {{- include "turnstone.selectorLabels" . | nindent 12 }}
+            app.kubernetes.io/component: disruption-guard
+          annotations:
+            checksum/script: {{ include (print $.Template.BasePath "/disruption-guard/configmap.yaml") . | sha256sum }}
+        spec:
+          serviceAccountName: {{ include "turnstone.fullname" . }}-disruption-guard
+          automountServiceAccountToken: true
+          restartPolicy: Never
+          {{- with .Values.imagePullSecrets }}
+          imagePullSecrets:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.podSecurityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.disruptionGuard.nodeSelector }}
+          nodeSelector:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.disruptionGuard.tolerations }}
+          tolerations:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          containers:
+            - name: guard
+              image: {{ include "turnstone.image" . }}
+              imagePullPolicy: {{ .Values.image.pullPolicy }}
+              {{- with .Values.containerSecurityContext }}
+              securityContext:
+                {{- toYaml . | nindent 16 }}
+              {{- end }}
+              command: ["python", "/scripts/guard.py"]
+              env:
+                {{- include "turnstone.db.env" . | nindent 16 }}
+                - name: POD_NAMESPACE
+                  valueFrom:
+                    fieldRef:
+                      fieldPath: metadata.namespace
+                - name: POD_LABEL_SELECTOR
+                  value: "app.kubernetes.io/name={{ include "turnstone.name" . }},app.kubernetes.io/instance={{ .Release.Name }},app.kubernetes.io/component=server"
+                - name: GUARD_ANNOTATION
+                  value: {{ .Values.disruptionGuard.annotation | quote }}
+                - name: GUARD_BUSY_STATES
+                  value: {{ join "," .Values.disruptionGuard.busyStates | quote }}
+                - name: GUARD_IDLE_GRACE_MINUTES
+                  value: {{ .Values.disruptionGuard.idleGraceMinutes | quote }}
+              volumeMounts:
+                - name: script
+                  mountPath: /scripts
+                  readOnly: true
+              resources:
+                {{- toYaml .Values.disruptionGuard.resources | nindent 16 }}
+          volumes:
+            - name: script
+              configMap:
+                name: {{ include "turnstone.fullname" . }}-disruption-guard
+                defaultMode: 0444
+{{- end }}

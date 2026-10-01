@@ -1,0 +1,23 @@
+{{- if .Values.searxng.enabled }}
+# Name is deliberately NOT release-prefixed. Turnstone's registry default for
+# tools.searxng_url is http://searxng:8080 (see docs/settings.md); a Service
+# literally named `searxng` in the same namespace makes web_search work with
+# no Turnstone-side configuration. One SearXNG per namespace follows.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Values.searxng.serviceName }}
+  labels:
+    {{- include "turnstone.labels" . | nindent 4 }}
+    app.kubernetes.io/component: searxng
+spec:
+  type: ClusterIP
+  ports:
+    - port: {{ .Values.searxng.port }}
+      targetPort: http
+      protocol: TCP
+      name: http
+  selector:
+    {{- include "turnstone.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: searxng
+{{- end }}

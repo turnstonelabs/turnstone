@@ -1,0 +1,103 @@
+{{- if .Values.searxng.enabled }}
+{{- if not .Values.searxng.image.tag }}
+{{- fail "searxng.image.tag is required (pin an immutable date tag, e.g. 2026.9.14-ef05645f0)" }}
+{{- end }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "turnstone.fullname" . }}-searxng
+  labels:
+    {{- include "turnstone.labels" . | nindent 4 }}
+    app.kubernetes.io/component: searxng
+spec:
+  replicas: {{ .Values.searxng.replicas }}
+  selector:
+    matchLabels:
+      {{- include "turnstone.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: searxng
+  template:
+    metadata:
+      labels:
+        {{- include "turnstone.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: searxng
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap-searxng.yaml") . | sha256sum }}
+    spec:
+      automountServiceAccountToken: false
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      # The image runs as its own `searxng` user (uid 977).
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 977
+        runAsGroup: 977
+        fsGroup: 977
+        seccompProfile:
+          type: RuntimeDefault
+      {{- with .Values.searxng.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.searxng.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.searxng.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: searxng
+          image: "{{ .Values.searxng.image.repository }}:{{ .Values.searxng.image.tag }}"
+          imagePullPolicy: {{ .Values.searxng.image.pullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          env:
+            - name: SEARXNG_BASE_URL
+              value: {{ .Values.searxng.baseUrl | quote }}
+            - name: SEARXNG_PORT
+              value: {{ .Values.searxng.port | quote }}
+            - name: SEARXNG_BIND_ADDRESS
+              value: "0.0.0.0"
+          ports:
+            - name: http
+              containerPort: {{ .Values.searxng.port }}
+              protocol: TCP
+          volumeMounts:
+            # Read-only directory mount, exactly like the compose stack's
+            # `./searxng:/etc/searxng:ro`.
+            - name: config
+              mountPath: /etc/searxng
+              readOnly: true
+            - name: cache
+              mountPath: /var/cache/searxng
+            - name: tmp
+              mountPath: /tmp
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 20
+            periodSeconds: 20
+          resources:
+            {{- toYaml .Values.searxng.resources | nindent 12 }}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "turnstone.fullname" . }}-searxng
+        - name: cache
+          emptyDir:
+            sizeLimit: 1Gi
+        - name: tmp
+          emptyDir: {}
+{{- end }}

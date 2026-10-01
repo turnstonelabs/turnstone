@@ -1,5 +1,9 @@
+{{- $kind := .Values.server.workloadKind | default "Deployment" }}
+{{- if not (or (eq $kind "Deployment") (eq $kind "StatefulSet")) }}
+{{- fail (printf "server.workloadKind must be Deployment or StatefulSet, got %q" $kind) }}
+{{- end }}
 apiVersion: apps/v1
-kind: Deployment
+kind: {{ $kind }}
 metadata:
   name: {{ include "turnstone.fullname" . }}-server
   labels:
@@ -7,6 +11,18 @@ metadata:
     app.kubernetes.io/component: server
 spec:
   replicas: {{ .Values.server.replicas }}
+  {{- if eq $kind "StatefulSet" }}
+  # Stable pod names (…-server-0..N-1) are the point of the StatefulSet: a
+  # restarted node re-registers under the same TURNSTONE_NODE_ID. Pods are
+  # independent nodes with no startup ordering, hence Parallel.
+  serviceName: {{ include "turnstone.server.headlessServiceName" . }}
+  podManagementPolicy: Parallel
+  updateStrategy:
+    type: RollingUpdate
+  {{- else }}
+  strategy:
+    {{- toYaml .Values.server.strategy | nindent 4 }}
+  {{- end }}
   selector:
     matchLabels:
       {{- include "turnstone.selectorLabels" . | nindent 6 }}
@@ -16,8 +32,30 @@ spec:
       labels:
         {{- include "turnstone.selectorLabels" . | nindent 8 }}
         app.kubernetes.io/component: server
+        {{- with .Values.server.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.server.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
     spec:
       serviceAccountName: {{ include "turnstone.serviceAccountName" . }}
+      # The server runs model-chosen shell commands. Nothing in it needs the
+      # Kubernetes API, so it must not hold a token that could reach it.
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: {{ .Values.server.terminationGracePeriodSeconds }}
+      {{- with (include "turnstone.server.priorityClassName" .) }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       {{- with .Values.server.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
@@ -34,6 +72,10 @@ spec:
         - name: server
           image: {{ include "turnstone.image" . }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- with .Values.containerSecurityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
           command:
             - turnstone-server
             - --host
@@ -54,24 +96,36 @@ spec:
             {{- include "turnstone.db.env" . | nindent 12 }}
             # Each replica is a distinct node in the rendezvous ring, so it
             # must advertise an address that reaches *itself*. The Service
-            # DNS name would load-balance across every replica, sending
-            # console traffic routed for node A to an arbitrary pod; the
-            # default (gethostname(), i.e. the pod name) is not resolvable
-            # at all. The pod IP is unique, routable in-cluster, and
-            # re-registered on every start, so churn is self-healing.
+            # DNS name would load-balance across every replica; the pod IP
+            # is unique, routable in-cluster, and re-registered on every
+            # start, so churn is self-healing.
             - name: POD_IP
               valueFrom:
                 fieldRef:
                   fieldPath: status.podIP
             - name: TURNSTONE_ADVERTISE_URL
               value: "http://$(POD_IP):{{ .Values.server.service.port }}"
-          {{- if or .Values.auth.existingSecret .Values.auth.jwtSecret }}
-            - name: TURNSTONE_JWT_SECRET
+            {{- if .Values.server.nodeIdFromPodName }}
+            # Node identity = pod name. Without this the server derives
+            # `{hostname}_{4hex}` with a fresh suffix on every start, which
+            # nothing outside the pod can map back to it (the disruption
+            # guard relies on this, and so does node affinity).
+            - name: TURNSTONE_NODE_ID
               valueFrom:
-                secretKeyRef:
-                  name: {{ include "turnstone.auth.secretName" . }}
-                  key: TURNSTONE_JWT_SECRET
-          {{- end }}
+                fieldRef:
+                  fieldPath: metadata.name
+            {{- end }}
+            {{- include "turnstone.jwt.env" . | nindent 12 }}
+            {{- include "turnstone.config.env" . | nindent 12 }}
+            {{- with .Values.server.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: workspace
+              mountPath: /workspace
+            {{- include "turnstone.config.mount" . | nindent 12 }}
           readinessProbe:
             httpGet:
               path: /health
@@ -86,3 +140,15 @@ spec:
             periodSeconds: 20
           resources:
             {{- toYaml .Values.server.resources | nindent 12 }}
+      volumes:
+        - name: data
+          emptyDir:
+            {{- with .Values.server.persistence.data.sizeLimit }}
+            sizeLimit: {{ . }}
+            {{- end }}
+        - name: workspace
+          emptyDir:
+            {{- with .Values.server.persistence.workspace.sizeLimit }}
+            sizeLimit: {{ . }}
+            {{- end }}
+        {{- include "turnstone.config.volume" . | nindent 8 }}

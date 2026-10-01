@@ -1,0 +1,18 @@
+{{- if .Values.pdb.enabled }}
+# One server node drains at a time. Karpenter (drift, expiry) and kubectl
+# drain both honour this; together with the disruption guard it keeps a
+# busy cluster from losing two nodes in one event.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "turnstone.fullname" . }}-server
+  labels:
+    {{- include "turnstone.labels" . | nindent 4 }}
+    app.kubernetes.io/component: server
+spec:
+  maxUnavailable: {{ .Values.pdb.maxUnavailable }}
+  selector:
+    matchLabels:
+      {{- include "turnstone.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: server
+{{- end }}

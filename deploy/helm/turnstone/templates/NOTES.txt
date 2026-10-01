@@ -1,6 +1,13 @@
 Turnstone {{ .Chart.AppVersion }} has been deployed.
 
-{{- if .Values.ingress.enabled }}
+{{- if .Values.httpRoute.enabled }}
+
+Access the console via the Gateway API route:
+{{- range .Values.httpRoute.hostnames }}
+  https://{{ . }}
+{{- end }}
+
+{{- else if .Values.ingress.enabled }}
 
 Access the application via your ingress:
 {{- range .Values.ingress.hosts }}
@@ -9,24 +16,29 @@ Access the application via your ingress:
 
 {{- else }}
 
-To access the Turnstone server, run:
+To access the Turnstone console (dashboard + node proxy), run:
 
-  kubectl port-forward svc/{{ include "turnstone.fullname" . }}-server {{ .Values.server.service.port }}:{{ .Values.server.service.port }}
-
-Then open: http://localhost:{{ .Values.server.service.port }}
-
-To access the Turnstone console (cluster dashboard), run:
-
-  kubectl port-forward svc/{{ include "turnstone.fullname" . }}-console {{ .Values.console.service.port }}:{{ .Values.console.service.port }}
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "turnstone.fullname" . }}-console {{ .Values.console.service.port }}:{{ .Values.console.service.port }}
 
 Then open: http://localhost:{{ .Values.console.service.port }}
 
 {{- end }}
 
-Components deployed:
-  - Server:  {{ include "turnstone.fullname" . }}-server  ({{ .Values.server.replicas }} replica(s))
-  - Console: {{ include "turnstone.fullname" . }}-console ({{ .Values.console.replicas }} replica(s))
-{{- if .Values.postgresql.enabled }}
-  - PostgreSQL (bitnami subchart)
-{{- end }}
+First admin user (any server pod works; they share one database):
 
+  kubectl -n {{ .Release.Namespace }} exec {{ if eq (.Values.server.workloadKind | default "Deployment") "StatefulSet" }}sts{{ else }}deploy{{ end }}/{{ include "turnstone.fullname" . }}-server -- \
+    turnstone-admin create-admin --username admin --name "Admin"
+
+Components deployed:
+  - Server:  {{ include "turnstone.fullname" . }}-server  ({{ .Values.server.workloadKind | default "Deployment" }}, {{ .Values.server.replicas }} replica(s))
+  - Console: {{ include "turnstone.fullname" . }}-console ({{ .Values.console.replicas }} replica(s))
+{{- if .Values.searxng.enabled }}
+  - SearXNG: {{ .Values.searxng.serviceName }}:{{ .Values.searxng.port }} (web_search backend)
+{{- end }}
+{{- if .Values.channel.enabled }}
+  - Channel gateway: {{ include "turnstone.fullname" . }}-channel
+{{- end }}
+{{- if .Values.disruptionGuard.enabled }}
+  - Disruption guard CronJob: {{ include "turnstone.fullname" . }}-disruption-guard
+{{- end }}
+  - Database: {{ .Values.database.external.host }}:{{ .Values.database.external.port }}/{{ .Values.database.external.database }} (external)

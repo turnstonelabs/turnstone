@@ -72,8 +72,31 @@ Determine the PostgreSQL host.
 {{- define "turnstone.postgresql.host" -}}
 {{- if .Values.postgresql.enabled }}
 {{- printf "%s-postgresql" .Release.Name }}
+{{- else if and .Values.cnpg.enabled (not .Values.database.external.host) }}
+{{- printf "%s-rw" (include "turnstone.cnpg.clusterName" .) }}
 {{- else }}
 {{- .Values.database.external.host }}
+{{- end }}
+{{- end }}
+
+{{/*
+Name of the chart-managed CloudNativePG Cluster (cnpg.enabled).
+*/}}
+{{- define "turnstone.cnpg.clusterName" -}}
+{{- .Values.cnpg.name | default (printf "%s-db" (include "turnstone.fullname" .)) | trunc 63 | trimSuffix "-" }}
+{{- end }}
+
+{{/*
+The Secret an external database's password comes from: an explicit
+database.external.existingSecret, else -- when the chart manages a CNPG
+Cluster -- the `<cluster>-app` basic-auth Secret CNPG generates for the
+initdb owner (key "password"). Empty when neither applies.
+*/}}
+{{- define "turnstone.db.externalSecret" -}}
+{{- if .Values.database.external.existingSecret }}
+{{- .Values.database.external.existingSecret }}
+{{- else if .Values.cnpg.enabled }}
+{{- printf "%s-app" (include "turnstone.cnpg.clusterName" .) }}
 {{- end }}
 {{- end }}
 
@@ -130,7 +153,7 @@ authenticate with it.
 {{- define "turnstone.db.inlinePassword" -}}
 {{- if .Values.postgresql.enabled }}
 {{- .Values.postgresql.auth.password | default "" }}
-{{- else if not .Values.database.external.existingSecret }}
+{{- else if not (include "turnstone.db.externalSecret" .) }}
 {{- .Values.database.external.password | default "" }}
 {{- end }}
 {{- end }}
@@ -207,8 +230,8 @@ holds LLM API keys and has no reason to carry a database password.
 */}}
 {{- define "turnstone.db.secretName" -}}
 {{- if not .Values.postgresql.enabled }}
-{{- if .Values.database.external.existingSecret }}
-{{- .Values.database.external.existingSecret }}
+{{- if (include "turnstone.db.externalSecret" .) }}
+{{- include "turnstone.db.externalSecret" . }}
 {{- else }}
 {{- printf "%s-secrets" (include "turnstone.fullname" .) }}
 {{- end }}
@@ -221,7 +244,7 @@ holds LLM API keys and has no reason to carry a database password.
 
 {{- define "turnstone.db.passwordKey" -}}
 {{- if not .Values.postgresql.enabled }}
-{{- if .Values.database.external.existingSecret }}
+{{- if (include "turnstone.db.externalSecret" .) }}
 {{- .Values.database.external.existingSecretPasswordKey | default "password" }}
 {{- else }}
 {{- printf "POSTGRES_PASSWORD" }}
@@ -285,4 +308,78 @@ Container image reference.
 {{- define "turnstone.image" -}}
 {{- $tag := .Values.image.tag | default .Chart.AppVersion }}
 {{- printf "%s:%s" .Values.image.repository $tag }}
+{{- end }}
+
+{{/*
+Shared config.toml volume + mount, rendered only when config.existingSecret is
+set. Mounted with subPath so the file lands exactly at config.mountPath; a
+Secret change therefore needs a pod restart, which upstream requires anyway
+("restart every consumer after editing bootstrap config").
+*/}}
+{{- define "turnstone.config.volume" -}}
+{{- if .Values.config.existingSecret }}
+- name: turnstone-config
+  secret:
+    secretName: {{ .Values.config.existingSecret }}
+    items:
+      - key: {{ .Values.config.key }}
+        path: config.toml
+        mode: 0400
+{{- end }}
+{{- end }}
+
+{{- define "turnstone.config.mount" -}}
+{{- if .Values.config.existingSecret }}
+- name: turnstone-config
+  mountPath: {{ .Values.config.mountPath }}
+  subPath: config.toml
+  readOnly: true
+{{- end }}
+{{- end }}
+
+{{- define "turnstone.config.env" -}}
+{{- if .Values.config.existingSecret }}
+- name: TURNSTONE_CONFIG
+  value: {{ .Values.config.mountPath | quote }}
+{{- end }}
+{{- end }}
+
+{{/*
+Optional JWT secret env entry (shared by console, server, channel).
+*/}}
+{{- define "turnstone.jwt.env" -}}
+{{- if or .Values.auth.existingSecret .Values.auth.jwtSecret }}
+- name: TURNSTONE_JWT_SECRET
+  valueFrom:
+    secretKeyRef:
+      name: {{ include "turnstone.auth.secretName" . }}
+      key: TURNSTONE_JWT_SECRET
+{{- end }}
+{{- end }}
+
+{{/*
+Name of the PriorityClass this chart creates (cluster-scoped, so it carries
+the release namespace to stay unique across installs).
+*/}}
+{{- define "turnstone.priorityClassName" -}}
+{{- printf "%s-%s-long-running" .Release.Namespace (include "turnstone.fullname" .) | trunc 63 | trimSuffix "-" }}
+{{- end }}
+
+{{/*
+Effective priorityClassName for server pods: an explicit value wins, else the
+chart's own class when enabled, else nothing.
+*/}}
+{{- define "turnstone.server.priorityClassName" -}}
+{{- if .Values.server.priorityClassName }}
+{{- .Values.server.priorityClassName }}
+{{- else if .Values.priorityClass.enabled }}
+{{- include "turnstone.priorityClassName" . }}
+{{- end }}
+{{- end }}
+
+{{/*
+Headless Service name used by the server StatefulSet.
+*/}}
+{{- define "turnstone.server.headlessServiceName" -}}
+{{- printf "%s-server-headless" (include "turnstone.fullname" .) | trunc 63 | trimSuffix "-" }}
 {{- end }}
