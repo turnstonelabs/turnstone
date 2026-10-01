@@ -66,6 +66,27 @@ def _raw_workstream_config(backend, ws_id: str) -> dict[str, str]:
     return {str(key): str(value) for key, value in rows}
 
 
+def _save_watch_snapshot(backend, ws_id, watch_id, output, *, poll_count=1):
+    meta = {
+        "watch_id": watch_id,
+        "watch_name": "checks",
+        "command": "echo poll",
+        "output": output,
+        "poll_count": poll_count,
+        "max_polls": 100,
+        "exit_code": 2,
+        "reason": "condition met",
+    }
+    backend.save_message(
+        ws_id,
+        "system",
+        f"Read watch {watch_id} by full ID.",
+        source="watch_triggered",
+        meta=json.dumps(meta),
+    )
+    return meta
+
+
 def _grant_project_read(backend, user_id: str) -> None:
     backend.create_user(user_id, user_id, user_id.title(), "hash")
     backend.create_role(
@@ -707,6 +728,155 @@ def test_missing_attachment_rolls_back_refs_config_history_and_binding(storage_b
     destination = backend.get_workstream("destination")
     assert destination is not None
     assert destination["project_id"] == "old-project"
+
+
+@pytest.mark.parametrize("unfinished_tool_turn", [False, True])
+def test_compacted_clone_retains_latest_watch_snapshots_behind_checkpoint(
+    storage_backend, unfinished_tool_turn
+) -> None:
+    backend = storage_backend
+    _register(backend, "source", "alice")
+    _register(backend, "destination", "alice", state="creating")
+    _register(backend, "unrelated", "other-owner")
+    backend.save_message("source", "user", "Old history stays compacted.")
+    _save_watch_snapshot(backend, "source", "archived", "obsolete output")
+    archived = _save_watch_snapshot(backend, "source", "archived", "retained output", poll_count=2)
+    secondary = _save_watch_snapshot(backend, "source", "secondary", "second retained output")
+    _save_watch_snapshot(backend, "source", "live", "obsolete live output")
+    for role, source, meta in (
+        ("system", "watch_triggered", {"watch_id": "archived", "output": "incomplete"}),
+        ("system", "watch_triggered", [archived]),
+        ("system", "watch_triggered", "invalid JSON"),
+        ("user", "watch_triggered", dict(archived, watch_id="wrong-role")),
+        ("system", "unrelated", dict(archived, watch_id="wrong-source")),
+    ):
+        backend.save_message(
+            "source",
+            role,
+            "Must not be inherited.",
+            source=source,
+            meta=meta if isinstance(meta, str) else json.dumps(meta),
+        )
+    source_watermark = backend.get_compaction_watermark("source")
+    backend.save_message(
+        "source",
+        "assistant",
+        "SUMMARY",
+        source="compaction",
+        meta=json.dumps({"watermark": source_watermark}),
+    )
+    backend.save_message("source", "user", "Continue.")
+    if unfinished_tool_turn:
+        backend.save_message(
+            "source",
+            "assistant",
+            "",
+            tool_calls=json.dumps(
+                [
+                    {
+                        "id": "unfinished",
+                        "type": "function",
+                        "function": {"name": "bash", "arguments": "{}"},
+                    }
+                ]
+            ),
+        )
+    live = _save_watch_snapshot(backend, "source", "live", "current live output", poll_count=3)
+    _save_watch_snapshot(backend, "unrelated", "archived", "unrelated private output")
+    _save_watch_snapshot(backend, "unrelated", "private-watch", "unrelated private output")
+    expected_context = [turn.text for turn in backend.load_message_turns("source")]
+
+    snapshot = backend.clone_workstream("source", "destination", principal_id="alice")
+
+    assert [turn.text for turn in snapshot.turns] == expected_context
+    assert [turn.text for turn in backend.load_message_turns("destination")] == expected_context
+    assert not any("archived" in text or "secondary" in text for text in expected_context)
+    assert backend.get_watch_snapshot("destination", "archived") == archived
+    assert backend.get_watch_snapshot("destination", "secondary") == secondary
+    assert backend.get_watch_snapshot("destination", "live") == live
+    for watch_id in ("private-watch", "wrong-role", "wrong-source"):
+        assert backend.get_watch_snapshot("destination", watch_id) is None
+    checkpoint = backend.get_compaction_checkpoint("destination")
+    assert checkpoint is not None
+    with backend._conn() as conn:
+        retained = conn.execute(
+            sa.select(conversations.c.meta)
+            .where(
+                conversations.c.ws_id == "destination",
+                conversations.c._source == "watch_triggered",
+                conversations.c.id <= checkpoint,
+            )
+            .order_by(conversations.c.id)
+        ).all()
+        watch_count = conn.scalar(
+            sa.select(sa.func.count())
+            .select_from(conversations)
+            .where(
+                conversations.c.ws_id == "destination",
+                conversations.c._source == "watch_triggered",
+            )
+        )
+    expected_retained = (
+        [archived, secondary, live] if unfinished_tool_turn else [archived, secondary]
+    )
+    assert [json.loads(row[0]) for row in retained] == expected_retained
+    assert watch_count == 3
+
+    # A later generation inherits the copied snapshot without the original source.
+    assert backend.delete_workstream("source")
+    destination = backend.ensure_workstream_incarnation_snapshot("destination")
+    assert destination is not None
+    assert backend.publish_deferred_create("destination", destination["fork_reservation_token"])
+    _register(backend, "descendant", "alice", state="creating")
+    descendant = backend.clone_workstream("destination", "descendant", principal_id="alice")
+    assert [turn.text for turn in descendant.turns] == expected_context
+    assert backend.get_watch_snapshot("descendant", "archived") == archived
+    assert backend.get_watch_snapshot("descendant", "secondary") == secondary
+    assert backend.get_watch_snapshot("descendant", "live") == live
+
+
+def test_compacted_watch_snapshot_copy_rolls_back_with_clone_failure(storage_backend) -> None:
+    backend = storage_backend
+    _register(backend, "source", "alice")
+    _register(backend, "destination", "alice", state="creating")
+    archived = _save_watch_snapshot(backend, "source", "archived", "retained output")
+    backend.save_message(
+        "source",
+        "assistant",
+        "SUMMARY",
+        source="compaction",
+        meta=json.dumps({"watermark": backend.get_compaction_watermark("source")}),
+    )
+    backend.save_workstream_config("source", {"source": "value"})
+    backend.save_workstream_config("destination", {"keep": "value"})
+    copied_counts = []
+
+    def fail_final_update(conn, _cursor, _statement, _parameters, context, _executemany):
+        statement = context.compiled.statement if context.compiled is not None else None
+        if isinstance(statement, sa.Update) and statement.table is workstreams:
+            copied_counts.append(
+                conn.scalar(
+                    sa.select(sa.func.count())
+                    .select_from(conversations)
+                    .where(
+                        conversations.c.ws_id == "destination",
+                        conversations.c._source == "watch_triggered",
+                    )
+                )
+            )
+            raise RuntimeError("simulated final clone write failure")
+
+    sa.event.listen(backend._engine, "before_cursor_execute", fail_final_update)
+    try:
+        with pytest.raises(RuntimeError, match="final clone write failure"):
+            backend.clone_workstream("source", "destination", principal_id="alice")
+    finally:
+        sa.event.remove(backend._engine, "before_cursor_execute", fail_final_update)
+    assert copied_counts == [1]
+    assert backend.count_messages("destination") == 0
+    assert backend.get_watch_snapshot("destination", "archived") is None
+    assert backend.load_workstream_config("destination") == {"keep": "value"}
+    assert backend.get_watch_snapshot("source", "archived") == archived
 
 
 def test_compacted_clone_rewrites_marker_to_destination_id_space(storage_backend) -> None:

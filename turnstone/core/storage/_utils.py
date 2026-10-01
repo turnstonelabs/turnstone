@@ -2384,6 +2384,24 @@ def prune_workstreams_shared(
     return (orphans, stale)
 
 
+def _watch_snapshot_meta(raw_meta: Any) -> dict[str, Any] | None:
+    """Validate watch metadata from a Turn or stored JSON, ignoring malformed data."""
+    try:
+        meta = json.loads(raw_meta) if isinstance(raw_meta, str) else raw_meta
+    except (TypeError, ValueError):
+        return None
+    if (
+        isinstance(meta, dict)
+        and isinstance(meta.get("watch_id"), str)
+        and meta["watch_id"]
+        and all(
+            key in meta for key in ("watch_name", "command", "output", "poll_count", "max_polls")
+        )
+    ):
+        return meta
+    return None
+
+
 def get_watch_snapshot_on_connection(conn: Any, ws_id: str, watch_id: str) -> dict[str, Any] | None:
     """Return the latest delivered snapshot from this workstream's own history."""
     if not watch_id:
@@ -2399,18 +2417,8 @@ def get_watch_snapshot_on_connection(conn: Any, ws_id: str, watch_id: str) -> di
         .order_by(conversations.c.id.desc())
     )
     for (raw_meta,) in rows:
-        try:
-            meta = json.loads(raw_meta)
-        except (TypeError, ValueError):
-            continue
-        if (
-            isinstance(meta, dict)
-            and meta.get("watch_id") == watch_id
-            and all(
-                key in meta
-                for key in ("watch_name", "command", "output", "poll_count", "max_polls")
-            )
-        ):
+        meta = _watch_snapshot_meta(raw_meta)
+        if meta is not None and meta["watch_id"] == watch_id:
             return meta
     return None
 
@@ -2711,6 +2719,26 @@ def _fork_turn_insert_row(
     return insert_row, attachment_ids
 
 
+def _fork_retained_watch_rows(rows: list[Any], live_turns: list[Turn]) -> list[Any]:
+    """Keep the latest valid snapshot per watch omitted from the active fork history."""
+    seen: set[str] = set()
+    for turn in live_turns:
+        if turn.role is Role.SYSTEM and turn.source == "watch_triggered":
+            meta = _watch_snapshot_meta(turn.meta.extra.get("source_meta"))
+            if meta is not None:
+                seen.add(meta["watch_id"])
+    retained = []
+    for row in reversed(rows):
+        if row[1] != "system" or row[7] != "watch_triggered":
+            continue
+        meta = _watch_snapshot_meta(row[10])
+        if meta is None or meta["watch_id"] in seen:
+            continue
+        seen.add(meta["watch_id"])
+        retained.append(row)
+    return retained[::-1]
+
+
 def clone_workstream_transaction(
     conn: Any,
     source_ws_id: str,
@@ -2953,6 +2981,12 @@ def clone_workstream_transaction(
     )
     watermark = _compaction_watermark(marker) if marker is not None else None
     has_checkpoint = marker is not None and watermark is not None
+    preliminary_turns = recover_trajectory(
+        reconstruct_turns_checkpointed(source_rows, source_ws_id, checkpoint=True)
+    )
+    retained_watch_rows = (
+        _fork_retained_watch_rows(source_rows, preliminary_turns) if has_checkpoint else []
+    )
     candidate_rows = (
         [marker]
         + [row for row in source_rows if row[0] > watermark and not _is_compaction_marker(row)]
@@ -2960,16 +2994,13 @@ def clone_workstream_transaction(
         else [row for row in source_rows if not _is_compaction_marker(row)]
     )
     candidate_attachment_refs: dict[int, list[str]] = {}
-    for row in candidate_rows:
+    for row in [*retained_watch_rows, *candidate_rows]:
         refs = _fork_attachment_refs(row[11] if len(row) > 11 else None)
         if refs and row[1] not in ("user", "tool"):
             raise ForkSourceUnavailableError("fork source attachment references are invalid")
         if refs:
             candidate_attachment_refs[int(row[0])] = refs
 
-    preliminary_turns = recover_trajectory(
-        reconstruct_turns_checkpointed(source_rows, source_ws_id, checkpoint=True)
-    )
     if has_checkpoint and (
         len(preliminary_turns) < 2
         or preliminary_turns[0].source != COMPACTION_SOURCE
@@ -3050,6 +3081,16 @@ def clone_workstream_transaction(
         )
 
     insert_rows = [insert_row for insert_row, _refs in serialized]
+    if retained_watch_rows:
+        # Copy snapshots inside the authorized source transaction, before the
+        # child checkpoint. Reads remain durable without restoring old model context.
+        conn.execute(
+            sa.insert(conversations),
+            [
+                _fork_turn_insert_row(turn, destination_ws_id, now)[0]
+                for turn in reconstruct_turns(retained_watch_rows, source_ws_id)
+            ],
+        )
     if has_checkpoint and insert_rows:
         marker_result = conn.execute(sa.insert(conversations), insert_rows[0])
         marker_id = marker_result.inserted_primary_key[0]

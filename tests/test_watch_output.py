@@ -284,9 +284,15 @@ def test_persisted_snapshot_keeps_output_and_condition_error_on_reload(
             restored.close()
 
 
-@pytest.mark.parametrize("compacted", [False, True])
+@pytest.mark.parametrize(
+    ("source_compacted", "fork_compacted"),
+    [(False, False), (False, True), (True, False), (True, True)],
+)
 def test_fork_reads_only_its_inherited_snapshot(
-    storage_backend: Any, monkeypatch: pytest.MonkeyPatch, compacted: bool
+    storage_backend: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    source_compacted: bool,
+    fork_compacted: bool,
 ) -> None:
     parent = make_registered_session(user_id="owner", ui=_WatchUI())
     storage = get_storage()
@@ -308,6 +314,9 @@ def test_fork_reads_only_its_inherited_snapshot(
         monkeypatch.setattr(runner, "_run_command", lambda _command: (_OUTPUT, 2))
         runner._poll_watch(row)
         _deliver_watch_notice(parent)
+        snapshot = next(turn for turn in parent.messages if turn.source == "watch_triggered")
+        if source_compacted:
+            _compact_watch_session(parent)
         source = storage.ensure_workstream_incarnation_snapshot(parent.ws_id)
         assert source is not None
         fork.fork_from_storage(
@@ -317,7 +326,6 @@ def test_fork_reads_only_its_inherited_snapshot(
         )
         # Neither the parent's newer row nor its newer history belongs to the fork.
         storage.update_watch(_WATCH_ID, last_output="new parent output", poll_count=2)
-        snapshot = next(turn for turn in parent.messages if turn.source == "watch_triggered")
         newer = dict(snapshot.meta.extra["source_meta"], output="new parent output", poll_count=2)
         storage.save_message(
             parent.ws_id, "system", "New notice", source="watch_triggered", meta=json.dumps(newer)
@@ -332,7 +340,7 @@ def test_fork_reads_only_its_inherited_snapshot(
             meta=json.dumps(dict(newer, watch_id=foreign_id, output="private output")),
         )
         reader = fork
-        if compacted:
+        if fork_compacted:
             _compact_watch_session(fork)
             restored = make_session(user_id="owner")
             assert restored.resume(fork.ws_id)

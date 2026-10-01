@@ -110,7 +110,7 @@ frozen.
   than entering model context with operator authority. The watch-result card still shows the
   output, and completed watches remain readable by name or ID. Delivered snapshots remain
   readable in forks and after compaction or checkpointed resume, even if the terminal poll
-  update failed.
+  update failed or the source was compacted before forking.
 
 - **Web UI typography.** Locally served font subsets retain the requested stylistic
   features, real italics and the 800 weight used by attention chips. Bundled symbol

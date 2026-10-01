@@ -534,6 +534,11 @@ attachment reference, or destination race aborts the whole transaction. Only
 after the committed snapshot is adopted in memory does the normal
 `creating -> idle -> ws_created` publication run.
 
+For a compacted source, the transaction also copies the latest delivered watch
+snapshot for each watch omitted from the active transcript. These rows precede
+the destination checkpoint, keeping model context bounded while preserving
+inherited results for the watch read action. Each fork owns its copied snapshots.
+
 Rehydration binds the private token before constructing the session, then
 rechecks it after configuration and history are loaded; a concurrent lifecycle
 change retires the hybrid candidate and retries from a fresh snapshot.

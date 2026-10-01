@@ -642,7 +642,8 @@ CI/CD pipelines, PR reviews, deployments, file changes, etc.
   from a later watch with the same name. Reads use the delivered notice's snapshot from
   active context or this workstream's persisted history, then fall back to its stored poll
   result. Forks can read inherited snapshots using the full ID, including after compaction
-  or restart.
+  or restart. Forking a compacted workstream copies retained snapshots behind the child
+  checkpoint, preserving access to results without adding old notices to active context.
 
 **Stop condition DSL** — The `stop_on` parameter accepts a Python expression
 evaluated after each poll. Available variables:

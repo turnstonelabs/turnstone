@@ -474,6 +474,9 @@ class StorageBackend(Protocol):
         destination to the source's effective project (or no project when the
         source link is absent/dangling).
 
+        Retained watch snapshots are copied behind the destination checkpoint
+        so inherited results remain readable without expanding its active context.
+
         The destination must already exist, belong to ``principal_id``, contain
         no conversation rows, and carry the same normalized project binding the
         source resolves to inside the transaction. A mismatch means source

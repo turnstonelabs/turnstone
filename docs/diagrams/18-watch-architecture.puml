@@ -132,6 +132,8 @@ note right
   The snapshot is available before
   the runner's final row commit.
   Forks keep inherited snapshots.
+  Compacted-source forks copy retained
+  snapshots before the child's checkpoint.
   Persisted snapshots survive compaction.
   Condition exception details also
   stay out of operator notice text.
