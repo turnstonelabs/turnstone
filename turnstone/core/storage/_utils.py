@@ -2384,6 +2384,37 @@ def prune_workstreams_shared(
     return (orphans, stale)
 
 
+def get_watch_snapshot_on_connection(conn: Any, ws_id: str, watch_id: str) -> dict[str, Any] | None:
+    """Return the latest delivered snapshot from this workstream's own history."""
+    if not watch_id:
+        return None
+    rows = conn.execute(
+        sa.select(conversations.c.meta)
+        .where(
+            conversations.c.ws_id == ws_id,
+            conversations.c.role == "system",
+            conversations.c._source == "watch_triggered",
+            conversations.c.meta.contains(json.dumps(watch_id)[1:-1], autoescape=True),
+        )
+        .order_by(conversations.c.id.desc())
+    )
+    for (raw_meta,) in rows:
+        try:
+            meta = json.loads(raw_meta)
+        except (TypeError, ValueError):
+            continue
+        if (
+            isinstance(meta, dict)
+            and meta.get("watch_id") == watch_id
+            and all(
+                key in meta
+                for key in ("watch_name", "command", "output", "poll_count", "max_polls")
+            )
+        ):
+            return meta
+    return None
+
+
 def get_compaction_floor_on_connection(conn: Any, ws_id: str) -> int:
     """Latest compaction floor inside the caller's transaction.
 

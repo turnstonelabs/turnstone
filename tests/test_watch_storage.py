@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import json
+
+import pytest
 import sqlalchemy as sa
 
 from turnstone.core.storage._schema import watches as watches_table
@@ -74,6 +77,94 @@ class TestWatchCRUD:
 
     def test_delete_nonexistent(self, db):
         assert db.delete_watch("nope") is False
+
+
+class TestWatchSnapshot:
+    @pytest.mark.parametrize("watch_id", ["snapshot-id", "snapshot_%_id", 'quote"id'])
+    def test_latest_exact_snapshot_is_scoped_to_its_workstream(self, db, watch_id):
+        db.register_workstream("snapshot-owner")
+        db.register_workstream("other-owner")
+        snapshot = {
+            "watch_id": watch_id,
+            "watch_name": "checks",
+            "command": "echo poll",
+            "output": "earlier output",
+            "poll_count": 1,
+            "max_polls": 100,
+            "exit_code": 0,
+            "reason": "condition met",
+        }
+        db.save_message(
+            "snapshot-owner",
+            "system",
+            "Notice",
+            source="watch_triggered",
+            meta=json.dumps(snapshot),
+        )
+        latest = dict(snapshot, output="", poll_count=2, exit_code=3)
+        db.save_message(
+            "snapshot-owner",
+            "system",
+            "Notice",
+            source="watch_triggered",
+            meta=json.dumps(latest),
+        )
+        # Newer invalid or unrelated candidates must not hide the real snapshot.
+        for meta in (
+            dict(snapshot, watch_id="another-id", output=watch_id),
+            {"watch_id": watch_id, "output": "incomplete metadata"},
+            [snapshot],
+            watch_id + " invalid JSON",
+        ):
+            db.save_message(
+                "snapshot-owner",
+                "system",
+                "Invalid notice",
+                source="watch_triggered",
+                meta=meta if isinstance(meta, str) else json.dumps(meta),
+            )
+        for ws_id, role, source in (
+            ("other-owner", "system", "watch_triggered"),
+            ("snapshot-owner", "user", "watch_triggered"),
+            ("snapshot-owner", "system", "unrelated"),
+        ):
+            db.save_message(
+                ws_id, role, "Unrelated notice", source=source, meta=json.dumps(snapshot)
+            )
+        assert db.get_watch_snapshot("snapshot-owner", watch_id) == latest
+        assert db.get_watch_snapshot("snapshot-owner", "") is None
+        assert db.get_watch_snapshot("snapshot-owner", "missing") is None
+        assert db.get_watch_snapshot("unrelated-workstream", watch_id) is None
+
+    def test_snapshot_survives_checkpoint_without_a_watch_row(self, db):
+        db.register_workstream("snapshot-owner")
+        snapshot = {
+            "watch_id": "inherited-watch",
+            "watch_name": "checks",
+            "command": "echo poll",
+            "output": "inherited output",
+            "poll_count": 7,
+            "max_polls": 100,
+        }
+        watermark = db.save_message(
+            "snapshot-owner",
+            "system",
+            "Watch notice",
+            source="watch_triggered",
+            meta=json.dumps(snapshot),
+        )
+        db.save_message(
+            "snapshot-owner",
+            "assistant",
+            "Watch completed.",
+            source="compaction",
+            meta=json.dumps({"watermark": watermark}),
+        )
+        assert not any(
+            turn.source == "watch_triggered" for turn in db.load_message_turns("snapshot-owner")
+        )
+        assert db.get_watch("inherited-watch") is None
+        assert db.get_watch_snapshot("snapshot-owner", "inherited-watch") == snapshot
 
 
 class TestIsWatchActive:

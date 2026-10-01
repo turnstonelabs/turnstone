@@ -27654,6 +27654,26 @@ class ChatSession:
             "max_polls": max_polls,
         }
 
+    def _watch_result_snapshot(self, watch_id: str) -> dict[str, Any] | None:
+        # A wake may read before the runner commits last_output. Forks inherit
+        # these snapshots even though their watch rows belong to the parent.
+        for turn in reversed(self.messages):
+            meta = turn.meta.extra.get("source_meta")
+            if (
+                turn.role is Role.SYSTEM
+                and turn.source == "watch_triggered"
+                and isinstance(meta, dict)
+                and meta.get("watch_id") == watch_id
+                and all(
+                    key in meta
+                    for key in ("watch_name", "command", "output", "poll_count", "max_polls")
+                )
+            ):
+                return meta
+        # Compaction removes the notice from active context, while its snapshot
+        # stays in this workstream's history. Do not read the watch owner's history.
+        return get_storage().get_watch_snapshot(self._ws_id, watch_id)
+
     def _exec_watch(self, item: dict[str, Any]) -> tuple[str, str]:
         from datetime import datetime, timedelta
 
@@ -27689,50 +27709,43 @@ class ChatSession:
 
         if action == "read":
             name = item["watch_name"]
-            # Exact ids must win over names: a later watch can reuse a completed
-            # watch's name, and notices point at the full id of their own poll.
-            target = storage.get_watch(name)
-            if target is not None and target["ws_id"] != self._ws_id:
-                target = None
-            if target is None:
-                target = storage.find_watch_by_name(self._ws_id, name)
-            if target is None:
-                msg = f'Watch "{name}" not found.'
-                self._report_tool_result(call_id, "watch", msg, is_error=True)
-                return call_id, msg
-            result = {
-                "watch_name": target["name"],
-                "command": target["command"],
-                "output": target.get("last_output"),
-                "poll_count": target["poll_count"],
-                "max_polls": target["max_polls"],
-                "exit_code": target.get("last_exit_code"),
-                "reason": "",
-            }
-            # A wake can deliver and read the notice before the runner commits
-            # last_output. Use that notice's snapshot without changing poll or
-            # held-delivery ordering. The row remains the fallback after the
-            # notice leaves the active transcript (compaction or restart).
-            for turn in reversed(self.messages):
-                meta = turn.meta.extra.get("source_meta")
-                if (
-                    turn.source == "watch_triggered"
-                    and isinstance(meta, dict)
-                    and meta.get("watch_id") == target["watch_id"]
-                    and "output" in meta
-                ):
-                    result.update(meta)
-                    break
+            # Notices advertise full ids, including inherited results whose row
+            # belongs to the parent. Only snapshots in our transcript grant access.
+            result = self._watch_result_snapshot(name)
+            if result is None:
+                # Exact ids win over reused names. Name/prefix resolution and
+                # row fallback remain restricted to this workstream's watches.
+                target = storage.get_watch(name)
+                if target is not None and target["ws_id"] != self._ws_id:
+                    target = None
+                if target is None:
+                    target = storage.find_watch_by_name(self._ws_id, name)
+                if target is None:
+                    msg = f'Watch "{name}" not found.'
+                    self._report_tool_result(call_id, "watch", msg, is_error=True)
+                    return call_id, msg
+                if target["watch_id"] != name:
+                    result = self._watch_result_snapshot(target["watch_id"])
+                if result is None:
+                    result = {
+                        "watch_name": target["name"],
+                        "command": target["command"],
+                        "output": target.get("last_output"),
+                        "poll_count": target["poll_count"],
+                        "max_polls": target["max_polls"],
+                        "exit_code": target.get("last_exit_code"),
+                        "reason": "",
+                    }
             if result["output"] is None:
                 msg = f'Watch "{result["watch_name"]}" has not polled yet.'
             else:
                 msg = (
                     f'Watch "{result["watch_name"]}" — '
                     f"poll #{result['poll_count']}/{result['max_polls']}, "
-                    f"exit code: {result['exit_code']}\n"
+                    f"exit code: {result.get('exit_code')}\n"
                     f"$ {result['command']}\n"
                 )
-                if result["reason"]:
+                if result.get("reason"):
                     msg += f"{result['reason']}\n"
                 msg += str(result["output"])
             self._report_tool_result(call_id, "watch", msg)

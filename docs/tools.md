@@ -639,8 +639,10 @@ CI/CD pipelines, PR reviews, deployments, file changes, etc.
 - `cancel` — Stop a watch by name or ID prefix. Auto-approved.
 - `read` — Read the latest poll output and exit code of an active or completed watch in this
   workstream. Auto-approved. Use the full ID from a notice to distinguish a completed watch
-  from a later watch with the same name. Reads use the delivered notice's snapshot when
-  available, then the stored poll result after compaction or restart.
+  from a later watch with the same name. Reads use the delivered notice's snapshot from
+  active context or this workstream's persisted history, then fall back to its stored poll
+  result. Forks can read inherited snapshots using the full ID, including after compaction
+  or restart.
 
 **Stop condition DSL** — The `stop_on` parameter accepts a Python expression
 evaluated after each poll. Available variables:

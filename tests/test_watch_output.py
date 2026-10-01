@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -12,13 +12,18 @@ from tests._session_helpers import (
     RecordingUI,
     make_registered_session,
     make_result,
+    make_session,
     replace_session_lane,
 )
+from turnstone.core.compaction import SummaryResult
 from turnstone.core.judge import JudgeConfig
 from turnstone.core.providers import ModelCapabilities
 from turnstone.core.storage import get_storage
 from turnstone.core.trajectory import dicts_from_turns
 from turnstone.core.watch import WatchRunner, build_watch_reminder
+
+if TYPE_CHECKING:
+    from turnstone.core.session import ChatSession
 
 _WATCH_ID = "a" * 32
 _SECRET = "abcdefghijklmnopqrstuvwxyz012345"
@@ -49,6 +54,28 @@ def _create_watch(ws_id: str, *, watch_id: str = _WATCH_ID, **fields: Any) -> di
     row = storage.get_watch(watch_id)
     assert row is not None
     return row
+
+
+def _deliver_watch_notice(session: ChatSession) -> None:
+    session._title_generated = True
+    with (
+        patch.object(session, "_stream_response", return_value=make_result(content="Noticed.")),
+        patch.object(session, "_update_token_table"),
+        patch.object(session, "_print_status_line"),
+        patch.object(session, "_visible_memory_count", return_value=0),
+    ):
+        session.send("Check the watch.")
+
+
+def _compact_watch_session(session: ChatSession) -> None:
+    session._msg_tokens = [1] * len(session.messages)
+    with patch.object(
+        session._compaction_engine,
+        "summarize_blocks",
+        return_value=SummaryResult(text="Watch completed.", producer="test-summary"),
+    ):
+        assert session._compact_messages(auto=False)
+    assert not any(turn.source == "watch_triggered" for turn in session.messages)
 
 
 def test_notice_hides_output_and_condition_exception() -> None:
@@ -251,6 +278,138 @@ def test_persisted_snapshot_keeps_output_and_condition_error_on_reload(
         assert "exit code: 2" in output
         assert "poll #1/100" in output
         assert "older poll" not in output
+    finally:
+        session.close()
+        if restored is not None:
+            restored.close()
+
+
+@pytest.mark.parametrize("compacted", [False, True])
+def test_fork_reads_only_its_inherited_snapshot(
+    storage_backend: Any, monkeypatch: pytest.MonkeyPatch, compacted: bool
+) -> None:
+    parent = make_registered_session(user_id="owner", ui=_WatchUI())
+    storage = get_storage()
+    storage.register_workstream(
+        "watch-fork",
+        user_id="owner",
+        kind="interactive",
+        state="creating",
+        fork_reservation_token="destination-token",
+    )
+    fork = make_session(
+        ws_id="watch-fork", user_id="owner", fork_reservation_token="destination-token"
+    )
+    restored = None
+    try:
+        row = _create_watch(parent.ws_id)
+        runner = WatchRunner(storage=storage, node_id="test-node")
+        parent.set_watch_runner(runner)
+        monkeypatch.setattr(runner, "_run_command", lambda _command: (_OUTPUT, 2))
+        runner._poll_watch(row)
+        _deliver_watch_notice(parent)
+        source = storage.ensure_workstream_incarnation_snapshot(parent.ws_id)
+        assert source is not None
+        fork.fork_from_storage(
+            parent.ws_id,
+            principal_id="owner",
+            source_reservation_token=str(source["fork_reservation_token"]),
+        )
+        # Neither the parent's newer row nor its newer history belongs to the fork.
+        storage.update_watch(_WATCH_ID, last_output="new parent output", poll_count=2)
+        snapshot = next(turn for turn in parent.messages if turn.source == "watch_triggered")
+        newer = dict(snapshot.meta.extra["source_meta"], output="new parent output", poll_count=2)
+        storage.save_message(
+            parent.ws_id, "system", "New notice", source="watch_triggered", meta=json.dumps(newer)
+        )
+        foreign_id = "c" * 32
+        _create_watch("unrelated-workstream", watch_id=foreign_id, last_output="private output")
+        storage.save_message(
+            "unrelated-workstream",
+            "system",
+            "Private notice",
+            source="watch_triggered",
+            meta=json.dumps(dict(newer, watch_id=foreign_id, output="private output")),
+        )
+        reader = fork
+        if compacted:
+            _compact_watch_session(fork)
+            restored = make_session(user_id="owner")
+            assert restored.resume(fork.ws_id)
+            assert not any(turn.source == "watch_triggered" for turn in restored.messages)
+            reader = restored
+        prepared = reader._prepare_watch("read", {"action": "read", "name": _WATCH_ID})
+        output = prepared["execute"](prepared)[1]
+        assert _OUTPUT in output
+        assert "poll #1/100" in output
+        assert "exit code: 2" in output
+        assert "new parent output" not in output
+        foreign = reader._prepare_watch("read", {"action": "read", "name": foreign_id})
+        foreign_output = foreign["execute"](foreign)[1]
+        assert "not found" in foreign_output
+        assert "private output" not in foreign_output
+    finally:
+        parent.close()
+        fork.close()
+        if restored is not None:
+            restored.close()
+
+
+@pytest.mark.parametrize("previous_output", [None, "older poll"])
+def test_failed_terminal_update_survives_compaction_and_checkpointed_resume(
+    storage_backend: Any, monkeypatch: pytest.MonkeyPatch, previous_output: str | None
+) -> None:
+    session = make_registered_session(ui=_WatchUI())
+    restored = None
+    try:
+        storage = get_storage()
+        previous_count = 0 if previous_output is None else 5
+        row = _create_watch(
+            session.ws_id,
+            stop_on="int(output)",
+            last_output=previous_output,
+            last_exit_code=0,
+            poll_count=previous_count,
+        )
+        runner = WatchRunner(storage=storage, node_id="test-node")
+        run_command = MagicMock(return_value=(_OUTPUT, 2))
+        monkeypatch.setattr(runner, "_run_command", run_command)
+        session.set_watch_runner(runner, wake_fn=lambda: _deliver_watch_notice(session))
+        real_update = storage.update_watch
+
+        def fail_poll_update(watch_id: str, **fields: Any) -> bool:
+            if "last_output" in fields:
+                raise RuntimeError("simulated terminal row update failure")
+            return real_update(watch_id, **fields)
+
+        monkeypatch.setattr(storage, "update_watch", fail_poll_update)
+        with pytest.raises(RuntimeError, match="terminal row update failure"):
+            runner._poll_watch(row)
+        stale_row = storage.get_watch(_WATCH_ID)
+        assert stale_row is not None
+        assert stale_row["active"]
+        runner._poll_watch(stale_row)
+        stale_row = storage.get_watch(_WATCH_ID)
+        assert stale_row is not None
+        assert not stale_row["active"]
+        assert stale_row["last_output"] == previous_output
+        assert stale_row["poll_count"] == previous_count
+        run_command.assert_called_once()
+        assert sum(turn.source == "watch_triggered" for turn in session.messages) == 1
+
+        _compact_watch_session(session)
+        restored = make_session()
+        assert restored.resume(session.ws_id)
+        assert not any(turn.source == "watch_triggered" for turn in restored.messages)
+        for reader in (session, restored):
+            for name in (_WATCH_ID, "checks"):
+                prepared = reader._prepare_watch("read", {"action": "read", "name": name})
+                output = prepared["execute"](prepared)[1]
+                assert _OUTPUT in output
+                assert "condition error:" in output
+                assert "exit code: 2" in output
+                assert f"poll #{previous_count + 1}/100" in output
+                assert "older poll" not in output
     finally:
         session.close()
         if restored is not None:

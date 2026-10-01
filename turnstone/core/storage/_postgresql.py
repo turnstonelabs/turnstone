@@ -150,6 +150,7 @@ from turnstone.core.storage._utils import (
     build_memory_scope_or_clause,
     clone_workstream_transaction,
     find_orphan_conversations,
+    get_watch_snapshot_on_connection,
     memory_index_health_inputs_on_connection,
     parse_checkpoint_watermark,
     prepare_attachment_commit,
@@ -2768,6 +2769,10 @@ class PostgreSQLBackend(_KeyedAttachmentSaveWrappers):
             if row is None:
                 return None
             return dict(row._mapping)
+
+    def get_watch_snapshot(self, ws_id: str, watch_id: str) -> dict[str, Any] | None:
+        with self._conn() as conn:
+            return get_watch_snapshot_on_connection(conn, ws_id, watch_id)
 
     def is_watch_active(self, watch_id: str) -> bool:
 

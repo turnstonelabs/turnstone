@@ -119,12 +119,20 @@ note over Session, UI
 end note
 Session -> Model : metadata-only operator notice + read hint
 Model -> Session : watch(action="read", name="<full watch id>")
-Session -> Storage : resolve watch within current workstream
-Storage --> Session : watch row (including completed watches)
-Session -> Session : use delivered snapshot, else stored last_output
+Session -> Session : find delivered snapshot in active transcript
+alt no active snapshot
+    Session -> Storage : get_watch_snapshot(current ws_id, full watch id)
+    Storage --> Session : snapshot from this workstream's persisted history
+end
+alt no delivered snapshot
+    Session -> Storage : resolve own watch; read stored last_output
+    Storage --> Session : watch row (including completed watches)
+end
 note right
   The snapshot is available before
   the runner's final row commit.
+  Forks keep inherited snapshots.
+  Persisted snapshots survive compaction.
   Condition exception details also
   stay out of operator notice text.
 end note

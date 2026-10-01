@@ -1690,6 +1690,14 @@ class StorageBackend(Protocol):
         """Return watch dict or None."""
         ...
 
+    def get_watch_snapshot(self, ws_id: str, watch_id: str) -> dict[str, Any] | None:
+        """Return the latest delivered snapshot in this workstream's persisted history.
+
+        Includes snapshots inherited by a fork and retained behind a compaction
+        checkpoint. Never consults the watch owner's history or another workstream.
+        """
+        ...
+
     def is_watch_active(self, watch_id: str) -> bool:
         """Return True iff the watch exists and its ``active`` flag is set.
 
