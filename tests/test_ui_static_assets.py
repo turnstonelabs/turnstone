@@ -28,8 +28,9 @@ _FONT_CSS = _SHARED / "fonts.css"
 # The directories are cached as immutable, so changed font files must ship under
 # a new directory name; record a new digest only with that rename.
 _FONT_DIR_DIGESTS = {
-    "inter-4.001": "c651b13369839ac78352218d6944146c3b80a81aa5bd2af054ae3832ee38ae09",
-    "jetbrains-mono-2.211": "1788d91982f02d90acffb827674006b0827be0d28282fe2e598244d256a8fc72",
+    "inter-4.001.1": "81d8ebce9d72a335e3c85a73112d0d0a1100d47e5d179d04a01bc5cc396b1001",
+    "jetbrains-mono-2.304": "0610110bc72e079bdb1d93e4bb6618f5e2da8ed40f8e296622fefff591764c26",
+    "dejavu-sans-2.37": "2bf4c5921d35072ff9029f5e8c20c5463c7378359a4ac3dbcf6cf7e9549f4612",
 }
 # The attribute through which each tag fetches a resource as the page loads.
 _RESOURCE_ATTRS = {
@@ -147,7 +148,7 @@ def test_offsite_classification(url: str, offsite: bool) -> None:
         ('@import "https://cdn.example.com/x.css";', True),
         ("@import'//cdn.example.com/x.css';", True),
         ("@import url(//cdn.example.com/x.css);", True),
-        ('a { src: url("/shared/inter-4.001/inter-latin.woff2") }', False),
+        ('a { src: url("/shared/inter-4.001.1/inter-normal.woff2") }', False),
         ("a { src: url(fonts/KaTeX_Main-Regular.woff2) }", False),
         ("a { fill: url(#gradient) }", False),
         (
@@ -245,4 +246,7 @@ def test_font_families_match_the_design_tokens() -> None:
     tokens = set(re.findall(r'--font-(?:ui|mono):\s*"([^"]+)"', base))
     assert len(tokens) == 2, f"expected the --font-ui and --font-mono tokens, got {tokens}"
     css = _FONT_CSS.read_text(encoding="utf-8")
-    assert set(re.findall(r'font-family:\s*"([^"]+)"', css)) == tokens
+    assert set(re.findall(r'font-family:\s*"([^"]+)"', css)) == tokens | {"Turnstone Symbols"}
+    for token in ["ui", "mono"]:
+        stack = re.search(r"--font-" + token + r":\s*([^;]+);", base)
+        assert stack and '"Turnstone Symbols"' in stack[1]

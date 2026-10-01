@@ -104,6 +104,10 @@ frozen.
 
 ### Fixed
 
+- **Web UI typography.** Locally served font subsets retain the requested stylistic
+  features, real italics and the 800 weight used by attention chips. Bundled symbol
+  fallback and information icons give interface marks consistent shapes across platforms (#1231).
+
 - **GPT-6 effort changes preserve the cached prompt prefix (#1246).** Supported standard
   Responses requests keep request-level effort at its initial value and replay later changes
   as `configuration_update` input items. Accepted turns record their resolved effort, so

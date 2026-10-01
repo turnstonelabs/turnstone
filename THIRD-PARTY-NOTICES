@@ -135,19 +135,30 @@ THE SOFTWARE.
 Inter 4.001
 https://github.com/rsms/inter
 
-Copyright 2020 The Inter Project Authors (https://github.com/rsms/inter)
+Copyright 2016 The Inter Project Authors (https://github.com/rsms/inter)
 
 Licensed under the SIL Open Font License, Version 1.1. The license text ships
-with the font files in turnstone/shared_static/inter-4.001/LICENSE and is
+with the font files in turnstone/shared_static/inter-4.001.1/LICENSE and is
 available with a FAQ at https://openfontlicense.org
 
 ================================================================================
 
-JetBrains Mono 2.211
+JetBrains Mono 2.304
 https://github.com/JetBrains/JetBrainsMono
 
 Copyright 2020 The JetBrains Mono Project Authors (https://github.com/JetBrains/JetBrainsMono)
 
 Licensed under the SIL Open Font License, Version 1.1. The license text ships
-with the font files in turnstone/shared_static/jetbrains-mono-2.211/LICENSE and
+with the font files in turnstone/shared_static/jetbrains-mono-2.304/LICENSE and
 is available with a FAQ at https://openfontlicense.org
+
+================================================================================
+
+DejaVu Sans 2.37 (interface symbol subset)
+https://dejavu-fonts.github.io/
+
+Copyright (c) 2003 by Bitstream, Inc. All Rights Reserved.
+DejaVu changes are in public domain. Imported glyphs carry additional notices.
+
+Licensed under the font license and copyright notices shipped with the subset
+in turnstone/shared_static/dejavu-sans-2.37/LICENSE.

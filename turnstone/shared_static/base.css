@@ -70,9 +70,9 @@
   --row-alt: rgba(255, 255, 255, 0.01);
 
   /* Typography — Inter for UI, JetBrains Mono for code. */
-  --font-ui: "Inter", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --font-ui: "Inter", "Turnstone Symbols", system-ui, sans-serif;
   --font-mono:
-    "JetBrains Mono", "SF Mono", "IBM Plex Mono", Consolas, monospace;
+    "JetBrains Mono", "Turnstone Symbols", monospace;
 
   /* ========================================================================
      Design-system tokens — semantic palette + shape + rhythm.  These

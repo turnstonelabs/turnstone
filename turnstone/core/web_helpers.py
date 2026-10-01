@@ -475,7 +475,7 @@ def cors_middleware(origins: list[str]) -> Middleware:
 # policy.  These directories already carry their library version in the URL,
 # so their contents can be cached immutably; every other first-party asset must
 # revalidate because ES-module imports do not inherit the entry module's ?v=.
-_VERSIONED_VENDOR_DIR = r"(?:katex|hljs|hls|mermaid|inter|jetbrains-mono)-\d+(?:\.\d+)+"
+_VERSIONED_VENDOR_DIR = r"(?:katex|hljs|hls|mermaid|inter|jetbrains-mono|dejavu-sans)-\d+(?:\.\d+)+"
 _VERSIONED_VENDOR_PATH_RE = re.compile(rf"^{_VERSIONED_VENDOR_DIR}/")
 
 
