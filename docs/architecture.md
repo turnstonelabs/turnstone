@@ -950,24 +950,11 @@ remain readable. See the [Responses input schema][responses-input-schema].
 
 [responses-input-schema]: https://developers.openai.com/api/reference/python/resources/responses/methods/create
 
-GPT-6 Astra (`gpt-6-astra`) has a 1,050,000-token context window, 128,000-token output limit, and
-reasoning levels `low`, `medium`, `high`, `xhigh`, and `max`. Temperature is always omitted.
-An unset effort leaves the server default in charge; the shared effort policy omits unsupported
-`none` and snaps `minimal` to `low`. Vision, native PDF input, tool search, reasoning replay,
-verbosity, and pro mode use the existing Responses paths. Astra also enables
-`supports_mid_conversation_system`: leading system/developer messages become `instructions`, while
-later messages keep their role and position in `input`. The canonical Turn IR is unchanged. Async
-tool execution, WebSocket steering, and `configuration_update` reasoning changes are not enabled.
-See the [OpenAI model guide](https://developers.openai.com/api/docs/guides/latest-model) and
-[model card](https://developers.openai.com/api/docs/models/gpt-6-astra).
-
-GPT-6 Sol (`gpt-6-sol`) and Luna (`gpt-6-luna`) share Astra's limits but follow the GPT-5.6
-effort contract: levels `none` through `max`, server default `medium`, and temperature only when
-the effort is explicitly `none`. Vision, native PDF input, tool search, reasoning replay,
-verbosity, and pro mode use the existing Responses paths. Native mid-conversation system messages
-are not enabled for either tier, so operator turns use the fold path. See the
-[Sol](https://developers.openai.com/api/docs/models/gpt-6-sol) and
-[Luna](https://developers.openai.com/api/docs/models/gpt-6-luna) model cards.
+Per-model contracts (limits, effort levels, temperature handling) live in the capability rows and
+their comments, not in this document. When a row sets `supports_mid_conversation_system`, leading
+system/developer messages become `instructions`, while later ones keep their role and position in
+`input`; the canonical Turn IR is unchanged. Rows without the flag join all system text into
+`instructions`, and operator turns use the fold path.
 
 The `openai-compatible` lane never consults the commercial table on either API surface. Chat
 Completions uses `OpenAIChatCompletionsProvider`; the Responses pin uses
@@ -980,24 +967,22 @@ Native mid-conversation system messages remain disabled by default for compatibl
 server's chat template may require system messages at the beginning even when it exposes the
 Responses API. These lanes keep using the existing folded operator reminders.
 
-**AnthropicProvider** (`_anthropic.py`): converts OpenAI-format messages to
-Anthropic content blocks, maps `system`/`developer` roles to the `system`
-parameter, groups consecutive `tool` result messages into user-role content
-blocks (converting `image_url` parts to Anthropic's `image` source format),
-and translates tool schemas from OpenAI function-calling format to
-Anthropic's `input_schema` format. Supports both manual and adaptive thinking
-modes, with effort parameter support for models like Claude Opus 4.6 and
-Sonnet 4.6. Replaces the `web_search` function tool with Anthropic's native
-`web_search_20250305` server-side tool — Claude decides when to search, the
-API executes it, and results stream back as `server_tool_use` /
-`web_search_tool_result` content blocks (emitted as `info_delta` for UI
-display). Automatic prompt caching is enabled via top-level `cache_control:
-{"type": "ephemeral"}` — the API places the cache breakpoint on the last
-cacheable block and advances it as conversations grow (90% input cost
-reduction on cache hits, 1.25x write on first turn). Cache metrics
-(`cache_creation_input_tokens`, `cache_read_input_tokens`) are extracted from
-the stream's usage events. The `anthropic` SDK is a core
-dependency — the Anthropic provider is first-class alongside OpenAI.
+**AnthropicProvider** (`_anthropic.py`): translates the lowered provider-neutral wire dicts into
+Anthropic content blocks. Leading `system`/`developer` messages go to the `system` parameter; on
+rows with `supports_mid_conversation_system`, later operator turns stay inline as `system` messages
+placed where the API accepts them, while other rows have already had them folded. Consecutive
+`tool` results are grouped into user-role content blocks (`image_url` parts become Anthropic
+`image` sources), and function-calling tool schemas become `input_schema`. The capability row
+picks manual or adaptive thinking; on rows with `supports_effort`, the requested effort is sent as
+`output_config.effort`, snapped to the row's `effort_levels`. Replaces the `web_search` function
+tool with Anthropic's native `web_search_20250305` server-side tool — Claude decides when to
+search, the API executes it, and results stream back as `server_tool_use` /
+`web_search_tool_result` content blocks (emitted as `info_delta` for UI display). Automatic prompt
+caching is enabled via top-level `cache_control: {"type": "ephemeral"}` — the API places the cache
+breakpoint on the last cacheable block and advances it as conversations grow (90% input cost
+reduction on cache hits, 1.25x write on first turn). Cache metrics (`cache_creation_input_tokens`,
+`cache_read_input_tokens`) are extracted from the stream's usage events. The `anthropic` SDK is a
+core dependency — the Anthropic provider is first-class alongside OpenAI.
 
 The Anthropic provider requires SDK v1 (`anthropic>=1,<2`). Its default
 client runs on HTTPX2, so a mid-body connection death escapes
@@ -1873,10 +1858,14 @@ compaction.
 
 ### State Emission on Errors
 
-- `send()` catches `KeyboardInterrupt` and generic `Exception`: calls
-  `_emit_state("error")` before re-raising
-- On interrupt: partial tool results and the originating assistant message
-  are popped from `self.messages` to keep state consistent
+- `send()` catches `KeyboardInterrupt` and generic `Exception`, finalizes the
+  generation under `_commit_for_generation()`, then re-raises.
+  `_record_fatal_error()` surfaces the sanitized error, persists it, and emits
+  `state=error`; a superseded generation's finalize is dropped so it cannot
+  paint an error over its live successor.
+- Nothing is popped from history: tool calls without results get synthesized
+  cancelled results so every call keeps a matching result, and queued messages
+  are flushed before the error is recorded.
 
 ### Web UI Resilience
 

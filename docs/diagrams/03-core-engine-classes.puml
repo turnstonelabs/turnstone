@@ -74,28 +74,45 @@ interface "LLMProvider" as LLMProvider <<Protocol>> {
     core/providers/_protocol.py
 }
 
-class "OpenAIProvider" as OpenAIProv {
-    Model capability lookup table
-    (GPT-5.x, O-series, search)
-    Passthrough: messages already
-    in OpenAI format.
-    Search models: web_search_options
-    + url_citation annotations.
-    Extended cache: 24h retention
-    for GPT-5.x (free).
+class "OpenAIChatCompletionsProvider" as ChatProv {
+    openai-compatible lane on
+    /v1/chat/completions.
+    Translates lowered wire dicts
+    to Chat Completions messages.
+    No static capability table:
+    plain defaults + model definition.
     --
-    core/providers/_openai.py
+    core/providers/_openai_chat.py
+}
+
+class "OpenAIResponsesProvider" as ResponsesProv {
+    Commercial openai lane on
+    /v1/responses (capability table
+    in _openai_common.py); compat=True
+    for the openai-compatible Responses pin.
+    Translates lowered wire dicts
+    to Responses input items.
+    Native search + url_citation footers.
+    --
+    core/providers/_openai_responses.py
+}
+
+class "XAIProvider" as XAIProv {
+    Responses surface at api.x.ai.
+    Opts in to server-side tool
+    outputs per capability row.
+    --
+    core/providers/_xai.py
 }
 
 class "AnthropicProvider" as AnthropicProv {
-    Converts OpenAI messages to
-    Anthropic content blocks.
+    Translates lowered wire dicts
+    to Anthropic content blocks.
     Adaptive + manual thinking.
     Native web search via
     web_search_20250305 server tool.
     Auto prompt caching via
     cache_control: ephemeral.
-    Lazy anthropic SDK import.
     --
     core/providers/_anthropic.py
 }
@@ -471,9 +488,11 @@ TerminalUI <|-- WsTermUI
 SessionUI <|.. WebUI
 SessionUI <|.. NullUI
 
-LLMProvider <|.. OpenAIProv
+LLMProvider <|.. ChatProv
+LLMProvider <|.. ResponsesProv
 LLMProvider <|.. AnthropicProv
-OpenAIProv <|-- GoogleProv
+ChatProv <|-- GoogleProv
+ResponsesProv <|-- XAIProv
 
 ChatSession --> SessionUI : uses
 ChatSession --> ResolvedBinding : owns coherent snapshot
