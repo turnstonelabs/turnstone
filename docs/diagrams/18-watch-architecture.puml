@@ -13,6 +13,7 @@ participant "ChatSession\n(session.py)" as Session <<session>>
 participant "WatchRunner\n(watch.py)" as Runner <<server>>
 participant "StorageBackend\n(SQLite / PostgreSQL)" as Storage <<storage>>
 participant "WebUI / SSE\n(server.py)" as UI <<ui>>
+participant "Model" as Model
 
 == Create Phase ==
 
@@ -71,9 +72,9 @@ loop for each due watch
         end note
 
         alt condition fired OR max_polls reached
+            Runner -> Runner : build_watch_reminder()
+            Runner -> Runner : _dispatch_result(ws_id, reminder)
             Runner -> Storage : update_watch(\npoll_count++,\nlast_output, active=False)
-            Runner -> Runner : format_watch_message()
-            Runner -> Runner : _dispatch_result(ws_id, msg)
         else not fired
             Runner -> Storage : update_watch(\npoll_count++,\nlast_output, next_poll)
         end
@@ -88,21 +89,14 @@ note over Runner, Session
 end note
 
 alt Path A: workstream active + idle
-    Runner -> Session : dispatch_fn(message)\n→ _watch_pending.put()
-    Session -> Session : _dispatch_pending_watch()\n→ self.send(message)
-    Session -> UI : SSE: thinking, content,\ntool calls...
-    note right
-      Watch result appears as
-      synthetic user message.
-      Model sees it and responds.
-      Depth guard: max 5 chains.
-    end note
+    Runner -> Session : dispatch_fn(reminder)\n→ NudgeQueue.enqueue(channel="any")
+    Session -> Session : wake workstream\n→ send("")
 
 else Path B: workstream active + busy
-    Runner -> Session : dispatch_fn(message)\n→ _watch_pending.put()
+    Runner -> Session : dispatch_fn(reminder)\n→ NudgeQueue.enqueue(channel="any")
     note right
-      Queued. Dispatched when
-      current send() reaches IDLE.
+      In-flight worker drains the notice
+      at its next user or tool seam.
     end note
 
 else Path C: workstream evicted
@@ -114,8 +108,28 @@ else Path C: workstream evicted
       3. set_watch_runner()
       4. register new dispatch_fn
     end note
-    Runner -> Session : restored dispatch_fn(message)
+    Runner -> Session : restored dispatch_fn(reminder)\n→ NudgeQueue.enqueue(channel="any")
 end
+
+Session -> Session : drain notice into watch_triggered system turn
+Session -> UI : system_turn(content=notice, meta=output snapshot)
+note over Session, UI
+  The card renders output from structured metadata.
+  Metadata is invisible to the model.
+end note
+Session -> Model : metadata-only operator notice + read hint
+Model -> Session : watch(action="read", name="<full watch id>")
+Session -> Storage : resolve watch within current workstream
+Storage --> Session : watch row (including completed watches)
+Session -> Session : use delivered snapshot, else stored last_output
+note right
+  The snapshot is available before
+  the runner's final row commit.
+  Condition exception details also
+  stay out of operator notice text.
+end note
+Session -> Session : output guard (when enabled)
+Session -> Model : tool result with command output
 
 == Cancel / List ==
 

@@ -1,7 +1,7 @@
 """Watch — periodic command polling within a workstream.
 
-A watch periodically runs a shell command and injects results back into the
-conversation when a stop condition is met or the output changes.  The
+A watch periodically runs a shell command and posts a notice to the
+conversation when a stop condition is met or the output changes. The
 ``WatchRunner`` is a server-level daemon thread that polls the database for
 due watches, runs their commands, and dispatches results.
 """
@@ -220,9 +220,9 @@ def evaluate_condition(
 
 
 def format_watch_message(
+    watch_id: str,
     name: str,
     command: str,
-    output: str,
     poll_count: int,
     max_polls: int,
     elapsed_secs: float,
@@ -230,7 +230,7 @@ def format_watch_message(
     is_final: bool,
     reason: str,
 ) -> str:
-    """Format a watch result as a synthetic user message."""
+    """Format an operator notice without command output or exception details."""
     elapsed = format_interval(elapsed_secs)
     lines = [f'[Watch "{name}" \u2014 poll #{poll_count}/{max_polls}, {elapsed} elapsed]']
 
@@ -242,35 +242,46 @@ def format_watch_message(
 
     lines.append("")
     lines.append(f"$ {command}")
-    lines.append(output)
+    lines.append(
+        f'Use watch(action="read", name={json.dumps(watch_id)}) to read the command output.'
+    )
 
     if is_final:
-        if reason:
-            lines.append("")
-            lines.append(f"[{reason} \u2014 watch auto-cancelled]")
+        # Condition exceptions can quote arbitrary command output. Only fixed,
+        # harness-authored trigger labels belong in operator-context text.
+        if reason.startswith("condition error:"):
+            trigger = "condition evaluation failed"
+        elif reason.startswith("condition met:"):
+            trigger = "condition met"
+        elif reason == "output changed":
+            trigger = "output changed"
         else:
-            lines.append("")
-            lines.append("[max polls reached \u2014 watch auto-cancelled]")
+            trigger = "max polls reached"
+        lines.append("")
+        lines.append(f"[{trigger} — watch auto-cancelled]")
 
     return "\n".join(lines)
 
 
 # The structured fields that ride the ``watch_triggered`` system turn's
 # ``_source_meta`` (delivered to the FE for the watch-result card).  ``output``
-# is the raw (sanitized) shell output so the card body renders it alone, without
-# re-showing the header / command lines that ``format_watch_message`` bakes into
-# the turn's text ``content`` (which is what the model reads on the wire).
+# is the sanitized shell output for the card and the ``watch`` read action.
+# Only the notice's text reaches the model; detail is pulled as a tool result.
 WATCH_REMINDER_OPTIONAL_KEYS = (
+    "watch_id",
     "watch_name",
     "command",
     "output",
     "poll_count",
     "max_polls",
     "is_final",
+    "exit_code",
+    "reason",
 )
 
 
 def build_watch_reminder(
+    watch_id: str,
     name: str,
     command: str,
     output: str,
@@ -280,28 +291,23 @@ def build_watch_reminder(
     stop_on: str | None,
     is_final: bool,
     reason: str,
+    exit_code: int | None = None,
 ) -> dict[str, Any]:
     """Build a structured ``watch_triggered`` reminder dict.
 
-    Returns a dict with ``{type, text, watch_name, command, output,
-    poll_count, max_polls, is_final}``.  The ``text`` field is the formatted body
-    (same content :func:`format_watch_message` produces) and becomes the
-    ``content`` of the first-class ``{"role": "system", "_source":
-    "watch_triggered"}`` turn the drain seam emits — the model-facing prose, with
-    the watch header / ``$ command`` / output all baked in.  The remaining fields
-    ride as the turn's structured ``_source_meta`` so the FE rebuilds the
-    watch-result card from them; ``output`` is carried separately so the card
-    body shows the raw shell output alone (without re-printing the header /
-    command the chrome already renders).  Both ``text`` and the structured fields
-    derive from the same inputs, so they cannot drift.  Compaction / channel
-    adapters keep seeing the human-readable shell output via the ``text`` field.
+    ``text`` becomes the operator-context system turn's model-facing content.
+    It carries watch metadata and a read-tool hint, never command output or
+    condition exception details. The remaining fields ride in wire-invisible
+    ``_source_meta`` for the result card and the read action's poll snapshot.
+    This snapshot is available as soon as the notice is delivered, including
+    when an idle wake reads it before the watch-row update commits.
     """
     return {
         "type": "watch_triggered",
         "text": format_watch_message(
+            watch_id=watch_id,
             name=name,
             command=command,
-            output=output,
             poll_count=poll_count,
             max_polls=max_polls,
             elapsed_secs=elapsed_secs,
@@ -309,12 +315,15 @@ def build_watch_reminder(
             is_final=is_final,
             reason=reason,
         ),
+        "watch_id": watch_id,
         "watch_name": name,
         "command": command,
         "output": output,
         "poll_count": poll_count,
         "max_polls": max_polls,
         "is_final": is_final,
+        "exit_code": exit_code,
+        "reason": reason,
     }
 
 
@@ -776,6 +785,7 @@ class WatchRunner:
                     pass  # elapsed stays 0.0
 
             reminder = build_watch_reminder(
+                watch_id=watch_id,
                 name=watch_row["name"],
                 command=command,
                 output=output,
@@ -785,6 +795,7 @@ class WatchRunner:
                 stop_on=stop_on,
                 is_final=is_final,
                 reason=reason,
+                exit_code=exit_code,
             )
             try:
                 delivered = self._dispatch_result(ws_id, reminder, watch_id)
@@ -871,7 +882,7 @@ class WatchRunner:
         """Deliver a watch result to the owning workstream.
 
         ``reminder`` is the structured dict produced by
-        :func:`build_watch_reminder` — ``text`` is the formatted body
+        :func:`build_watch_reminder` — ``text`` is the notice-only body
         (matched by the dispatch closure's :func:`sanitize_payload`
         pass) and the optional fields ride as queue-entry metadata.
 

@@ -5287,9 +5287,9 @@ class ChatSession:
           - a soft cap on per-session ``"watch_triggered"`` depth via
             :data:`_WATCH_QUEUE_SOFT_CAP` + drop-oldest-on-saturation.
           - producer-side :func:`sanitize_payload` over the whole
-            formatted message so steering-vector / control-char payloads
-            sourced from arbitrary shell output can't tamper with the
-            envelope at interpolation time.
+            notice and display metadata to remove steering vectors and
+            control characters. Command output stays in wire-invisible
+            metadata until the model pulls it through the watch read action.
 
         ``wake_fn`` runs once per enqueued fire, AFTER the entry lands
         on the queue.  The server wires it to
@@ -5366,10 +5366,11 @@ class ChatSession:
         Every producer of autonomous notices (watch fires, background-shell
         exits) rides this one helper, so policy fixes — caps, sanitization,
         wake-failure handling — can never silently apply to only one of
-        them.  ``sanitize_payload`` runs over the full text (and string
-        metadata values) so steering-vector / control-char payloads sourced
-        from arbitrary process output can't tamper with the envelope; an
-        all-control-chars text drops the event silently.  ``soft_cap``
+        them. ``sanitize_payload`` runs over the notice text and string
+        metadata values to remove steering vectors and control characters;
+        it does not establish trust. Producers keep process output and
+        exception details out of notice text; tools deliver those through
+        the output guard. An all-control-chars text drops the event silently. ``soft_cap``
         drop-oldest counts across ALL channels (``channel=None``) so
         entries a user cancel demoted to ``"quiet"`` still occupy the
         budget.  The wake makes an already-idle workstream deliver the
@@ -27504,25 +27505,25 @@ class ChatSession:
                 "execute": self._exec_watch,
                 "action": "list",
             }
-        if action == "cancel":
+        if action in ("cancel", "read"):
             name = args.get("name", "")
             if not name:
                 return {
                     "call_id": call_id,
                     "func_name": "watch",
-                    "header": "\u2717 watch cancel: missing name",
+                    "header": f"✗ watch {action}: missing name",
                     "preview": "",
                     "needs_approval": False,
-                    "error": "Error: 'name' is required for cancel",
+                    "error": f"Error: 'name' is required for {action}",
                 }
             return {
                 "call_id": call_id,
                 "func_name": "watch",
-                "header": f'\u23f1 watch: cancel "{name}"',
+                "header": f'⏱ watch: {action} "{name}"',
                 "preview": "",
                 "needs_approval": False,
                 "execute": self._exec_watch,
-                "action": "cancel",
+                "action": action,
                 "watch_name": name,
             }
         if action != "create":
@@ -27532,7 +27533,7 @@ class ChatSession:
                 "header": f"\u2717 watch: unknown action '{action}'",
                 "preview": "",
                 "needs_approval": False,
-                "error": f"Error: unknown action '{action}'. Use create, list, or cancel.",
+                "error": f"Error: unknown action '{action}'. Use create, list, cancel, or read.",
             }
 
         # --- action=create ---
@@ -27683,6 +27684,57 @@ class ChatSession:
                     f"cmd: {w['command'][:60]}"
                 )
             msg = "Active watches:\n" + "\n".join(lines)
+            self._report_tool_result(call_id, "watch", msg)
+            return call_id, msg
+
+        if action == "read":
+            name = item["watch_name"]
+            # Exact ids must win over names: a later watch can reuse a completed
+            # watch's name, and notices point at the full id of their own poll.
+            target = storage.get_watch(name)
+            if target is not None and target["ws_id"] != self._ws_id:
+                target = None
+            if target is None:
+                target = storage.find_watch_by_name(self._ws_id, name)
+            if target is None:
+                msg = f'Watch "{name}" not found.'
+                self._report_tool_result(call_id, "watch", msg, is_error=True)
+                return call_id, msg
+            result = {
+                "watch_name": target["name"],
+                "command": target["command"],
+                "output": target.get("last_output"),
+                "poll_count": target["poll_count"],
+                "max_polls": target["max_polls"],
+                "exit_code": target.get("last_exit_code"),
+                "reason": "",
+            }
+            # A wake can deliver and read the notice before the runner commits
+            # last_output. Use that notice's snapshot without changing poll or
+            # held-delivery ordering. The row remains the fallback after the
+            # notice leaves the active transcript (compaction or restart).
+            for turn in reversed(self.messages):
+                meta = turn.meta.extra.get("source_meta")
+                if (
+                    turn.source == "watch_triggered"
+                    and isinstance(meta, dict)
+                    and meta.get("watch_id") == target["watch_id"]
+                    and "output" in meta
+                ):
+                    result.update(meta)
+                    break
+            if result["output"] is None:
+                msg = f'Watch "{result["watch_name"]}" has not polled yet.'
+            else:
+                msg = (
+                    f'Watch "{result["watch_name"]}" — '
+                    f"poll #{result['poll_count']}/{result['max_polls']}, "
+                    f"exit code: {result['exit_code']}\n"
+                    f"$ {result['command']}\n"
+                )
+                if result["reason"]:
+                    msg += f"{result['reason']}\n"
+                msg += str(result["output"])
             self._report_tool_result(call_id, "watch", msg)
             return call_id, msg
 

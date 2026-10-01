@@ -295,9 +295,9 @@ class TestFormatInterval:
 class TestFormatWatchMessage:
     def test_basic(self):
         msg = format_watch_message(
+            watch_id="watch-pr",
             name="pr-review",
             command="gh pr view --json state",
-            output='{"state": "MERGED"}',
             poll_count=5,
             max_polls=100,
             elapsed_secs=1500,
@@ -316,9 +316,9 @@ class TestFormatWatchMessage:
 
     def test_non_final(self):
         msg = format_watch_message(
+            watch_id="watch-deploy",
             name="deploy",
             command="curl -s http://localhost/health",
-            output="ok",
             poll_count=3,
             max_polls=50,
             elapsed_secs=90,
@@ -333,9 +333,9 @@ class TestFormatWatchMessage:
 
     def test_max_polls_final(self):
         msg = format_watch_message(
+            watch_id="watch-test",
             name="test",
             command="echo hello",
-            output="hello",
             poll_count=100,
             max_polls=100,
             elapsed_secs=6000,
@@ -354,14 +354,14 @@ class TestFormatWatchMessage:
 class TestBuildWatchReminder:
     """The structured-reminder builder lifts ``format_watch_message``'s
     args into a dict the dispatch closure can pass to
-    ``WatchRunner._dispatch_result``.  ``text`` matches the formatter's
-    output verbatim (so compaction / channel adapters / wire splice
-    keep their behaviour), and the optional fields ride alongside for
-    the frontend's ``.msg.watch-result`` card.
+    ``WatchRunner._dispatch_result``. ``text`` is notice-only, and the
+    optional fields ride alongside for the frontend's watch-result card
+    and the read action's output snapshot.
     """
 
     def test_emits_text_body_and_fields(self):
         kwargs = dict(
+            watch_id="watch-pr",
             name="pr-review",
             command="gh pr view --json state",
             output='{"state": "MERGED"}',
@@ -373,23 +373,23 @@ class TestBuildWatchReminder:
             reason='condition met: data["state"] == "MERGED"',
         )
         reminder = build_watch_reminder(**kwargs)
-        # Round-trip with format_watch_message — text is the same body
-        # the wire splice + channel adapters have always seen.
-        assert reminder["text"] == format_watch_message(**kwargs)
+        notice_args = {k: v for k, v in kwargs.items() if k != "output"}
+        assert reminder["text"] == format_watch_message(**notice_args)
         # Optional fields ride alongside.
         assert reminder["type"] == "watch_triggered"
         assert reminder["watch_name"] == "pr-review"
         assert reminder["command"] == "gh pr view --json state"
-        # The raw shell output rides as its own field so the FE card body shows
-        # it alone (no header / command repeat); the wire ``text`` keeps the
-        # full prose for the model.
+        # Raw output stays in display metadata until the model reads it as tool data.
         assert reminder["output"] == '{"state": "MERGED"}'
+        assert reminder["output"] not in reminder["text"]
+        assert reminder["watch_id"] == "watch-pr"
         assert reminder["poll_count"] == 5
         assert reminder["max_polls"] == 100
         assert reminder["is_final"] is True
 
     def test_non_final_carries_is_final_false(self):
         reminder = build_watch_reminder(
+            watch_id="watch-deploy",
             name="deploy",
             command="curl -s http://localhost/health",
             output="ok",

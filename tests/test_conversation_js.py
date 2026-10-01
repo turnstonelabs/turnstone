@@ -15,7 +15,10 @@ import json
 import subprocess
 from pathlib import Path
 
+import pytest
+
 from tests._js_harness_helpers import FAKE_DOM, node_skip
+from turnstone.core.watch import build_watch_reminder
 
 _CONVERSATION_JS = (
     Path(__file__).resolve().parent.parent / "turnstone/shared_static/conversation.js"
@@ -70,6 +73,43 @@ def test_watch_card_carries_operator_context_marker() -> None:
         "msg-watch-footer",
     ):
         assert part in body, f"watch card missing {part}"
+
+
+@node_skip
+@pytest.mark.parametrize("output", ["external <script>command output</script>", ""])
+def test_watch_card_renders_output_from_metadata_without_inline_output(output: str) -> None:
+    reminder = build_watch_reminder(
+        watch_id="a" * 32,
+        name="checks",
+        command="echo poll",
+        output=output,
+        poll_count=2,
+        max_polls=100,
+        elapsed_secs=20,
+        stop_on=None,
+        is_final=True,
+        reason="output changed",
+    )
+    script = (
+        FAKE_DOM
+        + f"""
+const conv = await import({json.dumps(_CONVERSATION_JS.as_uri())});
+const reminder = {json.dumps(reminder)};
+const card = conv.buildWatchResultCard(reminder, reminder.text);
+const body = card.querySelector(".msg-watch-body");
+if (body.textContent !== reminder.output) throw new Error("card lost output metadata");
+if (body.children.length) throw new Error("command output was parsed as markup");
+if (!card.querySelector(".msg-watch-footer").textContent.includes("poll 2/100"))
+  throw new Error("card lost poll count");
+"""
+    )
+    result = subprocess.run(
+        ["node", "--input-type=module", "-e", script],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode == 0, result.stderr
 
 
 def test_nudge_marker_shape() -> None:

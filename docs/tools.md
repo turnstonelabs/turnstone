@@ -616,17 +616,18 @@ permissions and the recipient's notification settings. For a DM, pass the user's
 ### watch
 
 Set up periodic polling of a shell command within the current workstream.
-Results are injected back into the conversation as synthetic user messages,
-triggering the model to respond and act. Use for monitoring CI/CD pipelines,
-PR reviews, deployments, file changes, etc.
+When a watch fires, an operator-context notice identifies the watch and its trigger.
+The model reads command output with `watch(action="read", name="<watch id>")`, so external
+text arrives as tool data and passes through the configured output guard. Use for monitoring
+CI/CD pipelines, PR reviews, deployments, file changes, etc.
 
 | Parameter   | Type    | Required | Description |
 |-------------|---------|----------|-------------|
-| `action`    | string  | yes      | `create`, `list`, or `cancel`. |
+| `action`    | string  | yes      | `create`, `list`, `cancel`, or `read`. |
 | `command`   | string  | create   | Shell command to poll periodically. |
 | `poll_every`| string  | no       | Poll interval as duration (`30s`, `5m`, `1h`). Default: `5m`. |
 | `stop_on`   | string  | no       | Python expression for stop condition (see below). Omit for change detection. |
-| `name`      | string  | create   | Human-readable watch name (e.g. `pr-review`). Used as identifier for cancel. |
+| `name`      | string  | create, cancel, read | Human-readable name for create; name or watch ID prefix for cancel/read. |
 | `max_polls` | integer | no       | Max poll cycles before auto-cancel. Default: 100. |
 
 **Actions:**
@@ -636,6 +637,10 @@ PR reviews, deployments, file changes, etc.
   daemon polls every 15 seconds for due watches.
 - `list` — Show all active watches in this workstream. Auto-approved.
 - `cancel` — Stop a watch by name or ID prefix. Auto-approved.
+- `read` — Read the latest poll output and exit code of an active or completed watch in this
+  workstream. Auto-approved. Use the full ID from a notice to distinguish a completed watch
+  from a later watch with the same name. Reads use the delivered notice's snapshot when
+  available, then the stored poll result after compaction or restart.
 
 **Stop condition DSL** — The `stop_on` parameter accepts a Python expression
 evaluated after each poll. Available variables:
@@ -664,23 +669,26 @@ data.get("mergedAt") is not None
 
 **Lifecycle:**
 
-1. Model calls `watch(action="create", ...)` — persisted to SQLite.
+1. Model calls `watch(action="create", ...)` — persisted to storage.
 2. `WatchRunner` daemon polls for due watches every 15s.
 3. Each poll runs the command, evaluates the condition.
-4. When the condition fires (or max polls reached), the result is injected
-   as a synthetic user message and the watch auto-cancels.
-5. If the workstream was evicted, it is restored before injection.
+4. When the condition fires (or max polls reached), a metadata-only operator notice is queued
+   and the watch auto-cancels. Condition errors use a fixed failure label; exception details
+   are available through `read` with the delivered snapshot.
+5. An idle workstream wakes to handle the notice; an evicted workstream is restored first.
+   The watch-result card renders command output from display metadata. The model pulls it
+   through `read` as a normal tool result.
 6. Watches survive server restart (overdue watches fire once on recovery).
 
 **Constraints:**
 
 - Max 5 active watches per workstream.
 - Poll interval: 10s–24h.
-- Output truncated at 64 KB.
-- Max 5 consecutive watch dispatches per worker thread (depth guard).
-- Duplicate names rejected within the same workstream.
+- Stored output capped at 65,536 characters, with a truncation marker when capped.
+- Max 50 queued watch notices per session; saturation drops the oldest notice.
+- Duplicate names rejected among active watches in the same workstream.
 
-- **Auto-approve**: `create` requires approval; `list` and `cancel` are auto-approved.
+- **Auto-approve**: `create` requires approval; `list`, `cancel`, and `read` are auto-approved.
 - **Agent availability**: Main session only — not available to task sub-agents.
 
 > See [Watch Architecture](diagrams/png/18-watch-architecture.png) for the

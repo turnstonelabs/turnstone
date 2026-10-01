@@ -1,12 +1,12 @@
 {
   "name": "watch",
-  "description": "Set up periodic polling of a shell command within this workstream. Actions: 'create' starts a new watch, 'list' shows active watches, 'cancel' stops a watch. Watch results are injected into the conversation when the stop condition is met or output changes. Use for monitoring CI/CD, PR status, deployments, file changes, etc.",
+  "description": "Set up periodic polling of a shell command within this workstream. Actions: 'create' starts a new watch, 'list' shows active watches, 'cancel' stops a watch, 'read' returns the latest poll output of an active or completed watch. When the stop condition is met or output changes, a notice points to 'read' so command output is delivered as tool data. Use for monitoring CI/CD, PR status, deployments, file changes, etc.",
   "parameters": {
     "type": "object",
     "properties": {
       "action": {
         "type": "string",
-        "enum": ["create", "list", "cancel"],
+        "enum": ["create", "list", "cancel", "read"],
         "description": "Action to perform."
       },
       "command": {
@@ -23,7 +23,7 @@
       },
       "name": {
         "type": "string",
-        "description": "Human-readable name (e.g., 'pr-review'). Required for 'create', used as identifier for 'cancel'."
+        "description": "Human-readable name (e.g., 'pr-review') for 'create'; name or watch ID prefix for 'cancel' and 'read'. Use the full watch ID from a notice to read that watch's result even if its name is reused."
       },
       "max_polls": {
         "type": "integer",

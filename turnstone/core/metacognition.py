@@ -665,20 +665,19 @@ def sanitize_name(text: str) -> str:
 def sanitize_payload(text: str) -> str:
     """Permissive sanitiser for multi-line user-controlled nudge payloads.
 
-    Used by ``format_watch_message`` output rendered into the
-    ``watch_triggered`` nudge body.
+    Used by autonomous notice producers for their text and display metadata.
+    This strips framing hazards; it neither detects prompt injection nor
+    redacts credentials. Process output belongs in a guarded tool result.
 
     The wire-boundary fence escaping (``fence.neutralize`` at fold time)
     only defangs the ``[start system-reminder]`` operator marker; other
     angle-bracketed markers (``</thinking>``, ``<answer>``,
     ``<artifact>``, …) and Unicode steering vectors (RTL override,
     zero-width chars, tag chars) can still steer some models.  Strip
-    both classes before interpolation — self-injection only today
-    (watch commands are user-supplied), but the cost is one ``re.sub``
-    per payload.
+    both classes before interpolation, at the cost of one ``re.sub`` per payload.
 
     TAB / LF / CR are preserved (see ``_PAYLOAD_CONTROL_CHARS``) so
-    multi-line shell output in watch payloads keeps its line structure.
+    multi-line display metadata keeps its line structure.
     For single-line name fields where newlines would break surrounding
     structure, use :func:`sanitize_name` instead.
     """

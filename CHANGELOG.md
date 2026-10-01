@@ -104,6 +104,12 @@ frozen.
 
 ### Fixed
 
+- **Watch output is delivered as tool data (#1235).** Watch notices carry metadata and a
+  `watch(action="read", name="<watch id>")` hint. Command output and condition exception details
+  are returned through the normal tool-result path and its configured output guard, rather
+  than entering model context with operator authority. The watch-result card still shows the
+  output, and completed watches remain readable by name or ID.
+
 - **Web UI typography.** Locally served font subsets retain the requested stylistic
   features, real italics and the 800 weight used by attention chips. Bundled symbol
   fallback and information icons give interface marks consistent shapes across platforms (#1231).
