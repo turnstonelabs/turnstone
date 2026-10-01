@@ -103,7 +103,7 @@ turnstone/
     discord/          Discord adapter (bot, cog, views, streaming, config)
     slack/            Slack adapter (Socket Mode bot, DM routing, approval buttons)
   shared_static/      Shared design system (base.css, auth.js, theme.js, toast.js, utils.js, kb.js)
-    katex-0.18.9/    Vendored KaTeX math rendering library (MIT, woff2 fonts)
+    katex-0.18.10/    Vendored KaTeX math rendering library (MIT, woff2 fonts)
     inter-4.001/     Vendored UI typeface (SIL OFL 1.1, woff2 subsets)
     jetbrains-mono-2.211/  Vendored monospace typeface (SIL OFL 1.1, woff2 subsets)
   ui/
