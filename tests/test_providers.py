@@ -3214,6 +3214,26 @@ class TestOpenAIParameterGating:
         assert caps.supports_temperature is False
         assert caps.supports_mid_conversation_system is True
 
+    def test_gpt6_1_sol_row(self) -> None:
+        """GPT-6.1 Sol: the GPT-6 limits and surface with Astra's always-on
+        reasoning (no none level, never a temperature) and a documented
+        medium default.  The dotted id must neither fall to the default row
+        nor inherit the gpt-6-sol row's none level."""
+        for model in ("gpt-6.1-sol", "gpt-6.1-sol-2026-09-29"):
+            caps = lookup_openai_capabilities(model)
+            assert caps.context_window == 1050000, model
+            assert caps.max_output_tokens == 128000, model
+            assert caps.supports_temperature is False, model
+            assert caps.reasoning_effort_values == ("low", "medium", "high", "xhigh", "max"), model
+            assert caps.default_reasoning_effort == "medium", model
+            assert caps.supports_tool_search is True, model
+            assert caps.supports_vision is True, model
+            assert caps.supports_pdf is True, model
+            assert caps.supports_reasoning_replay is True, model
+            assert caps.supports_verbosity is True, model
+            assert caps.supports_pro_mode is True, model
+            assert caps.supports_mid_conversation_system is False, model
+
 
 class TestAnthropicOrphanedToolUse:
     """Verify _convert_messages synthesizes tool_results for orphaned tool_use."""
@@ -5065,9 +5085,10 @@ class TestOpenAIPromptCaching:
             assert "prompt_cache_retention" not in kwargs
 
     def test_gpt6_uses_prompt_cache_options(self) -> None:
-        """Every GPT-6 tier in the table uses the replacement cache API."""
-        tiers = [name for name in OPENAI_CAPABILITIES if name.startswith("gpt-6-")]
-        assert {"gpt-6-astra", "gpt-6-sol", "gpt-6-luna"} <= set(tiers)
+        """Every GPT-6 family row in the table, point releases included, uses
+        the replacement cache API."""
+        tiers = [name for name in OPENAI_CAPABILITIES if name.startswith("gpt-6")]
+        assert {"gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-6.1-sol"} <= set(tiers)
         for model in tiers:
             kwargs: dict[str, Any] = {}
             apply_cache_retention(kwargs, model)

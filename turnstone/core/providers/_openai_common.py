@@ -394,6 +394,25 @@ OPENAI_CAPABILITIES: dict[str, ModelCapabilities] = {
         supports_verbosity=True,
         supports_pro_mode=True,
     ),
+    # GPT-6.1 Sol — the newer Sol model.  Its dotted id prefix-matches no
+    # gpt-6 row, so it needs its own.  Like Astra it cannot disable reasoning
+    # (no "none" level) and rejects sampling parameters at every effort level;
+    # unlike Astra its documented default effort is "medium".  Native
+    # mid-conversation system messages are not documented for this model, so
+    # operator turns keep the fold path.
+    "gpt-6.1-sol": ModelCapabilities(
+        context_window=1050000,
+        max_output_tokens=128000,
+        supports_temperature=False,
+        reasoning_effort_values=("low", "medium", "high", "xhigh", "max"),
+        default_reasoning_effort="medium",
+        supports_tool_search=True,
+        supports_vision=True,
+        supports_pdf=True,
+        supports_reasoning_replay=True,
+        supports_verbosity=True,
+        supports_pro_mode=True,
+    ),
     # Search models — always search on every request, no reasoning_effort
     "gpt-5-search-api": ModelCapabilities(
         context_window=400000,
@@ -535,12 +554,12 @@ def apply_temperature_and_effort(
 def apply_cache_retention(kwargs: dict[str, Any], model: str) -> None:
     """Configure the prompt-cache lifetime supported by each known generation.
 
-    GPT-5.6 and the GPT-6 family replace the deprecated
-    ``prompt_cache_retention`` field with ``prompt_cache_options.ttl``; 30
-    minutes is currently its only accepted minimum lifetime.  Earlier GPT-5
-    models retain the 24-hour policy.
+    GPT-5.6 and the GPT-6 family, point releases such as ``gpt-6.1-sol``
+    included, replace the deprecated ``prompt_cache_retention`` field with
+    ``prompt_cache_options.ttl``; 30 minutes is currently its only accepted
+    minimum lifetime.  Earlier GPT-5 models retain the 24-hour policy.
     """
-    if model.startswith(("gpt-5.6", "gpt-6-")):
+    if model.startswith(("gpt-5.6", "gpt-6")):
         kwargs["prompt_cache_options"] = {"ttl": "30m"}
     elif model.startswith("gpt-5"):
         kwargs["prompt_cache_retention"] = "24h"

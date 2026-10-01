@@ -922,11 +922,11 @@ remains an isolated one-shot client and always closes it after the probe.
 
 **OpenAIResponsesProvider** (`_openai_responses.py`): the commercial `openai` lane always uses
 `/v1/responses`, translating the neutral message projection into Responses input items. The
-capability table covers GPT-5.4, GPT-5.5, GPT-5.6, GPT-6 Astra, Sol and Luna, search models, and
-audio roles. Captured reasoning items can be replayed when the operator enables reasoning replay.
-Native search replaces a visible client `web_search` tool on search-capable models; citations from
-`url_citation` annotations are formatted as footnotes. Pre-5.6 GPT-5 models request extended
-prompt-cache retention (`prompt_cache_retention: "24h"`); GPT-5.6 and the GPT-6 tiers use
+capability table covers GPT-5.4 through GPT-5.6, GPT-6 models, search models, and audio roles.
+Captured reasoning items can be replayed when the operator enables reasoning replay. Native search
+replaces a visible client `web_search` tool on search-capable models; citations from `url_citation`
+annotations are formatted as footnotes. Pre-5.6 GPT-5 models request extended prompt-cache retention
+(`prompt_cache_retention: "24h"`); GPT-5.6 and the GPT-6 family, point releases included, use
 `prompt_cache_options.ttl: "30m"`. Cache reads and writes are extracted from `cached_tokens` and
 `cache_write_tokens`. Unknown models get generic defaults with `supports_vision=False` and use
 client-side web search.

@@ -207,7 +207,7 @@ additional fields in the Models create/edit shelf:
 | Reasoning mode | `reasoning_mode` | `standard`, `pro` | Selects standard or higher-compute Pro execution without changing the model ID. |
 
 An empty selection means provider default and omits the capability key. Known GPT-5.6 and GPT-6
-Astra models inherit support from the built-in table without persisting redundant support flags. An
+models inherit support from the built-in table without persisting redundant support flags. An
 OpenAI-compatible model pinned to the Responses API can opt in with the `supports_verbosity` and
 `supports_pro_mode` capability tiles. Chat Completions and non-Responses providers do not surface or
 submit these controls.
