@@ -238,6 +238,7 @@ UI_TEMPLATE = """<!doctype html>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>ui livepass</title>
+    <link rel="stylesheet" href="/shared/fonts.css" />
     <link rel="stylesheet" href="shared/base.css" />
     <link rel="stylesheet" href="shared/ui-base.css" />
     <link rel="stylesheet" href="shared/chat.css" />
@@ -371,6 +372,7 @@ CONSOLE_TEMPLATE = """<!doctype html>
   <head>
     <meta charset="utf-8" />
     <title>console livepass</title>
+    <link rel="stylesheet" href="/shared/fonts.css" />
     <link rel="stylesheet" href="shared/base.css" />
     <link rel="stylesheet" href="shared/ui-base.css" />
     <link rel="stylesheet" href="console-static/style.css" />
@@ -708,6 +710,7 @@ SHELL_TEMPLATE = """<!doctype html>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>shell livepass</title>
+    <link rel="stylesheet" href="/shared/fonts.css" />
     <link rel="stylesheet" href="shared/base.css" />
     <link rel="stylesheet" href="shared/ui-base.css" />
     <link rel="stylesheet" href="shared/chat.css" />
@@ -843,6 +846,7 @@ PROXYBRAND_FRAME_TEMPLATE = """<!doctype html>
   <head>
     <meta charset="utf-8" />
     <title>proxied node</title>
+    <link rel="stylesheet" href="/shared/fonts.css" />
     <link rel="stylesheet" href="shared/base.css" />
     <link rel="stylesheet" href="shared/ui-base.css" />
     <link rel="stylesheet" href="static/style.css" />
@@ -939,6 +943,7 @@ ATTACH_TEMPLATE = """<!doctype html>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>attachments livepass</title>
+    <link rel="stylesheet" href="/shared/fonts.css" />
     <link rel="stylesheet" href="shared/base.css" />
     <link rel="stylesheet" href="shared/ui-base.css" />
     <link rel="stylesheet" href="shared/interactive.css" />
@@ -949,7 +954,6 @@ ATTACH_TEMPLATE = """<!doctype html>
       body {
         padding: 24px; margin: 0; display: flex; flex-direction: column;
         gap: 28px; background: var(--bg); color: var(--fg);
-        font-family: var(--font-sans, system-ui, sans-serif);
       }
       .demo-label {
         font: 11px var(--font-mono, monospace); color: var(--fg-dim);
@@ -1100,6 +1104,7 @@ PASTE_TEMPLATE = """<!doctype html>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>PASTE-HTTP-BOOTING</title>
+    <link rel="stylesheet" href="/shared/fonts.css" />
     <link rel="stylesheet" href="shared/base.css" />
     <link rel="stylesheet" href="shared/ui-base.css" />
     <link rel="stylesheet" href="shared/chat.css" />
@@ -1107,7 +1112,6 @@ PASTE_TEMPLATE = """<!doctype html>
       body {
         margin: 0; padding: 32px;
         background: var(--bg); color: var(--fg);
-        font-family: var(--font-sans, system-ui, sans-serif);
       }
       main { width: min(760px, 100%); margin: 0 auto; }
       #paste-source {
@@ -1278,6 +1282,7 @@ TASKAGENT_TEMPLATE = (
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>task_agent livepass</title>
+    <link rel="stylesheet" href="/shared/fonts.css" />
     <link rel="stylesheet" href="shared/base.css" />
     <link rel="stylesheet" href="shared/ui-base.css" />
     <link rel="stylesheet" href="shared/chat.css" />
@@ -1288,7 +1293,6 @@ TASKAGENT_TEMPLATE = (
       /* Harness-only framing (NOT under review) — a plausible pane context. */
       body {
         padding: 24px; margin: 0; background: var(--bg); color: var(--ink);
-        font-family: var(--font-sans, system-ui, sans-serif);
       }
       .demo-frame { max-width: 720px; margin: 0 auto; }
       .demo-label {
@@ -1491,6 +1495,7 @@ COPY_TEMPLATE = (
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>copy livepass</title>
+    <link rel="stylesheet" href="/shared/fonts.css" />
     <link rel="stylesheet" href="shared/base.css" />
     <link rel="stylesheet" href="shared/ui-base.css" />
     <link rel="stylesheet" href="shared/chat.css" />
@@ -1501,7 +1506,6 @@ COPY_TEMPLATE = (
       /* Harness-only framing (NOT under review) — a plausible pane context. */
       body {
         padding: 24px; margin: 0; background: var(--bg); color: var(--ink);
-        font-family: var(--font-sans, system-ui, sans-serif);
       }
       .demo-frame { max-width: 720px; margin: 0 auto; }
       .demo-label {
@@ -1752,6 +1756,7 @@ PERF_TEMPLATE = """<!doctype html>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>perf livepass</title>
+    <link rel="stylesheet" href="/shared/fonts.css" />
     <link rel="stylesheet" href="shared/base.css" />
     <link rel="stylesheet" href="shared/ui-base.css" />
     <link rel="stylesheet" href="shared/chat.css" />
@@ -2196,6 +2201,8 @@ def build(out: Path) -> None:
     ui.mkdir(parents=True, exist_ok=True)
     con.mkdir(parents=True, exist_ok=True)
 
+    # Font URLs in fonts.css resolve from the harness root.
+    symlink(out / "shared", ROOT / "turnstone/shared_static")
     symlink(ui / "shared", ROOT / "turnstone/shared_static")
     symlink(ui / "static", ROOT / "turnstone/ui/static")
     blocks = extract_dialogs(UI_INDEX)
