@@ -3891,6 +3891,7 @@ function _renderSettingRow(item) {
   const escapedKey = escapeHtml(item.key);
   const escapedShort = escapeHtml(shortKey);
   const escapedDesc = escapeHtml(item.description);
+  const isMcpPrivateNetwork = item.key === "mcp.oauth_allow_private_network";
 
   // Description (short TLDR) renders inline below the key.  The ? button
   // gates the long-form help paragraph + any reference_url link.
@@ -3957,6 +3958,10 @@ function _renderSettingRow(item) {
       '"' +
       checked +
       '><span class="settings-toggle-slider"></span></label>';
+    if (isMcpPrivateNetwork) {
+      html +=
+        '<p class="settings-private-network-warning" role="note"><strong>Deployment-wide:</strong> Applies to every OAuth MCP server. Enable it only when you trust every configured OAuth MCP server to reach private-network addresses.</p>';
+    }
   } else if (item.choices && item.choices.length > 0) {
     html +=
       '<select data-setting-key="' +

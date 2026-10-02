@@ -2513,6 +2513,18 @@ h3.skill-spec-heading {
 .settings-toggle input:focus-visible + .settings-toggle-slider {
   box-shadow: 0 0 0 3px var(--accent-dim);
 }
+.settings-private-network-warning {
+  max-width: 360px;
+  margin: 8px 0 0;
+  padding-left: 8px;
+  border-left: 2px solid var(--yellow);
+  color: var(--fg-dim);
+  font-size: 10px;
+  line-height: 1.4;
+}
+.settings-private-network-warning strong {
+  color: var(--yellow);
+}
 
 /* Actions column */
 .settings-actions {

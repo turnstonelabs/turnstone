@@ -27,6 +27,7 @@ _REDACT_CREDENTIALS_JS = (
     Path(__file__).resolve().parent.parent / "turnstone/shared_static/redact_credentials.js"
 )
 _CONSOLE_APP_JS = Path(__file__).resolve().parent.parent / "turnstone/console/static/app.js"
+_CONSOLE_ADMIN_JS = Path(__file__).resolve().parent.parent / "turnstone/console/static/admin.js"
 _CONSOLE_INDEX = Path(__file__).resolve().parent.parent / "turnstone/console/static/index.html"
 
 
@@ -123,6 +124,18 @@ def test_switch_tab_opens_an_interactive_pane() -> None:
         "'interactive'), not the retired createPane bootstrap."
     )
     assert "createPane" not in body, "the split-pane createPane bootstrap is retired."
+
+
+def test_mcp_private_network_setting_explains_its_deployment_wide_scope() -> None:
+    """The OAuth private-network opt-in must not look like a per-server switch."""
+    body = _CONSOLE_ADMIN_JS.read_text(encoding="utf-8")
+    renderer = _slice_function_body(body, "_renderSettingRow")
+    assert renderer is not None
+
+    assert 'item.key === "mcp.oauth_allow_private_network"' in renderer
+    assert "settings-private-network-warning" in renderer
+    assert "Applies to every OAuth MCP server" in renderer
+    assert 'type="checkbox" data-setting-key="' in renderer
 
 
 def test_tool_error_does_not_overwrite_approval_badge() -> None:
