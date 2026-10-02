@@ -104,6 +104,13 @@ frozen.
 
 ### Fixed
 
+- **Processes started by a stdio MCP server no longer outlive it (#1226).** A server that
+  started a helper process and then exited cleanly when its stdin closed left the helper
+  running, so every reconnect, reload, removal or shutdown leaked another. Once a stdio
+  server's connection has closed, whatever remains of its process group gets SIGTERM, then
+  SIGKILL after one second; the server itself keeps its usual window to shut down. Containers
+  now reap the stopped helpers; see the container init change above.
+
 - **Watch output is delivered as tool data (#1235).** Watch notices carry metadata and a
   `watch(action="read", name="<watch id>")` hint. Command output and condition exception details
   are returned through the normal tool-result path and its configured output guard, rather
