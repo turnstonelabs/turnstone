@@ -319,6 +319,16 @@ _PENDING_CONSENT_CLEARED_MAX = 4096
 _SDK_SESSION_TERMINATED_CODE = 32600
 
 
+def _exception_summary(exc: BaseException) -> str:
+    """``Type: message`` for a server's recorded error, or the bare type when the message is empty.
+
+    Type and message only, never a traceback: the exception chain can carry a request whose
+    headers hold a bearer token (see :meth:`MCPClientManager._record_refresh_failure`).
+    """
+    detail = str(exc)
+    return f"{type(exc).__name__}: {detail}" if detail else type(exc).__name__
+
+
 def _is_dead_transport(exc: BaseException) -> bool:
     """True when *exc* means the MCP session's transport is dead and the
     session must be torn down and rebuilt (vs a protocol-level rejection
@@ -520,6 +530,45 @@ def _mcp_to_openai(server_name: str, tool: Any) -> dict[str, Any]:
     }
 
 
+class InvalidCatalogError(Exception):
+    """A catalog page from an MCP server that fails the SDK's result validation.
+
+    The SDK validates a list result as a whole, so one malformed entry rejects its entire page, and
+    there is no public way, on SDK 1.x or 2.x, to read the valid entries around it (#1224). The
+    server did answer, so this is a conformance failure rather than a transport one: it never
+    counts against the circuit breaker, and the static health loop retries it on
+    ``_INVALID_CATALOG_RETRY_S`` instead of the reconnect backoff. Built by
+    :func:`_invalid_page_error`, whose message names the entry and the field for the server's
+    status and leaves out the entry's values.
+    """
+
+
+def _invalid_page_error(
+    server_name: str, kind: str, page: int, exc: ValidationError
+) -> InvalidCatalogError:
+    """The :class:`InvalidCatalogError` for page *page* of *kind*, which failed with *exc*."""
+    errors = exc.errors(include_url=False)
+    first = errors[0]
+    loc = first["loc"]
+    path = "".join(f"[{part}]" if isinstance(part, int) else f".{part}" for part in loc)
+    path = path.removeprefix(".")
+    if len(loc) >= 2 and isinstance(loc[1], int):
+        # A missing field reports the entry itself as its input, so its name is at hand.
+        entry = first.get("input") if first["type"] == "missing" and len(loc) == 3 else None
+        name = entry.get("name") if isinstance(entry, dict) else None
+        named = f" {name[:64]!r}" if isinstance(name, str) else ""
+        message = f"MCP server '{server_name}' lists an invalid {kind[:-1]}{named} at {path}"
+    elif path:
+        message = f"MCP server '{server_name}' sent an invalid {kind} list at {path}"
+    else:
+        message = f"MCP server '{server_name}' sent an invalid {kind} list"
+    notes = [f"page {page}"] if page > 1 else []
+    if len(errors) > 1:
+        notes.append(f"{len(errors) - 1} more error{'s' if len(errors) > 2 else ''}")
+    suffix = f" ({'; '.join(notes)})" if notes else ""
+    return InvalidCatalogError(f"{message}: {first['msg']}{suffix}")
+
+
 class _ListPage[P](Protocol):
     """One SDK list method, such as ``ClientSession.list_tools``."""
 
@@ -552,14 +601,19 @@ async def _list_catalog[P: mcp_types.PaginatedResult, T](
       an empty page that still carries a cursor, so a shorter run is read past. Every other page
       adds an item, so with the item cap this bounds the number of requests;
     * on a cursor already sent once, which would make the walk cycle;
-    * on a follow-up page the server answers with a JSON-RPC error or a result that does not
-      parse. An error that :func:`_is_dead_transport` reads as a dead transport is no answer,
-      and fails the walk like any other discovery request.
+    * on a follow-up page the server answers with a JSON-RPC error. An error that
+      :func:`_is_dead_transport` reads as a dead transport is no answer, and fails the walk like
+      any other discovery request.
 
     So a catalog is never published shorter than its first page, which is all that was published
     before catalogs were paged: partial visibility beats zero visibility. The cost is that a later
     page failing during a refresh publishes a shorter catalog than the one it replaces, until the
     next refresh or reconnect reads it whole.
+
+    A page that fails the SDK's result validation, first or later, raises
+    :class:`InvalidCatalogError` instead. Keeping the pages before it would silently drop every
+    entry from the malformed one onward, while the error names the entry to fix; and publishing
+    the valid entries of the failing page would need SDK internals (see the error's docstring).
 
     With *missing_ok*, METHOD_NOT_FOUND on the first page reads as an empty catalog; any other
     first-page error propagates. The walk has no deadline of its own: the refresh and pool paths
@@ -577,6 +631,8 @@ async def _list_catalog[P: mcp_types.PaginatedResult, T](
             kind,
         )
         return []
+    except ValidationError as exc:
+        raise _invalid_page_error(server_name, kind, 1, exc) from exc
     collected: dict[str, T] = {}
     sent: set[str] = set()
     stale = 0  # follow-up pages in a row that added nothing new
@@ -619,22 +675,23 @@ async def _list_catalog[P: mcp_types.PaginatedResult, T](
         sent.add(cursor)
         try:
             page = await list_page(params=mcp_types.PaginatedRequestParams(cursor=cursor))
-        except (McpError, ValidationError) as exc:
+        except McpError as exc:
             # The SDK fails a request in flight on a dying transport with an McpError too
             # (CONNECTION_CLOSED, or the synthesized "Session terminated"); that is no answer
             # from the server, so discovery fails as it would on any other request.
             if _is_dead_transport(exc):
                 raise
             log.warning(
-                "MCP server '%s' failed a later page of %s (%s); keeping the %d listed",
+                "MCP server '%s' failed a later page of %s (JSON-RPC error %s); "
+                "keeping the %d listed",
                 server_name,
                 kind,
-                f"JSON-RPC error {exc.error.code}"
-                if isinstance(exc, McpError)
-                else "invalid result",
+                exc.error.code,
                 len(collected),
             )
             break
+        except ValidationError as exc:
+            raise _invalid_page_error(server_name, kind, len(sent) + 1, exc) from exc
     return list(collected.values())[:cap]
 
 
@@ -1282,7 +1339,7 @@ class MCPClientManager:
                 await self._connect_one(name, cfg)
             except asyncio.CancelledError:
                 raise  # propagate so the background task can be cleanly stopped
-            except (Exception, BaseExceptionGroup) as exc:
+            except (Exception, BaseExceptionGroup):
                 # ``BaseExceptionGroup`` explicitly: anyio task groups wrap a
                 # transport failure that includes a stray CancelledError (an
                 # accept-then-RST server, a cancel-scope collapse) into a
@@ -1290,9 +1347,8 @@ class MCPClientManager:
                 # Before this arm, one such server at startup killed
                 # ``_connect_all`` before the health/sweep loops below were
                 # ever created — silently disabling all autonomous recovery.
+                # ``_connect_one`` already recorded it, under the connect lock.
                 log.warning("Failed to connect MCP server '%s'", name, exc_info=True)
-                self._set_error(name, f"{type(exc).__name__}: {exc}")
-                self._cb_record_failure(name)
 
         self._connected.set()
 
@@ -1330,6 +1386,11 @@ class MCPClientManager:
     # fail-fast, a different clock) so recovery is prompt.
     _STATIC_RECONNECT_BASE_S = 1.0
     _STATIC_RECONNECT_MAX_S = 60.0
+    # Health-loop retry for a static server whose catalog fails the SDK's validation
+    # (:class:`InvalidCatalogError`). A malformed entry stays until someone fixes the server, so
+    # retrying it at the reconnect cadence only repeats a full connect; an operator reconnect
+    # still retries at once.
+    _INVALID_CATALOG_RETRY_S = 300.0
     # Liveness-ping timeout. Deliberately generous (a slow-but-working server
     # must not churn): a ping that times out is treated as "slow, not dead" —
     # rescheduled, NOT evicted (only a ``_is_dead_transport`` failure evicts).
@@ -1739,12 +1800,19 @@ class MCPClientManager:
         ``StaticServerState`` (which would corrupt the entry or leak a stack).
         No caller holds the lock before calling in, and the body never re-enters
         ``_connect_one`` for the same name, so there is no reentrancy risk.
+
+        A failure is recorded before the lock is released, so a removal queued
+        on the lock clears the record instead of being undone by it.
         """
         if "__" in name:
             log.error("MCP server name '%s' contains '__' (reserved delimiter), skipping", name)
             return
         async with self._static_connect_lock_for(name):
-            await self._connect_one_locked(name, cfg)
+            try:
+                await self._connect_one_locked(name, cfg)
+            except (Exception, BaseExceptionGroup) as exc:
+                self._record_connect_failure(name, exc, breaker=True)
+                raise
 
     async def _ensure_static_connected(
         self, name: str, cfg: dict[str, Any], *, defer_if_busy: bool = True
@@ -1787,8 +1855,9 @@ class MCPClientManager:
         DEADLINE (dispatch flows again) and deliberately NOT
         ``_consecutive_failures``: a connect-ok / calls-fail server must still
         escalate to a trip; a real dispatch success is what resets the count
-        (:meth:`_cb_record_success`). Failure records one breaker failure and
-        re-raises.
+        (:meth:`_cb_record_success`). Failure records the error in the
+        server's status and one breaker failure, except for an
+        :class:`InvalidCatalogError`, and re-raises.
 
         Returns the session on success or reuse; ``None`` on a deliberate skip
         (server removed, or busy with an in-flight call); raises on a real
@@ -1846,15 +1915,16 @@ class MCPClientManager:
                 # failure count for a healthy server. The caller provides its
                 # own accounting (or doesn't — shutdown state is discarded).
                 if not isinstance(exc, asyncio.CancelledError):
-                    self._cb_record_failure(name)
+                    self._record_connect_failure(name, exc, breaker=True)
                 await self._teardown_static_session(name)
                 raise
             state = self._static_servers.get(name)
             if state is None or state.session is None:
                 # e.g. a stdio config with no command "connects" without a
                 # session — a real failure for a reconnect driver.
-                self._cb_record_failure(name)
-                raise RuntimeError(f"MCP server '{name}' reconnect produced no session")
+                no_session = RuntimeError(f"MCP server '{name}' reconnect produced no session")
+                self._record_connect_failure(name, no_session, breaker=True)
+                raise no_session
             # Finding-13 semantics: clear only the open-circuit deadline.
             self._circuit_open_until.pop(name, None)
             return state.session
@@ -2543,8 +2613,12 @@ class MCPClientManager:
         except Exception:
             log.warning("Prompt sync after connect failed for '%s'", name, exc_info=True)
 
-        # Connection succeeded — clear any previous error
+        # Connection succeeded — clear any previous error and the health loop's reconnect state
+        # (an invalid catalog's scheduled retry, the attempt count), so a session lost before the
+        # next ping tick reconnects at once and from the start of the backoff.
         self._last_error.pop(name, None)
+        self._static_reconnect_next.pop(name, None)
+        self._static_reconnect_attempt.pop(name, None)
 
     def _make_pool_notification_handler(self, key: tuple[str, str]) -> Any:
         """Build the per-(user, server) notification handler for a pool session.
@@ -3417,7 +3491,7 @@ class MCPClientManager:
                         # earlier and never reach here, so this is a genuine
                         # connect/discovery failure (transport, 5xx, timeout).
                         self._pool_discovery_error[key] = self._sanitize_error_detail(
-                            f"{type(exc).__name__}: {exc}"
+                            _exception_summary(exc)
                         )
                         self._ensure_eviction_loop()
                         log.debug(
@@ -4608,7 +4682,7 @@ class MCPClientManager:
             type(exc).__name__,
             exc,
         )
-        self._set_error(name, f"Refresh failed: {type(exc).__name__}: {exc}")
+        self._set_error(name, f"Refresh failed: {_exception_summary(exc)}")
         if name in self._server_configs:
             self._last_refresh[name] = (time.time(), f"error:{type(exc).__name__}")
         self._arm_refresh_retry(name)
@@ -5783,6 +5857,11 @@ class MCPClientManager:
 
         async def _reconnect() -> None:
             self._cb_clear(name)
+            # Reset the health loop's clock too: whatever it scheduled (an invalid catalog's
+            # 5-minute retry, a long backoff) predates this attempt, and if the attempt fails for
+            # another reason, such as a server still restarting, the next tick should retry.
+            self._static_reconnect_next.pop(name, None)
+            self._static_reconnect_attempt.pop(name, None)
             # FORCE semantics: drop the session BEFORE queueing on the lock
             # (lock-free, same as the dispatch eviction sites). Push-refresh
             # runners now share this lock, and parked ones bail instantly at
@@ -5818,7 +5897,10 @@ class MCPClientManager:
                     # externally cancelled mid-flight.
                     async with asyncio.timeout(self._STATIC_RECONNECT_ATTEMPT_TIMEOUT_S):
                         await self._connect_one_locked(name, cfg)
-                except BaseException:
+                except BaseException as exc:
+                    if not isinstance(exc, asyncio.CancelledError):
+                        # The operator's reconnect cleared the breaker; its outcome is theirs.
+                        self._record_connect_failure(name, exc, breaker=False)
                     # Connect failed mid-reconnect — drop the stale per-server
                     # catalog so the merged tool/resource/prompt maps don't keep
                     # advertising entries with no live session behind them, and
@@ -6010,6 +6092,47 @@ class MCPClientManager:
     def _set_error(self, name: str, msg: str) -> None:
         """Store a sanitized error string for a server."""
         self._last_error[name] = self._sanitize_error_detail(msg)
+
+    def _record_connect_failure(self, name: str, exc: BaseException, *, breaker: bool) -> None:
+        """Record a failed static connect: the ONE place that decides what the failure means.
+
+        Every static connect driver records here, under the per-name connect lock: startup
+        (:meth:`_connect_one`), the health loop and a dispatch's reconnect (through
+        :meth:`_ensure_static_connected`), and an operator reconnect. A failed add records nothing,
+        because it removes the registration. The error shows in the server's status until a
+        connect succeeds, and with *breaker* the failure counts against the circuit breaker.
+
+        An :class:`InvalidCatalogError` never counts against the breaker: the server answered, so
+        it says nothing about the transport (#1224). It schedules the health loop's next attempt
+        ``_INVALID_CATALOG_RETRY_S`` out, whichever driver saw it, and withdraws the catalog kept
+        from the last good connect. That catalog no longer describes the server, and with no
+        breaker to stop them, calls to its tools, resources and prompts (each a model tool) would
+        otherwise rerun the whole connect every time. Withdrawn prompts are synced to the
+        governance templates at once, like any other catalog change: the sync is global, so the
+        next one anywhere would delete the server's rows anyway, at a time set by unrelated events.
+        The rows come back when the server does.
+        """
+        self._set_error(name, _exception_summary(exc))
+        if not isinstance(exc, InvalidCatalogError):
+            if breaker:
+                self._cb_record_failure(name)
+            return
+        self._static_reconnect_next[name] = time.monotonic() + self._INVALID_CATALOG_RETRY_S
+        state = self._static_servers.get(name)
+        if state is None:
+            return
+        tools, resources, prompts = state.tools, state.resources, state.prompts
+        state.tools, state.resources, state.prompts = [], [], []
+        if tools:
+            self._rebuild_tools()
+        if resources:
+            self._rebuild_resources()
+        if prompts:
+            self._rebuild_prompts()
+            try:
+                self.sync_prompts_to_storage()
+            except Exception:
+                log.warning("Prompt sync after withdrawing '%s' failed", name, exc_info=True)
 
     def _drop_pool_discovery_errors(self, server_name: str) -> None:
         """Drop every user's recorded discovery failure for *server_name*.
@@ -6625,7 +6748,9 @@ class MCPClientManager:
         acts. Each tick, on the mcp-loop:
 
           * a DISCONNECTED server (``session is None``) is reconnected on a
-            capped, jittered, forever backoff (:meth:`_static_reconnect_delay`);
+            capped, jittered, forever backoff (:meth:`_static_reconnect_delay`),
+            or every ``_INVALID_CATALOG_RETRY_S`` while its catalog fails
+            validation;
           * a CONNECTED server is liveness-pinged (:meth:`_static_ping_one`) and a
             dead-but-idle one — which the SDK leaves as a non-None session with
             closed streams, so nothing else notices until a dispatch fails — is
@@ -6782,9 +6907,15 @@ class MCPClientManager:
             # escaping to the tick's exception isolation.
             attempt = self._static_reconnect_attempt.get(name, 0) + 1
             self._static_reconnect_attempt[name] = attempt
-            delay = self._static_reconnect_delay(attempt)
-            next_due = time.monotonic() + delay
-            self._static_reconnect_next[name] = next_due
+            if isinstance(exc, InvalidCatalogError):
+                # Already scheduled by _record_connect_failure, which every connect driver calls;
+                # not rewritten here, so a removal that ran meanwhile is not undone.
+                delay = self._INVALID_CATALOG_RETRY_S
+                next_due = self._static_reconnect_next.get(name, time.monotonic() + delay)
+            else:
+                delay = self._static_reconnect_delay(attempt)
+                next_due = time.monotonic() + delay
+                self._static_reconnect_next[name] = next_due
             # Loud on the first few failures, then decays to debug so a long /
             # permanent outage doesn't spam the log on every forever-retry.
             log_fn = log.warning if attempt <= self._CB_FAILURE_THRESHOLD else log.debug
@@ -6999,18 +7130,18 @@ class MCPClientManager:
         ``read_resource_sync`` / ``get_prompt_sync`` (call from their ``except``,
         then re-raise).
 
-        Protocol errors (``McpError`` from a healthy connection that rejected the
-        request) do NOT trip the breaker. A dead transport — anyio
-        Closed/BrokenResourceError, the SDK-swallowed ``McpError(CONNECTION_CLOSED)``,
-        a server-restarted session, or a gone httpx connection — IS a transport
-        failure even when it is an ``McpError``, so it trips the breaker AND evicts
-        the session (leaving the owner/streams for ``_connect_one_locked``'s
-        stale-guard close protocol to reap). Eviction is what lets the next
-        dispatch's ``session is None`` check fire ``_cb_auto_reconnect`` instead
-        of re-using the corpse.
+        Protocol errors (``McpError`` from a healthy connection that rejected the request) do NOT
+        trip the breaker, and neither does a result that does not match the protocol's schema
+        (``ValidationError``): the server answered, with something malformed, which says nothing
+        about the transport (#1224). A dead transport — anyio Closed/BrokenResourceError, the
+        SDK-swallowed ``McpError(CONNECTION_CLOSED)``, a server-restarted session, or a gone httpx
+        connection — IS a transport failure even when it is an ``McpError``, so it trips the
+        breaker AND evicts the session (leaving the owner/streams for ``_connect_one_locked``'s
+        stale-guard close protocol to reap). Eviction is what lets the next dispatch's
+        ``session is None`` check fire ``_cb_auto_reconnect`` instead of re-using the corpse.
         """
         dead = _is_dead_transport(exc)
-        if dead or not isinstance(exc, McpError):
+        if dead or not isinstance(exc, McpError | ValidationError):
             self._cb_record_failure(server_name)
         if dead:
             evict = self._static_servers.get(server_name)

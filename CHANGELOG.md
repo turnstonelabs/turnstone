@@ -118,8 +118,23 @@ frozen.
   within the existing per-server cap of 1,000 entries, which still truncates with a warning. An
   entry listed twice is published once. Empty pages that still point onward are read past. The
   walk also stops, with a warning, when the server repeats a cursor, sends ten pages in a row
-  with nothing new, or fails a later page; it keeps the pages already read, so a catalog is never
-  published shorter than its first page.
+  with nothing new, or answers a later page with a JSON-RPC error; it keeps the pages already
+  read, so a catalog is never published shorter than its first page.
+
+- **A malformed MCP tool no longer sets off a reconnect loop (#1224).** The MCP SDK rejects a
+  server's whole tool list when one entry fails its validation, such as a tool with no
+  `inputSchema`, so that server publishes no tools; keeping the valid ones would need SDK
+  internals. The server's status now names the entry and the field (`InvalidCatalogError: MCP
+  server 'docs' lists an invalid tool 'search' at tools[1].inputSchema: Field required`), and so
+  does each user's status for a per-user server. The failure no longer counts against the circuit
+  breaker. A shared server stops offering the tools, resources and prompts from its last good
+  connect (its prompts' templates are removed until it recovers), and is retried every five
+  minutes instead of on the reconnect backoff of up to a minute; an operator reconnect still
+  retries at once. A refresh that meets a malformed entry keeps the last good catalog and is
+  retried like any failed refresh. A malformed entry on a later page fails the same way instead
+  of cutting the catalog short, and a tool result that does not match the protocol's schema no
+  longer counts against the breaker either. A shared server's status also shows why a reconnect
+  failed, where before it showed only a failure at startup.
 
 - **Processes started by a stdio MCP server no longer outlive it (#1226).** A server that
   started a helper process and then exited cleanly when its stdin closed left the helper

@@ -832,17 +832,22 @@ at connection time (server names with `__` are rejected).
 after 3 consecutive transport failures (timeouts, broken pipes, connection
 resets). Cooldown uses capped exponential backoff (30 s base, 5 min max) with
 per-server jitter to avoid thundering herd. Protocol-level errors (`McpError`)
-from a healthy connection do not trip the breaker. When the cooldown expires
-(half-open), the next operation attempt triggers automatic reconnection. Manual
-`/mcp refresh` also clears the circuit on success. All sync bridge methods
-(`call_tool_sync`, `read_resource_sync`, `get_prompt_sync`, `refresh_sync`)
-cancel orphaned futures on timeout to prevent coroutine accumulation on the
-background event loop. Push notification refreshes are debounced (5 s per
-server) to protect against notification storms. Operators can force a
-catalog refresh or full reconnect from the admin panel; reconnects clear
-the circuit breaker and run a fresh handshake. Transport stream references
-are pre-closed before stack teardown to work around the MCP SDK's anyio
-cancel-scope CPU busy-loop (SDK #2147).
+from a healthy connection do not trip the breaker, and neither does a result
+that does not match the protocol's schema. One malformed entry fails its whole
+catalog list, so the connect publishes nothing and the server's status names
+the entry and the field. A static server also withdraws the tools, resources
+and prompts kept from its last good connect (syncing its prompt templates), and
+is retried every 5 min rather than on the health loop's reconnect backoff. When
+the cooldown expires (half-open), the next operation attempt triggers automatic
+reconnection. Manual `/mcp refresh` also clears the circuit on success. All
+sync bridge methods (`call_tool_sync`, `read_resource_sync`, `get_prompt_sync`,
+`refresh_sync`) cancel orphaned futures on timeout to prevent coroutine
+accumulation on the background event loop. Push notification refreshes are
+debounced (5 s per server) to protect against notification storms. Operators
+can force a catalog refresh or full reconnect from the admin panel; reconnects
+clear the circuit breaker and run a fresh handshake. Transport stream
+references are pre-closed before stack teardown to work around the MCP SDK's
+anyio cancel-scope CPU busy-loop (SDK #2147).
 
 **Error isolation:** Per-server connection/refresh failures are caught and logged; other
 servers are unaffected. Tool execution errors return error strings to the LLM

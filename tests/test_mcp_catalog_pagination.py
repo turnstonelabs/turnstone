@@ -32,6 +32,7 @@ from starlette.routing import Mount
 
 from tests.conftest import _free_port, _run_on_loop, _wait_tcp_ready, serve_until_exit
 from turnstone.core.mcp_client import (
+    InvalidCatalogError,
     MCPClientManager,
     PoolEntryState,
     _AuthCapture,
@@ -416,8 +417,12 @@ def test_later_page_error_keeps_the_pages_a_refresh_read(
     assert removed == ["mcp__paged__tools_0", "mcp__paged__tools_3", "mcp__paged__tools_4"]
 
 
-def test_unparseable_later_page_keeps_what_was_read() -> None:
-    """A later page that fails the SDK's result validation ends the walk like a JSON-RPC error."""
+def test_unparseable_later_page_fails_the_walk() -> None:
+    """A later page that fails the SDK's result validation fails the walk, unlike a JSON-RPC error.
+
+    Keeping the pages before it would hide every entry from the malformed one onward behind a log
+    line; the error names what to fix instead (#1224).
+    """
 
     async def list_page(
         *, params: mcp_types.PaginatedRequestParams | None
@@ -429,10 +434,14 @@ def test_unparseable_later_page_keeps_what_was_read() -> None:
             )
         return mcp_types.ListToolsResult.model_validate({"tools": "not a list"})
 
-    tools = asyncio.run(
-        _list_catalog("srv", "tools", list_page, lambda page: page.tools, lambda t: t.name, 10)
+    with pytest.raises(InvalidCatalogError) as caught:
+        asyncio.run(
+            _list_catalog("srv", "tools", list_page, lambda page: page.tools, lambda t: t.name, 10)
+        )
+    assert str(caught.value) == (
+        "MCP server 'srv' sent an invalid tools list at tools: "
+        "Input should be a valid list (page 2)"
     )
-    assert [t.name for t in tools] == ["first"]
 
 
 # A stdio server paging five tools two at a time, which exits while answering a

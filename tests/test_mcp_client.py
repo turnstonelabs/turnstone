@@ -20,6 +20,7 @@ import pytest
 from tests.conftest import _drain_background, _run_on_loop, _seed_static_state
 from turnstone.core.mcp_client import (
     _MAX_RESOURCES_PER_SERVER,
+    InvalidCatalogError,
     MCPClientManager,
     _db_servers_to_config,
     _is_dead_transport,
@@ -4800,6 +4801,25 @@ class TestReconnectSync:
             result = mgr.reconnect_sync("srv")
         assert result["connected"] is False
         assert "handshake failed" in result["error"]
+        assert mgr.get_server_status("srv")["error"] == "RuntimeError: handshake failed"
+
+    def test_reconnect_resets_the_health_loop_clock(self, running_loop_mgr):
+        """An operator reconnect that fails for an ordinary reason leaves no earlier
+        schedule (an invalid catalog's 5-minute retry) holding back the health loop."""
+        mgr, _loop, _thread = running_loop_mgr
+        mgr._static_reconnect_next["srv"] = time.monotonic() + 300.0
+        mgr._static_reconnect_attempt["srv"] = 10
+
+        async def _connect_one_locked(name: str, _cfg: dict[str, Any]) -> None:
+            raise ConnectionError("still restarting")
+
+        with (
+            patch.object(mgr, "_connect_one_locked", side_effect=_connect_one_locked),
+            patch.object(mgr, "_pre_close_streams", new=AsyncMock()),
+        ):
+            mgr.reconnect_sync("srv")
+        assert "srv" not in mgr._static_reconnect_next
+        assert "srv" not in mgr._static_reconnect_attempt
 
     def test_reconnect_failure_clears_stale_catalog(self, running_loop_mgr):
         # bug-2: when _connect_one fails mid-reconnect, the per-server
@@ -4835,6 +4855,31 @@ class TestReconnectSync:
         assert srv_state.resources == []
         assert srv_state.prompts == []
         assert "mcp__srv__t" not in mgr._tool_map
+
+    def test_invalid_catalog_withdraws_kept_catalog_and_syncs_prompts(self) -> None:
+        """An invalid catalog withdraws the last good catalog and syncs the prompt
+        templates at once (#1224); any other connect failure keeps both, so a
+        dispatch can still trigger the reconnect."""
+        mgr = MCPClientManager({"srv": {"type": "stdio", "command": "echo"}})
+        _seed_static_state(
+            mgr,
+            "srv",
+            tools=[_fake_openai_tool("mcp__srv__t")],
+            prompts=[_fake_prompt_dict(server="srv")],
+        )
+        mgr._rebuild_tools()
+        mgr._rebuild_prompts()
+
+        with patch.object(mgr, "sync_prompts_to_storage") as sync:
+            mgr._record_connect_failure("srv", ConnectionError("refused"), breaker=True)
+            kept = (mgr.is_mcp_tool("mcp__srv__t"), len(mgr._static_servers["srv"].prompts))
+            mgr._record_connect_failure("srv", InvalidCatalogError("bad tool"), breaker=True)
+
+        assert kept == (True, 1)
+        assert not mgr.is_mcp_tool("mcp__srv__t")
+        assert mgr._static_servers["srv"].prompts == []
+        sync.assert_called_once_with()
+        assert mgr._consecutive_failures.get("srv") == 1  # the ConnectionError only
 
     def test_reconnect_preserves_static_state_identity(self, running_loop_mgr):
         # q-3: PR #296 invariant 5 — _static_servers[name] must be the SAME
@@ -5689,7 +5734,9 @@ class TestStaticHealthLoop:
     def test_dispatch_reconnect_real_failure_records_breaker_once(self, running_loop_mgr) -> None:
         """A REAL connect failure through the dispatch path advances the breaker
         exactly ONCE — recorded inside _ensure_static_connected; the sync
-        boundary must not double-record the same outcome."""
+        boundary must not double-record the same outcome. The failure also
+        reaches the server's status, which a reconnect after a healthy start
+        once left empty."""
         mgr, loop, _ = running_loop_mgr
         _seed_static_state(mgr, "srv", session=None)
 
@@ -5702,6 +5749,7 @@ class TestStaticHealthLoop:
         ):
             mgr._cb_auto_reconnect("srv")
         assert mgr._consecutive_failures.get("srv") == 1
+        assert mgr.get_server_status("srv")["error"] == "ConnectionError: refused"
 
     def test_dispatch_reconnect_does_not_resurrect_removed_server(self, running_loop_mgr) -> None:
         """Review finding [2]: a dispatch racing remove_server_sync must not
