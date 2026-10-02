@@ -39,6 +39,14 @@ frozen.
 
 ### Changed
 
+- **Containers run Turnstone under an init process.** The image's entrypoint is now `tini`, and
+  the Helm chart's server and console pods set `shareProcessNamespace: true`, so the pod's
+  pause container is PID 1. Either one reaps orphaned processes, such as the helpers stdio MCP
+  servers leave behind, which Turnstone as PID 1 left as zombies. Turnstone now handles
+  SIGTERM in containers as it already does elsewhere: it shuts down as before, but the
+  container's exit code on `docker stop` or pod termination is 143 rather than 0. Overriding
+  the image entrypoint (`docker run --entrypoint ...`) bypasses `tini`.
+
 - **Shared model completion recovery.** Conversations, task agents, summaries, utilities,
   judges, and perception share a bounded retry allowance for empty responses and transient
   response failures. Task, summary, utility, judge, and perception calls also spend it on
