@@ -19,9 +19,12 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import contextlib
+import contextvars
 import gc
 import json
+import os
 import random
+import signal
 import threading
 import time
 import urllib.parse
@@ -34,6 +37,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 import anyio
 import httpx
+import mcp.client.stdio as mcp_stdio
 import mcp.types as mcp_types
 from mcp import ClientSession, McpError, StdioServerParameters
 from mcp.client.stdio import stdio_client
@@ -101,6 +105,88 @@ def _validate_oauth_user_url(url: str) -> None:
     raise ValueError(
         "MCP servers with auth_type='oauth_user' must use https:// (loopback http:// excepted)"
     )
+
+
+# ---------------------------------------------------------------------------
+# stdio server process groups
+# ---------------------------------------------------------------------------
+
+# The SDK starts each stdio server in a new session, so the server's pid is also
+# its process group id. The SDK kills that group only when the server ignores its
+# closed stdin; a server that exits cleanly, the correct response, leaves every
+# helper it started running (#1226). The group id stays reserved while any member
+# lives, so the transport owner stops what is left once ``stdio_client`` exits.
+# Nothing public exposes the pid: the owner sets a sink in its context while it
+# enters ``stdio_client``, and the SDK's spawn function, wrapped below, records
+# into it. Elsewhere the sink is unset and the SDK behaves as shipped.
+_stdio_server_pids: contextvars.ContextVar[list[int] | None] = contextvars.ContextVar(
+    "_stdio_server_pids", default=None
+)
+# How long helpers get to exit on SIGTERM before SIGKILL. The server's own window
+# is the SDK's, and has passed by the time this one starts.
+_STDIO_GROUP_GRACE_S = 1.0
+_STDIO_GROUP_POLL_S = 0.05
+
+
+def _install_stdio_pid_recorder() -> None:
+    if os.name != "posix":
+        return  # the SDK's Windows Job Object already ends the whole tree
+    # Private SDK name, unchanged from 1.30 through 2.2. If it goes, helpers leak
+    # as before; test_mcp_stdio_process_group fails rather than this import.
+    spawn = getattr(mcp_stdio, "_create_platform_compatible_process", None)
+    if spawn is None:
+        log.warning("MCP SDK stdio spawn hook not found; server helpers may outlive servers")
+        return
+
+    async def _recording_spawn(*args: Any, **kwargs: Any) -> Any:
+        process = await spawn(*args, **kwargs)
+        sink = _stdio_server_pids.get()
+        if sink is not None:
+            sink.append(process.pid)
+        return process
+
+    mcp_stdio._create_platform_compatible_process = _recording_spawn
+
+
+_install_stdio_pid_recorder()
+
+
+def _signal_probe(send: Callable[[int, int], None], target: int) -> bool:
+    """Probe with signal 0; only ESRCH proves *target* is gone."""
+    try:
+        send(target, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        pass  # processes we may not signal still count
+    return True
+
+
+def _server_leftovers_alive(pgid: int) -> bool:
+    """Whether a reaped stdio server's process group still has members.
+
+    The SDK reaps the server before ``stdio_client`` exits, and the id cannot be
+    reused while any member lives. A live process holding the server's pid
+    therefore means the group emptied and the id now belongs to someone else.
+    """
+    return _signal_probe(os.killpg, pgid) and not _signal_probe(os.kill, pgid)
+
+
+async def _stop_stdio_server_group(pgid: int) -> None:
+    """SIGTERM what is left of a stdio server's group, then SIGKILL after the grace."""
+    if not _server_leftovers_alive(pgid):
+        return
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        os.killpg(pgid, signal.SIGTERM)
+    deadline = time.monotonic() + _STDIO_GROUP_GRACE_S
+    try:
+        while _server_leftovers_alive(pgid) and time.monotonic() < deadline:
+            await asyncio.sleep(_STDIO_GROUP_POLL_S)
+    finally:
+        # Also when cancelled mid-grace: escalate now, never leave them running.
+        if _server_leftovers_alive(pgid):
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.killpg(pgid, signal.SIGKILL)
 
 
 # ---------------------------------------------------------------------------
@@ -2203,9 +2289,12 @@ class MCPClientManager:
         reach it to ``aclose()`` cross-task. Connect-phase failures are
         delivered through *ready*; post-ready death is observed by the
         done-callback (:meth:`_on_static_owner_death`), which evicts the
-        session for the health loop / next dispatch to reconnect.
+        session for the health loop / next dispatch to reconnect. Once the
+        transport has unwound, on every path, whatever a stdio server left in
+        its process group is stopped (:func:`_stop_stdio_server_group`).
         """
         state = self._ensure_static_state(name)
+        server_pids: list[int] = []  # recorded by the SDK spawn hook
         try:
             async with AsyncExitStack() as stack:
                 transport = cfg.get("type", "stdio")
@@ -2223,8 +2312,14 @@ class MCPClientManager:
                         args=cfg.get("args", []),
                         env=env,
                     )
-                    async with asyncio.timeout(self._CONNECT_TIMEOUT):
-                        read, write = await stack.enter_async_context(stdio_client(params))
+                    # Set only while the SDK spawns, so no task started later
+                    # from this context can record into it.
+                    sink = _stdio_server_pids.set(server_pids)
+                    try:
+                        async with asyncio.timeout(self._CONNECT_TIMEOUT):
+                            read, write = await stack.enter_async_context(stdio_client(params))
+                    finally:
+                        _stdio_server_pids.reset(sink)
                 # Stash stream refs so _pre_close_streams can unblock the
                 # SDK's transport tasks promptly during teardown (SDK #2147).
                 state.streams = (read, write)
@@ -2276,6 +2371,8 @@ class MCPClientManager:
                 )
                 with contextlib.suppress(BaseException):
                     ready.exception()  # mark retrieved: the waiter may be gone
+            for pgid in server_pids:
+                await _stop_stdio_server_group(pgid)
 
     def _on_static_owner_death(self, name: str, task: asyncio.Task[None]) -> None:
         """Done-callback for a transport owner: observe UNREQUESTED death.
