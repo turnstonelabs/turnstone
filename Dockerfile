@@ -18,9 +18,10 @@ RUN rm -f /etc/dpkg/dpkg.cfg.d/docker
 # per-line, per-file, and per-filesize so pathological inputs (minified
 # bundles, training-data JSONL with multi-MB single records) can't OOM us.
 # ffmpeg transcodes omni STT uploads (browser webm/opus) to the 16 kHz mono
-# WAV the omni chat-audio lane decodes.
+# WAV the omni chat-audio lane decodes. tini is the container's PID 1 (see
+# ENTRYPOINT).
 RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends \
-    libpq5 git curl jq man-db manpages procps file ripgrep ffmpeg \
+    libpq5 git curl jq man-db manpages procps file ripgrep ffmpeg tini \
     && rm -rf /var/lib/apt/lists/*
 
 # Node.js LTS (for npx-based MCP servers like @modelcontextprotocol/server-github)
@@ -69,7 +70,9 @@ ENV TURNSTONE_WORKSPACE=/workspace
 
 USER turnstone
 
-ENTRYPOINT ["entrypoint.sh"]
+# tini as PID 1 reaps orphaned processes, such as the helpers a stdio MCP server
+# leaves behind, and forwards signals to the service.
+ENTRYPOINT ["tini", "--", "entrypoint.sh"]
 
 # Default command (overridden per service in compose.yaml)
 CMD ["turnstone-server", "--host", "0.0.0.0", "--port", "8080"]

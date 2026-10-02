@@ -29,6 +29,9 @@ spec:
         app.kubernetes.io/component: console
     spec:
       serviceAccountName: {{ include "turnstone.serviceAccountName" . }}
+      # The pause container becomes PID 1 and reaps orphaned processes, such as the
+      # helpers a stdio MCP server leaves behind; Turnstone as PID 1 never would.
+      shareProcessNamespace: true
       {{- with .Values.console.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
