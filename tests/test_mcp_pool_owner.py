@@ -20,6 +20,7 @@ from contextlib import asynccontextmanager
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import mcp.types as mcp_types
 import pytest
 
 from turnstone.core.mcp_client import MCPClientManager, PoolEntryState, _AuthCapture
@@ -88,7 +89,7 @@ def _make_pool_session_mock() -> AsyncMock:
     session.initialize = AsyncMock()
     # None caps → resources/prompts discovery is skipped; only list_tools runs.
     session.get_server_capabilities = MagicMock(return_value=None)
-    session.list_tools = AsyncMock(return_value=MagicMock(tools=[]))
+    session.list_tools = AsyncMock(return_value=mcp_types.ListToolsResult(tools=[]))
     return session
 
 
@@ -197,7 +198,7 @@ class TestPoolTransportOwnerLifecycle:
 
         discovery_parked = asyncio.Event()
 
-        async def _parked_list_tools() -> Any:
+        async def _parked_list_tools(*, params: Any = None) -> Any:
             discovery_parked.set()
             await asyncio.sleep(3600)  # the transport never answers
 

@@ -53,17 +53,17 @@ def _dispatch_stub(mock_future: MagicMock) -> Any:
     return _rct
 
 
-def _fake_mcp_tool(name: str = "search", description: str = "Search stuff") -> MagicMock:
-    """Create a mock MCP tool object matching the SDK's Tool type."""
-    tool = MagicMock()
-    tool.name = name
-    tool.description = description
-    tool.inputSchema = {
-        "type": "object",
-        "properties": {"query": {"type": "string"}},
-        "required": ["query"],
-    }
-    return tool
+def _fake_mcp_tool(name: str = "search", description: str = "Search stuff") -> mcp_types.Tool:
+    """Create an SDK tool with a one-argument input schema."""
+    return mcp_types.Tool(
+        name=name,
+        description=description,
+        inputSchema={
+            "type": "object",
+            "properties": {"query": {"type": "string"}},
+            "required": ["query"],
+        },
+    )
 
 
 def _fake_openai_tool(name: str = "mcp__test__search") -> dict[str, Any]:
@@ -87,14 +87,9 @@ def _fake_mcp_resource(
     name: str = "readme",
     description: str = "Project readme",
     mime_type: str = "text/plain",
-) -> MagicMock:
-    """Create a mock MCP Resource object matching the SDK's Resource type."""
-    res = MagicMock()
-    res.uri = uri
-    res.name = name
-    res.description = description
-    res.mimeType = mime_type
-    return res
+) -> mcp_types.Resource:
+    """Create an SDK resource."""
+    return mcp_types.Resource(uri=uri, name=name, description=description, mimeType=mime_type)
 
 
 def _fake_resource_dict(
@@ -118,27 +113,22 @@ def _fake_mcp_prompt(
     name: str = "code_review",
     description: str = "Generate a code review",
     arguments: list[dict[str, Any]] | None = None,
-) -> MagicMock:
-    """Create a mock MCP Prompt object matching the SDK's Prompt type."""
-    prompt = MagicMock()
-    prompt.name = name
-    prompt.description = description
+) -> mcp_types.Prompt:
+    """Create an SDK prompt; it takes one required ``language`` argument by default."""
     if arguments is None:
-        arg = MagicMock()
-        arg.name = "language"
-        arg.description = "Programming language"
-        arg.required = True
-        prompt.arguments = [arg]
-    else:
-        mock_args = []
-        for a in arguments:
-            arg = MagicMock()
-            arg.name = a["name"]
-            arg.description = a.get("description", "")
-            arg.required = a.get("required", False)
-            mock_args.append(arg)
-        prompt.arguments = mock_args
-    return prompt
+        arguments = [{"name": "language", "description": "Programming language", "required": True}]
+    return mcp_types.Prompt(
+        name=name,
+        description=description,
+        arguments=[
+            mcp_types.PromptArgument(
+                name=a["name"],
+                description=a.get("description", ""),
+                required=a.get("required", False),
+            )
+            for a in arguments
+        ],
+    )
 
 
 def _fake_prompt_dict(
@@ -1060,25 +1050,24 @@ class TestRefreshServer:
     ) -> None:
         """Add empty list_resources/list_prompts mocks so _refresh_server works."""
         _seed_static_state(mgr, server_name, supports_resources=True, supports_prompts=True)
-        empty_res = MagicMock()
-        empty_res.resources = []
-        mock_session.list_resources = AsyncMock(return_value=empty_res)
-        empty_tmpl = MagicMock()
-        empty_tmpl.resourceTemplates = []
-        mock_session.list_resource_templates = AsyncMock(return_value=empty_tmpl)
-        empty_prompts = MagicMock()
-        empty_prompts.prompts = []
-        mock_session.list_prompts = AsyncMock(return_value=empty_prompts)
+        mock_session.list_resources = AsyncMock(
+            return_value=mcp_types.ListResourcesResult(resources=[])
+        )
+        mock_session.list_resource_templates = AsyncMock(
+            return_value=mcp_types.ListResourceTemplatesResult(resourceTemplates=[])
+        )
+        mock_session.list_prompts = AsyncMock(return_value=mcp_types.ListPromptsResult(prompts=[]))
 
     def test_refresh_detects_added_tools(self):
         async def _run() -> None:
             mgr = MCPClientManager({})
             mock_session = MagicMock()
-            mock_result = MagicMock()
-            mock_result.tools = [
-                _fake_mcp_tool("search"),
-                _fake_mcp_tool("create"),  # new tool
-            ]
+            mock_result = mcp_types.ListToolsResult(
+                tools=[
+                    _fake_mcp_tool("search"),
+                    _fake_mcp_tool("create"),  # new tool
+                ]
+            )
             mock_session.list_tools = AsyncMock(return_value=mock_result)
             self._add_empty_resource_prompt_mocks(mgr, "github", mock_session)
             _seed_static_state(
@@ -1100,8 +1089,7 @@ class TestRefreshServer:
         async def _run() -> None:
             mgr = MCPClientManager({})
             mock_session = MagicMock()
-            mock_result = MagicMock()
-            mock_result.tools = []  # all tools removed
+            mock_result = mcp_types.ListToolsResult(tools=[])  # all tools removed
             mock_session.list_tools = AsyncMock(return_value=mock_result)
             self._add_empty_resource_prompt_mocks(mgr, "github", mock_session)
             _seed_static_state(
@@ -1123,8 +1111,7 @@ class TestRefreshServer:
         async def _run() -> None:
             mgr = MCPClientManager({})
             mock_session = MagicMock()
-            mock_result = MagicMock()
-            mock_result.tools = [_fake_mcp_tool("search")]
+            mock_result = mcp_types.ListToolsResult(tools=[_fake_mcp_tool("search")])
             mock_session.list_tools = AsyncMock(return_value=mock_result)
             self._add_empty_resource_prompt_mocks(mgr, "github", mock_session)
             _seed_static_state(
@@ -1159,12 +1146,14 @@ class TestLastRefreshTracking:
     @staticmethod
     def _seed_minimal(mgr: MCPClientManager, name: str = "srv") -> MagicMock:
         mock_session = MagicMock()
-        mock_session.list_tools = AsyncMock(return_value=MagicMock(tools=[]))
-        mock_session.list_resources = AsyncMock(return_value=MagicMock(resources=[]))
-        mock_session.list_resource_templates = AsyncMock(
-            return_value=MagicMock(resourceTemplates=[])
+        mock_session.list_tools = AsyncMock(return_value=mcp_types.ListToolsResult(tools=[]))
+        mock_session.list_resources = AsyncMock(
+            return_value=mcp_types.ListResourcesResult(resources=[])
         )
-        mock_session.list_prompts = AsyncMock(return_value=MagicMock(prompts=[]))
+        mock_session.list_resource_templates = AsyncMock(
+            return_value=mcp_types.ListResourceTemplatesResult(resourceTemplates=[])
+        )
+        mock_session.list_prompts = AsyncMock(return_value=mcp_types.ListPromptsResult(prompts=[]))
         # Config present: outcome writes are config-gated (a removed server
         # must leave no stale row), so the tracked server must be configured.
         mgr._server_configs[name] = {"type": "stdio", "command": "x"}
@@ -2277,12 +2266,12 @@ class TestMCPResources:
 
             # Mock the re-fetch returning a new resource
             new_res = _fake_mcp_resource("file:///new", "new")
-            mock_res_result = MagicMock()
-            mock_res_result.resources = [new_res]
-            mock_session.list_resources = AsyncMock(return_value=mock_res_result)
-            mock_tmpl_result = MagicMock()
-            mock_tmpl_result.resourceTemplates = []
-            mock_session.list_resource_templates = AsyncMock(return_value=mock_tmpl_result)
+            mock_session.list_resources = AsyncMock(
+                return_value=mcp_types.ListResourcesResult(resources=[new_res])
+            )
+            mock_session.list_resource_templates = AsyncMock(
+                return_value=mcp_types.ListResourceTemplatesResult(resourceTemplates=[])
+            )
 
             await mgr._refresh_server_resources("fs")
             resources = mgr.get_resources()
@@ -2620,9 +2609,9 @@ class TestMCPPrompts:
 
             # Mock re-fetch returning a new prompt
             new_prompt = _fake_mcp_prompt("new_prompt", "A new prompt")
-            mock_prompt_result = MagicMock()
-            mock_prompt_result.prompts = [new_prompt]
-            mock_session.list_prompts = AsyncMock(return_value=mock_prompt_result)
+            mock_session.list_prompts = AsyncMock(
+                return_value=mcp_types.ListPromptsResult(prompts=[new_prompt])
+            )
 
             await mgr._refresh_server_prompts("tmpl")
             prompts = mgr.get_prompts()
@@ -3864,7 +3853,7 @@ class TestStaticNotificationRefresh:
         mgr = MCPClientManager({})
         mgr._CONNECT_TIMEOUT = 0.05  # instance override of the class constant
 
-        async def _hang() -> Any:
+        async def _hang(*, params: Any = None) -> Any:
             await asyncio.sleep(30)
 
         session = MagicMock()
@@ -3909,19 +3898,13 @@ class TestStaticNotificationRefresh:
         pool twin — a misbehaving server's push must not balloon the
         shared node's merged catalogs."""
         mgr = MCPClientManager({})
-
-        def _resource(i: int) -> MagicMock:
-            r = MagicMock()
-            r.uri = f"file:///r/{i}"
-            r.name = f"r{i}"
-            r.description = ""
-            r.mimeType = "text/plain"
-            return r
-
-        res_result = MagicMock()
-        res_result.resources = [_resource(i) for i in range(_MAX_RESOURCES_PER_SERVER + 50)]
-        tmpl_result = MagicMock()
-        tmpl_result.resourceTemplates = []
+        res_result = mcp_types.ListResourcesResult(
+            resources=[
+                _fake_mcp_resource(f"file:///r/{i}", f"r{i}", "")
+                for i in range(_MAX_RESOURCES_PER_SERVER + 50)
+            ]
+        )
+        tmpl_result = mcp_types.ListResourceTemplatesResult(resourceTemplates=[])
         session = MagicMock()
         session.list_resources = AsyncMock(return_value=res_result)
         session.list_resource_templates = AsyncMock(return_value=tmpl_result)
@@ -4549,7 +4532,7 @@ class TestStaticNotificationRefresh:
         mgr = MCPClientManager({})
         sibling_events: list[str] = []
 
-        async def _hanging_resources() -> Any:
+        async def _hanging_resources(*, params: Any = None) -> Any:
             try:
                 await asyncio.sleep(30)  # would mask the real error as TimeoutError
             except asyncio.CancelledError:
@@ -4557,7 +4540,7 @@ class TestStaticNotificationRefresh:
                 raise
             sibling_events.append("completed")
 
-        async def _fast_fail_templates() -> Any:
+        async def _fast_fail_templates(*, params: Any = None) -> Any:
             raise RuntimeError("method not found")
 
         session = MagicMock()

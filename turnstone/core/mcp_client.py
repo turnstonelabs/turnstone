@@ -33,7 +33,7 @@ from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 import anyio
 import httpx
@@ -47,6 +47,7 @@ from mcp.shared._httpx_utils import (
     MCP_DEFAULT_TIMEOUT,
     McpHttpClientFactory,
 )
+from pydantic import ValidationError
 
 from turnstone.core.config import load_config
 from turnstone.core.log import get_logger
@@ -207,14 +208,13 @@ async def _stop_stdio_server_group(pgid: int) -> None:
 # 1:1 against the new entry point when we migrate.
 
 
-# Defensive cap on the number of tools we accept from any single MCP
-# server's ``tools/list`` response. Real servers expose at most a few
-# dozen tools; a misconfigured or hostile upstream returning thousands
-# would amplify both memory (one OpenAI tool dict per entry) and
-# downstream BM25 reindex cost. Mirrors the ``_MAX_ERROR_LEN`` /
-# ``MAX_INSUFFICIENT_SCOPE_REPORTED`` defensive ceilings: we truncate
-# rather than reject so partial visibility beats zero visibility, and
-# emit a warning so operators can investigate.
+# Defensive cap on the number of tools we accept from any single MCP server's ``tools/list``
+# catalog, across all its pages; it also bounds how many pages are read (see ``_list_catalog``).
+# Real servers expose at most a few dozen tools; a misconfigured or hostile upstream returning
+# thousands would amplify both memory (one OpenAI tool dict per entry) and downstream BM25 reindex
+# cost. Mirrors the ``_MAX_ERROR_LEN`` / ``MAX_INSUFFICIENT_SCOPE_REPORTED`` defensive ceilings: we
+# truncate rather than reject so partial visibility beats zero visibility, and emit a warning so
+# operators can investigate.
 _MAX_TOOLS_PER_SERVER = 1000
 
 # Defensive caps mirroring ``_MAX_TOOLS_PER_SERVER`` for the resource and
@@ -228,6 +228,11 @@ _MAX_TOOLS_PER_SERVER = 1000
 _MAX_RESOURCES_PER_SERVER = 1000
 _MAX_RESOURCE_TEMPLATES_PER_SERVER = 1000
 _MAX_PROMPTS_PER_SERVER = 1000
+
+# Follow-up pages in a row that may add nothing new before a catalog walk stops. MCP allows an
+# empty page that still carries a cursor (a server can filter each page per caller), so a few are
+# read past; a run this long is taken for a server that ignores its cursor or pages forever.
+_MAX_PAGES_WITHOUT_PROGRESS = 10
 
 # Upper bound on concurrent per-user pool primes at ChatSession start. Servers
 # are warmed in parallel (so one slow/unreachable upstream can't stall the rest)
@@ -515,118 +520,235 @@ def _mcp_to_openai(server_name: str, tool: Any) -> dict[str, Any]:
     }
 
 
-def _cap_server_tools(server_name: str, tools: list[Any]) -> list[Any]:
-    """Apply ``_MAX_TOOLS_PER_SERVER`` cap with operator-visible warning.
+class _ListPage[P](Protocol):
+    """One SDK list method, such as ``ClientSession.list_tools``."""
 
-    Identity for inputs at or below the cap (no copy); slice + warn on
-    overflow. Caller is responsible for converting the returned list to
-    the OpenAI shape via :func:`_mcp_to_openai`.
+    def __call__(self, *, params: mcp_types.PaginatedRequestParams | None) -> Awaitable[P]:
+        """Request the page after ``params.cursor``, or the first page when ``params`` is None."""
+        ...
+
+
+async def _list_catalog[P: mcp_types.PaginatedResult, T](
+    server_name: str,
+    kind: str,
+    list_page: _ListPage[P],
+    items_of: Callable[[P], list[T]],
+    key_of: Callable[[T], str],
+    cap: int,
+    *,
+    missing_ok: bool = False,
+) -> list[T]:
+    """Every item one catalog lists, across its pages, deduplicated and capped at *cap*.
+
+    Follows ``nextCursor`` until the server stops returning one. An empty cursor ends the walk
+    too, because sending it back would ask for the first page again. An item listed twice is
+    published once, with its last definition: the SDK caches the last output schema it lists for a
+    tool, so the definition advertised is the one ``call_tool`` validates against.
+
+    A misbehaving server is stopped with a warning, and every stop keeps what was collected:
+
+    * at *cap* items, when the list is longer or a further page remains;
+    * after ``_MAX_PAGES_WITHOUT_PROGRESS`` follow-up pages in a row add nothing new. MCP allows
+      an empty page that still carries a cursor, so a shorter run is read past. Every other page
+      adds an item, so with the item cap this bounds the number of requests;
+    * on a cursor already sent once, which would make the walk cycle;
+    * on a follow-up page the server answers with a JSON-RPC error or a result that does not
+      parse. An error that :func:`_is_dead_transport` reads as a dead transport is no answer,
+      and fails the walk like any other discovery request.
+
+    So a catalog is never published shorter than its first page, which is all that was published
+    before catalogs were paged: partial visibility beats zero visibility. The cost is that a later
+    page failing during a refresh publishes a shorter catalog than the one it replaces, until the
+    next refresh or reconnect reads it whole.
+
+    With *missing_ok*, METHOD_NOT_FOUND on the first page reads as an empty catalog; any other
+    first-page error propagates. The walk has no deadline of its own: the refresh and pool paths
+    run it under ``asyncio.timeout`` and the static reconnect and add paths under an attempt
+    timeout, while the static connect at startup is unbounded, as its single list call was.
     """
-    if len(tools) <= _MAX_TOOLS_PER_SERVER:
-        return tools
-    log.warning(
-        "MCP server '%s' returned %d tools — truncating to %d "
-        "(_MAX_TOOLS_PER_SERVER cap). Misconfigured or hostile upstream?",
+    try:
+        page = await list_page(params=None)
+    except McpError as exc:
+        if not missing_ok or exc.error.code != mcp_types.METHOD_NOT_FOUND:
+            raise
+        log.debug(
+            "MCP server '%s' does not implement the %s list; treating it as empty",
+            server_name,
+            kind,
+        )
+        return []
+    collected: dict[str, T] = {}
+    sent: set[str] = set()
+    stale = 0  # follow-up pages in a row that added nothing new
+    while True:
+        before = len(collected)
+        for item in items_of(page):
+            collected[key_of(item)] = item
+        cursor = page.nextCursor
+        if len(collected) > cap or (cursor and len(collected) == cap):
+            log.warning(
+                "MCP server '%s' lists %d or more %s; keeping the first %d. "
+                "Misconfigured or hostile upstream?",
+                server_name,
+                cap,
+                kind,
+                cap,
+            )
+            break
+        if not cursor:
+            break
+        stale = stale + 1 if sent and len(collected) == before else 0
+        if stale >= _MAX_PAGES_WITHOUT_PROGRESS:
+            log.warning(
+                "MCP server '%s' sent %d pages of %s in a row with nothing new; "
+                "keeping the %d listed",
+                server_name,
+                stale,
+                kind,
+                len(collected),
+            )
+            break
+        if cursor in sent:
+            log.warning(
+                "MCP server '%s' repeated a cursor while listing %s; keeping the %d listed",
+                server_name,
+                kind,
+                len(collected),
+            )
+            break
+        sent.add(cursor)
+        try:
+            page = await list_page(params=mcp_types.PaginatedRequestParams(cursor=cursor))
+        except (McpError, ValidationError) as exc:
+            # The SDK fails a request in flight on a dying transport with an McpError too
+            # (CONNECTION_CLOSED, or the synthesized "Session terminated"); that is no answer
+            # from the server, so discovery fails as it would on any other request.
+            if _is_dead_transport(exc):
+                raise
+            log.warning(
+                "MCP server '%s' failed a later page of %s (%s); keeping the %d listed",
+                server_name,
+                kind,
+                f"JSON-RPC error {exc.error.code}"
+                if isinstance(exc, McpError)
+                else "invalid result",
+                len(collected),
+            )
+            break
+    return list(collected.values())[:cap]
+
+
+async def _list_all_tools(session: ClientSession, server_name: str) -> list[mcp_types.Tool]:
+    """Every tool *session* lists; see :func:`_list_catalog`."""
+    return await _list_catalog(
         server_name,
-        len(tools),
+        "tools",
+        session.list_tools,
+        lambda page: page.tools,
+        lambda tool: tool.name,
         _MAX_TOOLS_PER_SERVER,
     )
-    return tools[:_MAX_TOOLS_PER_SERVER]
 
 
-def _cap_server_resources(server_name: str, resources: list[Any]) -> list[Any]:
-    """Apply ``_MAX_RESOURCES_PER_SERVER`` cap with operator-visible warning.
-
-    Identity for inputs at or below the cap (no copy); slice + warn on
-    overflow. Mirrors :func:`_cap_server_tools` for the resource list path.
-    """
-    if len(resources) <= _MAX_RESOURCES_PER_SERVER:
-        return resources
-    log.warning(
-        "MCP server '%s' returned %d resources — truncating to %d "
-        "(_MAX_RESOURCES_PER_SERVER cap). Misconfigured or hostile upstream?",
+async def _list_all_prompts(session: ClientSession, server_name: str) -> list[mcp_types.Prompt]:
+    """Every prompt *session* lists; see :func:`_list_catalog`."""
+    return await _list_catalog(
         server_name,
-        len(resources),
-        _MAX_RESOURCES_PER_SERVER,
-    )
-    return resources[:_MAX_RESOURCES_PER_SERVER]
-
-
-def _cap_server_resource_templates(server_name: str, templates: list[Any]) -> list[Any]:
-    """Apply ``_MAX_RESOURCE_TEMPLATES_PER_SERVER`` cap with operator-visible warning.
-
-    Identity for inputs at or below the cap (no copy); slice + warn on
-    overflow. Mirrors :func:`_cap_server_resources` for the resource
-    template list path (RFC §3.2 templates are a separate catalog from
-    concrete resources but share the per-server amplification risk).
-    """
-    if len(templates) <= _MAX_RESOURCE_TEMPLATES_PER_SERVER:
-        return templates
-    log.warning(
-        "MCP server '%s' returned %d resource templates — truncating to %d "
-        "(_MAX_RESOURCE_TEMPLATES_PER_SERVER cap). Misconfigured or hostile upstream?",
-        server_name,
-        len(templates),
-        _MAX_RESOURCE_TEMPLATES_PER_SERVER,
-    )
-    return templates[:_MAX_RESOURCE_TEMPLATES_PER_SERVER]
-
-
-def _cap_server_prompts(server_name: str, prompts: list[Any]) -> list[Any]:
-    """Apply ``_MAX_PROMPTS_PER_SERVER`` cap with operator-visible warning.
-
-    Identity for inputs at or below the cap (no copy); slice + warn on
-    overflow. Mirrors :func:`_cap_server_tools` for the prompt list path.
-    """
-    if len(prompts) <= _MAX_PROMPTS_PER_SERVER:
-        return prompts
-    log.warning(
-        "MCP server '%s' returned %d prompts — truncating to %d "
-        "(_MAX_PROMPTS_PER_SERVER cap). Misconfigured or hostile upstream?",
-        server_name,
-        len(prompts),
+        "prompts",
+        session.list_prompts,
+        lambda page: page.prompts,
+        lambda prompt: prompt.name,
         _MAX_PROMPTS_PER_SERVER,
     )
-    return prompts[:_MAX_PROMPTS_PER_SERVER]
 
 
-async def _list_resources_compatible(session: Any, server_name: str) -> Any:
-    """List concrete resources, treating an unsupported method as empty.
+async def _list_all_resources(session: ClientSession, server_name: str) -> list[mcp_types.Resource]:
+    """Every concrete resource *session* lists, or none if it lacks the method.
 
-    MCP exposes one aggregate ``resources`` capability for both concrete
-    resources and resource templates. Servers may legitimately implement only
-    one of the two list methods, so the capability bit alone cannot tell us
-    which request is supported. Only the protocol's exact METHOD_NOT_FOUND code
-    is normalized; every other error remains a real discovery failure.
+    MCP exposes one aggregate ``resources`` capability for both concrete resources and resource
+    templates. Servers may legitimately implement only one of the two list methods, so the
+    capability bit alone cannot tell us which request is supported; hence ``missing_ok``, which
+    accepts only the protocol's exact METHOD_NOT_FOUND code.
     """
-    try:
-        return await session.list_resources()
-    except McpError as exc:
-        if exc.error.code != mcp_types.METHOD_NOT_FOUND:
-            raise
-        log.debug(
-            "MCP server '%s' does not implement resources/list; treating it as empty",
-            server_name,
-        )
-        return mcp_types.ListResourcesResult(resources=[])
+    return await _list_catalog(
+        server_name,
+        "resources",
+        session.list_resources,
+        lambda page: page.resources,
+        lambda resource: str(resource.uri),
+        _MAX_RESOURCES_PER_SERVER,
+        missing_ok=True,
+    )
 
 
-async def _list_resource_templates_compatible(session: Any, server_name: str) -> Any:
-    """List resource templates, treating an unsupported method as empty.
+async def _list_all_resource_templates(
+    session: ClientSession, server_name: str
+) -> list[mcp_types.ResourceTemplate]:
+    """Every resource template *session* lists, or none; see :func:`_list_all_resources`."""
+    return await _list_catalog(
+        server_name,
+        "resource templates",
+        session.list_resource_templates,
+        lambda page: page.resourceTemplates,
+        lambda template: template.uriTemplate,
+        _MAX_RESOURCE_TEMPLATES_PER_SERVER,
+        missing_ok=True,
+    )
 
-    See :func:`_list_resources_compatible` for why the aggregate capability
-    requires per-method probing and exact JSON-RPC error classification.
+
+def _resource_entries(
+    server_name: str,
+    resources: list[mcp_types.Resource],
+    templates: list[mcp_types.ResourceTemplate],
+) -> list[dict[str, Any]]:
+    """A server's published resource catalog: its concrete resources, then its templates.
+
+    Templates are catalog-only, flagged ``template``: their URIs hold placeholders, so
+    ``read_resource`` cannot read them directly.
     """
-    try:
-        return await session.list_resource_templates()
-    except McpError as exc:
-        if exc.error.code != mcp_types.METHOD_NOT_FOUND:
-            raise
-        log.debug(
-            "MCP server '%s' does not implement resources/templates/list; treating it as empty",
-            server_name,
-        )
-        return mcp_types.ListResourceTemplatesResult(resourceTemplates=[])
+    entries: list[dict[str, Any]] = [
+        {
+            "uri": str(r.uri),
+            "name": r.name or "",
+            "description": r.description or "",
+            "mimeType": r.mimeType or "",
+            "server": server_name,
+        }
+        for r in resources
+    ]
+    entries.extend(
+        {
+            "uri": str(t.uriTemplate),
+            "name": t.name or "",
+            "description": t.description or "",
+            "mimeType": t.mimeType or "",
+            "server": server_name,
+            "template": True,
+        }
+        for t in templates
+    )
+    return entries
+
+
+def _prompt_entries(server_name: str, prompts: list[mcp_types.Prompt]) -> list[dict[str, Any]]:
+    """A server's published prompt catalog, each prompt named ``mcp__{server}__{prompt}``."""
+    return [
+        {
+            "name": f"mcp__{server_name}__{p.name}",
+            "original_name": p.name,
+            "server": server_name,
+            "description": p.description or "",
+            "arguments": [
+                {
+                    "name": a.name,
+                    "description": a.description or "",
+                    "required": a.required or False,
+                }
+                for a in (p.arguments or [])
+            ],
+        }
+        for p in prompts
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -2343,69 +2465,27 @@ class MCPClientManager:
             # mid-discovery cancels the OWNER, not us — ``_await_owner_discovery``
             # races the owner so that death surfaces as a prompt ConnectionError
             # instead of hanging to the caller-side attempt timeout.
-            result = await self._await_owner_discovery(owner, session.list_tools())
-            capped = _cap_server_tools(name, result.tools)
-            server_tools: list[dict[str, Any]] = [_mcp_to_openai(name, tool) for tool in capped]
+            tools = await self._await_owner_discovery(owner, _list_all_tools(session, name))
+            server_tools: list[dict[str, Any]] = [_mcp_to_openai(name, tool) for tool in tools]
 
             # Discover resources. The protocol advertises the pair with one
             # aggregate capability, but either list method may independently be
-            # absent; the compatibility wrappers normalize only -32601.
+            # absent; the list helpers read only -32601 as an empty catalog.
             server_resources: list[dict[str, Any]] = []
             if resources_cap is not None:
-                res_result = await self._await_owner_discovery(
-                    owner, _list_resources_compatible(session, name)
+                resources = await self._await_owner_discovery(
+                    owner, _list_all_resources(session, name)
                 )
-                # Capped like the tools list above (and like the pool twins): a
-                # misbehaving server must not balloon the shared node's merged
-                # catalogs.
-                for r in _cap_server_resources(name, res_result.resources):
-                    server_resources.append(
-                        {
-                            "uri": str(r.uri),
-                            "name": r.name or "",
-                            "description": r.description or "",
-                            "mimeType": r.mimeType or "",
-                            "server": name,
-                        }
-                    )
-                # Templates are catalog-only — not directly readable via
-                # read_resource since they contain URI placeholders.
-                tmpl_result = await self._await_owner_discovery(
-                    owner, _list_resource_templates_compatible(session, name)
+                templates = await self._await_owner_discovery(
+                    owner, _list_all_resource_templates(session, name)
                 )
-                for t in _cap_server_resource_templates(name, tmpl_result.resourceTemplates):
-                    server_resources.append(
-                        {
-                            "uri": str(t.uriTemplate),
-                            "name": t.name or "",
-                            "description": t.description or "",
-                            "mimeType": t.mimeType or "",
-                            "server": name,
-                            "template": True,
-                        }
-                    )
+                server_resources = _resource_entries(name, resources, templates)
 
             # Discover prompts.
             server_prompts: list[dict[str, Any]] = []
             if prompts_cap is not None:
-                prompt_result = await self._await_owner_discovery(owner, session.list_prompts())
-                for p in _cap_server_prompts(name, prompt_result.prompts):
-                    server_prompts.append(
-                        {
-                            "name": f"mcp__{name}__{p.name}",
-                            "original_name": p.name,
-                            "server": name,
-                            "description": p.description or "",
-                            "arguments": [
-                                {
-                                    "name": a.name,
-                                    "description": a.description or "",
-                                    "required": a.required or False,
-                                }
-                                for a in (p.arguments or [])
-                            ],
-                        }
-                    )
+                prompts = await self._await_owner_discovery(owner, _list_all_prompts(session, name))
+                server_prompts = _prompt_entries(name, prompts)
 
             # The owner done-callback can evict the session in the same loop
             # turn that the final discovery call completes. Revalidate the
@@ -2451,7 +2531,7 @@ class MCPClientManager:
         log.info(
             "Connected MCP server '%s' — %d tool(s), %d resource(s), %d prompt(s)%s",
             name,
-            len(result.tools),
+            len(server_tools),
             resource_count,
             prompt_count,
             push_status,
@@ -2968,7 +3048,9 @@ class MCPClientManager:
         # which closes the owner in-task.
         try:
             async with asyncio.timeout(self._CONNECT_TIMEOUT):
-                tools_result = await self._await_owner_discovery(owner, session.list_tools())
+                tools = await self._await_owner_discovery(
+                    owner, _list_all_tools(session, server_name)
+                )
         except asyncio.CancelledError:
             task = asyncio.current_task()
             if task is not None and task.cancelling():
@@ -2983,13 +3065,12 @@ class MCPClientManager:
             await self._teardown_pool_entry(key)
             raise
 
-        capped_tools = _cap_server_tools(server_name, tools_result.tools)
         # STAGED — published to the entry only in the final wiring block
         # below, together with resources/prompts: a mid-discovery
         # failure tears the transport down and must leave the entry's
         # (retained) catalog exactly as it was, never half-updated with
         # the per-user maps still holding the old view.
-        server_tools = [_mcp_to_openai(server_name, tool) for tool in capped_tools]
+        server_tools = [_mcp_to_openai(server_name, tool) for tool in tools]
 
         # Phase 7b — discover resources (capability-gated). Same anyio /
         # ``asyncio.timeout`` invariant as the tool discovery above (R1).
@@ -2997,11 +3078,11 @@ class MCPClientManager:
         if resources_cap is not None:
             try:
                 async with asyncio.timeout(self._CONNECT_TIMEOUT):
-                    # 1-RTT (gather) instead of 2 sequential RTTs — both
-                    # calls share the same timeout budget and target
+                    # Concurrent (gather) rather than sequential — both
+                    # walks share the same timeout budget and target
                     # disjoint catalogs (resources vs. templates), so
                     # ordering is irrelevant.
-                    res_result, tmpl_result = await self._await_owner_discovery(
+                    resources, templates = await self._await_owner_discovery(
                         owner,
                         self._list_resource_pair(session, server_name),
                     )
@@ -3021,34 +3102,16 @@ class MCPClientManager:
                 await self._teardown_pool_entry(key)
                 raise
 
-            for r in _cap_server_resources(server_name, res_result.resources):
-                server_resources.append(
-                    {
-                        "uri": str(r.uri),
-                        "name": r.name or "",
-                        "description": r.description or "",
-                        "mimeType": r.mimeType or "",
-                        "server": server_name,
-                    }
-                )
-            for t in _cap_server_resource_templates(server_name, tmpl_result.resourceTemplates):
-                server_resources.append(
-                    {
-                        "uri": str(t.uriTemplate),
-                        "name": t.name or "",
-                        "description": t.description or "",
-                        "mimeType": t.mimeType or "",
-                        "server": server_name,
-                        "template": True,
-                    }
-                )
+            server_resources = _resource_entries(server_name, resources, templates)
 
         # Phase 7b — discover prompts (capability-gated).
         server_prompts: list[dict[str, Any]] = []
         if prompts_cap is not None:
             try:
                 async with asyncio.timeout(self._CONNECT_TIMEOUT):
-                    prompt_result = await self._await_owner_discovery(owner, session.list_prompts())
+                    prompts = await self._await_owner_discovery(
+                        owner, _list_all_prompts(session, server_name)
+                    )
             except asyncio.CancelledError:
                 task = asyncio.current_task()
                 if task is not None and task.cancelling():
@@ -3065,23 +3128,7 @@ class MCPClientManager:
                 await self._teardown_pool_entry(key)
                 raise
 
-            for p in _cap_server_prompts(server_name, prompt_result.prompts):
-                server_prompts.append(
-                    {
-                        "name": f"mcp__{server_name}__{p.name}",
-                        "original_name": p.name,
-                        "server": server_name,
-                        "description": p.description or "",
-                        "arguments": [
-                            {
-                                "name": a.name,
-                                "description": a.description or "",
-                                "required": a.required or False,
-                            }
-                            for a in (p.arguments or [])
-                        ],
-                    }
-                )
+            server_prompts = _prompt_entries(server_name, prompts)
 
         # Mirror the static commit guard. A transport owner can finish in the
         # same scheduling turn as the final discovery response; never publish
@@ -4280,9 +4327,8 @@ class MCPClientManager:
         # spawned refresh (and the connect lock it holds) forever; the pool
         # sibling (:meth:`_refresh_pool_server_tools`) already complies.
         async with asyncio.timeout(self._CONNECT_TIMEOUT):
-            result = await session.list_tools()
-        capped = _cap_server_tools(name, result.tools)
-        server_tools = [_mcp_to_openai(name, tool) for tool in capped]
+            tools = await _list_all_tools(session, name)
+        server_tools = [_mcp_to_openai(name, tool) for tool in tools]
         new_names = {t["function"]["name"] for t in server_tools}
 
         state.tools = server_tools
@@ -4328,14 +4374,13 @@ class MCPClientManager:
         # the spawned refresh task (and the ``open_lock`` it holds)
         # forever; the resource/prompt siblings already comply.
         async with asyncio.timeout(self._CONNECT_TIMEOUT):
-            result = await session.list_tools()
+            tools = await _list_all_tools(session, server_name)
         if self._user_pool_entries.get(key) is not entry:
             # The entry was replaced (full drop + re-create) while
             # list_tools was in flight — this result belongs to the
             # old entry; publishing it would clobber the new one.
             return [], []
-        capped = _cap_server_tools(server_name, result.tools)
-        server_tools = [_mcp_to_openai(server_name, tool) for tool in capped]
+        server_tools = [_mcp_to_openai(server_name, tool) for tool in tools]
         new_names = {t["function"]["name"] for t in server_tools}
         entry.tools = server_tools
         self._rebuild_user_tool_map(user_id)
@@ -4354,12 +4399,14 @@ class MCPClientManager:
             )
         return added, removed
 
-    async def _list_resource_pair(self, session: Any, server_name: str) -> tuple[Any, Any]:
-        """``list_resources`` + ``list_resource_templates`` in one bounded RTT.
+    async def _list_resource_pair(
+        self, session: ClientSession, server_name: str
+    ) -> tuple[list[mcp_types.Resource], list[mcp_types.ResourceTemplate]]:
+        """Every page of ``list_resources`` and ``list_resource_templates``, concurrently.
 
         The ONE copy of the paired-list protocol for both refresh twins
         (:meth:`_refresh_server_resources` /
-        :meth:`_refresh_pool_server_resources`). Both calls share the
+        :meth:`_refresh_pool_server_resources`). Both walks share the
         timeout budget and target disjoint catalogs (resources vs.
         templates), so ordering is irrelevant.
 
@@ -4386,12 +4433,10 @@ class MCPClientManager:
         task, GC-reaped) rather than held onto.
         """
         async with asyncio.timeout(self._CONNECT_TIMEOUT):
-            res_task = asyncio.create_task(_list_resources_compatible(session, server_name))
-            tmpl_task = asyncio.create_task(
-                _list_resource_templates_compatible(session, server_name)
-            )
+            res_task = asyncio.create_task(_list_all_resources(session, server_name))
+            tmpl_task = asyncio.create_task(_list_all_resource_templates(session, server_name))
             try:
-                res_result, tmpl_result = await asyncio.gather(res_task, tmpl_task)
+                resources, templates = await asyncio.gather(res_task, tmpl_task)
             except BaseException:
                 # First failure (or our own cancellation, incl. the
                 # timeout's): cancel the pair — a done task ignores it —
@@ -4402,7 +4447,7 @@ class MCPClientManager:
                     task.cancel()
                 await self._reap_bounded((res_task, tmpl_task))
                 raise
-            return res_result, tmpl_result
+            return resources, templates
 
     async def _reap_bounded(self, tasks: tuple[asyncio.Task[Any], ...]) -> None:
         """Await already-cancelled *tasks* under a grace deadline.
@@ -4462,33 +4507,12 @@ class MCPClientManager:
         user_id, server_name = key
         old_uris = {r["uri"] for r in (entry.resources or []) if not r.get("template")}
 
-        res_result, tmpl_result = await self._list_resource_pair(session, server_name)
+        resources, templates = await self._list_resource_pair(session, server_name)
         if self._user_pool_entries.get(key) is not entry:
             # Entry replaced mid-flight — stale result, discard.
             return [], []
 
-        server_resources: list[dict[str, Any]] = []
-        for r in _cap_server_resources(server_name, res_result.resources):
-            server_resources.append(
-                {
-                    "uri": str(r.uri),
-                    "name": r.name or "",
-                    "description": r.description or "",
-                    "mimeType": r.mimeType or "",
-                    "server": server_name,
-                }
-            )
-        for t in _cap_server_resource_templates(server_name, tmpl_result.resourceTemplates):
-            server_resources.append(
-                {
-                    "uri": str(t.uriTemplate),
-                    "name": t.name or "",
-                    "description": t.description or "",
-                    "mimeType": t.mimeType or "",
-                    "server": server_name,
-                    "template": True,
-                }
-            )
+        server_resources = _resource_entries(server_name, resources, templates)
 
         new_uris = {r["uri"] for r in server_resources if not r.get("template")}
         entry.resources = server_resources
@@ -4534,29 +4558,12 @@ class MCPClientManager:
         old_names = {p["name"] for p in (entry.prompts or [])}
 
         async with asyncio.timeout(self._CONNECT_TIMEOUT):
-            prompt_result = await session.list_prompts()
+            prompts = await _list_all_prompts(session, server_name)
         if self._user_pool_entries.get(key) is not entry:
             # Entry replaced mid-flight — stale result, discard.
             return [], []
 
-        server_prompts: list[dict[str, Any]] = []
-        for p in _cap_server_prompts(server_name, prompt_result.prompts):
-            server_prompts.append(
-                {
-                    "name": f"mcp__{server_name}__{p.name}",
-                    "original_name": p.name,
-                    "server": server_name,
-                    "description": p.description or "",
-                    "arguments": [
-                        {
-                            "name": a.name,
-                            "description": a.description or "",
-                            "required": a.required or False,
-                        }
-                        for a in (p.arguments or [])
-                    ],
-                }
-            )
+        server_prompts = _prompt_entries(server_name, prompts)
 
         new_names = {p["name"] for p in server_prompts}
         entry.prompts = server_prompts
@@ -5073,32 +5080,9 @@ class MCPClientManager:
         # turn the second list_resource_templates() call into AttributeError.
         session = state.session
 
-        res_result, tmpl_result = await self._list_resource_pair(session, name)
+        resources, templates = await self._list_resource_pair(session, name)
 
-        server_resources: list[dict[str, Any]] = []
-        # Capped like the pool twin — a misbehaving server's push must not
-        # balloon the shared node's merged catalogs.
-        for r in _cap_server_resources(name, res_result.resources):
-            server_resources.append(
-                {
-                    "uri": str(r.uri),
-                    "name": r.name or "",
-                    "description": r.description or "",
-                    "mimeType": r.mimeType or "",
-                    "server": name,
-                }
-            )
-        for t in _cap_server_resource_templates(name, tmpl_result.resourceTemplates):
-            server_resources.append(
-                {
-                    "uri": str(t.uriTemplate),
-                    "name": t.name or "",
-                    "description": t.description or "",
-                    "mimeType": t.mimeType or "",
-                    "server": name,
-                    "template": True,
-                }
-            )
+        server_resources = _resource_entries(name, resources, templates)
 
         state.resources = server_resources
         self._rebuild_resources()
@@ -5141,27 +5125,9 @@ class MCPClientManager:
         # ``asyncio.timeout`` mandatory — a wedged server must not hang a
         # spawned refresh (and the connect lock it holds) forever.
         async with asyncio.timeout(self._CONNECT_TIMEOUT):
-            prompt_result = await session.list_prompts()
+            prompts = await _list_all_prompts(session, name)
 
-        server_prompts: list[dict[str, Any]] = []
-        # Capped like the pool twin — see _refresh_server_resources.
-        for p in _cap_server_prompts(name, prompt_result.prompts):
-            server_prompts.append(
-                {
-                    "name": f"mcp__{name}__{p.name}",
-                    "original_name": p.name,
-                    "server": name,
-                    "description": p.description or "",
-                    "arguments": [
-                        {
-                            "name": a.name,
-                            "description": a.description or "",
-                            "required": a.required or False,
-                        }
-                        for a in (p.arguments or [])
-                    ],
-                }
-            )
+        server_prompts = _prompt_entries(name, prompts)
 
         state.prompts = server_prompts
         self._rebuild_prompts()

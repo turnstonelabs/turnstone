@@ -287,7 +287,7 @@ def _fake_connect_session() -> MagicMock:
     fake_caps.resources = None
     fake_caps.prompts = None
     fake_session.get_server_capabilities = MagicMock(return_value=fake_caps)
-    fake_session.list_tools = AsyncMock(return_value=MagicMock(tools=[]))
+    fake_session.list_tools = AsyncMock(return_value=mcp_types.ListToolsResult(tools=[]))
     return fake_session
 
 
@@ -654,14 +654,12 @@ class TestEviction:
             mgr._rebuild_user_tool_map("u0")
 
             class _RacingSession:
-                async def list_tools(self) -> Any:
+                async def list_tools(self, *, params: Any = None) -> Any:
                     # The entry is fully dropped and re-created while
                     # list_tools is in flight.
                     mgr._user_pool_entries.pop(key, None)
                     await mgr._ensure_pool_entry(key)
-                    res = MagicMock()
-                    res.tools = []
-                    return res
+                    return mcp_types.ListToolsResult(tools=[])
 
             entry.session = _RacingSession()
             added, removed = await mgr._refresh_pool_server_tools(key)

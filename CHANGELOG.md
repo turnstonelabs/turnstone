@@ -112,6 +112,15 @@ frozen.
 
 ### Fixed
 
+- **MCP catalogs are read past their first page (#1225).** A server that paginates its tools,
+  prompts, resources or resource templates had only its first page published, on connect and on
+  refresh, for shared and per-user servers alike. Each list is now followed to its last page,
+  within the existing per-server cap of 1,000 entries, which still truncates with a warning. An
+  entry listed twice is published once. Empty pages that still point onward are read past. The
+  walk also stops, with a warning, when the server repeats a cursor, sends ten pages in a row
+  with nothing new, or fails a later page; it keeps the pages already read, so a catalog is never
+  published shorter than its first page.
+
 - **Processes started by a stdio MCP server no longer outlive it (#1226).** A server that
   started a helper process and then exited cleanly when its stdin closed left the helper
   running, so every reconnect, reload, removal or shutdown leaked another. Once a stdio

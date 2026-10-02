@@ -86,7 +86,7 @@ def _make_session_mock() -> AsyncMock:
     session = AsyncMock()
     session.initialize = AsyncMock()
     session.get_server_capabilities = MagicMock(return_value=None)
-    session.list_tools = AsyncMock(return_value=MagicMock(tools=[]))
+    session.list_tools = AsyncMock(return_value=mcp_types.ListToolsResult(tools=[]))
     return session
 
 
@@ -374,7 +374,7 @@ class TestTransportOwnerLifecycle:
             )
         )
 
-        async def _park_resources() -> Any:
+        async def _park_resources(*, params: Any = None) -> Any:
             await asyncio.sleep(3600)
 
         session.list_resources = _park_resources
@@ -542,7 +542,7 @@ class TestTransportOwnerLifecycle:
 
         discovery_parked = asyncio.Event()
 
-        async def _parked_list_tools() -> Any:
+        async def _parked_list_tools(*, params: Any = None) -> Any:
             discovery_parked.set()
             await asyncio.sleep(3600)  # the transport never answers
 
@@ -588,7 +588,7 @@ class TestTransportOwnerLifecycle:
         patches: dict[str, Any] = {}
         fake = _fake_transport_and_session(patches)
 
-        async def _cancel_owner_and_return_tool() -> mcp_types.ListToolsResult:
+        async def _cancel_owner_and_return_tool(*, params: Any = None) -> mcp_types.ListToolsResult:
             owner = mgr._static_servers["new"].owner_task
             assert owner is not None
             owner.cancel()
