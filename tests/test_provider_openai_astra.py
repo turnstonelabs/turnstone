@@ -12,6 +12,7 @@ import httpx2
 import openai
 import pytest
 
+from turnstone.core.compaction import resolve_context_usage
 from turnstone.core.lowering import (
     drop_empty_user_turns,
     fold_system_turns,
@@ -169,6 +170,7 @@ def test_catalog_and_compatible_lane_isolation():
     assert caps["context_window"] == 1050000
     assert caps["max_output_tokens"] == 128000
     assert caps["supports_vision"] and caps["supports_pdf"] and caps["supports_tool_search"]
+    assert caps["supports_web_search"]
     assert caps["server_parses_reasoning"]
     assert lookup_model_capabilities(provider="openai", model="gpt-6-astra-test-snapshot") == caps
     for surface in ("chat", "responses"):
@@ -176,7 +178,58 @@ def test_catalog_and_compatible_lane_isolation():
         local_caps = local.get_capabilities("gpt-6-astra")
         assert local_caps.supports_temperature
         assert not local_caps.supports_mid_conversation_system
+        assert not local_caps.supports_web_search
         assert local_caps.reasoning_effort_values == ()
+
+
+def test_hosted_search_uses_default_row_and_resolves_context(sdk_boundary):
+    client, requests, outputs = sdk_boundary
+    provider = create_provider("openai")
+    lane = ModelLane(provider, client, "gpt-6-astra")
+    outputs.append(
+        [
+            {"type": "web_search_call", "id": "search_test", "status": "completed"},
+            {
+                "type": "message",
+                "id": "msg_test",
+                "role": "assistant",
+                "status": "completed",
+                "content": [{"type": "output_text", "text": "Found it.", "annotations": []}],
+            },
+        ]
+    )
+    result = model_turn(
+        lane,
+        [Turn.user("Search for the answer")],
+        tools=[{"type": "function", "function": {"name": "web_search", "parameters": {}}}],
+    )
+
+    assert requests[0]["tools"] == [{"type": "web_search"}]
+    assert result.turn.text == "Found it."
+    assert not result.turn.tool_calls
+    assert result.usage.prompt_tokens == 100
+    assert result.usage.completion_tokens == 10
+    assert result.usage.cache_read_tokens == 30
+    assert result.usage.cache_creation_tokens == 70
+    assert result.usage.prompt_tokens_cumulative
+    context = resolve_context_usage(result.usage, local_request_estimate=lambda: 50)
+    assert (context.anchor, context.served) == (50, None)
+
+
+@pytest.mark.parametrize("tool_names", [[], ["lookup"]])
+def test_hosted_search_respects_tool_visibility(sdk_boundary, tool_names):
+    client, requests, _ = sdk_boundary
+    lane = ModelLane(create_provider("openai"), client, "gpt-6-astra")
+    model_turn(
+        lane,
+        [Turn.user("Hello")],
+        tools=[
+            {"type": "function", "function": {"name": name, "parameters": {}}}
+            for name in tool_names
+        ],
+    )
+
+    assert all(tool["type"] != "web_search" for tool in requests[0].get("tools", []))
 
 
 def test_tool_continuation_preserves_reasoning_and_inline_instructions(sdk_boundary):

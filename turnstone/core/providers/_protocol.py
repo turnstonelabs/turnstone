@@ -41,8 +41,8 @@ class UsageInfo:
     ``total_tokens`` and the cache fields as reported.  Three more fields say
     what those counters mean for the CONTEXT, resolved in one place for every
     lane and consumer (:func:`turnstone.core.compaction.resolve_context_usage`):
-    a server-side tool loop samples several times inside one response and
-    reports billing totals, not the size of the next request.
+    hosted tools can add transient input or sample several times inside one
+    response, so billing totals need not describe the replayed request.
     """
 
     prompt_tokens: int
@@ -59,8 +59,8 @@ class UsageInfo:
     # the NEXT request will carry (server-side search results replayed as
     # native blocks).  0 when nothing was appended or nothing is replayed.
     appended_prompt_tokens: int = 0
-    # ``prompt_tokens`` sums the input of every server-side sampling pass and
-    # must not anchor the context estimate.  Set when a server tool ran.
+    # ``prompt_tokens`` includes transient server-tool input or sums repeated
+    # sampling passes, so it must not anchor the replay context estimate.
     prompt_tokens_cumulative: bool = False
 
 

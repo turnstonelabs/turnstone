@@ -252,10 +252,9 @@ class OpenAIChatCompletionsProvider:
         """
         if not caps.supports_web_search:
             return tools
-        # Replace-only: native search stands in for the client ``web_search``
-        # def. When the request never advertised one (persona visibility set,
-        # coordinator toolset), injecting the option would hand the model a
-        # capability its envelope hides.
+        # Add explicit search options only when replacing a client ``web_search``
+        # definition. Dedicated search models still search automatically when
+        # this option is omitted.
         if not tools or not any(t.get("function", {}).get("name") == "web_search" for t in tools):
             return tools
         tools = [t for t in tools if t.get("function", {}).get("name") != "web_search"]
@@ -335,12 +334,20 @@ class OpenAIChatCompletionsProvider:
             refuse_credential_headers(extra_headers)
             kwargs["extra_headers"] = extra_headers
 
+        # Dedicated search models search even without an explicit option; an
+        # operator can also enable search through the final request body. Both
+        # include server-side input in usage that is absent from replay.
+        search_options = (extra_body or {}).get(
+            "web_search_options", kwargs.get("web_search_options")
+        )
+        search_enabled = caps.supports_web_search or search_options is not None
+
         refuse_aborted_request(cancel_ref)
         if request_metrics_ref is not None:
             request_metrics_ref.append(
                 ProviderRequestMetrics(
                     serialized_tool_chars=serialized_tool_chars(kwargs.get("tools")),
-                    native_tools_enabled=request_uses_native_tools(kwargs),
+                    native_tools_enabled=search_enabled or request_uses_native_tools(kwargs),
                 )
             )
 
@@ -358,7 +365,12 @@ class OpenAIChatCompletionsProvider:
         if cancel_ref is not None:
             cancel_ref.append(stream)
         return iter_with_cleanup(
-            self._iter_stream(stream, finish_reason_optional=caps.finish_reason_optional), stream
+            self._iter_stream(
+                stream,
+                finish_reason_optional=caps.finish_reason_optional,
+                prompt_tokens_cumulative=search_enabled,
+            ),
+            stream,
         )
 
     def _iter_stream(
@@ -366,12 +378,17 @@ class OpenAIChatCompletionsProvider:
         stream: Any,
         *,
         finish_reason_optional: bool = False,
+        prompt_tokens_cumulative: bool = False,
         on_tool_call_delta: Callable[[ToolCallDelta, Any], None] | None = None,
     ) -> Iterator[StreamChunk]:
         """Convert OpenAI Chat Completions stream chunks to StreamChunks.
 
         *finish_reason_optional* is the model capability of the same name:
         it arms the lax-server finish shim at the end of this generator.
+
+        *prompt_tokens_cumulative* keeps hosted search billing separate from
+        replay context. The search-model capability or the request's final search
+        option determines this flag.
 
         *on_tool_call_delta* is called with ``(normalized, raw_sdk_delta)``
         for every tool-call delta — the normalized ``ToolCallDelta``
@@ -406,6 +423,7 @@ class OpenAIChatCompletionsProvider:
             if hasattr(chunk, "usage") and chunk.usage is not None:
                 sc.usage = extract_usage(chunk.usage)
                 if sc.usage:
+                    sc.usage.prompt_tokens_cumulative = prompt_tokens_cumulative
                     completion_tokens = sc.usage.completion_tokens
 
             if not chunk.choices:

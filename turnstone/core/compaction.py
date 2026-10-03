@@ -197,17 +197,16 @@ def resolve_context_usage(
     """Turn one call's reported usage into the anchor and the calibration denominator.
 
     A plain response reports one sampling pass, so ``prompt_tokens`` is both the anchor and the
-    denominator.  A response in which the provider ran its own tool loop reports billing totals
-    summed across passes (``prompt_tokens_cumulative``); the request's own size is then the
-    provider's single-pass figure when it gave one (``served_prompt_tokens``), else the caller's
-    local estimate of what it sent.  What the provider appended that the next request replays
-    (``appended_prompt_tokens``) is never folded into the anchor: it is the assistant turn's
-    cost, recorded on the turn by the completion builder, and charging it there keeps the
-    anchored estimate and the re-estimate from characters equal.  ``local_request_estimate`` is
-    called only when the provider left the request's size unknown, so callers pay for the
-    estimate, and touch the state it reads, only then.  One rule for every lane and every
-    consumer: the session's calibration, the task-agent estimator, and the agent context badge
-    all read this.
+    denominator. Hosted tools can include transient search input or sum input across passes
+    (``prompt_tokens_cumulative``); the request's own size is then the provider's single-pass
+    figure when it gave one (``served_prompt_tokens``), else the caller's local estimate of what
+    it sent. What the provider appended that the next request replays (``appended_prompt_tokens``)
+    is never folded into the anchor: it is the assistant turn's cost, recorded on the turn by the
+    completion builder. Charging it there keeps the anchored estimate and the re-estimate from
+    characters equal. ``local_request_estimate`` is called only when the provider left the
+    request's size unknown, so callers pay for the estimate, and touch the state it reads, only
+    then. One rule for every lane and every consumer: the session's calibration, the task-agent
+    estimator, and the agent context badge all read this.
     """
 
     if not usage.prompt_tokens_cumulative:

@@ -375,6 +375,7 @@ OPENAI_CAPABILITIES: dict[str, ModelCapabilities] = {
         supports_temperature=False,
         reasoning_effort_values=("low", "medium", "high", "xhigh", "max"),
         supports_reasoning_config_updates=True,
+        supports_web_search=True,
         supports_tool_search=True,
         supports_vision=True,
         supports_pdf=True,

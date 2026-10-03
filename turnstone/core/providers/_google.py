@@ -146,6 +146,7 @@ class GoogleProvider(OpenAIChatCompletionsProvider):
         stream: Any,
         *,
         finish_reason_optional: bool = False,
+        prompt_tokens_cumulative: bool = False,
         on_tool_call_delta: Callable[[ToolCallDelta, Any], None] | None = None,
     ) -> Iterator[StreamChunk]:
         """Wrap the base iterator to capture raw tool-call metadata.
@@ -186,6 +187,7 @@ class GoogleProvider(OpenAIChatCompletionsProvider):
         for sc in super()._iter_stream(
             stream,
             finish_reason_optional=finish_reason_optional,
+            prompt_tokens_cumulative=prompt_tokens_cumulative,
             on_tool_call_delta=_capture,
         ):
             # Attach provider_blocks on the finish-reason chunk

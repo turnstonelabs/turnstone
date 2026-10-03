@@ -96,6 +96,10 @@ def test_prepared_request_reports_native_tool_posture(family, mode):
     native = mode == "search" or (mode == "deferred" and family != "openai-compatible")
     if family == "openai":
         native = native or mode == "extra_disable"
+    elif family == "openai-compatible":
+        # Search-model capability is intrinsic on the Chat surface, even when
+        # the final request has no search option or explicitly sends null.
+        native = True
     else:
         native = native or mode in ("extra_native", "mcp")
     assert len(metrics) == 1

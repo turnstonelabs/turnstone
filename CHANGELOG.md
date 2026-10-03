@@ -112,6 +112,14 @@ frozen.
 
 ### Fixed
 
+- **Hosted search for Astra (#1191).** The capability table now enables native web search
+  when the session offers `web_search`, without requiring a model capability override.
+- **Chat search usage no longer inflates replay context (#1191).** Requests with hosted search
+  use the local context estimate instead of anchoring on billed input that includes search
+  results, including automatic search without explicit search options. Raw usage still charges
+  the token budget, and text calibration remains unchanged. Automatic search also marks the
+  request as using native tools, preventing an automatic replay of an accepted response.
+
 - **Stream cleanup after callback failures.** Chat and Responses adapters close the underlying
   SDK response when a local chunk callback interrupts generation, preserving the original error.
 

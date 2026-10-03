@@ -126,13 +126,27 @@ def test_product_failures_share_one_allowance(tmp_db, caller, shapes):
 
 
 @pytest.mark.parametrize("shape", ["empty", "death"])
-def test_native_request_extras_prohibit_product_replay(tmp_db, shape):
+@pytest.mark.parametrize(
+    "automatic,extra",
+    [
+        (False, {"web_search_options": {}}),
+        (True, None),
+        (True, {"web_search_options": None}),
+    ],
+    ids=["explicit", "automatic", "automatic_null"],
+)
+def test_native_search_prohibits_product_replay(tmp_db, shape, automatic, extra):
     with scripted_session(WorkstreamKind.INTERACTIVE, [shape]) as (session, ui, requests):
-        lane = replace(session._primary_lane(), extra_params={"web_search_options": {}})
+        lane = session._primary_lane()
+        lane = replace(
+            lane,
+            capabilities=replace(lane.capabilities, supports_web_search=automatic),
+            extra_params=extra,
+        )
         with pytest.raises(CompletionRecoveryError) as failure:
             model_turn(lane, [Turn.user("Continue")], tools=[], product_recovery=True)
         assert failure.value.native_tools_enabled is True
-        assert requests[0]["web_search_options"] == {}
+        assert requests[0].get("web_search_options") == (extra or {}).get("web_search_options")
         assert len(requests) == 1
 
 
