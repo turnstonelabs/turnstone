@@ -419,8 +419,7 @@ def _is_dead_transport(exc: BaseException) -> bool:
     if _classify_http_exception(exc) == "transport":
         return True
     if isinstance(exc, McpError):
-        err = exc.error
-        code = getattr(err, "code", None)
+        code = exc.error.code
         if code == mcp_types.CONNECTION_CLOSED:
             return True
         # Server-restarted-session loss: match the SDK's deterministic synthesized
