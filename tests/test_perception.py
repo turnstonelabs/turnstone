@@ -502,7 +502,7 @@ def test_local_perception_failure_preserves_parent_send_and_skips_parts_during_c
 ) -> None:
     import importlib
 
-    from tests.test_empty_completion import _session
+    from tests._session_helpers import scripted_session
     from turnstone.core.attachments import Attachment
     from turnstone.core.workstream import WorkstreamKind
 
@@ -522,7 +522,7 @@ def test_local_perception_failure_preserves_parent_send_and_skips_parts_during_c
     warning = Mock()
     monkeypatch.setattr(perception.log, "warning", warning)
     monkeypatch.setattr(model_turn_module, "_ingest_completion", fail_first_child)
-    with _session(WorkstreamKind.INTERACTIVE, ["answer"] * 6) as (session, ui, requests):
+    with scripted_session(WorkstreamKind.INTERACTIVE, ["answer"] * 6) as (session, ui, requests):
         session.context_window = 100_000
         primary = session._primary_lane()
         binding = ResolvedModelBinding(

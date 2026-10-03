@@ -29,6 +29,7 @@ from turnstone.core.providers._openai_common import (
     format_citations,
     format_document_wrapper,
     format_refusal,
+    iter_with_cleanup,
     lookup_openai_capabilities,
     reject_non_stream_response,
     resolve_server_side_tools,
@@ -695,10 +696,13 @@ class OpenAIResponsesProvider:
         reject_non_stream_response(stream, cancel_ref=cancel_ref)
         if cancel_ref is not None:
             cancel_ref.append(stream)
-        return self._iter_stream(
+        return iter_with_cleanup(
+            self._iter_stream(
+                stream,
+                finish_reason_optional=caps.finish_reason_optional,
+                reasoning_config=reasoning_config,
+            ),
             stream,
-            finish_reason_optional=caps.finish_reason_optional,
-            reasoning_config=reasoning_config,
         )
 
     def _iter_stream(

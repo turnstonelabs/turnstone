@@ -11,7 +11,7 @@ import httpx2
 import pytest
 from openai import APIConnectionError
 
-from tests.test_empty_completion import _REASONING, _session, _wire
+from tests._session_helpers import REASONING_SENTINEL, chat_completion_wire, scripted_session
 from turnstone.core.admission import ModelAdmission
 from turnstone.core.attachments import Attachment
 from turnstone.core.completion_recovery import (
@@ -59,7 +59,7 @@ def test_product_backoff_uses_elapsed_time_and_rechecks_cancellation(
     )
     monkeypatch.setattr("turnstone.core.model_turn.random", SimpleNamespace(random=lambda: 0.5))
     replies = ["empty"] if cancel_during_sleep else ["empty", "answer"]
-    with _session(WorkstreamKind.INTERACTIVE, replies) as (session, ui, requests):
+    with scripted_session(WorkstreamKind.INTERACTIVE, replies) as (session, ui, requests):
         if cancel_during_sleep:
             with pytest.raises(DeadlineCancelledError):
                 model_turn(
@@ -95,7 +95,7 @@ def _call(session, caller):
 @pytest.mark.parametrize("caller", ["utility", "task", "final"])
 @pytest.mark.parametrize("family", ["openai-compatible", "openai", "anthropic-compatible"])
 def test_product_recovery_accounts_rejected_and_accepted_sdk_attempts(tmp_db, caller, family):
-    with _session(WorkstreamKind.INTERACTIVE, ["separate", "answer"], family=family) as (
+    with scripted_session(WorkstreamKind.INTERACTIVE, ["separate", "answer"], family=family) as (
         session,
         ui,
         requests,
@@ -107,7 +107,7 @@ def test_product_recovery_accounts_rejected_and_accepted_sdk_attempts(tmp_db, ca
         assert usage.call_count == 2
         assert [call.args[0].completion_tokens for call in usage.call_args_list] == [43, 43]
         assert all(call.kwargs["model"] == "served-model" for call in usage.call_args_list)
-        assert _REASONING not in str(session.messages)
+        assert REASONING_SENTINEL not in str(session.messages)
         assert session._last_usage is None
 
 
@@ -117,7 +117,7 @@ def test_product_recovery_accounts_rejected_and_accepted_sdk_attempts(tmp_db, ca
     [["empty"] * 3, ["death"] * 3, ["empty", "death", "empty"], ["death", "empty", "death"]],
 )
 def test_product_failures_share_one_allowance(tmp_db, caller, shapes):
-    with _session(WorkstreamKind.INTERACTIVE, shapes) as (session, ui, requests):
+    with scripted_session(WorkstreamKind.INTERACTIVE, shapes) as (session, ui, requests):
         with patch.object(session, "_record_aux_usage") as usage, pytest.raises(RuntimeError):
             _call(session, caller)
         assert len(requests) == 3
@@ -127,7 +127,7 @@ def test_product_failures_share_one_allowance(tmp_db, caller, shapes):
 
 @pytest.mark.parametrize("shape", ["empty", "death"])
 def test_native_request_extras_prohibit_product_replay(tmp_db, shape):
-    with _session(WorkstreamKind.INTERACTIVE, [shape]) as (session, ui, requests):
+    with scripted_session(WorkstreamKind.INTERACTIVE, [shape]) as (session, ui, requests):
         lane = replace(session._primary_lane(), extra_params={"web_search_options": {}})
         with pytest.raises(CompletionRecoveryError) as failure:
             model_turn(lane, [Turn.user("Continue")], tools=[], product_recovery=True)
@@ -138,7 +138,7 @@ def test_native_request_extras_prohibit_product_replay(tmp_db, shape):
 
 def test_observer_fault_is_local_even_when_named_like_a_transport_error(tmp_db):
     fault = APIConnectionError(request=httpx2.Request("POST", "https://example.com/v1"))
-    with _session(WorkstreamKind.INTERACTIVE, ["empty"]) as (session, ui, requests):
+    with scripted_session(WorkstreamKind.INTERACTIVE, ["empty"]) as (session, ui, requests):
         with (
             patch.object(session, "_record_aux_usage", side_effect=fault) as usage,
             pytest.raises(ModelTurnLocalError) as failure,
@@ -157,7 +157,7 @@ def test_completed_billing_precedes_stop_and_no_reissue_follows(tmp_db):
         completed.append(usage)
         ref.abort()
 
-    with _session(WorkstreamKind.INTERACTIVE, ["empty"]) as (session, ui, requests):
+    with scripted_session(WorkstreamKind.INTERACTIVE, ["empty"]) as (session, ui, requests):
         with pytest.raises(DeadlineCancelledError):
             model_turn(
                 session._primary_lane(),
@@ -170,13 +170,24 @@ def test_completed_billing_precedes_stop_and_no_reissue_follows(tmp_db):
         assert completed[0].completion_tokens == 43
 
 
-def test_local_chunk_failure_cannot_become_a_transport_retry(tmp_db):
+@pytest.mark.parametrize(
+    "family,api_surface",
+    [
+        ("openai-compatible", "chat"),
+        ("openai-compatible", "responses"),
+        ("openai", None),
+        ("anthropic-compatible", None),
+    ],
+)
+def test_local_chunk_failure_cannot_become_a_transport_retry(tmp_db, family, api_surface):
     fault = APIConnectionError(request=httpx2.Request("POST", "https://example.com/v1"))
 
     def consume(_chunk):
         raise fault
 
-    with _session(WorkstreamKind.INTERACTIVE, ["answer"]) as (session, ui, requests):
+    with scripted_session(
+        WorkstreamKind.INTERACTIVE, ["answer"], family=family, api_surface=api_surface
+    ) as (session, ui, requests):
         with pytest.raises(ModelTurnLocalError) as failure:
             model_turn(
                 session._primary_lane(),
@@ -190,13 +201,14 @@ def test_local_chunk_failure_cannot_become_a_transport_retry(tmp_db):
 
 @pytest.mark.parametrize("boundary", ["on_chunk", "validate_wire", "admit_reissue"])
 def test_local_boundaries_preserve_an_existing_typed_fault(tmp_db, boundary):
-    fault = ModelTurnLocalError(KeyError(_REASONING), stage="completion ingestion")
+    fault = ModelTurnLocalError(KeyError(REASONING_SENTINEL), stage="completion ingestion")
 
     def fail(*_args):
         raise fault
 
     shape = "empty" if boundary == "admit_reissue" else "answer"
-    with _session(WorkstreamKind.INTERACTIVE, [shape]) as (session, ui, requests):
+    replies = [] if boundary == "validate_wire" else [shape]
+    with scripted_session(WorkstreamKind.INTERACTIVE, replies) as (session, ui, requests):
         with pytest.raises(ModelTurnLocalError) as failure:
             model_turn(
                 session._primary_lane(),
@@ -206,7 +218,7 @@ def test_local_boundaries_preserve_an_existing_typed_fault(tmp_db, boundary):
             )
         assert failure.value is fault
         assert "completion ingestion failed (KeyError)" in str(fault)
-        assert _REASONING not in str(fault)
+        assert REASONING_SENTINEL not in str(fault)
         assert len(requests) == (0 if boundary == "validate_wire" else 1)
 
 
@@ -217,7 +229,7 @@ def test_attachment_faults_do_not_retry_or_degrade_the_model_backend(tmp_db, fau
         if fault_kind == "storage"
         else APIConnectionError(request=httpx2.Request("GET", "https://storage.example.com/blobs"))
     )
-    with _session(WorkstreamKind.INTERACTIVE, []) as (session, ui, requests):
+    with scripted_session(WorkstreamKind.INTERACTIVE, []) as (session, ui, requests):
         tracker = MagicMock()
         session._registry = MagicMock(fallback=["spare"])
         with (
@@ -266,7 +278,11 @@ def test_attachment_faults_do_not_retry_or_degrade_the_model_backend(tmp_db, fau
 
 def test_stream_admission_fault_closes_native_response_without_replay(tmp_db):
     fault = RuntimeError("maximum context length exceeded in local health observer")
-    with _session(WorkstreamKind.INTERACTIVE, ["answer"], native=True) as (session, ui, requests):
+    with scripted_session(WorkstreamKind.INTERACTIVE, ["answer"], native=True) as (
+        session,
+        ui,
+        requests,
+    ):
         tracker = MagicMock()
         tracker.record_success.side_effect = fault
         completions = session._primary_lane().client.chat.completions
@@ -302,7 +318,7 @@ def test_attachment_control_flow_keeps_its_domain_type(tmp_db, fault):
     def resolve(_ids):
         raise fault
 
-    with _session(WorkstreamKind.INTERACTIVE, []) as (session, ui, requests):
+    with scripted_session(WorkstreamKind.INTERACTIVE, []) as (session, ui, requests):
         with pytest.raises(type(fault)) as failure:
             model_turn(
                 session._primary_lane(),
@@ -331,19 +347,19 @@ def test_accepted_overflow_classifies_at_any_tool_posture(native):
 
 
 def test_raw_default_still_returns_empty_for_excluded_callers(tmp_db):
-    with _session(WorkstreamKind.INTERACTIVE, ["separate"]) as (session, ui, requests):
+    with scripted_session(WorkstreamKind.INTERACTIVE, ["separate"]) as (session, ui, requests):
         result = model_turn(session._primary_lane(), [Turn.user("Continue")])
         assert result.content == ""
         assert len(requests) == 1
 
 
 def test_rejected_diagnostics_keep_counts_without_reasoning_payload(tmp_db, caplog):
-    with _session(WorkstreamKind.INTERACTIVE, ["separate"] * 3) as (session, ui, requests):
+    with scripted_session(WorkstreamKind.INTERACTIVE, ["separate"] * 3) as (session, ui, requests):
         with pytest.raises(EmptyCompletionError) as failure:
             _call(session, "utility")
-        assert failure.value.result.reasoning_chars == len(_REASONING)
+        assert failure.value.result.reasoning_chars == len(REASONING_SENTINEL)
         assert "model_turn.recovery_stopped" in caplog.text
-        assert _REASONING not in caplog.text
+        assert REASONING_SENTINEL not in caplog.text
 
 
 _VERDICT = json.dumps(
@@ -351,8 +367,12 @@ _VERDICT = json.dumps(
 )
 
 
-def _verdict_wire(shape, **kwargs):
-    return _wire(shape, **kwargs).replace(json.dumps("The work is complete."), json.dumps(_VERDICT))
+def _verdict_reply(shape):
+    return httpx2.Response(
+        200,
+        headers={"content-type": "text/event-stream"},
+        stream=httpx2.ByteStream(chat_completion_wire(shape, answer=_VERDICT).encode()),
+    )
 
 
 def _judge(session, kind):
@@ -383,10 +403,8 @@ def _judge(session, kind):
 @pytest.mark.parametrize("kind", ["intent", "output"])
 @pytest.mark.parametrize("shapes", [["empty", "answer"], ["empty", "death", "empty"]])
 def test_judges_use_shared_recovery_without_prompt_nudges(tmp_db, kind, shapes):
-    with (
-        patch("tests.test_empty_completion._wire", side_effect=_verdict_wire),
-        _session(WorkstreamKind.INTERACTIVE, shapes) as (session, ui, requests),
-    ):
+    replies = [_verdict_reply(shape) for shape in shapes]
+    with scripted_session(WorkstreamKind.INTERACTIVE, replies) as (session, ui, requests):
         _judge_instance, evaluate = _judge(session, kind)
         verdict = evaluate()
         assert len(requests) == len(shapes)
@@ -403,14 +421,8 @@ def test_judges_use_shared_recovery_without_prompt_nudges(tmp_db, kind, shapes):
 
 @pytest.mark.parametrize("tokens", [1, 3])
 def test_output_judge_charges_captured_limiter_for_each_dispatch(tmp_db, tokens):
-    with (
-        patch("tests.test_empty_completion._wire", side_effect=_verdict_wire),
-        _session(WorkstreamKind.INTERACTIVE, ["empty", "empty", "answer"]) as (
-            session,
-            ui,
-            requests,
-        ),
-    ):
+    replies = [_verdict_reply(shape) for shape in ["empty", "empty", "answer"][:tokens]]
+    with scripted_session(WorkstreamKind.INTERACTIVE, replies) as (session, ui, requests):
         judge, _evaluate = _judge(session, "output")
         session._output_guard_judge = judge
         session._output_guard_judge_cancel = threading.Event()
@@ -426,7 +438,7 @@ def test_output_judge_charges_captured_limiter_for_each_dispatch(tmp_db, tokens)
 
 
 def test_output_judge_reports_the_provider_cause_after_recovery_exhaustion(tmp_db):
-    with _session(WorkstreamKind.INTERACTIVE, ["death"] * 3) as (session, ui, requests):
+    with scripted_session(WorkstreamKind.INTERACTIVE, ["death"] * 3) as (session, ui, requests):
         _judge_instance, evaluate = _judge(session, "output")
         verdict = evaluate()
         assert len(requests) == 3
@@ -437,7 +449,7 @@ def test_output_judge_reports_the_provider_cause_after_recovery_exhaustion(tmp_d
 def test_output_judge_retirement_blocks_reissue_without_spending_quota(tmp_db, retirement):
     from turnstone.core.model_turn import _ingest_completion
 
-    with _session(WorkstreamKind.INTERACTIVE, ["empty"]) as (session, ui, requests):
+    with scripted_session(WorkstreamKind.INTERACTIVE, ["empty"]) as (session, ui, requests):
         judge, _evaluate = _judge(session, "output")
         session._output_guard_judge = judge
         session._output_guard_judge_cancel = threading.Event()
@@ -485,7 +497,7 @@ def test_judge_recovery_stays_inside_original_deadline(tmp_db, monkeypatch, kind
 
     module = "judge" if kind == "intent" else "output_guard_judge"
     with (
-        _session(WorkstreamKind.INTERACTIVE, ["empty"]) as (session, ui, requests),
+        scripted_session(WorkstreamKind.INTERACTIVE, ["empty"]) as (session, ui, requests),
         patch(f"turnstone.core.{module}.run_abortable_with_deadline", side_effect=bounded) as run,
     ):
         _judge_instance, evaluate = _judge(session, kind)
@@ -508,7 +520,7 @@ def test_main_local_publication_fault_cannot_trigger_compaction(tmp_db, site):
         "retry_notice": "on_info",
     }[site]
     shapes = ["answer" if site == "finish" else "empty"]
-    with _session(WorkstreamKind.INTERACTIVE, shapes) as (session, ui, requests):
+    with scripted_session(WorkstreamKind.INTERACTIVE, shapes) as (session, ui, requests):
         owner = ui if site == "retry_notice" else session
         with (
             patch.object(owner, target, side_effect=fault),
@@ -521,7 +533,11 @@ def test_main_local_publication_fault_cannot_trigger_compaction(tmp_db, site):
 
 
 def test_reissue_cannot_inherit_previous_requests_safe_posture(tmp_db):
-    with _session(WorkstreamKind.INTERACTIVE, ["empty", "empty"]) as (session, ui, requests):
+    with scripted_session(WorkstreamKind.INTERACTIVE, ["empty", "empty"]) as (
+        session,
+        ui,
+        requests,
+    ):
         lane = session._primary_lane()
         create = lane.provider.create_streaming
 
@@ -543,7 +559,7 @@ def test_reissue_cannot_inherit_previous_requests_safe_posture(tmp_db):
 @pytest.mark.parametrize("caller", ["utility", "task", "final"])
 def test_creation_failure_after_empty_cannot_restart_outer_recovery(tmp_db, caller):
     fault = APIConnectionError(request=httpx2.Request("POST", "https://example.com/v1"))
-    with _session(WorkstreamKind.INTERACTIVE, ["empty"]) as (session, ui, requests):
+    with scripted_session(WorkstreamKind.INTERACTIVE, ["empty"]) as (session, ui, requests):
         lane = session._primary_lane()
         create = lane.provider.create_streaming
 
@@ -565,7 +581,11 @@ def test_creation_failure_after_empty_cannot_restart_outer_recovery(tmp_db, call
 @pytest.mark.parametrize("finish", ["length", "content_filter"])
 @pytest.mark.parametrize("shape", ["answer", "empty"])
 def test_final_synthesis_preserves_nonblank_output_and_guards_once(tmp_db, finish, shape):
-    with _session(WorkstreamKind.INTERACTIVE, [shape], finish=finish) as (session, ui, requests):
+    with scripted_session(WorkstreamKind.INTERACTIVE, [shape], finish=finish) as (
+        session,
+        ui,
+        requests,
+    ):
         with patch.object(
             session, "_guard_subagent_synthesis", side_effect=lambda text, *a, **k: text
         ) as guard:
@@ -584,7 +604,7 @@ def test_main_local_admission_fault_cannot_fall_back_or_compact(tmp_db, transpor
         if transport_shaped
         else RuntimeError("maximum context length exceeded in local callback")
     )
-    with _session(WorkstreamKind.INTERACTIVE, []) as (session, ui, requests):
+    with scripted_session(WorkstreamKind.INTERACTIVE, []) as (session, ui, requests):
         with (
             patch.object(session, "_admit_memory_index_request", side_effect=fault),
             patch.object(session, "_try_fallback_lane") as fallback,
@@ -612,7 +632,7 @@ def test_ingestion_fault_is_local_after_billing_and_capacity_release(tmp_db, pro
         assert len(seen) == 1
         raise fault
 
-    with _session(WorkstreamKind.INTERACTIVE, ["tool"]) as (session, ui, requests):
+    with scripted_session(WorkstreamKind.INTERACTIVE, ["tool"]) as (session, ui, requests):
         with pytest.raises(RuntimeError) as failure:
             model_turn(
                 replace(session._primary_lane(), admission=admission),
@@ -634,7 +654,11 @@ def test_ingestion_fault_is_local_after_billing_and_capacity_release(tmp_db, pro
 
 def test_main_ingestion_fault_cannot_reopen_native_tool_replay(tmp_db):
     fault = RuntimeError("maximum context length exceeded in local finalization")
-    with _session(WorkstreamKind.INTERACTIVE, ["answer"], native=True) as (session, ui, requests):
+    with scripted_session(WorkstreamKind.INTERACTIVE, ["answer"], native=True) as (
+        session,
+        ui,
+        requests,
+    ):
         with (
             patch("turnstone.core.model_turn.finalize_provider_blocks", side_effect=fault),
             patch.object(session, "_compact_messages") as compact,
@@ -649,7 +673,7 @@ def test_main_ingestion_fault_cannot_reopen_native_tool_replay(tmp_db):
 
 @pytest.mark.parametrize("shape", ["empty", "death"])
 def test_main_budget_stop_blocks_both_replay_shapes(tmp_db, shape):
-    with _session(WorkstreamKind.INTERACTIVE, [shape]) as (session, ui, requests):
+    with scripted_session(WorkstreamKind.INTERACTIVE, [shape]) as (session, ui, requests):
         session._budget_exhausted = True
         with pytest.raises(CompletionRecoveryError):
             session._stream_response()
@@ -660,7 +684,7 @@ def test_empty_summary_exhaustion_bails_as_empty_summary_not_error(tmp_db):
     # A summary model that returns blank stops exhausts the shared allowance;
     # the lifecycle owner then reports the documented ``empty_summary`` bail
     # (informational, history kept), never a generic compaction error.
-    with _session(WorkstreamKind.INTERACTIVE, ["empty"] * 3) as (session, ui, requests):
+    with scripted_session(WorkstreamKind.INTERACTIVE, ["empty"] * 3) as (session, ui, requests):
         session.compact_max_tokens = 100
         session._system_tokens = 0
         session.messages = [

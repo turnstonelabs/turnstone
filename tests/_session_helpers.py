@@ -5,6 +5,8 @@ subclasses, and the tree's standard streaming provider fakes
 (``make_result`` / ``arm_session`` / ``scripted_provider`` /
 ``ArmedHandle``, at the bottom): every suite driving the streaming seam
 imports them from here, so the eager-arming contract lives in one place.
+``scripted_session`` drives the real SDK and provider over a finite HTTP reply
+script; ``chat_completion_wire`` and ``native_completion_wire`` build its SSE bodies.
 The one deliberate exception, ``test_model_registry.py``'s
 ``_make_session``, takes a different signature (registry / model_alias /
 reasoning_effort + ``_FakeUI``) and is NOT a candidate for sharing.
@@ -18,12 +20,23 @@ from __future__ import annotations
 import dataclasses
 import json
 import re
+from contextlib import contextmanager
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
+
+import anthropic
+import httpx2
+from openai import OpenAI
 
 from turnstone.core.model_turn import ModelTurnResult, resolve_model_binding
-from turnstone.core.providers import ModelCapabilities, StreamChunk, ToolCallDelta, UsageInfo
+from turnstone.core.providers import (
+    ModelCapabilities,
+    StreamChunk,
+    ToolCallDelta,
+    UsageInfo,
+    create_provider,
+)
 from turnstone.core.providers._protocol import ProviderRequestMetrics, serialized_tool_chars
 from turnstone.core.session import ChatSession
 from turnstone.core.session_ui_base import SessionUIBase
@@ -32,6 +45,7 @@ from turnstone.core.workstream import WorkstreamKind
 
 if TYPE_CHECKING:
     import logging
+    from collections.abc import Iterator, Sequence
 
 
 class NullUI(SessionUIBase):
@@ -623,6 +637,279 @@ class RecordingUI:
 
     def of(self, kind):
         return [d for k, d in self.events if k == kind]
+
+
+REASONING_SENTINEL = "private reasoning sentinel: inspect the completed child and"
+
+
+class UsageRecordingUI(RecordingUI):
+    """Record status usage as well as the ordered session events."""
+
+    def on_status(self, usage, context_window, effort):
+        self._rec("status", usage)
+
+
+def chat_completion_wire(shape, *, finish="stop", answer="The work is complete."):
+    """Build a chat stream with a selected content shape and finish reason."""
+    delta = {"content": ""}
+    if shape == "separate":
+        delta["reasoning_content"] = REASONING_SENTINEL
+    elif shape == "inline":
+        delta["content"] = f"<think>{REASONING_SENTINEL}</think>"
+    elif shape == "unclosed":
+        delta["content"] = f"<think>{REASONING_SENTINEL}"
+    elif shape == "whitespace":
+        delta["content"] = " \n\t"
+    elif shape == "answer":
+        delta["content"] = answer
+    elif shape == "literal":
+        delta["content"] = "<think>literal text</think>"
+    elif shape == "death":
+        delta["reasoning_content"] = REASONING_SENTINEL
+    elif shape == "tool":
+        delta["tool_calls"] = [
+            {
+                "index": 0,
+                "id": "call-once",
+                "type": "function",
+                "function": {"name": "lookup", "arguments": "{}"},
+            }
+        ]
+        finish = "tool_calls"
+    elif shape == "refusal":
+        delta["refusal"] = "Cannot help."
+    header = {
+        "id": "scope-response",
+        "object": "chat.completion.chunk",
+        "created": 1,
+        "model": "served-model",
+    }
+    chunks = [
+        {**header, "choices": [{"index": 0, "delta": delta, "finish_reason": None}]},
+        {
+            **header,
+            "choices": [{"index": 0, "delta": {}, "finish_reason": finish}],
+            "usage": {"prompt_tokens": 24038, "completion_tokens": 43, "total_tokens": 24081},
+        },
+    ]
+    if shape == "death":
+        chunks = chunks[:1]
+    return "".join("data: " + json.dumps(chunk) + "\n\n" for chunk in chunks) + "data: [DONE]\n\n"
+
+
+def native_completion_wire(family, shape):
+    """Build a completed Responses or Messages stream with the selected content shape."""
+    text = {
+        "answer": "The work is complete.",
+        "separate": REASONING_SENTINEL,
+        "inline": f"<think>{REASONING_SENTINEL}</think>",
+        "unclosed": f"<think>{REASONING_SENTINEL}",
+        "whitespace": " \n\t",
+        "literal": "<think>literal text</think>",
+    }[shape]
+    if family == "openai":
+        output = (
+            {
+                "type": "message",
+                "id": "msg",
+                "role": "assistant",
+                "status": "completed",
+                "content": [{"type": "output_text", "text": text, "annotations": []}],
+            }
+            if shape != "separate"
+            else {
+                "type": "reasoning",
+                "id": "reason",
+                "summary": [{"type": "summary_text", "text": text}],
+            }
+        )
+        events = [
+            {
+                "type": "response.completed",
+                "sequence_number": 1,
+                "response": {
+                    "id": "response",
+                    "object": "response",
+                    "created_at": 0,
+                    "model": "served-model",
+                    "status": "completed",
+                    "output": [output],
+                    "usage": {"input_tokens": 24038, "output_tokens": 43, "total_tokens": 24081},
+                },
+            }
+        ]
+    else:
+        kind = "thinking" if shape == "separate" else "text"
+        events = [
+            {
+                "type": "message_start",
+                "message": {
+                    "id": "message",
+                    "type": "message",
+                    "role": "assistant",
+                    "model": "served-model",
+                    "content": [],
+                    "stop_reason": None,
+                    "stop_sequence": None,
+                    "usage": {"input_tokens": 24038, "output_tokens": 0},
+                },
+            },
+            {"type": "content_block_start", "index": 0, "content_block": {"type": kind, kind: ""}},
+            {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": kind + "_delta", kind: text},
+            },
+            {"type": "content_block_stop", "index": 0},
+            {
+                "type": "message_delta",
+                "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                "usage": {"output_tokens": 43},
+            },
+            {"type": "message_stop"},
+        ]
+    return "".join(
+        "event: " + event["type"] + "\ndata: " + json.dumps(event) + "\n\n" for event in events
+    )
+
+
+def _scripted_response(
+    reply: str | httpx2.Response | httpx2.SyncByteStream,
+    request: httpx2.Request,
+    *,
+    family: str,
+    finish: str,
+) -> httpx2.Response:
+    if isinstance(reply, httpx2.Response):
+        return reply
+    if isinstance(reply, httpx2.SyncByteStream):
+        return httpx2.Response(
+            200,
+            headers={"content-type": "application/json"},
+            stream=reply,
+            request=request,
+        )
+    if reply == "connect":
+        raise httpx2.ConnectError("connection unavailable", request=request)
+    if reply in {"overloaded", "rate-limit", "invalid", "http503", "overflow"}:
+        error_type = {
+            "overloaded": "overloaded_error",
+            "rate-limit": "rate_limit_error",
+            "invalid": "invalid_request_error",
+            "http503": "overloaded_error",
+            "overflow": "context_length_exceeded",
+        }[reply]
+        body = {
+            "error": {
+                "type": error_type,
+                "message": "maximum number of tokens allowed per minute"
+                if reply == "rate-limit"
+                else (
+                    "maximum context length exceeded"
+                    if reply == "overflow"
+                    else "backend cannot serve this request"
+                ),
+            }
+        }
+        return httpx2.Response(
+            503 if reply == "http503" else 200,
+            headers={"content-type": "application/json"},
+            stream=httpx2.ByteStream(json.dumps(body).encode()),
+            request=request,
+        )
+    wire = (
+        chat_completion_wire(reply, finish=finish)
+        if family == "openai-compatible"
+        else native_completion_wire(family, reply)
+    )
+    return httpx2.Response(
+        200,
+        headers={"content-type": "text/event-stream"},
+        stream=httpx2.ByteStream(wire.encode()),
+        request=request,
+    )
+
+
+@contextmanager
+def scripted_session(
+    kind: WorkstreamKind,
+    replies: Sequence[str | httpx2.Response | httpx2.SyncByteStream],
+    *,
+    family: str = "openai-compatible",
+    api_surface: str | None = None,
+    server_parses: bool | None = True,
+    native: bool = False,
+    finish: str = "stop",
+    ui: Any = None,
+    sdk_retries: int = 0,
+    model: str = "served-model",
+    **session_kwargs: Any,
+) -> Iterator[tuple[ChatSession, Any, list[dict[str, Any]]]]:
+    """Drive a registered session through a real SDK over a finite reply script.
+
+    Entries are named completion shapes, JSON errors (overloaded, rate-limit, invalid,
+    http503, overflow), a connect failure, a JSON byte stream, or an explicit response.
+    Explicit responses let callers supply custom SSE bodies without patching a wire builder.
+    Named replies use unread byte streams so the SDK must consume or close each response.
+    ``family`` and ``api_surface`` select the same adapters as ``create_provider``.
+    ``server_parses=None`` preserves the selected adapter's reasoning capability.
+
+    Requires initialized test storage. Yields the session, its UI, and decoded request
+    bodies. SDK and session backoff delays are zero; SDK retries default to disabled.
+    Successful context exit requires the whole script to be consumed. Response closure
+    is checked on every exit while the client is still open, before teardown can mask leaks.
+    """
+    provider = create_provider(family, api_surface=api_surface)
+    wire_family = provider.provider_name
+    endpoint = {
+        "openai-compatible": "chat/completions",
+        "openai": "responses",
+        "anthropic-compatible": "messages",
+    }[wire_family]
+    requests: list[dict[str, Any]] = []
+    responses: list[httpx2.Response] = []
+
+    def respond(request: httpx2.Request) -> httpx2.Response:
+        assert request.url.path == "/v1/" + endpoint
+        index = len(requests)
+        requests.append(json.loads(request.content))
+        assert index < len(replies), "unexpected additional provider request"
+        response = _scripted_response(replies[index], request, family=wire_family, finish=finish)
+        responses.append(response)
+        return response
+
+    ui = ui if ui is not None else UsageRecordingUI()
+    client_type = anthropic.Anthropic if family == "anthropic-compatible" else OpenAI
+    with (
+        client_type(
+            api_key="test-only",
+            base_url=(
+                "https://provider.example.com"
+                if family == "anthropic-compatible"
+                else "https://provider.example.com/v1"
+            ),
+            http_client=httpx2.Client(transport=httpx2.MockTransport(respond)),
+            max_retries=sdk_retries,
+        ) as client,
+        patch.object(client, "_calculate_retry_timeout", return_value=0),
+    ):
+        session_kwargs.setdefault("user_id", "scripted-session-user")
+        session = make_registered_session(client=client, ui=ui, kind=kind, **session_kwargs)
+        session._title_generated = True
+        session._RETRY_BASE_DELAY = 0
+        capabilities = dataclasses.replace(
+            provider.get_capabilities(model), supports_web_search=native
+        )
+        if server_parses is not None:
+            capabilities = dataclasses.replace(capabilities, server_parses_reasoning=server_parses)
+        replace_session_lane(
+            session, provider=provider, client=client, model=model, capabilities=capabilities
+        )
+        try:
+            yield session, ui, requests
+        finally:
+            assert all(response.is_closed for response in responses), "unclosed scripted response"
+        assert len(requests) == len(replies), "scripted replies were not fully consumed"
 
 
 # ---------------------------------------------------------------------------

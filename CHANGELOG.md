@@ -112,6 +112,9 @@ frozen.
 
 ### Fixed
 
+- **Stream cleanup after callback failures.** Chat and Responses adapters close the underlying
+  SDK response when a local chunk callback interrupts generation, preserving the original error.
+
 - **MCP catalogs are read past their first page (#1225).** A server that paginates its tools,
   prompts, resources or resource templates had only its first page published, on connect and on
   refresh, for shared and per-user servers alike. Each list is now followed to its last page,

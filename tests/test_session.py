@@ -3122,11 +3122,15 @@ class TestTitleRetry:
         assert provider.create_streaming.call_count == (3 if failure == "stream_death" else 1)
 
     def test_empty_title_exhaustion_does_not_schedule_again_on_next_send(self, tmp_db, monkeypatch):
-        from tests.test_empty_completion import _session
+        from tests._session_helpers import scripted_session
         from turnstone.core.workstream import WorkstreamKind
 
         monkeypatch.setattr("turnstone.core.model_turn._DRAIN_RETRY_BASE_DELAY", 0.0)
-        with _session(WorkstreamKind.INTERACTIVE, ["empty"] * 3) as (session, _ui, requests):
+        with scripted_session(WorkstreamKind.INTERACTIVE, ["empty"] * 3) as (
+            session,
+            _ui,
+            requests,
+        ):
             session.messages = [Turn.user("Review the parser.")]
             session._title_generated = True  # Armed by the first send's title gate.
             session._generate_title()
@@ -3148,11 +3152,11 @@ class TestTitleRetry:
     def test_empty_title_refresh_preserves_latch_and_rebroadcasts_current_title(
         self, tmp_db, monkeypatch, latched
     ):
-        from tests.test_empty_completion import _session
+        from tests._session_helpers import scripted_session
         from turnstone.core.workstream import WorkstreamKind
 
         monkeypatch.setattr("turnstone.core.model_turn._DRAIN_RETRY_BASE_DELAY", 0.0)
-        with _session(WorkstreamKind.INTERACTIVE, ["empty"] * 3) as (session, ui, requests):
+        with scripted_session(WorkstreamKind.INTERACTIVE, ["empty"] * 3) as (session, ui, requests):
             session.messages = [Turn.user("Review the parser.")]
             # request_title_refresh clears this latch before launching. Other
             # callers can already be latched; neither state changes on blank.

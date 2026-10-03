@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import threading
 from contextlib import ExitStack, contextmanager
 from dataclasses import replace
@@ -11,10 +10,9 @@ from unittest.mock import MagicMock, patch
 
 import httpx2
 import pytest
-from openai import InternalServerError, OpenAI
+from openai import InternalServerError
 
-from tests._session_helpers import NullUI, make_registered_session, replace_session_lane
-from tests.test_empty_completion import _native_wire, _wire
+from tests._session_helpers import NullUI, scripted_session
 from tests.test_sdk_stream_boundary import _BlockingJsonStream
 from turnstone.core.completion_recovery import (
     CompletionRecoveryError,
@@ -25,15 +23,14 @@ from turnstone.core.deadline import DeadlineCancelledError, StreamAbortRef
 from turnstone.core.judge import JudgeConfig
 from turnstone.core.model_turn import model_turn
 from turnstone.core.providers import IncompleteStreamError
-from turnstone.core.providers._openai_chat import OpenAIChatCompletionsProvider
 from turnstone.core.providers._openai_common import (
     UpstreamRateLimitError,
     UpstreamResponseError,
     UpstreamTransientError,
 )
-from turnstone.core.providers._openai_responses import OpenAIResponsesProvider
 from turnstone.core.session import ChatSession
 from turnstone.core.trajectory import Turn
+from turnstone.core.workstream import WorkstreamKind
 
 _ANSWER = "The work is complete."
 
@@ -69,71 +66,6 @@ class _BrokenJsonBody(httpx2.SyncByteStream):
         self.closed = True
 
 
-class _Replies:
-    def __init__(self, surface: str, replies: list[str | httpx2.SyncByteStream]) -> None:
-        self.surface = surface
-        self.replies = replies
-        self.requests: list[dict[str, Any]] = []
-        self.responses: list[httpx2.Response] = []
-
-    def __call__(self, request: httpx2.Request) -> httpx2.Response:
-        expected_path = "/v1/chat/completions" if self.surface == "chat" else "/v1/responses"
-        assert request.url.path == expected_path
-        self.requests.append(json.loads(request.content))
-        index = len(self.requests) - 1
-        assert index < len(self.replies), "unexpected additional provider request"
-        reply = self.replies[index]
-        if isinstance(reply, httpx2.SyncByteStream):
-            response = httpx2.Response(
-                200,
-                headers={"content-type": "application/json"},
-                stream=reply,
-                request=request,
-            )
-        elif reply == "connect":
-            raise httpx2.ConnectError("connection unavailable", request=request)
-        elif reply in {"overloaded", "rate-limit", "invalid", "http503", "overflow"}:
-            error_type = {
-                "overloaded": "overloaded_error",
-                "rate-limit": "rate_limit_error",
-                "invalid": "invalid_request_error",
-                "http503": "overloaded_error",
-                "overflow": "context_length_exceeded",
-            }[reply]
-            response = httpx2.Response(
-                503 if reply == "http503" else 200,
-                headers={"content-type": "application/json"},
-                json={
-                    "error": {
-                        "type": error_type,
-                        "message": "maximum number of tokens allowed per minute"
-                        if reply == "rate-limit"
-                        else (
-                            "maximum context length exceeded"
-                            if reply == "overflow"
-                            else "backend cannot serve this request"
-                        ),
-                    }
-                },
-                request=request,
-            )
-        else:
-            response = httpx2.Response(
-                200,
-                headers={"content-type": "text/event-stream"},
-                text=_wire(reply) if self.surface == "chat" else _native_wire("openai", reply),
-                request=request,
-            )
-        self.responses.append(response)
-        return response
-
-    def assert_finished(self) -> None:
-        assert len(self.requests) == len(self.replies)
-        # Check while the SDK client is still open, before its teardown can hide
-        # a response leaked by the provider's invalid-body or recovery path.
-        assert all(response.is_closed for response in self.responses)
-
-
 @pytest.fixture(autouse=True)
 def no_recovery_wait(monkeypatch):
     monkeypatch.setattr("turnstone.core.model_turn._DRAIN_RETRY_BASE_DELAY", 0.0)
@@ -141,35 +73,24 @@ def no_recovery_wait(monkeypatch):
 
 @contextmanager
 def _session(replies, *, surface="chat", native=False, sdk_retries=0):
-    transport = _Replies(surface, replies)
-    provider = (
-        OpenAIChatCompletionsProvider()
-        if surface == "chat"
-        else OpenAIResponsesProvider(compat=True)
-    )
     with (
-        OpenAI(
-            api_key="offline-test-only",
-            base_url="https://provider.invalid/v1",
-            http_client=httpx2.Client(transport=httpx2.MockTransport(transport)),
-            max_retries=sdk_retries,
-        ) as client,
-        ExitStack() as stack,
-    ):
-        stack.enter_context(patch.object(client, "_calculate_retry_timeout", return_value=0))
-        ui = _UI()
-        session = make_registered_session(
-            client=client,
-            ui=ui,
+        scripted_session(
+            WorkstreamKind.INTERACTIVE,
+            replies,
+            api_surface=surface,
+            server_parses=None,
+            sdk_retries=sdk_retries,
+            ui=_UI(),
             user_id="response-recovery-user",
             context_window=100_000,
             max_tokens=256,
             compact_max_tokens=256,
             judge_config=JudgeConfig(enabled=False, output_guard=False),
-        )
-        lane = replace_session_lane(session, provider=provider, client=client, model="served-model")
-        session._title_generated = True
-        session._RETRY_BASE_DELAY = 0
+        ) as (session, ui, requests),
+        ExitStack() as stack,
+    ):
+        lane = session._primary_lane()
+        provider = lane.provider
         session._agent_prompt_components = ()
         session._task_tools = []
         if native is True:
@@ -194,7 +115,7 @@ def _session(replies, *, surface="chat", native=False, sdk_retries=0):
             stack.enter_context(
                 patch.object(provider, "create_streaming", side_effect=without_metrics)
             )
-        yield session, ui, transport
+        yield session, ui, requests
 
 
 @contextmanager
@@ -250,10 +171,9 @@ def _invoke(session, caller):
 def test_product_callers_recover_json_errors_without_replaying_their_operation(
     tmp_db, surface, caller, error
 ):
-    with _session([error, "answer"], surface=surface, sdk_retries=2) as (session, ui, transport):
+    with _session([error, "answer"], surface=surface, sdk_retries=2) as (session, ui, requests):
         assert _invoke(session, caller) == _ANSWER
-        transport.assert_finished()
-        assert transport.requests[0] == transport.requests[1]
+        assert requests[0] == requests[1]
         assert len(ui.aux_usage) == 1
         assert ui.aux_usage[0]["completion_tokens"] == 43
         if caller == "task":
@@ -265,7 +185,7 @@ def test_product_callers_recover_json_errors_without_replaying_their_operation(
     "replies", [["overloaded", "empty", "death"], ["empty", "rate-limit", "overloaded"]]
 )
 def test_json_empty_and_drain_failures_share_one_allowance(tmp_db, caller, replies):
-    with _session(replies) as (session, ui, transport):
+    with _session(replies) as (session, ui, requests):
         if caller == "task":
             result = _invoke(session, caller)
             assert result.startswith("Task error:")
@@ -273,9 +193,8 @@ def test_json_empty_and_drain_failures_share_one_allowance(tmp_db, caller, repli
         else:
             with pytest.raises(CompletionRecoveryError):
                 _invoke(session, caller)
-        transport.assert_finished()
-        assert len(transport.requests) == 3
-        assert transport.requests[0] == transport.requests[1] == transport.requests[2]
+        assert len(requests) == 3
+        assert requests[0] == requests[1] == requests[2]
         # Only the completed empty attempt has usage. Error bodies and
         # incomplete streams cannot create a fabricated completed charge.
         assert len(ui.aux_usage) == 1
@@ -293,16 +212,15 @@ def test_json_rejection_reissues_regardless_of_native_posture(tmp_db, caller, su
     with _session(["overloaded", "answer"], surface=surface, native=native, sdk_retries=2) as (
         session,
         ui,
-        transport,
+        requests,
     ):
         assert _invoke(session, caller) == _ANSWER
-        transport.assert_finished()
-        assert transport.requests[0] == transport.requests[1]
+        assert requests[0] == requests[1]
         assert len(ui.aux_usage) == 1
         if native and surface == "chat":
-            assert transport.requests[0]["web_search_options"] == {}
+            assert requests[0]["web_search_options"] == {}
         elif native:
-            assert {"type": "web_search"} in transport.requests[0]["tools"]
+            assert {"type": "web_search"} in requests[0]["tools"]
 
 
 @pytest.mark.parametrize("native", [True, None, False])
@@ -311,7 +229,7 @@ def test_main_json_rejection_is_a_creation_failure(tmp_db, native):
     any tool posture: the primary lane is retried, its health failure is
     recorded once, and the fallback walk runs before the error surfaces."""
     replies = ["overloaded"] * (ChatSession._MAX_RETRIES + 1)
-    with _session(replies, native=native) as (session, ui, transport):
+    with _session(replies, native=native) as (session, ui, requests):
         tracker = MagicMock()
         session._registry = MagicMock(fallback=["spare"])
         with (
@@ -320,8 +238,7 @@ def test_main_json_rejection_is_a_creation_failure(tmp_db, native):
             pytest.raises(UpstreamTransientError),
         ):
             _invoke(session, "main")
-        transport.assert_finished()
-        assert len(transport.requests) == ChatSession._MAX_RETRIES + 1
+        assert len(requests) == ChatSession._MAX_RETRIES + 1
         tracker.record_failure.assert_called_once()
         fallback.assert_called_once()
         assert ui.aux_usage == []
@@ -329,10 +246,10 @@ def test_main_json_rejection_is_a_creation_failure(tmp_db, native):
 
 def test_main_json_rejection_walks_fallbacks_after_the_ladder(tmp_db):
     replies = [*(["overloaded"] * (ChatSession._MAX_RETRIES + 1)), "answer"]
-    with _session(replies) as (session, ui, transport):
+    with _session(replies) as (session, ui, requests):
         with _fallbacks(session, ["spare"]) as (primary, trackers):
             assert _invoke(session, "main") == _ANSWER
-        assert [request["model"] for request in transport.requests] == [
+        assert [request["model"] for request in requests] == [
             *(["served-model"] * (ChatSession._MAX_RETRIES + 1)),
             "spare",
         ]
@@ -340,30 +257,27 @@ def test_main_json_rejection_walks_fallbacks_after_the_ladder(tmp_db):
         primary.record_success.assert_not_called()
         trackers["spare"].record_success.assert_called_once()
         trackers["spare"].record_failure.assert_not_called()
-        transport.assert_finished()
 
 
 def test_main_json_overflow_rejection_compacts(tmp_db):
     """A context rejection delivered as an HTTP-200 JSON body reaches the send
     loop's compact-and-retry arm like any other request-time overflow."""
-    with _session(["overflow", "answer"]) as (session, ui, transport):
+    with _session(["overflow", "answer"]) as (session, ui, requests):
         with patch.object(session, "_compact_messages") as compact:
             assert _invoke(session, "main") == _ANSWER
         compact.assert_called_once()
-        transport.assert_finished()
-        assert len(transport.requests) == 2
+        assert len(requests) == 2
 
 
 def test_main_json_rejection_health_fault_is_local(tmp_db):
     replies = ["overloaded"] * (ChatSession._MAX_RETRIES + 1)
-    with _session(replies) as (session, ui, transport):
+    with _session(replies) as (session, ui, requests):
         with _fallbacks(session, ["spare"]) as (primary, trackers):
             primary.record_failure.side_effect = ValueError("private health state")
             with pytest.raises(ModelTurnLocalError):
                 _invoke(session, "main")
         trackers["spare"].record_failure.assert_not_called()
         trackers["spare"].record_success.assert_not_called()
-        transport.assert_finished()
 
 
 @pytest.mark.parametrize("surface", ["chat", "responses"])
@@ -372,50 +286,45 @@ def test_main_json_rejection_health_fault_is_local(tmp_db):
     [("overloaded", UpstreamTransientError), ("rate-limit", UpstreamRateLimitError)],
 )
 def test_raw_call_keeps_original_json_error_and_single_request(tmp_db, surface, reply, error_type):
-    with _session([reply], surface=surface, sdk_retries=2) as (session, _ui, transport):
+    with _session([reply], surface=surface, sdk_retries=2) as (session, _ui, requests):
         with pytest.raises(error_type) as failure:
             model_turn(session._primary_lane(), [Turn.user("Continue")], product_recovery=False)
         assert not isinstance(failure.value, CompletionRecoveryError)
         assert failure.value.status_code == 200
-        transport.assert_finished()
 
 
 def test_unclassified_json_error_remains_terminal(tmp_db):
-    with _session(["invalid"]) as (session, ui, transport):
+    with _session(["invalid"]) as (session, ui, requests):
         with pytest.raises(CompletionRecoveryError) as failure:
             _invoke(session, "utility")
         assert type(completion_cause(failure.value)) is UpstreamResponseError
-        transport.assert_finished()
         assert ui.aux_usage == []
 
 
 def test_http503_retains_sdk_retry_ownership(tmp_db):
-    with _session(["http503"] * 3, sdk_retries=2) as (session, ui, transport):
+    with _session(["http503"] * 3, sdk_retries=2) as (session, ui, requests):
         with pytest.raises(InternalServerError) as failure:
             _invoke(session, "utility")
         assert failure.value.status_code == 503
-        transport.assert_finished()
-        assert len(transport.requests) == 3
+        assert len(requests) == 3
         assert ui.aux_usage == []
 
 
 @pytest.mark.parametrize("surface", ["chat", "responses"])
 def test_json_body_read_failure_recovers_and_closes_the_response(tmp_db, surface):
     body = _BrokenJsonBody()
-    with _session([body, "answer"], surface=surface, sdk_retries=2) as (session, ui, transport):
+    with _session([body, "answer"], surface=surface, sdk_retries=2) as (session, ui, requests):
         assert _invoke(session, "utility") == _ANSWER
-        transport.assert_finished()
         assert body.closed
         assert len(ui.aux_usage) == 1
 
 
 def test_raw_json_body_read_failure_is_not_retried(tmp_db):
     body = _BrokenJsonBody()
-    with _session([body], sdk_retries=2) as (session, _ui, transport):
+    with _session([body], sdk_retries=2) as (session, _ui, requests):
         with pytest.raises(IncompleteStreamError) as failure:
             model_turn(session._primary_lane(), [Turn.user("Continue")], product_recovery=False)
         assert isinstance(failure.value.__cause__, httpx2.ReadError)
-        transport.assert_finished()
         assert body.closed
 
 
@@ -423,7 +332,7 @@ def test_cancelling_json_body_read_closes_response_without_reissue(tmp_db):
     body = _BlockingJsonStream()
     cancel_ref = StreamAbortRef()
     errors: list[BaseException] = []
-    with _session([body]) as (session, ui, transport):
+    with _session([body]) as (session, ui, requests):
 
         def invoke():
             try:
@@ -441,7 +350,6 @@ def test_cancelling_json_body_read_closes_response_without_reissue(tmp_db):
             assert len(errors) == 1
             assert isinstance(errors[0], DeadlineCancelledError)
             assert body.closed.is_set()
-            transport.assert_finished()
             assert ui.aux_usage == []
         finally:
             cancel_ref.abort()
@@ -451,14 +359,14 @@ def test_cancelling_json_body_read_closes_response_without_reissue(tmp_db):
 def test_main_fallback_walk_dials_healthy_lanes_before_degraded_ones(tmp_db):
     ladder = ChatSession._MAX_RETRIES + 1
     replies = [*(["overloaded"] * ladder), *(["connect"] * ladder), "answer"]
-    with _session(replies) as (session, ui, transport):
+    with _session(replies) as (session, ui, requests):
         notices: list[str] = []
         with (
             _fallbacks(session, ["degraded", "healthy"], degraded={"degraded"}),
             patch.object(ui, "on_info", side_effect=notices.append),
         ):
             assert _invoke(session, "main") == _ANSWER
-        assert [request["model"] for request in transport.requests] == [
+        assert [request["model"] for request in requests] == [
             *(["served-model"] * ladder),
             *(["healthy"] * ladder),
             "degraded",
@@ -466,4 +374,3 @@ def test_main_fallback_walk_dials_healthy_lanes_before_degraded_ones(tmp_db):
         healthy_notice = notices.index("[Primary model failed, falling back to healthy]")
         degraded_notice = notices.index("[Fallback degraded is degraded, trying anyway]")
         assert healthy_notice < degraded_notice
-        transport.assert_finished()

@@ -21,6 +21,7 @@ from turnstone.core.providers._openai_common import (
     extract_usage,
     format_citations,
     format_refusal,
+    iter_with_cleanup,
     reject_non_stream_response,
     sanitize_messages,
 )
@@ -356,7 +357,9 @@ class OpenAIChatCompletionsProvider:
         reject_non_stream_response(stream, cancel_ref=cancel_ref)
         if cancel_ref is not None:
             cancel_ref.append(stream)
-        return self._iter_stream(stream, finish_reason_optional=caps.finish_reason_optional)
+        return iter_with_cleanup(
+            self._iter_stream(stream, finish_reason_optional=caps.finish_reason_optional), stream
+        )
 
     def _iter_stream(
         self,

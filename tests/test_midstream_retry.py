@@ -17,15 +17,11 @@ Fixture note: tests zero ``_RETRY_BASE_DELAY`` per instance (else each
 retry pays real exponential backoff).
 """
 
-import json
 import logging
-from contextlib import contextmanager
 from unittest.mock import MagicMock, patch
 
 import httpx
-import httpx2
 import pytest
-from openai import OpenAI
 
 from tests._session_helpers import (
     NullUI,
@@ -33,8 +29,8 @@ from tests._session_helpers import (
     arm_session,
     make_session,
     replace_session_lane,
+    scripted_session,
 )
-from tests.test_empty_completion import _wire
 from turnstone.core.completion_recovery import (
     CompletionRecoveryError,
     ModelTurnLocalError,
@@ -44,7 +40,6 @@ from turnstone.core.judge import JudgeConfig
 from turnstone.core.memory import load_last_error
 from turnstone.core.model_turn import WirePreparationError
 from turnstone.core.providers import IncompleteStreamError, StreamChunk, UsageInfo
-from turnstone.core.providers._openai_chat import OpenAIChatCompletionsProvider
 from turnstone.core.providers._protocol import ProviderRequestMetrics
 from turnstone.core.session import (
     BackendAuthUnavailableError,
@@ -55,6 +50,7 @@ from turnstone.core.session import (
 from turnstone.core.storage import get_storage
 from turnstone.core.streaming_text import ThinkTagSplitter
 from turnstone.core.trajectory import Turn, dicts_from_turns
+from turnstone.core.workstream import WorkstreamKind
 
 
 def _make_session(ui=None, **kwargs):
@@ -109,58 +105,19 @@ def _assistant_msgs(session):
     return [m for m in dicts_from_turns(session.messages) if m["role"] == "assistant"]
 
 
-@contextmanager
 def _sdk_response_session(replies):
-    """Script real SDK creation and drain failures without network retries."""
-    requests = []
-    responses = []
-
-    def handle(request):
-        assert request.url.path == "/v1/chat/completions"
-        index = len(requests)
-        requests.append(json.loads(request.content))
-        assert index < len(replies), "unexpected additional provider request"
-        reply = replies[index]
-        if reply == "connect":
-            raise httpx2.ConnectError("client is closed", request=request)
-        if reply == "json":
-            response = httpx2.Response(
-                200,
-                headers={"content-type": "application/json"},
-                json={"error": {"type": "overloaded_error", "message": "gateway overloaded"}},
-                request=request,
-            )
-        else:
-            response = httpx2.Response(
-                200,
-                headers={"content-type": "text/event-stream"},
-                text=_wire(reply),
-                request=request,
-            )
-        responses.append(response)
-        return response
-
-    with OpenAI(
-        api_key="offline-test-only",
-        base_url="https://provider.invalid/v1",
-        max_retries=0,
-        http_client=httpx2.Client(transport=httpx2.MockTransport(handle)),
-    ) as client:
-        ui = RecordingUI()
-        session = _make_session(
-            ui,
-            client=client,
-            context_window=100_000,
-            max_tokens=256,
-            judge_config=JudgeConfig(enabled=False, output_guard=False),
-        )
-        replace_session_lane(
-            session, provider=OpenAIChatCompletionsProvider(), client=client, model="initial-model"
-        )
-        yield session, ui, requests
-        assert len(requests) == len(replies)
-        # Assert before client teardown can hide a leaked accepted response.
-        assert all(response.is_closed for response in responses)
+    """Configure the shared SDK harness for creation and drain failure tests."""
+    return scripted_session(
+        WorkstreamKind.INTERACTIVE,
+        replies,
+        ui=RecordingUI(),
+        user_id="",
+        server_parses=None,
+        model="initial-model",
+        context_window=100_000,
+        max_tokens=256,
+        judge_config=JudgeConfig(enabled=False, output_guard=False),
+    )
 
 
 class TestMidStreamRetry:
@@ -1036,8 +993,8 @@ class TestAcceptedResponseWindow:
     @pytest.mark.parametrize(
         "replies",
         [
-            ["death", "json", *(["connect"] * ChatSession._MAX_RETRIES)],
-            ["json", "death", *(["connect"] * (ChatSession._MAX_RETRIES + 1))],
+            ["death", "overloaded", *(["connect"] * ChatSession._MAX_RETRIES)],
+            ["overloaded", "death", *(["connect"] * (ChatSession._MAX_RETRIES + 1))],
         ],
         ids=["death-then-json", "json-then-death"],
     )
@@ -1078,7 +1035,7 @@ class TestAcceptedResponseWindow:
         "prior_stream", [False, True], ids=["json-only", "reasoning-then-json"]
     )
     def test_stop_after_json_preserves_only_an_armed_turn(self, tmp_db, prior_stream):
-        replies = ["death", "json"] if prior_stream else ["json"]
+        replies = ["death", "overloaded"] if prior_stream else ["overloaded"]
         with _sdk_response_session(replies) as (session, ui, _requests):
             original_backoff = session._backoff_or_cancelled
             backoffs = 0
@@ -1106,7 +1063,7 @@ class TestAcceptedResponseWindow:
             assert session._serving_failure_contexts == {}
 
     def test_success_after_json_releases_the_earlier_stream_failure(self, tmp_db):
-        with _sdk_response_session(["death", "json", "answer"]) as (session, ui, _requests):
+        with _sdk_response_session(["death", "overloaded", "answer"]) as (session, ui, _requests):
             session.send("test")
 
             assert [message["content"] for message in _assistant_msgs(session)] == [

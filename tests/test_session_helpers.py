@@ -4,7 +4,7 @@ from unittest.mock import patch
 
 import pytest
 
-from tests._session_helpers import make_registered_session, make_session
+from tests._session_helpers import make_registered_session, make_session, scripted_session
 from turnstone.core.personas import PersonaSnapshot
 from turnstone.core.workstream import WorkstreamKind
 
@@ -124,3 +124,50 @@ def test_registered_session_factory_accepts_exact_repeated_metadata(tmp_db: str)
 
     assert first.ws_id == second.ws_id
     assert get_storage().get_workstream(first.ws_id) is not None
+
+
+@pytest.mark.parametrize("reply", ["answer", "overloaded"])
+@pytest.mark.parametrize("body_fails", [False, True])
+def test_scripted_session_checks_response_closure_before_client_teardown(
+    tmp_db: str, monkeypatch: pytest.MonkeyPatch, reply: str, body_fails: bool
+) -> None:
+    response = None
+    try:
+        with (
+            pytest.raises(AssertionError, match="unclosed scripted response"),
+            scripted_session(WorkstreamKind.INTERACTIVE, [reply]) as (session, _ui, _requests),
+        ):
+            client = session._primary_lane().client
+            request = client._client.build_request("POST", "/v1/chat/completions", json={})
+            response = client._client.send(request, stream=True)
+            assert not response.is_closed
+            original_close = client.close
+
+            def close():
+                # A teardown that releases responses must not hide a provider leak.
+                response.close()
+                original_close()
+
+            monkeypatch.setattr(client, "close", close)
+            if body_fails:
+                raise RuntimeError("test body failed")
+        assert client.is_closed()
+    finally:
+        if response is not None:
+            response.close()
+
+
+def test_scripted_session_rejects_unused_replies(tmp_db: str) -> None:
+    with (
+        pytest.raises(AssertionError, match="not fully consumed"),
+        scripted_session(WorkstreamKind.INTERACTIVE, ["answer"]),
+    ):
+        pass
+
+
+def test_scripted_session_rejects_additional_requests(tmp_db: str) -> None:
+    with (
+        pytest.raises(AssertionError, match="unexpected additional provider request"),
+        scripted_session(WorkstreamKind.INTERACTIVE, []) as (session, _ui, _requests),
+    ):
+        session._primary_lane().client._client.post("/v1/chat/completions", json={})
