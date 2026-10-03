@@ -213,19 +213,16 @@ class TestMcpToOpenai:
         result = _mcp_to_openai("fs", tool)
         assert result["function"]["name"] == "mcp__fs__list_files"
 
-    def test_missing_input_schema(self):
-        tool = MagicMock()
-        tool.name = "ping"
-        tool.description = "Ping the server"
-        tool.inputSchema = None
+    def test_empty_input_schema(self):
+        tool = mcp_types.Tool(name="ping", description="Ping the server", inputSchema={})
         result = _mcp_to_openai("test", tool)
         assert result["function"]["parameters"] == {"type": "object", "properties": {}}
 
-    def test_empty_description(self):
-        tool = MagicMock()
-        tool.name = "noop"
-        tool.description = ""
-        tool.inputSchema = {"type": "object", "properties": {}}
+    @pytest.mark.parametrize("description", [None, ""])
+    def test_empty_description(self, description):
+        tool = mcp_types.Tool(
+            name="noop", description=description, inputSchema={"type": "object", "properties": {}}
+        )
         result = _mcp_to_openai("test", tool)
         assert result["function"]["description"] == ""
 
@@ -2144,11 +2141,9 @@ class TestMCPResources:
         _seed_static_state(mgr, "fs", session=mock_session)
         mgr._loop = asyncio.new_event_loop()
 
-        # Mock the read_resource result
-        text_content = MagicMock(spec=["text"])
-        text_content.text = "Hello, world!"
-        mock_result = MagicMock()
-        mock_result.contents = [text_content]
+        mock_result = mcp_types.ReadResourceResult(
+            contents=[mcp_types.TextResourceContents(uri="file:///readme", text="Hello, world!")]
+        )
         mock_session.read_resource = AsyncMock(return_value=mock_result)
 
         thread = None
@@ -2172,10 +2167,9 @@ class TestMCPResources:
         _seed_static_state(mgr, "fs", session=mock_session)
         mgr._loop = asyncio.new_event_loop()
 
-        blob_content = MagicMock(spec=["blob"])
-        blob_content.blob = "aGVsbG8="
-        mock_result = MagicMock()
-        mock_result.contents = [blob_content]
+        mock_result = mcp_types.ReadResourceResult(
+            contents=[mcp_types.BlobResourceContents(uri="file:///img.png", blob="aGVsbG8=")]
+        )
         mock_session.read_resource = AsyncMock(return_value=mock_result)
 
         thread = None
@@ -2409,10 +2403,13 @@ class TestMCPResources:
         _seed_static_state(mgr, "db", session=mock_session)
         mgr._loop = asyncio.new_event_loop()
 
-        text_content = MagicMock(spec=["text"])
-        text_content.text = '{"name": "Alice"}'
-        mock_result = MagicMock()
-        mock_result.contents = [text_content]
+        mock_result = mcp_types.ReadResourceResult(
+            contents=[
+                mcp_types.TextResourceContents(
+                    uri="db://tables/users/rows/1", text='{"name": "Alice"}'
+                )
+            ]
+        )
         mock_session.read_resource = AsyncMock(return_value=mock_result)
 
         thread = None
@@ -2484,17 +2481,16 @@ class TestMCPPrompts:
         _seed_static_state(mgr, "tmpl", session=mock_session)
         mgr._loop = asyncio.new_event_loop()
 
-        # Build mock PromptMessage
-        msg1 = MagicMock()
-        msg1.role = "user"
-        msg1.content = MagicMock()
-        msg1.content.text = "Review this code"
-        msg2 = MagicMock()
-        msg2.role = "assistant"
-        msg2.content = MagicMock()
-        msg2.content.text = "Looks good!"
-        mock_result = MagicMock()
-        mock_result.messages = [msg1, msg2]
+        mock_result = mcp_types.GetPromptResult(
+            messages=[
+                mcp_types.PromptMessage(
+                    role="user", content=mcp_types.TextContent(type="text", text="Review this code")
+                ),
+                mcp_types.PromptMessage(
+                    role="assistant", content=mcp_types.TextContent(type="text", text="Looks good!")
+                ),
+            ]
+        )
         mock_session.get_prompt = AsyncMock(return_value=mock_result)
 
         thread = None
@@ -2986,9 +2982,7 @@ class TestCircuitBreaker:
         mgr._tool_map["mcp__test__ping"] = ("test", "ping")
         # Pre-set a failure
         mgr._consecutive_failures["test"] = 2
-        mock_result = MagicMock()
-        mock_result.content = []
-        mock_result.isError = False
+        mock_result = mcp_types.CallToolResult(content=[], isError=False)
         mock_future = MagicMock()
         mock_future.result.return_value = mock_result
         with patch("asyncio.run_coroutine_threadsafe", new=_dispatch_stub(mock_future)):

@@ -86,8 +86,12 @@ def _build_server() -> Server[Any, Any]:
         return [mcp_types.Tool(name="op", inputSchema={"type": "object"})]
 
     @server.call_tool()
-    async def call_tool(name: str, arguments: dict[str, Any]) -> list[mcp_types.TextContent]:
-        return [mcp_types.TextContent(type="text", text="ok")]
+    async def call_tool(name: str, arguments: dict[str, Any]) -> mcp_types.CallToolResult:
+        failed = bool(arguments.get("fail"))
+        return mcp_types.CallToolResult(
+            content=[mcp_types.TextContent(type="text", text="boom" if failed else "ok")],
+            isError=failed,
+        )
 
     @server.list_resources()
     async def resources() -> list[mcp_types.Resource]:
@@ -213,6 +217,22 @@ def _call(mgr: MCPClientManager, kind: str, pooled: bool) -> str:
 def _session(mgr: MCPClientManager, pooled: bool) -> Any:
     state = mgr._user_pool_entries[_KEY] if pooled else mgr._static_servers["srv"]
     return state.session
+
+
+def test_tool_error_preserves_error_prefix_and_session(dispatch_env):
+    """An isError result crosses the real transport and reaches the agent as an error."""
+    mgr, _upstream, pooled = dispatch_env
+    session = _session(mgr, pooled)
+
+    output = mgr.call_tool_sync(
+        "mcp__srv__op", {"fail": True}, user_id="user-1" if pooled else None, timeout=4
+    )
+
+    assert output == "Error: boom"
+    assert mgr._consecutive_failures.get("srv", 0) == 0
+    assert _session(mgr, pooled) is session
+    assert _call(mgr, "tool", pooled) == "ok"
+    assert _session(mgr, pooled) is session
 
 
 @pytest.mark.parametrize("kind", ["tool", "resource", "prompt"])

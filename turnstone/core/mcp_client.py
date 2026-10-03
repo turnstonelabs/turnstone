@@ -541,17 +541,17 @@ def _make_capturing_http_factory(
 # ---------------------------------------------------------------------------
 
 
-def _mcp_to_openai(server_name: str, tool: Any) -> dict[str, Any]:
+def _mcp_to_openai(server_name: str, tool: mcp_types.Tool) -> dict[str, Any]:
     """Convert a single MCP tool definition to OpenAI function-calling format.
 
     The tool name is prefixed ``mcp__{server}__{original}`` to avoid
     collisions with built-in tools and to identify the owning server.
     """
-    input_schema = getattr(tool, "inputSchema", None) or {
+    input_schema = tool.inputSchema or {
         "type": "object",
         "properties": {},
     }
-    description = getattr(tool, "description", "") or ""
+    description = tool.description or ""
     return {
         "type": "function",
         "function": {
@@ -2560,18 +2560,20 @@ class MCPClientManager:
         # as failed. The live owner/session must likewise be torn down before
         # the error escapes.
         try:
-            caps = session.get_server_capabilities()
+            caps: mcp_types.ServerCapabilities | None = session.get_server_capabilities()
 
-            tools_cap = getattr(caps, "tools", None) if caps else None
-            supports_list_changed = bool(getattr(tools_cap, "listChanged", False))
+            tools_cap = caps.tools if caps is not None else None
+            supports_list_changed = tools_cap is not None and bool(tools_cap.listChanged)
 
-            resources_cap = getattr(caps, "resources", None) if caps else None
+            resources_cap = caps.resources if caps is not None else None
             supports_resources = resources_cap is not None
-            supports_resource_list_changed = bool(getattr(resources_cap, "listChanged", False))
+            supports_resource_list_changed = resources_cap is not None and bool(
+                resources_cap.listChanged
+            )
 
-            prompts_cap = getattr(caps, "prompts", None) if caps else None
+            prompts_cap = caps.prompts if caps is not None else None
             supports_prompts = prompts_cap is not None
-            supports_prompt_list_changed = bool(getattr(prompts_cap, "listChanged", False))
+            supports_prompt_list_changed = prompts_cap is not None and bool(prompts_cap.listChanged)
 
             # Discover tools. Discovery runs in THIS caller task while the
             # transport is hosted by the owner, so a transport collapse
@@ -3136,13 +3138,17 @@ class MCPClientManager:
         # capability-gated so a server that doesn't implement them stays
         # cheap (no extra round-trips). Capabilities are populated by the
         # initialize roundtrip and immutable thereafter (R13).
-        caps = session.get_server_capabilities()
-        resources_cap = getattr(caps, "resources", None) if caps else None
-        prompts_cap = getattr(caps, "prompts", None) if caps else None
+        caps: mcp_types.ServerCapabilities | None = session.get_server_capabilities()
+        resources_cap = caps.resources if caps is not None else None
+        prompts_cap = caps.prompts if caps is not None else None
         entry.supports_resources = resources_cap is not None
-        entry.supports_resource_list_changed = bool(getattr(resources_cap, "listChanged", False))
+        entry.supports_resource_list_changed = resources_cap is not None and bool(
+            resources_cap.listChanged
+        )
         entry.supports_prompts = prompts_cap is not None
-        entry.supports_prompt_list_changed = bool(getattr(prompts_cap, "listChanged", False))
+        entry.supports_prompt_list_changed = prompts_cap is not None and bool(
+            prompts_cap.listChanged
+        )
 
         # Discover this user's tool catalog. Discovery runs in THIS caller task
         # while the transport is hosted by the owner, so an upstream failure
@@ -9147,7 +9153,7 @@ class MCPClientManager:
 # ---------------------------------------------------------------------------
 
 
-def _decode_tool_result(result: Any) -> str:
+def _decode_tool_result(result: mcp_types.CallToolResult) -> str:
     """Render an MCP ``tools/call`` result into the string the agent sees.
 
     Walks ``result.content`` collecting text parts and labelling binary
@@ -9157,20 +9163,19 @@ def _decode_tool_result(result: Any) -> str:
     """
     texts: list[str] = []
     for item in result.content:
-        if hasattr(item, "text"):
+        if isinstance(item, mcp_types.TextContent):
             texts.append(item.text)
-        elif hasattr(item, "data"):
-            mime = getattr(item, "mimeType", "binary")
-            texts.append(f"[{mime} data, {len(item.data)} bytes]")
+        elif isinstance(item, mcp_types.ImageContent | mcp_types.AudioContent):
+            texts.append(f"[{item.mimeType} data, {len(item.data)} bytes]")
         else:
             texts.append(str(item))
     output = "\n".join(texts) if texts else "(no output)"
-    if getattr(result, "isError", False):
+    if result.isError:
         output = f"Error: {output}"
     return output
 
 
-def _decode_resource_result(result: Any) -> str:
+def _decode_resource_result(result: mcp_types.ReadResourceResult) -> str:
     """Render an MCP ``resources/read`` result into the string the agent sees.
 
     Walks ``result.contents`` collecting text parts (TextResourceContents)
@@ -9179,23 +9184,23 @@ def _decode_resource_result(result: Any) -> str:
     """
     parts: list[str] = []
     for item in result.contents:
-        if hasattr(item, "text"):
+        if isinstance(item, mcp_types.TextResourceContents):
             parts.append(item.text)
-        elif hasattr(item, "blob"):
+        elif isinstance(item, mcp_types.BlobResourceContents):
             parts.append(item.blob)
         else:
             parts.append(str(item))
     return "\n".join(parts) if parts else "(empty resource)"
 
 
-def _decode_prompt_result(result: Any) -> list[dict[str, Any]]:
+def _decode_prompt_result(result: mcp_types.GetPromptResult) -> list[dict[str, Any]]:
     """Render an MCP ``prompts/get`` result into the list-of-messages
     the agent sees. Shared by the static and pool prompt-get paths.
     """
     messages: list[dict[str, Any]] = []
     for msg in result.messages:
         content = msg.content
-        text = content.text if hasattr(content, "text") else str(content)
+        text = content.text if isinstance(content, mcp_types.TextContent) else str(content)
         messages.append({"role": msg.role, "content": text})
     return messages
 

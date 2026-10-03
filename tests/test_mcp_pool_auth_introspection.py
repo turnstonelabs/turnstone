@@ -32,6 +32,7 @@ from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, MagicMock
 
 import httpx
+import mcp.types as mcp_types
 import pytest
 
 from tests._oauth_runtime_helpers import make_oauth_context
@@ -234,12 +235,10 @@ class TestCarrierLifecycle:
                 cap.status = 401
                 cap.www_authenticate = 'Bearer error="invalid_token"'
             call_index[0] += 1
-            content = MagicMock()
-            content.text = "ok"
-            res = MagicMock()
-            res.content = [content]
-            res.isError = False
-            return res
+            return mcp_types.CallToolResult(
+                content=[mcp_types.TextContent(type="text", text="ok")],
+                isError=False,
+            )
 
         async def _seed() -> None:
             entry = await mgr._ensure_pool_entry(("user-1", "pool-srv"))
@@ -625,12 +624,10 @@ class TestDispatcherAuthFlows:
                 # generic CONNECTION_CLOSED-shaped error.
                 _populate_active_capture(mgr, status=401, header='Bearer error="invalid_token"')
                 raise RuntimeError("upstream 401 (SDK-swallow shape)")
-            content = MagicMock()
-            content.text = "ok"
-            res = MagicMock()
-            res.content = [content]
-            res.isError = False
-            return res
+            return mcp_types.CallToolResult(
+                content=[mcp_types.TextContent(type="text", text="ok")],
+                isError=False,
+            )
 
         self._seed_pool_entry_with_call_tool(mgr, loop, _call_tool)
 
@@ -941,12 +938,10 @@ class TestBreakerInvariant:
             raise RuntimeError("upstream 401")
 
         async def _call_tool_success(name: str, args: dict[str, Any]) -> Any:
-            content = MagicMock()
-            content.text = "ok"
-            res = MagicMock()
-            res.content = [content]
-            res.isError = False
-            return res
+            return mcp_types.CallToolResult(
+                content=[mcp_types.TextContent(type="text", text="ok")],
+                isError=False,
+            )
 
         async def _call_tool_403(name: str, args: dict[str, Any]) -> Any:
             _populate_active_capture(
@@ -1053,12 +1048,10 @@ class TestOpenLockHeldAcrossCallTool:
                 observed_max = max(observed_max, in_flight)
             try:
                 await asyncio.sleep(0.1)
-                content = MagicMock()
-                content.text = "ok"
-                res = MagicMock()
-                res.content = [content]
-                res.isError = False
-                return res
+                return mcp_types.CallToolResult(
+                    content=[mcp_types.TextContent(type="text", text="ok")],
+                    isError=False,
+                )
             finally:
                 with in_flight_lock:
                     in_flight -= 1
@@ -1851,12 +1844,10 @@ class TestPoolPrimingAndTokenRotation:
         reconnect_tokens: list[str] = []
 
         async def _ok_call_tool(name: str, args: dict[str, Any]) -> Any:
-            content = MagicMock()
-            content.text = "ok"
-            res = MagicMock()
-            res.content = [content]
-            res.isError = False
-            return res
+            return mcp_types.CallToolResult(
+                content=[mcp_types.TextContent(type="text", text="ok")],
+                isError=False,
+            )
 
         async def _seed() -> None:
             entry = await mgr._ensure_pool_entry(("user-1", "pool-srv"))

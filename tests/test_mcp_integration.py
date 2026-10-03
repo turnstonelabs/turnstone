@@ -12,6 +12,7 @@ import asyncio
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
+import mcp.types as mcp_types
 import pytest
 
 from tests.conftest import _seed_static_state
@@ -52,8 +53,8 @@ def _make_prompt(
 
 
 def _make_mock_session(
-    read_resource_result: Any = None,
-    get_prompt_result: Any = None,
+    read_resource_result: mcp_types.ReadResourceResult | None = None,
+    get_prompt_result: mcp_types.GetPromptResult | None = None,
 ) -> AsyncMock:
     """Build a mock ClientSession with configurable async return values."""
     session = AsyncMock()
@@ -61,23 +62,22 @@ def _make_mock_session(
     if read_resource_result is not None:
         session.read_resource.return_value = read_resource_result
     else:
-        # Default: single text content
-        content_item = MagicMock()
-        content_item.text = "resource content"
-        result = MagicMock()
-        result.contents = [content_item]
-        session.read_resource.return_value = result
+        session.read_resource.return_value = mcp_types.ReadResourceResult(
+            contents=[
+                mcp_types.TextResourceContents(uri="file:///readme.md", text="resource content")
+            ]
+        )
 
     if get_prompt_result is not None:
         session.get_prompt.return_value = get_prompt_result
     else:
-        msg = MagicMock()
-        msg.role = "user"
-        msg.content = MagicMock()
-        msg.content.text = "Hello, World!"
-        result = MagicMock()
-        result.messages = [msg]
-        session.get_prompt.return_value = result
+        session.get_prompt.return_value = mcp_types.GetPromptResult(
+            messages=[
+                mcp_types.PromptMessage(
+                    role="user", content=mcp_types.TextContent(type="text", text="Hello, World!")
+                )
+            ]
+        )
 
     return session
 

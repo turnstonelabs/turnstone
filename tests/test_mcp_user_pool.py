@@ -283,9 +283,7 @@ def _fake_connect_session() -> MagicMock:
     """
     fake_session = MagicMock()
     fake_session.initialize = AsyncMock(return_value=None)
-    fake_caps = MagicMock()
-    fake_caps.resources = None
-    fake_caps.prompts = None
+    fake_caps = mcp_types.ServerCapabilities(tools=mcp_types.ToolsCapability())
     fake_session.get_server_capabilities = MagicMock(return_value=fake_caps)
     fake_session.list_tools = AsyncMock(return_value=mcp_types.ListToolsResult(tools=[]))
     return fake_session
@@ -330,6 +328,44 @@ _POOL_CONNECT_CFG = {
 
 
 class TestLazyConnect:
+    @pytest.mark.parametrize("kind", ["resources", "prompts"])
+    @pytest.mark.parametrize("list_changed", [None, False, True])
+    def test_sdk_capabilities_control_discovery_and_push(
+        self, running_loop_mgr, kind: str, list_changed: bool | None
+    ) -> None:
+        mgr, loop, _ = running_loop_mgr
+        session = _fake_connect_session()
+        session.get_server_capabilities.return_value = mcp_types.ServerCapabilities(
+            resources=(
+                mcp_types.ResourcesCapability(listChanged=list_changed)
+                if kind == "resources"
+                else None
+            ),
+            prompts=(
+                mcp_types.PromptsCapability(listChanged=list_changed) if kind == "prompts" else None
+            ),
+        )
+        session.list_resources = AsyncMock(return_value=mcp_types.ListResourcesResult(resources=[]))
+        session.list_resource_templates = AsyncMock(
+            return_value=mcp_types.ListResourceTemplatesResult(resourceTemplates=[])
+        )
+        session.list_prompts = AsyncMock(return_value=mcp_types.ListPromptsResult(prompts=[]))
+
+        with _patched_pool_transport(mgr, session):
+            entry = _run_on_loop(
+                loop,
+                mgr._connect_one_pool(
+                    ("user-1", "pool-srv"), dict(_POOL_CONNECT_CFG), "access-aaa"
+                ),
+            )
+
+        assert entry.supports_resources is (kind == "resources")
+        assert entry.supports_resource_list_changed is (kind == "resources" and bool(list_changed))
+        assert entry.supports_prompts is (kind == "prompts")
+        assert entry.supports_prompt_list_changed is (kind == "prompts" and bool(list_changed))
+        assert session.list_resources.await_count == int(kind == "resources")
+        assert session.list_prompts.await_count == int(kind == "prompts")
+
     def test_connect_pool_injects_authorization_header(self, running_loop_mgr) -> None:
         mgr, loop, _ = running_loop_mgr
 
@@ -1519,12 +1555,10 @@ class TestDispatchStateMachine:
         fake_session = MagicMock()
 
         async def _call_tool(name, args):
-            content = MagicMock()
-            content.text = "tool-result"
-            res = MagicMock()
-            res.content = [content]
-            res.isError = False
-            return res
+            return mcp_types.CallToolResult(
+                content=[mcp_types.TextContent(type="text", text="tool-result")],
+                isError=False,
+            )
 
         fake_session.call_tool = _call_tool
 
@@ -1701,12 +1735,10 @@ class TestHttpsEnforcement:
         fake_session = MagicMock()
 
         async def _call_tool(name, args):
-            content = MagicMock()
-            content.text = "ok"
-            res = MagicMock()
-            res.content = [content]
-            res.isError = False
-            return res
+            return mcp_types.CallToolResult(
+                content=[mcp_types.TextContent(type="text", text="ok")],
+                isError=False,
+            )
 
         fake_session.call_tool = _call_tool
 
@@ -1882,12 +1914,10 @@ class TestConcurrentDispatch:
                 # Hold a moment so concurrent calls would overlap if
                 # they weren't serialized on ``open_lock``.
                 await asyncio.sleep(0.1)
-                content = MagicMock()
-                content.text = "ok"
-                res = MagicMock()
-                res.content = [content]
-                res.isError = False
-                return res
+                return mcp_types.CallToolResult(
+                    content=[mcp_types.TextContent(type="text", text="ok")],
+                    isError=False,
+                )
             finally:
                 with in_flight_lock:
                     in_flight -= 1
@@ -1947,12 +1977,10 @@ class TestUserIdThreadThrough:
         fake_session = MagicMock()
 
         async def _call_tool(name, args):
-            content = MagicMock()
-            content.text = "static-output"
-            res = MagicMock()
-            res.content = [content]
-            res.isError = False
-            return res
+            return mcp_types.CallToolResult(
+                content=[mcp_types.TextContent(type="text", text="static-output")],
+                isError=False,
+            )
 
         fake_session.call_tool = _call_tool
         mgr._static_servers["static-srv"] = StaticServerState(
@@ -1987,12 +2015,10 @@ class TestUserIdThreadThrough:
         fake_session = MagicMock()
 
         async def _call_tool(name, args):
-            content = MagicMock()
-            content.text = "static-output"
-            res = MagicMock()
-            res.content = [content]
-            res.isError = False
-            return res
+            return mcp_types.CallToolResult(
+                content=[mcp_types.TextContent(type="text", text="static-output")],
+                isError=False,
+            )
 
         fake_session.call_tool = _call_tool
         mgr._static_servers["static-srv"] = StaticServerState(

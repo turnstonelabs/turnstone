@@ -129,6 +129,45 @@ def _fake_transport_and_session(mgr_module_patches: dict[str, Any]) -> dict[str,
 
 
 class TestTransportOwnerLifecycle:
+    @pytest.mark.parametrize("kind", ["tools", "resources", "prompts"])
+    @pytest.mark.parametrize("list_changed", [None, False, True])
+    def test_sdk_capabilities_control_discovery_and_push(
+        self, running_loop_mgr, kind: str, list_changed: bool | None
+    ) -> None:
+        mgr, loop, _ = running_loop_mgr
+        patches: dict[str, Any] = {}
+        fake = _fake_transport_and_session(patches)
+        session = fake["session"]
+        session.get_server_capabilities.return_value = mcp_types.ServerCapabilities(
+            tools=mcp_types.ToolsCapability(listChanged=list_changed) if kind == "tools" else None,
+            resources=(
+                mcp_types.ResourcesCapability(listChanged=list_changed)
+                if kind == "resources"
+                else None
+            ),
+            prompts=(
+                mcp_types.PromptsCapability(listChanged=list_changed) if kind == "prompts" else None
+            ),
+        )
+        session.list_prompts = AsyncMock(return_value=mcp_types.ListPromptsResult(prompts=[]))
+
+        with (
+            patch("turnstone.core.mcp_client.stdio_client", patches["stdio_client"]),
+            patch("turnstone.core.mcp_client.ClientSession", patches["ClientSession"]),
+        ):
+            _run(loop, mgr._connect_one_locked("srv", mgr._server_configs["srv"]))
+            state = mgr._static_servers["srv"]
+            assert state.supports_list_changed is (kind == "tools" and bool(list_changed))
+            assert state.supports_resources is (kind == "resources")
+            assert state.supports_resource_list_changed is (
+                kind == "resources" and bool(list_changed)
+            )
+            assert state.supports_prompts is (kind == "prompts")
+            assert state.supports_prompt_list_changed is (kind == "prompts" and bool(list_changed))
+            assert session.list_resources.await_count == int(kind == "resources")
+            assert session.list_prompts.await_count == int(kind == "prompts")
+            _run(loop, mgr._teardown_static_session("srv"))
+
     def test_connect_installs_owner_and_teardown_closes_gracefully(self, running_loop_mgr) -> None:
         mgr, loop, _ = running_loop_mgr
         patches: dict[str, Any] = {}
