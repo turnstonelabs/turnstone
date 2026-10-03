@@ -767,7 +767,9 @@ class TestBaseExceptionGroupHardening:
         async def _exploding_connect(name: str, _cfg: dict[str, Any]) -> None:
             raise BaseExceptionGroup("transport collapsed", [asyncio.CancelledError()])
 
-        with patch.object(mgr, "_connect_one", side_effect=_exploding_connect):
+        # Below ``_connect_one``, which records the failure under the connect lock
+        # and re-raises it into ``_connect_all``.
+        with patch.object(mgr, "_connect_one_locked", side_effect=_exploding_connect):
             _run(loop, mgr._connect_all())
 
         assert mgr._connected.is_set()
