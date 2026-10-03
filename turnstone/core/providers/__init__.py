@@ -25,11 +25,19 @@ from turnstone.core.providers._protocol import (
     thinking_off_template_kwargs,
     transport_guarded,
 )
+from turnstone.core.providers._switchyard import (
+    PROVIDER_NAME as SWITCHYARD_PROVIDER_NAME,
+)
+from turnstone.core.providers._switchyard import (
+    SwitchyardChatProvider,
+    SwitchyardResponsesProvider,
+)
 from turnstone.core.providers._xai import XAI_DEFAULT_BASE_URL, XAIProvider
 
 __all__ = [
     "ANTHROPIC_PROTOCOL_PROVIDERS",
     "ANTHROPIC_WORKSPACE_HEADER",
+    "API_SURFACE_PROVIDERS",
     "CompletionResult",
     "ContextWindowExceededError",
     "IncompleteStreamError",
@@ -39,6 +47,9 @@ __all__ = [
     "OpenAIProvider",
     "OpenAIResponsesProvider",
     "StreamChunk",
+    "SwitchyardChatProvider",
+    "SwitchyardResponsesProvider",
+    "SWITCHYARD_PROVIDER_NAME",
     "ToolCallDelta",
     "UsageInfo",
     "XAIProvider",
@@ -66,6 +77,8 @@ _provider_lock = threading.Lock()
 _openai_provider = OpenAIResponsesProvider()
 _openai_compat_provider = OpenAIChatCompletionsProvider()
 _openai_compat_responses_provider = OpenAIResponsesProvider(compat=True)
+_switchyard_provider = SwitchyardResponsesProvider()
+_switchyard_chat_provider = SwitchyardChatProvider()
 _xai_provider = XAIProvider()
 _anthropic_provider: LLMProvider | None = None
 _anthropic_compat_provider: LLMProvider | None = None
@@ -73,6 +86,15 @@ _google_provider: LLMProvider | None = None
 
 
 _VALID_API_SURFACES = ("chat", "responses")
+
+# Provider names whose adapter is an OpenAI-protocol client reached over a
+# caller-supplied ``base_url``: these are the lanes where ``api_surface``
+# decides chat vs responses on the wire. ``switchyard`` is listed by its
+# canonical name (SWITCHYARD_PROVIDER_NAME). The console mirrors this set as
+# ``_OPENAI_ADAPTER_PROVIDERS`` in console/static/admin.js, which gates the
+# "Server compatibility" knobs on it — keep the two in sync (pinned by
+# tests/test_provider_switchyard_wiring.py).
+API_SURFACE_PROVIDERS: frozenset[str] = frozenset({"openai-compatible", SWITCHYARD_PROVIDER_NAME})
 
 
 def create_provider(
@@ -104,19 +126,28 @@ def create_provider(
     ``"openai"``.  Code that needs to distinguish the two must read
     ``ModelConfig.provider`` and ``server_compat["api_surface"]``
     rather than ``provider.provider_name``.
+
+    ``provider_name="switchyard"`` returns the Switchyard adapter, which owns no
+    routing decision itself: it lowers Turnstone's ledger onto the surface
+    Switchyard exposes and classifies what the ledger cannot carry across the
+    provider boundary.  It resolves *api_surface* exactly as ``openai-compatible``
+    does, so moving a live row between the two names cannot change the request
+    shape; unlike ``openai-compatible`` it keeps its own ``provider_name``, so a
+    lane can report which adapter served it.
     """
     global _anthropic_provider, _anthropic_compat_provider, _google_provider  # noqa: PLW0603
     if provider_name == "openai":
         return _openai_provider
-    if provider_name == "openai-compatible":
+    if provider_name in API_SURFACE_PROVIDERS:
         normalised = (api_surface or "").strip().lower()
         if normalised and normalised not in _VALID_API_SURFACES:
             raise ValueError(
                 f"Unknown api_surface: {api_surface!r}. Supported: {', '.join(_VALID_API_SURFACES)}"
             )
-        if normalised == "responses":
-            return _openai_compat_responses_provider
-        return _openai_compat_provider
+        responses = normalised == "responses"
+        if provider_name == "openai-compatible":
+            return _openai_compat_responses_provider if responses else _openai_compat_provider
+        return _switchyard_provider if responses else _switchyard_chat_provider
     if provider_name == "xai":
         return _xai_provider
     if provider_name == "anthropic":
@@ -142,13 +173,16 @@ def create_provider(
             return _google_provider
     raise ValueError(
         f"Unknown provider: {provider_name!r}. "
-        "Supported: openai, anthropic, google, openai-compatible, anthropic-compatible, xai"
+        "Supported: openai, anthropic, google, openai-compatible, anthropic-compatible, "
+        "switchyard, xai"
     )
 
 
 # Providers whose models live on an operator-run server: no capability
 # table, the window comes from the endpoint, and a bearer is optional.
-LOCAL_PROVIDERS: frozenset[str] = frozenset({"openai-compatible", "anthropic-compatible"})
+LOCAL_PROVIDERS: frozenset[str] = frozenset(
+    {"openai-compatible", "anthropic-compatible", "switchyard"}
+)
 
 
 # Providers whose wire protocol is the Messages API: one provider class under two names (its
@@ -213,17 +247,21 @@ def create_client(
         )
         if not os.environ.get(env_name):
             resolved_key = LOCAL_PLACEHOLDER_API_KEY
-    if provider_name in ("openai", "openai-compatible", "google", "xai"):
+    if provider_name in ("openai", "openai-compatible", "switchyard", "google", "xai"):
         from openai import OpenAI
 
-        if provider_name == "openai-compatible" and not base_url:
+        if not base_url and provider_name in ("openai-compatible", "switchyard"):
             # The lane targets an operator-run server; without a base_url the
             # SDK would default to https://api.openai.com/v1 and send the
             # prompts meant for that server to the commercial API. Same
             # posture as the anthropic-compatible arm below.
+            example = (
+                "http://your-vllm-host:8000/v1"
+                if provider_name == "openai-compatible"
+                else "http://127.0.0.1:4000/v1"
+            )
             raise ValueError(
-                "openai-compatible requires base_url (the server's /v1 root, "
-                "e.g. http://your-vllm-host:8000/v1)"
+                f"{provider_name} requires base_url (the server's /v1 root, e.g. {example})"
             )
         if not base_url and provider_name == "google":
             from turnstone.core.providers._google import GOOGLE_DEFAULT_BASE_URL
@@ -265,7 +303,8 @@ def create_client(
         return anthropic.Anthropic(**kwargs)
     raise ValueError(
         f"Unknown provider: {provider_name!r}. "
-        "Supported: openai, anthropic, google, openai-compatible, anthropic-compatible, xai"
+        "Supported: openai, anthropic, google, openai-compatible, anthropic-compatible, "
+        "switchyard, xai"
     )
 
 

@@ -61,7 +61,11 @@ KNOB_VALUES: tuple[str, ...] = ("none", "minimal", "low", "medium", "high", "xhi
 # OpenAIResponsesProvider, whose surface ignores extra_body entirely, so
 # template overrides can never change an xai request and the ladder
 # projects xai through the flat channel only (fallthrough in _effective).
-_CHAT_LANES = frozenset({"openai-compatible", "google"})
+# switchyard is listed for its CHAT surface (SwitchyardChatProvider subclasses
+# the chat provider); on ``api_surface="responses"`` the _effective surface
+# check below drops it to the flat channel, exactly as for the
+# ``openai-compatible`` name.
+_CHAT_LANES = frozenset({"openai-compatible", "switchyard", "google"})
 
 
 def effort_ladder(
