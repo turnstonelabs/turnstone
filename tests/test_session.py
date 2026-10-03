@@ -17,6 +17,7 @@ from tests._oidc_test_helpers import keyed_app_state
 from tests._session_helpers import (
     FakeAnthropicBlock,
     as_stream,
+    make_fork_destination,
     make_registered_session,
     make_result,
     make_session,
@@ -11636,22 +11637,54 @@ class TestReminderSidechannelIsolation:
         assert extracted_user == "first message body"
         assert "SECRET_NUDGE_TEXT" not in extracted_user
 
+    @pytest.mark.parametrize("with_history", [False, True])
+    def test_fork_snapshot_alone_adopts_after_source_deletion(self, tmp_db, with_history):
+        storage = get_storage()
+        storage.register_workstream("fork_source", user_id="owner")
+        storage.save_workstream_config("fork_source", {"temperature": "0.25"})
+        if with_history:
+            storage.save_message("fork_source", "user", "copied history")
+        session = make_fork_destination()
+        original_ws_id = session.ws_id
+        snapshot = storage.clone_workstream("fork_source", original_ws_id, principal_id="owner")
+        assert storage.delete_workstream("fork_source")
+
+        with (
+            patch.object(
+                session, "_load_message_turns", side_effect=AssertionError("source history read")
+            ),
+            patch.object(
+                session, "_load_workstream_config", side_effect=AssertionError("source config read")
+            ),
+        ):
+            assert session.resume("fork_source", _fork_snapshot=snapshot) is True
+
+        assert session.ws_id == original_ws_id
+        assert session.messages == list(snapshot.turns)
+        assert [turn.text for turn in session.messages] == (
+            ["copied history"] if with_history else []
+        )
+        assert session.temperature == 0.25
+        assert storage.load_workstream_config(original_ws_id) == {"temperature": "0.25"}
+
     def test_fork_preserves_source(self, tmp_db):
         """A forked workstream's resumed transcript carries the wake
-        marker (``_source = "system_nudge"``).  The bulk-row builder
-        threads ``_source`` onto every fork row so reconnecting tabs see
-        the same marker the source workstream's originating tab rendered.
+        marker (``_source = "system_nudge"``) across clone and reopen.
         """
-        from turnstone.core.memory import register_workstream, save_message
+        from turnstone.core.memory import save_message
 
-        register_workstream("fork_source")
+        get_storage().register_workstream(
+            "fork_source", user_id="owner", state="idle", fork_reservation_token="source-token"
+        )
         save_message("fork_source", "user", "real turn")
         save_message("fork_source", "user", "", source="system_nudge")
         save_message("fork_source", "assistant", "ok")
 
-        forking_session = _make_session()
+        forking_session = make_fork_destination()
         fork_ws_id = forking_session._ws_id
-        assert forking_session.resume("fork_source", fork=True) is True
+        forking_session.fork_from_storage(
+            "fork_source", principal_id="owner", source_reservation_token="source-token"
+        )
 
         resumed_fork = _make_session()
         assert resumed_fork.resume(fork_ws_id) is True
@@ -11726,27 +11759,28 @@ class TestReminderSidechannelIsolation:
         )
 
         assert snapshot.config == {"temperature": "0.25"}
+        assert forking.ws_id == destination_ws
+        assert forking.messages == []
+        assert forking.temperature == 0.25
         assert backend.load_workstream_config(destination_ws) == {"successor": "keep"}
         replacement = backend.ensure_workstream_incarnation_snapshot(destination_ws)
         assert replacement is not None
         assert replacement["fork_reservation_token"] == replacement_token
 
     def test_fork_preserves_provider_content(self, tmp_db):
-        """Fork bug fix: the bulk-row builder reads the in-memory
-        ``_provider_content`` key (not the storage column name
-        ``provider_data``) when copying messages, so provider-fidelity
-        blocks (Anthropic thinking, web-search encrypted_content) survive
-        a fork instead of being silently dropped.
-
-        Round-trip: persist a source workstream whose assistant turn
-        carries ``provider_data``, ``resume(fork=True)`` it into a new
-        ws_id (driving the fixed bulk-save), then reload the fork's rows
-        and assert the provider blocks survived.
-        """
-        from turnstone.core.memory import register_workstream
+        """Provider blocks, provenance and native token charges survive a fork."""
         from turnstone.core.storage import get_storage
+        from turnstone.core.trajectory import NATIVE_TOKENS_META_KEY, PROVENANCE_META_KEY
 
-        register_workstream("fork_pc_src")
+        get_storage().register_workstream(
+            "fork_pc_src", user_id="owner", state="idle", fork_reservation_token="source-token"
+        )
+        provenance = {
+            "model_alias": "primary",
+            "backend_model_id": "test-model",
+            "registry_generation": 3,
+            "acting_principal_id": "owner",
+        }
         get_storage().save_message(
             "fork_pc_src",
             "assistant",
@@ -11757,30 +11791,42 @@ class TestReminderSidechannelIsolation:
                     {"type": "text", "text": "answer"},
                 ]
             ),
+            producer="test-provider",
+            meta=json.dumps({PROVENANCE_META_KEY: provenance, NATIVE_TOKENS_META_KEY: 4096}),
         )
 
-        forking = _make_session()
+        forking = make_fork_destination()
         fork_ws = forking._ws_id
-        assert forking.resume("fork_pc_src", fork=True) is True
+        forking.fork_from_storage(
+            "fork_pc_src", principal_id="owner", source_reservation_token="source-token"
+        )
 
-        # The fork persisted its own rows; reload and assert the
-        # provider_data column round-tripped (the bug dropped it because
-        # the builder read ``provider_data`` instead of ``_provider_content``).
         rows = get_storage().load_messages(fork_ws)
         asst = next(m for m in rows if m.get("role") == "assistant")
         assert asst.get("_provider_content") == [
             {"type": "thinking", "thinking": "reason", "signature": "s"},
             {"type": "text", "text": "answer"},
         ]
+        reopened = _make_session()
+        assert reopened.resume(fork_ws) is True
+        for session in (forking, reopened):
+            assistant = next(turn for turn in session.messages if turn.role is Role.ASSISTANT)
+            assert assistant.meta.extra[PROVENANCE_META_KEY] == provenance
+            assert assistant.native_tokens == 4096
+            assert assistant.native is not None
+            assert assistant.native.producer == "test-provider"
+            assert list(assistant.native.blocks) == asst["_provider_content"]
 
     def test_fork_reopen_preserves_tool_effect_metadata(self, tmp_db):
-        """Fork bulk persistence keeps TOOL's typed effect envelope."""
-        from turnstone.core.memory import register_workstream, save_message
+        """An atomic fork keeps the tool's effect envelope and acting principal."""
+        from turnstone.core.memory import save_message
         from turnstone.core.trajectory import EffectStatus
 
         source_ws = "fork_tool_meta_src"
         call_id = "call-effect"
-        register_workstream(source_ws)
+        get_storage().register_workstream(
+            source_ws, user_id="owner", state="idle", fork_reservation_token="source-token"
+        )
         save_message(source_ws, "user", "run the bounded action")
         save_message(
             source_ws,
@@ -11804,31 +11850,40 @@ class TestReminderSidechannelIsolation:
             meta=json.dumps(
                 {
                     "effect_status": EffectStatus.UNKNOWN.value,
+                    "acting_principal": "owner",
                 }
             ),
         )
         save_message(source_ws, "assistant", "The outcome remains unknown.")
 
-        forking = _make_session()
+        forking = make_fork_destination()
         fork_ws = forking._ws_id
-        assert forking.resume(source_ws, fork=True) is True
+        forking.fork_from_storage(
+            source_ws, principal_id="owner", source_reservation_token="source-token"
+        )
         in_memory_tool = next(turn for turn in forking.messages if turn.tool_call_id == call_id)
         assert in_memory_tool.effect_status is EffectStatus.UNKNOWN
+        assert in_memory_tool.meta.extra["acting_principal"] == "owner"
 
         reopened = _make_session()
         assert reopened.resume(fork_ws) is True
         persisted_tool = next(turn for turn in reopened.messages if turn.tool_call_id == call_id)
         assert persisted_tool.effect_status is EffectStatus.UNKNOWN
+        assert persisted_tool.meta.extra["acting_principal"] == "owner"
 
     def test_failed_fork_copy_leaves_live_session_untouched(self, tmp_db):
-        """A refused bulk transaction is not a partial in-memory resume."""
-        from turnstone.core.memory import register_workstream, save_message
+        """A refused clone leaves the live history and configuration intact."""
+        from turnstone.core.memory import save_message
+        from turnstone.core.storage import ForkSourceUnavailableError
 
         source_ws = "fork_copy_failure_source"
-        register_workstream(source_ws)
+        storage = get_storage()
+        storage.register_workstream(
+            source_ws, user_id="owner", state="idle", fork_reservation_token="source-token"
+        )
         save_message(source_ws, "user", "source-only history")
 
-        session = _make_session()
+        session = make_fork_destination()
         session.messages.append(Turn.user("keep current history"))
         session.temperature = 0.37
         session.max_tokens = 123
@@ -11837,135 +11892,20 @@ class TestReminderSidechannelIsolation:
         original_snapshot = dicts_from_turns(session.messages)
         original_binding = session._model_binding
 
-        with patch("turnstone.core.session.save_messages_bulk", return_value=False):
-            assert session.resume(source_ws, fork=True) is False
+        # The source is gone before the clone runs.
+        assert storage.delete_workstream(source_ws)
+        with pytest.raises(ForkSourceUnavailableError):
+            session.fork_from_storage(
+                source_ws, principal_id="owner", source_reservation_token="source-token"
+            )
 
+        assert storage.load_message_turns(session.ws_id) == []
         assert session.messages is original_messages
         assert dicts_from_turns(session.messages) == original_snapshot
         assert session._model_binding is original_binding
         assert session.temperature == 0.37
         assert session.max_tokens == 123
         assert session._token_budget == 7
-
-    @pytest.mark.parametrize("ownership_failure", [False, RuntimeError("storage down")])
-    def test_fork_preview_ownership_failure_is_fail_closed(self, tmp_db, ownership_failure):
-        """Descriptor metadata alone cannot authorize or survive a fork."""
-        from turnstone.core.storage import get_storage
-
-        preview = {
-            "attachment_id": "d" * 64,
-            "kind": "image",
-            "mime_type": "image/png",
-        }
-        source_turn = Turn.tool("preview-call", "preview shown")
-        source_turn.meta.extra["preview"] = preview
-        session = _make_session()
-        session.messages.append(Turn.user("keep current history"))
-        original_messages = session.messages
-        original_snapshot = dicts_from_turns(session.messages)
-        storage = get_storage()
-        ownership = (
-            {"side_effect": ownership_failure}
-            if isinstance(ownership_failure, Exception)
-            else {"return_value": ownership_failure}
-        )
-
-        with (
-            patch("turnstone.core.session.load_message_turns", return_value=[source_turn]),
-            patch.object(storage, "attachment_referenced_in_ws", **ownership),
-            patch("turnstone.core.session.save_messages_bulk") as bulk_save,
-        ):
-            assert session.resume("preview-source", fork=True) is False
-
-        bulk_save.assert_not_called()
-        assert session.messages is original_messages
-        assert dicts_from_turns(session.messages) == original_snapshot
-
-    def test_source_delete_between_row_and_blob_reads_aborts_fork(self, tmp_db):
-        """The raw row ref-list survives a lost blob-materialization race."""
-        import hashlib
-
-        from turnstone.core.memory import register_workstream, save_message
-        from turnstone.core.storage import get_storage
-
-        storage = get_storage()
-        source_ws = "fork_source_delete_race"
-        body = b"delete between reads"
-        attachment_id = hashlib.sha256(body).hexdigest()
-        register_workstream(source_ws)
-        row_id = save_message(source_ws, "user", "source text")
-        storage.save_attachment(
-            attachment_id,
-            "source.txt",
-            "text/plain",
-            len(body),
-            "text",
-            body,
-        )
-        storage.set_message_attachments(source_ws, row_id, [attachment_id])
-
-        session = _make_session()
-        fork_ws = session._ws_id
-        session.messages.append(Turn.user("keep current history"))
-        original_messages = session.messages
-        original_snapshot = dicts_from_turns(session.messages)
-        resolve_attachments = storage._resolve_row_attachments
-
-        def delete_source_before_blob_read(rows):
-            assert storage.delete_workstream(source_ws) is True
-            return resolve_attachments(rows)
-
-        with patch.object(
-            storage,
-            "_resolve_row_attachments",
-            side_effect=delete_source_before_blob_read,
-        ):
-            assert session.resume(source_ws, fork=True) is False
-
-        assert storage.load_messages(fork_ws) == []
-        assert session.messages is original_messages
-        assert dicts_from_turns(session.messages) == original_snapshot
-        assert storage.get_attachment(attachment_id) is None
-
-    def test_invalid_source_config_precedes_fork_transaction(self, tmp_db):
-        """Scalar validation cannot leave committed rows or retained blobs."""
-        import hashlib
-
-        from turnstone.core.memory import register_workstream, save_message
-        from turnstone.core.storage import get_storage
-
-        storage = get_storage()
-        source_ws = "fork_invalid_config_source"
-        body = b"still source owned"
-        attachment_id = hashlib.sha256(body).hexdigest()
-        register_workstream(source_ws)
-        row_id = save_message(source_ws, "user", "source text")
-        storage.save_attachment(
-            attachment_id,
-            "source.txt",
-            "text/plain",
-            len(body),
-            "text",
-            body,
-        )
-        storage.set_message_attachments(source_ws, row_id, [attachment_id])
-        storage.save_workstream_config(source_ws, {"temperature": "not-a-number"})
-
-        session = _make_session()
-        fork_ws = session._ws_id
-        session.messages.append(Turn.user("keep current history"))
-        original_messages = session.messages
-        original_snapshot = dicts_from_turns(session.messages)
-
-        with pytest.raises(ValueError, match="could not convert string to float"):
-            session.resume(source_ws, fork=True)
-
-        assert storage.load_messages(fork_ws) == []
-        assert session.messages is original_messages
-        assert dicts_from_turns(session.messages) == original_snapshot
-        stored = storage.get_attachment(attachment_id)
-        assert stored is not None
-        assert stored["refcount"] == 1
 
     def test_fork_reopen_keeps_user_attachment_and_tool_preview_after_source_delete(self, tmp_db):
         """A fork owns every copied attachment, including preview-only blobs.
@@ -11978,7 +11918,7 @@ class TestReminderSidechannelIsolation:
         """
         import hashlib
 
-        from turnstone.core.memory import register_workstream, save_message
+        from turnstone.core.memory import save_message
         from turnstone.core.preview import PREVIEW_BLOB_KIND, build_preview_descriptor
         from turnstone.core.storage import get_storage
         from turnstone.core.trajectory import EffectStatus, Role
@@ -12000,7 +11940,9 @@ class TestReminderSidechannelIsolation:
             size=len(preview_bytes),
         )
 
-        register_workstream(source_ws)
+        storage.register_workstream(
+            source_ws, user_id="owner", state="idle", fork_reservation_token="source-token"
+        )
         user_row_id = save_message(source_ws, "user", user_text)
         assert user_row_id
         storage.save_attachment(
@@ -12062,10 +12004,11 @@ class TestReminderSidechannelIsolation:
         storage.set_message_attachments(source_ws, tool_row_id, [preview_attachment_id])
         save_message(source_ws, "assistant", "The preview receipt is recorded.")
 
-        forking = _make_session()
+        forking = make_fork_destination()
         fork_ws = forking._ws_id
-        register_workstream(fork_ws)
-        assert forking.resume(source_ws, fork=True) is True
+        forking.fork_from_storage(
+            source_ws, principal_id="owner", source_reservation_token="source-token"
+        )
         assert storage.delete_workstream(source_ws) is True
 
         reopened = _make_session()

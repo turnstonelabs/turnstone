@@ -290,21 +290,6 @@ def save_tool_message_with_attachments(
     )
 
 
-def save_messages_bulk(rows: list[dict[str, Any]]) -> bool:
-    """Insert multiple conversation rows in a single transaction.
-
-    Returns whether the transaction committed. Most single-row persistence is
-    deliberately best-effort, but fork callers need an explicit durability
-    result so a missing attachment cannot be reported as a successful copy.
-    """
-    try:
-        get_storage().save_messages_bulk(rows)
-        return True
-    except Exception:
-        log.warning("Failed to bulk-save %d messages", len(rows), exc_info=True)
-        return False
-
-
 def load_messages(ws_id: str, *, repair: bool = True) -> list[dict[str, Any]]:
     """Load messages for a workstream and reconstruct OpenAI message format."""
     try:

@@ -19,7 +19,7 @@ from __future__ import annotations
 import json
 from unittest.mock import MagicMock, patch
 
-from tests._session_helpers import make_session
+from tests._session_helpers import make_fork_destination, make_session
 from turnstone.core import fence
 from turnstone.core.compaction import SummaryResult
 from turnstone.core.providers._anthropic import AnthropicProvider
@@ -545,31 +545,29 @@ def test_resume_resets_shared_state():
     rst.assert_called_once()
 
 
-def test_fork_persists_sender_meta():
-    # The fork bulk-persist must carry the user-turn sender stamp into the
-    # fork's rows (mirroring _append_user_turn), or the fork loses per-user
-    # attribution the first time it is reopened from the DB.
-    s = make_session(user_id="owner")
-    turns = [
-        turn_from_dict({"role": "user", "content": "hi", "_sender": "alice"}),
-        turn_from_dict({"role": "user", "content": "wake", "_source": "wake"}),
-        turn_from_dict({"role": "assistant", "content": "yo"}),
-    ]
-    storage = MagicMock()
-    storage.get_workstream.return_value = None
-    with (
-        patch("turnstone.core.session.load_message_turns", return_value=turns),
-        patch("turnstone.core.session.save_messages_bulk") as bulk,
-        patch("turnstone.core.session.get_storage", return_value=storage),
-        patch.object(s, "_save_config"),
-        patch.object(s, "_init_system_messages"),
-    ):
-        assert s.resume("src-ws", fork=True) is True
-    rows = bulk.call_args.args[0]
-    by_content = {r["content"]: r for r in rows}
-    assert json.loads(by_content["hi"]["meta"]) == {"sender": "alice"}
-    assert by_content["wake"]["meta"] is None  # synthetic: no sender stamped
-    assert by_content["yo"]["meta"] is None  # assistant rows carry no sender
+def test_fork_persists_sender_meta(tmp_db):
+    """Sender attribution survives cloning, source deletion and reopening."""
+    from turnstone.core.storage import get_storage
+
+    storage = get_storage()
+    storage.register_workstream(
+        "src-ws", user_id="owner", state="idle", fork_reservation_token="source-token"
+    )
+    storage.save_message("src-ws", "user", "hi", meta=json.dumps({"sender": "alice"}))
+    storage.save_message("src-ws", "user", "wake", source="wake")
+    storage.save_message("src-ws", "assistant", "yo")
+    fork = make_fork_destination()
+    fork.fork_from_storage("src-ws", principal_id="owner", source_reservation_token="source-token")
+    assert storage.delete_workstream("src-ws")
+    reopened = make_session(user_id="owner")
+    assert reopened.resume(fork.ws_id)
+    for session in (fork, reopened):
+        by_content = {turn.text: turn for turn in session.messages}
+        assert by_content["hi"].meta.extra["sender"] == "alice"
+        assert "sender" not in by_content["wake"].meta.extra
+        assert "sender" not in by_content["yo"].meta.extra
+        assert session._shared_workstream is True
+        assert "alice" in session._known_senders
 
 
 def test_resume_recovers_compacted_out_sender_end_to_end(tmp_db, mock_openai_client):

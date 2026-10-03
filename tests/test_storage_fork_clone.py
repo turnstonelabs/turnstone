@@ -691,6 +691,73 @@ def test_clone_preserves_raw_attachment_refs_and_balances_refcounts(storage_back
         assert attachment["refcount"] == 1
 
 
+@pytest.mark.parametrize("preview_id", [None, "", 123, "b" * 64])
+def test_clone_refuses_invalid_preview_reference(storage_backend, preview_id) -> None:
+    """A descriptor cannot grant access to an unrelated workstream's blob."""
+    backend = storage_backend
+    _register(backend, "source", "alice")
+    _register(backend, "destination", "alice", state="creating")
+    _register(backend, "unrelated", "bob")
+    attachment_id = "b" * 64
+    backend.save_attachment(attachment_id, "preview.html", "text/html", 7, "preview", b"private")
+    unrelated_row = backend.save_message("unrelated", "user", "private preview")
+    backend.set_message_attachments("unrelated", unrelated_row, [attachment_id])
+    backend.save_message(
+        "source",
+        "assistant",
+        "",
+        tool_calls=json.dumps(
+            [
+                {
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {"name": "render", "arguments": "{}"},
+                }
+            ]
+        ),
+    )
+    backend.save_message(
+        "source",
+        "tool",
+        "rendered",
+        tool_call_id="call-1",
+        meta=json.dumps({"preview": {"attachment_id": preview_id, "title": "Preview"}}),
+    )
+    backend.save_message("source", "assistant", "done")
+    backend.save_workstream_config("destination", {"keep": "value"})
+
+    with pytest.raises(ForkSourceUnavailableError, match="preview reference is invalid"):
+        backend.clone_workstream("source", "destination", principal_id="alice")
+
+    assert backend.load_message_turns("destination") == []
+    assert backend.load_workstream_config("destination") == {"keep": "value"}
+    assert not backend.attachment_referenced_in_ws(attachment_id, "destination")
+    attachment = backend.get_attachment(attachment_id)
+    assert attachment is not None and attachment["refcount"] == 1
+
+
+@pytest.mark.parametrize("raw_refs", ["invalid-json", "{}", '[""]', "[123]"])
+def test_clone_refuses_invalid_attachment_refs(storage_backend, raw_refs) -> None:
+    backend = storage_backend
+    _register(backend, "source", "alice")
+    _register(backend, "destination", "alice", state="creating")
+    row_id = backend.save_message("source", "user", "source text")
+    backend.save_workstream_config("destination", {"keep": "value"})
+    with backend._conn() as conn:
+        conn.execute(
+            sa.update(conversations)
+            .where(conversations.c.id == row_id)
+            .values(attachments=raw_refs)
+        )
+        conn.commit()
+
+    with pytest.raises(ForkSourceUnavailableError, match="attachment references are invalid"):
+        backend.clone_workstream("source", "destination", principal_id="alice")
+
+    assert backend.load_message_turns("destination") == []
+    assert backend.load_workstream_config("destination") == {"keep": "value"}
+
+
 def test_missing_attachment_rolls_back_refs_config_history_and_binding(storage_backend) -> None:
     backend = storage_backend
     backend.create_project("old-project", "Old", "alice", visibility="private")

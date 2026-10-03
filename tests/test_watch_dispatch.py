@@ -22,6 +22,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from tests._helpers import patch_session_storage
+from tests._session_helpers import make_fork_destination
 from turnstone.core.session import _WATCH_QUEUE_SOFT_CAP, ChatSession
 
 
@@ -519,16 +520,26 @@ class TestResumeReRegistration:
         assert set(runner.fns) == {"resume-target"}
 
     def test_fork_resume_keeps_registration(self, tmp_db):
+        from turnstone.core.storage import get_storage
+
         self._saved_ws("fork-src")
-        session = _make_session_for_dispatch()
+        source = get_storage().ensure_workstream_incarnation_snapshot("fork-src")
+        assert source is not None
+        session = make_fork_destination()
         old_id = session._ws_id
         runner = _RecordingRunner()
         session.set_watch_runner(runner, wake_fn=None)
 
-        assert session.resume("fork-src", fork=True) is True
+        session.fork_from_storage(
+            "fork-src",
+            principal_id="owner",
+            source_reservation_token=source["fork_reservation_token"],
+        )
 
         # Fork keeps its own identity — registration untouched.
         assert runner.events == [("set", old_id)]
+        assert session.ws_id == old_id
+        assert set(runner.fns) == {old_id}
 
     def test_resume_without_runner_is_noop(self, tmp_db):
         # CLI --resume / restore-fn shape: resume() runs BEFORE any

@@ -223,6 +223,26 @@ def make_registered_session(**kwargs: Any) -> ChatSession:
     return make_session(**kwargs)
 
 
+def make_fork_destination(*, user_id: str = "owner") -> ChatSession:
+    """Reserve an unpublished destination for tests of the atomic fork path."""
+    import uuid
+
+    from turnstone.core.storage import get_storage, is_storage_initialized
+
+    if not is_storage_initialized():
+        raise RuntimeError("make_fork_destination requires initialized test storage")
+    ws_id = uuid.uuid4().hex
+    token = uuid.uuid4().hex
+    get_storage().register_workstream(
+        ws_id,
+        user_id=user_id,
+        kind="interactive",
+        state="creating",
+        fork_reservation_token=token,
+    )
+    return make_session(ws_id=ws_id, user_id=user_id, fork_reservation_token=token)
+
+
 def mock_completion_result(
     content: str = "",
     tool_calls: list[dict[str, Any]] | None = None,

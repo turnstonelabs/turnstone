@@ -145,7 +145,6 @@ from turnstone.core.memory import (
     resolve_workstream,
     sanitize_error_text,
     save_message,
-    save_messages_bulk,
     save_tool_message_with_attachments,
     save_user_message_with_attachments,
     save_workstream_config,
@@ -6725,141 +6724,6 @@ class ChatSession:
                 self._title_generated = False
             return valid
 
-    def _persist_fork_messages(self, source_ws_id: str, turns: list[Turn]) -> bool:
-        """Durably copy canonical turns into this session's fork identity.
-
-        Runs before :meth:`resume` adopts any source history or configuration,
-        so a failed transaction leaves the current session untouched. Attachment
-        links and refcount retention are committed atomically by the storage
-        backend's bulk writer.
-        """
-        bulk_rows: list[dict[str, Any]] = []
-        storage = get_storage()
-        for turn in turns:
-            msg = turn_to_dict(turn)
-            tc = msg.get("tool_calls")
-            tc_json = json.dumps(tc) if tc else None
-            # Provider-fidelity blocks ride the in-memory
-            # ``_provider_content`` key (the live save path at ``_run_loop``
-            # reads the same key); the storage column is ``provider_data``.
-            pd = msg.get("_provider_content")
-            try:
-                pd_str = json.dumps(pd) if pd and not isinstance(pd, str) else pd
-            except (TypeError, ValueError):
-                pd_str = None
-            src = msg.get("_source")
-            sm = msg.get("_source_meta")
-            sender = msg.get("_sender")
-            raw_storage_ids = turn.meta.extra.get("storage_attachment_ids")
-            if raw_storage_ids is not None:
-                if not isinstance(raw_storage_ids, list) or any(
-                    not isinstance(attachment_id, str) or not attachment_id
-                    for attachment_id in raw_storage_ids
-                ):
-                    log.error(
-                        "ws.fork.attachment_refs_invalid",
-                        source_ws_id=source_ws_id[:8],
-                        fork_ws_id=self._ws_id[:8],
-                    )
-                    return False
-                attachment_ids = list(raw_storage_ids)
-            else:
-                attachment_ids = [
-                    block.attachment_id
-                    for block in turn.content
-                    if isinstance(block, AttachmentRef)
-                ]
-            preview = turn.meta.extra.get("preview")
-            fork_preview: dict[str, Any] | None = None
-            if turn.role is Role.TOOL and isinstance(preview, dict) and preview:
-                raw_preview_id = preview.get("attachment_id")
-                if not isinstance(raw_preview_id, str) or not raw_preview_id:
-                    log.error(
-                        "ws.fork.preview_descriptor_invalid",
-                        source_ws_id=source_ws_id[:8],
-                        fork_ws_id=self._ws_id[:8],
-                    )
-                    return False
-                if raw_storage_ids is not None:
-                    if raw_preview_id not in attachment_ids:
-                        log.error(
-                            "ws.fork.preview_unreferenced",
-                            source_ws_id=source_ws_id[:8],
-                            fork_ws_id=self._ws_id[:8],
-                            attachment_id=raw_preview_id,
-                        )
-                        return False
-                else:
-                    # Non-storage Turn doubles have no captured raw ref-list.
-                    # Prove source ownership strictly before adding a
-                    # meta-addressed preview; best-effort facade False would
-                    # otherwise turn a transient DB error into a dangling copy.
-                    try:
-                        preview_owned = storage.attachment_referenced_in_ws(
-                            raw_preview_id,
-                            source_ws_id,
-                        )
-                    except Exception:
-                        log.warning(
-                            "ws.fork.preview_ownership_failed",
-                            source_ws_id=source_ws_id[:8],
-                            fork_ws_id=self._ws_id[:8],
-                            attachment_id=raw_preview_id,
-                            exc_info=True,
-                        )
-                        return False
-                    if not preview_owned:
-                        log.error(
-                            "ws.fork.preview_unreferenced",
-                            source_ws_id=source_ws_id[:8],
-                            fork_ws_id=self._ws_id[:8],
-                            attachment_id=raw_preview_id,
-                        )
-                        return False
-                    attachment_ids.append(raw_preview_id)
-                fork_preview = preview
-            if turn.role is Role.TOOL:
-                meta_json = _tool_turn_meta(
-                    turn.effect_status,
-                    fork_preview,
-                )
-            elif isinstance(sm, dict) and sm:
-                meta_json = json.dumps(sm)
-            elif isinstance(sender, str) and sender:
-                meta_json = json.dumps({"sender": sender})
-            else:
-                meta_json = None
-
-            # Canonical Turns keep bytes out-of-line. Persist only their text
-            # projection in ``content`` and the exact ordered raw ref-list
-            # separately; handing multipart dict content to SQL both fails
-            # SQLite and loses the workstream-to-blob ownership link.
-            bulk_rows.append(
-                {
-                    "ws_id": self._ws_id,
-                    "role": msg.get("role", "user"),
-                    "content": turn.text,
-                    "tool_name": msg.get("name"),
-                    "tool_call_id": msg.get("tool_call_id"),
-                    "tool_calls": tc_json,
-                    "provider_data": pd_str,
-                    "source": src if isinstance(src, str) and src else None,
-                    "is_error": bool(msg.get("is_error", False)),
-                    "attachment_ids": attachment_ids,
-                    "producer": msg.get("_producer"),
-                    "meta": meta_json,
-                }
-            )
-        if save_messages_bulk(bulk_rows):
-            return True
-        log.error(
-            "ws.fork.messages_copy_failed",
-            source_ws_id=source_ws_id[:8],
-            fork_ws_id=self._ws_id[:8],
-            message_count=len(turns),
-        )
-        return False
-
     def fork_from_storage(
         self,
         source_ws_id: str,
@@ -6894,7 +6758,7 @@ class ChatSession:
             trusted_internal=trusted_internal,
             expected_session=expected_session,
         )
-        if not self.resume(source_ws_id, fork=True, _fork_snapshot=snapshot):
+        if not self.resume(source_ws_id, _fork_snapshot=snapshot):
             # A committed snapshot, including an empty one, must always adopt.
             # Treat a refusal as an invariant break so the create path rolls the
             # destination back instead of advertising a half-live fork.
@@ -6905,33 +6769,26 @@ class ChatSession:
         self,
         ws_id: str,
         *,
-        fork: bool = False,
         _fork_snapshot: ForkCloneSnapshot | None = None,
     ) -> bool:
         """Load messages from a previous workstream and resume it.
 
-        When *fork* is ``False`` (default), replaces the current
-        conversation with the loaded messages **and adopts the old
-        ws_id** so new messages continue in the same workstream.
+        Without ``_fork_snapshot``, replaces the current conversation with
+        the loaded messages and adopts ``ws_id`` so new messages continue
+        in the same workstream.
 
-        When *fork* is ``True``, the messages are copied but
-        ``self._ws_id`` is **kept unchanged** — the fork gets its own
-        identity while inheriting the conversation history.
+        With a committed ``_fork_snapshot``, adopts its history and config
+        while keeping ``self._ws_id`` unchanged. :meth:`fork_from_storage`
+        supplies that snapshot after atomically cloning the source.
 
         Restores persisted config (temperature, reasoning_effort, etc.)
         so the resumed/forked workstream behaves identically to the
         original.  Returns True on success.
         """
-        if _fork_snapshot is not None and not fork:
-            raise ValueError("a fork snapshot requires fork=True")
         from turnstone.core.node_affinity import require_execution_node
 
         if _fork_snapshot is not None:
             require_execution_node(_fork_snapshot.required_node_id, self._node_id)
-        elif fork:
-            source_row = get_storage().get_workstream(ws_id)
-            if source_row and source_row.get("required_node_id"):
-                raise ValueError("Use atomic workstream creation to fork a node-bound session")
         else:
             target_row = get_storage().get_workstream(ws_id)
             if target_row is not None:
@@ -6960,7 +6817,7 @@ class ChatSession:
         )
         resumed_attached_project_id = ""
         resumed_incarnation_token = ""
-        if not fork:
+        if _fork_snapshot is None:
             # History loading can overlap a same-ID replacement. Keep this
             # authoritative check after loading as well as the cheap preflight.
             storage = get_storage()
@@ -6981,10 +6838,9 @@ class ChatSession:
             )
             if target_row is not None and not resumed_incarnation_token:
                 raise RuntimeError(f"workstream {ws_id!r} has no durable incarnation token")
-        # Parse every scalar that can reject persisted input before either
-        # identity/history adoption or a fork's durable bulk copy. A corrupt
-        # value must not leave a half-adopted live session, nor committed fork
-        # rows/refcounts followed by an exception during assignment below.
+        # Parse persisted scalars before adopting identity or history so a
+        # corrupt value leaves the live session intact. The create lifecycle
+        # rolls back a committed fork if snapshot adoption fails.
         raw_temp = config.get("temperature") if config else None
         parsed_temperature = float(raw_temp) if raw_temp not in (None, "", "None") else None
         parsed_max_tokens = (
@@ -7001,17 +6857,12 @@ class ChatSession:
             else self._applied_skill_version
         )
         snap = snapshot_from_config(config or {})
-        if fork and snap != self._current_persona_snapshot():
-            # Fork sessions are constructed under the source persona because
-            # MCP visibility is a constructor-time gate.  Never overwrite a
-            # newer source stamp with that stale live envelope.  The atomic
-            # storage clone checks this before commit; this duplicate guard
-            # protects compatibility callers that supply/load snapshots by
-            # another route.
+        if _fork_snapshot is not None and snap != self._current_persona_snapshot():
+            # MCP visibility is a constructor-time gate. The clone checks the
+            # source persona before commit; adoption must also match the live
+            # session's envelope.
             raise ValueError(f"cannot fork {ws_id}: source persona changed during creation")
-        if fork and _fork_snapshot is None and not self._persist_fork_messages(ws_id, turns):
-            return False
-        if not fork:
+        if _fork_snapshot is None:
             if (snap.mcp if snap else True) and self._mcp_gated_off:
                 # The MCP lever is construction-time: narrowing is applied
                 # in place during adoption below, but a session whose
@@ -7074,7 +6925,7 @@ class ChatSession:
         # adopted stamp is MCP-off (_drop_mcp_surface below — widening was
         # refused before adoption).  A fork keeps its own creation-time
         # stamp.  Corrupt stamps raise — never silently rewritten.
-        if not fork:
+        if _fork_snapshot is None:
             self._apply_persona_snapshot(snap)
             if not self._persona_mcp and self._mcp_client is not None:
                 self._drop_mcp_surface()
@@ -7177,10 +7028,8 @@ class ChatSession:
                     self._skill_name = None
             if "notify_on_complete" in config:
                 self._notify_on_complete = config["notify_on_complete"]
-        # The copied turns were durably written before any source state was
-        # adopted. Persist the restored configuration under the fork's own id.
-        if fork:
-            # The fork just bulk-wrote every row self.messages holds — the
+        if _fork_snapshot is not None:
+            # The atomic clone persisted every row self.messages holds — the
             # persisted history under this ws_id cannot contain any sender
             # _recompute_shared_state's in-memory scan won't already find, so
             # the one-time persisted-sender read (needed for a real compaction-
@@ -7192,10 +7041,6 @@ class ChatSession:
             # values here by ws_id alone opened a clone-return -> same-id
             # replacement ABA window where this predecessor could overwrite
             # its successor before commit_create's token CAS rejected it.
-            # Legacy/non-snapshot fork callers still need to persist the
-            # adopted source config because they did not run the clone txn.
-            if _fork_snapshot is None:
-                self._save_config()
             self._title_generated = False  # allow auto-title for the fork
             log.info(
                 "ws.fork.messages_copied",
@@ -7204,7 +7049,7 @@ class ChatSession:
                 message_count=len(self.messages),
             )
 
-        if not fork:
+        if _fork_snapshot is None:
             self._follow_watch_registration(old_ws_id)
         self._init_system_messages()
         self._activate_token_calibration(self._primary_lane())
