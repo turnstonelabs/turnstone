@@ -1061,6 +1061,9 @@ class MCPClientManager:
         # Governance storage (optional — set via set_storage())
         self._storage: Any = None
         self._sync_lock = threading.Lock()
+        # Closed by shutdown() before it empties the catalogs, reopened by start(); see
+        # sync_prompts_to_storage.
+        self._prompt_sync_open = True
 
         # Circuit breaker (per-server) — prevents repeated calls to broken servers
         self._consecutive_failures: dict[str, int] = {}
@@ -1353,6 +1356,7 @@ class MCPClientManager:
     def start(self) -> None:
         """Launch background event loop and connect to all configured servers."""
         self._accepting_primes = True
+        self._prompt_sync_open = True
         self._loop = asyncio.new_event_loop()
         self._thread = threading.Thread(target=self._loop.run_forever, daemon=True, name="mcp-loop")
         self._thread.start()
@@ -4798,7 +4802,9 @@ class MCPClientManager:
         self._static_refresh_retry.discard(name)
         self._spawn_background(self._refresh_server_logged(name), label)
 
-    async def _refresh_server(self, name: str) -> tuple[list[str], list[str]] | None:
+    async def _refresh_server(
+        self, name: str, *, sync_unchanged: bool = True
+    ) -> tuple[list[str], list[str]] | None:
         """Re-fetch tools, resources, and prompts for one server.
 
         Returns ``(added_tools, removed_tools)`` names (tool diff only,
@@ -4840,6 +4846,10 @@ class MCPClientManager:
         / ``state.prompts`` are bounded to whichever sub-refresh
         succeeded — the documented trade-off vs leaving orphan tasks
         running after the error is observed.
+
+        *sync_unchanged* is passed to :meth:`_refresh_server_prompts`;
+        :meth:`_refresh_all` passes ``False`` (see there for the rule), and
+        the spawned passes keep the default, so each syncs what it publishes.
 
         Serialized on the per-name connect lock: every publisher of a
         static per-server catalog — a connect's discovery wiring, a
@@ -4910,7 +4920,7 @@ class MCPClientManager:
             results = await asyncio.gather(
                 self._refresh_server_tools(name),
                 self._refresh_server_resources(name),
-                self._refresh_server_prompts(name),
+                self._refresh_server_prompts(name, sync_unchanged=sync_unchanged),
                 return_exceptions=True,
             )
             first_exc: BaseException | None = next(
@@ -4981,9 +4991,31 @@ class MCPClientManager:
         failed. The ``_last_refresh`` status row carries the authoritative
         outcome for every operator surface (CLI, HTTP endpoint, admin
         pill) so they render consistently off ONE source of truth.
+
+        Each server's refresh runs with ``sync_unchanged=False``: a server
+        whose prompt catalog changed syncs the governance templates at
+        once, and the pass syncs them once more after its last server,
+        whether each server succeeded, failed or was skipped, so a pass
+        that changes nothing syncs once. That final sync is the pass's
+        repair step: it retries a save that failed after a catalog changed,
+        removes rows no catalog lists (such as those of a catalog withdrawn
+        without a save, or another writer's), resets promoted defaults and
+        refreshes timestamps. A pass that is cancelled or abandoned skips
+        only that: every catalog it changed was saved when it changed, and
+        a gap left before the pass waits for the next save. A server
+        reconnected here syncs on its own, as every connect does.
+
+        When garbage collection closes a pass that a stopped loop abandoned,
+        a reconnect suspended in the loop turns the close into an error that
+        reaches the per-server ``except``, on whatever thread collects. That
+        arm returns at once when it is off the pass's own loop: refreshing
+        the other servers there could start a transport on that thread's
+        loop, and the final sync could run while that thread holds the sync
+        lock, after shutdown emptied the catalog.
         """
         results: dict[str, tuple[list[str], list[str]] | None] = {}
         targets = [server_name] if server_name else list(self._server_configs.keys())
+        loop = asyncio.get_running_loop()
 
         for name in targets:
             try:
@@ -5046,7 +5078,7 @@ class MCPClientManager:
                         self._last_refresh.pop(name, None)
                         results[name] = None
                     continue
-                refreshed = await self._refresh_server(name)
+                refreshed = await self._refresh_server(name, sync_unchanged=False)
                 if refreshed is None:
                     # Skipped (lock busy) or superseded (removed /
                     # evicted) — a deliberate non-outcome: record neither
@@ -5066,6 +5098,12 @@ class MCPClientManager:
                 self._cb_record_success(name)
                 results[name] = (added, removed)
             except (Exception, BaseExceptionGroup) as exc:
+                try:
+                    running: asyncio.AbstractEventLoop | None = asyncio.get_running_loop()
+                except RuntimeError:
+                    running = None
+                if running is not loop:
+                    return results  # garbage collection is closing an abandoned pass
                 # BaseExceptionGroup: a transport task-group failure from the
                 # reconnect/refresh must stay isolated to this server, not
                 # abort the whole refresh pass. Redaction + retry-arm live
@@ -5095,7 +5133,7 @@ class MCPClientManager:
                     if dead_state is not None:
                         self._drop_static_session_and_stamp(name, dead_state)
 
-        # Final sync to clean up templates from servers that are no longer connected
+        # The pass's final sync, its repair step (see the docstring)
         try:
             self.sync_prompts_to_storage()
         except Exception:
@@ -5225,12 +5263,16 @@ class MCPClientManager:
         self._prompt_map = new_map
         self._notify_prompt_listeners()
 
-    async def _refresh_server_prompts(self, name: str) -> None:
+    async def _refresh_server_prompts(self, name: str, *, sync_unchanged: bool = True) -> None:
         """Re-fetch prompts for one server.
 
         MUST run with the per-name connect lock HELD — see
         :meth:`_refresh_server_tools` for the serialization contract (and
         why no post-await staleness recheck is needed).
+
+        Syncs the governance templates after publishing. With
+        *sync_unchanged* ``False`` it syncs only when the server's catalog
+        changed, for :meth:`_refresh_all`, whose docstring has the rule.
         """
         state = self._static_servers.get(name)
         if state is None or not state.supports_prompts:
@@ -5249,14 +5291,16 @@ class MCPClientManager:
 
         server_prompts = _prompt_entries(name, prompts)
 
+        changed = server_prompts != state.prompts
         state.prompts = server_prompts
         self._rebuild_prompts()
 
         # Sync discovered prompts into governance storage
-        try:
-            self.sync_prompts_to_storage()
-        except Exception:
-            log.warning("Prompt sync after refresh failed for '%s'", name, exc_info=True)
+        if changed or sync_unchanged:
+            try:
+                self.sync_prompts_to_storage()
+            except Exception:
+                log.warning("Prompt sync after refresh failed for '%s'", name, exc_info=True)
 
     # -- listener infrastructure ---------------------------------------------
 
@@ -5444,15 +5488,25 @@ class MCPClientManager:
         Returns ``{"added": [...], "removed": [...], "skipped": [...]}``.
         Thread-safe: serialized via ``_sync_lock`` to prevent races
         between ``set_storage()`` (main thread) and MCP background thread.
+
+        Does nothing once :meth:`shutdown` has begun clearing state: it
+        empties the catalog, and syncing that would delete every MCP
+        template. Shutdown closes syncs before it empties the catalog,
+        without this lock, so the check comes after the catalog is
+        copied: a copy taken after the catalog was emptied always sees
+        syncs closed.
         """
         if self._storage is None:
             return {"added": [], "removed": [], "skipped": []}
 
         with self._sync_lock:
-            return self._sync_prompts_locked()
+            prompts = list(self._prompts)
+            if not self._prompt_sync_open:
+                return {"added": [], "removed": [], "skipped": []}
+            return self._sync_prompts_locked(prompts)
 
-    def _sync_prompts_locked(self) -> dict[str, Any]:
-        """Inner sync logic — must be called under ``_sync_lock``."""
+    def _sync_prompts_locked(self, prompts: list[dict[str, Any]]) -> dict[str, Any]:
+        """Inner sync logic for the catalog *prompts* — must be called under ``_sync_lock``."""
         storage = self._storage
         added: list[str] = []
         removed: list[str] = []
@@ -5461,7 +5515,7 @@ class MCPClientManager:
         # Current MCP prompt names (the prefixed names used as template names)
         current_names: set[str] = set()
 
-        for prompt in list(self._prompts):
+        for prompt in prompts:
             name: str = prompt["name"][:256]
             server: str = prompt["server"][:128]
             current_names.add(name)
@@ -5708,7 +5762,8 @@ class MCPClientManager:
         # When no thread was started (tests wire ``_loop`` directly) the loop
         # is not ours to close — the stop above is all the owner needs.
 
-        # Clear all state
+        # Clear all state, closing prompt syncs first (see sync_prompts_to_storage)
+        self._prompt_sync_open = False
         self._background_tasks.clear()
         self._static_servers.clear()
         self._db_managed.clear()

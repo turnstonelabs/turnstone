@@ -161,6 +161,12 @@ frozen.
   SIGKILL after one second; the server itself keeps its usual window to shut down. Containers
   now reap the stopped helpers; see the container init change above.
 
+- **Shutdown no longer deletes MCP prompt templates (#1146).** A catalog refresh still waiting
+  on a reconnecting server when Turnstone shut down could finish during cleanup, after shutdown
+  had emptied the prompt catalog, and delete every MCP-sourced prompt template; the next sync
+  recreated them as new rows. A refresh abandoned at shutdown no longer syncs when cleanup
+  finishes it, and no prompt-template sync runs once shutdown starts emptying the catalog.
+
 - **Watch output is delivered as tool data (#1235).** Watch notices carry metadata and a
   `watch(action="read", name="<watch id>")` hint. Command output and condition exception details
   are returned through the normal tool-result path and its configured output guard, rather

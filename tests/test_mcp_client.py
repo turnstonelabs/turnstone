@@ -4130,7 +4130,7 @@ class TestStaticNotificationRefresh:
         automatic driver that can converge the catalog afterwards."""
         mgr, loop, _thread = running_loop_mgr
 
-        async def _boom(_name: str) -> tuple[list[str], list[str]]:
+        async def _boom(_name: str, **_kw: Any) -> tuple[list[str], list[str]]:
             raise TimeoutError("slow server")
 
         mgr._refresh_server_tools = _boom  # type: ignore[method-assign]
@@ -4172,7 +4172,7 @@ class TestStaticNotificationRefresh:
         mgr, loop, _thread = running_loop_mgr
         refreshed: list[str] = []
 
-        async def _rec(name: str) -> tuple[list[str], list[str]]:
+        async def _rec(name: str, **_kw: Any) -> tuple[list[str], list[str]]:
             refreshed.append(name)
             return [], []
 
@@ -4655,7 +4655,7 @@ class TestStaticNotificationRefresh:
             refreshed.append(name)
             return [], []
 
-        async def _rec_none(_name: str) -> None:
+        async def _rec_none(_name: str, **_kw: Any) -> None:
             return None
 
         mgr._refresh_server_tools = _rec_tools  # type: ignore[method-assign]
