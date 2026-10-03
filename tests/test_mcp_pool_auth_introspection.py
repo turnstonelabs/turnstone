@@ -169,10 +169,9 @@ class TestClassifyFailureWithCapture:
             assert mgr._classify_failure(exc, capture=None) == label
 
     def test_classify_failure_capture_with_unrelated_status_falls_through(self) -> None:
-        """Carrier with status=500 (not 401/403) doesn't classify as auth."""
+        """An unrelated status cannot replace the operation's own classification."""
         mgr = MCPClientManager({})
-        capture = _AuthCapture(status=500)
-        # The carrier's status isn't 401 or 403, and the exception is generic.
+        capture = _AuthCapture(status=400)
         assert mgr._classify_failure(ValueError("nope"), capture=capture) == "other"
 
 
@@ -286,17 +285,8 @@ class TestCarrierLifecycle:
         assert cap_a.status == 401
 
     @pytest.mark.anyio
-    async def test_response_hook_captures_4xx_only(self) -> None:
-        """Hook records on 401 and 403 only; 200/201/202/500 are ignored.
-
-        Verified by removing the ``status in (401, 403)`` guard in
-        ``_make_capturing_http_factory._hook`` and confirming that
-        ``status=200`` populates the carrier (test fails because we
-        assert ``capture.status is None`` for 200).
-
-        The hook is ``async`` (httpx invokes ``await hook(response)``),
-        so the test awaits it directly via the ``event_hooks`` slot.
-        """
+    async def test_response_hook_captures_http_failures(self) -> None:
+        """Auth and 5xx responses are captured; a 404 without a held session is ignored."""
         capture = _AuthCapture()
         factory = _make_capturing_http_factory(capture)
         client = factory()
@@ -306,16 +296,14 @@ class TestCarrierLifecycle:
             hook = hooks[0]
 
             req = httpx.Request("POST", "https://mcp.example.com/")
-            for ignored_status in (200, 201, 202, 500):
+            for ignored_status in (200, 201, 202, 400, 404, 429):
                 resp = httpx.Response(
                     ignored_status,
                     request=req,
                     headers={"www-authenticate": "Bearer should-be-ignored"},
                 )
                 await hook(resp)
-                assert capture.status is None, (
-                    f"hook recorded on {ignored_status}; expected only 401/403"
-                )
+                assert capture.status is None, f"hook recorded an unrelated HTTP {ignored_status}"
 
             for tracked_status in (401, 403):
                 capture.status = None
@@ -328,6 +316,15 @@ class TestCarrierLifecycle:
                 await hook(resp)
                 assert capture.status == tracked_status
                 assert capture.www_authenticate == f'Bearer error="x{tracked_status}"'
+
+            req = httpx.Request(
+                "POST", "https://mcp.example.com/", headers={"mcp-session-id": "held"}
+            )
+            for tracked_status in (404, 500, 502, 503, 599):
+                capture.status = None
+                await hook(httpx.Response(tracked_status, request=req))
+                assert capture.status == tracked_status
+                assert capture.www_authenticate is None
         finally:
             await client.aclose()
 
@@ -1012,45 +1009,6 @@ class TestBreakerInvariant:
         assert payload["error"]["code"] == "mcp_insufficient_scope"
         # STILL zero after the 403 cycle.
         assert mgr._consecutive_failures.get("pool-srv", 0) == 0
-
-
-# ---------------------------------------------------------------------------
-# Test 19: hard invariant 1 — static path does NOT receive the capture factory
-# ---------------------------------------------------------------------------
-
-
-class TestStaticPathUnchanged:
-    def test_static_path_does_not_pass_capturing_factory(self) -> None:
-        """``_connect_one`` (static path) must NEVER pass
-        ``httpx_client_factory`` to ``streamablehttp_client``.
-
-        Hard invariant 1: any change to the static-path connect plumbing
-        is potentially breaking. Verified by source inspection rather
-        than runtime mocking — the static path's call site is the only
-        non-test ``streamablehttp_client(...)`` invocation that must
-        omit the factory parameter.
-        """
-        import inspect
-
-        from turnstone.core import mcp_client
-
-        # The static path's streamablehttp_client call site lives in the
-        # transport owner task (``_static_transport_owner``); ``_connect_one``
-        # is a per-name-lock wrapper and ``_connect_one_locked`` only waits on
-        # the owner's readiness.
-        source = inspect.getsource(mcp_client.MCPClientManager._static_transport_owner)
-
-        # The static path's streamablehttp_client invocation should NOT
-        # mention ``httpx_client_factory``. Pool path keeps it.
-        assert "streamablehttp_client" in source
-        # The call site in the owner is bare — no factory keyword. We grep by
-        # line: the factory keyword must not appear in the static-path source.
-        for line in source.splitlines():
-            if "httpx_client_factory" in line:
-                pytest.fail(
-                    "_static_transport_owner (static path) passes httpx_client_factory "
-                    "to streamablehttp_client; hard invariant 1 violated."
-                )
 
 
 # ---------------------------------------------------------------------------

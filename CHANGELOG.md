@@ -121,6 +121,13 @@ frozen.
   with nothing new, or answers a later page with a JSON-RPC error; it keeps the pages already
   read, so a catalog is never published shorter than its first page.
 
+- **MCP HTTP failures release waiting calls promptly (#1223).** Shared and per-user connections
+  capture upstream HTTP status before the SDK loses it. A 5xx counts against the circuit breaker;
+  a 404 on a held session causes reconnection on the next call. HTTP 401/403 failures remain
+  breaker-neutral, including shared connections, and per-user auth refresh and consent handling
+  are preserved. Tools, resources, and prompts also stop waiting when their transport owner exits.
+  Caller deadlines and protocol errors returned with HTTP 200 remain breaker-neutral.
+
 - **A malformed MCP tool no longer sets off a reconnect loop (#1224).** The MCP SDK rejects a
   server's whole tool list when one entry fails its validation, such as a tool with no
   `inputSchema`, so that server publishes no tools; keeping the valid ones would need SDK

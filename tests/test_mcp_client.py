@@ -2201,30 +2201,20 @@ class TestMCPResources:
         with pytest.raises(RuntimeError, match="not connected"):
             mgr.read_resource_sync("file:///x")
 
-    def test_read_resource_sync_timeout(self):
+    def test_read_resource_sync_timeout(self, running_loop_mgr):
         """Verify timeout handling."""
-        mgr = MCPClientManager({})
+        mgr, _loop, _thread = running_loop_mgr
         mgr._resource_map = {"file:///x": ("fs", "file:///x")}
         mock_session = MagicMock()
         _seed_static_state(mgr, "fs", session=mock_session)
-        mgr._loop = asyncio.new_event_loop()
 
         async def _slow_read(_uri: str) -> None:
             await asyncio.sleep(10)
 
         mock_session.read_resource = _slow_read
 
-        thread = None
-        try:
-            thread = __import__("threading").Thread(target=mgr._loop.run_forever, daemon=True)
-            thread.start()
-            with pytest.raises(TimeoutError):
-                mgr.read_resource_sync("file:///x", timeout=1)
-        finally:
-            mgr._loop.call_soon_threadsafe(mgr._loop.stop)
-            if thread:
-                thread.join(timeout=5)
-            mgr._loop.close()
+        with pytest.raises(TimeoutError):
+            mgr.read_resource_sync("file:///x", timeout=1)
 
     def test_resource_listener_notification(self):
         """Verify callback fires on rebuild."""
@@ -2537,30 +2527,20 @@ class TestMCPPrompts:
         with pytest.raises(RuntimeError, match="not connected"):
             mgr.get_prompt_sync("mcp__dead__p")
 
-    def test_get_prompt_sync_timeout(self):
+    def test_get_prompt_sync_timeout(self, running_loop_mgr):
         """Verify timeout handling."""
-        mgr = MCPClientManager({})
+        mgr, _loop, _thread = running_loop_mgr
         mgr._prompt_map = {"mcp__tmpl__slow": ("tmpl", "slow")}
         mock_session = MagicMock()
         _seed_static_state(mgr, "tmpl", session=mock_session)
-        mgr._loop = asyncio.new_event_loop()
 
         async def _slow_prompt(_name: str, *, arguments: dict[str, str] | None = None) -> None:
             await asyncio.sleep(10)
 
         mock_session.get_prompt = _slow_prompt
 
-        thread = None
-        try:
-            thread = __import__("threading").Thread(target=mgr._loop.run_forever, daemon=True)
-            thread.start()
-            with pytest.raises(TimeoutError):
-                mgr.get_prompt_sync("mcp__tmpl__slow", timeout=1)
-        finally:
-            mgr._loop.call_soon_threadsafe(mgr._loop.stop)
-            if thread:
-                thread.join(timeout=5)
-            mgr._loop.close()
+        with pytest.raises(TimeoutError):
+            mgr.get_prompt_sync("mcp__tmpl__slow", timeout=1)
 
     def test_prompt_listener_notification(self):
         """Verify callback fires on rebuild."""

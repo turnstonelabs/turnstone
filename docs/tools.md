@@ -873,6 +873,13 @@ MCP-compatible service.
    and timed-out tool calls retain an unknown outcome. A connected server that never
    answers can continue to consume each caller's timeout budget.
 
+   HTTP 5xx responses fail waiting calls promptly and count against the server's
+   circuit breaker. A 404 for a held session discards that session so the next call
+   reconnects. HTTP 401/403 failures stay outside the breaker; per-user calls retain
+   their token refresh and consent handling. These rules cover tools, resources,
+   and prompts on both shared and per-user connections. A JSON-RPC error returned
+   with HTTP 200 remains a protocol rejection and keeps the session usable.
+
 ### Approval behavior
 
 MCP tools **require user approval by default** (`needs_approval: True`). turnstone

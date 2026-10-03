@@ -302,10 +302,13 @@ def _patched_pool_transport(
     stream factory's url/headers into *observed_kwargs* when given.
     """
 
-    def _stream_factory(*, url: str, headers: dict[str, str]) -> _AsyncCM:
+    def _stream_factory(
+        *, url: str, headers: dict[str, str], httpx_client_factory: Any
+    ) -> _AsyncCM:
         if observed_kwargs is not None:
             observed_kwargs["url"] = url
             observed_kwargs["headers"] = dict(headers)
+            observed_kwargs["httpx_client_factory"] = httpx_client_factory
         return _AsyncCM((AsyncMock(), AsyncMock(), lambda: None))
 
     async def _probe(*_args: Any, **_kwargs: Any) -> None:
@@ -1592,15 +1595,14 @@ class TestClassifyFailure:
         exc = httpx.HTTPStatusError("forbidden", request=req, response=resp)
         assert mgr._classify_failure(exc) == "auth_403"
 
-    def test_http_500_not_classified_as_auth(self) -> None:
+    def test_http_500_classified_as_transport(self) -> None:
         import httpx
 
         mgr = MCPClientManager({})
         req = httpx.Request("POST", "https://mcp.example.com/sse")
         resp = httpx.Response(500, request=req)
         exc = httpx.HTTPStatusError("server", request=req, response=resp)
-        # 5xx is not auth — falls through to "other".
-        assert mgr._classify_failure(exc) == "other"
+        assert mgr._classify_failure(exc) == "transport"
 
 
 # ---------------------------------------------------------------------------
