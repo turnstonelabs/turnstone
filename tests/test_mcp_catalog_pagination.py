@@ -40,7 +40,7 @@ from turnstone.core.mcp_client import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Iterator
+    from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
     from pathlib import Path
 
 logging.getLogger("uvicorn.error").setLevel(logging.WARNING)
@@ -67,6 +67,7 @@ class PagedCatalog:
         self.items: dict[str, list[str]] = {kind: [] for kind in KINDS}
         self.mode = "offset"
         self.requests: Counter[str] = Counter()
+        self.before_page: Callable[[str, str | None], Awaitable[None]] | None = None
 
     def fill(self, names: range) -> None:
         for kind in KINDS:
@@ -100,6 +101,8 @@ def _build_server(catalog: PagedCatalog) -> Server[Any, Any]:
     def _serve(kind: str, request_type: type, build: Any) -> None:
         async def _handle(request: Any) -> mcp_types.ServerResult:
             cursor = request.params.cursor if request.params is not None else None
+            if catalog.before_page is not None:
+                await catalog.before_page(kind, cursor)
             names, next_cursor = catalog.page(kind, cursor)
             return mcp_types.ServerResult(build(names, next_cursor))
 
@@ -272,6 +275,40 @@ def test_static_connect_and_refresh_publish_every_page(
         assert added == ["mcp__paged__tools_5", "mcp__paged__tools_6", "mcp__paged__tools_7"]
         assert removed == ["mcp__paged__tools_0"]
         assert _static_catalog(mgr, "paged") == catalog.items
+
+
+@pytest.mark.parametrize("phase", ["startup", "reconnect", "add"])
+def test_static_resource_pages_overlap(paged_server: tuple[str, PagedCatalog], phase: str) -> None:
+    """Both walks must reach each page before the server answers either one."""
+    url, catalog = paged_server
+    catalog.fill(range(5))
+    barriers: dict[str | None, asyncio.Barrier] = {}
+    paired_pages: set[str | None] = set()
+
+    async def _rendezvous(kind: str, cursor: str | None) -> None:
+        if kind not in ("resources", "templates"):
+            return
+        barrier = barriers.setdefault(cursor, asyncio.Barrier(2))
+        async with asyncio.timeout(5):
+            await barrier.wait()
+        paired_pages.add(cursor)
+
+    cfg = {"type": "http", "url": url}
+    if phase == "startup":
+        catalog.before_page = _rendezvous
+    with _started_manager({} if phase == "add" else {"paged": cfg}) as mgr:
+        if phase != "startup":
+            catalog.requests.clear()
+            catalog.before_page = _rendezvous
+            if phase == "add":
+                result = mgr.add_server_sync("paged", cfg, timeout=10)
+            else:
+                result = mgr.reconnect_sync("paged", timeout=10)
+            assert result["connected"], result
+
+        assert _static_catalog(mgr, "paged") == catalog.items
+        assert catalog.requests == {kind: 3 for kind in KINDS}
+        assert paired_pages == {None, "2", "4"}
 
 
 def test_pool_connect_and_refresh_publish_every_page(

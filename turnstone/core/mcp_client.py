@@ -2541,13 +2541,11 @@ class MCPClientManager:
             # Discover resources. The protocol advertises the pair with one
             # aggregate capability, but either list method may independently be
             # absent; the list helpers read only -32601 as an empty catalog.
+            # Both walks share one _CONNECT_TIMEOUT budget, including startup.
             server_resources: list[dict[str, Any]] = []
             if resources_cap is not None:
-                resources = await self._await_owner_discovery(
-                    owner, _list_all_resources(session, name)
-                )
-                templates = await self._await_owner_discovery(
-                    owner, _list_all_resource_templates(session, name)
+                resources, templates = await self._await_owner_discovery(
+                    owner, self._list_resource_pair(session, name)
                 )
                 server_resources = _resource_entries(name, resources, templates)
 
@@ -4478,9 +4476,7 @@ class MCPClientManager:
     ) -> tuple[list[mcp_types.Resource], list[mcp_types.ResourceTemplate]]:
         """Every page of ``list_resources`` and ``list_resource_templates``, concurrently.
 
-        The ONE copy of the paired-list protocol for both refresh twins
-        (:meth:`_refresh_server_resources` /
-        :meth:`_refresh_pool_server_resources`). Both walks share the
+        Shared by static and pool connect and refresh. Both walks share the
         timeout budget and target disjoint catalogs (resources vs.
         templates), so ordering is irrelevant.
 

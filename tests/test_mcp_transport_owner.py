@@ -87,6 +87,10 @@ def _make_session_mock() -> AsyncMock:
     session.initialize = AsyncMock()
     session.get_server_capabilities = MagicMock(return_value=None)
     session.list_tools = AsyncMock(return_value=mcp_types.ListToolsResult(tools=[]))
+    session.list_resources = AsyncMock(return_value=mcp_types.ListResourcesResult(resources=[]))
+    session.list_resource_templates = AsyncMock(
+        return_value=mcp_types.ListResourceTemplatesResult(resourceTemplates=[])
+    )
     return session
 
 
@@ -349,6 +353,97 @@ class TestTransportOwnerLifecycle:
             "session_exit",
             "transport_exit",
         ]
+
+    @pytest.mark.parametrize("failure", ["resources", "templates", "timeout", "owner", "caller"])
+    def test_resource_discovery_failure_reaps_both_walks(
+        self, running_loop_mgr, failure: str
+    ) -> None:
+        """Failed discovery drains both walks and leaves no session or published catalog."""
+        mgr, loop, _ = running_loop_mgr
+        patches: dict[str, Any] = {}
+        fake = _fake_transport_and_session(patches)
+        session = fake["session"]
+        session.get_server_capabilities = MagicMock(
+            return_value=mcp_types.ServerCapabilities(resources=mcp_types.ResourcesCapability())
+        )
+        session.list_tools = AsyncMock(
+            return_value=mcp_types.ListToolsResult(
+                tools=[mcp_types.Tool(name="ghost", inputSchema={"type": "object"})]
+            )
+        )
+        started: set[str] = set()
+        finished: set[str] = set()
+        both_started = asyncio.Event()
+        catalog_error = McpError(
+            mcp_types.ErrorData(code=mcp_types.INVALID_PARAMS, message="invalid resource catalog")
+        )
+
+        async def _list(kind: str) -> Any:
+            started.add(kind)
+            if len(started) == 2:
+                both_started.set()
+            try:
+                if failure == kind:
+                    await both_started.wait()
+                    raise catalog_error
+                await asyncio.Event().wait()
+            finally:
+                finished.add(kind)
+                fake["events"].append(f"{kind}_exit")
+
+        async def _resources(*, params: Any = None) -> Any:
+            return await _list("resources")
+
+        async def _templates(*, params: Any = None) -> Any:
+            return await _list("templates")
+
+        session.list_resources = _resources
+        session.list_resource_templates = _templates
+        expected = {
+            "resources": McpError,
+            "templates": McpError,
+            "timeout": TimeoutError,
+            "owner": ConnectionError,
+            "caller": asyncio.CancelledError,
+        }[failure]
+
+        async def _drive() -> None:
+            connect = asyncio.create_task(mgr._connect_one("srv", mgr._server_configs["srv"]))
+            try:
+                async with asyncio.timeout(5):
+                    await both_started.wait()
+                    if failure == "owner":
+                        owner = mgr._static_servers["srv"].owner_task
+                        assert owner is not None
+                        owner.cancel()
+                    elif failure == "caller":
+                        connect.cancel()
+                    with pytest.raises(expected) as caught:
+                        await connect
+                    if failure in ("resources", "templates"):
+                        assert caught.value is catalog_error
+            finally:
+                if not connect.done():
+                    connect.cancel()
+                await asyncio.gather(connect, return_exceptions=True)
+
+        with (
+            patch("turnstone.core.mcp_client.stdio_client", patches["stdio_client"]),
+            patch("turnstone.core.mcp_client.ClientSession", patches["ClientSession"]),
+            patch.object(mgr, "_CONNECT_TIMEOUT", 0.2 if failure == "timeout" else 30),
+        ):
+            _run(loop, _drive(), timeout=10)
+
+        assert started == finished == {"resources", "templates"}
+        state = mgr._static_servers["srv"]
+        assert state.session is None
+        assert state.owner_task is None
+        assert state.close_requested is None
+        assert state.tools == state.resources == state.prompts == []
+        assert mgr.get_tools() == mgr.get_resources() == mgr.get_prompts() == []
+        assert not mgr._static_connect_locks["srv"].locked()
+        if failure != "owner":
+            assert fake["events"][-2:] == ["session_exit", "transport_exit"]
 
     def test_timed_out_add_waits_for_atomic_rollback(self, running_loop_mgr) -> None:
         """Returning timeout must not strand an unconfigured live transport."""
