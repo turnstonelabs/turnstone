@@ -39,11 +39,6 @@ frozen.
 
 ### Changed
 
-- **One atomic workstream fork path.** `ChatSession.resume` no longer accepts a `fork`
-  argument; callers use `fork_from_storage` to create a fork. The committed clone
-  snapshot determines fork adoption. The unused in-process message copy has been
-  removed so fork metadata is serialized only by the storage clone.
-
 - **Containers run Turnstone under an init process.** The image's entrypoint is now `tini`, and
   the Helm chart's server and console pods set `shareProcessNamespace: true`, so the pod's
   pause container is PID 1. Either one reaps orphaned processes, such as the helpers stdio MCP
