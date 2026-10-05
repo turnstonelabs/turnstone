@@ -11,7 +11,7 @@ import pytest
 import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql
 
-from tests._storage_fakes import make_attachment
+from tests._storage_fakes import lease_row, make_attachment
 from turnstone.core import memory
 from turnstone.core.storage import (
     AttachmentWrite,
@@ -415,6 +415,8 @@ class _PostgresResult:
 
 
 class _PostgresConnection:
+    dialect = postgresql.dialect()
+
     def __init__(self, results: list[_PostgresResult]) -> None:
         self._results = results
         self.statements: list[Any] = []
@@ -447,7 +449,7 @@ def test_postgresql_atomic_path_emits_conflict_safe_transaction_sql() -> None:
     attachment = _attachment("5" * 64, b"postgres")
     conn = _PostgresConnection(
         [
-            _PostgresResult(row=("postgres-atomic",)),
+            _PostgresResult(row=lease_row("postgres-atomic")),
             _PostgresResult(scalar=41),
             _PostgresResult(scalar_values=[attachment.attachment_id]),
             _PostgresResult(scalar_values=[attachment.attachment_id]),

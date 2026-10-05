@@ -194,7 +194,7 @@ async def test_explicit_continuation_is_new_identity_and_inheritance_is_enforced
         headers=_auth("test-routing"),
     ).json()["ws_id"]
     storage = get_storage()
-    storage.save_message(source, "user", "saved history")
+    storage.save_message(source, "user", "saved history", lease=manager.lease_fence(source))
     manager.close(source)
     console, router = _console(storage)
     async with httpx.AsyncClient(

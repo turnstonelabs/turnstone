@@ -18,8 +18,12 @@ from __future__ import annotations
 
 import threading
 import time
+from typing import Any
+
+import pytest
 
 from turnstone.core.state_writer import StateWriter
+from turnstone.core.storage import LeaseFence, WorkstreamLeaseHeldError, WorkstreamLeaseLostError
 
 
 class _FakeStorage:
@@ -27,6 +31,7 @@ class _FakeStorage:
 
     def __init__(self, *, raises: BaseException | None = None) -> None:
         self.calls: list[tuple[str, str]] = []
+        self.leases: list[Any] = []
         self.raises = raises
         self._call_lock = threading.Lock()
         # Optional gate to pin a write inside update_workstream_state
@@ -35,7 +40,8 @@ class _FakeStorage:
         # Set by the writer thread once it enters update_workstream_state.
         self.write_started = threading.Event()
 
-    def update_workstream_state(self, ws_id: str, state: str) -> None:
+    def update_workstream_state(self, ws_id: str, state: str, *, lease: Any = None) -> None:
+        self.leases.append(lease)
         if self.write_gate is not None:
             self.write_started.set()
             self.write_gate.wait(timeout=2.0)
@@ -447,3 +453,63 @@ def test_record_wakes_flusher_immediately() -> None:
         assert ("ws-1", "running") in storage.calls
     finally:
         writer.shutdown(timeout=2.0)
+
+
+# ---------------------------------------------------------------------------
+# Owner lease
+# ---------------------------------------------------------------------------
+
+
+def test_buffered_and_terminal_writes_present_their_lease_fence() -> None:
+    storage = _FakeStorage()
+    errors: list[Exception] = []
+    writer = StateWriter(storage, on_flush_error=errors.append)
+    first = LeaseFence("ws-1", "node-a/1", 1, "tok")
+    newer = LeaseFence("ws-1", "node-a/1", 2, "tok")
+
+    writer.record("ws-1", "running", lease=first)
+    writer.record("ws-1", "thinking", lease=newer)
+    writer.flush()
+    writer.record("ws-1", "error", flush_now=True, lease=newer)
+
+    # Coalescing keeps the fence of the transition that wins.
+    assert storage.calls == [("ws-1", "thinking"), ("ws-1", "error")]
+    assert storage.leases == [newer, newer]
+    assert errors == []
+
+
+def test_lease_refusal_is_not_reported_as_a_flush_error() -> None:
+    class _RefusingStorage(_FakeStorage):
+        def update_workstream_state(self, ws_id: str, state: str, *, lease: Any = None) -> None:
+            raise WorkstreamLeaseLostError(ws_id)
+
+    errors: list[Exception] = []
+    writer = StateWriter(_RefusingStorage(), on_flush_error=errors.append)
+
+    writer.record("ws-1", "running", lease=LeaseFence("ws-1", "node-a/1", 1, "tok"))
+    writer.flush()
+    writer.record("ws-1", "error", flush_now=True)
+
+    assert errors == []
+
+
+@pytest.mark.parametrize(
+    ("refusal", "level"),
+    [(WorkstreamLeaseLostError, "DEBUG"), (WorkstreamLeaseHeldError, "WARNING")],
+)
+def test_a_refused_unfenced_state_write_is_a_warning(
+    refusal: type[Exception], level: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A lost fence is routine; an unfenced write meeting a live lease is a forgotten fence."""
+
+    class _RefusingStorage(_FakeStorage):
+        def update_workstream_state(self, ws_id: str, state: str, *, lease: Any = None) -> None:
+            raise refusal(ws_id)
+
+    writer = StateWriter(_RefusingStorage(), on_flush_error=lambda _exc: None)
+    with caplog.at_level("DEBUG", logger="turnstone.core.state_writer"):
+        writer.record("ws-1", "running")
+        writer.flush()
+
+    [record] = [r for r in caplog.records if "state_writer." in r.getMessage()]
+    assert record.levelname == level

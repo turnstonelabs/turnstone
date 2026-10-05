@@ -19,8 +19,59 @@ frozen.
 > running older code cannot use this OAuth storage until their code is upgraded; OAuth operations
 > on those processes can fail between migration and replacement. MCP API fields and token-keyring
 > configuration names are unchanged. See [Shared OAuth storage](docs/oauth-storage.md).
+>
+> **Before upgrading:** migration 078 adds the workstream owner lease to `workstreams`. Upgrade
+> every node, console and CLI that shares the database together: a process running older code
+> ignores the lease, so while versions are mixed two processes can write the same workstream.
+> Custom session factories must accept the new `workstream_lease` keyword argument and pass it
+> to the `ChatSession` they build; creating or opening a workstream fails when they do not.
+> `ChatSession.resume()` is removed: a session's workstream never changes after construction, so
+> hosts reopen a workstream with `SessionManager.open`, which builds its session and loads it with
+> `ChatSession.rehydrate()`. A host that embeds a `SessionManager` must call `start_lease_keeper()`
+> once it is built and `release_leases()` at shutdown, or its leases lapse after 30 seconds; a
+> custom `SessionEventEmitter` implements `on_lease_retired`, which announces a workstream another
+> process took over.
+> Custom storage backends must implement the lease methods (`acquire_workstream_lease`,
+> `renew_workstream_leases`, `release_workstream_lease`), `end_foreign_node_watches` and
+> `ensure_workstream_incarnation_snapshot` (which `open` now requires), and accept the `lease`
+> keyword on every session-owned write; `bulk_close_stale_orphans` and
+> `delete_stale_creating_reservations` no longer take `live_node_ids` (nor the latter
+> `local_node_id`), because liveness is now the lease.
+> `turnstone.core.policy.evaluate_tool_policy` and `evaluate_tool_policies_batch` are removed:
+> `evaluate_loaded_tool_policies` returns `None` when the policies cannot be read, and a caller
+> must then fail closed (see Security).
 
 ### Added
+
+- **One live owner per workstream.** A process that loads a workstream holds a time-bounded owner
+  lease on it, renewed every 10 seconds and judged against the database clock, and every write the
+  session makes presents the lease's fencing epoch. Two servers sharing PostgreSQL can no longer
+  both open the same workstream: the second answers 409 with code `workstream_lease_held` and the
+  holder's node; the console follows a refused open to the holder and its delete proxy retries there
+  once, while the node UI and the standalone shell say which node holds it. Concurrent opens of one
+  workstream load it once and report `already_loaded` to the others. A paused or partitioned former
+  holder cannot write history, state, configuration, attachments or lifecycle changes after another
+  process took over; its copy stops generating, tells open panes why, and is unloaded. A non-holder
+  cannot close or hard-delete a workstream another live process owns. SQLite keeps its
+  single-process behavior: a new process takes the lease over when it opens a workstream, though
+  until a crashed process's leases expire (up to 30 seconds), deleting, renaming or importing those
+  workstreams without opening them is refused, and the refusal names the crashed process's node,
+  which can be the restarted one. In the CLI, `/resume` and `/new` open the workstream
+  in a tab of their own, carrying the current tab's approvals (and `/new` its model, persona and
+  settings), and `/resume` of a workstream another tab has switches to that tab; one that fails
+  says why and stays on the current tab (or, when that tab was a stopped copy of the workstream it
+  named, brings the next one forward). The tab left closes once its messages are saved, retrying
+  any that are not; one whose background programs still run stays open until `/ws close`. A
+  workstream another process took over closes with a notice, the next one comes forward, and input
+  typed for the closed one is dropped; `/resume` of such a tab opens it again, `/ws close` says
+  whether a tab closed, moved elsewhere or is still saving, `/exit` works with none open, and a
+  slash command that fails or is interrupted reports why and returns to the prompt instead of
+  ending the CLI. A node that loses a workstream to another process announces `ws_unloaded` on its
+  event stream (not `ws_closed`: it may live on elsewhere), its own dashboard drops the row,
+  and the console's cluster stream forwards it with the node's ID, so dashboards list the
+  workstream under its holder only.
+  `turnstone_workstream_lease_events_total{event}` counts acquisitions, takeovers, conflicts,
+  renewals and losses. See [Workstream Owner Lease](docs/architecture.md#workstream-owner-lease).
 
 - **Attachment cases in `turnstone-eval`.** A case can attach text files (`attachments` entries
   with `filename`, `content` and an optional `mime_type`); each is classified like an upload and
@@ -39,6 +90,31 @@ frozen.
 
 ### Changed
 
+- **Routing prefers a workstream's owner, and cleanup keys on leases.** The console router sends a
+  workstream to the live node holding its owner lease (after any required node). Orphan close and
+  stale-create recovery skip workstreams with a live lease instead of trusting node heartbeats, and
+  boot prune, which had no liveness check, now skips them too, so a crashed process's workstreams
+  are reclaimed whatever node id the next process carries, and orphaned coordinators are now reaped.
+  On PostgreSQL, a workstream whose holder crashed can be reopened elsewhere after at most 30
+  seconds, and the router stops sending requests to it once its lease expires. `turnstone-server
+  --resume` waits once, up to that TTL, when its own previous process still holds the workstream,
+  and it and the CLI's `--resume` report any failure to resume as a one-line error; resuming a
+  workstream with no stored turns now opens it, with its saved settings, and resuming a
+  coordinator from the CLI or server startup is refused. Coordinator deletes now run on the
+  console. A watch is ended when another node opens its workstream, because a watch runs only on
+  the node that created it, and the model is told why unless the workstream has no messages.
+  Opening a workstream whose history or saved settings cannot be read answers 503 and can be
+  retried, instead of opening it empty or on default settings, and opening one (or viewing it
+  with write scope) on a node whose session slots are all busy answers 429, as a create does.
+- **Watch delivery reopens the workstream like a pane.** A watch fire for a workstream that is not
+  loaded now opens it through the session manager instead of building a separate session that
+  switched to it, so a pane opened meanwhile joins the same session and no empty workstream is left
+  behind. While nobody else is in it, a workstream opened this way approves its own tool calls,
+  audited as `unattended_watch` rather than as skip-permissions, until the first client opens it,
+  views it, sends to it, approves in it, stops it or attaches to its stream; a call an admin `ask`
+  policy matches takes the normal approval flow instead, as in an attended session (the
+  smart-approval judge, if enabled, or a person; the old restore approved it). A workstream with no
+  stored turns ends the watch.
 - **Containers run Turnstone under an init process.** The image's entrypoint is now `tini`, and
   the Helm chart's server and console pods set `shareProcessNamespace: true`, so the pod's
   pause container is PID 1. Either one reaps orphaned processes, such as the helpers stdio MCP
@@ -112,6 +188,17 @@ frozen.
 
 ### Fixed
 
+- **A saved workstream with no messages keeps its settings.** Opening one (from a pane, and now
+  also `--resume` and `/resume`) applied the constructor's defaults instead of its saved model,
+  sampling, instructions and skill, and the next settings change wrote those defaults over the
+  saved ones. It now opens with its saved settings.
+- **A storage error while opening a workstream no longer replaces its saved settings.** Building the
+  session saves its defaults when no settings are saved, and a read that failed counted as none
+  saved, so one failed read could overwrite the saved model, sampling, instructions and skill. That
+  open, or a create that hits the same failure, now answers 503 and can be retried.
+- **Warning toasts look like warnings.** Ten warning toasts in the shell, the node UI and judge
+  verdicts asked for a style the toast component does not have and fell back to the neutral one;
+  they now use the warning style.
 - **Hosted search for Astra (#1191).** The capability table now enables native web search
   when the session offers `web_search`, without requiring a model capability override.
 - **Chat search usage no longer inflates replay context (#1191).** Requests with hosted search
@@ -305,6 +392,21 @@ frozen.
 
 ### Security
 
+- **Tool policies that cannot be read refuse the batch.** When reading the admin tool policies
+  failed, every call came back as matching no policy, so `deny` rules stopped applying:
+  skip-permissions, "Always" grants, auto-approve lists, the smart-approval judge or a person could
+  run a call a `deny` rule covered. Now every call in the batch that needs approval is refused, with
+  a message telling the model to try again; calls that need no approval still run. Successful reads
+  stay cached for 60 seconds and a failed one is not cached, so the next batch reads again. This
+  applies to node and coordinator sessions and to the CLI. A call tool policies refused, or one
+  nobody answered before the approval deadline, is no longer reported to the model as the user
+  rejecting it.
+- **"Always" approves only what the person approved.** Approving a batch with "Always" also granted
+  the always-approval to a call a `deny` rule had refused in that batch, so the call ran without a
+  prompt if the rule was later removed or relaxed to `ask`. Refused calls now get no grant.
+- **The CLI's token-budget prompt always asks.** It crashed on every exhausted budget (the budget
+  item has no header), so a CLI session past its token budget could not continue; it now asks, and,
+  as on a node, neither skip-permissions, an auto-approve list nor a tool policy settles it.
 - **URL tools look up a hostname only after approval.** `web_fetch` and `open_preview` screened
   their target while preparing the call, and the screen resolved the hostname. A denied or
   cancelled call had already sent that name to DNS, and a private or unresolvable answer was

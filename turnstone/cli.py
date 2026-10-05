@@ -15,13 +15,17 @@ import readline
 import sys
 import textwrap
 import threading
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from turnstone.core.adapters.interactive_adapter import InteractiveAdapter
 from turnstone.core.judge import JudgeConfig
 from turnstone.core.oauth.context import OAuthContext
 from turnstone.core.session import ChatSession, SessionUI
-from turnstone.core.session_manager import SessionManager
+from turnstone.core.session_manager import (
+    PERSISTENCE_RECONCILE_INTERVAL_SECONDS,
+    CloseOutcome,
+    SessionManager,
+)
 from turnstone.core.workstream import (
     Workstream,
     WorkstreamKind,
@@ -56,6 +60,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
     from turnstone.core.personas import PersonaSnapshot
+    from turnstone.core.workstream_lease import WorkstreamLease
 
 # ─── Readline ─────────────────────────────────────────────────────────────
 
@@ -177,33 +182,45 @@ class TerminalUI(SessionUI):
 
         # Evaluate admin tool policies (deny/allow/ask) before prompting.
         if pending:
+            from turnstone.core.policy import (
+                POLICIES_UNREADABLE_DENIAL,
+                evaluate_loaded_tool_policies,
+            )
+
+            # ``None``: the policies could not be read, so every call needing
+            # approval is refused (no deny rule could be checked).
+            verdicts: dict[str, str | None] | None = {}
             try:
-                from turnstone.core.policy import evaluate_tool_policies_batch
                 from turnstone.core.storage._registry import get_storage
 
                 storage = get_storage()
-                if storage is not None:
-                    _policy_names = [
-                        it.get("approval_label", "") or it.get("func_name", "")
-                        for it in pending
-                        if it.get("func_name")
-                    ]
-                    if _policy_names:
-                        verdicts = evaluate_tool_policies_batch(storage, _policy_names)
-                        for it in pending:
-                            policy_name = it.get("approval_label", "") or it.get("func_name", "")
-                            verdict = verdicts.get(policy_name)
-                            if verdict == "deny":
-                                it["denied"] = True
-                                it["error"] = f"Blocked by tool policy ('{policy_name}')"
-                                it["needs_approval"] = False
-                            elif verdict == "allow":
-                                it["needs_approval"] = False
-                        pending = [
-                            it for it in items if it.get("needs_approval") and not it.get("error")
-                        ]
+                _policy_names = [
+                    it.get("approval_label", "") or it.get("func_name", "")
+                    for it in pending
+                    if it.get("func_name") and it.get("func_name") != "__budget_override__"
+                ]
+                if storage is not None and _policy_names:
+                    verdicts = evaluate_loaded_tool_policies(storage, _policy_names)
             except Exception:
-                logging.getLogger(__name__).debug("Policy evaluation unavailable", exc_info=True)
+                logging.getLogger(__name__).warning("Policy evaluation failed", exc_info=True)
+                verdicts = None
+            for it in pending:
+                if it.get("func_name") == "__budget_override__":
+                    # No policy settles the budget prompt. Refusing it here would read as
+                    # approved: this gate reports a refusal as an error on an approved batch.
+                    continue
+                policy_name = it.get("approval_label", "") or it.get("func_name", "")
+                if verdicts is None or verdicts.get(policy_name) == "deny":
+                    it["denied"] = True
+                    it["error"] = (
+                        POLICIES_UNREADABLE_DENIAL
+                        if verdicts is None
+                        else f"Blocked by tool policy ('{policy_name}')"
+                    )
+                    it["needs_approval"] = False
+                elif verdicts.get(policy_name) == "allow":
+                    it["needs_approval"] = False
+            pending = [it for it in items if it.get("needs_approval") and not it.get("error")]
 
         # Policy lookup is the one potentially blocking step before the prompt.
         # Recheck ownership so a close that landed during storage I/O cannot
@@ -214,11 +231,13 @@ class TerminalUI(SessionUI):
         with self._print_lock:
             # Print all headers, previews, and heuristic verdicts
             for item in items:
+                # The token-budget item has no header; its preview says what it asks.
+                header = item.get("header") or item.get("func_name", "")
                 if item.get("error"):
-                    sys.stdout.write(f"  {red(item['header'])}\n")
+                    sys.stdout.write(f"  {red(header)}\n")
                     sys.stdout.write(f"  {red(item['error'])}\n")
                 else:
-                    sys.stdout.write(f"  {yellow(item['header'])}\n")
+                    sys.stdout.write(f"  {yellow(header)}\n")
                 if item.get("preview"):
                     styled = dim(item["preview"]) if not item.get("error") else red(item["preview"])
                     sys.stdout.write(styled + "\n")
@@ -236,11 +255,14 @@ class TerminalUI(SessionUI):
                         sys.stdout.write(f"  Intent: {summary}\n")
             sys.stdout.flush()
 
-            if not pending or self.auto_approve:
+            # The token-budget prompt always reaches the person, as on a node: neither
+            # skip-permissions nor an auto-approve list settles it.
+            has_budget_override = any(it.get("func_name") == "__budget_override__" for it in items)
+            if not pending or (self.auto_approve and not has_budget_override):
                 return True, None
 
             # Per-tool auto-approve check
-            if self.auto_approve_tools:
+            if self.auto_approve_tools and not has_budget_override:
                 pending_names = {
                     it.get("approval_label", "") or it.get("func_name", "")
                     for it in pending
@@ -532,6 +554,20 @@ class WorkstreamTerminalUI(TerminalUI):
         else:
             self._buffer("error", message)
 
+    def on_workstream_stopped(self, message: str) -> None:
+        """Another process took this workstream over: say so even from the background.
+
+        The workstream leaves this CLI right after, so a buffered notice would
+        never be seen.
+        """
+        if self.is_foreground:
+            super().on_info(message)
+            return
+        ws = self.manager.get(self.ws_id)
+        label = f"{self.manager.index_of(self.ws_id)}:{ws.name}" if ws is not None else self.ws_id
+        with self._print_lock:
+            print(yellow(f"Workstream {label}: {message}"))
+
     def on_tool_result(
         self,
         call_id: str,
@@ -648,13 +684,7 @@ def _handle_ws_command(
             return False
         if skip_permissions and isinstance(ws.ui, TerminalUI):
             ws.ui.auto_approve = True
-        # Mark old active as background
-        old = manager.get_active()
-        if old and isinstance(old.ui, WorkstreamTerminalUI):
-            old.ui.set_foreground(False)
-        manager.switch(ws.id)
-        if isinstance(ws.ui, WorkstreamTerminalUI):
-            ws.ui.set_foreground(True)
+        _bring_to_front(manager, ws, previous=manager.get_active())
         print(f"Created workstream {cyan(ws.name)} (#{manager.index_of(ws.id)})")
         return True
 
@@ -663,11 +693,7 @@ def _handle_ws_command(
         old = manager.get_active()
         ws: Workstream | None = manager.switch_by_index(idx)  # type: ignore[no-redef]
         if ws:
-            if old and isinstance(old.ui, WorkstreamTerminalUI):
-                old.ui.set_foreground(False)
-            if isinstance(ws.ui, WorkstreamTerminalUI):
-                ws.ui.set_foreground(True)
-                ws.ui.flush_buffer()
+            _bring_to_front(manager, ws, previous=old)
             print(f"Switched to {cyan(ws.name)}")
             return True
         else:
@@ -692,17 +718,31 @@ def _handle_ws_command(
         assert ws_id is not None
         ws_obj = manager.get(ws_id)
         ws_name = ws_obj.name if ws_obj else "?"
-        if manager.close(ws_id):
-            print(f"Closed workstream {ws_name}")
+        outcome = manager.close_with_outcome(ws_id)
+        if outcome in (CloseOutcome.CLOSED, CloseOutcome.OWNED_ELSEWHERE):
+            if outcome is CloseOutcome.CLOSED:
+                print(f"Closed workstream {ws_name}")
+            else:
+                print(
+                    f"Closed workstream {ws_name} here; this copy no longer owned it "
+                    "(another process took it over, or its lease ran out)."
+                )
             # Ensure new active is foregrounded if any remain.
             new_active = manager.get_active()
-            if new_active and isinstance(new_active.ui, WorkstreamTerminalUI):
-                new_active.ui.set_foreground(True)
+            if new_active is not None:
+                _bring_to_front(manager, new_active)
             return True
-        # close() returned False — the ws was already closed or
-        # unknown. The old "last workstream" guard went away with the
-        # default-startup workstream.
-        print(red(f"Workstream {ws_name} not found or already closed"))
+        if outcome is CloseOutcome.UNRESOLVED_PERSISTENCE:
+            print(
+                yellow(
+                    f"Workstream {ws_name} stays open: its last messages are not saved yet. "
+                    "Try again shortly."
+                )
+            )
+        elif outcome is CloseOutcome.CLEANUP_PENDING:
+            print(yellow(f"Workstream {ws_name} is still cleaning up. Try again shortly."))
+        else:
+            print(red(f"Workstream {ws_name} not found or already closed"))
         return False
 
     elif sub == "rename":
@@ -928,37 +968,20 @@ def detect_model(client: Any, provider: str = "openai") -> tuple[str, int | None
 # ─── Main ──────────────────────────────────────────────────────────────────
 
 
-def resolve_cli_persona_kwargs(
-    storage: Any,
-    persona_arg: str | None,
-    resume_target: str | None,
-) -> dict[str, Any]:
-    """Resolve the persona stamp for a CLI session, pre-construction.
+def resolve_cli_persona_kwargs(storage: Any, persona_arg: str | None) -> dict[str, Any]:
+    """Resolve the persona stamp for a new CLI session, pre-construction.
 
-    ``--resume`` adopts the TARGET workstream's stamped persona (the resumed
-    session must run from its stamp, not tonight's default); otherwise
     ``--persona`` (or the interactive default persona) resolves against the
     shelf.  A database with no personas seeded yields ``{}`` — an unstamped
-    legacy session, byte-identical behavior.
+    legacy session, byte-identical behavior.  (``--resume`` opens the saved
+    workstream, which runs from its own stamp.)
 
     Unknown/disabled/kind-mismatched ``--persona`` names print a clear error
     and ``sys.exit(1)`` — a startup misconfiguration must not silently start
-    an unrestricted session.  A corrupt stamp on the resume target raises
-    (``snapshot_from_config``) for the same reason.
+    an unrestricted session.
     """
-    from turnstone.core.personas import (
-        resolve_persona_for_kind,
-        snapshot_from_config,
-        snapshot_from_persona,
-    )
+    from turnstone.core.personas import resolve_persona_for_kind, snapshot_from_persona
 
-    if resume_target and storage is not None:
-        if persona_arg:
-            print(yellow("--persona is ignored with --resume (the stamped persona applies)"))
-        snap = snapshot_from_config(storage.load_workstream_config(resume_target) or {})
-        if snap is not None:
-            return {"persona": snap.name, "persona_snapshot": snap}
-        return {}
     if persona_arg:
         row, err = resolve_persona_for_kind(storage, persona_arg, "interactive")
         if row is None:
@@ -1016,6 +1039,15 @@ def _close_all_sessions(manager: SessionManager) -> None:
         # leaks nothing — it only abandons wedged drain threads that die
         # with this process anyway.
         print(dim("  (interrupted — background shells already signalled)"))
+    # Hand the workstreams back so a server can open them at once instead of
+    # waiting out the lease TTL; release_leases first drains each session's
+    # admitted writes. A Ctrl-C here leaves the leases to expire.
+    try:
+        manager.release_leases()
+    except KeyboardInterrupt:
+        print(dim("  (interrupted — workstream leases expire on their own)"))
+    except Exception:
+        print(dim("  (could not release workstream leases; they expire on their own)"))
 
 
 def _judge_parallel_evaluations_arg(value: str) -> int:
@@ -1026,6 +1058,376 @@ def _judge_parallel_evaluations_arg(value: str) -> int:
         return int(validate_value("judge.parallel_evaluations", value))
     except ValueError as exc:
         raise argparse.ArgumentTypeError(str(exc)) from exc
+
+
+# What a line typed at the prompt does (see _classify_repl_input).
+ReplInputKind = Literal[
+    "empty", "exit", "cluster", "stale", "ws", "tab", "no_workstream", "dispatch"
+]
+# Why a tab /resume or /new left is still open: unsaved messages, or running programs.
+ParkReason = Literal["unsaved", "programs"]
+
+
+def _classify_repl_input(
+    manager: SessionManager, user_input: str, prompt_active: str | None
+) -> tuple[ReplInputKind, Workstream | None]:
+    """What one line typed at the prompt does: ``(kind, target)``.
+
+    ``prompt_active`` is the workstream the prompt showed. Kinds: ``empty``,
+    ``exit`` (in any case, whether or not a workstream is open), ``cluster``,
+    ``stale`` (typed for a workstream that closed while the prompt was up:
+    never sent into another conversation, and ``/ws`` lines included, since
+    their implicit target and indices moved), ``ws``, ``tab`` (``/resume`` or
+    ``/new``, with the tab they leave as ``target``, if any), ``no_workstream``,
+    and ``dispatch`` with that same workstream as ``target``.
+    """
+    line = user_input.strip()
+    if not line:
+        return "empty", None
+    if line.split()[0].lower() in ("/exit", "/quit", "/q"):
+        return "exit", None
+    if line.startswith("/cluster"):
+        return "cluster", None
+    target = manager.get(prompt_active) if prompt_active is not None else None
+    if manager.active_id != prompt_active or (prompt_active is not None and target is None):
+        return "stale", None
+    if line.startswith("/ws"):
+        return "ws", None
+    if line.split()[0].lower() in ("/resume", "/new"):
+        return "tab", target
+    if target is None or target.session is None:
+        return "no_workstream", None
+    return "dispatch", target
+
+
+def _bring_to_front(
+    manager: SessionManager, ws: Workstream, previous: Workstream | None = None
+) -> None:
+    """Put ``ws`` in front: background ``previous``, switch, show ``ws``'s buffered output."""
+    if (
+        previous is not None
+        and previous is not ws
+        and isinstance(previous.ui, WorkstreamTerminalUI)
+    ):
+        previous.ui.set_foreground(False)
+    if manager.active_id != ws.id:
+        manager.switch(ws.id)
+    if isinstance(ws.ui, WorkstreamTerminalUI):
+        ws.ui.set_foreground(True)
+        ws.ui.flush_buffer()
+
+
+def _bring_forward_after_background_close(manager: SessionManager) -> None:
+    """Show the workstream now in front after the previous one closed in the background.
+
+    The closed workstream's own notice (another process took it over, or its
+    lease ran out) printed before it closed; this tells the user where their
+    next input goes.
+    """
+    active = manager.get_active()
+    if active is None:
+        print(yellow("No workstream is open here any more. Use /ws new to start one, or /exit."))
+        return
+    _bring_to_front(manager, active)
+    print(yellow(f"Now in workstream {manager.index_of(active.id)}:{active.name}."))
+
+
+# ─── /resume and /new: tab operations (#988) ──────────────────────────────
+
+
+def _carry_approvals(left: Workstream | None, new: Workstream, skip_permissions: bool) -> None:
+    """Give a tab ``/resume`` or ``/new`` opened the approval state of the tab left.
+
+    One terminal UI used to serve both conversations, so skip-permissions and
+    "Always" grants carried over; they still do.
+    """
+    new_ui = new.ui
+    if not isinstance(new_ui, TerminalUI):
+        return
+    old_ui = left.ui if left is not None else None
+    if skip_permissions or (isinstance(old_ui, TerminalUI) and old_ui.auto_approve):
+        new_ui.auto_approve = True
+    if isinstance(old_ui, TerminalUI):
+        new_ui.auto_approve_tools.update(old_ui.auto_approve_tools)
+
+
+def _create_tab_like(manager: SessionManager, left: Workstream | None) -> Workstream:
+    """``/new``: a new workstream with the current tab's persona and settings.
+
+    The persona is construction-time; the other settings go through the path
+    a reopened workstream takes (``ChatSession.adopt_settings``), plus the
+    reasoning-display and debug toggles. A failure leaves no tab and no row.
+    """
+    old = left.session if left is not None else None
+    if old is None:
+        return manager.create(user_id="")
+    persona_kwargs: dict[str, Any] = {}
+    snap = old._current_persona_snapshot()
+    if snap is not None:
+        persona_kwargs = {"persona": snap.name, "persona_snapshot": snap}
+    config = old._config_for_save()
+    ws = manager.create(
+        user_id="",
+        model=old._model_alias or None,
+        defer_emit_created=True,
+        **persona_kwargs,
+    )
+    try:
+        new_session = ws.session
+        if new_session is not None:
+            new_session.adopt_settings(config)
+            new_session.show_reasoning = old.show_reasoning
+            new_session.debug = old.debug
+        if not manager.commit_create(ws):
+            raise RuntimeError("the new workstream was retired while it was created")
+    except BaseException:
+        with contextlib.suppress(Exception):
+            manager.rollback_create(ws)
+        raise
+    return ws
+
+
+# Close outcomes after which the tab is gone from this CLI.
+_TAB_GONE = (CloseOutcome.CLOSED, CloseOutcome.NOT_FOUND, CloseOutcome.OWNED_ELSEWHERE)
+
+# A saved workstream the manager will not open: a coordinator, or a row being
+# created or deleted.
+_NOT_OPENABLE = (
+    "Cannot resume {}: it is not an interactive workstream, or it is being created or deleted."
+)
+
+
+def _tab_is_clean(ws: Workstream) -> bool:
+    """Whether closing ``ws`` now loses nothing: every message saved, no turn half-done.
+
+    Never blocks: a session whose locks are busy counts as not clean.
+    """
+    session = ws.session
+    if session is None:
+        return True
+    return session.has_unresolved_conversation_persistence_nowait() is False
+
+
+def _runs_background_programs(ws: Workstream) -> bool:
+    return ws.session is not None and ws.session.has_running_background_shells()
+
+
+def _leave_tab(manager: SessionManager, left: Workstream, parked: dict[str, ParkReason]) -> None:
+    """Close the tab ``/resume`` or ``/new`` left, unless closing it would lose something.
+
+    A tab with unsaved messages stays open while they are retried and closes
+    by itself once they are saved; a tab whose background programs still run
+    stays open until the user closes it, so the programs keep running.
+    """
+    label = f"{manager.index_of(left.id)}:{left.name}"
+    if _runs_background_programs(left):
+        parked[left.id] = "programs"
+        print(
+            yellow(
+                f"Workstream {label} stays open: programs it started are still running. "
+                f"Close it with /ws close {manager.index_of(left.id)}."
+            )
+        )
+        return
+    if _tab_is_clean(left):
+        outcome = manager.close_with_outcome(left.id)
+        if outcome in _TAB_GONE:
+            return
+    parked[left.id] = "unsaved"
+    print(
+        yellow(
+            f"Workstream {label} stays open until its last messages are saved, "
+            "then closes by itself."
+        )
+    )
+
+
+def _close_parked_tabs(manager: SessionManager, parked: dict[str, ParkReason]) -> None:
+    """Close each tab left with unsaved messages once they are saved (run at each prompt)."""
+    for ws_id, reason in list(parked.items()):
+        ws = manager.get(ws_id)
+        if ws is None or ws_id == manager.active_id:
+            # Gone, or the user went back to it: no longer a tab left behind.
+            parked.pop(ws_id, None)
+            continue
+        if reason != "unsaved" or not _tab_is_clean(ws):
+            continue
+        label = f"{manager.index_of(ws_id)}:{ws.name}"
+        if manager.close_with_outcome(ws_id) in _TAB_GONE:
+            parked.pop(ws_id, None)
+            print(dim(f"Workstream {label} closed (its messages are saved)."))
+
+
+def _handle_tab_command(
+    manager: SessionManager,
+    line: str,
+    left: Workstream | None,
+    skip_permissions: bool,
+    parked: dict[str, ParkReason],
+) -> None:
+    """``/resume <id|alias>`` and ``/new``: open the workstream in a tab and leave this one.
+
+    No session changes its workstream in place (#988): ``/resume`` opens the
+    saved workstream through the manager, or switches to it when another tab
+    here has it; ``/new`` creates one with this tab's settings. Any refusal
+    prints one line and stays on the current tab, unless the current tab was a
+    stopped copy of the workstream ``/resume`` named: the open retires it first,
+    and the next tab comes forward.
+    """
+    from turnstone.core.memory import resolve_workstream
+
+    # Split as the classifier does (any whitespace), so a pasted tab or
+    # non-breaking space after the command still names its target.
+    word, *rest = line.split(None, 1)
+    word = word.lower()
+    arg = rest[0].strip() if rest else ""
+    if word == "/resume":
+        if not arg:
+            print("Usage: /resume <alias_or_ws_id>\nUse /workstreams to list saved workstreams.")
+            return
+        target_id = resolve_workstream(arg)
+        if not target_id:
+            print(yellow(f"Workstream not found: {arg}"))
+            return
+        # A tab whose lease moved has stopped and cannot write: it counts as
+        # gone, so resuming it opens it again (or names the process holding it).
+        if left is not None and target_id == left.id and manager.loaded(left.id) is not None:
+            print("Already in that workstream.")
+            return
+        new_ws = manager.loaded(target_id)
+        if new_ws is None:
+            try:
+                new_ws = manager.open(target_id)
+            except KeyboardInterrupt:
+                # The open may already have retired the stopped tab in front.
+                _front_after_a_retired_tab(manager, left)
+                raise
+            except Exception as exc:
+                # Open elsewhere (the message names the holder), a node
+                # requirement, a corrupt persona stamp, a storage error.
+                print(red(f"Cannot resume {target_id}: {exc}"))
+                _front_after_a_retired_tab(manager, left)
+                return
+            if new_ws is None:
+                print(yellow(_NOT_OPENABLE.format(arg)))
+                _front_after_a_retired_tab(manager, left)
+                return
+            _carry_approvals(left, new_ws, skip_permissions)
+        count = len(new_ws.session.messages) if new_ws.session is not None else 0
+        notice = f"Resumed {bold(target_id)} ({count} messages loaded)"
+    elif word == "/new":
+        try:
+            new_ws = _create_tab_like(manager, left)
+        except Exception as exc:
+            print(red(f"Cannot start a new workstream: {exc}"))
+            return
+        _carry_approvals(left, new_ws, skip_permissions)
+        notice = "New workstream started."
+    else:
+        return
+    _bring_to_front(manager, new_ws, previous=left)
+    print(notice)
+    if left is not None and manager.get(left.id) is left:
+        # Not when the tab left was a stopped copy of the one just reopened.
+        _leave_tab(manager, left, parked)
+
+
+def _front_after_a_retired_tab(manager: SessionManager, left: Workstream | None) -> None:
+    """After a failed ``/resume``: if its open retired the stopped tab left, show what is in front.
+
+    Resuming a tab whose lease moved opens it again, and the open retires the
+    stopped copy first; when it then fails, the workstream in front changed.
+    """
+    if left is not None and manager.get(left.id) is not left:
+        _bring_forward_after_background_close(manager)
+
+
+def _refuse_deleting_an_open_tab(manager: SessionManager, line: str) -> bool:
+    """``/delete`` of a workstream a tab here has open: say so, rather than the lease refusal.
+
+    That refusal reads as another process holding it. Returns whether the line
+    was handled.
+    """
+    from turnstone.core.memory import resolve_workstream
+
+    word, *rest = line.split(None, 1)
+    if word.lower() != "/delete" or not rest:
+        return False
+    target_id = resolve_workstream(rest[0].strip())
+    ws = manager.get(target_id) if target_id else None
+    if ws is None:
+        return False
+    idx = manager.index_of(ws.id)
+    print(yellow(f"Workstream {idx}:{ws.name} is open here; close it first with /ws close {idx}."))
+    return True
+
+
+def _open_for_cli_resume(manager: SessionManager, target_id: str, requested: str) -> Workstream:
+    """Open ``target_id`` for ``turnstone --resume``, or print one line and exit 1.
+
+    A node requirement or lease refusal, a corrupt persona stamp or a storage
+    error never ends the CLI with a traceback.
+    """
+    try:
+        opened = manager.open(target_id)
+    except Exception as exc:
+        logging.getLogger(__name__).debug("cli.startup_resume_failed", exc_info=True)
+        print(red(f"Cannot resume {target_id}: {exc}"))
+        sys.exit(1)
+    if opened is None:
+        print(red(_NOT_OPENABLE.format(requested)))
+        sys.exit(1)
+    return opened
+
+
+def _build_cli_manager(
+    session_factory: Callable[..., ChatSession], has_alias: Callable[[str], bool]
+) -> SessionManager:
+    """The CLI's workstream manager: a terminal UI per workstream, sessions from *session_factory*.
+
+    Opening a workstream saved with an alias this CLI does not define falls
+    back to the default model instead of failing (*has_alias* tells).
+    """
+    import queue
+
+    from turnstone.core.storage._registry import get_storage
+
+    # The adapter's ui_factory needs the manager, whose constructor takes the
+    # adapter: ``InteractiveAdapter.attach`` breaks the cycle.
+    adapter = InteractiveAdapter(
+        # The CLI consumes no SSE events: a tiny queue, and emit_* drops
+        # silently on Full (the adapter already suppresses).
+        global_queue=queue.Queue(maxsize=1),
+        ui_factory=lambda ws: WorkstreamTerminalUI(ws.id, adapter.manager),
+        session_factory=session_factory,
+    )
+    manager = SessionManager(
+        adapter, storage=get_storage(), max_active=50, model_validator=has_alias
+    )
+    adapter.attach(manager)
+    return manager
+
+
+# The servers' reconcile cadence (a module attribute, so tests can shorten it).
+_PERSISTENCE_RETRY_SECONDS = PERSISTENCE_RECONCILE_INTERVAL_SECONDS
+
+
+def _start_persistence_retries(manager: SessionManager) -> threading.Event:
+    """Retry unsaved conversation rows every second, as the server's maintenance loop does.
+
+    Returns the event that stops the thread.
+    """
+    stop = threading.Event()
+
+    def retry_loop() -> None:
+        while not stop.wait(_PERSISTENCE_RETRY_SECONDS):
+            try:
+                manager.reconcile_unresolved_persistence()
+            except Exception:
+                logging.getLogger(__name__).debug("cli.persistence_retry_failed", exc_info=True)
+
+    threading.Thread(target=retry_loop, name="cli-persistence-retry", daemon=True).start()
+    return stop
 
 
 def main() -> None:
@@ -1377,6 +1779,7 @@ def main() -> None:
         project_id: str = "",
         persona_snapshot: PersonaSnapshot | None = None,
         fork_reservation_token: str = "",
+        workstream_lease: WorkstreamLease | None = None,
     ) -> ChatSession:
         assert ui is not None, "session_factory requires a non-None UI"
         del project_id
@@ -1438,27 +1841,12 @@ def main() -> None:
             parent_ws_id=parent_ws_id,
             persona_snapshot=persona_snapshot,
             fork_reservation_token=fork_reservation_token,
+            workstream_lease=workstream_lease,
         )
 
-    # Create session manager and initial workstream. The InteractiveAdapter
-    # ui_factory needs the manager to build its terminal UI, but the
-    # manager's ctor takes the adapter — break the cycle via
-    # ``InteractiveAdapter.attach`` (mirrors the coord-side pattern).
-    import queue as _queue_mod
-
-    cli_adapter = InteractiveAdapter(
-        # CLI doesn't consume SSE events; drain into a tiny queue and let
-        # emit_* drop silently on Full (the adapter already suppresses).
-        global_queue=_queue_mod.Queue(maxsize=1),
-        ui_factory=lambda ws: WorkstreamTerminalUI(ws.id, cli_adapter.manager),
-        session_factory=session_factory,
-    )
-    manager = SessionManager(
-        cli_adapter,
-        storage=_get_storage(),
-        max_active=50,
-    )
-    cli_adapter.attach(manager)
+    manager = _build_cli_manager(session_factory, registry.has_alias)
+    # Renew the owner leases of the workstreams this REPL has open (#988).
+    manager.start_lease_keeper()
     # CLI has no background maintenance lifespan. Recover crash-abandoned
     # hidden creates once per launch after the manager is fully wired and
     # before a new caller-visible id can collide with durable residue.
@@ -1476,31 +1864,17 @@ def main() -> None:
             print(red(f"Workstream not found: {args.resume}"))
             sys.exit(1)
 
-    persona_kwargs = resolve_cli_persona_kwargs(cli_storage, args.persona, resume_target)
-
-    ws = manager.create(user_id="", **persona_kwargs)
+    if resume_target:
+        if args.persona:
+            print(yellow("--persona is ignored with --resume (the stamped persona applies)"))
+        ws = _open_for_cli_resume(manager, resume_target, args.resume)
+    else:
+        ws = manager.create(user_id="", **resolve_cli_persona_kwargs(cli_storage, args.persona))
     if args.skip_permissions and isinstance(ws.ui, TerminalUI):
         ws.ui.auto_approve = True
-
-    # Handle --resume
     if resume_target:
-        from turnstone.core.node_affinity import NodeAffinityError
-
-        if ws.session is None:
-            print(red("No session available."))
-            manager.close(ws.id)
-            sys.exit(1)
-        try:
-            resumed = ws.session.resume(resume_target)
-        except NodeAffinityError as exc:
-            manager.close(ws.id)
-            print(red(f"Cannot resume {resume_target}: {exc}"))
-            sys.exit(1)
-        if not resumed:
-            print(red(f"Workstream '{args.resume}' has no messages."))
-            manager.close(ws.id)
-            sys.exit(1)
-        print(f"Resumed workstream {bold(resume_target)} ({len(ws.session.messages)} messages)")
+        count = len(ws.session.messages) if ws.session is not None else 0
+        print(f"Resumed workstream {bold(resume_target)} ({count} messages)")
 
     # Background attention notification — write to stderr while user types
     def _bg_attention_notify(ws_id: str, state: WorkstreamState) -> None:
@@ -1536,68 +1910,115 @@ def main() -> None:
     if len(display_name) > 30:
         display_name = display_name[:27] + "..."
 
-    # Main loop
-    while True:
-        try:
-            # Show background workstream status if any need attention
-            if manager.count > 1:
-                _print_ws_status_line(manager)
-
-            # Build prompt with workstream info
-            active = manager.get_active()
-            if manager.count > 1 and active is not None:
-                idx = manager.index_of(active.id)
-                prompt_str = f"\001{BOLD}\002{idx}:{active.name}\001{RESET}\002 > "
-            else:
-                prompt_str = f"\001{BOLD}\002[{display_name}]\001{RESET}\002 > "
-            user_input = input(prompt_str)
-        except (EOFError, KeyboardInterrupt):
-            print()
-            break
-
-        user_input = user_input.strip()
-        if not user_input:
-            continue
-
-        if user_input.startswith("/ws"):
-            _handle_ws_command(manager, user_input, args.skip_permissions)
-            continue
-
-        if user_input.startswith("/cluster"):
-            _handle_cluster_command(user_input, args.console_url)
-            continue
-
-        active = manager.get_active()
-        if active is None or active.session is None:
-            continue
-        if user_input.startswith("/"):
-            should_exit = active.session.handle_command(user_input)
-            if should_exit:
+    # Main loop. ``seen_active`` is the workstream the user last saw in front:
+    # a workstream can close in the background (another process took it
+    # over), which moves the manager's active id without a /ws command.
+    seen_active = manager.active_id
+    # Tabs /resume or /new left open: "unsaved" ones close once saved,
+    # "programs" ones stay until the user closes them.
+    parked: dict[str, ParkReason] = {}
+    stop_retries = _start_persistence_retries(manager)
+    try:
+        while True:
+            try:
+                _close_parked_tabs(manager, parked)
+                if manager.active_id != seen_active:
+                    _bring_forward_after_background_close(manager)
+                    seen_active = manager.active_id
+            except KeyboardInterrupt:
+                # As at the prompt just below: Ctrl-C ends the session.
+                print()
                 break
-            # Dispatch deferred retry (handle_command sets _pending_retry)
-            retry_msg = active.session._pending_retry
-            if retry_msg:
-                active.session._pending_retry = None
+            except Exception as exc:
+                # A parked tab that cannot close now stays parked; the next
+                # prompt tries again.
+                print(red(f"Error: {exc}"))
+            try:
+                # Show background workstream status if any need attention
+                if manager.count > 1:
+                    _print_ws_status_line(manager)
+
+                # Build prompt with workstream info. The active id is read once:
+                # the prompt and the dispatch below both use this workstream.
+                prompt_active = manager.active_id
+                active = manager.get(prompt_active) if prompt_active is not None else None
+                if manager.count > 1 and active is not None:
+                    idx = manager.index_of(active.id)
+                    prompt_str = f"\001{BOLD}\002{idx}:{active.name}\001{RESET}\002 > "
+                else:
+                    prompt_str = f"\001{BOLD}\002[{display_name}]\001{RESET}\002 > "
+                user_input = input(prompt_str)
+            except (EOFError, KeyboardInterrupt):
+                print()
+                break
+
+            user_input = user_input.strip()
+            kind, target = _classify_repl_input(manager, user_input, prompt_active)
+            if kind == "empty":
+                continue
+            if kind == "exit":
+                break
+            if kind == "ws":
+                _handle_ws_command(manager, user_input, args.skip_permissions)
+                seen_active = manager.active_id
+                continue
+            if kind == "cluster":
+                _handle_cluster_command(user_input, args.console_url)
+                continue
+            if kind == "stale":
+                print(yellow("That workstream closed while you typed; your input was not sent."))
+                continue
+            if kind == "tab":
                 try:
-                    active.session.send(retry_msg)
+                    _handle_tab_command(manager, user_input, target, args.skip_permissions, parked)
+                except KeyboardInterrupt:
+                    print(f"\n{yellow('Interrupted.')}")
+                seen_active = manager.active_id
+                continue
+            if kind == "no_workstream" or target is None or target.session is None:
+                print(yellow("No workstream is open here. Use /ws new to start one, or /exit."))
+                continue
+            session = target.session
+            if user_input.startswith("/"):
+                if _refuse_deleting_an_open_tab(manager, user_input):
+                    continue
+                try:
+                    should_exit = session.handle_command(user_input)
+                except KeyboardInterrupt:
+                    print(f"\n{yellow('Interrupted.')}")
+                    continue
+                except Exception as e:
+                    print(f"\n{red(f'Error: {e}')}")
+                    continue
+                if should_exit:
+                    break
+                # Dispatch deferred retry (handle_command sets _pending_retry)
+                retry_msg = session._pending_retry
+                if retry_msg:
+                    session._pending_retry = None
+                    try:
+                        session.send(retry_msg)
+                    except KeyboardInterrupt:
+                        print(f"\n{yellow('Interrupted.')}")
+                    except Exception as e:
+                        print(f"\n{red(f'Error: {e}')}")
+            else:
+                try:
+                    session.send(user_input)
                 except KeyboardInterrupt:
                     print(f"\n{yellow('Interrupted.')}")
                 except Exception as e:
                     print(f"\n{red(f'Error: {e}')}")
-        else:
-            try:
-                active.session.send(user_input)
-            except KeyboardInterrupt:
-                print(f"\n{yellow('Interrupted.')}")
-            except Exception as e:
-                print(f"\n{red(f'Error: {e}')}")
-
-    _close_all_sessions(manager)
-    if mcp_client:
-        mcp_client.shutdown()
-    registry.shutdown()
-    shutdown_oauth_runtime(cli_auth_state)
-    close_mcp_crypto_state(cli_auth_state)
+    finally:
+        # Every exit from the loop, an unexpected error included, lets go of
+        # the workstreams this REPL holds.
+        stop_retries.set()
+        _close_all_sessions(manager)
+        if mcp_client:
+            mcp_client.shutdown()
+        registry.shutdown()
+        shutdown_oauth_runtime(cli_auth_state)
+        close_mcp_crypto_state(cli_auth_state)
 
     print("Goodbye.")
 

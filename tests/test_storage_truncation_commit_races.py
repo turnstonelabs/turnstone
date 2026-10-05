@@ -14,6 +14,7 @@ from sqlalchemy.dialects import postgresql
 from tests._storage_fakes import (
     ScriptedPostgresConnection,
     ScriptedPostgresResult,
+    lease_row,
     make_attachment,
     save_keyed,
 )
@@ -303,7 +304,7 @@ def test_postgresql_tail_truncation_locks_parent_and_releases_returned_refs() ->
     repeated = "e" * 64
     conn = ScriptedPostgresConnection(
         [
-            ScriptedPostgresResult(row=("postgres-truncate",)),
+            ScriptedPostgresResult(row=lease_row("postgres-truncate")),
             ScriptedPostgresResult(row=(42,)),
             ScriptedPostgresResult(rows=[(json.dumps([first, repeated, repeated]),), (None,)]),
             ScriptedPostgresResult(),
@@ -335,7 +336,7 @@ def test_postgresql_atomic_tail_truncation_computes_floor_under_parent_lock() ->
     repeated = "2" * 64
     conn = ScriptedPostgresConnection(
         [
-            ScriptedPostgresResult(row=("postgres-atomic-truncate",)),
+            ScriptedPostgresResult(row=lease_row("postgres-atomic-truncate")),
             ScriptedPostgresResult(scalar_value=6),
             ScriptedPostgresResult(scalar_value=14),
             ScriptedPostgresResult(scalar_value=4),

@@ -64,6 +64,35 @@ def test_spawned_shell_is_running_with_live_pid(registry):
     assert _pid_alive(shell.pid)
 
 
+def test_has_running_sees_shells_of_every_owner_until_they_end(registry):
+    assert registry.has_running() is False
+    unowned = registry.spawn("sleep 30")
+    owned = registry.spawn("sleep 30", owner="agent-1")
+    assert registry.has_running() is True
+
+    registry.kill(unowned.shell_id)
+    assert _wait_status(unowned, "killed")
+    assert registry.has_running() is True  # the agent's shell still runs
+    registry.kill(owned.shell_id, owner="agent-1")
+    assert _wait_status(owned, "killed")
+    assert registry.has_running() is False
+
+
+def test_a_session_reports_its_running_background_programs(tmp_db):
+    from tests._session_helpers import make_session
+
+    session = make_session()
+    try:
+        assert session.has_running_background_shells() is False
+        shell = session._background_shells.spawn("sleep 30")
+        assert session.has_running_background_shells() is True
+        session._background_shells.kill(shell.shell_id)
+        assert _wait_status(shell, "killed")
+        assert session.has_running_background_shells() is False
+    finally:
+        session.close()
+
+
 def test_spawn_records_command(registry):
     shell = registry.spawn("sleep 30")
     assert shell.command == "sleep 30"

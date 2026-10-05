@@ -127,15 +127,16 @@ def wake_workstream_if_pending(
         return False
     gone_probe = concrete_method(session, "is_workstream_gone")
     if gone_probe is not None and gone_probe():
-        # A hard-deleted workstream (the terminal gone latch) cannot accept
-        # ANY unattended turn: send admission refuses under the latch and
-        # the cancel finalizer converges that refusal internally, so a wake
-        # spawned past this point burns its drained nudges for nothing —
-        # and the latch does not paint ERROR, so the IDLE gate above stays
-        # open without this arm.  Refuse the spawn; queued interjections
-        # stay retained (their disposition on a deleted workstream is
-        # #1001's).  Logged because every other refusal on this lane is
-        # silent and "my queued message never delivered" needs one trace.
+        # A workstream deleted or taken over by another process (the terminal
+        # gone latch) cannot accept ANY unattended turn: send admission
+        # refuses under the latch and the cancel finalizer converges that
+        # refusal internally, so a wake spawned past this point burns its
+        # drained nudges for nothing — and the latch does not paint ERROR, so
+        # the IDLE gate above stays open without this arm.  Refuse the spawn;
+        # queued interjections stay retained (their disposition on a deleted
+        # workstream is #1001's).  Logged because every other refusal on this
+        # lane is silent and "my queued message never delivered" needs one
+        # trace.
         log.info("nudge_wake.refused_workstream_gone ws=%s trigger=%s", ws.id[:8], trigger)
         return False
     if ws.send_barrier_active():
@@ -197,6 +198,7 @@ def wake_workstream_if_pending(
         expected_session=session,
         thread_name=f"wake-nudge-{ws.id[:8]}",
         interjection_wake_signature=interjection_signature,
+        attended=False,
     )
     if deferred:
         log.info("nudge_wake.deferred_worker_busy ws=%s trigger=%s", ws.id[:8], trigger)

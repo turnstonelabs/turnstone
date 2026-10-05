@@ -62,6 +62,21 @@ class NodeSnapshot:
     reachable_reason: str = ""
 
 
+def _unloaded_event(ws_id: str, node_id: str, row: dict[str, Any]) -> dict[str, Any]:
+    """``ws_unloaded``: ``node_id`` no longer lists ``ws_id``; other nodes' rows stay.
+
+    Carries the row's project and owner, as ``ws_created`` does, so each
+    browser's tenancy filter can judge it.
+    """
+    return {
+        "type": "ws_unloaded",
+        "ws_id": ws_id,
+        "node_id": node_id,
+        "project_id": row.get("project_id", "") or "",
+        "user_id": row.get("user_id", "") or "",
+    }
+
+
 class ClusterCollector:
     """Aggregates cluster state from the service registry and per-node SSE streams.
 
@@ -525,6 +540,32 @@ class ClusterCollector:
 
     # -- SSE event handlers --------------------------------------------------
 
+    def _claim_for_node_locked(self, ws_id: str, node_id: str) -> list[dict[str, Any]]:
+        """Drop ``ws_id`` from every other node: ``node_id`` just loaded it.
+
+        One process at a time owns a workstream (#988), and a node that lost it
+        to another announces ``ws_unloaded``, not a close, perhaps after this
+        (or never, when partitioned). Only a ``ws_created`` delta claims: a node
+        sends it right after it loads a workstream, while a snapshot can come
+        from a holder that has not yet noticed its loss. Returns a
+        ``ws_unloaded`` event per node it dropped the row from, so browsers drop
+        it there too. Caller holds ``_lock``.
+        """
+        unloaded: list[dict[str, Any]] = []
+        for other_id, other in self._nodes.items():
+            row = other.workstreams.pop(ws_id, None) if other_id != node_id else None
+            if row is not None:
+                unloaded.append(_unloaded_event(ws_id, other_id, row))
+        return unloaded
+
+    def _listed_elsewhere_locked(self, ws_id: str, node_id: str) -> bool:
+        """Whether a node other than ``node_id`` lists ``ws_id``. Caller holds ``_lock``."""
+        return any(
+            ws_id in other.workstreams
+            for other_id, other in self._nodes.items()
+            if other_id != node_id
+        )
+
     def _reconcile_node(
         self, node_id: str, node: NodeSnapshot, new_ws_list: list[dict[str, Any]]
     ) -> list[dict[str, Any]]:
@@ -567,9 +608,13 @@ class ClusterCollector:
                     "user_id": ws.get("user_id", "") or "",
                 }
             )
-        # Removals
+        # Removals. One another node lists moved there: it did not close, and
+        # only this node's row goes.
         for ws_id in sorted(old_ids - new_ids):
-            pending.append({"type": "ws_closed", "ws_id": ws_id})
+            if self._listed_elsewhere_locked(ws_id, node_id):
+                pending.append(_unloaded_event(ws_id, node_id, node.workstreams[ws_id]))
+            else:
+                pending.append({"type": "ws_closed", "ws_id": ws_id})
         # State and name changes on existing workstreams
         for ws_id in sorted(new_ids & old_ids):
             old_ws = node.workstreams.get(ws_id, {})
@@ -693,6 +738,8 @@ class ClusterCollector:
                 ws_user = data.get("user_id", "") or ""
                 ws_project = data.get("project_id", "") or ""
                 ws_persona = data.get("persona", "") or ""
+                if ws_id:
+                    pending_events.extend(self._claim_for_node_locked(ws_id, node_id))
                 if ws_id and ws_id not in node.workstreams:
                     node.workstreams[ws_id] = {
                         "id": ws_id,
@@ -736,6 +783,14 @@ class ClusterCollector:
                 ws_id = data.get("ws_id", "")
                 node.workstreams.pop(ws_id, None)
                 pending_events.append({"type": "ws_closed", "ws_id": ws_id})
+
+            elif etype == "ws_unloaded":
+                # This node let go of the workstream (another process took it
+                # over, or its lease lapsed): browsers drop it from this node only.
+                ws_id = data.get("ws_id", "")
+                row = node.workstreams.pop(ws_id, None)
+                if row is not None:
+                    pending_events.append(_unloaded_event(ws_id, node_id, row))
 
             elif etype == "ws_rename":
                 ws_id = data.get("ws_id", "")

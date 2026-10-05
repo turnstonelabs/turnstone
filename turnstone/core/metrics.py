@@ -5,7 +5,21 @@ from __future__ import annotations
 import threading
 import time
 from collections import defaultdict
-from typing import Any
+from typing import Any, Literal, get_args
+
+#: Owner-lease events ``record_lease_event`` counts: acquisitions, takeovers of
+#: an expired (or, on SQLite, live) lease, refusals by a live owner, renewed
+#: leases, failed renewal passes, leases found lost, and orderly releases.
+LeaseEvent = Literal[
+    "acquired",
+    "takeover",
+    "conflict",
+    "renewed",
+    "renew_failed",
+    "lost",
+    "released",
+]
+LEASE_EVENTS: tuple[LeaseEvent, ...] = get_args(LeaseEvent)
 
 
 class MetricsCollector:
@@ -32,6 +46,8 @@ class MetricsCollector:
         # counters (continued)
         self._ratelimit_rejects: int = 0  # counter: total 429 responses
         self._evictions: int = 0  # counter: workstreams evicted
+        # counter: workstream owner-lease lifecycle events by kind (#988)
+        self._lease_events: dict[str, int] = defaultdict(int)
         # node_models publish (heartbeat-loop refresh of node_metadata.models)
         self._node_models_publish_written: int = 0
         self._node_models_publish_skipped: int = 0
@@ -106,6 +122,11 @@ class MetricsCollector:
     def record_eviction(self) -> None:
         with self._lock:
             self._evictions += 1
+
+    def record_lease_event(self, event: LeaseEvent, count: int = 1) -> None:
+        """Count workstream owner-lease events (see ``LEASE_EVENTS``)."""
+        with self._lock:
+            self._lease_events[event] += count
 
     def record_node_models_publish(self, *, written: bool) -> None:
         """Record one heartbeat-loop attempt to refresh ``node_metadata.models``.
@@ -186,6 +207,7 @@ class MetricsCollector:
             ratelimit_rejects = self._ratelimit_rejects
             backend_up = self._backend_up
             evictions = self._evictions
+            lease_events = dict(self._lease_events)
             judge_verdicts = dict(self._judge_verdicts)
             judge_latency = dict(self._judge_latency)
             judge_enabled = self._judge_enabled
@@ -297,6 +319,19 @@ class MetricsCollector:
             "Total workstreams evicted to make room for new ones",
             evictions,
         )
+
+        # turnstone_workstream_lease_events_total — every known event is
+        # always exposed, so a rate() over a quiet event reads 0, not absent.
+        lines.append(
+            "# HELP turnstone_workstream_lease_events_total "
+            "Workstream owner-lease lifecycle events by kind"
+        )
+        lines.append("# TYPE turnstone_workstream_lease_events_total counter")
+        for event in LEASE_EVENTS:
+            lines.append(
+                f'turnstone_workstream_lease_events_total{{event="{event}"}} '
+                f"{lease_events.get(event, 0)}"
+            )
 
         # turnstone_node_models_publish_total — split by outcome so an
         # operator can compute hit-rate as

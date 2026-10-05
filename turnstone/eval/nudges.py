@@ -1513,7 +1513,10 @@ class _ThrowawayEnvelopeStorage:
     def load_workstream_config(self, ws_id: str) -> dict[str, Any]:
         return dict(self._config.get(ws_id, {}))
 
-    def save_workstream_config(self, ws_id: str, config: dict[str, Any]) -> None:
+    def save_workstream_config(
+        self, ws_id: str, config: dict[str, Any], *, lease: Any = None
+    ) -> None:
+        del lease  # the throwaway envelope has no owner to fence
         self._config.setdefault(ws_id, {}).update(config)
 
 

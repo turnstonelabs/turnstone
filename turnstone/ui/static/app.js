@@ -994,18 +994,18 @@ function closeWorkstream(wsId) {
       } else if (result.status === 409) {
         showToast(
           "Conversation history is still being saved. Try ending the session again shortly.",
-          "warning",
+          "warn",
         );
       } else if (data.error) {
-        showToast(data.error, "warning");
+        showToast(data.error, "warn");
       } else {
-        showToast("Couldn't end the session. Try again shortly.", "warning");
+        showToast("Couldn't end the session. Try again shortly.", "warn");
       }
     })
     .catch(function () {
       // Transport failure: the close may not have reached the server at
       // all — say so instead of leaving the pane open with no feedback.
-      showToast("Couldn't end the session. Try again shortly.", "warning");
+      showToast("Couldn't end the session. Try again shortly.", "warn");
     });
 }
 
@@ -1427,7 +1427,7 @@ function submitEditTitle() {
   const input = document.getElementById("edit-title-input");
   const newTitle = input.value.trim();
   if (!newTitle) {
-    showToast("Title cannot be empty", "warning");
+    showToast("Title cannot be empty", "warn");
     return;
   }
 
@@ -1440,8 +1440,16 @@ function submitEditTitle() {
     body: JSON.stringify({ title: newTitle }),
   })
     .then(function (r) {
-      if (!r.ok) throw new Error("Failed to set title (HTTP " + r.status + ")");
-      return r.json();
+      if (r.ok) return r.json();
+      return readRefusal(r).then(function (refusal) {
+        throw new Error(
+          refusal.where
+            ? "This workstream is open " +
+                refusal.where +
+                ". Rename it there, or retry once it closes."
+            : "Failed to set title (HTTP " + r.status + ")",
+        );
+      });
     })
     .then(function (data) {
       window.TurnstoneHatch.setBusy(dlg, false);
@@ -1507,9 +1515,16 @@ function executeDeleteWs() {
 
   authFetch(url, { method: "POST" })
     .then(function (r) {
-      if (!r.ok)
-        throw new Error("Failed to delete workstream (HTTP " + r.status + ")");
-      return r.json();
+      if (r.ok) return r.json();
+      return readRefusal(r).then(function (refusal) {
+        throw new Error(
+          refusal.where
+            ? "This workstream is open " +
+                refusal.where +
+                ". Delete it there, or retry once it closes."
+            : "Failed to delete workstream (HTTP " + r.status + ")",
+        );
+      });
     })
     .then(function () {
       window.TurnstoneHatch.setBusy(dlg, false);
@@ -1568,6 +1583,18 @@ function dashboardResumeSession(wsId) {
     headers: { "Content-Type": "application/json" },
   })
     .then(function (r) {
+      if (r.status === 409) {
+        return readRefusal(r).then(function (refusal) {
+          showToast(
+            refusal.where
+              ? "This workstream is open " + refusal.where + ". Retry once it closes there."
+              : (typeof refusal.data.error === "string" && refusal.data.error) ||
+                  "Failed to open workstream",
+            "warn",
+          );
+          return {};
+        });
+      }
       if (!r.ok) throw new Error("HTTP " + r.status);
       return r.json();
     })
@@ -2041,6 +2068,12 @@ function connectGlobalSSE() {
       workstreams[data.ws_id].persona = data.persona || "";
       workstreams[data.ws_id].persistence_state = "healthy";
       renderTabBar();
+    } else if (data.type === "ws_unloaded") {
+      // Another process took the workstream over: it did not close, so no
+      // toast and the open pane stays (its own stream says it stopped); the
+      // roster lists only what this node holds.
+      delete workstreams[data.ws_id];
+      fireRender();
     } else if (data.type === "ws_closed") {
       const wsId = data.ws_id;
       delete workstreams[wsId];

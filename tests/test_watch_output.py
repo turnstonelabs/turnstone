@@ -342,8 +342,8 @@ def test_fork_reads_only_its_inherited_snapshot(
         reader = fork
         if fork_compacted:
             _compact_watch_session(fork)
-            restored = make_session(user_id="owner")
-            assert restored.resume(fork.ws_id)
+            restored = make_session(ws_id=fork.ws_id, user_id="owner")
+            assert restored.rehydrate()
             assert not any(turn.source == "watch_triggered" for turn in restored.messages)
             reader = restored
         prepared = reader._prepare_watch("read", {"action": "read", "name": _WATCH_ID})
@@ -406,8 +406,8 @@ def test_failed_terminal_update_survives_compaction_and_checkpointed_resume(
         assert sum(turn.source == "watch_triggered" for turn in session.messages) == 1
 
         _compact_watch_session(session)
-        restored = make_session()
-        assert restored.resume(session.ws_id)
+        restored = make_session(ws_id=session.ws_id)
+        assert restored.rehydrate()
         assert not any(turn.source == "watch_triggered" for turn in restored.messages)
         for reader in (session, restored):
             for name in (_WATCH_ID, "checks"):

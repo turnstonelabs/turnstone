@@ -1357,13 +1357,14 @@ def _seed_committed(ws_id: str, kind: str, mime: str, body: bytes, filename: str
     save + a tool row whose ref-list names it (the serving ownership gate)."""
     import hashlib
 
-    from turnstone.core.memory import save_attachment, save_message, set_message_attachments
+    from turnstone.core.memory import save_attachment, save_message
+    from turnstone.core.storage import get_storage
 
     aid = hashlib.sha256(b"preview:" + body).hexdigest()
     save_attachment(aid, filename, mime, len(body), kind, body, "tool")
     row_id = save_message(ws_id, "tool", "Preview shown", "open_preview", tool_call_id="c1")
     assert row_id is not None
-    set_message_attachments(ws_id, row_id, [aid])
+    get_storage().set_message_attachments(ws_id, row_id, [aid])
     return aid
 
 

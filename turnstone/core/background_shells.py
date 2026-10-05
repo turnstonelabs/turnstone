@@ -737,6 +737,11 @@ class BackgroundShellRegistry:
         with self._lock:
             return [s for s in self._shells.values() if s.owner == owner]
 
+    def has_running(self) -> bool:
+        """Whether any shell, whatever its owner, is still running."""
+        with self._lock:
+            return any(shell.status == "running" for shell in self._shells.values())
+
     def read(
         self,
         shell_id: str,

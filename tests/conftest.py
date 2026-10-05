@@ -202,6 +202,82 @@ def _no_leaked_threads(request: pytest.FixtureRequest) -> Iterator[None]:
 
 
 @pytest.fixture(autouse=True)
+def _every_lease_handle_has_a_slot(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+) -> Iterator[None]:
+    """Fail a test whose SessionManager still renews a lease no slot holds.
+
+    Every way a slot leaves must release its owner lease. A forgotten release
+    goes on renewing until shutdown and nothing else notices (#988), so at
+    teardown each manager built during the test may track only the handles of
+    its loaded slots, its retained failed-delete tombstones and its pending
+    creates. Opt out with ``@pytest.mark.allow_lease_outside_slot``.
+    """
+    if request.node.get_closest_marker("allow_lease_outside_slot"):
+        yield
+        return
+    from turnstone.core.session_manager import SessionManager
+
+    managers: list[SessionManager] = []
+    init = SessionManager.__init__
+
+    def tracked_init(self: SessionManager, *args: Any, **kwargs: Any) -> None:
+        init(self, *args, **kwargs)
+        managers.append(self)
+
+    monkeypatch.setattr(SessionManager, "__init__", tracked_init)
+    yield
+    stray: list[str] = []
+    for mgr in managers:
+        with mgr._lock:
+            slots = [
+                *mgr._workstreams.values(),
+                *mgr._failed_delete_tombstones.values(),
+                *mgr._pending_creates.values(),
+            ]
+        held = {id(ws._lease) for ws in slots if ws._lease is not None}
+        stray.extend(
+            f"{lease.ws_id[:8]} ({lease.state})"
+            for lease in mgr._lease_keeper.tracked()
+            if id(lease) not in held
+        )
+    if stray:
+        pytest.fail(
+            f"a SessionManager still renews leases no slot holds: {stray}. Release the "
+            "slot's lease on every exit, or mark @pytest.mark.allow_lease_outside_slot "
+            "if the test holds a bare handle on purpose."
+        )
+
+
+@pytest.fixture(autouse=True)
+def _default_sqlite_outside_the_repo(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path_factory: pytest.TempPathFactory,
+    pytestconfig: pytest.Config,
+) -> None:
+    """Keep an auto-initialized SQLite store out of the repo root.
+
+    ``get_storage()`` creates ``.turnstone.db`` in the current directory when
+    nothing initialized storage; while that is the repo root, the file is
+    shared by every run (and by a CLI started there), so point the default at
+    a temporary directory instead. A test that moved into its own directory
+    keeps the real default.
+    """
+    from turnstone.core.storage import _registry
+
+    init = _registry.init_storage
+    root = os.path.realpath(pytestconfig.rootpath)
+
+    def init_outside_the_repo(backend: str = "sqlite", **kwargs: Any) -> Any:
+        in_root = os.path.realpath(os.getcwd()) == root
+        if backend == "sqlite" and not kwargs.get("path") and in_root:
+            kwargs["path"] = str(tmp_path_factory.mktemp("default-storage") / ".turnstone.db")
+        return init(backend, **kwargs)
+
+    monkeypatch.setattr(_registry, "init_storage", init_outside_the_repo)
+
+
+@pytest.fixture(autouse=True)
 def _close_oauth_runtimes(
     monkeypatch: pytest.MonkeyPatch, _no_leaked_threads: None
 ) -> Iterator[None]:
@@ -611,7 +687,7 @@ def _clear_policy_cache():
 
     The cache is keyed by org_id (default ``""``), so without this
     autouse hook a policy created in test A would leak into test B's
-    ``evaluate_tool_policy`` call — distinct storage instances, same
+    ``evaluate_loaded_tool_policies`` call — distinct storage instances, same
     cache slot. Production singleton storage doesn't see the leak
     because there's only one storage instance for the process lifetime;
     the test isolation requirement is what motivates the autouse.

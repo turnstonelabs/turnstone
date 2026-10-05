@@ -797,6 +797,9 @@ WRITE_PATHS: frozenset[str] = frozenset(
         "/api/cluster/workstreams/new",
         "/api/memories",
         "/api/tts",
+        # The console deletes coordinators itself on this route, so no node
+        # re-checks the caller's scope.
+        "/api/route/workstreams/delete",
     }
 )
 

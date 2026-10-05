@@ -515,6 +515,8 @@ def test_node_shutdown_allows_revocation_to_finish_during_manager_drain(
             await asyncio.wait_for(progress, 5)
             assert observed == [True]
             assert upstream.revoked and client.is_closed
+            # Shutdown hands every workstream lease back.
+            app.state.workstreams.release_leases.assert_called_once()
 
     asyncio.run(run())
 

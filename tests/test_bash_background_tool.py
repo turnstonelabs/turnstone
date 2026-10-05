@@ -661,6 +661,7 @@ def test_cli_exit_closes_every_loaded_session():
     _close_all_sessions(manager)  # must not raise
     ws_a.session.close.assert_called_once()
     ws_b.session.close.assert_called_once(), "one bad teardown must not stop the rest"
+    manager.release_leases.assert_called_once()
     # Signal phase ran for every loaded session, before any close.
     ws_a.session._background_shells.signal_all.assert_called_once()
     ws_b.session._background_shells.signal_all.assert_called_once()

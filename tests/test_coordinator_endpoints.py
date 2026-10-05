@@ -473,7 +473,7 @@ def test_coord_set_title_alias_conflict_409(storage):
     mgr = _build_mgr(storage)
     first = mgr.create(user_id="user-1", name="c1")
     second = mgr.create(user_id="user-1", name="c2")
-    storage.set_workstream_alias(first.id, "taken")
+    storage.set_workstream_alias(first.id, "taken", lease=mgr.lease_fence(first.id))
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
     resp = client.post(
         f"/v1/api/workstreams/{second.id}/title", json={"title": "taken"}, headers=_COORD_HEADERS
@@ -914,7 +914,7 @@ def _seed_closed_coord_with_history(
     coordinator unless we've stamped at least one conversation row.
     """
     ws = mgr.create(user_id=user_id, name=name)
-    storage.save_message(ws.id, role="user", content="seed")
+    storage.save_message(ws.id, role="user", content="seed", lease=mgr.lease_fence(ws.id))
     closed = mgr.close(ws.id)
     assert closed
     return ws.id
@@ -966,10 +966,11 @@ def test_saved_excludes_currently_loaded(saved_storage):
     closed_id = _seed_closed_coord_with_history(mgr, storage, user_id="user-1", name="closed")
     # Create another coord, leave it loaded — should never appear in saved.
     loaded_ws = mgr.create(user_id="user-1", name="loaded")
-    storage.save_message(loaded_ws.id, role="user", content="seed")
+    loaded_fence = mgr.lease_fence(loaded_ws.id)
+    storage.save_message(loaded_ws.id, role="user", content="seed", lease=loaded_fence)
     # Force it to state='closed' on disk without removing from memory, to
     # exercise the defence-in-depth ``loaded`` filter.
-    storage.update_workstream_state(loaded_ws.id, "closed")
+    storage.update_workstream_state(loaded_ws.id, "closed", lease=loaded_fence)
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
     resp = client.get("/v1/api/workstreams/saved", headers=_COORD_HEADERS)
     assert resp.status_code == 200
@@ -991,11 +992,13 @@ def test_saved_excludes_active_state_rows(saved_storage):
     closed_id = _seed_closed_coord_with_history(mgr, storage, user_id="user-1", name="closed")
     # An idle row in storage with no in-memory presence — must not appear.
     orphan = mgr.create(user_id="user-1", name="orphan")
-    storage.save_message(orphan.id, role="user", content="seed")
-    # Drop from memory without changing state (simulates manager restart).
+    storage.save_message(orphan.id, role="user", content="seed", lease=mgr.lease_fence(orphan.id))
+    # Drop from memory without changing state (simulates a manager restart,
+    # whose shutdown releases the lease).
     mgr._workstreams.pop(orphan.id, None)
     if orphan.id in mgr._order:
         mgr._order.remove(orphan.id)
+    mgr._release_slot_lease(orphan)
     assert storage.get_workstream(orphan.id)["state"] == "idle"
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
     resp = client.get("/v1/api/workstreams/saved", headers=_COORD_HEADERS)
@@ -1568,7 +1571,7 @@ def test_detail_503_on_session_factory_misconfig(storage):
     mgr = _build_mgr(storage)
     storage.register_workstream("misconfig-coord", kind="coordinator", user_id="user-1")
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
-    with patch.object(mgr, "open", side_effect=ValueError("no such model alias")):
+    with patch.object(mgr, "open_with_outcome", side_effect=ValueError("no such model alias")):
         resp = client.get("/v1/api/workstreams/misconfig-coord", headers=_COORD_HEADERS)
     assert resp.status_code == 503
     assert "no such model alias" in resp.json()["error"]
@@ -1584,7 +1587,9 @@ def test_detail_correlation_id_on_unexpected_rehydrate_failure(storage):
     mgr = _build_mgr(storage)
     storage.register_workstream("broken-coord", kind="coordinator", user_id="user-1")
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
-    with patch.object(mgr, "open", side_effect=RuntimeError("internal stack frame leak")):
+    with patch.object(
+        mgr, "open_with_outcome", side_effect=RuntimeError("internal stack frame leak")
+    ):
         resp = client.get("/v1/api/workstreams/broken-coord", headers=_COORD_HEADERS)
     assert resp.status_code == 500
     body = resp.json()
@@ -1611,8 +1616,8 @@ class _HistoryHandoffSession:
     ) -> tuple[list[dict[str, Any]], str]:
         return load_messages(0), f"test-history.{self._history_generation}"
 
-    def resume(self, _ws_id: str) -> None:
-        return None
+    def rehydrate(self) -> bool:
+        return True
 
 
 def _build_history_mgr(storage: Any):
@@ -1631,7 +1636,7 @@ def test_history_returns_messages(storage):
     mgr = _build_history_mgr(storage)
     ws = mgr.create(user_id="user-1")
     # Seed a message in storage.
-    storage.save_message(ws.id, "user", "hello")
+    storage.save_message(ws.id, "user", "hello", lease=mgr.lease_fence(ws.id))
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
     resp = client.get(f"/v1/api/workstreams/{ws.id}/history", headers=_COORD_HEADERS)
     assert resp.status_code == 200
@@ -1646,7 +1651,7 @@ def test_history_any_admin_coordinator_caller_can_read(storage):
     # ``admin.coordinator`` caller.
     mgr = _build_history_mgr(storage)
     ws = mgr.create(user_id="owner")
-    storage.save_message(ws.id, "user", "hello")
+    storage.save_message(ws.id, "user", "hello", lease=mgr.lease_fence(ws.id))
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
     resp = client.get(
         f"/v1/api/workstreams/{ws.id}/history",
@@ -1834,7 +1839,7 @@ def test_history_clamps_limit_query_param(storage):
     # Seed enough messages to exercise the upper bound. SQLite's INSERT
     # is fast enough that 6 inserts in a tight loop is fine.
     for i in range(6):
-        storage.save_message(ws.id, "user", f"msg-{i}")
+        storage.save_message(ws.id, "user", f"msg-{i}", lease=mgr.lease_fence(ws.id))
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
     base = f"/v1/api/workstreams/{ws.id}/history"
 
@@ -1878,8 +1883,8 @@ def test_export_happy_path_returns_json_not_zip(storage):
     capability is admin-CLI-only."""
     mgr = _build_mgr(storage)
     ws = mgr.create(user_id="user-1")
-    storage.save_message(ws.id, "user", "coordinate the work")
-    storage.save_message(ws.id, "assistant", "on it")
+    storage.save_message(ws.id, "user", "coordinate the work", lease=mgr.lease_fence(ws.id))
+    storage.save_message(ws.id, "assistant", "on it", lease=mgr.lease_fence(ws.id))
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
 
     resp = client.get(f"/v1/api/workstreams/{ws.id}/export", headers=_COORD_HEADERS)
@@ -2498,7 +2503,7 @@ def test_open_rehydrates_when_not_in_memory(storage, monkeypatch):
     rehydrated.id = "coord-rehy"
     rehydrated.name = "rehydrated"
     rehydrated.user_id = "user-1"
-    monkeypatch.setattr(mgr, "open", MagicMock(return_value=rehydrated))
+    monkeypatch.setattr(mgr, "open_with_outcome", MagicMock(return_value=(rehydrated, True)))
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
     resp = client.post("/v1/api/workstreams/coord-rehy/open", headers=_COORD_HEADERS)
     assert resp.status_code == 200
@@ -2506,14 +2511,14 @@ def test_open_rehydrates_when_not_in_memory(storage, monkeypatch):
     assert body["ws_id"] == "coord-rehy"
     assert body["name"] == "rehydrated"
     assert "already_loaded" not in body
-    # SessionManager.open takes a single positional arg now — no
-    # per-caller ownership / admin plumbing.
-    mgr.open.assert_called_once_with("coord-rehy")
+    # The open takes a single positional arg now — no per-caller
+    # ownership / admin plumbing.
+    mgr.open_with_outcome.assert_called_once_with("coord-rehy")
 
 
 def test_open_returns_404_when_unknown_ws_id(storage, monkeypatch):
     mgr = _build_mgr(storage)
-    monkeypatch.setattr(mgr, "open", MagicMock(return_value=None))
+    monkeypatch.setattr(mgr, "open_with_outcome", MagicMock(return_value=(None, False)))
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
     resp = client.post("/v1/api/workstreams/nonexistent/open", headers=_COORD_HEADERS)
     assert resp.status_code == 404
@@ -2528,7 +2533,7 @@ def test_open_503_on_coord_mgr_unavailable(storage):
 def test_open_correlation_id_on_factory_failure(storage, monkeypatch):
     mgr = _build_mgr(storage)
     storage.register_workstream("bad-ws", kind="coordinator", user_id="user-1")
-    monkeypatch.setattr(mgr, "open", MagicMock(side_effect=RuntimeError("boom")))
+    monkeypatch.setattr(mgr, "open_with_outcome", MagicMock(side_effect=RuntimeError("boom")))
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
     resp = client.post("/v1/api/workstreams/bad-ws/open", headers=_COORD_HEADERS)
     assert resp.status_code == 500
@@ -2539,7 +2544,9 @@ def test_open_503_when_open_raises_value_error(storage, monkeypatch):
     """ValueError from the factory surfaces as 503 with the remediation text."""
     mgr = _build_mgr(storage)
     storage.register_workstream("bad-ws", kind="coordinator", user_id="user-1")
-    monkeypatch.setattr(mgr, "open", MagicMock(side_effect=ValueError("coord registry missing")))
+    monkeypatch.setattr(
+        mgr, "open_with_outcome", MagicMock(side_effect=ValueError("coord registry missing"))
+    )
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
     resp = client.post("/v1/api/workstreams/bad-ws/open", headers=_COORD_HEADERS)
     assert resp.status_code == 503
@@ -2644,7 +2651,9 @@ def test_tasks_round_trips_stored_envelope(storage):
             }
         ],
     }
-    storage.save_workstream_config(ws.id, {"tasks": json.dumps(envelope)})
+    storage.save_workstream_config(
+        ws.id, {"tasks": json.dumps(envelope)}, lease=mgr.lease_fence(ws.id)
+    )
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
     resp = client.get(f"/v1/api/workstreams/{ws.id}/tasks", headers=_COORD_HEADERS)
     assert resp.status_code == 200
@@ -2654,7 +2663,7 @@ def test_tasks_round_trips_stored_envelope(storage):
 def test_tasks_corrupt_envelope_returns_empty(storage):
     mgr = _build_mgr(storage)
     ws = mgr.create(user_id="user-1")
-    storage.save_workstream_config(ws.id, {"tasks": "NOT-JSON"})
+    storage.save_workstream_config(ws.id, {"tasks": "NOT-JSON"}, lease=mgr.lease_fence(ws.id))
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
     resp = client.get(f"/v1/api/workstreams/{ws.id}/tasks", headers=_COORD_HEADERS)
     assert resp.status_code == 200
@@ -2767,6 +2776,8 @@ def test_cluster_inspect_coordinator_self_path(storage):
     body = resp.json()
     assert body["persisted"]["ws_id"] == ws.id
     assert body["persisted"]["kind"] == "coordinator"
+    # The console holds this coordinator's lease; the holder is a routing hint only.
+    assert "lease_node_id" not in body["persisted"]
     # Live is populated from the manager snapshot (pending_approval key signals
     # we went through the coordinator branch, not the node-fetch branch).
     assert body["live"] is not None
@@ -2801,6 +2812,7 @@ def test_cluster_inspect_scrubs_private_assistant_provenance(storage):
             }
         ),
         commit_key="private-commit-key",
+        lease=mgr.lease_fence(ws.id),
     )
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
 
@@ -3047,7 +3059,9 @@ def test_cluster_inspect_message_limit_clamped(storage):
     ws = mgr.create(user_id="user-1")
     # 250 messages — last 200 must come back, in chronological order.
     for i in range(250):
-        storage.save_message(ws.id, role="user", content=f"msg-{i:04d}")
+        storage.save_message(
+            ws.id, role="user", content=f"msg-{i:04d}", lease=mgr.lease_fence(ws.id)
+        )
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
     resp = client.get(
         f"/v1/api/cluster/ws/{ws.id}/detail?message_limit=9999",
@@ -3068,7 +3082,7 @@ def test_cluster_inspect_zero_message_limit_returns_empty(storage):
     mgr = _build_mgr(storage)
     ws = mgr.create(user_id="user-1")
     for i in range(10):
-        storage.save_message(ws.id, role="user", content=f"msg-{i}")
+        storage.save_message(ws.id, role="user", content=f"msg-{i}", lease=mgr.lease_fence(ws.id))
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
     resp = client.get(
         f"/v1/api/cluster/ws/{ws.id}/detail?message_limit=0",
@@ -3181,7 +3195,7 @@ def test_coordinator_rows_dedupes_by_ws_id_in_memory_wins(storage):
     # stored row to prove the in-memory row wins.  Update the state
     # to something the manager would never produce so the dedup check
     # is unambiguous.
-    storage.update_workstream_state(live.id, "error")
+    storage.update_workstream_state(live.id, "error", lease=mgr.lease_fence(live.id))
 
     request = _persisted_rows_request(storage, mgr, "alice", frozenset({"read"}))
     rows = _coordinator_rows(request)
@@ -3258,7 +3272,9 @@ def test_coordinator_rows_surface_persisted_title(storage):
     # In-memory lane: a LIVE coordinator titled after creation.  The
     # manager assigned the placeholder ``ws.name``; the title is in the DB.
     live = mgr.create(user_id="alice", name="ws-abcd")
-    storage.update_workstream_title(live.id, "Refactor the auth layer")
+    storage.update_workstream_title(
+        live.id, "Refactor the auth layer", lease=mgr.lease_fence(live.id)
+    )
 
     # Persisted lane: a closed coordinator (evicted from the manager)
     # carrying BOTH a title and a user alias — the alias must win.

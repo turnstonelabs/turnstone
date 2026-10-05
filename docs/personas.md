@@ -28,13 +28,9 @@ The persona is resolved **once**, at workstream creation, and stamped into
 reads only the stamp:
 
 - **Editing or archiving a persona never changes an existing workstream.**
-  Rehydrate, resume, and post-compaction resume all run from the stamp.
-  A mid-session REPL `/resume` adopts the target workstream's stamp for
-  prompt, tools, and memory; for the MCP lever it can only narrow in
-  place — adopting an MCP-off stamp drops the live MCP surface, while
-  adopting an MCP-on stamp into a session whose persona dropped MCP at
-  construction is refused with an error telling you to reopen the
-  workstream fresh.
+  Every reopen (a pane, `--resume`, the CLI's `/resume`, a watch fire) builds
+  the session from the stamp, and post-compaction resume runs from it too.
+  The CLI's `/new` starts its workstream with the current tab's persona.
 - A workstream outlives its persona — an archived persona keeps labelling
   the workstreams stamped with it.
 - A partial or unparseable stamp is treated as corruption: session
@@ -113,8 +109,8 @@ seeded):
 - **API/SDK**: `CreateWorkstreamRequest.persona` (Python:
   `create_workstream(persona=...)`; TypeScript: `{ persona: ... }`).
 - **CLI**: `turnstone --persona <name>`. Unknown or disabled names error at
-  startup. `--resume` ignores `--persona` and adopts the resumed
-  workstream's stamp.
+  startup. `--resume` ignores `--persona`: the resumed workstream keeps its
+  stamp.
 - **Coordinator spawn**: `spawn_workstream` / `spawn_batch` take a
   `persona` argument, validated when the coordinator prepares the spawn
   and re-checked by the node that creates the child (children are always

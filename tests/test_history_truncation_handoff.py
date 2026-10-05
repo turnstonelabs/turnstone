@@ -244,10 +244,10 @@ def test_truncation_freezes_direct_admission_then_preserves_suffix_order(
     truncation_results: list[int] = []
     errors: list[BaseException] = []
 
-    def _frozen_truncate(ws_id: str, remove_count: int) -> int:
+    def _frozen_truncate(ws_id: str, remove_count: int, *, lease: Any = None) -> int:
         truncate_entered.set()
         assert release_truncate.wait(5), "test did not release strict truncation"
-        return real_truncate(ws_id, remove_count)
+        return real_truncate(ws_id, remove_count, lease=lease)
 
     def _observed_prepare(deferred: Any) -> None:
         append_prepare_entered.set()
@@ -328,10 +328,10 @@ def test_truncation_freezes_generation_commit_admission(tmp_db: Any) -> None:
     real_truncate = storage.truncate_messages_tail
     errors: list[BaseException] = []
 
-    def _frozen_truncate(ws_id: str, remove_count: int) -> int:
+    def _frozen_truncate(ws_id: str, remove_count: int, *, lease: Any = None) -> int:
         truncate_entered.set()
         assert release_truncate.wait(5), "test did not release strict truncation"
-        return real_truncate(ws_id, remove_count)
+        return real_truncate(ws_id, remove_count, lease=lease)
 
     def _rewind() -> None:
         try:
@@ -404,9 +404,9 @@ def test_truncation_waiting_for_older_ticket_keeps_commit_admission_open(
             truncation_wait_entered.set()
         return real_wait_for(predicate, timeout)
 
-    def _observe_truncate(ws_id: str, remove_count: int) -> int:
+    def _observe_truncate(ws_id: str, remove_count: int, *, lease: Any = None) -> int:
         strict_cut_entered.set()
-        return real_truncate(ws_id, remove_count)
+        return real_truncate(ws_id, remove_count, lease=lease)
 
     def _rewind() -> None:
         try:
@@ -535,10 +535,10 @@ def test_terminal_waits_for_admitted_truncation_ticket(
     terminal_results: list[bool] = []
     errors: list[BaseException] = []
 
-    def _frozen_truncate(ws_id: str, remove_count: int) -> int:
+    def _frozen_truncate(ws_id: str, remove_count: int, *, lease: Any = None) -> int:
         truncate_entered.set()
         assert release_truncate.wait(5), "test did not release admitted truncation"
-        return real_truncate(ws_id, remove_count)
+        return real_truncate(ws_id, remove_count, lease=lease)
 
     def _observe_wait(predicate: Any, timeout: float | None = None) -> bool:
         if threading.current_thread().name == f"{terminal_kind}-terminal":

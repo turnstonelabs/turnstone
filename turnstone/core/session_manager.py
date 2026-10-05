@@ -23,11 +23,19 @@ from turnstone.core.log import get_logger
 from turnstone.core.model_registry import ModelClientConstructionError, UnknownModelAliasError
 from turnstone.core.node_affinity import parse_required_node_id, require_execution_node
 from turnstone.core.personas import snapshot_from_config
+from turnstone.core.storage._protocol import WorkstreamLeaseHeldError, WorkstreamLeaseLostError
 from turnstone.core.workstream import (
     Workstream,
+    WorkstreamHistoryUnavailableError,
     WorkstreamKind,
     WorkstreamState,
     concrete_method,
+)
+from turnstone.core.workstream_lease import (
+    LeaseKeeper,
+    WorkstreamLease,
+    new_lease_holder,
+    record_lease_event,
 )
 
 if TYPE_CHECKING:
@@ -36,7 +44,7 @@ if TYPE_CHECKING:
     from turnstone.core.child_event_bus import ChildEventBus
     from turnstone.core.session import ChatSession, SessionUI
     from turnstone.core.state_writer import StateWriter
-    from turnstone.core.storage._protocol import StorageBackend
+    from turnstone.core.storage._protocol import LeaseFence, StorageBackend
 
 log = get_logger(__name__)
 
@@ -48,6 +56,40 @@ class CloseOutcome(enum.Enum):
     NOT_FOUND = "not_found"
     UNRESOLVED_PERSISTENCE = "unresolved_persistence"
     CLEANUP_PENDING = "cleanup_pending"
+    # Unloaded here, but the row was no longer this process's: another process
+    # took it over (the workstream did not close), or a maintenance pass closed
+    # and fenced it out after this copy's lease lapsed. HTTP answers it like
+    # NOT_FOUND, so the console re-routes the close to any holder.
+    OWNED_ELSEWHERE = "owned_elsewhere"
+
+
+_FACTORY_DROPPED_LEASE = "the session factory did not pass workstream_lease to the session it built"
+
+
+class SessionCapacityError(RuntimeError):
+    """Every slot is busy and none can be evicted: hosts answer 429, try later."""
+
+    def __init__(self, max_active: int) -> None:
+        super().__init__(f"All {max_active} slots are active")
+
+
+class SessionFactoryLeaseError(ValueError):
+    """A session factory built a session without the slot's ``workstream_lease``.
+
+    A ``ValueError``: hosts answer a misconfigured session factory with 503 and
+    its message.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(_FACTORY_DROPPED_LEASE)
+
+
+class _Release(enum.Enum):
+    """What releasing one lease found."""
+
+    RELEASED = "released"  # storage released it, or it was released before
+    NOT_OURS = "not_ours"  # the handle was lost, or storage found another fence
+    UNREACHABLE = "unreachable"  # storage failed; the lease expires on its own
 
 
 def _session_has_unresolved_persistence(session: Any) -> bool:
@@ -151,21 +193,6 @@ class WorkstreamAlreadyExistsError(RuntimeError):
     """A create request did not acquire a fresh durable workstream id."""
 
 
-# Maps each workstream kind to the ``services.service_type`` its hosting
-# process registers under.  Used by ``SessionManager.close_idle`` pass 2
-# to enumerate live peer processes for orphan-reaper liveness scoping.
-# Server processes register as ``("server", node_id, ...)`` (see
-# ``turnstone/server.py``); the console process as ``("console",
-# "console", ...)`` (see ``turnstone/console/server.py``).  Deriving from
-# kind here removes a duplicated-config footgun: any caller that builds
-# a ``SessionManager`` automatically gets the correct service_type for
-# its kind, with no risk of miswiring INTERACTIVE→"console" or vice
-# versa.
-_KIND_SERVICE_TYPE: dict[WorkstreamKind, str] = {
-    WorkstreamKind.INTERACTIVE: "server",
-    WorkstreamKind.COORDINATOR: "console",
-}
-
 # A create normally publishes in one request, but provider construction, a
 # large fork clone, or attachment validation can legitimately take longer than
 # a heartbeat window. Keep crash recovery independent from idle-session policy
@@ -238,10 +265,23 @@ class SessionKindAdapter(Protocol):
         """Construct the ``ChatSession`` for a workstream whose ``ui`` is already attached.
 
         ``**extra`` is the pass-through for kind-specific per-call
-        options (e.g. interactive's ``judge_model``). Each adapter
-        ignores what it doesn't recognise; the manager stays
-        kind-agnostic.
+        options (e.g. interactive's ``judge_model``), and for what the
+        manager supplies: ``workstream_lease`` (and, on a create,
+        ``fork_reservation_token``) must reach the ``ChatSession`` unchanged;
+        a session built without the lease fails the create or open with
+        :class:`SessionFactoryLeaseError`. An adapter may ignore other extras
+        it doesn't recognise; the manager stays kind-agnostic.
         """
+
+
+class ExactDeleteFn(Protocol):
+    """Exact hard delete of one durable incarnation.
+
+    ``lease`` is the manager's fence when it holds the workstream, else
+    ``None``; storage then refuses while another process owns a live lease.
+    """
+
+    def __call__(self, *, lease: LeaseFence | None) -> bool: ...
 
 
 class SessionEventEmitter(Protocol):
@@ -256,10 +296,11 @@ class SessionEventEmitter(Protocol):
     method — interactive's ``emit_state`` / ``emit_rehydrated`` are
     documented no-op stubs because those events fire from out-of-band
     channels (``WebUI._broadcast_state`` for state and the open handler for
-    rehydrate). Interactive ``emit_created`` and ``emit_closed`` are real,
-    bounded global-queue publications. Coordinator's four methods are all
-    real (cluster collector's pseudo-node sees every transition). See
-    :class:`SessionKindAdapter` docstring for the asymmetry rationale.
+    rehydrate). Interactive ``emit_created``, ``emit_closed`` and
+    ``on_lease_retired`` are real, bounded global-queue publications.
+    Coordinator's five methods are all real (cluster collector's pseudo-node
+    sees every transition). See :class:`SessionKindAdapter` docstring for the
+    asymmetry rationale.
     """
 
     def emit_created(self, ws: Workstream) -> None:
@@ -277,6 +318,15 @@ class SessionEventEmitter(Protocol):
 
     def emit_state(self, ws: Workstream, state: WorkstreamState) -> None:
         """Fire the state-transition event."""
+
+    def on_lease_retired(self, ws: Workstream) -> None:
+        """Bookkeeping for ``ws`` unloaded because another process took its row.
+
+        Called instead of :meth:`emit_closed`: the workstream did not close, it
+        lives on elsewhere. A kind whose ``emit_closed`` does more than announce
+        the close (the coordinator closes its row on its own pseudo-node) does
+        that part here.
+        """
 
     def emit_closed(
         self,
@@ -304,6 +354,9 @@ class SessionManager:
 
     _REHYDRATE_BIND_ATTEMPTS = 3
     _REHYDRATE_INCARNATION_ATTEMPTS = 3
+    #: Shared deadline for hosted sessions' admitted durable writes when the
+    #: host releases leases at shutdown; well inside one lease TTL.
+    _SHUTDOWN_DRAIN_SECONDS = 5.0
 
     def __init__(
         self,
@@ -344,6 +397,17 @@ class SessionManager:
         # creates still want unknown aliases to surface as 503.
         self._model_validator = model_validator
         self._node_id = node_id
+        # Owner leases (#988): this manager instance is one lease holder.
+        # Every loaded incarnation holds a lease the keeper renews, and storage
+        # refuses any session-owned write that does not present its current
+        # fence, so two processes can never both write one workstream.
+        self._lease_holder = new_lease_holder(node_id)
+        self._lease_keeper = LeaseKeeper(
+            storage,
+            self._lease_holder,
+            on_lost=self._on_leases_lost,
+            label=adapter.kind.value,
+        )
         self._workstreams: dict[str, Workstream] = {}
         # A hard-delete whose storage outcome is ambiguous may be the sole
         # owner of an accepted conversation repair journal. Keep that exact
@@ -424,19 +488,100 @@ class SessionManager:
         return getattr(self._adapter, "child_event_bus", None)
 
     @property
-    def _service_type(self) -> str | None:
-        """``services.service_type`` this manager's hosting process registers
-        under, derived from its ``kind``.  Used by ``close_idle`` pass 2 to
-        enumerate live peer processes.  Returns ``None`` for kinds that have
-        no production service mapping (only the two existing kinds map
-        today; ``None`` would be a marker for a future kind without a
-        clustered hosting model)."""
-        return _KIND_SERVICE_TYPE.get(self.kind)
-
-    @property
     def count(self) -> int:
         with self._lock:
             return len(self._workstreams)
+
+    def lease_fence(self, ws_id: str) -> LeaseFence | None:
+        """The fence a host presents when it writes ``ws_id`` directly, or ``None``.
+
+        An HTTP write for a workstream hosted here presents its slot's fence.
+        A lost or released handle still gives its fence, so the write is
+        refused rather than sent unfenced (which could fence out the new
+        owner). ``None`` once nothing here holds the id: the write then goes
+        unfenced, as offline maintenance.
+        """
+        lease = self._handle_for(ws_id)
+        return lease.fence if lease is not None else None
+
+    def _handle_for(self, ws_id: str) -> WorkstreamLease | None:
+        """This manager's handle for ``ws_id``: its slot's, whatever the state.
+
+        A retained failed-delete tombstone counts as the slot. Otherwise the
+        keeper's tracked handle, which covers an open or create between the
+        grant and the slot holding it.
+        """
+        with self._lock:
+            ws = self._workstreams.get(ws_id) or self._failed_delete_tombstones.get(ws_id)
+        if ws is not None:
+            with ws._lock:
+                lease = ws._lease
+            if lease is not None:
+                return lease
+        return self._lease_keeper.get(ws_id)
+
+    def start_lease_keeper(self) -> None:
+        """Start renewing this manager's leases. Hosts call it once at startup."""
+        self._lease_keeper.start()
+
+    def renew_leases_once(self) -> list[WorkstreamLease]:
+        """Run one renewal pass now and retire what it finds lost (test seam)."""
+        return self._lease_keeper.renew_once()
+
+    def release_leases(self) -> None:
+        """Release every lease at shutdown, once the writes it fences have landed.
+
+        Hosts call this when their sessions are done, so another process can
+        open the workstreams at once instead of waiting for the leases to
+        expire. Each hosted session first stops admitting durable writes and
+        drains those already admitted, under one shared deadline, while the
+        keeper keeps renewing; the state writer then flushes while every fence
+        is still valid. A session that does not drain in time keeps its
+        leases, which expire on their own: releasing under a live write would
+        refuse that write. The first storage failure stops the loop for the
+        same reason.
+        """
+        deadline = time.monotonic() + self._SHUTDOWN_DRAIN_SECONDS
+        kept: set[str] = set()
+        with self._lock:
+            slots = list(self._workstreams.values())
+        # Latch every session first, so none keeps admitting writes (and
+        # running work) while an earlier one drains: the shared budget then
+        # goes to finishing what was admitted, not to new writes.
+        for ws in slots:
+            close = (
+                concrete_method(ws.session, "close_publication") if ws.session is not None else None
+            )
+            if close is None:
+                continue
+            try:
+                close()
+            except Exception:
+                log.warning("session_mgr.shutdown_latch_failed ws=%s", ws.id[:8], exc_info=True)
+        for ws in slots:
+            drain = (
+                concrete_method(ws.session, "shutdown_publication_and_drain_durability")
+                if ws.session is not None
+                else None
+            )
+            if drain is None:
+                continue
+            try:
+                drained = drain(timeout=max(0.0, deadline - time.monotonic()))
+            except Exception:
+                log.warning("session_mgr.shutdown_drain_failed ws=%s", ws.id[:8], exc_info=True)
+                drained = False
+            if drained is False:
+                kept.add(ws.id)
+        self._lease_keeper.stop()
+        if self._state_writer is not None:
+            try:
+                self._state_writer.flush()
+            except Exception:
+                log.warning("session_mgr.shutdown_state_flush_failed", exc_info=True)
+        for lease in self._lease_keeper.tracked():
+            if lease.ws_id not in kept and self._release(lease) is _Release.UNREACHABLE:
+                break
 
     @property
     def eviction_count(self) -> int:
@@ -662,38 +807,65 @@ class SessionManager:
                 if inserted is False:
                     raise WorkstreamAlreadyExistsError(f"workstream {ws_id!r} already exists")
             except BaseException as exc:
-                with self._lock:
-                    self._remove_locked(ws_id)
-                    if self._pending_creates.get(ws_id) is ws:
-                        self._pending_creates.pop(ws_id, None)
-                try:
-                    self._adapter.cleanup_ui(ws)
-                except Exception:
-                    log.warning(
-                        "session_mgr.create.register_failure_cleanup_failed ws=%s",
-                        ws_id[:8],
-                        exc_info=True,
-                    )
+                self._unwind_pending_create(ws, "register_failure")
                 _release_create_lane()
                 if not requested_ws_id and isinstance(exc, WorkstreamAlreadyExistsError):
                     continue
                 raise
+
+            # Lease the reservation before anything can build on it: the
+            # constructor's config write and every later session write present
+            # this fence.
+            try:
+                lease = self._acquire_lease(ws_id, fork_reservation_token, allow_creating=True)
+                if lease is None:
+                    raise RuntimeError(
+                        f"workstream {ws_id!r} reservation vanished before its lease"
+                    )
+            except BaseException:
+                self._unwind_pending_create(ws, "lease_failure")
+                _release_create_lane()
+                try:
+                    self._storage.delete_workstream_if_fork_reserved(ws_id, fork_reservation_token)
+                except Exception:
+                    # The hidden creating row waits for stale-create recovery.
+                    log.warning(
+                        "session_mgr.create.lease_failure_delete_failed ws=%s",
+                        ws_id[:8],
+                        exc_info=True,
+                    )
+                raise
+            with ws._lock:
+                ws._lease = lease
 
             _release_create_lane()
             break
 
         built_session: Any | None = None
         try:
+            if not lease.held:
+                # Lost between the grant and the attach: the keeper reported it
+                # before any slot held it, so nothing would retire this one.
+                raise WorkstreamLeaseLostError(ws_id)
             session_kwargs = dict(extra_session_kwargs)
             session_kwargs["fork_reservation_token"] = fork_reservation_token
-            built_session = self._adapter.build_session(
-                ws,
-                skill=skill,
-                model=model,
-                client_type=client_type,
-                **session_kwargs,
-            )
+            session_kwargs["workstream_lease"] = lease
+            try:
+                built_session = self._adapter.build_session(
+                    ws,
+                    skill=skill,
+                    model=model,
+                    client_type=client_type,
+                    **session_kwargs,
+                )
+            except WorkstreamLeaseHeldError as exc:
+                if not lease.held:
+                    raise
+                # Nobody else can lease a creating row: an unfenced write the
+                # constructor made met this create's own lease.
+                raise SessionFactoryLeaseError() from exc
             built_session._fork_reservation_token = fork_reservation_token
+            self._check_session_lease(ws, built_session)
 
             # Construction may block on provider/config/storage work. A
             # terminal caller is allowed to retire the pending placeholder in
@@ -710,9 +882,9 @@ class SessionManager:
                 self._retire_built_session(built_session, ws_id)
                 built_session = None
                 raise RuntimeError(f"workstream {ws_id!r} was retired during construction")
-        except Exception:
-            # Release the slot so capacity isn't leaked, and call
-            # cleanup_ui on the placeholder so any listener/lock state
+        except BaseException:
+            # Release the slot (Ctrl-C included) so capacity isn't leaked, and
+            # call cleanup_ui on the placeholder so any listener/lock state
             # the UI factory allocated is released. The durable row is still
             # unpublished, so remove exactly that reservation too.
             with ws._lifecycle_lock:
@@ -736,10 +908,14 @@ class SessionManager:
             if built_session is not None and ws.session is not built_session:
                 self._retire_built_session(built_session, ws_id)
             if owned and fork_reservation_token:
+                deleted = False
                 try:
-                    self._storage.delete_workstream_if_fork_reserved(
-                        ws_id,
-                        fork_reservation_token,
+                    deleted = bool(
+                        self._storage.delete_workstream_if_fork_reserved(
+                            ws_id,
+                            fork_reservation_token,
+                            lease=lease.fence,
+                        )
                     )
                 except Exception:
                     log.warning(
@@ -747,16 +923,17 @@ class SessionManager:
                         ws_id[:8],
                         exc_info=True,
                     )
+                self._release_slot_lease(ws, row_deleted=deleted)
             raise
 
         if not defer_emit_created:
             try:
                 committed = self.commit_create(ws)
             except BaseException:
-                self._rollback_direct_create(ws)
+                self.rollback_create(ws)
                 raise
             if not committed:
-                self._rollback_direct_create(ws)
+                self.rollback_create(ws)
                 raise RuntimeError(f"workstream {ws_id!r} was retired during creation")
         return ws
 
@@ -782,8 +959,13 @@ class SessionManager:
                     exc_info=True,
                 )
 
-    def _rollback_direct_create(self, ws: Workstream) -> None:
-        """Best-effort exact rollback when immediate publication fails."""
+    def rollback_create(self, ws: Workstream) -> None:
+        """Undo a create that was never published: free its slot and delete its row, exactly.
+
+        Best effort. Covers an immediate publication that failed, and a create
+        made with ``defer_emit_created=True`` that its caller decided not to
+        commit.
+        """
 
         def _delete_reserved() -> None:
             try:
@@ -866,6 +1048,7 @@ class SessionManager:
                 published = self._storage.publish_deferred_create(
                     ws.id,
                     ws._fork_reservation_token,
+                    lease=self.own_row_fence(ws),
                 )
             except BaseException:
                 with self._lock:
@@ -955,12 +1138,10 @@ class SessionManager:
 
         Use after :meth:`create` was called with
         ``defer_emit_created=True`` and a post-create check determined
-        the workstream should not be advertised at all. Callers that
-        also want to remove the persisted storage row should call
-        ``turnstone.core.memory.delete_workstream(ws_id)`` separately
-        — :meth:`discard` only owns the in-memory side, mirroring the
-        split between ``mgr.create``'s slot reservation and
-        ``self._storage.register_workstream``'s row write.
+        the workstream should not be advertised at all. It releases the
+        slot's owner lease too; a caller that also removes the persisted row
+        does it in ``after_release`` or once this returns, because an
+        unfenced delete is refused while the lease is live.
 
         Distinct from :meth:`close`:
 
@@ -1070,6 +1251,9 @@ class SessionManager:
                     ws_id[:8] if ws_id else "",
                     exc_info=True,
                 )
+            # The caller's ``after_release`` usually deletes the unpublished
+            # row without a fence, which storage refuses while a lease lives.
+            self._release_slot_lease(candidate)
         if after_release is not None:
             after_release()
         return True
@@ -1078,13 +1262,21 @@ class SessionManager:
     # open — lazy rehydrate for a persisted workstream
     # ------------------------------------------------------------------
 
-    def open(
+    def open(self, ws_id: str) -> Workstream | None:
+        """Rehydrate a persisted workstream on demand (see :meth:`open_with_outcome`)."""
+        return self.open_with_outcome(ws_id)[0]
+
+    def open_with_outcome(
         self,
         ws_id: str,
         *,
         _incarnation_attempt: int = 0,
-    ) -> Workstream | None:
-        """Rehydrate a persisted workstream on demand.
+    ) -> tuple[Workstream | None, bool]:
+        """Rehydrate a persisted workstream on demand: ``(workstream, loaded_now)``.
+
+        ``loaded_now`` is ``False`` when the workstream was already loaded
+        here (another request won the race), so callers run their post-load
+        work exactly once.
 
         Returns ``None`` when the row doesn't exist, doesn't match our
         kind, or is tombstoned (``state='deleted'``). Turnstone is a
@@ -1101,37 +1293,37 @@ class SessionManager:
             with open_lock:
                 with self._lock:
                     if ws_id in self._retiring_ids or ws_id in self._failed_delete_tombstones:
-                        return None
+                        return None, False
                     existing = self._workstreams.get(ws_id)
                     if existing is not None and self._pending_creates.get(ws_id) is existing:
-                        return None
-                    if existing is not None and existing.session is not None:
-                        return existing
+                        return None, False
+                if existing is not None and existing.session is not None:
+                    stopped = self._stopped_handle(existing)
+                    if stopped is None:
+                        return existing, False
+                    # Its lease moved: retire the copy now (the id lane is this
+                    # open's, reentrant) instead of serving one that cannot
+                    # write, then open as usual, which names the new holder.
+                    self._on_leases_lost([stopped])
+                    with self._lock:
+                        if self._workstreams.get(ws_id) is existing:
+                            return existing, False
 
                 # Bind every rehydrated object to the durable incarnation it
                 # represents. Legacy tokenless rows are assigned a private
                 # token atomically with this snapshot, so a later exact delete
                 # can reject a stale endpoint snapshot before mutating a
                 # same-id local successor.
-                incarnation_snapshot = getattr(
-                    self._storage,
-                    "ensure_workstream_incarnation_snapshot",
-                    None,
-                )
-                if callable(incarnation_snapshot):
-                    row = incarnation_snapshot(ws_id)
-                else:
-                    incarnation_snapshot = None
-                    row = self._storage.get_workstream(ws_id)
+                row = self._storage.ensure_workstream_incarnation_snapshot(ws_id)
                 if row is None or row.get("kind") != self.kind:
-                    return None
+                    return None, False
                 # ``deleted`` is a tombstone — never resurrect.
                 # ``closed`` IS resurrectable; the Saved Workstreams
                 # landing makes restore an explicit user action, and
                 # ``_reserve_and_install`` still enforces
                 # max_active (evicting an idle peer or raising).
                 if row.get("state") in {"creating", "deleted"}:
-                    return None
+                    return None, False
 
                 require_execution_node(row.get("required_node_id"), self._node_id)
 
@@ -1139,49 +1331,77 @@ class SessionManager:
                 # per-id open lane prevents another opener for this id, while
                 # the helper serializes any victim incarnation exactly.
                 reservation_token = str(row.get("fork_reservation_token") or "")
-                if incarnation_snapshot is not None and not reservation_token:
+                if not reservation_token:
                     raise RuntimeError(f"workstream {ws_id!r} incarnation snapshot has no token")
-                ws, _evicted = self._reserve_and_install(
-                    ws_id,
-                    user_id=row.get("user_id") or "",
-                    name=row.get("name") or f"ws-{ws_id[:4]}",
-                    parent_ws_id=row.get("parent_ws_id"),
-                    project_id=row.get("project_id"),
-                    persona=row.get("persona") or "",
-                    reservation_token=reservation_token,
-                )
-
-                # Thread the persisted ``model_alias`` into
-                # ``build_session`` so reopened workstreams keep the
-                # model they were created with.  Pairs with the
-                # ``ChatSession.__init__`` skip-save guard: without
-                # both halves, ``_save_config`` clobbers persisted
-                # config with constructor defaults before
-                # ``ChatSession.resume`` reads them back.  When
-                # ``model_validator`` is wired and the saved alias is
-                # no longer in the registry, drop it so the factory
-                # falls back to its default — the session_factory
-                # itself still raises on unknown aliases, since
-                # fresh-create paths want that to surface as a 503.
-                saved_cfg = self._storage.load_workstream_config(ws_id)
-                saved_alias = (saved_cfg.get("model_alias") or None) if saved_cfg else None
-                if (
-                    saved_alias
-                    and self._model_validator is not None
-                    and not self._model_validator(saved_alias)
-                ):
-                    log.warning(
-                        "session_mgr.stale_alias_dropped ws=%s alias=%s",
-                        ws_id[:8],
-                        saved_alias,
+                # Lease before any slot is reserved, so a workstream another
+                # process owns raises WorkstreamLeaseHeldError without evicting
+                # an idle peer here. History loads after the grant, so nothing
+                # the previous owner committed can be missed.
+                lease = self._acquire_lease(ws_id, reservation_token)
+                if lease is None:
+                    # The snapshotted incarnation was replaced or retired.
+                    return self._reopen_after_incarnation_race(ws_id, _incarnation_attempt, "lease")
+                try:
+                    ws, _evicted = self._reserve_and_install(
+                        ws_id,
+                        user_id=row.get("user_id") or "",
+                        name=row.get("name") or f"ws-{ws_id[:4]}",
+                        parent_ws_id=row.get("parent_ws_id"),
+                        project_id=row.get("project_id"),
+                        persona=row.get("persona") or "",
+                        reservation_token=reservation_token,
                     )
-                    saved_alias = None
+                except BaseException:
+                    self._release(lease)
+                    raise
+                with ws._lock:
+                    ws._lease = lease
 
                 try:
+                    if not lease.held:
+                        # Lost between the grant and the attach: the keeper
+                        # reported it before any slot held it.
+                        raise WorkstreamLeaseLostError(ws_id)
+                    # Thread the persisted ``model_alias`` into
+                    # ``build_session`` so reopened workstreams keep the
+                    # model they were created with.  Pairs with the
+                    # ``ChatSession.__init__`` skip-save guard: without
+                    # both halves, ``_save_config`` clobbers persisted
+                    # config with constructor defaults before
+                    # ``ChatSession.rehydrate`` reads them back.  When
+                    # ``model_validator`` is wired and the saved alias is
+                    # no longer in the registry, drop it so the factory
+                    # falls back to its default — the session_factory
+                    # itself still raises on unknown aliases, since
+                    # fresh-create paths want that to surface as a 503.
+                    # Inside the unwind bracket, so a storage error here
+                    # releases the slot and its lease; it raises as the
+                    # session's own reads do (HTTP 503, retry shortly), never
+                    # opening the workstream on defaults.
+                    try:
+                        saved_cfg = self._storage.load_workstream_config(ws_id)
+                    except Exception as exc:
+                        log.warning(
+                            "session_mgr.config_read_failed ws=%s", ws_id[:8], exc_info=True
+                        )
+                        raise WorkstreamHistoryUnavailableError(ws_id) from exc
+                    saved_alias = (saved_cfg.get("model_alias") or None) if saved_cfg else None
+                    if (
+                        saved_alias
+                        and self._model_validator is not None
+                        and not self._model_validator(saved_alias)
+                    ):
+                        log.warning(
+                            "session_mgr.stale_alias_dropped ws=%s alias=%s",
+                            ws_id[:8],
+                            saved_alias,
+                        )
+                        saved_alias = None
+
                     # Persona snapshot rides the same pre-construction lane as
                     # the saved alias: the constructor applies the four levers
                     # (tool merge, MCP gate, composition) inside __init__, so
-                    # the stamp must land as a kwarg — resume() is too late.
+                    # the stamp must land as a kwarg — rehydrate() is too late.
                     # A corrupt/partial stamp raises here (loud construction
                     # error), never silently reverting to a default envelope.
                     # No stamp = legacy pre-persona workstream: the kwarg is
@@ -1192,7 +1412,7 @@ class SessionManager:
                     # forever (pinning a max_active slot and turning every
                     # later open() into the already-tracked RuntimeError).
                     persona_snapshot = snapshot_from_config(saved_cfg or {})
-                    extra_build_kwargs: dict[str, Any] = {}
+                    extra_build_kwargs: dict[str, Any] = {"workstream_lease": lease}
                     if persona_snapshot is not None:
                         extra_build_kwargs["persona_snapshot"] = persona_snapshot
 
@@ -1251,13 +1471,17 @@ class SessionManager:
                             requested_alias = None
                             continue
 
-                        if ws.session is not None and hasattr(ws.session, "resume"):
-                            ws.session.resume(ws_id)
+                        self._check_session_lease(ws, ws.session)
+                        # A workstream with no turns opens empty, with its
+                        # saved settings; a history read that fails raises
+                        # WorkstreamHistoryUnavailableError (HTTP 503).
+                        ws.session.rehydrate()
 
-                        # ``resume`` may adopt a persisted alias that differs
-                        # from the factory candidate (notably when an alias
-                        # reappears between default construction and resume).
-                        # Validate the lane that will actually be returned.
+                        # ``rehydrate`` may restore a persisted alias that
+                        # differs from the factory candidate (notably when an
+                        # alias reappears between default construction and
+                        # rehydrate). Validate the lane that will actually be
+                        # returned.
                         resumed_alias = self._rehydrate_candidate_alias(
                             ws,
                             candidate_alias,
@@ -1277,29 +1501,26 @@ class SessionManager:
                             requested_alias = None
                             continue
                         break
-                except Exception:
-                    # Build/resume failures leave no usable session. Resume
-                    # can also have partially loaded history/config, so roll
-                    # back the reserved slot and run the adapter's full UI
-                    # cleanup.  The raced-candidate replacement above is the
-                    # only path that intentionally avoids cleanup_ui.
+                except BaseException:
+                    # Build/rehydrate failures (Ctrl-C included) leave no
+                    # usable session. Rehydrate can also have partially
+                    # loaded history/config, so roll back the reserved slot
+                    # and its lease and run the adapter's full UI cleanup.
+                    # The raced-candidate replacement above is the only path
+                    # that intentionally avoids cleanup_ui.
                     self._retire_rehydrate_slot(ws)
                     raise
 
-                # Construction and resume perform multiple by-id storage
-                # reads outside the snapshot transaction. A remote
-                # delete/re-register in that window can otherwise produce a
-                # hybrid object (A's metadata/token with B's config/history).
-                # Re-read the private incarnation witness before this object
-                # is touched, advertised, or returned. An openable successor
-                # gets a bounded retry from its own fresh snapshot; a deleted
+                # Construction and resume perform multiple by-id storage reads outside the snapshot
+                # transaction. A delete/re-register in that window would produce a hybrid object
+                # (A's metadata/token with B's config/history). The lease taken above refuses other
+                # processes' deletes while it is live, so only a lease that lapsed during the build
+                # (renewal failing past the TTL) leaves this window open; re-read the private
+                # incarnation witness anyway before this object is touched, advertised, or returned.
+                # An openable successor gets a bounded retry from its own fresh snapshot; a deleted
                 # or provisional row simply remains unavailable.
                 try:
-                    current_row = (
-                        incarnation_snapshot(ws_id)
-                        if incarnation_snapshot is not None
-                        else self._storage.get_workstream(ws_id)
-                    )
+                    current_row = self._storage.ensure_workstream_incarnation_snapshot(ws_id)
                 except BaseException:
                     self._retire_rehydrate_slot(ws)
                     raise
@@ -1316,20 +1537,16 @@ class SessionManager:
                 if not current_openable or current_token != reservation_token:
                     self._retire_rehydrate_slot(ws)
                     if not current_openable:
-                        return None
-                    if _incarnation_attempt + 1 >= self._REHYDRATE_INCARNATION_ATTEMPTS:
-                        raise RuntimeError(
-                            f"workstream incarnation changed repeatedly while reopening {ws_id!r}"
-                        )
-                    log.warning(
-                        "session_mgr.rehydrate_incarnation_raced ws=%s attempt=%d",
-                        ws_id[:8],
-                        _incarnation_attempt + 1,
+                        return None, False
+                    return self._reopen_after_incarnation_race(
+                        ws_id, _incarnation_attempt, "witness"
                     )
-                    return self.open(
-                        ws_id,
-                        _incarnation_attempt=_incarnation_attempt + 1,
-                    )
+                if not lease.held:
+                    # The load found the lease gone (a refused fenced write
+                    # marked it lost) on the same incarnation, checked just
+                    # above: another process owns the workstream.
+                    self._retire_rehydrate_slot(ws)
+                    raise WorkstreamLeaseLostError(ws_id)
 
                 # No DB state-flip on resurrect. The in-memory session
                 # is IDLE; the DB row may still say 'closed' from the
@@ -1345,7 +1562,7 @@ class SessionManager:
                 # timestamp write is safe against concurrent close()
                 # because close still wins on the state column.
                 try:
-                    self._storage.touch_workstream(ws_id)
+                    self._storage.touch_workstream(ws_id, lease=self.own_row_fence(ws))
                 except Exception:
                     log.debug(
                         "session_mgr.touch_workstream_failed ws=%s",
@@ -1354,7 +1571,7 @@ class SessionManager:
                     )
                 if self._event_emitter is not None:
                     self._event_emitter.emit_rehydrated(ws)
-                return ws
+                return ws, True
         finally:
             self._release_open_lock(ws_id)
 
@@ -1444,6 +1661,7 @@ class SessionManager:
             with self._lock:
                 if self._workstreams.get(ws.id) is ws:
                     self._remove_locked(ws.id)
+            self._release_slot_lease(ws)
 
     @contextlib.contextmanager
     def _id_lifecycle(self, ws_id: str) -> Iterator[None]:
@@ -1568,6 +1786,7 @@ class SessionManager:
                         ws_id[:8],
                         exc_info=True,
                     )
+                self._release_slot_lease(candidate)
                 if self._event_emitter is not None and not was_unadvertised:
                     event_name = name or candidate.name
                     self._event_emitter.emit_closed(
@@ -1583,7 +1802,7 @@ class SessionManager:
         self,
         ws_id: str,
         *,
-        delete_fn: Callable[[], bool],
+        delete_fn: ExactDeleteFn,
         name: str = "",
         expected_reservation_token: str = "",
     ) -> bool:
@@ -1600,7 +1819,7 @@ class SessionManager:
         self,
         ws_id: str,
         *,
-        delete_fn: Callable[[], bool],
+        delete_fn: ExactDeleteFn,
         name: str = "",
         expected_reservation_token: str = "",
     ) -> bool:
@@ -1612,6 +1831,11 @@ class SessionManager:
         incarnation, hold its lifecycle lock across the storage delete and
         exact-object retirement. Pending creates use their durable reservation
         token, so a delete/re-register ABA cannot erase the replacement row.
+
+        ``delete_fn`` receives this manager's lease fence for a loaded
+        incarnation (after its durability tail drained) and ``None``
+        otherwise, so a workstream another process owns is refused with
+        :class:`WorkstreamLeaseHeldError` instead of being deleted from under it.
         """
         with self._lock:
             candidate = (
@@ -1626,7 +1850,11 @@ class SessionManager:
                 return False
 
         if candidate is None:
-            deleted = delete_fn()
+            # No slot is keyed by this id, and an open or create holds this id
+            # lane from its grant through the attach, so nothing here holds the
+            # lease: the delete goes unfenced, refused while another process
+            # holds a live one.
+            deleted = delete_fn(lease=None)
             if deleted and self._event_emitter is not None:
                 self._event_emitter.emit_closed(ws_id, reason="deleted", name=name)
             return deleted
@@ -1734,7 +1962,13 @@ class SessionManager:
                             tombstone=True,
                             incarnation=candidate._state_incarnation,
                         )
-                    deleted = delete_fn()
+                    # A stale local predecessor's lease cannot speak for the
+                    # authorized successor row; that row is deleted unfenced.
+                    deleted = delete_fn(
+                        lease=None
+                        if deleting_authorized_successor
+                        else self.own_row_fence(candidate)
+                    )
 
                 if not deleted:
                     # A conforming exact-delete false normally proves a
@@ -1775,6 +2009,7 @@ class SessionManager:
                         ws_id[:8],
                         exc_info=True,
                     )
+                self._release_slot_lease(candidate, row_deleted=True)
                 if self._event_emitter is not None and not was_unadvertised:
                     self._event_emitter.emit_closed(
                         ws_id,
@@ -1825,7 +2060,12 @@ class SessionManager:
         else:
             # The durable prefix is complete, so the historical
             # retire-and-rehydrate behavior remains safe.
-            self._retire_failed_persisted_delete(candidate)
+            owned_elsewhere = self._retire_failed_persisted_delete(candidate) is False
+            if owned_elsewhere and not was_unadvertised:
+                # The delete was refused because another process now owns the
+                # row: this copy unloaded as on any lease loss (the
+                # coordinator adapter drops its registry entry and row).
+                self._announce_unload(candidate, False)
 
     def _drop_delete_tombstone_locked(
         self,
@@ -1861,8 +2101,12 @@ class SessionManager:
         if was_unadvertised:
             self._failed_delete_unadvertised.add(ws_id)
 
-    def _retire_failed_persisted_delete(self, candidate: Workstream) -> None:
-        """Silently retire the exact object after a failed hard-delete."""
+    def _retire_failed_persisted_delete(self, candidate: Workstream) -> bool | None:
+        """Silently retire the exact object after a failed hard-delete.
+
+        Returns ``None`` when the object was no longer here to retire, else
+        whether its row was still ours (``False``: another process owns it).
+        """
         ws_id = candidate.id
         retired = False
         with self._lock:
@@ -1878,7 +2122,7 @@ class SessionManager:
             if self._active_id == ws_id:
                 self._active_id = self._first_visible_id_locked()
         if not retired:
-            return
+            return None
         try:
             self._adapter.cleanup_ui(candidate)
         except Exception:
@@ -1887,6 +2131,7 @@ class SessionManager:
                 ws_id[:8],
                 exc_info=True,
             )
+        return self._release_slot_lease(candidate)
 
     def _retain_failed_persisted_delete_tombstone(
         self,
@@ -1943,8 +2188,12 @@ class SessionManager:
     # ------------------------------------------------------------------
 
     def close(self, ws_id: str) -> bool:
-        """Soft-close one incarnation, preserving the historical bool API."""
-        return self.close_with_outcome(ws_id) is CloseOutcome.CLOSED
+        """Soft-close one incarnation; ``True`` when this call unloaded it.
+
+        That covers a workstream found owned by another process, which did
+        not close: :meth:`close_with_outcome` tells the two apart.
+        """
+        return self.close_with_outcome(ws_id) in (CloseOutcome.CLOSED, CloseOutcome.OWNED_ELSEWHERE)
 
     def close_with_outcome(self, ws_id: str) -> CloseOutcome:
         """Soft-close on the stable per-id lane and retain refusal detail."""
@@ -2031,16 +2280,12 @@ class SessionManager:
             # The dispatch tombstone was published before session preparation.
             # Storage and cleanup may block, but unrelated workstreams and
             # manager lookups do not.
-            try:
-                self._adapter.cleanup_ui(ws)
-            finally:
-                if was_unadvertised and ws._fork_reservation_token:
-                    self._delete_unadvertised_fork(ws)
-                else:
-                    self._persist_closed_state(ws)
-            if self._event_emitter is not None and not was_unadvertised:
-                self._event_emitter.emit_closed(ws_id, name=ws.name)
-            return CloseOutcome.CLOSED
+            ours = self._finish_soft_close(
+                ws, delete_unadvertised_fork=was_unadvertised and bool(ws._fork_reservation_token)
+            )
+            if not was_unadvertised:
+                self._announce_unload(ws, ours)
+            return CloseOutcome.CLOSED if ours else CloseOutcome.OWNED_ELSEWHERE
 
     def set_state(
         self,
@@ -2126,16 +2371,18 @@ class SessionManager:
 
     def _persist_state(self, ws: Workstream, state: WorkstreamState) -> None:
         """Persist one accepted state without any lifecycle lock held."""
+        fence = self.own_row_fence(ws)
         if self._state_writer is not None:
             self._state_writer.record(
                 ws.id,
                 state.value,
                 flush_now=(state is WorkstreamState.ERROR),
                 incarnation=ws._state_incarnation,
+                lease=fence,
             )
             return
         try:
-            self._storage.update_workstream_state(ws.id, state.value)
+            self._storage.update_workstream_state(ws.id, state.value, lease=fence)
         except Exception:
             log.debug(
                 "session_mgr.state_update_failed ws=%s",
@@ -2251,37 +2498,82 @@ class SessionManager:
             return
         self._state_tail_locks.pop(ws_id, None)
 
-    def _persist_closed_state(self, ws: Workstream) -> None:
-        """Write the terminal row after all predecessor tails finish."""
+    def _persist_closed_state(self, ws: Workstream) -> bool:
+        """Write the terminal row after all predecessor tails finish.
+
+        Returns ``False`` when the row turned out to belong to another process
+        (see :meth:`_write_closed_row_locked`).
+        """
         try:
             with ws._state_tail_lock:
-                if self._state_writer is not None:
-                    self._state_writer.discard(
-                        ws.id,
-                        tombstone=True,
-                        incarnation=ws._state_incarnation,
-                    )
-                try:
-                    self._storage.update_workstream_state(ws.id, "closed")
-                except Exception:
-                    log.debug(
-                        "session_mgr.state_update_failed ws=%s",
-                        ws.id[:8],
-                        exc_info=True,
-                    )
-                try:
-                    self._storage.delete_workstream_override(ws.id)
-                except Exception:
-                    log.debug(
-                        "session_mgr.override_delete_failed ws=%s",
-                        ws.id[:8],
-                        exc_info=True,
-                    )
+                return self._write_closed_row_locked(ws)
         finally:
             self._release_state_tail(ws)
 
-    def _delete_unadvertised_fork(self, ws: Workstream) -> None:
+    def _write_closed_row_locked(self, ws: Workstream) -> bool:
+        """Tombstone buffered state, write ``closed`` and drop the override.
+
+        The caller holds ``ws._state_tail_lock`` and owns its release. The
+        write presents the slot's fence (a lost one makes it refused).
+        Returns ``False``, leaving the override, when storage refused the
+        write: the row is no longer this copy's to close, because another
+        process took it over (the workstream lives on there) or a
+        maintenance pass closed and fenced it out after this copy's lease
+        lapsed.
+        """
+        if self._state_writer is not None:
+            self._state_writer.discard(
+                ws.id,
+                tombstone=True,
+                incarnation=ws._state_incarnation,
+            )
+        try:
+            self._storage.update_workstream_state(ws.id, "closed", lease=self.own_row_fence(ws))
+        except (WorkstreamLeaseLostError, WorkstreamLeaseHeldError):
+            log.info("session_mgr.closed_row_owned_elsewhere ws=%s", ws.id[:8])
+            return False
+        except Exception:
+            log.debug(
+                "session_mgr.state_update_failed ws=%s",
+                ws.id[:8],
+                exc_info=True,
+            )
+        try:
+            self._storage.delete_workstream_override(ws.id)
+        except Exception:
+            log.debug(
+                "session_mgr.override_delete_failed ws=%s",
+                ws.id[:8],
+                exc_info=True,
+            )
+        return True
+
+    def _announce_unload(self, ws: Workstream, ours: bool, *, reason: str = "") -> None:
+        """Announce that ``ws`` unloaded here: ``ws_closed`` only while its row was ours.
+
+        A workstream another process took over did not close; announcing it
+        would drop it from dashboards and panes while it is live there. The
+        emitter's lease-retired hook runs instead, also when maintenance closed
+        the row after this copy's lease lapsed.
+        """
+        emitter = self._event_emitter
+        if emitter is None:
+            return
+        if not ours:
+            log.info("session_mgr.unload_owned_elsewhere ws=%s", ws.id[:8])
+            try:
+                emitter.on_lease_retired(ws)
+            except Exception:
+                log.warning("session_mgr.lease_retire_hook_failed ws=%s", ws.id[:8], exc_info=True)
+            return
+        if reason:
+            emitter.emit_closed(ws.id, reason=reason, name=ws.name)
+        else:
+            emitter.emit_closed(ws.id, name=ws.name)
+
+    def _delete_unadvertised_fork(self, ws: Workstream) -> bool:
         """Delete a pending fork only while its durable fence is still ours."""
+        deleted = False
         try:
             with ws._state_tail_lock:
                 if self._state_writer is not None:
@@ -2294,6 +2586,7 @@ class SessionManager:
                     deleted = self._storage.delete_workstream_if_fork_reserved(
                         ws.id,
                         ws._fork_reservation_token,
+                        lease=self.own_row_fence(ws),
                     )
                     if not deleted:
                         log.debug(
@@ -2310,6 +2603,7 @@ class SessionManager:
                     )
         finally:
             self._release_state_tail(ws)
+        return bool(deleted)
 
     def _prepare_state_event(
         self,
@@ -2407,53 +2701,27 @@ class SessionManager:
 
         This maintenance is independent from :meth:`close_idle`: disabling
         idle eviction must not disable recovery of caller-known ids stranded by
-        a process death. The backend owns the atomic state/age/incarnation
+        a process death. The backend owns the atomic state/age/lease/incarnation
         check and complete dependent cleanup; this layer supplies the current
-        manager snapshot plus cluster liveness.
+        manager snapshot.
 
-        The current process's ``node_id`` is intentionally not treated as a
-        live-owner exemption by the backend. Stable ids (notably ``console``
-        and configured ``TURNSTONE_NODE_ID`` values) survive process restarts,
-        so an old reservation bearing our id must become reclaimable. Every
-        workstream presently loaded by this manager, including pending creates,
-        is excluded, and the age grace protects a create admitted just after
-        the snapshot.
+        A creator leases its reservation as soon as it registers it, so a
+        reservation whose creator is alive anywhere is never eligible, while a
+        crashed creator's lease expires and its rows become reclaimable
+        whatever node id the restarted process carries. Every workstream
+        presently loaded by this manager, including pending creates, is
+        excluded, and the age grace protects a create admitted just after the
+        snapshot.
 
-        Liveness or storage uncertainty fails closed and returns no ids.
+        Storage uncertainty fails closed and returns no ids.
         """
-        service_type = self._service_type
-        if service_type is None:
-            log.debug(
-                "session_mgr.stale_create_reap_no_service_type kind=%s",
-                self.kind.value,
-            )
-            return []
         with self._lock:
             loaded = list(self._workstreams.keys())
-        try:
-            live_services = self._storage.list_services(service_type)
-            live_node_ids = [
-                str(service["service_id"]) for service in live_services if service.get("service_id")
-            ]
-        except Exception:
-            log.debug(
-                "session_mgr.stale_create_reap_liveness_failed kind=%s",
-                self.kind.value,
-                exc_info=True,
-            )
-            return []
-
         cutoff = (datetime.now(UTC) - timedelta(seconds=max_age_seconds)).strftime(
             "%Y-%m-%dT%H:%M:%S"
         )
         try:
-            reaped = self._storage.delete_stale_creating_reservations(
-                self.kind,
-                cutoff,
-                loaded,
-                live_node_ids=live_node_ids,
-                local_node_id=self._node_id,
-            )
+            reaped = self._storage.delete_stale_creating_reservations(self.kind, cutoff, loaded)
         except Exception:
             log.debug(
                 "session_mgr.stale_create_reap_failed kind=%s",
@@ -2642,29 +2910,19 @@ class SessionManager:
           because any matching row is by definition not loaded by any
           live process and cannot be in a live interaction.
 
-          **Liveness scoping** (the rendezvous router's primitive
-          since PR #384): when ``self._service_type`` resolves to a
-          known service type — both production kinds do — pass 2
-          calls ``storage.list_services`` to enumerate peer processes
-          with recent heartbeats and protects rows whose ``node_id``
-          matches a live ``service_id`` from reap, even when *this*
-          manager is on a different node.  This is essential for
-          containerized deployments with dynamic hostnames: dead-pod
-          rows fall out of the live set after the heartbeat window
-          and become reapable; alive-pod rows stay protected as long
-          as the owner heartbeats.  A future kind with no service
-          registration would resolve ``_service_type`` to ``None``
-          and skip the live-services lookup (single-process / CLI).
-
-          **Conservative fallback**: if ``list_services`` raises,
-          pass 2 is skipped entirely this tick — never reap when
-          liveness state is unknown.  Pass 1 still runs.  Next tick
-          retries the lookup.
+          **Liveness scoping**: a workstream loaded by any live process
+          carries a renewed owner lease, and the backend never closes a
+          row whose lease is live, so rows another node has loaded stay
+          protected however their ``node_id`` was stamped.  A crashed
+          process stops renewing; its leases expire and its rows fall
+          through to the reap, whatever node id the next process
+          carries.
 
         Returns the combined list of closed ws_ids (in-memory first,
-        then DB orphans).  Pass 1 emits ``ws_closed``; pass 2 does
-        not, because never-loaded rows have no SSE listeners
-        expecting them.
+        then DB orphans).  Pass 1 emits ``ws_closed``, except for a copy
+        found owned by another process, which is unloaded and announced
+        as unloaded (its id is still returned); pass 2 does not, because
+        never-loaded rows have no SSE listeners expecting them.
 
         Atomic pop per victim under ``self._lock`` (bug-5): a pending
         tool result can flip state IDLE→RUNNING between the snapshot
@@ -2691,52 +2949,22 @@ class SessionManager:
         # Pass 2: reap DB orphans of this kind older than the cutoff.
         # Snapshot loaded keys under self._lock briefly so a concurrent
         # create/load doesn't get its row clobbered by the UPDATE; release
-        # before the DB call.
-        #
-        # Liveness scoping uses ``services.last_heartbeat`` — the same
-        # primitive the rendezvous router (PR #384) uses for routing.  A
-        # row's ``node_id`` is stamped at create time and never updated;
-        # in containerized deployments with dynamic hostnames the dead
-        # pod's ``node_id`` points at a service that's no longer
-        # heartbeating, so the row falls through to reap.  Conversely,
-        # rows whose ``node_id`` matches a heartbeating service are
-        # protected even when *this* manager is on a different node —
-        # the alive peer may legitimately have them loaded.
+        # before the DB call. Rows other live processes have loaded are
+        # protected by their owner leases (see the docstring).
         with self._lock:
             loaded = list(self._workstreams.keys())
         cutoff = (datetime.now(UTC) - timedelta(seconds=max_age_seconds)).strftime(
             "%Y-%m-%dT%H:%M:%S"
         )
-        live_node_ids: list[str] | None = None
-        skip_pass_2 = False
-        if self._service_type is not None:
-            try:
-                live_services = self._storage.list_services(self._service_type)
-                live_node_ids = [
-                    str(svc["service_id"]) for svc in live_services if svc.get("service_id")
-                ]
-            except Exception:
-                # Conservative fallback: skip pass 2 entirely this tick
-                # so we can't accidentally reap rows whose owners we
-                # failed to enumerate.  Next tick retries.
-                log.debug(
-                    "session_mgr.list_services_failed kind=%s",
-                    self.kind.value,
-                    exc_info=True,
-                )
-                skip_pass_2 = True
         orphans: list[str] = []
-        if not skip_pass_2:
-            try:
-                orphans = self._storage.bulk_close_stale_orphans(
-                    self.kind, cutoff, loaded, live_node_ids=live_node_ids
-                )
-            except Exception:
-                log.debug(
-                    "session_mgr.bulk_close_orphans_failed kind=%s",
-                    self.kind.value,
-                    exc_info=True,
-                )
+        try:
+            orphans = self._storage.bulk_close_stale_orphans(self.kind, cutoff, loaded)
+        except Exception:
+            log.debug(
+                "session_mgr.bulk_close_orphans_failed kind=%s",
+                self.kind.value,
+                exc_info=True,
+            )
         if orphans:
             log.info(
                 "session_mgr.bulk_close_orphans count=%d kind=%s",
@@ -2783,17 +3011,53 @@ class SessionManager:
                     self._active_id = self._first_visible_id_locked()
                 self._retain_state_tail_locked(ws)
 
-            try:
-                self._adapter.cleanup_ui(ws)
-            finally:
-                self._persist_closed_state(ws)
-            if self._event_emitter is not None:
-                self._event_emitter.emit_closed(ws.id, name=ws.name)
+            self._announce_unload(ws, self._finish_soft_close(ws))
             return True
+
+    def _finish_soft_close(self, ws: Workstream, *, delete_unadvertised_fork: bool = False) -> bool:
+        """Tear down a slot already removed from tracking: UI, durable close, lease.
+
+        Writes ``closed`` (or deletes a pending fork that was never advertised),
+        then releases the lease, even when the write raised: the slot is gone.
+        Returns whether the row was still this process's to close.
+        """
+        ours = True
+        deleted = False
+        try:
+            self._adapter.cleanup_ui(ws)
+        finally:
+            try:
+                if delete_unadvertised_fork:
+                    deleted = self._delete_unadvertised_fork(ws)
+                else:
+                    ours = self._persist_closed_state(ws)
+            finally:
+                released_ours = self._release_slot_lease(ws, row_deleted=deleted)
+        return ours and released_ours
 
     # ------------------------------------------------------------------
     # Lookup
     # ------------------------------------------------------------------
+
+    def loaded(self, ws_id: str) -> Workstream | None:
+        """The slot for ``ws_id`` when it is loaded here and can still write.
+
+        ``None`` while its session is still being built (an open in flight)
+        or once its lease was lost (another process owns the workstream and
+        the slot is about to retire): callers then go through
+        :meth:`open_with_outcome`.
+        """
+        ws = self.get(ws_id)
+        if ws is None or ws.session is None or self._stopped_handle(ws) is not None:
+            return None
+        return ws
+
+    @staticmethod
+    def _stopped_handle(ws: Workstream) -> WorkstreamLease | None:
+        """The slot's handle once it no longer owns its row, else ``None``."""
+        with ws._lock:
+            lease = ws._lease
+        return lease if lease is not None and lease.state == "lost" else None
 
     def get(self, ws_id: str) -> Workstream | None:
         with self._lock:
@@ -2880,7 +3144,7 @@ class SessionManager:
                     # candidate list came back empty.  No lock is held here.
                     self.reconcile_unresolved_persistence(blocking=True)
                     continue
-                raise RuntimeError(f"All {self._max_active} slots are active")
+                raise SessionCapacityError(self._max_active)
 
             for victim in candidates:
                 install_exc: BaseException | None = None
@@ -3084,6 +3348,274 @@ class SessionManager:
             self._active_id = self._first_visible_id_locked()
         self._prune_state_tail_locked(ws_id)
 
+    def _unwind_pending_create(self, ws: Workstream, stage: str) -> None:
+        """Drop a create's pending placeholder before its session exists."""
+        with self._lock:
+            self._remove_locked(ws.id)
+        try:
+            self._adapter.cleanup_ui(ws)
+        except Exception:
+            log.warning(
+                "session_mgr.create.cleanup_failed stage=%s ws=%s",
+                stage,
+                ws.id[:8],
+                exc_info=True,
+            )
+
+    def _reopen_after_incarnation_race(
+        self, ws_id: str, attempt: int, phase: str
+    ) -> tuple[Workstream | None, bool]:
+        """Reopen from a fresh snapshot after the incarnation changed under ``open``."""
+        if attempt + 1 >= self._REHYDRATE_INCARNATION_ATTEMPTS:
+            raise RuntimeError(
+                f"workstream incarnation changed repeatedly while reopening {ws_id!r}"
+            )
+        log.warning(
+            "session_mgr.rehydrate_incarnation_raced ws=%s attempt=%d phase=%s",
+            ws_id[:8],
+            attempt + 1,
+            phase,
+        )
+        return self.open_with_outcome(ws_id, _incarnation_attempt=attempt + 1)
+
+    # ------------------------------------------------------------------
+    # Internal — owner lease
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def own_row_fence(ws: Workstream) -> LeaseFence | None:
+        """The fence for writes to ``ws``'s row, by this manager or its host.
+
+        Derived from the slot's one handle, whatever its state: a lost or
+        released handle makes the write refused, never unfenced, so it keeps
+        working after the slot unloads. Before the lease is attached, writes
+        go unfenced. :meth:`lease_fence` instead looks a workstream up by id
+        and returns ``None`` once nothing here holds it.
+        """
+        with ws._lock:
+            lease = ws._lease
+        return lease.fence if lease is not None else None
+
+    def _acquire_lease(
+        self,
+        ws_id: str,
+        token: str,
+        *,
+        allow_creating: bool = False,
+    ) -> WorkstreamLease | None:
+        """Acquire this manager's owner lease on one exact incarnation.
+
+        Returns ``None`` when that incarnation is gone and raises
+        :class:`WorkstreamLeaseHeldError` while another process owns a live
+        lease. Every earlier handle for the id was released when its slot
+        left, so the keeper holds none for it.
+        """
+        try:
+            grant = self._storage.acquire_workstream_lease(
+                ws_id,
+                incarnation_token=token,
+                holder=self._lease_holder,
+                node_id=self._node_id,
+                ttl_seconds=self._lease_keeper.ttl_seconds,
+                allow_creating=allow_creating,
+            )
+        except WorkstreamLeaseHeldError as exc:
+            record_lease_event("conflict")
+            log.debug(
+                "session_mgr.lease_conflict ws=%s holder_node=%s retry_after_ms=%d",
+                ws_id[:8],
+                exc.holder_node_id,
+                exc.retry_after_ms,
+            )
+            raise
+        if grant is None:
+            return None
+        lease = WorkstreamLease(grant.fence)
+        record_lease_event("acquired")
+        if grant.previous_holder:
+            record_lease_event("takeover")
+            log.warning(
+                "session_mgr.lease_takeover ws=%s previous_holder=%s previous_node=%s "
+                "live=%s epoch=%d",
+                ws_id[:8],
+                grant.previous_holder,
+                grant.previous_node_id,
+                grant.took_over_live,
+                lease.epoch,
+            )
+        self._lease_keeper.track(lease)
+        return lease
+
+    def _release(self, lease: WorkstreamLease, *, row_gone: bool = False) -> _Release:
+        """Release one acquisition after its last durable write (best effort).
+
+        ``row_gone`` says the caller just deleted the row this lease names, so
+        there is nothing left in storage to release.
+        """
+        self._lease_keeper.untrack(lease)
+        if not lease.mark_released():
+            return _Release.NOT_OURS if lease.state == "lost" else _Release.RELEASED
+        if not row_gone:
+            try:
+                released = self._storage.release_workstream_lease(lease.fence)
+            except Exception:
+                # The lease expires on its own; until then the row reads as owned.
+                log.debug("session_mgr.lease_release_failed ws=%s", lease.ws_id[:8], exc_info=True)
+                return _Release.UNREACHABLE
+            if not released:
+                return _Release.NOT_OURS
+        record_lease_event("released")
+        log.debug("session_mgr.lease_released ws=%s epoch=%d", lease.ws_id[:8], lease.epoch)
+        return _Release.RELEASED
+
+    def _release_slot_lease(self, ws: Workstream, *, row_deleted: bool = False) -> bool:
+        """Release the slot's lease after its last durable write.
+
+        The handle stays, so a late write presents its now released fence and
+        is refused instead of landing unfenced. Returns ``False`` when the row
+        turned out to be another process's (the handle was lost, or storage
+        found another fence); an unknown outcome counts as ours.
+        ``row_deleted`` says the caller just deleted the row.
+        """
+        with ws._lock:
+            lease = ws._lease
+        if lease is None:
+            return True
+        return self._release(lease, row_gone=row_deleted) is not _Release.NOT_OURS
+
+    @staticmethod
+    def _slot_holds(ws: Workstream, lease: WorkstreamLease) -> bool:
+        with ws._lock:
+            return ws._lease is lease
+
+    @staticmethod
+    def _check_session_lease(ws: Workstream, session: Any) -> None:
+        """Check ``session`` writes with the slot's lease.
+
+        A session factory that drops ``workstream_lease`` builds a session whose
+        every write goes out unfenced, which storage refuses while this manager
+        holds the row: the create or open fails here, rather than the session
+        stopping at its first save as if another process owned the workstream.
+        """
+        with ws._lock:
+            lease = ws._lease
+        write_fence = concrete_method(session, "write_fence")
+        if lease is not None and write_fence is not None and write_fence() != lease.fence:
+            raise SessionFactoryLeaseError()
+
+    def _on_leases_lost(self, leases: list[WorkstreamLease]) -> None:
+        """Act on handles that no longer match their rows: stop every copy, then retire each.
+
+        The slot (or retained failed-delete tombstone) holding a handle
+        retires. Every session stops before any retirement waits for its id
+        lane and teardown, so each notice reaches viewers (the CLI prompt)
+        while the slot is still in front of them, however many losses arrived
+        together. A handle no slot holds (an open or create between the grant
+        and the attach) is ignored: the keeper already stopped renewing it,
+        and that open or create finds it lost before its slot takes it.
+        """
+        holders: list[tuple[Workstream, WorkstreamLease]] = []
+        for lease in leases:
+            with self._lock:
+                # A slot only ever holds its own workstream's lease.
+                candidates = [
+                    self._workstreams.get(lease.ws_id),
+                    self._failed_delete_tombstones.get(lease.ws_id),
+                ]
+            for ws in candidates:
+                if ws is not None and self._slot_holds(ws, lease):
+                    holders.append((ws, lease))
+                    break
+        for ws, lease in holders:
+            self._stop_session_for_lost_lease(ws, lease)
+        for ws, lease in holders:
+            try:
+                self._retire_lost_lease(ws, lease)
+            except Exception:
+                log.warning("session_mgr.lease_retire_failed ws=%s", ws.id[:8], exc_info=True)
+
+    @staticmethod
+    def _stop_session_for_lost_lease(ws: Workstream, lease: WorkstreamLease) -> None:
+        """Tell ``ws``'s session, if it has one yet, that its lease is lost (idempotent)."""
+        session = ws.session
+        stop = (
+            concrete_method(session, "handle_workstream_lease_lost")
+            if session is not None
+            else None
+        )
+        if stop is None:
+            return
+        try:
+            stop(lease)
+        except Exception:
+            log.warning("session_mgr.lease_retire_notify_failed ws=%s", ws.id[:8], exc_info=True)
+
+    def _retire_lost_lease(self, ws: Workstream, lease: WorkstreamLease) -> None:
+        """Unload ``ws``: its workstream now belongs to another process.
+
+        No durable write (the row belongs to the new owner), no override
+        delete and no ``ws_closed`` (the workstream did not close): the
+        emitter's lease-retired hook announces the unload instead. Open panes
+        receive the per-workstream closed sentinel and reconnect through the
+        router, which leads them to the new owner. A pending create is left to
+        its creator, which still owns the rollback.
+        """
+        with self._id_lifecycle(ws.id), ws._lifecycle_lock:
+            with self._lock:
+                tracked = self._workstreams.get(ws.id) is ws
+                tombstoned = self._failed_delete_tombstones.get(ws.id) is ws
+                if not (tracked or tombstoned) or self._pending_creates.get(ws.id) is ws:
+                    return
+                ws._lifecycle_terminal_active = True
+                self._retain_state_tail_locked(ws)
+            with ws._lock:
+                ws._closed = True
+                ws._state_revision += 1
+            try:
+                try:
+                    with ws._state_tail_lock:
+                        if self._state_writer is not None:
+                            self._state_writer.discard(
+                                ws.id,
+                                tombstone=True,
+                                incarnation=ws._state_incarnation,
+                            )
+                except Exception:
+                    # A buffered state write would only meet the new owner's
+                    # fence: never let it strand the retirement.
+                    log.warning(
+                        "session_mgr.lease_retire_state_tail_failed ws=%s",
+                        ws.id[:8],
+                        exc_info=True,
+                    )
+                with self._lock:
+                    if self._workstreams.get(ws.id) is ws:
+                        self._workstreams.pop(ws.id, None)
+                        if ws.id in self._order:
+                            self._order.remove(ws.id)
+                        if self._active_id == ws.id:
+                            self._active_id = self._first_visible_id_locked()
+                    self._drop_delete_tombstone_locked(ws.id, candidate=ws)
+                # Again here: an open in flight can attach its session after
+                # ``_on_leases_lost`` found none to stop.
+                self._stop_session_for_lost_lease(ws, lease)
+                try:
+                    self._adapter.cleanup_ui(ws)
+                except Exception:
+                    log.warning(
+                        "session_mgr.lease_retire_cleanup_failed ws=%s",
+                        ws.id[:8],
+                        exc_info=True,
+                    )
+                self._release_slot_lease(ws)
+            finally:
+                self._release_state_tail(ws)
+            # The row moved with the lease: the workstream lives on elsewhere.
+            # Announced inside the id lane, as close does, so a reopen here
+            # cannot land before this copy's retirement is told.
+            self._announce_unload(ws, False)
+        log.warning("session_mgr.lease_retired ws=%s epoch=%d", ws.id[:8], lease.epoch)
+
     def _finish_eviction(self, ws: Workstream) -> None:
         """Complete one already-reserved eviction and release its id fence."""
         try:
@@ -3112,13 +3644,12 @@ class SessionManager:
                     ws.id[:8],
                     exc_info=True,
                 )
+            # Eviction writes nothing durable: releasing the lease is what
+            # tells whether the row was still ours to announce.
+            ours = self._release_slot_lease(ws)
             if self._event_emitter is not None:
                 try:
-                    self._event_emitter.emit_closed(
-                        ws.id,
-                        reason="evicted",
-                        name=ws.name,
-                    )
+                    self._announce_unload(ws, ours, reason="evicted")
                 except Exception:
                     log.warning(
                         "session_mgr.eviction_emit_failed ws=%s",

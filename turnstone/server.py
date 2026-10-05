@@ -134,6 +134,7 @@ if TYPE_CHECKING:
     from starlette.types import ASGIApp, Receive, Scope, Send
 
     from turnstone.core.personas import PersonaSnapshot
+    from turnstone.core.workstream_lease import WorkstreamLease
 
 # ---------------------------------------------------------------------------
 # Static assets — loaded once at startup from turnstone/ui/static/
@@ -851,23 +852,20 @@ def _interactive_events_replay(
 def _watch_fire_wake_fn(ws: Workstream) -> Callable[[], object]:
     """Wake closure for watch fires, for ``ChatSession.set_watch_runner``.
 
-    Closes over the Workstream OBJECT, never its id: after an
-    eviction+restore the manager tracks the workstream under a fresh id
-    while the watch rows keep the resumed session's ``_ws_id``, so an
-    id-keyed ``manager.get`` lookup at fire time would miss.  Shared by
-    every ``set_watch_runner`` site (create, reopen, watch-restore,
-    CLI ``--resume``) so they can't drift on that subtlety.
+    Closes over the Workstream object, so a fire wakes exactly the slot that
+    registered (never a later copy loaded under the same id). Shared by every
+    ``set_watch_runner`` site (create, reopen, watch restore, ``--resume``).
     """
     return lambda: wake_workstream_if_pending(ws, trigger="watch-fire")
 
 
-def _watch_restore_owner(storage: Any, ws_id: str) -> str:
-    """Resolve the principal an unattended watch restore must execute as.
+def _require_watch_restore_owner(storage: Any, ws_id: str) -> None:
+    """Refuse a restore of a workstream with no persisted owner.
 
-    ``None`` means the target workstream no longer exists and ``""`` means a
-    legacy/unowned row. Neither may be turned into an anonymous, auto-approved
-    model call. Storage errors deliberately propagate so the restore caller can
-    retry them as transient failures.
+    A missing row or a legacy/unowned one may never become an anonymous,
+    auto-approved model call; the open that follows runs as the row's owner.
+    Storage errors deliberately propagate so the restore caller can retry them
+    as transient failures.
     """
     from turnstone.core.watch import WatchWorkstreamUnrestorable
 
@@ -875,24 +873,28 @@ def _watch_restore_owner(storage: Any, ws_id: str) -> str:
     if owner is None:
         log.warning("watch_restore: ws %s no longer exists", ws_id)
         raise WatchWorkstreamUnrestorable(ws_id)
-    resolved = str(owner).strip()
-    if not resolved:
+    if not str(owner).strip():
         log.error(
             "watch_restore: refusing unattended restore for unowned ws %s",
             ws_id,
         )
         raise WatchWorkstreamUnrestorable(ws_id)
-    return resolved
 
 
-def _interactive_open_post_load(request: Request, ws: Workstream) -> None:
-    """Post-load hook for the lifted interactive ``open`` body.
+def _publish_loaded_workstream(
+    ws: Workstream,
+    *,
+    runner: Any,
+    global_queue: queue.Queue[dict[str, Any]] | None,
+) -> None:
+    """Post-load work for an interactive workstream this node just loaded.
 
-    Runs after ``mgr.open(ws_id)`` returns the workstream (which
-    internally already attempted ``ws.session.resume(ws_id)`` and
-    fired ``InteractiveAdapter.emit_rehydrated`` — the latter being
-    a no-op stub on interactive per the documented asymmetry). This
-    callback handles the interactive-only out-of-band emissions:
+    Shared by every opener: the HTTP open and detail handlers, watch restore
+    and ``turnstone-server --resume``. Runs after ``mgr.open(ws_id)`` returns
+    the workstream (which already rehydrated it and fired
+    ``InteractiveAdapter.emit_rehydrated`` — a no-op stub on interactive per
+    the documented asymmetry). It handles the interactive-only out-of-band
+    emissions:
 
     1. Sync the workstream's name to the persisted display alias
        (a user-renamed workstream stores its alias separately from
@@ -908,12 +910,9 @@ def _interactive_open_post_load(request: Request, ws: Workstream) -> None:
        ``InteractiveAdapter.emit_rehydrated`` is a no-op stub
        precisely because this enqueue lives here.
     4. Re-wire the watch dispatch registration.  The workstream's
-       previous ``close()`` removed its registration, and nothing on
-       the ``open`` path restored it — so a watch firing on a
-       REOPENED, actively-viewed workstream found no dispatch fn and
-       took the restore path, spawning a duplicate auto-approved
-       session that raced turns into the same conversation the live
-       one was showing.
+       previous ``close()`` removed its registration; without it a watch
+       firing on the reopened workstream finds no dispatch fn and takes
+       the restore path instead of delivering into the live session.
     """
     from turnstone.core.memory import get_workstream_display_name
 
@@ -923,13 +922,10 @@ def _interactive_open_post_load(request: Request, ws: Workstream) -> None:
     if isinstance(ui, WebUI) and session is not None and session.messages:
         ui._enqueue({"type": "clear_ui"})
 
-    runner = getattr(request.app.state, "watch_runner", None)
     if runner is not None and session is not None:
-        # ``mgr.open`` already resumed, so this keys the registration on
-        # the adopted id (and ``resume()`` re-registers by itself anyway).
         session.set_watch_runner(runner, wake_fn=_watch_fire_wake_fn(ws))
 
-    gq: queue.Queue[dict[str, Any]] | None = getattr(request.app.state, "global_queue", None)
+    gq = global_queue
     if gq is not None:
         with contextlib.suppress(queue.Full):
             gq.put_nowait(
@@ -946,6 +942,157 @@ def _interactive_open_post_load(request: Request, ws: Workstream) -> None:
                     "persona": ws.persona,
                 }
             )
+
+
+def _interactive_open_post_load(request: Request, ws: Workstream) -> None:
+    """Post-load hook for the lifted interactive ``open`` body (see :func:`_publish_loaded_workstream`)."""
+    _publish_loaded_workstream(
+        ws,
+        runner=getattr(request.app.state, "watch_runner", None),
+        global_queue=getattr(request.app.state, "global_queue", None),
+    )
+
+
+def _check_persona_stamp(ws_id: str) -> None:
+    """Raise ``ValueError`` when ``ws_id``'s stored persona stamp is corrupt.
+
+    Opening applies the stamp itself; watch restore checks it first because a
+    corrupt stamp never clears, so its watch must stop retrying.
+    """
+    from turnstone.core.memory import load_workstream_config
+    from turnstone.core.personas import snapshot_from_config
+
+    snapshot_from_config(load_workstream_config(ws_id) or {})
+
+
+def make_watch_restore_fn(
+    manager: SessionManager,
+    *,
+    runner: Callable[[], Any],
+    global_queue: queue.Queue[dict[str, Any]] | None,
+) -> Callable[[str], Any]:
+    """Build the watch runner's ``restore_fn``: deliver into a workstream not loaded here.
+
+    The restore opens the workstream itself through ``manager`` (#988), so the
+    delivery runs in the workstream's own slot under its own owner lease.
+    ``runner`` returns the watch runner, which is built after this function.
+
+    Returns the dispatch closure the session registered, or ``None`` for a
+    transient failure the runner retries within the watch's poll budget:
+    another process holds the workstream, a node requirement, capacity, a
+    storage error or a history read that failed. A permanent failure raises
+    :class:`WatchWorkstreamUnrestorable` so the runner ends the watch: a
+    corrupt persona stamp, an unowned or missing workstream, no stored turns.
+
+    A workstream this restore loaded for the watch alone runs unattended: its
+    tool batches are auto-approved until a client attaches or starts work
+    there (:meth:`SessionUIBase.grant_unattended`). A workstream already
+    loaded here, by a pane or an earlier restore, is delivered into as it is.
+    """
+    from turnstone.core.storage import get_storage
+    from turnstone.core.watch import WatchWorkstreamUnrestorable
+
+    def restore(ws_id: str) -> Any:
+        try:
+            _check_persona_stamp(ws_id)
+        except ValueError as exc:
+            # PERMANENT: never run the watch, unattended, under an envelope the
+            # operator did not choose; a corrupt stamp cannot clear on its own.
+            log.warning("watch_restore: corrupt persona stamp on ws %s", ws_id, exc_info=True)
+            raise WatchWorkstreamUnrestorable(ws_id) from exc
+        try:
+            _require_watch_restore_owner(get_storage(), ws_id)
+        except WatchWorkstreamUnrestorable:
+            raise
+        except Exception:
+            # An owner read is authoritative for the execution principal. A
+            # storage blip is retryable; anonymous execution is not.
+            log.warning(
+                "watch_restore: owner lookup failed for ws %s (treating as transient)",
+                ws_id,
+                exc_info=True,
+            )
+            return None
+        try:
+            ws, loaded_now = manager.open_with_outcome(ws_id)
+        except Exception:
+            # TRANSIENT: another process holds it, a node requirement, all
+            # slots busy, a storage error or a history read that failed.
+            log.warning("watch_restore: cannot open ws %s (transient)", ws_id, exc_info=True)
+            return None
+        if ws is None:
+            # Open also answers None while an eviction or a create of the id is
+            # in flight; only a missing row is permanent.
+            try:
+                row = get_storage().get_workstream(ws_id)
+            except Exception:
+                return None
+            if row is None:
+                raise WatchWorkstreamUnrestorable(ws_id)
+            return None
+        live = runner()
+        session = ws.session
+        if session is None:
+            return None
+        if not loaded_now:
+            # Loaded here already: deliver into it as it is, approvals untouched.
+            if live.get_dispatch_fn(ws_id) is None:
+                session.set_watch_runner(live, wake_fn=_watch_fire_wake_fn(ws))
+            return live.get_dispatch_fn(ws_id)
+        ui = ws.ui
+        if not session.messages:
+            # No stored turns: nothing to deliver into, ever. Unload the empty
+            # workstream again unless a client attached meanwhile.
+            if not (isinstance(ui, WebUI) and ui.client_seen()):
+                with contextlib.suppress(Exception):
+                    manager.close(ws.id)
+            log.warning("watch_restore: ws %s has no stored turns", ws_id)
+            raise WatchWorkstreamUnrestorable(ws_id)
+        unattended = isinstance(ui, WebUI) and ui.grant_unattended()
+        try:
+            _publish_loaded_workstream(ws, runner=live, global_queue=global_queue)
+        except Exception:
+            log.warning("watch_restore: post-load failed for ws %s", ws_id, exc_info=True)
+        if manager.get(ws_id) is not ws:
+            # Unloaded meanwhile (closed, evicted or taken over): withdraw only
+            # this session's registration; the runner retries the delivery.
+            live.remove_dispatch_fn(ws_id, owner=session._watch_dispatch_fn)
+            return None
+        log.info("watch_restore.loaded ws=%s unattended=%s", ws_id[:8], unattended)
+        return live.get_dispatch_fn(ws_id)
+
+    return restore
+
+
+def _open_for_startup_resume(
+    manager: SessionManager, target_id: str, *, node_id: str | None
+) -> Workstream | None:
+    """Open ``target_id`` for ``turnstone-server --resume``.
+
+    A supervised restart of this node can find its crashed predecessor's lease
+    still live: wait it out once (the holder is this node, within one TTL)
+    instead of exiting into a restart loop that exhausts the start limit.
+    """
+    from turnstone.core.storage import WorkstreamLeaseHeldError
+    from turnstone.core.workstream_lease import LEASE_TTL_SECONDS
+
+    try:
+        return manager.open(target_id)
+    except WorkstreamLeaseHeldError as exc:
+        if not (
+            node_id
+            and exc.holder_node_id == node_id
+            and 0 < exc.retry_after_ms <= LEASE_TTL_SECONDS * 1000
+        ):
+            raise
+        log.warning(
+            "Workstream %s is still leased by this node's previous process; "
+            "waiting %d ms for that lease to expire",
+            target_id,
+            exc.retry_after_ms,
+        )
+        time.sleep(exc.retry_after_ms / 1000 + 1)
+        return manager.open(target_id)
 
 
 def _audit_workstream_opened(request: Request, ws: Workstream) -> None:
@@ -2127,8 +2274,8 @@ async def command(request: Request) -> JSONResponse:
                 # Answer 503, NOT the endpoint's generic 200-ok arm: a
                 # command worker that never spawned must be as loud as
                 # the busy 409 below — a status-code-only SDK caller
-                # would otherwise believe its /clear//name//resume
-                # applied and silently run against un-changed state.
+                # would otherwise believe its /clear or /name applied
+                # and silently run against un-changed state.
                 log.exception("command.worker_spawn_failed ws=%s", ws.id[:8])
                 return JSONResponse(
                     {
@@ -2242,10 +2389,9 @@ async def command(request: Request) -> JSONResponse:
                 # Post-command follow-ups run HERE, on the worker, not
                 # after the endpoint's done-wait: past the 25s backstop the
                 # endpoint has already answered {"status": "running"}, and
-                # follow-ups parked there were silently skipped — a slow
-                # /resume left every pane rendering the pre-resume
-                # transcript against a session whose history had changed,
-                # and the workstream list kept the stale name.
+                # follow-ups parked there were silently skipped — every pane
+                # kept rendering a transcript the command had changed, and the
+                # workstream list kept a stale name.
                 # Abandoned-worker guard, mirroring every sibling closure:
                 # a force-cancelled wedged command that unwedges minutes
                 # later must not fire clear_ui into a successor turn's live
@@ -2254,11 +2400,11 @@ async def command(request: Request) -> JSONResponse:
                 if ws.worker_thread is me:
                     if should_exit:
                         cmd_ui.on_info("Session ended. You can close this tab.")
-                    if cmd_word in ("/clear", "/new", "/resume"):
+                    if cmd_word == "/clear":
                         # clear_ui signals the frontend to re-fetch history
                         # via REST.
                         cmd_ui._enqueue({"type": "clear_ui"})
-                    if cmd_word in ("/name", "/resume"):
+                    if cmd_word == "/name":
                         # Sync the in-memory workstream name after any
                         # command that can change it, so /api/workstreams
                         # and future page loads see the right name.
@@ -3037,6 +3183,7 @@ async def _interactive_create_prepare_install(
             config=config_to_apply,
             node_id=node_id_to_apply,
             override_reason="local",
+            lease=SessionManager.own_row_fence(ws),
         )
     except Exception as exc:
         log.warning(
@@ -3193,9 +3340,9 @@ async def _interactive_create_post_install(
             init_enqueued = True
             if ws.worker_kind == "command":
                 # A command worker (e.g. a minutes-long /compact) holds the
-                # raced slot: the interjection queue is turn-shaped (length
-                # cap, and the text would cross a /resume identity swap) and
-                # must stay unreachable during command windows — same rule
+                # raced slot: the interjection queue is turn-shaped (its
+                # length cap) and must stay unreachable during command
+                # windows — same rule
                 # as the /send route's defer.  queue.Full is the existing
                 # backpressure surface: the create reports the first message
                 # as undelivered (``queue_full``) and the client retries.
@@ -3290,7 +3437,12 @@ async def delete_workstream_endpoint(request: Request) -> JSONResponse:
     from turnstone.core.audit import record_audit
     from turnstone.core.auth import require_permission
     from turnstone.core.log import get_logger
+    from turnstone.core.storage import (
+        WorkstreamLeaseHeldError,
+        WorkstreamLeaseLostError,
+    )
     from turnstone.core.storage._registry import get_storage
+    from turnstone.core.web_helpers import lease_refusal_response
 
     log = get_logger(__name__)
     ws_id = request.path_params.get("ws_id", "")
@@ -3314,8 +3466,9 @@ async def delete_workstream_endpoint(request: Request) -> JSONResponse:
     owner_uid, err = _require_ws_access(request, ws_id, resolved_row=row)
     if err:
         return err
-    # Authorize kind from the same snapshot that fences the deletion.
-    # Both saved tables route here, including coordinator deletions.
+    # Authorize kind from the same snapshot that fences the deletion. Console
+    # coordinators are deleted on the console (it holds their leases); a
+    # coordinator row reaching a node is authorized the same way.
     if row.get("kind") == WorkstreamKind.COORDINATOR:
         err = require_permission(request, "admin.coordinator")
         if err is not None:
@@ -3391,6 +3544,11 @@ async def delete_workstream_endpoint(request: Request) -> JSONResponse:
             return JSONResponse({"deleted": ws_id})
         log.warning("ws.delete.failed", reason="not_found", ws_id=ws_id[:8])
         return JSONResponse({"error": "Workstream not found"}, status_code=404)
+    except (WorkstreamLeaseHeldError, WorkstreamLeaseLostError) as exc:
+        # Another node owns the workstream: only its holder may delete it,
+        # after draining its durability tail. The console retries there.
+        log.info("ws.delete.owned_elsewhere", ws_id=ws_id[:8])
+        return lease_refusal_response(exc)
     except Exception as e:
         log.exception("ws.delete.error", ws_id=ws_id[:8], error=str(e))
         return JSONResponse({"error": "Delete failed"}, status_code=500)
@@ -5337,6 +5495,9 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None]:
     state_writer = getattr(app.state, "state_writer", None)
     if state_writer is not None:
         state_writer.start()
+    # Renew the owner leases of every loaded workstream (#988). Without
+    # renewal they lapse after the lease TTL and another node may take over.
+    app.state.workstreams.start_lease_keeper()
 
     # (The attachment orphan-reservation sweep is gone — pending uploads now
     # live in the per-node in-memory buffer with its own TTL eviction, so
@@ -5536,6 +5697,10 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None]:
 
         if loaded:
             await asyncio.to_thread(_close_loaded)
+    # Hand the workstreams back so another node can open them at once instead
+    # of waiting out the TTL; release_leases first drains each session's
+    # admitted writes, which close() does not wait for.
+    await asyncio.to_thread(app.state.workstreams.release_leases)
     # health_registry is stateless (no background threads) — nothing to stop
     if app.state.mcp_client:
         await asyncio.to_thread(app.state.mcp_client.shutdown)
@@ -6299,6 +6464,7 @@ def main() -> None:
         project_id: str = "",
         persona_snapshot: PersonaSnapshot | None = None,
         fork_reservation_token: str = "",
+        workstream_lease: WorkstreamLease | None = None,
     ) -> ChatSession:
         assert ui is not None
         # Resolve the effective alias once and use it consistently
@@ -6420,6 +6586,7 @@ def main() -> None:
             project_id=project_id,
             persona_snapshot=persona_snapshot,
             fork_reservation_token=fork_reservation_token,
+            workstream_lease=workstream_lease,
         )
 
     # Create WatchRunner (periodic command polling, server-level)
@@ -6457,209 +6624,60 @@ def main() -> None:
         model_validator=registry.has_alias,
     )
     interactive_adapter.attach(manager)
+    # Renew from here on: a startup ``--resume`` takes leases long before the
+    # lifespan runs (TLS setup alone can outlast the lease TTL). Idempotent.
+    manager.start_lease_keeper()
     WebUI._workstream_mgr = manager
-
-    def _resume_persona_kwargs(target_ws_id: str) -> dict[str, Any]:
-        """Pre-read a resume target's persona stamp for ``manager.create``.
-
-        The create-then-resume paths below construct the session BEFORE
-        ``resume()`` runs, and the persona MCP gate is construction-time
-        only — without this, restoring an MCP-off workstream would merge
-        the live MCP catalog back in.  A corrupt stamp raises (ValueError),
-        matching the rehydrate contract; no stamp = legacy, no kwargs.
-        """
-        from turnstone.core.memory import load_workstream_config
-        from turnstone.core.personas import snapshot_from_config
-
-        snap = snapshot_from_config(load_workstream_config(target_ws_id) or {})
-        if snap is None:
-            return {}
-        return {"persona": snap.name, "persona_snapshot": snap}
-
-    def _watch_restore_fn(ws_id: str) -> Any:
-        """Restore an evicted workstream so a watch can deliver results.
-
-        Returns the per-ws dispatch closure ``set_watch_runner`` registered
-        on the rehydrated session, so ``WatchRunner._dispatch_result`` can
-        re-deliver the current message into the rehydrated workstream's
-        :class:`NudgeQueue` without a second pass through ``restore_fn``.
-
-        Failure taxonomy: two failures are PERMANENT — the persona-stamp
-        pre-read raising (corrupt stamp, nothing created yet) and
-        ``resume()`` returning ``False`` (no stored turns: the target's
-        history is gone, so there is nothing to deliver into and every
-        retry would rebuild this shell just to fail again).  Everything
-        else after ``manager.create`` is treated as transient — the
-        half-built shell is closed so a failed attempt can't leak a
-        ``max_active`` slot, and the runner holds the reminder and
-        retries, bounded by the watch's own poll budget.  Deliberately
-        NOT mapping post-create ``ValueError`` to permanent: ``resume``
-        can raise it for reasons beyond the corrupt-stamp contract, and
-        a misclassification here silently kills the user's watch.
-        """
-        try:
-            persona_kwargs = _resume_persona_kwargs(ws_id)
-        except ValueError as exc:
-            # PERMANENT: corrupt persona stamp.  Refuse to run the watch
-            # under an envelope the operator didn't choose (it would be
-            # unattended AND auto-approved), and signal the runner to stop
-            # retrying and deactivate the watch rather than burn the whole
-            # attempt budget on a cause that can't clear on its own.
-            log.warning("watch_restore: corrupt persona stamp on ws %s", ws_id, exc_info=True)
-            raise WatchWorkstreamUnrestorable(ws_id) from exc
-
-        try:
-            owner_id = _watch_restore_owner(_get_storage(), ws_id)
-        except WatchWorkstreamUnrestorable:
-            raise
-        except Exception:
-            # An owner read is authoritative for the execution principal. A
-            # storage blip is retryable; anonymous execution is not.
-            log.warning(
-                "watch_restore: owner lookup failed for ws %s (treating as transient)",
-                ws_id,
-                exc_info=True,
-            )
-            return None
-
-        try:
-            ws = manager.create(user_id=owner_id, name="watch-restore", **persona_kwargs)
-        except RuntimeError:
-            # TRANSIENT: all restore slots active right now.  Return None so
-            # the runner holds the reminder and retries on a later tick.
-            log.warning("watch_restore: cannot restore ws %s (all slots active)", ws_id)
-            return None
-
-        try:
-            # Restored workstreams run unattended — auto-approve tool calls
-            # to avoid blocking forever on approval with no connected user.
-            if isinstance(ws.ui, WebUI):
-                ws.ui.auto_approve = True
-            if ws.session is None:
-                raise RuntimeError("created workstream has no session")
-            if not ws.session.resume(ws_id):
-                # ``resume``'s turn loader swallows storage errors into []
-                # (memory.load_message_turns), so False here is EITHER
-                # "history is gone" (permanent — without this check the
-                # fresh session keeps its own fresh ``_ws_id``, the
-                # registration below keys on THAT, and the reminder would
-                # be "delivered" into a blank, orphaned, auto-approved
-                # session while the watch deactivates as delivered) OR a
-                # transient read blip.  Re-probe with the RAISING storage
-                # call before declaring permanence: misclassifying a blip
-                # silently kills the user's watch and drops the fired
-                # reminder.
-                with contextlib.suppress(Exception):
-                    manager.close(ws.id)
-                try:
-                    turns_exist = bool(_get_storage().load_message_turns(ws_id, checkpointed=True))
-                except Exception:
-                    log.warning(
-                        "watch_restore: turns probe failed for ws %s (treating as transient)",
-                        ws_id,
-                        exc_info=True,
-                    )
-                    return None
-                if turns_exist:
-                    # Rows exist but resume()'s read came back empty — a
-                    # blip.  Retry on the held-delivery cadence.
-                    log.warning("watch_restore: empty resume read for ws %s (blip)", ws_id)
-                    return None
-                log.warning("watch_restore: ws %s has no stored turns", ws_id)
-                raise WatchWorkstreamUnrestorable(ws_id)
-            # A live registration may have appeared while this shell was
-            # being built — the user reopening the workstream mid-restore
-            # (``mgr.open`` + post-load registers their PANE).  The pane
-            # wins: deliver into it and close the redundant shell.
-            # Registering ours would silently clobber the pane's — every
-            # later fire would run unattended in the shell while the user
-            # watches a conversation that never shows its watch results.
-            # (A pane registration landing in the microseconds between
-            # this check and the set below can still be clobbered; that
-            # residue requires the reopen to race a window ~10^6 times
-            # narrower than the restore itself.)
-            existing = _watch_runner.get_dispatch_fn(ws_id)
-            if existing is not None:
-                log.info("watch_restore: live registration appeared for ws %s — yielding", ws_id)
-                with contextlib.suppress(Exception):
-                    manager.close(ws.id)
-                return existing
-            # ``ws`` is the freshly created workstream (manager-tracked id)
-            # even though the session resumed the original ``ws_id`` — the
-            # wake must target the live Workstream object, and firing it
-            # is what lets an unattended restore actually RUN the watch
-            # result (auto_approve above exists for exactly that turn).
-            ws.session.set_watch_runner(_watch_runner, wake_fn=_watch_fire_wake_fn(ws))
-            return _watch_runner.get_dispatch_fn(ws.session._ws_id)
-        except WatchWorkstreamUnrestorable:
-            raise  # shell already closed at the raise site above
-        except Exception:
-            # TRANSIENT: the shell exists but never became the watch's live
-            # target — close it (untrack + mark closed) so the failed
-            # attempt doesn't hold a max_active slot forever.
-            log.warning("watch_restore: resume failed for ws %s", ws_id, exc_info=True)
-            with contextlib.suppress(Exception):
-                manager.close(ws.id)
-            return None
 
     _watch_runner = WatchRunner(
         storage=_get_storage(),
         node_id=_node_id,
         tool_timeout=config_store.get("tools.timeout"),
-        restore_fn=_watch_restore_fn,
+        restore_fn=make_watch_restore_fn(
+            manager, runner=lambda: _watch_runner, global_queue=global_queue
+        ),
     )
 
-    # ``--resume`` lazily creates a workstream scoped to the resumed
-    # content. Without ``--resume`` no default workstream is spawned;
-    # the web UI handles the 0-ws state and users create workstreams
-    # on demand via POST /v1/api/workstreams.
+    # ``--resume`` opens the saved workstream at startup. Without it no
+    # default workstream is spawned; the web UI handles the 0-ws state and
+    # users create workstreams on demand via POST /v1/api/workstreams.
     if args.resume:
         from turnstone.core.memory import resolve_workstream
-        from turnstone.core.node_affinity import NodeAffinityError
 
         target_id = resolve_workstream(args.resume)
         if not target_id:
             log.error("Workstream not found: %s", args.resume)
             sys.exit(1)
         try:
-            resume_owner = _watch_restore_owner(_get_storage(), target_id)
+            _require_watch_restore_owner(_get_storage(), target_id)
         except WatchWorkstreamUnrestorable:
             log.error("Cannot resume unowned workstream: %s", target_id)
             sys.exit(1)
         except Exception:
             log.exception("Cannot resolve owner for workstream: %s", target_id)
             sys.exit(1)
-        ws = manager.create(
-            user_id=resume_owner,
-            name="resumed",
-            **_resume_persona_kwargs(target_id),
-        )
-        if not isinstance(ws.ui, WebUI):
-            raise TypeError(f"Expected WebUI, got {type(ws.ui).__name__}")
-        if args.skip_permissions or config_store.get("tools.skip_permissions"):
-            ws.ui.auto_approve = True
-        if ws.session is None:
-            manager.close(ws.id)
-            log.error("No session available for resume: %s", target_id)
-            sys.exit(1)
         try:
-            resumed = ws.session.resume(target_id)
-        except NodeAffinityError as exc:
-            manager.close(ws.id)
+            resumed = _open_for_startup_resume(manager, target_id, node_id=_node_id)
+        except Exception as exc:
+            # A node affinity or lease refusal, or anything else: one line
+            # (the traceback at debug, for an unexpected failure).
             log.error("Cannot resume %s: %s", target_id, exc)
+            log.debug("startup_resume.failed ws=%s", target_id[:8], exc_info=True)
             sys.exit(1)
-        if not resumed:
-            log.error("Workstream '%s' has no messages.", args.resume)
-            manager.close(ws.id)
+        if resumed is None:
+            log.error(
+                "Cannot resume %s: it is not an interactive workstream, or it is being "
+                "created or deleted",
+                args.resume,
+            )
             sys.exit(1)
-        # AFTER the successful resume (mirroring the restore fn's order),
-        # so the registration keys on the adopted ``target_id`` — the id
-        # the session's watch rows are stamped with.  Registered before
-        # resume, the registry key would be the create-time id no watch
-        # row references, and every fire would restore a SECOND
-        # auto-approved session onto the operator's live conversation.
-        ws.session.set_watch_runner(_watch_runner, wake_fn=_watch_fire_wake_fn(ws))
-        log.info("Resumed workstream %s (%d messages)", target_id, len(ws.session.messages))
+        if isinstance(resumed.ui, WebUI) and (
+            args.skip_permissions or config_store.get("tools.skip_permissions")
+        ):
+            resumed.ui.auto_approve = True
+        _publish_loaded_workstream(resumed, runner=_watch_runner, global_queue=global_queue)
+        message_count = len(resumed.session.messages) if resumed.session is not None else 0
+        log.info("Resumed workstream %s (%d messages)", target_id, message_count)
 
     # Record the default model and judge status in metrics
     _metrics.model = default_model_id

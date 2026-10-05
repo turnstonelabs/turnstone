@@ -1,5 +1,6 @@
 """Tests for turnstone.core.session — ChatSession construction."""
 
+import ast
 import base64
 import contextlib
 import json
@@ -7,6 +8,7 @@ import os
 import subprocess
 import threading
 import time
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, ClassVar
 from unittest.mock import MagicMock, call, patch
@@ -3262,7 +3264,7 @@ class TestTitleRetry:
         with patch.object(
             storage,
             "update_workstream_title",
-            side_effect=lambda ws_id, title: captured.update(title=title),
+            side_effect=lambda ws_id, title, lease=None: captured.update(title=title),
         ):
             session._generate_title()
 
@@ -3350,7 +3352,7 @@ class TestTitleRetry:
             with patch.object(
                 storage,
                 "update_workstream_title",
-                side_effect=lambda ws_id, title, _c=captured: _c.update(title=title),
+                side_effect=lambda ws_id, title, lease=None, _c=captured: _c.update(title=title),
             ):
                 session._generate_title()
             assert captured.get("title") == expected, (content, captured)
@@ -3388,7 +3390,7 @@ class TestTitleRetry:
         with patch.object(
             storage,
             "update_workstream_title",
-            side_effect=lambda ws_id, title: captured.update(title=title),
+            side_effect=lambda ws_id, title, lease=None: captured.update(title=title),
         ):
             session._generate_title()
 
@@ -3420,7 +3422,7 @@ class TestTitleRetry:
         with patch.object(
             storage,
             "update_workstream_title",
-            side_effect=lambda ws_id, title: captured.update(title=title),
+            side_effect=lambda ws_id, title, lease=None: captured.update(title=title),
         ):
             session._generate_title()
 
@@ -3449,45 +3451,10 @@ class TestTitleRetry:
         with patch.object(
             storage,
             "update_workstream_title",
-            side_effect=lambda ws_id, title: captured.update(title=title),
+            side_effect=lambda ws_id, title, lease=None: captured.update(title=title),
         ):
             session._generate_title()
         assert len(captured["title"]) == _TITLE_MAX_CHARS
-
-    def test_title_skipped_after_resume_changes_ws_id(self, tmp_db):
-        """If ws_id changes (via resume) during title generation, discard the result."""
-        from turnstone.core.providers._protocol import ModelCapabilities
-
-        session = _make_session()
-        storage = _bind_mock_storage(session)
-        session._title_generated = True
-        session.messages = turns_from_dicts(
-            [
-                {"role": "user", "content": "Hello"},
-                {"role": "assistant", "content": "Hi there"},
-            ]
-        )
-        original_ws_id = session._ws_id
-        result = mock_completion_result()
-        result.content = "Test Title"
-        provider = MagicMock()
-        provider.create_streaming.return_value = as_stream(result)
-        replace_session_lane(session, provider=provider, capabilities=ModelCapabilities())
-
-        # Simulate resume() changing ws_id while title generation is in flight
-        def _change_ws_id(*args, **kwargs):
-            session._ws_id = "different-ws-id"
-            return as_stream(result)
-
-        provider.create_streaming.side_effect = _change_ws_id
-
-        with patch.object(storage, "update_workstream_title") as mock_update:
-            session._generate_title()
-
-        # Title should NOT be applied to the new workstream
-        mock_update.assert_not_called()
-        # Restore for cleanup
-        session._ws_id = original_ws_id
 
     def test_title_fires_after_send_not_after_tool_free_turn(self, tmp_db):
         """Auto-title fires right after the user turn is recorded, BEFORE
@@ -3534,7 +3501,6 @@ class TestTitleRetry:
         )
         title_kwargs = title_record["kwargs"]
         assert title_kwargs["principal_id"] == "user-a"
-        assert title_kwargs["captured_ws_id"] == session.ws_id
         captured_messages = title_kwargs["captured_messages"]
         assert captured_messages[0].text == "refactor the auth layer"
         assert all(turn.role is not Role.ASSISTANT for turn in captured_messages)
@@ -8475,14 +8441,12 @@ class TestMemoryIndexSnapshotLifecycle:
         session._known_senders = {"original-sender"}
         session._shared_workstream = False
         session._db_senders_loaded = False
-        session._senders_dirty = True
         original_prefix = list(session.system_messages)
         original_system_tokens = session._system_tokens
         original_shared_state = (
             set(session._known_senders),
             session._shared_workstream,
             session._db_senders_loaded,
-            session._senders_dirty,
         )
         rendered = render_memory_index([])
         candidate = {
@@ -8525,7 +8489,6 @@ class TestMemoryIndexSnapshotLifecycle:
             session._known_senders,
             session._shared_workstream,
             session._db_senders_loaded,
-            session._senders_dirty,
         ) == original_shared_state
 
     def test_small_context_refuses_without_dispatch_or_snapshot_then_retries(self, tmp_db):
@@ -9849,99 +9812,6 @@ class TestMetacognitiveBuffers:
         assert session.dequeue_message("q-done") is False
         assert session._retracted_while_popped == set()
 
-    def test_identity_swap_drain_discards_what_cannot_land(self, tmp_db):
-        """Round-4 review pin: the /new//resume queue settlement never raises.
-        On a gone latch everything is discarded with a notice (flushing would
-        refuse and crash the REPL's only escape commands); a foreign-retained
-        entry is discarded with a notice rather than bleeding into the next
-        identity."""
-        # Gone latch: discard-all with notice.
-        ui = MagicMock()
-        session = _make_session(user_id="owner", ui=ui)
-        session._acting_user_id = "owner"
-        session.queue_message("stranded", interjector_user_id="owner", queue_msg_id="q1")
-        session._workstream_gone_ws = session._ws_id
-        # A stale in-flight marker must not outlive the identity swap: on
-        # the NEW workstream it would let a same-id miss record a bogus
-        # suppression.  (No window can be open on this CLI-only path — the
-        # clear is the belt-and-braces invariant, pinned here.)
-        session._popped_in_flight.add("stale-window-id")
-        session._drain_queue_for_identity_swap()
-        assert session._queued_messages == {}
-        assert session._popped_in_flight == set()
-        assert any("deleted" in str(c.args[0]) for c in ui.on_info.call_args_list)
-
-        # Foreign-retained entry on a healthy workstream: discarded, not bled.
-        ui2 = MagicMock()
-        session2 = _make_session(user_id="owner", ui=ui2)
-        session2._acting_user_id = "alice"
-        session2.queue_message("alice's words", interjector_user_id="alice", queue_msg_id="qa")
-        session2._acting_user_id = "bob"
-        session2._drain_queue_for_identity_swap()
-        assert session2._queued_messages == {}
-        assert not any(
-            "alice's words" in str(m.get("content")) for m in dicts_from_turns(session2.messages)
-        )
-        assert any("another participant" in str(c.args[0]) for c in ui2.on_info.call_args_list)
-
-    def test_identity_swap_mixed_queue_flushes_own_and_notices_foreign_only(self, tmp_db):
-        """Round-5 review pin (notice accuracy): on a mixed queue /new's
-        settlement persists the acting user's row into the CURRENT workstream
-        and the discard notice counts ONLY the other participant's rows."""
-        ui = MagicMock()
-        session = _make_session(user_id="owner", ui=ui)
-        session._acting_user_id = "alice"
-        session.queue_message("alice's words", interjector_user_id="alice", queue_msg_id="qa")
-        session._acting_user_id = "bob"
-        session.queue_message("bob's words", interjector_user_id="bob", queue_msg_id="qb")
-
-        session._drain_queue_for_identity_swap()
-
-        assert session._queued_messages == {}
-        # The flush's own window closed on the success path too.
-        assert session._popped_in_flight == set()
-        flushed = [
-            m
-            for m in dicts_from_turns(session.messages)
-            if m.get("role") == "user" and m.get("content") == "bob's words"
-        ]
-        assert len(flushed) == 1
-        notices = [str(c.args[0]) for c in ui.on_info.call_args_list]
-        assert any("1 queued message(s) from another participant" in n for n in notices)
-        assert not any("of your queued message" in n for n in notices)
-
-    def test_identity_swap_with_empty_queue_never_touches_the_journal(self, tmp_db):
-        """Round-5 review pin (total-ness): an empty queue skips the flush
-        preamble entirely, so a poisoned reconcile latch cannot raise out of
-        /new with nothing queued at all."""
-        from turnstone.core.session import ConversationPersistenceError
-
-        session = _make_session(user_id="owner")
-        session._conversation_persistence_failure_kind = "conflict"
-        session._conversation_persistence_error = ConversationPersistenceError("latched")
-
-        session._drain_queue_for_identity_swap()  # must not raise
-
-    def test_identity_swap_degrades_to_discard_when_the_flush_raises(self, tmp_db):
-        """Round-5 review pin (degrade arm): a flush failure of ANY class
-        becomes discard-with-notice — the escape commands can never be
-        blocked by an unhealthy journal, and the notice never miscounts the
-        actor's own rows as another participant's."""
-        ui = MagicMock()
-        session = _make_session(user_id="owner", ui=ui)
-        session._acting_user_id = "alice"
-        session.queue_message("alice's words", interjector_user_id="alice", queue_msg_id="qa")
-
-        with patch.object(
-            session, "_flush_queued_messages", side_effect=RuntimeError("journal refused")
-        ):
-            session._drain_queue_for_identity_swap()  # must not raise
-
-        assert session._queued_messages == {}
-        notices = [str(c.args[0]) for c in ui.on_info.call_args_list]
-        assert any("1 of your queued message(s)" in n for n in notices)
-        assert not any("another participant" in n for n in notices)
-
     def test_failure_finalizer_retains_foreign_queue_and_records_error(self, tmp_db):
         """Round-3 review: a foreign-owned queued entry (retained across its
         owner's failed turn) must not abort the next actor's failure finalizer
@@ -10130,6 +10000,63 @@ class TestMetacognitiveBuffers:
         # to the next user turn.
         assert session._nudge_queue.pending(channel="tool") == [("denial", format_nudge("denial"))]
         assert session._nudge_queue.pending(channel="user") == []
+
+    @pytest.mark.parametrize(
+        ("denial_msg", "reason", "refused_by"),
+        [
+            (
+                "Blocked by tool policy (pattern match for 'notify')",
+                "Blocked by tool policy",
+                "policy",
+            ),
+            (
+                "Blocked: the tool policies could not be read.",
+                "Tool policies could not be read",
+                "policy",
+            ),
+            (
+                "Denied by user: Approval timed out after 5s",
+                "Approval timed out after 5s",
+                "timeout",
+            ),
+        ],
+        ids=["deny-rule", "policies-unreadable", "nobody-answered"],
+    )
+    def test_a_refusal_no_person_made_queues_no_denial_nudge(
+        self, tmp_db, denial_msg, reason, refused_by
+    ):
+        """The nudge says the user rejected a call; a policy or an unanswered prompt is not that."""
+        session = _make_session()
+        session.messages.append(turn_from_dict({"role": "user", "content": "do the thing"}))
+        session.messages.append(turn_from_dict({"role": "assistant", "content": "calling"}))
+        item = {
+            "call_id": "call_1",
+            "func_name": "notify",
+            "needs_approval": True,
+            "execute": lambda p: (p["call_id"], "EXECUTED — must not happen"),
+        }
+
+        def refuse(items):
+            items[0].update(denied=True, denial_msg=denial_msg, _refused_by=refused_by)
+            return False, reason
+
+        with (
+            patch.object(session, "_safe_prepare_tool", return_value=item),
+            patch.object(session.ui, "approve_tools", side_effect=refuse),
+            patch.object(session, "_visible_memory_count", return_value=0),
+        ):
+            results, _feedback = session._execute_tools(
+                [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "notify", "arguments": "{}"},
+                    }
+                ]
+            )
+
+        assert results == [("call_1", denial_msg)]
+        assert session._nudge_queue.pending(channel="tool") == []
 
     def test_queued_message_appends_system_turn_after_tool_batch(self, tmp_db):
         """A queued message arriving during a tool batch becomes a
@@ -11654,10 +11581,10 @@ class TestReminderSidechannelIsolation:
                 session, "_load_message_turns", side_effect=AssertionError("source history read")
             ),
             patch.object(
-                session, "_load_workstream_config", side_effect=AssertionError("source config read")
+                session, "_read_workstream_config", side_effect=AssertionError("source config read")
             ),
         ):
-            assert session.resume("fork_source", _fork_snapshot=snapshot) is True
+            session.adopt_fork_snapshot("fork_source", snapshot)
 
         assert session.ws_id == original_ws_id
         assert session.messages == list(snapshot.turns)
@@ -11686,8 +11613,8 @@ class TestReminderSidechannelIsolation:
             "fork_source", principal_id="owner", source_reservation_token="source-token"
         )
 
-        resumed_fork = _make_session()
-        assert resumed_fork.resume(fork_ws_id) is True
+        resumed_fork = _make_session(ws_id=fork_ws_id)
+        assert resumed_fork.rehydrate() is True
 
         wake_msgs = [
             m
@@ -11807,8 +11734,8 @@ class TestReminderSidechannelIsolation:
             {"type": "thinking", "thinking": "reason", "signature": "s"},
             {"type": "text", "text": "answer"},
         ]
-        reopened = _make_session()
-        assert reopened.resume(fork_ws) is True
+        reopened = _make_session(ws_id=fork_ws)
+        assert reopened.rehydrate() is True
         for session in (forking, reopened):
             assistant = next(turn for turn in session.messages if turn.role is Role.ASSISTANT)
             assert assistant.meta.extra[PROVENANCE_META_KEY] == provenance
@@ -11865,8 +11792,8 @@ class TestReminderSidechannelIsolation:
         assert in_memory_tool.effect_status is EffectStatus.UNKNOWN
         assert in_memory_tool.meta.extra["acting_principal"] == "owner"
 
-        reopened = _make_session()
-        assert reopened.resume(fork_ws) is True
+        reopened = _make_session(ws_id=fork_ws)
+        assert reopened.rehydrate() is True
         persisted_tool = next(turn for turn in reopened.messages if turn.tool_call_id == call_id)
         assert persisted_tool.effect_status is EffectStatus.UNKNOWN
         assert persisted_tool.meta.extra["acting_principal"] == "owner"
@@ -12011,8 +11938,8 @@ class TestReminderSidechannelIsolation:
         )
         assert storage.delete_workstream(source_ws) is True
 
-        reopened = _make_session()
-        assert reopened.resume(fork_ws) is True
+        reopened = _make_session(ws_id=fork_ws)
+        assert reopened.rehydrate() is True
         copied = [turn for turn in reopened.messages if turn.role is not Role.SYSTEM]
         assert [turn.role for turn in copied] == [
             Role.USER,
@@ -14298,20 +14225,20 @@ class TestWhitespaceOnlyBlanknessGates:
         assert "no answer" in answer
 
 
-class TestResumeQueuesNoWakeEligibleNudge:
+class TestRehydrateQueuesNoWakeEligibleNudge:
     """Reopening a workstream must not queue anything the idle wake could
     deliver on a synthetic empty turn.
 
     The retired ``resume`` nudge was queued on the ``"user"`` channel from
-    inside :meth:`ChatSession.resume` — outside any send — and ``"user"``
+    inside ``ChatSession.resume`` (the load API before #988) — outside any send — and ``"user"``
     was wake-eligible, so the post-reopen IDLE transition spawned a wake
     whose empty turn held the worker slot while the user's real message
     arrived, pushing that message into the next tool seam as a mid-turn
-    interjection.  Two pins: ``resume`` leaves the queue empty, and a
+    interjection.  Two pins: ``rehydrate`` leaves the queue empty, and a
     ``"user"`` entry never arms the wake gate.
     """
 
-    def test_resume_leaves_nudge_queue_empty(self, tmp_db):
+    def test_rehydrate_leaves_nudge_queue_empty(self, tmp_db):
         from turnstone.core.nudge_queue import WAKE_PENDING
 
         first = _make_registered_session()
@@ -14325,9 +14252,9 @@ class TestResumeQueuesNoWakeEligibleNudge:
         ):
             first.send("hello")
 
-        second = _make_session()
+        second = _make_session(ws_id=first._ws_id)
         with patch.object(second, "_visible_memory_count", return_value=3):
-            assert second.resume(first._ws_id) is True
+            assert second.rehydrate() is True
         assert second._nudge_queue.pending() == []
         assert not second._nudge_queue.has_pending(WAKE_PENDING)
 
@@ -14362,3 +14289,60 @@ class TestResumeQueuesNoWakeEligibleNudge:
         assert sources == ["watch_triggered"]
         assert session._nudge_queue.pending(channel="user") == [("correction", "watch your step")]
         assert not session._nudge_queue.has_pending(WAKE_PENDING)
+
+
+class _WsIdAssignments(ast.NodeVisitor):
+    """Collect ``file:Class.function`` scopes that assign an attribute named ``_ws_id``."""
+
+    def __init__(self, relative: str, found: set[str]) -> None:
+        self.relative = relative
+        self.found = found
+        self.scopes: list[str] = []
+
+    def _scoped(self, node: ast.AST, name: str) -> None:
+        self.scopes.append(name)
+        self.generic_visit(node)
+        self.scopes.pop()
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        self._scoped(node, node.name)
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        self._scoped(node, node.name)
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        self._scoped(node, node.name)
+
+    def _check(self, targets: list[ast.expr]) -> None:
+        for target in targets:
+            for node in ast.walk(target):
+                if isinstance(node, ast.Attribute) and node.attr == "_ws_id":
+                    self.found.add(f"{self.relative}:{'.'.join(self.scopes)}")
+
+    def visit_Assign(self, node: ast.Assign) -> None:
+        self._check(node.targets)
+        self.generic_visit(node)
+
+    def visit_AugAssign(self, node: ast.AugAssign) -> None:
+        self._check([node.target])
+        self.generic_visit(node)
+
+    def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
+        self._check([node.target])
+        self.generic_visit(node)
+
+
+def test_a_session_never_changes_its_workstream_id() -> None:
+    """Only construction assigns ``ChatSession._ws_id`` (#988).
+
+    Code that captures the id and later compares it, for writes, titles or
+    watch registrations, relies on it never changing; a workstream is reopened
+    by building a new session.
+    """
+    root = Path(__file__).resolve().parents[1] / "turnstone"
+    found: set[str] = set()
+    for path in root.rglob("*.py"):
+        _WsIdAssignments(path.relative_to(root).as_posix(), found).visit(
+            ast.parse(path.read_text())
+        )
+    assert found == {"core/session.py:ChatSession.__init__"}

@@ -22,6 +22,21 @@ from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 
 from turnstone.core.log import get_logger
 from turnstone.core.project_access import fold_role_permissions
+from turnstone.core.storage._lease import (
+    acquire_lease_on_connection,
+    admit_offline_writes_on_connection,
+    admit_workstream_write_on_connection,
+    end_foreign_node_watches_on_connection,
+    enforce_workstream_lease,
+    fence_out_values,
+    live_lease_node_id,
+    lock_workstream_lease_row,
+    release_lease_on_connection,
+    renew_lease_batch_on_connection,
+    renewal_batches,
+    unleased_predicate,
+    update_workstream_row_on_connection,
+)
 from turnstone.core.storage._protocol import (
     FORK_RESERVATION_CONFIG_KEY,
     USER_SCOPED_AUTH_TYPES,
@@ -29,6 +44,8 @@ from turnstone.core.storage._protocol import (
     ConversationCommitWorkstreamGoneError,
     ForkCloneExpectation,
     ForkCloneSnapshot,
+    LeaseFence,
+    LeaseGrant,
     MCPOAuthPendingState,
     MCPPendingConsentRow,
     OAuthToken,
@@ -36,6 +53,7 @@ from turnstone.core.storage._protocol import (
     OIDCIdentity,
     OIDCPendingState,
     OIDCUserCredential,
+    WorkstreamLeaseLostError,
 )
 from turnstone.core.storage._schema import (
     api_tokens,
@@ -410,6 +428,8 @@ class PostgreSQLBackend(_KeyedAttachmentSaveWrappers):
         producer: str | None = None,
         meta: str | None = None,
         commit_key: str | None = None,
+        *,
+        lease: LeaseFence | None = None,
     ) -> int:
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
         values = prepare_conversation_row_values(
@@ -450,16 +470,16 @@ class PostgreSQLBackend(_KeyedAttachmentSaveWrappers):
             # deliberate legacy/offline seam for NULL keys. A call that saw a
             # parent but wakes after prune deleted it is refused below rather
             # than reclassified as a parentless import. Keyed live admission
-            # always refuses a missing parent.
-            parent = conn.execute(
-                sa.select(workstreams.c.ws_id).where(workstreams.c.ws_id == ws_id).with_for_update()
-            ).fetchone()
-            if commit_key is None and parent_observed is not None and parent is None:
-                raise RuntimeError("legacy conversation append crossed workstream deletion")
+            # always refuses a missing parent, and so does any fenced write.
+            parent = admit_workstream_write_on_connection(conn, ws_id, lease)
             if parent is None and commit_key is not None:
                 raise ConversationCommitWorkstreamGoneError(
                     "keyed conversation commit workstream no longer exists"
                 )
+            if parent is None and lease is not None:
+                raise WorkstreamLeaseLostError(ws_id)
+            if commit_key is None and parent_observed is not None and parent is None:
+                raise RuntimeError("legacy conversation append crossed workstream deletion")
             statement = postgresql_insert(conversations).values(**values)
             if commit_key is not None:
                 statement = statement.on_conflict_do_nothing(
@@ -498,6 +518,7 @@ class PostgreSQLBackend(_KeyedAttachmentSaveWrappers):
         commit_key: str,
         origin: str,
         exact_blob_metadata: bool,
+        lease: LeaseFence | None = None,
     ) -> int:
         """Dialect-local transaction shared by keyed USER and TOOL rows."""
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
@@ -521,11 +542,7 @@ class PostgreSQLBackend(_KeyedAttachmentSaveWrappers):
                 # attachment-bearing insert can commit behind deletion.  Holding
                 # it for the shared body below makes the parent check and every
                 # row/blob/refcount mutation one indivisible transaction.
-                parent = conn.execute(
-                    sa.select(workstreams.c.ws_id)
-                    .where(workstreams.c.ws_id == ws_id)
-                    .with_for_update()
-                ).fetchone()
+                parent = admit_workstream_write_on_connection(conn, ws_id, lease)
                 if parent is None:
                     raise ConversationCommitWorkstreamGoneError(
                         "keyed conversation commit workstream no longer exists"
@@ -600,7 +617,7 @@ class PostgreSQLBackend(_KeyedAttachmentSaveWrappers):
                 }
             )
         with self._conn() as conn:
-            self._lock_parents_refusing_crossed_deletion(conn, ws_ids)
+            self._admit_bulk_import_parents(conn, ws_ids)
             retain_attachment_refs(conn, attachment_ids)
             conn.execute(sa.insert(conversations), insert_rows)
             conn.execute(
@@ -610,21 +627,24 @@ class PostgreSQLBackend(_KeyedAttachmentSaveWrappers):
             )
             conn.commit()
 
-    def _lock_parents_refusing_crossed_deletion(
+    def _admit_bulk_import_parents(
         self,
         conn: sa.engine.Connection,
         ws_ids: set[str],
     ) -> None:
-        """Batched READ COMMITTED anomaly gate for the bulk import path.
+        """Admit every parent of a bulk import as an offline write, or refuse the batch.
 
-        The set-shaped twin of ``save_message``'s single-row
-        observed→lock→refuse sequence (its NULL-commit-key arm) — keep the
-        two semantically in lockstep. Matches prune/delete's parent-first
-        order; the ``ORDER BY ws_id`` on the locking read preserves the
-        sorted lock order that keeps concurrent bulk writers from
-        deadlocking one another. Missing parents retain the historical
-        import behavior and do not abort the batch; a parent OBSERVED but
-        not lockable crossed a concurrent deletion and refuses.
+        Each parent is admitted as an unfenced (offline) write: a workstream
+        with a live owner lease raises :class:`WorkstreamLeaseHeldError`, and
+        an expired lease is fenced out in this transaction. Also the batched
+        READ COMMITTED anomaly gate: the set-shaped twin of ``save_message``'s
+        single-row observed→lock→refuse sequence (its NULL-commit-key arm) —
+        keep the two semantically in lockstep. Matches prune/delete's
+        parent-first order; the ``ORDER BY ws_id`` on the locking read
+        preserves the sorted lock order that keeps concurrent bulk writers
+        from deadlocking one another. Missing parents retain the historical
+        import behavior and do not abort the batch; a parent OBSERVED but not
+        lockable crossed a concurrent deletion and refuses.
         """
         ordered = sorted(ws_ids)
         observed = {
@@ -633,15 +653,7 @@ class PostgreSQLBackend(_KeyedAttachmentSaveWrappers):
                 sa.select(workstreams.c.ws_id).where(workstreams.c.ws_id.in_(ordered))
             ).fetchall()
         }
-        locked = {
-            row[0]
-            for row in conn.execute(
-                sa.select(workstreams.c.ws_id)
-                .where(workstreams.c.ws_id.in_(ordered))
-                .order_by(workstreams.c.ws_id)
-                .with_for_update()
-            ).fetchall()
-        }
+        locked = admit_offline_writes_on_connection(conn, ordered)
         if observed - locked:
             raise RuntimeError("legacy conversation append crossed workstream deletion")
 
@@ -864,21 +876,27 @@ class PostgreSQLBackend(_KeyedAttachmentSaveWrappers):
         """Delete one conversation tail; caller owns the parent lock."""
         return _delete_messages_after_core(conn, ws_id, keep_count)
 
-    def delete_messages_after(self, ws_id: str, keep_count: int) -> int:
+    def delete_messages_after(
+        self, ws_id: str, keep_count: int, *, lease: LeaseFence | None = None
+    ) -> int:
         with self._conn() as conn:
             # Keyed commits, hard delete, and prune all lock the durable parent
             # before touching conversation rows. Take the same lock for a tail
             # truncation. A missing legacy parent has no row to lock; continue
-            # for orphan-truncation compatibility. Fencing same-id recreation
-            # across that gap requires a separate incarnation boundary.
-            conn.execute(
-                sa.select(workstreams.c.ws_id).where(workstreams.c.ws_id == ws_id).with_for_update()
-            ).fetchone()
+            # for orphan-truncation compatibility unless the caller presented
+            # a lease, which a missing row can no longer honor. Fencing
+            # same-id recreation across that gap requires a separate
+            # incarnation boundary.
+            parent = admit_workstream_write_on_connection(conn, ws_id, lease)
+            if parent is None and lease is not None:
+                raise WorkstreamLeaseLostError(ws_id)
             deleted = self._delete_messages_after_on_connection(conn, ws_id, keep_count)
             conn.commit()
             return deleted
 
-    def truncate_messages_tail(self, ws_id: str, remove_count: int) -> int:
+    def truncate_messages_tail(
+        self, ws_id: str, remove_count: int, *, lease: LeaseFence | None = None
+    ) -> int:
         """Atomically remove a compaction-floored number of newest rows."""
         if remove_count < 0:
             raise ValueError("remove_count must be non-negative")
@@ -895,11 +913,7 @@ class PostgreSQLBackend(_KeyedAttachmentSaveWrappers):
                 # Hold it across both count queries and the exact tail delete so
                 # another process cannot turn ``remove_count`` into an
                 # over-delete by committing in between them.
-                parent = conn.execute(
-                    sa.select(workstreams.c.ws_id)
-                    .where(workstreams.c.ws_id == ws_id)
-                    .with_for_update()
-                ).fetchone()
+                parent = admit_workstream_write_on_connection(conn, ws_id, lease)
                 if parent is None:
                     raise RuntimeError("tail truncation workstream no longer exists")
 
@@ -1038,6 +1052,7 @@ class PostgreSQLBackend(_KeyedAttachmentSaveWrappers):
 
         return _prune_workstreams_shared(
             retention_days,
+            dialect_name="postgresql",
             select_ids=_select_ids,
             delete_candidate=self._delete_prune_candidate,
         )
@@ -1075,13 +1090,18 @@ class PostgreSQLBackend(_KeyedAttachmentSaveWrappers):
 
     # -- Workstream config -----------------------------------------------------
 
-    def save_workstream_config(self, ws_id: str, config: dict[str, str]) -> None:
+    def save_workstream_config(
+        self, ws_id: str, config: dict[str, str], *, lease: LeaseFence | None = None
+    ) -> None:
         public_config = {
             key: value for key, value in config.items() if key != FORK_RESERVATION_CONFIG_KEY
         }
         if not public_config:
             return
         with self._conn() as conn:
+            parent = admit_workstream_write_on_connection(conn, ws_id, lease)
+            if parent is None and lease is not None:
+                raise WorkstreamLeaseLostError(ws_id)
             conn.execute(
                 sa.text(
                     "INSERT INTO workstream_config (ws_id, key, value) "
@@ -1114,6 +1134,7 @@ class PostgreSQLBackend(_KeyedAttachmentSaveWrappers):
         config: dict[str, str] | None = None,
         node_id: str | None = None,
         override_reason: str = "local",
+        lease: LeaseFence | None = None,
     ) -> bool:
         """Apply private prepublication writes to exactly one fork row."""
         from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -1126,9 +1147,9 @@ class PostgreSQLBackend(_KeyedAttachmentSaveWrappers):
             if key != FORK_RESERVATION_CONFIG_KEY
         }
         with self._conn() as conn:
-            row = conn.execute(
-                sa.select(workstreams.c.state).where(workstreams.c.ws_id == ws_id).with_for_update()
-            ).fetchone()
+            row = lock_workstream_lease_row(conn, ws_id)
+            # Lock the config fence after the row, the ordering clone and
+            # delete use; its value is read under that lock.
             reservation = conn.execute(
                 sa.select(workstream_config.c.value)
                 .where(
@@ -1139,12 +1160,13 @@ class PostgreSQLBackend(_KeyedAttachmentSaveWrappers):
             ).fetchone()
             if (
                 row is None
-                or str(row[0] or "") != "creating"
+                or str(row.state or "") != "creating"
                 or reservation is None
                 or str(reservation[0] or "") != fork_reservation_token
             ):
                 conn.rollback()
                 return False
+            enforce_workstream_lease(conn, ws_id, row, lease)
             if alias is not None:
                 incumbent = conn.execute(
                     sa.select(workstreams.c.ws_id).where(workstreams.c.alias == alias)
@@ -1202,15 +1224,17 @@ class PostgreSQLBackend(_KeyedAttachmentSaveWrappers):
         self,
         ws_id: str,
         fork_reservation_token: str,
+        *,
+        lease: LeaseFence | None = None,
     ) -> bool:
         """CAS one exact durable reservation from creating to idle."""
         if not ws_id or not fork_reservation_token:
             return False
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
         with self._conn() as conn:
-            row = conn.execute(
-                sa.select(workstreams.c.state).where(workstreams.c.ws_id == ws_id).with_for_update()
-            ).fetchone()
+            row = lock_workstream_lease_row(conn, ws_id)
+            # Lock the config fence after the row, the ordering clone and
+            # delete use; its value is read under that lock.
             reservation = conn.execute(
                 sa.select(workstream_config.c.value)
                 .where(
@@ -1221,12 +1245,13 @@ class PostgreSQLBackend(_KeyedAttachmentSaveWrappers):
             ).fetchone()
             if (
                 row is None
-                or str(row[0] or "") != "creating"
+                or str(row.state or "") != "creating"
                 or reservation is None
                 or str(reservation[0] or "") != fork_reservation_token
             ):
                 conn.rollback()
                 return False
+            enforce_workstream_lease(conn, ws_id, row, lease)
             published = conn.execute(
                 sa.update(workstreams)
                 .where(
@@ -1256,8 +1281,11 @@ class PostgreSQLBackend(_KeyedAttachmentSaveWrappers):
 
     # -- Workstream metadata ---------------------------------------------------
 
-    def set_workstream_alias(self, ws_id: str, alias: str) -> bool:
+    def set_workstream_alias(
+        self, ws_id: str, alias: str, *, lease: LeaseFence | None = None
+    ) -> bool:
         with self._conn() as conn:
+            admit_workstream_write_on_connection(conn, ws_id, lease)
             existing = conn.execute(
                 sa.select(workstreams.c.ws_id).where(workstreams.c.alias == alias)
             ).fetchone()
@@ -1334,9 +1362,9 @@ class PostgreSQLBackend(_KeyedAttachmentSaveWrappers):
             return None
 
     def get_workstream(self, ws_id: str) -> dict[str, Any] | None:
-        """Return the full workstreams row as a dict, or None if missing.
+        """Return the workstreams row as a dict (see the protocol), or None if missing.
 
-        Delegates to ``get_workstreams_batch`` so the 13-column projection
+        Delegates to ``get_workstreams_batch`` so the column projection
         + row→dict mapping live in one place — a future migration
         adding/renaming a column only has to be applied once per
         backend instead of in two parallel selects that can drift.
@@ -1390,11 +1418,11 @@ class PostgreSQLBackend(_KeyedAttachmentSaveWrappers):
             snapshot["fork_reservation_token"] = token
             return snapshot
 
-    def update_workstream_title(self, ws_id: str, title: str) -> None:
+    def update_workstream_title(
+        self, ws_id: str, title: str, *, lease: LeaseFence | None = None
+    ) -> None:
         with self._conn() as conn:
-            conn.execute(
-                sa.update(workstreams).where(workstreams.c.ws_id == ws_id).values(title=title)
-            )
+            update_workstream_row_on_connection(conn, ws_id, lease, {"title": title})
             conn.commit()
 
     # -- Workstream operations -------------------------------------------------
@@ -1499,13 +1527,13 @@ class PostgreSQLBackend(_KeyedAttachmentSaveWrappers):
             conn.commit()
             return inserted
 
-    def update_workstream_state(self, ws_id: str, state: str) -> None:
+    def update_workstream_state(
+        self, ws_id: str, state: str, *, lease: LeaseFence | None = None
+    ) -> None:
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
         with self._conn() as conn:
-            conn.execute(
-                sa.update(workstreams)
-                .where(workstreams.c.ws_id == ws_id)
-                .values(state=state, updated=now)
+            update_workstream_row_on_connection(
+                conn, ws_id, lease, {"state": state, "updated": now}
             )
             conn.commit()
 
@@ -1514,34 +1542,25 @@ class PostgreSQLBackend(_KeyedAttachmentSaveWrappers):
         kind: WorkstreamKind | str,
         cutoff: str,
         exclude_ws_ids: list[str],
-        live_node_ids: list[str] | None = None,
     ) -> list[str]:
         norm_kind = WorkstreamKind(kind).value
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+        # A row loaded by any live process carries a live owner lease, so the
+        # lease predicate protects it. Each candidate row is locked by the
+        # UPDATE itself and the predicate is re-evaluated against a
+        # concurrent acquisition's committed version, and the same statement
+        # fences out an expired lease.
         stmt = (
             sa.update(workstreams)
             .where(
                 workstreams.c.kind == norm_kind,
                 workstreams.c.state.in_(BULK_CLOSE_STATE_VALUES),
                 workstreams.c.updated < cutoff,
+                unleased_predicate("postgresql"),
             )
-            .values(state="closed", updated=now)
+            .values(state="closed", updated=now, **fence_out_values())
             .returning(workstreams.c.ws_id)
         )
-        # Protect rows whose owning process is still heartbeating in the
-        # services table (rendezvous router's liveness primitive).  NULL
-        # node_id rows have no owner identity — always eligible.  The
-        # ``and live_node_ids`` short-circuits both ``None`` (skip the
-        # filter entirely — single-process / operator backfill) and ``[]``
-        # (no nodes alive — every row unprotected, no extra predicate
-        # needed since absence equals match-all).
-        if live_node_ids is not None and live_node_ids:
-            stmt = stmt.where(
-                sa.or_(
-                    workstreams.c.node_id.is_(None),
-                    ~workstreams.c.node_id.in_(live_node_ids),
-                )
-            )
         if exclude_ws_ids:
             # Skip ``NOT IN ()`` when nothing to exclude — keeps the SQL clean
             # and avoids SQLAlchemy's empty-collection warning.
@@ -1557,33 +1576,17 @@ class PostgreSQLBackend(_KeyedAttachmentSaveWrappers):
         kind: WorkstreamKind | str,
         cutoff: str,
         exclude_ws_ids: list[str],
-        *,
-        live_node_ids: list[str],
-        local_node_id: str | None,
     ) -> list[str]:
         """Hard-delete stale hidden creates under exact row/token locks."""
-        if live_node_ids is None:
-            # Liveness uncertainty is never permission to reap.
-            return []
         norm_kind = WorkstreamKind(kind).value
-        local_owner = local_node_id or None
-        protected_live_nodes = {
-            node_id for node_id in live_node_ids if node_id and node_id != local_owner
-        }
         conditions: list[Any] = [
             workstreams.c.kind == norm_kind,
             workstreams.c.state == "creating",
             workstreams.c.updated < cutoff,
+            unleased_predicate("postgresql"),
         ]
         if exclude_ws_ids:
             conditions.append(~workstreams.c.ws_id.in_(exclude_ws_ids))
-        if protected_live_nodes:
-            conditions.append(
-                sa.or_(
-                    workstreams.c.node_id.is_(None),
-                    ~workstreams.c.node_id.in_(protected_live_nodes),
-                )
-            )
 
         deleted: list[str] = []
         tokenless_deleted = 0
@@ -1610,6 +1613,7 @@ class PostgreSQLBackend(_KeyedAttachmentSaveWrappers):
                     workstreams.c.kind == norm_kind,
                     workstreams.c.state == "creating",
                     workstreams.c.updated < cutoff,
+                    unleased_predicate("postgresql"),
                 ]
                 if token:
                     exact_conditions.append(
@@ -1638,22 +1642,18 @@ class PostgreSQLBackend(_KeyedAttachmentSaveWrappers):
             )
         return deleted
 
-    def touch_workstream(self, ws_id: str) -> None:
+    def touch_workstream(self, ws_id: str, *, lease: LeaseFence | None = None) -> None:
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
         with self._conn() as conn:
-            conn.execute(
-                sa.update(workstreams).where(workstreams.c.ws_id == ws_id).values(updated=now)
-            )
+            update_workstream_row_on_connection(conn, ws_id, lease, {"updated": now})
             conn.commit()
 
-    def update_workstream_name(self, ws_id: str, name: str) -> None:
+    def update_workstream_name(
+        self, ws_id: str, name: str, *, lease: LeaseFence | None = None
+    ) -> None:
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
         with self._conn() as conn:
-            conn.execute(
-                sa.update(workstreams)
-                .where(workstreams.c.ws_id == ws_id)
-                .values(name=name, updated=now)
-            )
+            update_workstream_row_on_connection(conn, ws_id, lease, {"name": name, "updated": now})
             conn.commit()
 
     def _delete_workstream_on_connection(self, conn: Any, ws_id: str) -> bool:
@@ -1699,13 +1699,11 @@ class PostgreSQLBackend(_KeyedAttachmentSaveWrappers):
         ).fetchone()
         return deleted is not None
 
-    def delete_workstream(self, ws_id: str) -> bool:
+    def delete_workstream(self, ws_id: str, *, lease: LeaseFence | None = None) -> bool:
         with self._conn() as conn:
             # Match clone/conditional-delete lock ordering: durable row first,
             # then conversations/config/dependents.
-            conn.execute(
-                sa.select(workstreams.c.ws_id).where(workstreams.c.ws_id == ws_id).with_for_update()
-            ).fetchone()
+            admit_workstream_write_on_connection(conn, ws_id, lease)
             deleted = self._delete_workstream_on_connection(conn, ws_id)
             conn.commit()
             return deleted
@@ -1714,15 +1712,15 @@ class PostgreSQLBackend(_KeyedAttachmentSaveWrappers):
         self,
         ws_id: str,
         fork_reservation_token: str,
+        *,
+        lease: LeaseFence | None = None,
     ) -> bool:
         if not fork_reservation_token:
             return False
         with self._conn() as conn:
             # Lock the durable incarnation before its config fence. This is
             # the same ordering as clone_workstream_transaction.
-            row = conn.execute(
-                sa.select(workstreams.c.ws_id).where(workstreams.c.ws_id == ws_id).with_for_update()
-            ).fetchone()
+            row = lock_workstream_lease_row(conn, ws_id)
             if row is None:
                 conn.rollback()
                 return False
@@ -1737,9 +1735,62 @@ class PostgreSQLBackend(_KeyedAttachmentSaveWrappers):
             if reservation is None or str(reservation[0] or "") != fork_reservation_token:
                 conn.rollback()
                 return False
+            enforce_workstream_lease(conn, ws_id, row, lease)
             deleted = self._delete_workstream_on_connection(conn, ws_id)
             conn.commit()
             return deleted
+
+    # -- Workstream owner lease ------------------------------------------------
+
+    def acquire_workstream_lease(
+        self,
+        ws_id: str,
+        *,
+        incarnation_token: str,
+        holder: str,
+        node_id: str | None,
+        ttl_seconds: float,
+        allow_creating: bool = False,
+    ) -> LeaseGrant | None:
+        with self._conn() as conn:
+            try:
+                grant = acquire_lease_on_connection(
+                    conn,
+                    ws_id=ws_id,
+                    incarnation_token=incarnation_token,
+                    holder=holder,
+                    node_id=node_id,
+                    ttl_ms=int(ttl_seconds * 1000),
+                    allow_creating=allow_creating,
+                    allow_live_takeover=False,
+                )
+                conn.commit()
+                return grant
+            except Exception:
+                conn.rollback()
+                raise
+
+    def renew_workstream_leases(
+        self,
+        holder: str,
+        fences: Sequence[LeaseFence],
+        *,
+        ttl_seconds: float,
+    ) -> set[str]:
+        owned: set[str] = set()
+        for batch in renewal_batches(holder, fences):
+            with self._conn() as conn:
+                owned |= renew_lease_batch_on_connection(
+                    conn, holder=holder, batch=batch, ttl_ms=int(ttl_seconds * 1000)
+                )
+                conn.commit()
+        return owned
+
+    def release_workstream_lease(self, fence: LeaseFence) -> bool:
+        with self._conn() as conn:
+            released = release_lease_on_connection(conn, fence)
+            conn.commit()
+            return released
 
     def list_orphan_conversations(self) -> list[dict[str, Any]]:
         with self._conn() as conn:
@@ -1794,7 +1845,12 @@ class PostgreSQLBackend(_KeyedAttachmentSaveWrappers):
             conn.commit()
 
     def set_message_attachments(
-        self, ws_id: str, message_id: int, attachment_ids: list[str]
+        self,
+        ws_id: str,
+        message_id: int,
+        attachment_ids: list[str],
+        *,
+        lease: LeaseFence | None = None,
     ) -> None:
         """Record a turn's ordered content-addressed ref-list on its row.
 
@@ -1805,6 +1861,7 @@ class PostgreSQLBackend(_KeyedAttachmentSaveWrappers):
         if not attachment_ids or not message_id:
             return
         with self._conn() as conn:
+            admit_workstream_write_on_connection(conn, ws_id, lease)
             conn.execute(
                 sa.update(conversations)
                 .where(
@@ -2871,6 +2928,14 @@ class PostgreSQLBackend(_KeyedAttachmentSaveWrappers):
             )
             conn.commit()
             return result.rowcount > 0
+
+    def end_foreign_node_watches(
+        self, ws_id: str, node_id: str, *, lease: LeaseFence | None = None
+    ) -> list[dict[str, Any]]:
+        with self._conn() as conn:
+            ended = end_foreign_node_watches_on_connection(conn, ws_id, node_id, lease)
+            conn.commit()
+        return ended
 
     def delete_watch(self, watch_id: str) -> bool:
 
@@ -4495,6 +4560,7 @@ class PostgreSQLBackend(_KeyedAttachmentSaveWrappers):
                     workstreams.c.project_id,
                     workstreams.c.persona,
                     workstreams.c.required_node_id,
+                    live_lease_node_id("postgresql"),
                 ).where(workstreams.c.ws_id.in_(clean))
             ).fetchall()
         for r in rows:
@@ -4515,6 +4581,8 @@ class PostgreSQLBackend(_KeyedAttachmentSaveWrappers):
                 "project_id": r[13],
                 "persona": r[14],
                 "required_node_id": r[15],
+                # Owner-lease routing hint: the live holder's node, or None.
+                "lease_node_id": r[16],
             }
             out[r[0]] = item
         return out

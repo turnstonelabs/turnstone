@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol, TypedDict, runtime_checkable
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterable
+    from collections.abc import Callable, Iterable, Sequence
     from contextlib import AbstractContextManager
 
     from turnstone.core.storage._notify import NotifyStream
@@ -59,6 +59,87 @@ class ConversationCommitWorkstreamGoneError(RuntimeError):
     journal uses the type to stop retrying instead of classifying the miss as
     a transient storage failure.
     """
+
+
+@dataclass(frozen=True, slots=True)
+class LeaseFence:
+    """Proof of one owner-lease acquisition, presented by every fenced write.
+
+    Issued by :meth:`StorageBackend.acquire_workstream_lease`. A fenced write
+    succeeds only while the row still carries this holder and epoch under this
+    incarnation token. Expiry alone does not invalidate it: an expired lease
+    stays exclusive until another holder takes the workstream over.
+    """
+
+    ws_id: str
+    holder: str
+    epoch: int
+    incarnation_token: str
+
+
+@dataclass(frozen=True, slots=True)
+class LeaseGrant:
+    """One successful owner-lease acquisition.
+
+    ``previous_holder`` and ``previous_node_id`` name the other holder whose
+    lease this grant replaced, or are empty when the row was unheld or held by
+    the same holder. ``took_over_live`` is true only when that lease had not
+    expired (SQLite's single-process takeover).
+    """
+
+    fence: LeaseFence
+    previous_holder: str = ""
+    previous_node_id: str = ""
+    took_over_live: bool = False
+
+
+class WorkstreamLeaseError(RuntimeError):
+    """An owner lease refused an operation (base of the two refusals).
+
+    Deliberately carries no ``status_code``: the fatal-turn classifier reads
+    that attribute, and a lease loss inside a turn is not an HTTP failure.
+    """
+
+
+class WorkstreamLeaseLostError(WorkstreamLeaseError):
+    """A fenced write's lease no longer owns the workstream.
+
+    Another holder took the workstream over, or the lease was released or
+    fenced out by offline maintenance. The failure is permanent for this
+    acquisition: the writer must stop and retire its copy of the workstream.
+    """
+
+    def __init__(self, ws_id: str) -> None:
+        self.ws_id = ws_id
+        super().__init__("This process no longer owns the workstream.")
+
+
+class WorkstreamLeaseHeldError(WorkstreamLeaseError):
+    """Another process holds a live owner lease on the workstream.
+
+    Raised when acquisition finds another holder's unexpired lease, and when a
+    write that presents no fence targets a workstream someone else owns.
+    ``holder_node_id`` is the owner's node (a routing hint, possibly empty) and
+    ``retry_after_ms`` the time left on its lease by the database clock.
+    """
+
+    status_code = 409
+    code = "workstream_lease_held"
+
+    def __init__(self, ws_id: str, *, holder_node_id: str = "", retry_after_ms: int = 0) -> None:
+        self.ws_id = ws_id
+        self.holder_node_id = holder_node_id
+        self.retry_after_ms = retry_after_ms
+        owner = f"node '{holder_node_id}'" if holder_node_id else "another process"
+        super().__init__(f"This workstream is open on {owner}.")
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "error": str(self),
+            "code": self.code,
+            "holder_node_id": self.holder_node_id,
+            "retry_after_ms": self.retry_after_ms,
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -273,6 +354,29 @@ class StorageBackend(Protocol):
     expose a ``_mapping`` attribute matching the production ``Row``
     shape; ``turnstone.testing.row_contract.assert_row_like`` is the
     canonical check for fixtures and fakes.
+
+    **Owner lease on session-owned writes.**  Writes to a workstream's
+    session-owned state (conversation rows, config, lifecycle state, title,
+    alias, name, ``updated``, hard delete) accept ``lease: LeaseFence |
+    None``.  A fenced write must match the row's holder, epoch and
+    incarnation token, otherwise it raises
+    :class:`WorkstreamLeaseLostError`.  An unfenced write is offline
+    maintenance: it raises :class:`WorkstreamLeaseHeldError` while any lease
+    is live, including one the caller's own manager holds, and on an expired
+    lease it clears the holder and advances the epoch in the same
+    transaction, so a paused former holder can never write after it.  Every
+    check runs under a lock on the parent row (PostgreSQL ``FOR UPDATE``,
+    SQLite ``BEGIN IMMEDIATE``); column updates that took no lock before now
+    take it.  With a fence presented, a missing row behaves as the pinned
+    tables in ``tests/test_storage_workstream_lease.py`` state: keyed
+    conversation saves raise :class:`ConversationCommitWorkstreamGoneError`;
+    unkeyed saves, configuration and ``delete_messages_after`` raise
+    :class:`WorkstreamLeaseLostError` (a fence a missing row can no longer
+    honor); column updates, ``set_message_attachments`` included, stay
+    no-ops, and :meth:`end_foreign_node_watches` ends nothing; truncation
+    keeps its ``RuntimeError``; the token-guarded lifecycle writes (hard
+    delete, the fork-reserved delete, and finalizing or publishing a
+    deferred create) return ``False``.
     """
 
     # -- Core conversation operations ------------------------------------------
@@ -292,6 +396,8 @@ class StorageBackend(Protocol):
         producer: str | None = None,
         meta: str | None = None,
         commit_key: str | None = None,
+        *,
+        lease: LeaseFence | None = None,
     ) -> int:
         """Log a message to the conversations table.
 
@@ -342,6 +448,7 @@ class StorageBackend(Protocol):
         event_id: int | None = None,
         meta: str | None = None,
         commit_key: str,
+        lease: LeaseFence | None = None,
     ) -> int:
         """Atomically commit one keyed USER row and its attachment references.
 
@@ -374,6 +481,7 @@ class StorageBackend(Protocol):
         is_error: bool = False,
         meta: str | None = None,
         commit_key: str,
+        lease: LeaseFence | None = None,
     ) -> int:
         """Atomically commit one keyed TOOL row and its attachment references.
 
@@ -591,7 +699,12 @@ class StorageBackend(Protocol):
         ...
 
     def set_message_attachments(
-        self, ws_id: str, message_id: int, attachment_ids: list[str]
+        self,
+        ws_id: str,
+        message_id: int,
+        attachment_ids: list[str],
+        *,
+        lease: LeaseFence | None = None,
     ) -> None:
         """Record a turn's ordered content-addressed ref-list on its row.
 
@@ -629,7 +742,9 @@ class StorageBackend(Protocol):
         """
         ...
 
-    def delete_messages_after(self, ws_id: str, keep_count: int) -> int:
+    def delete_messages_after(
+        self, ws_id: str, keep_count: int, *, lease: LeaseFence | None = None
+    ) -> int:
         """Delete conversation rows beyond the first *keep_count* rows for a workstream.
 
         Rows are ordered by auto-increment ``id``.  If the workstream has
@@ -638,7 +753,9 @@ class StorageBackend(Protocol):
         """
         ...
 
-    def truncate_messages_tail(self, ws_id: str, remove_count: int) -> int:
+    def truncate_messages_tail(
+        self, ws_id: str, remove_count: int, *, lease: LeaseFence | None = None
+    ) -> int:
         """Atomically remove up to *remove_count* newest conversation rows.
 
         The backend locks the durable workstream, derives both the current row
@@ -703,8 +820,9 @@ class StorageBackend(Protocol):
 
         Candidate predicates are rechecked while holding the same parent-row
         lock (or SQLite writer reservation) used by keyed conversation commits.
-        Deletion releases all attachment references transactionally. Returns
-        ``(orphans, stale)``.
+        Rows with a live owner lease are never candidates. Deletion releases
+        all attachment references transactionally. Returns ``(orphans,
+        stale)``.
         """
         ...
 
@@ -714,7 +832,9 @@ class StorageBackend(Protocol):
 
     # -- Workstream config -----------------------------------------------------
 
-    def save_workstream_config(self, ws_id: str, config: dict[str, str]) -> None:
+    def save_workstream_config(
+        self, ws_id: str, config: dict[str, str], *, lease: LeaseFence | None = None
+    ) -> None:
         """Persist workstream configuration key/value pairs."""
         ...
 
@@ -731,6 +851,7 @@ class StorageBackend(Protocol):
         config: dict[str, str] | None = None,
         node_id: str | None = None,
         override_reason: str = "local",
+        lease: LeaseFence | None = None,
     ) -> bool:
         """Atomically apply prepublication writes to one reserved incarnation.
 
@@ -745,6 +866,8 @@ class StorageBackend(Protocol):
         self,
         ws_id: str,
         fork_reservation_token: str,
+        *,
+        lease: LeaseFence | None = None,
     ) -> bool:
         """Publish exactly one reserved ``creating`` workstream.
 
@@ -763,7 +886,9 @@ class StorageBackend(Protocol):
 
     # -- Workstream metadata ---------------------------------------------------
 
-    def set_workstream_alias(self, ws_id: str, alias: str) -> bool:
+    def set_workstream_alias(
+        self, ws_id: str, alias: str, *, lease: LeaseFence | None = None
+    ) -> bool:
         """Set a human-friendly alias. Returns False if alias is taken."""
         ...
 
@@ -786,10 +911,13 @@ class StorageBackend(Protocol):
         ...
 
     def get_workstream(self, ws_id: str) -> dict[str, Any] | None:
-        """Return the full ``workstreams`` row as a dict, or ``None``.
+        """Return the ``workstreams`` row as a dict, or ``None``.
 
         Richer than :meth:`get_workstream_metadata` — includes ``state``,
-        ``user_id``, ``kind``, ``parent_ws_id``, and timestamps.  Used by
+        ``user_id``, ``kind``, ``parent_ws_id``, and timestamps. Of the owner
+        lease it carries only ``lease_node_id``, derived: the holder's node
+        while the lease is live by the database clock, else ``None`` (a routing
+        hint; the holder, epoch and expiry are not returned). Used by
         coordinator ``inspect_workstream`` and any caller that needs the
         authoritative row. This is a raw internal read: it deliberately
         returns provisional ``state='creating'`` reservations. User-visible,
@@ -800,7 +928,7 @@ class StorageBackend(Protocol):
         ...
 
     def ensure_workstream_incarnation_snapshot(self, ws_id: str) -> dict[str, Any] | None:
-        """Return the row plus a stable private incarnation token.
+        """Return the row plus a stable private incarnation token, never empty.
 
         The authoritative row read and creation of a token for legacy rows are
         one transaction.  Callers can therefore authorize this immutable
@@ -819,7 +947,9 @@ class StorageBackend(Protocol):
         """
         ...
 
-    def update_workstream_title(self, ws_id: str, title: str) -> None:
+    def update_workstream_title(
+        self, ws_id: str, title: str, *, lease: LeaseFence | None = None
+    ) -> None:
         """Set or update the auto-generated title for a workstream."""
         ...
 
@@ -1109,7 +1239,9 @@ class StorageBackend(Protocol):
         """
         ...
 
-    def update_workstream_state(self, ws_id: str, state: str) -> None:
+    def update_workstream_state(
+        self, ws_id: str, state: str, *, lease: LeaseFence | None = None
+    ) -> None:
         """Update a workstream's state and bump updated timestamp."""
         ...
 
@@ -1118,7 +1250,6 @@ class StorageBackend(Protocol):
         kind: WorkstreamKind | str,
         cutoff: str,
         exclude_ws_ids: list[str],
-        live_node_ids: list[str] | None = None,
     ) -> list[str]:
         """Close DB-side workstream rows of *kind* whose state is in
         ``BULK_CLOSE_STATE_VALUES`` and whose ``updated`` is lex-older than
@@ -1130,24 +1261,11 @@ class StorageBackend(Protocol):
         format ``update_workstream_state`` writes — lex compare is safe for
         same-offset timestamps.  Empty ``exclude_ws_ids`` means no exclusion.
 
-        ``live_node_ids`` is the set of ``services.service_id`` values whose
-        ``last_heartbeat`` is recent (i.e. owning processes still alive);
-        rows whose ``node_id`` matches one of these are protected because
-        their owning process may legitimately have them loaded on another
-        worker.  ``None`` skips the filter entirely (single-process / tests
-        / operator backfill).  Empty list ``[]`` treats every node as dead —
-        useful when operator scripts want to reap regardless of liveness.
-
-        Rows with ``NULL`` ``node_id`` are always eligible: they have no
-        meaningful owner identity, so age alone gates the reap.
-
-        Liveness scoping replaces an earlier ``node_id == self`` heuristic.
-        That heuristic broke in the post-rendezvous-routing world (PR #384):
-        ``workstreams.node_id`` is stamped at create time and never updated,
-        so dead-pod orphans in containerized deployments with dynamic
-        hostnames couldn't be reclaimed.  ``services.last_heartbeat`` is the
-        rendezvous router's authoritative liveness primitive — using it here
-        keeps reap scoping aligned with routing.
+        Only rows without a live owner lease are eligible: a workstream loaded
+        by any live process renews its lease, so lease liveness (not the
+        creating node's heartbeat) decides whether a row is orphaned. The
+        same statement fences out an expired lease, so a paused former holder
+        can never write into the row it closes.
 
         Asymmetric with ``SessionManager.close_idle``'s in-memory pass on
         purpose: that pass closes only ``IDLE`` (legitimately-attentive rows
@@ -1162,29 +1280,24 @@ class StorageBackend(Protocol):
         kind: WorkstreamKind | str,
         cutoff: str,
         exclude_ws_ids: list[str],
-        *,
-        live_node_ids: list[str],
-        local_node_id: str | None,
     ) -> list[str]:
         """Hard-delete abandoned provisional creates of *kind*.
 
         Eligible rows must still be ``state='creating'``, have
-        ``updated < cutoff``, and not appear in ``exclude_ws_ids``. State, age
-        and deletion are checked under one backend transaction/row lock. When
-        the private incarnation token exists it is rechecked under that same
-        lock. Legacy/corrupt tokenless reservations are also recoverable: the
-        locked durable row itself is the incarnation fence, and backends emit
-        a warning when reclaiming one. Implementations must use the ordinary
-        complete-delete machinery so conversations, config, overrides and
-        attachment refcounts are cleaned together.
+        ``updated < cutoff``, hold no live owner lease, and not appear in
+        ``exclude_ws_ids``. State, age, lease and deletion are checked under
+        one backend transaction/row lock. When the private incarnation token
+        exists it is rechecked under that same lock. Legacy/corrupt tokenless
+        reservations are also recoverable: the locked durable row itself is
+        the incarnation fence, and backends emit a warning when reclaiming one.
+        Implementations must use the ordinary complete-delete machinery so
+        conversations, config, overrides and attachment refcounts are cleaned
+        together.
 
-        ``live_node_ids`` is required rather than optional: callers must skip
-        this operation when service liveness cannot be established. Rows owned
-        by a live peer are protected. ``local_node_id`` is the current
-        process's service id and is deliberately exempt from that protection;
-        after a restart the predecessor's rows carry the same stable id, while
-        the current process's live reservations are protected by
-        ``exclude_ws_ids`` plus the age cutoff.
+        A creator leases its reservation right after registering it, so a
+        live creator anywhere protects its row, while a crashed creator's
+        lease expires and its rows become reclaimable whatever node id the
+        restarted process carries.
 
         This is intentionally separate from
         :meth:`bulk_close_stale_orphans`. A provisional create was never
@@ -1193,7 +1306,7 @@ class StorageBackend(Protocol):
         """
         ...
 
-    def touch_workstream(self, ws_id: str) -> None:
+    def touch_workstream(self, ws_id: str, *, lease: LeaseFence | None = None) -> None:
         """Bump a workstream row's ``updated`` timestamp without touching its
         state.
 
@@ -1211,11 +1324,13 @@ class StorageBackend(Protocol):
         """
         ...
 
-    def update_workstream_name(self, ws_id: str, name: str) -> None:
+    def update_workstream_name(
+        self, ws_id: str, name: str, *, lease: LeaseFence | None = None
+    ) -> None:
         """Update a workstream's display name."""
         ...
 
-    def delete_workstream(self, ws_id: str) -> bool:
+    def delete_workstream(self, ws_id: str, *, lease: LeaseFence | None = None) -> bool:
         """Delete a workstream and owned state, releasing its ID for reuse."""
         ...
 
@@ -1223,12 +1338,66 @@ class StorageBackend(Protocol):
         self,
         ws_id: str,
         fork_reservation_token: str,
+        *,
+        lease: LeaseFence | None = None,
     ) -> bool:
         """Delete only the durable incarnation carrying ``token``.
 
         The token check and complete workstream deletion are one transaction.
         It applies to provisional and published manager-created rows; a missing
         or replaced row returns ``False`` without mutation.
+        """
+        ...
+
+    # -- Workstream owner lease ------------------------------------------------
+
+    def acquire_workstream_lease(
+        self,
+        ws_id: str,
+        *,
+        incarnation_token: str,
+        holder: str,
+        node_id: str | None,
+        ttl_seconds: float,
+        allow_creating: bool = False,
+    ) -> LeaseGrant | None:
+        """Acquire the owner lease of one exact workstream incarnation.
+
+        Row lock, incarnation check and grant are one transaction. Every grant
+        advances the fencing epoch, so each earlier fence of the row stops
+        matching, this holder's own included. Returns ``None`` when the row is
+        missing, deleted, provisional (``state='creating'``) without
+        ``allow_creating``, or carries a different incarnation token. Raises
+        :class:`WorkstreamLeaseHeldError` while another holder's lease is live
+        by the database clock. SQLite grants anyway: it serves one process,
+        and a crash restart must not wait for its predecessor's lease to
+        expire.
+        """
+        ...
+
+    def renew_workstream_leases(
+        self,
+        holder: str,
+        fences: Sequence[LeaseFence],
+        *,
+        ttl_seconds: float,
+    ) -> set[str]:
+        """Extend every listed lease *holder* still owns; return the ids it still owns.
+
+        A lease renews while its row still carries the fence's holder and
+        epoch, even after expiry: until another holder takes it over, an
+        expired lease is still exclusive. An id missing from the result was
+        taken over, released, fenced out or deleted. A backend with row locks
+        does not wait on a row another transaction holds: that lease counts as
+        owned without being extended this time. Renewal never changes
+        ``updated``.
+        """
+        ...
+
+    def release_workstream_lease(self, fence: LeaseFence) -> bool:
+        """Clear one exact acquisition; ``False`` when it no longer owns the row.
+
+        The epoch is kept, so a released fence can never match again.
         """
         ...
 
@@ -1742,6 +1911,19 @@ class StorageBackend(Protocol):
 
     def update_watch(self, watch_id: str, **fields: Any) -> bool:
         """Update specified fields on a watch. Returns True if found."""
+        ...
+
+    def end_foreign_node_watches(
+        self, ws_id: str, node_id: str, *, lease: LeaseFence | None = None
+    ) -> list[dict[str, Any]]:
+        """Deactivate ``ws_id``'s active watches bound to a node other than ``node_id``.
+
+        A session-owned write of the workstream that just moved to ``node_id``:
+        admitted under the owner lease like the others, so a copy whose lease
+        lapsed while it loaded ends nothing. Watches with no node stay active.
+        Returns the ended watches (``watch_id``, ``name``, ``command`` and
+        ``node_id``); a missing workstream ends nothing.
+        """
         ...
 
     def delete_watch(self, watch_id: str) -> bool:

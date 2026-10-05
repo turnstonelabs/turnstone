@@ -9,6 +9,7 @@ import pytest
 import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql
 
+from tests._storage_fakes import expire_lease, lease_row
 from tests.test_session_manager import FakeAdapter
 from turnstone.core.session_manager import SessionManager
 from turnstone.core.storage import ForkCloneExpectation, ForkDestinationConflictError
@@ -60,7 +61,14 @@ class _UnknownRowcountResult:
         return self._rows
 
 
+def _lease_row(state: str = "idle", token: str = "") -> Any:
+    """A ``lock_workstream_lease_row`` result for an unleased row."""
+    return lease_row("", state=state, token=token)
+
+
 class _ScriptedPostgresConnection:
+    dialect = postgresql.dialect()
+
     def __init__(self, *results: _UnknownRowcountResult) -> None:
         self._results = list(results)
         self.statements: list[Any] = []
@@ -191,8 +199,6 @@ def test_stale_creating_reaper_hard_deletes_dependents_and_attachment_refs(
         "interactive",
         "2024-01-01T00:00:00",
         [],
-        live_node_ids=["stable-node"],
-        local_node_id="stable-node",
     )
 
     assert deleted == [ws_id]
@@ -212,31 +218,33 @@ def test_stale_creating_reaper_hard_deletes_dependents_and_attachment_refs(
     )
 
 
-def test_stale_creating_reaper_fences_state_age_owner_token_and_loaded_ids(
+def test_stale_creating_reaper_fences_state_age_lease_token_and_loaded_ids(
     storage_backend: Any,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     backend = storage_backend
     stale_ids = [
-        "same-node-abandoned",
-        "same-node-loaded",
-        "dead-peer-abandoned",
-        "live-peer-protected",
+        "unleased-abandoned",
+        "loaded-here",
+        "expired-lease-abandoned",
+        "live-lease-protected",
         "published-protected",
         "tokenless-protected",
     ]
-    for ws_id, node_id, token in [
-        ("same-node-abandoned", "stable-node", "same-token"),
-        ("same-node-loaded", "stable-node", "loaded-token"),
-        ("dead-peer-abandoned", "dead-peer", "dead-token"),
-        ("live-peer-protected", "live-peer", "live-token"),
-        ("published-protected", "dead-peer", "published-token"),
-        ("tokenless-protected", "dead-peer", ""),
+    # Node ids are stamped but ignored: only state, age, lease, token and the
+    # caller's loaded ids decide.
+    for ws_id, token in [
+        ("unleased-abandoned", "unleased-token"),
+        ("loaded-here", "loaded-token"),
+        ("expired-lease-abandoned", "expired-token"),
+        ("live-lease-protected", "live-token"),
+        ("published-protected", "published-token"),
+        ("tokenless-protected", ""),
     ]:
         assert (
             backend.register_workstream(
                 ws_id,
-                node_id=node_id,
+                node_id="some-node",
                 state="creating",
                 kind="interactive",
                 fork_reservation_token=token,
@@ -244,44 +252,47 @@ def test_stale_creating_reaper_fences_state_age_owner_token_and_loaded_ids(
             is True
         )
     assert backend.publish_deferred_create("published-protected", "published-token") is True
+    # A live creator anywhere protects its reservation through its lease; the
+    # row's node id grants no protection of its own.
+    for ws_id, token in [
+        ("live-lease-protected", "live-token"),
+        ("expired-lease-abandoned", "expired-token"),
+    ]:
+        assert (
+            backend.acquire_workstream_lease(
+                ws_id,
+                incarnation_token=token,
+                holder="live-peer/1",
+                node_id="live-peer",
+                ttl_seconds=30.0,
+                allow_creating=True,
+            )
+            is not None
+        )
+    expire_lease(backend, "expired-lease-abandoned")
     _force_updated(backend, stale_ids, "2020-01-01T00:00:00")
     _register_creating(backend, "fresh-protected", "fresh-token")
 
     deleted = backend.delete_stale_creating_reservations(
         "interactive",
         "2024-01-01T00:00:00",
-        ["same-node-loaded"],
-        live_node_ids=["stable-node", "live-peer"],
-        local_node_id="stable-node",
+        ["loaded-here"],
     )
 
     assert set(deleted) == {
-        "same-node-abandoned",
-        "dead-peer-abandoned",
+        "unleased-abandoned",
+        "expired-lease-abandoned",
         "tokenless-protected",
     }
     assert "storage.stale_create_tokenless_reaped" in caplog.text
     for ws_id in [
-        "same-node-loaded",
-        "live-peer-protected",
+        "loaded-here",
+        "live-lease-protected",
         "published-protected",
         "fresh-protected",
     ]:
         assert backend.get_workstream(ws_id) is not None
     assert backend.get_workstream("published-protected")["state"] == "idle"
-
-    # The public protocol requires an authoritative liveness result. Backends
-    # still fail closed if a non-conforming caller passes uncertainty through.
-    assert (
-        backend.delete_stale_creating_reservations(
-            "interactive",
-            "2024-01-01T00:00:00",
-            [],
-            live_node_ids=None,  # type: ignore[arg-type]
-            local_node_id="stable-node",
-        )
-        == []
-    )
 
 
 def test_retention_prune_leaves_stale_creating_for_complete_reaper(
@@ -498,6 +509,9 @@ def test_other_manager_cannot_open_until_exact_create_publication(storage_backen
     assert published is not None
     assert published["state"] == "idle"
     assert _raw_config(backend, ws_id)[FORK_RESERVATION_CONFIG_KEY] == token
+    # The creator owns the published workstream until it closes and releases
+    # its lease; only then can another manager open it on PostgreSQL.
+    assert creator.close(ws_id) is True
     reopened = observer.open(ws_id)
     assert reopened is not None
     assert reopened.id == ws_id
@@ -533,7 +547,7 @@ def test_postgresql_publish_uses_returning_when_driver_rowcount_is_unknown() -> 
     ws_id = "postgres-publish-returning"
     token = "postgres-publish-incarnation"
     backend, conn = _scripted_postgres_backend(
-        _UnknownRowcountResult(row=("creating",)),
+        _UnknownRowcountResult(row=_lease_row("creating", token)),
         _UnknownRowcountResult(row=(token,)),
         _UnknownRowcountResult(row=(ws_id,)),
     )
@@ -549,7 +563,7 @@ def test_postgresql_conditional_delete_uses_returning_when_rowcount_is_unknown()
     ws_id = "postgres-delete-returning"
     token = "postgres-delete-incarnation"
     backend, conn = _scripted_postgres_backend(
-        _UnknownRowcountResult(row=(ws_id,)),
+        _UnknownRowcountResult(row=_lease_row("idle", token)),
         _UnknownRowcountResult(row=(token,)),
         _UnknownRowcountResult(rows=[]),
         _UnknownRowcountResult(),
@@ -588,8 +602,6 @@ def test_postgresql_stale_creating_reaper_locks_state_age_and_exact_incarnation(
         "interactive",
         "2024-01-01T00:00:00",
         [],
-        live_node_ids=["stable-node", "live-peer"],
-        local_node_id="stable-node",
     ) == [ws_id]
 
     conn.assert_consumed()
@@ -598,6 +610,7 @@ def test_postgresql_stale_creating_reaper_locks_state_age_and_exact_incarnation(
     candidate_sql = str(conn.statements[0].compile(dialect=postgresql.dialect())).lower()
     assert "workstreams.state" in candidate_sql
     assert "workstreams.updated" in candidate_sql
+    assert "workstreams.lease_expires_ms" in candidate_sql
     assert "for update skip locked" in candidate_sql
     token_sql = str(conn.statements[1].compile(dialect=postgresql.dialect())).lower()
     assert "workstream_config" in token_sql
@@ -605,6 +618,7 @@ def test_postgresql_stale_creating_reaper_locks_state_age_and_exact_incarnation(
     exact_sql = str(conn.statements[2].compile(dialect=postgresql.dialect())).lower()
     assert "workstreams.state" in exact_sql
     assert "workstreams.updated" in exact_sql
+    assert "workstreams.lease_expires_ms" in exact_sql
     assert "workstream_config.value" in exact_sql
 
 
@@ -630,8 +644,6 @@ def test_postgresql_stale_creating_reaper_recovers_tokenless_locked_row(
         "interactive",
         "2024-01-01T00:00:00",
         [],
-        live_node_ids=[],
-        local_node_id="stable-node",
     ) == [ws_id]
 
     conn.assert_consumed()
@@ -678,6 +690,7 @@ def test_postgresql_retention_prune_excludes_creating_rows() -> None:
     for candidate_sql in (orphan_select_sql, stale_select_sql):
         assert "workstreams.state" in candidate_sql
         assert "creating" in candidate_sql
+        assert "workstreams.lease_expires_ms" in candidate_sql
         assert "for update" not in candidate_sql
     assert "not (exists" in orphan_select_sql
     # Round-3 review guards: the orphan category excludes named workstreams

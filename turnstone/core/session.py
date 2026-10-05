@@ -38,7 +38,7 @@ import traceback
 import uuid
 from datetime import UTC, datetime, timedelta
 from html import escape as _html_escape
-from typing import TYPE_CHECKING, Any, ClassVar, Literal, Protocol, cast
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, NamedTuple, Protocol, cast
 
 import httpx
 import httpx2
@@ -129,19 +129,17 @@ from turnstone.core.memory import (
     acquire_memory_index_snapshot,
     clear_last_error,
     count_structured_memories,
-    delete_workstream,
     find_structured_memory_scopes,
     get_attachments,
     get_skill_by_name,
-    get_workstream_display_name,
     list_default_skills,
     list_skills_by_activation,
     list_workstreams_with_history,
-    load_message_turns,
     load_workstream_config,
     normalize_memory_name,
     persist_last_error,
     prospective_memory_index,
+    read_message_turns,
     resolve_workstream,
     sanitize_error_text,
     save_message,
@@ -175,6 +173,7 @@ from turnstone.core.metacognition import (
     nudge_allowed,
     record_nudge,
     sanitize_display,
+    sanitize_name,
     sanitize_payload,
     should_nudge,
     task_too_long_message,
@@ -258,14 +257,18 @@ from turnstone.core.storage import (
     AttachmentWrite,
     ConversationCommitConflictError,
     ConversationCommitWorkstreamGoneError,
+    WorkstreamLeaseHeldError,
+    WorkstreamLeaseLostError,
 )
 from turnstone.core.storage._registry import get_storage
 from turnstone.core.storage._utils import (
     COMPACTION_SOURCE,
     COMPACTION_SUMMARY_LABEL,
+    WATCH_OWNERSHIP_CHANGED_REASON,
     ProjectMemoryAuthorizationError,
     attachment_to_content_part,
     normalize_search_terms,
+    watch_snapshot_meta,
 )
 from turnstone.core.streaming_text import ThinkTagSplitter
 from turnstone.core.tool_advisory import (
@@ -325,6 +328,7 @@ from turnstone.core.web import (
 from turnstone.core.workstream import (
     INTERJECTION_CAP_CHARS,
     PENDING_SENDS_MAX,
+    WorkstreamHistoryUnavailableError,
     WorkstreamKind,
     concrete_method,
 )
@@ -357,8 +361,9 @@ if TYPE_CHECKING:
     from turnstone.core.output_guard import OutputAssessment
     from turnstone.core.output_guard_judge import OutputGuardJudge, OutputJudgeVerdict
     from turnstone.core.rerank import Reranker, RerankHit, RerankLane
-    from turnstone.core.storage import ForkCloneSnapshot
+    from turnstone.core.storage import ForkCloneSnapshot, LeaseFence
     from turnstone.core.web_search import WebSearchClient
+    from turnstone.core.workstream_lease import WorkstreamLease
 
 # ---------------------------------------------------------------------------
 # Cancellation support
@@ -2168,7 +2173,7 @@ class _SystemPrefixPlan:
 
     composition_epoch: int
     memory_signature: tuple[str, str, str, str, bool]
-    shared_state: tuple[str, set[str], bool]
+    shared_state: tuple[set[str], bool]
     agent_prompt_components: tuple[_PromptComponent, ...]
     system_messages: list[dict[str, Any]]
 
@@ -2966,10 +2971,9 @@ def _queued_row_owner(row: tuple[str, ...]) -> str:
     """Owner principal of a queued-message row; ``""`` = unowned/legacy.
 
     THE single reading of the tuple layout "owner is index 2 when
-    present" — the partition pop, the foreign-row predicate, the
-    identity-swap notice counting, and the advisory sender stamp must
-    all agree, or the before_spawn gate and the retention behavior
-    contradict each other.  Deliberately no ``.strip()``: owners are
+    present" — the partition pop, the foreign-row predicate and the
+    advisory sender stamp must all agree, or the before_spawn gate and
+    the retention behavior contradict each other.  Deliberately no ``.strip()``: owners are
     stripped at write time and legacy rows injected by tests must read
     back verbatim.
     """
@@ -3007,6 +3011,15 @@ class _QueuedFlushPlan:
     prefix: str
     items: tuple[tuple[str, _QueuedRow], ...]
     turn: _GenuineUserTurnPlan
+
+
+class _ConfigScalars(NamedTuple):
+    """A persisted config's numeric settings, parsed before anything is applied."""
+
+    temperature: float | None
+    max_tokens: int
+    token_budget: int
+    skill_version: int
 
 
 class ChatSession:
@@ -3058,6 +3071,7 @@ class ChatSession:
         persona_snapshot: PersonaSnapshot | None = None,
         model_binding: ResolvedModelBinding | None = None,
         fork_reservation_token: str = "",
+        workstream_lease: WorkstreamLease | None = None,
     ):
         if kind == WorkstreamKind.COORDINATOR and not user_id:
             # Coordinators carry real authority — they mint child-spawn
@@ -3263,12 +3277,10 @@ class ChatSession:
         # provider-cached prompt prefix. ``_known_senders`` (everyone who has
         # ever spoken here) gates the one-time "has joined" note and only
         # grows: deriving it from the in-memory slice alone would forget
-        # participants once compaction narrows history. ``_senders_dirty``
-        # memoizes recomputes per turn (the composer runs many times per
-        # turn); ``_db_senders_loaded`` marks the one-time full-history read.
+        # participants once compaction narrows history. ``_db_senders_loaded``
+        # marks the one-time full-history read.
         self._shared_workstream: bool = False
         self._known_senders: set[str] = set()
-        self._senders_dirty: bool = True
         self._db_senders_loaded: bool = False
         # user_id -> display username cache for shared-workstream labels / join
         # notes, so senders read as usernames (like the owner banner) not raw
@@ -3313,6 +3325,26 @@ class ChatSession:
         # Internal destination-incarnation witness installed by SessionManager
         # for exact lifecycle create/fork/delete operations.
         self._fork_reservation_token = fork_reservation_token
+        # Owner lease of the workstream this session writes (#988). Every
+        # durable write snapshots its fence at admission, next to the ws id,
+        # and storage refuses a fence another process has since replaced. A
+        # bare session (no manager) has none and writes unfenced, which
+        # storage refuses while another process holds a live lease. Set once,
+        # here: a session's workstream never changes.
+        self._workstream_lease = workstream_lease
+        self._workstream_lease_lost = False
+        # Whether settings are saved, for the save at the end of construction.  A session the
+        # manager builds (it holds the owner lease) reads strictly: a failed read raises rather
+        # than answer "nothing saved", which would save the constructor's defaults over the
+        # settings.  It reads here, before anything registers this object with shared state (the
+        # MCP listeners below), so that raise leaves nothing to undo.  One built without a lease
+        # (an eval or optimizer run's throwaway session) loads nothing a save could overwrite, so
+        # storage trouble must not stop it.
+        settings_saved = bool(
+            self._read_workstream_config(self._ws_id)
+            if workstream_lease is not None
+            else load_workstream_config(self._ws_id)
+        )
         self._memory_index_snapshot: dict[str, Any] | None = None
         # Generation whose accepted input contains at least one genuine human
         # USER turn.  Snapshot admission consults this witness at the provider
@@ -3333,8 +3365,8 @@ class ChatSession:
         # pre-persona workstream — all levers at their open positions,
         # byte-identical to today.
         # Persona levers — declared here for typing, populated from the stamp
-        # (or the open defaults) by the shared helper so construction and resume
-        # adoption can't drift on the default values.
+        # (or the open defaults) by _apply_persona_snapshot; a load compares its
+        # inverse, _current_persona_snapshot, with the stored stamp.
         self._persona_name: str
         self._persona_prompt: str
         self._persona_tools: frozenset[str] | None
@@ -3379,15 +3411,12 @@ class ChatSession:
         self._notify_count = 0
         # Watch support: server-level runner injected via set_watch_runner()
         self._watch_runner: Any = None  # WatchRunner | None
-        # The wake_fn last passed to set_watch_runner, kept so a non-fork
-        # resume() can re-register the dispatch closure under the adopted
-        # ws_id with the same wake wiring (registration follows identity).
+        # The wake_fn last passed to set_watch_runner, read at fire time.
         self._watch_wake_fn: Callable[[], object] | None = None
         # The dispatch closure this session last registered — the OWNER
-        # token for registry removals: multiple live sessions can
-        # transiently serve one ws_id (watch-restore shell vs a reopened
-        # pane; in-session /resume of an id open in another pane), and a
-        # blind removal on teardown would unregister the OTHER session.
+        # token for registry removals: a retired copy can tear down after a
+        # fresh session for the same ws_id registered, and a blind removal
+        # would unregister the live one.
         self._watch_dispatch_fn: Callable[[dict[str, Any], str], None] | None = None
         # Metacognitive nudges: ephemeral prompts for proactive memory use.
         # One ``NudgeQueue`` per session; producers tag each entry with a
@@ -3521,6 +3550,9 @@ class ChatSession:
         # provider request derives tool wire; terminal close may leave it set.
         self._mcp_projection_dirty = False
         self._publication_shutdown = False
+        # Set with the latch by a terminal stop (lease loss, host shutdown);
+        # never cleared, so a refused soft close cannot roll that stop back.
+        self._publication_terminal = False
         # Durable writes admitted by generation commits execute in the same
         # order as their in-memory/live commits, but never while
         # ``_generation_lock`` is held.  A slow database must backpressure the
@@ -3558,13 +3590,10 @@ class ChatSession:
         self._history_visibility_lock = threading.RLock()
         self._history_handoff_epoch = uuid.uuid4().hex
         self._history_handoff_revision = 0
-        # KEYED BY WORKSTREAM IDENTITY: set to the ws_id whose durable parent
-        # a keyed save observed hard-deleted (cross-node delete or prune),
-        # never cleared. Readers compare against the CURRENT self._ws_id, so
-        # an identity swap (/new, resume) structurally un-poisons the session
-        # object while the latch stays permanent for the workstream that died
-        # — no reset choreography to forget (round-4 review).
-        self._workstream_gone_ws: str | None = None
+        # Set once a keyed save observed this workstream's durable parent
+        # hard-deleted (cross-node delete or prune) or its lease taken by
+        # another process; never cleared.
+        self._workstream_gone = False
         self._pending_conversation_commits: collections.OrderedDict[
             str, _PendingConversationCommit
         ] = collections.OrderedDict()
@@ -3651,14 +3680,9 @@ class ChatSession:
         # Task agents keep their native tools; only the MCP surface closes.
         # Model authentication is host infrastructure, not an MCP tool-surface
         # capability. Its independent client remains available when the persona
-        # hides MCP tools, resources and prompts or a resume drops that surface.
+        # hides MCP tools, resources and prompts.
         self._model_token_client = model_token_client
         self._mcp_client = mcp_client if self._persona_mcp else None
-        # True when a real client was withheld by the persona gate (as
-        # opposed to no MCP in the deployment at all).  Mid-session
-        # ``resume()`` refuses to adopt an MCP-on stamp in that case —
-        # the dropped surface cannot be rebuilt post-construction.
-        self._mcp_gated_off = mcp_client is not None and not self._persona_mcp
         self._mcp_refresh_cb: Any = None  # Callable | None (avoid import)
         self._mcp_resource_cb: Any = None
         self._mcp_prompt_cb: Any = None
@@ -3814,21 +3838,27 @@ class ChatSession:
         # principal has been bound; constructor-time composition omits it.
         self.system_messages: list[dict[str, Any]] = []
         self._init_system_messages()
-        # Skip on rehydrate — ``_save_config`` is ``INSERT OR
-        # REPLACE`` per-key, and the persisted row is what
-        # ``ChatSession.resume`` is about to read back.  Pairs with
-        # ``SessionManager.open``'s saved-alias threading; together
-        # they keep reopened workstreams on their original model and
-        # settings instead of silently resetting to constructor
-        # defaults.
-        if not self._load_workstream_config(self._ws_id):
+        # Skip on rehydrate — ``_save_config`` is ``INSERT OR REPLACE`` per-key, and the
+        # persisted row is what :meth:`rehydrate` is about to read back.  Pairs with
+        # ``SessionManager.open``'s saved-alias threading; together they keep reopened
+        # workstreams on their original model and settings instead of silently resetting
+        # to constructor defaults.  ``settings_saved`` was read before any registration.
+        if not settings_saved:
             if self._fork_reservation_token:
-                storage = get_storage()
-                if not storage.finalize_deferred_create(
-                    self._ws_id,
-                    self._fork_reservation_token,
-                    config=self._config_for_save(),
-                ):
+                # A refusal or failure here leaves no session to close, so undo the MCP
+                # registrations: the client would hold this half-built object for good.
+                try:
+                    finalized = get_storage().finalize_deferred_create(
+                        self._ws_id,
+                        self._fork_reservation_token,
+                        config=self._config_for_save(),
+                        lease=self.write_fence(),
+                    )
+                except BaseException:
+                    self._unregister_mcp_listeners()
+                    raise
+                if not finalized:
+                    self._unregister_mcp_listeners()
                     raise RuntimeError(
                         f"workstream {self._ws_id!r} was retired during construction"
                     )
@@ -4227,21 +4257,38 @@ class ChatSession:
         """Capabilities from the current coherent primary lane."""
         return require_lane_capabilities(self._primary_lane())
 
-    def _load_workstream_config(self, ws_id: str) -> dict[str, str]:
-        """Best-effort durable workstream configuration read."""
-        return load_workstream_config(ws_id)
+    def _read_workstream_config(self, ws_id: str) -> dict[str, str]:
+        """Read this workstream's saved configuration, raising like the history read.
+
+        An unreadable configuration is never taken for an empty one, which would
+        run the workstream under defaults it never had, then save them over it.
+        """
+        try:
+            return get_storage().load_workstream_config(ws_id)
+        except Exception as exc:
+            log.warning("session.config_read_failed ws=%s", ws_id[:8], exc_info=True)
+            raise WorkstreamHistoryUnavailableError(ws_id) from exc
 
     def _load_message_turns(self, ws_id: str) -> list[Turn]:
-        """Best-effort durable resume read."""
-        return load_message_turns(ws_id, checkpointed=True)
+        """Read this workstream's history to load it.
 
-    def _save_last_error(self, ws_id: str, text: str) -> None:
+        A read that fails raises :class:`WorkstreamHistoryUnavailableError`: a
+        workstream is never loaded empty while its stored turns could not be
+        read.
+        """
+        try:
+            return read_message_turns(ws_id)
+        except Exception as exc:
+            log.warning("session.history_read_failed ws=%s", ws_id[:8], exc_info=True)
+            raise WorkstreamHistoryUnavailableError(ws_id) from exc
+
+    def _save_last_error(self, ws_id: str, text: str, lease: LeaseFence | None) -> None:
         """Best-effort fatal-error persistence."""
-        persist_last_error(ws_id, text)
+        persist_last_error(ws_id, text, lease=lease)
 
-    def _clear_last_error(self, ws_id: str) -> None:
+    def _clear_last_error(self, ws_id: str, lease: LeaseFence | None) -> None:
         """Best-effort recovery clear."""
-        clear_last_error(ws_id)
+        clear_last_error(ws_id, lease=lease)
 
     def _get_skill_by_name(self, name: str) -> dict[str, Any] | None:
         """Best-effort skill lookup."""
@@ -4288,7 +4335,7 @@ class ChatSession:
 
     def _save_config(self) -> None:
         """Persist LLM-affecting config so resumed workstreams behave identically."""
-        save_workstream_config(self._ws_id, self._config_for_save())
+        save_workstream_config(self._ws_id, self._config_for_save(), lease=self.write_fence())
 
     def _render_skill_body(
         self,
@@ -5312,12 +5359,8 @@ class ChatSession:
         A user-cancelled watch's last splat is informative (the reminder
         carries ``is_final=True``), not stale-noise to suppress.
 
-        The registration is keyed on ``self._ws_id`` AT CALL TIME.  The
-        identity-rebind sites (non-fork :meth:`resume`, ``/new``) call
-        :meth:`_follow_watch_registration` to move it onto the new id
-        (re-invoking this method with the ``wake_fn`` stored below) —
-        callers therefore don't need to order their own
-        ``set_watch_runner``/``resume`` calls.
+        The registration is keyed on ``self._ws_id``, which never changes
+        after construction.
         """
         self._watch_runner = runner
         self._watch_wake_fn = wake_fn
@@ -5330,9 +5373,8 @@ class ChatSession:
             # bubble (command preview + poll counter).  Sanitization, the
             # drop-oldest soft cap (latest output is most useful) and the
             # wake live on the shared external-event rail —
-            # ``self._watch_wake_fn`` is read at FIRE time there, so an
-            # identity rebind that re-invoked ``set_watch_runner`` is
-            # honored without rebuilding this closure.
+            # ``self._watch_wake_fn`` is read at FIRE time there, so a later
+            # ``set_watch_runner`` is honored without rebuilding this closure.
             if not isinstance(reminder, dict):
                 # Untrusted boundary: a non-dict reminder must drop silently
                 # (as the old empty-text early-return did), not TypeError out
@@ -5374,7 +5416,10 @@ class ChatSession:
         entries a user cancel demoted to ``"quiet"`` still occupy the
         budget.  The wake makes an already-idle workstream deliver the
         entry now — busy workstreams are safe, ``session_worker.send``
-        downgrades to a no-op while a worker owns the session.
+        downgrades to a no-op while a worker owns the session. One notice
+        bypasses the rail on purpose: the ownership-change watch notice
+        (:meth:`_end_foreign_node_watches`) is a durable system turn and
+        applies ``sanitize_payload`` itself.
         """
         if not isinstance(text, str):
             # Untrusted producers (watch reminder payloads) can carry a
@@ -5421,6 +5466,26 @@ class ChatSession:
                     nudge_type,
                     exc_info=True,
                 )
+
+    def _unregister_mcp_listeners(self) -> None:
+        """Remove this session's MCP change listeners (``close`` and a failed construction).
+
+        ``user_id`` MUST match the value used at registration: the listener identity is
+        ``(user_id, callback)``, not callback alone, and an unscoped removal would leave the
+        registration in place. ``bind_acting_user`` may have re-scoped the registrations since
+        construction, so the tracked ``_mcp_listener_user_id`` (not ``_mcp_user_id``) is the
+        registration identity.
+        """
+        mcp = self._mcp_client
+        if mcp and self._mcp_refresh_cb:
+            mcp.remove_listener(self._mcp_refresh_cb, user_id=self._mcp_listener_user_id)
+            self._mcp_refresh_cb = None
+        if mcp and self._mcp_resource_cb:
+            mcp.remove_resource_listener(self._mcp_resource_cb, user_id=self._mcp_listener_user_id)
+            self._mcp_resource_cb = None
+        if mcp and self._mcp_prompt_cb:
+            mcp.remove_prompt_listener(self._mcp_prompt_cb, user_id=self._mcp_listener_user_id)
+            self._mcp_prompt_cb = None
 
     def close(self) -> None:
         """Release resources (listener registrations, etc.).
@@ -5483,33 +5548,12 @@ class ChatSession:
         if output_guard is not None:
             output_guard.retire()
         with self._acting_user_bind_lock:
-            mcp = self._mcp_client
-            if mcp and self._mcp_refresh_cb:
-                # ``user_id`` MUST match the value used at registration —
-                # the listener identity is ``(user_id, callback)``, not
-                # callback alone. ``bind_acting_user`` may have re-scoped
-                # the registrations since construction, so the tracked
-                # ``_mcp_listener_user_id`` (not ``_mcp_user_id``) is the
-                # registration identity.
-                mcp.remove_listener(self._mcp_refresh_cb, user_id=self._mcp_listener_user_id)
-                self._mcp_refresh_cb = None
-            if mcp and self._mcp_resource_cb:
-                # ``user_id`` MUST mirror the value passed at registration —
-                # the listener identity is ``(user_id, callback)`` and an
-                # unscoped removal would leave the registration in place.
-                mcp.remove_resource_listener(
-                    self._mcp_resource_cb, user_id=self._mcp_listener_user_id
-                )
-                self._mcp_resource_cb = None
-            if mcp and self._mcp_prompt_cb:
-                mcp.remove_prompt_listener(self._mcp_prompt_cb, user_id=self._mcp_listener_user_id)
-                self._mcp_prompt_cb = None
+            self._unregister_mcp_listeners()
             self._mcp_projection_epoch += 1
         if self._watch_runner and self._watch_dispatch_fn is not None:
-            # Owner-checked: a watch-restore shell and a reopened pane can
-            # both have served this ws_id — tearing down one must not
-            # unregister the other (whose next fire would then restore a
-            # DUPLICATE auto-approved session onto the live conversation).
+            # Owner-checked: an unloaded copy of this workstream (retired
+            # after a lease loss, evicted) can close after a successor here
+            # registered the same ws_id, and must not unregister it.
             self._watch_runner.remove_dispatch_fn(self._ws_id, owner=self._watch_dispatch_fn)
         if self._coord_client is not None and hasattr(self._coord_client, "close"):
             try:
@@ -5523,41 +5567,6 @@ class ChatSession:
         # the next drain.
         self._background_shells.close()
         self._cleanup_skill_resources()
-
-    def _drop_mcp_surface(self) -> None:
-        """Drop the live MCP surface to match an adopted MCP-off stamp.
-
-        Mirror of the constructor's persona MCP gate for the one path that
-        changes the lever after construction: a mid-session ``resume()``
-        adopting an MCP-off stamp.  Deregisters the three listeners (same
-        ``_mcp_listener_user_id`` identity rule as ``close()``), drops the
-        client reference, and resets both toolsets to the builtin lists.
-        Reachable on BOTH kinds (#725): a coordinator resume() can adopt an
-        MCP-off stamp too — the kind-aware ``_set_session_tools`` resets it
-        to COORDINATOR_TOOLS, never the interactive lanes.  The caller
-        rebuilds tool search and recomposes the prompt.
-        """
-        with self._acting_user_bind_lock:
-            if self._mcp_client is None:
-                return
-            manager = self._mcp_client
-            if self._mcp_refresh_cb:
-                manager.remove_listener(self._mcp_refresh_cb, user_id=self._mcp_listener_user_id)
-                self._mcp_refresh_cb = None
-            if self._mcp_resource_cb:
-                manager.remove_resource_listener(
-                    self._mcp_resource_cb, user_id=self._mcp_listener_user_id
-                )
-                self._mcp_resource_cb = None
-            if self._mcp_prompt_cb:
-                manager.remove_prompt_listener(
-                    self._mcp_prompt_cb, user_id=self._mcp_listener_user_id
-                )
-                self._mcp_prompt_cb = None
-            self._mcp_projection_epoch += 1
-            self._mcp_client = None
-            self._set_session_tools([])
-            self._render_agent_tool_descriptions()
 
     def set_model_mint_client(self, client: ModelTokenClient | None) -> None:
         """Update model authentication independently of the persona's MCP surface."""
@@ -6513,7 +6522,6 @@ class ChatSession:
         current_title: str = "",
         *,
         principal_id: str | None = None,
-        captured_ws_id: str | None = None,
         captured_messages: tuple[Turn, ...] | None = None,
         origin_generation: int = 0,
     ) -> None:
@@ -6522,7 +6530,7 @@ class ChatSession:
         When *current_title* is provided (e.g. during a refresh), the prompt
         asks the LLM to produce a **different** title.
         """
-        ws_id = captured_ws_id or self._ws_id
+        ws_id = self._ws_id
         captured_principal = (
             (self._mcp_effective_user_id or "").strip()
             if principal_id is None
@@ -6561,10 +6569,8 @@ class ChatSession:
             if not user_msg:
                 log.info("ws.title.gen_skip", ws_id=ws_id[:8], reason="no_user_message")
                 # Broadcast current name so UI resets any "refreshing" indicator
-                if (
-                    current_title
-                    and self._ws_id == ws_id
-                    and self._title_owner_is_valid(origin_generation, reset_latch=True)
+                if current_title and self._title_owner_is_valid(
+                    origin_generation, reset_latch=True
                 ):
                     self.ui.on_rename(current_title)
                 return
@@ -6681,25 +6687,30 @@ class ChatSession:
                 origin_generation,
                 reset_latch=True,
             )
-            if title and self._ws_id == ws_id and title_owner_valid:
+            if title and title_owner_valid:
                 log.info("ws.title.updating", ws_id=ws_id[:8], title=title)
-                update_workstream_title(ws_id, title)
-                self.ui.on_rename(title)
-                log.info("ws.title.success", ws_id=ws_id[:8], title=title)
+                if update_workstream_title(ws_id, title, lease=self.write_fence()):
+                    self.ui.on_rename(title)
+                    log.info("ws.title.success", ws_id=ws_id[:8], title=title)
+                else:
+                    log.info("ws.title.not_written", ws_id=ws_id[:8], title=title)
+                    # The new title is announced only once written; re-send the
+                    # current name so the UI resets the "refreshing" indicator.
+                    if current_title:
+                        self.ui.on_rename(current_title)
             else:
                 log.info(
                     "ws.title.skip",
                     ws_id=ws_id[:8],
-                    reason="empty_title_or_ws_changed",
+                    reason="empty_title_or_owner_retired",
                     title=title,
                 )
                 # Broadcast current name so the UI resets the "refreshing" indicator
-                if current_title and self._ws_id == ws_id and title_owner_valid:
+                if current_title and title_owner_valid:
                     self.ui.on_rename(current_title)
         except Exception as e:
-            # Only reset if ws_id hasn't changed (e.g., via /resume) to
-            # avoid re-enabling titling for a different workstream.
-            if self._ws_id == ws_id and self._title_owner_is_valid(
+            # Re-enable titling only while this generation still owns it.
+            if self._title_owner_is_valid(
                 origin_generation,
                 reset_latch=True,
             ):
@@ -6758,32 +6769,46 @@ class ChatSession:
             trusted_internal=trusted_internal,
             expected_session=expected_session,
         )
-        if not self.resume(source_ws_id, _fork_snapshot=snapshot):
-            # A committed snapshot, including an empty one, must always adopt.
-            # Treat a refusal as an invariant break so the create path rolls the
-            # destination back instead of advertising a half-live fork.
-            raise RuntimeError("committed fork snapshot could not be adopted")
+        self.adopt_fork_snapshot(source_ws_id, snapshot)
         return snapshot
 
-    def resume(
+    def rehydrate(self) -> bool:
+        """Load this session's own saved workstream and continue it.
+
+        The manager calls this right after building the session for a saved
+        workstream (:meth:`SessionManager.open`); a session's workstream id
+        never changes after construction. Returns ``False`` when the
+        workstream has no stored turns, whose saved settings still apply; a
+        history or configuration that cannot be read raises
+        :class:`WorkstreamHistoryUnavailableError`. Loading also ends this
+        workstream's watches bound to another node, durably and once, telling
+        the model only when stored turns were loaded
+        (:meth:`_end_foreign_node_watches`).
+        """
+        return self._resume(self._ws_id, _fork_snapshot=None)
+
+    def adopt_fork_snapshot(self, source_ws_id: str, snapshot: ForkCloneSnapshot) -> None:
+        """Adopt a committed fork clone's history and config under this workstream's id."""
+        self._resume(source_ws_id, _fork_snapshot=snapshot)
+
+    def _resume(
         self,
         ws_id: str,
         *,
-        _fork_snapshot: ForkCloneSnapshot | None = None,
+        _fork_snapshot: ForkCloneSnapshot | None,
     ) -> bool:
-        """Load messages from a previous workstream and resume it.
+        """Load a saved conversation into this session.
 
-        Without ``_fork_snapshot``, replaces the current conversation with
-        the loaded messages and adopts ``ws_id`` so new messages continue
-        in the same workstream.
-
-        With a committed ``_fork_snapshot``, adopts its history and config
-        while keeping ``self._ws_id`` unchanged. :meth:`fork_from_storage`
-        supplies that snapshot after atomically cloning the source.
+        Without ``_fork_snapshot``, ``ws_id`` is this session's own
+        workstream (:meth:`rehydrate`): its stored messages become the
+        conversation. With a committed ``_fork_snapshot``, adopts its history
+        and config while keeping ``self._ws_id`` unchanged;
+        :meth:`fork_from_storage` supplies that snapshot after atomically
+        cloning the source ``ws_id``.
 
         Restores persisted config (temperature, reasoning_effort, etc.)
-        so the resumed/forked workstream behaves identically to the
-        original.  Returns True on success.
+        so the reopened/forked workstream behaves identically to the
+        original, history or not. Returns whether any turns were loaded.
         """
         from turnstone.core.node_affinity import require_execution_node
 
@@ -6798,32 +6823,22 @@ class ChatSession:
             if _fork_snapshot is not None
             else self._load_message_turns(ws_id)
         )
-        if not turns and _fork_snapshot is None:
-            return False
-        # Pre-rebind identity, for moving the watch dispatch registration
-        # onto the adopted id at the end of a successful non-fork resume.
-        old_ws_id = self._ws_id
         # Load persisted config and parse the persona stamp BEFORE touching
-        # session identity/history: a corrupt stamp must raise while this
-        # session is still intact — the web /command surface reports the
-        # error and continues on the CURRENT workstream, and a half-adopted
-        # resume would run the corrupt target under this session's envelope,
-        # after which the next _save_config would "repair" the target's
-        # stamp with a persona the operator never chose for it.
+        # session history: a corrupt stamp must raise while this session is
+        # still intact, never run the workstream under an envelope the
+        # operator did not choose (the next _save_config would then "repair"
+        # the stamp with a persona nobody picked).
         config = (
             dict(_fork_snapshot.config)
             if _fork_snapshot is not None
-            else self._load_workstream_config(ws_id)
+            else self._read_workstream_config(ws_id)
         )
         resumed_attached_project_id = ""
         resumed_incarnation_token = ""
         if _fork_snapshot is None:
             # History loading can overlap a same-ID replacement. Keep this
             # authoritative check after loading as well as the cheap preflight.
-            storage = get_storage()
-            target_row = storage.ensure_workstream_incarnation_snapshot(ws_id)
-            if target_row is not None:
-                require_execution_node(target_row.get("required_node_id"), self._node_id)
+            target_row, resumed_incarnation_token = self._incarnation_snapshot(ws_id)
             raw_project_id = target_row.get("project_id") if target_row is not None else None
             target_project_id = (
                 raw_project_id.strip()
@@ -6831,74 +6846,40 @@ class ChatSession:
                 else ""
             )
             resumed_attached_project_id = target_project_id
-            resumed_incarnation_token = (
-                str(target_row.get("fork_reservation_token") or "")
-                if target_row is not None
-                else ""
-            )
-            if target_row is not None and not resumed_incarnation_token:
-                raise RuntimeError(f"workstream {ws_id!r} has no durable incarnation token")
-        # Parse persisted scalars before adopting identity or history so a
-        # corrupt value leaves the live session intact. The create lifecycle
-        # rolls back a committed fork if snapshot adoption fails.
-        raw_temp = config.get("temperature") if config else None
-        parsed_temperature = float(raw_temp) if raw_temp not in (None, "", "None") else None
-        parsed_max_tokens = (
-            int(config["max_tokens"]) if config and "max_tokens" in config else self.max_tokens
-        )
-        parsed_token_budget = (
-            int(config["token_budget"] or "0")
-            if config and "token_budget" in config
-            else self._token_budget
-        )
-        parsed_skill_version = (
-            int(config["applied_skill_version"] or "0")
-            if config and "applied_skill_version" in config
-            else self._applied_skill_version
-        )
+        # Parse persisted scalars before touching history so a corrupt value
+        # leaves the live session intact. The create lifecycle rolls back a
+        # committed fork if snapshot adoption fails.
+        scalars = self._parse_config_scalars(config)
         snap = snapshot_from_config(config or {})
-        if _fork_snapshot is not None and snap != self._current_persona_snapshot():
-            # MCP visibility is a constructor-time gate. The clone checks the
-            # source persona before commit; adoption must also match the live
-            # session's envelope.
-            raise ValueError(f"cannot fork {ws_id}: source persona changed during creation")
+        if snap != self._current_persona_snapshot():
+            # The persona is construction-time (MCP visibility above all): the
+            # manager builds a session with its workstream's stored stamp, and
+            # a fork's clone checks the source's before commit. A session built
+            # under another persona (a factory that ignored the stamp, a source
+            # changed during creation) is refused rather than run out of step
+            # with the stamp, which its next _save_config would rewrite.
+            if _fork_snapshot is not None:
+                raise ValueError(f"cannot fork {ws_id}: source persona changed during creation")
+            raise ValueError(f"cannot load {ws_id}: this session was built under another persona")
         if _fork_snapshot is None:
-            if (snap.mcp if snap else True) and self._mcp_gated_off:
-                # The MCP lever is construction-time: narrowing is applied
-                # in place during adoption below, but a session whose
-                # persona dropped the client at construction cannot rebuild
-                # it — refuse rather than run out of step with the stamp.
-                raise ValueError(
-                    f"cannot resume {ws_id} in place: its persona enables "
-                    "MCP, which this session's persona dropped at "
-                    "construction — open the workstream fresh instead"
-                )
-            self._ws_id = ws_id
             self._fork_reservation_token = resumed_incarnation_token
             self._memory_attached_project_id = resumed_attached_project_id
-            # A non-fork resume repoints this session at a DIFFERENT existing
-            # workstream's identity (fork keeps self._ws_id, so its nonces stay
-            # correctly scoped to the ws they were minted for). The sender-label
-            # and operator-fold nonces are trust anchors declared in that OTHER
-            # workstream's cached system prefix; carrying them across to this
-            # one would let a token that leaked there forge a marker here —
-            # exactly the cross-workstream leak class this remint (and
-            # _reset_shared_state below) closes.
-            self._envelope_nonce = fence.mint_nonce()
-            self._sender_label_nonce = fence.mint_nonce()
         self.messages = turns
-        # Shared-workstream state is per-workstream: this session object now
-        # points at (possibly different) history, so forget and re-derive.
+        with self._history_handoff_lock:
+            # The transcript was replaced wholesale: no history token minted
+            # before this stays valid.
+            self._history_handoff_revision += 1
+        # The conversation was replaced: re-derive the shared-workstream state.
         self._reset_shared_state()
         self._memory_index_snapshot = None
-        # A resume adopts another durable workstream identity. Its composed
-        # prefix cannot carry over.
+        # The history, config and persona loaded here replace what the
+        # composed prefix was built from.
         self._invalidate_system_prefix()
         self._read_files.clear()
         self._repeat_detector.clear()
         self._last_usage = None
         self._invalidate_token_calibration_anchors()
-        self._title_generated = True  # don't re-title resumed workstreams
+        self._title_generated = bool(turns)  # don't re-title a saved conversation
         self._msg_tokens = [
             max(1, int(self._msg_char_count(m) / self._chars_per_token)) for m in self.messages
         ]
@@ -6915,124 +6896,14 @@ class ChatSession:
             resume_diagnostics.model,
         )
         # Restore persisted config (loaded and stamp-parsed above, before
-        # any session state was touched).
-        # Adopt the persona stamp of the workstream being resumed — a
-        # non-fork resume adopts the target's identity, so keeping this
-        # session's creation-time stamp would clobber the target's on the
-        # next _save_config.  The prompt/visibility/memory levers reapply
-        # via the _init_system_messages() recompose below and the per-call
-        # visibility filter; the MCP lever narrows in place when the
-        # adopted stamp is MCP-off (_drop_mcp_surface below — widening was
-        # refused before adoption).  A fork keeps its own creation-time
-        # stamp.  Corrupt stamps raise — never silently rewritten.
-        if _fork_snapshot is None:
-            self._apply_persona_snapshot(snap)
-            if not self._persona_mcp and self._mcp_client is not None:
-                self._drop_mcp_surface()
-            # Re-gate tool search under the adopted stamp: a hard set must
-            # drop the ToolSearchManager (else the recomposed prompt keeps
-            # the tool_search hint and the expanded-names escape hatch keeps
-            # since-discovered tools visible), and a soft set must gain one.
-            self._rebuild_tool_search()
+        # any session state was touched; the persona already matches it).
         if config:
-            # Restore model via registry (same path as /model command).
-            # An alias vanishing between the ``has_alias`` check and the
-            # resolve returns None with the binding untouched, so the
-            # constructor's coherent default falls through to the
-            # unreachable-alias branch instead of raising out of the resume.
-            saved_alias = config.get("model_alias", "")
-            saved_model = config.get("model", "")
-            bound_cfg: ModelConfig | None = None
-            bind_cause_logged = False
-            if saved_alias and self._registry and self._registry.has_alias(saved_alias):
-                try:
-                    bind_res = self._bind_model_from_registry(saved_alias)
-                    bound_cfg = bind_res[0] if bind_res is not None else None
-                except ModelClientConstructionError as exc:
-                    # The saved alias IS in the registry; its client failed
-                    # to construct. Log that cause — the unreachable-alias
-                    # arm below would point operators at a registry state
-                    # that is not the problem — and keep the constructor's
-                    # default binding, as for a missing alias.
-                    default_diagnostics = lane_diagnostics(self._primary_lane())
-                    log.warning(
-                        "Resume: saved alias=%r is in the registry but its "
-                        "client could not be constructed (%s); keeping "
-                        "default provider=%s model=%s",
-                        saved_alias,
-                        exc,
-                        default_diagnostics.provider_type,
-                        default_diagnostics.model,
-                    )
-                    bind_cause_logged = True
-            if bound_cfg is not None:
-                self.context_window = bound_cfg.context_window
-                if not self._manual_tool_truncation:
-                    self.tool_truncation = _auto_tool_truncation_chars(
-                        bound_cfg.context_window, self._chars_per_token
-                    )
-                bound_diagnostics = lane_diagnostics(self._primary_lane())
-                log.info(
-                    "Resume: resolved alias=%s → provider=%s, model=%s, ctx=%d",
-                    saved_alias,
-                    bound_diagnostics.provider_type,
-                    bound_diagnostics.model,
-                    bound_cfg.context_window,
-                )
-            elif not bind_cause_logged and (saved_alias or saved_model):
-                # Saved alias is unset or no longer in the registry.
-                # Don't copy ``saved_model`` onto the constructor's
-                # default provider/client — pairing a removed model
-                # name with the default provider produces an API call
-                # the default provider can't service, which is exactly
-                # the broken state operators see today on the reopen
-                # path.  The constructor already resolved a coherent
-                # default; keep it intact and warn so the missing
-                # alias is auditable.
-                default_diagnostics = lane_diagnostics(self._primary_lane())
-                log.warning(
-                    "Resume: saved alias=%r model=%r unreachable; "
-                    "keeping default provider=%s model=%s",
-                    saved_alias,
-                    saved_model,
-                    default_diagnostics.provider_type,
-                    default_diagnostics.model,
-                )
-            if "temperature" in config:
-                # "" = unset (wire omission); "None" guards rows written
-                # by the brief str(None) era of _save_config.
-                self.temperature = parsed_temperature
-            if "reasoning_effort" in config:
-                self.reasoning_effort = config["reasoning_effort"] or None
-            if "max_tokens" in config:
-                self.max_tokens = parsed_max_tokens
-            if "instructions" in config:
-                self.instructions = config["instructions"] or None
-            if "skill" in config or "template" in config:
-                self._skill_name = config.get("skill") or config.get("template") or None
-                # Restore #572's invocation-args payload BEFORE
-                # ``_load_skills`` so the substitution pass renders with
-                # the original args instead of an empty default.
-                self._skill_arguments = config.get("skill_arguments", "") or ""
-                self._load_skills()
-            if "token_budget" in config:
-                self._token_budget = parsed_token_budget
-            if "applied_skill_id" in config:
-                self._applied_skill_id = config["applied_skill_id"]
-            if "applied_skill_version" in config:
-                self._applied_skill_version = parsed_skill_version
-            if "applied_skill_content" in config:
-                self._applied_skill_content = config["applied_skill_content"]
-                if self._applied_skill_content:
-                    self._skill_content = self._applied_skill_content
-                    self._skill_name = None
-            if "notify_on_complete" in config:
-                self._notify_on_complete = config["notify_on_complete"]
+            self._apply_persisted_config(config, scalars)
         if _fork_snapshot is not None:
             # The atomic clone persisted every row self.messages holds — the
             # persisted history under this ws_id cannot contain any sender
-            # _recompute_shared_state's in-memory scan won't already find, so
-            # the one-time persisted-sender read (needed for a real compaction-
+            # the composer's in-memory scan won't already find, so the
+            # one-time persisted-sender read (needed for a real compaction-
             # narrowed resume) would be a pure redundant DB round-trip here.
             # Mark it already-satisfied; the in-memory scan alone is complete.
             self._db_senders_loaded = True
@@ -7049,42 +6920,142 @@ class ChatSession:
                 message_count=len(self.messages),
             )
 
-        if _fork_snapshot is None:
-            self._follow_watch_registration(old_ws_id)
         self._init_system_messages()
         self._activate_token_calibration(self._primary_lane())
-        return True
+        if _fork_snapshot is None:
+            self._end_foreign_node_watches(tell=bool(turns))
+        return bool(turns)
 
-    def _follow_watch_registration(self, old_ws_id: str) -> None:
-        """Move the watch dispatch registration onto the current
-        ``_ws_id`` after an identity rebind (non-fork :meth:`resume`,
-        ``/new``).
+    def _parse_config_scalars(self, config: dict[str, str] | None) -> _ConfigScalars:
+        """Parse a persisted config's numeric settings, raising on a corrupt value."""
+        raw_temp = config.get("temperature") if config else None
+        return _ConfigScalars(
+            temperature=float(raw_temp) if raw_temp not in (None, "", "None") else None,
+            max_tokens=(
+                int(config["max_tokens"]) if config and "max_tokens" in config else self.max_tokens
+            ),
+            token_budget=(
+                int(config["token_budget"] or "0")
+                if config and "token_budget" in config
+                else self._token_budget
+            ),
+            skill_version=(
+                int(config["applied_skill_version"] or "0")
+                if config and "applied_skill_version" in config
+                else self._applied_skill_version
+            ),
+        )
 
-        The registry is keyed by ``_ws_id`` at registration time.
-        Without the move, watches stamped with the NEW id never find
-        this live session — every fire takes the restore path and
-        spawns a DUPLICATE auto-approved session racing writes into the
-        same conversation — while fires for the OLD id keep delivering
-        into a session that no longer displays that conversation.  The
-        new key goes live BEFORE the old one is removed so no fire can
-        observe a window with no registration at all (which would
-        likewise divert to the restore path).  If ANOTHER live session
-        already serves the new id (in-session /resume of a workstream
-        open in a second pane — an inherently degenerate two-writers
-        state), its registration is NOT stolen: the original owner
-        keeps its watch fires.  Removal of the old key is owner-checked
-        for the same reason.
+    def _apply_persisted_config(self, config: dict[str, str], scalars: _ConfigScalars) -> None:
+        """Apply a persisted config's model, sampling, instructions and skill settings.
+
+        The persona stamp is applied separately: it is construction-time.
         """
-        if self._watch_runner is None:
-            return
-        old_fn = self._watch_dispatch_fn
-        existing = self._watch_runner.get_dispatch_fn(self._ws_id)
-        if existing is None or existing is old_fn:
-            self.set_watch_runner(self._watch_runner, wake_fn=self._watch_wake_fn)
-        else:
-            log.warning("watch_registry.adopted_id_owned_elsewhere ws=%s", self._ws_id[:8])
-        if old_ws_id != self._ws_id:
-            self._watch_runner.remove_dispatch_fn(old_ws_id, owner=old_fn)
+        # Restore model via registry (same path as /model command).
+        # An alias vanishing between the ``has_alias`` check and the
+        # resolve returns None with the binding untouched, so the
+        # constructor's coherent default falls through to the
+        # unreachable-alias branch instead of raising out of the resume.
+        saved_alias = config.get("model_alias", "")
+        saved_model = config.get("model", "")
+        bound_cfg: ModelConfig | None = None
+        bind_cause_logged = False
+        if saved_alias and self._registry and self._registry.has_alias(saved_alias):
+            try:
+                bind_res = self._bind_model_from_registry(saved_alias)
+                bound_cfg = bind_res[0] if bind_res is not None else None
+            except ModelClientConstructionError as exc:
+                # The saved alias IS in the registry; its client failed
+                # to construct. Log that cause — the unreachable-alias
+                # arm below would point operators at a registry state
+                # that is not the problem — and keep the constructor's
+                # default binding, as for a missing alias.
+                default_diagnostics = lane_diagnostics(self._primary_lane())
+                log.warning(
+                    "Resume: saved alias=%r is in the registry but its "
+                    "client could not be constructed (%s); keeping "
+                    "default provider=%s model=%s",
+                    saved_alias,
+                    exc,
+                    default_diagnostics.provider_type,
+                    default_diagnostics.model,
+                )
+                bind_cause_logged = True
+        if bound_cfg is not None:
+            self.context_window = bound_cfg.context_window
+            if not self._manual_tool_truncation:
+                self.tool_truncation = _auto_tool_truncation_chars(
+                    bound_cfg.context_window, self._chars_per_token
+                )
+            bound_diagnostics = lane_diagnostics(self._primary_lane())
+            log.info(
+                "Resume: resolved alias=%s → provider=%s, model=%s, ctx=%d",
+                saved_alias,
+                bound_diagnostics.provider_type,
+                bound_diagnostics.model,
+                bound_cfg.context_window,
+            )
+        elif not bind_cause_logged and (saved_alias or saved_model):
+            # Saved alias is unset or no longer in the registry.
+            # Don't copy ``saved_model`` onto the constructor's
+            # default provider/client — pairing a removed model
+            # name with the default provider produces an API call
+            # the default provider can't service, which is exactly
+            # the broken state operators see today on the reopen
+            # path.  The constructor already resolved a coherent
+            # default; keep it intact and warn so the missing
+            # alias is auditable.
+            default_diagnostics = lane_diagnostics(self._primary_lane())
+            log.warning(
+                "Resume: saved alias=%r model=%r unreachable; keeping default provider=%s model=%s",
+                saved_alias,
+                saved_model,
+                default_diagnostics.provider_type,
+                default_diagnostics.model,
+            )
+        if "temperature" in config:
+            # "" = unset (wire omission); "None" guards rows written
+            # by the brief str(None) era of _save_config.
+            self.temperature = scalars.temperature
+        if "reasoning_effort" in config:
+            self.reasoning_effort = config["reasoning_effort"] or None
+        if "max_tokens" in config:
+            self.max_tokens = scalars.max_tokens
+        if "instructions" in config:
+            self.instructions = config["instructions"] or None
+        if "skill" in config or "template" in config:
+            self._skill_name = config.get("skill") or config.get("template") or None
+            # Restore #572's invocation-args payload BEFORE
+            # ``_load_skills`` so the substitution pass renders with
+            # the original args instead of an empty default.
+            self._skill_arguments = config.get("skill_arguments", "") or ""
+            self._load_skills()
+        if "token_budget" in config:
+            self._token_budget = scalars.token_budget
+        if "applied_skill_id" in config:
+            self._applied_skill_id = config["applied_skill_id"]
+        if "applied_skill_version" in config:
+            self._applied_skill_version = scalars.skill_version
+        if "applied_skill_content" in config:
+            self._applied_skill_content = config["applied_skill_content"]
+            if self._applied_skill_content:
+                self._skill_content = self._applied_skill_content
+                self._skill_name = None
+        if "notify_on_complete" in config:
+            self._notify_on_complete = config["notify_on_complete"]
+
+    def adopt_settings(self, config: dict[str, str]) -> None:
+        """Take another session's saved settings (``_config_for_save``), as CLI ``/new`` does.
+
+        Applied the way a reopened workstream applies its own config: model,
+        sampling, instructions, skill and its snapshot, token budget and the
+        completion notice. The persona is construction-time and stays this
+        session's own.
+        """
+        self._apply_persisted_config(config, self._parse_config_scalars(config))
+        self._init_system_messages()
+        self._activate_token_calibration(self._primary_lane())
+        self._save_config()
 
     def _nudges_enabled(self, nudge_type: str) -> bool:
         """Config gate + required-tool visibility for ADVICE nudges.
@@ -7414,7 +7385,6 @@ class ChatSession:
                 self._known_senders,
                 self._shared_workstream,
                 self._db_senders_loaded,
-                self._senders_dirty,
             ) = shared_state
             self._memory_index_snapshot = snapshot
             self._system_prefix_signature = plan.memory_signature
@@ -7587,7 +7557,7 @@ class ChatSession:
         composition_principal_id = memory_access.principal_id or None
         shared_state_plan = self._plan_shared_state()
         owner = (self._mcp_user_id or "").strip()
-        planned_senders = set(self._known_senders) | shared_state_plan[1]
+        planned_senders = set(self._known_senders) | shared_state_plan[0]
         planned_senders.update(
             s
             for turn in self.messages
@@ -8480,109 +8450,42 @@ class ChatSession:
             log.debug("display-name lookup failed for user=%s", user_id, exc_info=True)
         return name
 
-    def _invalidate_shared_state(self) -> None:
-        """Mark shared-workstream state for recompute.
-
-        The cheap flag half of the per-turn memo in
-        :meth:`_recompute_shared_state`; called when a sender-stamped user turn
-        is appended (the only live event that can change the participant set)."""
-        self._senders_dirty = True
-
     def _reset_shared_state(self) -> None:
-        """Forget shared-workstream state entirely.
+        """Forget shared-workstream state entirely, so the next compose re-derives it.
 
-        For :meth:`resume`, which points this session object at (possibly
-        different) history — the monotonic guarantees in
-        :meth:`_recompute_shared_state` hold per *workstream*, not per session
-        object, so carrying senders across a resume would leak one
-        workstream's participant set into another's framing."""
+        For a history load (:meth:`rehydrate`, :meth:`adopt_fork_snapshot`),
+        which replaces the conversation the state was derived from, and for a
+        rewind, which can drop the only turns that made the workstream shared:
+        the monotonic guarantees in :meth:`_resolved_shared_state_plan` hold
+        per history."""
         self._shared_workstream = False
         self._known_senders = set()
         self._db_senders_loaded = False
-        self._senders_dirty = True
 
-    def _load_persisted_senders(self) -> set[str]:
-        """One-time full-history sender read for :meth:`_recompute_shared_state`.
+    def _plan_shared_state(self) -> tuple[set[str], bool]:
+        """Read the persisted sender seed without mutating session state.
 
         Compaction narrows ``self.messages`` to a ``[summary] + [tail]`` slice,
         so scanning it alone forgets participants whose turns were summarized
-        away. The persisted rows keep every sender ever stamped; read them once
-        per workstream. A storage error leaves ``_db_senders_loaded`` unset so
-        the next recompute (at most one per user turn, via the memo) retries
-        instead of pinning an incomplete participant set for the session's
-        lifetime.
-
-        ``_db_senders_loaded`` is latched True only if ``self._ws_id`` is still
-        the workstream this read queried: a concurrent :meth:`resume` can
-        repoint it between the query and the flag write, and marking the read
-        "done" for the NEW workstream (whose senders we never loaded) would let
-        a later recompute skip its persisted seed and misframe it. When they
-        diverge, the caller's own ws_id-snapshot guard discards the returned
-        set, and the flag stays False so the correct workstream is read next."""
-        ws_id = self._ws_id
-        try:
-            senders = {s for s in get_storage().list_message_senders(ws_id) if s}
-            if self._ws_id == ws_id:
-                self._db_senders_loaded = True
-            return senders
-        except Exception:
-            log.debug("persisted-sender load failed for ws=%s", ws_id, exc_info=True)
-        return set()
-
-    def _plan_shared_state(self) -> tuple[str, set[str], bool]:
-        """Read the persisted sender seed without mutating session state."""
-        ws_id = self._ws_id
+        away. The persisted rows keep every sender ever stamped; they are read
+        once per history. A storage error reports the read incomplete, so the
+        next system-prompt compose retries instead of pinning an incomplete
+        participant set.
+        """
         if self._db_senders_loaded:
-            return ws_id, set(), True
+            return set(), True
         try:
-            return ws_id, {s for s in get_storage().list_message_senders(ws_id) if s}, True
+            return {s for s in get_storage().list_message_senders(self._ws_id) if s}, True
         except Exception:
-            log.debug("persisted-sender load failed for ws=%s", ws_id, exc_info=True)
-            return ws_id, set(), False
+            log.debug("persisted-sender load failed for ws=%s", self._ws_id, exc_info=True)
+            return set(), False
 
     def _resolved_shared_state_plan(
         self,
-        ws_id: str,
         persisted_senders: set[str],
         read_complete: bool,
-    ) -> tuple[set[str], bool, bool, bool]:
-        """Return the sender state produced by one pre-read snapshot."""
-        known_senders = set(self._known_senders)
-        shared_workstream = self._shared_workstream
-        db_senders_loaded = self._db_senders_loaded
-        senders_dirty = self._senders_dirty
-        if self._ws_id == ws_id:
-            owner = (self._mcp_user_id or "").strip()
-            live_senders = {
-                s
-                for turn in self.messages
-                if turn.role is Role.USER and (s := (turn.meta.extra.get("sender") or "").strip())
-            }
-            known_senders |= persisted_senders | live_senders
-            if not shared_workstream:
-                shared_workstream = any(s != owner for s in known_senders)
-            if read_complete:
-                db_senders_loaded = True
-            if db_senders_loaded:
-                senders_dirty = False
-        return known_senders, shared_workstream, db_senders_loaded, senders_dirty
-
-    def _apply_shared_state_plan(
-        self,
-        ws_id: str,
-        persisted_senders: set[str],
-        read_complete: bool,
-    ) -> None:
-        """Apply one pre-read sender snapshot at an owner-fenced seam."""
-        (
-            self._known_senders,
-            self._shared_workstream,
-            self._db_senders_loaded,
-            self._senders_dirty,
-        ) = self._resolved_shared_state_plan(ws_id, persisted_senders, read_complete)
-
-    def _recompute_shared_state(self) -> None:
-        """Refresh shared-workstream state from history — monotonically.
+    ) -> tuple[set[str], bool, bool]:
+        """Return the sender state produced by one pre-read snapshot — monotonically.
 
         ``_known_senders`` unions the current trajectory's recorded senders
         (the ``meta.extra["sender"]`` stamped by :meth:`_append_user_turn`)
@@ -8593,23 +8496,25 @@ class ChatSession:
         reverting would misattribute a known-multi-user conversation AND flip
         the banner bytes, invalidating the provider prompt-prefix cache that
         the hour-rounded timestamp above exists to protect.
+        """
+        owner = (self._mcp_user_id or "").strip()
+        live_senders = {
+            s
+            for turn in self.messages
+            if turn.role is Role.USER and (s := (turn.meta.extra.get("sender") or "").strip())
+        }
+        known_senders = set(self._known_senders) | persisted_senders | live_senders
+        shared_workstream = self._shared_workstream or any(s != owner for s in known_senders)
+        db_senders_loaded = self._db_senders_loaded or read_complete
+        return known_senders, shared_workstream, db_senders_loaded
 
-        Memoized per turn via ``_senders_dirty``: system-prompt composition
-        runs many times within a turn (state transitions, MCP refresh, tool
-        results) but the sender set only changes on user-turn append and
-        history (re)load.
-
-        ``resume()`` can run concurrently with an MCP background-thread
-        callback that also calls this (:meth:`_init_system_messages` is
-        invoked from the pool listener callbacks registered in ``__init__``,
-        on the client's own thread, not the request thread). A snapshot of
-        ``self._ws_id`` before and after the scan detects the case where
-        ``resume()`` repointed this session at a different workstream mid-scan
-        and discards the now-mixed-workstream result instead of committing it,
-        leaving the flag dirty for a subsequent, consistent recompute."""
-        if not self._senders_dirty:
-            return
-        self._apply_shared_state_plan(*self._plan_shared_state())
+    def _apply_shared_state_plan(self, persisted_senders: set[str], read_complete: bool) -> None:
+        """Apply one pre-read sender snapshot at an owner-fenced seam."""
+        (
+            self._known_senders,
+            self._shared_workstream,
+            self._db_senders_loaded,
+        ) = self._resolved_shared_state_plan(persisted_senders, read_complete)
 
     def _maybe_note_new_participant(
         self,
@@ -8638,7 +8543,6 @@ class ChatSession:
         # read while the lifecycle lock is held.
         self._known_senders.add(s)
         self._shared_workstream = self._shared_workstream or s != owner
-        self._senders_dirty = not self._db_senders_loaded
         became_shared = not was_shared and self._shared_workstream
         if became_shared and recompose_system:
             # First non-owner sender: recompose so the banner gains the shared
@@ -8829,9 +8733,10 @@ class ChatSession:
 
         if state in ("idle", "running") and self._has_persisted_error:
             persist_ws_id = self._ws_id
+            persist_fence = self.write_fence()
             error_revision = self._persisted_error_revision
             if deferred_persistence is None:
-                self._clear_last_error(persist_ws_id)
+                self._clear_last_error(persist_ws_id, persist_fence)
                 self._has_persisted_error = False
                 self._conversation_persistence_fatal_revision = None
             else:
@@ -8839,7 +8744,7 @@ class ChatSession:
                 def _clear_if_owned() -> None:
                     if not _owner_valid():
                         return
-                    self._clear_last_error(persist_ws_id)
+                    self._clear_last_error(persist_ws_id, persist_fence)
                     # Storage stays outside the generation lock.  Re-check
                     # after it returns so a successor or a newer same-owner
                     # fatal error keeps the latch set and receives its own
@@ -9038,11 +8943,12 @@ class ChatSession:
         except Exception:
             log.debug("session.on_error_dispatch_failed", exc_info=True)
         persist_ws_id = self._ws_id
+        persist_fence = self.write_fence()
         if deferred_persistence is None:
-            self._save_last_error(persist_ws_id, safe)
+            self._save_last_error(persist_ws_id, safe, persist_fence)
         else:
             deferred_persistence.append(
-                functools.partial(self._save_last_error, persist_ws_id, safe)
+                functools.partial(self._save_last_error, persist_ws_id, safe, persist_fence)
             )
         # Manager-owned persistence recovery reads and retires this exact
         # revision under the generation lock. Publish the revision and both
@@ -9502,9 +9408,9 @@ class ChatSession:
     def _apply_persona_snapshot(self, snap: PersonaSnapshot | None) -> None:
         """Set the five persona lever attrs from a stamp — or the open defaults
         when ``snap`` is None (legacy / bare session).  The single owner of the
-        all-or-none snapshot→attr mapping, shared by construction and resume
-        adoption so the defaults can't drift between the two sites.  Callers own
-        any follow-up (MCP-surface drop, tool-search rebuild) themselves."""
+        all-or-none snapshot→attr mapping, applied at construction; its inverse
+        is :meth:`_current_persona_snapshot`, which a load compares with the
+        stored stamp (a session built under another persona is refused)."""
         self._persona_name = snap.name if snap else ""
         self._persona_prompt = snap.prompt if snap else ""
         self._persona_tools = snap.tools if snap else None
@@ -10457,15 +10363,16 @@ class ChatSession:
         notify_state_change = False
         with self._history_visibility_lock:
             with self._history_handoff_lock:
-                if self._workstream_gone_ws == self._ws_id:
-                    # The durable parent is deleted: there is no authoritative
-                    # transcript to verify a handoff against, and minting a
-                    # token over the empty load is exactly the silent-wipe
-                    # mechanism (round-3 review). Raising routes /history to
-                    # its fail-closed 503 arm, which keeps the pane's stale
-                    # transcript visible.
+                if self._workstream_gone:
+                    # The durable parent is deleted, or another process owns it:
+                    # there is no authoritative transcript here to verify a
+                    # handoff against, and minting a token over the empty load
+                    # is exactly the silent-wipe mechanism (round-3 review).
+                    # Raising routes /history to its fail-closed 503 arm, which
+                    # keeps the pane's stale transcript visible.
                     raise ConversationCommitWorkstreamGoneError(
-                        "workstream was deleted; no history handoff can be verified"
+                        "workstream was deleted or is owned elsewhere; no history handoff "
+                        "can be verified"
                     )
                 overscan = len(self._pending_conversation_commits)
             loaded = load_messages(overscan)
@@ -10536,6 +10443,10 @@ class ChatSession:
             )
             return client_queue, [], "fresh", 0, 0, snapshot
 
+    def has_running_background_shells(self) -> bool:
+        """Whether a program this session started in the background is still running."""
+        return self._background_shells.has_running()
+
     def has_unresolved_conversation_persistence(self) -> bool:
         """Whether an accepted row lacks a confirmed complete durable commit.
 
@@ -10577,19 +10488,148 @@ class ChatSession:
             self._history_handoff_lock.release()
 
     def is_workstream_gone(self) -> bool:
-        """True once a keyed save observed THIS workstream's parent deleted.
+        """True once THIS workstream can no longer be written from here.
 
-        The latch records the ws_id that died and is never cleared; readers
-        compare it against the current identity, so an identity swap (/new,
-        ``resume``) to a different workstream reads False structurally.
-        While it matches, new conversation admissions refuse (the
+        A keyed save found its parent row deleted, or the owner lease refused
+        a row because another process now owns the workstream
+        (``_workstream_lease_lost`` tells the two apart). The latch is never
+        cleared. While it is set, new conversation admissions refuse (the
         finalizer/force-abandon lanes still converge via
         ``allow_workstream_gone``) and ``capture_history_handoff`` refuses to
         mint tokens, so a pane keeps its stale transcript rather than
         rendering a silently wiped one.
         """
         with self._history_handoff_lock:
-            return self._workstream_gone_ws == self._ws_id
+            return self._workstream_gone
+
+    def write_fence(self) -> LeaseFence | None:
+        """The owner-lease fence a durable write admitted now must present."""
+        lease = getattr(self, "_workstream_lease", None)
+        return lease.fence if lease is not None else None
+
+    def handle_workstream_lease_lost(self, lease: WorkstreamLease | None = None) -> None:
+        """Stop for good: another process now owns this workstream (idempotent).
+
+        Installs the terminal publication latch (:meth:`_close_publication_locked`), so no lane (the
+        ``allow_workstream_gone`` convergence finalizers included) can write state or ``last_error``
+        into the new owner's row and a running generation stops at its next checkpoint; marks the
+        lost handle (``lease``, by default the session's own) and tells live viewers why. Pending
+        approvals end when the manager's retirement cleans the UI up. The manager retires this
+        object once it hears of the loss, from a renewal, which also reports a handle marked lost
+        after a refused write. Nothing durable is written. Safe inside a durable closure: it takes
+        only the reentrant generation lock, never the transition lock.
+        """
+        with self._generation_lock:
+            if getattr(self, "_workstream_lease_lost", False):
+                return
+            self._workstream_lease_lost = True
+            self._close_publication_locked()
+        lost = lease if lease is not None else getattr(self, "_workstream_lease", None)
+        if lost is not None:
+            lost.mark_lost()
+        log.warning("session.workstream_lease_lost ws=%s", self._ws_id[:8])
+        notice = (
+            "This copy of the workstream has stopped: another process took it "
+            "over, or its lease ran out. Reopen the workstream to continue."
+        )
+        try:
+            # A UI with a dedicated hook (the CLI's tabs) shows the notice even
+            # when the workstream is not the one in front.
+            stopped = concrete_method(self.ui, "on_workstream_stopped")
+            if stopped is not None:
+                stopped(notice)
+            else:
+                self.ui.on_info(notice)
+        except Exception:
+            log.debug("ui notice failed after workstream lease loss", exc_info=True)
+
+    def _incarnation_snapshot(self, ws_id: str) -> tuple[dict[str, Any] | None, str]:
+        """Snapshot the incarnation this session loads: ``(row, token)``.
+
+        Checks the execution node; a missing row returns ``(None, "")``.
+        """
+        from turnstone.core.node_affinity import require_execution_node
+
+        row = get_storage().ensure_workstream_incarnation_snapshot(ws_id)
+        if row is None:
+            return None, ""
+        require_execution_node(row.get("required_node_id"), self._node_id)
+        return row, str(row["fork_reservation_token"])
+
+    def _end_foreign_node_watches(self, *, tell: bool) -> None:
+        """End this workstream's watches that belong to another node.
+
+        Watches run only on the node that created them, and only the lease holder may write this
+        conversation, so the new owner ends them when it loads the workstream: one write admitted
+        under the lease deactivates them all, then, when ``tell``, the model gets one notice per
+        watch, on a best-effort basis (a notice whose save fails leaves the watch ended untold). A
+        workstream with no stored turns ends its watches untold: there is no conversation to tell,
+        and a notice turn would make it look restorable to a watch restore. A copy whose lease
+        lapsed while it loaded ends nothing, and only active watches are ended, so a notice is never
+        repeated. The notice is a durable system turn rather than a queued external event (it must
+        survive the session closing before its next turn), so its model-authored fields get the
+        rail's sanitizers here. The old node's runner then finds the watch inactive and stops. A
+        storage failure leaves the watches to that runner's own retry budget.
+
+        A session without a node (the CLI) ends nothing: it holds a workstream only while it runs,
+        and the owning node's watch restore retries a fire within the watch's delivery and poll
+        budget, so a fire can lapse while the CLI holds the workstream.
+        """
+        own_node = self._node_id or ""
+        if not own_node:
+            return
+        try:
+            ended = get_storage().end_foreign_node_watches(
+                self._ws_id, own_node, lease=self.write_fence()
+            )
+        except (WorkstreamLeaseLostError, WorkstreamLeaseHeldError):
+            # The lease moved while this copy loaded: the watches are the new
+            # owner's to keep, and this copy stops, as a refused save stops it.
+            log.info("session.foreign_watch_end_refused ws=%s", self._ws_id[:8])
+            lease = getattr(self, "_workstream_lease", None)
+            if lease is not None:
+                lease.mark_lost()
+            return
+        except Exception:
+            log.warning("session.foreign_watch_end_failed ws=%s", self._ws_id[:8], exc_info=True)
+            return
+        for watch in ended:
+            watch_id = str(watch["watch_id"])
+            if self.is_workstream_gone():
+                # The workstream is no longer this session's to speak for.
+                return
+            log.info(
+                "session.foreign_watch_ended ws=%s watch=%s node=%s",
+                self._ws_id[:8],
+                watch_id[:8],
+                watch.get("node_id"),
+            )
+            if not tell:
+                continue
+            name = sanitize_name(str(watch.get("name") or ""))[:80]
+            notice = (
+                f'Watch "{name}" has ended: ownership of this workstream moved to another '
+                "server, and a watch runs only on the server that created it. Create the "
+                "watch again if you still need it."
+            )
+            try:
+                self._append_system_turn(
+                    "watch_triggered",
+                    notice,
+                    watch_id=watch_id,
+                    watch_name=name,
+                    command=sanitize_payload(str(watch.get("command") or "")),
+                    output=notice,
+                    is_final=True,
+                    reason=WATCH_OWNERSHIP_CHANGED_REASON,
+                )
+            except Exception:
+                log.warning(
+                    "session.foreign_watch_notice_failed ws=%s watch=%s",
+                    self._ws_id[:8],
+                    watch_id[:8],
+                    exc_info=True,
+                )
 
     def conversation_persistence_status(self) -> dict[str, object]:
         """Return a content-free live projection of durable journal health."""
@@ -10911,6 +10951,7 @@ class ChatSession:
             row_id = 0
             conflict: ConversationCommitConflictError | None = None
             gone: ConversationCommitWorkstreamGoneError | None = None
+            lease_refusal: WorkstreamLeaseLostError | WorkstreamLeaseHeldError | None = None
             try:
                 row_id = int(entry.persist() or 0)
             except ConversationCommitConflictError as exc:
@@ -10919,55 +10960,56 @@ class ChatSession:
             except ConversationCommitWorkstreamGoneError as exc:
                 gone = exc
                 error_cause = exc
+            except (WorkstreamLeaseLostError, WorkstreamLeaseHeldError) as exc:
+                lease_refusal = exc
+                error_cause = exc
             except Exception as exc:
                 error_cause = exc
-
+            lost_handle: WorkstreamLease | None = None
             with self._history_handoff_lock:
+                # Any lease refusal means this copy no longer owns the
+                # workstream. A write that forgot its fence also lands here
+                # (storage refuses it while the lease is live) and stops the
+                # session loudly rather than retrying forever.
+                lease_lost = lease_refusal is not None
+                if lease_lost:
+                    lost_handle = getattr(self, "_workstream_lease", None)
+                    if lost_handle is not None:
+                        lost_handle.mark_lost()
                 if row_id > 0:
                     self._pending_conversation_commits.pop(entry.commit_key, None)
                     if not self._pending_conversation_commits:
                         self._clear_conversation_persistence_failure_locked()
-                    notify_state_change = self._conversation_persistence_state_needs_notification(
-                        previous_state,
-                        self._conversation_persistence_state_locked(),
-                    )
-                elif gone is not None:
-                    # The durable parent row was hard-deleted after these rows
-                    # were accepted; keyed saves never recreate it, so no retry
-                    # can succeed. The delete is the newer authoritative ruling
-                    # on this workstream: discard the journal so close and
-                    # eviction stop waiting on rows that can never land, and
-                    # return NORMALLY — the deletion, not this persist, is the
-                    # user-facing event, and raising here would only re-latch a
-                    # phantom error over an empty journal. The revision bump
-                    # invalidates every token minted over the discarded rows.
-                    # The latch makes the discovery terminal: new conversation
-                    # admissions refuse (finalizer lanes still converge) and
-                    # capture_history_handoff stops minting tokens, so panes
-                    # keep their stale-but-real transcript instead of a
-                    # silently wiped one. Re-entry with the latch already set
-                    # (further in-flight saves of the same generation) is
-                    # idempotent. The forensic log carries commit keys and
-                    # roles only — never message content.
+                elif gone is not None or lease_lost:
+                    # No retry can land these rows: the durable parent row was hard-deleted (keyed
+                    # saves never recreate it), or another process now owns the workstream and its
+                    # history is the authoritative one. That newer ruling wins: discard the journal
+                    # so close and eviction stop waiting on rows that can never land, and return
+                    # NORMALLY — the deletion or takeover, not this persist, is the user-facing
+                    # event, and raising here would only re-latch a phantom error over an empty
+                    # journal. The revision bump invalidates every token minted over the discarded
+                    # rows. The latch makes the discovery terminal: new conversation admissions
+                    # refuse (finalizer lanes still converge) and capture_history_handoff stops
+                    # minting tokens, so panes keep their stale-but-real transcript instead of a
+                    # silently wiped one. Re-entry with the latch already set (further in-flight
+                    # saves of the same generation) is idempotent. The forensic log carries commit
+                    # keys and roles only — never message content.
                     discarded = [
-                        (key, str(entry.message.get("role", "")))
-                        for key, entry in self._pending_conversation_commits.items()
+                        (key, str(pending.message.get("role", "")))
+                        for key, pending in self._pending_conversation_commits.items()
                     ]
                     self._pending_conversation_commits.clear()
                     self._clear_conversation_persistence_failure_locked()
                     self._history_handoff_revision += 1
-                    self._workstream_gone_ws = self._ws_id
+                    self._workstream_gone = True
                     request_resync = True
-                    resync_reason = "workstream_gone"
+                    resync_reason = "lease_lost" if lease_lost else "workstream_gone"
                     log.error(
-                        "session.conversation_rows_discarded_workstream_gone ws=%s rows=%d discarded=%s",
+                        "session.conversation_rows_discarded ws=%s reason=%s rows=%d discarded=%s",
                         self._ws_id[:8],
+                        resync_reason,
                         len(discarded),
                         discarded,
-                    )
-                    notify_state_change = self._conversation_persistence_state_needs_notification(
-                        previous_state,
-                        self._conversation_persistence_state_locked(),
                     )
                 else:
                     failed_at = datetime.now(UTC)
@@ -11007,12 +11049,16 @@ class ChatSession:
                     )
                     if request_resync:
                         self._conversation_persistence_resync_commit_key = entry.commit_key
-                    notify_state_change = self._conversation_persistence_state_needs_notification(
-                        previous_state,
-                        self._conversation_persistence_state_locked(),
-                    )
+                notify_state_change = self._conversation_persistence_state_needs_notification(
+                    previous_state,
+                    self._conversation_persistence_state_locked(),
+                )
         if notify_state_change:
             self._notify_conversation_persistence_state_changed()
+        if lease_lost:
+            # Outside the handoff lock: the stop takes the generation lock,
+            # which ranks above it.
+            self.handle_workstream_lease_lost(lost_handle)
         # A listener can atomically register immediately before a tool-only
         # assistant is accepted. Its inflight snapshot is empty, and failure
         # prevents the later tool-info event that would reconstruct the row.
@@ -11205,9 +11251,12 @@ class ChatSession:
             return True
         with self._generation_lock:
             self._generation += 1
-            self._cancel_event = threading.Event()
-            self._publication_shutdown = False
             self._soft_close_preparing = False
+            if not self._publication_terminal:
+                # A terminal stop that landed meanwhile (lease loss, host
+                # shutdown) stays: only this attempt's own latch rolls back.
+                self._cancel_event = threading.Event()
+                self._publication_shutdown = False
         # A callback suppressed by the temporary shutdown latch marked the
         # projection dirty. Reconcile outside lifecycle/actor locks so a local
         # manager read cannot block Stop or actor handoff. Failure is retained
@@ -11372,11 +11421,7 @@ class ChatSession:
                 )
                 or (origin_generation and self._generation != origin_generation)
                 or (not allow_cancelled and self._cancel_event.is_set())
-                or (
-                    not allow_workstream_gone
-                    and getattr(self, "_workstream_gone_ws", None) is not None
-                    and self._workstream_gone_ws == self._ws_id
-                )
+                or (not allow_workstream_gone and getattr(self, "_workstream_gone", False))
             ):
                 return False
             owner_token = _active_commit_origin_generation.set(origin_generation)
@@ -11443,7 +11488,37 @@ class ChatSession:
             raise commit_error
         return True
 
-    def shutdown_publication_and_drain_durability(self) -> None:
+    def _close_publication_locked(self) -> None:
+        """Install the terminal publication latch; the caller holds the generation lock.
+
+        The latch goes in before cooperative cancellation. A worker that
+        observes the cancel edge must not synthesize a new ws-id-only TOOL
+        storage closure: the authorized durable incarnation may already have
+        been replaced on another node. Successful exact deletion erases the
+        debt; an ambiguous same/unknown outcome retains it in the manager
+        tombstone.
+        """
+        self._publication_shutdown = True
+        # Terminal: a refused soft close's rollback leaves this latch alone.
+        self._publication_terminal = True
+        self._cancel_event.set()
+        self._approval_cancel_epoch = getattr(self, "_approval_cancel_epoch", 0) + 1
+        self._soft_close_preparing = False
+        structural_condition = getattr(self, "_tool_structural_condition", None)
+        if structural_condition is not None:
+            structural_condition.notify_all()
+
+    def close_publication(self) -> None:
+        """Stop admitting durable writes and cancel the running work (idempotent).
+
+        The first half of :meth:`shutdown_publication_and_drain_durability`,
+        for a host that latches every session before it drains any of them.
+        """
+        with self._generation_lock:
+            self._close_publication_locked()
+        self.resolve_close_approvals()
+
+    def shutdown_publication_and_drain_durability(self, timeout: float | None = None) -> bool:
         """Close admission, cancel resources, and drain admitted batches.
 
         Hard deletion needs a stronger boundary than cooperative worker
@@ -11457,23 +11532,14 @@ class ChatSession:
 
         Resource teardown remains in :meth:`close`; this narrow primitive is
         used before the storage delete, while ordinary adapter cleanup runs
-        after the lifecycle outcome is known.
+        after the lifecycle outcome is known. Host shutdown passes ``timeout``
+        before releasing owner leases; the return value says whether the
+        admitted batches drained in time (always ``True`` without a timeout).
         """
+        deadline = None if timeout is None else time.monotonic() + max(0.0, timeout)
         with self._generation_lock:
             structural_debt = getattr(self, "_tool_structural_debt", None)
-            # Install the terminal latch before cooperative cancellation.
-            # A worker that observes the cancel edge must not synthesize a
-            # new ws-id-only TOOL storage closure: the authorized durable
-            # incarnation may already have been replaced on another node.
-            # Successful exact deletion erases the debt; an ambiguous
-            # same/unknown outcome retains it in the manager tombstone.
-            self._publication_shutdown = True
-            self._cancel_event.set()
-            self._approval_cancel_epoch = getattr(self, "_approval_cancel_epoch", 0) + 1
-            self._soft_close_preparing = False
-            structural_condition = getattr(self, "_tool_structural_condition", None)
-            if structural_condition is not None:
-                structural_condition.notify_all()
+            self._close_publication_locked()
             durability_high_water = self._durability_next_ticket
 
         # Hard delete is terminal even when its durable outcome is ambiguous.
@@ -11493,8 +11559,9 @@ class ChatSession:
                 terminal_error = exc
 
         with self._durability_cond:
-            self._durability_cond.wait_for(
-                lambda: self._durability_serving_ticket >= durability_high_water
+            drained = self._durability_cond.wait_for(
+                lambda: self._durability_serving_ticket >= durability_high_water,
+                timeout=None if deadline is None else max(0.0, deadline - time.monotonic()),
             )
 
         # Un-ticketed lost-ACK reconciliation uses the visibility lane.  Take
@@ -11504,11 +11571,18 @@ class ChatSession:
         # may now delete storage without a late reconciliation resurrecting a
         # conversation row.
         history_visibility_lock = getattr(self, "_history_visibility_lock", None)
-        if history_visibility_lock is not None:
-            with history_visibility_lock:
-                pass
+        if drained and history_visibility_lock is not None:
+            if deadline is None:
+                history_visibility_lock.acquire()
+            else:
+                drained = history_visibility_lock.acquire(
+                    timeout=max(0.0, deadline - time.monotonic())
+                )
+            if drained:
+                history_visibility_lock.release()
         if terminal_error is not None:
             raise terminal_error
+        return drained
 
     def _consume_cancel(self, my_generation: int) -> bool:
         """Clear this generation's cancel signal on exit; report if one landed.
@@ -11746,6 +11820,7 @@ class ChatSession:
             meta_envelope["client_send_ids"] = list(stable_client_send_ids)
         meta_json = json.dumps(meta_envelope) if meta_envelope else None
         persist_ws_id = self._ws_id
+        persist_fence = self.write_fence()
         persist_user_id = self._user_id
         attachment_writes = _attachment_writes(attachments)
         persist_event_id: int | None = None
@@ -11761,6 +11836,7 @@ class ChatSession:
                     event_id=persist_event_id,
                     meta=meta_json,
                     commit_key=commit_key,
+                    lease=persist_fence,
                 )
             else:
                 message_id = save_message(
@@ -11771,6 +11847,7 @@ class ChatSession:
                     event_id=persist_event_id,
                     meta=meta_json,
                     commit_key=commit_key,
+                    lease=persist_fence,
                 )
             return message_id
 
@@ -11796,10 +11873,6 @@ class ChatSession:
             # captured in ``_persist_user_turn``.
             history_revision_before = self._history_handoff_revision
             self.messages.append(user_turn)
-            if sender:
-                # A newly recorded sender can change shared-workstream state;
-                # let the next system-prompt compose re-derive it.
-                self._invalidate_shared_state()
             self._msg_tokens.append(user_token_estimate)
             try:
                 pending = self._journal_conversation_row_locked(
@@ -11969,6 +12042,7 @@ class ChatSession:
         token_estimate = max(1, int(self._msg_char_count(turn) / self._chars_per_token))
         meta_json = json.dumps(meta) if meta else None
         persist_ws_id = self._ws_id
+        persist_fence = self.write_fence()
         commit_key = uuid.uuid4().hex
         persist_event_id: int | None = None
 
@@ -11981,6 +12055,7 @@ class ChatSession:
                 event_id=persist_event_id,
                 meta=meta_json,
                 commit_key=commit_key,
+                lease=persist_fence,
             )
 
         # The semantic event and row admission are one handoff transition. A
@@ -12348,7 +12423,6 @@ class ChatSession:
             # can overtake a blocked user-row insert.
             if not self._title_generated and user_input.strip() and not from_wake:
                 self._title_generated = True
-                title_ws_id = self._ws_id
                 title_messages = tuple(self.messages)
 
                 def _launch_title() -> None:
@@ -12361,7 +12435,6 @@ class ChatSession:
                         target=self._generate_title,
                         kwargs={
                             "principal_id": turn_principal_id,
-                            "captured_ws_id": title_ws_id,
                             "captured_messages": title_messages,
                             "origin_generation": my_generation,
                         },
@@ -12765,6 +12838,7 @@ class ChatSession:
                         or completed_tool_calls_json
                     ):
                         persist_ws_id = self._ws_id
+                        persist_fence = self.write_fence()
                         persist_producer = completed_result.producer or None
                         # Provenance and the native lane's replay cost ride the
                         # row together (one builder, shared with the fork clone),
@@ -12814,6 +12888,7 @@ class ChatSession:
                                     producer=persist_producer,
                                     meta=persist_meta,
                                     commit_key=commit_key,
+                                    lease=persist_fence,
                                 )
 
                             # Structural acceptance is inseparable from journal
@@ -13440,6 +13515,7 @@ class ChatSession:
                         if tool_preview is not None:
                             tool_atts.append(tool_preview[1])
                         persist_ws_id = self._ws_id
+                        persist_fence = self.write_fence()
                         commit_key = uuid.uuid4().hex
                         event_id_ref: list[int | None] = [None]
                         persist_meta = _tool_turn_meta(
@@ -13472,6 +13548,7 @@ class ChatSession:
                             commit_key=commit_key,
                             persist=self._tool_row_persist_closure(
                                 ws_id=persist_ws_id,
+                                lease=persist_fence,
                                 text=store_text,
                                 tool_name=_tname,
                                 call_id=tc_id,
@@ -13643,6 +13720,7 @@ class ChatSession:
                     else:
                         msg["content"] = "[generation cancelled before completion]"
                     persist_ws_id = self._ws_id
+                    persist_fence = self.write_fence()
                     commit_key = uuid.uuid4().hex
                     persist_event_id: int | None = None
                     persist_content = msg["content"]
@@ -13661,6 +13739,7 @@ class ChatSession:
                             event_id=persist_event_id,
                             meta=persist_meta,
                             commit_key=commit_key,
+                            lease=persist_fence,
                         )
 
                     tok_est = max(
@@ -13979,6 +14058,7 @@ class ChatSession:
                 if preview_entry is not None:
                     cancelled_turn.meta.extra["preview"] = preview_entry[0]
                 persist_ws_id = self._ws_id
+                persist_fence = self.write_fence()
                 commit_key = uuid.uuid4().hex
                 event_id_ref: list[int | None] = [None]
                 persist_meta = _tool_turn_meta(
@@ -14038,6 +14118,7 @@ class ChatSession:
                     commit_key=commit_key,
                     persist=self._tool_row_persist_closure(
                         ws_id=persist_ws_id,
+                        lease=persist_fence,
                         text=detail,
                         tool_name=func_name,
                         call_id=tc_id,
@@ -14103,6 +14184,7 @@ class ChatSession:
         self,
         *,
         ws_id: str,
+        lease: LeaseFence | None,
         text: str,
         tool_name: str,
         call_id: str,
@@ -14130,6 +14212,7 @@ class ChatSession:
                     is_error=is_error,
                     meta=meta_json,
                     commit_key=commit_key,
+                    lease=lease,
                 )
             return save_message(
                 ws_id,
@@ -14141,6 +14224,7 @@ class ChatSession:
                 is_error=is_error,
                 meta=meta_json,
                 commit_key=commit_key,
+                lease=lease,
             )
 
         return _persist
@@ -14237,17 +14321,24 @@ class ChatSession:
             if m.role is Role.USER and m.source != COMPACTION_SOURCE
         ]
 
-    def _persist_truncation(self, removed_count: int) -> int:
+    def _persist_truncation(
+        self,
+        removed_count: int,
+        *,
+        ws_id: str,
+        lease: LeaseFence | None,
+    ) -> int:
         """Atomically remove a compaction-floored durable tail.
 
         The backend owns parent locking, row-count/floor calculation, exact
         deletion, and attachment reference release in one transaction.  It
         raises on a missing parent or storage failure; callers must not publish
-        the corresponding live cut until this returns successfully.
+        the corresponding live cut until this returns successfully. The staged
+        cut passes the ws id and fence it snapshotted at admission.
         """
         if removed_count <= 0:
             return 0
-        return get_storage().truncate_messages_tail(self._ws_id, removed_count)
+        return get_storage().truncate_messages_tail(ws_id, removed_count, lease=lease)
 
     def _commit_history_truncation(
         self,
@@ -14318,6 +14409,8 @@ class ChatSession:
         durable_removed = sum(
             1 for turn in removed_turns if not turn.meta.extra.get("no_durable_row")
         )
+        persist_ws_id = self._ws_id
+        persist_fence = self.write_fence()
 
         def _persist_and_publish_truncation() -> None:
             try:
@@ -14347,7 +14440,9 @@ class ChatSession:
                         ):
                             raise RuntimeError("conversation changed outside truncation admission")
 
-                    self._persist_truncation(durable_removed)
+                    self._persist_truncation(
+                        durable_removed, ws_id=persist_ws_id, lease=persist_fence
+                    )
 
                     # Storage has committed.  From this point onward only
                     # infallible list/field updates and best-effort UI repair
@@ -16312,6 +16407,7 @@ class ChatSession:
             # retains the canonical ASSISTANT marker role.
             if self._ws_id:
                 persist_ws_id = self._ws_id
+                persist_fence = self.write_fence()
                 commit_key = uuid.uuid4().hex
                 event_id_ref: list[int | None] = [None]
                 marker_meta: dict[str, Any] = {
@@ -16341,6 +16437,7 @@ class ChatSession:
                 def _persist_compaction_marker(
                     *,
                     ws_id: str = persist_ws_id,
+                    row_lease: LeaseFence | None = persist_fence,
                     row_commit_key: str = commit_key,
                     row_event_id: list[int | None] = event_id_ref,
                 ) -> int:
@@ -16377,6 +16474,7 @@ class ChatSession:
                         event_id=row_event_id[0],
                         producer=summary_result.producer,
                         commit_key=row_commit_key,
+                        lease=row_lease,
                     )
 
                 # END publication, fallback repair, marker admission, and
@@ -17942,80 +18040,6 @@ class ChatSession:
         """
         return self._flush_queued_messages()
 
-    def _drain_queue_for_identity_swap(self) -> None:
-        """Settle the queue before /new or /resume swaps this session's ws_id.
-
-        TOTAL: it must be impossible for the escape commands to raise out of
-        here — the CLI dispatches them uncaught, and an unhealthy journal
-        must never block leaving a workstream (round-5 review). Stranded OWN
-        text persists into the CURRENT workstream when the journal can accept
-        it; everything that cannot land is discarded WITH an accurate notice,
-        never carried across the swap. The except arm is deliberately
-        ``(GenerationCancelled, Exception)`` rather than a curated tuple —
-        the direct-flush raise surface (reconcile poison gate, commit
-        refusal, journal admission internals, storage drivers) is open-ended,
-        and a curated tuple is exactly how the last "never raises" version
-        ended up raising.
-        """
-        with self._queued_lock:
-            if not self._queued_messages:
-                # Skip even the flush's direct-mode preamble: the reconcile
-                # poison gate can raise with nothing queued at all.
-                self._retracted_while_popped.clear()
-                self._popped_in_flight.clear()
-                return
-        if self.is_workstream_gone():
-            with self._queued_lock:
-                dropped = len(self._queued_messages)
-                self._queued_messages.clear()
-                self._retracted_while_popped.clear()
-                self._popped_in_flight.clear()
-            if dropped:
-                self.ui.on_info(
-                    f"Discarded {dropped} queued message(s) — the workstream was "
-                    "deleted and can no longer save them."
-                )
-            return
-        flushed_ok = True
-        try:
-            self._flush_queued_messages()
-        except (GenerationCancelled, Exception):
-            flushed_ok = False
-            log.warning("session.identity_swap_flush_failed ws=%s", self._ws_id[:8], exc_info=True)
-        principal = (self._mcp_effective_user_id or "").strip()
-        with self._queued_lock:
-            own = 0
-            foreign = 0
-            for row in self._queued_messages.values():
-                owner = _queued_row_owner(row)
-                if principal and owner and owner != principal:
-                    foreign += 1
-                else:
-                    own += 1
-            self._queued_messages.clear()
-            self._retracted_while_popped.clear()
-            # No pop window can be open here (CLI-only path, single REPL
-            # thread, no CLI wake lane), so this is a belt-and-braces
-            # invariant, not a live close: a stale in-flight id must not
-            # outlive the identity swap and suppress a legitimate later
-            # message on the NEW workstream.
-            self._popped_in_flight.clear()
-        # Per-partition notices: after a SUCCESSFUL flush the leftovers are
-        # provably another participant's; after a failed flush the actor's
-        # own unsaved rows must never be counted as someone else's.
-        if own:
-            self.ui.on_info(
-                f"Discarded {own} of your queued message(s) — they could not be "
-                "saved before leaving this workstream."
-            )
-        if foreign:
-            self.ui.on_info(
-                f"Discarded {foreign} queued message(s) from another participant — "
-                "they cannot follow into a different workstream."
-            )
-        if not flushed_ok and not own and not foreign:
-            self.ui.on_info("Queued messages could not be saved and were discarded.")
-
     def compact_now(self, *, principal_id: str | None = None) -> bool:
         """Manual compaction with send()'s full generation discipline.
 
@@ -18769,12 +18793,22 @@ class ChatSession:
                                     else "Denied by user"
                                 )
                     user_feedback = None  # feedback is in the denial_msg
-                    if self._nudges_enabled("denial") and should_nudge(
-                        "denial",
-                        self._metacog_state,
-                        message_count=len(self.messages),
-                        memory_count=denial_memory_count,
-                        cooldown_secs=self._mem_cfg.nudge_cooldown,
+                    # The nudge says the user rejected a call: only when a person did,
+                    # not when tool policies refused it or nobody answered in time
+                    # (``_refused_by``).
+                    person_rejected = any(
+                        item.get("denied") and not item.get("_refused_by") for item in items
+                    )
+                    if (
+                        person_rejected
+                        and self._nudges_enabled("denial")
+                        and should_nudge(
+                            "denial",
+                            self._metacog_state,
+                            message_count=len(self.messages),
+                            memory_count=denial_memory_count,
+                            cooldown_secs=self._mem_cfg.nudge_cooldown,
+                        )
                     ):
                         # Tool channel, not user: the denial is a response to THIS
                         # batch, so the nudge rides ``_collect_advisories`` with
@@ -23696,6 +23730,7 @@ class ChatSession:
                     status=item["status"],
                     child_ws_id=item["child_ws_id"],
                     note=item["note"],
+                    lease=self.write_fence(),
                 )
             elif action == "update":
                 result = self._coord_client.tasks_update(
@@ -23705,11 +23740,16 @@ class ChatSession:
                     status=item["status"],
                     child_ws_id=item["child_ws_id"],
                     note=item["note"],
+                    lease=self.write_fence(),
                 )
             elif action == "remove":
-                result = self._coord_client.tasks_remove(self._ws_id, task_id=item["task_id"])
+                result = self._coord_client.tasks_remove(
+                    self._ws_id, task_id=item["task_id"], lease=self.write_fence()
+                )
             elif action == "reorder":
-                result = self._coord_client.tasks_reorder(self._ws_id, task_ids=item["task_ids"])
+                result = self._coord_client.tasks_reorder(
+                    self._ws_id, task_ids=item["task_ids"], lease=self.write_fence()
+                )
             else:  # unreachable — _prepare validated the enum
                 result = {"error": f"unknown action: {action}"}
         except Exception as e:
@@ -27503,17 +27543,10 @@ class ChatSession:
         # A wake may read before the runner commits last_output. Forks inherit
         # these snapshots even though their watch rows belong to the parent.
         for turn in reversed(self.messages):
-            meta = turn.meta.extra.get("source_meta")
-            if (
-                turn.role is Role.SYSTEM
-                and turn.source == "watch_triggered"
-                and isinstance(meta, dict)
-                and meta.get("watch_id") == watch_id
-                and all(
-                    key in meta
-                    for key in ("watch_name", "command", "output", "poll_count", "max_polls")
-                )
-            ):
+            if turn.role is not Role.SYSTEM or turn.source != "watch_triggered":
+                continue
+            meta = watch_snapshot_meta(turn.meta.extra.get("source_meta"))
+            if meta is not None and meta.get("watch_id") == watch_id:
                 return meta
         # Compaction removes the notice from active context, while its snapshot
         # stays in this workstream's history. Do not read the watch owner's history.
@@ -28330,11 +28363,11 @@ class ChatSession:
             "/resume",
             "/delete",
         }:
-            # These commands predate the multi-user HTTP surface and mutate or
-            # enumerate storage globally. Web/chat/scheduled callers have
-            # ACL-aware create/open/list/delete endpoints instead; allowing the
-            # REPL implementations remotely would bypass private-project
-            # visibility and detach the ChatSession id from its manager/UI key.
+            # CLI-only: /new and /resume open tabs in the CLI's own loop, and
+            # /workstreams and /delete enumerate or mutate storage globally.
+            # Web/chat/scheduled callers have ACL-aware create/open/list/delete
+            # endpoints instead; running these here would bypass
+            # private-project visibility.
             self.ui.on_error("This workstream command is only available in the local CLI.")
             return False
 
@@ -28389,59 +28422,6 @@ class ChatSession:
             self._activate_token_calibration(self._primary_lane())
             self.ui.on_info("Context cleared (messages preserved in database).")
 
-        elif cmd == "/new":
-            # Settle stranded queued text BEFORE the identity swap so it is
-            # persisted into the workstream it was ADDRESSED to (or discarded
-            # with a notice when it cannot land — gone latch / foreign owner).
-            # Sends during the command window itself defer in the /send route
-            # (ws._pending_sends) and never queue; this covers only a
-            # message stranded by a dying send worker's closing race
-            # before this command started.
-            self._drain_queue_for_identity_swap()
-            self.messages.clear()
-            self._read_files.clear()
-            self._repeat_detector.clear()
-            self._last_usage = None
-            self._invalidate_token_calibration_anchors()
-            self._msg_tokens = []
-            old_ws_id = self._ws_id
-            while True:
-                candidate_ws_id = uuid.uuid4().hex
-                inserted = get_storage().register_workstream(
-                    candidate_ws_id,
-                    node_id=self._node_id,
-                    persona=self._persona_name or None,
-                )
-                if inserted is not False:
-                    break
-            self._ws_id = candidate_ws_id
-            self._fork_reservation_token = ""
-            self._memory_index_snapshot = None
-            # A brand-new ws_id is the same class of identity change as a
-            # non-fork resume(): the old workstream's participant state must
-            # not leak into this empty one, its trust nonces must not carry
-            # over (see resume()'s matching reset + remint), and the watch
-            # dispatch registration must follow the identity — otherwise
-            # watches created here (stamped with the new id) never reach
-            # this session, and the old workstream's fires land in a
-            # conversation that no longer shows them.
-            self._reset_shared_state()
-            self._envelope_nonce = fence.mint_nonce()
-            self._sender_label_nonce = fence.mint_nonce()
-            self._follow_watch_registration(old_ws_id)
-            self._title_generated = False
-            # The cached prefix carries the workstream identity and both trust
-            # nonces even when memory is disabled. Rebuild it immediately for
-            # the replacement CLI workstream so the next request cannot reuse
-            # the predecessor's envelope declaration.
-            self._init_system_messages()
-            self._activate_token_calibration(self._primary_lane())
-            # The session keeps its persona across /new. The row reservation
-            # above carries the display slug, and _save_config writes the full
-            # immutable stamp below.
-            self._save_config()
-            self.ui.on_info("New workstream started.")
-
         elif cmd == "/workstreams":
             rows = list_workstreams_with_history(20)
             if not rows:
@@ -28460,50 +28440,24 @@ class ChatSession:
                     )
                 self.ui.on_info("\n".join(lines))
 
-        elif cmd == "/resume":
-            from turnstone.core.node_affinity import NodeAffinityError
-
-            if not arg:
-                self.ui.on_info(
-                    "Usage: /resume <alias_or_ws_id>\nUse /workstreams to list available workstreams."
-                )
-            else:
-                target_id = resolve_workstream(arg.strip())
-                if not target_id:
-                    self.ui.on_info(f"Workstream not found: {arg.strip()}")
-                elif target_id == self._ws_id:
-                    self.ui.on_info("Already in that workstream.")
-                else:
-                    # Same pre-swap settlement as /new: stranded queued text
-                    # persists into the CURRENT workstream (or is discarded
-                    # with a notice) before resume() swaps identities.
-                    self._drain_queue_for_identity_swap()
-                    try:
-                        resumed: bool | None = self.resume(target_id)
-                    except (ValueError, NodeAffinityError) as exc:
-                        # Corrupt stamp or MCP-lever refusal: resume parses
-                        # before mutating, so this session is untouched —
-                        # report and stay on the current workstream.
-                        self.ui.on_error(f"Cannot resume {target_id}: {exc}")
-                        resumed = None
-                    if resumed:
-                        self.ui.on_info(
-                            f"Resumed {bold(target_id)} ({len(self.messages)} messages loaded)"
-                        )
-                        name = get_workstream_display_name(target_id)
-                        if name:
-                            self.ui.on_rename(name)
-                    elif resumed is False:
-                        self.ui.on_info(f"Workstream {arg.strip()} has no messages.")
-
         elif cmd == "/name":
             if not arg:
                 self.ui.on_info(f"Current workstream: {self._ws_id}")
-            elif set_workstream_alias(self._ws_id, arg.strip()):
-                self.ui.on_info(f"Workstream named: {bold(arg.strip())}")
-                self.ui.on_rename(arg.strip())
             else:
-                self.ui.on_info(f"Alias '{arg.strip()}' is already in use.")
+                try:
+                    named = set_workstream_alias(
+                        self._ws_id,
+                        arg.strip(),
+                        lease=self.write_fence(),
+                    )
+                except (WorkstreamLeaseLostError, WorkstreamLeaseHeldError) as exc:
+                    self.ui.on_info(f"Cannot name this workstream: {exc}")
+                else:
+                    if named:
+                        self.ui.on_info(f"Workstream named: {bold(arg.strip())}")
+                        self.ui.on_rename(arg.strip())
+                    else:
+                        self.ui.on_info(f"Alias '{arg.strip()}' is already in use.")
 
         elif cmd == "/delete":
             if not arg:
@@ -28516,10 +28470,21 @@ class ChatSession:
                     self.ui.on_info(f"Workstream not found: {arg.strip()}")
                 elif target_id == self._ws_id:
                     self.ui.on_info("Cannot delete the active workstream.")
-                elif delete_workstream(target_id):
-                    self.ui.on_info(f"Deleted workstream {arg.strip()}")
                 else:
-                    self.ui.on_info(f"Failed to delete workstream {arg.strip()}")
+                    try:
+                        deleted = get_storage().delete_workstream(target_id)
+                    except WorkstreamLeaseHeldError as exc:
+                        # Open somewhere: in another process, or in another
+                        # workstream tab here (close it first with /ws close).
+                        self.ui.on_error(f"Cannot delete {arg.strip()}: {exc}")
+                    except Exception:
+                        log.warning("Failed to delete workstream ws=%s", target_id, exc_info=True)
+                        self.ui.on_info(f"Failed to delete workstream {arg.strip()}")
+                    else:
+                        if deleted:
+                            self.ui.on_info(f"Deleted workstream {arg.strip()}")
+                        else:
+                            self.ui.on_info(f"Failed to delete workstream {arg.strip()}")
 
         elif cmd == "/history":
             query = arg.strip() if arg else None
@@ -28783,10 +28748,10 @@ class ChatSession:
                         "  /instructions <text>   Set developer instructions",
                         "  /skill [name|clear]    Set/show/clear active skill",
                         "  /clear                 Clear context (workstream preserved in database)",
-                        "  /new                   Start a new workstream (old one stays resumable)",
+                        "  /new                   Start a new workstream in a new tab",
                         "",
                         "  /workstreams           List saved workstreams",
-                        "  /resume <id|alias>     Resume a previous workstream",
+                        "  /resume <id|alias>     Open a saved workstream in a new tab",
                         "  /name <alias>          Name the current workstream",
                         "  /delete <id|alias>     Delete a saved workstream",
                         "",

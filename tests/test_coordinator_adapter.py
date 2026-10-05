@@ -19,6 +19,7 @@ import pytest
 from turnstone.console.coordinator_adapter import CoordinatorAdapter
 from turnstone.console.coordinator_ui import ConsoleCoordinatorUI
 from turnstone.core.session_manager import SessionManager
+from turnstone.core.storage import LeaseFence, LeaseGrant
 from turnstone.core.workstream import Workstream, WorkstreamKind, WorkstreamState
 
 
@@ -179,7 +180,7 @@ def test_deferred_stale_state_does_not_consume_coordinator_content(
     storage = MagicMock()
     storage.get_workstream.return_value = None
 
-    def update_state(_ws_id: str, state: str) -> None:
+    def update_state(_ws_id: str, state: str, lease: Any = None) -> None:
         nonlocal first_idle
         should_block = False
         with write_lock:
@@ -192,6 +193,9 @@ def test_deferred_stale_state_does_not_consume_coordinator_content(
                 raise RuntimeError("test predecessor state write was not released")
 
     storage.update_workstream_state.side_effect = update_state
+    storage.acquire_workstream_lease.side_effect = lambda ws_id, **kwargs: LeaseGrant(
+        LeaseFence(ws_id, kwargs["holder"], 1, kwargs["incarnation_token"])
+    )
     ui = ConsoleCoordinatorUI(ws_id="coord-content")
     adapter, collector = _make_adapter(ui_factory=lambda _ws: ui)
     manager = SessionManager(
@@ -679,6 +683,22 @@ class TestCoordinatorAdapterChildrenRegistry:
         # coord-b untouched
         assert adapter._registry.parent_for("child-b1") == "coord-b"
         assert adapter._registry.ui_for("coord-b") is not None
+
+    def test_lease_retirement_closes_the_row_on_this_consoles_pseudo_node(self) -> None:
+        adapter, collector = _make_adapter()
+        adapter._registry.install("coord-a", object())
+        adapter._registry.merge_children("coord-a", ["child-a1"])
+        ws = _make_ws()
+        ws.id = "coord-a"
+
+        adapter.on_lease_retired(ws)
+
+        assert adapter._registry.ui_for("coord-a") is None
+        assert adapter._registry.parent_for("child-a1") is None
+        # The pseudo-node row is per console and nothing else would remove it
+        # from this console's dashboard; another console now runs the
+        # coordinator under its own row.
+        collector.emit_console_ws_closed.assert_called_once_with("coord-a")
 
     def test_prime_children_from_snapshot_merges_without_overwriting(self) -> None:
         # Snapshot priming now lives on ClusterChildSource (production

@@ -237,6 +237,7 @@ def send(
     principal_id: str = "",
     force_abandonable: bool = True,
     interjection_wake_signature: object | None = None,
+    attended: bool = True,
 ) -> bool:
     """Dispatch work onto a workstream's worker thread.
 
@@ -309,6 +310,11 @@ def send(
     refuses the dispatch without spawning. Reuse-path admission remains the
     caller's ``enqueue`` responsibility.
 
+    ``attended`` says the work comes from a client. Only the queued-nudge wake
+    gate passes ``False``; client work first ends any blanket approval a watch
+    restore granted the workstream (:meth:`Workstream.note_client`), so a new
+    dispatch caller is safe by default.
+
     Returns:
         ``True`` on successful enqueue (existing worker accepted) or
         thread spawn (no live worker).
@@ -325,6 +331,8 @@ def send(
         recover instead of wedging behind a flag no thread will clear.
     """
     name = thread_name or f"session-worker-{ws.id[:8]}"
+    if attended:
+        ws.note_client()
 
     worker_claim: WorkerClaim | None = None
 

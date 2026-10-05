@@ -45,10 +45,17 @@ role and permission-override editors.
 Admin-defined rules that control tool execution:
 
 - **Pattern matching**: Glob syntax via `fnmatch` (e.g., `bash*`, `file_write`, `*`)
-- **Actions**: `allow` (auto-approve), `deny` (block), `ask` (normal approval flow)
+- **Actions**: `allow` (auto-approve), `deny` (block), `ask` (normal approval flow).
+  Skip-permissions, which an operator opts into, approves `ask`-matched calls
+  too. The approval a watch restore grants a workstream nobody is in does not:
+  an `ask`-matched call goes through the normal flow (the smart-approval judge,
+  when enabled, judges the whole batch and may clear it; otherwise it waits for
+  a person), while the rest of the batch runs without a prompt.
 - **Priority**: Higher priority evaluated first, first match wins
-- **Enforcement**: `evaluate_tool_policies_batch()` called in `WebUI.approve_tools()`
-  before the `auto_approve` check
+- **Enforcement**: `evaluate_loaded_tool_policies()` called in the approval gate
+  (`approve_tools()`, shared by node and coordinator sessions, and the CLI's) before
+  any automatic approval. When the policies cannot be read, every call in the batch
+  that needs approval is refused and the model is told to try again.
 - **MCP granular policies**: MCP resources and prompts are evaluated using their
   `approval_label` for fine-grained control:
   - Resource reads: `mcp_resource__{uri}` (e.g., `mcp_resource__file:///docs/*` to allow,
@@ -241,7 +248,11 @@ Both Python and TypeScript console SDKs expose governance methods:
   assignment fails, preventing locked-out first user
 - **API token RBAC**: `_authenticate_api_token` loads permissions from user's
   roles, ensuring API tokens are subject to RBAC enforcement
-- **Policy evaluation is fail-open**: If storage is unavailable, tool policies
-  degrade to the existing approval flow (not auto-approve)
+- **Policy evaluation fails closed**: When the policies cannot be read, every call
+  in the batch that needs approval is refused, so no automatic approval
+  (skip-permissions, "Always" grants, auto-approve lists, the smart-approval
+  judge, a watch restore's grant) and no person can run a call a `deny` rule might
+  cover. Calls that need no approval still run. A failed read is not cached, so the
+  next batch reads again.
 - **Audit IP resolution**: `_audit_context()` prefers `X-Forwarded-For` for
   client IP when behind a reverse proxy, falling back to `request.client.host`

@@ -305,9 +305,9 @@ class TestTemplatePersistence:
         save_message(ws_id, "user", "hello")
 
         # New session without template, then resume
-        session2 = _make_session()
+        session2 = _make_session(ws_id=ws_id)
         assert session2._skill_name is None
-        resumed = session2.resume(ws_id)
+        resumed = session2.rehydrate()
         assert resumed
         assert session2._skill_name == "my-tpl"
         content = _sys_content(session2)
@@ -448,8 +448,8 @@ class TestResumeDeletedTemplate:
         db.delete_prompt_template("t1")
 
         # Resume into a new session
-        session2 = _make_session()
-        resumed = session2.resume(ws_id)
+        session2 = _make_session(ws_id=ws_id)
+        resumed = session2.rehydrate()
 
         assert resumed
         assert session2._skill_name == "ephemeral-tpl"
@@ -483,7 +483,9 @@ class TestSkillFactoryPassthrough:
         def factory(ui, model_alias=None, ws_id=None, *, skill=None, **_kwargs):
             nonlocal captured_skill
             captured_skill = skill
-            return _make_session(skill=captured_skill)
+            return _make_session(
+                skill=captured_skill, workstream_lease=_kwargs.get("workstream_lease")
+            )
 
         gq: queue.Queue[dict] = queue.Queue(maxsize=1000)
         adapter = InteractiveAdapter(
@@ -510,7 +512,7 @@ class TestSkillFactoryPassthrough:
         def factory(ui, model_alias=None, ws_id=None, *, skill=None, **_kwargs):
             nonlocal captured_skill
             captured_skill = skill
-            return _make_session(skill=skill)
+            return _make_session(skill=skill, workstream_lease=_kwargs.get("workstream_lease"))
 
         gq: queue.Queue[dict] = queue.Queue(maxsize=1000)
         adapter = InteractiveAdapter(

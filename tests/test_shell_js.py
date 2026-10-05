@@ -21,7 +21,12 @@ from urllib.parse import urljoin, urlsplit
 
 import pytest
 
-from tests._js_harness_helpers import slice_braced_block, strip_js_comments
+from tests._js_harness_helpers import (
+    node_skip,
+    run_node_source,
+    slice_braced_block,
+    strip_js_comments,
+)
 
 _ROOT = Path(__file__).resolve().parent.parent
 _SHARED = _ROOT / "turnstone/shared_static"
@@ -907,6 +912,49 @@ def test_node_proxied_close_409_uses_plain_retry_copy() -> None:
         "Conversation history is still being saved. Try ending the session again shortly." in close
     )
     assert "pm.close(pane.id)" in close, "successful and already-closed cases still drop the tab"
+
+
+@node_skip
+def test_node_proxied_title_and_delete_name_the_holder_on_a_lease_refusal() -> None:
+    """A pane whose node lost the workstream says where it is open, and keeps the tab."""
+    utils = (_SHELL_JS.parent / "utils.js").read_text(encoding="utf-8")
+    shell = _SHELL_JS.read_text(encoding="utf-8")
+    helpers = ""
+    for name, params in (("leaseRefusalWhere", "status, data"), ("readRefusal", "r")):
+        body = slice_braced_block(utils, utils.index(f"export function {name}("))
+        assert body is not None
+        helpers += f"function {name}({params}) {body}\n"
+    menu_body = slice_braced_block(shell, shell.index("function convTabMenu("))
+    assert menu_body is not None
+    result = run_node_source(
+        helpers
+        + """
+import assert from 'node:assert/strict';
+const toasts = []; const closed = [];
+const window = { showToast: (m, k) => toasts.push([k, m]), confirm: () => true,
+                 prompt: () => "new title" };
+globalThis.window = window;
+const paneAccelBadge = () => "";
+const findWs = () => null;
+const refused = { ok: false, status: 409,
+  json: async () => ({ code: "workstream_lease_held", holder_node_id: "node-b" }) };
+const postWsVerb = async () => refused;
+function convTabMenu(pane, pm, wsId, opts) """
+        + menu_body
+        + """
+const pm = { close: (id) => closed.push(id) };
+const items = convTabMenu({ id: "p1" }, pm, "ws1",
+  { deleteVerb: true, titleVerbs: true, base: () => "/node/x" });
+for (const label of ["Delete", "Edit title"]) {
+  items.find((i) => i.label === label).action();
+}
+await new Promise((r) => setTimeout(r, 20));
+const held = "This session is open on node 'node-b'. Retry once it closes there.";
+assert.deepEqual(toasts, [["warn", held], ["warn", held]]);
+assert.deepEqual(closed, []);  // a refused delete keeps the tab
+"""
+    )
+    assert result.returncode == 0, result.stderr
 
 
 def test_coordinator_tab_menu_enables_title_verbs() -> None:

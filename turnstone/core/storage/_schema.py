@@ -173,6 +173,18 @@ workstreams = sa.Table(
     sa.Column("persona", sa.Text, nullable=True),
     sa.Column("created", sa.Text, nullable=False),
     sa.Column("updated", sa.Text, nullable=False),
+    # Owner lease (migration 078): at most one live writer per incarnation.
+    # lease_holder is boot-scoped (one per SessionManager instance), so it is
+    # not the node id; lease_node_id is the holder's node, a routing hint.
+    # lease_epoch advances on every acquisition and offline fence-out, so a
+    # retired or paused holder's fence cannot match again; it restarts at 0
+    # when an id is registered again, so fences also carry the incarnation
+    # token. lease_expires_ms is epoch milliseconds on the database clock.
+    # See core/storage/_lease.py.
+    sa.Column("lease_holder", sa.Text, nullable=True),
+    sa.Column("lease_node_id", sa.Text, nullable=True),
+    sa.Column("lease_epoch", sa.BigInteger, nullable=False, server_default="0"),
+    sa.Column("lease_expires_ms", sa.BigInteger, nullable=True),
 )
 
 sa.Index("idx_workstreams_node_id", workstreams.c.node_id)

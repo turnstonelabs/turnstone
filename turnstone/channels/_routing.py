@@ -519,18 +519,24 @@ class ChannelRouter:
             return PolicyVerdict(kind="none")
 
         try:
-            from turnstone.core.policy import evaluate_tool_policies_batch
+            from turnstone.core.policy import evaluate_loaded_tool_policies
 
             verdicts = await asyncio.to_thread(
-                evaluate_tool_policies_batch,
+                evaluate_loaded_tool_policies,
                 self._storage,
                 tool_names,
             )
         except Exception:
-            # Fail-open: freezing every workstream on a storage hiccup is worse
-            # than letting the approval fall through to interactive review.
-            # Log at WARNING so the policy-DB outage is still auditable.
+            # An unexpected error evaluating the rows defers like an unreadable read
+            # (a storage outage arrives as None; the policy cache logs it).
             log.warning("channel_router.policy_evaluation_failed", exc_info=True)
+            verdicts = None
+        if verdicts is None:
+            # Unreadable policies defer, as a batch no policy matched does: the node's
+            # approval gate already applied them to this batch (it refuses one it
+            # cannot check), and freezing every workstream on a storage hiccup is
+            # worse. The channel then asks in the chat, or approves on its own
+            # auto-approve settings.
             return PolicyVerdict(kind="defer", tool_names=tool_names)
 
         denied = [n for n, v in verdicts.items() if v == "deny"]

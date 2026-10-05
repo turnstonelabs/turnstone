@@ -308,8 +308,9 @@ All verdicts are persisted to the `intent_verdicts` table (migration 012):
 - LLM verdicts are stored when the `intent_verdict` event is delivered
 - The `user_decision` column is updated when the user approves or denies;
   auto-approved rows carry the bypass reason (`policy`, `blanket`,
-  `auto_approve_tools`, `smart_approval`), and rows whose verdict landed only
-  after a newer batch replaced the judge generation carry `superseded`
+  `auto_approve_tools`, `smart_approval`, `unattended_watch`), and rows whose
+  verdict landed only after a newer batch replaced the judge generation carry
+  `superseded`
 - Every stored verdict — including the benign `risk_level = "none"` majority —
   is re-attached to its tool call on history replay, so a reloaded workstream
   shows the same verdict badges the live stream did

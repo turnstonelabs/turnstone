@@ -50,125 +50,37 @@ def test_cli_workstreams_command_keeps_local_repl_behavior(tmp_db: str) -> None:
     ui.on_info.assert_called_once_with("No saved workstreams.")
 
 
-def test_cli_resume_command_keeps_local_repl_behavior(tmp_db: str) -> None:
-    ui = MagicMock()
-    session = make_registered_session(ui=ui, client_type=ClientType.CLI)
-    session.resume = MagicMock(return_value=False)
-
-    with patch("turnstone.core.session.resolve_workstream", return_value="target-ws") as resolve:
-        assert session.handle_command("/resume target") is False
-
-    resolve.assert_called_once_with("target")
-    session.resume.assert_called_once_with("target-ws")
-    ui.on_info.assert_called_once_with("Workstream target has no messages.")
-
-
 def test_cli_delete_command_keeps_local_repl_behavior(tmp_db: str) -> None:
     ui = MagicMock()
     session = make_registered_session(ui=ui, client_type=ClientType.CLI, ws_id="current-ws")
 
+    storage = MagicMock()
+    storage.delete_workstream.return_value = True
     with (
         patch("turnstone.core.session.resolve_workstream", return_value="target-ws") as resolve,
-        patch("turnstone.core.session.delete_workstream", return_value=True) as delete,
+        patch("turnstone.core.session.get_storage", return_value=storage),
     ):
         assert session.handle_command("/delete target") is False
 
     resolve.assert_called_once_with("target")
-    delete.assert_called_once_with("target-ws")
+    storage.delete_workstream.assert_called_once_with("target-ws")
     ui.on_info.assert_called_once_with("Deleted workstream target")
 
 
-def test_cli_new_retries_a_live_generated_id(
-    tmp_db: str,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from turnstone.core.storage import get_storage
-
-    storage = get_storage()
-    consumed = "a" * 32
-    replacement = "b" * 32
-    assert storage.register_workstream(consumed) is True
-    generated = iter((MagicMock(hex=consumed), MagicMock(hex=replacement)))
-    monkeypatch.setattr("turnstone.core.session.uuid.uuid4", lambda: next(generated))
-    session = make_registered_session(client_type=ClientType.CLI, ws_id="current-ws")
-
-    assert session.handle_command("/new") is False
-
-    assert session.ws_id == replacement
-    assert storage.get_workstream(consumed) is not None
-    assert storage.get_workstream(replacement) is not None
-
-
-@pytest.mark.parametrize("memory_enabled", [False, True])
-def test_cli_new_recomposes_cached_prefix_after_identity_swap(
-    tmp_db: str,
-    memory_enabled: bool,
-) -> None:
-    session = make_registered_session(
-        client_type=ClientType.CLI,
-        ws_id="current-ws",
-    )
-    session._persona_memory = memory_enabled
-    session._init_system_messages()
-    before = session.system_messages[0]["content"]
-    old_ws_id = session.ws_id
-    old_epoch = session._system_prefix_epoch
-
-    assert session.handle_command("/new") is False
-
-    after = session.system_messages[0]["content"]
-    assert session._system_prefix_epoch > old_epoch
-    assert session.ws_id != old_ws_id
-    assert session.ws_id in after
-    assert old_ws_id not in after
-    assert after != before
-
-
-def test_nonfork_resume_rebinds_project_memory_context_before_recomposition(tmp_db: str) -> None:
-    """A supported identity adoption must not retain the prior project's memory rung."""
+def test_rehydrate_binds_the_project_memory_of_its_workstream(tmp_db: str) -> None:
+    """A session built without the project (the CLI's factory drops it) takes the row's."""
     from turnstone.core.storage import get_storage
 
     storage = get_storage()
     assert storage is not None
-    storage.create_project("source-project", "Source Project", "alice")
     storage.create_project("target-project", "Target Project", "alice")
-    storage.register_workstream(
-        "current-ws",
-        user_id="alice",
-        project_id="source-project",
-    )
-    storage.register_workstream(
-        "target-ws",
-        user_id="alice",
-        project_id="target-project",
-    )
+    storage.register_workstream("target-ws", user_id="alice", project_id="target-project")
     storage.save_message("target-ws", "user", "target history")
-    storage.acquire_memory_index_snapshot("current-ws", "alice")
 
-    session = make_registered_session(
-        client_type=ClientType.CLI,
-        user_id="alice",
-        ws_id="current-ws",
-        project_id="source-project",
-    )
-    assert session.resume("target-ws") is True
+    session = make_session(client_type=ClientType.CLI, user_id="alice", ws_id="target-ws")
+    assert session.rehydrate() is True
 
-    assert session.ws_id == "target-ws"
     access = session._memory_access()
     assert access.project_id == "target-project"
     assert access.project_name == "Target Project"
-    assert access.project_writable is True
     assert ("project", "target-project") in session._visible_scopes()
-    assert ("project", "source-project") not in session._visible_scopes()
-    prompt = "\n".join(str(message.get("content", "")) for message in session.system_messages)
-    assert "Source Project" not in prompt
-
-    generation = session._claim_generation(principal_id="alice")
-    session._admit_memory_index_request(
-        session._primary_lane(),
-        my_generation=generation,
-        principal_id="alice",
-    )
-    wire = list(session.system_messages)
-    assert "Target Project" in str(wire)
-    assert "Source Project" not in str(wire)

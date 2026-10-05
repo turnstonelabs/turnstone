@@ -2,8 +2,19 @@
 
 import pytest
 
-from turnstone.core.policy import evaluate_tool_policies_batch, evaluate_tool_policy
+from turnstone.core.policy import evaluate_loaded_tool_policies
 from turnstone.core.storage._sqlite import SQLiteBackend
+
+
+def _verdict(storage, tool_name):
+    verdicts = evaluate_loaded_tool_policies(storage, [tool_name])
+    assert verdicts is not None
+    return verdicts[tool_name]
+
+
+class BrokenStorage:
+    def list_tool_policies(self, org_id=""):
+        raise RuntimeError("boom")
 
 
 @pytest.fixture
@@ -15,75 +26,67 @@ def storage(tmp_path):
 
 
 def test_no_policies_returns_none(storage):
-    result = evaluate_tool_policy(storage, "bash")
+    result = _verdict(storage, "bash")
     assert result is None
 
 
 def test_exact_match_allow(storage):
     storage.create_tool_policy("p1", "allow-read", "read_file", "allow", 0)
-    assert evaluate_tool_policy(storage, "read_file") == "allow"
-    assert evaluate_tool_policy(storage, "write_file") is None
+    assert _verdict(storage, "read_file") == "allow"
+    assert _verdict(storage, "write_file") is None
 
 
 def test_glob_match_deny(storage):
     storage.create_tool_policy("p1", "block-bash", "bash*", "deny", 0)
-    assert evaluate_tool_policy(storage, "bash") == "deny"
-    assert evaluate_tool_policy(storage, "bash_exec") == "deny"
-    assert evaluate_tool_policy(storage, "read_file") is None
+    assert _verdict(storage, "bash") == "deny"
+    assert _verdict(storage, "bash_exec") == "deny"
+    assert _verdict(storage, "read_file") is None
 
 
 def test_wildcard_match(storage):
     storage.create_tool_policy("p1", "ask-all", "*", "ask", 0)
-    assert evaluate_tool_policy(storage, "anything") == "ask"
+    assert _verdict(storage, "anything") == "ask"
 
 
 def test_priority_ordering(storage):
     # Higher priority wins
     storage.create_tool_policy("p1", "allow-all", "*", "allow", 0)
     storage.create_tool_policy("p2", "deny-bash", "bash*", "deny", 100)
-    assert evaluate_tool_policy(storage, "bash") == "deny"  # p2 matches first (higher priority)
-    assert evaluate_tool_policy(storage, "read_file") == "allow"  # p1 matches
+    assert _verdict(storage, "bash") == "deny"  # p2 matches first (higher priority)
+    assert _verdict(storage, "read_file") == "allow"  # p1 matches
 
 
 def test_disabled_policy_skipped(storage):
     storage.create_tool_policy("p1", "block-bash", "bash*", "deny", 100, enabled=False)
     storage.create_tool_policy("p2", "allow-all", "*", "allow", 0)
-    assert evaluate_tool_policy(storage, "bash") == "allow"  # p1 disabled, falls through to p2
+    assert _verdict(storage, "bash") == "allow"  # p1 disabled, falls through to p2
 
 
 def test_batch_evaluation(storage):
     storage.create_tool_policy("p1", "block-bash", "bash*", "deny", 100)
     storage.create_tool_policy("p2", "allow-read", "read_*", "allow", 50)
-    results = evaluate_tool_policies_batch(storage, ["bash", "read_file", "write_file"])
+    results = evaluate_loaded_tool_policies(storage, ["bash", "read_file", "write_file"])
     assert results["bash"] == "deny"
     assert results["read_file"] == "allow"
     assert results["write_file"] is None
 
 
-def test_storage_failure_returns_none():
-    """Graceful degradation on storage failure."""
-
-    class BrokenStorage:
-        def list_tool_policies(self, org_id=""):
-            raise RuntimeError("boom")
-
-    assert evaluate_tool_policy(BrokenStorage(), "bash") is None
+def test_unreadable_policies_answer_none_not_no_match():
+    """Not a verdict per tool, which would read as "no policy matched": the gates fail closed."""
+    assert evaluate_loaded_tool_policies(BrokenStorage(), ["a", "b"]) is None
 
 
-def test_batch_storage_failure():
-    class BrokenStorage:
-        def list_tool_policies(self, org_id=""):
-            raise RuntimeError("boom")
-
-    results = evaluate_tool_policies_batch(BrokenStorage(), ["a", "b"])
-    assert results == {"a": None, "b": None}
+def test_a_failed_read_is_not_cached(storage):
+    storage.create_tool_policy("p1", "block-bash", "bash*", "deny", 0)
+    assert evaluate_loaded_tool_policies(BrokenStorage(), ["bash"]) is None
+    assert evaluate_loaded_tool_policies(storage, ["bash"]) == {"bash": "deny"}
 
 
 def test_first_match_wins(storage):
     # Two policies match, first by priority wins
     storage.create_tool_policy("p1", "deny-bash", "bash*", "deny", 100)
     storage.create_tool_policy("p2", "allow-bash", "bash*", "allow", 50)
-    assert evaluate_tool_policy(storage, "bash_exec") == "deny"
+    assert _verdict(storage, "bash_exec") == "deny"
 
 
 # ---------------------------------------------------------------------------
@@ -94,40 +97,40 @@ def test_first_match_wins(storage):
 def test_mcp_resource_wildcard_deny(storage):
     """Deny all MCP resource reads via glob pattern."""
     storage.create_tool_policy("p1", "block-resources", "mcp_resource__*", "deny", 100)
-    assert evaluate_tool_policy(storage, "mcp_resource__file:///secret.txt") == "deny"
-    assert evaluate_tool_policy(storage, "mcp_resource__db://users") == "deny"
-    assert evaluate_tool_policy(storage, "read_file") is None  # unrelated tool
+    assert _verdict(storage, "mcp_resource__file:///secret.txt") == "deny"
+    assert _verdict(storage, "mcp_resource__db://users") == "deny"
+    assert _verdict(storage, "read_file") is None  # unrelated tool
 
 
 def test_mcp_resource_per_server_pattern(storage):
     """Allow resources from a specific server, deny others."""
     storage.create_tool_policy("p1", "block-all-resources", "mcp_resource__*", "deny", 50)
     storage.create_tool_policy("p2", "allow-docs", "mcp_resource__file:///docs/*", "allow", 100)
-    assert evaluate_tool_policy(storage, "mcp_resource__file:///docs/readme.md") == "allow"
-    assert evaluate_tool_policy(storage, "mcp_resource__file:///etc/passwd") == "deny"
+    assert _verdict(storage, "mcp_resource__file:///docs/readme.md") == "allow"
+    assert _verdict(storage, "mcp_resource__file:///etc/passwd") == "deny"
 
 
 def test_mcp_prompt_wildcard_ask(storage):
     """Require approval for all MCP prompt invocations."""
     storage.create_tool_policy("p1", "ask-prompts", "mcp__*", "ask", 100)
-    assert evaluate_tool_policy(storage, "mcp__github__code_review") == "ask"
-    assert evaluate_tool_policy(storage, "mcp__templates__greeting") == "ask"
-    assert evaluate_tool_policy(storage, "bash") is None
+    assert _verdict(storage, "mcp__github__code_review") == "ask"
+    assert _verdict(storage, "mcp__templates__greeting") == "ask"
+    assert _verdict(storage, "bash") is None
 
 
 def test_mcp_prompt_per_server_allow(storage):
     """Auto-approve prompts from a trusted server."""
     storage.create_tool_policy("p1", "ask-all-mcp", "mcp__*", "ask", 50)
     storage.create_tool_policy("p2", "allow-trusted", "mcp__trusted__*", "allow", 100)
-    assert evaluate_tool_policy(storage, "mcp__trusted__greeting") == "allow"
-    assert evaluate_tool_policy(storage, "mcp__untrusted__evil") == "ask"
+    assert _verdict(storage, "mcp__trusted__greeting") == "allow"
+    assert _verdict(storage, "mcp__untrusted__evil") == "ask"
 
 
 def test_mcp_batch_mixed(storage):
     """Batch evaluation with mixed MCP and built-in tools."""
     storage.create_tool_policy("p1", "block-resources", "mcp_resource__*", "deny", 100)
     storage.create_tool_policy("p2", "allow-prompts", "mcp__trusted__*", "allow", 100)
-    results = evaluate_tool_policies_batch(
+    results = evaluate_loaded_tool_policies(
         storage,
         ["mcp_resource__file:///x", "mcp__trusted__greeting", "bash", "mcp__other__y"],
     )
@@ -163,5 +166,5 @@ def test_mcp_tool_granular_policy(storage):
     storage.create_tool_policy("p1", "ask-all-mcp", "mcp__*", "ask", 50)
     storage.create_tool_policy("p2", "allow-github", "mcp__github__*", "allow", 100)
     # MCP tools now use func_name as approval_label
-    assert evaluate_tool_policy(storage, "mcp__github__search") == "allow"
-    assert evaluate_tool_policy(storage, "mcp__untrusted__exec") == "ask"
+    assert _verdict(storage, "mcp__github__search") == "allow"
+    assert _verdict(storage, "mcp__untrusted__exec") == "ask"

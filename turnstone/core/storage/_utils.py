@@ -17,6 +17,7 @@ if TYPE_CHECKING:
 from turnstone.core.attachments import AUDIO_MIME_TO_FORMAT, unreadable_placeholder
 from turnstone.core.log import get_logger
 from turnstone.core.project_access import decide_project_access, fold_role_permissions
+from turnstone.core.storage._lease import unleased_predicate
 from turnstone.core.storage._protocol import (
     FORK_RESERVATION_CONFIG_KEY,
     AttachmentWrite,
@@ -25,6 +26,7 @@ from turnstone.core.storage._protocol import (
     ForkCloneSnapshot,
     ForkDestinationConflictError,
     ForkSourceUnavailableError,
+    LeaseFence,
 )
 from turnstone.core.storage._schema import (
     conversations,
@@ -733,6 +735,7 @@ class KeyedAttachmentSaveWrappers:
         event_id: int | None = None,
         meta: str | None = None,
         commit_key: str,
+        lease: LeaseFence | None = None,
     ) -> int:
         """Commit a keyed USER row and all attachment ownership atomically."""
         return self._save_message_with_attachments(
@@ -746,6 +749,7 @@ class KeyedAttachmentSaveWrappers:
             commit_key=commit_key,
             origin="upload",
             exact_blob_metadata=False,
+            lease=lease,
         )
 
     def save_tool_message_with_attachments(
@@ -760,6 +764,7 @@ class KeyedAttachmentSaveWrappers:
         is_error: bool = False,
         meta: str | None = None,
         commit_key: str,
+        lease: LeaseFence | None = None,
     ) -> int:
         """Commit a keyed TOOL row and all attachment ownership atomically."""
         return self._save_message_with_attachments(
@@ -775,6 +780,7 @@ class KeyedAttachmentSaveWrappers:
             commit_key=commit_key,
             origin="tool",
             exact_blob_metadata=True,
+            lease=lease,
         )
 
 
@@ -1901,7 +1907,7 @@ def reconstruct_messages(
     send-time repair (:func:`turnstone.core.lowering.repair_wire_messages`), the
     single place the wire path synthesizes cancellation results.  Callers that
     consume the messages as LLM context via the session send path
-    (``session.resume``) get that repair for free; a consumer that bypasses it
+    (``ChatSession.rehydrate``) get that repair for free; a consumer that bypasses it
     (``export``) runs ``repair_wire_messages`` itself.  Callers reading for
     *display* (the ``/history`` REST endpoint) should pass ``repair=False`` so
     the user sees the actual partial state — refreshing during tool execution
@@ -2320,6 +2326,7 @@ ORPHAN_PRUNE_GRACE_SECONDS = 2 * 60 * 60
 def prune_workstreams_shared(
     retention_days: int,
     *,
+    dialect_name: str,
     select_ids: Callable[[tuple[Any, ...]], list[str]],
     delete_candidate: Callable[[str, tuple[Any, ...]], bool],
 ) -> tuple[int, int]:
@@ -2331,6 +2338,13 @@ def prune_workstreams_shared(
     separate-statement recheck; SQLite: ``BEGIN IMMEDIATE`` recheck).  The
     same predicate tuple drives discovery AND recheck, so every conjunct
     must be a pure SQLAlchemy expression with no per-call state.
+
+    Both categories exclude rows with a live owner lease (``dialect_name``
+    selects the database-clock expression): a process that has the
+    workstream loaded renews its lease, so an empty or old row it is using is
+    never pruned from under it. The recheck re-reads the clock under the row
+    lock, and an acquisition needs that lock, so no lease can appear between
+    the recheck and the delete.
 
     Orphan category — zero conversation rows — carries two guards beyond
     ``state != 'creating'``:
@@ -2355,8 +2369,10 @@ def prune_workstreams_shared(
     orphan_cutoff = (datetime.now(UTC) - timedelta(seconds=ORPHAN_PRUNE_GRACE_SECONDS)).strftime(
         "%Y-%m-%dT%H:%M:%S"
     )
+    unleased = unleased_predicate(dialect_name)
     orphan_predicate = (
         workstreams.c.state != "creating",
+        unleased,
         ~sa.exists(
             sa.select(conversations.c.id).where(conversations.c.ws_id == workstreams.c.ws_id)
         ),
@@ -2375,6 +2391,7 @@ def prune_workstreams_shared(
         )
         stale_predicate = (
             workstreams.c.state != "creating",
+            unleased,
             workstreams.c.alias.is_(None),
             workstreams.c.updated < stale_cutoff,
         )
@@ -2384,7 +2401,13 @@ def prune_workstreams_shared(
     return (orphans, stale)
 
 
-def _watch_snapshot_meta(raw_meta: Any) -> dict[str, Any] | None:
+#: ``reason`` of the system turn that tells the model a watch ended because its
+#: workstream moved to another node. It is a notice, not a watch result:
+#: snapshot readers skip it.
+WATCH_OWNERSHIP_CHANGED_REASON = "ownership_changed"
+
+
+def watch_snapshot_meta(raw_meta: Any) -> dict[str, Any] | None:
     """Validate watch metadata from a Turn or stored JSON, ignoring malformed data."""
     try:
         meta = json.loads(raw_meta) if isinstance(raw_meta, str) else raw_meta
@@ -2394,6 +2417,7 @@ def _watch_snapshot_meta(raw_meta: Any) -> dict[str, Any] | None:
         isinstance(meta, dict)
         and isinstance(meta.get("watch_id"), str)
         and meta["watch_id"]
+        and meta.get("reason") != WATCH_OWNERSHIP_CHANGED_REASON
         and all(
             key in meta for key in ("watch_name", "command", "output", "poll_count", "max_polls")
         )
@@ -2417,7 +2441,7 @@ def get_watch_snapshot_on_connection(conn: Any, ws_id: str, watch_id: str) -> di
         .order_by(conversations.c.id.desc())
     )
     for (raw_meta,) in rows:
-        meta = _watch_snapshot_meta(raw_meta)
+        meta = watch_snapshot_meta(raw_meta)
         if meta is not None and meta["watch_id"] == watch_id:
             return meta
     return None
@@ -2724,14 +2748,14 @@ def _fork_retained_watch_rows(rows: list[Any], live_turns: list[Turn]) -> list[A
     seen: set[str] = set()
     for turn in live_turns:
         if turn.role is Role.SYSTEM and turn.source == "watch_triggered":
-            meta = _watch_snapshot_meta(turn.meta.extra.get("source_meta"))
+            meta = watch_snapshot_meta(turn.meta.extra.get("source_meta"))
             if meta is not None:
                 seen.add(meta["watch_id"])
     retained = []
     for row in reversed(rows):
         if row[1] != "system" or row[7] != "watch_triggered":
             continue
-        meta = _watch_snapshot_meta(row[10])
+        meta = watch_snapshot_meta(row[10])
         if meta is None or meta["watch_id"] in seen:
             continue
         seen.add(meta["watch_id"])

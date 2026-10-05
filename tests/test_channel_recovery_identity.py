@@ -70,7 +70,9 @@ async def test_retained_channel_cannot_adopt_another_users_workstream(app_client
     attacker = client.post("/v1/api/workstreams/new", json={}, headers=_auth("attacker")).json()[
         "ws_id"
     ]
-    storage.save_message(attacker, "user", "ATTACKER-CONTROLLED SAVED HISTORY")
+    storage.save_message(
+        attacker, "user", "ATTACKER-CONTROLLED SAVED HISTORY", lease=manager.lease_fence(attacker)
+    )
     storage.create_channel_user("discord", "111", "victim")
     storage.create_channel_route("discord", "555", source, channel_user_id="111")
     manager.close(source)

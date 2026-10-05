@@ -98,6 +98,136 @@ main()
         assert "CLI token sweep disabled" in result.stdout
 
 
+@pytest.mark.parametrize("failure", ["interrupt", "error"])
+def test_a_failure_before_the_prompt_still_tears_the_cli_down(tmp_path: Path, failure: str) -> None:
+    """The per-prompt work (closing parked tabs) runs under the loop's error handling."""
+    config_path = tmp_path / "config.toml"
+    config_path.write_text("", encoding="utf-8")
+    config_path.chmod(0o600)
+    script = """
+import sys
+from turnstone import cli
+
+failure = sys.argv.pop(1)
+calls = []
+original_close_all = cli._close_all_sessions
+original_parked = cli._close_parked_tabs
+
+def close_all(manager):
+    print("TEARDOWN", flush=True)
+    original_close_all(manager)
+
+def parked(manager, tabs):
+    calls.append(1)
+    if len(calls) == 2:
+        raise KeyboardInterrupt if failure == "interrupt" else RuntimeError("close failed")
+    return original_parked(manager, tabs)
+
+cli._close_all_sessions = close_all
+cli._close_parked_tabs = parked
+cli.main()
+"""
+    env = {key: value for key, value in os.environ.items() if not key.startswith("TURNSTONE_")}
+    env.update(
+        {
+            "OPENAI_API_KEY": "dummy",
+            "TURNSTONE_DB_BACKEND": "sqlite",
+            "TURNSTONE_DB_PATH": str(tmp_path / "turnstone.db"),
+        }
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            script,
+            failure,
+            "--config",
+            str(config_path),
+            "--model",
+            "startup-test-model",
+            "--retention-days",
+            "0",
+            "--no-judge",
+        ],
+        input="\n\n/exit\n",
+        text=True,
+        capture_output=True,
+        cwd=Path(__file__).resolve().parents[1],
+        env=env,
+        timeout=60,
+        check=False,
+    )
+
+    output = result.stdout + result.stderr
+    assert result.returncode == 0, output
+    assert "TEARDOWN" in result.stdout and "Goodbye." in result.stdout
+    if failure == "error":
+        # The CLI says what failed and keeps going to the next prompt.
+        assert "Error: close failed" in result.stdout
+
+
+def test_a_slash_command_that_fails_or_is_interrupted_returns_to_the_prompt(
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "config.toml"
+    config_path.write_text("", encoding="utf-8")
+    config_path.chmod(0o600)
+    script = """
+from turnstone import cli
+from turnstone.core.session import ChatSession
+
+original = ChatSession.handle_command
+
+def handle_command(self, line):
+    if line == "/boom":
+        raise RuntimeError("boom failed")
+    if line == "/stop":
+        raise KeyboardInterrupt
+    return original(self, line)
+
+ChatSession.handle_command = handle_command
+cli.main()
+"""
+    env = {key: value for key, value in os.environ.items() if not key.startswith("TURNSTONE_")}
+    env.update(
+        {
+            "OPENAI_API_KEY": "dummy",
+            "TURNSTONE_DB_BACKEND": "sqlite",
+            "TURNSTONE_DB_PATH": str(tmp_path / "turnstone.db"),
+        }
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            script,
+            "--config",
+            str(config_path),
+            "--model",
+            "startup-test-model",
+            "--retention-days",
+            "0",
+            "--no-judge",
+        ],
+        input="/new\n/boom\n/stop\n/exit\n",
+        text=True,
+        capture_output=True,
+        cwd=Path(__file__).resolve().parents[1],
+        env=env,
+        timeout=60,
+        check=False,
+    )
+
+    output = result.stdout + result.stderr
+    assert result.returncode == 0, output
+    assert "Error: boom failed" in result.stdout, output
+    assert "Interrupted." in result.stdout, output
+    # Both returned to the prompt: the /exit after them still ran.
+    assert "Goodbye." in result.stdout, output
+
+
 @pytest.mark.parametrize("oauth_pool", [False, True], ids=["model-only", "web-user-pool"])
 def test_cli_model_auth_with_mcp_disabled_persona(
     tmp_path: Path, sqlite_backend_factory: Callable[[str], SQLiteBackend], oauth_pool: bool

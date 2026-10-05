@@ -1,10 +1,20 @@
-"""Tests for tool policy enforcement in the CLI entry point."""
+"""Tests for tool policy enforcement in the approval gates: the CLI's and the shared one."""
 
 from __future__ import annotations
 
+import queue
+from typing import TYPE_CHECKING, Any
 from unittest.mock import MagicMock, patch
 
+import pytest
+
+from tests.conftest import resolve_when_pending
 from turnstone.cli import TerminalUI
+from turnstone.core.policy import POLICIES_UNREADABLE_DENIAL
+from turnstone.server import WebUI
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
 # ---------------------------------------------------------------------------
 # CLI
@@ -34,7 +44,7 @@ class TestCLIPolicyEnforcement:
 
         with (
             patch(
-                "turnstone.core.policy.evaluate_tool_policies_batch",
+                "turnstone.core.policy.evaluate_loaded_tool_policies",
                 return_value={"bash": "deny"},
             ),
             patch(
@@ -55,7 +65,7 @@ class TestCLIPolicyEnforcement:
 
         with (
             patch(
-                "turnstone.core.policy.evaluate_tool_policies_batch",
+                "turnstone.core.policy.evaluate_loaded_tool_policies",
                 return_value={"read_file": "allow"},
             ),
             patch(
@@ -83,3 +93,223 @@ class TestCLIPolicyEnforcement:
 
         # Should fall through to normal prompt (which we answered 'y')
         assert approved is True
+
+    def test_unreadable_policies_refuse_every_call_even_under_skip_permissions(self):
+        ui = TerminalUI()
+        ui.auto_approve = True
+        items = self._make_items("bash")
+
+        with (
+            patch("turnstone.core.policy.evaluate_loaded_tool_policies", return_value=None),
+            patch("turnstone.core.storage._registry.get_storage", return_value=MagicMock()),
+            patch("builtins.input", side_effect=AssertionError("prompted")),
+        ):
+            ui.approve_tools(items)
+
+        assert items[0]["denied"] is True
+        assert items[0]["error"] == POLICIES_UNREADABLE_DENIAL
+
+    def test_a_policy_evaluation_that_raises_refuses_too(self):
+        ui = TerminalUI()
+        ui.auto_approve = True
+        items = self._make_items("bash")
+
+        with patch("turnstone.core.storage._registry.get_storage", side_effect=OSError("disk")):
+            ui.approve_tools(items)
+
+        assert items[0]["error"] == POLICIES_UNREADABLE_DENIAL
+
+    def test_no_policy_settles_the_budget_prompt_in_a_mixed_batch(self):
+        """The budget item takes no policy verdict even beside a call the unreadable policies
+        refuse: this gate reports a refusal as an error on an approved batch, which for the
+        budget item would read as approved."""
+        ui = TerminalUI()
+        budget, bash = self._make_items("__budget_override__", "bash")
+
+        with (
+            patch("turnstone.core.policy.evaluate_loaded_tool_policies", return_value=None),
+            patch("turnstone.core.storage._registry.get_storage", return_value=MagicMock()),
+            patch("builtins.input", return_value="n"),
+        ):
+            approved, _ = ui.approve_tools([budget, bash])
+
+        assert approved is False  # the person was asked, and said no
+        assert not budget.get("error")
+        assert bash["error"] == POLICIES_UNREADABLE_DENIAL
+
+    @pytest.mark.parametrize("verdicts", [None, {"__budget_override__": "allow"}])
+    @pytest.mark.parametrize(
+        ("auto_approve", "auto_approve_tools"),
+        [(False, set()), (True, set()), (False, {"__budget_override__"})],
+        ids=["plain", "skip-permissions", "auto-approve-list"],
+    )
+    def test_the_budget_prompt_always_asks_the_person(
+        self, verdicts, auto_approve, auto_approve_tools
+    ):
+        """As on a node: no policy, skip-permissions or auto-approve list settles it."""
+        ui = TerminalUI()
+        ui.auto_approve = auto_approve
+        ui.auto_approve_tools = set(auto_approve_tools)
+        # The exact item ``ChatSession.send`` builds: no header, call id or label.
+        item = {
+            "func_name": "__budget_override__",
+            "preview": "Token budget (1,000) exhausted. Approve to continue.",
+            "needs_approval": True,
+        }
+        prompts: list[str] = []
+
+        def answer(prompt: str) -> str:
+            prompts.append(prompt)
+            return "y"
+
+        with (
+            patch("turnstone.core.policy.evaluate_loaded_tool_policies", return_value=verdicts),
+            patch("turnstone.core.storage._registry.get_storage", return_value=MagicMock()),
+            patch("builtins.input", side_effect=answer),
+        ):
+            approved, _ = ui.approve_tools([item])
+
+        assert approved is True
+        assert len(prompts) == 1
+
+
+# ---------------------------------------------------------------------------
+# Shared gate (node and coordinator sessions)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def web_ui() -> Iterator[WebUI]:
+    WebUI._global_queue = queue.Queue()
+    yield WebUI(ws_id="ws-policy")
+    WebUI._global_queue = None
+
+
+def _bash_and_a_read() -> list[dict[str, Any]]:
+    """A call that needs approval and one that does not."""
+    return [
+        {
+            "call_id": f"c-{name}",
+            "header": f"Tool: {name}",
+            "preview": "",
+            "func_name": name,
+            "approval_label": name,
+            "needs_approval": needs_approval,
+        }
+        for name, needs_approval in (("bash", True), ("read_file", False))
+    ]
+
+
+@pytest.mark.parametrize(
+    "approval", ["a person", "skip-permissions", "auto-approve tools", "unattended grant", "judge"]
+)
+def test_unreadable_policies_refuse_every_call_needing_approval(web_ui: WebUI, approval: str):
+    """No deny rule could be checked, so nothing needing approval runs, on any approval."""
+    if approval == "skip-permissions":
+        web_ui.auto_approve = True
+    elif approval == "auto-approve tools":
+        web_ui.auto_approve_tools = {"bash"}
+    elif approval == "unattended grant":
+        assert web_ui.grant_unattended()
+    elif approval == "judge":
+        web_ui.smart_approvals_enabled = True
+    items = _bash_and_a_read()
+    prompt = resolve_when_pending(web_ui, True)  # a person would approve a prompt
+    prompt.start()
+    try:
+        with (
+            patch("turnstone.core.storage._registry.get_storage", return_value=MagicMock()),
+            patch("turnstone.core.policy.evaluate_loaded_tool_policies", return_value=None),
+            patch.object(WebUI, "_apply_smart_approvals", side_effect=AssertionError("judged")),
+        ):
+            approved, reason = web_ui.approve_tools(items)
+    finally:
+        prompt.cancel()
+
+    assert (approved, reason) == (False, "Tool policies could not be read")
+    bash, read_file = items
+    assert (bash["denied"], bash["denial_msg"]) == (True, POLICIES_UNREADABLE_DENIAL)
+    assert bash["_refused_by"] == "policy"  # no person rejected it: no denial nudge
+    assert not read_file.get("denied")  # needs no approval: the session still runs it
+    assert web_ui.serialize_recent_auto_approvals() == []
+
+
+def test_a_policy_evaluation_that_raises_refuses_the_same_way(web_ui: WebUI):
+    web_ui.auto_approve = True
+    items = _bash_and_a_read()
+
+    with patch("turnstone.core.storage._registry.get_storage", side_effect=OSError("disk")):
+        approved, _reason = web_ui.approve_tools(items)
+
+    assert approved is False
+    assert items[0]["denial_msg"] == POLICIES_UNREADABLE_DENIAL
+
+
+def test_a_storage_that_cannot_list_policies_refuses_end_to_end(web_ui: WebUI):
+    """Nothing patched in the policy module: the real cached read fails, the gate refuses."""
+
+    class BrokenStorage:
+        def list_tool_policies(self, org_id=""):
+            raise RuntimeError("database unavailable")
+
+    web_ui.auto_approve = True
+    items = _bash_and_a_read()
+
+    with patch("turnstone.core.storage._registry.get_storage", return_value=BrokenStorage()):
+        approved, reason = web_ui.approve_tools(items)
+
+    assert (approved, reason) == (False, "Tool policies could not be read")
+    assert items[0]["denial_msg"] == POLICIES_UNREADABLE_DENIAL
+
+
+def test_a_deny_rule_marks_its_refusal_as_policy(web_ui: WebUI):
+    items = _bash_and_a_read()
+
+    with (
+        patch("turnstone.core.storage._registry.get_storage", return_value=MagicMock()),
+        patch(
+            "turnstone.core.policy.evaluate_loaded_tool_policies",
+            return_value={"bash": "deny"},
+        ),
+    ):
+        approved, reason = web_ui.approve_tools(items)
+
+    assert (approved, reason) == (False, "Blocked by tool policy")
+    assert items[0]["_refused_by"] == "policy"
+
+
+# ---------------------------------------------------------------------------
+# Channel router (a second check, after the node's gate asked a person)
+# ---------------------------------------------------------------------------
+
+
+def _router_verdict(storage: Any) -> Any:
+    import asyncio
+
+    from turnstone.channels._routing import ChannelRouter
+
+    router = ChannelRouter("http://server.example", storage)
+    return asyncio.run(router.evaluate_tool_policies(_bash_and_a_read()))
+
+
+def test_the_channel_router_defers_on_unreadable_policies():
+    class BrokenStorage:
+        def list_tool_policies(self, org_id=""):
+            raise RuntimeError("database unavailable")
+
+    verdict = _router_verdict(BrokenStorage())
+
+    assert (verdict.kind, verdict.tool_names) == ("defer", ["bash"])
+
+
+def test_the_channel_router_applies_a_readable_deny(tmp_path: Any):
+    from turnstone.core.storage._sqlite import SQLiteBackend
+
+    storage = SQLiteBackend(str(tmp_path / "policies.db"))
+    try:
+        storage.create_tool_policy("p1", "block-bash", "bash", "deny", 0)
+        verdict = _router_verdict(storage)
+    finally:
+        storage.close()
+
+    assert (verdict.kind, verdict.denied_tools) == ("deny", ["bash"])

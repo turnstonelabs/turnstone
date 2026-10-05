@@ -88,6 +88,13 @@ def test_emit_closed_defaults_to_closed_reason() -> None:
     }
 
 
+def test_a_workstream_another_process_took_is_announced_unloaded_not_closed() -> None:
+    adapter, gq = _make_adapter()
+    adapter.on_lease_retired(_make_ws())
+    assert gq.get_nowait() == {"type": "ws_unloaded", "ws_id": "ws-1"}
+    assert gq.empty()
+
+
 def test_emit_closed_propagates_evicted_reason_and_name() -> None:
     adapter, gq = _make_adapter()
     adapter.emit_closed("ws-1", reason="evicted", name="my-ws")

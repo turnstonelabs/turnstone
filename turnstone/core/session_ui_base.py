@@ -432,7 +432,7 @@ class AutoApproveReason:
     ``.value`` dance at every emit site, and no surprise behaviour
     if a consumer compares against the literal).
 
-    The six reasons reflect the disjoint set of paths that bypass
+    The seven reasons reflect the disjoint set of paths that bypass
     the operator approval gate:
 
     - :attr:`SKILL` — workstream's skill template populated
@@ -460,6 +460,10 @@ class AutoApproveReason:
       ``judge.confidence_threshold``.  Distinct pill so an operator
       can see the judge — not a policy or a prior "Always" click —
       cleared this call.
+    - :attr:`UNATTENDED_WATCH` — a watch restore loaded the workstream
+      for the watch alone and no client had attached yet
+      (:meth:`SessionUIBase.grant_unattended`).  Distinct from
+      :attr:`BLANKET` so an operator can tell it from skip-permissions.
     """
 
     SKILL = "skill"
@@ -468,9 +472,10 @@ class AutoApproveReason:
     BLANKET = "blanket"
     AUTO_APPROVE_TOOLS = "auto_approve_tools"
     SMART_APPROVAL = "smart_approval"
+    UNATTENDED_WATCH = "unattended_watch"
 
     ALL: frozenset[str] = frozenset(
-        {SKILL, ALWAYS, POLICY, BLANKET, AUTO_APPROVE_TOOLS, SMART_APPROVAL}
+        {SKILL, ALWAYS, POLICY, BLANKET, AUTO_APPROVE_TOOLS, SMART_APPROVAL, UNATTENDED_WATCH}
     )
 
 
@@ -610,6 +615,13 @@ class SessionUIBase:
         # dashboard detail, approve routing) use ``_approval_cycles``.
         self._pending_approval: dict[str, Any] | None = None
         self.auto_approve = False
+        # Blanket approval a watch restore grants a workstream it loaded for
+        # the watch alone (#988), kept apart from ``auto_approve`` and ended
+        # for good by the first client that attaches or starts work. A leaf
+        # lock makes the grant and that first client one ordered pair.
+        self._unattended_lock = threading.Lock()
+        self._unattended = False
+        self._client_seen = False
         self.auto_approve_tools: set[str] = set()
         # Runtime "Approve + Always" grants are scoped to the immutable
         # execution principal, not the shared session. Configured/template
@@ -1402,6 +1414,29 @@ class SessionUIBase:
             self._register_or_close_listener_locked(client_queue)
         return client_queue
 
+    def grant_unattended(self) -> bool:
+        """Auto-approve tool batches until a client attaches or starts work.
+
+        A watch restore calls this for a workstream it loaded for the watch
+        alone. Returns ``False``, granting nothing, once a client was seen.
+        """
+        with self._unattended_lock:
+            if self._client_seen:
+                return False
+            self._unattended = True
+            return True
+
+    def note_client(self) -> None:
+        """A client attached or started work here: any unattended grant ends for good."""
+        with self._unattended_lock:
+            self._client_seen = True
+            self._unattended = False
+
+    def client_seen(self) -> bool:
+        """Whether a client has attached or started work here."""
+        with self._unattended_lock:
+            return self._client_seen
+
     def _register_or_close_listener_locked(
         self,
         client_queue: queue.Queue[dict[str, Any]],
@@ -1411,7 +1446,10 @@ class SessionUIBase:
         Caller holds ``_listeners_lock``. The terminal queue is deliberately
         not retained: the events route consumes ``ws_closed`` internally and
         exits, while a nonexistent consumer cannot leak a queue on the dead UI.
+        Every attach ends an unattended grant first, before the replay
+        preamble is built.
         """
+        self.note_client()
         if getattr(self, "_listeners_terminal", False):
             client_queue.put_nowait({"type": "ws_closed"})
             return
@@ -1849,7 +1887,11 @@ class SessionUIBase:
         names = {
             item.get("approval_label", "") or item.get("func_name", "")
             for item in cycle.items
-            if item.get("needs_approval") and item.get("func_name") and not item.get("error")
+            if item.get("needs_approval")
+            and item.get("func_name")
+            and not item.get("error")
+            # A call a policy refused is in the cycle's card, but nobody chose to approve it.
+            and not item.get("denied")
         }
         names.discard("")
         names.discard("__budget_override__")
@@ -2208,10 +2250,13 @@ class SessionUIBase:
         1. Reset the per-round verdict cache so late LLM verdicts from
            the previous round can't leak onto this one.
         2. Evaluate admin-defined tool policies (deny short-circuits;
-           allow tags items as auto-approved with ``AutoApproveReason.POLICY``).
+           allow tags items as auto-approved with ``AutoApproveReason.POLICY``;
+           policies that cannot be read refuse every call needing approval).
         3. Per-tool auto-approve via configured ``self.auto_approve_tools``
            plus execution-principal-scoped "Approve + Always" grants.
-        4. Budget-override carve-out + blanket ``self.auto_approve``.
+        4. Budget-override carve-out + blanket ``self.auto_approve``, or a
+           watch restore's unattended grant (:meth:`grant_unattended`, tagged
+           ``unattended_watch``; moot while ``auto_approve`` is on).
            Synthetic ``__budget_override__`` items always prompt.
         5. Activity tagging + ``_broadcast_activity`` so the dashboard
            reflects approval state.
@@ -2351,85 +2396,97 @@ class SessionUIBase:
         # operator prompt when a skill's token budget is exhausted, so a
         # wildcard ``*: allow`` policy must never auto-approve it. Same
         # rationale gates the carve-out check below at line 470.
+        # Calls an "ask" policy matched: the unattended watch grant leaves them
+        # to the normal approval flow (ids, since the items are plain dicts).
+        policy_asked: set[int] = set()
+
+        def _refuse_by_policy(reason: str) -> tuple[bool, str | None]:
+            """Answer a batch policy refused: its ``denied`` calls do not run.
+
+            Calls that need no approval, or that an ``allow`` policy approved, still run.
+            Records the policy-allowed siblings first: the fall-through branch never runs
+            on this path, so without this the policy bypass is invisible to /dashboard +
+            audit.  ``_record_auto_approves`` MUST run before ``_persist_auto_approved_*``
+            so the call_id → reason lookup map is populated before the heuristic INSERTs go
+            in: otherwise an LLM judge verdict firing in the gap lands with
+            ``user_decision="pending"`` and stays that way.
+            """
+            policy_deferred: list[Callable[[], None]] = []
+
+            def _commit_policy_result() -> None:
+                self._record_auto_approves(items, deferred=policy_deferred)
+                self._persist_auto_approved_heuristic_verdicts(items, deferred=policy_deferred)
+                self._enqueue({"type": "tool_info", "items": self._serialize_approval_items(items)})
+
+            if not _admit(_commit_policy_result):
+                return False, "Cancelled by user"
+            for persist in policy_deferred:
+                persist()
+            return False, reason
+
         if pending:
+            # ``None``: the policies could not be read.
+            verdicts: dict[str, str | None] | None = {}
             try:
-                from turnstone.core.policy import evaluate_tool_policies_batch
+                from turnstone.core.policy import evaluate_loaded_tool_policies
                 from turnstone.core.storage._registry import get_storage
 
                 storage = get_storage()
-                if storage is not None:
-                    tool_names = [
-                        it.get("approval_label", "") or it.get("func_name", "")
-                        for it in pending
-                        if it.get("func_name") and it.get("func_name") != "__budget_override__"
-                    ]
-                    if tool_names:
-                        verdicts = evaluate_tool_policies_batch(storage, tool_names)
-                        if _cancelled():
-                            return False, "Cancelled by user"
-                        still_pending = []
-                        for it in pending:
-                            policy_name = it.get("approval_label", "") or it.get("func_name", "")
-                            # Synthetic budget-override item bypasses policy
-                            # matching entirely — falls through to the carve-out
-                            # gate so an operator always sees the prompt.
-                            if it.get("func_name") == "__budget_override__":
-                                still_pending.append(it)
-                                continue
-                            verdict = verdicts.get(policy_name)
-                            if verdict == "deny":
-                                it["denied"] = True
-                                it["denial_msg"] = (
-                                    f"Blocked by tool policy (pattern match for '{policy_name}')"
-                                )
-                            elif verdict == "allow":
-                                # Admin-defined ``allow`` rule fires the
-                                # auto-approve gate without any UI prompt.
-                                # Tag for /dashboard visibility so the
-                                # operator can see which calls bypassed
-                                # the prompt and why.
-                                it["needs_approval"] = False
-                                self._tag_auto_approved([it], AutoApproveReason.POLICY)
-                            else:
-                                still_pending.append(it)
-                        # If all were resolved by policy, check if any were denied
-                        if not still_pending:
-                            any_denied = any(it.get("denied") for it in items)
-                            if any_denied:
-                                # Record the policy-allowed siblings before
-                                # the early return — the fall-through
-                                # branch never runs on this path, so without
-                                # this the policy bypass is invisible to
-                                # /dashboard + audit.  ``_record_auto_approves``
-                                # MUST run before ``_persist_auto_approved_*``
-                                # so the call_id → reason lookup map is
-                                # populated before the heuristic INSERTs go
-                                # in: otherwise an LLM judge verdict firing
-                                # in the gap lands with ``user_decision=
-                                # "pending"`` and stays that way.
-                                policy_deferred: list[Callable[[], None]] = []
-
-                                def _commit_policy_result() -> None:
-                                    self._record_auto_approves(items, deferred=policy_deferred)
-                                    self._persist_auto_approved_heuristic_verdicts(
-                                        items,
-                                        deferred=policy_deferred,
-                                    )
-                                    self._enqueue(
-                                        {
-                                            "type": "tool_info",
-                                            "items": self._serialize_approval_items(items),
-                                        }
-                                    )
-
-                                if not _admit(_commit_policy_result):
-                                    return False, "Cancelled by user"
-                                for persist in policy_deferred:
-                                    persist()
-                                return False, "Blocked by tool policy"
-                        pending = still_pending
+                tool_names = [
+                    it.get("approval_label", "") or it.get("func_name", "")
+                    for it in pending
+                    if it.get("func_name") and it.get("func_name") != "__budget_override__"
+                ]
+                if storage is not None and tool_names:
+                    verdicts = evaluate_loaded_tool_policies(storage, tool_names)
             except Exception:
-                log.debug("Tool policy evaluation failed", exc_info=True)
+                log.warning("approve_tools.policy_evaluation_failed", exc_info=True)
+                verdicts = None
+            if _cancelled():
+                return False, "Cancelled by user"
+            if verdicts is None:
+                # No call needing approval can be checked against a deny rule, so none
+                # runs: an automatic approval (skip-permissions, an "Always" grant, the
+                # judge, the unattended grant) or a person could otherwise run a call an
+                # admin denied.
+                from turnstone.core.policy import POLICIES_UNREADABLE_DENIAL
+
+                for it in pending:
+                    it["denied"] = True
+                    it["denial_msg"] = POLICIES_UNREADABLE_DENIAL
+                    # Private (the wire projection is an allowlist): no person rejected it.
+                    it["_refused_by"] = "policy"
+                return _refuse_by_policy("Tool policies could not be read")
+            still_pending = []
+            for it in pending:
+                policy_name = it.get("approval_label", "") or it.get("func_name", "")
+                # Synthetic budget-override item bypasses policy
+                # matching entirely — falls through to the carve-out
+                # gate so an operator always sees the prompt.
+                if it.get("func_name") == "__budget_override__":
+                    still_pending.append(it)
+                    continue
+                verdict = verdicts.get(policy_name)
+                if verdict == "deny":
+                    it["denied"] = True
+                    it["denial_msg"] = f"Blocked by tool policy (pattern match for '{policy_name}')"
+                    it["_refused_by"] = "policy"
+                elif verdict == "allow":
+                    # Admin-defined ``allow`` rule fires the
+                    # auto-approve gate without any UI prompt.
+                    # Tag for /dashboard visibility so the
+                    # operator can see which calls bypassed
+                    # the prompt and why.
+                    it["needs_approval"] = False
+                    self._tag_auto_approved([it], AutoApproveReason.POLICY)
+                else:
+                    if verdict == "ask":
+                        policy_asked.add(id(it))
+                    still_pending.append(it)
+            # If all were resolved by policy, check if any were denied
+            if not still_pending and any(it.get("denied") for it in items):
+                return _refuse_by_policy("Blocked by tool policy")
+            pending = still_pending
         if _cancelled():
             return False, "Cancelled by user"
         # -- End tool policy evaluation -------------------------------------------
@@ -2473,7 +2530,20 @@ class SessionUIBase:
         # from the pre-filter ``items`` list at the top of the function so a
         # policy/auto-approve pass that drained the override from ``pending``
         # cannot disarm this gate.
-        blanket_active = self.auto_approve and not has_budget_override
+        # Skip-permissions wins the tag: a batch it approves reads as blanket.
+        unattended = getattr(self, "_unattended", False) and not self.auto_approve
+        # An "ask" policy wants the normal approval flow even while nobody is
+        # here: the grant then covers only the calls no "ask" policy matched,
+        # after the judge below, and the asked calls the judge does not clear
+        # wait at the prompt for a person.
+        grant_unasked_only = (
+            unattended and not has_budget_override and any(id(it) in policy_asked for it in pending)
+        )
+        if grant_unasked_only:
+            unattended = False
+        smart_commit_actions: list[Callable[[], None]] = []
+        auto_deferred: list[Callable[[], None]] = []
+        blanket_active = (self.auto_approve or unattended) and not has_budget_override
 
         # -- Smart Approvals (judge.smart_approvals) -----------------------------
         # Last automatic gate before the human prompt, after the explicit
@@ -2482,13 +2552,13 @@ class SessionUIBase:
         # still-pending call the judge cleared with a high-confidence
         # ``approve``.  Skipped under blanket auto-approve (everything is
         # approved already) and when a ``__budget_override__`` pseudo-tool
-        # is present (it must always reach a human).
+        # is present (it must always reach a human).  An unattended batch an
+        # "ask" policy matched is judged whole, as in an attended session (the
+        # judge's clearance is all or nothing).
         # Smart qualification is read-only.  Its mutations, audit stamps, and
         # visible auto-approval commit join the one terminal admission below;
         # a Stop between the verdict wait and that admission therefore leaves
         # no half-approved batch behind.
-        smart_commit_actions: list[Callable[[], None]] = []
-        auto_deferred: list[Callable[[], None]] = []
         if pending and smart_config.enabled and not blanket_active and not has_budget_override:
             pending = self._apply_smart_approvals(
                 pending,
@@ -2498,6 +2568,14 @@ class SessionUIBase:
                 commit_actions=smart_commit_actions,
                 persistence_actions=auto_deferred,
             )
+        if grant_unasked_only:
+            granted = [it for it in pending if id(it) not in policy_asked]
+            for it in granted:
+                # Resolved like a policy ``allow``: only the asked calls cross the gate.
+                it["needs_approval"] = False
+            if granted:
+                self._tag_auto_approved(granted, AutoApproveReason.UNATTENDED_WATCH)
+            pending = [it for it in pending if id(it) in policy_asked]
 
         if not pending or blanket_active:
             first = items[0] if items else {}
@@ -2512,7 +2590,12 @@ class SessionUIBase:
                     # dashboard can distinguish it from the other automatic
                     # paths.  These item mutations share the same admission as
                     # their visible/audited decision.
-                    self._tag_auto_approved(pending, AutoApproveReason.BLANKET)
+                    self._tag_auto_approved(
+                        pending,
+                        AutoApproveReason.UNATTENDED_WATCH
+                        if unattended
+                        else AutoApproveReason.BLANKET,
+                    )
                 with self._ws_lock:
                     self._ws_current_activity = f"⚙ {label}: {preview}" if label else ""
                     self._ws_activity_state = "tool" if label else ""
@@ -2664,6 +2747,9 @@ class SessionUIBase:
             for item in pending:
                 item["denied"] = True
                 item["denial_msg"] = denial_msg
+                if cycle.decision == "timeout":
+                    # Nobody answered: not a person's rejection (private, like the policy mark).
+                    item["_refused_by"] = "timeout"
 
         return approved, feedback
 

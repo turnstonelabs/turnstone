@@ -27,12 +27,39 @@ class ErrorResponse(BaseModel):
     """Standard error response body."""
 
     error: str = Field(description="Error message")
+    code: str | None = Field(
+        default=None,
+        description=(
+            "Machine-readable reason on some refusals, e.g. ``workstream_lease_held`` "
+            "(another process owns the workstream) or ``wrong_execution_node``"
+        ),
+    )
+    holder_node_id: str | None = Field(
+        default=None,
+        description="With ``workstream_lease_held``: the node holding the lease, if known",
+    )
+    retry_after_ms: int | None = Field(
+        default=None,
+        description="With ``workstream_lease_held``: milliseconds until that lease expires",
+    )
 
 
 class StatusResponse(BaseModel):
     """Generic success response."""
 
     status: str = Field(default="ok", examples=["ok"])
+
+
+class WorkstreamDeleteRequest(BaseModel):
+    """POST /v1/api/route/workstreams/delete request."""
+
+    ws_id: str = Field(description="ID of the workstream to delete")
+
+
+class WorkstreamDeleteResponse(BaseModel):
+    """Success response of a workstream delete."""
+
+    deleted: str = Field(description="ID of the workstream that was deleted")
 
 
 class DeleteSettingResponse(BaseModel):

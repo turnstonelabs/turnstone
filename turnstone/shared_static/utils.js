@@ -10,6 +10,32 @@
    (console app.js / admin.js / governance.js, ui app.js, inline onclick=)
    working; modules should import instead. */
 
+// Where a workstream is open, for a 409 that is an owner-lease refusal
+// (code ``workstream_lease_held``): "on node 'X'" when the holder is a valid
+// node id (display-only, validated like node ids), else "in another process".
+// ``null`` for any other response, other 409s included (a node-affinity
+// refusal, a name already taken), so callers show those as they are.
+export function leaseRefusalWhere(status, data) {
+  if (status !== 409 || !data || data.code !== "workstream_lease_held") return null;
+  const holder = data.holder_node_id;
+  return typeof holder === "string" && /^[A-Za-z0-9_.-]{1,256}$/.test(holder)
+    ? "on node '" + holder + "'"
+    : "in another process";
+}
+
+// Read a refused response once: its JSON body (``{}`` when it has none or it
+// is not an object) and, for an owner-lease refusal, where the workstream is
+// open (see ``leaseRefusalWhere``).
+export function readRefusal(r) {
+  return Promise.resolve()
+    .then(() => r.json())
+    .catch(() => ({}))
+    .then((data) => {
+      const body = data && typeof data === "object" ? data : {};
+      return { data: body, where: leaseRefusalWhere(r.status, body) };
+    });
+}
+
 export function escapeHtml(text) {
   const el = document.createElement("span");
   el.textContent = text;
@@ -329,6 +355,7 @@ export async function exportWorkstreamDownload(wsId, btn, base) {
 // boot time, well after this deferred module has evaluated.  New module code
 // imports instead.  Drop entries as the classic bundles migrate.
 Object.assign(window, {
+  readRefusal,
   escapeHtml,
   formatTokens,
   ctxClass,

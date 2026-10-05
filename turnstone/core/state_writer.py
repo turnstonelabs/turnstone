@@ -36,6 +36,15 @@ AFTER ``close()``'s sync 'closed' write. The flow that preserves it:
 ws_id could flush AFTER the sync 'error' write and clobber it. Same
 fix — ``record(flush_now=True)`` discards any pending entry and waits
 on the flush_lock before the sync write.
+
+**Owner lease**. Each buffered entry carries the owner-lease fence its
+workstream held when the transition was accepted, and the flush presents
+it. Storage refuses a fence another process has since replaced, so a
+holder paused with buffered state cannot write it into the successor's
+row. A lost fence is the expected end of a lost lease and is logged at
+debug; a held refusal (an unfenced write meeting a live lease) means a
+forgotten fence and is logged at warning. Neither is a storage fault, so
+neither reaches ``on_flush_error``.
 """
 
 from __future__ import annotations
@@ -45,11 +54,27 @@ import threading
 from typing import TYPE_CHECKING, Any
 
 from turnstone.core.log import get_logger
+from turnstone.core.storage._protocol import WorkstreamLeaseHeldError, WorkstreamLeaseLostError
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+    from turnstone.core.storage._protocol import LeaseFence
+
 log = get_logger(__name__)
+
+
+def _log_lease_refusal(ws_id: str, exc: Exception) -> None:
+    """Log a state write an owner lease refused; never reported as a flush error.
+
+    A lost fence is routine (the slot is being retired). A held refusal means
+    a write that presented no fence met a live lease: the manager stops
+    writing a row it gave back, so that can only be a forgotten fence.
+    """
+    if isinstance(exc, WorkstreamLeaseHeldError):
+        log.warning("state_writer.unfenced_write_refused ws=%s", ws_id[:8])
+    else:
+        log.debug("state_writer.lease_refused ws=%s", ws_id[:8])
 
 
 class StateWriter:
@@ -72,11 +97,12 @@ class StateWriter:
         self._flush_interval = flush_interval
         self._max_buffer = max_buffer
         self._on_flush_error = on_flush_error
-        # ws_id → (manager incarnation, state.value). Python dict preserves
-        # insertion order, so iterating the buffer yields oldest-first for
-        # FIFO eviction.  Incarnations prevent an old deferred tail from
-        # writing after the same logical id has been reopened.
-        self._buffer: dict[str, tuple[int | None, str]] = {}
+        # ws_id → (manager incarnation, state.value, lease fence). Python
+        # dict preserves insertion order, so iterating the buffer yields
+        # oldest-first for FIFO eviction.  Incarnations prevent an old
+        # deferred tail from writing after the same logical id has been
+        # reopened in this process; the fence does the same across processes.
+        self._buffer: dict[str, tuple[int | None, str, LeaseFence | None]] = {}
         self._incarnations: dict[str, int] = {}
         # Workstream ids whose CURRENT incarnation is closed.  ``reopen``
         # clears the id but installs a fresh token; explicit old-token records
@@ -102,6 +128,7 @@ class StateWriter:
         *,
         flush_now: bool = False,
         incarnation: int | None = None,
+        lease: LeaseFence | None = None,
     ) -> None:
         """Buffer (or sync-write) a state transition.
 
@@ -133,7 +160,9 @@ class StateWriter:
                             incarnation is None or pending[0] == incarnation
                         ):
                             self._buffer.pop(ws_id, None)
-                    self._storage.update_workstream_state(ws_id, state)
+                    self._storage.update_workstream_state(ws_id, state, lease=lease)
+            except (WorkstreamLeaseLostError, WorkstreamLeaseHeldError) as exc:
+                _log_lease_refusal(ws_id, exc)
             except Exception as exc:
                 log.debug(
                     "state_writer.flush_now_failed ws=%s",
@@ -158,7 +187,7 @@ class StateWriter:
             effective_incarnation = (
                 incarnation if incarnation is not None else self._incarnations.get(ws_id)
             )
-            self._buffer[ws_id] = (effective_incarnation, state)
+            self._buffer[ws_id] = (effective_incarnation, state, lease)
         # Wake the flusher so a single transition gets persisted within
         # ~one round-trip rather than waiting up to flush_interval.
         # Coalescing across bursts still happens because the flusher
@@ -294,12 +323,14 @@ class StateWriter:
                     return
                 pending = self._buffer
                 self._buffer = {}
-            for ws_id, (incarnation, state) in pending.items():
+            for ws_id, (incarnation, state, lease) in pending.items():
                 with self._lock:
                     if not self._accepts_locked(ws_id, incarnation):
                         continue
                 try:
-                    self._storage.update_workstream_state(ws_id, state)
+                    self._storage.update_workstream_state(ws_id, state, lease=lease)
+                except (WorkstreamLeaseLostError, WorkstreamLeaseHeldError) as exc:
+                    _log_lease_refusal(ws_id, exc)
                 except Exception as exc:
                     log.debug(
                         "state_writer.flush_failed ws=%s",

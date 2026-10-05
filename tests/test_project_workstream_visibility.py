@@ -491,6 +491,24 @@ class TestClusterTenancyFilter:
         assert filt.event_visible({"type": "cluster_state", "ws_id": "w-priv"}) is True
         assert filt.event_touches_storage({"type": "ws_created", "ws_id": "x"}) is False
 
+    def test_ws_unloaded_is_judged_even_after_a_close_cleared_the_id(self) -> None:
+        """A stale holder's unload after the new owner's close must not reveal a hidden row."""
+        from turnstone.console.server import _ClusterTenancyFilter
+
+        filt = _ClusterTenancyFilter(_ScriptedVis({"ph": False}))
+        filt.filter_snapshot(self._snap())  # w-priv judged hidden
+        assert filt.event_visible({"type": "ws_closed", "ws_id": "w-priv"}) is False
+        unloaded = {
+            "type": "ws_unloaded",
+            "ws_id": "w-priv",
+            "node_id": "node-a",
+            "project_id": "ph",
+            "user_id": "a",
+        }
+        assert filt.event_touches_storage(unloaded) is True
+        assert filt.event_visible(unloaded) is False
+        assert filt.event_visible({**unloaded, "ws_id": "w-vis", "project_id": ""}) is True
+
     def test_ws_created_judged_and_closed_cleans_up(self) -> None:
         from turnstone.console.server import _ClusterTenancyFilter
 

@@ -70,6 +70,12 @@ class ConsoleRouter:
         # the metrics gauge.  Strictly increasing so dashboards can
         # detect when membership stops being refreshed.
         self._refresh_counter: int = 0
+        # Refreshes started (bumped under ``_refresh_lock`` before the reads),
+        # and the start number of the last one that succeeded, so
+        # ``force_refresh(since=...)`` can share a refresh that read storage
+        # after its caller's evidence arrived.
+        self._refresh_started: int = 0
+        self._fresh_generation: int = 0
 
     # ------------------------------------------------------------------
     # Cache management
@@ -95,7 +101,7 @@ class ConsoleRouter:
         finally:
             self._refresh_lock.release()
 
-    def force_refresh(self) -> bool:
+    def force_refresh(self, *, since: int | None = None) -> bool:
         """Refresh now, blocking if another refresh is in progress.
 
         Used by the 404-retry path in the routing proxy when ``route()``
@@ -103,13 +109,32 @@ class ConsoleRouter:
         the retry needs a guaranteed-fresh view of membership +
         overrides before giving up.
 
+        ``since`` is :attr:`refresh_generation` read when the caller's
+        evidence (the 404) arrived: a refresh that started after it read
+        storage later, so a burst of 404s shares one instead of queueing
+        a scan each. Returns ``False`` without reading when it shares one.
+
         Async callers must wrap this in ``asyncio.to_thread`` — the
         method takes a blocking lock and issues storage queries.
         """
         with self._refresh_lock:
+            if since is not None and self._fresh_generation > since:
+                return False
             return self._refresh_locked()
 
+    @property
+    def refresh_generation(self) -> int:
+        """How many refreshes have started; pass it to :meth:`force_refresh`."""
+        return self._refresh_started
+
+    def knows_node(self, node_id: str) -> bool:
+        """Whether ``node_id`` is in the cached live-node list."""
+        with self._lock:
+            return any(node.node_id == node_id for node in self._nodes)
+
     def _refresh_locked(self) -> bool:
+        self._refresh_started += 1
+        generation = self._refresh_started
         services = self._storage.list_services("server", max_age_seconds=120)
         new_nodes = sorted(
             (
@@ -137,6 +162,7 @@ class ConsoleRouter:
             self._nodes = new_nodes
             self._overrides = new_overrides
             self._refresh_counter += 1
+        self._fresh_generation = generation
         return changed
 
     # ------------------------------------------------------------------
@@ -144,29 +170,48 @@ class ConsoleRouter:
     # ------------------------------------------------------------------
 
     def route(
-        self, ws_id: str, *, can_read: Callable[[dict[str, Any]], bool] | None = None
+        self,
+        ws_id: str,
+        *,
+        can_read: Callable[[dict[str, Any]], bool] | None = None,
+        known_row: dict[str, Any] | None = None,
     ) -> NodeRef:
         """Route a workstream to its assigned node.
 
         Priority:
-        A durable requirement wins over location overrides and HRW. Invisible
-        rows use the same placement as unknown IDs, avoiding a private-source
-        oracle through unavailable-node responses. Callers without a filter
-        are trusted internal consumers.
+        A durable requirement wins, then the live node holding the
+        workstream's owner lease, then location overrides and HRW. Storage
+        reports the holder's node only while the lease is live by the
+        database clock, so a crashed holder stops attracting traffic once its
+        lease expires and the usual placement picks a node that can take it
+        over. The holder is still only a hint: a node that cannot serve the
+        workstream answers 409 so the caller retries. Invisible rows use the
+        same placement as unknown IDs, avoiding a private-source oracle
+        through unavailable-node responses. Callers without a filter are
+        trusted internal consumers. ``known_row`` is the existing row a caller
+        just read with ``get_workstream`` or ``get_workstreams_batch``, saving
+        the read here: those reads report ``lease_node_id`` only while the
+        lease is live, while ``ensure_workstream_incarnation_snapshot``
+        returns the stored value, expired or not, and must never be passed.
         """
         if not ws_id:
             raise NoAvailableNodeError("invalid ws_id: empty")
         try:
-            row = self._storage.get_workstream(ws_id)
+            row = known_row if known_row is not None else self._storage.get_workstream(ws_id)
             visible = row is None or can_read is None or can_read(row)
             required = (
                 parse_required_node_id(row.get("required_node_id")) if row and visible else None
             )
+            holder = str(row.get("lease_node_id") or "") if row and visible else ""
         except Exception as exc:
             raise NoAvailableNodeError("Cannot resolve workstream execution requirement") from exc
         if required:
             return self.required_node(required)
         with self._lock:
+            if holder:
+                for node in self._nodes:
+                    if node.node_id == holder:
+                        return node
             ref = self._overrides.get(ws_id) if visible else None
             if ref is not None:
                 return ref

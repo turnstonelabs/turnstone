@@ -121,10 +121,15 @@ from turnstone.core.session_routes import (
 from turnstone.core.skill_field_validation import SKILL_RUNTIME_CONFIG_FIELDS
 from turnstone.core.skill_kind import SkillKind
 from turnstone.core.skill_parser import MAX_SKILL_DESCRIPTION_LEN
+from turnstone.core.storage import (
+    WorkstreamLeaseHeldError,
+    WorkstreamLeaseLostError,
+)
 from turnstone.core.token_store.crypto import STARTUP_KEY_REQUIRED_HINT
 from turnstone.core.web_helpers import (
     RevalidatingStaticFiles,
     is_safe_static_asset_path,
+    lease_refusal_response,
     read_json_or_400,
     require_storage_or_503,
     static_asset_cache_control,
@@ -137,7 +142,7 @@ from turnstone.core.workstream import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator, Callable, Iterable
+    from collections.abc import AsyncGenerator, Awaitable, Callable, Iterable
 
     from starlette.requests import Request
 
@@ -259,6 +264,10 @@ _JS_PROXY_SHIM = """\
 _VALID_NODE_ID = re.compile(r"^[a-zA-Z0-9._-]+$")
 _VALID_WS_ID_RE = re.compile(r"^[a-f0-9]{1,64}$")
 _VALID_CREATE_WS_ID_RE = re.compile(r"^[a-f0-9]{32}$")
+# An id the routed delete places in an upstream path: no separator, query,
+# fragment or dot segment can reach the URL. Not hex-only, matching what the
+# node's own delete route accepts.
+_PATH_SAFE_WS_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 _MAX_ROUTE_RESUME_LEN = 256
 # The schedule API keeps this many characters (code points) of a task's
 # initial message and of its name.  The console launcher and the admin shelf
@@ -1123,7 +1132,12 @@ async def cluster_ws_detail(request: Request) -> JSONResponse:
 
     return JSONResponse(
         {
-            "persisted": row,
+            # ``lease_node_id`` is an internal routing hint, as in coordinator inspect.
+            "persisted": (
+                {key: value for key, value in row.items() if key != "lease_node_id"}
+                if isinstance(row, dict)
+                else row
+            ),
             "live": live,
             "messages": messages,
         }
@@ -1405,7 +1419,9 @@ class _ClusterTenancyFilter:
             return True
         etype = event.get("type")
         wid = str(event.get("ws_id") or "")
-        if etype == "ws_created":
+        if etype in ("ws_created", "ws_unloaded"):
+            # Both carry the row's project and owner: judged afresh, never let
+            # through just because a close cleared the id from the hidden set.
             return self._judge(wid, event.get("project_id") or "", event.get("user_id") or "")
         if etype == "ws_closed" and wid:
             was_suppressed = wid in self._hidden or wid in self._unresolved
@@ -1426,7 +1442,7 @@ class _ClusterTenancyFilter:
         if self._bypass:
             return False
         wid = str(event.get("ws_id") or "")
-        return event.get("type") == "ws_created" or wid in self._unresolved
+        return event.get("type") in ("ws_created", "ws_unloaded") or wid in self._unresolved
 
 
 async def cluster_snapshot(request: Request) -> JSONResponse:
@@ -2491,7 +2507,8 @@ async def route_create(request: Request) -> Response:
         # not rendezvous the fresh id to another node while the collector is
         # still between refresh ticks.
         await asyncio.to_thread(router.remember_override, destination_ws_id, ref)
-        _emit_route_audit(
+        await asyncio.to_thread(
+            _emit_route_audit,
             request,
             "route.workstream.create",
             destination_ws_id,
@@ -2641,6 +2658,207 @@ async def route_attachment_proxy(request: Request) -> Response:
     )
 
 
+def _lease_refusal_holder(resp: httpx.Response) -> str | None:
+    """The holder a node's owner-lease refusal names ("" when unknown); None otherwise."""
+    if resp.status_code != WorkstreamLeaseHeldError.status_code:
+        return None
+    try:
+        body = resp.json()
+    except ValueError:
+        return None
+    if not isinstance(body, dict) or body.get("code") != WorkstreamLeaseHeldError.code:
+        return None
+    holder = body.get("holder_node_id")
+    return holder if isinstance(holder, str) else ""
+
+
+def _is_lease_refusal(resp: httpx.Response) -> bool:
+    """A node refused because another process owns the workstream's lease."""
+    return _lease_refusal_holder(resp) is not None
+
+
+async def _prepare_reroute(router: ConsoleRouter, resp: httpx.Response, ref: NodeRef) -> bool:
+    """Ready a re-route after a 404 or a lease refusal; False when it cannot move.
+
+    A 404 may come from stale membership or overrides, so refresh first. A
+    lease refusal names the holder: the refusing node itself means the route
+    cannot move, so its 409 stands. An empty holder or a node the router
+    already knows needs no refresh, because ``route()`` re-reads the holder
+    from the row on every call; an unknown holder refreshes membership first.
+    A burst of these shares one refresh: each passes the refresh generation
+    it saw on arrival, so a refresh that started later serves it too.
+    """
+    since = router.refresh_generation
+    holder = _lease_refusal_holder(resp)
+    if holder is None:
+        await asyncio.to_thread(router.force_refresh, since=since)
+        return True
+    if holder and holder == ref.node_id:
+        return False
+    if holder and not router.knows_node(holder):
+        await asyncio.to_thread(router.force_refresh, since=since)
+    return True
+
+
+async def _resend_if_route_moved(
+    request: Request,
+    router: ConsoleRouter,
+    ws_id: str,
+    verb: str,
+    t0: float,
+    ref: NodeRef,
+    resp: httpx.Response,
+    send: Callable[[NodeRef], Awaitable[httpx.Response]],
+) -> tuple[NodeRef, httpx.Response] | Response:
+    """Re-route once after ``resp`` and resend when the route moved.
+
+    The caller decides which responses warrant this. Returns the node and
+    response to report (unchanged when the route cannot move or stays the
+    same, so there is no loop and no scan), or a finished response when the
+    workstream's durable node requirement refuses the new route or the new
+    node is unreachable.
+    """
+    if not await _prepare_reroute(router, resp, ref):
+        return ref, resp
+    try:
+        new_ref = await _request_route(request, router, ws_id)
+    except NodeAffinityError as exc:
+        return _record_route(
+            request,
+            verb,
+            exc.status_code,
+            t0,
+            JSONResponse(exc.as_dict(), status_code=exc.status_code),
+        )
+    except (NoAvailableNodeError, ValueError):
+        return ref, resp
+    if (new_ref.node_id, new_ref.url) == (ref.node_id, ref.url):
+        return ref, resp
+    try:
+        return new_ref, await send(new_ref)
+    except httpx.HTTPError:
+        return _record_route(
+            request,
+            verb,
+            502,
+            t0,
+            JSONResponse(
+                {"error": f"retry node {new_ref.node_id} unreachable"},
+                status_code=502,
+            ),
+        )
+
+
+async def _delete_coordinator_on_console(
+    request: Request,
+    coord_mgr: Any,
+    ws_id: str,
+) -> JSONResponse | dict[str, Any] | None:
+    """Delete a coordinator here, or say where the delete goes.
+
+    Returns the response when this console answered: a coordinator's delete,
+    or 404 for a row that does not exist (storage is shared, so there is
+    nothing to delete anywhere). Returns the plain row read when it shows
+    another kind, for the router to reuse, and ``None`` when it could not
+    learn the kind or when only the incarnation snapshot showed another kind
+    (that raw row carries the stored ``lease_node_id``, expired or not, so
+    the router reads the live projection itself).
+
+    Coordinators run on the console, which holds their owner leases, so a
+    node would refuse the delete of a loaded one. Through the coordinator
+    manager, a loaded coordinator drains its durability tail first and its
+    lease fences the exact delete; an unloaded row is deleted unfenced and
+    refused only if another console owns it. The auth middleware enforces
+    the write scope (``WRITE_PATHS``). Like the console's other coordinator
+    surfaces, an unknown, provisional or invisible private-project
+    coordinator answers one 404 before ``admin.coordinator`` is checked, so
+    the route reveals nothing about coordinators the caller cannot see. A
+    lease refusal names the holder ``console``, the pseudo node every
+    console shares.
+    """
+    from turnstone.core.auth import WorkstreamProjectVisibility, require_permission
+
+    storage = getattr(request.app.state, "auth_storage", None)
+    if storage is None:
+        # Nothing marks a coordinator here without storage: the router sends
+        # the delete to a node, where a coordinator this console holds stays
+        # fenced by its lease, and interactive deletes keep working.
+        return None
+    if coord_mgr.get(ws_id) is None:
+        # Learn the kind with a plain read: only a coordinator needs the
+        # locking incarnation snapshot. When the read fails, the router sends
+        # the delete to a node, and a coordinator this console holds stays
+        # fenced by its lease there.
+        try:
+            probe = await asyncio.to_thread(storage.get_workstream, ws_id)
+        except Exception:
+            log.warning("route.coord_delete.kind_read_failed ws_id=%s", ws_id[:8], exc_info=True)
+            return None
+        if probe is None:
+            return JSONResponse({"error": "Workstream not found"}, status_code=404)
+        if probe.get("kind") != WorkstreamKind.COORDINATOR:
+            return dict(probe)
+    try:
+        row = await asyncio.to_thread(storage.ensure_workstream_incarnation_snapshot, ws_id)
+    except Exception:
+        log.warning("route.coord_delete.snapshot_failed ws_id=%s", ws_id[:8], exc_info=True)
+        return JSONResponse({"error": "Delete failed"}, status_code=500)
+    miss = JSONResponse({"error": "Workstream not found"}, status_code=404)
+    if row is None or row.get("state") == "creating":
+        return miss
+    if row.get("kind") != WorkstreamKind.COORDINATOR:
+        # Never hand the router a raw snapshot (see the docstring).
+        return None
+    visibility = WorkstreamProjectVisibility.for_request(request, storage=storage)
+    try:
+        visible = await asyncio.to_thread(
+            visibility.ws_visible,
+            row.get("project_id") or "",
+            ws_owner=row.get("user_id") or "",
+        )
+    except Exception:
+        log.warning("route.coord_delete.visibility_failed ws_id=%s", ws_id[:8], exc_info=True)
+        return JSONResponse({"error": "Delete failed"}, status_code=500)
+    if not visible:
+        return miss
+    err = require_permission(request, "admin.coordinator")
+    if err is not None:
+        return err
+    # Never empty: the snapshot mints a token for a legacy row.
+    token = str(row["fork_reservation_token"])
+    delete_exact = functools.partial(storage.delete_workstream_if_fork_reserved, ws_id, token)
+    try:
+        deleted = await asyncio.to_thread(
+            coord_mgr.delete_persisted,
+            ws_id,
+            delete_fn=delete_exact,
+            name=str(row.get("name") or ""),
+            expected_reservation_token=token,
+        )
+    except (WorkstreamLeaseHeldError, WorkstreamLeaseLostError) as exc:
+        return lease_refusal_response(exc)
+    except Exception:
+        log.exception("route.coord_delete.failed ws_id=%s", ws_id[:8])
+        return JSONResponse({"error": "Delete failed"}, status_code=500)
+    if not deleted:
+        return miss
+    user_id, ip = _audit_context(request)
+    try:
+        await asyncio.to_thread(
+            record_audit,
+            storage,
+            user_id,
+            "workstream.deleted",
+            "workstream",
+            ws_id,
+            {"kind": WorkstreamKind.COORDINATOR.value, "parent_ws_id": row.get("parent_ws_id")},
+            ip,
+        )
+    except Exception:
+        log.debug("route.coord_delete.audit_failed ws_id=%s", ws_id[:8], exc_info=True)
+    return JSONResponse({"deleted": ws_id})
+
+
 async def route_proxy(request: Request) -> Response:
     """Generic routing proxy for send/approve/cancel/command/close.
 
@@ -2783,55 +3001,37 @@ async def route_proxy(request: Request) -> Response:
             ),
         )
 
-    # Transparent retry on 404 (at most once):
-    #
-    # The rendezvous-selected node doesn't have the workstream.  Refresh
-    # membership + overrides and re-route.  If the route changed (e.g., a
-    # local-create override was added since the last cache load, or a
-    # node has joined / dropped), retry on the new node.  If the route
-    # is the same, return the 404 as-is — no loop, no scan.
+    # Transparent retry on 404 (at most once): the selected node doesn't
+    # have the workstream loaded. Refresh membership + overrides and
+    # re-route; ``route()`` rereads the lease holder from the row, so a moved
+    # workstream routes to its new owner. These verbs act on a loaded
+    # workstream, so a node that does not host it answers 404, never a lease
+    # refusal; such a 409 passes through unchanged.
     if resp.status_code == 404:
-        # Off the event loop — force_refresh takes a blocking lock and
-        # issues two storage queries.  Coalesces internally so a 404
-        # stampede after a node churn doesn't N×-multiply DB reads.
-        await asyncio.to_thread(router.force_refresh)
-        try:
-            new_ref = await _request_route(request, router, ws_id)
-        except NodeAffinityError as exc:
-            return _record_route(
-                request,
-                verb,
-                exc.status_code,
-                t0,
-                JSONResponse(exc.as_dict(), status_code=exc.status_code),
-            )
-        except (NoAvailableNodeError, ValueError):
-            new_ref = ref
-        if (new_ref.node_id, new_ref.url) != (ref.node_id, ref.url):
-            try:
-                resp = await client.request(
-                    http_method,
-                    f"{new_ref.url}{upstream_path}",
-                    json=body,
-                    headers=headers,
-                )
-            except httpx.HTTPError:
-                return _record_route(
-                    request,
-                    verb,
-                    502,
-                    t0,
-                    JSONResponse(
-                        {"error": f"retry node {new_ref.node_id} unreachable"},
-                        status_code=502,
-                    ),
-                )
-            ref = new_ref  # retried node — used for audit attribution (only emits on 2xx via the next block).
+        moved = await _resend_if_route_moved(
+            request,
+            router,
+            ws_id,
+            verb,
+            t0,
+            ref,
+            resp,
+            lambda node: client.request(
+                http_method,
+                f"{node.url}{upstream_path}",
+                json=body,
+                headers=headers,
+            ),
+        )
+        if isinstance(moved, Response):
+            return moved
+        # The retried node is the one audit attribution names (2xx only).
+        ref, resp = moved
 
     if 200 <= resp.status_code < 300:
         action = _ROUTE_PROXY_AUDIT_ACTIONS.get(verb)
         if action:
-            _emit_route_audit(request, action, ws_id, ref.node_id)
+            await asyncio.to_thread(_emit_route_audit, request, action, ws_id, ref.node_id)
     return _record_route(
         request,
         verb,
@@ -2852,9 +3052,43 @@ async def route_workstream_delete(request: Request) -> Response:
     (path parameter), so ``route_proxy``'s ``/api/route/... → /api/...``
     rewrite doesn't apply.  This dedicated handler reads ``ws_id`` from the
     request body, routes to the owning node, and forwards to the path-parameter
-    form.  Used by the coordinator's ``delete_workstream`` tool.
+    form.  Used by the coordinator's ``delete_workstream`` tool and the
+    saved-coordinators table. Coordinator rows are deleted on this console
+    (see :func:`_delete_coordinator_on_console`), which also answers an id
+    with no row; others go to the node that owns the workstream.
     """
     t0 = time.monotonic()
+    try:
+        body = await request.json()
+    except Exception:
+        return _record_route(
+            request,
+            "delete",
+            400,
+            t0,
+            JSONResponse({"error": "Invalid JSON body"}, status_code=400),
+        )
+
+    ws_id = body.get("ws_id", "") if isinstance(body, dict) else ""
+    if not isinstance(ws_id, str) or not _PATH_SAFE_WS_ID_RE.fullmatch(ws_id):
+        return _record_route(
+            request,
+            "delete",
+            400,
+            t0,
+            JSONResponse({"error": "ws_id required"}, status_code=400),
+        )
+    coord_mgr = getattr(request.app.state, "coord_mgr", None)
+    known_row: dict[str, Any] | None = None
+    if coord_mgr is not None:
+        handled = await _delete_coordinator_on_console(request, coord_mgr, ws_id)
+        if isinstance(handled, JSONResponse):
+            if 200 <= handled.status_code < 300:
+                await asyncio.to_thread(
+                    _emit_route_audit, request, "route.workstream.delete", ws_id, "console"
+                )
+            return _record_route(request, "delete", handled.status_code, t0, handled)
+        known_row = handled
     router: ConsoleRouter | None = request.app.state.router
     if router is None:
         return _record_route(
@@ -2869,29 +3103,8 @@ async def route_workstream_delete(request: Request) -> Response:
         )
     if not router.is_ready():
         await asyncio.to_thread(router.refresh_cache)
-
     try:
-        body = await request.json()
-    except Exception:
-        return _record_route(
-            request,
-            "delete",
-            400,
-            t0,
-            JSONResponse({"error": "Invalid JSON body"}, status_code=400),
-        )
-
-    ws_id = body.get("ws_id", "")
-    if not ws_id:
-        return _record_route(
-            request,
-            "delete",
-            400,
-            t0,
-            JSONResponse({"error": "ws_id required"}, status_code=400),
-        )
-    try:
-        ref = await _request_route(request, router, ws_id)
+        ref = await _request_route(request, router, ws_id, known_row=known_row)
     except NodeAffinityError as exc:
         return _record_route(
             request,
@@ -2926,8 +3139,31 @@ async def route_workstream_delete(request: Request) -> Response:
             ),
         )
 
+    # Only the node owning the workstream's lease may delete it (after its
+    # durability tail drains). On a refusal, re-route once to the holder.
+    if _is_lease_refusal(resp):
+        moved = await _resend_if_route_moved(
+            request,
+            router,
+            ws_id,
+            "delete",
+            t0,
+            ref,
+            resp,
+            lambda node: client.post(
+                f"{node.url}/v1/api/workstreams/{ws_id}/delete",
+                json=body,
+                headers=headers,
+            ),
+        )
+        if isinstance(moved, Response):
+            return moved
+        ref, resp = moved
+
     if 200 <= resp.status_code < 300:
-        _emit_route_audit(request, "route.workstream.delete", ws_id, ref.node_id)
+        await asyncio.to_thread(
+            _emit_route_audit, request, "route.workstream.delete", ws_id, ref.node_id
+        )
     return _record_route(
         request,
         "delete",
@@ -2990,8 +3226,18 @@ async def _resolve_fork_source(
     return row
 
 
-async def _request_route(request: Request, router: ConsoleRouter, ws_id: str) -> NodeRef:
-    """Resolve durable policy off-loop, with the request's history visibility."""
+async def _request_route(
+    request: Request,
+    router: ConsoleRouter,
+    ws_id: str,
+    *,
+    known_row: dict[str, Any] | None = None,
+) -> NodeRef:
+    """Resolve durable policy off-loop, with the request's history visibility.
+
+    ``known_row`` is the workstream row the caller already read, if any, with
+    ``get_workstream`` or ``get_workstreams_batch`` (see ``ConsoleRouter.route``).
+    """
     from turnstone.core.auth import WorkstreamProjectVisibility
 
     visibility = WorkstreamProjectVisibility.for_request(
@@ -3003,6 +3249,7 @@ async def _request_route(request: Request, router: ConsoleRouter, ws_id: str) ->
         can_read=lambda row: visibility.ws_visible(
             row.get("project_id") or "", ws_owner=row.get("user_id") or ""
         ),
+        known_row=known_row,
     )
 
 
@@ -5505,6 +5752,8 @@ def _bootstrap_coord_subsystem(
     # ``app.state._idle_nudge_watchers``.
     try:
         coord_state_writer.start()
+        # Renew the owner leases of loaded coordinators (#988).
+        coord_mgr.start_lease_keeper()
         # Coord-side observer: enqueues idle_children / idle_tasks
         # nudges when a coord goes IDLE with unfinished work — children
         # still running, open tasks still held, or both (the two fire
@@ -5559,6 +5808,10 @@ def _bootstrap_coord_subsystem(
             coord_state_writer.shutdown(timeout=2.0)
         except Exception:
             log.warning("console.coord_bootstrap_rollback_state_writer_failed", exc_info=True)
+        try:
+            coord_mgr.release_leases()
+        except Exception:
+            log.warning("console.coord_bootstrap_rollback_lease_release_failed", exc_info=True)
         try:
             coord_idle_observer.shutdown()
         except Exception:
@@ -5767,6 +6020,13 @@ def _teardown_partial_coord_subsystem(app: Any) -> None:
     except Exception:
         log.warning("console.coord_partial_idle_nudge_shutdown_failed", exc_info=True)
 
+    mgr = getattr(state, "coord_mgr", None)
+    if mgr is not None:
+        try:
+            mgr.release_leases()
+        except Exception:
+            log.warning("console.coord_partial_lease_release_failed", exc_info=True)
+
     state.coord_mgr = None
     state.coord_adapter = None
     state.coord_registry = None
@@ -5902,8 +6162,6 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None]:
             storage.register_service("console", "console", console_url)
 
             # Periodic heartbeat to keep the registration alive
-            import asyncio
-
             async def _console_heartbeat() -> None:
                 from turnstone.core.storage._registry import StorageUnavailableError
 
@@ -6078,9 +6336,11 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None]:
     coord_registry_shutdown = getattr(app.state, "coord_registry", None)
     if coord_registry_shutdown is not None:
         try:
-            # Coordinator sessions stop through the adapter first; the registry
-            # can then retire pooled model and rerank transports without a new
-            # session resolving behind the teardown.
+            # The adapter has stopped its child-event source; the registry can
+            # now retire pooled model and rerank transports. Coordinator
+            # sessions stay loaded (see the MCP note below); a running turn
+            # fails on its closed transport, and records that failure only if
+            # its write lands before ``release_leases`` latches the session.
             await asyncio.to_thread(coord_registry_shutdown.shutdown)
         except Exception:
             log.debug("console.coord_registry_shutdown_failed", exc_info=True)
@@ -6092,6 +6352,16 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None]:
             await asyncio.to_thread(coord_state_writer_shutdown.shutdown)
         except Exception:
             log.debug("console.coord_state_writer_shutdown_failed", exc_info=True)
+    coord_mgr_shutdown = getattr(app.state, "coord_mgr", None)
+    if coord_mgr_shutdown is not None:
+        try:
+            # Last, after the state writer: release_leases drains each
+            # coordinator's admitted writes before handing its lease back, so
+            # another console can open it at once instead of waiting out the
+            # TTL.
+            await asyncio.to_thread(coord_mgr_shutdown.release_leases)
+        except Exception:
+            log.debug("console.coord_lease_release_failed", exc_info=True)
     # Drop the shared ConsoleCoordinatorUI refs on teardown so tests
     # that spin up multiple lifespan instances don't carry stale
     # manager/collector references across them.
@@ -16634,8 +16904,9 @@ def create_app(
                         route_proxy,
                         methods=["POST"],
                     ),
-                    # Coordinator-only hard delete — forwards to the server's
-                    # path-parameter form at /v1/api/workstreams/{ws_id}/delete.
+                    # Hard delete: a coordinator is deleted here (the console
+                    # holds its lease); any other workstream is forwarded to
+                    # its node's /v1/api/workstreams/{ws_id}/delete.
                     Route(
                         "/api/route/workstreams/delete",
                         route_workstream_delete,

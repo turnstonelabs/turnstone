@@ -1,8 +1,10 @@
 """Tests for workstream persistence and resume functionality."""
 
 import json
+from typing import Any
 from unittest.mock import MagicMock, patch
 
+import pytest
 import sqlalchemy as sa
 
 from tests._oidc_test_helpers import keyed_app_state
@@ -21,6 +23,7 @@ from turnstone.core.memory import (
     update_workstream_title,
 )
 from turnstone.core.model_turn import resolve_model_binding
+from turnstone.core.personas import snapshot_from_config
 from turnstone.core.session import ChatSession
 from turnstone.core.storage import get_storage
 from turnstone.core.trajectory import turn_to_dict
@@ -276,18 +279,19 @@ class TestWorkstreamsTable:
             conn.execute(sa.text("SELECT tool_call_id FROM conversations LIMIT 0"))
 
 
-# ── ChatSession.resume ────────────────────────────────────────────────
+# ── ChatSession.rehydrate ────────────────────────────────────────────────
 
 
-class TestResumeWorkstream:
-    def test_resume_loads_messages(self, tmp_db, mock_openai_client):
+class TestRehydrateWorkstream:
+    def test_rehydrate_loads_messages(self, tmp_db, mock_openai_client):
         # Set up a workstream with messages in DB
         register_workstream("old_ws_123")
         save_message("old_ws_123", "user", "hello world")
         save_message("old_ws_123", "assistant", "hi there")
 
-        # Create a new session and resume
+        # Create a new session and rehydrate it
         session = ChatSession(
+            ws_id="old_ws_123",
             client=mock_openai_client,
             model="test-model",
             ui=MagicMock(),
@@ -296,18 +300,16 @@ class TestResumeWorkstream:
             max_tokens=1000,
             tool_timeout=10,
         )
-        original_id = session._ws_id
-        assert original_id != "old_ws_123"
-
-        result = session.resume("old_ws_123")
+        result = session.rehydrate()
         assert result is True
         assert session._ws_id == "old_ws_123"
         assert len(session.messages) == 2
         assert turn_to_dict(session.messages[0])["content"] == "hello world"
         assert session._title_generated is True
 
-    def test_resume_nonexistent_returns_false(self, tmp_db, mock_openai_client):
+    def test_rehydrate_nonexistent_returns_false(self, tmp_db, mock_openai_client):
         session = ChatSession(
+            ws_id="nonexistent",
             client=mock_openai_client,
             model="test-model",
             ui=MagicMock(),
@@ -316,7 +318,7 @@ class TestResumeWorkstream:
             max_tokens=1000,
             tool_timeout=10,
         )
-        assert session.resume("nonexistent") is False
+        assert session.rehydrate() is False
 
     def test_workstream_not_registered_until_message(self, tmp_db, mock_openai_client):
         session = ChatSession(
@@ -461,7 +463,7 @@ class TestInterruptedWorkstreamRepair:
 
         The default repair pass strips the trailing
         ``assistant(tool_calls)`` when not all tool results are persisted
-        — correct for ``session.resume`` (LLM context), wrong for the
+        — correct for ``rehydrate`` (LLM context), wrong for the
         REST display read.  A user refreshing the coordinator page mid-
         tool-execution would otherwise lose the entire trailing turn
         from the UI.  ``repair=False`` returns the raw persisted state.
@@ -557,8 +559,8 @@ class TestWorkstreamConfig:
         delete_workstream("s1")
         assert load_workstream_config("s1") == {}
 
-    def test_resume_restores_config(self, tmp_db):
-        """ChatSession.resume() should restore persisted config."""
+    def test_rehydrate_restores_config(self, tmp_db):
+        """ChatSession.rehydrate() should restore persisted config."""
         client = MagicMock()
         client.models.list.return_value.data = [MagicMock(id="test-model")]
         ui = MagicMock()
@@ -586,40 +588,48 @@ class TestWorkstreamConfig:
             },
         )
 
-        # Create a new session with different defaults, then resume
-        session = ChatSession(
-            client=client,
-            model="test",
-            ui=ui,
-            instructions=None,
-            temperature=0.7,
-            max_tokens=4096,
-            tool_timeout=30,
-        )
+        def build(persona_snapshot: Any) -> ChatSession:
+            return ChatSession(
+                ws_id="orig",
+                client=client,
+                model="test",
+                ui=ui,
+                instructions=None,
+                temperature=0.7,
+                max_tokens=4096,
+                tool_timeout=30,
+                persona_snapshot=persona_snapshot,
+            )
+
+        # The manager builds the session with the stored persona stamp, then
+        # loads the rest of the saved config over the constructor defaults.
+        session = build(snapshot_from_config(load_workstream_config("orig")))
         assert session.temperature == 0.7  # default
-        assert session._persona_name == ""  # unstamped constructor default
-        result = session.resume("orig")
+        result = session.rehydrate()
         assert result is True
         assert session.temperature == 0.3
         assert session.reasoning_effort == "high"
         assert session.max_tokens == 2048
         assert session.instructions == "be concise"
-        # Non-fork resume adopts the target's persona stamp so a later
-        # _save_config can't clobber it with this session's own stamp.
         assert session._persona_name == "writer"
         assert session._persona_prompt == "You are a creative writing partner."
         assert session._persona_tools == frozenset()
         assert session._persona_mcp is False
         assert session._persona_memory is True
 
-    def test_resume_keeps_defaults_when_alias_unresolvable(self, tmp_db):
+        # A session built under another persona (a factory that ignored the
+        # stamp) is refused rather than run, or saved, under the wrong one.
+        with pytest.raises(ValueError, match="built under another persona"):
+            build(None).rehydrate()
+
+    def test_rehydrate_keeps_defaults_when_alias_unresolvable(self, tmp_db):
         """When the saved alias is empty or no longer in the registry,
-        ``resume()`` must NOT copy ``saved_model`` onto the constructor's
+        ``rehydrate()`` must NOT copy ``saved_model`` onto the constructor's
         default provider.  Pairing a removed model name with a default
         provider that doesn't know about it produces a broken session
         whose next API call fails — the exact regression Copilot flagged
         on PR #465.  The constructor already resolved a coherent default
-        (provider + model + capabilities); resume should leave it intact
+        (provider + model + capabilities); rehydrate should leave it intact
         and just log the unreachable saved values."""
         client = MagicMock()
         client.models.list.return_value.data = [MagicMock(id="test-model")]
@@ -632,12 +642,13 @@ class TestWorkstreamConfig:
         register_workstream("model_ws")
         save_message("model_ws", "user", "hello")
         save_message("model_ws", "assistant", "hi")
-        # Empty alias + an orphan model name — same shape resume sees
+        # Empty alias + an orphan model name — same shape rehydrate sees
         # when an operator removes an alias from the registry that the
         # workstream was originally pinned to.
         save_workstream_config("model_ws", {"model": "gpt-5", "model_alias": ""})
 
         session = ChatSession(
+            ws_id="model_ws",
             client=client,
             model="gpt-5-nano",
             ui=ui,
@@ -647,13 +658,13 @@ class TestWorkstreamConfig:
             tool_timeout=10,
         )
         assert session.model == "gpt-5-nano"
-        result = session.resume("model_ws")
+        result = session.rehydrate()
         assert result is True
         # Constructor's coherent default is preserved — saved orphan
         # model name is NOT copied over.
         assert session.model == "gpt-5-nano"
 
-    def test_resume_restore_stamps_current_generation(self, tmp_db):
+    def test_rehydrate_restore_stamps_current_generation(self, tmp_db):
         from turnstone.core.model_registry import ModelConfig, ModelRegistry
 
         reg = ModelRegistry(
@@ -668,6 +679,7 @@ class TestWorkstreamConfig:
         save_workstream_config("gen_ws", {"model": "m-b", "model_alias": "b"})
         binding = resolve_model_binding(reg, "a")
         session = ChatSession(
+            ws_id="gen_ws",
             client=binding.lane.client,
             model=binding.lane.model,
             ui=MagicMock(),
@@ -688,7 +700,7 @@ class TestWorkstreamConfig:
             app_state=keyed_app_state(),
         )
 
-        assert session.resume("gen_ws") is True
+        assert session.rehydrate() is True
 
         assert session.model == "m-b"
         binding = session._model_binding
@@ -697,8 +709,8 @@ class TestWorkstreamConfig:
         assert binding.config is reg.get_config("b")
         assert binding.registry_generation == reg.generation
 
-    def test_resume_keeps_binding_when_alias_vanishes_mid_restore(self, tmp_db):
-        """The has_alias/resolve straddle must not raise out of resume."""
+    def test_rehydrate_keeps_binding_when_alias_vanishes_mid_restore(self, tmp_db):
+        """The has_alias/resolve straddle must not raise out of rehydrate."""
         from turnstone.core.model_registry import ModelConfig, ModelRegistry
 
         reg = ModelRegistry(
@@ -710,6 +722,7 @@ class TestWorkstreamConfig:
         save_workstream_config("race_ws", {"model": "m-a", "model_alias": "a"})
         binding = resolve_model_binding(reg, "a")
         session = ChatSession(
+            ws_id="race_ws",
             client=binding.lane.client,
             model=binding.lane.model,
             ui=MagicMock(),
@@ -726,12 +739,12 @@ class TestWorkstreamConfig:
         # has_alias passes, then the resolve finds the alias gone — the
         # straddle a concurrent reload produces.
         with patch.object(reg, "resolve_binding", side_effect=ValueError("Unknown model alias: a")):
-            assert session.resume("race_ws") is True  # must not raise
+            assert session.rehydrate() is True  # must not raise
 
         assert session._model_binding is old_binding
         assert session.model == "m-a"
 
-    def test_resume_construction_failure_logs_true_cause_keeps_binding(
+    def test_rehydrate_construction_failure_logs_true_cause_keeps_binding(
         self, tmp_db, monkeypatch, caplog
     ):
         """Logs the construction cause, not the unreachable-alias one."""
@@ -751,6 +764,7 @@ class TestWorkstreamConfig:
         save_workstream_config("cons_ws", {"model": "m-a", "model_alias": "a"})
         binding = resolve_model_binding(reg, "default")
         session = ChatSession(
+            ws_id="cons_ws",
             client=binding.lane.client,
             model=binding.lane.model,
             ui=MagicMock(),
@@ -769,7 +783,7 @@ class TestWorkstreamConfig:
 
         monkeypatch.setattr(mr_module, "create_client", _boom)
         with caplog.at_level(logging.WARNING):
-            assert session.resume("cons_ws") is True  # must not raise
+            assert session.rehydrate() is True  # must not raise
 
         assert session._model_binding is old_binding
         blob = " ".join(r.getMessage() for r in caplog.records)
@@ -788,7 +802,7 @@ class TestWorkstreamConfig:
         ``INSERT OR REPLACE`` per-key — silently resetting model_alias,
         temperature, reasoning_effort, max_tokens, skill, the persona
         stamp, and instructions to the constructor defaults *before*
-        ``resume()`` got a chance to read them back.
+        ``rehydrate()`` got a chance to read them back.
         """
         client = MagicMock()
         client.models.list.return_value.data = [MagicMock(id="test-model")]
@@ -842,7 +856,7 @@ class TestWorkstreamConfig:
     def test_init_writes_config_on_fresh_create(self, tmp_db):
         """The opposite half of the contract: when no config row exists
         yet, ``__init__`` must still persist the constructor's values so
-        a later resume can find them. This is the path that previously
+        a later rehydrate can find them. This is the path that previously
         worked — the fix must not break it."""
         client = MagicMock()
         client.models.list.return_value.data = [MagicMock(id="test-model")]

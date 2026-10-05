@@ -30,6 +30,12 @@ import pytest
 
 from turnstone.core.model_registry import ModelClientConstructionError, UnknownModelAliasError
 from turnstone.core.session_manager import CloseOutcome, SessionKindAdapter, SessionManager
+from turnstone.core.storage import (
+    LeaseFence,
+    LeaseGrant,
+    WorkstreamLeaseHeldError,
+    WorkstreamLeaseLostError,
+)
 from turnstone.core.workstream import (
     BULK_CLOSE_STATE_VALUES,
     Workstream,
@@ -71,15 +77,15 @@ class FakeUI:
 
 
 class FakeSession:
-    """Minimal ChatSession stand-in; exposes cancel / close / resume."""
+    """Minimal ChatSession stand-in; exposes cancel / close / rehydrate."""
 
     def __init__(self, ws_id: str, *, model_alias: str | None = None) -> None:
         self.ws_id = ws_id
         self.model_alias = model_alias
         self.cancelled = False
         self.closed = False
-        self.resumed = False
-        self.resume_hook: Callable[[], None] | None = None
+        self.rehydrated = False
+        self.rehydrate_hook: Callable[[], None] | None = None
 
     def cancel(self) -> None:
         self.cancelled = True
@@ -87,10 +93,11 @@ class FakeSession:
     def close(self) -> None:
         self.closed = True
 
-    def resume(self, ws_id: str) -> None:
-        if self.resume_hook is not None:
-            self.resume_hook()
-        self.resumed = True
+    def rehydrate(self) -> bool:
+        if self.rehydrate_hook is not None:
+            self.rehydrate_hook()
+        self.rehydrated = True
+        return True
 
 
 class FakeAdapter:
@@ -114,6 +121,7 @@ class FakeAdapter:
         self.build_session_hook: Callable[[Workstream, object | None], FakeSession] | None = None
         # Slow down session build so concurrent tests can race.
         self.build_session_delay = 0.0
+        self.lease_retired: list[str] = []
 
     def emit_created(self, ws: Workstream) -> None:
         with self._events_lock:
@@ -142,6 +150,10 @@ class FakeAdapter:
     ) -> None:
         with self._events_lock:
             self.events.append(_Event("closed", ws_id, reason=reason, name=name))
+
+    def on_lease_retired(self, ws: Workstream) -> None:
+        with self._events_lock:
+            self.lease_retired.append(ws.id)
 
     def cleanup_ui(self, ws: Workstream) -> None:
         self.cleaned_up.append(ws.id)
@@ -216,6 +228,24 @@ class _Row:
     required_node_id: str | None = None
     project_id: str | None = None
     persona: str | None = None
+    # Owner lease (wall-clock expiry stands in for the database clock).
+    lease_holder: str | None = None
+    lease_node_id: str | None = None
+    lease_epoch: int = 0
+    lease_expires_at: float | None = None
+
+    def lease_live(self) -> bool:
+        return (
+            self.lease_holder is not None
+            and self.lease_expires_at is not None
+            and self.lease_expires_at > time.time()
+        )
+
+    def fence_out(self) -> None:
+        self.lease_holder = None
+        self.lease_node_id = None
+        self.lease_expires_at = None
+        self.lease_epoch += 1
 
 
 class FakeStorage:
@@ -227,12 +257,6 @@ class FakeStorage:
         self.touch_calls: list[str] = []
         self.register_raises = False
         self.lock = threading.Lock()
-        # Live-services lookup target for close_idle pass 2.  Map
-        # service_type → list of live service_ids.  Tests that exercise
-        # liveness scoping populate this directly; default empty means
-        # "no peers alive" (every row unprotected by liveness).
-        self.live_services: dict[str, list[str]] = {}
-        self.list_services_raises = False
         self.delete_stale_creating_raises = False
         # Per-ws config (model_alias, temperature, …).  Populated by
         # tests that exercise the rehydrate-preserves-config path; the
@@ -242,10 +266,115 @@ class FakeStorage:
         # original on construction.
         self.ws_config: dict[str, dict[str, str]] = {}
         self.fork_reservations: dict[str, str] = {}
+        # Owner-lease knobs: PostgreSQL semantics by default (a live lease of
+        # another holder refuses acquisition); flip to model SQLite.
+        self.allow_live_takeover = False
+        self.renew_raises = False
+        self.renew_calls = 0
+        self.released: list[LeaseFence] = []
 
     @staticmethod
     def _now_iso() -> str:
         return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+
+    # -- owner lease ------------------------------------------------------
+
+    def acquire_workstream_lease(
+        self,
+        ws_id: str,
+        *,
+        incarnation_token: str,
+        holder: str,
+        node_id: str | None,
+        ttl_seconds: float,
+        allow_creating: bool = False,
+    ) -> LeaseGrant | None:
+        with self.lock:
+            row = self.rows.get(ws_id)
+            if row is None or not incarnation_token:
+                return None
+            if self.fork_reservations.get(ws_id) != incarnation_token:
+                return None
+            if row.state == "deleted" or (row.state == "creating" and not allow_creating):
+                return None
+            live = row.lease_live()
+            other = row.lease_holder is not None and row.lease_holder != holder
+            if live and other and not self.allow_live_takeover:
+                raise WorkstreamLeaseHeldError(
+                    ws_id,
+                    holder_node_id=row.lease_node_id or "",
+                    retry_after_ms=int(((row.lease_expires_at or 0) - time.time()) * 1000),
+                )
+            previous_holder = row.lease_holder or "" if other else ""
+            previous_node = row.lease_node_id or "" if other else ""
+            row.lease_holder = holder
+            row.lease_node_id = node_id or None
+            row.lease_epoch += 1
+            row.lease_expires_at = time.time() + ttl_seconds
+            return LeaseGrant(
+                fence=LeaseFence(ws_id, holder, row.lease_epoch, incarnation_token),
+                previous_holder=previous_holder,
+                previous_node_id=previous_node,
+                took_over_live=bool(live and other),
+            )
+
+    def renew_workstream_leases(
+        self,
+        holder: str,
+        fences: Any,
+        *,
+        ttl_seconds: float,
+    ) -> set[str]:
+        with self.lock:
+            self.renew_calls += 1
+            if self.renew_raises:
+                raise RuntimeError("renew forced failure")
+            renewed: set[str] = set()
+            for fence in fences:
+                row = self.rows.get(fence.ws_id)
+                if (
+                    row is not None
+                    and fence.holder == holder
+                    and row.lease_holder == holder
+                    and row.lease_epoch == fence.epoch
+                ):
+                    row.lease_expires_at = time.time() + ttl_seconds
+                    renewed.add(fence.ws_id)
+            return renewed
+
+    def release_workstream_lease(self, fence: LeaseFence) -> bool:
+        with self.lock:
+            row = self.rows.get(fence.ws_id)
+            if row is None or not self._fence_matches_locked(row, fence):
+                return False
+            row.lease_holder = None
+            row.lease_node_id = None
+            row.lease_expires_at = None
+            self.released.append(fence)
+            return True
+
+    def _fence_matches_locked(self, row: _Row, fence: LeaseFence) -> bool:
+        return (
+            row.lease_holder == fence.holder
+            and row.lease_epoch == fence.epoch
+            and self.fork_reservations.get(row.ws_id, "") == fence.incarnation_token
+        )
+
+    def _admit_locked(self, ws_id: str, lease: LeaseFence | None) -> _Row | None:
+        """Mirror of ``_lease.admit_workstream_write_on_connection``."""
+        row = self.rows.get(ws_id)
+        if row is None:
+            return None
+        if lease is not None:
+            if not self._fence_matches_locked(row, lease):
+                raise WorkstreamLeaseLostError(ws_id)
+            return row
+        if row.lease_holder is None:
+            return row
+        if row.lease_live():
+            raise WorkstreamLeaseHeldError(ws_id, holder_node_id=row.lease_node_id or "")
+        row.fence_out()
+        return row
 
     def register_workstream(
         self,
@@ -285,29 +414,32 @@ class FakeStorage:
             if fork_reservation_token:
                 self.fork_reservations[ws_id] = fork_reservation_token
 
-    def touch_workstream(self, ws_id: str) -> None:
+    def touch_workstream(self, ws_id: str, *, lease: LeaseFence | None = None) -> None:
         with self.lock:
+            row = self._admit_locked(ws_id, lease)
+            # Recorded once admitted: a refused touch is not a touch.
             self.touch_calls.append(ws_id)
-            if ws_id in self.rows:
-                self.rows[ws_id].updated = self._now_iso()
+            if row is not None:
+                row.updated = self._now_iso()
 
-    def update_workstream_state(self, ws_id: str, state: str) -> None:
+    def update_workstream_state(
+        self, ws_id: str, state: str, *, lease: LeaseFence | None = None
+    ) -> None:
         with self.lock:
+            row = self._admit_locked(ws_id, lease)
             self.state_updates.append((ws_id, state))
-            if ws_id in self.rows:
-                self.rows[ws_id].state = state
-                self.rows[ws_id].updated = self._now_iso()
+            if row is not None:
+                row.state = state
+                row.updated = self._now_iso()
 
     def bulk_close_stale_orphans(
         self,
         kind: WorkstreamKind | str,
         cutoff: str,
         exclude_ws_ids: list[str],
-        live_node_ids: list[str] | None = None,
     ) -> list[str]:
         kind_str = kind.value if isinstance(kind, WorkstreamKind) else str(kind)
         excluded = set(exclude_ws_ids)
-        live_set = set(live_node_ids) if live_node_ids else set()
         now = self._now_iso()
         closed: list[str] = []
         with self.lock:
@@ -317,16 +449,11 @@ class FakeStorage:
                     and row.state in BULK_CLOSE_STATE_VALUES
                     and row.updated < cutoff
                     and ws_id not in excluded
+                    and not row.lease_live()
                 ):
-                    # Liveness gate: when live_node_ids was provided AND
-                    # non-empty, protect rows whose owner is in the live
-                    # set.  NULL node_id is always eligible.  When
-                    # live_node_ids is None or empty, no protection
-                    # (mirror of the real backends).
-                    if live_node_ids and row.node_id is not None and row.node_id in live_set:
-                        continue
                     row.state = "closed"
                     row.updated = now
+                    row.fence_out()
                     self.state_updates.append((ws_id, "closed"))
                     closed.append(ws_id)
         return closed
@@ -336,19 +463,11 @@ class FakeStorage:
         kind: WorkstreamKind | str,
         cutoff: str,
         exclude_ws_ids: list[str],
-        *,
-        live_node_ids: list[str],
-        local_node_id: str | None,
     ) -> list[str]:
-        if live_node_ids is None:  # type: ignore[comparison-overlap]
-            return []
         if self.delete_stale_creating_raises:
             raise RuntimeError("stale creating delete forced failure")
         kind_str = kind.value if isinstance(kind, WorkstreamKind) else str(kind)
         excluded = set(exclude_ws_ids)
-        protected_live = {
-            node_id for node_id in live_node_ids if node_id and node_id != local_node_id
-        }
         deleted: list[str] = []
         with self.lock:
             for ws_id, row in list(self.rows.items()):
@@ -357,9 +476,8 @@ class FakeStorage:
                     or row.state != "creating"
                     or row.updated >= cutoff
                     or ws_id in excluded
+                    or row.lease_live()
                 ):
-                    continue
-                if row.node_id is not None and row.node_id in protected_live:
                     continue
                 self.rows.pop(ws_id, None)
                 self.ws_config.pop(ws_id, None)
@@ -367,14 +485,14 @@ class FakeStorage:
                 deleted.append(ws_id)
         return deleted
 
-    def list_services(self, service_type: str, max_age_seconds: int = 120) -> list[dict[str, str]]:
-        if self.list_services_raises:
-            raise RuntimeError("list_services forced failure")
+    def lease_row(self, ws_id: str, *, holder: str, ttl_seconds: float = 30.0) -> None:
+        """Give a row a live lease held elsewhere (test seam)."""
         with self.lock:
-            return [
-                {"service_id": sid, "service_type": service_type}
-                for sid in self.live_services.get(service_type, [])
-            ]
+            row = self.rows[ws_id]
+            row.lease_holder = holder
+            row.lease_node_id = holder.split("/", 1)[0]
+            row.lease_epoch += 1
+            row.lease_expires_at = time.time() + ttl_seconds
 
     def get_workstream(self, ws_id: str) -> dict[str, Any] | None:
         with self.lock:
@@ -455,8 +573,9 @@ class FakeStorage:
                 counts[row.state] = counts.get(row.state, 0) + 1
         return counts
 
-    def delete_workstream(self, ws_id: str) -> None:
+    def delete_workstream(self, ws_id: str, *, lease: LeaseFence | None = None) -> None:
         with self.lock:
+            self._admit_locked(ws_id, lease)
             self.rows.pop(ws_id, None)
             self.ws_config.pop(ws_id, None)
             self.fork_reservations.pop(ws_id, None)
@@ -465,10 +584,15 @@ class FakeStorage:
         self,
         ws_id: str,
         fork_reservation_token: str,
+        *,
+        lease: LeaseFence | None = None,
     ) -> bool:
         with self.lock:
+            if ws_id not in self.rows:
+                return False
             if self.fork_reservations.get(ws_id) != fork_reservation_token:
                 return False
+            self._admit_locked(ws_id, lease)
             self.rows.pop(ws_id, None)
             self.ws_config.pop(ws_id, None)
             self.fork_reservations.pop(ws_id, None)
@@ -478,6 +602,8 @@ class FakeStorage:
         self,
         ws_id: str,
         fork_reservation_token: str,
+        *,
+        lease: LeaseFence | None = None,
     ) -> bool:
         with self.lock:
             row = self.rows.get(ws_id)
@@ -487,6 +613,7 @@ class FakeStorage:
                 or self.fork_reservations.get(ws_id) != fork_reservation_token
             ):
                 return False
+            self._admit_locked(ws_id, lease)
             row.state = "idle"
             row.updated = self._now_iso()
             return True
@@ -502,11 +629,15 @@ class FakeStorage:
         with self.lock:
             return dict(self.ws_config.get(ws_id, {}))
 
-    def save_workstream_config(self, ws_id: str, config: dict[str, str]) -> None:
+    def save_workstream_config(
+        self, ws_id: str, config: dict[str, str], *, lease: LeaseFence | None = None
+    ) -> None:
         # Mirrors the real backend's INSERT OR REPLACE per-key semantics
         # — callers expect a partial save to overwrite only the keys
         # they pass, not the whole row.
         with self.lock:
+            if self._admit_locked(ws_id, lease) is None and lease is not None:
+                raise WorkstreamLeaseLostError(ws_id)
             row = self.ws_config.setdefault(ws_id, {})
             row.update(config)
 
@@ -913,63 +1044,29 @@ def test_open_resurrects_closed_state() -> None:
     assert reopened is not None
     assert reopened.id == ws_id
     assert reopened.session is not None
-    assert reopened.session.resumed is True  # type: ignore[attr-defined]
+    assert reopened.session.rehydrated is True  # type: ignore[attr-defined]
     # Open fires emit_rehydrated (NOT emit_created) so observers can
     # gate any extra resurrect-only setup on it (e.g. coord's
     # storage-seeded children rebuild).
     assert ws_id in [e.ws_id for e in adapter.events_of("rehydrated")]
 
 
-def test_open_supports_tokenless_legacy_rows_but_hides_creating() -> None:
-    """Rehydrate needs only the public row; private create state stays hidden."""
+def test_open_mints_a_tokenless_legacy_row_a_token_but_hides_creating() -> None:
+    """A legacy row gets its private token with the open's snapshot, then the lease.
 
-    rows = {
-        "legacy-closed": {
-            "ws_id": "legacy-closed",
-            "user_id": "u1",
-            "name": "legacy",
-            "kind": WorkstreamKind.INTERACTIVE,
-            "state": "closed",
-            "parent_ws_id": None,
-            "project_id": None,
-            "persona": "",
-        },
-        "pending-create": {
-            "ws_id": "pending-create",
-            "user_id": "u1",
-            "name": "pending",
-            "kind": WorkstreamKind.INTERACTIVE,
-            "state": "creating",
-            "parent_ws_id": None,
-            "project_id": None,
-            "persona": "",
-        },
-    }
-
-    class _LegacyStorage:
-        """Pre-incarnation read surface: deliberately has no private snapshot API."""
-
-        def get_workstream(self, ws_id: str) -> dict[str, Any] | None:
-            return rows.get(ws_id)
-
-        def load_workstream_config(self, ws_id: str) -> dict[str, str]:
-            return {}
-
-        def touch_workstream(self, ws_id: str) -> None:
-            return None
-
-    adapter = FakeAdapter()
-    mgr = SessionManager(
-        adapter,
-        storage=_LegacyStorage(),  # type: ignore[arg-type]
-        max_active=2,
-        event_emitter=adapter,
-    )
+    Private create state stays hidden.
+    """
+    mgr, _, storage = _make_manager()
+    storage.register_workstream("legacy-closed", user_id="u1", name="legacy", state="closed")
+    storage.fork_reservations.pop("legacy-closed", None)
+    storage.register_workstream("pending-create", user_id="u1", name="pending", state="creating")
 
     reopened = mgr.open("legacy-closed")
 
     assert reopened is not None
-    assert reopened._fork_reservation_token == ""
+    minted = storage.fork_reservations["legacy-closed"]
+    assert minted and reopened._fork_reservation_token == minted
+    assert reopened._lease is not None and reopened._lease.held
     assert mgr.open("pending-create") is None
     assert mgr.get("pending-create") is None
 
@@ -982,7 +1079,7 @@ def test_open_threads_saved_model_alias_into_build_session() -> None:
     the production session_factory resolves ``_effective_default_alias()``
     → ChatSession's ``__init__`` writes those defaults to
     ``workstream_config`` (INSERT OR REPLACE) → the subsequent
-    ``resume()`` restores what is now the default. Net effect: every
+    ``rehydrate()`` restores what is now the default. Net effect: every
     persisted knob (model, temperature, reasoning_effort, max_tokens,
     skill, the persona stamp, instructions, …) silently resets on every
     reopen and on every service restart.
@@ -1081,7 +1178,7 @@ def test_open_retries_default_when_alias_disappears_during_build() -> None:
     ui: Any = reopened.ui
     assert adapter.build_models == [saved_alias, None]
     assert active is adapter.built_sessions[-1]
-    assert active.resumed is True
+    assert active.rehydrated is True
     assert adapter.cleaned_up == []
     assert reopened._closed is False
     assert ui.closed_broadcast is False
@@ -1203,9 +1300,9 @@ def test_open_replaces_candidate_when_alias_disappears_before_resume() -> None:
     assert len(stale) == 1
     assert stale[0].closed is True
     assert stale[0].cancelled is True
-    assert stale[0].resumed is False
+    assert stale[0].rehydrated is False
     assert active is adapter.built_sessions[-1]
-    assert active.resumed is True
+    assert active.rehydrated is True
     assert active.closed is False
     assert adapter.cleaned_up == []
     assert reopened._closed is False
@@ -1232,7 +1329,7 @@ def test_open_replaces_candidate_when_alias_disappears_during_resume() -> None:
         session = FakeSession(ws.id)
         if model == saved_alias:
             stale.append(session)
-            session.resume_hook = live_aliases.clear
+            session.rehydrate_hook = live_aliases.clear
         return session
 
     adapter.build_session_hook = build
@@ -1243,11 +1340,11 @@ def test_open_replaces_candidate_when_alias_disappears_during_resume() -> None:
     ui: Any = reopened.ui
     assert adapter.build_models == [saved_alias, None]
     assert len(stale) == 1
-    assert stale[0].resumed is True
+    assert stale[0].rehydrated is True
     assert stale[0].closed is True
     assert stale[0].cancelled is True
     assert active is adapter.built_sessions[-1]
-    assert active.resumed is True
+    assert active.rehydrated is True
     assert active.closed is False
     assert adapter.cleaned_up == []
     assert reopened._closed is False
@@ -1280,7 +1377,7 @@ def test_open_validates_alias_that_resume_actually_adopts() -> None:
                 session.model_alias = saved_during
                 live_aliases.remove(saved_during)
 
-            session.resume_hook = adopt_then_remove
+            session.rehydrate_hook = adopt_then_remove
         return session
 
     adapter.build_session_hook = build
@@ -1288,7 +1385,7 @@ def test_open_validates_alias_that_resume_actually_adopts() -> None:
 
     assert reopened is not None
     assert adapter.build_models == [saved_before, None]
-    assert stale[0].resumed is True
+    assert stale[0].rehydrated is True
     assert stale[0].cancelled is True
     assert stale[0].closed is True
     assert reopened.session is adapter.built_sessions[-1]
@@ -1399,7 +1496,7 @@ def test_open_replaces_default_candidate_removed_during_resume() -> None:
                 live_aliases.clear()
                 live_aliases.add("default-b")
 
-            session.resume_hook = switch_default
+            session.rehydrate_hook = switch_default
         return session
 
     adapter.build_session_hook = build
@@ -1407,7 +1504,7 @@ def test_open_replaces_default_candidate_removed_during_resume() -> None:
 
     assert reopened is not None
     assert adapter.build_models == [None, None]
-    assert stale[0].resumed is True
+    assert stale[0].rehydrated is True
     assert stale[0].cancelled is True
     assert stale[0].closed is True
     assert reopened.session is adapter.built_sessions[-1]
@@ -1415,21 +1512,24 @@ def test_open_replaces_default_candidate_removed_during_resume() -> None:
 
 
 def test_open_touches_workstream_on_rehydrate() -> None:
-    """Rehydrating a workstream must bump its ``updated`` so a concurrent
-    close_idle pass-2 in this same process can't clobber the freshly-loaded
-    row to ``closed`` because its DB ``updated`` is older than the cutoff.
-    The touch is best-effort (try/except in open()) but must fire on the
-    happy path."""
+    """Rehydrating a workstream bumps its ``updated``, with the new lease's fence.
+
+    The live lease is what keeps close_idle's pass 2 off the row; the touch
+    keeps ``updated`` honest. It is best-effort (try/except in open()), so a
+    touch that dropped its fence would be refused silently: check it landed.
+    """
     mgr, _, storage = _make_manager()
     ws = mgr.create(user_id="u1")
     ws_id = ws.id
     mgr.close(ws_id)
     storage.touch_calls.clear()  # only care about touches from rehydrate
+    storage.rows[ws_id].updated = "2000-01-01T00:00:00"
 
     reopened = mgr.open(ws_id)
 
     assert reopened is not None
     assert ws_id in storage.touch_calls
+    assert storage.rows[ws_id].updated > "2000-01-01T00:00:00"
 
 
 def test_open_ignores_owner_mismatch() -> None:
@@ -1731,7 +1831,7 @@ def test_set_state_deferred_mutates_live_then_persists_before_publish() -> None:
     deferred: list[Any] = []
     before = ws.last_active
     storage.update_workstream_state = MagicMock(
-        side_effect=lambda _ws_id, state: order.append(("persist", state))
+        side_effect=lambda _ws_id, state, lease=None: order.append(("persist", state))
     )
     adapter.emit_state = MagicMock(
         side_effect=lambda _ws, state: order.append(("adapter", state.value))
@@ -1766,7 +1866,7 @@ def test_direct_set_state_persists_before_publishing() -> None:
     ws = mgr.create(user_id="u1")
     order: list[tuple[str, str]] = []
     storage.update_workstream_state = MagicMock(
-        side_effect=lambda _ws_id, state: order.append(("persist", state))
+        side_effect=lambda _ws_id, state, lease=None: order.append(("persist", state))
     )
     adapter.emit_state = MagicMock(
         side_effect=lambda _ws, state: order.append(("publish", state.value))
@@ -1789,7 +1889,7 @@ def test_direct_successor_waits_for_running_deferred_tail_and_publishes_last() -
     release_old_write = threading.Event()
     writes: list[str] = []
 
-    def update_state(_ws_id: str, state: str) -> None:
+    def update_state(_ws_id: str, state: str, lease: object = None) -> None:
         if state == "running":
             old_write_started.set()
             assert release_old_write.wait(2)
@@ -1883,13 +1983,12 @@ def test_delayed_state_persistence_cannot_overwrite_closed_workstream() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_reap_stale_creating_reservations_recovers_local_restart_and_dead_peer() -> None:
+def test_reap_stale_creating_reservations_recovers_abandoned_rows_and_spares_live_leases() -> None:
     mgr, _, storage = _make_manager(node_id="stable-node")
-    storage.live_services["server"] = ["stable-node", "live-peer"]
     for ws_id, node_id, token in [
         ("abandoned-local", "stable-node", "local-token"),
         ("abandoned-dead-peer", "dead-peer", "dead-token"),
-        ("protected-live-peer", "live-peer", "live-token"),
+        ("protected-live-lease", "dead-peer", "live-token"),
         ("ambiguous-tokenless", "dead-peer", ""),
     ]:
         storage.register_workstream(
@@ -1900,6 +1999,7 @@ def test_reap_stale_creating_reservations_recovers_local_restart_and_dead_peer()
             updated="2020-01-01T00:00:00",
             fork_reservation_token=token,
         )
+    storage.lease_row("protected-live-lease", holder="live-peer/1")
     storage.register_workstream(
         "already-published",
         node_id="dead-peer",
@@ -1918,27 +2018,11 @@ def test_reap_stale_creating_reservations_recovers_local_restart_and_dead_peer()
         "abandoned-dead-peer",
         "ambiguous-tokenless",
     }
-    assert "protected-live-peer" in storage.rows
+    assert "protected-live-lease" in storage.rows
     assert "ambiguous-tokenless" not in storage.rows
     assert storage.rows["already-published"].state == "idle"
     assert storage.rows[pending.id].state == "creating"
     assert mgr.commit_create(pending) is True
-
-
-def test_reap_stale_creating_reservations_fails_closed_on_liveness_error() -> None:
-    mgr, _, storage = _make_manager(node_id="stable-node")
-    storage.list_services_raises = True
-    storage.register_workstream(
-        "ambiguous-owner",
-        node_id="stable-node",
-        kind=WorkstreamKind.INTERACTIVE,
-        state="creating",
-        updated="2020-01-01T00:00:00",
-        fork_reservation_token="reservation",
-    )
-
-    assert mgr.reap_stale_creating_reservations(max_age_seconds=0) == []
-    assert storage.rows["ambiguous-owner"].state == "creating"
 
 
 def test_reap_stale_creating_reservations_fails_closed_on_delete_error() -> None:
@@ -1959,7 +2043,6 @@ def test_reap_stale_creating_reservations_fails_closed_on_delete_error() -> None
 
 def test_reap_stale_creating_reservations_supports_node_less_cli_boot() -> None:
     mgr, _, storage = _make_manager(node_id=None)
-    storage.live_services["server"] = ["live-server"]
     storage.register_workstream(
         "abandoned-cli-create",
         node_id=None,
@@ -1976,6 +2059,7 @@ def test_reap_stale_creating_reservations_supports_node_less_cli_boot() -> None:
         updated="2020-01-01T00:00:00",
         fork_reservation_token="remote-reservation",
     )
+    storage.lease_row("remote-live-create", holder="live-server/1")
 
     assert mgr.reap_stale_creating_reservations(max_age_seconds=0) == ["abandoned-cli-create"]
     assert "remote-live-create" in storage.rows
@@ -2074,125 +2158,58 @@ def test_close_idle_filters_db_orphans_by_kind() -> None:
     assert storage.rows["interactive-orphan"].state == "closed"
 
 
-def test_close_idle_protects_rows_owned_by_live_services() -> None:
-    """Multi-node correctness: rows whose ``node_id`` matches a service
-    with a recent heartbeat must NOT be reaped, even when *this* manager
-    is on a different node — the alive peer may legitimately have them
-    loaded.  Liveness is the rendezvous router's primitive (post-PR-#384);
-    using it here keeps reap scoping aligned with routing.
-
-    Default ``_make_manager`` uses an INTERACTIVE adapter, which derives
-    ``service_type='server'`` — so live_services seeded under "server"
-    are what the manager queries."""
+def test_close_idle_protects_rows_with_live_leases() -> None:
+    """Multi-node correctness: a row another live process has loaded
+    carries a renewed owner lease and must NOT be reaped, while an
+    unleased row is reaped whatever node id it was stamped with."""
     mgr, _, storage = _make_manager()
-    storage.live_services["server"] = ["node-b"]  # only node-b is alive
     storage.register_workstream(
-        "ours-from-dead-node",
-        node_id="node-a",  # dead pod (not in live_services)
+        "abandoned",
+        node_id="node-a",
         kind=WorkstreamKind.INTERACTIVE,
         updated="2020-01-01T00:00:00",
     )
-    storage.register_workstream(
-        "theirs-still-alive",
-        node_id="node-b",
-        kind=WorkstreamKind.INTERACTIVE,
-        updated="2020-01-01T00:00:00",
-    )
-
-    closed = mgr.close_idle(max_age_seconds=0.0)
-
-    assert closed == ["ours-from-dead-node"]
-    assert storage.rows["ours-from-dead-node"].state == "closed"
-    assert storage.rows["theirs-still-alive"].state == "idle"
-
-
-def test_close_idle_protects_live_services_for_coordinator_kind() -> None:
-    """Coord-side parity: a coordinator manager derives
-    ``service_type='console'``, so live_services seeded under "console"
-    are what gets queried.  Mirrors the interactive test to ensure both
-    halves of the production wiring are exercised."""
-    coord_adapter = FakeAdapter(kind=WorkstreamKind.COORDINATOR)
-    mgr, _, storage = _make_manager(coord_adapter)
-    storage.live_services["console"] = ["console"]  # console is alive
-    storage.register_workstream(
-        "alive-console-coord",
-        node_id="console",
-        kind=WorkstreamKind.COORDINATOR,
-        updated="2020-01-01T00:00:00",
-    )
-    storage.register_workstream(
-        "dead-console-coord",
-        node_id="dead-console-instance",  # not in live set
-        kind=WorkstreamKind.COORDINATOR,
-        updated="2020-01-01T00:00:00",
-    )
-
-    closed = mgr.close_idle(max_age_seconds=0.0)
-
-    assert closed == ["dead-console-coord"]
-    assert storage.rows["alive-console-coord"].state == "idle"
-    assert storage.rows["dead-console-coord"].state == "closed"
-
-
-def test_close_idle_reaps_rows_with_null_node_id() -> None:
-    """A row with no ``node_id`` has no owner identity — age alone gates
-    the reap.  Defends against a NULL silently propagating through ``NOT
-    IN (live)`` and protecting orphans forever."""
-    mgr, _, storage = _make_manager()
-    storage.live_services["server"] = ["node-a"]
     storage.register_workstream(
         "no-owner",
         node_id=None,
         kind=WorkstreamKind.INTERACTIVE,
         updated="2020-01-01T00:00:00",
     )
-
-    closed = mgr.close_idle(max_age_seconds=0.0)
-
-    assert closed == ["no-owner"]
-
-
-def test_close_idle_reaps_all_orphans_when_no_peers_alive() -> None:
-    """When ``list_services`` returns an empty list (no heartbeating
-    peers), every stale orphan is unprotected and gets reaped.  This is
-    the cold-start / single-process / dead-cluster-recovery case."""
-    mgr, _, storage = _make_manager()
-    # storage.live_services["server"] left empty — no peers heartbeating
     storage.register_workstream(
-        "any-node-1",
+        "loaded-elsewhere",
         node_id="node-a",
         kind=WorkstreamKind.INTERACTIVE,
         updated="2020-01-01T00:00:00",
     )
-    storage.register_workstream(
-        "any-node-2",
-        node_id="node-b",
-        kind=WorkstreamKind.INTERACTIVE,
-        updated="2020-01-01T00:00:00",
-    )
+    storage.lease_row("loaded-elsewhere", holder="node-b/1")
 
     closed = mgr.close_idle(max_age_seconds=0.0)
 
-    assert set(closed) == {"any-node-1", "any-node-2"}
+    assert set(closed) == {"abandoned", "no-owner"}
+    assert storage.rows["abandoned"].state == "closed"
+    assert storage.rows["loaded-elsewhere"].state == "idle"
 
 
-def test_close_idle_skips_pass_2_when_list_services_fails() -> None:
-    """Conservative fallback: if list_services fails we can't enumerate
-    live owners safely, so pass 2 must skip rather than reap blind.  Pass
-    1 (in-memory IDLE) still runs."""
-    mgr, _, storage = _make_manager()
-    storage.list_services_raises = True
-    storage.register_workstream(
-        "would-be-orphan",
-        node_id="node-a",
-        kind=WorkstreamKind.INTERACTIVE,
-        updated="2020-01-01T00:00:00",
-    )
+def test_close_idle_protects_live_leases_for_coordinator_kind() -> None:
+    """Coordinator parity: a coordinator loaded by a live console keeps
+    its lease and survives, and one a dead console left behind is
+    reaped even though every console shares the stable ``console`` id."""
+    coord_adapter = FakeAdapter(kind=WorkstreamKind.COORDINATOR)
+    mgr, _, storage = _make_manager(coord_adapter)
+    for ws_id in ("alive-console-coord", "dead-console-coord"):
+        storage.register_workstream(
+            ws_id,
+            node_id="console",
+            kind=WorkstreamKind.COORDINATOR,
+            updated="2020-01-01T00:00:00",
+        )
+    storage.lease_row("alive-console-coord", holder="console/1")
 
     closed = mgr.close_idle(max_age_seconds=0.0)
 
-    assert closed == []
-    assert storage.rows["would-be-orphan"].state == "idle"
+    assert closed == ["dead-console-coord"]
+    assert storage.rows["alive-console-coord"].state == "idle"
+    assert storage.rows["dead-console-coord"].state == "closed"
 
 
 def test_list_all_returns_creation_order() -> None:

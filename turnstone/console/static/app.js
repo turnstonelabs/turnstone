@@ -190,6 +190,15 @@ function patchClusterState(data) {
         persona: data.persona || "",
       });
     }
+  } else if (t === "ws_unloaded") {
+    // The node let go of a workstream another process holds (it did not
+    // close): drop it from that node only, and leave panes and the saved list.
+    const node = clusterState.nodes[data.node_id];
+    if (node) {
+      node.workstreams = (node.workstreams || []).filter(function (ws) {
+        return ws.id !== data.ws_id;
+      });
+    }
   } else if (t === "ws_closed") {
     Object.keys(clusterState.nodes).forEach(function (nid) {
       const n = clusterState.nodes[nid];
@@ -458,6 +467,7 @@ function handleClusterEvent(data) {
   if (
     data.type === "cluster_state" ||
     data.type === "ws_created" ||
+    data.type === "ws_unloaded" ||
     data.type === "ws_closed" ||
     data.type === "ws_rename" ||
     data.type === "node_joined" ||
@@ -2562,7 +2572,26 @@ function _initSavedCoordTable() {
             showToast("Coordinator no longer available");
             loadSavedCoordinators();
           } else if (r.status === 503) {
-            showToast("Coordinator subsystem not configured");
+            // A missing coordinator subsystem, a session-factory error or a
+            // history read to retry: the body says which.
+            readRefusal(r).then(function (refusal) {
+              showToast(
+                (typeof refusal.data.error === "string" &&
+                  refusal.data.error) ||
+                  "Coordinator subsystem not configured",
+              );
+            });
+          } else if (r.status === 409) {
+            readRefusal(r).then(function (refusal) {
+              showToast(
+                // The holder of a coordinator's lease is always a console.
+                refusal.where
+                  ? "This coordinator is open on another console. Retry once it closes there."
+                  : (typeof refusal.data.error === "string" &&
+                      refusal.data.error) ||
+                      "Failed to restore coordinator (409)",
+              );
+            });
           } else {
             showToast("Failed to restore coordinator (" + r.status + ")");
           }
@@ -2575,9 +2604,9 @@ function _initSavedCoordTable() {
     delete: {
       idPrefix: "coord-delete",
       buttonId: "coord-delete-btn",
-      // Coordinators live on whichever node owns the ws_id; the router proxy
-      // reads ws_id from the body, resolves the owning node via rendezvous
-      // hashing, and forwards to that node's POST workstreams/{ws_id}/delete.
+      // The console deletes a coordinator itself (it holds coordinator
+      // leases); the same route forwards an interactive delete to the node
+      // that owns the workstream.
       buildDeleteRequest: function (wsId) {
         return {
           url: "/v1/api/route/workstreams/delete",
@@ -2675,40 +2704,46 @@ window.TS_APP.buildNodeInfo = function (node) {
 // saved-row resume, AND reload-rehydrate all funnel through here).
 //
 // Try the live/origin hint first to reuse an already loaded session. A missing,
-// unreachable, or wrong-node hint requires a fresh route lookup. The router
-// preserves durable node requirements; flexible sessions retain HRW recovery.
-// Both the router and the executing node enforce the requirement.
+// unreachable, or wrong-node hint requires a fresh route lookup, and so does a
+// hint whose node refused because another node owns the session's lease: the
+// router prefers that owner. The router preserves durable node requirements;
+// flexible sessions retain HRW recovery. Both the router and the executing node
+// enforce the requirement.
 window.TS_APP.resolveInteractiveNode = function (wsId, hintNodeId) {
   const readFailure = function (r) {
-    return Promise.resolve()
-      .then(function () {
-        return r.json();
-      })
-      .catch(function () {
-        return {};
-      })
-      .then(function (data) {
-        const required = data && data.required_node_id;
-        if (
-          data &&
-          ((r.status === 503 && data.code === "required_node_unavailable") ||
-            (r.status === 409 && data.code === "wrong_execution_node")) &&
-          typeof required === "string" &&
-          /^[A-Za-z0-9_.-]{1,256}$/.test(required)
-        ) {
-          return {
-            status: r.status,
-            code: data.code,
-            requiredNodeId: required,
-            error:
-              "This session requires node '" +
-              required +
-              "'. Retry when it returns, or continue elsewhere from saved history.",
-            canContinue: true,
-          };
-        }
-        return { status: r.status };
-      });
+    return readRefusal(r).then(function (refusal) {
+      const data = refusal.data;
+      const required = data.required_node_id;
+      if (
+        ((r.status === 503 && data.code === "required_node_unavailable") ||
+          (r.status === 409 && data.code === "wrong_execution_node")) &&
+        typeof required === "string" &&
+        /^[A-Za-z0-9_.-]{1,256}$/.test(required)
+      ) {
+        return {
+          status: r.status,
+          code: data.code,
+          requiredNodeId: required,
+          error:
+            "This session requires node '" +
+            required +
+            "'. Retry when it returns, or continue elsewhere from saved history.",
+          canContinue: true,
+        };
+      }
+      if (refusal.where) {
+        // Another node owns the session's lease; the route lookup leads to it.
+        return {
+          status: r.status,
+          code: data.code,
+          error:
+            "This session is open " +
+            refusal.where +
+            " and could not be reached there. Retry in a moment.",
+        };
+      }
+      return { status: r.status };
+    });
   };
   const openOn = function (nodeId) {
     return authFetch(
@@ -2761,7 +2796,8 @@ window.TS_APP.resolveInteractiveNode = function (wsId, hintNodeId) {
         if (
           res.status === 404 ||
           res.status === 502 ||
-          res.code === "wrong_execution_node"
+          res.code === "wrong_execution_node" ||
+          res.code === "workstream_lease_held"
         )
           return routeFallback();
         return failResult(res);

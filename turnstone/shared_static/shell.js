@@ -26,6 +26,7 @@
 import { PaneManager, ShellPane, openPopupMenu } from "./pane.js";
 import { mountRail, mountManage, glyph, setRowBadge } from "./rail.js";
 import { authFetch } from "./auth.js";
+import { readRefusal } from "./utils.js";
 // The interactive pane is a real ES module beside us in /shared (step 5a) — the
 // shell imports it directly, and it exists in every deployment.  The coordinator
 // pane lives at an absolute /static path that only the CONSOLE serves, so it is
@@ -207,11 +208,23 @@ function ensureInteractiveNode(caps, wsId, hint, openFirst) {
       "/v1/api/workstreams/" + encodeURIComponent(wsId) + "/open",
       { method: "POST" },
     )
-      .then((r) =>
-        r.ok
-          ? { nodeId: null }
-          : { error: "Could not reopen this session (" + r.status + ")." },
-      )
+      .then((r) => {
+        if (r.ok) return { nodeId: null };
+        if (r.status !== 409) {
+          return { error: "Could not reopen this session (" + r.status + ")." };
+        }
+        return readRefusal(r).then(({ data, where }) => {
+          if (where) {
+            return { error: "This session is open " + where + ". Retry once it closes there." };
+          }
+          // Another 409 (a node requirement): its own message says why.
+          return {
+            error:
+              (typeof data.error === "string" && data.error) ||
+              "Could not reopen this session (409).",
+          };
+        });
+      })
       .catch(() => ({ error: "Could not reopen this session." }));
   }
   if (
@@ -332,6 +345,14 @@ function convTabMenu(pane, pm, wsId, opts) {
   const toast = (msg, kind) => {
     if (typeof G.showToast === "function") G.showToast(msg, kind);
   };
+  // A refused node verb: say where the workstream is open when another
+  // process owns it (an owner-lease refusal), else the generic failure.
+  const refusalToast = (r, fallback) =>
+    readRefusal(r).then(({ where }) =>
+      where
+        ? toast("This session is open " + where + ". Retry once it closes there.", "warn")
+        : toast(fallback, "error"),
+    );
   if (opts.titleVerbs) {
     if (typeof G.refreshWorkstreamTitle === "function")
       items.push({
@@ -377,7 +398,7 @@ function convTabMenu(pane, pm, wsId, opts) {
             .then((r) =>
               r.ok
                 ? toast("Title updated", "success")
-                : toast("Failed to set title", "error"),
+                : refusalToast(r, "Failed to set title"),
             )
             .catch(() => toast("Failed to set title", "error"));
         },
@@ -435,8 +456,7 @@ function convTabMenu(pane, pm, wsId, opts) {
               // 404 = no row left to delete (already deleted elsewhere) — the
               // intent is satisfied either way; drop the tab.
               if (!r.ok && r.status !== 404) {
-                toast("Failed to delete session", "error");
-                return;
+                return refusalToast(r, "Failed to delete session");
               }
               pm.close(pane.id);
               toast("Session deleted", "success");
@@ -631,7 +651,7 @@ async function mountShell() {
   // manager stays chrome-free and just returns the reason.
   const splitFeedback = (r) => {
     if (r && !r.ok && r.reason && typeof window.showToast === "function")
-      window.showToast(r.reason, "warning");
+      window.showToast(r.reason, "warn");
   };
   const splitRightBtn = tbBtn("tb-split", "◫", "Split right");
   splitRightBtn.addEventListener("click", () =>
@@ -757,7 +777,7 @@ async function mountShell() {
                       if (typeof window.showToast === "function")
                         window.showToast(
                           "Conversation history is still being saved. Try ending the session again shortly.",
-                          "warning",
+                          "warn",
                         );
                     } else failToast();
                   })
@@ -1017,7 +1037,7 @@ async function mountShell() {
           window._hasCoordPermission(),
         onDeny: () =>
           window.showToast &&
-          window.showToast("admin.coordinator permission required", "warning"),
+          window.showToast("admin.coordinator permission required", "warn"),
       });
     } catch (e) {
       console.error("L-shell: coordinator pane unavailable", e);

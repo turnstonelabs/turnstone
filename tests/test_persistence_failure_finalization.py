@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import queue
 import threading
+import time
 from typing import Any
 from unittest.mock import MagicMock, patch
 
@@ -19,6 +20,11 @@ from turnstone.core.session_manager import WorkstreamAlreadyExistsError
 from turnstone.core.session_routes import SessionEndpointConfig, make_cancel_handler
 from turnstone.core.storage import ConversationCommitConflictError
 from turnstone.core.trajectory import Role, ToolCall, Turn
+
+
+def _expire_lease(storage: Any, ws_id: str) -> None:
+    """Let the holder's lease lapse, as if this manager had paused."""
+    storage.rows[ws_id].lease_expires_at = time.time() - 1
 
 
 def _run_force_cancel_handler(
@@ -724,7 +730,7 @@ def test_ambiguous_hard_delete_hides_structural_debt_until_exact_retry() -> None
 
     tool_save = MagicMock(return_value=0)
 
-    def _raise_delete() -> bool:
+    def _raise_delete(*, lease: object = None) -> bool:
         raise RuntimeError("injected durable delete failure")
 
     try:
@@ -762,9 +768,10 @@ def test_ambiguous_hard_delete_hides_structural_debt_until_exact_retry() -> None
 
         assert manager.delete_persisted(
             ws.id,
-            delete_fn=lambda: storage.delete_workstream_if_fork_reserved(
+            delete_fn=lambda *, lease: storage.delete_workstream_if_fork_reserved(
                 ws.id,
                 ws._fork_reservation_token,
+                lease=lease,
             ),
             expected_reservation_token=ws._fork_reservation_token,
         )
@@ -802,11 +809,48 @@ def test_false_delete_retains_same_incarnation_unresolved_tombstone(
         is False
     )
 
-    delete.assert_called_once_with()
+    delete.assert_called_once_with(lease=ws._lease.fence)
     persist.assert_called_once_with()
     assert manager._failed_delete_tombstones[ws.id] is ws
     assert manager.get(ws.id) is None
     assert adapter.cleaned_up == []
+    assert [event for event in adapter.events if event.kind == "closed"] == []
+
+
+def test_a_retained_tombstone_keeps_its_lease_until_another_process_takes_it() -> None:
+    """Losing the lease is the only thing that clears a tombstone whose row lives on."""
+    manager, adapter, storage = _make_manager()
+    ws = manager.create(user_id="owner", ws_id="tombstone-lease")
+    session = make_session(ws_id=ws.id, user_id="owner", ui=RecordingUI())
+    ws.session = session
+    _journal_failed_row(session, MagicMock(return_value=0), commit_key="tombstone-lease-row")
+    assert (
+        manager.delete_persisted(
+            ws.id,
+            delete_fn=MagicMock(return_value=False),
+            expected_reservation_token=ws._fork_reservation_token,
+        )
+        is False
+    )
+    lease = ws._lease
+    assert manager._failed_delete_tombstones[ws.id] is ws
+    assert lease is not None and lease.held
+    assert manager.lease_fence(ws.id) == lease.fence
+    assert {held.ws_id for held in manager._lease_keeper.tracked()} == {ws.id}
+
+    _expire_lease(storage, ws.id)
+    grant = storage.acquire_workstream_lease(
+        ws.id,
+        incarnation_token=storage.fork_reservations[ws.id],
+        holder="node-b/1",
+        node_id="node-b",
+        ttl_seconds=30.0,
+    )
+    assert grant is not None
+    manager.renew_leases_once()
+
+    assert ws.id not in manager._failed_delete_tombstones
+    assert manager._lease_keeper.tracked() == []
     assert [event for event in adapter.events if event.kind == "closed"] == []
 
 
@@ -822,9 +866,9 @@ def test_false_delete_retires_only_proven_old_incarnation(
     persist = MagicMock(return_value=0)
     _journal_failed_row(session, persist, commit_key=f"false-{durable_outcome}-row")
 
-    def _false_after_durable_change() -> bool:
+    def _false_after_durable_change(*, lease: Any = None) -> bool:
         if durable_outcome == "missing":
-            storage.delete_workstream(ws.id)
+            storage.delete_workstream(ws.id, lease=lease)
         else:
             storage.fork_reservations[ws.id] = "replacement-token"
         return False
@@ -855,10 +899,11 @@ def test_delete_ack_loss_probe_cannot_close_remote_successor() -> None:
     persist = MagicMock(return_value=0)
     _journal_failed_row(session, persist, commit_key="ack-loss-row")
 
-    def _delete_then_raise() -> bool:
+    def _delete_then_raise(*, lease: Any = None) -> bool:
         assert storage.delete_workstream_if_fork_reserved(
             ws.id,
             ws._fork_reservation_token,
+            lease=lease,
         )
         raise RuntimeError("delete ACK lost")
 
@@ -905,6 +950,8 @@ def test_hard_delete_never_writes_predecessor_tool_into_remote_successor() -> No
     _seed_tool_structural_debt(session, "predecessor-tool-call")
     predecessor_token = ws._fork_reservation_token
 
+    # A remote node can replace A only after A's lease lapsed.
+    _expire_lease(storage, ws.id)
     storage.delete_workstream(ws.id)
     storage.register_workstream(
         ws.id,
@@ -918,9 +965,10 @@ def test_hard_delete_never_writes_predecessor_tool_into_remote_successor() -> No
         assert (
             manager.delete_persisted(
                 ws.id,
-                delete_fn=lambda: storage.delete_workstream_if_fork_reserved(
+                delete_fn=lambda *, lease: storage.delete_workstream_if_fork_reserved(
                     ws.id,
                     predecessor_token,
+                    lease=lease,
                 ),
                 expected_reservation_token=predecessor_token,
             )
@@ -1045,9 +1093,10 @@ def test_unadvertised_delete_tombstone_retry_emits_no_close_event() -> None:
 
     assert manager.delete_persisted(
         ws.id,
-        delete_fn=lambda: storage.delete_workstream_if_fork_reserved(
+        delete_fn=lambda *, lease: storage.delete_workstream_if_fork_reserved(
             ws.id,
             ws._fork_reservation_token,
+            lease=lease,
         ),
         expected_reservation_token=ws._fork_reservation_token,
     )
@@ -1077,6 +1126,8 @@ def test_unadvertised_predecessor_does_not_suppress_successor_delete_event() -> 
         )
     assert ws.id in manager._failed_delete_unadvertised
 
+    # A remote node can replace A only after A's lease lapsed.
+    _expire_lease(storage, ws.id)
     storage.delete_workstream(ws.id)
     storage.register_workstream(
         ws.id,
@@ -1086,9 +1137,10 @@ def test_unadvertised_predecessor_does_not_suppress_successor_delete_event() -> 
     )
     assert manager.delete_persisted(
         ws.id,
-        delete_fn=lambda: storage.delete_workstream_if_fork_reserved(
+        delete_fn=lambda *, lease: storage.delete_workstream_if_fork_reserved(
             ws.id,
             "advertised-successor-token",
+            lease=lease,
         ),
         expected_reservation_token="advertised-successor-token",
     )
@@ -1989,12 +2041,3 @@ def test_gone_discard_is_a_terminal_latch_not_a_phantom_error() -> None:
     # converts the raise to its 503 error arm.
     with pytest.raises(GenerationCancelled):
         session.rewind(1)
-    # An identity swap (the /new//resume shape) structurally un-poisons:
-    # the latch names the DEAD workstream, not the session object, so a
-    # session repointed at a different ws_id admits again with no reset
-    # choreography (round-4 review).
-    session._ws_id = "fresh-after-swap"
-    assert session.is_workstream_gone() is False
-    ran.clear()
-    assert session._commit_for_generation(0, lambda _d: ran.append(1)) is True
-    assert ran == [1]

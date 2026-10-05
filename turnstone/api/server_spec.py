@@ -18,6 +18,7 @@ from turnstone.api.schemas import (
     AuthWhoamiResponse,
     ErrorResponse,
     StatusResponse,
+    WorkstreamDeleteResponse,
 )
 from turnstone.api.server_schemas import (
     MEMORY_NAME_INPUT_DESCRIPTION,
@@ -257,14 +258,21 @@ SERVER_ENDPOINTS: list[EndpointSpec] = [
         "/v1/api/workstreams/{ws_id}/delete",
         "POST",
         "Permanently delete a saved workstream",
-        error_codes=[400, 404, 500],
+        response_model=WorkstreamDeleteResponse,
+        error_codes=[400, 404, 409, 500],
         tags=["Workstreams"],
     ),
     EndpointSpec(
         "/v1/api/workstreams/{ws_id}/open",
         "POST",
         "Load a saved workstream into memory",
-        error_codes=[400, 404, 500],
+        description=(
+            "``409`` with code ``workstream_lease_held`` names the node that has "
+            "the workstream open. ``429`` when every session slot on the node is "
+            "busy (retry later). ``503`` when its history or saved settings could "
+            "not be read (retry shortly) or the session factory is misconfigured."
+        ),
+        error_codes=[400, 404, 409, 429, 500, 503],
         tags=["Workstreams"],
     ),
     EndpointSpec(
@@ -289,13 +297,14 @@ SERVER_ENDPOINTS: list[EndpointSpec] = [
             "Returns the persisted workstream's display fields. If the "
             "session isn't currently in memory, write scope is additionally "
             "required before the manager rehydrates it "
-            "before responding; ``500`` on rehydrate failure carries a "
+            "before responding; ``429`` when every session slot is busy "
+            "(retry later); ``500`` on rehydrate failure carries a "
             "correlation id matching the server log line. Lifted from "
             "the coord-only surface in the Stage 2 history/detail verb "
             "lift — interactive previously had no detail endpoint."
         ),
         response_model=WorkstreamDetailResponse,
-        error_codes=[400, 403, 404, 500, 503],
+        error_codes=[400, 403, 404, 409, 429, 500, 503],
         tags=["Workstreams"],
     ),
     EndpointSpec(

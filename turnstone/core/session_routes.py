@@ -36,19 +36,29 @@ import functools
 import re
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Protocol, cast
+from typing import TYPE_CHECKING, Any, Literal, Protocol, cast
 
 from starlette.responses import JSONResponse
 from starlette.routing import Route
 
 from turnstone.core.log import get_logger
 from turnstone.core.node_affinity import NodeAffinityError
-from turnstone.core.session_manager import CloseOutcome, WorkstreamAlreadyExistsError
+from turnstone.core.session_manager import (
+    CloseOutcome,
+    SessionCapacityError,
+    WorkstreamAlreadyExistsError,
+)
 from turnstone.core.session_replay import session_replay_preamble
 from turnstone.core.session_ui_base import CrossPrincipalApprovalError
+from turnstone.core.storage import (
+    WorkstreamLeaseHeldError,
+    WorkstreamLeaseLostError,
+)
+from turnstone.core.web_helpers import lease_refusal_response
 from turnstone.core.workstream import (
     INTERJECTION_CAP_CHARS,
     PENDING_SENDS_MAX,
+    WorkstreamHistoryUnavailableError,
     _PendingSend,
     concrete_method,
     workstream_persistence_state,
@@ -859,6 +869,7 @@ def make_approve_handler(
         ws = mgr.get(ws_id)
         if ws is None:
             return JSONResponse({"error": cfg.not_found_label}, status_code=404)
+        ws.note_client()
         ui = ws.ui
         resolve_approval = getattr(ui, "resolve_approval", None)
         find_cycle = getattr(ui, "find_approval_cycle", None)
@@ -1060,7 +1071,13 @@ def make_close_handler(
         storage = getattr(request.app.state, "auth_storage", None)
         if supports_close_reason and reason and storage is not None:
             try:
-                storage.save_workstream_config(ws_id, {"close_reason": reason})
+                await asyncio.to_thread(
+                    storage.save_workstream_config, ws_id, {"close_reason": reason}
+                )
+            except WorkstreamLeaseHeldError:
+                # Close released this node's lease; another node reopened
+                # the workstream first and owns its config now.
+                log.debug("ws.close_reason.owned_elsewhere ws_id=%s", ws_id[:8])
             except Exception:
                 log.warning(
                     "ws.close.reason_persist_failed ws=%s",
@@ -1194,7 +1211,18 @@ def make_set_title_handler(cfg: SessionEndpointConfig) -> Handler:
             return JSONResponse({"error": "title is required"}, status_code=400)
         title = title[:80]
 
-        if not await asyncio.to_thread(set_workstream_alias, ws_id, title):
+        # A workstream hosted here presents this manager's owner-lease fence;
+        # otherwise the write is refused while another process owns it.
+        try:
+            renamed = await asyncio.to_thread(
+                set_workstream_alias,
+                ws_id,
+                title,
+                lease=mgr.lease_fence(ws_id),
+            )
+        except (WorkstreamLeaseHeldError, WorkstreamLeaseLostError) as exc:
+            return lease_refusal_response(exc)
+        if not renamed:
             return JSONResponse(
                 {"error": "That name is already used by another workstream"},
                 status_code=409,
@@ -1320,6 +1348,8 @@ def make_cancel_handler(
         ws = mgr.get(ws_id)
         if ws is None:
             return JSONResponse({"error": cfg.not_found_label}, status_code=404)
+        # A client stopping it: a watch restore's blanket approval ends here.
+        ws.note_client()
         session = ws.session
         ui = ws.ui
         if session is None or ui is None:
@@ -2039,6 +2069,88 @@ def make_retry_handler(
     return retry
 
 
+# Per caller: (factory-misconfig log, internal-failure log, verb in the 500 body).
+_OPEN_FAILURE_WORDING: dict[str, tuple[str, str, str]] = {
+    "open": (
+        "ws.open.factory_misconfig ws_id=%s exc=%r",
+        "ws.open.rehydrate_failed correlation_id=%s ws_id=%s",
+        "open",
+    ),
+    "detail": (
+        "ws.detail.factory_misconfig ws_id=%s exc=%r",
+        "ws.detail.rehydrate_failed correlation_id=%s ws_id=%s",
+        "rehydrate",
+    ),
+}
+
+
+async def _open_or_refusal(
+    mgr: SessionManager,
+    ws_id: str,
+    cfg: SessionEndpointConfig,
+    caller: Literal["open", "detail"],
+) -> tuple[Workstream | None, bool] | JSONResponse:
+    """Open ``ws_id`` off the event loop, or return the response its failure maps to.
+
+    Shared by the open and detail handlers (``caller`` picks their log events
+    and wording).
+    """
+    misconfig_log, failed_log, verb = _OPEN_FAILURE_WORDING[caller]
+    try:
+        # Off the event loop: opening builds a session, takes the owner lease
+        # and can retire a stopped copy here.
+        return await asyncio.to_thread(mgr.open_with_outcome, ws_id)
+    except NodeAffinityError as exc:
+        return JSONResponse(exc.as_dict(), status_code=exc.status_code)
+    except (WorkstreamLeaseHeldError, WorkstreamLeaseLostError) as exc:
+        # Open on another node: the 409 names the holder. The console
+        # browser re-resolves the route (the router prefers the holder)
+        # and opens there; no proxy retries an open.
+        return lease_refusal_response(exc)
+    except SessionCapacityError as exc:
+        # Every slot busy and none evictable: try later, as a create is told.
+        return JSONResponse({"error": str(exc)}, status_code=429)
+    except WorkstreamHistoryUnavailableError as exc:
+        # A storage blip reading the history or settings: transient, never served empty.
+        return JSONResponse({"error": str(exc)}, status_code=503)
+    except ValueError as exc:
+        # Session factory misconfig (e.g., a model alias that no longer
+        # exists). Surface the factory's remediation text as a 503 so the
+        # operator can fix it without digging through stack traces. Same
+        # shape coord used pre-lift; standardised across both kinds here.
+        log.warning(misconfig_log, ws_id[:8], exc)
+        return JSONResponse({"error": _safe_factory_misconfig_message(exc)}, status_code=503)
+    except Exception:
+        # Bare ``Exception`` is intentional: ``mgr.open`` can raise from
+        # ``adapter.build_session`` (no documented exception spec — depends
+        # on the kind's session factory) or from ``ChatSession.rehydrate``
+        # propagating a partial-restore failure (corrupted workstream_config
+        # row, model-registry mismatch on saved alias, etc.). Either way the
+        # workstream isn't loadable; the operator needs the correlation-id'd
+        # log entry to diagnose.
+        #
+        # Don't echo the exception text — it can leak internal paths / frame
+        # names. Log with a correlation id and return that to the client so
+        # support can match a report to the log line. Mirrors coord's
+        # pre-lift ``coordinator_open`` 500 path. The per-kind noun
+        # (``audit_action_prefix``: "workstream" / "coordinator") matches the
+        # pre-lift ``coordinator_open`` / ``open_workstream`` wording.
+        import secrets
+
+        correlation_id = secrets.token_hex(4)
+        log.warning(failed_log, correlation_id, ws_id[:8] if ws_id else "", exc_info=True)
+        kind_noun = cfg.audit_action_prefix or "workstream"
+        return JSONResponse(
+            {
+                "error": (
+                    f"failed to {verb} {kind_noun} (internal error). "
+                    f"correlation_id={correlation_id}"
+                )
+            },
+            status_code=500,
+        )
+
+
 def make_open_handler(
     cfg: SessionEndpointConfig,
     *,
@@ -2116,9 +2228,12 @@ def make_open_handler(
                 return err_tenant
 
         # Already-loaded shortcut — both kinds return the same
-        # ``{ws_id, name, already_loaded: true}`` shape.
-        existing = mgr.get(ws_id)
+        # ``{ws_id, name, already_loaded: true}`` shape. A slot whose session
+        # is still being built belongs to an open in flight, and a copy whose
+        # lease moved cannot write: the open below answers for both.
+        existing = mgr.loaded(ws_id)
         if existing is not None:
+            existing.note_client()
             return JSONResponse(
                 {
                     "ws_id": existing.id,
@@ -2127,68 +2242,22 @@ def make_open_handler(
                 }
             )
 
-        try:
-            ws = mgr.open(ws_id)
-        except NodeAffinityError as exc:
-            return JSONResponse(exc.as_dict(), status_code=exc.status_code)
-        except ValueError as exc:
-            # Session factory misconfig (e.g., a model alias that
-            # no longer exists). Surface the factory's remediation
-            # text as a 503 so the operator can fix it without
-            # digging through stack traces. Same shape coord used
-            # pre-lift; standardised across both kinds here.
-            log.warning("ws.open.factory_misconfig ws_id=%s exc=%r", ws_id[:8], exc)
-            return JSONResponse({"error": _safe_factory_misconfig_message(exc)}, status_code=503)
-        except Exception:
-            # Bare ``Exception`` is intentional: ``mgr.open`` can
-            # raise from ``adapter.build_session`` (no documented
-            # exception spec — depends on the kind's session factory)
-            # or from ``ChatSession.resume`` propagating a partial-
-            # restore failure (corrupted workstream_config row,
-            # model-registry mismatch on saved alias, etc.). Either
-            # way the workstream isn't loadable; the operator needs
-            # the correlation-id'd log entry to diagnose.
-            #
-            # Don't echo the exception text — it can leak internal
-            # paths / frame names. Log with a correlation id and
-            # return that to the client so support can match a
-            # report to the log line. Mirrors coord's pre-lift
-            # ``coordinator_open`` 500 path.
-            import secrets
+        opened = await _open_or_refusal(mgr, ws_id, cfg, "open")
+        if isinstance(opened, JSONResponse):
+            return opened
+        ws, loaded_now = opened
 
-            correlation_id = secrets.token_hex(4)
-            log.warning(
-                "ws.open.rehydrate_failed correlation_id=%s ws_id=%s",
-                correlation_id,
-                ws_id[:8] if ws_id else "",
-                exc_info=True,
-            )
-            # Per-kind noun in the user-facing error so coord callers
-            # see "failed to open coordinator" and interactive callers
-            # see "failed to open workstream" (matching the pre-lift
-            # ``coordinator_open`` / ``open_workstream`` wording on
-            # both sides). ``audit_action_prefix`` is the existing
-            # per-kind label both lifespans already construct
-            # ("workstream" / "coordinator"); reusing it here gives
-            # the cfg field its first runtime reader.
-            kind_noun = cfg.audit_action_prefix or "workstream"
-            return JSONResponse(
-                {
-                    "error": (
-                        f"failed to open {kind_noun} (internal error). "
-                        f"correlation_id={correlation_id}"
-                    )
-                },
-                status_code=500,
-            )
-
-        # Both except branches above ``return``; ``ws`` is bound here.
         if ws is None:
             # ``mgr.open`` returns None for missing rows, kind
             # mismatch, and tombstoned rows — all surface as 404
             # for the caller (the kind-specific failure mode is
             # internal detail).
             return JSONResponse({"error": cfg.not_found_label}, status_code=404)
+        # A client is opening it: a watch restore's blanket approval ends here.
+        ws.note_client()
+        if not loaded_now:
+            # A concurrent open loaded it first and ran the post-load work.
+            return JSONResponse({"ws_id": ws.id, "name": ws.name, "already_loaded": True})
 
         # Kind-specific post-load action (interactive: UI replay +
         # handler-side ws_created enqueue; coord: None and the
@@ -3463,6 +3532,12 @@ def make_create_handler(
             return JSONResponse({"error": "Workstream already exists"}, status_code=409)
         except NodeAffinityError as exc:
             return JSONResponse(exc.as_dict(), status_code=exc.status_code)
+        except (WorkstreamLeaseHeldError, WorkstreamLeaseLostError) as exc:
+            # A RuntimeError subclass: map it before the capacity arm below.
+            return lease_refusal_response(exc)
+        except WorkstreamHistoryUnavailableError as exc:
+            # Also a RuntimeError: the new session's settings read failed. Transient.
+            return JSONResponse({"error": str(exc)}, status_code=503)
         except RuntimeError as exc:
             # ``SessionManager.create`` documents RuntimeError as
             # "manager at capacity" — translate to 429 (rate-limit /
@@ -4942,11 +5017,17 @@ def make_detail_handler(cfg: SessionEndpointConfig) -> Handler:
                 return err_tenant
 
         ws = mgr.get(ws_id)
+        auth = getattr(request.state, "auth_result", None)
+        may_open = auth is not None and auth.has_scope("write")
+        if ws is not None and mgr.loaded(ws_id) is None and (may_open or ws.session is not None):
+            # A slot whose session is still being built belongs to an open in
+            # flight, which a writer joins below (a reader reads the slot as
+            # is); a copy whose lease moved cannot serve anyone.
+            ws = None
         if ws is None:
-            auth = getattr(request.state, "auth_result", None)
             if auth is None:
                 return JSONResponse({"error": "Unauthorized"}, status_code=401)
-            if not auth.has_scope("write"):
+            if not may_open:
                 storage = getattr(request.app.state, "auth_storage", None)
                 if storage is None or cfg.list_kind is None:
                     return JSONResponse({"error": "Storage unavailable"}, status_code=503)
@@ -4964,55 +5045,23 @@ def make_detail_handler(cfg: SessionEndpointConfig) -> Handler:
                 return JSONResponse(
                     {"error": "Reopening a saved session requires write scope"}, status_code=403
                 )
-            try:
-                ws = mgr.open(ws_id)
-            except NodeAffinityError as exc:
-                return JSONResponse(exc.as_dict(), status_code=exc.status_code)
-            except ValueError as exc:
-                # Session factory misconfig (e.g. a model alias that no
-                # longer resolves). Surface remediation text as 503
-                # mirroring :func:`make_open_handler`.
-                log.warning("ws.detail.factory_misconfig ws_id=%s exc=%r", ws_id[:8], exc)
-                return JSONResponse(
-                    {"error": _safe_factory_misconfig_message(exc)}, status_code=503
-                )
-            except Exception:
-                # Bare ``Exception`` is intentional — see
-                # :func:`make_open_handler` for the rationale
-                # (``adapter.build_session`` / ``ChatSession.resume``
-                # have no documented exception spec).
-                import secrets
-
-                correlation_id = secrets.token_hex(4)
-                log.warning(
-                    "ws.detail.rehydrate_failed correlation_id=%s ws_id=%s",
-                    correlation_id,
-                    ws_id[:8] if ws_id else "",
-                    exc_info=True,
-                )
-                kind_noun = cfg.audit_action_prefix or "workstream"
-                return JSONResponse(
-                    {
-                        "error": (
-                            f"failed to rehydrate {kind_noun} (internal error). "
-                            f"correlation_id={correlation_id}"
-                        )
-                    },
-                    status_code=500,
-                )
+            opened = await _open_or_refusal(mgr, ws_id, cfg, "detail")
+            if isinstance(opened, JSONResponse):
+                return opened
+            ws, loaded_now = opened
             if ws is None:
                 # ``mgr.open`` returns None for missing rows, kind
                 # mismatch, and tombstoned rows — all surface as 404.
                 return JSONResponse({"error": cfg.not_found_label}, status_code=404)
 
             # A detail GET that lazily rehydrates IS an open — run the
-            # same kind-specific post-load the open handler runs.
-            # Skipping it leaves the now-live session with no watch
-            # dispatch registration (its next watch fire would take the
-            # restore path and spawn a duplicate auto-approved session
-            # racing writes into this live conversation) and never tells
-            # dashboards the workstream came live (``ws_created``).
-            if cfg.open_post_load is not None:
+            # same kind-specific post-load the open handler runs, once:
+            # a concurrent open that loaded it first already ran it.
+            # Skipping it leaves the now-live session without a watch
+            # dispatch registration (each watch fire would take the
+            # restore path to find it) and never tells dashboards the
+            # workstream came live (``ws_created``).
+            if loaded_now and cfg.open_post_load is not None:
                 try:
                     # Off-loop: interactive's post_load does blocking
                     # storage I/O (display-name lookup).
@@ -5025,6 +5074,9 @@ def make_detail_handler(cfg: SessionEndpointConfig) -> Handler:
                         ws.id[:8],
                         exc_info=True,
                     )
+
+        # A client is looking at it: a watch restore's blanket approval ends here.
+        ws.note_client()
 
         # Pending-approval snapshot — lets a freshly-loaded chat tab
         # paint the inline approval gate from this single response
@@ -5151,14 +5203,12 @@ def _make_dispatch_attempt(
     """Build one atomic queue-or-spawn attempt bound to ONE session capture.
 
     The single dispatch implementation shared by the /send route's
-    immediate path and :func:`_drain_pending_sends` — session re-capture
-    across /resume//new identity swaps, the cross-user and attachment
-    queue guards, ``send_id`` threading (the queue path reuses it as
-    ``queue_msg_id`` so the client's DELETE targets one id either way),
-    and the spawn-path metrics all live here, once.  Callers re-capture
-    ``ws.session`` before every attempt and pass it in: closures bound
-    to a pre-swap capture would send the user's message into the wrong
-    workstream's transcript.
+    immediate path and :func:`_drain_pending_sends` — session re-capture,
+    the cross-user and attachment queue guards, ``send_id`` threading (the
+    queue path reuses it as ``queue_msg_id`` so the client's DELETE targets
+    one id either way), and the spawn-path metrics all live here, once.
+    Callers re-capture ``ws.session`` before every attempt and pass it in,
+    so a dispatch never reaches a session the slot no longer holds.
 
     ``queue_outcome`` (second element of the return) is written only
     when the dispatcher takes the live-worker reuse path; empty after a
@@ -5337,9 +5387,7 @@ def _drain_pending_sends(ws: Workstream) -> None:
     route has answered).  It owns the waiting the parked POST used to do
     — but server-side, so a client timeout or abort can no longer become
     message loss.  Entries dispatch in arrival order via their prebuilt
-    attempt closures, re-capturing ``ws.session`` per attempt (a /resume
-    or /new that swapped the session mid-window routes the message into
-    the post-swap session, exactly as the park did).
+    attempt closures, re-capturing ``ws.session`` per attempt.
 
     Terminal outcomes per entry: dispatched (fresh spawn — or, for a
     queue-shaped entry, the interjection fallback into a live turn,
@@ -5690,9 +5738,7 @@ def make_send_handler(cfg: SessionEndpointConfig) -> Handler:
         # Defer-and-drain.  While a slash-command worker holds the slot (a
         # manual /compact can hold it for MINUTES), a send must not take
         # the interjection-queue path — its INTERJECTION_CAP_CHARS cap and
-        # cross-user guard are mid-TURN semantics, and a queued message
-        # would cross a
-        # /resume//new identity swap into the wrong workstream.  Instead
+        # cross-user guard are mid-TURN semantics.  Instead
         # of parking THIS request until the window closes (which encoded
         # "client disconnected" as "message retracted" — deterministic
         # message loss for every bounded caller: the coordinator client

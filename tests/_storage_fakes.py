@@ -9,7 +9,10 @@ arm and ``fetchall``/``scalar`` the prune copy lacked.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import Any
+
+from sqlalchemy.dialects import postgresql
 
 from turnstone.core.storage import AttachmentWrite
 
@@ -98,7 +101,63 @@ class ScriptedPostgresResult:
         return self._scalar_value
 
 
+def lease_row(ws_id: str, *, state: str = "idle", token: str = "") -> Any:
+    """A parent-row lock result for an unleased workstream.
+
+    Mirrors the columns ``_lease.lock_workstream_lease_row`` and
+    ``_lease.admit_offline_writes_on_connection`` read, so scripted
+    transactions take the unfenced, unleased admission path.
+    """
+    return SimpleNamespace(
+        ws_id=ws_id,
+        state=state,
+        lease_holder=None,
+        lease_node_id=None,
+        lease_epoch=0,
+        lease_expires_ms=None,
+        incarnation_token=token,
+        now_ms=0,
+        lease_live=False,
+    )
+
+
+def expire_lease(backend: Any, ws_id: str) -> None:
+    """Move a workstream's owner-lease expiry into the past on the database clock."""
+    import sqlalchemy as sa
+
+    from turnstone.core.storage._schema import workstreams
+
+    with backend._engine.connect() as conn:
+        conn.execute(
+            sa.update(workstreams).where(workstreams.c.ws_id == ws_id).values(lease_expires_ms=1)
+        )
+        conn.commit()
+
+
+def acquire_lease(
+    backend: Any,
+    ws_id: str,
+    *,
+    holder: str = "node-a/1",
+    token: str = "",
+    allow_creating: bool = False,
+) -> Any:
+    """Take a real backend's owner lease on ``ws_id`` (token ``tok-<id>`` by default)."""
+    grant = backend.acquire_workstream_lease(
+        ws_id,
+        incarnation_token=token or f"tok-{ws_id}",
+        holder=holder,
+        node_id=holder.split("/", 1)[0],
+        ttl_seconds=30.0,
+        allow_creating=allow_creating,
+    )
+    assert grant is not None
+    return grant.fence
+
+
 class ScriptedPostgresConnection:
+    dialect = postgresql.dialect()
+
     def __init__(self, results: list[ScriptedPostgresResult]) -> None:
         self._results = results
         self.statements: list[Any] = []

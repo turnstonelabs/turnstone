@@ -1234,8 +1234,15 @@ def test_tasks_exec_add_dispatches(coord_session):
     coord.tasks_add.return_value = {"id": "tsk_new", "title": "plan"}
     item = sess._prepare_tool(_tc("tasks", {"action": "add", "title": "plan", "status": "pending"}))
     _, _ = sess._exec_tasks(item)
+    # The coordinator's own config row is written with its owner-lease fence
+    # (none for this unmanaged test session).
     coord.tasks_add.assert_called_once_with(
-        sess._ws_id, title="plan", status="pending", child_ws_id="", note=""
+        sess._ws_id,
+        title="plan",
+        status="pending",
+        child_ws_id="",
+        note="",
+        lease=sess.write_fence(),
     )
 
 

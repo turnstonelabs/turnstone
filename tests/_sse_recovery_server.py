@@ -113,6 +113,7 @@ class RecoveryServer:
             kind: WorkstreamKind = WorkstreamKind.INTERACTIVE,
             parent_ws_id: str | None = None,
             project_id: str = "",
+            workstream_lease: Any = None,
             **_extra: Any,
         ) -> ChatSession:
             client = self._pending_client
@@ -130,6 +131,9 @@ class RecoveryServer:
                 user_id="recovery-user",
                 client_type=ClientType.WEB,
                 kind=kind,
+                # The manager's owner lease: without it every session write
+                # is unfenced and refused while the manager holds the row.
+                workstream_lease=workstream_lease,
                 # Don't truncate large tool outputs: the harness tests
                 # recovery, not the tool-result truncation budget, and a
                 # truncated /history would diverge from the full live event

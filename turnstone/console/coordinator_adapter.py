@@ -276,6 +276,18 @@ class CoordinatorAdapter:
         except Exception:
             log.debug("coord_adapter.closed_fanout_failed ws=%s", ws_id[:8], exc_info=True)
 
+    def on_lease_retired(self, ws: Workstream) -> None:
+        """Forget a coordinator another console now owns.
+
+        A real node announces a workstream it lost as ``ws_unloaded``, not a
+        close (the workstream lives on elsewhere). A coordinator's row on the
+        console pseudo-node is different: each console keeps its own, nothing
+        reconciles it, and the new owner is another console with its own
+        collector. So this console closes it like any close: the children
+        registry entry goes and the row leaves this console's dashboard.
+        """
+        self.emit_closed(ws.id)
+
     # ------------------------------------------------------------------
     # UI cleanup — unblock pending events + broadcast ws_closed to listeners
     # ------------------------------------------------------------------
@@ -466,8 +478,7 @@ class CoordinatorAdapter:
                 # stay unreachable during command windows — same rule as the
                 # /send route's defer.  Fail the dispatch (returns False, the
                 # caller's retryable-backpressure surface) rather than queue
-                # a message that would be capped and could cross a /resume
-                # identity swap.
+                # a message that would be capped.
                 raise queue.Full()
             admission = session_worker.claimed_slot_queue_admission(ws, acting_user_id)
             if admission is None:

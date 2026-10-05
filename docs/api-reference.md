@@ -1424,10 +1424,10 @@ advertising a half-create.
 Long-lived server and console processes also run hidden-reservation recovery at
 boot and every five minutes, independently of ordinary idle eviction. It only
 considers rows still in internal `state='creating'` and older than two hours,
-excluding IDs currently loaded or pending in the manager. A live remote owner
-protects its rows; the current process's stable node ID does not self-protect,
-so a restart can recover its predecessor's residue. Failure to establish
-service liveness, or a storage failure, deletes nothing. Eligible rows are
+excluding IDs currently loaded or pending in the manager. A reservation with a
+live owner lease is never eligible; a crashed creator's lease expires, and its
+rows then become reclaimable whatever node ID the restarted process carries. A
+storage failure deletes nothing. Eligible rows are
 atomically hard-deleted with their dependent records and attachment refcounts;
 an eligible tokenless legacy or corrupt reservation is locked, recovered, and
 logged as a warning. Retention pruning leaves `creating` rows to this path. The

@@ -79,6 +79,14 @@ class _PolicyCache:
 
 _cache = _PolicyCache()
 
+# What the approval gates tell a call needing approval when the policies could
+# not be read: no approval, automatic or a person's, may run a call that a deny
+# rule might cover.
+POLICIES_UNREADABLE_DENIAL = (
+    "Blocked: the tool policies could not be read, so this call was not checked "
+    "against them and did not run. Try again shortly."
+)
+
 
 def invalidate_policy_cache(org_id: str | None = None) -> None:
     """Drop the cached policy snapshot for ``org_id`` (or all orgs).
@@ -90,50 +98,22 @@ def invalidate_policy_cache(org_id: str | None = None) -> None:
     _cache.invalidate(org_id)
 
 
-def evaluate_tool_policy(
+def evaluate_loaded_tool_policies(
     storage: StorageBackend,
-    tool_name: str,
+    tool_names: list[str],
     org_id: str = "",
-) -> str | None:
-    """Check tool policies for *tool_name*.
+) -> dict[str, str | None] | None:
+    """Evaluate the tool policies for each name, from one cached read.
 
-    Policies are evaluated in priority order (highest first).  The first
-    matching policy wins.
-
-    Returns ``"allow"``, ``"deny"``, or ``"ask"`` if a policy matches,
-    or ``None`` if no policy matches (caller should fall through to the
-    default approval behaviour).
+    Policies are evaluated in priority order (highest first) and the first
+    matching one wins: each name maps to ``"allow"``, ``"deny"`` or ``"ask"``,
+    or to ``None`` when no policy matches (the default approval flow applies).
+    Returns ``None`` when the policies could not be read: the approval gates
+    then refuse every call needing approval (:data:`POLICIES_UNREADABLE_DENIAL`).
     """
     policies = _cache.get(storage, org_id)
     if policies is None:
         return None
-
-    for policy in policies:
-        if not policy.get("enabled", True):
-            continue
-        pattern = policy.get("tool_pattern", "")
-        if fnmatch.fnmatch(tool_name, pattern):
-            action: str = policy.get("action", "ask")
-            if action in ("allow", "deny", "ask"):
-                return action
-            log.warning("Unknown policy action %r for policy %s", action, policy.get("policy_id"))
-            return "ask"
-
-    return None
-
-
-def evaluate_tool_policies_batch(
-    storage: StorageBackend,
-    tool_names: list[str],
-    org_id: str = "",
-) -> dict[str, str | None]:
-    """Evaluate policies for multiple tools at once (single cached read).
-
-    Returns a dict mapping each tool name to its policy result.
-    """
-    policies = _cache.get(storage, org_id)
-    if policies is None:
-        return {name: None for name in tool_names}
 
     results: dict[str, str | None] = {}
     for name in tool_names:
@@ -141,8 +121,7 @@ def evaluate_tool_policies_batch(
         for policy in policies:
             if not policy.get("enabled", True):
                 continue
-            pattern = policy.get("tool_pattern", "")
-            if fnmatch.fnmatch(name, pattern):
+            if fnmatch.fnmatch(name, policy.get("tool_pattern", "")):
                 action = policy.get("action", "ask")
                 result = action if action in ("allow", "deny", "ask") else "ask"
                 break

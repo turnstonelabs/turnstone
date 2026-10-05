@@ -678,9 +678,13 @@ data.get("mergedAt") is not None
 4. When the condition fires (or max polls reached), a metadata-only operator notice is queued
    and the watch auto-cancels. Condition errors use a fixed failure label; exception details
    are available through `read` with the delivered snapshot.
-5. An idle workstream wakes to handle the notice; an evicted workstream is restored first.
-   The watch-result card renders command output from display metadata. The model pulls it
-   through `read` as a normal tool result.
+5. An idle workstream wakes to handle the notice. One that is not loaded is opened first, and
+   while nobody else is in it, it approves its own tool calls (audited as `unattended_watch`)
+   until the first client opens it, views it, sends to it, approves in it, stops it or attaches
+   to its stream. A workstream open in another process is retried for a few minutes, within the
+   watch's budget, so a fire can lapse while it stays open there; one with no stored turns ends
+   the watch. The watch-result card renders command output from display metadata. The model
+   pulls it through `read` as a normal tool result.
 6. Watches survive server restart (overdue watches fire once on recovery).
 
 **Constraints:**

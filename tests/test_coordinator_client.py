@@ -753,6 +753,8 @@ def test_inspect_returns_persisted_fields(populated_storage):
     # Verdicts deliberately not surfaced — see the inline comment in
     # CoordinatorClient.inspect().
     assert "verdicts" not in result
+    # The lease holder is a routing hint, not child state.
+    assert "lease_node_id" not in result
 
 
 def test_inspect_refuses_workstreams_outside_coordinator_subtree(populated_storage):

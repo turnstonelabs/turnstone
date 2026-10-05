@@ -1647,38 +1647,6 @@ class TestSessionRefresh:
         self._assert_actor_projection(session, "actor-b", coordinator=False)
         assert not self._mcp_names(session._tools) & {f"mcp__stale__tool{i}" for i in range(25)}
 
-    def test_stalled_refresh_cannot_republish_after_surface_drop(self, tmp_db):
-        started = threading.Event()
-        release = threading.Event()
-        catalog = self._actor_catalog("actor-a")
-
-        def get_tools(*, user_id=None):
-            if threading.current_thread().name == "stale-drop":
-                started.set()
-                assert release.wait(timeout=5)
-            return catalog
-
-        manager = MagicMock()
-        manager.get_tools.side_effect = get_tools
-        session = self._make_session(
-            mcp_client=manager,
-            user_id="actor-a",
-            tool_search="on",
-        )
-        stale = threading.Thread(target=session._on_mcp_tools_changed, name="stale-drop")
-        stale.start()
-        assert started.wait(timeout=5)
-        session._drop_mcp_surface()
-        session._rebuild_tool_search()
-        release.set()
-        stale.join(timeout=5)
-
-        assert not stale.is_alive()
-        assert self._mcp_names(session._tools) == set()
-        assert self._mcp_names(session._task_tools) == set()
-        assert session._tool_search is not None
-        assert session._tool_search.search("alphacatalogtoken") == []
-
     def test_stalled_refresh_cannot_republish_after_surface_replacement(self, tmp_db):
         started = threading.Event()
         release = threading.Event()

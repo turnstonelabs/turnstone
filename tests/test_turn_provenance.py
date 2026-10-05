@@ -781,6 +781,7 @@ def test_history_projection_failure_returns_503_without_private_row_fields(
         ),
         meta=json.dumps({PROVENANCE_META_KEY: raw}),
         commit_key=private_commit_key,
+        lease=manager.lease_fence(workstream.id),
     )
     client = _make_client(storage, coord_mgr=manager, registry=_fake_registry())
 

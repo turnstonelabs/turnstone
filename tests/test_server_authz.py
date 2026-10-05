@@ -296,8 +296,9 @@ class _FakeSession:
     def set_watch_runner(self, *_a: Any, **_kw: Any) -> None:
         pass
 
-    def resume(self, _ws_id: str) -> bool:
-        return False
+    def rehydrate(self) -> bool:
+        # Open loads the saved history through this; the fake has none to load.
+        return True
 
     def fork_from_storage(
         self,
@@ -2182,37 +2183,6 @@ class TestCompactCommandDispatch:
         assert ws.session.sends == []
         assert ws.session.queue_calls == []
 
-    def test_deferred_send_dispatches_into_post_swap_session(self, app_client):
-        """The drain re-captures ws.session per attempt: a /resume-style
-        identity swap during the window routes the deferred message into
-        the POST-swap session — the same guarantee the park's
-        per-iteration re-capture provided."""
-        client, mgr = app_client
-        ws_id = self._create_ws(client)
-        ws = mgr.get(ws_id)
-        assert ws is not None
-        old_session = ws.session
-        gate = threading.Event()
-        old_session.compact_gate = gate
-        client.post(
-            "/v1/api/command",
-            json={"command": "/compact", "ws_id": ws_id},
-            headers=_auth("user-1"),
-        )
-        r = client.post(
-            f"/v1/api/workstreams/{ws_id}/send",
-            json={"message": "post-swap please"},
-            headers=_auth("user-1"),
-        )
-        assert r.json()["status"] == "queued"
-        new_session = _FakeSession(ws_id=ws_id, user_id="user-1")
-        ws.session = new_session  # the in-place identity swap
-        gate.set()
-        wait_until(lambda: new_session.sends, timeout=8.0)
-        assert [s[0] for s in new_session.sends] == ["post-swap please"]
-        assert old_session.sends == []
-        wait_until(lambda: self._drain_idle(ws), timeout=8.0)
-
     def test_rejected_deferred_entry_waits_for_slot_then_fresh_spawns(self, app_client):
         """The drain's rejection arm: an entry the interjection fallback
         refuses (cross-user here; attachments/oversized take the same
@@ -3312,6 +3282,7 @@ class TestCreateForkRollback:
                 ws_id=ws_id,
                 user_id=ui._user_id,
                 fork_reservation_token=kwargs["fork_reservation_token"],
+                workstream_lease=kwargs.get("workstream_lease"),
             )
             sessions.append(session)
             return session
@@ -3492,7 +3463,10 @@ class TestCreateForkRollback:
             if lifecycle == "close":
                 assert mgr.close(destination_id) is True
             else:
-                assert storage.delete_workstream(destination_id) is True
+                assert (
+                    storage.delete_workstream(destination_id, lease=mgr.lease_fence(destination_id))
+                    is True
+                )
                 assert mgr.delete(destination_id) is True
         finally:
             release_clone.set()

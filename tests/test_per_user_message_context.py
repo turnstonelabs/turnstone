@@ -17,6 +17,7 @@ the shared-state detection + one-time "has joined" note.
 from __future__ import annotations
 
 import json
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 from tests._session_helpers import make_fork_destination, make_session
@@ -387,16 +388,19 @@ def test_labels_render_resolved_usernames():
 # -- shared-state detection + join note ---------------------------------------
 
 
-def test_recompute_shared_state_from_history():
+def _derive_shared_state(s: Any) -> None:
+    """What each system-prompt compose does: read the sender seed, then apply it."""
+    s._apply_shared_state_plan(*s._plan_shared_state())
+
+
+def test_shared_state_derives_from_history():
     s = make_session(user_id="owner")
     with patch("turnstone.core.session.get_storage", return_value=None):
         s.messages.append(turn_from_dict({"role": "user", "content": "a", "_sender": "owner"}))
-        s._invalidate_shared_state()  # what _append_user_turn does for stamped turns
-        s._recompute_shared_state()
+        _derive_shared_state(s)
         assert s._shared_workstream is False  # owner alone is not shared
         s.messages.append(turn_from_dict({"role": "user", "content": "b", "_sender": "alice"}))
-        s._invalidate_shared_state()
-        s._recompute_shared_state()
+        _derive_shared_state(s)
     assert s._shared_workstream is True
     assert s._known_senders == {"owner", "alice"}
 
@@ -408,13 +412,11 @@ def test_shared_state_latches_and_senders_never_shrink():
     s = make_session(user_id="owner")
     with patch("turnstone.core.session.get_storage", return_value=None):
         s.messages.append(turn_from_dict({"role": "user", "content": "a", "_sender": "alice"}))
-        s._invalidate_shared_state()
-        s._recompute_shared_state()
+        _derive_shared_state(s)
         assert s._shared_workstream is True
         # compaction-style narrowing: alice's turns vanish from the slice
         s.messages = [turn_from_dict({"role": "user", "content": "s", "_sender": "owner"})]
-        s._invalidate_shared_state()
-        s._recompute_shared_state()
+        _derive_shared_state(s)
         assert s._shared_workstream is True  # latched
         assert "alice" in s._known_senders  # union, never overwrite
         # ...so the returning participant does not re-fire the join note
@@ -427,58 +429,30 @@ def test_recompute_unions_persisted_senders_once():
     # A rehydrating worker sees only the checkpointed slice; the one-time
     # full-history read recovers participants summarized out of it.
     s = make_session(user_id="owner")
-    s._reset_shared_state()  # the state resume() leaves behind
+    s._reset_shared_state()  # the state a history load leaves behind
     fake = MagicMock()
     fake.list_message_senders.return_value = ["alice"]
     with patch("turnstone.core.session.get_storage", return_value=fake):
-        s._recompute_shared_state()
+        _derive_shared_state(s)
         assert s._shared_workstream is True
         assert "alice" in s._known_senders
-        s._invalidate_shared_state()
-        s._recompute_shared_state()  # second turn: no second full-history read
+        _derive_shared_state(s)  # second compose: no second full-history read
     fake.list_message_senders.assert_called_once()
 
 
 def test_persisted_sender_read_retries_after_storage_error():
     # A transient storage error must not pin an incomplete participant set:
-    # the next recompute (next user turn) retries the full-history read.
+    # the next compose retries the full-history read.
     s = make_session(user_id="owner")
     s._reset_shared_state()
     fake = MagicMock()
     fake.list_message_senders.side_effect = [RuntimeError("storage down"), ["alice"]]
     with patch("turnstone.core.session.get_storage", return_value=fake):
-        s._recompute_shared_state()  # error -> degraded this turn, not cached
+        _derive_shared_state(s)  # error -> degraded this compose, not cached
         assert s._shared_workstream is False
-        s._invalidate_shared_state()  # next user turn
-        s._recompute_shared_state()  # retried, recovered
+        _derive_shared_state(s)  # retried, recovered
     assert s._shared_workstream is True
     assert fake.list_message_senders.call_count == 2
-
-
-def test_recompute_is_memoized_per_turn():
-    # _init_system_messages fires many times within a turn; between user-turn
-    # appends the recompute is a no-op flag check, not an O(n) rescan.
-    s = make_session(user_id="owner")
-    storage = MagicMock()
-    storage.list_message_senders.return_value = []
-    with patch("turnstone.core.session.get_storage", return_value=storage):
-        s._reset_shared_state()
-        s._recompute_shared_state()
-        s.messages.append(turn_from_dict({"role": "user", "content": "b", "_sender": "alice"}))
-        s._recompute_shared_state()  # memoized: append not yet visible
-        assert s._shared_workstream is False
-        s._invalidate_shared_state()  # what _append_user_turn does
-        s._recompute_shared_state()
-        assert s._shared_workstream is True
-
-
-def test_append_user_turn_invalidates_shared_state():
-    s = make_session(user_id="owner")
-    s._acting_user_id = "alice"
-    with patch("turnstone.core.session.save_message", return_value=1):
-        s._senders_dirty = False
-        s._append_user_turn("hello", ())
-    assert s._senders_dirty is True
 
 
 def test_new_participant_flips_shared_and_emits_join_note_once(tmp_db):
@@ -489,14 +463,9 @@ def test_new_participant_flips_shared_and_emits_join_note_once(tmp_db):
     # parent first; preserve that prerequisite in this direct-session test.
     register_workstream(s.ws_id, user_id="owner")
     s._known_senders = {"owner"}
-    # _maybe_note_new_participant recomputes (not hand-mutates) shared state,
-    # deriving it from self.messages -- so, matching its real call contract
-    # (send() invokes it right after _append_user_turn, which stamps the turn
-    # AND marks state dirty via _invalidate_shared_state), both must happen
-    # here too: appending alone leaves _senders_dirty at whatever __init__'s
-    # own compose left it (False), and the recompute would silently no-op.
+    # send() invokes _maybe_note_new_participant right after _append_user_turn
+    # stamps the turn.
     s.messages.append(turn_from_dict({"role": "user", "content": "hi", "_sender": "alice"}))
-    s._invalidate_shared_state()
     with (
         patch.object(s, "_init_system_messages") as recompose,
         patch("turnstone.core.session.get_storage", return_value=None),
@@ -524,10 +493,10 @@ def test_owner_only_never_shared():
 # -- resume / fork carry attribution across the DB round-trip -----------------
 
 
-def test_resume_resets_shared_state():
-    # resume() can point this session object at a different workstream's
-    # history; the monotonic shared-state guarantees are per workstream.
-    s = make_session(user_id="owner")
+def test_rehydrate_resets_shared_state():
+    # A history load replaces the conversation the shared state was derived
+    # from; the monotonic shared-state guarantees hold per history.
+    s = make_session(ws_id="ws-other", user_id="owner")
     s._known_senders = {"alice"}
     s._shared_workstream = True
     turns = [turn_from_dict({"role": "user", "content": "x", "_sender": "owner"})]
@@ -535,14 +504,15 @@ def test_resume_resets_shared_state():
     storage.get_workstream.return_value = None
     storage.ensure_workstream_incarnation_snapshot.return_value = None
     with (
-        patch("turnstone.core.session.load_message_turns", return_value=turns),
+        patch("turnstone.core.session.read_message_turns", return_value=turns),
         patch("turnstone.core.session.get_storage", return_value=storage),
         patch.object(s, "_reset_shared_state", wraps=s._reset_shared_state) as rst,
         patch.object(s, "_save_config"),
         patch.object(s, "_init_system_messages"),
     ):
-        assert s.resume("ws-other") is True
+        assert s.rehydrate() is True
     rst.assert_called_once()
+    assert (s._known_senders, s._shared_workstream) == (set(), False)
 
 
 def test_fork_persists_sender_meta(tmp_db):
@@ -559,8 +529,8 @@ def test_fork_persists_sender_meta(tmp_db):
     fork = make_fork_destination()
     fork.fork_from_storage("src-ws", principal_id="owner", source_reservation_token="source-token")
     assert storage.delete_workstream("src-ws")
-    reopened = make_session(user_id="owner")
-    assert reopened.resume(fork.ws_id)
+    reopened = make_session(ws_id=fork.ws_id, user_id="owner")
+    assert reopened.rehydrate()
     for session in (fork, reopened):
         by_content = {turn.text: turn for turn in session.messages}
         assert by_content["hi"].meta.extra["sender"] == "alice"
@@ -609,8 +579,10 @@ def test_resume_recovers_compacted_out_sender_end_to_end(tmp_db, mock_openai_cli
     # Conversation continues, owner only -- alice has no post-marker row either.
     save_message(ws, "user", "after summary", meta=json.dumps({"sender": "owner"}))
 
-    sess2 = make_session(client=mock_openai_client, context_window=10_000, max_tokens=1_000)
-    assert sess2.resume(ws) is True
+    sess2 = make_session(
+        ws_id=ws, client=mock_openai_client, context_window=10_000, max_tokens=1_000
+    )
+    assert sess2.rehydrate() is True
     senders_in_slice = {m.meta.extra.get("sender") for m in sess2.messages if m.role is Role.USER}
     assert "alice" not in senders_in_slice  # confirms the checkpointed slice really is narrowed
 

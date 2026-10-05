@@ -339,7 +339,7 @@ class TestHandleCommand:
         _populate_simple(session)
         ui = session.ui
         ui.on_error = MagicMock()
-        session._workstream_gone_ws = session._ws_id
+        session._workstream_gone = True
         session.handle_command("/rewind 1")
         ui.on_error.assert_called_once()
         assert "refused" in ui.on_error.call_args[0][0].lower()
@@ -368,11 +368,11 @@ class TestHandleCommand:
 class TestDeleteMessagesAfter:
     def test_delete_truncates_db(self, tmp_db):
         from turnstone.core.memory import (
-            delete_messages_after,
             load_messages,
             register_workstream,
             save_message,
         )
+        from turnstone.core.storage import get_storage
 
         ws_id = "test-ws-delete"
         register_workstream(ws_id)
@@ -381,7 +381,7 @@ class TestDeleteMessagesAfter:
         save_message(ws_id, "user", "Bye")
         save_message(ws_id, "assistant", "Goodbye!")
 
-        deleted = delete_messages_after(ws_id, 2)
+        deleted = get_storage().delete_messages_after(ws_id, 2)
         assert deleted == 2
 
         msgs = load_messages(ws_id)
@@ -391,32 +391,32 @@ class TestDeleteMessagesAfter:
 
     def test_delete_nothing(self, tmp_db):
         from turnstone.core.memory import (
-            delete_messages_after,
             register_workstream,
             save_message,
         )
+        from turnstone.core.storage import get_storage
 
         ws_id = "test-ws-noop"
         register_workstream(ws_id)
         save_message(ws_id, "user", "Hello")
 
-        deleted = delete_messages_after(ws_id, 10)
+        deleted = get_storage().delete_messages_after(ws_id, 10)
         assert deleted == 0
 
     def test_delete_all(self, tmp_db):
         from turnstone.core.memory import (
-            delete_messages_after,
             load_messages,
             register_workstream,
             save_message,
         )
+        from turnstone.core.storage import get_storage
 
         ws_id = "test-ws-all"
         register_workstream(ws_id)
         save_message(ws_id, "user", "Hello")
         save_message(ws_id, "assistant", "Hi!")
 
-        deleted = delete_messages_after(ws_id, 0)
+        deleted = get_storage().delete_messages_after(ws_id, 0)
         assert deleted == 2
         assert load_messages(ws_id) == []
 

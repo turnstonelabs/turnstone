@@ -1409,16 +1409,15 @@ class TestSkillCatalogDisclosure:
         session._memory_config.index_budget_chars = 65_536
         session._user_id = "test-user"
         session._acting_user_id = ""
-        # _init_system_messages -> _recompute_shared_state reads the session
-        # owner (_mcp_user_id) to decide shared-workstream framing; __init__
-        # normally sets it from user_id, so seed it here for the __new__ build.
+        # _init_system_messages derives shared-workstream framing from the
+        # session owner (_mcp_user_id); __init__ normally sets it from user_id,
+        # so seed it here for the __new__ build.
         session._mcp_user_id = "test-user"
-        # Shared-state fields _recompute_shared_state reads; _db_senders_loaded
-        # True short-circuits the full-history storage read this __new__ build
-        # has no ws for, leaving the in-memory (empty) scan -> not shared.
+        # Shared-state fields the compose reads; _db_senders_loaded True
+        # short-circuits the full-history storage read this __new__ build has
+        # no ws for, leaving the in-memory (empty) scan -> not shared.
         session._shared_workstream = False
         session._known_senders = set()
-        session._senders_dirty = True
         session._db_senders_loaded = True
         session._sender_label_nonce = "testnonce"
         storage = MagicMock()

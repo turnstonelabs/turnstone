@@ -143,6 +143,8 @@ from turnstone.api.schemas import (
     StatusResponse,
     UpdateScheduleRequest,
     UserInfo,
+    WorkstreamDeleteRequest,
+    WorkstreamDeleteResponse,
 )
 from turnstone.api.server_schemas import (
     ApproveRequest,
@@ -1340,6 +1342,21 @@ CONSOLE_ENDPOINTS: list[EndpointSpec] = [
         tags=["Routing"],
     ),
     EndpointSpec(
+        "/v1/api/route/workstreams/delete",
+        "POST",
+        "Permanently delete a workstream through the console",
+        description=(
+            'Body ``{"ws_id": "..."}``.  A coordinator is deleted on this '
+            "console, which holds its lease; any other workstream is forwarded to "
+            "the node that owns it, and retried once at the holder when that node "
+            "answers ``409`` ``workstream_lease_held``."
+        ),
+        request_model=WorkstreamDeleteRequest,
+        response_model=WorkstreamDeleteResponse,
+        error_codes=[400, 403, 404, 409, 500, 502, 503],
+        tags=["Routing"],
+    ),
+    EndpointSpec(
         "/v1/api/route",
         "GET",
         "Look up which node owns a workstream",
@@ -1392,10 +1409,12 @@ CONSOLE_ENDPOINTS: list[EndpointSpec] = [
             "session isn't currently in memory, write scope is additionally "
             "required before the manager rehydrates it "
             "before responding; ``500`` on rehydrate failure carries a "
-            "correlation id matching the server log line."
+            "correlation id matching the server log line; ``409`` "
+            "``workstream_lease_held`` when another console holds it; ``429`` "
+            "when every coordinator slot is busy (retry later)."
         ),
         response_model=WorkstreamDetailResponse,
-        error_codes=[400, 403, 404, 500, 503],
+        error_codes=[400, 403, 404, 409, 429, 500, 503],
         tags=["Coordinator"],
     ),
     EndpointSpec(
@@ -1419,10 +1438,25 @@ CONSOLE_ENDPOINTS: list[EndpointSpec] = [
             "Parity with ``POST /v1/api/workstreams/{ws_id}/open`` — gives "
             "SDK callers and operators a way to warm a coordinator without "
             "browsing to it.  Idempotent: ``already_loaded=true`` when the "
-            "session was already in memory."
+            "session was already in memory.  ``409`` ``workstream_lease_held`` "
+            "when another console holds the coordinator; ``429`` when every "
+            "coordinator slot is busy (retry later)."
         ),
         response_model=CoordinatorOpenResponse,
-        error_codes=[400, 403, 404, 500, 503],
+        error_codes=[400, 403, 404, 409, 429, 500, 503],
+        tags=["Coordinator"],
+    ),
+    EndpointSpec(
+        "/v1/api/workstreams/{ws_id}/title",
+        "POST",
+        "Set a coordinator workstream's title",
+        description=(
+            'Body ``{"title": "..."}``.  ``409`` when another workstream already '
+            "uses the name, or with code ``workstream_lease_held`` when "
+            "another console holds the coordinator. ``503`` when the console "
+            "runs no coordinator subsystem."
+        ),
+        error_codes=[400, 403, 404, 409, 503],
         tags=["Coordinator"],
     ),
     EndpointSpec(

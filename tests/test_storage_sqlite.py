@@ -7,6 +7,9 @@ from typing import Any
 import pytest
 import sqlalchemy as sa
 
+from tests._storage_fakes import acquire_lease as _acquire
+from tests._storage_fakes import expire_lease as _expire_lease
+from turnstone.core.storage._protocol import WorkstreamLeaseLostError
 from turnstone.core.storage._schema import workstreams
 
 # -- Workstream registration ---------------------------------------------------
@@ -1020,108 +1023,82 @@ class TestBulkCloseStaleOrphans:
             ).one()
         assert row[0] != stale_updated
 
-    def test_protects_rows_owned_by_live_services(self, backend):
-        """Liveness scoping (post-#384 rendezvous-routing world): rows
-        whose ``node_id`` matches a heartbeating service must NOT be
-        reaped, because that owner may legitimately have them loaded on
-        another worker.  Rows whose ``node_id`` matches a dead service
-        ARE eligible — that's how dead-pod orphans get reclaimed in
-        containerized deployments with dynamic hostnames."""
-        backend.register_workstream("dead-node", node_id="dead-pod-x4k2", kind="interactive")
-        backend.register_workstream("alive-node", node_id="alive-pod-y9p3", kind="interactive")
-        _force_updated(backend, "dead-node", "2020-01-01T00:00:00")
-        _force_updated(backend, "alive-node", "2020-01-01T00:00:00")
-
-        closed = backend.bulk_close_stale_orphans(
-            "interactive",
-            cutoff="2024-01-01T00:00:00",
-            exclude_ws_ids=[],
-            live_node_ids=["alive-pod-y9p3"],
-        )
-
-        assert closed == ["dead-node"]
-        rows = backend.get_workstreams_batch(["dead-node", "alive-node"])
-        assert rows["dead-node"]["state"] == "closed"
-        assert rows["alive-node"]["state"] == "idle"
-
-    def test_null_node_id_always_eligible(self, backend):
-        """A row with NULL ``node_id`` has no owner identity — age alone
-        gates the reap.  Belt-and-suspenders against ``NULL NOT IN (...)``
-        evaluating to NULL (not TRUE) and silently protecting orphans
-        forever."""
-        backend.register_workstream("no-owner", node_id=None, kind="interactive")
-        _force_updated(backend, "no-owner", "2020-01-01T00:00:00")
-
-        closed = backend.bulk_close_stale_orphans(
-            "interactive",
-            cutoff="2024-01-01T00:00:00",
-            exclude_ws_ids=[],
-            live_node_ids=["some-other-node"],
-        )
-
-        assert closed == ["no-owner"]
-
-    def test_live_node_ids_none_skips_filter(self, backend):
-        """``live_node_ids=None`` is the single-process / operator-backfill
-        mode — all rows of *kind* are eligible regardless of node_id."""
-        backend.register_workstream("node-a", node_id="node-a", kind="interactive")
-        backend.register_workstream("node-b", node_id="node-b", kind="interactive")
-        _force_updated(backend, "node-a", "2020-01-01T00:00:00")
-        _force_updated(backend, "node-b", "2020-01-01T00:00:00")
+    def test_live_lease_protects_row_whatever_its_node(self, backend):
+        """A workstream loaded by any live process carries a renewed owner
+        lease, so bulk close never touches it.  The creating ``node_id``
+        grants no protection of its own: a crashed process's rows are
+        reclaimable whatever node id the next process carries."""
+        for ws_id in ("leased", "unleased"):
+            backend.register_workstream(
+                ws_id, node_id="node-a", kind="interactive", fork_reservation_token=f"tok-{ws_id}"
+            )
+            _force_updated(backend, ws_id, "2020-01-01T00:00:00")
+        _acquire(backend, "leased", holder="node-b/1")
 
         closed = backend.bulk_close_stale_orphans(
             "interactive", cutoff="2024-01-01T00:00:00", exclude_ws_ids=[]
         )
 
-        assert set(closed) == {"node-a", "node-b"}
+        assert closed == ["unleased"]
+        rows = backend.get_workstreams_batch(["leased", "unleased"])
+        assert rows["leased"]["state"] == "idle"
+        assert rows["unleased"]["state"] == "closed"
 
-    def test_empty_live_node_ids_treats_all_as_dead(self, backend):
-        """Empty list ``live_node_ids=[]`` means "no nodes alive" — every
-        row's owner is unprotected.  Useful for operator scripts that
-        want to reap regardless of liveness."""
-        backend.register_workstream("any", node_id="node-a", kind="interactive")
-        _force_updated(backend, "any", "2020-01-01T00:00:00")
+    def test_expired_lease_is_closed_and_fenced_out(self, backend):
+        """An expired lease no longer protects the row, and the closing
+        statement retires it: the paused former holder cannot write after."""
+        backend.register_workstream(
+            "expired", kind="interactive", fork_reservation_token="tok-expired"
+        )
+        fence = _acquire(backend, "expired", holder="node-a/1")
+        _force_updated(backend, "expired", "2020-01-01T00:00:00")
+        _expire_lease(backend, "expired")
 
         closed = backend.bulk_close_stale_orphans(
-            "interactive",
-            cutoff="2024-01-01T00:00:00",
-            exclude_ws_ids=[],
-            live_node_ids=[],
+            "interactive", cutoff="2024-01-01T00:00:00", exclude_ws_ids=[]
         )
 
-        assert closed == ["any"]
+        assert closed == ["expired"]
+        assert backend.get_workstream("expired")["state"] == "closed"
+        with backend._engine.connect() as conn:
+            holder, epoch = conn.execute(
+                sa.select(workstreams.c.lease_holder, workstreams.c.lease_epoch).where(
+                    workstreams.c.ws_id == "expired"
+                )
+            ).one()
+        assert holder is None
+        assert epoch == fence.epoch + 1
+        with pytest.raises(WorkstreamLeaseLostError):
+            backend.update_workstream_state("expired", "running", lease=fence)
+        assert backend.get_workstream("expired")["state"] == "closed"
 
-    def test_combines_live_node_ids_and_exclude_ws_ids(self, backend):
+    def test_combines_lease_and_exclude_ws_ids(self, backend):
         """Both filters stack as AND clauses on the UPDATE.  Covers the
         full 2x2 matrix to catch a future edit that replaces an AND with
-        an OR or drops one of the filters: only the (orphan + dead-node)
+        an OR or drops one of the filters: only the unloaded, unleased
         cell should be reaped."""
-        # All four registered with the same stale ``updated``.
-        for ws_id, node in [
-            ("loaded-alive", "alive-node"),
-            ("loaded-dead", "dead-node"),
-            ("orphan-alive", "alive-node"),
-            ("orphan-dead", "dead-node"),
-        ]:
-            backend.register_workstream(ws_id, node_id=node, kind="interactive")
+        for ws_id in ("loaded-leased", "loaded-free", "orphan-leased", "orphan-free"):
+            backend.register_workstream(
+                ws_id, kind="interactive", fork_reservation_token=f"tok-{ws_id}"
+            )
             _force_updated(backend, ws_id, "2020-01-01T00:00:00")
+        _acquire(backend, "loaded-leased", holder="node-a/1")
+        _acquire(backend, "orphan-leased", holder="node-b/1")
 
         closed = backend.bulk_close_stale_orphans(
             "interactive",
             cutoff="2024-01-01T00:00:00",
-            exclude_ws_ids=["loaded-alive", "loaded-dead"],
-            live_node_ids=["alive-node"],
+            exclude_ws_ids=["loaded-leased", "loaded-free"],
         )
 
-        # Only orphan-dead is unprotected by both filters.
-        assert closed == ["orphan-dead"]
+        assert closed == ["orphan-free"]
         rows = backend.get_workstreams_batch(
-            ["loaded-alive", "loaded-dead", "orphan-alive", "orphan-dead"]
+            ["loaded-leased", "loaded-free", "orphan-leased", "orphan-free"]
         )
-        assert rows["loaded-alive"]["state"] == "idle"
-        assert rows["loaded-dead"]["state"] == "idle"
-        assert rows["orphan-alive"]["state"] == "idle"
-        assert rows["orphan-dead"]["state"] == "closed"
+        assert rows["loaded-leased"]["state"] == "idle"
+        assert rows["loaded-free"]["state"] == "idle"
+        assert rows["orphan-leased"]["state"] == "idle"
+        assert rows["orphan-free"]["state"] == "closed"
 
 
 # -- touch_workstream ----------------------------------------------------------

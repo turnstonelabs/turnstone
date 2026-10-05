@@ -24,6 +24,8 @@ from turnstone.core.storage import (
     AttachmentWrite,
     ConversationCommitConflictError,
     ConversationCommitWorkstreamGoneError,
+    WorkstreamLeaseError,
+    WorkstreamLeaseLostError,
     get_storage,
 )
 from turnstone.core.workstream import WorkstreamKind
@@ -32,6 +34,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable
     from contextlib import AbstractContextManager
 
+    from turnstone.core.storage import LeaseFence
     from turnstone.core.trajectory import Turn
 
 log = get_logger(__name__)
@@ -139,7 +142,28 @@ def normalize_key(key: str) -> str:
 # -- Core conversation operations ---------------------------------------------
 
 
-_TYPED_COMMIT_ERRORS = (ConversationCommitConflictError, ConversationCommitWorkstreamGoneError)
+_TYPED_COMMIT_ERRORS = (
+    ConversationCommitConflictError,
+    ConversationCommitWorkstreamGoneError,
+    WorkstreamLeaseError,
+)
+
+# Owner-lease refusals of a best-effort write (see ``_log_lease_refusal``).
+_LEASE_REFUSALS = WorkstreamLeaseError
+
+
+def _log_lease_refusal(exc: Exception, what: str, ws_id: str) -> None:
+    """Log one best-effort write that an owner lease refused.
+
+    A lost lease is the expected end of a copy another process took over (the
+    lease keeper and the session journal report it), so it logs quietly. An
+    unfenced write refused by a live lease means an offline writer raced the
+    owner, or a caller forgot its fence: both need to be visible.
+    """
+    if isinstance(exc, WorkstreamLeaseLostError):
+        log.debug("%s refused: this process lost the owner lease ws=%s", what, ws_id)
+    else:
+        log.warning("%s refused by another holder's owner lease ws=%s", what, ws_id)
 
 
 def _keyed_save(operation: Callable[[], int], describe: str) -> int:
@@ -174,6 +198,8 @@ def save_message(
     producer: str | None = None,
     meta: str | None = None,
     commit_key: str | None = None,
+    *,
+    lease: LeaseFence | None = None,
 ) -> int:
     """Log a message to the conversations table.
 
@@ -200,6 +226,9 @@ def save_message(
     ``commit_key`` is the per-workstream idempotency identity for one admitted
     conversation row. Retrying the same non-NULL key returns the original row
     id without appending a duplicate.
+
+    ``lease`` is the writer's owner-lease fence; storage refuses it with a
+    typed lease error once another process owns the workstream.
     """
     return _keyed_save(
         lambda: get_storage().save_message(
@@ -216,6 +245,7 @@ def save_message(
             producer=producer,
             meta=meta,
             commit_key=commit_key,
+            lease=lease,
         ),
         f"Failed to save message for ws={ws_id} role={role}",
     )
@@ -230,6 +260,7 @@ def save_user_message_with_attachments(
     event_id: int | None = None,
     meta: str | None = None,
     commit_key: str,
+    lease: LeaseFence | None = None,
 ) -> int:
     """Atomically persist a keyed USER row and its attachment ownership.
 
@@ -249,6 +280,7 @@ def save_user_message_with_attachments(
             event_id=event_id,
             meta=meta,
             commit_key=commit_key,
+            lease=lease,
         ),
         f"Failed atomic user attachment commit for ws={ws_id} commit_key={commit_key}",
     )
@@ -265,6 +297,7 @@ def save_tool_message_with_attachments(
     is_error: bool = False,
     meta: str | None = None,
     commit_key: str,
+    lease: LeaseFence | None = None,
 ) -> int:
     """Atomically persist a keyed TOOL row and its attachment ownership.
 
@@ -285,6 +318,7 @@ def save_tool_message_with_attachments(
             is_error=is_error,
             meta=meta,
             commit_key=commit_key,
+            lease=lease,
         ),
         f"Failed atomic tool attachment commit for ws={ws_id} commit_key={commit_key}",
     )
@@ -299,21 +333,12 @@ def load_messages(ws_id: str, *, repair: bool = True) -> list[dict[str, Any]]:
         return []
 
 
-def load_message_turns(ws_id: str, *, checkpointed: bool = True) -> list[Turn]:
-    """Load a workstream's history as canonical ``Turn``s (by-reference content).
+def read_message_turns(ws_id: str) -> list[Turn]:
+    """Load a workstream's checkpointed history for a session load, raising on any error.
 
-    The resume path — see :meth:`StorageBackend.load_message_turns`.  Returns an
-    empty list on any storage error (a failed resume must not crash the session).
-
-    ``checkpointed=True`` (resume default) returns the bounded ``[summary]+[tail]``
-    view when a compaction marker exists; ``checkpointed=False`` returns the full
-    transcript (markers dropped) for export/audit.
+    A read that fails is never mistaken for an empty history.
     """
-    try:
-        return get_storage().load_message_turns(ws_id, checkpointed=checkpointed)
-    except Exception:
-        log.warning("Failed to load message turns for ws=%s", ws_id, exc_info=True)
-        return []
+    return get_storage().load_message_turns(ws_id, checkpointed=True)
 
 
 def get_compaction_watermark(ws_id: str, preserve_tail: int = 0) -> int | None:
@@ -358,16 +383,6 @@ def save_attachment(
         )
     except Exception:
         log.warning("Failed to save attachment id=%s", attachment_id, exc_info=True)
-
-
-def set_message_attachments(ws_id: str, message_id: int, attachment_ids: list[str]) -> None:
-    """Record a turn's ordered content-addressed ref-list on its conversations row."""
-    if not attachment_ids or not message_id:
-        return
-    try:
-        get_storage().set_message_attachments(ws_id, message_id, attachment_ids)
-    except Exception:
-        log.warning("Failed to set message attachments ws=%s", ws_id, exc_info=True)
 
 
 def get_attachments(attachment_ids: list[str]) -> list[dict[str, Any]]:
@@ -432,23 +447,6 @@ def get_compaction_floor(ws_id: str) -> int:
         return -1
 
 
-def delete_messages_after(ws_id: str, keep_count: int) -> int:
-    """Delete conversation rows beyond the first *keep_count* rows.
-
-    Returns the number of rows deleted, or 0 on error.
-    """
-    try:
-        return get_storage().delete_messages_after(ws_id, keep_count)
-    except Exception:
-        log.warning(
-            "Failed to delete messages after count=%d for ws=%s",
-            keep_count,
-            ws_id,
-            exc_info=True,
-        )
-        return 0
-
-
 # -- Workstream management ----------------------------------------------------
 
 
@@ -484,28 +482,12 @@ def register_workstream(
         log.warning("Failed to register workstream ws=%s", ws_id, exc_info=True)
 
 
-def update_workstream_state(ws_id: str, state: str) -> None:
-    """Update a workstream's state."""
-    try:
-        get_storage().update_workstream_state(ws_id, state)
-    except Exception:
-        log.warning("Failed to update workstream state ws=%s state=%s", ws_id, state, exc_info=True)
-
-
 def delete_workstream_override(ws_id: str) -> None:
     """Fire-and-forget override deletion."""
     try:
         get_storage().delete_workstream_override(ws_id)
     except Exception:
         log.warning("override delete failed for %s", ws_id[:8], exc_info=True)
-
-
-def update_workstream_name(ws_id: str, name: str) -> None:
-    """Update a workstream's display name."""
-    try:
-        get_storage().update_workstream_name(ws_id, name)
-    except Exception:
-        log.warning("Failed to update workstream name ws=%s", ws_id, exc_info=True)
 
 
 def list_workstreams_with_history(
@@ -603,10 +585,17 @@ def resolve_workstream(alias_or_id: str) -> str | None:
 # -- Workstream config --------------------------------------------------------
 
 
-def save_workstream_config(ws_id: str, config: dict[str, str]) -> None:
+def save_workstream_config(
+    ws_id: str,
+    config: dict[str, str],
+    *,
+    lease: LeaseFence | None = None,
+) -> None:
     """Persist workstream configuration key/value pairs."""
     try:
-        get_storage().save_workstream_config(ws_id, config)
+        get_storage().save_workstream_config(ws_id, config, lease=lease)
+    except _LEASE_REFUSALS as exc:
+        _log_lease_refusal(exc, "Workstream config write", ws_id)
     except Exception:
         log.warning("Failed to save workstream config ws=%s", ws_id, exc_info=True)
 
@@ -628,6 +617,7 @@ def finalize_deferred_create(
     config: dict[str, str] | None = None,
     node_id: str | None = None,
     override_reason: str = "local",
+    lease: LeaseFence | None = None,
 ) -> bool:
     """Atomically finalize storage writes for one reserved fork create."""
     return get_storage().finalize_deferred_create(
@@ -637,12 +627,8 @@ def finalize_deferred_create(
         config=config,
         node_id=node_id,
         override_reason=override_reason,
+        lease=lease,
     )
-
-
-def publish_deferred_create(ws_id: str, fork_reservation_token: str) -> bool:
-    """Atomically expose one exact reserved workstream incarnation."""
-    return get_storage().publish_deferred_create(ws_id, fork_reservation_token)
 
 
 def get_workstream_reservation_token(ws_id: str) -> str:
@@ -705,7 +691,7 @@ def sanitize_error_text(text: str, *, max_len: int = LAST_ERROR_MAX_LEN) -> str:
     return cleaned
 
 
-def persist_last_error(ws_id: str, err_msg: str) -> None:
+def persist_last_error(ws_id: str, err_msg: str, *, lease: LeaseFence | None = None) -> None:
     """Persist (sanitized) exception text so the coordinator's inspect /
     wait_for_workstream can surface it on the next poll.
 
@@ -719,12 +705,14 @@ def persist_last_error(ws_id: str, err_msg: str) -> None:
         return
     sanitized = sanitize_error_text(err_msg)
     try:
-        get_storage().save_workstream_config(ws_id, {LAST_ERROR_CONFIG_KEY: sanitized})
+        get_storage().save_workstream_config(ws_id, {LAST_ERROR_CONFIG_KEY: sanitized}, lease=lease)
+    except _LEASE_REFUSALS as exc:
+        _log_lease_refusal(exc, "last_error write", ws_id)
     except Exception:
         log.warning("Failed to persist last_error ws=%s", ws_id, exc_info=True)
 
 
-def clear_last_error(ws_id: str) -> None:
+def clear_last_error(ws_id: str, *, lease: LeaseFence | None = None) -> None:
     """Clear the persisted ``last_error`` row.
 
     Called on successful recovery (state transitions from ``error`` back
@@ -737,7 +725,9 @@ def clear_last_error(ws_id: str) -> None:
     if not ws_id:
         return
     try:
-        get_storage().save_workstream_config(ws_id, {LAST_ERROR_CONFIG_KEY: ""})
+        get_storage().save_workstream_config(ws_id, {LAST_ERROR_CONFIG_KEY: ""}, lease=lease)
+    except _LEASE_REFUSALS as exc:
+        _log_lease_refusal(exc, "last_error clear", ws_id)
     except Exception:
         log.warning("Failed to clear last_error ws=%s", ws_id, exc_info=True)
 
@@ -799,10 +789,22 @@ def list_skills_by_activation(
 # -- Workstream metadata ------------------------------------------------------
 
 
-def set_workstream_alias(ws_id: str, alias: str) -> bool:
-    """Set a human-friendly alias. Returns False if alias is taken."""
+def set_workstream_alias(
+    ws_id: str,
+    alias: str,
+    *,
+    lease: LeaseFence | None = None,
+) -> bool:
+    """Set a human-friendly alias. Returns False if alias is taken.
+
+    An owner-lease refusal raises (:class:`WorkstreamLeaseError`): callers
+    report it as such (the HTTP route maps it to its own 409) rather than as
+    a taken alias.
+    """
     try:
-        return get_storage().set_workstream_alias(ws_id, alias)
+        return get_storage().set_workstream_alias(ws_id, alias, lease=lease)
+    except WorkstreamLeaseError:
+        raise
     except Exception:
         log.warning("Failed to set alias ws=%s alias=%s", ws_id, alias, exc_info=True)
         return False
@@ -868,12 +870,17 @@ def get_workstream_row(ws_id: str) -> dict[str, Any] | None:
         return None
 
 
-def update_workstream_title(ws_id: str, title: str) -> None:
-    """Set or update the auto-generated title for a workstream."""
+def update_workstream_title(ws_id: str, title: str, *, lease: LeaseFence | None = None) -> bool:
+    """Set or update the auto-generated title for a workstream; ``True`` when it was written."""
     try:
-        get_storage().update_workstream_title(ws_id, title)
+        get_storage().update_workstream_title(ws_id, title, lease=lease)
+    except _LEASE_REFUSALS as exc:
+        _log_lease_refusal(exc, "Title write", ws_id)
+        return False
     except Exception:
         log.warning("Failed to update title ws=%s", ws_id, exc_info=True)
+        return False
+    return True
 
 
 # -- Conversation search -------------------------------------------------------

@@ -43,7 +43,7 @@ def _patch_storage(storage: Any):
 
 def _patch_policies(verdicts: dict[str, str]):
     return patch(
-        "turnstone.core.policy.evaluate_tool_policies_batch",
+        "turnstone.core.policy.evaluate_loaded_tool_policies",
         return_value=verdicts,
     )
 

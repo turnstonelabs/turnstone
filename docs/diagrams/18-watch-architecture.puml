@@ -99,14 +99,16 @@ else Path B: workstream active + busy
       at its next user or tool seam.
     end note
 
-else Path C: workstream evicted
+else Path C: workstream not loaded
     Runner -> Runner : restore_fn(ws_id)
     note right
-      1. mgr.create() — may evict
-         another idle workstream
-      2. session.resume(ws_id)
-      3. set_watch_runner()
-      4. register new dispatch_fn
+      1. persona and owner checks
+      2. mgr.open_with_outcome(ws_id) — may evict
+         another idle workstream; open in another
+         process → retry later; no turns → watch ends
+      3. opened here: unattended approval until
+         the first client, set_watch_runner()
+      4. already loaded: register its dispatch_fn
     end note
     Runner -> Session : restored dispatch_fn(reminder)\n→ NudgeQueue.enqueue(channel="any")
 end
@@ -154,7 +156,7 @@ note right : action="cancel" (auto-approve)
 note over Runner, Storage
   **Startup:**
   1. WatchRunner created in main() with storage + node_id
-  2. restore_fn closure captures SessionManager
+  2. restore_fn = make_watch_restore_fn(manager)
   3. Initial workstream: session.set_watch_runner(runner)
   4. _lifespan(): runner.start() — daemon thread begins
 

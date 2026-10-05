@@ -169,6 +169,7 @@ class _BuildRealSessionAdapter:
             kind=self.kind,
             parent_ws_id=ws.parent_ws_id,
             project_id=ws.project_id,
+            workstream_lease=extra.get("workstream_lease"),
         )
 
 
@@ -529,6 +530,7 @@ def test_coord_idle_with_children_and_open_tasks_delivers_both(coord_mgr, tmp_db
                     }
                 )
             },
+            lease=mgr.lease_fence(coord.id),
         )
 
         coord.session.messages.append(turn_from_dict({"role": "user", "content": "spawn"}))
@@ -630,6 +632,7 @@ def test_coord_idle_with_open_tasks_and_no_children_omits_children_content(coord
                     }
                 )
             },
+            lease=mgr.lease_fence(coord.id),
         )
 
         coord.session.messages.append(turn_from_dict({"role": "user", "content": "work"}))
@@ -727,6 +730,7 @@ def test_stop_latch_survives_the_liveness_wake(coord_mgr, tmp_db):
                     }
                 )
             },
+            lease=mgr.lease_fence(coord.id),
         )
         coord.session.messages.append(turn_from_dict({"role": "user", "content": "work"}))
         coord.session.messages.append(turn_from_dict({"role": "assistant", "content": "ok"}))
@@ -1128,6 +1132,7 @@ def test_queued_interjection_owns_the_idle_seam(coord_mgr, tmp_db):
                     }
                 )
             },
+            lease=mgr.lease_fence(coord.id),
         )
         coord.session.messages.append(turn_from_dict({"role": "user", "content": "spawn"}))
         coord.session.messages.append(turn_from_dict({"role": "assistant", "content": "ok"}))
@@ -1385,7 +1390,7 @@ def test_interjection_handoff_skips_the_pop_on_a_gone_workstream(tmp_db):
     session = make_chat_session()
     session._nudge_queue.enqueue("idle_tasks", "open tasks remain", "wake")
     _c, _p, msg_id = session.queue_message("held message")
-    session._workstream_gone_ws = session._ws_id
+    session._workstream_gone = True
 
     sends: list[tuple[Any, ...]] = []
 

@@ -21,6 +21,8 @@ if TYPE_CHECKING:
     from starlette.responses import JSONResponse
     from starlette.types import Scope
 
+    from turnstone.core.storage import WorkstreamLeaseHeldError, WorkstreamLeaseLostError
+
 
 def latin1_safe_filename(name: str, *, fallback: str = "attachment") -> str:
     """A ``Content-Disposition`` ``filename`` value that is safe on the wire.
@@ -129,6 +131,24 @@ async def read_json_or_400(request: Request) -> dict[str, Any] | JSONResponse:
 
         structlog.get_logger(__name__).warning("read_json_or_400.unexpected", exc_info=True)
         return _JSONResponse({"error": "Failed to read request body"}, status_code=500)
+
+
+def lease_refusal_response(
+    exc: WorkstreamLeaseHeldError | WorkstreamLeaseLostError,
+) -> JSONResponse:
+    """The 409 ``workstream_lease_held`` answer to an owner-lease refusal.
+
+    The body names the holder's node when it is known, so a client can follow it.
+    A loss carries no holder (the refusing process only knows it no longer owns
+    the workstream), so it shares the held shape with an empty
+    ``holder_node_id``, and the router finds the owner.
+    """
+    from starlette.responses import JSONResponse as _JSONResponse
+
+    from turnstone.core.storage import WorkstreamLeaseHeldError as _Held
+
+    held = exc if isinstance(exc, _Held) else _Held(exc.ws_id)
+    return _JSONResponse(held.as_dict(), status_code=_Held.status_code)
 
 
 async def read_multipart_create_or_400(

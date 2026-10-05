@@ -156,6 +156,18 @@ class InteractiveAdapter:
     def emit_rehydrated(self, ws: Workstream) -> None:
         del ws  # no-op — mirrors emit_created (handler-side ws_created)
 
+    def on_lease_retired(self, ws: Workstream) -> None:
+        """Announce ``ws_unloaded``: this node let go of a workstream that is no longer its.
+
+        Another process took it over, or maintenance closed it after this
+        copy's lease lapsed. Not ``ws_closed``: the workstream may live on
+        elsewhere, so this node's dashboard and the console drop it from this
+        node only, and panes keep the generic closed signal (they reconnect
+        through the router).
+        """
+        with contextlib.suppress(queue.Full):
+            self._global_queue.put_nowait({"type": "ws_unloaded", "ws_id": ws.id})
+
     def emit_closed(
         self,
         ws_id: str,

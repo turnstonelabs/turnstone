@@ -100,8 +100,11 @@ def test_console_lifespan_shuts_coord_registry_after_adapter() -> None:
     adapter = source.find('getattr(app.state, "coord_adapter", None)')
     registry = source.find('getattr(app.state, "coord_registry", None)', adapter)
     state_writer = source.find('getattr(app.state, "coord_state_writer", None)', registry)
-    assert adapter != -1 and registry != -1 and state_writer != -1
-    assert adapter < registry < state_writer
+    # Leases go back last: buffered state writes still present their fences.
+    leases = source.find("coord_mgr_shutdown.release_leases", state_writer)
+    assert adapter != -1 and registry != -1 and state_writer != -1 and leases != -1
+    assert adapter < registry < state_writer < leases
+    assert source.count("coord_mgr_shutdown.release_leases") == 1
 
 
 # ---------------------------------------------------------------------------

@@ -172,10 +172,10 @@ note left of Manager
     even when ordinary idle eviction is disabled.
   • Candidates remain state="creating", are >2h old,
     and are absent from the manager loaded/pending set.
-  • Live remote owners are protected. The current stable
-    node ID does not self-protect, enabling restart recovery.
-  • Unknown liveness or storage failure deletes nothing.
-  • One transaction rechecks state, age, and token, then
+  • A live owner lease protects a row; a crashed creator's
+    lease expires, whatever node ID the restart carries.
+  • A storage failure deletes nothing.
+  • One transaction rechecks state, age, lease and token, then
     hard-deletes dependents and releases attachment refs.
   • Tokenless legacy/corrupt rows use their locked durable
     row as the incarnation fence and log a warning.

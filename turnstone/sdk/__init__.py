@@ -24,6 +24,7 @@ from turnstone.sdk.events import (
     ClusterWsClosedEvent,
     ClusterWsCreatedEvent,
     ClusterWsRenameEvent,
+    ClusterWsUnloadedEvent,
     ConnectedEvent,
     ContentEvent,
     ConversationPersistenceState,
@@ -48,6 +49,7 @@ from turnstone.sdk.events import (
     WsClosedEvent,
     WsRenameEvent,
     WsStateEvent,
+    WsUnloadedEvent,
 )
 from turnstone.sdk.server import AsyncTurnstoneServer, TurnstoneServer
 
@@ -88,6 +90,7 @@ __all__ = [
     "WsActivityEvent",
     "WsRenameEvent",
     "WsClosedEvent",
+    "WsUnloadedEvent",
     # Cluster events
     "ClusterEvent",
     "NodeJoinedEvent",
@@ -95,5 +98,6 @@ __all__ = [
     "ClusterStateEvent",
     "ClusterWsCreatedEvent",
     "ClusterWsClosedEvent",
+    "ClusterWsUnloadedEvent",
     "ClusterWsRenameEvent",
 ]

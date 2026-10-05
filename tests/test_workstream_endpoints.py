@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import logging
 import queue
@@ -27,6 +28,7 @@ if TYPE_CHECKING:
     from starlette.requests import Request
     from starlette.responses import Response
 
+from tests._storage_fakes import expire_lease as _expire_lease
 from turnstone.core.auth import AuthResult
 from turnstone.core.history_decoration import (
     decorate_history_messages,
@@ -125,6 +127,8 @@ def title_client(_inject_storage):
     # (manager_lookup + _interactive_tenant_check) so the tests exercise
     # the production resolution path (mgr fast-path → storage ownership).
     mock_mgr = MagicMock()
+    # The manager holds no owner lease for these storage-only rows.
+    mock_mgr.lease_fence.return_value = None
     cfg = SessionEndpointConfig(
         permission_gate=None,
         manager_lookup=lambda _r: (mock_mgr, None),
@@ -174,6 +178,8 @@ def open_client(_inject_storage):
         return resolve_workstream(ws_id)
 
     mock_mgr = MagicMock()
+    # ``loaded`` is ``get`` for a slot that can still write (the tests' slots can).
+    mock_mgr.loaded.side_effect = lambda ws_id: mock_mgr.get(ws_id)
     cfg = SessionEndpointConfig(
         permission_gate=None,
         manager_lookup=lambda _r: (mock_mgr, None),
@@ -729,13 +735,13 @@ class TestDeleteWorkstream:
         captured_tokens: list[str] = []
         original_delete = storage.delete_workstream_if_fork_reserved
 
-        def _blocked_exact_delete(candidate_id: str, token: str) -> bool:
+        def _blocked_exact_delete(candidate_id: str, token: str, *, lease: Any = None) -> bool:
             assert candidate_id == ws_id
             assert token
             captured_tokens.append(token)
             delete_admitted.set()
             assert release_delete.wait(timeout=10), "test did not install replacement"
-            return original_delete(candidate_id, token)
+            return original_delete(candidate_id, token, lease=lease)
 
         monkeypatch.setattr(
             storage,
@@ -753,6 +759,10 @@ class TestDeleteWorkstream:
             # The endpoint has atomically installed a private token and
             # authorized that snapshot. A direct concurrent delete releases
             # the ID, while the captured token remains predecessor-specific.
+            # A loaded incarnation can be replaced only after its owner lease
+            # lapsed (the holder paused).
+            if mgr is not None:
+                _expire_lease(storage, ws_id)
             assert storage.delete_workstream(ws_id) is True
             assert (
                 storage.register_workstream(
@@ -847,6 +857,8 @@ class TestSetWorkstreamTitle:
             json={"title": "taken-name"},
         )
         assert r.status_code == 409
+        # An alias conflict, not an owner-lease refusal (which shares the status).
+        assert r.json().get("code") != "workstream_lease_held"
 
 
 # ===========================================================================
@@ -936,12 +948,39 @@ class TestOpenWorkstream:
         client, mock_mgr, gq = open_client
         mock_resolve.return_value = "ws-abc"
         mock_mgr.get.return_value = None  # not loaded
-        mock_mgr.open.return_value = (
-            None  # mgr.open's contract: None for missing/wrong-kind/tombstone
-        )
+        # mgr.open's contract: None for missing/wrong-kind/tombstone.
+        mock_mgr.open_with_outcome.return_value = (None, False)
         r = client.post("/v1/api/workstreams/ws-abc/open")
         assert r.status_code == 404
         assert "not found" in r.json()["error"].lower()
+
+    @patch("turnstone.core.memory.resolve_workstream")
+    def test_open_is_told_to_retry_when_the_history_cannot_be_read(self, mock_resolve, open_client):
+        from turnstone.core.workstream import WorkstreamHistoryUnavailableError
+
+        client, mock_mgr, gq = open_client
+        mock_resolve.return_value = "ws-abc"
+        mock_mgr.get.return_value = None
+        mock_mgr.open_with_outcome.side_effect = WorkstreamHistoryUnavailableError("ws-abc")
+
+        r = client.post("/v1/api/workstreams/ws-abc/open")
+
+        assert r.status_code == 503
+        assert "retry" in r.json()["error"]
+
+    @patch("turnstone.core.memory.resolve_workstream")
+    def test_open_of_a_full_node_is_told_to_retry_later(self, mock_resolve, open_client):
+        from turnstone.core.session_manager import SessionCapacityError
+
+        client, mock_mgr, gq = open_client
+        mock_resolve.return_value = "ws-abc"
+        mock_mgr.get.return_value = None
+        mock_mgr.open_with_outcome.side_effect = SessionCapacityError(2)
+
+        r = client.post("/v1/api/workstreams/ws-abc/open")
+
+        assert r.status_code == 429
+        assert r.json()["error"] == "All 2 slots are active"
 
     @patch("turnstone.core.memory.resolve_workstream")
     def test_open_calls_mgr_open_not_mgr_create(self, mock_resolve, open_client):
@@ -958,11 +997,11 @@ class TestOpenWorkstream:
         loaded_ws = MagicMock()
         loaded_ws.id = "ws-resolved"
         loaded_ws.name = "resolved"
-        mock_mgr.open.return_value = loaded_ws
+        mock_mgr.open_with_outcome.return_value = (loaded_ws, True)
 
         r = client.post("/v1/api/workstreams/some-alias/open")
         assert r.status_code == 200
-        mock_mgr.open.assert_called_once_with("ws-resolved")
+        mock_mgr.open_with_outcome.assert_called_once_with("ws-resolved")
         mock_mgr.create.assert_not_called()
 
     @patch("turnstone.core.memory.resolve_workstream")
@@ -978,13 +1017,13 @@ class TestOpenWorkstream:
         loaded_ws = MagicMock()
         loaded_ws.id = "ws-canonical-id"
         loaded_ws.name = "x"
-        mock_mgr.open.return_value = loaded_ws
+        mock_mgr.open_with_outcome.return_value = (loaded_ws, True)
 
         r = client.post("/v1/api/workstreams/my-friendly-alias/open")
         assert r.status_code == 200
         mock_resolve.assert_called_once_with("my-friendly-alias")
         mock_mgr.get.assert_called_once_with("ws-canonical-id")
-        mock_mgr.open.assert_called_once_with("ws-canonical-id")
+        mock_mgr.open_with_outcome.assert_called_once_with("ws-canonical-id")
 
     @patch("turnstone.core.memory.resolve_workstream")
     def test_open_post_load_callback_fires_with_request_and_ws(self, mock_resolve, _inject_storage):
@@ -1011,6 +1050,7 @@ class TestOpenWorkstream:
             return resolve_workstream(ws_id)
 
         mock_mgr = MagicMock()
+        mock_mgr.loaded.side_effect = lambda ws_id: mock_mgr.get(ws_id)
         cfg = SessionEndpointConfig(
             permission_gate=None,
             manager_lookup=lambda _r: (mock_mgr, None),
@@ -1053,7 +1093,7 @@ class TestOpenWorkstream:
         opened_ws = MagicMock()
         opened_ws.id = "ws-fresh"
         opened_ws.name = "fresh-name"
-        mock_mgr.open.return_value = opened_ws
+        mock_mgr.open_with_outcome.return_value = (opened_ws, True)
         r = client.post("/v1/api/workstreams/ws-fresh/open")
         assert r.status_code == 200
         assert captured == [("ws-fresh", "fresh-name")]
@@ -1079,6 +1119,7 @@ class TestOpenWorkstream:
             return resolve_workstream(ws_id)
 
         mock_mgr = MagicMock()
+        mock_mgr.loaded.side_effect = lambda ws_id: mock_mgr.get(ws_id)
         cfg = SessionEndpointConfig(
             permission_gate=None,
             manager_lookup=lambda _r: (mock_mgr, None),
@@ -1103,7 +1144,7 @@ class TestOpenWorkstream:
 
         mock_resolve.return_value = "ws-fresh"
         mock_mgr.get.return_value = None
-        mock_mgr.open.side_effect = RuntimeError("session factory blew up")
+        mock_mgr.open_with_outcome.side_effect = RuntimeError("session factory blew up")
 
         r = client.post("/v1/api/workstreams/ws-fresh/open")
         assert r.status_code == 500
@@ -1136,6 +1177,7 @@ class TestOpenWorkstream:
             return resolve_workstream(ws_id)
 
         mock_mgr = MagicMock()
+        mock_mgr.loaded.side_effect = lambda ws_id: mock_mgr.get(ws_id)
         cfg = SessionEndpointConfig(
             permission_gate=None,
             manager_lookup=lambda _r: (mock_mgr, None),
@@ -1164,7 +1206,7 @@ class TestOpenWorkstream:
         opened_ws = MagicMock()
         opened_ws.id = "ws-fresh"
         opened_ws.name = "fresh-name"
-        mock_mgr.open.return_value = opened_ws
+        mock_mgr.open_with_outcome.return_value = (opened_ws, True)
 
         r = client.post("/v1/api/workstreams/ws-fresh/open")
         assert r.status_code == 200
@@ -1352,6 +1394,8 @@ def _build_detail_app(
     mock_mgr: Any,
     tenant_check: Any = None,
 ) -> TestClient:
+    # ``loaded`` is ``get`` for a slot that can still write (the tests' slots can).
+    mock_mgr.loaded.side_effect = lambda ws_id: mock_mgr.get(ws_id)
     cfg = _interactive_endpoint_cfg(mock_mgr, tenant_check=tenant_check)
     handler = make_detail_handler(cfg)
     app = Starlette(
@@ -1362,6 +1406,27 @@ def _build_detail_app(
             ),
         ],
         middleware=[Middleware(_InjectAuthMiddleware)],
+    )
+    app.state.workstreams = mock_mgr
+    return TestClient(app)
+
+
+def _detail_client(
+    mock_mgr: Any, *, scopes: frozenset[str], cfg: SessionEndpointConfig | None = None
+) -> TestClient:
+    """The detail route for a caller with ``scopes``; ``mock_mgr.loaded`` stays as set."""
+
+    class _Auth(BaseHTTPMiddleware):
+        async def dispatch(self, request: Request, call_next: Any) -> Response:
+            request.state.auth_result = AuthResult(
+                user_id="test-user", scopes=scopes, token_source="config", permissions=scopes
+            )
+            return await call_next(request)
+
+    handler = make_detail_handler(cfg or _interactive_endpoint_cfg(mock_mgr))
+    app = Starlette(
+        routes=[Mount("/v1", routes=[Route("/api/workstreams/{ws_id}", handler, methods=["GET"])])],
+        middleware=[Middleware(_Auth)],
     )
     app.state.workstreams = mock_mgr
     return TestClient(app)
@@ -1696,6 +1761,7 @@ class TestHistoryInteractive:
         assert any(m.get("content") == "from cold storage" for m in body["messages"])
         assert body["handoff_token"] is None
         mock_mgr.open.assert_not_called()
+        mock_mgr.open_with_outcome.assert_not_called()
 
     def test_404_on_missing_ws_id(self, _inject_storage):
         mock_mgr = MagicMock()
@@ -1756,7 +1822,7 @@ class TestHistoryInteractive:
         the UI can render what the operator was watching live.
 
         Storage's ``load_messages`` defaults to a repair pass that
-        strips this exact shape (correct for ``session.resume``, wrong
+        strips this exact shape (correct for ``rehydrate``, wrong
         for display).  ``make_history_handler`` must opt out via
         ``repair=False``; flipping that flag back on breaks this test.
         """
@@ -2427,6 +2493,81 @@ class TestDetailInteractive:
             "pending_approval_details": [],
         }
 
+    @staticmethod
+    def _unloadable_slot(ws_id: str, *, building: bool) -> tuple[Any, Any]:
+        """A slot ``loaded()`` does not serve: mid-build, or a copy whose lease moved."""
+        slot = MagicMock()
+        slot.id, slot.name, slot.user_id, slot.kind = ws_id, "slot", "test-user", "interactive"
+        slot.state.value = "idle"
+        if building:
+            slot.session = None
+        mock_mgr = MagicMock()
+        mock_mgr.get.return_value = slot
+        mock_mgr.loaded.return_value = None
+        return mock_mgr, slot
+
+    def test_a_reader_reads_a_slot_still_being_built_as_is(self):
+        mock_mgr, _slot = self._unloadable_slot("ws-building", building=True)
+        client = _detail_client(mock_mgr, scopes=frozenset({"read"}))
+
+        r = client.get("/v1/api/workstreams/ws-building")
+
+        assert r.status_code == 200
+        assert r.json()["name"] == "slot"
+        mock_mgr.open.assert_not_called()
+        mock_mgr.open_with_outcome.assert_not_called()
+
+    def test_a_writer_joins_the_open_in_flight_without_rerunning_post_load(self):
+        mock_mgr, slot = self._unloadable_slot("ws-building", building=True)
+        mock_mgr.open_with_outcome.return_value = (slot, False)
+        post_load = MagicMock()
+        cfg = dataclasses.replace(_interactive_endpoint_cfg(mock_mgr), open_post_load=post_load)
+        client = _detail_client(mock_mgr, scopes=frozenset({"read", "write"}), cfg=cfg)
+
+        r = client.get("/v1/api/workstreams/ws-building")
+
+        assert r.status_code == 200
+        mock_mgr.open_with_outcome.assert_called_once_with("ws-building")
+        post_load.assert_not_called()
+
+    def test_a_writer_gets_the_holder_for_a_copy_whose_lease_moved(self):
+        from turnstone.core.storage import WorkstreamLeaseHeldError
+
+        mock_mgr, _slot = self._unloadable_slot("ws-moved", building=False)
+        mock_mgr.open_with_outcome.side_effect = WorkstreamLeaseHeldError(
+            "ws-moved", holder_node_id="node-b", retry_after_ms=900
+        )
+        client = _detail_client(mock_mgr, scopes=frozenset({"read", "write"}))
+
+        r = client.get("/v1/api/workstreams/ws-moved")
+
+        assert r.status_code == 409
+        assert r.json()["code"] == "workstream_lease_held"
+        assert r.json()["holder_node_id"] == "node-b"
+
+    def test_a_writer_is_told_to_retry_when_the_history_cannot_be_read(self):
+        from turnstone.core.workstream import WorkstreamHistoryUnavailableError
+
+        mock_mgr, _slot = self._unloadable_slot("ws-blip", building=True)
+        mock_mgr.open_with_outcome.side_effect = WorkstreamHistoryUnavailableError("ws-blip")
+        client = _detail_client(mock_mgr, scopes=frozenset({"read", "write"}))
+
+        r = client.get("/v1/api/workstreams/ws-blip")
+
+        assert r.status_code == 503
+        assert "retry" in r.json()["error"]
+
+    def test_a_writer_reopening_on_a_full_node_is_told_to_retry_later(self):
+        from turnstone.core.session_manager import SessionCapacityError
+
+        mock_mgr, _slot = self._unloadable_slot("ws-full", building=True)
+        mock_mgr.open_with_outcome.side_effect = SessionCapacityError(2)
+        client = _detail_client(mock_mgr, scopes=frozenset({"read", "write"}))
+
+        r = client.get("/v1/api/workstreams/ws-full")
+
+        assert r.status_code == 429
+
     def test_projects_sanitized_persistence_state(self):
         ws_id = "ws-detail-persistence"
         ws_state = MagicMock()
@@ -2565,20 +2706,20 @@ class TestDetailInteractive:
         rehydrated.kind = "interactive"
         mock_mgr = MagicMock()
         mock_mgr.get.return_value = None
-        mock_mgr.open.return_value = rehydrated
+        mock_mgr.open_with_outcome.return_value = (rehydrated, True)
         client = _build_detail_app(mock_mgr)
 
         r = client.get(f"/v1/api/workstreams/{ws_id}")
         assert r.status_code == 200
         assert r.json()["name"] == "rehydrated"
-        mock_mgr.open.assert_called_once_with(ws_id)
+        mock_mgr.open_with_outcome.assert_called_once_with(ws_id)
 
     def test_404_on_missing_ws_id(self):
         mock_mgr = MagicMock()
         mock_mgr.get.return_value = None
         # ``mgr.open`` returns None for missing rows / kind mismatch /
         # tombstoned rows — all 404 with the per-kind label.
-        mock_mgr.open.return_value = None
+        mock_mgr.open_with_outcome.return_value = (None, False)
         client = _build_detail_app(mock_mgr)
 
         r = client.get("/v1/api/workstreams/no-such-ws")
@@ -2592,7 +2733,7 @@ class TestDetailInteractive:
         :func:`make_open_handler`."""
         mock_mgr = MagicMock()
         mock_mgr.get.return_value = None
-        mock_mgr.open.side_effect = ValueError("alias 'gone' no longer resolves")
+        mock_mgr.open_with_outcome.side_effect = ValueError("alias 'gone' no longer resolves")
         client = _build_detail_app(mock_mgr)
 
         r = client.get("/v1/api/workstreams/ws-misconfig")
@@ -2605,7 +2746,7 @@ class TestDetailInteractive:
         echoed (no internal-detail leak)."""
         mock_mgr = MagicMock()
         mock_mgr.get.return_value = None
-        mock_mgr.open.side_effect = RuntimeError("internal stack frame leak")
+        mock_mgr.open_with_outcome.side_effect = RuntimeError("internal stack frame leak")
         client = _build_detail_app(mock_mgr)
 
         r = client.get("/v1/api/workstreams/ws-broken")
@@ -2663,6 +2804,7 @@ class TestTenantCheckOnReadEndpoints:
         # And mgr.get was NEVER consulted — the gate fires first.
         mock_mgr.get.assert_not_called()
         mock_mgr.open.assert_not_called()
+        mock_mgr.open_with_outcome.assert_not_called()
 
     def test_detail_succeeds_when_tenant_check_allows(self):
         """A passing tenant_check (returns ``None``) lets the handler
@@ -2776,6 +2918,7 @@ class TestTenantCheckOnReadEndpoints:
         assert any(m.get("content") == "from cold storage" for m in body["messages"])
         assert body["handoff_token"] is None
         mock_mgr.open.assert_not_called()
+        mock_mgr.open_with_outcome.assert_not_called()
         # Pin the offload — reverting ``await asyncio.to_thread(cfg.tenant_check, ...)``
         # to ``cfg.tenant_check(...)`` leaves the response shape intact
         # but drops ``cold_check`` from the spy's call list.
@@ -2809,7 +2952,7 @@ class TestTenantCheckOnReadEndpoints:
         rehydrated.ui = None  # bypass pending-approval serializer
         mock_mgr = MagicMock()
         mock_mgr.get.return_value = None
-        mock_mgr.open.return_value = rehydrated
+        mock_mgr.open_with_outcome.return_value = (rehydrated, True)
 
         def cold_check(request: Any, ws_id: str, mgr: Any) -> JSONResponse | None:
             _owner, err = resolve_workstream_owner(
@@ -2834,7 +2977,7 @@ class TestTenantCheckOnReadEndpoints:
         assert body["name"] == "rehydrated-ws"
         # Lazy rehydrate path engaged — the handler called mgr.open after
         # the cold-cache tenant_check resolved through storage.
-        mock_mgr.open.assert_called_once_with(ws_id)
+        mock_mgr.open_with_outcome.assert_called_once_with(ws_id)
         # Pin the offload — see the history test for the rationale.
         assert cold_check in offloaded, (
             f"tenant_check must be invoked through asyncio.to_thread; got {offloaded}"

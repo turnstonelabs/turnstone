@@ -34,7 +34,9 @@ async def test_restart_retains_association_and_recovers_history(app_client, plat
     source = client.post(
         "/v1/api/workstreams/new", json={"name": "channel"}, headers=_auth("owner")
     ).json()["ws_id"]
-    storage.save_message(source, "user", "Remember the original conversation")
+    storage.save_message(
+        source, "user", "Remember the original conversation", lease=manager.lease_fence(source)
+    )
     if restart != "bot":
         manager.close(source)
         assert manager.get(source) is None

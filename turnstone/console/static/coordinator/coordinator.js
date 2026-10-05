@@ -1011,6 +1011,7 @@ function createCoordinatorPane(root, wsId, opts) {
     "blanket",
     "auto_approve_tools",
     "smart_approval",
+    "unattended_watch",
   ]);
   const UNKNOWN_AUTO_APPROVE_REASON = "unknown";
 

@@ -131,10 +131,11 @@ note right of creating
   • Boot pass, then every 5 min even when idle
     eviction is disabled.
   • Only rows >2h old; manager loaded/pending
-    IDs and live remote owners are protected.
-  • The current stable node ID is not a live-owner
-    exemption, allowing restart recovery.
-  • Unknown liveness/storage fails closed. Deletion
+    IDs and rows with a live owner lease are
+    protected.
+  • A crashed creator's lease expires, so its rows
+    are reclaimed whatever node ID restarts.
+  • A storage failure deletes nothing. Deletion
     is atomic across dependents and attachment refs.
   • Tokenless legacy/corrupt rows are locked,
     reaped, and logged with a warning.

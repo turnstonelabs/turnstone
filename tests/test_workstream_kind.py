@@ -436,8 +436,7 @@ def test_chatsession_coordinator_persona_mcp_off_wins(tmp_db):
     """A coordinator persona with mcp=False gates the surface off even
     when the factory passed a live client — same precedence as
     interactive (the 1762 persona gate composes upstream of the kind
-    branch), and ``_mcp_gated_off`` records that a real client was
-    withheld so resume() refuses to adopt an MCP-on stamp."""
+    branch)."""
     from turnstone.core.personas import PersonaSnapshot
 
     mcp_client = _mcp_client_mock()
@@ -448,54 +447,6 @@ def test_chatsession_coordinator_persona_mcp_off_wins(tmp_db):
     mcp_client.add_listener.assert_not_called()
     mcp_client.add_resource_listener.assert_not_called()
     mcp_client.add_prompt_listener.assert_not_called()
-    assert sess._mcp_gated_off is True
-
-
-def test_chatsession_coordinator_drop_mcp_surface_resets_to_coordinator_tools(tmp_db):
-    """The resume()-adopts-MCP-off-stamp path (_drop_mcp_surface) on a
-    COORDINATOR resets to COORDINATOR_TOOLS — never the interactive lanes
-    — and removes all three listeners under the tracked registration
-    identity.  Direct cell for the docstring's both-kinds claim; every
-    sibling coordinator MCP transition has one."""
-    from unittest.mock import patch
-
-    mcp_client = _mcp_client_mock()
-    with patch("turnstone.core.session.try_prime_user_pools"):
-        sess = _make_coordinator(mcp_client=mcp_client)
-    assert "mcp__foo__bar" in {t["function"]["name"] for t in sess._tools}
-
-    sess._drop_mcp_surface()
-
-    names = {t["function"]["name"] for t in sess._tools}
-    assert "mcp__foo__bar" not in names
-    assert "spawn_workstream" in names
-    assert sess._task_tools == []
-    assert sess._mcp_client is None
-    mcp_client.remove_listener.assert_called_once()
-    assert mcp_client.remove_listener.call_args.kwargs.get("user_id") == "user-1"
-    mcp_client.remove_resource_listener.assert_called_once()
-    mcp_client.remove_prompt_listener.assert_called_once()
-
-
-def test_chatsession_coordinator_drop_mcp_surface_after_rebind_uses_tracked_id(tmp_db):
-    """After bind_acting_user re-scopes the listener registrations to a
-    NEW operator, a subsequent surface drop must remove them under the
-    tracked _mcp_listener_user_id (the rebound identity) — removal keyed
-    on the owner id would leave the rebound registrations leaking."""
-    from unittest.mock import patch
-
-    mcp_client = _mcp_client_mock()
-    with patch("turnstone.core.session.try_prime_user_pools"):
-        sess = _make_coordinator(mcp_client=mcp_client)
-        sess.bind_acting_user("user-2")
-
-    assert sess._mcp_listener_user_id == "user-2"
-
-    sess._drop_mcp_surface()
-
-    assert mcp_client.remove_listener.call_args.kwargs.get("user_id") == "user-2"
-    assert mcp_client.remove_resource_listener.call_args.kwargs.get("user_id") == "user-2"
-    assert mcp_client.remove_prompt_listener.call_args.kwargs.get("user_id") == "user-2"
 
 
 def test_coordinator_catalog_change_rebuilds_merged_tools(tmp_db):

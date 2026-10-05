@@ -471,8 +471,9 @@ class RecentAutoApproval(BaseModel):
             "click), ``policy`` (admin tool-policy ``allow`` rule), "
             "``blanket`` (workstream-level ``auto_approve=True``), "
             "``smart_approval`` (Smart Approvals: high-confidence LLM "
-            "judge ``approve`` verdict), or ``auto_approve_tools`` "
-            "(legacy / unknown writer)."
+            "judge ``approve`` verdict), ``unattended_watch`` (a watch "
+            "restore loaded the workstream and no client had reached it "
+            "yet), or ``auto_approve_tools`` (legacy / unknown writer)."
         ),
     )
     ts: float = Field(

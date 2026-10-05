@@ -413,13 +413,12 @@ class WatchRunner:
         self._dispatch_fns: dict[str, Callable[[dict[str, Any], str], None]] = {}
         self._dispatch_lock = threading.Lock()
 
-        # Restore admission control.  The restore path (``manager.create``
-        # + ``session.resume``) must not run twice for one ws_id, or two
-        # watches on the same evicted workstream — polled on separate pool
-        # threads — would each spawn a live auto-approved session racing
-        # writes into one conversation history.  ``_restoring`` tracks the
-        # ws_ids with a restore in flight; ``_restore_lock`` guards it but
-        # is held only for the fast admit/reject check, NEVER across the
+        # Restore admission control.  One restore (``manager.open``) runs per
+        # ws_id at a time: a second, for another watch on the same unloaded
+        # workstream polled on another pool thread, would only wait on the
+        # manager's open and get the same slot back.  ``_restoring`` tracks
+        # the ws_ids with a restore in flight; ``_restore_lock`` guards it
+        # but is held only for the fast admit/reject check, NEVER across the
         # slow restore (which would pin the caller's poll slot and starve
         # the pool).  A poll is admitted only when its ws_id isn't already
         # restoring AND fewer than :data:`MAX_CONCURRENT_RESTORES` restores
@@ -525,13 +524,12 @@ class WatchRunner:
         self, ws_id: str, owner: Callable[[dict[str, Any], str], None] | None = None
     ) -> None:
         """Remove the registration for ``ws_id`` — with ``owner`` given,
-        ONLY if the registered fn IS that closure.  Multiple live
-        sessions can transiently serve one ws_id (a watch-restore shell
-        vs a reopened pane; an in-session ``/resume`` of an id open in
-        another pane), and a blind removal from one session's teardown
-        would silently unregister the OTHER, still-live session — its
-        next fire would then take the restore path and spawn a duplicate
-        auto-approved session onto the live conversation.
+        ONLY if the registered fn IS that closure.  Two sessions can
+        transiently serve one ws_id (a copy retiring after its lease moved,
+        and the session that reopened the workstream), and a blind removal
+        from one session's teardown would silently unregister the OTHER,
+        still-live session — its fires would then take the restore path
+        until that re-registered it.
         """
         with self._dispatch_lock:
             if owner is not None and self._dispatch_fns.get(ws_id) is not owner:
@@ -863,9 +861,10 @@ class WatchRunner:
         """Deliver via the registered dispatch fn, if one exists.
 
         Returns ``True`` (delivered), ``False`` (a fn is registered but it
-        raised — the ws is live, so the caller must NOT restore, which
-        would spawn a duplicate session), or ``None`` (no fn registered —
-        the ws may be evicted and the caller should try to restore).
+        raised — the ws is live, so the caller does not restore, which
+        would only hand back the same session), or ``None`` (no fn
+        registered — the ws may be evicted and the caller should try to
+        restore).
         """
         with self._dispatch_lock:
             fn = self._dispatch_fns.get(ws_id)

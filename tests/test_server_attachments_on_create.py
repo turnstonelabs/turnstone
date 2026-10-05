@@ -14,6 +14,7 @@ import json
 import queue
 import threading
 import time
+from typing import Any
 
 import pytest
 from starlette.testclient import TestClient
@@ -230,6 +231,9 @@ class _FakeSession:
         # _record_fatal_error model below can emit through the real UI.
         self.ui = None
         self._has_persisted_error = False
+        # The manager's owner lease, forwarded by the app_client factory so
+        # durable writes present its fence the way ChatSession's do.
+        self.workstream_lease: Any = None
 
     def _record_fatal_error(self, exc):
         """Faithful model of ChatSession._record_fatal_error: sanitize, emit
@@ -239,7 +243,8 @@ class _FakeSession:
         safe = sanitize_error_text(f"{type(exc).__name__}: {exc}")
         if self.ui is not None:
             self.ui.on_error(safe)
-        persist_last_error(self.ws_id, safe)
+        lease = self.workstream_lease
+        persist_last_error(self.ws_id, safe, lease=lease.fence if lease is not None else None)
         self._has_persisted_error = True
         if self.ui is not None:
             self.ui.on_state_change("error")
@@ -259,13 +264,12 @@ class _FakeSession:
             # can assert the lifecycle landed.
             if attachments and self.ws_id and self.user_id:
                 from turnstone.core.attachment_buffer import get_attachment_buffer
-                from turnstone.core.memory import (
-                    save_attachment,
-                    save_message,
-                    set_message_attachments,
-                )
+                from turnstone.core.memory import save_attachment, save_message
+                from turnstone.core.storage import get_storage
 
-                mid = save_message(self.ws_id, "user", text)
+                lease = self.workstream_lease
+                fence = lease.fence if lease is not None else None
+                mid = save_message(self.ws_id, "user", text, lease=fence)
                 buf = get_attachment_buffer()
                 ref_ids = []
                 for a in attachments:
@@ -279,7 +283,7 @@ class _FakeSession:
                     )
                     ref_ids.append(a.attachment_id)
                     buf.discard(a.attachment_id, ws_id=self.ws_id, user_id=self.user_id)
-                set_message_attachments(self.ws_id, mid, ref_ids)
+                get_storage().set_message_attachments(self.ws_id, mid, ref_ids, lease=fence)
 
     # Methods the create handler may call but we don't care about
     def set_watch_runner(self, *_a, **_kw):
@@ -291,8 +295,9 @@ class _FakeSession:
     def request_title_refresh(self, *_a, **_kw):
         pass
 
-    def resume(self, *_a, **_kw):
-        return False
+    def rehydrate(self, *_a, **_kw):
+        # Open loads the saved history through this; the fake has none to load.
+        return True
 
 
 class _FakeUI:
@@ -357,6 +362,7 @@ def app_client(tmp_path, monkeypatch):
         # Hand the fake its UI so the faithful _record_fatal_error model can
         # emit on_error/on_state_change exactly as the real ChatSession does.
         s.ui = ui
+        s.workstream_lease = _kw.get("workstream_lease")
         fake_sessions.append(s)
         return s
 

@@ -1194,7 +1194,7 @@ class TestWorkerExitInterjectionBackstop:
             # pending-commit journal, so the unresolved-persistence blocker
             # reads False exactly when no turn can ever land — the latch
             # needs its own refusal arm or the wake spawns doomed.
-            session._workstream_gone_ws = session._ws_id
+            session._workstream_gone = True
 
         assert (
             wake_workstream_if_pending(
@@ -1218,7 +1218,7 @@ class TestWorkerExitInterjectionBackstop:
             interjector_user_id="alice",
             turn_principal_id="alice",
         )
-        session._workstream_gone_ws = session._ws_id
+        session._workstream_gone = True
         assert session.claim_pending_interjection_wake() is None
         assert list(session._queued_messages) == ["gone-q"]
 

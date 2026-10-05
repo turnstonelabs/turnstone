@@ -326,11 +326,14 @@ class TestWakeWorkstreamIfPending:
             expected_session: Any,
             interjection_wake_signature: Any,
             thread_name: Any,
+            attended: bool,
         ) -> bool:
             # Mimic a live worker owning the workstream: send routes the
             # wake to the no-op enqueue rather than spawning a daemon.
             assert expected_session is ws.session
             assert interjection_wake_signature is None
+            # A wake is never client work: it keeps a watch restore's grant.
+            assert attended is False
             enqueue()
             return True
 

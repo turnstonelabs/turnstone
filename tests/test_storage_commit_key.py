@@ -13,6 +13,7 @@ from sqlalchemy.dialects import postgresql
 from tests._storage_fakes import (
     ScriptedPostgresConnection,
     ScriptedPostgresResult,
+    lease_row,
 )
 from turnstone.console.coordinator_client import _serialize_messages
 from turnstone.core import memory
@@ -329,7 +330,7 @@ def test_concurrent_keyed_save_and_hard_delete_leave_no_orphan(
 def test_postgresql_plain_keyed_insert_uses_parent_lock_and_partial_conflict_target() -> None:
     conn = ScriptedPostgresConnection(
         [
-            ScriptedPostgresResult(row=("postgres-plain",)),
+            ScriptedPostgresResult(row=lease_row("postgres-plain")),
             ScriptedPostgresResult(scalar_value=81),
             ScriptedPostgresResult(),
         ]
@@ -363,7 +364,7 @@ def test_postgresql_null_key_locks_existing_parent_before_legacy_append() -> Non
     conn = ScriptedPostgresConnection(
         [
             ScriptedPostgresResult(row=("postgres-legacy",)),
-            ScriptedPostgresResult(row=("postgres-legacy",)),
+            ScriptedPostgresResult(row=lease_row("postgres-legacy")),
             ScriptedPostgresResult(scalar_value=82),
             ScriptedPostgresResult(),
         ]
@@ -433,7 +434,7 @@ def test_postgresql_bulk_legacy_writer_locks_existing_parents_in_sorted_order() 
     conn = ScriptedPostgresConnection(
         [
             ScriptedPostgresResult(rows=[("ws-a",)]),
-            ScriptedPostgresResult(rows=[("ws-a",)]),
+            ScriptedPostgresResult(rows=[lease_row("ws-a")]),
             ScriptedPostgresResult(),
             ScriptedPostgresResult(),
         ]
@@ -450,9 +451,11 @@ def test_postgresql_bulk_legacy_writer_locks_existing_parents_in_sorted_order() 
 
     compiled = [statement.compile(dialect=postgresql.dialect()) for statement in conn.statements]
     sql = [str(item) for item in compiled]
-    # Both probes carry the full sorted id set in one expanding IN list.
-    assert list(compiled[0].params.values()) == [["ws-a", "ws-b"]]
-    assert list(compiled[1].params.values()) == [["ws-a", "ws-b"]]
+    # Both probes carry the full sorted id set in one expanding IN list (the
+    # locking probe also binds the database-clock expression's scale).
+    for probe in compiled[:2]:
+        lists = [value for value in probe.params.values() if isinstance(value, list)]
+        assert lists == [["ws-a", "ws-b"]]
     assert "FOR UPDATE" not in sql[0]
     assert "FOR UPDATE" in sql[1]
     assert "ORDER BY workstreams.ws_id" in sql[1]

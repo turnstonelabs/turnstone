@@ -517,6 +517,103 @@ class TestCollectorDelta:
         # Verify in-memory state was updated
         assert c._nodes["node-a"].workstreams["ws1"]["state"] == "running"
 
+    def test_a_workstream_another_node_loads_leaves_the_old_node(self):
+        """The new holder's ws_created moves it: browsers drop the old node's row first."""
+        c = _make_collector()
+        c._nodes["node-a"] = NodeSnapshot(
+            node_id="node-a",
+            server_url="http://a:8080",
+            workstreams={
+                "ws1": {
+                    "id": "ws1",
+                    "name": "test",
+                    "state": "idle",
+                    "project_id": "p-private",
+                    "user_id": "u-owner",
+                }
+            },
+        )
+        c._nodes["node-b"] = NodeSnapshot(node_id="node-b", server_url="http://b:8080")
+        q: queue.Queue[dict] = queue.Queue()
+        c.register_listener(q)
+
+        c._apply_delta("node-b", {"type": "ws_created", "ws_id": "ws1", "name": "test"})
+
+        assert "ws1" not in c._nodes["node-a"].workstreams
+        assert "ws1" in c._nodes["node-b"].workstreams
+        events = [q.get_nowait() for _ in range(q.qsize())]
+        assert [(e["type"], e["node_id"]) for e in events] == [
+            ("ws_unloaded", "node-a"),
+            ("ws_created", "node-b"),
+        ]
+        assert (events[0]["project_id"], events[0]["user_id"]) == ("p-private", "u-owner")
+
+    def test_a_node_that_let_go_of_a_workstream_drops_only_its_own_row(self):
+        """``ws_unloaded``: only that node let go of it, so no ``ws_closed`` reaches browsers.
+
+        The event carries the row's project and owner: the tenancy filter judges it by them.
+        """
+        c = _make_collector()
+        row = {
+            "id": "ws1",
+            "name": "test",
+            "state": "idle",
+            "project_id": "p-private",
+            "user_id": "u-owner",
+        }
+        c._nodes["node-a"] = NodeSnapshot(
+            node_id="node-a", server_url="http://a:8080", workstreams={"ws1": dict(row)}
+        )
+        c._nodes["node-b"] = NodeSnapshot(
+            node_id="node-b", server_url="http://b:8080", workstreams={"ws1": dict(row)}
+        )
+        q: queue.Queue[dict] = queue.Queue()
+        c.register_listener(q)
+
+        c._apply_delta("node-a", {"type": "ws_unloaded", "ws_id": "ws1"})
+        c._apply_delta("node-a", {"type": "ws_unloaded", "ws_id": "ws1"})  # already gone
+
+        assert "ws1" not in c._nodes["node-a"].workstreams
+        assert "ws1" in c._nodes["node-b"].workstreams
+        events = [q.get_nowait() for _ in range(q.qsize())]
+        assert events == [
+            {
+                "type": "ws_unloaded",
+                "ws_id": "ws1",
+                "node_id": "node-a",
+                "project_id": "p-private",
+                "user_id": "u-owner",
+            }
+        ]
+
+    def test_a_snapshot_without_a_workstream_another_node_lists_unloads_it_there(self):
+        c = _make_collector()
+        row = {
+            "id": "ws1",
+            "name": "test",
+            "state": "idle",
+            "project_id": "p-private",
+            "user_id": "u-owner",
+        }
+        c._nodes["node-a"] = NodeSnapshot(
+            node_id="node-a", server_url="http://a:8080", workstreams={"ws1": dict(row)}
+        )
+        c._nodes["node-b"] = NodeSnapshot(
+            node_id="node-b", server_url="http://b:8080", workstreams={"ws1": dict(row)}
+        )
+
+        pending = c._reconcile_node("node-a", c._nodes["node-a"], [])
+
+        assert [
+            (e["type"], e["ws_id"], e["node_id"], e["project_id"], e["user_id"]) for e in pending
+        ] == [("ws_unloaded", "ws1", "node-a", "p-private", "u-owner")]
+        assert "ws1" not in c._nodes["node-a"].workstreams
+        # A workstream no other node lists still closes.
+        c._nodes["node-b"].workstreams.clear()
+        c._nodes["node-a"].workstreams["ws2"] = {"id": "ws2", "name": "t", "state": "idle"}
+        pending = c._reconcile_node("node-a", c._nodes["node-a"], [])
+        assert [e["ws_id"] for e in pending if e["type"] == "ws_closed"] == ["ws2"]
+
     def test_apply_delta_ws_state_projects_persistence_state(self):
         c = _make_collector()
         c._nodes["node-a"] = NodeSnapshot(

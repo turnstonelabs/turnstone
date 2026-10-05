@@ -34,7 +34,7 @@ from turnstone.core.session import ChatSession
 from turnstone.core.storage import get_storage
 from turnstone.core.trajectory import dicts_from_turns
 from turnstone.core.watch import WatchRunner, WatchWorkstreamUnrestorable
-from turnstone.server import _watch_restore_owner
+from turnstone.server import _require_watch_restore_owner
 
 
 class _NullUI:
@@ -44,12 +44,13 @@ class _NullUI:
         return MagicMock()
 
 
-def _make_session(*, user_id: str = "") -> ChatSession:
+def _make_session(*, user_id: str = "", ws_id: str | None = None) -> ChatSession:
     """Real ChatSession with the same minimal setup the unit-test suite
     uses; no LLM calls happen until a chat-loop method is exercised
     (and even then the LLM provider is patched).
     """
     return ChatSession(
+        ws_id=ws_id,
         client=MagicMock(),
         model="test-model",
         ui=_NullUI(),
@@ -64,19 +65,19 @@ def _make_session(*, user_id: str = "") -> ChatSession:
 def test_watch_restore_owner_requires_persisted_principal() -> None:
     storage = MagicMock()
     storage.get_workstream_owner.return_value = "user-123"
-    assert _watch_restore_owner(storage, "ws-1") == "user-123"
+    assert _require_watch_restore_owner(storage, "ws-1") is None
 
     storage.get_workstream_owner.return_value = ""
     with pytest.raises(WatchWorkstreamUnrestorable):
-        _watch_restore_owner(storage, "ws-unowned")
+        _require_watch_restore_owner(storage, "ws-unowned")
 
     storage.get_workstream_owner.return_value = None
     with pytest.raises(WatchWorkstreamUnrestorable):
-        _watch_restore_owner(storage, "ws-missing")
+        _require_watch_restore_owner(storage, "ws-missing")
 
     storage.get_workstream_owner.side_effect = RuntimeError("storage unavailable")
     with pytest.raises(RuntimeError, match="storage unavailable"):
-        _watch_restore_owner(storage, "ws-transient")
+        _require_watch_restore_owner(storage, "ws-transient")
 
 
 def test_watch_fires_then_user_send_drains_envelope(tmp_db, monkeypatch):
@@ -195,96 +196,6 @@ def test_three_back_to_back_watch_fires_drain_into_one_turn(tmp_db, monkeypatch)
     # And there's exactly ONE assistant turn (not three).
     assistant_turns = [m for m in msgs if m.get("role") == "assistant"]
     assert len(assistant_turns) == 1
-
-
-def test_watch_dispatch_through_restore_fn_lands_on_rehydrated_session(tmp_db, monkeypatch):
-    """Cover the production ``_watch_restore_fn`` closure surface.
-
-    Path under test:
-      WatchRunner._dispatch_result(ws_id, msg, watch_id)
-        no dispatch fn registered (original session evicted)
-        restore_fn(ws_id) constructs a fresh ChatSession,
-            calls session.resume(ws_id) to adopt the original ws_id,
-            re-registers the dispatch closure via session.set_watch_runner,
-            returns runner.get_dispatch_fn(session._ws_id)
-        runner invokes the returned fn with (msg, watch_id)
-        watch payload lands on the rehydrated session's NudgeQueue
-
-    Construction inside ``server.py``'s ``_watch_restore_fn`` is the new
-    contract surface introduced by the switchover; this test pins that
-    contract so a future refactor of the closure (e.g. swapping
-    ``manager.create + session.resume`` for ``manager.open``) doesn't
-    silently break the watch-restore pipeline.
-    """
-    # Stage 1 — build the original session and persist a message so
-    # ``session.resume`` finds the ws_id in storage.
-    owner_id = "user-123"
-    storage = get_storage()
-    original = _make_session(user_id=owner_id)
-    original_ws_id = original._ws_id
-    storage.register_workstream(original_ws_id, user_id=owner_id)
-    # Persist a stub user message so ``load_messages(original_ws_id)``
-    # returns something non-empty (resume short-circuits on empty).
-    storage.save_message(original_ws_id, "user", "kickoff message")
-
-    # Stage 2 — runner with NO dispatch fn registered (simulates the
-    # original session being evicted between watch fire and dispatch).
-    # The restore_fn captures *which* fresh ChatSession got built so the
-    # test can assert the queue landed on it (not on the original).
-    rehydrated_holder: dict[str, ChatSession] = {}
-
-    def _restore_fn(ws_id: str) -> Any:
-        """Mirror the production ``_watch_restore_fn`` closure shape:
-        construct a fresh session, resume the persisted ws_id (so the
-        new session adopts the original ws_id), wire the dispatch
-        closure, return the dispatch fn.
-        """
-        owner_storage = MagicMock()
-        owner_storage.get_workstream_owner.return_value = owner_id
-        new_session = _make_session(
-            user_id=_watch_restore_owner(owner_storage, ws_id),
-        )
-        ok = new_session.resume(ws_id)
-        assert ok, "resume should succeed against a non-empty message log"
-        new_session.set_watch_runner(runner)
-        rehydrated_holder["session"] = new_session
-        return runner.get_dispatch_fn(new_session._ws_id)
-
-    runner = WatchRunner(
-        storage=MagicMock(),
-        node_id="test-node",
-        restore_fn=_restore_fn,
-    )
-
-    # Sanity: no dispatch fn registered yet for the original ws_id.
-    assert runner.get_dispatch_fn(original_ws_id) is None
-
-    # Stage 3 — fire a watch result.  ``_dispatch_result`` should fall
-    # through to the restore branch.  The dispatch surface takes a
-    # structured reminder dict.
-    runner._dispatch_result(
-        original_ws_id,
-        {"type": "watch_triggered", "text": "post-restore body"},
-        "watch-1",
-    )
-
-    # The restore fn ran exactly once and produced a fresh session that
-    # adopted the original ws_id.
-    assert "session" in rehydrated_holder, "restore_fn was not invoked"
-    rehydrated = rehydrated_holder["session"]
-    assert rehydrated is not original
-    assert rehydrated._ws_id == original_ws_id
-    assert rehydrated._mcp_effective_user_id == owner_id
-
-    # The watch payload landed on the rehydrated session's queue, not on
-    # the (now-evicted) original session's queue.
-    assert len(rehydrated._nudge_queue) == 1
-    assert rehydrated._nudge_queue.pending(channel="any") == [
-        ("watch_triggered", "post-restore body")
-    ]
-    # Original session's queue stays empty — the dispatch did NOT
-    # accidentally route back to it.
-    assert len(original._nudge_queue) == 0
 
 
 @pytest.mark.parametrize(
@@ -565,3 +476,155 @@ def test_cancel_clears_pending_terminal_dispatched_entry(
     session._exec_watch({"call_id": "c1", "action": "cancel", "watch_name": "leak-watch"})
 
     assert watch_id not in runner._terminal_dispatched
+
+
+# Each branch of the production restore, driven over a stand-in manager so a
+# branch can be forced; test_a_restore_through_a_real_manager_opens_leases_and_delivers
+# below runs it through a real SessionManager and lease.
+
+
+def _restore(
+    *,
+    loaded_now: bool = True,
+    history: bool = True,
+    unloaded_meanwhile: bool = False,
+    open_error: BaseException | None = None,
+) -> tuple[Any, Any, WatchRunner, Any]:
+    """Run the production restore once against a stand-in manager."""
+    from types import SimpleNamespace
+
+    from turnstone.server import WebUI, make_watch_restore_fn
+
+    get_storage().register_workstream("ws-watched", user_id="owner")
+    if history:
+        get_storage().save_message("ws-watched", "user", "watch the build")
+    session = _make_session(user_id="owner", ws_id="ws-watched")
+    if history:
+        assert session.rehydrate()
+    ui = WebUI(ws_id="ws-watched", user_id="owner")
+    ws = SimpleNamespace(id="ws-watched", session=session, ui=ui, name="")
+    manager = MagicMock()
+    if open_error is not None:
+        manager.open_with_outcome.side_effect = open_error
+    else:
+        manager.open_with_outcome.return_value = (ws, loaded_now)
+    manager.get.side_effect = lambda _ws_id: None if unloaded_meanwhile else ws
+    runner = WatchRunner(storage=MagicMock(), node_id="node-a")
+    restore = make_watch_restore_fn(manager, runner=lambda: runner, global_queue=None)
+    return restore, manager, runner, ws
+
+
+def test_a_restore_registers_the_workstream_it_opened_and_runs_it_unattended(tmp_db: str) -> None:
+    restore, _manager, runner, ws = _restore()
+
+    dispatch = restore("ws-watched")
+
+    assert dispatch is ws.session._watch_dispatch_fn
+    assert runner.get_dispatch_fn("ws-watched") is dispatch
+    assert ws.ui._unattended is True
+    ws.ui.note_client()
+    assert ws.ui._unattended is False
+
+
+def test_a_restore_delivers_into_a_workstream_already_loaded_as_it_is(tmp_db: str) -> None:
+    restore, _manager, runner, ws = _restore(loaded_now=False)
+
+    dispatch = restore("ws-watched")
+
+    assert dispatch is runner.get_dispatch_fn("ws-watched") is not None
+    assert ws.ui._unattended is False
+
+
+def test_a_restore_withdraws_a_workstream_unloaded_while_it_registered(tmp_db: str) -> None:
+    """The fire waits for the next restore instead of landing in a gone session."""
+    restore, _manager, runner, _ws = _restore(unloaded_meanwhile=True)
+
+    assert restore("ws-watched") is None
+    assert runner.get_dispatch_fn("ws-watched") is None
+
+
+def test_a_restore_of_a_workstream_without_turns_closes_it_and_ends_the_watch(
+    tmp_db: str,
+) -> None:
+    restore, manager, runner, _ws = _restore(history=False)
+
+    with pytest.raises(WatchWorkstreamUnrestorable):
+        restore("ws-watched")
+    manager.close.assert_called_once_with("ws-watched")
+    assert runner.get_dispatch_fn("ws-watched") is None
+
+
+def test_a_restore_that_cannot_open_retries_later(tmp_db: str) -> None:
+    from turnstone.core.storage import WorkstreamLeaseHeldError
+
+    restore, _manager, _runner, _ws = _restore(
+        open_error=WorkstreamLeaseHeldError("ws-watched", holder_node_id="cli")
+    )
+
+    assert restore("ws-watched") is None
+
+
+def test_a_restore_ends_the_watch_only_when_the_row_is_gone(tmp_db: str) -> None:
+    restore, manager, _runner, _ws = _restore()
+    manager.open_with_outcome.return_value = (None, False)
+
+    # The row exists: an eviction or create in flight, retried later.
+    assert restore("ws-watched") is None
+    get_storage().delete_workstream("ws-watched")
+    with pytest.raises(WatchWorkstreamUnrestorable):
+        restore("ws-watched")
+
+
+def test_a_restore_through_a_real_manager_opens_leases_and_delivers(
+    tmp_db: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The manager opens and leases the workstream for real; only the model turn is stubbed."""
+    from tests._session_helpers import make_session
+    from tests.test_session_manager import FakeAdapter, _make_manager
+    from turnstone import server
+    from turnstone.server import WebUI, make_watch_restore_fn
+
+    class _WebAdapter(FakeAdapter):
+        def build_ui(self, ws: Any) -> Any:
+            return WebUI(ws_id=ws.id, user_id=ws.user_id)
+
+        def cleanup_ui(self, ws: Any) -> None:
+            self.cleaned_up.append(ws.id)
+            if ws.session is not None:
+                ws.session.close()
+
+        def build_session(self, ws: Any, **kwargs: Any) -> Any:
+            return make_session(
+                ui=ws.ui,
+                ws_id=ws.id,
+                user_id=ws.user_id,
+                workstream_lease=kwargs.get("workstream_lease"),
+                fork_reservation_token=kwargs.get("fork_reservation_token", ""),
+            )
+
+    storage = get_storage()
+    assert storage.register_workstream(
+        "ws-real", user_id="owner", fork_reservation_token="tok-real"
+    )
+    storage.save_message("ws-real", "user", "watch the build")
+    mgr, _, _ = _make_manager(_WebAdapter(), storage=storage, node_id="node-a")
+    # The fire's wake would start a model turn: the one stubbed piece.
+    monkeypatch.setattr(server, "_watch_fire_wake_fn", lambda _ws: lambda: None)
+    runner = WatchRunner(
+        storage=MagicMock(),
+        node_id="node-a",
+        restore_fn=make_watch_restore_fn(mgr, runner=lambda: runner, global_queue=None),
+    )
+
+    runner._dispatch_result(
+        "ws-real", {"type": "watch_triggered", "text": "build finished"}, "watch-1"
+    )
+
+    ws = mgr.get("ws-real")
+    assert ws is not None and ws.session is not None
+    assert ws.session._nudge_queue.pending(channel="any") == [("watch_triggered", "build finished")]
+    # The restored turn runs as the workstream's owner, from the row.
+    assert ws.user_id == "owner" and ws.session._mcp_effective_user_id == "owner"
+    assert storage.get_workstream("ws-real")["lease_node_id"] == "node-a"
+    assert ws.ui._unattended is True
+    assert mgr.close("ws-real")

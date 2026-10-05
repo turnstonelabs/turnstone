@@ -590,7 +590,7 @@ class TestWatchRunner:
         # Unknown ws → None.
         assert runner.get_dispatch_fn("ws-missing") is None
         # Owner-checked removal: a non-owner's teardown must not remove a
-        # still-live registration (restore shell vs reopened pane).
+        # still-live registration (an unloaded copy vs its reopened successor).
         runner.remove_dispatch_fn("ws-1", owner=MagicMock())
         assert runner.get_dispatch_fn("ws-1") is fn
         # The owner (or a blind removal) does remove it.

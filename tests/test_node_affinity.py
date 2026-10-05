@@ -64,7 +64,7 @@ def test_node_create_and_fork_requirements(app_client, multipart):
     assert response.status_code == 200, response.text
     source = response.json()["ws_id"]
     storage = get_storage()
-    storage.save_message(source, "user", "Saved host history")
+    storage.save_message(source, "user", "Saved host history", lease=manager.lease_fence(source))
     manager.close(source)
     response = client.post(
         "/v1/api/workstreams/new", json={"resume_ws": source}, headers=_auth("owner")
@@ -99,7 +99,7 @@ def test_node_create_and_fork_requirements(app_client, multipart):
 
 
 @pytest.mark.parametrize("replace_during_load", [False, True])
-def test_core_resume_checks_node_before_adopting_identity(app_client, replace_during_load):
+def test_rehydrate_checks_the_node_before_loading_history(app_client, replace_during_load):
     from unittest.mock import Mock
 
     from turnstone.core.session import ChatSession
@@ -111,52 +111,51 @@ def test_core_resume_checks_node_before_adopting_identity(app_client, replace_du
     ).json()["ws_id"]
     session = ChatSession.__new__(ChatSession)
     session._node_id = "host-1" if replace_during_load else "node-1"
-    session._ws_id = "original"
+    session._ws_id = source
     session._load_message_turns = Mock(return_value=[object()])
-    session._load_workstream_config = Mock(return_value={})
+    session._read_workstream_config = Mock(return_value={})
     if replace_during_load:
         storage = get_storage()
 
         def replace_source(_ws_id):
-            storage.delete_workstream(source)
+            storage.delete_workstream(source, lease=manager.lease_fence(source))
             storage.register_workstream(source, required_node_id="node-1")
             return [object()]
 
         session._load_message_turns.side_effect = replace_source
     with pytest.raises(NodeAffinityError):
-        session.resume(source)
-    assert session._ws_id == "original"
+        session.rehydrate()
     if not replace_during_load:
         session._load_message_turns.assert_not_called()
-        session._load_workstream_config.assert_not_called()
+        session._read_workstream_config.assert_not_called()
 
 
-def test_cli_resume_refuses_requirement_without_exiting_repl(monkeypatch):
+@pytest.mark.parametrize("refusal", ["affinity", "lease"])
+def test_cli_resume_refuses_requirement_without_leaving_the_tab(monkeypatch, capsys, refusal):
+    """The target is bound to another node, or another process holds its owner lease."""
+    from types import SimpleNamespace
     from unittest.mock import Mock
 
-    from turnstone.core.session import ChatSession
+    from turnstone.cli import _handle_tab_command
+    from turnstone.core.storage import WorkstreamLeaseHeldError
 
-    session = ChatSession.__new__(ChatSession)
-    session._user_id, session._node_id, session._ws_id = "owner", None, "current"
-    session.ui = Mock()
-    session._drain_queue_for_identity_swap = lambda: None
-    session._load_message_turns = lambda _: [object()]
-    session._load_workstream_config = lambda _: {}
-    storage = Mock()
-    storage.ensure_workstream_incarnation_snapshot.return_value = {
-        "required_node_id": "host-1",
-        "fork_reservation_token": "token",
-    }
-    storage.get_workstream.return_value = (
-        storage.ensure_workstream_incarnation_snapshot.return_value
+    left = SimpleNamespace(id="current", name="current", ui=None, session=None)
+    manager = Mock()
+    # The current tab stays loaded; the target is not.
+    manager.get.side_effect = lambda ws_id: left if ws_id == left.id else None
+    manager.loaded.return_value = None
+    manager.open.side_effect = (
+        NodeAffinityError("host-1", unavailable=True)
+        if refusal == "affinity"
+        else WorkstreamLeaseHeldError("target", holder_node_id="host-1")
     )
-    monkeypatch.setattr("turnstone.core.session.current_worker_claim", lambda _: None)
-    monkeypatch.setattr("turnstone.core.session.resolve_workstream", lambda _: "target")
-    monkeypatch.setattr("turnstone.core.session.get_storage", lambda: storage)
-    assert session.handle_command("/resume target", principal_id="owner") is False
-    assert session._ws_id == "current"
-    session.ui.on_error.assert_called_once()
-    assert "host-1" in session.ui.on_error.call_args.args[0]
+    monkeypatch.setattr("turnstone.core.memory.resolve_workstream", lambda _: "target")
+
+    _handle_tab_command(manager, "/resume target", left, False, {})
+
+    assert "host-1" in capsys.readouterr().out
+    manager.switch.assert_not_called()
+    manager.close_with_outcome.assert_not_called()
 
 
 @pytest.mark.parametrize("lifecycle", ["autoclose", "eviction", "restart"])
@@ -188,59 +187,95 @@ def test_requirement_survives_lifecycle_and_same_node_restart(db, lifecycle):
             manager.close(current.id)
 
 
-@pytest.mark.parametrize("entrypoint", ["cli.py", "server.py"])
-def test_startup_resume_refusal_closes_temporary_session(monkeypatch, entrypoint):
-    """Run the startup blocks with real resume, without starting network services."""
-    import ast
-    import sys
-    from pathlib import Path
-    from types import SimpleNamespace
+@pytest.mark.parametrize("refusal", ["affinity", "lease"])
+def test_server_startup_resume_refusal_does_not_wait(refusal):
+    """The target is bound to another node, or another process holds its owner lease."""
     from unittest.mock import Mock
 
-    from turnstone.core.session import ChatSession
+    from turnstone.core.storage import WorkstreamLeaseHeldError
+    from turnstone.server import _open_for_startup_resume
 
-    session = ChatSession.__new__(ChatSession)
-    session._node_id, session._ws_id = "node-1", "temporary"
-    session._load_message_turns = lambda _: [object()]
-    session._load_workstream_config = lambda _: {}
-    storage = Mock()
-    storage.ensure_workstream_incarnation_snapshot.return_value = {
-        "required_node_id": "host-1",
-        "fork_reservation_token": "token",
-    }
-    monkeypatch.setattr("turnstone.core.session.get_storage", lambda: storage)
-    monkeypatch.setattr("turnstone.core.memory.resolve_workstream", lambda _: "saved")
-    ws = SimpleNamespace(id="temporary", session=session, ui=SimpleNamespace())
     manager = Mock()
-    manager.create.return_value = ws
-    source = Path(__file__).resolve().parents[1] / "turnstone" / entrypoint
-    tree = ast.parse(source.read_text())
-    expected_test = "resume_target" if entrypoint == "cli.py" else "args.resume"
-    blocks = [
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.If)
-        and ast.unparse(node.test) == expected_test
-        and "ws.session.resume(" in ast.unparse(node)
-    ]
-    assert len(blocks) == 1
-    namespace = dict(
-        args=SimpleNamespace(resume="saved", skip_permissions=False),
-        resume_target="saved",
-        ws=ws,
-        manager=manager,
-        red=lambda value: value,
-        sys=sys,
-        log=Mock(),
-        _get_storage=lambda: storage,
-        _watch_restore_owner=lambda *_: "owner",
-        _resume_persona_kwargs=lambda _: {},
-        WebUI=SimpleNamespace,
-        config_store=SimpleNamespace(get=lambda _: False),
+    manager.open.side_effect = (
+        NodeAffinityError("host-1", unavailable=True)
+        if refusal == "affinity"
+        else WorkstreamLeaseHeldError("saved", holder_node_id="node-2", retry_after_ms=1500)
     )
-    code = compile(ast.Module(body=blocks, type_ignores=[]), str(source), "exec")
+
+    with pytest.raises((NodeAffinityError, WorkstreamLeaseHeldError)):
+        _open_for_startup_resume(manager, "saved", node_id="node-1")
+    manager.open.assert_called_once_with("saved")
+
+
+@pytest.mark.parametrize("refusal", ["affinity", "lease", "missing"])
+def test_cli_startup_resume_refusal_exits_with_one_line(capsys, refusal):
+    from unittest.mock import Mock
+
+    from turnstone.cli import _open_for_cli_resume
+    from turnstone.core.storage import WorkstreamLeaseHeldError
+
+    manager = Mock()
+    if refusal == "missing":
+        manager.open.return_value = None
+    else:
+        manager.open.side_effect = (
+            NodeAffinityError("host-1", unavailable=True)
+            if refusal == "affinity"
+            else WorkstreamLeaseHeldError("saved", holder_node_id="node-2")
+        )
+
     with pytest.raises(SystemExit) as error:
-        exec(code, namespace)
+        _open_for_cli_resume(manager, "saved", "my-alias")
+
     assert error.value.code == 1
-    assert session._ws_id == "temporary"
-    manager.close.assert_called_once_with("temporary")
+    out = capsys.readouterr().out
+    assert out.count("\n") == 1
+    if refusal == "missing":
+        assert "Cannot resume my-alias: it is not an interactive workstream" in out
+    else:
+        assert "Cannot resume saved" in out
+
+
+def test_server_startup_resume_waits_once_for_its_own_previous_process(monkeypatch):
+    """A supervised restart finds its crashed predecessor's lease still live: it
+    waits that out once instead of exiting into a restart loop."""
+    from unittest.mock import Mock
+
+    from turnstone import server
+    from turnstone.core.storage import WorkstreamLeaseHeldError
+
+    refusals = [
+        WorkstreamLeaseHeldError("saved", holder_node_id="node-1", retry_after_ms=1500),
+        WorkstreamLeaseHeldError("saved", holder_node_id="node-2", retry_after_ms=1500),
+    ]
+    manager = Mock()
+    manager.open.side_effect = refusals
+    sleeps: list[float] = []
+    monkeypatch.setattr(server.time, "sleep", sleeps.append)
+
+    with pytest.raises(WorkstreamLeaseHeldError) as error:
+        server._open_for_startup_resume(manager, "saved", node_id="node-1")
+
+    # One wait (the predecessor's remaining lease plus a margin), then the
+    # second refusal names another node.
+    assert sleeps == [2.5]
+    assert error.value.holder_node_id == "node-2"
+    assert manager.open.call_count == 2
+
+
+def test_server_startup_resume_never_waits_without_a_node_id(monkeypatch):
+    from unittest.mock import Mock
+
+    from turnstone import server
+    from turnstone.core.storage import WorkstreamLeaseHeldError
+
+    manager = Mock()
+    manager.open.side_effect = WorkstreamLeaseHeldError(
+        "saved", holder_node_id="", retry_after_ms=1500
+    )
+    sleeps: list[float] = []
+    monkeypatch.setattr(server.time, "sleep", sleeps.append)
+
+    with pytest.raises(WorkstreamLeaseHeldError):
+        server._open_for_startup_resume(manager, "saved", node_id=None)
+    assert sleeps == []

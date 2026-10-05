@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import secrets
 import threading
+from typing import Any
 
 import pytest
 
@@ -251,6 +252,72 @@ class TestRefreshLifecycle:
         router.force_refresh()
         assert router.node_count() == 2
 
+    def test_force_refresh_shares_a_refresh_that_started_after_its_evidence(self) -> None:
+        """A burst of 404s scans storage once, not once per 404."""
+        router, storage = _make_router()
+        calls = 0
+        list_services = storage.list_services
+
+        def counting_list_services(*args: Any, **kwargs: Any) -> Any:
+            nonlocal calls
+            calls += 1
+            return list_services(*args, **kwargs)
+
+        storage.list_services = counting_list_services  # type: ignore[method-assign]
+        seen = router.refresh_generation  # all three 404s arrive here
+        router.force_refresh(since=seen)
+        assert router.force_refresh(since=seen) is False
+        assert router.force_refresh(since=seen) is False
+        assert calls == 1
+        # Evidence that arrives after that refresh started gets its own.
+        router.force_refresh(since=router.refresh_generation)
+        assert calls == 2
+
+    def test_a_refresh_already_reading_when_the_evidence_arrives_is_not_shared(self) -> None:
+        """It may have read storage before the change the 404 reports."""
+        router, storage = _make_router()
+        started, release = threading.Event(), threading.Event()
+        calls = 0
+        list_services = storage.list_services
+
+        def slow_first(*args: Any, **kwargs: Any) -> Any:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                started.set()
+                release.wait(2)
+            return list_services(*args, **kwargs)
+
+        storage.list_services = slow_first  # type: ignore[method-assign]
+        in_flight = threading.Thread(target=router.refresh_cache)
+        in_flight.start()
+        assert started.wait(2)
+        seen = router.refresh_generation  # the 404 arrives while that refresh reads
+        release.set()
+        in_flight.join(2)
+
+        router.force_refresh(since=seen)
+
+        assert calls == 2
+
+    def test_a_failed_refresh_is_never_shared(self) -> None:
+        router, storage = _make_router()
+        seen = router.refresh_generation
+        list_services = storage.list_services
+
+        def down(*_args: Any, **_kwargs: Any) -> Any:
+            raise RuntimeError("down")
+
+        storage.list_services = down  # type: ignore[method-assign]
+        with pytest.raises(RuntimeError):
+            router.force_refresh(since=seen)
+        storage.list_services = list_services  # type: ignore[method-assign]
+        storage.services = [NODE_A]
+
+        router.force_refresh(since=seen)
+
+        assert router.node_count() == 1
+
     def test_remember_override_cannot_be_erased_by_stale_inflight_refresh(self) -> None:
         """A pre-commit refresh snapshot publishes before the create hint."""
 
@@ -379,3 +446,70 @@ class TestDurableRequirement:
         monkeypatch.setattr(storage, "get_workstream", broken)
         with pytest.raises(NoAvailableNodeError):
             router.route("pinned")
+
+
+class TestOwnerLeaseRouting:
+    """The node holding a workstream's owner lease is the one that can serve it."""
+
+    def test_live_lease_holder_precedes_overrides_and_rendezvous(self) -> None:
+        router, storage = _make_router()
+        storage.services = [NODE_A, NODE_B, NODE_C]
+        storage.overrides = [{"ws_id": "moved", "node_id": "node-a"}]
+        storage.workstreams["moved"] = {"lease_node_id": "node-c"}
+        router.refresh_cache()
+
+        assert router.route("moved") == NodeRef("node-c", "http://c:8080")
+
+    def test_requirement_still_precedes_the_lease_holder(self) -> None:
+        router, storage = _make_router()
+        storage.services = [NODE_A, NODE_B]
+        storage.workstreams["pinned"] = {"required_node_id": "node-a", "lease_node_id": "node-b"}
+        router.refresh_cache()
+
+        assert router.route("pinned").node_id == "node-a"
+
+    def test_holder_that_is_not_a_live_node_falls_through(self) -> None:
+        router, storage = _make_router()
+        storage.services = [NODE_A, NODE_B]
+        ws_id = _random_ws_id()
+        storage.overrides = [{"ws_id": ws_id, "node_id": "node-b"}]
+        router.refresh_cache()
+        # A crashed node, the console pseudo-node, or a CLI holder (no node).
+        for holder in ("node-gone", "console", "", None):
+            storage.workstreams[ws_id] = {"lease_node_id": holder}  # type: ignore[dict-item]
+            assert router.route(ws_id).node_id == "node-b"
+
+    def test_a_row_the_caller_already_read_is_not_read_again(self) -> None:
+        router, storage = _make_router()
+        storage.services = [NODE_A, NODE_B, NODE_C]
+        router.refresh_cache()
+        storage.workstreams["read-once"] = {"lease_node_id": "node-a"}
+
+        ref = router.route("read-once", known_row={"lease_node_id": "node-c"})
+
+        assert ref.node_id == "node-c"
+
+    def test_lease_holder_is_read_on_every_call(self) -> None:
+        router, storage = _make_router()
+        storage.services = [NODE_A, NODE_B]
+        router.refresh_cache()
+        storage.workstreams["roaming"] = {"lease_node_id": "node-a"}
+        assert router.route("roaming").node_id == "node-a"
+        storage.workstreams["roaming"]["lease_node_id"] = "node-b"
+        assert router.route("roaming").node_id == "node-b"
+
+    def test_invisible_rows_do_not_disclose_their_holder(self) -> None:
+        router, storage = _make_router()
+        storage.services = [NODE_A, NODE_B]
+        router.refresh_cache()
+        # Pick an id whose rendezvous placement differs from its holder.
+        ws_id = next(
+            candidate
+            for candidate in (_random_ws_id() for _ in range(200))
+            if router.rendezvous_node(candidate).node_id == "node-a"
+        )
+        storage.workstreams[ws_id] = {"lease_node_id": "node-b"}
+
+        # An unreadable row gets the placement of an unknown id: plain HRW.
+        assert router.route(ws_id, can_read=lambda row: False).node_id == "node-a"
+        assert router.route(ws_id, can_read=lambda row: True).node_id == "node-b"

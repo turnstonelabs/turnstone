@@ -11,6 +11,7 @@ from turnstone.sdk.events import (
     ClusterWsClosedEvent,
     ClusterWsCreatedEvent,
     ClusterWsRenameEvent,
+    ClusterWsUnloadedEvent,
     CompactionEvent,
     ConnectedEvent,
     ContentEvent,
@@ -35,6 +36,7 @@ from turnstone.sdk.events import (
     WsClosedEvent,
     WsRenameEvent,
     WsStateEvent,
+    WsUnloadedEvent,
 )
 
 # ---------------------------------------------------------------------------
@@ -401,6 +403,18 @@ def test_cluster_ws_created_event():
 def test_cluster_ws_closed_event():
     e = ClusterEvent.from_dict({"type": "ws_closed", "ws_id": "ws2"})
     assert isinstance(e, ClusterWsClosedEvent)
+    assert e.ws_id == "ws2"
+
+
+def test_cluster_ws_unloaded_event():
+    e = ClusterEvent.from_dict({"type": "ws_unloaded", "ws_id": "ws2", "node_id": "node-a"})
+    assert isinstance(e, ClusterWsUnloadedEvent)
+    assert (e.ws_id, e.node_id) == ("ws2", "node-a")
+
+
+def test_ws_unloaded_event():
+    e = ServerEvent.from_dict({"type": "ws_unloaded", "ws_id": "ws2"})
+    assert isinstance(e, WsUnloadedEvent)
     assert e.ws_id == "ws2"
 
 

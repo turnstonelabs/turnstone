@@ -554,7 +554,10 @@ def _record_fatal_stub(ui: Any, captured: dict[str, str]) -> Any:
     stub.ui = ui
     stub._emit_state = lambda state, **_kwargs: captured.setdefault("state", state)
     stub._format_backend_error = lambda exc: ChatSession._format_backend_error(stub, exc)
-    stub._save_last_error = lambda ws_id, text: ChatSession._save_last_error(stub, ws_id, text)
+    stub._save_last_error = lambda ws_id, text, lease=None: ChatSession._save_last_error(
+        stub, ws_id, text, lease
+    )
+    stub.write_fence = lambda: None
     return stub
 
 
@@ -565,7 +568,7 @@ def test_record_fatal_uses_enriched_message_for_known(monkeypatch):
 
     captured: dict[str, str] = {}
 
-    def fake_persist(ws_id: str, msg: str) -> None:
+    def fake_persist(ws_id: str, msg: str, *, lease: Any = None) -> None:
         captured["persist"] = msg
 
     def fake_sanitize(text: str, *, max_len: int = 1024) -> str:
@@ -604,7 +607,7 @@ def test_record_fatal_falls_back_for_unknown(monkeypatch):
 
     captured: dict[str, str] = {}
 
-    def fake_persist(ws_id: str, msg: str) -> None:
+    def fake_persist(ws_id: str, msg: str, *, lease: Any = None) -> None:
         captured["persist"] = msg
 
     def fake_sanitize(text: str, *, max_len: int = 1024) -> str:
@@ -645,7 +648,9 @@ def test_record_fatal_log_level_contract(
     not add an ERROR-level line per CLI interrupt."""
     import logging
 
-    monkeypatch.setattr("turnstone.core.session.persist_last_error", lambda ws_id, msg: None)
+    monkeypatch.setattr(
+        "turnstone.core.session.persist_last_error", lambda ws_id, msg, lease=None: None
+    )
     monkeypatch.setattr("turnstone.core.session.sanitize_error_text", lambda text, **kw: text)
 
     class _UI:

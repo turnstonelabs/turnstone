@@ -181,6 +181,10 @@ class TestRequiredScope:
     def test_post_workstreams_new_needs_write(self):
         assert required_scope("POST", "/api/workstreams/new") == "write"
 
+    def test_post_routed_delete_needs_write(self):
+        # The console deletes coordinators itself, so it must enforce the scope.
+        assert required_scope("POST", "/v1/api/route/workstreams/delete") == "write"
+
     def test_all_write_paths_need_write(self):
         for path in WRITE_PATHS:
             scope = required_scope("POST", path)

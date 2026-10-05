@@ -13,10 +13,12 @@ from turnstone.core import session_worker
 from turnstone.core.session import ChatSession
 from turnstone.core.session_manager import SessionManager
 from turnstone.core.state_writer import StateWriter
-from turnstone.core.workstream import WorkstreamState
+from turnstone.core.workstream import Workstream, WorkstreamState
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+
+    from turnstone.core.storage import LeaseFence
 
 
 class _AttemptSignallingLock:
@@ -53,12 +55,14 @@ class _BlockingErrorStorage(FakeStorage):
         self.release_error_write = threading.Event()
         self._blocked_error = False
 
-    def update_workstream_state(self, ws_id: str, state: str) -> None:
+    def update_workstream_state(
+        self, ws_id: str, state: str, *, lease: LeaseFence | None = None
+    ) -> None:
         if state == "error" and not self._blocked_error:
             self._blocked_error = True
             self.error_write_entered.set()
             assert self.release_error_write.wait(timeout=10), "test did not release state write"
-        super().update_workstream_state(ws_id, state)
+        super().update_workstream_state(ws_id, state, lease=lease)
 
 
 class _RecordingStateWriter(StateWriter):
@@ -107,6 +111,8 @@ class _RaisingDiscardStateWriter(StateWriter):
 class _DurabilitySession(FakeSession):
     """Fake resource shell using ChatSession's real durability lane."""
 
+    _close_publication_locked = ChatSession._close_publication_locked
+
     def __init__(self, ws_id: str) -> None:
         super().__init__(ws_id)
         self._generation_lock = threading.RLock()
@@ -127,12 +133,19 @@ class _DurabilitySession(FakeSession):
             _admit,
         )
 
-    def shutdown_publication_and_drain_durability(self) -> None:
+    def shutdown_publication_and_drain_durability(self, timeout: float | None = None) -> bool:
         self.shutdown_entered.set()
-        ChatSession.shutdown_publication_and_drain_durability(self)  # type: ignore[arg-type]
+        return ChatSession.shutdown_publication_and_drain_durability(  # type: ignore[arg-type]
+            self, timeout
+        )
 
     def resolve_close_approvals(self) -> None:
         pass
+
+
+def _expire_lease(storage: FakeStorage, ws_id: str) -> None:
+    """Let the holder's lease lapse, as if this manager had paused."""
+    storage.rows[ws_id].lease_expires_at = time.time() - 1
 
 
 class _ReplaceAfterSnapshotStorage(FakeStorage):
@@ -498,7 +511,12 @@ def test_capacity_admission_does_not_retire_an_idle_send_barrier(
 
 
 def test_open_retries_when_durable_incarnation_changes_mid_rehydrate() -> None:
-    """A snapshot-A/config-B hybrid is retired before it can be returned."""
+    """A replaced incarnation's snapshot is never leased, so no hybrid is built.
+
+    The owner lease is bound to the snapshot's incarnation token: acquiring
+    with token A after the row became B returns nothing, and the open retries
+    from B's own snapshot before any session is constructed.
+    """
     ws_id = "open-incarnation-aba"
     storage = _ReplaceAfterSnapshotStorage(ws_id, "token-b")
     storage.register_workstream(
@@ -524,11 +542,93 @@ def test_open_retries_when_durable_incarnation_changes_mid_rehydrate() -> None:
     assert reopened.name == "row-b"
     assert reopened._fork_reservation_token == "token-b"
     assert reopened.session is not None
-    assert adapter.build_models == ["model-b", "model-b"]
-    assert len(adapter.built_sessions) == 2
-    assert adapter.built_sessions[0].cancelled is True
-    assert adapter.built_sessions[0].closed is True
+    assert reopened._lease is not None
+    assert reopened._lease.fence.incarnation_token == "token-b"
+    assert adapter.build_models == ["model-b"]
+    assert len(adapter.built_sessions) == 1
     assert [(event.kind, event.ws_id) for event in adapter.events] == [("rehydrated", ws_id)]
+
+
+def _replace_during_first_build(
+    storage: FakeStorage,
+    adapter: FakeAdapter,
+    ws_id: str,
+    *,
+    reregister: bool,
+    lease_found_lost: bool = False,
+) -> list[FakeSession]:
+    """Build hook: while the first candidate rehydrates, the open's lease lapses
+    (renewals failing past the TTL) and another process deletes the row,
+    optionally registering the id again as a new incarnation. With
+    ``lease_found_lost`` the load also finds its lease gone (as a refused fenced
+    write or a renewal marks it)."""
+    first: list[FakeSession] = []
+
+    def build(ws: Workstream, model: object | None) -> FakeSession:
+        session = FakeSession(ws.id)
+        if not first:
+            first.append(session)
+
+            def replace_row() -> None:
+                storage.rows[ws_id].lease_expires_at = time.time() - 1
+                storage.delete_workstream(ws_id)
+                if reregister:
+                    storage.register_workstream(
+                        ws_id,
+                        user_id="owner-b",
+                        name="row-b",
+                        kind="interactive",
+                        fork_reservation_token="token-b",
+                    )
+                if lease_found_lost:
+                    assert ws._lease is not None
+                    ws._lease.mark_lost()
+
+            session.rehydrate_hook = replace_row
+        return session
+
+    adapter.build_session_hook = build
+    return first
+
+
+@pytest.mark.parametrize("lease_found_lost", [False, True], ids=["lease-unnoticed", "lease-lost"])
+@pytest.mark.parametrize("reregister", [True, False])
+def test_open_rechecks_the_incarnation_after_a_lease_lapse_mid_build(
+    reregister: bool, lease_found_lost: bool
+) -> None:
+    """The post-build witness still catches a row replaced while the lease lapsed, before the
+    lost lease is taken for another process holding the same workstream."""
+    ws_id = "open-replaced-mid-build"
+    storage = FakeStorage()
+    storage.register_workstream(
+        ws_id,
+        user_id="owner-a",
+        name="row-a",
+        kind="interactive",
+        fork_reservation_token="token-a",
+    )
+    adapter = FakeAdapter()
+    mgr = SessionManager(adapter, storage=storage, max_active=3, event_emitter=adapter)
+    first = _replace_during_first_build(
+        storage, adapter, ws_id, reregister=reregister, lease_found_lost=lease_found_lost
+    )
+
+    reopened = mgr.open(ws_id)
+
+    assert first[0].cancelled and first[0].closed
+    held = [lease.fence.incarnation_token for lease in mgr._lease_keeper.tracked()]
+    if reregister:
+        assert reopened is not None
+        assert len(adapter.built_sessions) == 2
+        assert reopened.user_id == "owner-b"
+        assert reopened._lease is not None
+        assert reopened._lease.fence.incarnation_token == "token-b"
+        assert held == ["token-b"]
+    else:
+        assert reopened is None
+        assert len(adapter.built_sessions) == 1
+        assert held == []
+        assert mgr.get(ws_id) is None
 
 
 def test_close_idle_racing_delete_persisted_has_one_deleted_terminal() -> None:
@@ -542,10 +642,10 @@ def test_close_idle_racing_delete_persisted_has_one_deleted_terminal() -> None:
     delete_results: list[bool] = []
     idle_results: list[list[str]] = []
 
-    def _delete_row() -> bool:
+    def _delete_row(*, lease: LeaseFence | None) -> bool:
         delete_entered.set()
         assert release_delete.wait(timeout=10), "test did not release durable delete"
-        storage.delete_workstream(ws.id)
+        storage.delete_workstream(ws.id, lease=lease)
         return True
 
     def _delete() -> None:
@@ -607,9 +707,9 @@ def test_stale_delete_snapshot_does_not_tombstone_current_local_successor() -> N
     assert successor is not None
     delete_called = threading.Event()
 
-    def _delete_a() -> bool:
+    def _delete_a(*, lease: LeaseFence | None) -> bool:
         delete_called.set()
-        return storage.delete_workstream_if_fork_reserved(ws_id, "token-a")
+        return storage.delete_workstream_if_fork_reserved(ws_id, "token-a", lease=lease)
 
     assert (
         mgr.delete_persisted(
@@ -646,6 +746,9 @@ def test_current_delete_snapshot_retires_stale_local_predecessor() -> None:
     predecessor = mgr.open(ws_id)
     assert predecessor is not None
     predecessor_session = predecessor.session
+    # A remote node may delete A only once A's lease expired (this manager
+    # paused); then it re-registers the id as B.
+    _expire_lease(storage, ws_id)
     assert storage.delete_workstream_if_fork_reserved(ws_id, "token-a") is True
     storage.register_workstream(
         ws_id,
@@ -658,9 +761,10 @@ def test_current_delete_snapshot_retires_stale_local_predecessor() -> None:
     assert (
         mgr.delete_persisted(
             ws_id,
-            delete_fn=lambda: storage.delete_workstream_if_fork_reserved(
+            delete_fn=lambda *, lease: storage.delete_workstream_if_fork_reserved(
                 ws_id,
                 "token-b",
+                lease=lease,
             ),
             expected_reservation_token="token-b",
             name="successor",
@@ -698,6 +802,7 @@ def test_delete_direction_snapshot_does_not_hold_global_manager_lock() -> None:
     )
     predecessor = mgr.open(ws_id)
     assert predecessor is not None
+    _expire_lease(storage, ws_id)
     assert storage.delete_workstream_if_fork_reserved(ws_id, "token-a") is True
     storage.register_workstream(
         ws_id,
@@ -711,9 +816,10 @@ def test_delete_direction_snapshot_does_not_hold_global_manager_lock() -> None:
         target=lambda: delete_results.append(
             mgr.delete_persisted(
                 ws_id,
-                delete_fn=lambda: storage.delete_workstream_if_fork_reserved(
+                delete_fn=lambda *, lease: storage.delete_workstream_if_fork_reserved(
                     ws_id,
                     "token-b",
+                    lease=lease,
                 ),
                 expected_reservation_token="token-b",
             )
@@ -746,7 +852,7 @@ def test_delete_exception_retires_exact_object_and_allows_reopen() -> None:
     mgr, adapter, storage = _make_manager()
     ws = mgr.create(user_id="u1", name="survives")
 
-    def _raise_delete() -> bool:
+    def _raise_delete(*, lease: LeaseFence | None) -> bool:
         raise RuntimeError("delete forced failure")
 
     with pytest.raises(RuntimeError, match="delete forced failure"):
@@ -787,9 +893,10 @@ def test_state_writer_discard_exception_retires_exact_object_and_allows_reopen()
     with pytest.raises(RuntimeError, match="discard forced failure"):
         mgr.delete_persisted(
             ws.id,
-            delete_fn=lambda: storage.delete_workstream_if_fork_reserved(
+            delete_fn=lambda *, lease: storage.delete_workstream_if_fork_reserved(
                 ws.id,
                 ws._fork_reservation_token,
+                lease=lease,
             ),
             expected_reservation_token=ws._fork_reservation_token,
         )
@@ -835,8 +942,8 @@ def test_terminal_during_session_build_closes_late_session(terminal: str) -> Non
             assert mgr.close(ws_id) is True
         else:
 
-            def _delete_row() -> bool:
-                storage.delete_workstream(ws_id)
+            def _delete_row(*, lease: LeaseFence | None) -> bool:
+                storage.delete_workstream(ws_id, lease=lease)
                 return True
 
             assert mgr.delete_persisted(ws_id, delete_fn=_delete_row) is True
@@ -890,9 +997,9 @@ def test_delete_drains_and_tombstones_predecessor_state_before_same_id_successor
     durable_delete_called = threading.Event()
     delete_results: list[bool] = []
 
-    def _delete_row() -> bool:
+    def _delete_row(*, lease: LeaseFence | None) -> bool:
         writer.lifecycle_order.append("delete")
-        storage.delete_workstream(ws_id)
+        storage.delete_workstream(ws_id, lease=lease)
         durable_delete_called.set()
         return True
 
@@ -954,7 +1061,7 @@ def test_delete_drains_admitted_conversation_write_and_fences_same_id_successor(
     def _persist_predecessor() -> None:
         persist_entered.set()
         assert release_persist.wait(timeout=10), "test did not release conversation write"
-        backend.save_message(ws_id, "user", "late predecessor")
+        backend.save_message(ws_id, "user", "late predecessor", lease=predecessor._lease.fence)
 
     commit_results: list[bool] = []
     commit_thread = threading.Thread(
@@ -967,11 +1074,12 @@ def test_delete_drains_admitted_conversation_write_and_fences_same_id_successor(
     delete_called = threading.Event()
     delete_results: list[bool] = []
 
-    def _delete_exact() -> bool:
+    def _delete_exact(*, lease: LeaseFence | None) -> bool:
         delete_called.set()
         return backend.delete_workstream_if_fork_reserved(
             ws_id,
             predecessor._fork_reservation_token,
+            lease=lease,
         )
 
     delete_thread = threading.Thread(
@@ -1027,8 +1135,8 @@ def test_same_id_successor_created_waits_for_predecessor_closed_publication(
     predecessor = mgr.create(ws_id=ws_id, user_id="u1", name="predecessor")
     delete_results: list[bool] = []
 
-    def _delete_row() -> bool:
-        storage.delete_workstream(ws_id)
+    def _delete_row(*, lease: LeaseFence | None) -> bool:
+        storage.delete_workstream(ws_id, lease=lease)
         return True
 
     delete_thread = threading.Thread(

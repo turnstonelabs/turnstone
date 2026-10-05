@@ -54,11 +54,13 @@ export type {
   WsActivityEvent,
   WsRenameEvent,
   WsClosedEvent,
+  WsUnloadedEvent,
   NodeJoinedEvent,
   NodeLostEvent,
   ClusterStateEvent,
   ClusterWsCreatedEvent,
   ClusterWsClosedEvent,
+  ClusterWsUnloadedEvent,
   ClusterWsRenameEvent,
   ClusterSnapshotEvent,
 } from "./events.js";

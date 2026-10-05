@@ -19,6 +19,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
     from turnstone.core.session import ChatSession, SessionUI
+    from turnstone.core.workstream_lease import WorkstreamLease
 
 # What KIND of work a worker slot holds.  A Literal (not a free-form str)
 # so a typo'd comparison or a new dispatch caller passing "commands" is a
@@ -71,6 +72,22 @@ def concrete_method(obj: Any, name: str) -> Callable[..., Any] | None:
 # ---------------------------------------------------------------------------
 # Kind enum — single source of truth for the workstream dispatch classifier
 # ---------------------------------------------------------------------------
+
+
+class WorkstreamHistoryUnavailableError(RuntimeError):
+    """A workstream's stored history or settings could not be read while opening or creating it.
+
+    Raised instead of loading an empty history, which would let the workstream be served, and
+    written to, as if it had no turns, or taking unread settings for none saved, which would save
+    defaults over them.
+    """
+
+    def __init__(self, ws_id: str) -> None:
+        self.ws_id = ws_id
+        super().__init__(
+            f"the stored history or settings of workstream {ws_id!r} could not be read; "
+            "retry shortly"
+        )
 
 
 class WorkstreamKind(enum.StrEnum):
@@ -256,6 +273,12 @@ class Workstream:
     # transactional clone expectations. It survives publication so rollback
     # and hard-delete can reject a same-id replacement exactly.
     _fork_reservation_token: str = field(default="", repr=False)
+    # The owner-lease handle for this workstream's row (#988), guarded by ``_lock`` and attached by
+    # ``SessionManager`` at create or open. The manager's state and lifecycle writes present its
+    # fence whatever the handle's state (a lost handle makes them refused, never unfenced). ``None``
+    # only before the lease is attached. The handle stays after its release, so a late write
+    # presents the released fence and is refused.
+    _lease: WorkstreamLease | None = field(default=None, repr=False)
     # Prepared, bounded lifecycle-publication data for a deferred interactive
     # create. The HTTP setup hook fills these fields before
     # ``SessionManager.commit_create``; ``InteractiveAdapter.emit_created``
@@ -369,6 +392,16 @@ class Workstream:
     def __post_init__(self) -> None:
         if not self.name:
             self.name = f"ws-{self.id[:4]}"
+
+    def note_client(self) -> None:
+        """A client attached to or started work in this workstream (#988).
+
+        Ends, for good, any blanket approval a watch restore granted its UI
+        while it held the workstream for the watch alone.
+        """
+        note = concrete_method(self.ui, "note_client") if self.ui is not None else None
+        if note is not None:
+            note()
 
     def send_barrier_active(self) -> bool:
         """True while the /send order barrier holds — the ONE definition.

@@ -1657,6 +1657,7 @@ def _make_session(
     ws_id: str | None = None,
     judge_config: Any | None = None,
     config_store: Any | None = None,
+    workstream_lease: Any | None = None,
 ) -> Any:
     """Create a ChatSession with one factory-shaped atomic model binding.
 
@@ -1703,6 +1704,7 @@ def _make_session(
         judge_config=judge_config,
         config_store=config_store,
         model_binding=binding,
+        workstream_lease=workstream_lease,
     )
 
 
@@ -1968,6 +1970,7 @@ class TestSessionReopenModelBinding:
                 model_alias=model_alias or registry.default,
                 kind=kwargs.get("kind", WorkstreamKind.INTERACTIVE),
                 ws_id=ws_id,
+                workstream_lease=kwargs.get("workstream_lease"),
             )
             session._nudges_enabled = MagicMock(return_value=False)
             factory_lanes.append(_lane(session))
@@ -1980,10 +1983,13 @@ class TestSessionReopenModelBinding:
         )
         with (
             patch(
-                "turnstone.core.session.load_message_turns",
+                "turnstone.core.session.read_message_turns",
                 return_value=[Turn.user("restored")],
             ),
-            patch("turnstone.core.session.load_workstream_config", return_value=config),
+            patch(
+                "turnstone.core.session.ChatSession._read_workstream_config",
+                return_value=config,
+            ),
         ):
             reopened = manager.open("saved-workstream")
         assert reopened is not None

@@ -37,6 +37,7 @@ from turnstone.core.session import (
 )
 from turnstone.core.session_manager import SessionManager
 from turnstone.core.session_ui_base import SessionUIBase
+from turnstone.core.storage import LeaseFence, LeaseGrant
 from turnstone.core.trajectory import (
     EffectStatus,
     Role,
@@ -895,7 +896,7 @@ class TestTaskAgentStreamAbort:
             patch.object(session, "_prepare_tool", side_effect=fake_prepare),
             patch.object(session, "_evaluate_intent", return_value=None),
             patch("turnstone.core.storage._registry.get_storage", return_value=None),
-            patch("turnstone.core.policy.evaluate_tool_policies_batch", return_value={}),
+            patch("turnstone.core.policy.evaluate_loaded_tool_policies", return_value={}),
         ):
             agent.start()
             try:
@@ -968,7 +969,7 @@ class TestTaskAgentStreamAbort:
             ),
             patch.object(session, "_prepare_tool", side_effect=_prepare),
             patch.object(session, "_evaluate_intent", return_value=None),
-            patch("turnstone.core.policy.evaluate_tool_policies_batch", return_value={}),
+            patch("turnstone.core.policy.evaluate_loaded_tool_policies", return_value={}),
         ):
             worker = threading.Thread(target=_send, daemon=True)
             worker.start()
@@ -1047,7 +1048,7 @@ class TestTaskAgentStreamAbort:
             ),
             patch.object(session, "_prepare_tool", side_effect=_prepare),
             patch.object(session, "_evaluate_intent", return_value=None),
-            patch("turnstone.core.policy.evaluate_tool_policies_batch", return_value={}),
+            patch("turnstone.core.policy.evaluate_loaded_tool_policies", return_value={}),
             patch("builtins.input", return_value="y") as prompt,
         ):
             worker = threading.Thread(target=_send, daemon=True)
@@ -1150,7 +1151,7 @@ class TestTaskAgentStreamAbort:
             patch.object(session, "_prepare_tool", side_effect=prepare_tool),
             patch.object(session, "_evaluate_intent", return_value=None),
             patch("turnstone.core.storage._registry.get_storage", return_value=None),
-            patch("turnstone.core.policy.evaluate_tool_policies_batch", return_value={}),
+            patch("turnstone.core.policy.evaluate_loaded_tool_policies", return_value={}),
         ):
             task = self._start_task(session, item, outcomes)
             try:
@@ -3040,62 +3041,6 @@ class TestSendGenerationInitializationPublication:
         assert "successor_memory" in rendered
         assert "old_private_memory" not in rendered
 
-    def test_deferred_title_launch_keeps_pre_rebind_identity_and_history(
-        self,
-        tmp_db,
-    ) -> None:
-        """A resume during the user save cannot retarget deferred title work."""
-        session = _make_session(ws_id="opening-ws", user_id="opening-principal")
-        storage = _bind_storage_mock()
-        storage.get_workstream.return_value = None
-        storage.ensure_workstream_incarnation_snapshot.return_value = None
-        generation = session._claim_generation()
-        successor_turn = turn_from_dict(
-            {"role": "user", "content": "successor workstream history"},
-        )
-
-        def save_then_resume(*args: Any, **_kwargs: Any) -> int:
-            assert args[:3] == ("opening-ws", "user", "original opening message")
-            assert session.resume("resumed-ws") is True
-            return 1
-
-        with (
-            patch.object(session, "_nudges_enabled", return_value=False),
-            patch.object(
-                session,
-                "_plan_shared_state",
-                return_value=("opening-ws", {"opening-principal"}, True),
-            ),
-            patch.object(session, "_init_system_messages") as init_system,
-            patch("turnstone.core.session.load_message_turns", return_value=[successor_turn]),
-            patch("turnstone.core.session.load_workstream_config", return_value={}),
-            patch("turnstone.core.session.save_message", side_effect=save_then_resume),
-            patch("turnstone.core.session.threading.Thread") as title_thread,
-        ):
-            session._initialize_send_generation(
-                my_generation=generation,
-                user_input="original opening message",
-                attachments=None,
-                send_id="opening-send",
-                from_wake=False,
-                turn_principal_id="opening-principal",
-                wire_part_cache={},
-            )
-
-        assert session.ws_id == "resumed-ws"
-        assert tuple(turn.text for turn in session.messages) == ("successor workstream history",)
-        init_system.assert_called_once_with()
-        title_thread.assert_called_once()
-        title_call = title_thread.call_args
-        assert title_call.kwargs["target"] == session._generate_title
-        assert title_call.kwargs["kwargs"]["principal_id"] == "opening-principal"
-        assert title_call.kwargs["kwargs"]["captured_ws_id"] == "opening-ws"
-        assert title_call.kwargs["kwargs"]["origin_generation"] == generation
-        assert tuple(turn.text for turn in title_call.kwargs["kwargs"]["captured_messages"]) == (
-            "original opening message",
-        )
-        title_thread.return_value.start.assert_called_once_with()
-
     def test_close_refuses_title_launch_delayed_behind_opening_storage(
         self,
         tmp_db,
@@ -3155,7 +3100,6 @@ class TestSendGenerationInitializationPublication:
         session = _make_session(user_id="principal")
         session._title_generated = True
         session._db_senders_loaded = False
-        session._senders_dirty = True
         generation = session._claim_generation()
         storage = _bind_storage_mock()
         lock_owned_during_reads: list[bool] = []
@@ -3661,7 +3605,7 @@ class TestGenerationDurabilityFIFO:
         with patch.object(
             storage,
             "save_workstream_config",
-            side_effect=lambda ws_id, _config: clear_calls.append(ws_id),
+            side_effect=lambda ws_id, _config, lease=None: clear_calls.append(ws_id),
         ):
             predecessor.start()
             try:
@@ -3717,7 +3661,7 @@ class TestGenerationDurabilityFIFO:
         storage = MagicMock()
         storage.get_workstream.return_value = None
 
-        def update_state(_ws_id: str, state: str) -> None:
+        def update_state(_ws_id: str, state: str, lease: object = None) -> None:
             if state == WorkstreamState.RUNNING.value:
                 old_storage_started.set()
                 if not release_old_storage.wait(2):
@@ -3726,6 +3670,9 @@ class TestGenerationDurabilityFIFO:
                 storage_states.append(state)
 
         storage.update_workstream_state.side_effect = update_state
+        storage.acquire_workstream_lease.side_effect = lambda ws_id, **kwargs: LeaseGrant(
+            LeaseFence(ws_id, kwargs["holder"], 1, kwargs["incarnation_token"])
+        )
 
         class _Adapter:
             kind = WorkstreamKind.INTERACTIVE

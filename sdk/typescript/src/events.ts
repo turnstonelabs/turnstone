@@ -295,6 +295,12 @@ export interface WsClosedEvent {
   name?: string;
 }
 
+/** This node let go of the workstream (taken over, or its lease lapsed): drop it here only. */
+export interface WsUnloadedEvent {
+  type: "ws_unloaded";
+  ws_id: string;
+}
+
 /** Discriminated union of all server SSE event types. */
 export type ServerEvent =
   | ConnectedEvent
@@ -324,7 +330,8 @@ export type ServerEvent =
   | WsStateEvent
   | WsActivityEvent
   | WsRenameEvent
-  | WsClosedEvent;
+  | WsClosedEvent
+  | WsUnloadedEvent;
 
 // ---------------------------------------------------------------------------
 // Console cluster SSE events
@@ -367,6 +374,13 @@ export interface ClusterWsClosedEvent {
   ws_id: string;
 }
 
+/** A node let go of the workstream (taken over, or its lease lapsed): drop it there only. */
+export interface ClusterWsUnloadedEvent {
+  type: "ws_unloaded";
+  ws_id: string;
+  node_id: string;
+}
+
 export interface ClusterWsRenameEvent {
   type: "ws_rename";
   ws_id: string;
@@ -387,6 +401,7 @@ export type ClusterEvent =
   | ClusterStateEvent
   | ClusterWsCreatedEvent
   | ClusterWsClosedEvent
+  | ClusterWsUnloadedEvent
   | ClusterWsRenameEvent
   | ClusterSnapshotEvent;
 

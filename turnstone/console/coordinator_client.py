@@ -396,7 +396,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
     from turnstone.core.child_event_bus import ChildEventBus
-    from turnstone.core.storage._protocol import StorageBackend
+    from turnstone.core.storage._protocol import LeaseFence, StorageBackend
 
 log = get_logger(__name__)
 
@@ -1724,12 +1724,18 @@ class CoordinatorClient:
             return empty, False
         return load_task_envelope(self._storage, ws_id)
 
-    def _save_tasks(self, ws_id: str, envelope: dict[str, Any]) -> None:
+    def _save_tasks(
+        self,
+        ws_id: str,
+        envelope: dict[str, Any],
+        lease: LeaseFence | None,
+    ) -> None:
         # Save only the ``tasks`` key so concurrent writers to other
         # workstream_config keys (e.g. reasoning_effort from the admin UI)
-        # aren't clobbered by a read-modify-write on the full row.
+        # aren't clobbered by a read-modify-write on the full row. ``lease``
+        # is the coordinator session's owner-lease fence.
         self._storage.save_workstream_config(
-            ws_id, {"tasks": json.dumps(envelope, separators=(",", ":"))}
+            ws_id, {"tasks": json.dumps(envelope, separators=(",", ":"))}, lease=lease
         )
 
     def _task_lock(self, ws_id: str) -> threading.Lock:
@@ -1755,6 +1761,7 @@ class CoordinatorClient:
         status: str = "pending",
         child_ws_id: str = "",
         note: str = "",
+        lease: LeaseFence | None = None,
     ) -> dict[str, Any]:
         if ws_id != self._coord_ws_id:
             return {"error": f"tasks scope violation: {ws_id}"}
@@ -1845,7 +1852,7 @@ class CoordinatorClient:
             if clean_note:
                 task["note"] = clean_note
             envelope["tasks"].append(task)
-            self._save_tasks(ws_id, envelope)
+            self._save_tasks(ws_id, envelope, lease)
             return task
 
     def tasks_update(
@@ -1857,6 +1864,7 @@ class CoordinatorClient:
         status: str | None = None,
         child_ws_id: str | None = None,
         note: str | None = None,
+        lease: LeaseFence | None = None,
     ) -> dict[str, Any]:
         if ws_id != self._coord_ws_id:
             return {"error": f"tasks scope violation: {ws_id}"}
@@ -1902,14 +1910,16 @@ class CoordinatorClient:
                         else:
                             t.pop("note", None)
                     t["updated"] = _utc_now_iso()
-                    self._save_tasks(ws_id, envelope)
+                    self._save_tasks(ws_id, envelope, lease)
                     # t is a dict pulled out of a json-decoded list; mypy
                     # sees it as Any from the decode path.  Cast back to
                     # the annotated return type.
                     return dict(t)
             return {"error": f"task not found: {task_id}"}
 
-    def tasks_remove(self, ws_id: str, *, task_id: str) -> dict[str, Any]:
+    def tasks_remove(
+        self, ws_id: str, *, task_id: str, lease: LeaseFence | None = None
+    ) -> dict[str, Any]:
         """Remove a task by id.  Returns a result dict shaped like the
         other mutators — the caller can then distinguish scope violation
         vs corrupt envelope vs genuine not-found rather than collapsing
@@ -1926,10 +1936,12 @@ class CoordinatorClient:
             envelope["tasks"] = [t for t in envelope["tasks"] if t.get("id") != task_id]
             if len(envelope["tasks"]) == before:
                 return {"error": f"task not found: {task_id}"}
-            self._save_tasks(ws_id, envelope)
+            self._save_tasks(ws_id, envelope, lease)
             return {"ok": True, "task_id": task_id}
 
-    def tasks_reorder(self, ws_id: str, *, task_ids: list[str]) -> dict[str, Any]:
+    def tasks_reorder(
+        self, ws_id: str, *, task_ids: list[str], lease: LeaseFence | None = None
+    ) -> dict[str, Any]:
         """Reject unless ``task_ids`` is an exact permutation of the
         current set — prevents silent task loss from a partial reorder.
         """
@@ -1949,7 +1961,7 @@ class CoordinatorClient:
                 }
             by_id = {t.get("id"): t for t in envelope["tasks"]}
             envelope["tasks"] = [by_id[tid] for tid in task_ids]
-            self._save_tasks(ws_id, envelope)
+            self._save_tasks(ws_id, envelope, lease)
             return {"ok": True, "order": task_ids}
 
     def inspect(
@@ -2022,7 +2034,8 @@ class CoordinatorClient:
         # in the result below.  Verdict history remains queryable
         # through the admin / audit surfaces.
         result: dict[str, Any] = {
-            **full,
+            # ``lease_node_id`` is an internal routing hint, not child state.
+            **{key: value for key, value in full.items() if key != "lease_node_id"},
             "messages": _serialize_messages(
                 messages, include_provider_content=include_provider_content
             ),

@@ -182,27 +182,30 @@ class TestToolSearchEscape:
         assert session._tool_search is not None
         assert "tool_search" in _wire_names(session)
 
-    def test_mid_session_adopt_of_hard_set_drops_tool_search(
+    def test_a_hard_set_stamp_refuses_a_session_built_without_it(
         self, tmp_db, mock_openai_client
     ) -> None:
-        from turnstone.core.memory import register_workstream, save_workstream_config
+        from turnstone.core.memory import register_workstream, save_message, save_workstream_config
 
-        # Unstamped session with a live ToolSearchManager and a discovered tool.
-        session = _session(mock_openai_client, mcp_client=self._mcp_client(), tool_search="on")
-        assert session._tool_search is not None
+        # Unstamped session (a factory that ignored the stamp) with a live
+        # ToolSearchManager and a discovered tool, for a workstream whose
+        # stored stamp is hard-set (scribe-shaped). The pathway is gated at
+        # construction (test_omitted_is_hard), so the load refuses instead.
+        session = _session(
+            mock_openai_client,
+            ws_id="t" * 32,
+            mcp_client=self._mcp_client(),
+            tool_search="on",
+        )
         session._tool_search.expand_visible(["mcp_widget"])
-        # Adopt a hard-set (scribe-shaped) stamp via non-fork resume.
         register_workstream("t" * 32)
-        from turnstone.core.memory import save_message
-
         save_message("t" * 32, "user", "hi")
         save_workstream_config(
             "t" * 32, _snap(name="scribe", tools=frozenset(), memory=False).to_config()
         )
-        assert session.resume("t" * 32)
-        # The pathway is re-gated: no manager, no hint target, no escape hatch.
-        assert session._tool_search is None
-        assert _wire_names(session) == []
+        with pytest.raises(ValueError, match="built under another persona"):
+            session.rehydrate()
+        assert session.messages == []
 
     def test_omitted_is_hard(self, tmp_db, mock_openai_client) -> None:
         session = _session(
@@ -684,8 +687,13 @@ class TestRehydrateThreading:
         with patch.object(session, "_utility_completion", return_value=summary):
             assert session._compact_messages(auto=True) is True
 
-        fresh = _session(mock_openai_client)
-        assert fresh.resume(ws_id)
+        # A fresh load builds from the stamp still stored, as the manager does.
+        from turnstone.core.memory import load_workstream_config
+        from turnstone.core.personas import snapshot_from_config
+
+        stored = snapshot_from_config(load_workstream_config(ws_id))
+        fresh = _session(mock_openai_client, ws_id=ws_id, persona_snapshot=stored)
+        assert fresh.rehydrate()
         assert fresh._persona_name == "scribe"
         assert fresh._persona_prompt == "P"
         assert fresh._persona_tools == frozenset({"read_file"})
@@ -694,14 +702,14 @@ class TestRehydrateThreading:
 
 
 # ---------------------------------------------------------------------------
-# Guard 9, resume-adoption lane — a mid-session ``resume()`` parses the target
-# stamp BEFORE mutating session state: a corrupt stamp leaves this session
-# intact; an MCP-on stamp is refused by an MCP-gated-off session; an MCP-off
-# stamp narrows the live MCP surface in place.
+# Guard 9, rehydrate lane — ``rehydrate()`` parses the stored stamp BEFORE
+# mutating session state: a corrupt stamp raises with nothing loaded, and a
+# session built under another persona than the stored one (its MCP lever either
+# way) is refused with nothing loaded.
 # ---------------------------------------------------------------------------
 
 
-class TestResumeAdoption:
+class TestRehydrateStamp:
     @staticmethod
     def _mcp() -> MagicMock:
         mcp = MagicMock()
@@ -712,7 +720,7 @@ class TestResumeAdoption:
         mcp.prompt_count_for_user.return_value = 0
         return mcp
 
-    def test_corrupt_target_stamp_leaves_session_intact(self, tmp_db, mock_openai_client) -> None:
+    def test_corrupt_stamp_loads_nothing(self, tmp_db, mock_openai_client) -> None:
         from turnstone.core.memory import (
             load_workstream_config,
             register_workstream,
@@ -720,48 +728,47 @@ class TestResumeAdoption:
             save_workstream_config,
         )
 
-        a_id, b_id = "a" * 32, "b" * 32
-        register_workstream(a_id)
-        save_message(a_id, "user", "hi from A")
-        session = _session(mock_openai_client)
-        assert session.resume(a_id)  # this session lives on A
-        before_msgs = list(session.messages)
-
+        b_id = "b" * 32
         register_workstream(b_id)
         save_message(b_id, "user", "hi from B")
         save_workstream_config(b_id, {"persona": "scribe"})  # partial = corrupt
         b_config_before = load_workstream_config(b_id)
+        session = _session(mock_openai_client, ws_id=b_id)
 
         with pytest.raises(ValueError, match="corrupt persona snapshot"):
-            session.resume(b_id)
-        # Parse-before-mutate: identity + history untouched, still on A.
-        assert session._ws_id == a_id
-        assert session.messages == before_msgs
-        # ...and a later config save writes A's row, never repairs B's stamp
-        # with a persona the operator never chose for B.
-        session._save_config()
+            session.rehydrate()
+        # Parse-before-mutate: no history loaded, and the stamp is never
+        # "repaired" with a persona the operator did not choose.
+        assert session.messages == []
         assert load_workstream_config(b_id) == b_config_before
 
-    def test_mcp_on_stamp_refused_when_gated_off(self, tmp_db, mock_openai_client) -> None:
+    def test_an_mcp_on_stamp_refuses_a_session_built_mcp_off(
+        self, tmp_db, mock_openai_client
+    ) -> None:
         from turnstone.core.memory import (
             register_workstream,
             save_message,
             save_workstream_config,
         )
 
-        # A real client was withheld by the persona gate → _mcp_gated_off.
-        session = _session(
-            mock_openai_client, mcp_client=self._mcp(), persona_snapshot=_snap(mcp=False)
-        )
-        assert session._mcp_gated_off is True
+        # A real client was withheld by the persona gate at construction.
         b_id = "b" * 32
+        session = _session(
+            mock_openai_client,
+            ws_id=b_id,
+            mcp_client=self._mcp(),
+            persona_snapshot=_snap(mcp=False),
+        )
         register_workstream(b_id)
         save_message(b_id, "user", "hi")
         save_workstream_config(b_id, _snap(name="scribe", mcp=True).to_config())
-        with pytest.raises(ValueError, match="open the workstream fresh"):
-            session.resume(b_id)
+        with pytest.raises(ValueError, match="built under another persona"):
+            session.rehydrate()
+        assert session.messages == []
 
-    def test_mcp_off_stamp_narrows_in_place(self, tmp_db, mock_openai_client) -> None:
+    def test_an_mcp_off_stamp_refuses_a_session_built_with_mcp(
+        self, tmp_db, mock_openai_client
+    ) -> None:
         from turnstone.core.memory import (
             register_workstream,
             save_message,
@@ -769,27 +776,16 @@ class TestResumeAdoption:
         )
 
         mcp = self._mcp()
-        session = _session(mock_openai_client, mcp_client=mcp)  # legacy: MCP live
-        assert session._mcp_client is mcp
-        assert "mcp_widget" in {t["function"]["name"] for t in session._tools if "function" in t}
-
         b_id = "b" * 32
+        session = _session(mock_openai_client, ws_id=b_id, mcp_client=mcp)  # legacy: MCP live
         register_workstream(b_id)
         save_message(b_id, "user", "hi")
         save_workstream_config(b_id, _snap(name="scribe", mcp=False).to_config())
-        assert session.resume(b_id)
-        # Surface dropped in place: client gone, no MCP tools on either set.
-        assert session._mcp_client is None
-        assert "mcp_widget" not in {
-            t["function"]["name"] for t in session._tools if "function" in t
-        }
-        assert "mcp_widget" not in {
-            t["function"]["name"] for t in session._task_tools if "function" in t
-        }
-        # ...and the three listeners were deregistered on the way out.
-        mcp.remove_listener.assert_called()
-        mcp.remove_resource_listener.assert_called()
-        mcp.remove_prompt_listener.assert_called()
+        with pytest.raises(ValueError, match="built under another persona"):
+            session.rehydrate()
+        # Nothing changed: the live surface stays as built, nothing loaded.
+        assert session._mcp_client is mcp
+        assert session.messages == []
 
 
 # ---------------------------------------------------------------------------
@@ -845,7 +841,7 @@ class TestCliPersona:
                 "applies_to_kinds": ["interactive"],
             }
         )
-        kwargs = resolve_cli_persona_kwargs(storage, "writer", None)
+        kwargs = resolve_cli_persona_kwargs(storage, "writer")
         assert kwargs["persona"] == "writer"
         assert kwargs["persona_snapshot"].tools == frozenset()
 
@@ -853,7 +849,7 @@ class TestCliPersona:
         from turnstone.cli import resolve_cli_persona_kwargs
 
         with pytest.raises(SystemExit):
-            resolve_cli_persona_kwargs(get_storage(), "nope", None)
+            resolve_cli_persona_kwargs(get_storage(), "nope")
         assert "not found or disabled" in capsys.readouterr().out
 
     def test_kind_mismatch_exits(self, tmp_db) -> None:
@@ -869,21 +865,12 @@ class TestCliPersona:
             }
         )
         with pytest.raises(SystemExit):
-            resolve_cli_persona_kwargs(storage, "exec", None)
-
-    def test_resume_adopts_target_stamp(self, tmp_db) -> None:
-        from turnstone.cli import resolve_cli_persona_kwargs
-        from turnstone.core.memory import save_workstream_config
-
-        snap = _snap(name="scribe", tools=frozenset(), mcp=False, memory=False)
-        save_workstream_config("t" * 32, snap.to_config())
-        kwargs = resolve_cli_persona_kwargs(get_storage(), None, "t" * 32)
-        assert kwargs["persona_snapshot"] == snap
+            resolve_cli_persona_kwargs(storage, "exec")
 
     def test_no_default_yields_legacy(self, tmp_db) -> None:
         from turnstone.cli import resolve_cli_persona_kwargs
 
-        assert resolve_cli_persona_kwargs(get_storage(), None, None) == {}
+        assert resolve_cli_persona_kwargs(get_storage(), None) == {}
 
 
 # ---------------------------------------------------------------------------
@@ -1053,6 +1040,7 @@ class TestForkAdoptsStamp:
                 user_id=getattr(ui, "_user_id", ""),
                 project_id=str(kw.get("project_id") or ""),
                 persona_snapshot=kw.get("persona_snapshot"),
+                workstream_lease=kw.get("workstream_lease"),
             )
 
         gq: queue.Queue[dict[str, Any]] = queue.Queue()
@@ -1314,10 +1302,10 @@ class TestForkAdoptsStamp:
             clone_returned = True
             return snapshot
 
-        def _track_save(ws_id: str, config: dict[str, str]) -> None:
+        def _track_save(ws_id: str, config: dict[str, str], *, lease: Any = None) -> None:
             if ws_id == destination_id and clone_returned:
                 post_clone_destination_saves.append(dict(config))
-            original_save(ws_id, config)
+            original_save(ws_id, config, lease=lease)
 
         with (
             patch.object(storage, "load_workstream_config", side_effect=_change_after_preflight),
@@ -1519,6 +1507,7 @@ class TestCreateStampsPersona:
                 tool_timeout=10,
                 ws_id=ws_id,
                 persona_snapshot=kw.get("persona_snapshot"),
+                workstream_lease=kw.get("workstream_lease"),
             )
 
         gq: queue.Queue[dict[str, Any]] = queue.Queue()

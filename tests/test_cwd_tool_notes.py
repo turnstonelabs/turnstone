@@ -216,16 +216,3 @@ class TestSessionCwdNotes:
             session._on_mcp_tools_changed()
         assert _desc(session._tools, "bash").count(f"Commands run in {os.getcwd()}") == 1
         assert _desc(session._task_tools, "bash").count(f"Commands run in {os.getcwd()}") == 1
-
-    def test_mcp_drop_surface_keeps_single_note(self, tmp_db):
-        # The MCP-disconnect rebuild (_drop_mcp_surface, reached via resume()
-        # adopting an MCP-off persona) is the third rebuild trigger — the note
-        # must survive it, exactly once, on both lanes.
-        mock_mcp = MagicMock()
-        mock_mcp.get_tools.return_value = []
-        with patch("turnstone.core.session.get_workspace_dir", return_value=None):
-            session = _make_session(mcp_client=mock_mcp)
-            session._drop_mcp_surface()
-        assert session._mcp_client is None
-        assert _desc(session._tools, "bash").count(f"Commands run in {os.getcwd()}") == 1
-        assert _desc(session._task_tools, "bash").count(f"Commands run in {os.getcwd()}") == 1

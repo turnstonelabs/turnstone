@@ -1077,7 +1077,7 @@ class Pane {
         const func = verdict.func_name || "";
         showToast(
           "Judge verdict for " + func + ": " + rec + " (" + conf + "%)",
-          rec === "approve" ? "success" : rec === "deny" ? "error" : "warning",
+          rec === "approve" ? "success" : rec === "deny" ? "error" : "warn",
         );
         return;
       }

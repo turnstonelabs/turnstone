@@ -542,9 +542,9 @@ class TestSkillSessionRuntime:
         ws_id = session1.ws_id
         save_message(ws_id, "user", "hello")
 
-        session2 = _make_session()
+        session2 = _make_session(ws_id=ws_id)
         assert session2._skill_name is None
-        resumed = session2.resume(ws_id)
+        resumed = session2.rehydrate()
         assert resumed
         assert session2._skill_name == "resume-skill"
         content = _sys_content(session2)
@@ -2074,6 +2074,7 @@ class TestSkillConfigAppliedToWorkstream:
                 tool_timeout=30,
                 ws_id=ws_id,
                 skill=kwargs.get("skill"),
+                workstream_lease=kwargs.get("workstream_lease"),
             )
 
         gq: queue.Queue[dict[str, Any]] = queue.Queue()

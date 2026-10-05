@@ -5902,6 +5902,108 @@
         }
       }
     },
+    "/v1/api/route/workstreams/delete": {
+      "post": {
+        "summary": "Permanently delete a workstream through the console",
+        "operationId": "v1_api_route_workstreams_delete_post",
+        "tags": [
+          "Routing"
+        ],
+        "description": "Body ``{\"ws_id\": \"...\"}``.  A coordinator is deleted on this console, which holds its lease; any other workstream is forwarded to the node that owns it, and retried once at the holder when that node answers ``409`` ``workstream_lease_held``.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WorkstreamDeleteRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkstreamDeleteResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Error 400",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Error 403",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Error 409",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Error 500",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "Error 502",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Error 503",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/api/route": {
       "get": {
         "summary": "Look up which node owns a workstream",
@@ -6095,7 +6197,7 @@
         "tags": [
           "Coordinator"
         ],
-        "description": "Returns the persisted coordinator's display fields.  If the session isn't currently in memory, write scope is additionally required before the manager rehydrates it before responding; ``500`` on rehydrate failure carries a correlation id matching the server log line.",
+        "description": "Returns the persisted coordinator's display fields.  If the session isn't currently in memory, write scope is additionally required before the manager rehydrates it before responding; ``500`` on rehydrate failure carries a correlation id matching the server log line; ``409`` ``workstream_lease_held`` when another console holds it; ``429`` when every coordinator slot is busy (retry later).",
         "parameters": [
           {
             "name": "ws_id",
@@ -6139,6 +6241,26 @@
           },
           "404": {
             "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Error 409",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Error 429",
             "content": {
               "application/json": {
                 "schema": {
@@ -6209,7 +6331,7 @@
         "tags": [
           "Coordinator"
         ],
-        "description": "Parity with ``POST /v1/api/workstreams/{ws_id}/open`` \u2014 gives SDK callers and operators a way to warm a coordinator without browsing to it.  Idempotent: ``already_loaded=true`` when the session was already in memory.",
+        "description": "Parity with ``POST /v1/api/workstreams/{ws_id}/open`` \u2014 gives SDK callers and operators a way to warm a coordinator without browsing to it.  Idempotent: ``already_loaded=true`` when the session was already in memory.  ``409`` ``workstream_lease_held`` when another console holds the coordinator; ``429`` when every coordinator slot is busy (retry later).",
         "parameters": [
           {
             "name": "ws_id",
@@ -6261,8 +6383,103 @@
               }
             }
           },
+          "409": {
+            "description": "Error 409",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Error 429",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
           "500": {
             "description": "Error 500",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Error 503",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/api/workstreams/{ws_id}/title": {
+      "post": {
+        "summary": "Set a coordinator workstream's title",
+        "operationId": "v1_api_workstreams_{ws_id}_title_post",
+        "tags": [
+          "Coordinator"
+        ],
+        "description": "Body ``{\"title\": \"...\"}``.  ``409`` when another workstream already uses the name, or with code ``workstream_lease_held`` when another console holds the coordinator. ``503`` when the console runs no coordinator subsystem.",
+        "parameters": [
+          {
+            "name": "ws_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Error 400",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Error 403",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Error 409",
             "content": {
               "application/json": {
                 "schema": {
@@ -7931,6 +8148,45 @@
             "description": "Error message",
             "title": "Error",
             "type": "string"
+          },
+          "code": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Machine-readable reason on some refusals, e.g. ``workstream_lease_held`` (another process owns the workstream) or ``wrong_execution_node``",
+            "title": "Code"
+          },
+          "holder_node_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "With ``workstream_lease_held``: the node holding the lease, if known",
+            "title": "Holder Node Id"
+          },
+          "retry_after_ms": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "With ``workstream_lease_held``: milliseconds until that lease expires",
+            "title": "Retry After Ms"
           }
         },
         "required": [
@@ -16031,6 +16287,36 @@
           "turns"
         ],
         "title": "RewindRequest",
+        "type": "object"
+      },
+      "WorkstreamDeleteRequest": {
+        "description": "POST /v1/api/route/workstreams/delete request.",
+        "properties": {
+          "ws_id": {
+            "description": "ID of the workstream to delete",
+            "title": "Ws Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "ws_id"
+        ],
+        "title": "WorkstreamDeleteRequest",
+        "type": "object"
+      },
+      "WorkstreamDeleteResponse": {
+        "description": "Success response of a workstream delete.",
+        "properties": {
+          "deleted": {
+            "description": "ID of the workstream that was deleted",
+            "title": "Deleted",
+            "type": "string"
+          }
+        },
+        "required": [
+          "deleted"
+        ],
+        "title": "WorkstreamDeleteResponse",
         "type": "object"
       },
       "ListWorkstreamsResponse": {

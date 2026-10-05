@@ -441,6 +441,13 @@ class WsClosedEvent(ServerEvent):
     name: str = ""
 
 
+@dataclass
+class WsUnloadedEvent(ServerEvent):
+    """This node let go of the workstream (taken over, or its lease lapsed): drop it here only."""
+
+    type: str = "ws_unloaded"
+
+
 # ---------------------------------------------------------------------------
 # Console cluster events  (/v1/api/cluster/events)
 # ---------------------------------------------------------------------------
@@ -498,6 +505,15 @@ class ClusterWsCreatedEvent(ClusterEvent):
 class ClusterWsClosedEvent(ClusterEvent):
     type: str = "ws_closed"
     ws_id: str = ""
+
+
+@dataclass
+class ClusterWsUnloadedEvent(ClusterEvent):
+    """A node let go of the workstream (taken over, or its lease lapsed): drop it there only."""
+
+    type: str = "ws_unloaded"
+    ws_id: str = ""
+    node_id: str = ""
 
 
 @dataclass
@@ -592,6 +608,7 @@ _SERVER_REGISTRY: dict[str, type[ServerEvent]] = {
         WsActivityEvent,
         WsRenameEvent,
         WsClosedEvent,
+        WsUnloadedEvent,
     ]
 }
 
@@ -603,6 +620,7 @@ _CLUSTER_REGISTRY: dict[str, type[ClusterEvent]] = {
         ClusterStateEvent,
         ClusterWsCreatedEvent,
         ClusterWsClosedEvent,
+        ClusterWsUnloadedEvent,
         ClusterWsRenameEvent,
         ClusterSnapshotEvent,
         NodeSnapshotEvent,

@@ -214,7 +214,8 @@ class "ChatSession" as ChatSession {
     + compact_now() → bool
     + fork_from_storage(source_ws_id, principal_id, ...)
     + handle_command(command: str)
-    + resume(ws_id: str)
+    + rehydrate() → bool
+    + adopt_fork_snapshot(source_ws_id, snapshot)
     - _save_config()
     - _stream_response(my_generation) → ModelTurnResult
     - _model_turn_with_fallback(consumer, prepare_wire) → ModelTurnResult
@@ -263,6 +264,7 @@ interface "SessionEventEmitter" as EventEmitter <<Protocol>> {
     + emit_rehydrated(ws)
     + emit_state(ws, state)
     + emit_closed(ws_id, reason, name)
+    + on_lease_retired(ws)
 }
 
 class "SessionManager" as SessionMgr {

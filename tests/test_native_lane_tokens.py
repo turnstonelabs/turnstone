@@ -441,7 +441,9 @@ def test_cost_survives_storage_fork_and_resume(
     st = storage_backend
     ws = "ws-native-lane"
     st.register_workstream(ws, user_id="u1", title="t", kind="interactive")
-    reopened = make_session(client=mock_openai_client, context_window=200_000, max_tokens=1_000)
+    reopened = make_session(
+        ws_id=ws, client=mock_openai_client, context_window=200_000, max_tokens=1_000
+    )
     # The producing provider is this session's own, so a resume replays the lane.
     producer = reopened._model_binding.lane.provider.provider_name
     provenance = TurnProvenance(
@@ -473,7 +475,7 @@ def test_cost_survives_storage_fork_and_resume(
     assert fork_meta[NATIVE_TOKENS_META_KEY] == APPENDED
     assert fork_meta[PROVENANCE_META_KEY] == provenance.to_meta()
 
-    assert reopened.resume(ws) is True
+    assert reopened.rehydrate() is True
     assert reopened.messages[1].native_tokens == APPENDED
     # The resumed estimate charges the lane before any provider count exists.
     assert reopened._msg_tokens[1] >= APPENDED

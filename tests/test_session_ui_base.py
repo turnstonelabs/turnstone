@@ -243,6 +243,35 @@ def test_peer_can_make_binary_decision_but_cannot_add_feedback_or_always() -> No
     )
 
 
+def test_approve_always_grants_nothing_for_a_call_a_policy_refused() -> None:
+    """The refused call is on the card, but the person chose to always approve only the rest."""
+    ui = _make_ui()
+    cycle = _register_cycle(ui, ["c1", "c2"], execution_principal_id="alice")
+    cycle.items[1].update(
+        func_name="write_file", approval_label="write_file", denied=True, _refused_by="policy"
+    )
+
+    with _patch_get_storage(MagicMock()):
+        ui.resolve_approval(
+            True, always=True, cycle_id=cycle.cycle_id, resolver_principal_id="alice"
+        )
+
+    assert ui._always_approve_tools_by_principal["alice"] == {"bash"}
+
+
+def test_a_prompt_nobody_answers_is_marked_as_no_rejection() -> None:
+    """The session then sends no "the user rejected it" nudge."""
+    ui = _make_ui()
+    ui._APPROVAL_WAIT_TIMEOUT = 0.05
+    item = _pending_item("t-1")
+
+    with _patch_get_storage(MagicMock()), _patch_policies({}):
+        approved, _feedback = ui.approve_tools([item])
+
+    assert approved is False
+    assert (item["denied"], item["_refused_by"]) == (True, "timeout")
+
+
 def test_same_principal_feedback_and_always_are_preserved_and_attributed() -> None:
     storage = MagicMock()
     ui = _make_ui()
@@ -1913,7 +1942,7 @@ def _patch_policies(verdicts: dict[str, str]):  # type: ignore[no-untyped-def]
     """Neutralise the admin tool-policy stage so approve_tools tests
     isolate the Smart Approvals gate."""
     return patch(
-        "turnstone.core.policy.evaluate_tool_policies_batch",
+        "turnstone.core.policy.evaluate_loaded_tool_policies",
         return_value=verdicts,
     )
 
@@ -2215,6 +2244,50 @@ def test_approve_tools_smart_approves_whole_batch_without_prompt() -> None:
     assert "approve_request" not in events
 
 
+def _unattended_smart_ui() -> _SeedingUI:
+    ui = _SeedingUI(ws_id="ws-1", user_id="u1")
+    ui.smart_approvals_enabled = True
+    ui.smart_approval_threshold = 0.95
+    ui.smart_approval_wait_seconds = 1.0
+    assert ui.grant_unattended() is True
+    return ui
+
+
+def test_unattended_grant_lets_the_judge_clear_an_ask_matched_batch() -> None:
+    """The judge counts as the normal flow for an "ask" call nobody is there for."""
+    ui = _unattended_smart_ui()
+    asked, other = _pending_item("c1", "bash"), _pending_item("c2", "read_file")
+    ui.seed_verdicts = [_llm_verdict("c1"), _llm_verdict("c2")]
+    with _patch_get_storage(MagicMock()), _patch_policies({"bash": "ask"}):
+        approved, _feedback = ui.approve_tools([asked, other])
+
+    assert approved is True
+    # It judged the whole batch, all or nothing, as in an attended session.
+    assert [asked["auto_approve_reason"], other["auto_approve_reason"]] == [
+        "smart_approval",
+        "smart_approval",
+    ]
+    assert ui._approval_cycles == {}
+
+
+def test_unattended_grant_leaves_what_the_judge_holds_to_a_person() -> None:
+    ui = _unattended_smart_ui()
+    asked, other = _pending_item("c1", "bash"), _pending_item("c2", "read_file")
+    # One call the judge will not clear holds the whole batch.
+    ui.seed_verdicts = [_llm_verdict("c1"), _llm_verdict("c2", recommendation="review")]
+    timer = resolve_when_pending(ui, False)
+    timer.start()
+    try:
+        with _patch_get_storage(MagicMock()), _patch_policies({"bash": "ask"}):
+            approved, _feedback = ui.approve_tools([asked, other])
+    finally:
+        timer.cancel()
+
+    assert approved is False  # the person refused the asked call
+    assert not asked.get("auto_approved")
+    assert other["auto_approve_reason"] == "unattended_watch"
+
+
 def test_approve_tools_skips_smart_stage_when_disabled() -> None:
     """With Smart Approvals off (the default), a confident approve verdict
     does NOT bypass the human — approve_tools blocks on the prompt as
@@ -2392,6 +2465,13 @@ def test_auto_approve_reason_vocabulary_matches_js() -> None:
     assert m, "KNOWN_AUTO_APPROVE_REASONS set not found in coordinator.js"
     js_reasons = set(re.findall(r'"([^"]+)"', m.group(1)))
     assert js_reasons == AutoApproveReason.ALL
+    # ...and ALL names every reason the class defines.
+    defined = {
+        value
+        for name, value in vars(AutoApproveReason).items()
+        if name.isupper() and isinstance(value, str)
+    }
+    assert defined == AutoApproveReason.ALL
 
 
 def test_verdict_confidence_rejects_non_finite() -> None:

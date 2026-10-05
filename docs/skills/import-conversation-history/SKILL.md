@@ -31,7 +31,7 @@ Two tables carry the conversation:
 | `kind` | yes | `"interactive"` for normal threads. Do NOT use `"coordinator"` for imports — that's reserved for cluster-spawned coordinator workstreams. |
 | `parent_ws_id` | no | Leave NULL. Only set if you're importing a coordinator-spawned subtree and re-parenting it; rare. |
 | `user_id` | yes | Owner. Must exist in `users`; importer must know which Turnstone user owns the imported history. |
-| `node_id` | no | Nullable creation-time service/liveness hint. It is not the routing key or durable owner and may become stale after membership changes. Let a routed create stamp it; a direct shared-storage import may leave it NULL. |
+| `node_id` | no | Nullable creation-time placement hint. It is not the routing key or the owner (the owner lease is) and may become stale after membership changes. Let a routed create stamp it; a direct shared-storage import may leave it NULL. |
 | `alias` | no | Human-typeable short name. Optional; must be unique cluster-wide if set. |
 | `title` | no | Auto-titled later by the LLM; safe to leave NULL on import. |
 | `skill_id`, `skill_version` | yes | Default `""` and `0` unless the source thread was scoped to a Turnstone skill. |
@@ -64,8 +64,9 @@ The internal format is **OpenAI-shaped**, even when the source was Anthropic or 
   change when nodes join, leave, change weight, or an override changes. There
   is no stable prefix-derived placement to pre-compute or persist.
 - `workstreams.node_id` is stamped at creation and is not updated as HRW
-  placement changes. It supports display and liveness-safe cleanup; the console
-  router does not use it as the ordinary ownership decision.
+  placement changes. It is display metadata: cleanup keys on the owner lease,
+  and the console router prefers the node holding a live lease before ordinary
+  placement.
 - For multi-node imports, create through the console routing proxy when the
   lifecycle must be published, or write the history once through the cluster's
   configured **shared storage backend**. Never partition rows across node-local
@@ -102,6 +103,8 @@ Do **not** create the destination through the web/SDK create endpoint before a
 direct bulk import. Create publishes an empty live session. If that already
 happened, close the workstream and confirm the manager-authoritative live probe
 returns false before writing, then explicitly open it again after validation.
+Storage enforces this: while any server holds the workstream's owner lease, the
+import's writes are refused with `WorkstreamLeaseHeldError`.
 
 For attachment-free history, `save_messages_bulk(rows)` is the canonical
 single-transaction insert primitive and bypasses the LLM round-trip entirely.

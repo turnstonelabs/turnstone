@@ -401,9 +401,9 @@ def test_delete_endpoint_waits_for_admitted_create_publication(
         assert release_emit.wait(timeout=10), "test did not release create publication"
         original_emit(ws)
 
-    def _tracked_delete(candidate_id: str, reservation_token: str) -> bool:
+    def _tracked_delete(candidate_id: str, reservation_token: str, *, lease: Any = None) -> bool:
         durable_delete_entered.set()
-        return original_delete(candidate_id, reservation_token)
+        return original_delete(candidate_id, reservation_token, lease=lease)
 
     def _tracked_delete_persisted(*args: Any, **kwargs: Any) -> bool:
         delete_admission_entered.set()
@@ -522,7 +522,10 @@ def test_interactive_post_install_has_no_late_publication_after_terminal(
         if terminal == "close":
             assert mgr.close(destination_id) is True
         else:
-            assert storage.delete_workstream(destination_id) is True
+            assert (
+                storage.delete_workstream(destination_id, lease=mgr.lease_fence(destination_id))
+                is True
+            )
             assert mgr.delete(destination_id) is True
 
         events_before_release = _drain_global_events(client)

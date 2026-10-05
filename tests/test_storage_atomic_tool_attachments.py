@@ -12,7 +12,7 @@ from typing import Any
 import pytest
 from sqlalchemy.dialects import postgresql
 
-from tests._storage_fakes import make_attachment
+from tests._storage_fakes import lease_row, make_attachment
 from turnstone.core import memory
 from turnstone.core.storage import (
     AttachmentWrite,
@@ -388,6 +388,8 @@ class _PostgresResult:
 
 
 class _PostgresConnection:
+    dialect = postgresql.dialect()
+
     def __init__(self, results: list[_PostgresResult | BaseException]) -> None:
         self._results = results
         self.statements: list[Any] = []
@@ -435,7 +437,7 @@ def test_postgresql_tool_insert_uses_one_conflict_safe_transaction() -> None:
     attachment = _attachment("5" * 64, b"postgres-tool")
     conn = _PostgresConnection(
         [
-            _PostgresResult(row=("postgres-tool-insert",)),
+            _PostgresResult(row=lease_row("postgres-tool-insert")),
             _PostgresResult(scalar=51),
             _PostgresResult(scalar_values=[attachment.attachment_id]),
             _PostgresResult(scalar_values=[attachment.attachment_id]),
@@ -490,7 +492,7 @@ def test_postgresql_identical_retry_emits_no_refcount_update() -> None:
     )
     conn = _PostgresConnection(
         [
-            _PostgresResult(row=("postgres-tool-retry",)),
+            _PostgresResult(row=lease_row("postgres-tool-retry")),
             _PostgresResult(scalar=None),
             _PostgresResult(row=existing),
             _PostgresResult(rows=[_blob_row(attachment)]),
@@ -513,7 +515,7 @@ def test_postgresql_partial_failure_rolls_back_the_transaction() -> None:
     attachment = _attachment("7" * 64, b"postgres-rollback")
     conn = _PostgresConnection(
         [
-            _PostgresResult(row=("postgres-tool-rollback",)),
+            _PostgresResult(row=lease_row("postgres-tool-rollback")),
             _PostgresResult(scalar=71),
             _PostgresResult(scalar_values=[attachment.attachment_id]),
             RuntimeError("injected PostgreSQL retain failure"),

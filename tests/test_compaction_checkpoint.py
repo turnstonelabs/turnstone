@@ -1,22 +1,22 @@
 """Tests for persisted compaction checkpoints (rehydration-deadlock fix).
 
 Compaction swaps a session's in-memory history for a summary but leaves the full
-transcript in storage.  Without a durable marker, ``resume()`` reloaded the full
+transcript in storage.  Without a durable marker, a reload brought back the full
 pre-compaction history, which on a long session — or one switched to a smaller-
 context model — exceeds the window and deadlocks the first send.
 
 The fix persists one ``_source="compaction"`` marker (summary + watermark) so
-resume rehydrates ``[summary] + [rows after the watermark]`` while the full
+a session load gets ``[summary] + [rows after the watermark]`` while the full
 history stays in storage for ``/history``/export.  Covered here:
 
 - ``get_compaction_watermark`` — the boundary id (max-summarized), with and
   without a preserved tail, and on an empty workstream.
-- ``load_message_turns`` (resume) — checkpoint-aware slice, latest-marker-wins,
+- ``load_message_turns`` (session load) — checkpoint-aware slice, latest-marker-wins,
   preserved-tail handling, and the full-history fallbacks (no marker, malformed
   marker) that keep every pre-checkpoint session loading exactly as before.
 - ``load_messages`` (display) — markers stay invisible to ``/history``.
-- End-to-end: ``_compact_messages`` writes the marker and a fresh ``resume()``
-  rehydrates the bounded view, not the full transcript.
+- End-to-end: ``_compact_messages`` writes the marker and a fresh ``rehydrate()``
+  loads the bounded view, not the full transcript.
 """
 
 from __future__ import annotations
@@ -260,8 +260,10 @@ def test_compaction_persists_checkpoint_and_resume_is_bounded(tmp_db, mock_opena
     save_message(ws, "user", "after compaction")
 
     # A fresh session reopens the workstream.
-    sess2 = make_session(client=mock_openai_client, context_window=10_000, max_tokens=1_000)
-    assert sess2.resume(ws) is True
+    sess2 = make_session(
+        ws_id=ws, client=mock_openai_client, context_window=10_000, max_tokens=1_000
+    )
+    assert sess2.rehydrate() is True
     texts = [t.text for t in sess2.messages]
 
     assert texts[:2] == ["[Conversation summary]", "DENSE SUMMARY"]
@@ -393,8 +395,10 @@ def test_compaction_summary_producer_survives_storage_round_trip(
     assert fork_meta["summary_producer"] == "final-summary-producer"
     assert fork_meta[PROVENANCE_META_KEY] == provenance.to_meta()
 
-    reopened = make_session(client=mock_openai_client, context_window=10_000, max_tokens=1_000)
-    assert reopened.resume(ws) is True
+    reopened = make_session(
+        ws_id=ws, client=mock_openai_client, context_window=10_000, max_tokens=1_000
+    )
+    assert reopened.rehydrate() is True
     assert reopened.messages[1].text == "DENSE SUMMARY"
     assert (
         reopened.messages[1].meta.extra["source_meta"]["summary_producer"]
@@ -555,14 +559,14 @@ def test_rewind_after_compaction_never_deletes_summary_backing(tmp_db, mock_open
     sess._ws_id = ws
 
     # Trim one tail turn → keep = max(floor 4, total 6 - 1) = 5 → deletes only "a1".
-    sess._persist_truncation(1)
+    sess._persist_truncation(1, ws_id=sess._ws_id, lease=sess.write_fence())
     assert st.count_messages(ws) == 5
     survived = [t.text for t in st.load_message_turns(ws)]
     assert survived[:2] == ["[Conversation summary]", "SUMMARY"]  # marker + prefix intact
     assert "q1" in survived
 
     # Over-deep trim → clamps at the floor; the marker + prefix still survive.
-    sess._persist_truncation(100)
+    sess._persist_truncation(100, ws_id=sess._ws_id, lease=sess.write_fence())
     assert st.count_messages(ws) == 4  # floored at prefix + marker
     after = [t.text for t in st.load_message_turns(ws)]
     assert after == ["[Conversation summary]", "SUMMARY"]  # summary backing never deleted
@@ -582,7 +586,7 @@ def test_persist_truncation_uncompacted_matches_plain_tail_delete(tmp_db, mock_o
 
     sess = make_session(client=mock_openai_client, context_window=10_000, max_tokens=1_000)
     sess._ws_id = ws
-    sess._persist_truncation(2)  # remove the last 2
+    sess._persist_truncation(2, ws_id=sess._ws_id, lease=sess.write_fence())  # remove the last 2
     assert st.count_messages(ws) == 3
 
 
@@ -609,7 +613,7 @@ def test_persist_truncation_propagates_atomic_storage_failure(tmp_db, mock_opena
         ),
         pytest.raises(RuntimeError, match="injected atomic truncation failure"),
     ):
-        sess._persist_truncation(2)
+        sess._persist_truncation(2, ws_id=sess._ws_id, lease=sess.write_fence())
     assert st.count_messages(ws) == 4  # nothing deleted
 
 
@@ -625,7 +629,7 @@ def test_persist_truncation_zero_is_a_storage_noop(tmp_db, mock_openai_client):
     sess = make_session(client=mock_openai_client)
     sess._ws_id = ws
     with patch.object(st, "truncate_messages_tail") as truncate:
-        assert sess._persist_truncation(0) == 0
+        assert sess._persist_truncation(0, ws_id=sess._ws_id, lease=sess.write_fence()) == 0
     truncate.assert_not_called()
 
 

@@ -42,6 +42,7 @@ if TYPE_CHECKING:
     from turnstone.core.model_registry import ModelRegistry
     from turnstone.core.personas import PersonaSnapshot
     from turnstone.core.session import SessionUI
+    from turnstone.core.workstream_lease import WorkstreamLease
 
 log = get_logger(__name__)
 
@@ -104,6 +105,7 @@ def build_console_session_factory(
         judge_model: str | None = None,
         persona_snapshot: PersonaSnapshot | None = None,
         fork_reservation_token: str = "",
+        workstream_lease: WorkstreamLease | None = None,
     ) -> ChatSession:
         assert ui is not None, "console session_factory requires a non-None UI"
         if kind != WorkstreamKind.COORDINATOR:
@@ -250,6 +252,7 @@ def build_console_session_factory(
             coord_client=coord_client,
             persona_snapshot=persona_snapshot,
             fork_reservation_token=fork_reservation_token,
+            workstream_lease=workstream_lease,
         )
 
     return factory

@@ -2979,34 +2979,6 @@ class TestCompactionNoticeStamp:
         assert "notice" not in seen
 
 
-class TestPreSwapQueueFlush:
-    def test_new_flushes_stranded_queue_into_old_workstream(self, session):
-        """A message stranded in the queue from BEFORE a /new (a dying send
-        worker's closing race) must be persisted into the workstream it was
-        ADDRESSED to — flushed pre-swap, never carried across the identity
-        change into the fresh workstream's transcript."""
-        session._ws_id = "ws-old"
-        session.queue_message("stranded text")
-        saved: list[tuple[str, str, str]] = []
-
-        def fake_save(ws_id, role, content, **_kw):
-            saved.append((ws_id, role, content))
-            return 1
-
-        with (
-            patch("turnstone.core.session.save_message", side_effect=fake_save),
-            patch("turnstone.core.memory.register_workstream"),
-            patch.object(session, "_save_config"),
-            patch.object(session, "_follow_watch_registration"),
-        ):
-            session.handle_command("/new")
-        assert session._ws_id != "ws-old"
-        assert not session._queued_messages
-        flushed = [row for row in saved if row[2] == "stranded text"]
-        assert flushed and flushed[0][0] == "ws-old"  # old identity, pre-swap
-        assert all(row[2] != "stranded text" for row in saved if row[0] != "ws-old")
-
-
 class TestOrphanedCompactionRetirement:
     """A force-abandoned compaction must retire at its next checkpoint once
     a successor claims the generation — the checkpoint's event arm alone
