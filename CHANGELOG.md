@@ -188,6 +188,18 @@ frozen.
 
 ### Fixed
 
+- **A failed request no longer strands a web search (Anthropic).** When the model called web
+  search alongside another tool, the API held the search back until the next request. If that
+  request failed (an exhausted credit balance, say) and a new message followed, every later request
+  was rejected (`web_search tool use with id ... was found without a corresponding
+  web_search_tool_result block`) and the workstream could not continue. Such a search is now sent
+  back with the API's own `unavailable` error, so the model sees that it failed and can search
+  again in a later turn. A mid-turn compaction that kept a reply opening with a search result, but
+  summarized away the search that produced it, no longer breaks the workstream either.
+- **Native tool search keeps working after its first round (Anthropic).** The search's result was
+  left out when the conversation was sent back, so the API rejected every request from the second
+  one after a search onward and the workstream could not continue. The result is now passed back
+  unchanged, and workstreams already stuck this way continue.
 - **A saved workstream with no messages keeps its settings.** Opening one (from a pane, and now
   also `--resume` and `/resume`) applied the constructor's defaults instead of its saved model,
   sampling, instructions and skill, and the next settings change wrote those defaults over the

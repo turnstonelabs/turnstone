@@ -6,6 +6,7 @@ The ``anthropic`` SDK is imported lazily so it remains an optional dependency.
 
 from __future__ import annotations
 
+import functools
 import json
 import logging
 import sys
@@ -81,13 +82,231 @@ def _merge_consecutive(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
 _ANCHOR_USER_TEXT = "(No new user message.)"
 
 
+def _is_server_tool_result(block: Any) -> bool:
+    """True for a server tool result block (``web_search_tool_result`` and kin).
+
+    The client ``tool_result`` type lacks the leading underscore, so the suffix
+    test never matches it.
+    """
+    return isinstance(block, dict) and str(block.get("type", "")).endswith("_tool_result")
+
+
 def _ends_in_server_tool_result(msg: dict[str, Any]) -> bool:
     """True for an assistant turn whose last block is a server tool result."""
     content = msg.get("content")
     if not isinstance(content, list) or not content:
         return False
-    last = content[-1]
-    return isinstance(last, dict) and str(last.get("type", "")).endswith("_tool_result")
+    return _is_server_tool_result(content[-1])
+
+
+def _is_server_tool_block(block: Any) -> bool:
+    """True for a server tool call (``server_tool_use``) or a server tool result."""
+    return _is_server_tool_result(block) or (
+        isinstance(block, dict) and block.get("type") == "server_tool_use"
+    )
+
+
+def _continues_turn(msg: dict[str, Any]) -> bool:
+    """True for a message that leaves the assistant turn before it open.
+
+    That is a system message, or a user message holding nothing but tool results.
+    """
+    if msg["role"] == "system":
+        return True
+    content = msg["content"]
+    return (
+        msg["role"] == "user"
+        and isinstance(content, list)
+        and all(isinstance(b, dict) and b.get("type") == "tool_result" for b in content)
+    )
+
+
+def _unavailable_result(call: dict[str, Any]) -> dict[str, Any] | None:
+    """The API's own ``unavailable`` error result for a server tool *call*.
+
+    ``None`` for a server tool missing from ``_SERVER_TOOL_RESULT_TYPES``, whose
+    result shape is not known here.
+    """
+    result_type = _SERVER_TOOL_RESULT_TYPES.get(str(call.get("name", "")))
+    if result_type is None:
+        return None
+    return {
+        "type": result_type,
+        "tool_use_id": call.get("id"),
+        "content": {"type": f"{result_type}_error", "error_code": "unavailable"},
+    }
+
+
+@functools.lru_cache(maxsize=4096)
+def _log_repair_once(message: str, block_id: str) -> None:
+    """Log one pairing repair at INFO, the first time this process makes it.
+
+    History keeps the original blocks, so a repair recurs on every request that
+    replays them; this bounded memo keeps one line per block (an evicted block is
+    merely logged again).
+    """
+    log.info(message, block_id)
+
+
+def _pair_server_tool_blocks(
+    messages: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], bool]:
+    """Give each server tool call on the wire one result, and each result its call.
+
+    When a response mixes client tool calls with a server tool call (native web
+    search or tool search), the API returns the server call unrun.  It runs the
+    call on the next request and opens the next assistant turn with the result,
+    but only while that request still continues the turn: nothing but tool results
+    (and system messages) after it.  Three histories break that pairing, and the
+    API rejects every request that carries them:
+
+    * The continuation never succeeds and user text follows, or a later assistant
+      turn lacks the result, so the call can never run (``... tool use with id ...
+      was found without a corresponding web_search_tool_result block``).  The call
+      stays, answered by the API's own error result (code ``unavailable``,
+      documented as "an internal error occurred" for web search and "the search
+      couldn't run" for tool search): the model sees the search it asked for and
+      that it failed, not a call erased from its history, and not an empty result,
+      which would claim the search ran and matched nothing.  Repeating a search has
+      no effect to reconcile, so this holds even when the search may have run
+      unseen.  The answered calls move ahead of the turn's first client call, as
+      the API wants client calls after every server result in a turn, and go
+      together in their order, then their results: the API's own shape for
+      parallel searches.  Interleaved, the history would read as a search repeated
+      after an error result told the model not to.  A server tool with no known
+      error result has its call dropped instead.
+    * Mid-turn compaction keeps the in-flight turn, which opens with the result,
+      and summarizes away the turn holding the call.  The result is dropped; a
+      summary never carries search results either.
+    * A converter that dropped a tool search's result made the API run the search
+      again, so the next stored reply opens with a second result for the call.
+      Only the first result, in the call's own turn, is kept.
+
+    A turn left empty is dropped whole.  Each block's fate depends only on the
+    history around it: a turn's wire changes once, when the turn ends with a call
+    still unrun, and then stays fixed as later turns are appended.
+
+    Returns the repaired messages and whether any block was dropped: a drop can
+    leave a turn empty or change how it ends, so the caller re-runs placement,
+    merging and this pass.  Unchanged input comes back as the same list.
+    """
+    answered = {
+        block.get("tool_use_id")
+        for msg in messages
+        if msg["role"] == "assistant" and isinstance(msg["content"], list)
+        for block in msg["content"]
+        if _is_server_tool_result(block)
+    }
+    # open_after[i]: everything after message i leaves its turn open, so an unrun
+    # call in message i still runs on this request.
+    open_after = [True] * len(messages)
+    for i in range(len(messages) - 2, -1, -1):
+        open_after[i] = open_after[i + 1] and _continues_turn(messages[i + 1])
+    # Calls seen earlier on the wire whose result has not come yet.
+    awaiting: set[Any] = set()
+    out: list[dict[str, Any]] = []
+    settled: list[str] = []
+    dropped: list[str] = []
+    for i, msg in enumerate(messages):
+        content = msg["content"]
+        if (
+            msg["role"] != "assistant"
+            or not isinstance(content, list)
+            or not any(_is_server_tool_block(b) for b in content)
+        ):
+            out.append(msg)
+            continue
+        blocks: list[Any] = []
+        answered_calls: list[Any] = []
+        unavailable: list[Any] = []
+        # Where the first answered call stood, and where the first client call is.
+        group_at: int | None = None
+        first_client: int | None = None
+        changed = False
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "server_tool_use":
+                if block.get("id") not in answered and not open_after[i]:
+                    changed = True
+                    result = _unavailable_result(block)
+                    if result is None:
+                        log.warning(
+                            "Dropped an unrun call of server tool %r, which has no "
+                            "registered result type",
+                            block.get("name"),
+                        )
+                        dropped.append(str(block.get("id")))
+                        continue
+                    settled.append(str(block.get("id")))
+                    _log_repair_once(
+                        "Answered server tool call %s as unavailable: its turn ended "
+                        "before the call could run",
+                        str(block.get("id")),
+                    )
+                    if group_at is None:
+                        group_at = len(blocks)
+                    answered_calls.append(block)
+                    unavailable.append(result)
+                    continue
+                awaiting.add(block.get("id"))
+            elif _is_server_tool_result(block):
+                # No call before it, or its call already has a result.
+                if block.get("tool_use_id") not in awaiting:
+                    changed = True
+                    dropped.append(str(block.get("tool_use_id")))
+                    _log_repair_once(
+                        "Dropped a server tool result for %s: no call before it awaits one",
+                        str(block.get("tool_use_id")),
+                    )
+                    continue
+                awaiting.remove(block.get("tool_use_id"))
+            elif (
+                first_client is None and isinstance(block, dict) and block.get("type") == "tool_use"
+            ):
+                first_client = len(blocks)
+            blocks.append(block)
+        if group_at is not None:
+            at = group_at if first_client is None else min(group_at, first_client)
+            blocks[at:at] = answered_calls + unavailable
+        if not changed:
+            out.append(msg)
+        elif blocks:
+            out.append({**msg, "content": blocks})
+    if not settled and not dropped:
+        return messages, False
+    log.debug(
+        "Server tool pairing: answered unrun call(s) %s as unavailable, dropped %s",
+        settled,
+        dropped,
+    )
+    return out, bool(dropped)
+
+
+def _finish_wire(
+    messages: list[dict[str, Any]], *, server_blocks: int, place_system: bool
+) -> list[dict[str, Any]]:
+    """Place inline system messages, merge same-role turns, then pair server tool blocks.
+
+    Pairing runs on the final shape because a placeholder user turn ends an
+    assistant turn just as user text does.  A drop can change that shape (a turn
+    left empty, or one that no longer ends in a server result), so every step runs
+    again after a drop.  Each block is answered or dropped at most once, so the
+    drops never outnumber ``server_blocks``; the bound guards that argument, not an
+    expected case.
+    """
+    passes = 0
+    while True:
+        if place_system:
+            messages = _place_system_messages(messages)
+        messages = _merge_consecutive(messages)
+        if not server_blocks:
+            return messages
+        if passes > server_blocks:
+            log.warning("Server tool pairing still dropping blocks after %d passes", passes)
+            return messages
+        messages, dropped = _pair_server_tool_blocks(messages)
+        if not dropped:
+            return messages
+        passes += 1
 
 
 def _place_system_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -142,6 +361,16 @@ _WEB_SEARCH_TOOL_TYPE = "web_search_20250305"
 
 # Tool search: server-side BM25 tool discovery for deferred tools
 _TOOL_SEARCH_TOOL_TYPE = "tool_search_tool_bm25"
+
+# The result block type of each server tool this lane injects, keyed by the name on
+# its ``server_tool_use``.  The one registry for server tools: the valid block set
+# takes its result types from here, and pairing answers an unrunnable call with
+# this type's ``unavailable`` error.
+_SERVER_TOOL_RESULT_TYPES = {
+    "web_search": "web_search_tool_result",
+    _TOOL_SEARCH_TOOL_TYPE: "tool_search_tool_result",
+}
+
 # Beta value that unlocks ``thinking.block_binding`` (see
 # ``ModelCapabilities.thinking_prefix_bound``).  Sent as an
 # ``anthropic-beta`` request header, comma-joined with any value a caller
@@ -512,12 +741,14 @@ def _map_reasoning_to_effort(
 # the synthetic ``reasoning_text`` from path-3 capture) are dropped
 # individually; valid Anthropic blocks in the same message still ride
 # the verbatim path.  When no valid blocks survive, the converter falls
-# through to the text+tool_calls rebuild path.  Web-search blocks
-# (``server_tool_use`` / ``web_search_tool_result``) stay in the set
-# because they carry ``encrypted_content`` the API requires for
-# round-trip continuity — the per-block filter preserves them even when
-# they share a message with a foreign block (the prior all-or-nothing
-# filter would have silently dropped them in that case).
+# through to the text+tool_calls rebuild path.  Server tool blocks
+# (``server_tool_use`` and the result types in
+# ``_SERVER_TOOL_RESULT_TYPES``) stay in the set because the API wants
+# them passed back unchanged: it rejects a call whose result is
+# missing, and web search results carry the ``encrypted_content`` that
+# round-trip continuity needs.  The per-block filter preserves them even
+# when they share a message with a foreign block (the prior
+# all-or-nothing filter would have silently dropped them in that case).
 ANTHROPIC_VALID_BLOCK_TYPES = frozenset(
     {
         "text",
@@ -527,7 +758,7 @@ ANTHROPIC_VALID_BLOCK_TYPES = frozenset(
         "tool_use",
         "tool_result",
         "server_tool_use",
-        "web_search_tool_result",
+        *_SERVER_TOOL_RESULT_TYPES.values(),
     }
 )
 
@@ -765,9 +996,16 @@ class AnthropicProvider:
         shared a message with ``server_tool_use`` /
         ``web_search_tool_result``.  If the filter leaves nothing, the
         converter falls through to the text+tool_calls rebuild path.
+
+        A server tool call or result whose pairing is broken on the final wire (an
+        interrupted continuation followed by new user text; a compaction that kept
+        a result but summarized its call away; a second result for one call) is
+        repaired there; see ``_pair_server_tool_blocks``.
         """
         system_parts: list[str] = []
         converted: list[dict[str, Any]] = []
+        # Server tool blocks reaching the wire: zero skips the pairing repair.
+        server_blocks = 0
         # Leading system/developer messages are the base prompt → hoist into the
         # top-level ``system`` param; a system message AFTER the first non-system
         # turn is a mid-conversation operator turn (present only on the native
@@ -828,6 +1066,8 @@ class AnthropicProvider:
                             all_input_valid = False
                             continue
                         valid_blocks.append(b)
+                        if _is_server_tool_block(b):
+                            server_blocks += 1
                         if (
                             not replay_reasoning_to_model
                             and btype in ANTHROPIC_REASONING_BLOCK_TYPES
@@ -948,9 +1188,12 @@ class AnthropicProvider:
             converted.append({"role": "user", "content": str(msg.get("content", ""))})
             i += 1
 
-        if supports_mid_conversation_system:
-            converted = _place_system_messages(converted)
-        return "\n\n".join(system_parts), _merge_consecutive(converted)
+        converted = _finish_wire(
+            converted,
+            server_blocks=server_blocks,
+            place_system=supports_mid_conversation_system,
+        )
+        return "\n\n".join(system_parts), converted
 
     @staticmethod
     def _convert_content_parts(parts: list[dict[str, Any]]) -> list[dict[str, Any]]:

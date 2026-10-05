@@ -526,6 +526,26 @@ class TestConstants:
         assert "tool_use" in ANTHROPIC_VALID_BLOCK_TYPES
         assert "tool_result" in ANTHROPIC_VALID_BLOCK_TYPES
 
+    def test_every_injected_server_tool_has_a_replayed_result_type(self) -> None:
+        # A server tool whose result type is missing from the registry has its result
+        # filtered on replay, so the API rejects every later request (native tool
+        # search did exactly that).  Every server tool the lane injects must be listed.
+        from turnstone.core.providers._anthropic import _SERVER_TOOL_RESULT_TYPES
+
+        provider = AnthropicProvider()
+        caps = provider.get_capabilities("claude-opus-5-5")
+        assert caps.supports_web_search and caps.supports_tool_search
+        client_tools = [
+            {"name": "web_search", "input_schema": {"type": "object"}},
+            {"name": "deferred", "input_schema": {"type": "object"}},
+        ]
+        tools = provider._inject_tool_search(
+            provider._inject_web_search(client_tools, caps), caps, frozenset({"deferred"})
+        )
+        server_tools = {t["name"] for t in tools if "type" in t}
+        assert server_tools == set(_SERVER_TOOL_RESULT_TYPES)
+        assert set(_SERVER_TOOL_RESULT_TYPES.values()) <= ANTHROPIC_VALID_BLOCK_TYPES
+
     def test_reasoning_subset_of_valid(self) -> None:
         # The strip set must be a subset of the valid set — otherwise
         # the strip predicate would never match anything (we only

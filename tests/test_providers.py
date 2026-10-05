@@ -1627,6 +1627,443 @@ class TestAnthropicProvider:
         assert after_next[: len(after_reply)] == after_reply
         self._assert_system_placement_legal(after_next)
 
+    @staticmethod
+    def _unrun_search_history() -> list[dict[str, Any]]:
+        # A response that called a client tool and web search together: the API
+        # returns the search unrun, runs it on the next request, and opens the
+        # next assistant turn with its result.
+        return [
+            {"role": "user", "content": "build the digest"},
+            {
+                "role": "assistant",
+                "content": "",
+                "_provider_content": [
+                    {"type": "thinking", "thinking": "fetch and search", "signature": "sig"},
+                    {"type": "tool_use", "id": "toolu_1", "name": "run", "input": {}},
+                    {
+                        "type": "server_tool_use",
+                        "id": "srvtoolu_1",
+                        "name": "web_search",
+                        "input": {"query": "q"},
+                    },
+                ],
+                "tool_calls": [
+                    {
+                        "id": "toolu_1",
+                        "type": "function",
+                        "function": {"name": "run", "arguments": "{}"},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "toolu_1", "content": "out"},
+        ]
+
+    @staticmethod
+    def _block_types(msg: dict[str, Any]) -> list[str]:
+        return [b["type"] for b in msg["content"]]
+
+    @pytest.mark.parametrize("trailing_system", [False, True])
+    def test_unrun_server_tool_call_kept_while_turn_continues(self, trailing_system: bool) -> None:
+        # Only tool results (and a system note) follow, so this request still
+        # continues the turn and the API runs the search now.
+        history = self._unrun_search_history()
+        if trailing_system:
+            history.append({"role": "system", "content": "a tool failed"})
+        _, converted = self.provider._convert_messages(
+            history, supports_mid_conversation_system=True
+        )
+        assert converted[1]["content"] is history[1]["_provider_content"]
+        assert self._block_types(converted[-1 - trailing_system]) == ["tool_result"]
+
+    _UNAVAILABLE = {
+        "type": "web_search_tool_result",
+        "tool_use_id": "srvtoolu_1",
+        "content": {"type": "web_search_tool_result_error", "error_code": "unavailable"},
+    }
+
+    @pytest.mark.parametrize(
+        ("tool", "result_type"),
+        [
+            ("web_search", "web_search_tool_result"),
+            ("tool_search_tool_bm25", "tool_search_tool_result"),
+        ],
+    )
+    @pytest.mark.parametrize("native", [False, True])
+    def test_unrun_server_tool_call_answered_unavailable_after_user_text(
+        self, native: bool, tool: str, result_type: str
+    ) -> None:
+        # The continuation failed (an exhausted credit balance, say) and the user
+        # wrote again: the text ends the turn, so the search can never run and the
+        # API would reject every request that still carries it unanswered.  It is
+        # answered with the API's own "unavailable" error, the pair moved ahead of
+        # the client call (the API wants client calls after every server result).
+        history = [
+            *self._unrun_search_history(),
+            {"role": "system", "content": "a tool failed"},
+            {"role": "user", "content": "please recover"},
+        ]
+        history[1]["_provider_content"][2]["name"] = tool
+        _, converted = self.provider._convert_messages(
+            history, supports_mid_conversation_system=native
+        )
+        native_lane = history[1]["_provider_content"]
+        assert converted[1]["content"] == [
+            native_lane[0],
+            native_lane[2],
+            {
+                "type": result_type,
+                "tool_use_id": "srvtoolu_1",
+                "content": {"type": f"{result_type}_error", "error_code": "unavailable"},
+            },
+            native_lane[1],
+        ]
+        assert converted[1]["content"][0] is native_lane[0]
+        assert self._block_types(converted[2])[0] == "tool_result"
+        assert converted[2]["content"][-1] == {"type": "text", "text": "please recover"}
+
+    def test_answered_server_tool_call_kept_after_user_text(self) -> None:
+        # The continuation succeeded, so the next assistant turn opens with the
+        # result and the call stays on the wire.
+        history = [
+            *self._unrun_search_history(),
+            {
+                "role": "assistant",
+                "content": "found it",
+                "_provider_content": [
+                    {"type": "web_search_tool_result", "tool_use_id": "srvtoolu_1", "content": []},
+                    {"type": "text", "text": "found it"},
+                ],
+            },
+            {"role": "user", "content": "thanks"},
+        ]
+        _, converted = self.provider._convert_messages(history)
+        assert converted[1]["content"] is history[1]["_provider_content"]
+
+    def test_repair_is_logged_once_per_call(self, caplog) -> None:
+        # The repair recurs on every request that replays the turn; operators get
+        # one INFO line per call, not one per request.
+        history = [*self._unrun_search_history(), {"role": "user", "content": "please recover"}]
+        history[1]["_provider_content"][2]["id"] = "srvtoolu_logged_once"
+        with caplog.at_level(logging.INFO, logger="turnstone.core.providers._anthropic"):
+            self.provider._convert_messages(history)
+            self.provider._convert_messages(history)
+        lines = [
+            r
+            for r in caplog.records
+            if r.levelno == logging.INFO and "srvtoolu_logged_once" in r.getMessage()
+        ]
+        assert len(lines) == 1
+
+    def test_unrun_server_tool_call_answered_when_later_turn_lacks_result(self) -> None:
+        # A later assistant turn without the result also ends the turn.
+        history = [
+            *self._unrun_search_history(),
+            {"role": "assistant", "content": "done"},
+        ]
+        _, converted = self.provider._convert_messages(history)
+        assert self._block_types(converted[1]) == [
+            "thinking",
+            "server_tool_use",
+            "web_search_tool_result",
+            "tool_use",
+        ]
+        assert converted[-1]["content"] == [{"type": "text", "text": "done"}]
+
+    def test_paused_search_answered_unavailable_after_user_text(self) -> None:
+        # A paused turn (no client calls) left its search unrun; it stays in place.
+        call = {
+            "type": "server_tool_use",
+            "id": "srvtoolu_1",
+            "name": "web_search",
+            "input": {"query": "q"},
+        }
+        history = [
+            {"role": "user", "content": "search"},
+            {"role": "assistant", "content": "", "_provider_content": [call]},
+            {"role": "user", "content": "anything?"},
+        ]
+        _, converted = self.provider._convert_messages(history)
+        assert converted[1]["content"] == [call, self._UNAVAILABLE]
+
+    def test_several_unrun_searches_are_answered_as_one_parallel_group(self) -> None:
+        # The incident's shape: client calls, then two searches, then a client call.
+        # The calls go first, then their results, the API's own shape for parallel
+        # searches; interleaved, the second search would read as a retry after the
+        # first result said not to use the tool again.
+        calls = [
+            {"type": "tool_use", "id": f"toolu_{n}", "name": "run", "input": {}} for n in (1, 2, 3)
+        ]
+        searches = [
+            {
+                "type": "server_tool_use",
+                "id": f"srvtoolu_{n}",
+                "name": "web_search",
+                "input": {"query": f"q{n}"},
+            }
+            for n in (1, 2)
+        ]
+        last = {"type": "tool_use", "id": "toolu_4", "name": "run", "input": {}}
+        thinking = {"type": "thinking", "thinking": "gather", "signature": "sig"}
+        history = [
+            {"role": "user", "content": "digest"},
+            {
+                "role": "assistant",
+                "content": "",
+                "_provider_content": [thinking, *calls, *searches, last],
+                "tool_calls": [
+                    {
+                        "id": c["id"],
+                        "type": "function",
+                        "function": {"name": "run", "arguments": "{}"},
+                    }
+                    for c in [*calls, last]
+                ],
+            },
+            *[{"role": "tool", "tool_call_id": c["id"], "content": "done"} for c in [*calls, last]],
+            {"role": "user", "content": "please recover"},
+        ]
+        _, converted = self.provider._convert_messages(history)
+        results = [
+            {
+                "type": "web_search_tool_result",
+                "tool_use_id": s["id"],
+                "content": {"type": "web_search_tool_result_error", "error_code": "unavailable"},
+            }
+            for s in searches
+        ]
+        assert converted[1]["content"] == [
+            thinking,
+            searches[0],
+            searches[1],
+            results[0],
+            results[1],
+            *calls,
+            last,
+        ]
+
+    def test_unrun_call_of_other_server_tool_is_dropped(self, caplog) -> None:
+        # Only server tools with a registered result type can be answered; a missing
+        # registration is loud, not a silent drop.
+        history = [*self._unrun_search_history(), {"role": "user", "content": "please recover"}]
+        history[1]["_provider_content"][2]["name"] = "code_execution"
+        with caplog.at_level(logging.WARNING, logger="turnstone.core.providers._anthropic"):
+            _, converted = self.provider._convert_messages(history)
+        assert self._block_types(converted[1]) == ["thinking", "tool_use"]
+        assert any("code_execution" in r.getMessage() for r in caplog.records)
+
+    @staticmethod
+    def _compacted_with_orphan_result(tail: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        # Mid-turn compaction kept only the in-flight turn, which opens with the
+        # result of a search whose call was summarized away.
+        return [
+            {"role": "user", "content": "[Conversation summary]"},
+            {"role": "assistant", "content": "Summary."},
+            {
+                "role": "assistant",
+                "content": "",
+                "_provider_content": [
+                    {"type": "web_search_tool_result", "tool_use_id": "srvtoolu_1", "content": []},
+                    *tail,
+                ],
+            },
+        ]
+
+    def test_server_tool_result_without_its_call_is_dropped(self) -> None:
+        history = [
+            *self._compacted_with_orphan_result(
+                [
+                    {"type": "thinking", "thinking": "next", "signature": "sig"},
+                    {"type": "tool_use", "id": "toolu_2", "name": "run", "input": {}},
+                ]
+            ),
+            {"role": "tool", "tool_call_id": "toolu_2", "content": "out"},
+        ]
+        history[2]["tool_calls"] = [
+            {"id": "toolu_2", "type": "function", "function": {"name": "run", "arguments": "{}"}}
+        ]
+        _, converted = self.provider._convert_messages(history)
+        assert self._block_types(converted[1]) == ["text", "thinking", "tool_use"]
+
+    def test_dropped_result_reruns_system_placement_when_native(self) -> None:
+        # The kept turn ended in the result, so the note needed no placeholder;
+        # without the result it ends in plain text and now does.
+        from turnstone.core.providers._anthropic import _ANCHOR_USER_TEXT
+
+        history = [*self._compacted_with_orphan_result([]), {"role": "system", "content": "note"}]
+        _, converted = self.provider._convert_messages(
+            history, supports_mid_conversation_system=True
+        )
+        assert [m["role"] for m in converted] == ["user", "assistant", "user", "system"]
+        assert converted[2]["content"] == _ANCHOR_USER_TEXT
+        self._assert_system_placement_legal(converted)
+
+    def test_turn_left_empty_by_dropped_result_is_removed(self) -> None:
+        history = [
+            {"role": "user", "content": "search"},
+            {
+                "role": "assistant",
+                "content": "",
+                "_provider_content": [
+                    {"type": "web_search_tool_result", "tool_use_id": "srvtoolu_1", "content": []}
+                ],
+            },
+            {"role": "system", "content": "note"},
+            {"role": "user", "content": "anything?"},
+        ]
+        _, converted = self.provider._convert_messages(
+            history, supports_mid_conversation_system=True
+        )
+        assert [m["role"] for m in converted] == ["user", "system"]
+        assert self._block_types(converted[0]) == ["text", "text"]
+        self._assert_system_placement_legal(converted)
+
+    def test_unrun_call_before_orphan_result_settles_after_placement_reruns(self) -> None:
+        # Dropping the result leaves the turn ending in the unrun call, so the note
+        # needs a placeholder user turn; that placeholder ends the turn, so the next
+        # pass answers the call.
+        from turnstone.core.providers._anthropic import _ANCHOR_USER_TEXT
+
+        call = {
+            "type": "server_tool_use",
+            "id": "srvtoolu_1",
+            "name": "web_search",
+            "input": {"query": "q"},
+        }
+        history = [
+            {"role": "user", "content": "search"},
+            {
+                "role": "assistant",
+                "content": "",
+                "_provider_content": [
+                    call,
+                    {"type": "web_search_tool_result", "tool_use_id": "srvtoolu_9", "content": []},
+                ],
+            },
+            {"role": "system", "content": "note"},
+        ]
+        _, converted = self.provider._convert_messages(
+            history, supports_mid_conversation_system=True
+        )
+        assert [m["role"] for m in converted] == ["user", "assistant", "user", "system"]
+        assert converted[1]["content"] == [call, self._UNAVAILABLE]
+        assert converted[2]["content"] == _ANCHOR_USER_TEXT
+        self._assert_system_placement_legal(converted)
+
+    def test_pairing_returns_a_paired_wire_unchanged(self) -> None:
+        from turnstone.core.providers._anthropic import _pair_server_tool_blocks
+
+        wire = [
+            {"role": "user", "content": "search"},
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "server_tool_use",
+                        "id": "srvtoolu_1",
+                        "name": "web_search",
+                        "input": {"query": "q"},
+                    },
+                    {"type": "web_search_tool_result", "tool_use_id": "srvtoolu_1", "content": []},
+                    {"type": "text", "text": "found it"},
+                ],
+            },
+            {"role": "user", "content": "thanks"},
+        ]
+        paired, dropped = _pair_server_tool_blocks(wire)
+        assert paired is wire
+        assert dropped is False
+
+    def test_answered_unrun_call_keeps_wire_prefix_as_history_grows(self) -> None:
+        history = [*self._unrun_search_history(), {"role": "user", "content": "please recover"}]
+        reply = {"role": "assistant", "content": "recovered"}
+        _, before = self.provider._convert_messages(history)
+        _, after_next = self.provider._convert_messages(
+            [*history, reply, {"role": "user", "content": "next"}]
+        )
+        assert after_next[: len(before)] == before
+
+    @staticmethod
+    def _tool_search_history() -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        # A native tool-search turn (search, its result, a call to the found tool)
+        # and its tool result.
+        search_turn = [
+            {"type": "thinking", "thinking": "find a weather tool", "signature": "sig"},
+            {
+                "type": "server_tool_use",
+                "id": "srvtoolu_1",
+                "name": "tool_search_tool_bm25",
+                "input": {"query": "weather"},
+            },
+            {
+                "type": "tool_search_tool_result",
+                "tool_use_id": "srvtoolu_1",
+                "content": {
+                    "type": "tool_search_tool_search_result",
+                    "tool_references": [{"type": "tool_reference", "tool_name": "get_weather"}],
+                },
+            },
+            {"type": "tool_use", "id": "toolu_1", "name": "get_weather", "input": {}},
+        ]
+        history = [
+            {"role": "user", "content": "weather in Paris?"},
+            {
+                "role": "assistant",
+                "content": "",
+                "_provider_content": search_turn,
+                "tool_calls": [
+                    {
+                        "id": "toolu_1",
+                        "type": "function",
+                        "function": {"name": "get_weather", "arguments": "{}"},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "toolu_1", "content": "18C"},
+        ]
+        return search_turn, history
+
+    def test_tool_search_turn_keeps_its_result_and_wire_prefix(self) -> None:
+        # Native tool search: the result must be passed back unchanged, so the turn
+        # replays whole and reads the same on every later request.
+        search_turn, history = self._tool_search_history()
+        _, before = self.provider._convert_messages(history)
+        _, after_next = self.provider._convert_messages(
+            [
+                *history,
+                {"role": "assistant", "content": "It is 18C."},
+                {"role": "user", "content": "And Rome?"},
+            ]
+        )
+        assert before[1]["content"] is search_turn
+        assert after_next[: len(before)] == before
+
+    def test_second_result_for_an_answered_call_is_dropped(self) -> None:
+        # A converter that dropped the search's result made the API run the search
+        # again, so the stored reply opens with a second result for the same call.
+        search_turn, history = self._tool_search_history()
+        rerun = {**search_turn[2]}
+        _, converted = self.provider._convert_messages(
+            [
+                *history,
+                {
+                    "role": "assistant",
+                    "content": "It is 18C.",
+                    "_provider_content": [rerun, {"type": "text", "text": "It is 18C."}],
+                },
+                {"role": "user", "content": "And Rome?"},
+            ]
+        )
+        assert converted[1]["content"] is search_turn
+        assert converted[3]["content"] == [{"type": "text", "text": "It is 18C."}]
+        results = [
+            b
+            for m in converted
+            if isinstance(m["content"], list)
+            for b in m["content"]
+            if b.get("type") == "tool_search_tool_result"
+        ]
+        assert len(results) == 1
+
     def test_reasoning_params_mapping(self) -> None:
         assert self.provider._reasoning_params("low", None, max_tokens=32768) == {
             "thinking": {"type": "enabled", "budget_tokens": 1024}
