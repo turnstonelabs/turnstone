@@ -45,8 +45,8 @@ trusted cert, point Caddy at Let's Encrypt by editing `turnstone/deploy/Caddyfil
 browser  --h2 / HTTPS-->  caddy:443  --h1.1 / HTTP-->  console:8090
 ```
 
-Caddy uses its **own local CA** (`issuer internal`, see `turnstone/deploy/Caddyfile`), so
-the setup is self-contained with no dependency on the console's ACME path. The CA and
+Caddy uses its **own local CA** (`cert_issuer internal`, see `turnstone/deploy/Caddyfile`),
+so the setup is self-contained with no dependency on the console's ACME path. The CA and
 the dashboard's certificate live in the `caddy-data` volume, so they survive restarts,
 and the certificate is valid for a year (Caddy renews it with about a third left).
 Trust the local root once to silence the browser warning:
@@ -59,7 +59,9 @@ docker compose exec caddy \
 The certificate names the address you browse to: `localhost` or a host name gets
 a certificate for that name. A browser sends no name when it dials an IP address,
 so every IP address gets one certificate for `127.0.0.1`. From another machine,
-browse by host name if you want the trusted root to silence the warning.
+browse by host name if you want the trusted root to silence the warning. Caddy
+issues a certificate for any name a client asks for, so anyone who can reach the
+port can add certificates to that volume: publish it only to networks you trust.
 
 Caddy reads its Caddyfile only when it starts. After editing it, or after a `git
 pull` that changes it, run `docker compose restart caddy`. Re-running `run.sh`

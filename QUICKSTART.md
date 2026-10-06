@@ -55,8 +55,8 @@ pipx run --spec turnstone turnstone-doctor --dir ~/turnstone
 3. **Version check** — reports the installed version, version drift across your
    cluster's nodes, and the latest upstream stable/experimental releases.
 4. **Caddy check** — on a Docker install, confirms Caddy is running the
-   Caddyfile on disk. It reads the file only when it starts, so after a `git pull`
-   or an edit the report gives you the restart command.
+   Caddyfile on disk. Caddy reads the file only when it starts, so after a `git
+   pull` or an edit the report gives you the restart command.
 5. **Interactive diagnosis** — it reads logs, `/health`, `docker compose ps`,
    `systemctl`, config, and ports to pin down problems like a node not joining
    the console, an unreachable database, a down model backend, port conflicts,

@@ -428,7 +428,8 @@ frozen.
   for a year and kept in the `caddy-data` volume, so the certificate a browser accepted stays the
   same. Caddy reads its Caddyfile only when it starts: re-running `run.sh` now restarts it, and
   otherwise run `docker compose restart caddy`. Certificates already issued are replaced as they
-  come due.
+  come due. Caddy also closes open dashboard streams within 5 seconds when it stops; before, a
+  restart with the dashboard open waited out Docker's 10-second stop timeout and was killed.
 
 ### Security
 
