@@ -138,7 +138,7 @@ services:
       # - "127.0.0.1:${SEARXNG_HTTPS_PORT:-8444}:8444"
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
-      - caddy-data:/data # persist Caddy's local CA across restarts
+      - caddy-data:/data # persist Caddy's local CA and certs across restarts
       - caddy-config:/config
     networks:
       - turnstone-net

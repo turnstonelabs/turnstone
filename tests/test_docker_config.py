@@ -385,3 +385,18 @@ def test_installer_upgrades_legacy_node_override(tmp_path):
     result = run_installer_functions(tmp_path, "NODE_COUNT=3; write_compose_override")
     assert result.returncode == 0, result.stderr
     assert len(yaml.safe_load(path.read_text())["services"]) == 7
+
+
+@pytest.mark.parametrize("restarted", [True, False])
+def test_installer_restarts_caddy_to_load_pulled_caddyfile(tmp_path, restarted):
+    # `up -d` leaves an unchanged caddy container on the Caddyfile it started with.
+    status = 0 if restarted else 1
+    result = run_installer_functions(
+        tmp_path,
+        f'docker_mock() {{ echo "$PWD|$*" >>calls.log; return {status}; }}; restart_caddy',
+    )
+    assert result.returncode == 0, result.stderr
+    assert (tmp_path / "calls.log").read_text().splitlines() == [
+        f"{tmp_path}|compose restart caddy"
+    ]
+    assert ("compose restart caddy" in result.stderr) is not restarted

@@ -25,7 +25,9 @@ Startup sequence:
 3. **Version check** — :func:`check_versions` reports the installed version,
    cluster version drift (via storage + ``/health``), and the latest upstream
    stable/experimental releases.
-4. **Diagnose loop** — the LLM drives read-only diagnostic tools.
+4. **Caddy check** — :func:`check_caddy_config` reports whether a compose
+   stack's Caddy is running the Caddyfile on disk.
+5. **Diagnose loop** — the LLM drives read-only diagnostic tools.
 """
 
 from __future__ import annotations
@@ -937,6 +939,116 @@ def render_version_report(vr: VersionReport) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Caddy config drift (docker-compose)
+# ---------------------------------------------------------------------------
+
+# Where both compose stacks mount the Caddyfile, and Caddy's default admin API.
+_CADDYFILE_IN_CONTAINER = "/etc/caddy/Caddyfile"
+_CADDY_ADMIN_CONFIG_URL = "http://127.0.0.1:2019/config/"
+
+
+@dataclass
+class CaddyConfigCheck:
+    """Whether the running Caddy serves the Caddyfile on disk."""
+
+    caddyfile: str  # host path of the bind-mounted Caddyfile
+    compose_dir: str
+    in_sync: bool | None  # None when the two could not be compared (see detail)
+    detail: str = ""
+
+
+def _run_docker(
+    cmd: list[str], *, cwd: Path | None = None, input_text: str | None = None
+) -> subprocess.CompletedProcess[str] | None:
+    """Run a read-only docker command with stdout and stderr kept apart."""
+    try:
+        return subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=15,
+            cwd=str(cwd) if cwd else None,
+            input=input_text,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return None
+
+
+def check_caddy_config(profile: InstallProfile) -> CaddyConfigCheck | None:
+    """Compare the config the running Caddy loaded with its Caddyfile on disk.
+
+    Caddy reads its Caddyfile only when it starts, and a ``git pull`` replaces the
+    file, leaving the container's bind mount on the old copy; so a checkout update
+    or an edit reaches the dashboard only once Caddy restarts. Both sides are
+    compared as Caddy's JSON, adapted by the container's own ``caddy``. Returns
+    None when there is no running ``caddy`` service with a bind-mounted Caddyfile.
+    """
+    if not (profile.docker_available and profile.compose_files):
+        return None
+    compose_file = profile.compose_files[0]
+    ps = _run_docker(
+        ["docker", "compose", "-f", str(compose_file), "ps", "-q", "caddy"],
+        cwd=profile.project_dir,
+    )
+    cid = ps.stdout.strip() if ps and ps.returncode == 0 else ""
+    if not cid:
+        return None
+    fmt = (
+        "{{range .Mounts}}{{if eq .Destination "
+        f'"{_CADDYFILE_IN_CONTAINER}"'
+        "}}{{.Source}}{{end}}{{end}}"
+    )
+    inspect = _run_docker(["docker", "inspect", "--format", fmt, cid])
+    source = inspect.stdout.strip() if inspect and inspect.returncode == 0 else ""
+    if not source:
+        return None
+    check = CaddyConfigCheck(source, str(compose_file.parent), None)
+    try:
+        on_disk = Path(source).read_text(encoding="utf-8")
+    except OSError as exc:
+        check.detail = f"cannot read the Caddyfile on disk ({exc})"
+        return check
+    loaded = _run_docker(["docker", "exec", cid, "wget", "-qO-", _CADDY_ADMIN_CONFIG_URL])
+    if loaded is None or loaded.returncode != 0:
+        check.detail = "Caddy's admin API did not return its running config"
+        return check
+    # /dev/stdin so the container adapts the host's copy, not its stale mount.
+    adapted = _run_docker(
+        ["docker", "exec", "-i", cid, "caddy", "adapt", "--config", "/dev/stdin"]
+        + ["--adapter", "caddyfile"],
+        input_text=on_disk,
+    )
+    if adapted is None or adapted.returncode != 0:
+        # Caddy's error can quote the offending token, so scrub it like tool output.
+        reason = _scrub_tool_output(adapted.stderr.strip()[-500:]) if adapted else ""
+        check.detail = "the Caddyfile on disk did not adapt" + (f": {reason}" if reason else "")
+        return check
+    try:
+        check.in_sync = json.loads(loaded.stdout) == json.loads(adapted.stdout)
+    except ValueError:
+        check.detail = "Caddy returned config that is not JSON"
+    return check
+
+
+def render_caddy_check(check: CaddyConfigCheck) -> str:
+    """Render a CaddyConfigCheck as a human/LLM-readable block."""
+    lines: list[str] = ["## Caddy (dashboard HTTPS)"]
+    if check.in_sync:
+        lines.append(f"- Running the Caddyfile on disk: {check.caddyfile}")
+    elif check.in_sync is False:
+        lines.append(
+            f"- STALE: Caddy is running an older config than {check.caddyfile}. It reads "
+            "its Caddyfile only when it starts, so an update or edit since then is not "
+            f"live. Fix: `cd {check.compose_dir} && docker compose restart caddy`"
+        )
+    else:
+        lines.append(
+            f"- Could not compare Caddy's running config with {check.caddyfile}: {check.detail}"
+        )
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # Self-configuring LLM brain (§3)
 # ---------------------------------------------------------------------------
 
@@ -1034,16 +1146,17 @@ def render_backend_verdict(verdict: BackendVerdict) -> str:
 
 
 def render_full_report(
-    profile: InstallProfile, versions: VersionReport, verdict: BackendVerdict
+    profile: InstallProfile,
+    versions: VersionReport,
+    verdict: BackendVerdict,
+    caddy: CaddyConfigCheck | None = None,
 ) -> str:
-    """Combine the preflight, version, and backend blocks into one report."""
-    return "\n\n".join(
-        [
-            render_profile_report(profile),
-            render_version_report(versions),
-            render_backend_verdict(verdict),
-        ]
-    )
+    """Combine the preflight, version, Caddy, and backend blocks into one report."""
+    blocks = [render_profile_report(profile), render_version_report(versions)]
+    if caddy is not None:
+        blocks.append(render_caddy_check(caddy))
+    blocks.append(render_backend_verdict(verdict))
+    return "\n\n".join(blocks)
 
 
 # ---------------------------------------------------------------------------
@@ -2117,7 +2230,7 @@ def _build_report(
     storage, storage_err = open_storage(profile)
     versions = check_versions(profile, storage, offline=offline)
     brain, verdict = resolve_doctor_brain(profile, storage, storage_err)
-    report = render_full_report(profile, versions, verdict)
+    report = render_full_report(profile, versions, verdict, check_caddy_config(profile))
     return profile, versions, brain, verdict, report
 
 

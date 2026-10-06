@@ -45,18 +45,30 @@ trusted cert, point Caddy at Let's Encrypt by editing `turnstone/deploy/Caddyfil
 browser  --h2 / HTTPS-->  caddy:443  --h1.1 / HTTP-->  console:8090
 ```
 
-Caddy uses its **own local CA** (`tls internal`, see `turnstone/deploy/Caddyfile`), so the
-setup is self-contained with no dependency on the console's ACME path. Trust the
-local root once to silence the browser warning:
+Caddy uses its **own local CA** (`issuer internal`, see `turnstone/deploy/Caddyfile`), so
+the setup is self-contained with no dependency on the console's ACME path. The CA and
+the dashboard's certificate live in the `caddy-data` volume, so they survive restarts,
+and the certificate is valid for a year (Caddy renews it with about a third left).
+Trust the local root once to silence the browser warning:
 
 ```bash
 docker compose exec caddy \
   cat /data/caddy/pki/authorities/local/root.crt   # import into your OS/browser
 ```
 
+The certificate names the address you browse to: `localhost` or a host name gets
+a certificate for that name. A browser sends no name when it dials an IP address,
+so every IP address gets one certificate for `127.0.0.1`. From another machine,
+browse by host name if you want the trusted root to silence the warning.
+
+Caddy reads its Caddyfile only when it starts. After editing it, or after a `git
+pull` that changes it, run `docker compose restart caddy`. Re-running `run.sh`
+does this for you, and `turnstone-doctor --report` flags a Caddy that is still
+running an older config.
+
 **Can Caddy get its cert from the console's internal CA instead?** Not directly.
 The console's ACME signing routes require Turnstone's rotating enrollment JWT,
-which a standard Caddy ACME issuer does not attach. Keep `tls internal`, or use a
+which a standard Caddy ACME issuer does not attach. Keep Caddy's local CA, or use a
 public ACME CA for a publicly trusted certificate. An authenticated gateway or
 Caddy plugin would be required to use Turnstone's responder.
 
