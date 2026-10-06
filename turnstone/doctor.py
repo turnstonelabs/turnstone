@@ -38,6 +38,7 @@ import getpass
 import json
 import os
 import re
+import shlex
 import socket
 import subprocess
 import sys
@@ -721,7 +722,7 @@ def _compose_image_tag(profile: InstallProfile) -> str:
                 for line in envf.read_text(encoding="utf-8").splitlines():
                     if line.startswith("TURNSTONE_IMAGE_TAG="):
                         return line.partition("=")[2].strip()
-        except OSError:
+        except (OSError, UnicodeDecodeError):
             continue
     return ""
 
@@ -945,6 +946,10 @@ def render_version_report(vr: VersionReport) -> str:
 # Where both compose stacks mount the Caddyfile, and Caddy's default admin API.
 _CADDYFILE_IN_CONTAINER = "/etc/caddy/Caddyfile"
 _CADDY_ADMIN_CONFIG_URL = "http://127.0.0.1:2019/config/"
+# What `caddy adapt` logs when a relative `import` can't be found. From /dev/stdin
+# it looks beside /dev, not the Caddyfile, and a missing glob still exits 0.
+_CADDY_IMPORT_ERRORS = ("No files matching import glob pattern", "File to import not found")
+_CADDY_STDIN_LINE_RE = re.compile(r"at /dev/stdin:(\d+)")
 
 
 @dataclass
@@ -965,7 +970,8 @@ def _run_docker(
         return subprocess.run(
             cmd,
             capture_output=True,
-            text=True,
+            encoding="utf-8",  # the Caddyfile is UTF-8 whatever the host locale
+            errors="replace",
             timeout=15,
             cwd=str(cwd) if cwd else None,
             input=input_text,
@@ -1005,10 +1011,12 @@ def check_caddy_config(profile: InstallProfile) -> CaddyConfigCheck | None:
     check = CaddyConfigCheck(source, str(compose_file.parent), None)
     try:
         on_disk = Path(source).read_text(encoding="utf-8")
-    except OSError as exc:
+    except (OSError, UnicodeDecodeError) as exc:
         check.detail = f"cannot read the Caddyfile on disk ({exc})"
         return check
-    loaded = _run_docker(["docker", "exec", cid, "wget", "-qO-", _CADDY_ADMIN_CONFIG_URL])
+    loaded = _run_docker(
+        ["docker", "exec", cid, "wget", "-T", "5", "-qO-", _CADDY_ADMIN_CONFIG_URL]
+    )
     if loaded is None or loaded.returncode != 0:
         check.detail = "Caddy's admin API did not return its running config"
         return check
@@ -1018,10 +1026,26 @@ def check_caddy_config(profile: InstallProfile) -> CaddyConfigCheck | None:
         + ["--adapter", "caddyfile"],
         input_text=on_disk,
     )
-    if adapted is None or adapted.returncode != 0:
-        # Caddy's error can quote the offending token, so scrub it like tool output.
-        reason = _scrub_tool_output(adapted.stderr.strip()[-500:]) if adapted else ""
-        check.detail = "the Caddyfile on disk did not adapt" + (f": {reason}" if reason else "")
+    if adapted is None:
+        check.detail = "`caddy adapt` did not run in the container"
+        return check
+    if any(marker in adapted.stderr for marker in _CADDY_IMPORT_ERRORS):
+        check.detail = (
+            "the Caddyfile imports files by relative path, which doctor cannot "
+            "resolve when it feeds Caddy the file on disk"
+        )
+        return check
+    if adapted.returncode != 0:
+        # Caddy's message can quote the offending token, which may be a secret, and
+        # the report is shared and sent to a model; so name the line, not the text.
+        line = _CADDY_STDIN_LINE_RE.search(adapted.stderr)
+        where = f" at line {line.group(1)}" if line else ""
+        check.detail = (
+            f"Caddy cannot parse the Caddyfile on disk{where}, so a restart would fail. "
+            f"See why: `cd {shlex.quote(check.compose_dir)} && docker compose exec -T "
+            f"caddy caddy adapt --config /dev/stdin --adapter caddyfile < "
+            f"{shlex.quote(source)}`"
+        )
         return check
     try:
         check.in_sync = json.loads(loaded.stdout) == json.loads(adapted.stdout)
@@ -1039,7 +1063,7 @@ def render_caddy_check(check: CaddyConfigCheck) -> str:
         lines.append(
             f"- STALE: Caddy is running an older config than {check.caddyfile}. It reads "
             "its Caddyfile only when it starts, so an update or edit since then is not "
-            f"live. Fix: `cd {check.compose_dir} && docker compose restart caddy`"
+            f"live. Fix: `cd {shlex.quote(check.compose_dir)} && docker compose restart caddy`"
         )
     else:
         lines.append(

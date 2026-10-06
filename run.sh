@@ -543,7 +543,7 @@ PY
 restart_caddy() {
     info "Restarting Caddy so it loads the current Caddyfile."
     ( cd "$INSTALL_DIR" && $DOCKER compose restart caddy ) \
-        || warn "Caddy did not restart, so Caddyfile changes are not live yet. Run: cd $INSTALL_DIR && $DOCKER compose restart caddy"
+        || warn "Caddy did not restart, so Caddyfile changes are not live yet. Run: cd $(printf '%q' "$INSTALL_DIR") && $DOCKER compose restart caddy"
 }
 
 # -- summary ------------------------------------------------------------------

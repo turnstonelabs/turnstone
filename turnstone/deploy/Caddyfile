@@ -1,7 +1,7 @@
 # Browser TLS for the console dashboard:
 #   browser --h2/HTTPS--> caddy:443 --h1.1/HTTP--> console:8090
 # The console serves HTTP (it's the ACME bootstrap endpoint), so browser TLS is
-# terminated here. `issuer internal` uses Caddy's own local CA; trust its root once:
+# terminated here. Certs come from Caddy's own local CA; trust its root once:
 #   docker compose exec caddy cat /data/caddy/pki/authorities/local/root.crt
 # See docs/tls.md (incl. the acme_ca→console alternative and why it's not default).
 {
@@ -10,27 +10,28 @@
 	# recreates the container, so every restart issued a new cert. A fixed name
 	# keeps one cert; 127.0.0.1 also matches a same-host browser that dials it.
 	default_sni 127.0.0.1
-}
-
-# Certs persist in the caddy-data volume. A one-year lifetime (renewed with about
-# a third left) keeps the same cert long enough for a browser's "proceed anyway"
-# to stick. Apple platforms reject TLS certs valid for over 825 days, even from a
-# locally trusted root, so keep it under that. sign_with_root: Caddy's
-# intermediate lasts 7 days, and a cert never outlives the cert that signed it.
-(local_tls) {
-	tls {
-		issuer internal {
-			lifetime 365d
-			sign_with_root
-		}
-		# on_demand: a port-only site has no fixed name to pre-issue for; safe
-		# here because the issuer is Caddy's local CA, not a public one.
-		on_demand
+	# Every cert lasts a year and is kept in the caddy-data volume, so the cert a
+	# browser accepted stays the same across restarts. Some clients reject TLS
+	# certs valid for over 825 days, even from a locally trusted root, so keep it
+	# under that. sign_with_root: Caddy's intermediate lasts 7 days, and a cert
+	# never outlives the cert that signed it.
+	cert_issuer internal {
+		lifetime 365d
+		sign_with_root
 	}
+	# Close open dashboard streams on shutdown rather than waiting on them until
+	# Docker's stop timeout kills Caddy.
+	grace_period 5s
 }
 
 :443 {
-	import local_tls
+	# on_demand: a port-only site has no fixed name to pre-issue for. It also lets
+	# any client that reaches this port have Caddy issue a cert for a name it
+	# makes up, and with the one-year lifetime each stays in caddy-data for a
+	# year. Accepted for the dashboard; publish the port only to networks you trust.
+	tls {
+		on_demand
+	}
 	reverse_proxy console:8090 {
 		flush_interval -1 # stream the dashboard SSE without buffering
 	}
@@ -46,6 +47,8 @@
 # maps the host port. A dedicated port (not a sub-path) avoids SearxNG's
 # base-URL/asset issues under a subdirectory.
 :8444 {
-	import local_tls
+	tls {
+		on_demand
+	}
 	reverse_proxy searxng:8080
 }
