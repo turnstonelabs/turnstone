@@ -277,7 +277,8 @@ class TestToolSearchEscape:
     def test_native_search_loads_stay_within_a_persona_set(
         self, tmp_db, mock_openai_client, persona_tools, visible
     ) -> None:
-        # A forked history can carry a native search that a persona's set never allowed.
+        # A persona that restricts tools never runs native tool search, and its stamp, which
+        # a fork copies, cannot change; the offer still goes through the persona's filter.
         session = _session(
             mock_openai_client,
             mcp_client=self._mcp_client(),
