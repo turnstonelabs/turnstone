@@ -7,10 +7,11 @@ of the Chat Completions endpoint.
 
 from __future__ import annotations
 
+import functools
 import json
 from dataclasses import replace
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any, NoReturn
+from typing import TYPE_CHECKING, Any, NamedTuple, NoReturn
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -70,6 +71,55 @@ _SERVER_EXECUTED_ITEM_TYPES = frozenset({"web_search_call"})
 # Adapter-owned replay metadata on the first native output item. The generic
 # trajectory and storage preserve it opaquely; input projection never sends it.
 _REASONING_CONFIG_KEY = "_reasoning_config"
+
+
+class _HostedItem(NamedTuple):
+    """How a stored hosted tool item replays as input: its SDK input shape."""
+
+    tool: str  # the hosted tool that adds the item
+    required: tuple[str, ...]  # fields the API rejects the item without (live 400)
+    optional: tuple[str, ...]
+
+
+# Hosted tool output items replayed as input, by item type. OpenAI documents replaying every
+# output item of a stateless request, and accepted these in each shape probed live
+# (2026-10-05, #1281): with and without reasoning replay, in any status, with the tool absent
+# from the request, and with either half of a tool search alone. Ids stay off the wire: they
+# are optional on input, and the API rejects an id it did not mint, which a row produced by
+# another Responses endpoint but stored under the same producer can carry. A replayed search
+# shows the model its query or opened page, not what it found: the API accepts ``results``
+# and ``action.sources`` on input but leaves them out of the model's context, so neither is
+# requested or replayed.
+_HOSTED_ITEMS: dict[str, _HostedItem] = {
+    "web_search_call": _HostedItem("web_search", (), ("status", "action")),
+    "tool_search_call": _HostedItem(
+        "tool_search", ("arguments",), ("status", "call_id", "execution")
+    ),
+    "tool_search_output": _HostedItem(
+        "tool_search", ("tools",), ("status", "call_id", "execution")
+    ),
+}
+
+# The input fields of each web search action type (the SDK input shape).
+_WEB_SEARCH_ACTION_FIELDS: dict[str, tuple[str, ...]] = {
+    "search": ("query", "queries"),
+    "open_page": ("url",),
+    "find_in_page": ("pattern", "url"),
+}
+
+
+@functools.lru_cache(maxsize=4096)
+def _log_hosted_omission_once(item_type: str, item_id: str, omitted: str) -> None:
+    """Log what a replayed hosted item leaves out, once per process.
+
+    History keeps the stored item, so the same omission recurs on every request.
+    """
+    log.info(
+        "openai.responses.hosted_item_omission",
+        item_type=item_type,
+        item_id=item_id,
+        omitted=omitted,
+    )
 
 
 def _extend_message_annotations(item: Any, annotations: list[Any]) -> None:
@@ -281,6 +331,7 @@ class OpenAIResponsesProvider:
         supports_mid_conversation_system: bool = False,
         native_producer: str = "openai",
         assistant_item_ends: list[int] | None = None,
+        hosted_tools: frozenset[str] = frozenset(),
     ) -> tuple[str | None, list[dict[str, Any]]]:
         """Convert Chat Completions messages to Responses API input items.
 
@@ -295,6 +346,11 @@ class OpenAIResponsesProvider:
         only when *replay_reasoning_to_model* is True; phase is independent of
         that toggle. Explicitly foreign producer metadata is ignored, while
         untagged legacy native blocks retain shape-based replay.
+
+        Output items of the hosted tools in *hosted_tools* (``web_search``,
+        ``tool_search``) are replayed in their native positions, whatever the
+        reasoning toggle. With tool search, each call to a tool that an earlier
+        search loaded carries the tool's namespace (:func:`_namespace_loaded_calls`).
 
         ``assistant_item_ends`` records the converted end of each response so effort
         updates can be inserted before that response's subsequent user or tool input.
@@ -365,6 +421,7 @@ class OpenAIResponsesProvider:
                         msg,
                         native_by_assistant_ordinal.get(assistant_ordinal_post, []),
                         replay_reasoning_to_model=replay_reasoning_to_model,
+                        hosted_tools=hosted_tools,
                     )
                 )
                 assistant_ordinal_post += 1
@@ -385,6 +442,8 @@ class OpenAIResponsesProvider:
                     }
                 )
 
+        if "tool_search" in hosted_tools:
+            _namespace_loaded_calls(items)
         instructions = "\n\n".join(instructions_parts) if instructions_parts else None
         return instructions, items
 
@@ -489,6 +548,7 @@ class OpenAIResponsesProvider:
             supports_mid_conversation_system=caps.supports_mid_conversation_system,
             native_producer=self.provider_name,
             assistant_item_ends=assistant_item_ends,
+            hosted_tools=self._replayed_hosted_tools(caps),
         )
         tools = apply_tool_search(caps, tools, deferred_names)
         converted_tools = self._convert_tools(tools, caps)
@@ -591,6 +651,21 @@ class OpenAIResponsesProvider:
         if not self._compat:
             apply_cache_retention(kwargs, model)
         return kwargs
+
+    def _replayed_hosted_tools(self, caps: ModelCapabilities) -> frozenset[str]:
+        """The hosted tools whose output items are replayed: each one the model can run.
+
+        The model's capability, not this request's tool list, decides, so a history
+        replays the same way when a request leaves a tool out. The replay is verified
+        against OpenAI's own API only, so a compatible endpoint, which reports the same
+        provider name, and a subclass serving another API replay none.
+        """
+        if self._compat or self.provider_name != "openai":
+            return frozenset()
+        tools = set(resolve_server_side_tools(caps))
+        if caps.supports_tool_search:
+            tools.add("tool_search")
+        return frozenset(tools)
 
     def _uses_reasoning_config_updates(
         self, caps: ModelCapabilities, kwargs: dict[str, Any], reasoning: dict[str, Any]
@@ -1090,26 +1165,49 @@ def _assistant_items_for_input(
     native: list[dict[str, Any]],
     *,
     replay_reasoning_to_model: bool,
+    hosted_tools: frozenset[str] = frozenset(),
 ) -> list[dict[str, Any]]:
     """Recover native message phases/order only while canonical history agrees.
 
     A Turn joins all output messages into one text field. Native blocks retain
     their boundaries, but may predate edits, fence neutralization, or call repair.
-    Match the text and call IDs before using that layout, and always construct
-    calls from the lowered canonical fields. An ambiguous layout falls back to
-    canonical text/calls with no guessed phase, plus the existing reasoning replay.
+    Match the text and call IDs before using that layout (a turn without text needs
+    only its call IDs to match), and always construct calls from the lowered
+    canonical fields. An ambiguous layout falls back to canonical text/calls with no
+    guessed phase, plus the existing reasoning replay.
+
+    Hosted tool items of *hosted_tools* replay alongside the reasoning: in native
+    order, and ahead of the text and calls when the layout falls back. With tool
+    search, a call also carries the namespace of the native call with its ID. Other
+    output items stay omitted.
     """
     content = message.get("content")
-    calls = [
-        {
+    namespaces: dict[str, str] = {}
+    if "tool_search" in hosted_tools:
+        for block in native:
+            call_id, namespace = block.get("call_id"), block.get("namespace")
+            if (
+                block.get("type") == "function_call"
+                and isinstance(call_id, str)
+                and isinstance(namespace, str)
+                and call_id
+                and namespace
+            ):
+                namespaces[call_id] = namespace
+    calls: list[dict[str, Any]] = []
+    for tc in message.get("tool_calls") or []:
+        call = {
             "type": "function_call",
             "call_id": tc.get("id", ""),
             "name": tc.get("function", {}).get("name", ""),
             "arguments": tc.get("function", {}).get("arguments", ""),
         }
-        for tc in message.get("tool_calls") or []
-    ]
-    reasoning: list[dict[str, Any]] = []
+        if call["call_id"] in namespaces:
+            call["namespace"] = namespaces[call["call_id"]]
+        calls.append(call)
+    # Reasoning and hosted tool items, in native order: the fallback layout keeps them
+    # ahead of its text and calls.
+    prelude: list[dict[str, Any]] = []
     ordered: list[dict[str, Any]] = []
     text_items: list[dict[str, Any]] = []
     native_call_ids: list[str] = []
@@ -1120,8 +1218,11 @@ def _assistant_items_for_input(
         if kind == "reasoning" and replay_reasoning_to_model:
             item = _reasoning_item_for_input(block)
             if item is not None:
-                reasoning.append(item)
+                prelude.append(item)
                 ordered.append(item)
+        elif (hosted := _hosted_item_for_input(block, hosted_tools)) is not None:
+            prelude.append(hosted)
+            ordered.append(hosted)
         elif kind == "function_call":
             if len(native_call_ids) < len(calls):
                 ordered.append(calls[len(native_call_ids)])
@@ -1153,9 +1254,12 @@ def _assistant_items_for_input(
                     projected["phase"] = block["phase"]
                 text_items.append(projected)
                 ordered.append(projected)
-        # Hosted tool output remains omitted, as on the legacy replay path.
 
-    if valid_layout and text_items and native_call_ids == [call["call_id"] for call in calls]:
+    if (
+        valid_layout
+        and (text_items or not content)
+        and native_call_ids == [call["call_id"] for call in calls]
+    ):
         native_text = "".join(item["content"] for item in text_items)
         if content == native_text:
             return ordered
@@ -1171,8 +1275,8 @@ def _assistant_items_for_input(
             return ordered
 
     if content:
-        reasoning.append({"type": "message", "role": "assistant", "content": content})
-    return reasoning + calls
+        prelude.append({"type": "message", "role": "assistant", "content": content})
+    return prelude + calls
 
 
 def _reasoning_item_for_input(stored: dict[str, Any]) -> dict[str, Any] | None:
@@ -1216,3 +1320,104 @@ def _reasoning_item_for_input(stored: dict[str, Any]) -> dict[str, Any] | None:
     if encrypted:
         out["encrypted_content"] = encrypted
     return out
+
+
+def _hosted_item_for_input(
+    stored: dict[str, Any], hosted_tools: frozenset[str]
+) -> dict[str, Any] | None:
+    """Project a stored hosted tool item into its input shape, or None when it is not replayed.
+
+    The stored item is the SDK's ``model_dump``: absent fields are None, and the first
+    output item can carry this adapter's ``_reasoning_config``. Only the item's input
+    fields go back, without their Nones. An item missing a field the API requires is
+    omitted, and a search action of a type the API does not know is left off its item;
+    each omission is logged, so the replayed record never shrinks silently.
+    """
+    kind = stored.get("type")
+    spec = _HOSTED_ITEMS.get(kind) if isinstance(kind, str) else None
+    if spec is None or spec.tool not in hosted_tools:
+        return None
+    item_id = stored.get("id") if isinstance(stored.get("id"), str) else ""
+    for field in spec.required:
+        if stored.get(field) is None:
+            _log_hosted_omission_once(kind, item_id, f"the item, which has no {field}")
+            return None
+    item: dict[str, Any] = {"type": kind}
+    for field in (*spec.required, *spec.optional):
+        if stored.get(field) is not None:
+            item[field] = stored[field]
+    if kind == "web_search_call" and "action" in item:
+        action = _web_search_action_for_input(item["action"])
+        if action is None:
+            del item["action"]
+            _log_hosted_omission_once(kind, item_id, "its action, of an unknown type")
+        else:
+            item["action"] = action
+    elif kind == "tool_search_output":
+        if not isinstance(item["tools"], list):
+            _log_hosted_omission_once(kind, item_id, "the item, whose tools are not a list")
+            return None
+        item["tools"] = [_tool_for_input(tool) for tool in item["tools"]]
+    return item
+
+
+def _web_search_action_for_input(action: Any) -> dict[str, Any] | None:
+    """Project a web search action into its input shape, or None for a type the API lacks."""
+    action_type = action.get("type") if isinstance(action, dict) else None
+    fields = _WEB_SEARCH_ACTION_FIELDS.get(action_type) if isinstance(action_type, str) else None
+    if fields is None:
+        return None
+    projected = {"type": action_type}
+    for field in fields:
+        if action.get(field) is not None:
+            projected[field] = action[field]
+    return projected
+
+
+def _tool_for_input(tool: Any) -> Any:
+    """Project a tool definition a tool search loaded into its input shape.
+
+    ``model_dump`` spells the ``async`` field ``async_`` and writes absent fields as None.
+    A namespace's own tools are projected the same way.
+    """
+    if not isinstance(tool, dict):
+        return tool
+    out = {
+        ("async" if key == "async_" else key): value
+        for key, value in tool.items()
+        if value is not None
+    }
+    if isinstance(out.get("tools"), list):
+        out["tools"] = [_tool_for_input(member) for member in out["tools"]]
+    return out
+
+
+def _namespace_loaded_calls(items: list[dict[str, Any]]) -> None:
+    """Give each call to a tool that an earlier tool search loaded the tool's namespace.
+
+    Once a ``tool_search_output`` has loaded a deferred tool, the API rejects a later call
+    to it that has no namespace, unless the tool is also offered undeferred (live probe,
+    2026-10-05). A native call keeps its own namespace. A call without one, from another
+    producer's turn or made while the tool was offered undeferred, takes the namespace the
+    load gave it: a function loaded on its own is its own namespace, and a namespace's
+    functions take the namespace's name. Calls before the load are left as they are.
+
+    ``items`` is rewritten in place, one item for one, so the response boundaries that
+    ``assistant_item_ends`` recorded still hold.
+    """
+    loaded: dict[str, str] = {}
+    for index, item in enumerate(items):
+        if item.get("type") == "tool_search_output":
+            for tool in item.get("tools") or []:
+                if not isinstance(tool, dict) or not isinstance(tool.get("name"), str):
+                    continue
+                if tool.get("type") == "function":
+                    loaded[tool["name"]] = tool["name"]
+                elif tool.get("type") == "namespace":
+                    for member in tool.get("tools") or []:
+                        if isinstance(member, dict) and isinstance(member.get("name"), str):
+                            loaded[member["name"]] = tool["name"]
+        elif item.get("type") == "function_call" and "namespace" not in item:
+            namespace = loaded.get(item.get("name", ""))
+            if namespace:
+                items[index] = {**item, "namespace": namespace}

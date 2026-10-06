@@ -1098,9 +1098,14 @@ client-side web search.
 
 Responses replay preserves native assistant message boundaries, `commentary` / `final_answer`
 phases, and their order among tool calls. Phase preservation does not depend on reasoning replay;
-when reasoning replay is enabled, those items retain their native positions too. The provider
-matches stored message text and call IDs against the lowered canonical history before restoring
-that layout; repaired call arguments come from canonical fields. Generated citation footers remain
+when reasoning replay is enabled, those items retain their native positions too. Hosted web search
+and tool search items keep their native positions whatever the reasoning setting, for a model whose
+capability row runs that tool; compatible endpoints and xAI leave them out. They go back without
+their ids, which the API rejects when another endpoint minted them, and an item the API cannot
+take back is left out and logged. A call to a tool that an earlier tool search loaded carries the
+tool's namespace, which the API requires once the load is in the input. The provider matches
+stored message text and call IDs against the lowered canonical history before restoring that
+layout; repaired call arguments come from canonical fields. Generated citation footers remain
 attached once to the last message. If edits make the layout ambiguous, replay uses current text
 without guessing a phase. Explicitly foreign producer metadata is excluded; legacy untagged blocks
 remain readable. See the [Responses input schema][responses-input-schema].

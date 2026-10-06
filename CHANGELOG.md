@@ -192,6 +192,14 @@ frozen.
   also `--resume` and `/resume`) applied the constructor's defaults instead of its saved model,
   sampling, instructions and skill, and the next settings change wrote those defaults over the
   saved ones. It now opens with its saved settings.
+- **The model keeps its own searches in its history (OpenAI).** Replayed history left out the web
+  searches and tool searches the model ran itself, so it searched again for tools it had already
+  found. Both now replay where they ran, and a call to a tool that a search loaded carries the
+  namespace the API requires for it. A replayed web search shows the model its query or the page
+  it opened, not the results, which the API does not take back. Compatible endpoints and xAI
+  replay as before. A workstream that searched misses the prompt cache once, on its first request
+  after the update. One that searched again for tools it had already found resends each of those
+  searches, with the definitions it loaded, until it compacts.
 - **A storage error while opening a workstream no longer replaces its saved settings.** Building the
   session saves its defaults when no settings are saved, and a read that failed counted as none
   saved, so one failed read could overwrite the saved model, sampling, instructions and skill. That

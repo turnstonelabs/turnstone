@@ -30,6 +30,10 @@ Two xAI-specific extensions over the inherited Responses behaviour:
    does not populate it; callers thread it via ``extra_headers`` on
    :meth:`create_streaming` once they know the workstream id.
 
+Hosted tool items such as ``web_search_call`` are not replayed here: the
+base class replays them to OpenAI's own API only, the one it is verified
+against (``_replayed_hosted_tools`` checks ``provider_name``).
+
 A static :data:`GROK_CAPABILITIES` table covers the five chat models
 listed at docs.x.ai/developers/models (May 2026).  Aliases such as
 ``grok-4.3-latest`` resolve via the existing longest-prefix lookup.
