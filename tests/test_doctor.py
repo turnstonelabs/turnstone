@@ -14,6 +14,7 @@ from turnstone.doctor import (
     SYSTEM_PROMPT,
     TOOLS,
     BackendVerdict,
+    CaddyConfigCheck,
     ConfigFileInfo,
     InstallProfile,
     VersionReport,
@@ -45,11 +46,13 @@ from turnstone.doctor import (
     _tool_read_file,
     _tool_systemd_status,
     _version_behind,
+    check_caddy_config,
     check_versions,
     detect_install_profile,
     execute_tool,
     family_of,
     open_storage,
+    render_caddy_check,
     render_full_report,
     render_profile_report,
     render_version_report,
@@ -1118,6 +1121,119 @@ class TestRenderVersionReport:
     def test_omits_per_node_line_when_empty(self) -> None:
         out = render_version_report(self._vr())
         assert "Per-node versions:" not in out
+
+
+class TestCaddyConfigCheck:
+    """check_caddy_config compares Caddy's loaded JSON with the adapted host Caddyfile."""
+
+    LOADED = '{"apps": {"tls": {"lifetime": 1}}}'
+
+    def _fake_docker(
+        self, calls: list[tuple[list[str], str | None]], **results: tuple[int, str, str]
+    ) -> object:
+        def fake(
+            cmd: list[str], *, cwd: Path | None = None, input_text: str | None = None
+        ) -> MagicMock:
+            calls.append((cmd, input_text))
+            if "ps" in cmd:
+                key = "ps"
+            elif "inspect" in cmd:
+                key = "inspect"
+            elif "wget" in cmd:
+                key = "loaded"
+            else:
+                key = "adapted"
+            rc, out, err = results.get(key, (0, "", ""))
+            return MagicMock(returncode=rc, stdout=out, stderr=err)
+
+        return fake
+
+    def _run(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        adapted: tuple[int, str, str],
+        loaded: tuple[int, str, str] = (0, LOADED, ""),
+    ) -> tuple[CaddyConfigCheck | None, list[tuple[list[str], str | None]]]:
+        caddyfile = tmp_path / "Caddyfile"
+        caddyfile.write_text(":443 {\n}\n")
+        calls: list[tuple[list[str], str | None]] = []
+        monkeypatch.setattr(
+            "turnstone.doctor._run_docker",
+            self._fake_docker(
+                calls,
+                ps=(0, "abc123\n", ""),
+                inspect=(0, f"{caddyfile}\n", ""),
+                loaded=loaded,
+                adapted=adapted,
+            ),
+        )
+        profile = _make_profile(
+            tmp_path, docker_available=True, compose_files=[tmp_path / "compose.yaml"]
+        )
+        return check_caddy_config(profile), calls
+
+    def test_in_sync_when_loaded_config_matches_adapted_file(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        check, calls = self._run(tmp_path, monkeypatch, adapted=(0, self.LOADED, ""))
+        assert check is not None and check.in_sync is True
+        assert "Running the Caddyfile on disk" in render_caddy_check(check)
+        # The host's copy is adapted, never the container's possibly stale mount.
+        adapt_cmd, fed = calls[-1]
+        assert "/dev/stdin" in adapt_cmd and fed == ":443 {\n}\n"
+        # exec only runs a GET and `caddy adapt`, which prints and changes nothing.
+        assert not any(set(cmd) & (MUTATING_TOKENS - {"exec"}) for cmd, _ in calls)
+
+    def test_stale_when_configs_differ(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        check, _ = self._run(tmp_path, monkeypatch, adapted=(0, '{"apps": {}}', ""))
+        assert check is not None and check.in_sync is False
+        out = render_caddy_check(check)
+        assert "STALE" in out
+        assert f"cd {tmp_path} && docker compose restart caddy" in out
+
+    def test_unreadable_admin_api_is_inconclusive(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        check, _ = self._run(
+            tmp_path, monkeypatch, loaded=(1, "", "refused"), adapted=(0, self.LOADED, "")
+        )
+        assert check is not None and check.in_sync is None
+        assert "admin API" in render_caddy_check(check)
+
+    def test_unadaptable_file_reports_caddys_error(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        err = "syntax error: line 3, near upstream=http://admin:hunter2@backend:9000"
+        check, _ = self._run(tmp_path, monkeypatch, adapted=(1, "", err))
+        assert check is not None and check.in_sync is None
+        assert "syntax error: line 3" in check.detail
+        assert "hunter2" not in check.detail
+
+    def test_no_running_caddy_skips_the_section(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        calls: list[tuple[list[str], str | None]] = []
+        monkeypatch.setattr(
+            "turnstone.doctor._run_docker", self._fake_docker(calls, ps=(0, "", ""))
+        )
+        profile = _make_profile(
+            tmp_path, docker_available=True, compose_files=[tmp_path / "compose.yaml"]
+        )
+        assert check_caddy_config(profile) is None
+        assert check_caddy_config(_make_profile(tmp_path)) is None
+        assert len(calls) == 1
+
+    def test_full_report_includes_section_only_when_checked(self, tmp_path: Path) -> None:
+        profile = _make_profile(tmp_path)
+        vr = VersionReport(__version__, "", {}, [], [], False, "", "", "skipped", False, False)
+        verdict = BackendVerdict(False, "no db")
+        assert "## Caddy" not in render_full_report(profile, vr, verdict)
+        check = CaddyConfigCheck("/x/Caddyfile", "/x", True)
+        assert "## Caddy" in render_full_report(profile, vr, verdict, check)
 
 
 class TestVersionBehind:

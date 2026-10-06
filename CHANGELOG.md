@@ -87,6 +87,9 @@ frozen.
   on the alias's client so model turns, the Detect probe, the doctor check, and delegated-credential
   calls all carry it. Values must be visible ASCII of at most 128 characters; the console refuses
   anything else, or a value on a provider that does not speak the Anthropic protocol.
+- **`turnstone-doctor` flags a Caddy running an outdated Caddyfile.** On a Docker install, the
+  report compares the config Caddy loaded with the Caddyfile on disk and, when they differ, gives
+  the `docker compose restart caddy` command that applies it.
 
 ### Changed
 
@@ -417,6 +420,15 @@ frozen.
   node token metrics. Both judges now record every completed model call under the judge's own
   model, which is the configured judge alias's model when one is set. Like the other auxiliary
   calls, judge calls do not move the live context gauge of the workstream they run for.
+- **The dashboard keeps one HTTPS certificate across restarts.** A browser sends no server name
+  when it dials an IP address, so Caddy named the certificate after its container's Docker
+  address, which changes whenever compose recreates the container, and issued a new one each
+  time; every certificate also expired after 12 hours. Such connections now get one certificate
+  for `127.0.0.1`, and each certificate Caddy issues for the dashboard and the SearxNG UI is valid
+  for a year and kept in the `caddy-data` volume, so the certificate a browser accepted stays the
+  same. Caddy reads its Caddyfile only when it starts: re-running `run.sh` now restarts it, and
+  otherwise run `docker compose restart caddy`. Certificates already issued are replaced as they
+  come due.
 
 ### Security
 

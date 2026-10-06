@@ -14,8 +14,8 @@
 #   5. picks free host ports for Caddy (prefers 443) and PostgreSQL
 #   6. writes a .env with a generated JWT secret + Postgres password
 #   7. optionally creates shared config.toml for OAuth/SSO and delegation
-#   8. pins the choices and runs `docker compose up -d`, then prints how to
-#      finish setup in the UI
+#   8. pins the choices, runs `docker compose up -d` and restarts Caddy so it
+#      loads the current Caddyfile, then prints how to finish setup in the UI
 #
 # Re-running is safe: it updates the checkout and keeps existing .env/config.toml.
 #
@@ -535,6 +535,17 @@ PY
     fi
 }
 
+# -- caddy --------------------------------------------------------------------
+# Caddy reads its Caddyfile only when it starts, and `up -d` leaves it running
+# when its image and settings are unchanged, so a re-run that pulled a new
+# Caddyfile would not apply it. Restarting also remounts the file, which a pull
+# replaces rather than edits in place.
+restart_caddy() {
+    info "Restarting Caddy so it loads the current Caddyfile."
+    ( cd "$INSTALL_DIR" && $DOCKER compose restart caddy ) \
+        || warn "Caddy did not restart, so Caddyfile changes are not live yet. Run: cd $INSTALL_DIR && $DOCKER compose restart caddy"
+}
+
 # -- summary ------------------------------------------------------------------
 print_done() {
     local url scale
@@ -615,6 +626,7 @@ main() {
     if ! ( cd "$INSTALL_DIR" && $DOCKER compose up -d --remove-orphans ); then
         die "the stack failed to start (see output above). Inspect logs: cd $INSTALL_DIR && $DOCKER compose logs"
     fi
+    restart_caddy
 
     print_done
 }

@@ -21,7 +21,8 @@ Caddy, the channel gateway, and **10 server nodes** (`node-1`…`node-10`). No
 
 Open the dashboard at **https://localhost:8443**. It's served by Caddy with its
 own local CA, so trust the root certificate once (or click through the browser
-warning):
+warning). The certificate is valid for a year and survives restarts (see
+[tls.md](tls.md#browser-access-dashboard-https)):
 
 ```bash
 docker compose exec caddy cat /data/caddy/pki/authorities/local/root.crt
@@ -468,7 +469,7 @@ docker compose build --no-cache # rebuild from scratch
 | `postgres-data` | PostgreSQL data directory |
 | `turnstone-data` | `/data` per node (SQLite fallback, local state) |
 | `workspace` | `/workspace` (unless `WORKSPACE_MOUNT` is set) |
-| `caddy-data` / `caddy-config` | Caddy's local CA and config (dev stack) |
+| `caddy-data` / `caddy-config` | Caddy's local CA, the dashboard certificate, and config |
 
 ## Working directory
 
