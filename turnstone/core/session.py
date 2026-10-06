@@ -9475,7 +9475,8 @@ class ChatSession:
         When tool search is active:
         - Native mode (provider supports it): send all tools (provider
           marks deferred ones with defer_loading).
-        - Client-side fallback: send visible tools + synthetic tool_search.
+        - Client-side fallback: send visible tools + synthetic tool_search,
+          plus the tools a replayed native search loaded.
 
         Without tool search: return self._tools unchanged.
 
@@ -9494,7 +9495,9 @@ class ChatSession:
         could offer them for discovery.
         """
         caps = caps if caps is not None else self._get_capabilities()
-        if not self._tool_search:
+        # Read once: an MCP catalog refresh on another thread can replace or drop the manager.
+        tool_search = self._tool_search
+        if not tool_search:
             tools = self._tools
         else:
             if caps.supports_tool_search and self._persona_tools is None:
@@ -9505,9 +9508,19 @@ class ChatSession:
                 # Forced for persona visibility sets — the synthetic
                 # tool_search + expanded-names union is how a soft set
                 # grows, and the persona filter below would otherwise
-                # eat the provider's deferred catalog.
-                visible = self._tool_search.get_visible_tools()
-                tools = visible + [self._tool_search.get_search_tool_definition()]
+                # eat the provider's deferred catalog.  The tools a
+                # replayed native search loaded go out too, unrecorded
+                # (see _natively_loaded_tool_names); the persona filter
+                # still drops any its set does not allow.
+                tools = tool_search.get_visible_tools()
+                loaded = self._natively_loaded_tool_names()
+                if loaded:
+                    tools = tools + [
+                        tool
+                        for tool in tool_search.get_deferred_tools()
+                        if tool.get("function", {}).get("name") in loaded
+                    ]
+                tools = tools + [tool_search.get_search_tool_definition()]
 
         # Gate web_search: only include when a backend exists
         if not caps.supports_web_search and not self._resolve_search_client():
@@ -9527,6 +9540,28 @@ class ChatSession:
             tools = _without_tool(tools, "use_prompt")
 
         return self._apply_persona_visibility(tools)
+
+    def _natively_loaded_tool_names(self) -> frozenset[str]:
+        """Tools that a provider-native tool search in the replayed history loaded.
+
+        A lane whose tool search runs client-side sends only the tools that search expanded,
+        but the history it replays can hold native search results from a lane of the same
+        replay family (a model switch). The API resolves their tool references against the
+        request's tools, so ``_get_active_tools`` offers these tools too, without recording
+        them as discovered; a name the catalog no longer has stays out, and the provider
+        offers it as unavailable. The family is that of the lane activated for this dispatch.
+        """
+        if self._active_replay_producer is None:
+            return frozenset()
+        from turnstone.core.providers._anthropic import tool_search_references  # noqa: PLC0415
+
+        family = replay_family(self._active_replay_producer)
+        return frozenset(
+            name
+            for turn in self.messages
+            if turn.native is not None and replay_family(turn.native.producer) == family
+            for name, _search_id in tool_search_references(turn.native.blocks)
+        )
 
     def _get_deferred_names(self, caps: ModelCapabilities | None = None) -> frozenset[str] | None:
         """Return names of deferred tools for native provider search, or None."""

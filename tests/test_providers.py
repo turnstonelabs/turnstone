@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import logging
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, ClassVar
 from unittest.mock import MagicMock, PropertyMock, patch
 
 import pytest
@@ -2063,6 +2063,116 @@ class TestAnthropicProvider:
             if b.get("type") == "tool_search_tool_result"
         ]
         assert len(results) == 1
+
+    def _tool_search_converted(self) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        search_turn, history = self._tool_search_history()
+        _, converted = self.provider._convert_messages(
+            [
+                *history,
+                {"role": "assistant", "content": "It is 18C."},
+                {"role": "user", "content": "And Rome?"},
+            ]
+        )
+        return search_turn, converted
+
+    def _kwargs_with(
+        self,
+        converted: list[dict[str, Any]],
+        tools: list[str] | None,
+        deferred: frozenset[str] | None = None,
+    ) -> dict[str, Any]:
+        return self.provider._build_thinking_and_kwargs(
+            caps=self.provider.get_capabilities("claude-opus-5-5"),
+            reasoning_effort=None,
+            extra_params=None,
+            max_tokens=1024,
+            temperature=None,
+            converted_msgs=converted,
+            system_prompt="",
+            model="claude-opus-5-5",
+            tools=None
+            if tools is None
+            else [
+                {"type": "function", "function": {"name": tool, "parameters": {}}} for tool in tools
+            ],
+            deferred_names=deferred,
+        )
+
+    _STUB: ClassVar[dict[str, Any]] = {
+        "name": "get_weather",
+        "description": "This tool is no longer available.",
+        "input_schema": {"type": "object", "properties": {}},
+    }
+
+    # None: the stub is the request's only tool, which is why it is a plain definition (the
+    # API rejects a tool list in which every tool is deferred).
+    @pytest.mark.parametrize("tools", [None, ["run"], ["run", "get_weather"]])
+    def test_reference_to_a_tool_no_longer_offered_gets_a_stub(self, tools) -> None:
+        # The API expands every reference in history from this request's tools and
+        # rejects one it cannot resolve (live 400), as when the tool's MCP server is
+        # offline. History keeps what the search loaded; a stub says the tool is gone.
+        search_turn, converted = self._tool_search_converted()
+        kwargs = self._kwargs_with(converted, tools)
+        assert converted[1]["content"] is search_turn
+        offered = tools is not None and "get_weather" in tools
+        assert (self._STUB in kwargs["tools"]) is not offered
+        assert [tool["name"] for tool in kwargs["tools"]].count("get_weather") == 1
+
+    def test_deferred_tool_a_search_loaded_needs_no_stub(self) -> None:
+        # The shape production sends: the loaded tool deferred, beside the search tool.
+        _, converted = self._tool_search_converted()
+        kwargs = self._kwargs_with(converted, ["run", "get_weather"], frozenset({"get_weather"}))
+        assert self._STUB not in kwargs["tools"]
+        assert {"defer_loading": True}.items() <= next(
+            t for t in kwargs["tools"] if t["name"] == "get_weather"
+        ).items()
+
+    @staticmethod
+    def _search(call_id: str, content: dict[str, Any]) -> list[dict[str, Any]]:
+        return [
+            {
+                "type": "server_tool_use",
+                "id": call_id,
+                "name": "tool_search_tool_bm25",
+                "input": {"query": "weather"},
+            },
+            {"type": "tool_search_tool_result", "tool_use_id": call_id, "content": content},
+        ]
+
+    def test_two_searches_for_one_missing_tool_get_one_stub(self, caplog) -> None:
+        # Tool names must be unique, so a second stub of the same name would bring the 400
+        # back. Each search is still logged once.
+        from turnstone.core.providers._anthropic import _log_repair_once
+
+        _log_repair_once.cache_clear()
+        found = {
+            "type": "tool_search_tool_search_result",
+            "tool_references": [{"type": "tool_reference", "tool_name": "get_weather"}],
+        }
+        converted = [
+            {"role": "user", "content": "weather in Paris?"},
+            {"role": "assistant", "content": [*self._search("srvtoolu_a", found)]},
+            {"role": "user", "content": "and Rome?"},
+            {"role": "assistant", "content": [*self._search("srvtoolu_b", found)]},
+            {"role": "user", "content": "and Berlin?"},
+        ]
+        with caplog.at_level(logging.INFO, logger="turnstone.core.providers._anthropic"):
+            for _ in range(2):
+                kwargs = self._kwargs_with(converted, ["run"])
+                assert [t["name"] for t in kwargs["tools"]].count("get_weather") == 1
+        lines = [r.getMessage() for r in caplog.records if "no longer available" in r.getMessage()]
+        assert len(lines) == 2
+        assert any("srvtoolu_a" in line for line in lines)
+        assert any("srvtoolu_b" in line for line in lines)
+
+    def test_failed_search_needs_no_stub(self) -> None:
+        failed = {"type": "tool_search_tool_result_error", "error_code": "unavailable"}
+        converted = [
+            {"role": "user", "content": "weather?"},
+            {"role": "assistant", "content": [*self._search("srvtoolu_c", failed)]},
+            {"role": "user", "content": "go on"},
+        ]
+        assert [t["name"] for t in self._kwargs_with(converted, ["run"])["tools"]] == ["run"]
 
     def test_reasoning_params_mapping(self) -> None:
         assert self.provider._reasoning_params("low", None, max_tokens=32768) == {

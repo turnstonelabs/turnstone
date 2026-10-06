@@ -35,7 +35,7 @@ from turnstone.core.providers._protocol import (
 from turnstone.core.trajectory import materialize_attachments
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterator
+    from collections.abc import Callable, Iterable, Iterator
 
 log = logging.getLogger(__name__)
 
@@ -138,14 +138,14 @@ def _unavailable_result(call: dict[str, Any]) -> dict[str, Any] | None:
 
 
 @functools.lru_cache(maxsize=4096)
-def _log_repair_once(message: str, block_id: str) -> None:
-    """Log one pairing repair at INFO, the first time this process makes it.
+def _log_repair_once(message: str, *args: str) -> None:
+    """Log one wire repair at INFO, the first time this process makes it.
 
     History keeps the original blocks, so a repair recurs on every request that
-    replays them; this bounded memo keeps one line per block (an evicted block is
-    merely logged again).
+    replays them; this bounded memo keeps one line per repaired block (an evicted
+    entry is merely logged again).
     """
-    log.info(message, block_id)
+    log.info(message, *args)
 
 
 def _pair_server_tool_blocks(
@@ -307,6 +307,72 @@ def _finish_wire(
         if not dropped:
             return messages
         passes += 1
+
+
+def tool_search_references(blocks: Iterable[Any]) -> Iterator[tuple[str, str]]:
+    """Yield ``(tool name, search id)`` for each tool a tool search result in *blocks* loaded.
+
+    The one reader of a native tool search's ``tool_reference`` list, so the session's offer
+    (``ChatSession._natively_loaded_tool_names``) and the provider's stubs see the same
+    names. A failed search loads nothing.
+    """
+    result_type = _SERVER_TOOL_RESULT_TYPES[_TOOL_SEARCH_TOOL_TYPE]
+    for block in blocks:
+        if not isinstance(block, dict) or block.get("type") != result_type:
+            continue
+        result = block.get("content")
+        references = result.get("tool_references") if isinstance(result, dict) else None
+        for reference in references or []:
+            name = reference.get("tool_name") if isinstance(reference, dict) else None
+            if isinstance(name, str):
+                yield name, str(block.get("tool_use_id"))
+
+
+# The definition a replayed tool search's reference resolves to once the request no longer
+# offers the tool (see ``_stubs_for_unoffered_references``).
+_UNOFFERED_TOOL_DESCRIPTION = "This tool is no longer available."
+
+
+def _stubs_for_unoffered_references(
+    messages: list[dict[str, Any]], tools: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Define each tool that a replayed tool search loaded and this request does not offer.
+
+    The API expands every ``tool_reference`` in history from this request's ``tools`` and
+    rejects a reference with no definition there (live 400, "Tool reference 'X' not found in
+    available tools"). A tool a past search loaded leaves the request when its MCP server goes
+    offline or is removed, or on a shared workstream when it came from another user's catalog;
+    a tool the session still has stays offered, even where its search runs client-side
+    (``ChatSession._natively_loaded_tool_names``). History keeps what the search loaded, and
+    the stub tells the model the tool is gone. Each stub is a plain definition, not a deferred
+    one: the request may offer no other tool, and the API rejects a tool list in which every
+    tool is deferred.
+    """
+    offered = {tool.get("name") for tool in tools if isinstance(tool, dict)}
+    missing: list[str] = []
+    for message in messages:
+        content = message.get("content")
+        if message.get("role") != "assistant" or not isinstance(content, list):
+            continue
+        for name, search_id in tool_search_references(content):
+            if name in offered:
+                continue
+            _log_repair_once(
+                "Offered tool %s as no longer available: replayed tool search %s loaded it, "
+                "and this request does not offer it",
+                name,
+                search_id,
+            )
+            if name not in missing:
+                missing.append(name)
+    return [
+        {
+            "name": name,
+            "description": _UNOFFERED_TOOL_DESCRIPTION,
+            "input_schema": {"type": "object", "properties": {}},
+        }
+        for name in missing
+    ]
 
 
 def _place_system_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -905,6 +971,9 @@ class AnthropicProvider:
             anthropic_tools = self._inject_web_search(anthropic_tools, caps)
             anthropic_tools = self._inject_tool_search(anthropic_tools, caps, deferred_names)
             kwargs["tools"] = anthropic_tools
+        stubs = _stubs_for_unoffered_references(converted_msgs, kwargs.get("tools", []))
+        if stubs:
+            kwargs["tools"] = [*kwargs.get("tools", []), *stubs]
         kwargs.update(thinking_params)
 
         # Effort param for models that support it (Opus 4.8, Opus 4.7, Opus 4.6, Sonnet 4.6, Opus 4.5).

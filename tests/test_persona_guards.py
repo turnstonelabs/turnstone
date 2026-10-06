@@ -20,6 +20,7 @@ from turnstone.core.session import ChatSession
 from turnstone.core.storage import get_storage
 from turnstone.core.storage._utils import PERSONA_MUTABLE
 from turnstone.core.tools import TASK_AGENT_TOOLS
+from turnstone.core.trajectory import Turn, turn_from_dict
 from turnstone.core.workstream import WorkstreamKind
 
 if TYPE_CHECKING:
@@ -222,6 +223,73 @@ class TestToolSearchEscape:
         # ...and it stays disabled across an MCP catalog refresh.
         session._rebuild_tool_search()
         assert session._tool_search is None
+
+    @staticmethod
+    def _native_search_turn(producer: str, name: str) -> Turn:
+        return turn_from_dict(
+            {
+                "role": "assistant",
+                "content": "",
+                "_producer": producer,
+                "_provider_content": [
+                    {
+                        "type": "tool_search_tool_result",
+                        "tool_use_id": "srvtoolu_1",
+                        "content": {
+                            "type": "tool_search_tool_search_result",
+                            "tool_references": [{"type": "tool_reference", "tool_name": name}],
+                        },
+                    }
+                ],
+            }
+        )
+
+    @pytest.mark.parametrize(
+        ("producer", "name", "visible"),
+        [
+            ("anthropic", "mcp_widget", True),
+            ("anthropic-compatible", "mcp_widget", True),
+            ("openai", "mcp_widget", False),
+            ("anthropic", "mcp_gone", False),
+        ],
+    )
+    def test_native_search_loads_join_a_client_side_wire(
+        self, tmp_db, mock_openai_client, producer, name, visible
+    ) -> None:
+        # A lane whose tool search runs client-side sends only the tools it expanded, but the
+        # history it replays can hold a native search from its replay family, and the API
+        # resolves those references against the request's tools. Another family's blocks
+        # never replay here, and a name the catalog lost is left to the provider's stub.
+        session = _session(mock_openai_client, mcp_client=self._mcp_client(), tool_search="on")
+        session._active_replay_producer = "anthropic"
+        session.messages = [Turn.user("weather?"), self._native_search_turn(producer, name)]
+        assert ("mcp_widget" in _wire_names(session)) is visible
+        # Offered for this request only: nothing is recorded as discovered.
+        assert not session._tool_search.is_expanded("mcp_widget")
+
+    @pytest.mark.parametrize(
+        ("persona_tools", "visible"),
+        [
+            (frozenset({"read_file", "tool_search"}), False),
+            (frozenset({"read_file", "tool_search", "mcp_widget"}), True),
+        ],
+    )
+    def test_native_search_loads_stay_within_a_persona_set(
+        self, tmp_db, mock_openai_client, persona_tools, visible
+    ) -> None:
+        # A forked history can carry a native search that a persona's set never allowed.
+        session = _session(
+            mock_openai_client,
+            mcp_client=self._mcp_client(),
+            tool_search="on",
+            persona_snapshot=_snap(tools=persona_tools),
+        )
+        session._active_replay_producer = "anthropic"
+        session.messages = [
+            Turn.user("weather?"),
+            self._native_search_turn("anthropic", "mcp_widget"),
+        ]
+        assert ("mcp_widget" in _wire_names(session)) is visible
 
     def test_soft_set_expansion_recomposes_prompt(self, tmp_db, mock_openai_client) -> None:
         # A soft set composed the prompt against the pre-expansion visible

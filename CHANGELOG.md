@@ -199,7 +199,9 @@ frozen.
 - **Native tool search keeps working after its first round (Anthropic).** The search's result was
   left out when the conversation was sent back, so the API rejected every request from the second
   one after a search onward and the workstream could not continue. The result is now passed back
-  unchanged, and workstreams already stuck this way continue.
+  unchanged, and workstreams already stuck this way continue. A tool that a search found but a
+  later request no longer offers, for example because its MCP server is offline, is offered as no
+  longer available, since the API rejects a request whose history names a tool it does not have.
 - **A saved workstream with no messages keeps its settings.** Opening one (from a pane, and now
   also `--resume` and `/resume`) applied the constructor's defaults instead of its saved model,
   sampling, instructions and skill, and the next settings change wrote those defaults over the
