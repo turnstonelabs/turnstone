@@ -137,7 +137,12 @@ After `_execute_tools()` returns, the main `send()` loop compacts/truncates
 completed results to the remaining shared budget and then runs the heuristic
 and optional LLM output guard. The task-agent loop deliberately guards the
 observed raw output before applying its size cap, so truncation cannot hide a
-sensitive result from that check.
+sensitive result from that check. Both loops append controller-authored output
+guard advisories after the complete tool-result block; the task-agent loop also
+guards each text part of list results. If a flagged result is clipped after the
+guard scan, the advisory says the finding may concern the part that was cut.
+The model-facing projection excludes free-form judge reasoning and maps
+judge-only symbols through the controller registry.
 
 After guard work, the owning loop rechecks generation ownership. On the main
 conversation path, one generation-fenced commit appends the complete

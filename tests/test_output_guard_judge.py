@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import re
 import threading
 import time
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from tests._session_helpers import as_stream
 from tests._session_helpers import mock_completion_result as _mock_result
@@ -14,11 +15,16 @@ from turnstone.core.deadline import DeadlineExceededError
 from turnstone.core.judge import JudgeConfig
 from turnstone.core.model_registry import ModelConfig
 from turnstone.core.model_turn import ModelLane, ResolvedModelBinding
+from turnstone.core.output_guard import OUTPUT_GUARD_SYMBOLS
 from turnstone.core.output_guard_judge import (
+    _CHARS_PER_TOKEN,
+    _MAX_CITATIONS_PER_FINDING,
     _SYSTEM_PROMPT,
     OutputGuardJudge,
     OutputJudgeVerdict,
     _extract_json,
+    _number_output_lines,
+    _parse_citations,
 )
 from turnstone.core.providers._protocol import ModelCapabilities, UsageInfo
 
@@ -207,6 +213,94 @@ class TestCapabilityThreading:
         assert v.succeeded
         assert captured["capabilities"] is judge._capabilities
         assert captured["capabilities"].supports_tools is False
+
+
+class TestOutputTokenBudget:
+    @staticmethod
+    def _evaluate(
+        *,
+        model_cap: int,
+        context_window: int = 200_000,
+        alias_cap: int | None = None,
+        global_cap: int | None = None,
+        output: str = "small output",
+    ) -> tuple[dict[str, Any], OutputJudgeVerdict, OutputGuardJudge]:
+        provider, captured = TestCapabilityThreading._recording_provider()
+        caps = ModelCapabilities(
+            context_window=context_window,
+            max_output_tokens=model_cap,
+        )
+        model_config = ModelConfig(
+            "session",
+            "http://session",
+            "key",
+            "session-model",
+            context_window=context_window,
+            max_tokens=alias_cap,
+        )
+        store = _VersionedConfigStore(temperature=0.0, reasoning_effort="")
+        store._values["model.max_tokens"] = global_cap
+        client = MagicMock(base_url="http://session", api_key="s")
+        judge = OutputGuardJudge(
+            config=JudgeConfig(output_guard_llm=True),
+            session_binding=_binding(
+                provider,
+                client,
+                "session-model",
+                capabilities=caps,
+                config=model_config,
+            ),
+            config_store=store,
+        )
+        with patch.object(judge, "_create_client", return_value=client):
+            verdict = judge.evaluate(output)
+        return captured, verdict, judge
+
+    def test_alias_model_cap_wins_and_is_bounded_by_advertised_maximum(self) -> None:
+        captured, verdict, _judge = self._evaluate(
+            model_cap=1000,
+            alias_cap=500,
+            global_cap=200,
+        )
+
+        assert verdict.succeeded
+        assert captured["max_tokens"] == 500
+
+    def test_alias_cap_never_exceeds_advertised_maximum(self) -> None:
+        captured, verdict, _judge = self._evaluate(model_cap=300, alias_cap=500)
+
+        assert verdict.succeeded
+        assert captured["max_tokens"] == 300
+
+    def test_global_setting_applies_when_alias_has_no_cap(self) -> None:
+        captured, verdict, _judge = self._evaluate(
+            model_cap=1000,
+            global_cap=240,
+        )
+
+        assert verdict.succeeded
+        assert captured["max_tokens"] == 240
+
+    def test_advertised_maximum_is_fallback_without_configured_caps(self) -> None:
+        captured, verdict, _judge = self._evaluate(model_cap=350)
+
+        assert verdict.succeeded
+        assert captured["max_tokens"] == 350
+
+    def test_cap_is_fitted_to_the_remaining_context_window(self) -> None:
+        output = "x" * 24_000
+        captured, verdict, _judge = self._evaluate(
+            model_cap=8000,
+            context_window=10_000,
+            alias_cap=5000,
+            output=output,
+        )
+        prompt = OutputGuardJudge._user_prompt(output)
+        estimate = int((len(_SYSTEM_PROMPT) + len(prompt)) / _CHARS_PER_TOKEN)
+
+        assert verdict.succeeded
+        assert captured["max_tokens"] == min(5000, 10_000 - estimate)
+        assert captured["max_tokens"] < 5000
 
 
 class TestVerdictDataclass:
@@ -587,6 +681,33 @@ class TestBindingFreshness:
             JudgeConfig(output_guard_llm=True, output_guard_llm_timeout=45.0),
         )
 
+    def test_model_max_tokens_change_invalidates_the_guard(self) -> None:
+        store = _VersionedConfigStore(temperature=0.0, reasoning_effort="")
+        store._values["model.max_tokens"] = 120
+        provider = _make_provider()
+        model_config = ModelConfig(
+            "session",
+            "http://session",
+            "key",
+            "session-model",
+            context_window=200_000,
+        )
+        session_binding = _binding(
+            provider,
+            MagicMock(base_url="http://session", api_key="s"),
+            "session-model",
+            config=model_config,
+        )
+        config = JudgeConfig(output_guard_llm=True)
+        judge = OutputGuardJudge(config, session_binding, config_store=store)
+        assert judge._max_output_tokens == 120
+
+        store._values["model.max_tokens"] = 240
+        store.version += 1
+        assert not judge.binding_is_current(session_binding, config)
+        replacement = OutputGuardJudge(config, session_binding, config_store=store)
+        assert replacement._max_output_tokens == 240
+
     def test_explicit_alias_tracks_config_store_sampling_without_registry_reload(self) -> None:
         store = _VersionedConfigStore(temperature=0.25, reasoning_effort="low")
         registry = MagicMock()
@@ -951,8 +1072,21 @@ class TestFenceEscape:
         judge whole."""
         big_output = "Z" * 20_000
         prompt = OutputGuardJudge._user_prompt(big_output, func_name="web_fetch")
-        assert big_output in prompt
+        assert f"1: {big_output}" in prompt
         assert "chars omitted" not in prompt
+
+    def test_user_prompt_numbers_each_line_for_citations(self) -> None:
+        prompt = OutputGuardJudge._user_prompt("first\nsecond")
+
+        assert "1: first\n2: second" in prompt
+        assert _number_output_lines("first\nsecond") == "1: first\n2: second"
+
+    def test_list_part_prompt_can_disable_line_citations(self) -> None:
+        prompt = OutputGuardJudge._user_prompt("first\nsecond", include_citations=False)
+
+        assert "1: first" not in prompt
+        assert "first\nsecond" in prompt
+        assert "Flagged-line citations" not in prompt
 
     def test_user_prompt_skips_heuristic_section_when_clean(self) -> None:
         # risk='none' and empty flags → no "Heuristic stage flagged" line.
@@ -986,6 +1120,49 @@ class TestFenceEscape:
         # Attacker tag defanged; the tag canonicalises to lowercase (the defang
         # rebuilds from the real tag), only the nonce-ish suffix is preserved.
         assert "[\\end tool_output_XYZ]" in prompt
+
+
+class TestCitationValidation:
+    def test_ranges_reject_invalid_values_merge_overlap_and_cap(self) -> None:
+        ranges = [
+            {"start_line": 4, "end_line": 5},
+            {"start_line": 2, "end_line": 3},
+            {"start_line": 3, "end_line": 4},
+            {"start_line": 0, "end_line": 1},
+            {"start_line": 6, "end_line": 5},
+            {"start_line": True, "end_line": 2},
+            {"start_line": "7", "end_line": 7},
+            {"start_line": 99, "end_line": 99},
+            *[{"start_line": line, "end_line": line} for line in (7, 9, 11, 13, 15, 17)],
+        ]
+
+        parsed = _parse_citations(ranges, line_count=20)
+
+        assert parsed == ((2, 5), (7, 7), (9, 9), (11, 11), (13, 13))
+        assert len(parsed) == _MAX_CITATIONS_PER_FINDING
+
+    def test_valid_citations_are_returned_but_list_parts_cannot_cite(self) -> None:
+        content = (
+            '{"risk_level":"high","flags":["prompt_injection"],'
+            '"citations":[{"start_line":2,"end_line":2}]}'
+        )
+        judge = _make_judge(content=content)
+        cited = judge.evaluate("clean line\nflagged line")
+        uncited = judge.evaluate("clean line\nflagged line", include_citations=False)
+
+        assert cited.succeeded
+        assert cited.citations == ((2, 2),)
+        assert uncited.succeeded
+        assert uncited.citations == ()
+
+    def test_prompt_registry_matches_projection_registry_without_fallback(self) -> None:
+        prompt_registry = _SYSTEM_PROMPT.split(
+            "Controller flag registry (choose only from these symbols):\n", 1
+        )[1].split("\nReturn at most", 1)[0]
+        prompt_symbols = re.findall(r'^- "([^"]+)":', prompt_registry, re.MULTILINE)
+
+        assert prompt_symbols == list(OUTPUT_GUARD_SYMBOLS)
+        assert "unclassified" not in prompt_symbols
 
 
 class TestExtractJson:

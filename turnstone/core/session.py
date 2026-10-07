@@ -1197,6 +1197,7 @@ _RECALL_RESULT_CONTENT_CAP: int = 2000
 # in-loop truncation in _run_agent) — bounds what the sub-agent's own model sees
 # on its next turn.  Distinct from (and larger than) the recall per-step cap.
 _AGENT_TOOL_OUTPUT_CAP: int = 16000
+_AGENT_OUTPUT_CUT_ADVISORY = "The finding may concern the part of this result that was cut off."
 # The output guard scans this much of a task-agent tool result before the
 # clip.  Wider than the clip so a credential straddling the clip boundary is
 # seen whole and redacted, yet bounded so a tool server never chooses how much
@@ -8703,6 +8704,7 @@ class ChatSession:
         messages: list[dict[str, Any]],
         *,
         caps: ModelCapabilities,
+        include_operator_declaration: bool = False,
     ) -> list[dict[str, Any]]:
         """Prepare ``model_turn``-lowered messages without re-sanitizing.
 
@@ -8712,6 +8714,16 @@ class ChatSession:
         only remaining call/result pass.
         """
         structured = self._prepare_wire_structure(messages, caps=caps)
+        if include_operator_declaration and not caps.supports_mid_conversation_system:
+            declaration = build_operator_instruction_declaration(self._envelope_nonce)
+            for index, message in enumerate(structured):
+                if message.get("role") != "system" or not isinstance(message.get("content"), str):
+                    continue
+                content = message["content"]
+                if declaration not in content:
+                    structured = list(structured)
+                    structured[index] = {**message, "content": f"{content}\n\n{declaration}"}
+                break
         return repair_wire_messages(structured)
 
     def _emit_state(
@@ -13436,6 +13448,7 @@ class ChatSession:
                                         _tc_names.get(tc_id, ""),
                                         tool_args=_tc_args.get(tc_id, ""),
                                         my_generation=my_generation,
+                                        include_citations=False,
                                     )
                                     if _part_assess is not None:
                                         assessment = _part_assess
@@ -13460,6 +13473,7 @@ class ChatSession:
                 # the backstop for a batch that grew past its allowance.
                 recut: list[tuple[int, str, Any, OutputAssessment | None]] = []
                 for _ri, tc_id, output, assessment in guarded_results:
+                    original_output = output
                     rendered = _admissions.get(tc_id)
                     if (
                         rendered is not None
@@ -13479,6 +13493,23 @@ class ChatSession:
                                 marker_factory=_result_marker_factory(_tc_names.get(tc_id, "")),
                             )
                             .text
+                        )
+                    if (
+                        assessment is not None
+                        and assessment.citations
+                        and isinstance(original_output, str)
+                        and isinstance(output, str)
+                        and output != original_output
+                    ):
+                        from turnstone.core.output_guard import filter_line_stable_citations
+
+                        assessment = dataclasses.replace(
+                            assessment,
+                            citations=filter_line_stable_citations(
+                                assessment.citations,
+                                original_output,
+                                output,
+                            ),
                         )
                     recut.append((_ri, tc_id, output, assessment))
                 guarded_results = recut
@@ -17385,14 +17416,17 @@ class ChatSession:
         my_generation: int = 0,
         principal_id: str | None = None,
         cancel_ref: StreamAbortRef | None = None,
+        include_citations: bool = True,
     ) -> tuple[str, OutputAssessment | None]:
         """Run the output guard on tool result text.
 
         Two stages.  The heuristic regex stage always runs; the LLM judge
         (issue #560 mitigation #1) runs when ``judge.output_guard_llm``
-        is enabled.  When both run and the LLM succeeds, the LLM verdict
-        is the *acted* assessment (informs redaction + UI + return);
-        otherwise the heuristic stands.  Both tier rows are persisted
+        is enabled. When both run and the LLM succeeds, its risk can escalate
+        the acted assessment, while heuristic findings cannot be lowered.
+        Operator display and audit retain the raw judge verdict; model context
+        receives only heuristic annotations and registered judge symbols.
+        Redaction remains heuristic-only. Both tier rows are persisted
         whenever the LLM ran, for audit completeness.
 
         ``tool_args`` is the JSON-string args the tool was called with
@@ -17421,7 +17455,9 @@ class ChatSession:
         from turnstone.core.output_guard import (
             OutputAssessment,
             evaluate_output,
+            filter_line_stable_citations,
             merge_guard_display_payload,
+            project_judge_output_findings,
         )
 
         judge_principal = principal_id
@@ -17482,6 +17518,7 @@ class ChatSession:
                 heuristic_risk=heuristic.risk_level,
                 heuristic_flags=tuple(heuristic.flags),
                 heuristic_annotations=tuple(heuristic.annotations),
+                include_citations=include_citations,
                 my_generation=my_generation,
                 principal_id=judge_principal,
                 cancel_ref=cancel_ref,
@@ -17621,24 +17658,28 @@ class ChatSession:
         if d is None:
             return output, None
 
-        # Context-facing annotations (what the MODEL sees via the
-        # output_guard operator-context system turn):
-        # the heuristic findings, plus the LLM's reasoning ONLY when the LLM
-        # ESCALATED (flagged something itself).  We deliberately never inject
-        # the judge's "benign" reasoning into the model context — a judge
-        # fooled into "none" on a real heuristic finding must not get to tell
-        # the model the output is safe.  The operator UI still shows the full
-        # LLM verdict via the chip payload below.
-        context_annotations = list(heuristic.annotations)
-        if llm is not None and llm.risk_level != "none" and llm.reasoning:
-            context_annotations.append(llm.reasoning)
-        # acted's risk/flags come straight from the merge payload so the
-        # context advisory can't drift from the chip.
+        # The operator chip keeps raw judge flags and reasoning. Model context
+        # gets the heuristic annotations plus registered judge symbols; when
+        # an escalation has no usable symbol, the projection uses
+        # ``unclassified`` instead of judge-written prose.
+        context_flags, context_annotations = project_judge_output_findings(
+            heuristic.flags,
+            heuristic.annotations,
+            llm.flags if llm is not None else (),
+            escalated=llm is not None and llm.risk_level != "none",
+        )
+        final_output = output
+        if wants_redaction and heuristic.sanitized is not None:
+            final_output = heuristic.sanitized
+        citations = list(llm.citations) if llm is not None else []
+        if citations and final_output != output:
+            citations = filter_line_stable_citations(citations, output, final_output)
         acted = OutputAssessment(
-            flags=list(d["flags"]),
+            flags=context_flags,
             risk_level=str(d["risk_level"]),
             annotations=context_annotations,
             sanitized=heuristic.sanitized,
+            citations=citations,
         )
 
         d["func_name"] = func_name
@@ -17731,6 +17772,7 @@ class ChatSession:
         heuristic_risk: str = "none",
         heuristic_flags: tuple[str, ...] = (),
         heuristic_annotations: tuple[str, ...] = (),
+        include_citations: bool = True,
         my_generation: int = 0,
         principal_id: str = "",
         cancel_ref: StreamAbortRef | None = None,
@@ -17811,6 +17853,7 @@ class ChatSession:
                 heuristic_risk=heuristic_risk,
                 heuristic_flags=heuristic_flags,
                 heuristic_annotations=heuristic_annotations,
+                include_citations=include_citations,
                 cancel_event=cancel_event,
                 admit_reissue=_admit_reissue,
                 backend_auth_resolver=self._model_backend_auth_resolver_for_principal(principal_id),
@@ -18438,6 +18481,27 @@ class ChatSession:
         """Return non-empty browser correlation ids in queue arrival order."""
         return tuple(csid for row in items.values() if (csid := _queued_row_client_send_id(row)))
 
+    @staticmethod
+    def _output_guard_advisory(
+        assessment: OutputAssessment | None,
+    ) -> tuple[str, str, dict[str, Any]] | None:
+        """Build the shared model/UI projection for one output-guard finding."""
+        if assessment is None:
+            return None
+        from turnstone.core.output_guard import format_output_guard_citations
+
+        annotations = list(assessment.annotations)
+        citation_note = format_output_guard_citations(assessment.citations)
+        if citation_note:
+            annotations.append(citation_note)
+        guard_meta: dict[str, Any] = {
+            "flags": list(assessment.flags),
+            "risk_level": assessment.risk_level,
+            "annotations": annotations,
+            "redacted": assessment.sanitized is not None,
+        }
+        return "output_guard", render_output_guard_text(guard_meta), guard_meta
+
     def _collect_advisories(
         self,
         assessment: OutputAssessment | None,
@@ -18476,14 +18540,9 @@ class ChatSession:
         # derive the wire/UI text ``content`` from it via
         # ``render_output_guard_text`` so the prose the model reads and the FE
         # guard-finding card cannot drift.  Mirrors the legacy GuardAdvisory.
-        if assessment is not None:
-            guard_meta: dict[str, Any] = {
-                "flags": list(assessment.flags),
-                "risk_level": assessment.risk_level,
-                "annotations": list(assessment.annotations),
-                "redacted": assessment.sanitized is not None,
-            }
-            specs.append(("output_guard", render_output_guard_text(guard_meta), guard_meta))
+        guard_spec = self._output_guard_advisory(assessment)
+        if guard_spec is not None:
+            specs.append(guard_spec)
 
         # Last-result-in-batch drain seams: queued user messages (Seam 1)
         # and tool/any-channel metacog nudges.  Both fire once per batch so a
@@ -25827,6 +25886,7 @@ class ChatSession:
                     prepare_wire=lambda wire, serving_lane: self._prepare_lowered_wire_messages(
                         wire,
                         caps=require_lane_capabilities(serving_lane),
+                        include_operator_declaration=True,
                     ),
                 )
             except Exception:
@@ -26329,6 +26389,7 @@ class ChatSession:
             # Execute tools sequentially (not parallel) to avoid
             # concurrent _read_files mutation from worker threads.
             tool_names = frozenset(t["function"]["name"] for t in tools)
+            pending_guard_advisories: list[tuple[OutputAssessment, str]] = []
             for tc_dict in result.tool_calls:
                 cancel_scope.check()
                 tool_name = tc_dict["function"]["name"].strip()
@@ -26526,25 +26587,99 @@ class ChatSession:
                             tool_name=tool_name,
                         )
 
-                # Output guard on the window.  Agent outputs are always str.
+                # Guard text and citation numbering remain local to each result
+                # part; list results do not have one shared line coordinate space.
                 cancel_scope.check()
-                if self._judge_cfg and self._judge_cfg.output_guard and isinstance(output, str):
-                    output, _ = self._evaluate_output(
-                        tc_dict["id"],
-                        output,
-                        tool_name,
-                        tool_args=tc_dict.get("function", {}).get("arguments", ""),
-                        my_generation=origin_generation,
-                        principal_id=agent_principal,
-                        cancel_ref=cancel_scope.cancel_ref,
-                    )
+                assessment: OutputAssessment | None = None
+                if self._judge_cfg and self._judge_cfg.output_guard:
+                    tool_args = tc_dict.get("function", {}).get("arguments", "")
+                    if isinstance(output, str):
+                        output, assessment = self._evaluate_output(
+                            tc_dict["id"],
+                            output,
+                            tool_name,
+                            tool_args=tool_args,
+                            my_generation=origin_generation,
+                            principal_id=agent_principal,
+                            cancel_ref=cancel_scope.cancel_ref,
+                        )
+                    elif isinstance(output, list):
+                        for part in output:
+                            if (
+                                isinstance(part, dict)
+                                and part.get("type") == "text"
+                                and isinstance(part.get("text"), str)
+                                and part["text"]
+                            ):
+                                part_original_chars = len(part["text"])
+                                part_original = part["text"]
+                                if len(part_original) > _AGENT_GUARD_WINDOW_CHARS:
+                                    part_original = _clip_agent_text(
+                                        part_original,
+                                        _AGENT_GUARD_WINDOW_CHARS,
+                                        original_chars=len(part["text"]),
+                                        tool_name=tool_name,
+                                    )
+                                part["text"], part_assessment = self._evaluate_output(
+                                    tc_dict["id"],
+                                    part_original,
+                                    tool_name,
+                                    tool_args=tool_args,
+                                    my_generation=origin_generation,
+                                    principal_id=agent_principal,
+                                    cancel_ref=cancel_scope.cancel_ref,
+                                    include_citations=False,
+                                )
+                                if len(part["text"]) > _AGENT_TOOL_OUTPUT_CAP:
+                                    guarded_part = part["text"]
+                                    part["text"] = _clip_agent_text(
+                                        guarded_part,
+                                        _AGENT_TOOL_OUTPUT_CAP,
+                                        original_chars=part_original_chars,
+                                        tool_name=tool_name,
+                                    )
+                                    if part_assessment is not None:
+                                        from turnstone.core.output_guard import (
+                                            filter_line_stable_citations,
+                                        )
+
+                                        part_assessment = dataclasses.replace(
+                                            part_assessment,
+                                            annotations=[
+                                                *part_assessment.annotations,
+                                                _AGENT_OUTPUT_CUT_ADVISORY,
+                                            ],
+                                            citations=filter_line_stable_citations(
+                                                part_assessment.citations,
+                                                guarded_part,
+                                                part["text"],
+                                            ),
+                                        )
+                                if part_assessment is not None:
+                                    pending_guard_advisories.append((part_assessment, tool_name))
+                cancel_scope.check()
                 if isinstance(output, str) and len(output) > _AGENT_TOOL_OUTPUT_CAP:
+                    guarded_output = output
                     output = _clip_agent_text(
                         output,
                         _AGENT_TOOL_OUTPUT_CAP,
                         original_chars=original_chars,
                         tool_name=tool_name,
                     )
+                    if assessment is not None:
+                        from turnstone.core.output_guard import filter_line_stable_citations
+
+                        assessment = dataclasses.replace(
+                            assessment,
+                            annotations=[*assessment.annotations, _AGENT_OUTPUT_CUT_ADVISORY],
+                            citations=filter_line_stable_citations(
+                                assessment.citations,
+                                guarded_output,
+                                output,
+                            ),
+                        )
+                if assessment is not None:
+                    pending_guard_advisories.append((assessment, tool_name))
 
                 # NOTE: for a vision tool result ``output`` is a list[dict] of
                 # inline content parts (read_file on an image).  It lowers back
@@ -26576,6 +26711,15 @@ class ChatSession:
                     child_ids={tc_dict["id"]},
                 )
                 execution_journal.release_child(tc_dict["id"])
+            cancel_scope.check()
+            for assessment, _tool_name in pending_guard_advisories:
+                guard_spec = self._output_guard_advisory(assessment)
+                if guard_spec is None:
+                    continue
+                source, content, _meta = guard_spec
+                advisory_turn = Turn.system(content, source=source)
+                agent_turns.append(advisory_turn)
+                context_turns.append(advisory_turn)
             # Successful compaction runs at the top of the next iteration.
             # Drop the just-completed provider response and last tool locals
             # before that summary/model call so the context swap is also a real

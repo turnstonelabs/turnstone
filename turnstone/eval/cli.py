@@ -139,6 +139,33 @@ def _run_nudges_cli(args: argparse.Namespace, model: str, api_key: str) -> None:
     print(f"\n  results -> {args.output}")
 
 
+def _run_output_guard_cli(
+    args: argparse.Namespace,
+    client: OpenAI,
+    model: str,
+) -> None:
+    """Run a judge, citation-location, or task-agent output-guard eval."""
+    from turnstone.eval.output_guard import run_output_guard_eval
+
+    if args.parallel != 1:
+        raise SystemExit("--output-guard runs serially; use --parallel 1")
+    result = run_output_guard_eval(
+        client=client,
+        model=model,
+        mode=args.output_guard,
+        cases=args.cells,
+        n_runs=args.n_runs if args.n_runs is not None else 3,
+        max_tokens=args.max_tokens,
+        timeout=args.test_timeout,
+    )
+    result["meta"]["base_url"] = args.base_url
+    with open(args.output, "w") as f:
+        json.dump(result, f, indent=2)
+        f.write("\n")
+    print(json.dumps(result["aggregate"], indent=2))
+    print(f"Results written to {args.output}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Headless measurement for turnstone (scores tool use against expected actions)",
@@ -254,9 +281,18 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--output-guard",
+        choices=("judge", "locate", "subagent"),
+        default=None,
+        help=(
+            "Measure output-guard judge accuracy, cited-line location, or task-agent "
+            "response to a guarded tool result"
+        ),
+    )
+    parser.add_argument(
         "--cells",
         default=None,
-        help="--nudges: comma-separated cell ids to run (default: all)",
+        help="--nudges / --output-guard: comma-separated case ids to run (default: all)",
     )
     parser.add_argument(
         "--body-override",
@@ -301,10 +337,18 @@ def main() -> None:
         assert detected is not None  # fatal=True guarantees non-None or SystemExit
         model = detected
 
+    if sum((bool(args.nudges), bool(args.skill_adherence), args.output_guard is not None)) > 1:
+        parser.error("--nudges, --skill-adherence, and --output-guard are separate modes")
+
     # Nudge-response mode carries its own cells and uses the coordinator's
     # natural composition — branch before the test_file / prompt paths.
     if args.nudges:
         _run_nudges_cli(args, model, api_key)
+        return
+    if args.output_guard:
+        if args.prompt or args.body_override:
+            parser.error("--output-guard does not use --prompt or --body-override")
+        _run_output_guard_cli(args, client, model)
         return
     if args.test_file is None:
         parser.error("test_file is required unless --nudges is given")

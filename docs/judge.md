@@ -505,11 +505,31 @@ The same merge runs live and on reconnect (both call
 `output_guard.merge_guard_display_payload`), so the chip can't drift between
 the two surfaces.
 
-The MODEL on the other side of the conversation is shown the merged
-`risk_level` + `flags` (via the `GuardAdvisory` spliced into the tool-result
-envelope), but is **never** told the judge cleared a finding — a judge fooled
-into "none" must not get to talk the model out of caution. The judge's
-"benign" verdict is operator-facing only.
+The model-facing advisory is a separate projection. Heuristic flags and their
+controller-authored annotations pass through as before. Judge-only flags map
+through the closed `OUTPUT_GUARD_SYMBOLS` registry; an unknown symbol, or an
+escalated verdict with no usable symbol, becomes `unclassified`. A judge's
+free-form reasoning and raw flags stay on the operator chip and in the audit
+row. Registry sentences are emitted in registry order, deduplicated, and
+capped per finding. This keeps model-facing system context controller-authored
+even though the judge read untrusted output.
+
+The same assessment and rendered advisory reach the main conversation and the
+in-process `task_agent` loop. The task agent receives the finding after the
+complete tool-result block, including the text parts of multimodal list
+results. Its guarded text is scanned before the agent output cap; an advisory
+notes when the finding may concern clipped content. If the serving model folds
+operator turns, the task-agent system prompt declares the session nonce and the
+advisory folds into the preceding tool result under that fence.
+
+When the LLM judge returns validated line citations, the advisory names those
+line numbers relative to the first line of the tool result and does not quote
+their contents. Citations survive only when redaction and clipping leave the
+referenced line numbers stable. Citations are not produced for the heuristic
+stage or for separately guarded text parts of a list result.
+
+The judge's "benign" verdict remains operator-facing only; it cannot remove a
+heuristic finding from the model-facing projection.
 
 ### SSE event: `output_warning`
 

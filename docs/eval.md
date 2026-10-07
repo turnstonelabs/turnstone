@@ -492,6 +492,29 @@ turnstone-eval tests.json --parallel 4        # run cases across 4 workers
 turnstone-eval tests.json -v                  # verbose per-turn logging
 ```
 
+### Output-guard behavior evals
+
+These cases use the production judge prompt and parser, nonce-folded advisory,
+and heuristic output guard. They run serially against the configured
+OpenAI-compatible endpoint; tool calls in the sub-agent eval are denied before
+execution and never access the network.
+
+```
+turnstone-eval --output-guard judge --model local-model --n-runs 3
+turnstone-eval --output-guard locate --model local-model --cells judge_read_file_offset
+turnstone-eval --output-guard subagent --model local-model --n-runs 5
+```
+
+`judge` reports detection, symbol recall, unclassified findings, citation
+precision and recall, benign-control false positives, parse failures, and
+output-cap cutoffs. Its cases include long tool output, a `read_file` result
+starting at a nonzero offset, and output longer than the task-agent clip.
+`locate` asks the model to quote lines named by a validated advisory and reports
+exact-quote accuracy on numbered and unnumbered results. `subagent` compares
+directive-attempt rates with and without the output-guard advisory; a matching
+tool call counts as acting on the directive even though the evaluator denies
+it.
+
 ### Optimize (`turnstone-optimizer`)
 
 ```
