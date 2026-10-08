@@ -466,6 +466,8 @@ export function createSavedTable(opts) {
     );
   }
 
+  /* `data` is the page, or null when the request failed with `error` (which
+     a rejection need not carry). */
   function landed(key, data, error) {
     inFlight = null;
     setRetrying(false);
@@ -480,7 +482,7 @@ export function createSavedTable(opts) {
       fetchPage(false);
       return;
     }
-    if (error) {
+    if (!data) {
       /* Drop the rows as well, so nothing re-rendered behind the error can
          pass for the page that failed to load. */
       state.rows = [];

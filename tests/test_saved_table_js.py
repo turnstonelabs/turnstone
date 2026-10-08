@@ -271,6 +271,15 @@ assert.equal(body.children[0].dataset.wsId, 'ws-20');
 """)
 
 
+def test_a_rejection_without_a_reason_still_shows_the_error():
+    _run(r"""
+table.load(Promise.reject());
+await settle();
+assert.equal(elements.get('error').hidden, false);
+assert.equal(elements.get('error-text').textContent, 'Could not load saved sessions.');
+""")
+
+
 def test_delete_mode_holds_every_fetch_until_it_ends():
     _run(r"""
 element('del-button');
