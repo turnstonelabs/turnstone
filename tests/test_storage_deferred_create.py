@@ -162,7 +162,7 @@ def test_creating_row_is_hidden_from_ordinary_storage_discovery(storage_backend:
     # User-facing discovery never exposes a half-constructed durable row,
     # even when it already has an alias and conversation history.
     assert ws_id not in _row_ids(backend.list_workstreams(user_id="alice"))
-    assert ws_id not in _row_ids(backend.list_workstreams_with_history(user_id="alice"))
+    assert ws_id not in _row_ids(backend.list_workstreams_with_history())
     assert backend.resolve_workstream(ws_id) is None
     assert backend.resolve_workstream("creating-row") is None
     assert backend.resolve_workstream("hidden-alias") is None
@@ -312,53 +312,11 @@ def test_retention_prune_leaves_stale_creating_for_complete_reaper(
     assert row["state"] == "creating"
 
 
-def test_history_child_count_excludes_creating_until_publication(storage_backend: Any) -> None:
-    backend = storage_backend
-    parent_id = "published-parent-1234"
-    child_id = "creating-child-1234"
-    token = "child-incarnation"
-    assert (
-        backend.register_workstream(
-            parent_id,
-            name="published parent",
-            state="idle",
-            user_id="alice",
-            kind="coordinator",
-        )
-        is True
-    )
-    backend.save_message(parent_id, "user", "make the parent listable")
-    assert (
-        backend.register_workstream(
-            child_id,
-            name="hidden child",
-            state="creating",
-            user_id="alice",
-            kind="interactive",
-            parent_ws_id=parent_id,
-            fork_reservation_token=token,
-        )
-        is True
-    )
-
-    rows = backend.list_workstreams_with_history(kind="coordinator", user_id="alice")
-    assert len(rows) == 1
-    assert rows[0][0] == parent_id
-    assert rows[0][12] == 0
-
-    assert backend.publish_deferred_create(child_id, token) is True
-
-    rows = backend.list_workstreams_with_history(kind="coordinator", user_id="alice")
-    assert len(rows) == 1
-    assert rows[0][0] == parent_id
-    assert rows[0][12] == 1
-
-
 def test_history_apis_exclude_creating_until_publication(storage_backend: Any) -> None:
     backend = storage_backend
     visible_id, creating_id, token = _seed_visible_and_creating(backend)
 
-    assert _row_ids(backend.list_workstreams_with_history(user_id="alice")) == {visible_id}
+    assert _row_ids(backend.list_workstreams_with_history()) == {visible_id}
     assert {str(row[1]) for row in backend.search_history("deferredvisibilityneedle")} == {
         visible_id
     }
@@ -367,7 +325,7 @@ def test_history_apis_exclude_creating_until_publication(storage_backend: Any) -
     assert backend.publish_deferred_create(creating_id, token) is True
 
     expected = {visible_id, creating_id}
-    assert _row_ids(backend.list_workstreams_with_history(user_id="alice")) == expected
+    assert _row_ids(backend.list_workstreams_with_history()) == expected
     assert {str(row[1]) for row in backend.search_history("deferredvisibilityneedle")} == expected
     assert {str(row[1]) for row in backend.search_history_recent(limit=20)} == expected
 
@@ -412,7 +370,7 @@ def test_publish_deferred_create_is_exact_token_cas_and_exposes_idle_row(
     assert backend.get_workstream_reservation_token(ws_id) == token
     assert _raw_config(backend, ws_id) == {FORK_RESERVATION_CONFIG_KEY: token}
     assert ws_id in _row_ids(backend.list_workstreams(user_id="alice"))
-    assert ws_id in _row_ids(backend.list_workstreams_with_history(user_id="alice"))
+    assert ws_id in _row_ids(backend.list_workstreams_with_history())
     assert backend.resolve_workstream(ws_id) == ws_id
     assert backend.resolve_workstream("published-alias") == ws_id
 

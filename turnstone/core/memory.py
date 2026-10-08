@@ -490,39 +490,10 @@ def delete_workstream_override(ws_id: str) -> None:
         log.warning("override delete failed for %s", ws_id[:8], exc_info=True)
 
 
-def list_workstreams_with_history(
-    limit: int = 20,
-    *,
-    kind: WorkstreamKind | str | None = None,
-    user_id: str | None = None,
-    state: str | None = None,
-    offset: int = 0,
-) -> list[Any]:
-    """List workstreams that have conversation messages.
-
-    ``kind`` forwards to the storage layer's SQL-side filter — pass
-    ``WorkstreamKind.INTERACTIVE`` from the interactive "saved
-    workstreams" endpoint so coordinator rows (which persist
-    conversation history too) don't leak into that sidebar.  Default
-    ``None`` preserves legacy all-kinds behaviour.
-
-    ``user_id`` enforces tenant scoping at the SQL layer.  Pass the
-    authenticated caller's uid from any tenant-visible endpoint;
-    leaving it as ``None`` means cluster-wide (service-scoped
-    callers only).
-
-    ``state`` filters by lifecycle state — pass ``"closed"`` from the
-    coordinator-saved surface so deleted / currently-active rows don't
-    end up in the saved cards.  Default ``None`` preserves all-states.
-    """
+def list_workstreams_with_history(limit: int = 20) -> list[Any]:
+    """List workstreams that have conversation messages, newest first."""
     try:
-        return get_storage().list_workstreams_with_history(
-            limit,
-            kind=kind,
-            user_id=user_id,
-            state=state,
-            offset=offset,
-        )
+        return get_storage().list_workstreams_with_history(limit)
     except Exception:
         log.warning("Failed to list workstreams with history", exc_info=True)
         return []

@@ -976,8 +976,8 @@ def format_idle_tasks_nudge(
       The branch's wait call takes every id (capped at
       :data:`NUDGE_IDLE_CHILDREN_WAIT_CAP`, ``mode="any"``), which is
       unambiguous because a list slot has no wrong element to pick, and
-      ``child_ws_id`` takes the first — most recently updated, since
-      the caller's query orders by ``updated DESC``.
+      ``child_ws_id`` takes the first — the child whose conversation
+      changed last, since the caller's query orders by ``updated DESC``.
 
     ``None`` is NOT an input.  The old "I am not asserting a children
     state" hedge branch died when the observer began failing its whole

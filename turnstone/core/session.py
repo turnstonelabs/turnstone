@@ -28682,9 +28682,7 @@ class ChatSession:
                 self.ui.on_info("No saved workstreams.")
             else:
                 lines = ["Workstreams:\n"]
-                # Column order from the storage SELECT: ws_id, alias, title,
-                # name, created, updated, message_count, … (tail ignored).
-                for wid, alias, title, _name, _created, updated, count, *_extra in rows:
+                for wid, alias, title, _name, _created, updated, count in rows:
                     display_name = alias or wid
                     display_title = f"  {title}" if title else ""
                     marker = " *" if wid == self._ws_id else "  "

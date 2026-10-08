@@ -5,7 +5,7 @@
 
      - renderSessionRow(sess, opts)  — one .dash-row from a column spec
      - SavedColumns                  — shared column descriptors
-     - createSavedTable(opts)        — filter + sort + render, wrapping the
+     - createSavedTable(opts)        — fetch + page + render, wrapping the
                                        multi-select delete controller
      - createSavedCardsController    — the delete-mode controller (below)
 
@@ -14,16 +14,16 @@
 
    Built with safe DOM APIs (createElement + textContent), never innerHTML,
    so user-supplied alias/title/name/skill fields never reach the DOM as
-   HTML.  Depends on formatRelativeTime (from /shared/utils.js).
+   HTML.  Depends on formatRelativeTime and cssEscape (from /shared/utils.js).
 */
 
-import { formatRelativeTime } from "./utils.js";
+import { cssEscape, formatRelativeTime } from "./utils.js";
 import { showToast } from "./toast.js";
 import { authFetch } from "./auth.js";
 
 /* ==========================================================================
    Saved-list TABLE primitives — the row builder (renderSessionRow) plus a
-   shared filter / sort / render orchestrator (createSavedTable).  Both the
+   shared fetch / page / render orchestrator (createSavedTable).  Both the
    server UI (Saved Workstreams) and the console (Saved Coordinators) build
    their saved list from these so the two surfaces can't drift.  The only
    per-surface input is the column spec (MSGS vs CHILDREN), the DOM refs,
@@ -78,6 +78,12 @@ function _personaLabel(name) {
   return tp.personaLabel(name) || name;
 }
 
+/* The skill chip is visual, and its title reaches only a pointer, so a
+   row's accessible name carries the skill too. */
+function _skillNote(sess) {
+  return sess.launch_skill ? " (skill: " + sess.launch_skill + ")" : "";
+}
+
 function _nameCell(sess) {
   var wrap = document.createElement("div");
   wrap.className = "scell-name";
@@ -89,31 +95,40 @@ function _nameCell(sess) {
   if (sess.launch_skill) {
     var chip = document.createElement("span");
     chip.className = "skill-chip";
+    /* A long name can cut the chip's label short; hovering names the skill. */
+    chip.title = sess.launch_skill;
     var g = document.createElement("span");
     g.className = "skill-chip-g";
     g.setAttribute("aria-hidden", "true");
     g.textContent = "◆";
     chip.appendChild(g);
-    chip.appendChild(document.createTextNode(sess.launch_skill));
+    var label = document.createElement("span");
+    label.className = "skill-chip-label";
+    label.textContent = sess.launch_skill;
+    chip.appendChild(label);
     wrap.appendChild(chip);
   }
   return wrap;
 }
 
 /* Column factory — shared descriptors.  Each: {key, label, width, align,
-   cell(sess)->Node|string, sort(sess)->comparable}.  The only difference
-   between the two surfaces is count("message_count","MSGS") vs
-   count("child_count","CHILDREN"). */
+   cell(sess)->Node|string}.  `key` doubles as the column's sort key on
+   GET /v1/api/workstreams/saved (the server sorts every page), and `order`
+   "asc" makes a column's first click sort A to Z (the rest start highest or
+   newest first).  The only difference between the two surfaces is
+   count("message_count","MSGS") vs count("child_count","CHILDREN").  A
+   column with a `drop` rank leaves when the table is too narrow for NAME,
+   lowest rank first, and one with `nameMin` leaves whenever NAME would be
+   narrower than that (see createSavedTable's visibleColumns); NAME, CTX
+   and LAST never do. */
 export var SavedColumns = {
   name: function () {
     return {
       key: "name",
       label: "NAME",
       width: "minmax(0,1fr)",
+      order: "asc",
       cell: _nameCell,
-      sort: function (s) {
-        return (s.alias || s.title || s.name || s.ws_id).toLowerCase();
-      },
     };
   },
   model: function () {
@@ -122,12 +137,10 @@ export var SavedColumns = {
       label: "MODEL",
       width: "150px",
       cls: "scell-model",
-      hideBelow: true,
+      order: "asc",
+      drop: 5,
       cell: function (s) {
         return s.model_alias || "—";
-      },
-      sort: function (s) {
-        return (s.model_alias || "").toLowerCase();
       },
     };
   },
@@ -136,14 +149,12 @@ export var SavedColumns = {
       key: "project",
       label: "PROJECT",
       width: "120px",
-      hideBelow: true,
+      order: "asc",
+      drop: 4,
       cell: function (s) {
         return (
           _projectName(s.project_id) || (s.project_id ? "Unavailable" : "—")
         );
-      },
-      sort: function (s) {
-        return (_projectName(s.project_id) || "").toLowerCase();
       },
     };
   },
@@ -152,12 +163,10 @@ export var SavedColumns = {
       key: "persona",
       label: "PERSONA",
       width: "110px",
-      hideBelow: true,
+      order: "asc",
+      drop: 3,
       cell: function (s) {
         return _personaLabel(s.persona) || "—";
-      },
-      sort: function (s) {
-        return (_personaLabel(s.persona) || "").toLowerCase();
       },
     };
   },
@@ -167,11 +176,9 @@ export var SavedColumns = {
       label: label,
       width: width || "72px",
       align: "right",
+      drop: 2,
       cell: function (s) {
         return String(s[field] != null ? s[field] : 0);
-      },
-      sort: function (s) {
-        return s[field] != null ? s[field] : 0;
       },
     };
   },
@@ -183,9 +190,6 @@ export var SavedColumns = {
       align: "right",
       title: "Context window used as of last activity",
       cell: _ctxCell,
-      sort: function (s) {
-        return typeof s.context_ratio === "number" ? s.context_ratio : 0;
-      },
     };
   },
   last: function () {
@@ -199,9 +203,6 @@ export var SavedColumns = {
           ? formatRelativeTime(s.updated)
           : s.updated || "";
       },
-      sort: function (s) {
-        return s.updated || "";
-      },
     };
   },
   id: function () {
@@ -211,12 +212,11 @@ export var SavedColumns = {
       width: "76px",
       align: "right",
       cls: "scell-id",
-      hideBelow: true,
+      /* Few people use the id, so it goes first and early. */
+      drop: 1,
+      nameMin: 280,
       cell: function (s) {
         return s.ws_id.substring(0, 7);
-      },
-      sort: function (s) {
-        return s.ws_id;
       },
     };
   },
@@ -241,11 +241,12 @@ export function renderSessionRow(sess, opts) {
   if (canActivate) row.setAttribute("tabindex", "0");
   row.setAttribute(
     "aria-label",
-    !canActivate
+    (!canActivate
       ? sess.alias || sess.title || sess.name || sess.ws_id
       : typeof opts.ariaLabel === "function"
         ? opts.ariaLabel(sess)
-        : "Resume: " + (sess.alias || sess.title || sess.name || sess.ws_id),
+        : "Resume: " + (sess.alias || sess.title || sess.name || sess.ws_id)) +
+      _skillNote(sess),
   );
   var main = document.createElement("div");
   main.className = "dash-row-main";
@@ -274,41 +275,85 @@ export function renderSessionRow(sess, opts) {
   return row;
 }
 
-/* Shared saved-list table: owns client-side filter + sort + render and
-   wraps the existing multi-select delete controller.  Apps pass DOM refs +
-   a column spec + the delete-request shape; the per-app delete-bar HTML
-   keeps wiring its inline onclick thunks to `table.controller.*`.
+/* URL for one page of GET /v1/api/workstreams/saved — the query the table
+   asks for.  Sort and order always go along, so the server's defaults never
+   have to match the table's. */
+export function savedListUrl(query) {
+  var params = new URLSearchParams();
+  params.set("limit", String(query.limit));
+  if (query.offset) params.set("offset", String(query.offset));
+  if (query.q) params.set("q", query.q);
+  params.set("sort", query.sort);
+  params.set("order", query.order);
+  return "/v1/api/workstreams/saved?" + params.toString();
+}
+
+/* Rows per saved-list page. */
+var PAGE_SIZE = 20;
+
+/* Shared saved-list table: the server pages, searches and sorts
+   (GET /v1/api/workstreams/saved), so the table holds only the query — page,
+   filter text, sort column — and fetches the page it shows.  It wraps the
+   existing multi-select delete controller.  Apps pass DOM refs + a column
+   spec + the delete-request shape; the per-app delete-bar HTML keeps wiring
+   its inline onclick thunks to `table.controller.*`.
+
+   One request is out at a time.  load() is the app's refresh (at boot,
+   after events, from Retry): a call while a request is out asks once more
+   after it lands, however many calls came.  Paging, sorting and searching
+   ask for their own query; a click made while a request is out waits for
+   it, and an answer for a query the user has since left is dropped for one
+   that asks for the newest.  reset() drops every answer still out.  While
+   rows are selected for deletion nothing is fetched: the table asks again
+   once delete mode ends, however it ends.  Pages, sorts and searches mark
+   the rows pending until their answer arrives.
 
    opts:
      headerEl, bodyEl  — the .dash-colheaders + .dash-table elements
-     filterEl          — optional <input> for the client-side name filter
+     filterEl          — optional <input> for the search box
      footerEl          — optional element for the count line
      paginationEl      — optional .pagination container; the table fills it
                          with Prev / “page X / Y” / Next and hides it when
                          the list fits on one page or delete mode is active
-     pageSize          — rows per page (default 20)
+     errorEl, errorTextEl — optional load-error block and its text; while it
+                         shows, the rows and the footer hide.  Its Retry
+                         calls the app's loader.
      columns           — array from SavedColumns
-     noun              — "workstream" / "coordinator"
+     noun              — "workstream" / "session"
+     onLoad            — optional ({total, filter, failed}) => void, once a
+                         page lands or fails to load
      onActivate        — sess => void (resume); gated by delete mode
      canActivate       — optional sess => boolean (default true)
      canDelete         — optional sess => boolean (default true)
+     canDeleteAny      — () => boolean: whether the viewer may delete saved
+                         items at all.  The Delete button follows it and the
+                         list, not the rows on the current page.
      activateLabel     — optional sess => string (aria when not deleting)
      emptyText         — empty-state copy
-     delete            — {idPrefix, buttonId, buildDeleteRequest, onClose}
-   returns { setItems(items), render(), controller }. */
+     delete            — {idPrefix, buttonId, buildDeleteRequest}
+
+   returns { load(ready), render(), reset(), controller }.  load()'s
+   optional `ready` promise holds the first page until it settles (the node
+   waits for the project and persona names). */
 export function createSavedTable(opts) {
   var state = {
-    items: [],
+    rows: [],
+    total: 0,
     filter: "",
     sortKey: "updated",
     sortDir: -1,
-    compact: false,
+    /* The table's measured width in px; 0 until it has one. */
+    width: 0,
     page: 0,
+    /* The page and filter that produced `rows`.  The pager and footer
+       describe these until the next page arrives, not the newer query a
+       click has already asked for. */
+    shownPage: 0,
+    shownFilter: "",
+    /* Whether a page, or a failure, has landed since the last reset.  Until
+       then the table says it is loading. */
+    loaded: false,
   };
-  /* Client-side page size — the list is fetched whole and sliced here, so
-     the visible page (and therefore the delete controller's Select-All
-     fan-out) is capped at this many rows. */
-  var pageSize = opts.pageSize || 20;
 
   var controller = createSavedCardsController({
     idPrefix: opts.delete.idPrefix,
@@ -324,39 +369,300 @@ export function createSavedTable(opts) {
     render: function () {
       render();
     },
-    onClose: opts.delete.onClose,
+    /* The deleted rows leave the page at once, and the list is fetched again
+       as delete mode ends, which the controller does next (render() replays
+       the fetch). */
+    onDeleted: function (ids) {
+      var gone = {};
+      ids.forEach(function (id) {
+        gone[id] = true;
+      });
+      var kept = state.rows.filter(function (s) {
+        return !gone[s.ws_id];
+      });
+      state.total = Math.max(
+        0,
+        state.total - (state.rows.length - kept.length),
+      );
+      state.rows = kept;
+      /* Deleting a whole last page leaves it past the end: the fetch asks
+         for the last page that still exists instead, and the pager never
+         names a page past it. */
+      var last = Math.max(0, Math.ceil(state.total / PAGE_SIZE) - 1);
+      if (!kept.length && state.page > last) state.page = last;
+      if (state.shownPage > last) state.shownPage = last;
+      deferredFetch = true;
+    },
   });
 
-  function matches(sess) {
-    if (!state.filter) return true;
-    var hay = (
-      (sess.alias || "") +
-      " " +
-      (sess.title || "") +
-      " " +
-      (sess.name || "") +
-      " " +
-      (_projectName(sess.project_id) || "") +
-      " " +
-      sess.ws_id
-    ).toLowerCase();
-    return hay.indexOf(state.filter) !== -1;
+  function query() {
+    return {
+      limit: PAGE_SIZE,
+      offset: state.page * PAGE_SIZE,
+      q: state.filter,
+      sort: state.sortKey,
+      order: state.sortDir < 0 ? "desc" : "asc",
+    };
   }
 
-  function column(key) {
-    for (var i = 0; i < opts.columns.length; i++) {
-      if (opts.columns[i].key === key) return opts.columns[i];
+  function queryKey(q) {
+    return JSON.stringify([q.limit, q.offset, q.q, q.sort, q.order]);
+  }
+
+  function noMatchText(filter) {
+    return "No " + opts.noun + "s match “" + filter + "”";
+  }
+
+  /* While rows are selected for deletion, searching or sorting would fetch
+     another page and drop the selections; the search box and the column
+     headers say so. */
+  var pauseHint = "Search and sort pause while you select rows to delete";
+
+  /* Set while a fetch waits for delete mode to end: a new page would drop
+     the selections on this one.  render() asks again once the mode ends. */
+  var deferredFetch = false;
+
+  /* The request out: its query key (null when none), whether the list may
+     have changed since it was sent, and the reset() generation it belongs
+     to. */
+  var inFlight = null;
+  var changed = false;
+  var generation = 0;
+
+  /* Ask for the current query, or note that the request out should be
+     followed by another.  `fresh` (load()) means the list itself may have
+     changed, so even the query already out is asked for again once it
+     lands; a page, sort or search only needs its own query. */
+  function fetchPage(fresh, ready) {
+    if (controller.inMode()) {
+      deferredFetch = true;
+      return;
+    }
+    if (inFlight !== null) {
+      if (fresh) changed = true;
+      return;
+    }
+    var q = query();
+    var key = queryKey(q);
+    var mine = generation;
+    inFlight = key;
+    changed = false;
+    setRetrying(true);
+    var page = authFetch(savedListUrl(q)).then(function (r) {
+      if (!r.ok) {
+        throw new Error(
+          "Could not load saved " + opts.noun + "s (" + r.status + ").",
+        );
+      }
+      return r.json();
+    });
+    Promise.all([page, ready]).then(
+      function (res) {
+        if (mine === generation) landed(key, res[0], null);
+      },
+      function (error) {
+        if (mine === generation) landed(key, null, error);
+      },
+    );
+  }
+
+  function landed(key, data, error) {
+    inFlight = null;
+    setRetrying(false);
+    /* Rows being selected stay as they are; the table asks again once
+       delete mode ends. */
+    if (controller.inMode()) {
+      deferredFetch = true;
+      return;
+    }
+    /* The user paged, sorted or searched while it was out. */
+    if (key !== queryKey(query())) {
+      fetchPage(false);
+      return;
+    }
+    if (error) {
+      /* Drop the rows as well, so nothing re-rendered behind the error can
+         pass for the page that failed to load. */
+      state.rows = [];
+      state.total = 0;
+      state.loaded = true;
+      setError(
+        (error && error.message) || "Could not load saved " + opts.noun + "s.",
+      );
+      setPending(false);
+      notifyLoad(true);
+      render();
+    } else {
+      var rows = data.workstreams || [];
+      var total = data.total > 0 ? data.total : 0;
+      var lastPage = Math.max(0, Math.ceil(total / PAGE_SIZE) - 1);
+      /* A page past the end — rows deleted, or other sessions loaded since —
+         steps back to the last page that exists and asks for it.  Only ever
+         back, so a page the count says exists but that came back empty is
+         shown empty instead of being asked for again. */
+      if (!rows.length && state.page > lastPage) {
+        state.page = lastPage;
+        fetchPage(false);
+        return;
+      }
+      setError("");
+      state.rows = rows;
+      /* Never report fewer rows than this page already holds. */
+      state.total = Math.max(total, state.page * PAGE_SIZE + rows.length);
+      state.shownPage = state.page;
+      state.shownFilter = state.filter;
+      state.loaded = true;
+      setPending(false);
+      notifyLoad(false);
+      render();
+    }
+    if (changed) fetchPage(true);
+  }
+
+  /* Tell the app before the page is drawn: a section it shows for the page
+     is laid out by the time render() measures the table, so the page lands
+     in the columns that fit. */
+  function notifyLoad(failed) {
+    if (typeof opts.onLoad === "function") {
+      opts.onLoad({
+        total: state.total,
+        filter: state.shownFilter,
+        failed: failed,
+      });
+    }
+  }
+
+  /* While a request is out behind the load error, its Retry says so. */
+  function setRetrying(on) {
+    if (!opts.errorEl || (on && opts.errorEl.hidden)) return;
+    var retry = opts.errorEl.querySelector("button");
+    if (retry) retry.textContent = on ? "Retrying…" : "Retry";
+    if (on) opts.errorEl.setAttribute("aria-busy", "true");
+    else opts.errorEl.removeAttribute("aria-busy");
+  }
+
+  /* Show or clear the load error.  The rows and footer hide while it shows;
+     the table, emptied first, hides its own headers and pager. */
+  function setError(message) {
+    if (opts.errorEl) opts.errorEl.hidden = !message;
+    if (opts.errorTextEl) opts.errorTextEl.textContent = message;
+    [opts.bodyEl, opts.footerEl].forEach(function (el) {
+      if (el) el.style.display = message ? "none" : "";
+    });
+  }
+
+  /* The user asked for another page, sort or search. */
+  function requestPage() {
+    if (controller.inMode()) {
+      deferredFetch = true;
+      return;
+    }
+    setPending(true);
+    fetchPage(false);
+  }
+
+  /* The rows on screen are about to give way to a page the user asked for.
+     The CSS dims them after a short delay, so a fast answer never flickers,
+     and aria-busy tells assistive technology to wait for it. */
+  function setPending(on) {
+    if (!opts.bodyEl) return;
+    if (on && !opts.bodyEl.classList.contains("is-pending")) {
+      /* Rows drawn in this same task have no style yet; working it out now
+         gives them the delayed dimming too, instead of an instant one. */
+      void opts.bodyEl.offsetWidth;
+    }
+    opts.bodyEl.classList.toggle("is-pending", on);
+    if (on) opts.bodyEl.setAttribute("aria-busy", "true");
+    else opts.bodyEl.removeAttribute("aria-busy");
+  }
+
+  /* Re-rendering replaces the headers, pager buttons and rows, which would
+     drop keyboard focus to the page.  focusedKey() names the focused control
+     inside `container` by its data-focus-key, which its replacement carries
+     too; refocus() then focuses the first of `keys` that is there and
+     enabled. */
+  function focusedKey(container) {
+    var key = null;
+    for (var el = document.activeElement; el; el = el.parentNode) {
+      if (el === container) return key;
+      if (!key && el.dataset && el.dataset.focusKey) key = el.dataset.focusKey;
     }
     return null;
   }
 
-  /* On narrow viewports drop the lower-value columns (those flagged
-     hideBelow — model, id) so NAME, the column this redesign exists to keep
-     readable, never collapses to zero. */
-  function visibleColumns() {
-    return opts.columns.filter(function (c) {
-      return !(state.compact && c.hideBelow);
+  function refocus(container, keys) {
+    for (var i = 0; i < keys.length; i++) {
+      if (!keys[i]) continue;
+      var el = container.querySelector(
+        '[data-focus-key="' + cssEscape(keys[i]) + '"]',
+      );
+      if (el && !el.disabled) {
+        el.focus({ preventScroll: true });
+        return;
+      }
+    }
+  }
+
+  /* When the table is too narrow, drop the lower-value columns one at a time,
+     lowest `drop` rank first (id, the counts, persona, project, model, the
+     console's KIND), until NAME, the column this redesign exists to keep
+     readable, has at least NAME_MIN: room for a long name beside a skill
+     chip.  A column with `nameMin` (ID) leaves whenever NAME would get less
+     than that.  It goes by the table's own width, not the window's: a side
+     rail or a split pane narrows it as much as a phone does. */
+  var NAME_MIN = 200;
+  /* Besides its columns a row takes 16px of padding on each side and a 3px
+     left border, and delete mode's checkbox gutter takes 18px more.  The
+     gutter is always reserved, so entering delete mode never squeezes NAME
+     or changes the columns. */
+  var ROW_OVERHEAD = 53;
+  var dropOrder = opts.columns
+    .filter(function (c) {
+      return c.drop;
+    })
+    .sort(function (a, b) {
+      return a.drop - b.drop;
     });
+
+  function fixedWidth(cols) {
+    return cols.reduce(function (sum, c) {
+      /* "150px" → 150; NAME's flexible track adds nothing. */
+      var px = parseFloat(c.width);
+      return c.key === "name" || isNaN(px) ? sum : sum + px;
+    }, 0);
+  }
+
+  function visibleColumns() {
+    var cols = opts.columns;
+    /* Unmeasured (hidden, or no layout at all): every column. */
+    if (!state.width) return cols;
+    /* The sorted column goes last, so its caret shows as long as it can. */
+    var order = dropOrder
+      .filter(function (c) {
+        return c.key !== state.sortKey;
+      })
+      .concat(
+        dropOrder.filter(function (c) {
+          return c.key === state.sortKey;
+        }),
+      );
+    for (var i = 0; i < order.length; i++) {
+      var room = state.width - ROW_OVERHEAD - fixedWidth(cols);
+      if (room >= (order[i].nameMin || NAME_MIN)) break;
+      cols = cols.filter(function (c) {
+        return c !== order[i];
+      });
+    }
+    return cols;
+  }
+
+  function sameColumns(a, b) {
+    return (
+      a.length === b.length &&
+      a.every(function (c, i) {
+        return c === b[i];
+      })
+    );
   }
 
   function gridTemplate(cols) {
@@ -367,27 +673,14 @@ export function createSavedTable(opts) {
       .join(" ");
   }
 
-  function sorted() {
-    var col = column(state.sortKey) || column("updated");
-    var out = state.items.filter(matches);
-    if (col) {
-      out.sort(function (a, b) {
-        var av = col.sort(a);
-        var bv = col.sort(b);
-        if (av < bv) return -state.sortDir;
-        if (av > bv) return state.sortDir;
-        return 0;
-      });
-    }
-    return out;
-  }
-
   function renderHeaders(cols) {
     if (!opts.headerEl) return;
     opts.headerEl.style.gridTemplateColumns = gridTemplate(cols);
     /* Shift the headers in lockstep with the rows' checkbox gutter so the
        columns stay registered while multi-selecting. */
-    opts.headerEl.classList.toggle("saved-cols-delete", controller.inMode());
+    var deleting = controller.inMode();
+    opts.headerEl.classList.toggle("saved-cols-delete", deleting);
+    var focused = focusedKey(opts.headerEl);
     opts.headerEl.replaceChildren();
     cols.forEach(function (col) {
       var active = col.key === state.sortKey;
@@ -396,14 +689,26 @@ export function createSavedTable(opts) {
         "scol" +
         (col.align === "right" ? " scell-r" : "") +
         (active ? " sorted" : "");
+      h.dataset.focusKey = "sort:" + col.key;
       h.setAttribute("role", "button");
-      h.setAttribute("tabindex", "0");
-      h.setAttribute("aria-label", "Sort by " + col.label);
+      h.setAttribute("tabindex", deleting ? "-1" : "0");
+      /* Sorting fetches a different page, which would drop the selections
+         on this one — the same reason the pager hides in delete mode. */
+      if (deleting) h.setAttribute("aria-disabled", "true");
+      /* aria-sort is not exposed on a button, so the name carries the
+         order; it keeps the visible label for speech input. */
       h.setAttribute(
-        "aria-sort",
-        active ? (state.sortDir < 0 ? "descending" : "ascending") : "none",
+        "aria-label",
+        "Sort by " +
+          col.label +
+          (active
+            ? state.sortDir < 0
+              ? ", sorted descending"
+              : ", sorted ascending"
+            : ""),
       );
-      if (col.title) h.title = col.title;
+      if (deleting) h.title = pauseHint;
+      else if (col.title) h.title = col.title;
       h.appendChild(document.createTextNode(col.label));
       /* Every sortable header carries a caret so the affordance is
          discoverable at rest — inactive ones faint, the active one
@@ -414,17 +719,22 @@ export function createSavedTable(opts) {
       car.textContent = active ? (state.sortDir < 0 ? "▼" : "▲") : "↕";
       h.appendChild(car);
       function doSort() {
+        if (controller.inMode()) return;
+        var before = visibleColumns();
         if (state.sortKey === col.key) {
           state.sortDir = -state.sortDir;
         } else {
           state.sortKey = col.key;
-          /* text columns default A→Z, everything else newest/highest-first */
-          state.sortDir = col.key === "name" || col.key === "model" ? 1 : -1;
+          state.sortDir = col.order === "asc" ? 1 : -1;
         }
-        /* Re-sorting reshuffles which rows land on which page; jump back to
-           the first page so the user isn't stranded mid-list. */
+        /* A new order starts from its first page.  The sorted column drops
+           last, so a new sort can change which columns fit and redraw the
+           rows; otherwise only the headers change before the page lands. */
         state.page = 0;
-        render();
+        var cols = visibleColumns();
+        if (sameColumns(before, cols)) renderHeaders(cols);
+        else render();
+        requestPage();
       }
       h.onclick = doSort;
       h.onkeydown = function (e) {
@@ -435,64 +745,94 @@ export function createSavedTable(opts) {
       };
       opts.headerEl.appendChild(h);
     });
+    refocus(opts.headerEl, [focused]);
   }
 
-  /* footer copy:
-       filteredCount — rows after the name filter (the paginated population)
-       start         — index of the first visible row within filteredCount
-       shown         — rows actually painted this page
-       pages         — total page count for filteredCount
+  /* footer copy, for the page on screen:
+       start  — index of its first row within the total
+       shown  — rows painted on it
+       pages  — total page count
+       note   — appended to the count (a sort whose column is hidden)
      When the list spans more than one page the footer leads with the
      visible range so the Prev/Next control reads as intentional paging, not
-     a silent truncation. */
-  function renderFooter(filteredCount, start, shown, pages) {
+     a silent truncation.  The total is the server's count of every matching
+     row. */
+  function renderFooter(start, shown, pages, note) {
     if (!opts.footerEl) return;
-    var total = state.items.length;
+    /* Nothing to count before the first page lands. */
+    if (!state.loaded) {
+      opts.footerEl.textContent = "";
+      return;
+    }
+    var total = state.total;
+    var filter = state.shownFilter;
     var noun = opts.noun + (total === 1 ? "" : "s");
-    if (pages > 1 && filteredCount > 0) {
-      var rangeNoun = opts.noun + (filteredCount === 1 ? "" : "s");
+    if (!total) {
+      opts.footerEl.textContent = filter ? "" : "0 " + noun;
+      if (filter) {
+        /* The body already shows that nothing matches; the footer is the
+           live region, so it says so too, to screen readers only. */
+        var note = document.createElement("span");
+        note.className = "sr-only";
+        note.textContent = noMatchText(filter);
+        opts.footerEl.appendChild(note);
+      }
+      return;
+    }
+    if (pages > 1 && shown) {
       var range =
         "Showing " +
         (start + 1) +
         "–" +
         (start + shown) +
         " of " +
-        filteredCount +
-        " " +
-        rangeNoun;
-      opts.footerEl.textContent = state.filter
-        ? range + " matching “" + state.filter + "”"
-        : range;
-      return;
-    }
-    /* Single page: the empty/filtered body message owns the "no match" copy,
-       so the footer stays a plain total — the two don't say the same thing
-       twice. */
-    if (state.filter && filteredCount > 0 && filteredCount !== total) {
-      opts.footerEl.textContent =
-        filteredCount +
-        " of " +
         total +
         " " +
-        noun +
-        " match “" +
-        state.filter +
-        "”";
-    } else {
-      opts.footerEl.textContent = total + " " + noun;
+        noun;
+      opts.footerEl.textContent =
+        (filter ? range + " matching “" + filter + "”" : range) + note;
+      return;
     }
+    opts.footerEl.textContent =
+      (filter
+        ? total +
+          " " +
+          noun +
+          (total === 1 ? " matches" : " match") +
+          " “" +
+          filter +
+          "”"
+        : total + " " + noun) + note;
+  }
+
+  /* The sorted column drops last, but it can drop: the footer then says what
+     order the rows are in. */
+  function hiddenSortNote(cols) {
+    var shown = cols.some(function (c) {
+      return c.key === state.sortKey;
+    });
+    var col = opts.columns.find(function (c) {
+      return c.key === state.sortKey;
+    });
+    if (shown || !col) return "";
+    return (
+      " · sorted by " +
+      col.label.toLowerCase() +
+      (state.sortDir < 0 ? ", descending" : ", ascending")
+    );
   }
 
   /* Fill the optional .pagination container with Prev / “page X / Y” / Next.
      Hidden when the list fits on one page or while multi-selecting: paging
      in delete mode would orphan the user's checkbox selections, which live
-     on the visible page only.  Buttons are rebuilt each render so their
-     onclick closures always page over the current filtered/sorted list.
-     The page label is intentionally NOT a live region — the footer (already
-     aria-live) announces the resulting "Showing X–Y of Z" range. */
+     on the visible page only.  Buttons are rebuilt each render, and the one
+     that had focus passes it on.  The page label is intentionally NOT a
+     live region — the footer (already aria-live) announces the resulting
+     "Showing X–Y of Z" range. */
   function renderPagination(pages) {
     if (!opts.paginationEl) return;
     var pag = opts.paginationEl;
+    var focused = focusedKey(pag);
     if (pages <= 1 || controller.inMode()) {
       pag.style.display = "none";
       pag.replaceChildren();
@@ -508,72 +848,102 @@ export function createSavedTable(opts) {
        (console/static/app.js renderPagination) is 1-based.  The rendered
        "X / Y" is identical — only the internal index differs — so don't
        assume a shared base if the two are ever unified. */
+    var current = state.shownPage;
+    /* Prev and Next step from the page on screen, so a request still out,
+       or one that failed, never changes where they lead. */
     var prev = document.createElement("button");
     prev.type = "button";
+    prev.dataset.focusKey = "pager:prev";
     prev.setAttribute("aria-label", "Previous page");
     prev.textContent = "◄ Prev";
-    prev.disabled = state.page <= 0;
+    prev.disabled = current <= 0;
     prev.onclick = function () {
-      if (state.page > 0) {
-        state.page--;
-        render();
+      if (current > 0) {
+        state.page = current - 1;
+        requestPage();
       }
     };
     var label = document.createElement("span");
-    label.textContent = state.page + 1 + " / " + pages;
+    label.textContent = current + 1 + " / " + pages;
     var next = document.createElement("button");
     next.type = "button";
+    next.dataset.focusKey = "pager:next";
     next.setAttribute("aria-label", "Next page");
     next.textContent = "Next ►";
-    next.disabled = state.page >= pages - 1;
+    next.disabled = current >= pages - 1;
     next.onclick = function () {
-      if (state.page < pages - 1) {
-        state.page++;
-        render();
+      if (current < pages - 1) {
+        state.page = current + 1;
+        requestPage();
       }
     };
     pag.replaceChildren(prev, label, next);
     pag.setAttribute(
       "aria-label",
-      "Saved " + opts.noun + "s — page " + (state.page + 1) + " of " + pages,
+      "Saved " + opts.noun + "s — page " + (current + 1) + " of " + pages,
     );
+    /* Reaching the first or last page disables the button just used; focus
+       moves to the other one. */
+    if (focused) {
+      refocus(pag, [
+        focused,
+        focused === "pager:next" ? "pager:prev" : "pager:next",
+      ]);
+    }
   }
 
   function render() {
+    /* Measured here as well, so a page lands in the columns that fit. */
+    var measured = opts.bodyEl && opts.bodyEl.clientWidth;
+    if (measured) state.width = measured;
     var cols = visibleColumns();
-    var all = sorted();
-    var filteredCount = all.length;
-    /* Clamp the page after a delete / filter / upstream churn shrinks the
-       list, then slice to it.  The delete controller only ever sees the
-       visible page, so its Select-All / count can't reach off-page rows. */
-    var pages = Math.max(1, Math.ceil(filteredCount / pageSize));
-    if (state.page > pages - 1) state.page = pages - 1;
-    if (state.page < 0) state.page = 0;
-    var start = state.page * pageSize;
-    var rows = all.slice(start, start + pageSize);
+    var rows = state.rows;
+    var pages = Math.max(1, Math.ceil(state.total / PAGE_SIZE));
     controller.setItems(rows);
+    var deleting = controller.inMode();
+    /* Rows being selected stay as they are; their fetch waits (see
+       requestPage). */
+    if (deleting) setPending(false);
+    /* The fetch that render() replays below, once delete mode has ended. */
+    var replaying = deferredFetch && !deleting;
     var deleteButton = document.getElementById(opts.delete.buttonId);
     if (deleteButton) {
-      deleteButton.style.display = state.items.some(function (s) {
-        return !opts.canDelete || opts.canDelete(s);
-      })
-        ? ""
-        : "none";
+      /* Its place in the toolbar follows the viewer, not this page or
+         search, so the search box never shifts under someone typing in it:
+         taken whenever the viewer may delete, shown while the list has
+         anything (a search that matches nothing included). */
+      deleteButton.style.display = opts.canDeleteAny() ? "" : "none";
+      deleteButton.style.visibility =
+        state.total > 0 || state.shownFilter ? "" : "hidden";
     }
+    /* Searching fetches a different page too (see renderHeaders). */
+    if (opts.filterEl) {
+      opts.filterEl.disabled = deleting;
+      opts.filterEl.title = deleting ? pauseHint : "";
+    }
+    var focused = focusedKey(opts.bodyEl);
     /* One grid write per render: rows read it from the inherited CSS var. */
     if (opts.bodyEl) {
       opts.bodyEl.style.setProperty("--saved-grid", gridTemplate(cols));
       opts.bodyEl.replaceChildren();
     }
-    if (!filteredCount) {
+    if (!rows.length) {
       /* Empty state owns the space — hide the column headers so it doesn't
          read as a broken grid. */
       if (opts.headerEl) opts.headerEl.style.display = "none";
       var empty = document.createElement("div");
       empty.className = "dashboard-empty";
-      empty.textContent = state.filter
-        ? "No " + opts.noun + "s match “" + state.filter + "”"
-        : opts.emptyText || "No saved items";
+      /* A total above zero means the list goes on, only not on this page:
+         rows left between the count and the page query, or were deleted,
+         in which case the page is already being fetched again. */
+      empty.textContent =
+        replaying || !state.loaded
+          ? "Loading…"
+          : state.total > 0
+            ? "No " + opts.noun + "s on this page"
+            : state.shownFilter
+              ? noMatchText(state.shownFilter)
+              : opts.emptyText || "No saved items";
       if (opts.bodyEl) opts.bodyEl.appendChild(empty);
     } else {
       if (opts.headerEl) opts.headerEl.style.display = "";
@@ -589,54 +959,101 @@ export function createSavedTable(opts) {
             if (typeof opts.onActivate === "function") opts.onActivate(s, el);
           },
         });
+        row.dataset.focusKey = "row:" + sess.ws_id;
         controller.decorateCard(row, sess);
         opts.bodyEl.appendChild(row);
       });
+      refocus(opts.bodyEl, [focused]);
     }
-    if (controller.inMode()) controller.refreshBar();
+    if (deleting) controller.refreshBar();
     renderPagination(pages);
-    renderFooter(filteredCount, start, rows.length, pages);
+    renderFooter(
+      state.shownPage * PAGE_SIZE,
+      rows.length,
+      pages,
+      hiddenSortNote(cols),
+    );
+    /* Delete mode just ended (the controller re-renders on every mode
+       change): fetch what was asked for meanwhile. */
+    if (deferredFetch && !controller.inMode()) {
+      deferredFetch = false;
+      requestPage();
+    }
   }
 
-  /* Debounce only the filter keystrokes; setItems / sort / delete render
-     immediately. */
+  /* Debounce the search keystrokes — each settled value is one request.
+     Text an input method is still composing is not a search yet: the
+     compositionend that commits it schedules one. */
   var filterTimer = null;
+  function scheduleSearch() {
+    if (filterTimer) clearTimeout(filterTimer);
+    filterTimer = setTimeout(function () {
+      var value = opts.filterEl.value.trim();
+      if (value === state.filter) return;
+      state.filter = value;
+      /* A new search starts from its first page. */
+      state.page = 0;
+      requestPage();
+    }, 250);
+  }
   if (opts.filterEl) {
-    opts.filterEl.addEventListener("input", function () {
-      if (filterTimer) clearTimeout(filterTimer);
-      filterTimer = setTimeout(function () {
-        state.filter = opts.filterEl.value.trim().toLowerCase();
-        /* A narrower filter usually means fewer pages; restart at page 1 so
-           the user lands on matches rather than an out-of-range page. */
-        state.page = 0;
-        render();
-      }, 120);
+    opts.filterEl.addEventListener("input", function (e) {
+      if (e && e.isComposing) return;
+      scheduleSearch();
     });
+    opts.filterEl.addEventListener("compositionend", scheduleSearch);
   }
 
-  /* Saved table owns its responsive layout: below the breakpoint the
-     hideBelow columns drop and NAME reclaims the width. */
-  if (typeof window !== "undefined" && window.matchMedia) {
-    var mq = window.matchMedia("(max-width: 760px)");
-    state.compact = mq.matches;
-    var onMq = function (e) {
-      state.compact = e.matches;
-      render();
-    };
-    if (mq.addEventListener) mq.addEventListener("change", onMq);
-    else if (mq.addListener) mq.addListener(onMq);
+  /* Saved table owns its responsive layout (see visibleColumns): it watches
+     its own width and re-renders only when that changes which columns fit.
+     A hidden table measures 0 and keeps its last width. */
+  if (typeof ResizeObserver === "function" && opts.bodyEl) {
+    var refit = false;
+    new ResizeObserver(function (entries) {
+      var width = Math.round(entries[0].contentRect.width);
+      if (!width || width === state.width) return;
+      var before = visibleColumns().length;
+      state.width = width;
+      /* An empty table shows no columns. */
+      if (!state.rows.length || visibleColumns().length === before) return;
+      /* Redraw on the next frame, not inside the observer: new rows change
+         the body's height, which the browser would otherwise report as a
+         resize loop. */
+      if (refit) return;
+      refit = true;
+      requestAnimationFrame(function () {
+        refit = false;
+        render();
+      });
+    }).observe(opts.bodyEl);
   }
 
   return {
+    /* Fetch the current query: the app's refresh. */
+    load: function (ready) {
+      /* Until a page lands the table says it is loading. */
+      if (!state.loaded) render();
+      fetchPage(true, ready);
+    },
     reset: function () {
-      state.items = [];
+      if (filterTimer) clearTimeout(filterTimer);
+      /* Answers still out belong to the identity this forgets. */
+      generation++;
+      inFlight = null;
+      changed = false;
+      deferredFetch = false;
+      setPending(false);
+      setRetrying(false);
+      setError("");
+      state.rows = [];
+      state.total = 0;
       state.filter = "";
       state.page = 0;
+      state.shownPage = 0;
+      state.shownFilter = "";
+      state.loaded = false;
       if (opts.filterEl) opts.filterEl.value = "";
       controller.reset();
-    },
-    setItems: function (items) {
-      state.items = items || [];
       render();
     },
     render: render,
@@ -680,9 +1097,11 @@ export function createSavedTable(opts) {
                          the controller on mode start/cancel and Select-
                          All toggle.  Caller is responsible for calling
                          setItems(items) + decorateCard() inside it.
-     onClose           — optional () => void; called once after the user
-                         closes the post-delete results modal.  Typical
-                         use: re-fetch the saved list.
+     onDeleted         — optional ids => void; called once when the user
+                         closes the post-delete results modal, with the
+                         ids that were deleted, just before delete mode
+                         ends (render() runs next).  Typical use: drop
+                         those rows and re-fetch the saved list.
 */
 export function createSavedCardsController(opts) {
   var state = { mode: false, selected: {}, items: [] };
@@ -757,7 +1176,11 @@ export function createSavedCardsController(opts) {
     chk.className = "ws-card-check";
     chk.checked = !!state.selected[sess.ws_id];
     var label = sess.alias || sess.title || sess.name || sess.ws_id;
-    chk.setAttribute("aria-label", "Select " + label + " for deletion");
+    chk.setAttribute(
+      "aria-label",
+      "Select " + label + _skillNote(sess) + " for deletion",
+    );
+    chk.dataset.focusKey = "check:" + sess.ws_id;
     chk.onclick = function (e) {
       e.stopPropagation();
       if (chk.checked) state.selected[sess.ws_id] = true;
@@ -795,9 +1218,11 @@ export function createSavedCardsController(opts) {
   }
 
   function start() {
+    /* The page may hold rows this viewer cannot delete (the list's other
+       pages may not). */
     if (!state.items.length) {
       if (typeof showToast === "function") {
-        showToast("No saved " + opts.noun + "s to delete");
+        showToast("Nothing on this page you can delete");
       }
       return;
     }
@@ -912,14 +1337,17 @@ export function createSavedCardsController(opts) {
        results are showing, any of them must exit delete mode and refresh
        the now-stale list, not just the footer button. */
     state.resultsShown = false;
+    state.deleted = [];
     window.TurnstoneHatch.openDialog(dlg, {
       onClose: function () {
         if (!state.resultsShown) return; // pre-delete cancel keeps the mode
         state.resultsShown = false;
+        /* Still in delete mode: the caller's refetch waits for the mode
+           change that follows, so there is one fetch, not two. */
+        if (typeof opts.onDeleted === "function") opts.onDeleted(state.deleted);
         cancel();
         var t = document.getElementById(opts.buttonId);
         if (t && typeof t.focus === "function") t.focus();
-        if (typeof opts.onClose === "function") opts.onClose();
       },
     });
   }
@@ -958,7 +1386,12 @@ export function createSavedCardsController(opts) {
           var status = r.status;
           var contentType = r.headers.get("content-type") || "";
           if (r.ok) {
-            results.push({ name: name, shortId: shortId, ok: true });
+            results.push({
+              wsId: wsId,
+              name: name,
+              shortId: shortId,
+              ok: true,
+            });
             return;
           }
           return r.text().then(function (body) {
@@ -1037,6 +1470,13 @@ export function createSavedCardsController(opts) {
          dismissal pair the foot grammar forbids. */
       var cancelBtn = dlg ? dlg.querySelector(".sh-foot [data-close]") : null;
       if (cancelBtn) cancelBtn.hidden = true;
+      state.deleted = results
+        .filter(function (r) {
+          return r.ok;
+        })
+        .map(function (r) {
+          return r.wsId;
+        });
       state.resultsShown = true;
       if (delBtn) {
         delBtn.textContent = "Close";
@@ -1090,7 +1530,5 @@ export function createSavedCardsController(opts) {
 // this deferred module evaluated).  New module code imports instead.
 Object.assign(window, {
   SavedColumns,
-  renderSessionRow,
   createSavedTable,
-  createSavedCardsController,
 });

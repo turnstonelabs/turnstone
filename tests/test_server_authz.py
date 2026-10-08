@@ -1095,8 +1095,7 @@ class TestSavedWorkstreamsTrustedTeamVisibility:
 
     def _seed(self, client):
         """Create two workstreams per user, each with a message so they
-        land in list_workstreams_with_history (the SQL gates on an
-        EXISTS conversation)."""
+        count as saved (the saved list needs conversation history)."""
         from turnstone.core.storage import get_storage
 
         storage = get_storage()

@@ -40,6 +40,18 @@ frozen.
 > `turnstone.core.policy.evaluate_tool_policy` and `evaluate_tool_policies_batch` are removed:
 > `evaluate_loaded_tool_policies` returns `None` when the policies cannot be read, and a caller
 > must then fail closed (see Security).
+>
+> **Before upgrading:** migration 079 replaces the `usage_events` `ws_id` index with a
+> `(ws_id, timestamp)` index, built concurrently on PostgreSQL. Custom storage backends must
+> implement `list_saved_workstreams`; `list_workstreams_with_history` takes only `limit` (no
+> `kind`, `user_id`, `state` or `offset`) and returns only `(ws_id, alias, title, name, created,
+> updated, message_count)`;
+> `touch_workstream` is removed, and only conversation writes may change `updated`:
+> `update_workstream_state`, `update_workstream_name`, `publish_deferred_create` and
+> `bulk_close_stale_orphans` leave it unchanged, while `delete_messages_after` and
+> `truncate_messages_tail` stamp it when they remove rows. `SessionEndpointConfig` drops
+> `saved_state_filter` and `saved_loaded_lookup`, and `make_unified_saved_handler` its unused
+> `permission_gate`.
 
 ### Added
 
@@ -111,6 +123,35 @@ frozen.
 
 ### Changed
 
+- **Saved sessions page, search and sort on the server (#1268).** `GET /v1/api/workstreams/saved`
+  on nodes and the console takes `limit` (default 50, at most 200; `0` returns only the total),
+  `offset`, `q` (a case-insensitive substring of at most 256 characters), `sort` and `order`, and
+  its response adds `total`, `limit` and `offset`; a malformed parameter answers 400. Search folds
+  letters beyond ASCII on SQLite, and on PostgreSQL as far as the database's locale does. Project
+  names count for search and the project sort only for callers with `project.read`, who are the
+  ones the dashboards can show them to.
+  A saved session is now one with history that no process has loaded (no live owner lease), for
+  both kinds: a node's list no longer includes workstreams loaded on it or on any other node, and
+  the console's no longer includes interactive sessions that nodes have loaded. The dashboards'
+  saved tables fetch each page, search and sort from the server, so they reach every stored
+  session; sorting and searching pause while rows are selected for deletion, as paging already
+  did. While a page loads its rows dim and keyboard focus stays on the control that asked for it,
+  and a failed load on a node's dashboard shows the error with a Retry button, as the console's
+  already did. Each dashboard keeps one request for the list in flight and asks once more after it,
+  however many refreshes arrive meanwhile. The Python and TypeScript SDKs'
+  `list_saved_workstreams` / `listSavedWorkstreams` take the same options and still read an older
+  server's unpaged answer.
+- **A workstream's `updated` is the last change to its conversation (#1268).** Saving or removing
+  messages (rewind, retry) sets it; state changes, renames, opening, closing and cleanup no longer
+  do. Lists ordered by `updated` (the saved sessions, the CLI's `/workstreams`, a project's
+  workstreams, the console cluster view's stored coordinators and a coordinator's children) now
+  order by real use, so a coordinator closed today but last used long ago no longer jumps into the
+  cluster view's 200 most recent. `session.retention_days` ages an unnamed workstream from its last
+  conversation change, so opening an old unnamed workstream no longer restarts its clock; naming it
+  still keeps it. Cleanup of a workstream no process holds now waits for the idle timeout from its
+  last conversation change rather than from its last state change, and orphan close and retention
+  also leave a workstream whose owner lease ran out within their window, since a holder whose
+  renewals are failing may still have it open.
 - **Routing prefers a workstream's owner, and cleanup keys on leases.** The console router sends a
   workstream to the live node holding its owner lease (after any required node). Orphan close and
   stale-create recovery skip workstreams with a live lease instead of trusting node heartbeats, and
@@ -219,6 +260,30 @@ frozen.
 
 ### Fixed
 
+- **Saved sessions list all stored history (#1268).** The saved list returned at most the 50 newest
+  sessions of each kind that the caller could see, without a total, so the dashboard's pager and
+  search never reached older sessions. It now pages through every session the caller may see, with
+  an exact total. A coordinator left behind by a console that crashed or restarted appears once its
+  owner lease expires (within 30 seconds), instead of only after the idle timeout closed it, or
+  never when the idle timeout is 0. Closing a session, by hand, at its idle timeout or in cleanup,
+  no longer stamps it as just updated, so it keeps its place in the list instead of jumping to the
+  top (see the change to `updated`); sessions closed before this release keep the time stamped
+  then. On PostgreSQL the list's latest-usage lookup could scan every newer usage event for each
+  session (over a second for a few hundred sessions); migration 079's index makes it a short index
+  scan.
+- **Saved lists keep their NAME column, and empty states are legible (#1268).** The dashboards'
+  saved tables dropped columns by the window's width, so beside the side rail or in a split pane
+  NAME could shrink to nothing (at a 1024-pixel window on the console); they now go by their own
+  width and drop one lower-value column at a time until NAME has 200 pixels: ID first (whenever
+  NAME would have less than 280), then the message or children count, PERSONA, PROJECT, MODEL and
+  the console's KIND, keeping the sorted column for last; if even that one goes, the footer names
+  the order. A long name and its skill chip share the cell, the chip names its skill on hover and
+  the row's accessible name includes it, and cut-off text keeps a gap before the next column. The
+  header's search box and Delete move to their own row when they no longer fit beside the title,
+  the search box narrowing as far as it must so Delete is never pushed out of view; in a narrow
+  pane the pager drops below the count instead of squeezing it; Retry says so while it works; and
+  the CTX column no longer goes blank on phones. Empty and error messages in both apps lost an
+  extra opacity that put them below WCAG AA contrast.
 - **The output-guard judge gets its model's output budget (#1291).** The LLM stage capped every
   verdict at 512 tokens, and the cap counts reasoning as well as the answer, so a thinking model
   could spend it before writing the verdict; the verdict was then dropped and only the regex stage

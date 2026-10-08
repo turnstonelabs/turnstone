@@ -161,6 +161,31 @@ BULK_CLOSE_STATE_VALUES: frozenset[str] = frozenset(
     }
 )
 
+# Paging of the saved-session list (``StorageBackend.list_saved_workstreams``
+# and ``GET /v1/api/workstreams/saved``). Kept here so the storage query, the
+# route's validation and the API schema share one definition: the page size
+# when the caller names none, the largest page (a larger ``limit`` is clamped),
+# and the longest search text (a longer ``q`` is refused).
+SAVED_PAGE_DEFAULT_LIMIT = 50
+SAVED_PAGE_MAX_LIMIT = 200
+SAVED_SEARCH_MAX_CHARS = 256
+
+# Sort keys of the saved-session list: the columns of the saved table.
+SAVED_WORKSTREAM_SORT_KEYS: frozenset[str] = frozenset(
+    {
+        "updated",
+        "name",
+        "kind",
+        "persona",
+        "project",
+        "model",
+        "message_count",
+        "child_count",
+        "context_ratio",
+        "ws_id",
+    }
+)
+
 
 # ---------------------------------------------------------------------------
 # Deferred sends

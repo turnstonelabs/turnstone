@@ -15,6 +15,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Iterator, Sequence
 
     from turnstone.core.storage._notify import Notify, NotifyStream
+    from turnstone.core.storage._protocol import SavedWorkstreamPage
     from turnstone.core.trajectory import Turn
 
 import sqlalchemy as sa
@@ -26,9 +27,9 @@ from turnstone.core.storage._lease import (
     acquire_lease_on_connection,
     admit_offline_writes_on_connection,
     admit_workstream_write_on_connection,
+    close_stale_orphans_on_connection,
     end_foreign_node_watches_on_connection,
     enforce_workstream_lease,
-    fence_out_values,
     live_lease_node_id,
     lock_workstream_lease_row,
     release_lease_on_connection,
@@ -55,6 +56,7 @@ from turnstone.core.storage._protocol import (
     OIDCUserCredential,
     WorkstreamLeaseLostError,
 )
+from turnstone.core.storage._saved import query_saved_workstreams
 from turnstone.core.storage._schema import (
     api_tokens,
     audit_events,
@@ -169,6 +171,7 @@ from turnstone.core.storage._utils import (
     clone_workstream_transaction,
     find_orphan_conversations,
     get_watch_snapshot_on_connection,
+    listed_project_predicate,
     memory_index_health_inputs_on_connection,
     parse_checkpoint_watermark,
     prepare_attachment_commit,
@@ -183,6 +186,7 @@ from turnstone.core.storage._utils import (
     sanitize_text,
     save_attachment_commit_transaction,
     senders_from_user_meta,
+    stamp_conversation_change,
     structured_memory_exact_scope_predicate,
     structured_memory_filter_scope_predicate,
 )
@@ -243,7 +247,10 @@ from turnstone.core.storage._utils import (
 from turnstone.core.storage._utils import (
     validate_and_clear_default_persona as _validate_and_clear_default_persona,
 )
-from turnstone.core.workstream import BULK_CLOSE_STATE_VALUES, WorkstreamKind
+from turnstone.core.workstream import (
+    SAVED_PAGE_DEFAULT_LIMIT,
+    WorkstreamKind,
+)
 
 log = get_logger(__name__)
 
@@ -496,9 +503,7 @@ class PostgreSQLBackend(_KeyedAttachmentSaveWrappers):
             else:
                 rowid = int(resolved)
             if inserted:
-                conn.execute(
-                    sa.update(workstreams).where(workstreams.c.ws_id == ws_id).values(updated=now)
-                )
+                stamp_conversation_change(conn, ws_id, now=now)
             conn.commit()
             return rowid
 
@@ -620,11 +625,7 @@ class PostgreSQLBackend(_KeyedAttachmentSaveWrappers):
             self._admit_bulk_import_parents(conn, ws_ids)
             retain_attachment_refs(conn, attachment_ids)
             conn.execute(sa.insert(conversations), insert_rows)
-            conn.execute(
-                sa.update(workstreams)
-                .where(workstreams.c.ws_id.in_(sorted(ws_ids)))
-                .values(updated=now)
-            )
+            stamp_conversation_change(conn, ws_ids, now=now)
             conn.commit()
 
     def _admit_bulk_import_parents(
@@ -931,61 +932,48 @@ class PostgreSQLBackend(_KeyedAttachmentSaveWrappers):
 
     # -- Workstream management -------------------------------------------------
 
-    def list_workstreams_with_history(
-        self,
-        limit: int = 20,
-        *,
-        kind: WorkstreamKind | str | None = None,
-        user_id: str | None = None,
-        state: str | None = None,
-        offset: int = 0,
-    ) -> list[Any]:
-        # See SQLite sibling for the rationale on the kind / user_id / state filters.
-        params: dict[str, Any] = {"limit": limit, "offset": max(0, offset)}
-        kind_clause = ""
-        user_clause = ""
-        state_clause = ""
-        if kind is not None:
-            params["kind"] = WorkstreamKind(kind).value
-            kind_clause = "AND w.kind = :kind "
-        if user_id is not None:
-            params["user_id"] = user_id
-            user_clause = "AND w.user_id = :user_id "
-        if state is not None:
-            params["state"] = state
-            state_clause = "AND w.state = :state "
+    def list_workstreams_with_history(self, limit: int = 20) -> list[Any]:
         with self._conn() as conn:
             return list(
                 conn.execute(
                     sa.text(
                         "SELECT w.ws_id, w.alias, w.title, w.name, w.created, w.updated, "
                         "(SELECT COUNT(*) FROM conversations c "
-                        " WHERE c.ws_id = w.ws_id), "
-                        "w.node_id, w.state, w.kind, "
-                        "wcm.value, wcs.value, "
-                        "(SELECT COUNT(*) FROM workstreams ch "
-                        " WHERE ch.parent_ws_id = w.ws_id "
-                        " AND ch.state != 'creating'), "
-                        "(SELECT ue.prompt_tokens FROM usage_events ue "
-                        " WHERE ue.ws_id = w.ws_id "
-                        " ORDER BY ue.timestamp DESC LIMIT 1), "
-                        "md.context_window, w.project_id, w.user_id, w.persona "
+                        " WHERE c.ws_id = w.ws_id) "
                         "FROM workstreams w "
-                        "LEFT JOIN workstream_config wcm "
-                        "  ON wcm.ws_id = w.ws_id AND wcm.key = 'model_alias' "
-                        "LEFT JOIN workstream_config wcs "
-                        "  ON wcs.ws_id = w.ws_id AND wcs.key = 'skill' "
-                        "LEFT JOIN model_definitions md ON md.alias = wcm.value "
                         "WHERE EXISTS "
                         "  (SELECT 1 FROM conversations c WHERE c.ws_id = w.ws_id) "
                         "AND w.state != 'creating' "
-                        f"{kind_clause}"
-                        f"{user_clause}"
-                        f"{state_clause}"
-                        "ORDER BY w.updated DESC LIMIT :limit OFFSET :offset"
+                        "ORDER BY w.updated DESC LIMIT :limit"
                     ),
-                    params,
+                    {"limit": limit},
                 ).fetchall()
+            )
+
+    def list_saved_workstreams(
+        self,
+        *,
+        kinds: Sequence[WorkstreamKind | str],
+        viewer: str | None,
+        project_names: bool = False,
+        search: str = "",
+        sort: str = "updated",
+        descending: bool = True,
+        limit: int = SAVED_PAGE_DEFAULT_LIMIT,
+        offset: int = 0,
+    ) -> SavedWorkstreamPage:
+        with self._conn() as conn:
+            return query_saved_workstreams(
+                conn,
+                dialect_name="postgresql",
+                kinds=kinds,
+                viewer=viewer,
+                project_names=project_names,
+                search=search,
+                sort=sort,
+                descending=descending,
+                limit=limit,
+                offset=offset,
             )
 
     def _delete_prune_candidate(
@@ -1230,7 +1218,6 @@ class PostgreSQLBackend(_KeyedAttachmentSaveWrappers):
         """CAS one exact durable reservation from creating to idle."""
         if not ws_id or not fork_reservation_token:
             return False
-        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
         with self._conn() as conn:
             row = lock_workstream_lease_row(conn, ws_id)
             # Lock the config fence after the row, the ordering clone and
@@ -1258,7 +1245,7 @@ class PostgreSQLBackend(_KeyedAttachmentSaveWrappers):
                     workstreams.c.ws_id == ws_id,
                     workstreams.c.state == "creating",
                 )
-                .values(state="idle", updated=now)
+                .values(state="idle")
                 .returning(workstreams.c.ws_id)
             ).fetchone()
             if published is None:
@@ -1530,11 +1517,8 @@ class PostgreSQLBackend(_KeyedAttachmentSaveWrappers):
     def update_workstream_state(
         self, ws_id: str, state: str, *, lease: LeaseFence | None = None
     ) -> None:
-        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
         with self._conn() as conn:
-            update_workstream_row_on_connection(
-                conn, ws_id, lease, {"state": state, "updated": now}
-            )
+            update_workstream_row_on_connection(conn, ws_id, lease, {"state": state})
             conn.commit()
 
     def bulk_close_stale_orphans(
@@ -1543,33 +1527,10 @@ class PostgreSQLBackend(_KeyedAttachmentSaveWrappers):
         cutoff: str,
         exclude_ws_ids: list[str],
     ) -> list[str]:
-        norm_kind = WorkstreamKind(kind).value
-        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
-        # A row loaded by any live process carries a live owner lease, so the
-        # lease predicate protects it. Each candidate row is locked by the
-        # UPDATE itself and the predicate is re-evaluated against a
-        # concurrent acquisition's committed version, and the same statement
-        # fences out an expired lease.
-        stmt = (
-            sa.update(workstreams)
-            .where(
-                workstreams.c.kind == norm_kind,
-                workstreams.c.state.in_(BULK_CLOSE_STATE_VALUES),
-                workstreams.c.updated < cutoff,
-                unleased_predicate("postgresql"),
-            )
-            .values(state="closed", updated=now, **fence_out_values())
-            .returning(workstreams.c.ws_id)
-        )
-        if exclude_ws_ids:
-            # Skip ``NOT IN ()`` when nothing to exclude — keeps the SQL clean
-            # and avoids SQLAlchemy's empty-collection warning.
-            stmt = stmt.where(~workstreams.c.ws_id.in_(exclude_ws_ids))
         with self._conn() as conn:
-            result = conn.execute(stmt)
-            ids = [row[0] for row in result]
+            closed = close_stale_orphans_on_connection(conn, kind, cutoff, exclude_ws_ids)
             conn.commit()
-            return ids
+            return closed
 
     def delete_stale_creating_reservations(
         self,
@@ -1642,18 +1603,11 @@ class PostgreSQLBackend(_KeyedAttachmentSaveWrappers):
             )
         return deleted
 
-    def touch_workstream(self, ws_id: str, *, lease: LeaseFence | None = None) -> None:
-        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
-        with self._conn() as conn:
-            update_workstream_row_on_connection(conn, ws_id, lease, {"updated": now})
-            conn.commit()
-
     def update_workstream_name(
         self, ws_id: str, name: str, *, lease: LeaseFence | None = None
     ) -> None:
-        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
         with self._conn() as conn:
-            update_workstream_row_on_connection(conn, ws_id, lease, {"name": name, "updated": now})
+            update_workstream_row_on_connection(conn, ws_id, lease, {"name": name})
             conn.commit()
 
     def _delete_workstream_on_connection(self, conn: Any, ws_id: str) -> bool:
@@ -6445,17 +6399,9 @@ class PostgreSQLBackend(_KeyedAttachmentSaveWrappers):
         self, user_id: str, include_archived: bool = False
     ) -> list[dict[str, Any]]:
         with self._conn() as conn:
-            member_subq = sa.select(project_members.c.project_id).where(
-                project_members.c.user_id == user_id
+            q = sa.select(projects).where(
+                listed_project_predicate(projects, user_id, include_archived=include_archived)
             )
-            cond = sa.or_(
-                projects.c.owner_id == user_id,
-                projects.c.visibility == "public",
-                projects.c.project_id.in_(member_subq),
-            )
-            q = sa.select(projects).where(cond)
-            if not include_archived:
-                q = q.where(projects.c.state == "active")
             rows = conn.execute(q.order_by(projects.c.name)).fetchall()
             return [_row_to_dict(r) for r in rows]
 

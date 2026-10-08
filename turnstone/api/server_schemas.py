@@ -608,6 +608,7 @@ class SavedWorkstreamInfo(BaseModel):
     ws_id: str
     alias: str | None = None
     title: str | None = None
+    name: str = ""
     created: str
     updated: str
     message_count: int
@@ -626,7 +627,18 @@ class SavedWorkstreamInfo(BaseModel):
 
 
 class ListSavedWorkstreamsResponse(BaseModel):
+    """One page of saved workstreams.
+
+    ``total`` counts every row matching the request's search, across all
+    pages; ``limit`` and ``offset`` echo the page the server applied. A server
+    older than paging sends only ``workstreams``; the defaults keep a newer
+    SDK reading it.
+    """
+
     workstreams: list[SavedWorkstreamInfo]
+    total: int = 0
+    limit: int = 0
+    offset: int = 0
 
 
 # ---------------------------------------------------------------------------

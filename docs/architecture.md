@@ -733,13 +733,16 @@ The web server's background lifecycle-maintenance thread calls
 `SessionManager.close_idle()` when ordinary idle eviction is enabled (every
 `timeout / 4`, max 5 min). Any loaded IDLE workstream whose `last_active` is
 older than the configured timeout is closed; non-IDLE loaded workstreams are
-not. A second storage pass closes old, unloaded rows left by dead process
-incarnations. A workstream any live process has loaded renews its owner lease,
-so the pass skips rows with a live lease and fences out expired ones in the
-same statement; the row's `node_id` grants no protection of its own.
-On close, a `ws_closed` event is broadcast so browser clients remove the tab.
-`--workstream-idle-timeout` controls this path (default: 120 minutes, 0 =
-disable); the separate stale-create recovery above keeps running when it is 0.
+not. A second storage pass closes unloaded rows left by dead process
+incarnations whose conversation has not changed for the timeout. A workstream
+any live process has loaded renews its owner lease, so the pass skips rows
+with a live lease and fences out expired ones in the same statement; the row's
+`node_id` grants no protection of its own. It also leaves a row whose lease
+expired less than the timeout ago, since a holder whose renewals are failing
+may still have it open. On close, a `ws_closed` event is broadcast so browser
+clients remove the tab. `--workstream-idle-timeout` controls this path
+(default: 120 minutes, 0 = disable); the separate stale-create recovery above
+keeps running when it is 0.
 
 **Workstream eviction at capacity:** When `SessionManager.create()` would
 exceed `max_workstreams` (configurable via `[server].max_workstreams`, default
@@ -1952,11 +1955,14 @@ reservations, which belong to the crash-recovery path above. It removes:
   workstream is a user mid-first-turn (its first rows may still be held in a
   serving node's in-memory commit journal, invisible to other nodes), never
   housekeeping debris
-- Unnamed workstreams (`alias IS NULL`) older than `retention_days` days (default 90)
+- Unnamed workstreams (`alias IS NULL`) whose conversation last changed more than
+  `retention_days` days ago (default 90)
 
-Named (aliased) workstreams are never pruned by either category. Configure
-with `--retention-days N` (0 = disable age pruning; the orphan sweep still
-runs, grace-gated).
+Named (aliased) workstreams are never pruned by either category, nor is a row
+with a live owner lease or one whose lease expired within the category's
+window (the grace, or `retention_days`): a holder whose renewals are failing
+may still have it open. Configure with `--retention-days N` (0 = disable age
+pruning; the orphan sweep still runs, grace-gated).
 
 ---
 

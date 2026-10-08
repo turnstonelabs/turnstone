@@ -207,8 +207,8 @@ function patchClusterState(data) {
       });
     });
     // The saved list spans BOTH kinds now, so refresh on any close — the
-    // in-flight coalescing guard in loadSavedCoordinators (single fetch +
-    // one catch-up) prevents per-close fan-out into the saved endpoint.
+    // saved table keeps one request out and asks once more after it, so a
+    // burst of closes never fans out into the saved endpoint.
     if (typeof loadSavedCoordinators === "function") {
       loadSavedCoordinators();
     }
@@ -2368,84 +2368,15 @@ document.addEventListener("keydown", function (e) {
 // each kind independently; activation follows the returned kind and node.
 // ---------------------------------------------------------------------------
 
-// In-flight de-dup for loadSavedCoordinators.  ws_closed events can
-// arrive in bursts on a busy cluster; without this guard each one
-// triggers a parallel fetch.  Single boolean is enough because the
-// renderer reads from the latest response — a coalesced re-fetch right
-// after the in-flight one resolves catches any state change.
-let _savedCoordsInFlight = false;
-let _savedCoordsRetry = false;
-
+// Refresh the saved table (at boot, after events, from Retry).  The table
+// keeps one request out at a time and asks once more after it, however many
+// calls arrive meanwhile.
 function loadSavedCoordinators() {
   if (!hasScope("read") || !_coordTable) return;
-  // Freeze the list while the user is multi-selecting — re-rendering
-  // mid-mode would shuffle the visible page out from under them.  The
-  // delete-mode wrapper drains the retry flag on cancel/onClose.
-  if (_coordTable && _coordTable.controller.inMode()) {
-    _savedCoordsRetry = true;
-    return;
-  }
-  if (_savedCoordsInFlight) {
-    _savedCoordsRetry = true;
-    return;
-  }
-  _savedCoordsInFlight = true;
-  const generation = authGeneration();
-  authFetch("/v1/api/workstreams/saved")
-    .then(function (r) {
-      if (!r.ok)
-        throw new Error("Could not load saved sessions (" + r.status + ").");
-      return r.json();
-    })
-    .then(function (data) {
-      if (generation !== authGeneration()) return;
-      // Belt-and-braces: if the user entered delete mode while this
-      // fetch was already in flight, defer the render — re-rendering
-      // mid-selection would shuffle visible cards and reshape selections.
-      if (_coordTable && _coordTable.controller.inMode()) {
-        _savedCoordsRetry = true;
-        return;
-      }
-      const saved = data.workstreams || [];
-      _setSavedError("");
-      const sec = document.getElementById("saved-coordinators");
-      if (sec) sec.style.display = saved.length ? "" : "none";
-      _coordTable.setItems(saved);
-    })
-    .catch(function (error) {
-      if (generation !== authGeneration()) return;
-      _coordTable.setItems([]);
-      _setSavedError(error.message || "Could not load saved sessions.");
-      const sec = document.getElementById("saved-coordinators");
-      if (sec) sec.style.display = "";
-    })
-    .finally(function () {
-      if (generation !== authGeneration()) return;
-      _savedCoordsInFlight = false;
-      // If at least one call arrived while we were in flight, fire one
-      // catch-up fetch (not N) so the UI reflects the latest state
-      // without a per-event fan-out.
-      if (_savedCoordsRetry) {
-        _savedCoordsRetry = false;
-        loadSavedCoordinators();
-      }
-    });
-}
-
-function _setSavedError(message) {
-  const error = document.getElementById("coord-saved-error");
-  if (error) error.hidden = !message;
-  const text = document.getElementById("coord-saved-error-text");
-  if (text) text.textContent = message;
-  ["saved-coord-cards", "coord-saved-footer"].forEach(function (id) {
-    const element = document.getElementById(id);
-    if (element) element.style.display = message ? "none" : "";
-  });
+  _coordTable.load();
 }
 
 function _savedAuthChanged() {
-  _savedCoordsInFlight = _savedCoordsRetry = false;
-  _setSavedError("");
   if (_coordTable) _coordTable.reset();
   const sec = document.getElementById("saved-coordinators");
   if (sec) sec.style.display = "none";
@@ -2480,15 +2411,15 @@ function _initSavedCoordTable() {
       key: "kind",
       label: "KIND",
       width: "62px",
+      order: "asc",
+      // Last to go when the table is too narrow for NAME.
+      drop: 6,
       cell: function (s) {
         const tag = document.createElement("span");
         const coord = s.kind === "coordinator";
         tag.className = "kind-tag" + (coord ? " coord" : " int");
         tag.textContent = coord ? "COORD" : "INT";
         return tag;
-      },
-      sort: function (s) {
-        return s.kind || "";
       },
     },
     SavedColumns.persona(),
@@ -2505,11 +2436,27 @@ function _initSavedCoordTable() {
     filterEl: document.getElementById("coord-filter"),
     footerEl: document.getElementById("coord-saved-footer"),
     paginationEl: document.getElementById("coord-pagination"),
+    errorEl: document.getElementById("coord-saved-error"),
+    errorTextEl: document.getElementById("coord-saved-error-text"),
     columns: COORD_COLUMNS,
     noun: "session",
     emptyText: "No saved sessions",
+    // The section shows while there is a list, a search (whose box must stay
+    // up when nothing matches) or an error to show.
+    onLoad: function (page) {
+      const sec = document.getElementById("saved-coordinators");
+      if (sec) {
+        sec.style.display =
+          page.total || page.filter || page.failed ? "" : "none";
+      }
+    },
     canActivate: _canActOnSavedSession,
     canDelete: _canActOnSavedSession,
+    // Interactive sessions need only write; the button stays put on pages
+    // of coordinators this viewer cannot delete.
+    canDeleteAny: function () {
+      return hasScope("write");
+    },
     activateLabel: function (s) {
       return (
         "Resume " +
@@ -2617,12 +2564,6 @@ function _initSavedCoordTable() {
           },
         };
       },
-      onClose: function () {
-        // Drain queued retries before the explicit reload (see the freeze
-        // gate in loadSavedCoordinators) so .finally() doesn't double-fetch.
-        _savedCoordsRetry = false;
-        loadSavedCoordinators();
-      },
     },
   });
   // The PROJECT and PERSONA columns resolve names from the shared caches,
@@ -2646,12 +2587,6 @@ function startCoordDeleteMode() {
 }
 function cancelCoordDeleteMode() {
   _coordTable.controller.cancel();
-  // The freeze gate (see loadSavedCoordinators) may have queued retries
-  // while we were multi-selecting; drain them now that we're idle again.
-  if (_savedCoordsRetry) {
-    _savedCoordsRetry = false;
-    loadSavedCoordinators();
-  }
 }
 function toggleCoordSelectAll() {
   _coordTable.controller.toggleAll();

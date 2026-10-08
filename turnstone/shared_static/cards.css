@@ -20,6 +20,9 @@
   transition:
     color 0.15s,
     border-color 0.15s;
+  /* In a tight toolbar the search box gives way, not the button's label. */
+  flex: none;
+  white-space: nowrap;
 }
 .ws-delete-btn:hover {
   color: var(--red);
@@ -235,6 +238,11 @@
   display: flex;
   align-items: center;
   gap: 8px;
+  /* Stays at the right when the header wraps it onto its own row, where in a
+     pane narrower than the toolbar the search box gives way instead of
+     pushing Delete out of the header. */
+  margin-left: auto;
+  min-width: 0;
 }
 .saved-filter {
   background: var(--bg);
@@ -245,6 +253,7 @@
   font-size: 11px;
   padding: 4px 10px;
   width: 200px;
+  min-width: 0;
 }
 .saved-filter::placeholder {
   color: var(--fg-dim);
@@ -254,6 +263,12 @@
   outline: none;
   border-color: var(--accent);
   box-shadow: 0 0 0 2px var(--accent-dim);
+}
+/* Delete mode pauses search (the selections live on this page).  The rule
+   above replaces the browser's own disabled look, so restate it. */
+.saved-filter:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
 }
 
 /* Sortable column headers — saved table only (active uses .dash-col). */
@@ -308,12 +323,30 @@
 [data-theme="light"] .saved-row:nth-child(even) {
   background: rgba(0, 0, 0, 0.03);
 }
+/* A page, sort or search on its way (createSavedTable marks the table
+   .is-pending): dim the rows it will replace, after a short delay so a fast
+   answer never flickers.  The row's own transitions stay on .dash-row. */
+.dash-table.is-pending .saved-row .dash-row-main {
+  opacity: 0.55;
+  transition: opacity 0.15s ease 0.2s;
+}
+@media (prefers-reduced-motion: reduce) {
+  /* Keep the delay, so fast answers still never flicker; drop the fade. */
+  .dash-table.is-pending .saved-row .dash-row-main {
+    transition-duration: 0s;
+  }
+}
 .scell {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
   font-size: 12px;
+}
+/* Keeps a cut-off name, chip, persona, project or model off the next
+   column's content. */
+.scell:not(.scell-r) {
+  padding-right: 8px;
 }
 .scell-r {
   text-align: right;
@@ -326,14 +359,18 @@
   align-items: center;
   gap: 8px;
   min-width: 0;
+  overflow: hidden;
   font-weight: 500;
   color: var(--fg-bright);
 }
+/* The name keeps a few characters however narrow the column gets; a skill
+   chip beside it gives way first, down to its own minimum (see
+   .skill-chip). */
 .scell-name .scell-nm {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  min-width: 0;
+  min-width: 3em;
 }
 .scell-model {
   color: var(--fg-dim);
@@ -360,9 +397,16 @@
 /* Skill chip — cool-slate lane, distinct from the amber accent + CTX
    colours; glyph + >=0.15 tint keeps it legible at chip size. */
 .skill-chip {
-  flex: none;
+  /* Shrinks long before the name does, but keeps enough of its label to
+     read (createSavedTable leaves NAME room for both); the title names the
+     skill in full. */
+  flex: 0 100 auto;
+  min-width: min(6em, 35%);
+  overflow: hidden;
+  white-space: nowrap;
   display: inline-flex;
   align-items: center;
+  justify-content: center;
   gap: 3px;
   font-size: 9.5px;
   font-weight: 600;
@@ -377,17 +421,36 @@
   font-size: 8px;
   opacity: 0.85;
 }
+.skill-chip-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
 [data-theme="light"] .skill-chip {
   color: #44507a;
   background: rgba(90, 110, 180, 0.14);
   border-color: rgba(90, 110, 180, 0.4);
 }
 
-/* Footer count line — mirrors the active table's footer altitude. */
+/* A load error stands in for the column headers under the open-bottomed
+   .dash-header, so it closes that card's sides and bottom. */
+.saved-error {
+  border: 1px solid var(--border);
+  border-top: none;
+  border-radius: 0 0 var(--radius) var(--radius);
+}
+/* Room for "Retrying…", so the centred message stays put as Retry works. */
+.saved-error .sh-btn {
+  min-width: 8.5em;
+}
+
+/* Footer count line — mirrors the active table's footer altitude.  It
+   repeats the search text, which can be one long unbroken string. */
 .saved-footer {
   padding: 9px 16px;
   font-size: 11px;
   color: var(--fg-dim);
+  overflow-wrap: anywhere;
 }
 
 /* Footer + pager share one justified row: the dim range readout anchors the
@@ -401,9 +464,18 @@
   align-items: center;
   justify-content: space-between;
   gap: 12px;
+  /* In a narrow pane the pager drops below the count instead of squeezing
+     it. */
+  flex-wrap: wrap;
+}
+.saved-pager-row .saved-footer {
+  flex: 1 1 auto;
+  min-width: 0;
 }
 .saved-pager-row .pagination {
   padding: 6px 16px;
+  flex: none;
+  margin-left: auto;
 }
 @media (max-width: 760px) {
   .saved-pager-row {
@@ -413,6 +485,25 @@
   }
   .saved-pager-row .pagination {
     justify-content: center;
+    margin-left: 0;
+  }
+}
+/* When the title, a 200px search box and Delete no longer fit on one line
+   (a phone, or a narrow pane), the saved toolbar takes its own row, still
+   at the right. */
+.dash-header:has(> .saved-toolbar) {
+  flex-wrap: wrap;
+  gap: 8px;
+}
+/* On a phone the search box takes the width Delete leaves it. */
+@media (max-width: 480px) {
+  .saved-toolbar {
+    flex: 1 1 100%;
+  }
+  .saved-filter {
+    flex: 1;
+    min-width: 0;
+    width: auto;
   }
 }
 
@@ -432,6 +523,14 @@
    rows reserve a 34px checkbox gutter, so the headers shift to match. */
 .dash-colheaders.saved-cols-delete {
   padding-left: 34px;
+}
+/* Sorting pauses too: the headers drop their pointer and hover cues (the
+   sorted column keeps its accent, as at rest). */
+.dash-colheaders.saved-cols-delete .scol {
+  cursor: default;
+}
+.dash-colheaders.saved-cols-delete .scol:not(.sorted):hover {
+  color: inherit;
 }
 .dash-row.ws-selected {
   background: rgba(248, 113, 113, 0.08);

@@ -207,8 +207,9 @@
                 id="ws-filter"
                 class="saved-filter"
                 type="search"
-                placeholder="Filter by name&#x2026;"
-                aria-label="Filter saved workstreams"
+                maxlength="256"
+                placeholder="Search name, project or ID&#x2026;"
+                aria-label="Search saved workstreams"
                 autocomplete="off"
               />
               <button
@@ -220,6 +221,17 @@
                 <span aria-hidden="true">&#x1f5d1;</span> Delete
               </button>
             </div>
+          </div>
+          <div
+            id="ws-saved-error"
+            class="dashboard-empty saved-error"
+            role="alert"
+            hidden
+          >
+            <span id="ws-saved-error-text"></span>
+            <button class="sh-btn" onclick="loadSavedWorkstreams()">
+              Retry
+            </button>
           </div>
           <div class="dash-colheaders" id="ws-saved-colheaders"></div>
           <div

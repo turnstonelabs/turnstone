@@ -146,6 +146,27 @@ async def test_operator_discovers_own_and_project_history(history_apps, required
     assert (await apps.node.get("/v1/api/workstreams/related/history")).status_code == 200
 
 
+async def test_saved_lists_only_workstreams_no_process_has_open(history_apps):
+    """An open workstream holds its owner lease, so neither the node's saved
+    list nor the console's repeats a session the active list already shows."""
+    apps = history_apps
+
+    async def saved(client):
+        body = (await client.get("/v1/api/workstreams/saved")).json()
+        return {row["ws_id"] for row in body["workstreams"]}, body["total"]
+
+    assert (await apps.node.post("/v1/api/workstreams/related/open")).status_code == 200
+    for client in (apps.node, apps.console):
+        ids, total = await saved(client)
+        assert "related" not in ids
+        assert total == len(ids)
+    assert (await apps.node.post("/v1/api/workstreams/related/close", json={})).status_code == 200
+    for client in (apps.node, apps.console):
+        ids, total = await saved(client)
+        assert "related" in ids
+        assert total == len(ids)
+
+
 async def test_real_close_preserves_discovery_and_emits_event(history_apps):
     apps = history_apps
     assert (await apps.node.post("/v1/api/workstreams/related/open")).status_code == 200
@@ -215,7 +236,7 @@ async def test_saved_query_failure_is_unavailable(history_apps, monkeypatch):
     def fail(**kwargs):
         raise RuntimeError("private database diagnostic")
 
-    monkeypatch.setattr(history_apps.storage, "list_workstreams_with_history", fail)
+    monkeypatch.setattr(history_apps.storage, "list_saved_workstreams", fail)
     for client in (history_apps.node, history_apps.console):
         response = await client.get("/v1/api/workstreams/saved")
         assert response.status_code == 503

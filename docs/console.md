@@ -484,9 +484,14 @@ an idle retry.
 ### Saved and filtered sessions
 
 Saved coordinator and interactive sessions share one list with kind and persona
-labels, filtering, pagination, and multi-select deletion. Opening a saved
-coordinator rehydrates it in the console; opening a saved interactive session
-resolves its node, calls `open`, and then connects the node-proxied pane.
+labels, search by name, project or ID, sorting, pagination, and multi-select
+deletion. A session is saved when it has history and no process has it loaded,
+so a coordinator a crashed console left behind appears once its owner lease
+expires. The server searches, sorts and pages the whole list, so every stored
+session is reachable; sorting and searching pause while rows are selected for
+deletion. Opening a saved coordinator rehydrates it in the console; opening a
+saved interactive session resolves its node, calls `open`, and then connects the
+node-proxied pane.
 
 The filtered live table carries STATE, NAME, MODEL, NODE, TASK, TOKENS, and CTX
 columns. The browser maintains a local `clusterState` initialized from the

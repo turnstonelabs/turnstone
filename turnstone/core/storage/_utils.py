@@ -17,7 +17,7 @@ if TYPE_CHECKING:
 from turnstone.core.attachments import AUDIO_MIME_TO_FORMAT, unreadable_placeholder
 from turnstone.core.log import get_logger
 from turnstone.core.project_access import decide_project_access, fold_role_permissions
-from turnstone.core.storage._lease import unleased_predicate
+from turnstone.core.storage._lease import unheld_since_predicate, unleased_predicate
 from turnstone.core.storage._protocol import (
     FORK_RESERVATION_CONFIG_KEY,
     AttachmentWrite,
@@ -100,6 +100,28 @@ def build_memory_scope_or_clause(
         parts = [f"scope = :sc{i}", f"scope_id = :sid{i}"]
         clauses.append("(" + " AND ".join(parts) + ")")
     return " OR ".join(clauses), params
+
+
+def listed_project_predicate(
+    project: sa.FromClause, user_id: str, *, include_archived: bool = False
+) -> sa.ColumnElement[bool]:
+    """Projects in *user_id*'s project list: owned, public or joined.
+
+    ``list_projects_for_user`` lists these, and the saved-session search and sort read a
+    project's name only where that list would show it, so both use this one predicate.
+    *project* is the ``projects`` table or an alias of it. Archived projects are left out
+    unless *include_archived*.
+    """
+    listed = sa.or_(
+        project.c.owner_id == user_id,
+        project.c.visibility == "public",
+        project.c.project_id.in_(
+            sa.select(project_members.c.project_id).where(project_members.c.user_id == user_id)
+        ),
+    )
+    if include_archived:
+        return listed
+    return sa.and_(listed, project.c.state == "active")
 
 
 def memory_index_health_inputs_on_connection(
@@ -1127,8 +1149,30 @@ def save_attachment_commit_transaction(
     retain_attachment_refs(conn, attachment_ids)
     if index_content is not None:
         index_content(row_id)
-    conn.execute(sa.update(workstreams).where(workstreams.c.ws_id == ws_id).values(updated=now))
+    stamp_conversation_change(conn, ws_id, now=now)
     return row_id
+
+
+def stamp_conversation_change(
+    conn: Any, ws_ids: str | Iterable[str], *, now: str | None = None
+) -> None:
+    """Record that a workstream's conversation changed: set its ``updated``.
+
+    ``updated`` is the last change to the conversation (messages saved,
+    removed or cloned in). Every write that changes conversation rows calls
+    this inside its own transaction; lifecycle and metadata writes (state,
+    name, publication, open, close, cleanup) never do. *now* lets a caller
+    reuse the timestamp it gave the rows it wrote.
+    """
+    ids = [ws_ids] if isinstance(ws_ids, str) else sorted(set(ws_ids))
+    stamp = now or datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+    # Chunked under SQLite's bind-parameter limit for large imports.
+    for start in range(0, len(ids), 500):
+        chunk = ids[start : start + 500]
+        match = (
+            workstreams.c.ws_id == chunk[0] if len(chunk) == 1 else workstreams.c.ws_id.in_(chunk)
+        )
+        conn.execute(sa.update(workstreams).where(match).values(updated=stamp))
 
 
 def find_orphan_conversations(conn: Any) -> list[dict[str, Any]]:
@@ -2378,6 +2422,11 @@ def prune_workstreams_shared(
         ),
         workstreams.c.alias.is_(None),
         workstreams.c.updated < orphan_cutoff,
+        # A holder that stopped renewing within the window may still have the
+        # row open. This boundary is measured on the database clock at each
+        # statement; the recheck only re-tests discovered ids, and a renewal
+        # in between only removes a candidate.
+        unheld_since_predicate(dialect_name, orphan_cutoff),
     )
     for ws_id in select_ids(orphan_predicate):
         if delete_candidate(ws_id, orphan_predicate):
@@ -2394,6 +2443,7 @@ def prune_workstreams_shared(
             unleased,
             workstreams.c.alias.is_(None),
             workstreams.c.updated < stale_cutoff,
+            unheld_since_predicate(dialect_name, stale_cutoff),
         )
         for ws_id in select_ids(stale_predicate):
             if delete_candidate(ws_id, stale_predicate):
@@ -2549,6 +2599,8 @@ def delete_messages_after_core(
     for (refs,) in deleted:
         doomed_ids.extend(parse_attachment_refs(refs))
     release_attachment_refs(conn, doomed_ids)
+    if deleted:
+        stamp_conversation_change(conn, ws_id)
     return len(deleted)
 
 
@@ -3141,11 +3193,12 @@ def clone_workstream_transaction(
     updated = conn.execute(
         sa.update(workstreams)
         .where(workstreams.c.ws_id == destination_ws_id)
-        .values(project_id=effective_project_id, required_node_id=required_node_id, updated=now)
+        .values(project_id=effective_project_id, required_node_id=required_node_id)
         .returning(workstreams.c.ws_id)
     ).fetchone()
     if updated is None:
         raise ForkDestinationConflictError("fork destination is no longer available")
+    stamp_conversation_change(conn, destination_ws_id, now=now)
 
     return ForkCloneSnapshot(
         turns=tuple(final_turns),

@@ -304,6 +304,7 @@ async def test_list_saved_workstreams():
                         {
                             "ws_id": "s1",
                             "title": "test",
+                            "name": "named",
                             "created": "2024-01-01",
                             "updated": "2024-01-02",
                             "message_count": 5,
@@ -316,7 +317,10 @@ async def test_list_saved_workstreams():
                             "context_tokens": 500,
                             "context_ratio": 0.5,
                         }
-                    ]
+                    ],
+                    "total": 41,
+                    "limit": 50,
+                    "offset": 0,
                 }
             )
         }
@@ -325,15 +329,56 @@ async def test_list_saved_workstreams():
         client = AsyncTurnstoneServer(httpx_client=hc)
         resp = await client.list_saved_workstreams()
         assert len(resp.workstreams) == 1
+        assert (resp.total, resp.limit, resp.offset) == (41, 50, 0)
         ws = resp.workstreams[0]
         # enriched fields deserialize onto the model, incl. kind -> enum
         from turnstone.core.workstream import WorkstreamKind
 
+        assert ws.name == "named"
         assert ws.model_alias == "m1"
         assert ws.launch_skill == "news"
         assert ws.context_ratio == 0.5
         assert ws.child_count == 2
         assert ws.kind == WorkstreamKind.INTERACTIVE
+
+
+@pytest.mark.anyio
+async def test_list_saved_workstreams_sends_page_search_and_sort():
+    seen: list[httpx.URL] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url)
+        return httpx.Response(200, json={"workstreams": [], "total": 0, "limit": 20, "offset": 40})
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as hc:
+        client = AsyncTurnstoneServer(httpx_client=hc)
+        await client.list_saved_workstreams(
+            limit=20, offset=40, search="notes", sort="name", order="asc"
+        )
+        await client.list_saved_workstreams()
+    assert dict(seen[0].params) == {
+        "limit": "20",
+        "offset": "40",
+        "q": "notes",
+        "sort": "name",
+        "order": "asc",
+    }
+    assert dict(seen[1].params) == {}
+
+
+@pytest.mark.anyio
+async def test_list_saved_workstreams_reads_a_server_older_than_paging():
+    """An older server answers only ``workstreams`` (each without ``name``)."""
+    row = {"ws_id": "s1", "created": "2024-01-01", "updated": "2024-01-02", "message_count": 5}
+    transport = _mock_transport(
+        {"GET /v1/api/workstreams/saved": _json_response({"workstreams": [row]})}
+    )
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as hc:
+        resp = await AsyncTurnstoneServer(httpx_client=hc).list_saved_workstreams()
+    assert [ws.ws_id for ws in resp.workstreams] == ["s1"]
+    assert (resp.total, resp.limit, resp.offset) == (0, 0, 0)
+    assert resp.workstreams[0].name == ""
 
 
 # ---------------------------------------------------------------------------

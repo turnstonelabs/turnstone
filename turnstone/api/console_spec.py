@@ -166,6 +166,7 @@ from turnstone.api.server_schemas import (
     WorkstreamDetailResponse,
     WorkstreamHistoryResponse,
 )
+from turnstone.api.server_spec import SAVED_WORKSTREAMS_QUERY_PARAMS
 
 CONSOLE_ENDPOINTS: list[EndpointSpec] = [
     # --- Cluster ---
@@ -1422,12 +1423,16 @@ CONSOLE_ENDPOINTS: list[EndpointSpec] = [
         "GET",
         "List saved sessions visible to the caller",
         description=(
-            "Requires read scope. Interactive rows use creator/project visibility; "
-            "coordinator rows additionally require admin.coordinator. A caller without "
-            "that permission receives only interactive rows."
+            "One page of sessions with history that no process has loaded, "
+            "interactive and coordinator rows sorted and paged as one list. Requires "
+            "read scope. Interactive rows use creator/project visibility; coordinator "
+            "rows additionally require admin.coordinator. A caller without that "
+            "permission receives only interactive rows. total counts every matching "
+            "row across pages. A malformed parameter returns 400."
         ),
         response_model=ListSavedWorkstreamsResponse,
-        error_codes=[503],
+        query_params=SAVED_WORKSTREAMS_QUERY_PARAMS,
+        error_codes=[400, 503],
         tags=["Workstreams"],
     ),
     EndpointSpec(

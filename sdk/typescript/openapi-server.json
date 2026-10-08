@@ -1665,7 +1665,74 @@
         "tags": [
           "Workstreams"
         ],
-        "description": "Lists interactive history visible through creator/project access; requires read scope.",
+        "description": "One page of interactive workstreams with history that no process has loaded, visible through creator/project access; requires read scope. total counts every matching row across pages. A malformed parameter returns 400.",
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "default": 50
+            },
+            "description": "Rows per page (default 50, at most 200; larger values are clamped, and 0 returns only the total)."
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "default": 0
+            },
+            "description": "Matching rows to skip before the page starts."
+          },
+          {
+            "name": "q",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Case-insensitive substring of the alias, title, name, project name or ws_id (at most 256 characters)."
+          },
+          {
+            "name": "sort",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "updated",
+              "enum": [
+                "child_count",
+                "context_ratio",
+                "kind",
+                "message_count",
+                "model",
+                "name",
+                "persona",
+                "project",
+                "updated",
+                "ws_id"
+              ]
+            },
+            "description": "Column to sort by; ws_id breaks ties so pages never overlap."
+          },
+          {
+            "name": "order",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "desc",
+              "enum": [
+                "asc",
+                "desc"
+              ]
+            },
+            "description": "Sort direction."
+          }
+        ],
         "responses": {
           "200": {
             "description": "Success",
@@ -1673,6 +1740,16 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/ListSavedWorkstreamsResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Error 400",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
                 }
               }
             }
@@ -3969,6 +4046,7 @@
         "type": "object"
       },
       "ListSavedWorkstreamsResponse": {
+        "description": "One page of saved workstreams.\n\n``total`` counts every row matching the request's search, across all\npages; ``limit`` and ``offset`` echo the page the server applied. A server\nolder than paging sends only ``workstreams``; the defaults keep a newer\nSDK reading it.",
         "properties": {
           "workstreams": {
             "items": {
@@ -3976,6 +4054,21 @@
             },
             "title": "Workstreams",
             "type": "array"
+          },
+          "total": {
+            "default": 0,
+            "title": "Total",
+            "type": "integer"
+          },
+          "limit": {
+            "default": 0,
+            "title": "Limit",
+            "type": "integer"
+          },
+          "offset": {
+            "default": 0,
+            "title": "Offset",
+            "type": "integer"
           }
         },
         "required": [
@@ -4013,6 +4106,11 @@
             ],
             "default": null,
             "title": "Title"
+          },
+          "name": {
+            "default": "",
+            "title": "Name",
+            "type": "string"
           },
           "created": {
             "title": "Created",

@@ -596,7 +596,9 @@ def _coordinator_rows(request: Request) -> list[dict[str, Any]]:
     # display name (``alias > title > name``) for the LIVE coordinators
     # too — ``ws.name`` is the synthetic placeholder.  Cluster-wide
     # (trusted-team visibility).  Indexed by ws_id so both lanes resolve
-    # the same way.
+    # the same way.  ``updated`` is the last conversation change (closing
+    # or opening one leaves it alone), so the 200 rows are the coordinators
+    # used most recently.
     storage = getattr(request.app.state, "auth_storage", None)
     persisted: list[Any] = []
     if storage is not None:
@@ -639,9 +641,9 @@ def _coordinator_rows(request: Request) -> list[dict[str, Any]]:
         # ``limit=200`` ``meta`` map, so a live coord outside that window
         # reports ``""`` here. The user-visible ``name`` stays correct
         # (resolved via the uncapped ``live_display`` above, and the UI
-        # renders ``title || name``); the empty title is harmless and the
-        # window is unreachable in practice (live coords are bounded by
-        # ``max_active`` and sort to the top of ``updated DESC``).
+        # renders ``title || name``), so the empty title is harmless.  A live
+        # coord can sit outside the window: opening one does not move its
+        # ``updated``, only its conversation does.
         m = meta.get(ws_id)
         return str(m.get("title") or "") if m is not None else ""
 
@@ -4394,36 +4396,6 @@ def _coord_spawn_metrics(ui: Any) -> None:
         with ui._ws_lock:
             ui._ws_messages += 1
             ui._ws_turn_tool_calls = 0
-
-
-async def _coord_saved_loaded_lookup(request: Request) -> set[str]:
-    """Return ws_ids currently held in ``coord_mgr``'s warm pool.
-
-    Wired onto :attr:`SessionEndpointConfig.saved_loaded_lookup`.
-    Defence-in-depth filter for the saved-coordinators list — a row
-    can be ``state='closed'`` on disk for a few seconds while the
-    close-emit sequence races the in-memory pop, and we don't want
-    the saved card grid showing a coord that's still loaded.
-
-    Empty set when ``coord_mgr`` isn't attached (subsystem unavailable)
-    or empty (zero-element snapshot — skip the executor hop too).
-    Errors are swallowed by the lifted body's outer ``try/except``;
-    returning ``set()`` here on a missing manager keeps the caller
-    happy without trampling the lifted body's error log.
-    """
-    coord_mgr = getattr(request.app.state, "coord_mgr", None)
-    if coord_mgr is None:
-        return set()
-    # Cheap probe: an empty pool can answer without paying the
-    # ``asyncio.to_thread`` round-trip. ``count`` reads under the
-    # manager lock but doesn't block; if the manager isn't empty we
-    # still need ``list_all`` under to_thread because the snapshot
-    # itself acquires the same lock.
-    if coord_mgr.count == 0:
-        return set()
-    return await asyncio.to_thread(
-        lambda: {ws.id for ws in coord_mgr.list_all()},
-    )
 
 
 async def coordinator_page(request: Request) -> Response:
@@ -16741,16 +16713,11 @@ def create_app(
         # No alias surface on coord today — the lifted body falls
         # back to ``ws.name`` when ``list_resolve_titles`` is None.
         list_resolve_titles=None,
-        # Explicit kind classifier for the lifted list/saved factory's
-        # storage filter (drops the pre-fix ``audit_action_prefix``
-        # string compare that would have silently leaked interactive
-        # rows for any future kind).
+        # Explicit kind classifier for the lifted factories that read
+        # storage rows (saved, history, export, detail; drops the pre-fix
+        # ``audit_action_prefix`` string compare that would have silently
+        # leaked interactive rows for any future kind).
         list_kind=WorkstreamKind.COORDINATOR,
-        # Coord saved cards show only explicitly-closed coordinators —
-        # active / in-flight rows live in the active list and
-        # tombstones are non-resurrectable.
-        saved_state_filter="closed",
-        saved_loaded_lookup=_coord_saved_loaded_lookup,
         # Isolate coord SSE polling on its own 200-thread pool so a
         # handful of coord tabs (each parking a thread on
         # ``client_queue.get``) can't starve the default executor and
@@ -16762,12 +16729,9 @@ def create_app(
     )
     # Minimal interactive cfg used ONLY by the unified saved-list handler
     # so the console's L-shell dashboard can show a single saved list
-    # spanning both kinds. Storage is shared across kinds, so this drives
-    # ``list_workstreams_with_history(kind=INTERACTIVE, ...)`` with
-    # interactive's own saved semantics: ``state=None`` (every persisted
-    # interactive row — safe because delete is a HARD delete, so no
-    # ``deleted`` tombstone is ever written; there is no storage-side
-    # filter) and no warm-pool exclusion. The verb fields
+    # spanning both kinds. Storage is shared across kinds, so the handler
+    # lists interactive rows alongside coordinators by the same rule: history
+    # and no live owner lease. The verb fields
     # (manager_lookup / tenant_check / labels) are required by the
     # dataclass but never consulted on the read-only saved path — the
     # console mounts no interactive verb handlers, only the merged saved
@@ -16780,8 +16744,6 @@ def create_app(
         not_found_label="Workstream not found",
         audit_action_prefix="workstream",
         list_kind=WorkstreamKind.INTERACTIVE,
-        saved_state_filter=None,
-        saved_loaded_lookup=None,
     )
     coord_workstream_routes: list[Any] = []
     register_session_routes(
@@ -16789,9 +16751,10 @@ def create_app(
         prefix="/api/workstreams",
         handlers=SharedSessionVerbHandlers(
             list_workstreams=make_list_handler(coord_endpoint_config),  # lifted: shared body
-            # Unified saved list: coordinator + interactive in one
-            # response for the L-shell dashboard. Each kind retains its
-            # permission, state filter, and warm-pool exclusion.
+            # Unified saved list: coordinator + interactive rows searched,
+            # sorted and paged as one list for the L-shell dashboard. Each
+            # kind keeps its own permission gate; both follow the saved rule
+            # (history, no live owner lease).
             list_saved=make_unified_saved_handler(
                 [coord_endpoint_config, interactive_saved_cfg],
             ),

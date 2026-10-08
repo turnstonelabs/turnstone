@@ -177,12 +177,12 @@
           ></div>
         </section>
 
-        <!-- Saved coordinators — closed sessions that persist on disk.
-         Mirrors the interactive UI's "Saved Workstreams" card grid
-         (same /shared/cards.css primitives, same response item shape
-         from /v1/api/workstreams/saved).  Click a card →
-         /coordinator/{ws_id} → the lifted detail factory lazy-rehydrates
-         from storage.  Hidden until at least one saved coordinator loads. -->
+        <!-- Saved sessions — coordinators and interactive sessions with
+         history that no process has open.  Mirrors the interactive UI's
+         "Saved Workstreams" table (same /shared/cards.js table, same
+         /v1/api/workstreams/saved pages).  A coordinator row opens as a
+         pane after POST /open; an interactive row opens on its node.
+         Hidden until there is a list, a search or an error to show. -->
         <section
           id="saved-coordinators"
           style="display: none"
@@ -195,8 +195,9 @@
                 id="coord-filter"
                 class="saved-filter"
                 type="search"
-                placeholder="Filter by name&#x2026;"
-                aria-label="Filter saved sessions"
+                maxlength="256"
+                placeholder="Search name, project or ID&#x2026;"
+                aria-label="Search saved sessions"
                 autocomplete="off"
               />
               <button
@@ -211,7 +212,7 @@
           </div>
           <div
             id="coord-saved-error"
-            class="dashboard-empty"
+            class="dashboard-empty saved-error"
             role="alert"
             hidden
           >

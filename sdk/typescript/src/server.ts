@@ -18,6 +18,7 @@ import type {
   ListAttachmentsResponse,
   ListMemoriesOptions,
   ListMemoriesResponse,
+  ListSavedWorkstreamsOptions,
   ListSavedWorkstreamsResponse,
   ListWorkstreamsResponse,
   MemoryInfo,
@@ -369,8 +370,16 @@ export class TurnstoneServer extends BaseClient {
 
   // -- Saved workstreams ----------------------------------------------------
 
-  async listSavedWorkstreams(): Promise<ListSavedWorkstreamsResponse> {
-    return this.request("GET", "/v1/api/workstreams/saved");
+  async listSavedWorkstreams(
+    opts?: ListSavedWorkstreamsOptions,
+  ): Promise<ListSavedWorkstreamsResponse> {
+    const params: Record<string, string | number> = {};
+    if (opts?.limit !== undefined) params.limit = opts.limit;
+    if (opts?.offset) params.offset = opts.offset;
+    if (opts?.search) params.q = opts.search;
+    if (opts?.sort) params.sort = opts.sort;
+    if (opts?.order) params.order = opts.order;
+    return this.request("GET", "/v1/api/workstreams/saved", { params });
   }
 
   // -- Skills -----------------------------------------------------------------

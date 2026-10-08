@@ -1552,23 +1552,9 @@ class SessionManager:
                 # is IDLE; the DB row may still say 'closed' from the
                 # last close(). The next set_state() call syncs it
                 # naturally; writing 'idle' here could race a concurrent
-                # close() that writes 'closed' under self._lock.
-                #
-                # Bump only ``updated`` (no state write) so this row's
-                # timestamp is fresh against the orphan-reaper cutoff —
-                # otherwise a concurrent close_idle pass-2 in this same
-                # process could clobber a freshly-rehydrated row whose
-                # ``updated`` is older than the cutoff.  The pure-
-                # timestamp write is safe against concurrent close()
-                # because close still wins on the state column.
-                try:
-                    self._storage.touch_workstream(ws_id, lease=self.own_row_fence(ws))
-                except Exception:
-                    log.debug(
-                        "session_mgr.touch_workstream_failed ws=%s",
-                        ws_id[:8],
-                        exc_info=True,
-                    )
+                # close() that writes 'closed' under self._lock. The lease
+                # taken above keeps the orphan reaper off this row however
+                # old its ``updated``, which opening leaves alone.
                 if self._event_emitter is not None:
                     self._event_emitter.emit_rehydrated(ws)
                 return ws, True

@@ -2,10 +2,10 @@
 
 Covers the tenancy predicate (:class:`WorkstreamProjectVisibility`), the
 create-time attach gate (:func:`ensure_project_attachable`), the row-access
-gate in :func:`resolve_workstream_owner`, and the saved-list filter in
-``_collect_saved_rows`` — the choke points that keep workstreams attached
-to a private project out of non-members' listings and 403 their direct
-access.
+gate in :func:`resolve_workstream_owner`, and the saved-list filter applied
+by ``list_saved_workstreams`` — the choke points that keep workstreams
+attached to a private project out of non-members' listings and 403 their
+direct access.
 """
 
 from __future__ import annotations
@@ -16,6 +16,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from tests._storage_fakes import stamp_updated_newest_first
 from turnstone.core.auth import (
     WorkstreamProjectVisibility,
     ensure_project_attachable,
@@ -77,6 +78,7 @@ def _request_for(
     return SimpleNamespace(
         state=SimpleNamespace(auth_result=_FakeAuth(uid, scopes, permissions)),
         app=SimpleNamespace(state=SimpleNamespace(auth_storage=storage)),
+        query_params={},
     )
 
 
@@ -363,17 +365,12 @@ class TestResolveWorkstreamOwnerProjectGate:
 
 
 class TestSavedListFilter:
-    """The saved-sessions collector drops private-project rows server-side
-    and carries project_id on surviving rows (real ephemeral DB)."""
+    """The saved-sessions list drops private-project rows server-side and
+    carries project_id on surviving rows (real ephemeral DB)."""
 
     async def test_saved_rows_filtered_and_carry_project_id(self, tmp_db: str) -> None:
         from turnstone.core.memory import register_workstream, save_message
-        from turnstone.core.session_routes import (
-            SessionEndpointConfig,
-            _collect_saved_rows,
-        )
         from turnstone.core.storage import get_storage
-        from turnstone.core.workstream import WorkstreamKind
 
         storage = get_storage()
         storage.create_project("p1", "Secret", "alice")
@@ -387,29 +384,44 @@ class TestSavedListFilter:
         for wid in ("ws-plain", "ws-priv", "ws-pub", "ws-own"):
             save_message(wid, "user", "hello")
 
-        cfg = SessionEndpointConfig(
-            permission_gate=None,
-            manager_lookup=lambda request: (None, None),
-            tenant_check=None,
-            not_found_label="Workstream not found",
-            audit_action_prefix="workstream",
-            list_kind=WorkstreamKind.INTERACTIVE,
-            saved_state_filter=None,
-            saved_loaded_lookup=None,
-        )
-
-        rows = await _collect_saved_rows(cfg, _request_for("bob", storage=storage))
-        ids = {r["ws_id"] for r in rows}
+        body = await _saved_body(_request_for("bob", storage=storage))
+        ids = {r["ws_id"] for r in body["workstreams"]}
         # bob: no membership in p1 — alice's private ws is dropped; the
         # public-project ws, the project-less ws, and bob's own
         # private-project ws all survive.
         assert ids == {"ws-plain", "ws-pub", "ws-own"}
-        by_id = {r["ws_id"]: r for r in rows}
+        assert body["total"] == 3
+        by_id = {r["ws_id"]: r for r in body["workstreams"]}
         assert by_id["ws-pub"]["project_id"] == "p2"
         assert by_id["ws-plain"]["project_id"] is None
 
-        rows_alice = await _collect_saved_rows(cfg, _request_for("alice", storage=storage))
-        assert {r["ws_id"] for r in rows_alice} == {"ws-plain", "ws-priv", "ws-pub", "ws-own"}
+        body_alice = await _saved_body(_request_for("alice", storage=storage))
+        assert {r["ws_id"] for r in body_alice["workstreams"]} == {
+            "ws-plain",
+            "ws-priv",
+            "ws-pub",
+            "ws-own",
+        }
+
+
+async def _saved_body(request: Any) -> dict[str, Any]:
+    import json
+
+    from turnstone.core.session_routes import SessionEndpointConfig, make_saved_handler
+    from turnstone.core.workstream import WorkstreamKind
+
+    cfg = SessionEndpointConfig(
+        permission_gate=None,
+        manager_lookup=lambda request: (None, None),
+        tenant_check=None,
+        not_found_label="Workstream not found",
+        audit_action_prefix="workstream",
+        list_kind=WorkstreamKind.INTERACTIVE,
+    )
+    response = await make_saved_handler(cfg)(request)
+    assert response.status_code == 200
+    body: dict[str, Any] = json.loads(bytes(response.body))
+    return body
 
 
 class TestTriStateVisibility:
@@ -625,74 +637,32 @@ class TestCreateValidatorProjectGate:
 
 
 class TestSavedListPagination:
-    """The saved-list collector pages past invisible rows instead of
-    letting a post-SQL filter shrink the window."""
+    """Rows the caller cannot see never occupy a page or count toward the
+    total, however many of them sort ahead of the visible ones."""
 
-    def _row(self, i: int, project_id: str | None) -> tuple:
-        return (
-            f"ws-{i:03d}",
-            None,
-            None,
-            f"n{i}",
-            "2026-01-01T00:00:00",
-            f"{99999 - i}",  # updated: descending with i
-            1,
-            "node-a",
-            "idle",
-            "interactive",
-            None,
-            None,
-            0,
-            0,
-            None,
-            project_id,
-            "alice",
-            None,  # persona
-        )
+    async def test_pages_and_total_cover_only_visible_rows(self, tmp_db: str) -> None:
+        from turnstone.core.memory import register_workstream
+        from turnstone.core.storage import get_storage
 
-    def _cfg(self):
-        from turnstone.core.session_routes import SessionEndpointConfig
-        from turnstone.core.workstream import WorkstreamKind
+        storage = get_storage()
+        storage.create_project("p-priv", "Secret", "alice")
+        rows = []
+        # Newest first: 60 private rows bob cannot see, then 70 he can.
+        for i in range(130):
+            wid = f"ws-{i:03d}"
+            register_workstream(wid, user_id="alice", project_id="p-priv" if i < 60 else None)
+            rows.append({"ws_id": wid, "role": "user", "content": "hi"})
+        storage.save_messages_bulk(rows)
+        stamp_updated_newest_first(storage, [f"ws-{i:03d}" for i in range(130)])
 
-        return SessionEndpointConfig(
-            permission_gate=None,
-            manager_lookup=lambda request: (None, None),
-            tenant_check=None,
-            not_found_label="Workstream not found",
-            audit_action_prefix="workstream",
-            list_kind=WorkstreamKind.INTERACTIVE,
-            saved_state_filter=None,
-            saved_loaded_lookup=None,
-        )
+        request = _request_for("bob", storage=storage)
+        first = await _saved_body(request)
+        assert first["total"] == 70
+        assert [r["ws_id"] for r in first["workstreams"]] == [f"ws-{i:03d}" for i in range(60, 110)]
 
-    def _patch(self, monkeypatch: pytest.MonkeyPatch, rows: list) -> Any:
-        def _fake(limit=20, *, kind=None, user_id=None, state=None, offset=0):
-            return rows[offset : offset + limit]
-
-        vis = WorkstreamProjectVisibility("bob", storage=_fake_storage())  # denies any pid
-        monkeypatch.setattr(
-            WorkstreamProjectVisibility,
-            "for_request",
-            classmethod(lambda cls, request, storage=None: vis),
-        )
-        return _request_for("bob", storage=SimpleNamespace(list_workstreams_with_history=_fake))
-
-    async def test_pages_past_invisible_rows(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        from turnstone.core.session_routes import _collect_saved_rows
-
-        rows = [self._row(i, "ph") for i in range(60)] + [
-            self._row(i, None) for i in range(60, 130)
+        request.query_params = {"offset": "50"}
+        second = await _saved_body(request)
+        assert second["total"] == 70
+        assert [r["ws_id"] for r in second["workstreams"]] == [
+            f"ws-{i:03d}" for i in range(110, 130)
         ]
-        request = self._patch(monkeypatch, rows)
-        result = await _collect_saved_rows(self._cfg(), request)
-        assert len(result) == 50
-        assert result[0]["ws_id"] == "ws-060"
-        assert result[-1]["ws_id"] == "ws-109"
-
-    async def test_scan_cap_terminates(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        from turnstone.core.session_routes import _collect_saved_rows
-
-        rows = [self._row(i, "ph") for i in range(5000)]
-        request = self._patch(monkeypatch, rows)
-        result = await _collect_saved_rows(self._cfg(), request)
-        assert result == []

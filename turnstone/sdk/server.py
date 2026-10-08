@@ -500,9 +500,37 @@ class AsyncTurnstoneServer(_BaseClient):
 
     # -- saved workstreams ----------------------------------------------------
 
-    async def list_saved_workstreams(self) -> ListSavedWorkstreamsResponse:
+    async def list_saved_workstreams(
+        self,
+        *,
+        limit: int | None = None,
+        offset: int = 0,
+        search: str = "",
+        sort: str | None = None,
+        order: str | None = None,
+    ) -> ListSavedWorkstreamsResponse:
+        """One page of saved workstreams; ``total`` counts every page.
+
+        ``None`` and empty arguments take the server's defaults (its page
+        size, newest first); ``limit=0`` returns only ``total``. Page by
+        advancing ``offset`` until it reaches ``total``.
+        """
+        params: dict[str, Any] = {}
+        if limit is not None:
+            params["limit"] = limit
+        if offset:
+            params["offset"] = offset
+        if search:
+            params["q"] = search
+        if sort is not None:
+            params["sort"] = sort
+        if order is not None:
+            params["order"] = order
         return await self._request(
-            "GET", "/v1/api/workstreams/saved", response_model=ListSavedWorkstreamsResponse
+            "GET",
+            "/v1/api/workstreams/saved",
+            params=params,
+            response_model=ListSavedWorkstreamsResponse,
         )
 
     # -- skills --------------------------------------------------------------
@@ -879,8 +907,20 @@ class TurnstoneServer:
 
     # -- saved workstreams ----------------------------------------------------
 
-    def list_saved_workstreams(self) -> ListSavedWorkstreamsResponse:
-        return self._runner.run(self._async.list_saved_workstreams())
+    def list_saved_workstreams(
+        self,
+        *,
+        limit: int | None = None,
+        offset: int = 0,
+        search: str = "",
+        sort: str | None = None,
+        order: str | None = None,
+    ) -> ListSavedWorkstreamsResponse:
+        return self._runner.run(
+            self._async.list_saved_workstreams(
+                limit=limit, offset=offset, search=search, sort=sort, order=order
+            )
+        )
 
     # -- skills --------------------------------------------------------------
 

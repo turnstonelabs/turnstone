@@ -5885,17 +5885,10 @@ def create_app(
         # instead of N per-row queries. Returns a {ws_id: title-or-None}
         # dict; the lifted body falls back to ``ws.name`` per-row.
         list_resolve_titles=_get_ws_display_names,
-        # Explicit kind classifier for the lifted list/saved factory's
-        # storage filter — required to avoid silently filtering for
-        # the wrong kind when a future kind is added.
+        # Explicit kind classifier for the lifted factories that read
+        # storage rows (saved, history, export, detail) — required to avoid
+        # silently filtering for the wrong kind when a future kind is added.
         list_kind=WorkstreamKind.INTERACTIVE,
-        # No state filter: the interactive saved sidebar shows every
-        # persisted workstream the storage layer doesn't already
-        # tombstone (deleted rows are excluded at the SQL level).
-        saved_state_filter=None,
-        # No in-memory exclusion: an interactive workstream that's
-        # both saved AND loaded is a normal display state.
-        saved_loaded_lookup=None,
     )
     # ``accepted_permissions`` gates the lifted body on any one of the
     # named perms when ``cfg.permission_gate`` is ``None`` (interactive

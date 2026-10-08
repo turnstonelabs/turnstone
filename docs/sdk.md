@@ -88,7 +88,7 @@ Both `TurnstoneServer` (sync) and `AsyncTurnstoneServer` (async) expose:
 | **Streaming** | `stream_events(ws_id, *, last_event_id=None, history_token=None)` | `Iterator[ServerEvent]` |
 | | `stream_global_events()` | `Iterator[ServerEvent]` |
 | **High-level** | `send_and_wait(message, ws_id, *, timeout, on_event)` | `TurnResult` |
-| **Saved** | `list_saved_workstreams()` | `ListSavedWorkstreamsResponse` |
+| **Saved** | `list_saved_workstreams(*, limit, offset, search, sort, order)` | `ListSavedWorkstreamsResponse` |
 | **Auth** | `login(username=..., password=...)` | `AuthLoginResponse` |
 | | `login(token="ts_xxx")` | `AuthLoginResponse` |
 | | `logout()` | `StatusResponse` |

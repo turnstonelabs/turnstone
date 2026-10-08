@@ -31,6 +31,7 @@ from turnstone.core.storage._protocol import (
     WorkstreamLeaseLostError,
 )
 from turnstone.core.storage._schema import watches, workstream_config, workstreams
+from turnstone.core.workstream import BULK_CLOSE_STATE_VALUES, WorkstreamKind
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Sequence
@@ -425,6 +426,25 @@ def unleased_predicate(dialect_name: str) -> sa.ColumnElement[bool]:
     )
 
 
+def unheld_since_predicate(dialect_name: str, cutoff: str) -> sa.ColumnElement[bool]:
+    """Rows whose owner lease, if any, ran out by *cutoff* (UTC ``YYYY-MM-DDTHH:MM:SS``).
+
+    Release and fence-out clear the expiry, so an expiry that remains belongs to a holder that
+    stopped renewing (it crashed, or its renewals are failing) and falls one lease TTL after its
+    last renewal. Maintenance that judges a row by its age also waits for that expiry, so a row
+    renewed up to one TTL before *cutoff* is still kept. A workstream someone reopened to read
+    keeps an old ``updated``, and a renewal outage must not let cleanup close or prune it while
+    it is still open. The window is measured back from the database clock, like every other
+    lease comparison.
+    """
+    parsed = datetime.strptime(cutoff, "%Y-%m-%dT%H:%M:%S").replace(tzinfo=UTC)
+    window_ms = max(0, int((datetime.now(UTC) - parsed).total_seconds() * 1000))
+    return sa.or_(
+        workstreams.c.lease_expires_ms.is_(None),
+        workstreams.c.lease_expires_ms <= db_now_ms(dialect_name) - window_ms,
+    )
+
+
 @functools.cache
 def live_lease_node_id(dialect_name: str) -> sa.ColumnElement[Any]:
     """``lease_node_id`` while the lease is live by the database clock, else NULL.
@@ -453,3 +473,40 @@ def fence_out_values() -> dict[str, Any]:
         "lease_expires_ms": None,
         "lease_epoch": workstreams.c.lease_epoch + 1,
     }
+
+
+def close_stale_orphans_on_connection(
+    conn: Any,
+    kind: WorkstreamKind | str,
+    cutoff: str,
+    exclude_ws_ids: Sequence[str],
+) -> list[str]:
+    """Both backends' ``bulk_close_stale_orphans``: close the rows and return their ids.
+
+    One UPDATE ... RETURNING, so eligibility is judged and the closed rows are
+    reported by the same statement: a row a new message freshened or
+    ``set_state`` moved out of the bulk-close set is neither closed nor
+    reported. A row loaded by any live process carries a live owner lease, so
+    the lease predicate protects it (PostgreSQL re-evaluates it against a
+    concurrent acquisition's committed version of each row the UPDATE locks),
+    and the same statement fences out an expired lease. ``updated`` keeps the
+    session's last real use (see the protocol docstring). The caller commits.
+    """
+    dialect_name = conn.dialect.name
+    stmt = (
+        sa.update(workstreams)
+        .where(
+            workstreams.c.kind == WorkstreamKind(kind).value,
+            workstreams.c.state.in_(BULK_CLOSE_STATE_VALUES),
+            workstreams.c.updated < cutoff,
+            unleased_predicate(dialect_name),
+            unheld_since_predicate(dialect_name, cutoff),
+        )
+        .values(state="closed", **fence_out_values())
+        .returning(workstreams.c.ws_id)
+    )
+    if exclude_ws_ids:
+        # Nothing to exclude leaves out ``NOT IN ()`` and SQLAlchemy's
+        # empty-collection warning.
+        stmt = stmt.where(~workstreams.c.ws_id.in_(exclude_ws_ids))
+    return [row[0] for row in conn.execute(stmt)]

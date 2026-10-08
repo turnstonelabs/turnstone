@@ -102,6 +102,7 @@ export type {
   DashboardAggregate,
   DashboardResponse,
   SavedWorkstreamInfo,
+  ListSavedWorkstreamsOptions,
   ListSavedWorkstreamsResponse,
   BackendStatus,
   McpStatus,

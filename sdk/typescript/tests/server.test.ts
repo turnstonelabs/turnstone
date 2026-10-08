@@ -52,6 +52,54 @@ describe("TurnstoneServer", () => {
     );
   });
 
+  it("listSavedWorkstreams sends page, search and sort parameters", async () => {
+    const fetchFn = mockFetch({
+      workstreams: [],
+      total: 120,
+      limit: 20,
+      offset: 40,
+    });
+    const client = new TurnstoneServer({
+      baseUrl: "http://test",
+      fetch: fetchFn,
+    });
+    const resp = await client.listSavedWorkstreams({
+      limit: 20,
+      offset: 40,
+      search: "release notes",
+      sort: "name",
+      order: "asc",
+    });
+    expect(resp.total).toBe(120);
+    const url = new URL((fetchFn as ReturnType<typeof vi.fn>).mock.calls[0][0]);
+    expect(url.pathname).toBe("/v1/api/workstreams/saved");
+    expect(Object.fromEntries(url.searchParams)).toEqual({
+      limit: "20",
+      offset: "40",
+      q: "release notes",
+      sort: "name",
+      order: "asc",
+    });
+  });
+
+  it("listSavedWorkstreams leaves defaults to the server", async () => {
+    const fetchFn = mockFetch({
+      workstreams: [],
+      total: 0,
+      limit: 50,
+      offset: 0,
+    });
+    const client = new TurnstoneServer({
+      baseUrl: "http://test",
+      fetch: fetchFn,
+    });
+    await client.listSavedWorkstreams();
+    expect(fetchFn).toHaveBeenCalledWith(
+      "http://test/v1/api/workstreams/saved",
+      expect.objectContaining({ method: "GET" }),
+    );
+  });
+
   it("createWorkstream sends correct body", async () => {
     const fetchFn = mockFetch({ ws_id: "ws_new", name: "Analysis" });
     const client = new TurnstoneServer({

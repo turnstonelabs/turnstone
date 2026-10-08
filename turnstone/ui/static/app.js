@@ -1034,31 +1034,11 @@ function toggleDashboard() {
   showDashboard();
 }
 
-// Paint a transient message (loading / error) into the saved-workstreams
-// area.  Clears any cards AND hides the pagination control \u2014 it's a sibling
-// of the cards container, so a bare replaceChildren on the cards alone would
-// leave stale Prev/Next visible and still wired to the previous list cache.
-// A successful load re-shows it (and the footer) via _wsTable.setItems.
-function _setSavedWsMessage(text) {
-  document
-    .getElementById("dashboard-saved-cards")
-    .replaceChildren(makeEmptyState(text));
-  const pag = document.getElementById("ws-pagination");
-  if (pag) pag.style.display = "none";
-  const footer = document.getElementById("ws-saved-footer");
-  if (footer) footer.textContent = "";
-}
-
 function loadDashboard() {
   const generation = authGeneration();
   const tableEl = document.getElementById("dash-ws-table");
   tableEl.replaceChildren(makeEmptyState("Loading\u2026"));
-  _setSavedWsMessage("Loading\u2026");
   const dashP = authFetch("/v1/api/dashboard").then(function (r) {
-    return r.json();
-  });
-  const sessP = authFetch("/v1/api/workstreams/saved").then(function (r) {
-    if (!r.ok) throw new Error("Saved sessions unavailable");
     return r.json();
   });
   // Refresh the projects cache alongside the table so the per-row project pills
@@ -1071,27 +1051,28 @@ function loadDashboard() {
   const persP = window.TurnstonePersonas
     ? window.TurnstonePersonas.refreshPersonas()
     : Promise.resolve();
-  Promise.all([dashP, sessP, projP, persP])
+  Promise.all([dashP, projP, persP])
     .then(function (res) {
       if (generation !== authGeneration()) return;
       const dashData = res[0];
-      const wsList = dashData.workstreams || [];
-      const agg = dashData.aggregate || {};
-      renderDashboardTable(wsList, agg);
-      const activeWsIds = {};
-      wsList.forEach(function (ws) {
-        activeWsIds[ws.ws_id] = true;
-      });
-      const savedList = (res[1].workstreams || []).filter(function (s) {
-        return !activeWsIds[s.ws_id];
-      });
-      _wsTable.setItems(savedList);
+      renderDashboardTable(
+        dashData.workstreams || [],
+        dashData.aggregate || {},
+      );
     })
     .catch(function () {
       if (generation !== authGeneration()) return;
       tableEl.replaceChildren(makeEmptyState("Failed to load"));
-      _setSavedWsMessage("Failed to load");
     });
+  // The server leaves out workstreams any node has loaded (they hold an owner
+  // lease), so the active rows above never repeat as saved ones.  The first
+  // page waits for the project and persona names that label its rows.
+  _wsTable.load(Promise.all([projP, persP]));
+}
+
+// Fetch the saved table's page again: Retry, and events that change the list.
+function loadSavedWorkstreams() {
+  _wsTable.load();
 }
 
 function renderDashboardTable(wsList, agg) {
@@ -1264,10 +1245,10 @@ function updateDashFooter(agg) {
 }
 
 // Saved Workstreams table.  The shared createSavedTable (/shared/cards.js)
-// owns filter + sort + render and wraps the multi-select delete controller;
-// the per-app inputs are the column spec, the DOM refs, and the path-keyed
-// delete request.  Coordinators (console/static) use the same helper with a
-// CHILDREN column instead of MSGS.
+// fetches, pages, sorts and renders the server's pages and wraps the
+// multi-select delete controller; the per-app inputs are the column spec,
+// the DOM refs, and the path-keyed delete request.  Coordinators
+// (console/static) use the same helper with a CHILDREN column instead of MSGS.
 let _wsTable = null;
 
 // Built at boot, not parse: the saved-table substrate (/shared/cards.js) is a
@@ -1290,6 +1271,8 @@ function _initSavedWsTable() {
     filterEl: document.getElementById("ws-filter"),
     footerEl: document.getElementById("ws-saved-footer"),
     paginationEl: document.getElementById("ws-pagination"),
+    errorEl: document.getElementById("ws-saved-error"),
+    errorTextEl: document.getElementById("ws-saved-error-text"),
     columns: WS_COLUMNS,
     noun: "workstream",
     emptyText: "No saved workstreams",
@@ -1297,6 +1280,9 @@ function _initSavedWsTable() {
       return hasScope("write");
     },
     canDelete: function () {
+      return hasScope("write");
+    },
+    canDeleteAny: function () {
       return hasScope("write");
     },
     activateLabel: function (s) {
@@ -1313,9 +1299,6 @@ function _initSavedWsTable() {
           url: "/v1/api/workstreams/" + encodeURIComponent(wsId) + "/delete",
           options: { method: "POST" },
         };
-      },
-      onClose: function () {
-        loadDashboard();
       },
     },
   });

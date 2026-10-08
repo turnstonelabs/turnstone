@@ -397,6 +397,11 @@ class WorkstreamProjectVisibility:
 
     Project rows and membership verdicts are memoized per instance —
     construct one per request/connection, not per row.
+
+    The saved-session list applies these rules in SQL instead, so it can page
+    and count in the database: ``workstream_visible_predicate`` in
+    ``core/storage/_saved.py``. A parity test pins the two together; change
+    them in step.
     """
 
     def __init__(self, user_id: str, *, bypass: bool = False, storage: Any = None) -> None:
@@ -428,6 +433,15 @@ class WorkstreamProjectVisibility:
         callers that transform payloads (not just drop rows) use this to
         leave them untouched."""
         return self._bypass
+
+    @property
+    def viewer(self) -> str | None:
+        """The ``viewer`` argument for storage-side visibility filters.
+
+        ``None`` (no filter) for a bypass instance, else the user id, which
+        is empty for an anonymous caller.
+        """
+        return None if self._bypass else self._user_id
 
     def _resolve_storage(self) -> Any:
         if self._storage is None:

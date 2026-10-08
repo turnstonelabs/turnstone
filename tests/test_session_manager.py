@@ -254,7 +254,6 @@ class FakeStorage:
     def __init__(self) -> None:
         self.rows: dict[str, _Row] = {}
         self.state_updates: list[tuple[str, str]] = []
-        self.touch_calls: list[str] = []
         self.register_raises = False
         self.lock = threading.Lock()
         self.delete_stale_creating_raises = False
@@ -414,14 +413,6 @@ class FakeStorage:
             if fork_reservation_token:
                 self.fork_reservations[ws_id] = fork_reservation_token
 
-    def touch_workstream(self, ws_id: str, *, lease: LeaseFence | None = None) -> None:
-        with self.lock:
-            row = self._admit_locked(ws_id, lease)
-            # Recorded once admitted: a refused touch is not a touch.
-            self.touch_calls.append(ws_id)
-            if row is not None:
-                row.updated = self._now_iso()
-
     def update_workstream_state(
         self, ws_id: str, state: str, *, lease: LeaseFence | None = None
     ) -> None:
@@ -430,7 +421,6 @@ class FakeStorage:
             self.state_updates.append((ws_id, state))
             if row is not None:
                 row.state = state
-                row.updated = self._now_iso()
 
     def bulk_close_stale_orphans(
         self,
@@ -440,7 +430,9 @@ class FakeStorage:
     ) -> list[str]:
         kind_str = kind.value if isinstance(kind, WorkstreamKind) else str(kind)
         excluded = set(exclude_ws_ids)
-        now = self._now_iso()
+        # As in the backends: a holder that stopped renewing after the cutoff
+        # may still have the row open.
+        cutoff_at = datetime.strptime(cutoff, "%Y-%m-%dT%H:%M:%S").replace(tzinfo=UTC).timestamp()
         closed: list[str] = []
         with self.lock:
             for ws_id, row in self.rows.items():
@@ -450,9 +442,10 @@ class FakeStorage:
                     and row.updated < cutoff
                     and ws_id not in excluded
                     and not row.lease_live()
+                    and (row.lease_expires_at is None or row.lease_expires_at <= cutoff_at)
                 ):
+                    # ``updated`` keeps the last real use, as in the backends.
                     row.state = "closed"
-                    row.updated = now
                     row.fence_out()
                     self.state_updates.append((ws_id, "closed"))
                     closed.append(ws_id)
@@ -615,7 +608,6 @@ class FakeStorage:
                 return False
             self._admit_locked(ws_id, lease)
             row.state = "idle"
-            row.updated = self._now_iso()
             return True
 
     def get_workstream_reservation_token(self, ws_id: str) -> str:
@@ -1511,25 +1503,24 @@ def test_open_replaces_default_candidate_removed_during_resume() -> None:
     assert reopened.session.model_alias == "default-b"  # type: ignore[union-attr]
 
 
-def test_open_touches_workstream_on_rehydrate() -> None:
-    """Rehydrating a workstream bumps its ``updated``, with the new lease's fence.
+def test_open_leaves_updated_alone() -> None:
+    """Reopening a workstream does not change its ``updated``.
 
-    The live lease is what keeps close_idle's pass 2 off the row; the touch
-    keeps ``updated`` honest. It is best-effort (try/except in open()), so a
-    touch that dropped its fence would be refused silently: check it landed.
+    ``updated`` records the last change to the conversation, so a session
+    someone only opened keeps its place in newest-first lists. The live lease
+    the open takes is what keeps close_idle's pass 2 off the row.
     """
     mgr, _, storage = _make_manager()
     ws = mgr.create(user_id="u1")
     ws_id = ws.id
     mgr.close(ws_id)
-    storage.touch_calls.clear()  # only care about touches from rehydrate
     storage.rows[ws_id].updated = "2000-01-01T00:00:00"
 
     reopened = mgr.open(ws_id)
 
     assert reopened is not None
-    assert ws_id in storage.touch_calls
-    assert storage.rows[ws_id].updated > "2000-01-01T00:00:00"
+    assert storage.rows[ws_id].updated == "2000-01-01T00:00:00"
+    assert storage.rows[ws_id].lease_live()
 
 
 def test_open_ignores_owner_mismatch() -> None:

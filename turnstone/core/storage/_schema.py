@@ -172,6 +172,9 @@ workstreams = sa.Table(
     # build a session.  Added in migration 063.
     sa.Column("persona", sa.Text, nullable=True),
     sa.Column("created", sa.Text, nullable=False),
+    # updated: the last change to the conversation (a message saved, removed
+    # or cloned in). State, name, publication, lease and cleanup writes leave
+    # it alone, so lists sort by real use and retention ages from it.
     sa.Column("updated", sa.Text, nullable=False),
     # Owner lease (migration 078): at most one live writer per incarnation.
     # lease_holder is boot-scoped (one per SessionManager instance), so it is
@@ -750,7 +753,7 @@ usage_events = sa.Table(
 sa.Index("idx_usage_events_timestamp", usage_events.c.timestamp)
 sa.Index("idx_usage_events_user", usage_events.c.user_id, usage_events.c.timestamp)
 sa.Index("idx_usage_events_model", usage_events.c.model, usage_events.c.timestamp)
-sa.Index("idx_usage_events_ws", usage_events.c.ws_id)
+sa.Index("idx_usage_events_ws_timestamp", usage_events.c.ws_id, usage_events.c.timestamp)
 
 audit_events = sa.Table(
     "audit_events",

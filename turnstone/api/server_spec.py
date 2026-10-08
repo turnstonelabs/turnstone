@@ -56,6 +56,42 @@ from turnstone.api.server_schemas import (
     WorkstreamDetailResponse,
     WorkstreamHistoryResponse,
 )
+from turnstone.core.workstream import (
+    SAVED_PAGE_DEFAULT_LIMIT,
+    SAVED_PAGE_MAX_LIMIT,
+    SAVED_SEARCH_MAX_CHARS,
+    SAVED_WORKSTREAM_SORT_KEYS,
+)
+
+#: Query parameters of ``GET /v1/api/workstreams/saved``, shared with the
+#: console spec.
+SAVED_WORKSTREAMS_QUERY_PARAMS: list[QueryParam] = [
+    QueryParam(
+        "limit",
+        f"Rows per page (default {SAVED_PAGE_DEFAULT_LIMIT}, at most {SAVED_PAGE_MAX_LIMIT}; "
+        "larger values are clamped, and 0 returns only the total).",
+        schema_type="integer",
+        default=SAVED_PAGE_DEFAULT_LIMIT,
+    ),
+    QueryParam(
+        "offset",
+        "Matching rows to skip before the page starts.",
+        schema_type="integer",
+        default=0,
+    ),
+    QueryParam(
+        "q",
+        "Case-insensitive substring of the alias, title, name, project name or ws_id "
+        f"(at most {SAVED_SEARCH_MAX_CHARS} characters).",
+    ),
+    QueryParam(
+        "sort",
+        "Column to sort by; ws_id breaks ties so pages never overlap.",
+        default="updated",
+        enum=sorted(SAVED_WORKSTREAM_SORT_KEYS),
+    ),
+    QueryParam("order", "Sort direction.", default="desc", enum=["asc", "desc"]),
+]
 
 SERVER_ENDPOINTS: list[EndpointSpec] = [
     # --- Workstream management ---
@@ -423,9 +459,15 @@ SERVER_ENDPOINTS: list[EndpointSpec] = [
         "/v1/api/workstreams/saved",
         "GET",
         "List saved workstreams",
-        description="Lists interactive history visible through creator/project access; requires read scope.",
+        description=(
+            "One page of interactive workstreams with history that no process has "
+            "loaded, visible through creator/project access; requires read scope. "
+            "total counts every matching row across pages. A malformed parameter "
+            "returns 400."
+        ),
         response_model=ListSavedWorkstreamsResponse,
-        error_codes=[503],
+        query_params=SAVED_WORKSTREAMS_QUERY_PARAMS,
+        error_codes=[400, 503],
         tags=["Workstreams"],
     ),
     # --- Skills ---

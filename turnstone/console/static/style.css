@@ -385,6 +385,8 @@
   :root {
     --dash-grid: 50px 1fr 50px;
   }
+  /* The active table's columns.  The saved table reuses the CTX cell class
+     but sizes its own grid, which keeps a CTX column. */
   .dash-col-model,
   .dash-cell-model,
   .dash-col-node,
@@ -392,7 +394,7 @@
   .dash-col-task,
   .dash-cell-task,
   .dash-col-ctx,
-  .dash-cell-ctx {
+  .dash-row:not(.saved-row) .dash-cell-ctx {
     display: none;
   }
   #cluster-status-bar {

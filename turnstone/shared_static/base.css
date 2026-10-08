@@ -1038,6 +1038,8 @@ body {
 /* ==========================================================================
    Empty state
    ========================================================================== */
+/* --fg-dim alone clears WCAG AA in both themes; an extra opacity dropped
+   this small italic text below it.  Messages can echo a long search. */
 .dashboard-empty {
   color: var(--fg-dim);
   font-size: 12px;
@@ -1045,7 +1047,7 @@ body {
   text-align: center;
   font-family: var(--font-ui);
   font-style: italic;
-  opacity: 0.7;
+  overflow-wrap: anywhere;
 }
 
 /* ==========================================================================

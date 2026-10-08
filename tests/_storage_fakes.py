@@ -121,17 +121,43 @@ def lease_row(ws_id: str, *, state: str = "idle", token: str = "") -> Any:
     )
 
 
-def expire_lease(backend: Any, ws_id: str) -> None:
-    """Move a workstream's owner-lease expiry into the past on the database clock."""
+def expire_lease(backend: Any, ws_id: str, *, seconds_ago: float | None = None) -> None:
+    """Move a workstream's owner-lease expiry into the past on the database clock.
+
+    By default it expired long ago. *seconds_ago* expires it only that recently:
+    a holder that just stopped renewing, as in a renewal outage.
+    """
+    import time
+
     import sqlalchemy as sa
 
     from turnstone.core.storage._schema import workstreams
 
+    expires_ms = 1 if seconds_ago is None else int((time.time() - seconds_ago) * 1000)
     with backend._engine.connect() as conn:
         conn.execute(
-            sa.update(workstreams).where(workstreams.c.ws_id == ws_id).values(lease_expires_ms=1)
+            sa.update(workstreams)
+            .where(workstreams.c.ws_id == ws_id)
+            .values(lease_expires_ms=expires_ms)
         )
         conn.commit()
+
+
+def stamp_updated_newest_first(backend: Any, ws_ids: list[str]) -> None:
+    """Stamp ``updated`` so *ws_ids* sort newest-first in list order, one second apart."""
+    from datetime import datetime, timedelta
+
+    import sqlalchemy as sa
+
+    from turnstone.core.storage._schema import workstreams
+
+    newest = datetime(2026, 1, 1, 12, 0, 0)
+    with backend._engine.begin() as conn:
+        for i, ws_id in enumerate(ws_ids):
+            stamp = (newest - timedelta(seconds=i)).strftime("%Y-%m-%dT%H:%M:%S")
+            conn.execute(
+                sa.update(workstreams).where(workstreams.c.ws_id == ws_id).values(updated=stamp)
+            )
 
 
 def acquire_lease(

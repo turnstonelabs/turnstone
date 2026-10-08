@@ -306,8 +306,8 @@ class _NudgePlan:
 
 # Soft cap on the snapshot query.  Higher than ``WAIT_MAX_WS_IDS`` so
 # the SQL ``LIMIT`` (applied before the Python state filter) doesn't
-# clip genuinely-active children whose ``updated`` timestamp is older
-# than recently-closed siblings.  Realistic coord histories are far
+# clip genuinely-active children whose conversation changed before that
+# of finished siblings (``updated``).  Realistic coord histories are far
 # smaller than this; if a coord ever exceeds it, the formatter still
 # truncates to ``WAIT_MAX_WS_IDS`` for the model-facing suggestion.
 _ACTIVE_CHILDREN_QUERY_LIMIT = 200
@@ -1198,11 +1198,11 @@ class CoordinatorIdleObserver:
 
         ``list_workstreams`` orders by ``updated DESC`` and applies its
         ``LIMIT`` in SQL before any state filter, so a coord with many
-        recently-closed children could clip out genuinely-active rows
-        whose ``updated`` timestamp is older.  We bump the limit well
-        above ``NUDGE_IDLE_CHILDREN_WAIT_CAP`` to absorb that —
-        realistic coord histories are far smaller than the bumped
-        limit.  Pushing the state filter into SQL would be the
+        finished children used more recently could clip out
+        genuinely-active rows whose last conversation change is older.
+        We bump the limit well above ``NUDGE_IDLE_CHILDREN_WAIT_CAP`` to
+        absorb that — realistic coord histories are far smaller than the
+        bumped limit.  Pushing the state filter into SQL would be the
         structural fix, but that requires a storage-protocol change;
         flagged as a follow-up.
         """

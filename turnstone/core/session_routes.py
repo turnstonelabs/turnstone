@@ -58,6 +58,10 @@ from turnstone.core.web_helpers import lease_refusal_response
 from turnstone.core.workstream import (
     INTERJECTION_CAP_CHARS,
     PENDING_SENDS_MAX,
+    SAVED_PAGE_DEFAULT_LIMIT,
+    SAVED_PAGE_MAX_LIMIT,
+    SAVED_SEARCH_MAX_CHARS,
+    SAVED_WORKSTREAM_SORT_KEYS,
     WorkstreamHistoryUnavailableError,
     _PendingSend,
     concrete_method,
@@ -317,18 +321,6 @@ CreateAuditEmitter = Callable[
 # requested ws_id; missing rows map to ``None``, and the caller
 # falls back to ``ws.name`` per-row.
 ListResolveTitles = Callable[[list[str]], dict[str, str | None]]
-# (request) -> set of ws_ids currently held in memory by the kind's
-# manager. Coord wires a callable that returns
-# ``{ws.id for ws in coord_mgr.list_all()}`` so the saved-card list
-# can defence-in-depth filter out coordinators currently in the warm
-# pool (a coord can be ``state='closed'`` on disk briefly while the
-# close-emit sequence races the in-memory pop). Interactive wires
-# ``None``: an interactive workstream that's both saved and loaded
-# is a normal display state, not a race the saved card needs to
-# hide. Async because the coord-side implementation runs through
-# ``asyncio.to_thread`` (the manager lock is acquired in
-# ``coord_mgr.list_all``).
-SavedLoadedLookup = Callable[["Request"], Awaitable[set[str]]]
 
 
 @dataclass(frozen=True)
@@ -527,31 +519,14 @@ class SessionEndpointConfig:
     # in one storage round-trip; coord wires ``None`` (no alias
     # surface today). See :data:`ListResolveTitles`.
     list_resolve_titles: ListResolveTitles | None = None
-    # Kind classifier for the lifted ``list``/``saved`` factories'
-    # storage filter. Required when a kind mounts either handler —
-    # the factories pass it straight through to
-    # ``list_workstreams_with_history(kind=...)``. Distinct from
-    # ``audit_action_prefix`` (audit-action namespacing) so adding a
-    # third kind doesn't have to overload the audit prefix as a
-    # filter. ``None`` is allowed for kinds that don't mount a
-    # list/saved handler.
+    # Kind classifier for the lifted factories that read storage rows:
+    # ``saved`` passes it to ``list_saved_workstreams(kinds=...)``, and
+    # ``history``, ``export`` and ``detail`` check a stored row's kind
+    # against it. Required when a kind mounts any of them. Distinct from
+    # ``audit_action_prefix`` (audit-action namespacing) so adding a third
+    # kind doesn't have to overload the audit prefix as a filter. ``None``
+    # is allowed only for kinds that mount none of them.
     list_kind: WorkstreamKind | None = None
-    # Storage-side state filter for the saved-list endpoint. Interactive
-    # wires ``None`` — saved sidebar shows every persisted interactive
-    # workstream regardless of state. This is safe because delete is a
-    # HARD delete (``session_manager.delete`` -> ``sa.delete(workstreams)``)
-    # and no ``state='deleted'`` tombstone is ever written (WorkstreamState
-    # has no DELETED member); there is NO storage-side state filter to lean
-    # on, so if a soft-delete tombstone is ever introduced this list must
-    # add an explicit ``state != 'deleted'`` guard. Coord wires ``"closed"``
-    # so only explicitly-closed coordinators surface in the saved-card grid;
-    # active / in-flight rows live in the active list.
-    saved_state_filter: str | None = None
-    # (request) -> set of ws_ids in the kind's in-memory pool. Coord
-    # wires a coroutine that returns ``{ws.id for ws in
-    # coord_mgr.list_all()}`` (defence-in-depth filter — see
-    # :data:`SavedLoadedLookup`). Interactive wires ``None``.
-    saved_loaded_lookup: SavedLoadedLookup | None = None
 
 
 @dataclass(frozen=True)
@@ -3825,207 +3800,174 @@ def make_list_handler(cfg: SessionEndpointConfig) -> Handler:
     return list_workstreams_handler
 
 
-class _SavedQueryError(RuntimeError):
-    """The saved-list query failed, rather than returning an empty list."""
+class _SavedParamError(ValueError):
+    """A saved-list query parameter is malformed."""
 
 
-async def _collect_saved_rows(
-    cfg: SessionEndpointConfig,
-    request: Request,
-) -> list[dict[str, Any]]:
-    """Query + exclude-loaded + row-build for one kind's saved list.
+@dataclass(frozen=True)
+class _SavedPageQuery:
+    """The parsed query string of ``GET {prefix}/saved``."""
 
-    The shared inner body of :func:`make_saved_handler` (and one of the
-    N bodies :func:`make_unified_saved_handler` fans over): runs the
-    storage query filtered by ``cfg.list_kind`` / ``cfg.saved_state_filter``,
-    drops any ws_id reported by ``cfg.saved_loaded_lookup`` (coord-only
-    warm-pool exclusion), and serialises each surviving row to the
-    saved-card dict shape.
+    limit: int
+    offset: int
+    search: str
+    sort: str
+    descending: bool
 
-    Caller-owned (NOT done here): ``cfg.permission_gate`` and the
-    ``cfg.list_kind is None`` misconfig guard — both belong to the
-    handler wrapper so the unified handler can admit kinds before
-    fanning out. ``cfg.list_kind`` is therefore assumed
-    non-``None`` on entry.
+
+def _parse_saved_page_query(request: Request) -> _SavedPageQuery:
+    """Read ``limit``, ``offset``, ``q``, ``sort`` and ``order``.
+
+    A malformed value raises :class:`_SavedParamError` instead of falling back
+    to its default, so a caller never mistakes one page for another. A
+    ``limit`` above ``SAVED_PAGE_MAX_LIMIT`` is clamped to it, and ``limit=0``
+    asks for the total alone.
     """
-    import asyncio
+    params = request.query_params
 
-    from turnstone.core.auth import WorkstreamProjectVisibility
+    def _integer(name: str, default: int) -> int:
+        raw = (params.get(name) or "").strip()
+        if not raw:
+            return default
+        try:
+            return int(raw)
+        except ValueError:
+            raise _SavedParamError(f"{name} must be an integer") from None
 
-    storage = getattr(request.app.state, "auth_storage", None)
-    if storage is None:
-        raise _SavedQueryError("Storage unavailable")
-    visibility = WorkstreamProjectVisibility.for_request(request, storage=storage)
-
-    def _fetch_visible_rows() -> list[Any]:
-        """Page through storage until 50 visible rows (or exhaustion).
-
-        The visibility filter runs post-SQL, so a plain LIMIT-then-filter
-        would silently shrink the window whenever recently-updated rows
-        belong to private projects the caller can't see — their own rows
-        at position 51+ would never surface. Paging with OFFSET restores
-        the 'top-50 most-recent VISIBLE' contract. Runs entirely in the
-        worker thread: both the query and the per-row project lookups
-        are storage I/O. Bounded at 20 pages (1000 rows scanned) as a
-        runaway guard; hitting it is logged, not silent.
-        """
-        visible: list[Any] = []
-        offset = 0
-        page = 50
-        max_pages = 20
-        for _ in range(max_pages):
-            batch = storage.list_workstreams_with_history(
-                limit=page,
-                kind=cfg.list_kind,
-                user_id=None,
-                state=cfg.saved_state_filter,
-                offset=offset,
-            )
-            for row in batch:
-                # project_id / owner are the SELECT tail — see the column
-                # order comment below.
-                if visibility.ws_visible(row[15], ws_owner=row[16] or ""):
-                    visible.append(row)
-                    if len(visible) >= 50:
-                        return visible
-            if len(batch) < page:
-                return visible
-            offset += page
-        log.info(
-            "ws.saved.visibility_scan_capped kind=%s scanned=%d visible=%d",
-            cfg.list_kind,
-            max_pages * page,
-            len(visible),
+    limit = _integer("limit", SAVED_PAGE_DEFAULT_LIMIT)
+    if limit < 0:
+        raise _SavedParamError("limit must not be negative")
+    limit = min(limit, SAVED_PAGE_MAX_LIMIT)
+    offset = _integer("offset", 0)
+    if offset < 0:
+        raise _SavedParamError("offset must not be negative")
+    search = (params.get("q") or "").strip()
+    if len(search) > SAVED_SEARCH_MAX_CHARS:
+        raise _SavedParamError(f"q must be at most {SAVED_SEARCH_MAX_CHARS} characters")
+    # PostgreSQL text cannot hold one, and SQLite would end the pattern there.
+    if chr(0) in search:
+        raise _SavedParamError("q must not contain a NUL character")
+    sort = (params.get("sort") or "updated").strip()
+    if sort not in SAVED_WORKSTREAM_SORT_KEYS:
+        raise _SavedParamError(
+            "sort must be one of: " + ", ".join(sorted(SAVED_WORKSTREAM_SORT_KEYS))
         )
-        return visible
+    order = (params.get("order") or "desc").strip().lower()
+    if order not in ("asc", "desc"):
+        raise _SavedParamError("order must be asc or desc")
+    return _SavedPageQuery(
+        limit=limit,
+        offset=offset,
+        search=search,
+        sort=sort,
+        descending=order == "desc",
+    )
+
+
+def _saved_row_payload(row: dict[str, Any]) -> dict[str, Any]:
+    """Serialise one ``list_saved_workstreams`` row to the saved-list shape.
+
+    ``context_ratio`` comes from the same SQL expression the CTX sort uses
+    (PostgreSQL returns it as a decimal), rounded for display.
+    """
+    ctx_tokens = row["context_tokens"] or 0
+    context_ratio = round(float(row["context_ratio"] or 0), 3)
+    return {
+        "ws_id": row["ws_id"],
+        "alias": row["alias"],
+        "title": row["title"],
+        "name": row["name"],
+        "created": row["created"],
+        "updated": row["updated"],
+        "message_count": row["message_count"],
+        "node_id": row["node_id"] or "",
+        "state": row["state"],
+        "kind": row["kind"],
+        "model_alias": row["model_alias"] or None,
+        "launch_skill": row["launch_skill"] or None,
+        "child_count": row["child_count"] or 0,
+        "context_tokens": ctx_tokens,
+        "context_ratio": context_ratio,
+        "project_id": row["project_id"] or None,
+        "persona": row["persona"] or None,
+    }
+
+
+async def _saved_page_response(kinds: list[WorkstreamKind], request: Request) -> Response:
+    """One saved-list page of *kinds* for the request's principal.
+
+    The shared body of :func:`make_saved_handler` and
+    :func:`make_unified_saved_handler`. Project visibility is applied in SQL
+    (service scope reads everything), so ``total`` counts exactly the rows this
+    caller can page through. Malformed parameters answer 400; a failed query
+    answers 503 rather than an empty list.
+    """
+    from turnstone.core.auth import WorkstreamProjectVisibility, require_permission
 
     try:
-        rows = await asyncio.to_thread(_fetch_visible_rows)
-    except Exception as exc:
-        log.warning("ws.saved.query_failed kind=%s", cfg.list_kind, exc_info=True)
-        raise _SavedQueryError("Saved sessions unavailable") from exc
-
-    # Coord-only: exclude ws_ids currently in the warm pool.
-    loaded: set[str] = set()
-    if cfg.saved_loaded_lookup is not None:
-        try:
-            loaded = await cfg.saved_loaded_lookup(request)
-        except Exception:
-            # Defence-in-depth filter — never let a lookup error
-            # block the saved list. Log + continue with empty
-            # set (worst case: a duplicate row in the saved list
-            # for a few seconds during a close-emit race).
-            log.debug(
-                "ws.saved.loaded_lookup_failed",
-                exc_info=True,
-            )
-
-    # Column order from list_workstreams_with_history (keep in sync with
-    # the storage SELECT): ws_id, alias, title, name, created, updated,
-    # message_count, node_id, state, kind, model_alias, launch_skill,
-    # child_count, context_tokens, context_window, project_id, owner,
-    # persona.
-    # The occupancy ratio is derived here (Python float division) rather
-    # than in SQL so the NULL / zero-window cases stay obvious and
-    # identical across backends.  context_window is NULL for model
-    # aliases absent from model_definitions (e.g. config.toml-only
-    # models), so context_ratio degrades to 0.0 there rather than
-    # reporting a bogus occupancy.
-    result: list[dict[str, Any]] = []
-    for row in rows:
-        (
-            wid,
-            alias,
-            title,
-            name,
-            created,
-            updated,
-            count,
-            node_id,
-            state,
-            kind,
-            model_alias,
-            launch_skill,
-            child_count,
-            context_tokens,
-            context_window,
-            project_id,
-            owner,
-            persona,
-        ) = row
-        if wid in loaded:
-            continue
-        ctx_tokens = context_tokens or 0
-        context_ratio = (
-            round(ctx_tokens / context_window, 3) if ctx_tokens and context_window else 0.0
+        query = _parse_saved_page_query(request)
+    except _SavedParamError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    if not kinds:
+        # Every kind was refused: answer the empty page here rather than
+        # trusting each storage backend to read an empty kind list as none.
+        return JSONResponse(
+            {"workstreams": [], "total": 0, "limit": query.limit, "offset": query.offset}
         )
-        result.append(
-            {
-                "ws_id": wid,
-                "alias": alias,
-                "title": title,
-                "name": name,
-                "created": created,
-                "updated": updated,
-                "message_count": count,
-                "node_id": node_id or "",
-                "state": state,
-                "kind": kind,
-                "model_alias": model_alias or None,
-                "launch_skill": launch_skill or None,
-                "child_count": child_count or 0,
-                "context_tokens": ctx_tokens,
-                "context_ratio": context_ratio,
-                "project_id": project_id or None,
-                "persona": persona or None,
-            }
+    storage = getattr(request.app.state, "auth_storage", None)
+    if storage is None:
+        return JSONResponse({"error": "Saved sessions unavailable"}, status_code=503)
+    viewer = WorkstreamProjectVisibility.for_request(request).viewer
+    # Search and sort read project names only for a caller who may list them:
+    # the gate of GET /v1/api/projects, where the dashboards get the names.
+    project_names = require_permission(request, "project.read") is None
+    try:
+        page = await asyncio.to_thread(
+            storage.list_saved_workstreams,
+            kinds=kinds,
+            viewer=viewer,
+            project_names=project_names,
+            search=query.search,
+            sort=query.sort,
+            descending=query.descending,
+            limit=query.limit,
+            offset=query.offset,
         )
-    return result
+    except Exception:
+        log.warning("ws.saved.query_failed kinds=%s", [kind.value for kind in kinds], exc_info=True)
+        return JSONResponse({"error": "Saved sessions unavailable"}, status_code=503)
+    return JSONResponse(
+        {
+            "workstreams": [_saved_row_payload(row) for row in page.rows],
+            "total": page.total,
+            "limit": query.limit,
+            "offset": query.offset,
+        }
+    )
 
 
 def make_saved_handler(cfg: SessionEndpointConfig) -> Handler:
-    """Lifted body for ``GET {prefix}/saved`` — list persisted workstreams.
+    """Lifted body for ``GET {prefix}/saved`` — one page of saved workstreams.
 
-    Both kinds share the storage-backed listing sequence (auth →
-    ``list_workstreams_with_history`` filtered by kind → optional
-    in-memory exclusion filter → row serialisation → respond).
+    A saved workstream has conversation history and no live owner lease: no
+    process has it loaded, so it can be resumed (see
+    :meth:`StorageBackend.list_saved_workstreams`). The query string selects
+    the page: ``limit`` (default :data:`SAVED_PAGE_DEFAULT_LIMIT`, at most
+    :data:`SAVED_PAGE_MAX_LIMIT`), ``offset``, ``q`` (substring search),
+    ``sort`` (a column key) and ``order`` (``asc`` / ``desc``, default
+    ``desc``). The response is ``{workstreams, total, limit, offset}``, where
+    ``total`` counts every matching row.
+
     Per-kind divergence:
 
     - ``cfg.permission_gate`` — coord's ``admin.coordinator`` check.
     - ``cfg.list_kind`` — required ``WorkstreamKind`` passed straight
-      through to ``list_workstreams_with_history(kind=...)``. The
-      handler treats a missing value as a configuration error and
-      surfaces 500 with a clear log line — fails loud rather than
-      silently filtering for the wrong kind. Distinct from
-      ``audit_action_prefix`` (audit-action namespacing) so adding a
-      third kind doesn't have to overload the audit prefix as a
+      through to ``list_saved_workstreams(kinds=...)``. The handler treats a
+      missing value as a configuration error and surfaces 500 with a clear
+      log line — fails loud rather than silently filtering for the wrong
+      kind. Distinct from ``audit_action_prefix`` (audit-action namespacing)
+      so adding a third kind doesn't have to overload the audit prefix as a
       kind classifier.
-    - ``cfg.saved_state_filter`` — coord wires ``"closed"`` so only
-      explicitly-closed coordinators surface; interactive wires
-      ``None`` (all persisted states except provisional ``creating``;
-      interactive deletion removes the row).
-    - ``cfg.saved_loaded_lookup`` — coord-only defence-in-depth
-      filter that excludes ws_ids currently in the in-memory pool
-      (a row can be ``state='closed'`` briefly while the close-emit
-      sequence races the in-memory pop). Interactive ``None``.
-
-    Always-include row shape: ``{ws_id, alias, title, name,
-    created, updated, message_count}``. Identical between kinds
-    pre-lift; the lift just moves the row construction into one
-    place.
-
-    Behaviour changes vs the pre-lift handlers:
-
-    - **Top-level response key converges on ``"workstreams"``.**
-      Pre-lift coord returned ``{"coordinators": [...]}``; the
-      lifted body returns ``{"workstreams": [...]}``. Mirrors the
-      active-list convergence.
-    - **Interactive's storage call moves to ``asyncio.to_thread``.**
-      Pre-lift interactive ran ``list_workstreams_with_history``
-      inline — under heavy load the SQL (which includes a
-      correlated COUNT subquery) stalled every other async
-      handler. Coord already used ``to_thread`` (perf-2 from the
-      saved-coordinators review); convergence lifts interactive up.
 
     Args:
         cfg: per-kind policy bundle.
@@ -4050,56 +3992,22 @@ def make_saved_handler(cfg: SessionEndpointConfig) -> Handler:
                 {"error": "saved handler misconfigured"},
                 status_code=500,
             )
-
-        try:
-            result = await _collect_saved_rows(cfg, request)
-        except _SavedQueryError:
-            return JSONResponse({"error": "Saved sessions unavailable"}, status_code=503)
-        return JSONResponse({"workstreams": result})
+        return await _saved_page_response([cfg.list_kind], request)
 
     return saved_workstreams_handler
 
 
-def _saved_updated_sort_key(row: dict[str, Any]) -> tuple[int, str]:
-    """Descending-``updated`` sort key for the merged saved list.
-
-    Used with ``sorted(..., reverse=True)``. Returns ``(1, str(updated))``
-    for rows carrying an ``updated`` value and ``(0, "")`` for rows
-    missing it — so under ``reverse=True`` real rows sort newest-first
-    and ``updated``-less rows fall to the tail (the presence flag differs
-    so the string element of a present row is never compared against the
-    absent placeholder). ``updated`` is coerced to ``str`` purely as a
-    crash-proof comparator: each storage backend yields a single
-    homogeneous timestamp type (ISO string on sqlite, ``datetime`` on
-    postgres) whose lexical order matches chronological order, and
-    ``list_workstreams_with_history`` already returns each kind
-    ``ORDER BY updated DESC``, so this only re-interleaves two
-    already-sorted same-type runs — never an int-vs-string compare.
-    """
-    updated = row.get("updated")
-    if updated is None:
-        return (0, "")
-    return (1, str(updated))
-
-
-def make_unified_saved_handler(
-    cfgs: list[SessionEndpointConfig],
-    permission_gate: PermissionGate | None = None,
-) -> Handler:
-    """Saved-list handler that spans multiple kinds in one response.
+def make_unified_saved_handler(cfgs: list[SessionEndpointConfig]) -> Handler:
+    """Saved-list handler that pages through several kinds as one list.
 
     The console's L-shell dashboard wants ONE saved list covering both
-    coordinator and interactive sessions. Storage is shared across kinds,
-    so this fans :func:`_collect_saved_rows` over each ``cfg`` (preserving
-    every kind's own ``list_kind`` / ``saved_state_filter`` /
-    ``saved_loaded_lookup`` semantics — coord keeps its ``state='closed'``
-    + warm-pool exclusion, interactive keeps its persisted non-creating rows),
-    concatenates the rows, and re-sorts the union by ``updated`` descending
-    (``updated``-less rows last).
+    coordinator and interactive sessions. Storage is shared across kinds, so
+    the admitted kinds are queried together and sorted, searched and paged as
+    one list, with the same query string and response as
+    :func:`make_saved_handler`.
 
-    The optional outer gate applies to the whole list. Each kind's own
-    permission gate then controls its admission: a 403 omits that kind
-    before querying storage; authentication and other errors propagate.
+    Each kind's own permission gate controls its admission: a 403 omits that
+    kind before querying storage; authentication and other errors propagate.
     Admitted rows retain their project visibility checks.
 
     Each ``cfg`` must wire ``list_kind`` (a missing value is a mount-time
@@ -4107,21 +4015,15 @@ def make_unified_saved_handler(
     filtering for the wrong kind, matching :func:`make_saved_handler`.
 
     Args:
-        cfgs: per-kind policy bundles to merge, in any order (the response
-            is re-sorted by ``updated`` regardless of cfg order).
-        permission_gate: single gate applied to the whole list. ``None``
-            relies on upstream auth middleware only.
+        cfgs: per-kind policy bundles to merge, in any order (rows are
+            sorted by the requested key regardless of cfg order).
     """
 
     async def unified_saved_handler(request: Request) -> Response:
-        if permission_gate is not None:
-            err = permission_gate(request)
-            if err is not None:
-                return err
-
         # Fail loud BEFORE any query (same contract as the single-kind
         # handler): a cfg mounted into the union without a kind would
         # otherwise filter for the wrong (or all) kinds.
+        kinded: list[tuple[SessionEndpointConfig, WorkstreamKind]] = []
         for cfg in cfgs:
             if cfg.list_kind is None:
                 log.error("ws.saved.unified.misconfigured_no_list_kind")
@@ -4129,30 +4031,17 @@ def make_unified_saved_handler(
                     {"error": "saved handler misconfigured"},
                     status_code=500,
                 )
+            kinded.append((cfg, cfg.list_kind))
 
-        admitted = []
-        for cfg in cfgs:
+        kinds: list[WorkstreamKind] = []
+        for cfg, kind in kinded:
             err = cfg.permission_gate(request) if cfg.permission_gate else None
             if err is not None:
                 if err.status_code == 403:
                     continue
                 return err
-            admitted.append(cfg)
-
-        # The per-kind collections are independent (shared store, no data
-        # dependency), so overlap their DB round-trips instead of summing them.
-        import asyncio
-
-        try:
-            parts = await asyncio.gather(*(_collect_saved_rows(cfg, request) for cfg in admitted))
-        except _SavedQueryError:
-            return JSONResponse({"error": "Saved sessions unavailable"}, status_code=503)
-        merged: list[dict[str, Any]] = []
-        for part in parts:
-            merged.extend(part)
-
-        merged.sort(key=_saved_updated_sort_key, reverse=True)
-        return JSONResponse({"workstreams": merged})
+            kinds.append(kind)
+        return await _saved_page_response(kinds, request)
 
     return unified_saved_handler
 

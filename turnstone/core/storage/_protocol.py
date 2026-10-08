@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol, TypedDict, runtime_checkable
 
+from turnstone.core.workstream import SAVED_PAGE_DEFAULT_LIMIT
+
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Sequence
     from contextlib import AbstractContextManager
@@ -75,6 +77,17 @@ class LeaseFence:
     holder: str
     epoch: int
     incarnation_token: str
+
+
+@dataclass(frozen=True, slots=True)
+class SavedWorkstreamPage:
+    """One page of :meth:`StorageBackend.list_saved_workstreams` results.
+
+    ``total`` counts every matching row, not only this page's.
+    """
+
+    rows: list[dict[str, Any]]
+    total: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -749,7 +762,8 @@ class StorageBackend(Protocol):
 
         Rows are ordered by auto-increment ``id``.  If the workstream has
         N rows total and ``keep_count`` < N, the last N - keep_count rows
-        are deleted.  Returns the number of rows deleted.
+        are deleted, and ``updated`` is stamped because the conversation
+        changed.  Returns the number of rows deleted.
         """
         ...
 
@@ -761,57 +775,65 @@ class StorageBackend(Protocol):
         The backend locks the durable workstream, derives both the current row
         count and latest compaction floor inside that transaction, and never
         deletes rows backing the latest compaction marker.  Attachment
-        refcounts are released for exactly the rows deleted.  Missing
-        workstreams and storage failures raise; a negative count is invalid.
+        refcounts are released for exactly the rows deleted, and ``updated``
+        is stamped when any were.  Missing workstreams and storage failures
+        raise; a negative count is invalid.
         """
         ...
 
     # -- Workstream management -------------------------------------------------
 
-    def list_workstreams_with_history(
-        self,
-        limit: int = 20,
-        *,
-        kind: WorkstreamKind | str | None = None,
-        user_id: str | None = None,
-        state: str | None = None,
-        offset: int = 0,
-    ) -> list[Any]:
+    def list_workstreams_with_history(self, limit: int = 20) -> list[Any]:
         """List workstreams that have messages, ordered by updated DESC.
 
-        ``offset`` skips that many rows before applying ``limit`` — the
-        saved-list collector pages through with it so a post-SQL
-        visibility filter can keep fetching until it fills its window.
-
-        ``kind`` filters at the SQL layer — pass ``WorkstreamKind.INTERACTIVE``
-        from the interactive "saved workstreams" sidebar so coordinator rows
-        (which also persist conversation history) don't leak into that
-        surface.  Default ``None`` preserves the legacy all-kinds behaviour.
-
-        ``user_id`` pushes ``WHERE user_id = :user_id`` into SQL so tenant
-        scoping is enforced server-side rather than relying on handlers to
-        remember a client-side filter.  Pass the authenticated caller's
-        uid from any tenant-visible endpoint; pass ``None`` for
-        service-scoped callers that legitimately need cluster-wide
-        visibility.  Mirrors the same contract on ``list_workstreams``.
-
-        ``state`` filters by lifecycle state — pass ``"closed"`` from the
-        coordinator "saved" surface so the list excludes deleted /
-        currently-active rows.  Default ``None`` preserves all-states
-        behaviour.  Accepts a string (rather than the WorkstreamState
-        enum) to match the on-disk column type.
+        The CLI's ``/workstreams`` listing: every kind, user and state except a
+        provisional create, loaded or not. The saved-session API uses
+        :meth:`list_saved_workstreams` instead.
 
         Returns rows of ``(ws_id, alias, title, name, created, updated,
-        message_count, node_id, state, kind, model_alias, launch_skill,
-        child_count, context_tokens, context_window, project_id, user_id,
-        persona)`` ordered by updated DESC.  The trailing enrichment columns
-        feed the saved-list DTO: ``model_alias`` / ``launch_skill`` come
-        from ``workstream_config``; ``context_tokens`` is the most recent
-        ``usage_events`` prompt size and ``context_window`` the model's
-        window (the caller divides them for the occupancy ratio);
-        ``child_count`` counts child workstreams.  New columns MUST keep
-        appending at the tail — a full-arity unpack in session_routes
-        consumes this exact tuple.
+        message_count)``.
+        """
+        ...
+
+    def list_saved_workstreams(
+        self,
+        *,
+        kinds: Sequence[WorkstreamKind | str],
+        viewer: str | None,
+        project_names: bool = False,
+        search: str = "",
+        sort: str = "updated",
+        descending: bool = True,
+        limit: int = SAVED_PAGE_DEFAULT_LIMIT,
+        offset: int = 0,
+    ) -> SavedWorkstreamPage:
+        """One page of saved workstreams, plus the total across all pages.
+
+        A workstream is saved when it has conversation history, is neither a
+        provisional create nor deleted, and holds no live owner lease: no
+        process has it loaded, so it can be resumed. A workstream left behind
+        by a crashed process qualifies once its lease expires, whatever state
+        it was last stored in.
+
+        ``kinds`` lists the kinds to include; an empty list matches nothing.
+        ``viewer`` is the caller's user id for project visibility (``""`` is
+        anonymous); ``None`` skips the visibility check, for service-scoped
+        callers. ``project_names`` says whether the caller may read project
+        names (``project.read``); only then do search and the ``project``
+        sort read them, and only for projects the viewer's own project list
+        includes. ``search`` matches a case-insensitive substring of the
+        alias, title, name, that project name and the ws_id. ``sort`` is one
+        of :data:`turnstone.core.workstream.SAVED_WORKSTREAM_SORT_KEYS`, with
+        ``ws_id`` breaking ties so pages never overlap; an unknown key raises
+        ``ValueError``.
+
+        Each row is a dict with ``ws_id``, ``alias``, ``title``, ``name``,
+        ``created``, ``updated``, ``message_count``, ``node_id``, ``state``,
+        ``kind``, ``model_alias`` and ``launch_skill`` (from
+        ``workstream_config``), ``child_count``, ``context_tokens`` (the
+        latest usage event's prompt size), ``context_ratio`` (that size over
+        the model's ``model_definitions`` window; 0 when either is unknown),
+        ``project_id`` and ``persona``.
         """
         ...
 
@@ -820,9 +842,10 @@ class StorageBackend(Protocol):
 
         Candidate predicates are rechecked while holding the same parent-row
         lock (or SQLite writer reservation) used by keyed conversation commits.
-        Rows with a live owner lease are never candidates. Deletion releases
-        all attachment references transactionally. Returns ``(orphans,
-        stale)``.
+        Rows with a live owner lease are never candidates, nor rows whose lease
+        expired within the category's age window (a holder that stopped
+        renewing may still have them open). Deletion releases all attachment
+        references transactionally. Returns ``(orphans, stale)``.
         """
         ...
 
@@ -876,7 +899,7 @@ class StorageBackend(Protocol):
         ``False`` without mutation.  The private token remains as the durable
         incarnation fence used by exact hard-delete; clone admission also
         requires ``state='creating'`` so the token is not a reusable fork
-        capability after publication.
+        capability after publication.  Publication leaves ``updated`` alone.
         """
         ...
 
@@ -1242,7 +1265,11 @@ class StorageBackend(Protocol):
     def update_workstream_state(
         self, ws_id: str, state: str, *, lease: LeaseFence | None = None
     ) -> None:
-        """Update a workstream's state and bump updated timestamp."""
+        """Update a workstream's state.
+
+        ``updated`` is left alone: it records the last change to the
+        conversation, and a state change is lifecycle, not content.
+        """
         ...
 
     def bulk_close_stale_orphans(
@@ -1254,18 +1281,24 @@ class StorageBackend(Protocol):
         """Close DB-side workstream rows of *kind* whose state is in
         ``BULK_CLOSE_STATE_VALUES`` and whose ``updated`` is lex-older than
         *cutoff*, excluding rows currently loaded in memory.  Sets
-        ``state='closed'`` and bumps ``updated``.  Returns the list of ws_ids
-        actually transitioned.
+        ``state='closed'`` and leaves ``updated`` as it was: closing an
+        abandoned row is maintenance, not activity, so the saved list keeps
+        sorting and showing the session by its last real use and retention
+        keeps aging it from there.  Returns the list of ws_ids actually
+        transitioned.
 
         ``cutoff`` is a UTC ``YYYY-MM-DDTHH:MM:SS`` string matching the on-disk
-        format ``update_workstream_state`` writes — lex compare is safe for
+        format ``updated`` is written in — lex compare is safe for
         same-offset timestamps.  Empty ``exclude_ws_ids`` means no exclusion.
 
         Only rows without a live owner lease are eligible: a workstream loaded
         by any live process renews its lease, so lease liveness (not the
-        creating node's heartbeat) decides whether a row is orphaned. The
-        same statement fences out an expired lease, so a paused former holder
-        can never write into the row it closes.
+        creating node's heartbeat) decides whether a row is orphaned. A lease
+        that expired after *cutoff* still protects the row: its holder may only
+        have missed renewals, and opening a workstream leaves its ``updated``
+        as old as its conversation. The same statement fences out an expired
+        lease, so a paused former holder can never write into the row it
+        closes.
 
         Asymmetric with ``SessionManager.close_idle``'s in-memory pass on
         purpose: that pass closes only ``IDLE`` (legitimately-attentive rows
@@ -1306,28 +1339,10 @@ class StorageBackend(Protocol):
         """
         ...
 
-    def touch_workstream(self, ws_id: str, *, lease: LeaseFence | None = None) -> None:
-        """Bump a workstream row's ``updated`` timestamp without touching its
-        state.
-
-        Used by ``SessionManager.open()`` on cold rehydrate so a freshly-
-        loaded row's ``updated`` can't be older than the orphan-reaper cutoff
-        — protects against a same-process race where a parallel
-        ``close_idle`` pass-2 snapshots loaded keys after the storage read
-        but before the in-memory install.  Distinct from
-        ``update_workstream_state(ws_id, current_state)`` because the
-        rehydrate path explicitly avoids a state write (see the
-        ``open()`` no-DB-state-flip-on-resurrect comment): a state write
-        could race a concurrent ``close()`` and resurrect a closed row.
-        Bumping only ``updated`` is safe — close still wins on the state
-        column.
-        """
-        ...
-
     def update_workstream_name(
         self, ws_id: str, name: str, *, lease: LeaseFence | None = None
     ) -> None:
-        """Update a workstream's display name."""
+        """Update a workstream's display name; ``updated`` is left alone."""
         ...
 
     def delete_workstream(self, ws_id: str, *, lease: LeaseFence | None = None) -> bool:

@@ -411,7 +411,6 @@ SESSION_WRITES: dict[str, Write] = {
     "update_workstream_name": lambda b, ws, lease: b.update_workstream_name(
         ws, "name", lease=lease
     ),
-    "touch_workstream": lambda b, ws, lease: b.touch_workstream(ws, lease=lease),
     "end_foreign_node_watches": lambda b, ws, lease: b.end_foreign_node_watches(
         ws, "node-new", lease=lease
     ),
@@ -484,7 +483,6 @@ MISSING_PARENT_OUTCOMES: dict[str, type[Exception] | None] = {
     "save_workstream_config": WorkstreamLeaseLostError,
     "set_message_attachments": None,
     "set_workstream_alias": None,
-    "touch_workstream": None,
     "truncate_messages_tail": RuntimeError,
     "update_workstream_name": None,
     "update_workstream_state": None,

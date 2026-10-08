@@ -941,12 +941,30 @@ active, and `conflict` requires operator intervention.
 
 ### `GET /v1/api/workstreams/saved`
 
-Returns a list of saved workstreams from the database, ordered by most recently
-updated.
+Returns one page of saved workstreams: those with conversation history that no process has loaded
+(no live owner lease), whatever state they were last stored in. A workstream that a process has
+open appears in that process's active list instead.
 
 Requires `read` scope and applies creator/project visibility. On a node, this lists interactive
 workstreams. On the console, it includes interactive workstreams and also coordinator rows when the
-caller has `admin.coordinator`. A failed storage query returns 503 rather than an empty list.
+caller has `admin.coordinator`, sorted and paged as one list. A malformed parameter returns 400; a
+failed storage query returns 503 rather than an empty list.
+
+**Query parameters:**
+
+| Parameter | Default   | Description                                                                 |
+|-----------|-----------|-----------------------------------------------------------------------------|
+| `limit`   | `50`      | Rows per page, at most 200; larger values are clamped, and `0` returns only `total` |
+| `offset`  | `0`       | Matching rows to skip before the page starts                                |
+| `q`       |           | Case-insensitive substring of the alias, title, name, project name or ws_id, at most 256 characters and no NUL |
+| `sort`    | `updated` | `updated`, `name`, `kind`, `persona`, `project`, `model`, `message_count`, `child_count`, `context_ratio` or `ws_id`; `ws_id` breaks ties |
+| `order`   | `desc`    | `asc` or `desc`                                                             |
+
+The project name counts for `q` and `sort=project` only when the caller holds `project.read` (the
+permission `GET /v1/api/projects` needs) and the caller's own project list includes the project.
+Case folding covers letters beyond ASCII on SQLite; on PostgreSQL it follows the database's locale
+(a `C` locale folds only ASCII). Page through the list by advancing `offset` until it reaches
+`total`.
 
 **Response:**
 
@@ -961,9 +979,14 @@ caller has `admin.coordinator`. A failed storage query returns 503 rather than a
       "updated": "2026-03-01 11:30:00",
       "message_count": 42
     }
-  ]
+  ],
+  "total": 137,
+  "limit": 50,
+  "offset": 0
 }
 ```
+
+`total` counts every row matching `q` across all pages.
 
 Each saved workstream object:
 
@@ -973,7 +996,7 @@ Each saved workstream object:
 | `alias`         | string/null | User-assigned short name                   |
 | `title`         | string/null | LLM-generated title                        |
 | `created`       | string      | ISO timestamp of workstream creation       |
-| `updated`       | string      | ISO timestamp of last message              |
+| `updated`       | string      | ISO timestamp of the last conversation change (a message saved or removed) |
 | `message_count` | int         | Number of messages in the workstream       |
 
 ---
