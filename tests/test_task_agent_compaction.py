@@ -337,7 +337,7 @@ def test_estimator_observe_without_served_figure_keeps_ratio_and_own_estimate() 
     assert estimator.estimate(messages) == own_estimate
 
 
-def _prepared_tool(tool_call: dict[str, Any], _principal: str):
+def _prepared_tool(tool_call: dict[str, Any], _principal: str, **_kwargs: Any):
     call_id = tool_call["id"]
     return {
         "call_id": call_id,

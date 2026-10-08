@@ -581,23 +581,27 @@ def test_prepare_tool_blocks_revoked_tool():
 def test_prepare_tool_allows_non_revoked_tool():
     """The revocation gate must not fire on a tool name that isn't in
     the revoked set.  We pick a name that's also not in the preparers
-    dict so we can assert the 'unknown tool' result shape without
+    dict so we can assert the 'not available' result shape without
     exercising a real preparer."""
     from turnstone.core.session import ChatSession
 
     session = ChatSession.__new__(ChatSession)
     session._revoked_tools = frozenset({"spawn_workstream"})
     session._mcp_client = None
+    session._shared_workstream = False
     session.ui = MagicMock()
 
     tc = {
         "id": "call-2",
         "function": {"name": "this_tool_is_not_registered", "arguments": "{}"},
     }
-    item = session._prepare_tool(tc)
-    # Unknown tool path — not the revocation error path.
+    # A bare session has no model lane to derive its tool offer from, so the
+    # refusal is handed one.
+    item = session._prepare_tool_for_principal(tc, "", offered=frozenset())
+    # Not-available path — not the revocation error path.
     err = str(item.get("error") or "")
     assert "revoked" not in err.lower()
+    assert "is not available now" in err
 
 
 # ---------------------------------------------------------------------------

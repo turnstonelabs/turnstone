@@ -723,9 +723,11 @@ class TestSessionIntegration:
         }
         prepared = session._prepare_tool(tc)
         assert "error" in prepared
-        assert "Unknown tool" in prepared["error"]
-        # Error lists available tools so the model can self-correct
+        assert "'nonexistent' is not available now" in prepared["error"]
+        # Error lists the offered tools so the model can self-correct...
         assert "bash" in prepared["error"]
+        # ...and only those: an interactive session offers no coordinator tools.
+        assert "spawn_workstream" not in prepared["error"]
         # Surfaces warning to user
         session.ui.on_error.assert_called_once()
         assert "nonexistent" in session.ui.on_error.call_args[0][0]
@@ -890,19 +892,18 @@ class TestSessionIntegration:
         assert registered_cb is removed_cb
 
     def test_session_unknown_tool_lists_user_scoped_catalog(self, tmp_db):
-        """The "Unknown tool" error message lists tools the session can
-        actually invoke — drawn from the merged user-scoped catalog,
-        not the manager's private static-only ``_tool_map``."""
+        """The refusal of a tool dispatch cannot run lists the MCP tools the
+        session offers — drawn from the user's merged catalog, static and
+        pool entries alike."""
         mock_mcp = MagicMock()
-        # Pretend the user's merged view contains a static + pool entry.
-        mock_mcp.get_tools.return_value = [
+        # A static entry everyone sees, plus a pool entry only in user-7's view.
+        mock_mcp.get_tools.side_effect = lambda user_id=None: [
             _fake_openai_tool("mcp__static__list"),
-            _fake_openai_tool("mcp__pool-srv__do"),
+            *([_fake_openai_tool("mcp__pool-srv__do")] if user_id == "user-7" else []),
         ]
         mock_mcp.is_mcp_tool.return_value = False
-        session = self._make_session(mcp_client=mock_mcp, user_id="user-7")
-        # Reset the call counter so we observe only the _prepare_tool call.
-        mock_mcp.get_tools.reset_mock()
+        # Tool search off, so the MCP tools are offered outright, not deferred.
+        session = self._make_session(mcp_client=mock_mcp, user_id="user-7", tool_search="off")
 
         tc = {
             "id": "call_unknown",
@@ -910,14 +911,10 @@ class TestSessionIntegration:
         }
         prepared = session._prepare_tool(tc)
         assert "error" in prepared
-        # The error mentions both static and pool tools — proves we're
-        # consulting the merged catalog rather than ``_tool_map``.
+        # Both entries are listed, and the pool one exists only in user-7's
+        # view: the list is this user's merged catalog.
         assert "mcp__static__list" in prepared["error"]
         assert "mcp__pool-srv__do" in prepared["error"]
-        # And the catalog request was scoped to this session's user.
-        assert any(
-            call.kwargs.get("user_id") == "user-7" for call in mock_mcp.get_tools.call_args_list
-        )
 
 
 # ---------------------------------------------------------------------------

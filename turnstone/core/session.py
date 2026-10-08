@@ -1675,6 +1675,12 @@ _active_tool_origin_generation: contextvars.ContextVar[int] = contextvars.Contex
 _active_tool_prepare_principal: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "turnstone_active_tool_prepare_principal", default=None
 )
+# Tools the request being dispatched offered, when they are not the session's own (a task
+# agent's list).  None means the session's offer, which the refusal of a tool dispatch cannot
+# run derives itself.
+_active_tool_prepare_offer: contextvars.ContextVar[frozenset[str] | None] = contextvars.ContextVar(
+    "turnstone_active_tool_prepare_offer", default=None
+)
 
 # Generation whose bounded live commit is currently staging durable closures
 # on this thread.  State UIs use the captured value to refuse a delayed tail
@@ -9641,7 +9647,9 @@ class ChatSession:
 
     def _get_deferred_names(self, caps: ModelCapabilities | None = None) -> frozenset[str] | None:
         """Return names of deferred tools for native provider search, or None."""
-        if not self._tool_search:
+        # Read once: an MCP catalog refresh on another thread can replace or drop the manager.
+        tool_search = self._tool_search
+        if not tool_search:
             return None
         if self._persona_tools is not None:
             # Persona visibility sets force client-side tool search — see
@@ -9650,7 +9658,7 @@ class ChatSession:
         caps = caps if caps is not None else self._get_capabilities()
         if not caps.supports_tool_search:
             return None  # Client-side mode — no deferred names for provider
-        deferred = self._tool_search.get_deferred_tools()
+        deferred = tool_search.get_deferred_tools()
         return frozenset(name for t in deferred if (name := t.get("function", {}).get("name", "")))
 
     # Retryability is lane-owned and projected through ``lane_error_is_retryable``.
@@ -12312,13 +12320,20 @@ class ChatSession:
         principal_id: str,
         *,
         safe: bool = False,
+        offered: frozenset[str] | None = None,
     ) -> dict[str, Any]:
-        """Prepare any tool under one immutable turn principal."""
+        """Prepare any tool under one immutable turn principal.
+
+        *offered* names the tools the calling request offered when they are not the session's
+        own, as for a task agent, so that a refusal lists the caller's tools.
+        """
         principal = principal_id.strip()
         token = _active_tool_prepare_principal.set(principal)
+        offer_token = _active_tool_prepare_offer.set(offered)
         try:
             item = self._safe_prepare_tool(tc) if safe else self._prepare_tool(tc)
         finally:
+            _active_tool_prepare_offer.reset(offer_token)
             _active_tool_prepare_principal.reset(token)
         # The safe path can synthesize an error item after a preparer raises;
         # every issued tool still carries the same execution authority field.
@@ -19229,6 +19244,47 @@ class ChatSession:
         item["_principal_id"] = self._tool_prepare_principal_id()
         return item
 
+    def _unavailable_tool_error(self, func_name: str) -> str:
+        """What the model is told when it calls a tool that dispatch cannot run.
+
+        The name may be one the model saw earlier in the session: the catalog changes between
+        requests (an MCP server drops a tool or goes away, or another user sends on a shared
+        workstream, and the catalog follows the sender), and a replayed tool search can still
+        show a tool the request no longer offers. Another user is named as a cause only once the
+        workstream is shared, since the model passes the causes on. The other tools listed are a
+        task agent's own, or the ones the session's next request offers outright; deferred tools
+        are left to tool search.
+        """
+        offered = _active_tool_prepare_offer.get()
+        deferred: frozenset[str] = frozenset()
+        if offered is None:
+            caps = self._get_capabilities()
+            deferred = self._get_deferred_names(caps) or frozenset()
+            offered = frozenset(
+                name
+                for tool in self._get_active_tools(caps) or []
+                if (name := tool.get("function", {}).get("name")) and name not in deferred
+            )
+        # A revoked tool stays on the wire but dispatch refuses it, so it is no alternative.
+        offered = offered - self._revoked_tools
+        others = sorted(offered - {func_name})
+        causes = ["It may have been removed since it was offered"]
+        if self._shared_workstream:
+            causes.append("be available only to another user of this workstream")
+        # An exact match for an offered name, as a task agent's always is, is no misspelling.
+        if func_name not in offered:
+            causes.append("its name may be misspelled")
+        parts = [f"Tool {func_name!r} is not available now. {', or '.join(causes)}."]
+        if others:
+            parts.append(f"Other tools offered now: {', '.join(others)}.")
+        else:
+            parts.append("No other tools are offered now.")
+        if deferred or "tool_search" in offered:
+            parts.append("More tools may be found with tool search.")
+        if others:
+            parts.append("To call one, use its name exactly as listed.")
+        return " ".join(parts)
+
     def _prepare_tool_item(self, tc: dict[str, Any]) -> dict[str, Any]:
         """Parse a tool call and prepare preview info for display."""
         call_id = tc["id"]
@@ -19352,26 +19408,14 @@ class ChatSession:
                 func_name, user_id=prepare_user_id
             ):
                 return self._prepare_mcp_tool(call_id, func_name, args)
-            self.ui.on_error(f"Model called unknown tool: {func_name!r}")
-            available = list(preparers)
-            if self._mcp_client:
-                available.extend(
-                    sorted(
-                        t["function"]["name"]
-                        for t in self._mcp_client.get_tools(user_id=prepare_user_id)
-                    )
-                )
+            self.ui.on_error(f"Model called a tool that is not available now: {func_name!r}")
             return {
                 "call_id": call_id,
                 "func_name": func_name,
-                "header": f"\u2717 Unknown tool: {func_name}",
+                "header": f"\u2717 {func_name}: not available",
                 "preview": "",
                 "needs_approval": False,
-                "error": ControllerText(
-                    f"Unknown tool: {func_name!r}. "
-                    f"Available tools: {', '.join(available)}. "
-                    f"Use one of the listed tool names exactly."
-                ),
+                "error": ControllerText(self._unavailable_tool_error(func_name)),
             }
         assert args is not None  # guaranteed by the early return on args is None above
         return preparer(call_id, args)
@@ -26415,7 +26459,7 @@ class ChatSession:
 
             # Execute tools sequentially (not parallel) to avoid
             # concurrent _read_files mutation from worker threads.
-            tool_names = {t["function"]["name"] for t in tools}
+            tool_names = frozenset(t["function"]["name"] for t in tools)
             # Output-guard advisories wait for the step's complete tool block:
             # the results of one assistant turn's calls must stay contiguous on
             # every wire, as in the main loop's fold.
@@ -26458,6 +26502,7 @@ class ChatSession:
                     prepared = self._prepare_tool_for_principal(
                         tc_dict,
                         agent_principal,
+                        offered=tool_names,
                     )
                     prepared["_approval_cancel_witness"] = _ApprovalCancelWitness(
                         self,

@@ -261,6 +261,16 @@ frozen.
   replay as before. A workstream that searched misses the prompt cache once, on its first request
   after the update. One that searched again for tools it had already found resends each of those
   searches, with the definitions it loaded, until it compacts.
+- **A refused tool call says the tool is not available, not "Unknown tool" (#1287).** Tools can
+  leave a session mid-conversation: an MCP server drops one or goes away, or another user sends on
+  a shared workstream, whose tools follow the sender. When the model called one, it was told
+  "Unknown tool" and to use a listed name exactly, and the operator saw "Model called unknown
+  tool", as if the model had made the name up. Both now say the tool is not available now, and the
+  model is told it may have been removed or be misspelled, or, on a shared workstream, belong to
+  another user. The tools that reply lists are the ones the request offers, where it used to name
+  every built-in tool, including coordinator tools in a regular session, tools a persona hides and
+  tools an operator revoked. With tool search on, it lists the tools offered outright and says more
+  may be found by searching, and a task agent sees its own tools.
 - **A storage error while opening a workstream no longer replaces its saved settings.** Building the
   session saves its defaults when no settings are saved, and a read that failed counted as none
   saved, so one failed read could overwrite the saved model, sampling, instructions and skill. That

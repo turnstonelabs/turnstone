@@ -1660,7 +1660,7 @@ class TestFrameworkTextThroughRealExecution:
         with _send_with_real_execution(session, steps, _evaluate_output=evaluate):
             session.send("go")
 
-        assert _tool_turn_texts(session)[0].startswith("Unknown tool: 'nope'")
+        assert _tool_turn_texts(session)[0].startswith("Tool 'nope' is not available now.")
         evaluate.assert_not_called()
 
     def test_a_read_file_image_carries_only_framework_text(self, session, tmp_path):
