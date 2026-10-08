@@ -2930,14 +2930,13 @@ def _interactive_create_build_kwargs(
 
     Wired onto :attr:`SessionEndpointConfig.create_build_kwargs`. The
     factory threads the resolved skill_data + skill_id + version
-    through; this builder picks the right model (skill override
-    beats body) and assembles the full kwargs dict that
+    through; this builder assembles the full kwargs dict that
     ``SessionManager.create`` accepts (including the kind-specific
-    ``judge_model`` / ``client_type`` / ``parent_ws_id`` extras).
+    ``judge_model`` / ``client_type`` / ``parent_ws_id`` extras). The
+    model alias is the one the request names, else the default: a skill
+    never picks it.
     """
     resolved_model = body.get("model") or None
-    if skill_data and skill_data.get("model"):
-        resolved_model = skill_data["model"]
     requested_ws_id = body.get("ws_id", "") or ""
     if not isinstance(requested_ws_id, str):
         requested_ws_id = ""
@@ -3054,8 +3053,8 @@ async def _interactive_create_prepare_install(
     3. For a pre-committed fork, persist its requested alias.
     4. Prepare bounded clear/create/rename/watch publication data for the
        interactive adapter; nothing is emitted from this phase.
-    5. Apply the skill's session config (temperature / reasoning /
-       max_tokens / approval policy / metadata).
+    5. Apply the skill's session config (token budget / approval
+       policy / metadata).
     6. Resolve notify_targets (schedule targets win over skill
        fallback).
     7. Pin the workstream's routing to this node when no caller-
@@ -3086,18 +3085,12 @@ async def _interactive_create_prepare_install(
             alias_to_apply = user_name
 
     # Apply skill session config (only for new workstreams with a skill).
+    # The model alias supplies temperature, effort and max_tokens, and the
+    # operator setting the task-agent turn cap; a skill sets none of them.
     if skill_data and not resumed and ws.session:
         sess = ws.session
-        if skill_data.get("temperature") is not None:
-            sess.temperature = skill_data["temperature"]
-        if skill_data.get("reasoning_effort"):
-            sess.reasoning_effort = skill_data["reasoning_effort"]
-        if skill_data.get("max_tokens") is not None:
-            sess.max_tokens = skill_data["max_tokens"]
         if skill_data.get("token_budget", 0) > 0:
             sess._token_budget = skill_data["token_budget"]
-        if skill_data.get("agent_max_turns") is not None:
-            sess.agent_max_turns = skill_data["agent_max_turns"]
         if skill_data.get("auto_approve"):
             ws.ui.auto_approve = True
         allowed = skill_data.get("allowed_tools", "")

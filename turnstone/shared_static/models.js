@@ -19,11 +19,11 @@
  * change-detection / bridge come from the shared `makeListCache` core;
  * installs a `window.TurnstoneModels` bridge for the classic app.js bundles.
  *
- * NOTE (parallel readers, intentionally NOT unified here): the console
- * governance panel (_sklcModelsPromise), the per-node voice-role fetch, and
- * the admin schedule picker are independent /v1/api/models readers with
- * their own (or no) caching.  This cache is a fourth path scoped to the
- * composer pickers; unifying the others is a separate follow-up.
+ * NOTE (parallel readers, intentionally NOT unified here): the per-node
+ * voice-role fetch and the admin schedule picker are independent
+ * /v1/api/models readers with their own (or no) caching.  This cache is a
+ * third path scoped to the composer pickers; unifying the others is a
+ * separate follow-up.
  */
 
 import { makeListCache } from "./list_cache.js";

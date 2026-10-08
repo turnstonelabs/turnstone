@@ -45,7 +45,12 @@ _MAX_COMPATIBILITY_LEN = 500
 
 @dataclass(frozen=True)
 class ParsedSkill:
-    """Structured representation of a SKILL.md file."""
+    """Structured representation of a SKILL.md file.
+
+    SKILL.md ``model:`` and ``effort:`` are deliberately not read: the workstream's model alias
+    chooses the model and its effort (#1292). Like any other unread key, they survive only in
+    ``raw_frontmatter``.
+    """
 
     name: str
     description: str
@@ -67,14 +72,6 @@ class ParsedSkill:
     # sees both in the listing; kept here separately for the admin
     # parse-preview UI which surfaces it as its own field.
     when_to_use: str = ""
-    # SKILL.md spec ``model:`` and ``effort:`` — per-skill model
-    # override + reasoning effort.  Fields keep their spec names here
-    # for fidelity at the parser layer; the install handler translates
-    # ``effort`` → ``prompt_templates.reasoning_effort`` at the storage
-    # boundary.  Seeding fires only on initial create — re-install
-    # short-circuits at the source_url dedup so admin overrides survive.
-    model: str = ""
-    effort: str = ""
     # SKILL.md spec ``disable-model-invocation:`` and ``user-invocable:``
     # — invocation-control axes.  Stored in raw spec shape on the
     # dataclass; defaults match spec (both invokers can use the skill
@@ -373,8 +370,6 @@ def parse_skill_md(raw: str, *, lenient: bool = False) -> ParsedSkill | None:
         # list; ``_extract_list`` handles both shapes via ``_LIST_SPLIT_RE``.
         paths=_extract_list(meta, "paths"),
         when_to_use=when_to_use,
-        model=_extract_str(meta, "model"),
-        effort=_extract_str(meta, "effort"),
         # Invocation-control axes — spec defaults: model can
         # autoload (disable-model-invocation=False) AND user can pick
         # from the menu (user-invocable=True).

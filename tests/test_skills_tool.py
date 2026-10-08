@@ -1018,11 +1018,9 @@ class TestExecSkillsCreate:
             )
         assert "'content' is required" in item.get("error", "")
 
-    def test_create_invalid_temperature_errors(self) -> None:
-        """Non-numeric temperature input now returns an explicit error
-        rather than silently coercing to None.  Matches the max_tokens /
-        token_budget shape — every numeric field on the validator errors
-        loudly on bad input, no silent coerce."""
+    def test_create_ignores_model_settings(self) -> None:
+        """A skill carries no model alias, sampling settings or task-agent turn cap
+        (#1292): a create naming them proceeds, and none reaches the stored fields."""
         session = _make_session()
         with patch("turnstone.core.auth.user_has_permission", return_value=True):
             item = session._prepare_skills(
@@ -1032,11 +1030,16 @@ class TestExecSkillsCreate:
                     "name": "x",
                     "content": "b",
                     "description": "d",
+                    "model": "some-alias",
                     "temperature": "not-a-number",
+                    "reasoning_effort": "max",
+                    "max_tokens": 9,
+                    "agent_max_turns": 4,
                 },
             )
-        err = item.get("error", "")
-        assert "temperature must be a number" in err, err
+        assert "error" not in item, item.get("error")
+        dropped = {"model", "temperature", "reasoning_effort", "max_tokens", "agent_max_turns"}
+        assert not dropped & set(item["session_fields"])
 
     def test_create_invalid_kind_errors(self) -> None:
         """SkillKind ValueError branch — model passes unknown kind, gets
@@ -1199,6 +1202,62 @@ class TestExecSkillsUpdate:
             )
         assert "readonly" in item.get("error", "")
         assert "runtime config" in item.get("error", "")
+        # The hint offers only the runtime fields this tool can set, not the admin API's
+        # ``priority`` / ``hidden_from_menu``.
+        hints = [t for nt, t, _ in session._nudge_queue.drain(TOOL_DRAIN) if nt == "skill_hint"]
+        assert hints == [
+            "Readonly skills preserve external-source fidelity. Editable runtime fields: "
+            "allowed_tools, auto_approve, notify_on_complete, token_budget"
+        ]
+
+    def test_update_readonly_applies_every_field_its_hint_names(self) -> None:
+        """Each field the readonly hint offers is one this tool's update applies."""
+        samples = {
+            "allowed_tools": ["read_file"],
+            "auto_approve": True,
+            "notify_on_complete": [],
+            "token_budget": 100,
+        }
+        session = _make_session()
+        row = self._existing_row()
+        row["readonly"] = True
+        storage = MagicMock()
+        storage.get_prompt_template_by_name.return_value = row
+        assert session._SKILLS_TOOL_RUNTIME_FIELDS
+        for field in sorted(session._SKILLS_TOOL_RUNTIME_FIELDS):
+            with (
+                patch("turnstone.core.auth.user_has_permission", return_value=True),
+                patch("turnstone.core.session.get_storage", return_value=storage),
+            ):
+                item = session._prepare_skills(
+                    "c", {"action": "update", "name": "existing", field: samples[field]}
+                )
+            assert "error" not in item, (field, item.get("error"))
+            assert set(item["updates"]) == {field}
+
+    def test_update_exec_readonly_flip_hint_names_tool_fields(self) -> None:
+        """A skill that went readonly after approval rejects a content update, and the
+        hint lists the runtime fields this tool can set."""
+        session = _make_session()
+        storage = MagicMock()
+        storage.get_prompt_template_by_name.return_value = self._existing_row()
+        storage.get_prompt_template.return_value = {**self._existing_row(), "readonly": True}
+        with (
+            patch("turnstone.core.auth.user_has_permission", return_value=True),
+            patch("turnstone.core.session.get_storage", return_value=storage),
+        ):
+            item = session._prepare_skills(
+                "c", {"action": "update", "name": "existing", "content": "X"}
+            )
+            _, output = session._exec_skills(item)
+        assert "became readonly between approval and exec" in output
+        storage.update_prompt_template.assert_not_called()
+        hints = [t for nt, t, _ in session._nudge_queue.drain(TOOL_DRAIN) if nt == "skill_hint"]
+        assert hints == [
+            "An admin flipped the readonly flag on this skill after the operator approved the "
+            "update. Re-issue the update against only runtime fields: allowed_tools, "
+            "auto_approve, notify_on_complete, token_budget."
+        ]
 
     def test_update_snapshots_to_skill_versions(self) -> None:
         """Snapshot version uses max(existing version) + 1 — NOT count+1.

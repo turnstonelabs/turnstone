@@ -128,8 +128,9 @@ class TestParseSkill:
         assert data["allowed_tools"] == ["read_file", "list_directory"]
         assert data["paths"] == ["**/*.py", "src/api/**"]
         assert data["when_to_use"] == "when the user asks to review code"
-        assert data["model"] == "claude-opus-4-7"
-        assert data["effort"] == "high"
+        # ``model:`` / ``effort:`` are not read: the workstream's alias decides (#1292).
+        assert "model" not in data
+        assert "effort" not in data
         assert data["disable_model_invocation"] is True
         assert data["user_invocable"] is False
         assert data["arguments"] == ["pr_number", "focus"]
@@ -156,8 +157,6 @@ class TestParseSkill:
         assert data["allowed_tools"] == []
         assert data["paths"] == []
         assert data["when_to_use"] == ""
-        assert data["model"] == ""
-        assert data["effort"] == ""
         # Spec defaults: model can autoload, user can pick.
         assert data["disable_model_invocation"] is False
         assert data["user_invocable"] is True

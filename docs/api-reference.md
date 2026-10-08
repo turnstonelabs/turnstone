@@ -1398,7 +1398,7 @@ A deleted workstream ID remains reserved while a channel route references it.
 Creating a new workstream with that ID returns `409`; channel recovery forks or
 starts a conversation under a new ID before updating the association.
 
-> **Skill behavior:** When `skill` is specified, the skill's content is injected as a system message and its session config fields (model, temperature, auto-approve, token budget, etc.) override system defaults for the new workstream.
+> **Skill behavior:** When `skill` is specified, the skill's content is injected as a system message and its session config fields (auto-approve, allowed tools, token budget, completion notifications) override system defaults for the new workstream. A skill never chooses the model: the workstream runs on `model`, else the default alias, and that alias supplies temperature, reasoning effort and max tokens. Task agents take their turn cap from the `tools.agent_max_turns` setting.
 
 #### Fork behavior (`resume_ws`)
 

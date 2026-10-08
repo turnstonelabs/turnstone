@@ -52,6 +52,18 @@ frozen.
 > `truncate_messages_tail` stamp it when they remove rows. `SessionEndpointConfig` drops
 > `saved_state_filter` and `saved_loaded_lookup`, and `make_unified_saved_handler` its unused
 > `permission_gate`.
+>
+> **Before upgrading:** migration 080 drops the `model`, `temperature`, `reasoning_effort`,
+> `max_tokens` and `agent_max_turns` columns from skills (`prompt_templates`) and discards their
+> values (see Removed). This query lists the skills that set any of them: `SELECT name, model,
+> temperature, reasoning_effort, max_tokens, agent_max_turns FROM prompt_templates WHERE model <> ''
+> OR temperature IS NOT NULL OR reasoning_effort <> '' OR max_tokens IS NOT NULL OR agent_max_turns
+> IS NOT NULL`. To keep a skill's model settings, put them on a model alias and select that alias
+> where the skill is used. Task agents take their turn cap only from the `tools.agent_max_turns`
+> setting, which is unlimited (-1) by default, so set it if a skill capped task-agent turns.
+> Scheduled tasks, channels and coordinator spawns that relied on a skill's model run on the model
+> they name, else the default alias. Workstreams created before the upgrade keep the model and
+> settings they were saved with.
 
 ### Added
 
@@ -257,6 +269,19 @@ frozen.
   `judge.output_guard_model` to keep a separate model for the guard. A workstream's own judge model
   (the launcher's judge picker, the create API's `judge_model`, the CLI's `--judge-model`) is that
   workstream's `judge.model`, so it runs the guard too unless `judge.output_guard_model` is set.
+
+### Removed
+
+- **Skills no longer choose the model, its settings or the task-agent turn cap (#1292)**
+  *(BREAKING)* — a skill's model alias, temperature, reasoning effort, max tokens and agent max
+  turns are gone from the skill editor, the admin skill API (`SkillInfo`, the create and update
+  bodies, the SKILL.md parse preview), the `skills` tool and the Python and TypeScript SDK types. A
+  workstream runs on the model its create request names, else the default alias, and that alias
+  supplies temperature, reasoning effort and max tokens; task agents take their turn cap from the
+  `tools.agent_max_turns` setting. Installing a SKILL.md now ignores its `model:` and `effort:`
+  keys, like any other unsupported key, reversing the 1.6.0 ingestion. Rows of the console's
+  `GET /v1/api/models` no longer carry `effort_ladder`, which only the skill editor read; the admin
+  model form keeps its ladder through `POST /v1/api/admin/models/effort-ladder`.
 
 ### Fixed
 

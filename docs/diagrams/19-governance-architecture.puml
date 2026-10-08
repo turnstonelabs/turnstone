@@ -45,7 +45,7 @@ package "Template Runtime" {
 
 package "Skill Runtime" {
   [resolve_skill()] as wtr
-  [apply settings\n(model, budget, prompt)] as wta
+  [apply settings\n(budget, approvals, prompt)] as wta
   [budget gate\n(session.send)] as wtb
 }
 

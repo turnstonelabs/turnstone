@@ -641,14 +641,11 @@ prompt_templates = sa.Table(
     sa.Column("installed_at", sa.Text, nullable=False, server_default=""),
     sa.Column("installed_by", sa.Text, nullable=False, server_default=""),
     sa.Column("scan_version", sa.Text, nullable=False, server_default=""),
-    # Session config (merged from workstream templates)
-    sa.Column("model", sa.Text, nullable=False, server_default=""),
+    # Session config (merged from workstream templates).  The model and its
+    # sampling settings come from the workstream's alias and the task-agent
+    # turn cap from the operator setting, never a skill (#1292).
     sa.Column("auto_approve", sa.Integer, nullable=False, server_default="0"),
-    sa.Column("temperature", sa.Float, nullable=True),
-    sa.Column("reasoning_effort", sa.Text, nullable=False, server_default=""),
-    sa.Column("max_tokens", sa.Integer, nullable=True),
     sa.Column("token_budget", sa.Integer, nullable=False, server_default="0"),
-    sa.Column("agent_max_turns", sa.Integer, nullable=True),
     sa.Column("notify_on_complete", sa.Text, nullable=False, server_default="[]"),
     sa.Column("enabled", sa.Integer, nullable=False, server_default="1"),
     sa.Column("priority", sa.Integer, nullable=False, server_default="0"),

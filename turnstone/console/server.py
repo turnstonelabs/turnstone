@@ -1660,45 +1660,8 @@ async def list_available_models(request: Request) -> JSONResponse:
         return err
 
     rows = storage.list_model_definitions(enabled_only=True)
-    # Only expose alias/model/provider (+ the derived effort ladder) —
-    # rows also contain api_key, base_url, etc.
-    from turnstone.core.providers.effort_ladder import effort_ladder_for_model
-
-    models = []
-    for r in rows:
-        # ``effort_ladder`` starts as the empty list so the row schema is
-        # stable even when the try block below bails on a malformed
-        # capabilities column — clients can index the key unconditionally.
-        entry: dict[str, Any] = {
-            "alias": r["alias"],
-            "model": r["model"],
-            "provider": r["provider"],
-            "effort_ladder": [],
-        }
-        try:
-            # ``capabilities`` is a JSON string (sa.Text column) with
-            # ``server_compat`` namespaced inside — parse it the same way
-            # the model_registry loader does.  Read (don't pop) the
-            # namespace: the ladder's field filter drops non-capability
-            # keys, so the parsed dict can stay unmutated.
-            caps: dict[str, Any] = {}
-            raw_caps = r.get("capabilities")
-            if raw_caps:
-                parsed = json.loads(raw_caps)
-                if isinstance(parsed, dict):
-                    caps = parsed
-            server_compat = caps.get("server_compat", {})
-            api_surface = (
-                server_compat.get("api_surface", "") if isinstance(server_compat, dict) else ""
-            )
-            entry["effort_ladder"] = effort_ladder_for_model(
-                r["provider"], r["model"], caps, api_surface=str(api_surface or "")
-            )
-        except Exception:
-            # Unknown provider string / malformed capabilities row must
-            # not take down the picker — the ladder is an annotation.
-            log.debug("models.effort_ladder_failed alias=%s", r.get("alias"), exc_info=True)
-        models.append(entry)
+    # Only expose alias/model/provider — rows also contain api_key, base_url, etc.
+    models = [{"alias": r["alias"], "model": r["model"], "provider": r["provider"]} for r in rows]
 
     # Include effective defaults for clients (web UI, channel gateway).
     default_alias = ""
@@ -8580,13 +8543,8 @@ def _skill_to_response(r: dict[str, Any], resource_count: int = 0) -> dict[str, 
         "org_id": r.get("org_id", ""),
         "created_by": r.get("created_by", ""),
         # Session config fields
-        "model": r.get("model", ""),
         "auto_approve": r.get("auto_approve", False),
-        "temperature": r.get("temperature"),
-        "reasoning_effort": r.get("reasoning_effort", ""),
-        "max_tokens": r.get("max_tokens"),
         "token_budget": r.get("token_budget", 0),
-        "agent_max_turns": r.get("agent_max_turns"),
         # Coerce the legacy ``"{}"`` sentinel from rows pre-migration 051;
         # the field is contractually a JSON-array string everywhere else.
         "notify_on_complete": (
@@ -9591,8 +9549,6 @@ async def admin_parse_skill(request: Request) -> JSONResponse:
             # ``description``; surface it separately too so the admin
             # parse-preview UI can show what came from where.
             "when_to_use": parsed.when_to_use,
-            "model": parsed.model,
-            "effort": parsed.effort,
             # Invocation-control axes (#571).  Echoed back to the admin
             # UI so the parse-preview can show what the source SKILL.md
             # gated; the UI also uses ``user_invocable`` to pre-fill
@@ -9843,14 +9799,6 @@ async def admin_skill_install(request: Request) -> JSONResponse:
                 allowed_tools=allowed_tools_str,
                 paths=paths_str,
                 hidden_from_menu=install_hidden_from_menu,
-                # SKILL.md spec ``model:`` + ``effort:`` — seed the
-                # corresponding ``model`` / ``reasoning_effort`` columns
-                # at install time so the SKILL.md author's intent
-                # survives the import.  Only fires on initial create —
-                # the same-name / same-source duplicate checks above
-                # protect admin-set values on re-install.
-                model=parsed.model,
-                reasoning_effort=parsed.effort,
                 # SKILL.md spec ``arguments:`` + ``argument-hint:`` —
                 # named positional slots + autocomplete display.  Round-
                 # trip through install so the renderer's $<name>

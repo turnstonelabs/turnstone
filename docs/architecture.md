@@ -1456,21 +1456,19 @@ both local-server lanes, so `thinking_mode`/`thinking_param`/
 Only the Responses API surface (native reasoning) ignores it.
 
 The console surfaces this projection as an *effective effort ladder*:
-the admin model form's per-model effort select and the skill
-launch-config effort select annotate each position with what the
-request will carry, in plain words — a position whose delivered level
-matches its name stays plain ("Max"), a snapped position says so
-("Low — sends high"), the adaptive lanes' none position warns
-"thinking stays on", and budget detail lives in the tooltip. A
-position is never labeled after a sibling that shares its wire (that
-rendered "Max (= minimal)", implying a downgrade the wire doesn't
-contain). Computed server-side by `providers/effort_ladder.py` from
-the same mapping functions the providers use at request time and
-shipped on `/v1/api/models` rows (every row carries `effort_ladder`,
-empty when the capabilities column fails to parse) and
-`POST /v1/api/admin/models/effort-ladder`. The ladder describes what
-Turnstone sends — a server-side template may alias further (DeepSeek-V4
-folds `low`/`medium` into its default `high` tier).
+the admin model form's per-model effort select annotates each position
+with what the request will carry, in plain words — a position whose
+delivered level matches its name stays plain ("Max"), a snapped
+position says so ("Low — sends high"), the adaptive lanes' none
+position warns "thinking stays on", and budget detail lives in the
+tooltip. A position is never labeled after a sibling that shares its
+wire (that rendered "Max (= minimal)", implying a downgrade the wire
+doesn't contain). Computed server-side by `providers/effort_ladder.py`
+from the same mapping functions the providers use at request time and
+served by `POST /v1/api/admin/models/effort-ladder`. The ladder
+describes what Turnstone sends — a server-side template may alias
+further (DeepSeek-V4 folds `low`/`medium` into its default `high`
+tier).
 
 The `anthropic-compatible` lane never sends Anthropic's native
 `thinking`/`output_config` params — they are not in vLLM's request
@@ -1528,8 +1526,8 @@ rows are never modified).
    sub-agents, allowing a cheaper model for autonomous loops
 
 **Per-workstream selection:** `POST /v1/api/workstreams/new` accepts an optional
-`"model"` field, along with `skill` (skill name)
-which can override the model before workstream creation.
+`"model"` field; without one the workstream runs on the default alias. A
+`skill` never selects the model or its sampling settings.
 
 ### Tool Output Truncation
 
@@ -2412,13 +2410,18 @@ poll cycle.
 
 The console has two write-path capabilities:
 
-1. **Workstream creation** — sends HTTP requests to target server nodes
-   to create workstreams. Auto-selects the node with
-   the most available capacity if no target is specified. When a `skill`
-   field is present, the server resolves the skill BEFORE `mgr.create()`
-   (applying the model override to the creation request) and snapshot-applies
-   remaining settings (auto-approve, token budget, temperature, etc.) to the
-   workstream config AFTER creation.
+1. **Workstream creation** — sends HTTP requests to target server nodes to
+   create workstreams. Auto-selects the node with the most available capacity
+   if no target is specified. When a `skill` field is present, the server
+   resolves the skill BEFORE `mgr.create()` and passes its name to it, so the
+   new session starts with the skill's content in its system message. AFTER
+   creation it snapshot-applies the skill's token budget, auto-approve, allowed
+   tools and completion notifications (used when the request names no
+   `notify_targets`) and records the applied skill's id, version and content.
+   The model is the request's `model`, else the default alias; temperature,
+   reasoning effort and max tokens come from that alias, else the global model
+   settings, and the task-agent turn cap from `tools.agent_max_turns`. A skill
+   sets none of these.
 
 2. **Reverse proxy** — serves each node's server UI through the console port at
    `/node/{node_id}/`. Uses `httpx.AsyncClient` to proxy HTTP and SSE traffic.
@@ -2619,8 +2622,9 @@ can be created with any permission subset. JWTs carry both `scopes` and
 Tool policies use glob pattern matching (`fnmatch`) with priority-ordered
 first-match-wins evaluation to control tool execution (allow/deny/ask).
 Skills provide reusable system messages with `{{variable}}` substitution
-plus session configuration (model, temperature, auto-approve, token budget,
-etc.). Usage events are recorded per-LLM-request for token accounting.
+plus session configuration (auto-approve, allowed tools, token budget,
+etc.); the model and its sampling settings come from the workstream's
+alias. Usage events are recorded per-LLM-request for token accounting.
 An append-only audit log captures all admin mutations.
 
 Skills are snapshot-applied once at workstream creation — not a live binding.
