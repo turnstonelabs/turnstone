@@ -8458,9 +8458,7 @@ function _onModelFieldChange() {
    adaptive none position warns "thinking stays on"; budget detail
    lives in the tooltip.  Never label a position after a sibling that
    shares its token — that rendered "Max (= minimal)", implying a
-   downgrade the wire doesn't contain.  Defined here and shared as a
-   page global with governance.js (skill launch config), which loads
-   after this file. */
+   downgrade the wire doesn't contain. */
 function _annotateEffortSelect(sel, ladder) {
   if (!sel) return;
   const byVal = {};

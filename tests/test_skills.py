@@ -143,13 +143,8 @@ def _create_template(db, template_id, name, content, **kwargs):
         author=kwargs.get("author", ""),
         activation=kwargs.get("activation", "named"),
         token_estimate=kwargs.get("token_estimate", 0),
-        model=kwargs.get("model", ""),
         auto_approve=kwargs.get("auto_approve", False),
-        temperature=kwargs.get("temperature"),
-        reasoning_effort=kwargs.get("reasoning_effort", ""),
-        max_tokens=kwargs.get("max_tokens"),
         token_budget=kwargs.get("token_budget", 0),
-        agent_max_turns=kwargs.get("agent_max_turns"),
         notify_on_complete=kwargs.get("notify_on_complete", "{}"),
         enabled=kwargs.get("enabled", True),
         allowed_tools=kwargs.get("allowed_tools", "[]"),
@@ -1001,15 +996,40 @@ class TestSkillAPI:
         )
         resp = api_client.put(
             "/v1/api/admin/skills/s1",
-            json={"model": "gpt-5", "temperature": 0.5, "enabled": False},
+            json={"token_budget": 900, "priority": 4, "enabled": False},
         )
         assert resp.status_code == 200
         data = resp.json()
-        assert data["model"] == "gpt-5"
-        assert data["temperature"] == 0.5
+        assert data["token_budget"] == 900
+        assert data["priority"] == 4
         assert data["enabled"] is False
         # Spec fields must remain unchanged
         assert data["content"] == "external content"
+
+    def test_update_skill_readonly_model_settings_are_not_runtime_config(
+        self, api_client, api_storage
+    ):
+        """A skill has no model, sampling or task-agent turn settings to edit (#1292)."""
+        _create_template(
+            api_storage,
+            "s1",
+            "installed-skill",
+            "external content",
+            origin="source",
+            readonly=True,
+        )
+        resp = api_client.put(
+            "/v1/api/admin/skills/s1",
+            json={
+                "model": "gpt-5",
+                "temperature": 0.5,
+                "reasoning_effort": "max",
+                "max_tokens": 9,
+                "agent_max_turns": 4,
+            },
+        )
+        assert resp.status_code == 400
+        assert "runtime config" in resp.json()["error"].lower()
 
     def test_update_skill_readonly_hidden_from_menu_allowed(self, api_client, api_storage):
         """``hidden_from_menu`` is in SKILL_RUNTIME_CONFIG_FIELDS so an admin
@@ -1133,8 +1153,8 @@ class TestSkillAPI:
         )
         assert resp.status_code == 200
         data = resp.json()
-        # Config fields updated
-        assert data["model"] == "gpt-5"
+        # Config fields updated; a skill has no model to set (#1292)
+        assert "model" not in data
         assert data["enabled"] is False
         assert data["token_budget"] == 50000
         # Spec fields unchanged
@@ -1509,26 +1529,23 @@ class TestMCPSyncSkillFields:
 class TestSkillSessionConfigApplication:
     """Test that session config fields stored on skills round-trip correctly."""
 
-    def test_skill_with_model_override(self, db):
-        """Skill with model= stores and returns the value."""
+    def test_skill_rows_carry_no_model_settings_or_turn_cap(self, db):
+        """A skill has no model alias, sampling settings or task-agent turn cap
+        (#1292); an update naming them changes nothing instead of writing a
+        dropped column."""
         _create_template(db, "s1", "model-skill", "content")
-        db.update_prompt_template("s1", model="test-model")
+        db.update_prompt_template(
+            "s1",
+            model="test-model",
+            temperature=0.3,
+            reasoning_effort="high",
+            max_tokens=9,
+            agent_max_turns=4,
+        )
         tpl = db.get_skill_by_name("model-skill")
         assert tpl is not None
-        assert tpl["model"] == "test-model"
-
-    def test_skill_with_temperature(self, db):
-        """Skill with temperature= stores and returns the value."""
-        db.create_prompt_template(
-            template_id="s1",
-            name="temp-skill",
-            category="general",
-            content="content",
-            temperature=0.3,
-        )
-        tpl = db.get_skill_by_name("temp-skill")
-        assert tpl is not None
-        assert tpl["temperature"] == 0.3
+        dropped = {"model", "temperature", "reasoning_effort", "max_tokens", "agent_max_turns"}
+        assert not dropped & tpl.keys()
 
     def test_skill_with_token_budget(self, db):
         """Skill with token_budget= stores and returns the value."""
@@ -1572,19 +1589,6 @@ class TestSkillSessionConfigApplication:
         parsed = json.loads(tpl["allowed_tools"])
         assert parsed == ["bash", "read_file"]
 
-    def test_skill_with_reasoning_effort(self, db):
-        """Skill with reasoning_effort= stores and returns the value."""
-        db.create_prompt_template(
-            template_id="s1",
-            name="effort-skill",
-            category="general",
-            content="content",
-            reasoning_effort="high",
-        )
-        tpl = db.get_skill_by_name("effort-skill")
-        assert tpl is not None
-        assert tpl["reasoning_effort"] == "high"
-
     def test_disabled_skill_not_in_summary(self, db):
         """A disabled skill is listed but with enabled=False."""
         db.create_prompt_template(
@@ -1606,26 +1610,16 @@ class TestSkillSessionConfigApplication:
             name="full-config-skill",
             category="general",
             content="You are a full config skill.",
-            model="gpt-5",
             auto_approve=True,
-            temperature=0.7,
-            reasoning_effort="high",
-            max_tokens=2048,
             token_budget=10000,
-            agent_max_turns=5,
             notify_on_complete='{"channel":"discord"}',
             enabled=True,
             allowed_tools='["bash","read_file","write_file"]',
         )
         tpl = db.get_skill_by_name("full-config-skill")
         assert tpl is not None
-        assert tpl["model"] == "gpt-5"
         assert tpl["auto_approve"] is True
-        assert tpl["temperature"] == 0.7
-        assert tpl["reasoning_effort"] == "high"
-        assert tpl["max_tokens"] == 2048
         assert tpl["token_budget"] == 10000
-        assert tpl["agent_max_turns"] == 5
         assert tpl["notify_on_complete"] == '{"channel":"discord"}'
         assert tpl["enabled"] is True
         parsed_tools = json.loads(tpl["allowed_tools"])
@@ -1691,16 +1685,12 @@ class TestSkillMigrationBehaviors:
             "my-profile",
             "Profile content",
             category="profile",
-            model="gpt-5",
-            temperature=0.3,
             token_budget=5000,
             auto_approve=True,
         )
         skill = db.get_prompt_template_by_name("my-profile")
         assert skill is not None
         assert skill["category"] == "profile"
-        assert skill["model"] == "gpt-5"
-        assert skill["temperature"] == 0.3
         assert skill["token_budget"] == 5000
         assert skill["auto_approve"] is True
 
@@ -1724,7 +1714,6 @@ class TestSkillMigrationBehaviors:
             "skills-deploy-bot",
             "Migrated from ws_template",
             category="profile",
-            model="gpt-5",
         )
         assert db.get_prompt_template_by_name("deploy-bot") is not None
         assert db.get_prompt_template_by_name("skills-deploy-bot") is not None
@@ -1792,6 +1781,8 @@ class TestSkillAdminEndpoints:
                 "description": "A test skill",
                 "tags": ["test"],
                 "activation": "named",
+                "token_budget": 100,
+                # An older client's model settings are ignored (#1292).
                 "model": "gpt-5",
                 "temperature": 0.5,
             },
@@ -1804,8 +1795,9 @@ class TestSkillAdminEndpoints:
         assert data["description"] == "A test skill"
         assert data["tags"] == ["test"]
         assert data["activation"] == "named"
-        assert data["model"] == "gpt-5"
-        assert data["temperature"] == 0.5
+        assert data["token_budget"] == 100
+        assert "model" not in data
+        assert "temperature" not in data
         assert "template_id" in data
 
     def test_create_skill_duplicate_name_409(self, full_api_client):
@@ -1856,15 +1848,15 @@ class TestSkillAdminEndpoints:
             f"/v1/api/admin/skills/{skill_id}",
             json={
                 "description": "new desc",
-                "temperature": 0.8,
-                "model": "gpt-5",
+                "token_budget": 800,
+                "priority": 3,
             },
         )
         assert resp.status_code == 200
         data = resp.json()
         assert data["description"] == "new desc"
-        assert data["temperature"] == 0.8
-        assert data["model"] == "gpt-5"
+        assert data["token_budget"] == 800
+        assert data["priority"] == 3
 
     def test_delete_skill_via_api(self, full_api_client):
         """DELETE removes the skill and subsequent GET returns 404."""
@@ -1954,15 +1946,6 @@ class TestSkillAdminEndpoints:
         assert resp.status_code == 200
         versions = resp.json()["versions"]
         assert len(versions) == 1
-
-    def test_create_skill_invalid_temperature_400(self, full_api_client):
-        """POST with temperature=5 returns 400."""
-        resp = full_api_client.post(
-            "/v1/api/admin/skills",
-            json={"name": "bad-temp", "content": "content", "temperature": 5},
-        )
-        assert resp.status_code == 400
-        assert "temperature" in resp.json()["error"].lower()
 
     def test_create_skill_invalid_activation_400(self, full_api_client):
         """POST with activation='bogus' returns 400."""
@@ -2072,6 +2055,8 @@ class TestSkillConfigAppliedToWorkstream:
                 temperature=0.5,
                 max_tokens=4096,
                 tool_timeout=30,
+                # Production passes the operator's ``tools.agent_max_turns`` here.
+                agent_max_turns=7,
                 ws_id=ws_id,
                 skill=kwargs.get("skill"),
                 workstream_lease=kwargs.get("workstream_lease"),
@@ -2155,28 +2140,66 @@ class TestSkillConfigAppliedToWorkstream:
         # gates BEFORE mgr.create, so storage stays clean.
         assert len(list(storage.list_workstreams())) == 0
 
-    def test_session_receives_temperature(self, _ws_app):
-        """Skill temperature overrides the session default."""
+    @staticmethod
+    def _serve_rows_with_model_settings(monkeypatch: pytest.MonkeyPatch, storage: Any) -> None:
+        """Make skill lookups return the five keys a skill row no longer has, the
+        shape of a custom backend or a row read before migration 080."""
+        real_lookup = storage.get_prompt_template_by_name
+
+        def _lookup(name: str) -> dict[str, Any] | None:
+            row = real_lookup(name)
+            if row is None:
+                return None
+            return {
+                **row,
+                "model": "skill-model",
+                "temperature": 0.9,
+                "reasoning_effort": "high",
+                "max_tokens": 1024,
+                "agent_max_turns": 3,
+            }
+
+        monkeypatch.setattr(storage, "get_prompt_template_by_name", _lookup)
+
+    def test_skill_never_sets_the_model_or_sampling(self, _ws_app, monkeypatch):
+        """A skill leaves the default alias, its settings and the task-agent turn
+        cap in place (#1292)."""
         client, mgr, storage = _ws_app
-        _create_template(storage, "s1", "warm-skill", "Be warm.", temperature=0.9, enabled=True)
+        _create_template(storage, "s1", "legacy-skill", "Be warm.", enabled=True)
+        self._serve_rows_with_model_settings(monkeypatch, storage)
 
-        resp = client.post("/v1/api/workstreams/new", json={"skill": "warm-skill"})
-        assert resp.status_code == 200
-        ws_id = resp.json()["ws_id"]
-        ws = mgr.get(ws_id)
-        assert ws is not None and ws.session is not None
-        assert ws.session.temperature == 0.9
-
-    def test_session_receives_max_tokens(self, _ws_app):
-        """Skill max_tokens overrides the session default."""
-        client, mgr, storage = _ws_app
-        _create_template(storage, "s1", "token-skill", "Be concise.", max_tokens=1024, enabled=True)
-
-        resp = client.post("/v1/api/workstreams/new", json={"skill": "token-skill"})
+        resp = client.post("/v1/api/workstreams/new", json={"skill": "legacy-skill"})
         assert resp.status_code == 200
         ws = mgr.get(resp.json()["ws_id"])
         assert ws is not None and ws.session is not None
-        assert ws.session.max_tokens == 1024
+        sess = ws.session
+        assert sess.model == "test-model"
+        assert (sess.temperature, sess.reasoning_effort, sess.max_tokens) == (0.5, None, 4096)
+        assert sess.agent_max_turns == 7  # the session factory's operator value
+
+    def test_node_factory_passes_the_operator_turn_cap(self):
+        """The node session factory, a closure in ``server.main``, gives every session the
+        operator's ``tools.agent_max_turns``: the task-agent turn cap's only source (#1292)."""
+        import inspect
+
+        from turnstone import server
+
+        src = inspect.getsource(server.main)
+        assert 'agent_max_turns=config_store.get("tools.agent_max_turns")' in src
+
+    def test_request_model_wins_over_a_skill(self, _ws_app, monkeypatch):
+        """The model the create request names is the one the workstream runs on."""
+        client, mgr, storage = _ws_app
+        _create_template(storage, "s1", "legacy-skill", "Be warm.", enabled=True)
+        self._serve_rows_with_model_settings(monkeypatch, storage)
+
+        resp = client.post(
+            "/v1/api/workstreams/new", json={"skill": "legacy-skill", "model": "request-model"}
+        )
+        assert resp.status_code == 200
+        ws = mgr.get(resp.json()["ws_id"])
+        assert ws is not None and ws.session is not None
+        assert ws.session.model == "request-model"
 
     def test_session_receives_token_budget(self, _ws_app):
         """Skill token_budget is applied to the session."""
@@ -2190,32 +2213,6 @@ class TestSkillConfigAppliedToWorkstream:
         ws = mgr.get(resp.json()["ws_id"])
         assert ws is not None and ws.session is not None
         assert ws.session._token_budget == 50000
-
-    def test_session_receives_reasoning_effort(self, _ws_app):
-        """Skill reasoning_effort is applied to the session."""
-        client, mgr, storage = _ws_app
-        _create_template(
-            storage, "s1", "effort-skill", "Think hard.", reasoning_effort="high", enabled=True
-        )
-
-        resp = client.post("/v1/api/workstreams/new", json={"skill": "effort-skill"})
-        assert resp.status_code == 200
-        ws = mgr.get(resp.json()["ws_id"])
-        assert ws is not None and ws.session is not None
-        assert ws.session.reasoning_effort == "high"
-
-    def test_session_receives_agent_max_turns(self, _ws_app):
-        """Skill agent_max_turns is applied to the session."""
-        client, mgr, storage = _ws_app
-        _create_template(
-            storage, "s1", "turns-skill", "Few turns.", agent_max_turns=3, enabled=True
-        )
-
-        resp = client.post("/v1/api/workstreams/new", json={"skill": "turns-skill"})
-        assert resp.status_code == 200
-        ws = mgr.get(resp.json()["ws_id"])
-        assert ws is not None and ws.session is not None
-        assert ws.session.agent_max_turns == 3
 
     def test_auto_approve_set_on_ui(self, _ws_app):
         """Skill auto_approve=True propagates to the WebUI."""
@@ -2254,19 +2251,6 @@ class TestSkillConfigAppliedToWorkstream:
         assert isinstance(ws.ui, WebUI)
         assert ws.ui.auto_approve_tools == {"bash", "read_file"}
 
-    def test_skill_model_overrides_resolved_model(self, _ws_app):
-        """Skill model field overrides the default session model."""
-        client, mgr, storage = _ws_app
-        _create_template(
-            storage, "s1", "model-skill", "Use specific model.", model="gpt-5", enabled=True
-        )
-
-        resp = client.post("/v1/api/workstreams/new", json={"skill": "model-skill"})
-        assert resp.status_code == 200
-        ws = mgr.get(resp.json()["ws_id"])
-        assert ws is not None and ws.session is not None
-        assert ws.session.model == "gpt-5"
-
     def test_all_session_config_fields_applied(self, _ws_app):
         """All session config fields from a skill are applied together."""
         from turnstone.server import WebUI
@@ -2277,12 +2261,7 @@ class TestSkillConfigAppliedToWorkstream:
             "s1",
             "full-skill",
             "Full config skill.",
-            model="gpt-5",
-            temperature=0.8,
-            reasoning_effort="high",
-            max_tokens=2048,
             token_budget=100000,
-            agent_max_turns=10,
             auto_approve=True,
             allowed_tools='["bash", "write_file", "read_file"]',
             notify_on_complete='{"channel": "discord"}',
@@ -2294,12 +2273,7 @@ class TestSkillConfigAppliedToWorkstream:
         ws = mgr.get(resp.json()["ws_id"])
         assert ws is not None and ws.session is not None
         sess = ws.session
-        assert sess.model == "gpt-5"
-        assert sess.temperature == 0.8
-        assert sess.reasoning_effort == "high"
-        assert sess.max_tokens == 2048
         assert sess._token_budget == 100000
-        assert sess.agent_max_turns == 10
         assert sess._notify_on_complete == '{"channel": "discord"}'
         assert sess._applied_skill_id == "s1"
         assert sess._applied_skill_content == "Full config skill."

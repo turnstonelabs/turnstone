@@ -22785,7 +22785,6 @@ class ChatSession:
             "tags": tags,
             "version": r.get("version") or "",
             "description": r.get("description") or "",
-            "model": r.get("model") or "",
             "enabled": bool(r.get("enabled")),
             "risk_level": r.get("risk_level") or "",
             "activation": r.get("activation") or "",
@@ -23136,6 +23135,15 @@ class ChatSession:
     # HTTP path (``console/server.py``) read the same set — drift between
     # them would let one surface accept a field the other rejects.
     _SKILLS_READONLY_FIELDS: ClassVar[frozenset[str]] = SKILL_RUNTIME_CONFIG_FIELDS
+    # The readonly hints name only the runtime fields this tool's schema declares. That leaves out
+    # the admin API's ``priority`` and ``hidden_from_menu``, which this tool cannot set, and
+    # ``enabled``, which the ``enable`` / ``disable`` actions set.
+    _SKILLS_TOOL_RUNTIME_FIELDS: ClassVar[frozenset[str]] = SKILL_RUNTIME_CONFIG_FIELDS & {
+        prop
+        for tool in TOOLS
+        if tool["function"]["name"] == "skills"
+        for prop in tool["function"]["parameters"]["properties"]
+    }
 
     def _prepare_skills_update(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
         from turnstone.core.skill_field_validation import parse_skill_session_config
@@ -23241,7 +23249,7 @@ class ChatSession:
                         system_reminder=(
                             "Readonly skills preserve external-source "
                             "fidelity. Editable runtime fields: "
-                            + ", ".join(sorted(self._SKILLS_READONLY_FIELDS))
+                            + ", ".join(sorted(self._SKILLS_TOOL_RUNTIME_FIELDS))
                         ),
                     ),
                 )
@@ -23341,8 +23349,9 @@ class ChatSession:
                     system_reminder=(
                         "An admin flipped the readonly flag on this "
                         "skill after the operator approved the update. "
-                        "Re-issue the update against only runtime fields "
-                        "(model, temperature, allowed_tools, etc.)."
+                        "Re-issue the update against only runtime fields: "
+                        + ", ".join(sorted(self._SKILLS_TOOL_RUNTIME_FIELDS))
+                        + "."
                     ),
                 )
                 self._report_tool_result(call_id, "skills", msg, is_error=True)

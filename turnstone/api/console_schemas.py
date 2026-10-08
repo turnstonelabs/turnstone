@@ -370,13 +370,8 @@ class SkillInfo(BaseModel):
     version: str = "1.0.0"
     author: str = ""
     token_estimate: int = 0
-    model: str = ""
     auto_approve: bool = False
-    temperature: float | None = None
-    reasoning_effort: str = ""
-    max_tokens: int | None = None
     token_budget: int = 0
-    agent_max_turns: int | None = None
     notify_on_complete: str = "[]"
     enabled: bool = True
     priority: int = 0
@@ -423,13 +418,8 @@ class CreateSkillRequest(BaseModel):
     org_id: str = ""
     author: str = ""
     version: str = "1.0.0"
-    model: str = ""
     auto_approve: bool = False
-    temperature: float | None = None
-    reasoning_effort: str = ""
-    max_tokens: int | None = None
     token_budget: int = 0
-    agent_max_turns: int | None = None
     notify_on_complete: str = "[]"
     enabled: bool = True
     priority: int = 0
@@ -489,13 +479,8 @@ class UpdateSkillRequest(BaseModel):
     activation: str | None = None
     author: str | None = None
     version: str | None = None
-    model: str | None = None
     auto_approve: bool | None = None
-    temperature: float | None = None
-    reasoning_effort: str | None = None
-    max_tokens: int | None = None
     token_budget: int | None = None
-    agent_max_turns: int | None = None
     notify_on_complete: str | None = None
     enabled: bool | None = None
     priority: int | None = None
@@ -962,8 +947,6 @@ class ParseSkillResponse(BaseModel):
     # admin parse-preview UI can show what the source SKILL.md
     # provided in each field.
     when_to_use: str = ""
-    model: str = ""
-    effort: str = ""
     # Invocation-control axes (#571).  The install handler derives
     # ``hidden_from_menu`` from ``user_invocable`` at the storage
     # boundary; these raw spec fields surface here so the admin UI

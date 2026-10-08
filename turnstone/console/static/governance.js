@@ -1699,12 +1699,7 @@ function showCreateTemplateModal() {
   document.getElementById("skl-paste-hint").hidden = false;
   document.getElementById("skl-default").checked = false;
   // Session config fields
-  document.getElementById("sklc-model").value = "";
-  document.getElementById("sklc-temperature").value = "";
-  document.getElementById("sklc-reasoning-effort").value = "";
-  document.getElementById("sklc-max-tokens").value = "";
   document.getElementById("sklc-token-budget").value = "";
-  document.getElementById("sklc-agent-max-turns").value = "";
   document.getElementById("sklc-auto-approve").checked = false;
   document.getElementById("sklc-allowed-tools").value = "";
   document.getElementById("sklc-allowed-tools").disabled = false;
@@ -1764,12 +1759,7 @@ function submitCreateTemplate() {
         .filter(Boolean)
     : [];
   // Session config fields
-  const csTemp = document.getElementById("sklc-temperature").value.trim();
-  const csMaxTok = document.getElementById("sklc-max-tokens").value.trim();
   const csBudget = document.getElementById("sklc-token-budget").value.trim();
-  const csMaxTurns = document
-    .getElementById("sklc-agent-max-turns")
-    .value.trim();
   const csAllowed = (
     document.getElementById("sklc-allowed-tools").value || ""
   ).trim();
@@ -1829,13 +1819,8 @@ function submitCreateTemplate() {
     content: content,
     variables: JSON.stringify(varList),
     is_default: document.getElementById("skl-default").checked,
-    model: document.getElementById("sklc-model").value.trim(),
     auto_approve: document.getElementById("sklc-auto-approve").checked,
-    temperature: csTemp ? parseFloat(csTemp) : null,
-    reasoning_effort: document.getElementById("sklc-reasoning-effort").value,
-    max_tokens: csMaxTok ? parseInt(csMaxTok, 10) : null,
     token_budget: csBudget ? parseInt(csBudget, 10) : 0,
-    agent_max_turns: csMaxTurns ? parseInt(csMaxTurns, 10) : null,
     allowed_tools: JSON.stringify(csAllowedArr),
     paths: JSON.stringify(csPathsArr),
     hidden_from_menu: document.getElementById("skl-hidden-from-menu").checked,
@@ -1964,19 +1949,9 @@ function showEditTemplateModal(tmplId) {
   document.getElementById("skl-paste-hint").hidden = true;
   document.getElementById("skl-default").checked = tmpl.is_default;
   // Session config fields
-  document.getElementById("sklc-model").value = tmpl.model || "";
-  _sklcScheduleEffortLadder();
-  document.getElementById("sklc-temperature").value =
-    tmpl.temperature != null ? tmpl.temperature : "";
-  document.getElementById("sklc-reasoning-effort").value =
-    tmpl.reasoning_effort || "";
-  document.getElementById("sklc-max-tokens").value =
-    tmpl.max_tokens != null ? tmpl.max_tokens : "";
   document.getElementById("sklc-token-budget").value = tmpl.token_budget
     ? tmpl.token_budget
     : "";
-  document.getElementById("sklc-agent-max-turns").value =
-    tmpl.agent_max_turns != null ? tmpl.agent_max_turns : "";
   document.getElementById("sklc-auto-approve").checked =
     tmpl.auto_approve || false;
   // allowed_tools: parse JSON array to comma-separated display
@@ -2124,16 +2099,11 @@ function showEditTemplateModal(tmplId) {
   });
   // Runtime config fields: always editable, even for readonly skills.
   // Admins should be able to override these local-UX-ish values
-  // (model, effort, hidden-from-menu, ...) on installed skills
-  // without unlocking the row.  Must match SKILL_RUNTIME_CONFIG_FIELDS
-  // in turnstone/core/skill_field_validation.py.
+  // (token budget, approvals, hidden-from-menu, ...) on installed
+  // skills without unlocking the row.  Must match
+  // SKILL_RUNTIME_CONFIG_FIELDS in turnstone/core/skill_field_validation.py.
   [
-    "sklc-model",
-    "sklc-temperature",
-    "sklc-reasoning-effort",
-    "sklc-max-tokens",
     "sklc-token-budget",
-    "sklc-agent-max-turns",
     "sklc-auto-approve",
     "sklc-enabled",
     "skl-hidden-from-menu",
@@ -2492,12 +2462,7 @@ function submitEditTemplate() {
         .filter(Boolean)
     : [];
   // Session config fields
-  const esTemp = document.getElementById("sklc-temperature").value.trim();
-  const esMaxTok = document.getElementById("sklc-max-tokens").value.trim();
   const esBudget = document.getElementById("sklc-token-budget").value.trim();
-  const esMaxTurns = document
-    .getElementById("sklc-agent-max-turns")
-    .value.trim();
   const esAllowed = (
     document.getElementById("sklc-allowed-tools").value || ""
   ).trim();
@@ -2561,13 +2526,8 @@ function submitEditTemplate() {
     content: content,
     variables: JSON.stringify(varList),
     is_default: document.getElementById("skl-default").checked,
-    model: document.getElementById("sklc-model").value.trim(),
     auto_approve: document.getElementById("sklc-auto-approve").checked,
-    temperature: esTemp ? parseFloat(esTemp) : null,
-    reasoning_effort: document.getElementById("sklc-reasoning-effort").value,
-    max_tokens: esMaxTok ? parseInt(esMaxTok, 10) : null,
     token_budget: esBudget ? parseInt(esBudget, 10) : 0,
-    agent_max_turns: esMaxTurns ? parseInt(esMaxTurns, 10) : null,
     allowed_tools: JSON.stringify(esAllowedArr),
     notify_on_complete: esNotifyVal,
     enabled: document.getElementById("sklc-enabled").checked,
@@ -5146,55 +5106,3 @@ function _submitOGPShelf() {
       errEl.classList.add("is-visible");
     });
 }
-
-/* Effort-ladder annotation for the skill launch-config effort select.
-   Resolves the typed alias against /v1/api/models (each row carries a
-   server-computed effort_ladder) and reuses the page-global
-   _annotateEffortSelect from admin.js, which loads before this file. */
-let _sklcModelsPromise = null;
-let _sklcLadderTimer = null;
-/* Called from app.js on the models_changed SSE event so edited/added
-   models don't serve a stale ladder until page reload. */
-function _sklcInvalidateModelsCache() {
-  _sklcModelsPromise = null;
-}
-function _sklcRefreshEffortLadder() {
-  const sel = document.getElementById("sklc-reasoning-effort");
-  const aliasEl = document.getElementById("sklc-model");
-  if (!sel || !aliasEl || typeof _annotateEffortSelect !== "function") return;
-  const alias = aliasEl.value.trim();
-  if (!alias) {
-    _annotateEffortSelect(sel, null);
-    return;
-  }
-  if (!_sklcModelsPromise) {
-    _sklcModelsPromise = authFetch("/v1/api/models")
-      .then(function (r) {
-        return r.json();
-      })
-      .catch(function (e) {
-        // A cached rejection would block every retry (the truthy guard
-        // above) — reset so the next keystroke can refetch.
-        _sklcModelsPromise = null;
-        throw e;
-      });
-  }
-  _sklcModelsPromise
-    .then(function (d) {
-      const row = (d.models || []).find(function (m) {
-        return m.alias === alias;
-      });
-      _annotateEffortSelect(sel, row ? row.effort_ladder : null);
-    })
-    .catch(function () {
-      /* silent — annotation only */
-    });
-}
-function _sklcScheduleEffortLadder() {
-  clearTimeout(_sklcLadderTimer);
-  _sklcLadderTimer = setTimeout(_sklcRefreshEffortLadder, 500);
-}
-(function () {
-  const el = document.getElementById("sklc-model");
-  if (el) el.addEventListener("input", _sklcScheduleEffortLadder);
-})();

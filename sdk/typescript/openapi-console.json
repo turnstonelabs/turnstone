@@ -14552,61 +14552,15 @@
             "title": "Token Estimate",
             "type": "integer"
           },
-          "model": {
-            "default": "",
-            "title": "Model",
-            "type": "string"
-          },
           "auto_approve": {
             "default": false,
             "title": "Auto Approve",
             "type": "boolean"
           },
-          "temperature": {
-            "anyOf": [
-              {
-                "type": "number"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "default": null,
-            "title": "Temperature"
-          },
-          "reasoning_effort": {
-            "default": "",
-            "title": "Reasoning Effort",
-            "type": "string"
-          },
-          "max_tokens": {
-            "anyOf": [
-              {
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "default": null,
-            "title": "Max Tokens"
-          },
           "token_budget": {
             "default": 0,
             "title": "Token Budget",
             "type": "integer"
-          },
-          "agent_max_turns": {
-            "anyOf": [
-              {
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "default": null,
-            "title": "Agent Max Turns"
           },
           "notify_on_complete": {
             "default": "[]",
@@ -14847,16 +14801,6 @@
             "title": "When To Use",
             "type": "string"
           },
-          "model": {
-            "default": "",
-            "title": "Model",
-            "type": "string"
-          },
-          "effort": {
-            "default": "",
-            "title": "Effort",
-            "type": "string"
-          },
           "disable_model_invocation": {
             "default": false,
             "title": "Disable Model Invocation",
@@ -14945,61 +14889,15 @@
             "title": "Version",
             "type": "string"
           },
-          "model": {
-            "default": "",
-            "title": "Model",
-            "type": "string"
-          },
           "auto_approve": {
             "default": false,
             "title": "Auto Approve",
             "type": "boolean"
           },
-          "temperature": {
-            "anyOf": [
-              {
-                "type": "number"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "default": null,
-            "title": "Temperature"
-          },
-          "reasoning_effort": {
-            "default": "",
-            "title": "Reasoning Effort",
-            "type": "string"
-          },
-          "max_tokens": {
-            "anyOf": [
-              {
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "default": null,
-            "title": "Max Tokens"
-          },
           "token_budget": {
             "default": 0,
             "title": "Token Budget",
             "type": "integer"
-          },
-          "agent_max_turns": {
-            "anyOf": [
-              {
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "default": null,
-            "title": "Agent Max Turns"
           },
           "notify_on_complete": {
             "default": "[]",
@@ -15210,18 +15108,6 @@
             "default": null,
             "title": "Version"
           },
-          "model": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "default": null,
-            "title": "Model"
-          },
           "auto_approve": {
             "anyOf": [
               {
@@ -15234,42 +15120,6 @@
             "default": null,
             "title": "Auto Approve"
           },
-          "temperature": {
-            "anyOf": [
-              {
-                "type": "number"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "default": null,
-            "title": "Temperature"
-          },
-          "reasoning_effort": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "default": null,
-            "title": "Reasoning Effort"
-          },
-          "max_tokens": {
-            "anyOf": [
-              {
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "default": null,
-            "title": "Max Tokens"
-          },
           "token_budget": {
             "anyOf": [
               {
@@ -15281,18 +15131,6 @@
             ],
             "default": null,
             "title": "Token Budget"
-          },
-          "agent_max_turns": {
-            "anyOf": [
-              {
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "default": null,
-            "title": "Agent Max Turns"
           },
           "notify_on_complete": {
             "anyOf": [

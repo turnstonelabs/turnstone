@@ -857,13 +857,8 @@ def test_create_rejects_disabled_skill(storage):
             author="",
             activation="named",
             token_estimate=0,
-            model="",
             auto_approve=False,
-            temperature=None,
-            reasoning_effort="",
-            max_tokens=None,
             token_budget=0,
-            agent_max_turns=None,
             notify_on_complete="{}",
             enabled=False,  # the gate under test
             allowed_tools="[]",

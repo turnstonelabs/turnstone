@@ -67,8 +67,11 @@ Admin-defined rules that control tool execution:
 ### Skills
 
 Admin-curated system message skills injected at workstream startup. Skills also
-include session configuration (model, temperature, auto-approve, token budget,
-etc.) since workstream templates were merged into the skills system in v0.8.0.
+include session configuration (auto-approve, allowed tools, token budget, etc.)
+since workstream templates were merged into the skills system in v0.8.0. A
+skill does not choose the model or set temperature, reasoning effort, max
+tokens or the task-agent turn cap: those come from the workstream's model alias
+and the `tools.agent_max_turns` setting.
 
 - **Runtime behavior**: Skills are loaded once at session creation and injected
   into the system message *before* user `instructions`. Skills set the baseline;
@@ -119,13 +122,12 @@ etc.) since workstream templates were merged into the skills system in v0.8.0.
   - SDK: `discover_skills(q)` and `install_skill(source, skill_id=..., url=...)`
     on both Python and TypeScript console clients.
 - **Runtime config on installed skills**: Installed (readonly) skills can have
-  their runtime configuration edited — model, temperature, reasoning effort,
-  token budget, max tokens, agent max turns, auto-approve, allowed tools,
-  and enabled flag. The server restricts updates to these fields only via
-  `_SKILL_RUNTIME_CONFIG_FIELDS` filtering; spec/content fields (name,
+  their runtime configuration edited — token budget, auto-approve, allowed
+  tools, completion notifications, priority, menu visibility, and enabled
+  flag. The server restricts updates to these fields only via
+  `SKILL_RUNTIME_CONFIG_FIELDS` filtering; spec/content fields (name,
   description, tags, license, compatibility, content, activation) remain
-  immutable. The admin UI shows "Save Config" instead of "Save" for these
-  skills. Audit action: `skill.update.config`.
+  immutable. Audit action: `skill.update.config`.
 - **Admin UI**: Create/Edit skill modals use a two-column spec manifest layout
   (left: Identity / Manifest / Deployment; right: Skill Content editor with
   monospace font). Runtime Config is a collapsible 3-column grid below.

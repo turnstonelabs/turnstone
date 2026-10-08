@@ -364,43 +364,25 @@ Content.
 
 
 class TestModelAndEffort:
-    """SKILL.md spec ``model:`` / ``effort:`` — per-skill overrides."""
+    """SKILL.md ``model:`` / ``effort:`` — not read: the alias decides (#1292)."""
 
-    def test_model_extracted(self) -> None:
+    def test_model_and_effort_not_read(self) -> None:
         raw = """\
 ---
 name: with-model
-model: claude-opus-4-7
----
-
-Content.
-"""
-        result = parse_skill_md(raw)
-        assert result.model == "claude-opus-4-7"
-
-    def test_effort_extracted(self) -> None:
-        raw = """\
----
-name: with-effort
+model: upstream-model
 effort: high
 ---
 
 Content.
 """
         result = parse_skill_md(raw)
-        assert result.effort == "high"
-
-    def test_both_default_empty(self) -> None:
-        raw = """\
----
-name: bare
----
-
-Content.
-"""
-        result = parse_skill_md(raw)
-        assert result.model == ""
-        assert result.effort == ""
+        assert result.name == "with-model"
+        assert not hasattr(result, "model")
+        assert not hasattr(result, "effort")
+        # Kept only where every unread key goes.
+        assert result.raw_frontmatter["model"] == "upstream-model"
+        assert result.raw_frontmatter["effort"] == "high"
 
 
 class TestInvocationControl:

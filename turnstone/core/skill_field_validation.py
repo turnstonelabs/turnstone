@@ -24,12 +24,7 @@ _VALID_ACTIVATIONS: frozenset[str] = frozenset({"named", "default", "search"})
 # runtime field.
 SKILL_RUNTIME_CONFIG_FIELDS: frozenset[str] = frozenset(
     {
-        "model",
-        "temperature",
-        "reasoning_effort",
-        "max_tokens",
         "token_budget",
-        "agent_max_turns",
         "auto_approve",
         "allowed_tools",
         "enabled",
@@ -39,7 +34,7 @@ SKILL_RUNTIME_CONFIG_FIELDS: frozenset[str] = frozenset(
         # (mapped from ``user-invocable: false``) but admin override
         # is a local UX preference — operators should be able to
         # hide / unhide an installed skill in the picker without
-        # unlocking the row.  Same precedent as ``model`` / ``effort``.
+        # unlocking the row.
         "hidden_from_menu",
     }
 )
@@ -56,39 +51,20 @@ def parse_skill_session_config(body: dict[str, Any]) -> tuple[dict[str, Any], st
 
     Field rules:
 
-    - ``temperature``: float in [0.0, 2.0] or None / "" → None.
-      Non-numeric input (string that doesn't parse, dict, list) errors
-      out — matches ``max_tokens`` / ``token_budget`` for numeric-field
-      consistency.
-    - ``max_tokens``: int >= 1 or None / "" → None
     - ``token_budget``: int >= 0 (defaults to 0 if missing-but-empty)
-    - ``agent_max_turns``: int >= 1 or None / "" → None
-    - ``reasoning_effort``: string (stripped)
     - ``auto_approve`` / ``enabled``: bool
     - ``activation``: one of ``_VALID_ACTIVATIONS``
     - ``notify_on_complete``: JSON array string ("[]" if blank or
       legacy ``{}`` sentinel from migrations 011/021)
     - ``allowed_tools``: JSON array string (accepts list, JSON string,
       or comma-separated CSV string → canonicalized to JSON array)
-    - ``model``: string (stripped)
+
+    A skill carries no model alias, temperature, reasoning effort, max
+    tokens or task-agent turn cap: the workstream's alias and the
+    operator's ``tools.agent_max_turns`` setting supply those (#1292),
+    and a body that names them has them ignored like any unknown key.
     """
     fields: dict[str, Any] = {}
-
-    if "model" in body:
-        fields["model"] = str(body["model"] or "").strip()
-
-    if "temperature" in body:
-        temp = body["temperature"]
-        if temp is None or temp == "":
-            fields["temperature"] = None
-        else:
-            try:
-                temp = float(temp)
-            except (ValueError, TypeError):
-                return {}, "temperature must be a number between 0 and 2"
-            if not (0.0 <= temp <= 2.0):
-                return {}, "temperature must be between 0 and 2"
-            fields["temperature"] = temp
 
     if "token_budget" in body:
         try:
@@ -98,35 +74,6 @@ def parse_skill_session_config(body: dict[str, Any]) -> tuple[dict[str, Any], st
         if tb < 0:
             return {}, "token_budget must be non-negative"
         fields["token_budget"] = tb
-
-    if "max_tokens" in body:
-        mt = body["max_tokens"]
-        if mt is not None and mt != "":
-            try:
-                mt = int(mt)
-            except (ValueError, TypeError):
-                return {}, "max_tokens must be an integer"
-            if mt < 1:
-                return {}, "max_tokens must be positive"
-            fields["max_tokens"] = mt
-        else:
-            fields["max_tokens"] = None
-
-    if "agent_max_turns" in body:
-        amt = body["agent_max_turns"]
-        if amt is not None and amt != "":
-            try:
-                amt = int(amt)
-            except (ValueError, TypeError):
-                return {}, "agent_max_turns must be an integer"
-            if amt < 1:
-                return {}, "agent_max_turns must be positive"
-            fields["agent_max_turns"] = amt
-        else:
-            fields["agent_max_turns"] = None
-
-    if "reasoning_effort" in body:
-        fields["reasoning_effort"] = str(body["reasoning_effort"] or "").strip()
 
     if "auto_approve" in body:
         fields["auto_approve"] = bool(body.get("auto_approve", False))

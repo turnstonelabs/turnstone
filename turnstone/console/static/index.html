@@ -3893,53 +3893,10 @@
               <details class="rawhatch">
                 <summary>
                   Runtime Config
-                  <span class="label-hint"
-                    >model, temperature, token limits</span
-                  >
+                  <span class="label-hint">token budget, approvals</span>
                 </summary>
                 <div class="rawhatch-body">
                   <div class="skill-config-grid">
-                    <div>
-                      <label for="sklc-model">Model</label
-                      ><input
-                        id="sklc-model"
-                        type="text"
-                        placeholder="Default model"
-                      />
-                    </div>
-                    <div>
-                      <label for="sklc-temperature">Temperature</label
-                      ><input
-                        id="sklc-temperature"
-                        type="number"
-                        step="0.1"
-                        min="0"
-                        max="2"
-                        placeholder="System default"
-                      />
-                    </div>
-                    <div>
-                      <label for="sklc-reasoning-effort"
-                        >Reasoning Effort</label
-                      >
-                      <select id="sklc-reasoning-effort">
-                        <option value="">System default</option>
-                        <option value="low">Low</option>
-                        <option value="medium">Medium</option>
-                        <option value="high">High</option>
-                        <option value="xhigh">Extra High</option>
-                        <option value="max">Max</option>
-                      </select>
-                    </div>
-                    <div>
-                      <label for="sklc-max-tokens">Max Tokens</label
-                      ><input
-                        id="sklc-max-tokens"
-                        type="number"
-                        min="1"
-                        placeholder="System default"
-                      />
-                    </div>
                     <div>
                       <label for="sklc-token-budget">Token Budget</label
                       ><input
@@ -3947,15 +3904,6 @@
                         type="number"
                         min="0"
                         placeholder="0 = unlimited"
-                      />
-                    </div>
-                    <div>
-                      <label for="sklc-agent-max-turns">Agent Max Turns</label
-                      ><input
-                        id="sklc-agent-max-turns"
-                        type="number"
-                        min="1"
-                        placeholder="System default"
                       />
                     </div>
                   </div>

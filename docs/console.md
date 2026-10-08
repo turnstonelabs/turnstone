@@ -434,7 +434,7 @@ is hidden when only one kind is available. Its options include:
 - **Node placement** — "Least loaded" picks the reachable node with the most
   headroom, or "Specific node" pins the create to a node from the live list.
 - **Persona** — optional dropdown listing the enabled personas for the workstream kind. Sets the system-message composition and capability envelope at creation, snapshotted server-side; empty uses the kind's default. Picking one requires no `persona.*` permission.
-- **Skill** — optional dropdown listing enabled skills. Applies the skill's model, auto-approve policy, token budget, and other behavioral settings at creation time.
+- **Skill** — optional dropdown listing enabled skills. Applies the skill's auto-approve policy, token budget, and other behavioral settings at creation time; the model comes from the **Model** selector.
 - **Project** — optional project filing. Private projects require owner/member access. A coordinator child inherits its parent's project unless explicitly routed to another attachable project.
 - **Name** — optional text input. Auto-generated if left empty.
 - **Model** — optional selector populated from the target model registry.
