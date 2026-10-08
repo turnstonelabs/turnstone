@@ -3132,6 +3132,8 @@ class MCPClientManager:
                 owner.cancel()
                 await asyncio.wait({owner}, timeout=self._OWNER_CANCEL_GRACE_S)
             raise
+        except GeneratorExit:
+            raise  # garbage collection is closing an abandoned connect (see _connect_one_locked)
         except BaseException:
             # Connect failed: the owner delivered the failure and is unwinding
             # itself in-task. Reap quietly, then surface the error.
