@@ -380,7 +380,6 @@ def _run_script(
             ledger,
             label="task",
             tools=tools,
-            auto_tools={TOOL_NAME},
             parent_call_id="task-parent",
             principal_id="user-a",
             execution_journal=execution_journal,

@@ -13,7 +13,6 @@ _META_KEYS = {
     "task_agent",
     "coordinator",
     "interactive",
-    "auto_approve",
     "primary_key",
     # Per-kind variant overrides.  Schema:
     #   "kind_variants": {
@@ -46,7 +45,7 @@ def _load_tools() -> tuple[list[dict[str, Any]], dict[str, Any]]:
     Returns (tool_defs, metadata) where:
       - tool_defs: list of OpenAI function-calling dicts
       - metadata: dict mapping tool_name -> {task_agent, coordinator,
-                  interactive, auto_approve, primary_key, kind_variants}
+                  interactive, primary_key, kind_variants}
     """
     tools = []
     meta = {}
@@ -126,7 +125,6 @@ INTERACTIVE_TOOLS = [
     )
 ]
 INTERACTIVE_TOOL_NAMES = frozenset(t["function"]["name"] for t in INTERACTIVE_TOOLS)
-TASK_AUTO_TOOLS = {n for n, m in _META.items() if m.get("auto_approve")}
 PRIMARY_KEY_MAP = {n: m["primary_key"] for n, m in _META.items() if "primary_key" in m}
 
 

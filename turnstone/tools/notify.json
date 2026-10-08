@@ -31,6 +31,5 @@
   "task_agent": true,
   "coordinator": true,
   "interactive": true,
-  "auto_approve": true,
   "primary_key": "message"
 }

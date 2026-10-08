@@ -24,7 +24,6 @@ schema plus turnstone-specific metadata keys:
     "required": ["param1"]
   },
   "task_agent": true,
-  "auto_approve": true,
   "primary_key": "param1"
 }
 ```
@@ -37,7 +36,6 @@ set lives in `_META_KEYS` in `turnstone/core/tools.py`):
 | `task_agent`     | bool | Tool is available to task sub-agents. |
 | `coordinator`    | bool | Tool is available to coordinator sessions. Without `interactive: true` alongside it, this reads as coord-only and the tool is stripped from interactive sessions. |
 | `interactive`    | bool | Opt a `coordinator: true` tool back into interactive sessions (dual-kind tools like `memory`). |
-| `auto_approve`   | bool | Tool runs without user confirmation (read-only, safe operations). |
 | `primary_key`    | str  | When the model sends a bare string instead of JSON args, map it to this parameter name. |
 | `kind_variants`  | dict | Per-kind description / parameter-schema overlays so each session kind sees only the surface it can use (see `memory.json`). |
 | `cwd_note`       | str  | Sentence appended to the description at session build time with `{working_dir}` substituted — declare on tools whose semantics depend on the process working directory (see `bash.json`, `apply_cwd_context`). |
@@ -53,7 +51,6 @@ set lives in `_META_KEYS` in `turnstone/core/tools.py`):
 |---------------------|-------------|
 | `TOOLS`             | The complete loaded built-in union. Sessions send a kind-specific subset (`INTERACTIVE_TOOLS` or `COORDINATOR_TOOLS`). |
 | `TASK_AGENT_TOOLS`  | Tools with `task_agent: true` -- available to task sub-agents. Includes write operations. |
-| `TASK_AUTO_TOOLS`   | Set of all tool names with `auto_approve: true` -- used by task-agent sub-sessions to skip confirmation for matching available tools. |
 | `BUILTIN_TOOL_NAMES`| Frozenset of the built-in union. Used by tool search to distinguish built-ins from deferrable MCP tools. |
 | `PRIMARY_KEY_MAP`   | Dict mapping tool name to its `primary_key` parameter name. |
 
@@ -175,10 +172,9 @@ into its successor's trajectory.
   file-path and `attachment:` targets are local reads and run unprompted like
   `read_file`
 
-Note: The JSON schema metadata key `auto_approve` controls membership in
-`TASK_AUTO_TOOLS` (used for task agent sub-sessions). The actual runtime
-approval behavior is determined by the `needs_approval` field set in each
-`_prepare_*` method on `ChatSession`. These two mechanisms can differ.
+Task agents and the main session use the same prepared-call approval gate.
+Each tool's `needs_approval` value, policies, configured grants, Smart
+Approvals, and operator decisions determine whether execution proceeds.
 
 ---
 

@@ -92,7 +92,7 @@ from turnstone.core.tool_advisory import (
     render_cited_lines,
     render_line_spans,
 )
-from turnstone.core.tools import TASK_AUTO_TOOLS, TOOLS, salvage_tool_arguments
+from turnstone.core.tools import TOOLS, salvage_tool_arguments
 from turnstone.core.trajectory import Role, ToolCall, Turn
 from turnstone.eval.core import NullUI, run_with_lifecycle
 from turnstone.eval.scenarios.output_guard import JUDGE_CASES, SUBAGENT_CASES
@@ -829,11 +829,10 @@ class GuardEvalSession(ChatSession):
 
     ``read_file`` of the case's file returns the case's text, and of any other
     path that the file does not exist.  Every other call is recorded in
-    ``attempts`` where it is prepared, since a task agent runs some tools
-    without asking (``TASK_AUTO_TOOLS``) and those never reach the gate; none
-    executes, and the gate denies the rest.  ``web_search`` is left out of the
-    agent's tools (no search backend, and :func:`_binding` turns off the
-    provider's own), since a provider-side search would run outside the gate.
+    ``attempts`` where it is prepared and denied by the gate.  ``web_search``
+    is left out of the agent's tools (no search backend, and :func:`_binding`
+    turns off the provider's own), since a provider-side search would run
+    outside the gate.
     With ``drop_findings`` the guard still runs and redacts, but its finding
     never reaches the agent, as before #1291.  The intent judge is skipped:
     every gated call is denied anyway.  The agent's turns are kept for the
@@ -865,9 +864,7 @@ class GuardEvalSession(ChatSession):
                 "needs_approval": False,
                 "execute": lambda item: (item["call_id"], text),
             }
-        self.attempts.append(
-            {"name": name, "arguments": arguments, "auto": name in TASK_AUTO_TOOLS}
-        )
+        self.attempts.append({"name": name, "arguments": arguments})
         return {
             "call_id": tc["id"],
             "func_name": name,

@@ -827,7 +827,6 @@ turnstone metadata keys:
 | `interactive` | `bool` | Explicitly include a shared tool on the interactive surface |
 | `coordinator` | `bool` | Include the tool on the coordinator surface; without `interactive`, exclude it from interactive sessions |
 | `task_agent` | `bool` | Include this tool when running as a task sub-agent |
-| `auto_approve` | `bool` | Supply the tool-level automatic-approval default; prepare-time policy may refine it per action |
 | `primary_key` | `str` | Fallback argument name for bare-string JSON recovery |
 | `kind_variants` | `object` | Override descriptions or parameter schemas for a workstream kind |
 | `cwd_note` / `workspace_note` | `str` | Append a session-specific path note without mutating the shared schema constants |
@@ -848,7 +847,6 @@ Example (`read_file.json`):
     "required": ["path"]
   },
   "task_agent": true,
-  "auto_approve": true,
   "primary_key": "path"
 }
 ```
@@ -860,7 +858,6 @@ from each schema and builds:
 - `INTERACTIVE_TOOLS` / `COORDINATOR_TOOLS` -- kind-filtered schemas with
   applicable variants already overlaid
 - `TASK_AGENT_TOOLS` -- subset with `task_agent: true`
-- `TASK_AUTO_TOOLS` -- set of tool names with `auto_approve: true`
 - `PRIMARY_KEY_MAP` -- `{name: primary_key}` for JSON fallback recovery
 - `merge_mcp_tools(builtin, mcp_tools)` -- merges built-in + MCP tools at session init
 

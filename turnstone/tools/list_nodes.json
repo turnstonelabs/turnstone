@@ -25,6 +25,5 @@
       }
     }
   },
-  "coordinator": true,
-  "auto_approve": true
+  "coordinator": true
 }

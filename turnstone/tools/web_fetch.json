@@ -16,6 +16,5 @@
     "required": ["url", "question"]
   },
   "task_agent": true,
-  "auto_approve": true,
   "primary_key": "url"
 }

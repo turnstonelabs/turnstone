@@ -845,7 +845,6 @@ class TestTextFromOutsideComposedIntoSkippedTurns:
                 [Turn.system("immutable task identity"), Turn.user("delegated contract")],
                 label="task",
                 tools=TOOLS,
-                auto_tools={TOOL_NAME},
                 parent_call_id="task-parent",
                 principal_id="user-a",
             )

@@ -34,6 +34,5 @@
     },
     "required": ["ws_ids"]
   },
-  "coordinator": true,
-  "auto_approve": true
+  "coordinator": true
 }

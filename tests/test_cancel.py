@@ -884,7 +884,6 @@ class TestTaskAgentStreamAbort:
                     session._run_agent(
                         [Turn.user("test")],
                         tools=[{"type": "function", "function": {"name": "read_file"}}],
-                        auto_tools=set(),
                         label="test",
                     )
                 )
@@ -1781,7 +1780,6 @@ class TestTaskAgentStreamAbort:
                 [Turn.user("go")],
                 label="task",
                 tools=[{"type": "function", "function": {"name": "read_file"}}],
-                auto_tools={"read_file"},
             )
 
         assert provider.create_streaming.call_count == 1
@@ -1814,7 +1812,6 @@ class TestTaskAgentStreamAbort:
                 [Turn.user("fetch the page")],
                 label="task",
                 tools=[{"type": "function", "function": {"name": "web_fetch"}}],
-                auto_tools={"web_fetch"},
             )
 
         approve.assert_called_once()
@@ -1875,7 +1872,6 @@ class TestTaskAgentStreamAbort:
                 [Turn.user("go")],
                 label="task",
                 tools=[{"type": "function", "function": {"name": "web_fetch"}}],
-                auto_tools={"web_fetch"},
             )
 
         response.raise_for_status.assert_called_once()
@@ -1929,7 +1925,6 @@ class TestTaskAgentStreamAbort:
                 [Turn.user("go")],
                 label="task",
                 tools=[{"type": "function", "function": {"name": "web_fetch"}}],
-                auto_tools={"web_fetch"},
             )
 
         assert len(seen_refs) == 1

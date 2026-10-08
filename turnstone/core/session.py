@@ -284,7 +284,6 @@ from turnstone.core.tools import (
     INTERACTIVE_TOOLS,
     PRIMARY_KEY_MAP,
     TASK_AGENT_TOOLS,
-    TASK_AUTO_TOOLS,
     TOOLS,
     apply_cwd_context,
     merge_mcp_tools,
@@ -25755,7 +25754,6 @@ class ChatSession:
         agent_turns: list[Turn],
         label: str = "agent",
         tools: list[dict[str, Any]] | None = None,
-        auto_tools: set[str] | None = None,
         reasoning_effort: str | None = None,
         agent_alias: str | None = None,
         parent_call_id: str | None = None,
@@ -25784,7 +25782,6 @@ class ChatSession:
                         agent_turns,
                         label=label,
                         tools=tools,
-                        auto_tools=auto_tools,
                         reasoning_effort=reasoning_effort,
                         agent_alias=agent_alias,
                         parent_call_id=parent_call_id,
@@ -25809,7 +25806,6 @@ class ChatSession:
         agent_turns: list[Turn],
         label: str = "agent",
         tools: list[dict[str, Any]] | None = None,
-        auto_tools: set[str] | None = None,
         reasoning_effort: str | None = None,
         agent_alias: str | None = None,
         parent_call_id: str | None = None,
@@ -25829,8 +25825,6 @@ class ChatSession:
             label: Display prefix for progress lines (e.g. "task").
             tools: Tool definitions to send to the API. Defaults to the
                 session's task tool set.
-            auto_tools: Set of tool names the agent may execute. Defaults to
-                TASK_AUTO_TOOLS.
             reasoning_effort: Override reasoning effort for this agent.
             agent_alias: Per-call model alias override (the LLM passed
                 ``model="<alias>"`` to task_agent).  Wins over
@@ -25856,8 +25850,6 @@ class ChatSession:
         ).strip()
         if tools is None:
             tools = self._task_tools
-        if auto_tools is None:
-            auto_tools = TASK_AUTO_TOOLS
         max_tool_turns = self.agent_max_turns
         # ``execution_journal`` is bounded cancellation/recall truth.
         # ``context_turns`` is the bounded trajectory sent back to the model and
@@ -26465,14 +26457,67 @@ class ChatSession:
             # every wire, as in the main loop's fold.
             guard_turns: list[Turn] = []
             call_count = len(result.tool_calls)
-            for call_number, tc_dict in enumerate(result.tool_calls, start=1):
+            prepared_by_index: list[dict[str, Any] | None] = []
+            approval_items: list[dict[str, Any]] = []
+            for tc_dict in result.tool_calls:
                 cancel_scope.check()
                 tool_name = tc_dict["function"]["name"].strip()
-                # Register every issued sub-tool under its parent task_agent —
-                # not only the execute path — so a guard-branch error's
-                # output_warning still nests under the task card.
                 self._note_agent_child(tc_dict["id"], parent_call_id)
                 execution_journal.register_child(tc_dict["id"])
+                if tool_name == "task_agent" or tool_name not in tool_names:
+                    prepared_by_index.append(None)
+                    continue
+
+                prepared = self._prepare_tool_for_principal(
+                    tc_dict,
+                    agent_principal,
+                    safe=True,
+                    offered=tool_names,
+                )
+                prepared["_approval_cancel_witness"] = _ApprovalCancelWitness(
+                    self,
+                    cancel_scope.cancel_ref,
+                )
+                prepared_by_index.append(prepared)
+                if not prepared.get("error") and "execute" in prepared:
+                    approval_items.append(prepared)
+
+            # Match the main session's one-gate-per-model-turn behavior. This
+            # keeps policy, operator grants, Smart Approvals, and judge audit
+            # consistent while preserving sequential child execution below.
+            if approval_items:
+                agent_judge_cancel = self._evaluate_intent(
+                    approval_items,
+                    conversation=context_turns,
+                    agent_gate=True,
+                    principal_id=agent_principal,
+                    cancel_ref=cancel_scope.cancel_ref,
+                )
+                cancel_scope.check()
+                self._push_smart_approval_config(approval_items)
+                cancel_scope.check()
+                try:
+                    approved, denial_feedback = self.ui.approve_tools(approval_items)
+                finally:
+                    jc_live = self._judge_cfg
+                    if agent_judge_cancel and jc_live and jc_live.cancel_on_approval:
+                        agent_judge_cancel.set()
+
+                if not approved:
+                    for item in approval_items:
+                        if item.get("needs_approval") and not item.get("error"):
+                            if not item.get("denied"):
+                                item["denied"] = True
+                            if not item.get("denial_msg"):
+                                item["denial_msg"] = (
+                                    f"Denied by user: {denial_feedback}"
+                                    if denial_feedback
+                                    else "Denied by user"
+                                )
+
+            for call_number, tc_dict in enumerate(result.tool_calls, start=1):
+                tool_index = call_number - 1
+                tool_name = tc_dict["function"]["name"].strip()
 
                 # is_error for the recalled step: the guard / prepare / unknown
                 # branches produce explicit error text; the execute paths record
@@ -26482,7 +26527,7 @@ class ChatSession:
                 is_tool_error = False
                 child_effect_status: EffectStatus | None = None
                 cancelled_before_execution = False
-                prepared: dict[str, Any] | None = None
+                prepared_item = prepared_by_index[tool_index]
                 output: Any
                 # Guard 1: block recursive agent calls.
                 if tool_name == "task_agent":
@@ -26499,92 +26544,19 @@ class ChatSession:
                     is_tool_error = True
                     child_effect_status = EffectStatus.NONE
                 else:
-                    prepared = self._prepare_tool_for_principal(
-                        tc_dict,
-                        agent_principal,
-                        offered=tool_names,
-                    )
-                    prepared["_approval_cancel_witness"] = _ApprovalCancelWitness(
-                        self,
-                        cancel_scope.cancel_ref,
-                    )
-
-                    if prepared.get("error"):
-                        output = prepared["error"]
+                    assert prepared_item is not None
+                    if prepared_item.get("error"):
+                        output = prepared_item["error"]
                         is_tool_error = True
                         child_effect_status = EffectStatus.NONE
-                    # Auto-execute tools in the auto_tools set.
-                    elif tool_name in auto_tools and not prepared.get("allow_private_origin"):
-                        # Paint the step pending under the task card before it
-                        # runs (web) / print the leg (CLI) — the typed successor
-                        # to the old on_info turn-leg.  Approval-gated tools
-                        # paint via approve_tools instead.
-                        self._paint_agent_step(parent_call_id, prepared)
-                        _, output = _execute_agent_tool(prepared, tool_name)
-                        is_tool_error = self._tool_error_flags.pop(tc_dict["id"], False)
-                    # Other tools and private-network grants use the approval gate.
-                    elif "execute" in prepared:
-                        # Run the SAME intent-validation pipeline the main
-                        # loop runs (issue: sub-agent calls previously hit
-                        # the gate judge-blind — no heuristic verdict on
-                        # the card, no LLM verdict, no audit row, and
-                        # Smart Approvals could never clear them).  The
-                        # judge grounds intent in the sub-agent's OWN
-                        # trajectory: its task prompt is the delegation
-                        # contract the operator approved, so "does this
-                        # call serve the task" is the local alignment
-                        # question.  ``agent_gate=True`` keeps this
-                        # generation off the main-loop supersede slot —
-                        # parallel siblings each own theirs — and the
-                        # config push honours a hot judge.* reload per
-                        # gate, exactly like the main loop.
-                        agent_judge_cancel = self._evaluate_intent(
-                            [prepared],
-                            conversation=context_turns,
-                            agent_gate=True,
-                            principal_id=agent_principal,
-                            cancel_ref=cancel_scope.cancel_ref,
-                        )
-                        cancel_scope.check()
-                        self._push_smart_approval_config([prepared])
-                        cancel_scope.check()
-                        try:
-                            approved, denial_feedback = self.ui.approve_tools([prepared])
-                        finally:
-                            # Mirror the main gate's post-decision policy:
-                            # fire the abort only when the operator opted
-                            # into ``judge.cancel_on_approval``; default
-                            # leaves the daemon to finish for the audit
-                            # trail (bounded to this one call).
-                            jc_live = self._judge_cfg
-                            if agent_judge_cancel and jc_live and jc_live.cancel_on_approval:
-                                agent_judge_cancel.set()
-                        # The approval witness may have self-denied because
-                        # Stop/close won before or during cycle registration.
-                        # Record that issued call as a confirmed NONE before
-                        # propagating cancellation; raising here would leave an
-                        # unanswered gap and fabricate an in-flight UNKNOWN.
+                    elif "execute" in prepared_item:
+                        # A Stop during approval still records this issued call as
+                        # unstarted before cancellation unwinds the task trajectory.
                         cancelled_before_execution = cancel_scope.aborted
-                        if not approved and not prepared.get("denied"):
-                            # ``approve_tools`` already stamps a SPECIFIC
-                            # denial_msg on a denied item (the matched policy
-                            # pattern, or the operator's feedback) and returns
-                            # the reason as its second value.  Only fill a
-                            # default when some other not-approved path left it
-                            # unset — never clobber the specific reason with a
-                            # flat "Denied by user", and fold the returned
-                            # feedback in so the sub-agent can adapt (mirrors the
-                            # main tool loop's denial handling).
-                            prepared["denied"] = True
-                            prepared["denial_msg"] = (
-                                f"Denied by user: {denial_feedback}"
-                                if denial_feedback
-                                else "Denied by user"
-                            )
                         if cancelled_before_execution:
                             output = "(cancelled before execution; no side effects)"
                             child_effect_status = EffectStatus.NONE
-                        elif prepared.get("denied"):
+                        elif prepared_item.get("denied"):
                             # A denial is not an execution error — keep is_error
                             # False so recall shows the denial text, not red.
                             # The web gate records the reason in ``denial_msg``;
@@ -26592,13 +26564,13 @@ class ChatSession:
                             # (and returns approved=True) — honour whichever the
                             # gate set before the flat default.
                             output = ControllerText(
-                                prepared.get("denial_msg")
-                                or prepared.get("error")
+                                prepared_item.get("denial_msg")
+                                or prepared_item.get("error")
                                 or "Denied by user"
                             )
                             child_effect_status = EffectStatus.NONE
                         else:
-                            _, output = _execute_agent_tool(prepared, tool_name)
+                            _, output = _execute_agent_tool(prepared_item, tool_name)
                             is_tool_error = self._tool_error_flags.pop(tc_dict["id"], False)
                     else:
                         output = ControllerText(f"Unknown tool: {tool_name}")
@@ -26749,7 +26721,16 @@ class ChatSession:
             # Drop the just-completed provider response and last tool locals
             # before that summary/model call so the context swap is also a real
             # reachability boundary for multimodal/native payloads.
-            del result, tc_dict, prepared, output, assessment
+            del (
+                result,
+                tc_dict,
+                prepared_item,
+                prepared_by_index,
+                approval_items,
+                output,
+                assessment,
+                guard_turns,
+            )
             turn += 1
             tool_progress_epoch += 1
 
@@ -26903,7 +26884,6 @@ class ChatSession:
                 agent_turns,
                 label="task",
                 tools=task_tools,
-                auto_tools=TASK_AUTO_TOOLS,
                 agent_alias=item.get("model_override"),
                 parent_call_id=call_id,
                 principal_id=item.get("_principal_id"),

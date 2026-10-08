@@ -162,7 +162,6 @@ def test_a_task_agent_is_shown_its_own_tools(tmp_db) -> None:
             [Turn.system("task identity"), Turn.user("look it up")],
             label="task",
             tools=[_tool("read_file"), _tool(GONE)],
-            auto_tools={"read_file"},
             parent_call_id="task-parent",
             principal_id="user-a",
         )

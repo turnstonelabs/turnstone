@@ -20,6 +20,5 @@
     "required": ["ws_id"]
   },
   "coordinator": true,
-  "auto_approve": true,
   "primary_key": "ws_id"
 }

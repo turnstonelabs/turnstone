@@ -4,7 +4,6 @@ from turnstone.core.tools import (
     _META,
     PRIMARY_KEY_MAP,
     TASK_AGENT_TOOLS,
-    TASK_AUTO_TOOLS,
     TOOLS,
 )
 
@@ -104,34 +103,14 @@ class TestToolsMetadata:
             # coordinators get the full MCP surface — tools, resources,
             # prompts — persona-gated like every session.  The catalog
             # blocks in the system prompt and the name-keyed dispatch
-            # light up together with these schemas; both tools keep
-            # auto_approve:false, so coordinator calls prompt like any
-            # other MCP-backed action.
+            # light up together with these schemas; prepared-call approval
+            # determines whether either tool needs an operator prompt.
             "read_resource",
             "use_prompt",
         }
 
-    def test_auto_approve_sets_match(self):
-        expected = {
-            "read_file",
-            "search",
-            "diff_file",
-            "web_fetch",
-            "web_search",
-            "notify",
-            # Background-shell follow-ups: ``bash_output`` is read-only;
-            # ``kill_shell`` only signals process groups the session itself
-            # spawned via an approved bash call — strictly risk-reducing,
-            # so gating cleanup behind approval adds friction, not safety.
-            "bash_output",
-            "kill_shell",
-            # Coordinator read-only tools (no-mutation, safe to auto-approve):
-            "inspect_workstream",
-            "list_workstreams",
-            "list_nodes",
-            "wait_for_workstream",
-        }
-        assert expected == TASK_AUTO_TOOLS
+    def test_tool_metadata_does_not_override_runtime_approval(self):
+        assert all("auto_approve" not in metadata for metadata in _META.values())
 
     def test_primary_key_map(self):
         expected = {

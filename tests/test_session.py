@@ -3699,7 +3699,6 @@ class TestAgentOutputGuard:
                 session._run_agent(
                     [Turn.user("test")],
                     tools=[{"type": "function", "function": {"name": "read_file"}}],
-                    auto_tools=set(),
                     label="test",
                 )
 
@@ -3778,7 +3777,6 @@ class TestAgentOutputGuard:
             session._run_agent(
                 [Turn.system("You are a task agent."), Turn.user("Summarize the files.")],
                 tools=[{"type": "function", "function": {"name": "read_file"}}],
-                auto_tools={"read_file"},
                 label="test",
             )
         return create
@@ -3854,7 +3852,6 @@ class TestAgentOutputGuard:
             session._run_agent(
                 [Turn.system("You are a task agent."), Turn.user("Write the file.")],
                 tools=[{"type": "function", "function": {"name": "write_file"}}],
-                auto_tools=set(),
                 label="test",
             )
 
@@ -3894,7 +3891,6 @@ class TestAgentOutputGuard:
             session._run_agent(
                 [Turn.system("You are a task agent."), Turn.user("Read the file.")],
                 tools=[{"type": "function", "function": {"name": "read_file"}}],
-                auto_tools=set(),
                 label="test",
             )
 
@@ -4069,11 +4065,12 @@ class TestAgentOutputGuard:
                     {"type": "function", "function": {"name": "read_file"}},
                     {"type": "function", "function": {"name": "write_file"}},
                 ],
-                auto_tools={"read_file"},
                 label="test",
             )
 
-        [conversation] = seen
+        assert len(seen) == 2
+        first_call, conversation = seen
+        assert not any(t.role is Role.SYSTEM and t.source == "output_guard" for t in first_call)
         guard_turns = [
             t for t in conversation if t.role is Role.SYSTEM and t.source == "output_guard"
         ]
@@ -4186,7 +4183,6 @@ class TestAgentOutputGuard:
             result = session._run_agent(
                 [Turn.user("test")],
                 tools=[{"type": "function", "function": {"name": "read_file"}}],
-                auto_tools=set(),
                 label="test",
             )
 
@@ -4862,7 +4858,6 @@ class TestAgentContextReporting:
             output = session._run_agent(
                 [Turn.user("test")],
                 tools=[],
-                auto_tools=set(),
                 parent_call_id="task-A",
             )
 
@@ -4885,7 +4880,6 @@ class TestAgentContextReporting:
             session._run_agent(
                 [Turn.user("test")],
                 tools=[],
-                auto_tools=set(),
                 parent_call_id="task-A",
             )
 
@@ -4905,7 +4899,7 @@ class TestAgentContextReporting:
             patch.object(session, "_context_window_for_lane", return_value=128_000) as window,
             patch("turnstone.core.session.model_turn", return_value=result),
         ):
-            session._run_agent([Turn.user("test")], tools=[], auto_tools=set())
+            session._run_agent([Turn.user("test")], tools=[])
 
         window.assert_called_once()
         assert ui.context_calls == []
@@ -4934,7 +4928,6 @@ class TestAgentContextReporting:
             session._run_agent(
                 [Turn.user("test")],
                 tools=[],
-                auto_tools=set(),
                 parent_call_id="task-A",
                 origin_generation=generation,
             )
@@ -5525,7 +5518,6 @@ class TestRunAgentDenialMessage:
             session._run_agent(
                 agent_turns,
                 tools=[{"type": "function", "function": {"name": "notify"}}],
-                auto_tools=set(),  # nothing auto -> notify routes through approval
                 label="task",
                 parent_call_id="task-1",
             )
@@ -5571,6 +5563,308 @@ class TestRunAgentDenialMessage:
 
         text = self._run_with_denial(approve)
         assert text == "Blocked by tool policy ('notify')"
+
+
+def test_task_agent_batches_prepared_calls_through_one_shared_gate() -> None:
+    from turnstone.core.providers._openai_chat import OpenAIChatCompletionsProvider
+    from turnstone.core.session_ui_base import SessionUIBase
+
+    class _GateUI(SessionUIBase, NullUI):
+        pass
+
+    ui = _GateUI(ws_id="ws-task-batched-gate", user_id="u1")
+    session = _make_session(ui=ui)
+    client = replace_session_lane(session, provider=OpenAIChatCompletionsProvider()).client
+    client.chat.completions.create = scripted_chat_client(
+        {
+            "tool_calls": [
+                {"id": "read-1", "name": "read_file", "arguments": '{"path":"x"}'},
+                {"id": "search-1", "name": "search", "arguments": '{"query":"x"}'},
+                {
+                    "id": "fetch-1",
+                    "name": "web_fetch",
+                    "arguments": '{"url":"https://example.com","question":"x"}',
+                },
+                {"id": "web-search-1", "name": "web_search", "arguments": '{"query":"x"}'},
+            ],
+            "finish_reason": "tool_calls",
+        },
+        {"content": "done"},
+    )
+    executed: list[str] = []
+    gated_items: list[dict[str, Any]] = []
+    judged_items: list[dict[str, Any]] = []
+    storage = MagicMock()
+    fake_judge = MagicMock()
+    fake_judge.arg_budget_chars.return_value = 10_000
+
+    def make_verdict(item: dict[str, Any], tier: str) -> SimpleNamespace:
+        return SimpleNamespace(
+            to_dict=lambda: {
+                "verdict_id": f"{tier}-{item['call_id']}",
+                "call_id": item["call_id"],
+                "func_name": item["func_name"],
+                "func_args": item["func_args"],
+                "tier": tier,
+                "recommendation": "review",
+                "risk_level": "medium",
+                "confidence": 0.5,
+            }
+        )
+
+    def evaluate(items: list[dict[str, Any]], _conversation: Any, **kwargs: Any) -> list[Any]:
+        judged_items.extend(dict(item) for item in items)
+        for item in items:
+            kwargs["callback"](make_verdict(item, "llm"))
+        kwargs["done_callback"]()
+        return [make_verdict(item, "heuristic") for item in items]
+
+    fake_judge.evaluate.side_effect = evaluate
+
+    def prepare(tc_dict: dict[str, Any], **_kwargs: Any) -> dict[str, Any]:
+        call_id = tc_dict["id"]
+        name = tc_dict["function"]["name"]
+
+        def execute(_item: dict[str, Any]) -> tuple[str, str]:
+            executed.append(name)
+            return call_id, f"{name} result"
+
+        return {
+            **json.loads(tc_dict["function"]["arguments"]),
+            "call_id": call_id,
+            "func_name": name,
+            "needs_approval": name in {"web_fetch", "web_search"},
+            "execute": execute,
+        }
+
+    def deny(items: list[dict[str, Any]]) -> tuple[bool, str]:
+        gated_items.extend(items)
+        return False, "not approved"
+
+    turns = [Turn.user("inspect and search")]
+    with (
+        patch.object(session, "_prepare_tool", side_effect=prepare),
+        patch.object(session, "_ensure_judge", return_value=fake_judge),
+        patch.object(session, "_push_smart_approval_config") as config,
+        patch.object(session.ui, "approve_tools", side_effect=deny) as approve,
+        patch.object(session, "_resolve_search_client", return_value=MagicMock()),
+        patch("turnstone.core.storage._registry.get_storage", return_value=storage),
+    ):
+        assert (
+            session._run_agent(
+                turns,
+                tools=[
+                    {"type": "function", "function": {"name": name}}
+                    for name in ("read_file", "search", "web_fetch", "web_search")
+                ],
+                principal_id="user-a",
+            )
+            == "done"
+        )
+
+    assert [item["func_name"] for item in gated_items] == [
+        "read_file",
+        "search",
+        "web_fetch",
+        "web_search",
+    ]
+    assert [item["needs_approval"] for item in gated_items] == [False, False, True, True]
+    assert approve.call_count == config.call_count == fake_judge.evaluate.call_count == 1
+    assert [item["func_name"] for item in judged_items] == ["web_fetch", "web_search"]
+    assert judged_items[0]["func_args"] == {
+        "url": "https://example.com",
+        "question": "x",
+    }
+    assert judged_items[1]["func_args"] == {"query": "x", "category": ""}
+    assert set(ui._llm_verdicts) == {"fetch-1", "web-search-1"}
+    assert storage.upsert_intent_verdict.call_count == 2
+    assert executed == ["read_file", "search"]
+    tool_results = [turn.text for turn in turns if turn.role is Role.TOOL]
+    assert tool_results == [
+        "read_file result",
+        "search result",
+        "Denied by user: not approved",
+        "Denied by user: not approved",
+    ]
+
+
+def test_task_agent_local_reads_run_without_an_approval_prompt() -> None:
+    from turnstone.core.providers._openai_chat import OpenAIChatCompletionsProvider
+    from turnstone.core.session_ui_base import SessionUIBase
+
+    class _GateUI(SessionUIBase, NullUI):
+        pass
+
+    ui = _GateUI(ws_id="ws-task-local-reads", user_id="u1")
+    event_queue = ui._register_listener()
+    session = _make_session(ui=ui)
+    client = replace_session_lane(session, provider=OpenAIChatCompletionsProvider()).client
+    client.chat.completions.create = scripted_chat_client(
+        {
+            "tool_calls": [
+                {"id": "read-1", "name": "read_file", "arguments": '{"path":"x"}'},
+                {"id": "search-1", "name": "search", "arguments": '{"query":"x"}'},
+            ],
+            "finish_reason": "tool_calls",
+        },
+        {"content": "done"},
+    )
+    executed: list[str] = []
+
+    def prepare(tc_dict: dict[str, Any], **_kwargs: Any) -> dict[str, Any]:
+        call_id = tc_dict["id"]
+        name = tc_dict["function"]["name"]
+        return {
+            "call_id": call_id,
+            "func_name": name,
+            "needs_approval": False,
+            "execute": lambda _item: (executed.append(name) or call_id, f"{name} result"),
+        }
+
+    with patch.object(session, "_prepare_tool", side_effect=prepare):
+        assert (
+            session._run_agent(
+                [Turn.user("inspect local files")],
+                tools=[
+                    {"type": "function", "function": {"name": name}}
+                    for name in ("read_file", "search")
+                ],
+            )
+            == "done"
+        )
+
+    assert executed == ["read_file", "search"]
+    events = []
+    while not event_queue.empty():
+        events.append(event_queue.get_nowait())
+    assert any(event["type"] == "tool_info" for event in events)
+    assert all(event["type"] != "approve_request" for event in events)
+
+
+@pytest.mark.parametrize("tool_name", ["web_fetch", "web_search"])
+def test_task_agent_web_tools_obey_admin_deny_policy(tool_name: str) -> None:
+    from turnstone.core.providers._openai_chat import OpenAIChatCompletionsProvider
+    from turnstone.core.session_ui_base import SessionUIBase
+
+    ui = SessionUIBase(ws_id="ws-task-policy", user_id="u1")
+    session = _make_session(ui=ui)
+    client = replace_session_lane(session, provider=OpenAIChatCompletionsProvider()).client
+    arguments = (
+        '{"url":"https://example.com","question":"x"}'
+        if tool_name == "web_fetch"
+        else '{"query":"x"}'
+    )
+    client.chat.completions.create = scripted_chat_client(
+        {
+            "tool_calls": [
+                {
+                    "id": "web-1",
+                    "name": tool_name,
+                    "arguments": arguments,
+                }
+            ],
+            "finish_reason": "tool_calls",
+        },
+        {"content": "done"},
+    )
+    execute = MagicMock(return_value=("web-1", "fetched"))
+
+    def prepare(tc_dict: dict[str, Any], **_kwargs: Any) -> dict[str, Any]:
+        return {
+            "call_id": tc_dict["id"],
+            "func_name": tool_name,
+            "approval_label": tool_name,
+            "needs_approval": True,
+            "execute": execute,
+        }
+
+    turns = [Turn.user("fetch this page")]
+    with (
+        patch.object(session, "_prepare_tool", side_effect=prepare),
+        patch.object(session, "_evaluate_intent", return_value=None),
+        patch("turnstone.core.storage._registry.get_storage", return_value=MagicMock()),
+        patch.object(session, "_resolve_search_client", return_value=MagicMock()),
+        patch(
+            "turnstone.core.policy.evaluate_loaded_tool_policies",
+            return_value={tool_name: "deny"},
+        ),
+    ):
+        session._run_agent(
+            turns,
+            tools=[{"type": "function", "function": {"name": tool_name}}],
+        )
+
+    execute.assert_not_called()
+    tool_results = [turn.text for turn in turns if turn.role is Role.TOOL]
+    assert tool_results == [f"Blocked by tool policy (pattern match for '{tool_name}')"]
+
+
+@pytest.mark.parametrize("runner", ["main", "task"])
+def test_web_fetch_auto_approve_configuration_is_shared(runner: str) -> None:
+    from turnstone.core.providers._openai_chat import OpenAIChatCompletionsProvider
+    from turnstone.core.session_ui_base import SessionUIBase
+
+    class _GateUI(SessionUIBase, NullUI):
+        pass
+
+    ui = _GateUI(ws_id=f"ws-auto-approve-{runner}", user_id="u1")
+    ui.auto_approve_tools = {"web_fetch"}
+    event_queue = ui._register_listener()
+    session = _make_session(ui=ui)
+    execute = MagicMock(side_effect=lambda item: (item["call_id"], "fetched"))
+    prepared = {
+        "call_id": "fetch-1",
+        "func_name": "web_fetch",
+        "approval_label": "web_fetch",
+        "needs_approval": True,
+        "execute": execute,
+    }
+    tool_call = {
+        "id": "fetch-1",
+        "function": {
+            "name": "web_fetch",
+            "arguments": '{"url":"https://example.com","question":"x"}',
+        },
+    }
+    script_call = {
+        "id": "fetch-1",
+        "name": "web_fetch",
+        "arguments": '{"url":"https://example.com","question":"x"}',
+    }
+
+    with (
+        patch.object(session, "_evaluate_intent", return_value=None),
+        patch("turnstone.core.storage._registry.get_storage", return_value=MagicMock()),
+        patch("turnstone.core.policy.evaluate_loaded_tool_policies", return_value={}),
+    ):
+        if runner == "main":
+            with patch.object(session, "_safe_prepare_tool", return_value=prepared):
+                results, _feedback = session._execute_tools([tool_call])
+            assert results == [("fetch-1", "fetched")]
+        else:
+            client = replace_session_lane(
+                session,
+                provider=OpenAIChatCompletionsProvider(),
+            ).client
+            client.chat.completions.create = scripted_chat_client(
+                {"tool_calls": [script_call], "finish_reason": "tool_calls"},
+                {"content": "done"},
+            )
+            with patch.object(session, "_prepare_tool", return_value=prepared):
+                assert (
+                    session._run_agent(
+                        [Turn.user("fetch this page")],
+                        tools=[{"type": "function", "function": {"name": "web_fetch"}}],
+                    )
+                    == "done"
+                )
+
+    events = []
+    while not event_queue.empty():
+        events.append(event_queue.get_nowait())
+    assert execute.call_count == 1, f"events={events!r}; prepared={prepared!r}"
+    assert any(event["type"] == "tool_info" for event in events)
+    assert all(event["type"] != "approve_request" for event in events)
 
 
 class TestTaskExecutionJournalProjection:
@@ -5936,7 +6230,6 @@ class TestSubAgentErrorRecall:
                 turns,
                 tools=[{"type": "function", "function": {"name": "bash"}}],
                 label="task",
-                auto_tools={"bash"},
                 parent_call_id="t1",
             )
 
@@ -13385,7 +13678,6 @@ def test_task_agent_static_auth_fallback_never_reresolves_as_successor():
     result = session._run_agent(
         [Turn.user("finish the task")],
         tools=[],
-        auto_tools=set(),
         principal_id="user-a",
     )
 
@@ -13447,7 +13739,6 @@ def test_task_agent_defers_pinned_auth_resolution_until_model_admission():
         result = session._run_agent(
             [Turn.user("finish the task")],
             tools=[],
-            auto_tools=set(),
             principal_id="user-a",
         )
 
@@ -13482,7 +13773,6 @@ def test_already_cancelled_task_agent_does_not_resolve_backend_auth():
         session._run_agent(
             [Turn.user("finish the task")],
             tools=[],
-            auto_tools=set(),
             principal_id="user-a",
         )
 
@@ -14700,7 +14990,6 @@ class TestInlineReasoningSeamLanes:
             [Turn.system("You are a test agent."), Turn.user("Report findings.")],
             label="task",
             tools=[],
-            auto_tools=set(),
         )
         assert out == "Sub-agent findings."
 
@@ -14717,7 +15006,6 @@ class TestInlineReasoningSeamLanes:
                 [Turn.system("You are a test agent."), Turn.user("Report findings.")],
                 label="task",
                 tools=[],
-                auto_tools=set(),
             )
 
 
@@ -14735,7 +15023,6 @@ class TestWhitespaceOnlyBlanknessGates:
                 [Turn.system("You are a test agent."), Turn.user("Report findings.")],
                 label="task",
                 tools=[],
-                auto_tools=set(),
             )
 
     def test_web_fetch_whitespace_only_extraction_is_honest_error(self, monkeypatch, tmp_db):

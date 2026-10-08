@@ -21,6 +21,5 @@
     "required": ["query"]
   },
   "task_agent": true,
-  "auto_approve": true,
   "primary_key": "query"
 }
