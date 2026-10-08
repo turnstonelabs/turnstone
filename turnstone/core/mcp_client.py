@@ -2549,8 +2549,8 @@ class MCPClientManager:
         except GeneratorExit:
             # Garbage collection is closing a connect that a stopped loop abandoned, and it may
             # close this coroutine before the ones awaiting it. Nothing can be awaited with the
-            # loop gone, and the owner is that loop's garbage too: re-raise at once, so the close
-            # unwinds every frame cleanly whichever the collector reaches first.
+            # loop gone: re-raise at once, recording nothing, so this frame unwinds quietly
+            # whichever the collector reaches first.
             raise
         except BaseException:
             # Connect failed: the owner delivered the failure and is unwinding
@@ -5021,17 +5021,18 @@ class MCPClientManager:
         reconnected here syncs on its own, as every connect does.
 
         When garbage collection closes a pass that a stopped loop abandoned,
-        on whatever thread collects, ``GeneratorExit`` unwinds it: no
-        per-server ``except`` catches that, so the pass refreshes no further
-        server and skips its final sync. Refreshing the other servers there
-        could start a transport on that thread's loop, and the final sync
-        could run while that thread holds the sync lock, after shutdown
-        emptied the catalog. The collector may close the coroutines a
-        reconnect awaits before this one, so the connect path re-raises
-        ``GeneratorExit`` without awaiting or recording anything. A frame
-        that awaited as it unwound would turn the close into an error; the
-        per-server ``except`` then returns at once when it is off the pass's
-        own loop.
+        on whatever thread collects, the pass must refresh no further server
+        and skip its final sync: refreshing the other servers there could
+        start a transport on that thread's loop, and the final sync could run
+        while that thread holds the sync lock, after shutdown emptied the
+        catalog. The collector may close the coroutines a reconnect awaits
+        before this one, so the connect path re-raises ``GeneratorExit``
+        without awaiting or recording anything, and no per-server ``except``
+        catches that. The close can still turn into an error on the way out:
+        releasing the connect lock while another driver waits on it schedules
+        that driver on the closed loop, which raises "Event loop is closed"
+        without awaiting anything. The per-server ``except`` catches that
+        error and returns at once when it is off the pass's own loop.
         """
         results: dict[str, tuple[list[str], list[str]] | None] = {}
         targets = [server_name] if server_name else list(self._server_configs.keys())

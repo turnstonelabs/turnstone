@@ -529,7 +529,8 @@ class TestRefreshPassSync:
         With no other driver queued on the server's connect lock, whichever it closes first, the
         close unwinds every frame without raising, records no connect failure (a close says
         nothing about the server) and syncs nothing. The chain is closed before shutdown, so a
-        teardown on the way out would still find the server."""
+        teardown on the way out would still find the server. The transport owner is a stub, so
+        the real owner's own close is not covered here."""
         mgr = _synced_manager(db, {"srv0": ["kept"], "srv1": ["other"]})
         mgr._static_servers["srv1"].session = None
         loop = asyncio.new_event_loop()
@@ -570,6 +571,54 @@ class TestRefreshPassSync:
         assert _mcp_template_names(db) == ["mcp__srv0__kept", "mcp__srv1__other"]
         mgr.shutdown()
         del task, chain
+        gc.collect()  # the abandoned tasks report themselves here, not in a later test
+
+    @pytest.mark.parametrize("first", ["_refresh_all", "_connect_one_locked"])
+    def test_queued_driver_still_stops_the_collected_pass(self, db: Any, first: str) -> None:
+        """With another driver queued on the stalled server's connect lock, the close turns into
+        an error on the way out: releasing the lock schedules that driver on the closed loop,
+        which raises "Event loop is closed". The pass's per-server except catches it off its own
+        loop and returns at once, so it records no failure, refreshes no further server and syncs
+        nothing. Closing the reconnect first raises that error from the close instead; that order
+        is not pinned here."""
+        mgr = _synced_manager(db, {"srv0": ["a"], "srv1": ["b"]})
+        mgr._static_servers["srv0"].session = None
+        cfg = mgr._server_configs["srv0"]
+        loop = asyncio.new_event_loop()
+        stalled = asyncio.Event()
+
+        async def _owner_forever(*_args: Any, **_kw: Any) -> None:
+            stalled.set()
+            await asyncio.Event().wait()
+
+        mgr._static_transport_owner = _owner_forever  # type: ignore[method-assign]
+        try:
+            task = loop.create_task(mgr._refresh_all())
+            loop.run_until_complete(asyncio.wait_for(stalled.wait(), timeout=5))
+            queued = loop.create_task(
+                mgr._ensure_static_connected("srv0", cfg, defer_if_busy=False)
+            )
+            loop.run_until_complete(asyncio.sleep(0))
+        finally:
+            loop.close()
+        assert not queued.done()
+        chain: list[Any] = [task.get_coro()]
+        while asyncio.iscoroutine(chain[-1].cr_await):
+            chain.append(chain[-1].cr_await)
+        names = [coro.__name__ for coro in chain]
+        assert names == ["_refresh_all", "_ensure_static_connected", "_connect_one_locked"]
+
+        with _counting_syncs(mgr) as sync:
+            chain[names.index(first)].close()
+            for coro in chain:
+                coro.close()
+
+        assert sync.call_count == 0
+        assert "srv0" not in mgr._last_refresh
+        assert "srv1" not in mgr._last_refresh
+        assert "srv0" not in mgr._last_error
+        mgr.shutdown()
+        del task, queued, chain
         gc.collect()  # the abandoned tasks report themselves here, not in a later test
 
     def test_sync_after_shutdown_keeps_the_templates(self, db: Any) -> None:
