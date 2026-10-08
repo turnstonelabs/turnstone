@@ -6418,6 +6418,7 @@ def main() -> None:
             model=config_store.get("judge.model"),
             smart_approvals=config_store.get("judge.smart_approvals"),
             confidence_threshold=config_store.get("judge.confidence_threshold"),
+            pending_as_attention=config_store.get("judge.pending_as_attention"),
             max_context_ratio=config_store.get("judge.max_context_ratio"),
             timeout=config_store.get("judge.timeout"),
             parallel_evaluations=config_store.get("judge.parallel_evaluations", 1),

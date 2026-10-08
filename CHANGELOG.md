@@ -43,6 +43,17 @@ frozen.
 
 ### Added
 
+- **`judge.pending_as_attention` setting.** A new backward-compatible boolean
+  (`true` by default) controls whether a tool call whose intent-judge verdict is
+  still pending counts as operator attention. When set to `false`, the
+  workstream stays in the `running` state and the dashboard/coordinator do not
+  raise an "Approval required" marker while the judge is still evaluating; the
+  workstream only enters `attention` once the judge has ruled and a human
+  approval is genuinely needed (a review/deny or low-confidence verdict, or a
+  judge error/timeout `llm_fallback`). The approval prompt and its approve/deny
+  buttons remain available in both modes. Under parallel task agents a
+  human-pending cycle always beats a judge-pending sibling. See
+  [docs/judge.md](docs/judge.md#pending-judge-evaluation-as-attention).
 - **Output-guard evals in `turnstone-eval` (#1291).** `--output-guard judge` scores the LLM stage on
   tool outputs with directives planted at known lines: detection, false positives, whether its flags
   stay inside the fixed vocabulary, citation precision and recall, and failed verdicts.

@@ -695,6 +695,24 @@ def _build_registry() -> dict[str, SettingDef]:
             "to require near-certainty. Has no effect while judge.smart_approvals is off.",
         ),
         SettingDef(
+            "judge.pending_as_attention",
+            "bool",
+            True,
+            "Treat pending judge evaluation as operator attention",
+            "judge",
+            help="When enabled (default), a tool call whose intent-judge verdict is still "
+            "pending is reported as needing operator attention (the workstream enters the "
+            "attention state and the dashboard/coordinator flag 'Approval required'). When "
+            "disabled, a pending judge evaluation is NOT operator attention: the workstream "
+            "stays in the running state and no 'Approval required' attention marker is raised "
+            "until the judge has ruled and a human approval is genuinely needed (a review/deny "
+            "verdict, a low-confidence verdict, or a judge error/timeout fallback). The "
+            "approval prompt and its approve/deny buttons remain available in both modes; this "
+            "setting only controls whether the workstream is flagged as demanding operator "
+            "attention while the judge is still evaluating. Disable it to avoid attention "
+            "noise from tool calls the judge is about to auto-approve.",
+        ),
+        SettingDef(
             "judge.max_context_ratio",
             "float",
             0.5,

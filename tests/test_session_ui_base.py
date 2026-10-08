@@ -4550,3 +4550,305 @@ def test_late_stale_generation_verdict_stamps_superseded() -> None:
             judge_event=gen_b,
         )
     storage.update_intent_verdict.assert_any_call("v-b-late", user_decision="approved")
+
+
+# ---------------------------------------------------------------------------
+# Judge-pending attention gating (judge.pending_as_attention)
+# ---------------------------------------------------------------------------
+
+
+def _register_judge_pending_cycle(
+    ui: SessionUIBase,
+    call_ids: list[str],
+    *,
+    judge_event: threading.Event | None = None,
+    cycle_id: str | None = None,
+) -> Any:
+    """Register a live cycle whose items carry heuristic verdicts but no LLM
+    verdicts — i.e. the judge is still evaluating (judge-pending)."""
+    from turnstone.core.session_ui_base import ApprovalCycle
+
+    items = [_pending_item(cid) for cid in call_ids]
+    card: dict[str, Any] = {
+        "type": "approve_request",
+        "cycle_id": cycle_id or f"cycle-{'-'.join(call_ids)}",
+        "items": ui._serialize_approval_items(items),
+        "judge_pending": True,
+    }
+    cycle = ApprovalCycle(items, card, judge_event)
+    ui._register_approval_cycle(cycle)
+    return cycle
+
+
+def test_judge_pending_as_attention_defaults_true() -> None:
+    """Backward compatible default: pending judge evaluation still counts as
+    operator attention — ``_maybe_release_deferred_attention`` is a no-op."""
+    ui = _make_ui()
+    assert ui.judge_pending_as_attention is True
+    _register_judge_pending_cycle(ui, ["c1"])
+    session = MagicMock()
+    ui.bind_session(session)
+    # Even with a human-ready cycle, the default never re-emits (the normal
+    # lifecycle already put the workstream in attention).
+    ui._llm_verdicts["c1"] = _llm_verdict("c1", recommendation="review")
+    ui._maybe_release_deferred_attention()
+    session._emit_state.assert_not_called()
+
+
+def test_attention_state_for_defers_when_judge_pending() -> None:
+    """judge.pending_as_attention=False + a judge-pending batch and no
+    existing human-ready cycle → the state is deferred to ``running``."""
+    ui = _make_ui()
+    ui.judge_pending_as_attention = False
+    item = _pending_item("c1")  # heuristic verdict, no cached LLM verdict
+    assert ui._attention_state_for([item]) == "running"
+
+
+def test_attention_state_for_attention_when_human_ready_item() -> None:
+    """A single human-ready item in the batch (judge ruled, needs human)
+    forces ``attention`` even while a sibling item is still judge-pending."""
+    ui = _make_ui()
+    ui.judge_pending_as_attention = False
+    item_a = _pending_item("c1")  # judge-pending
+    item_b = _pending_item("c2")
+    ui._llm_verdicts["c2"] = _llm_verdict("c2", recommendation="review", confidence=0.9)
+    assert ui._attention_state_for([item_a, item_b]) == "attention"
+
+
+def test_attention_state_for_attention_when_existing_human_cycle() -> None:
+    """An existing live human-ready cycle forces ``attention`` even while the
+    incoming batch is entirely judge-pending (parallel task agents)."""
+    ui = _make_ui()
+    ui.judge_pending_as_attention = False
+    _register_judge_pending_cycle(ui, ["c1"])
+    _register_judge_pending_cycle(ui, ["c2"])
+    ui._llm_verdicts["c2"] = _llm_verdict("c2", recommendation="review", confidence=0.9)
+    item = _pending_item("c3")  # judge-pending incoming batch
+    assert ui._attention_state_for([item]) == "attention"
+
+
+def test_attention_state_for_attention_default_true() -> None:
+    """With the default ``judge.pending_as_attention=True`` the state stays
+    ``attention`` even while the judge is still evaluating."""
+    ui = _make_ui()
+    item = _pending_item("c1")
+    assert ui._attention_state_for([item]) == "attention"
+
+
+def test_any_live_human_ready_false_while_judge_pending() -> None:
+    """A judge-pending cycle (heuristic verdict, no LLM verdict) is not
+    human-ready, so the workstream is not operator attention yet."""
+    ui = _make_ui()
+    ui.judge_pending_as_attention = False
+    _register_judge_pending_cycle(ui, ["c1"])
+    assert ui._any_live_human_ready() is False
+
+
+def test_any_live_human_ready_true_when_human_ready_item() -> None:
+    """A single human-ready item forces attention even while a sibling item in
+    the SAME cycle is still judge-pending."""
+    ui = _make_ui()
+    ui.judge_pending_as_attention = False
+    _register_judge_pending_cycle(ui, ["c1", "c2"])
+    ui._llm_verdicts["c1"] = _llm_verdict("c1", recommendation="review", confidence=0.9)
+    assert ui._any_live_human_ready() is True
+
+
+def test_any_live_human_ready_true_when_sibling_cycle_human_ready() -> None:
+    """A human-ready cycle forces attention even while a sibling cycle is
+    still judge-pending (parallel task agents)."""
+    ui = _make_ui()
+    ui.judge_pending_as_attention = False
+    _register_judge_pending_cycle(ui, ["c1"])
+    _register_judge_pending_cycle(ui, ["c2"])
+    ui._llm_verdicts["c2"] = _llm_verdict("c2", recommendation="review", confidence=0.9)
+    assert ui._any_live_human_ready() is True
+
+
+def test_any_live_human_ready_excludes_resolved_cycles() -> None:
+    """A resolved cycle never forces attention, so a late verdict for an
+    already-concluded approval cannot re-emit ``attention``."""
+    ui = _make_ui()
+    ui.judge_pending_as_attention = False
+    _register_judge_pending_cycle(ui, ["c1"])
+    ui._llm_verdicts["c1"] = _llm_verdict("c1", recommendation="review", confidence=0.9)
+    assert ui._any_live_human_ready() is True
+    ui.resolve_approval(True, None, call_id="c1")
+    assert ui._any_live_human_ready() is False
+
+
+def test_publish_intent_verdict_live_reemits_attention_when_human_needed() -> None:
+    """Integration: the judge daemon delivers a verdict through
+    ``_publish_intent_verdict_live`` (the actual runtime path, NOT the public
+    ``on_intent_verdict`` hook), and the deferred ``attention`` state is
+    re-emitted through the bound session.  No artificial card mutation."""
+    storage = MagicMock()
+    ui = _make_ui()
+    ui.judge_pending_as_attention = False
+    gen = threading.Event()
+    _register_judge_pending_cycle(ui, ["c1"], judge_event=gen)
+    session = MagicMock()
+    ui.bind_session(session)
+    with _patch_get_storage(storage):
+        ui._publish_intent_verdict_live(
+            _llm_verdict("c1", recommendation="review", confidence=0.9),
+            judge_event=gen,
+        )
+    session._emit_state.assert_called_once_with("attention")
+    assert ui._llm_verdicts["c1"]["recommendation"] == "review"
+
+
+def test_publish_intent_verdict_live_no_reemit_for_stale_generation() -> None:
+    """A stale-generation verdict (persist-only, never cached) does not flip a
+    live cycle to human-ready, so no attention re-emit."""
+    storage = MagicMock()
+    ui = _make_ui()
+    ui.judge_pending_as_attention = False
+    gen_live = threading.Event()
+    gen_stale = threading.Event()
+    _register_judge_pending_cycle(ui, ["c1"], judge_event=gen_live)
+    session = MagicMock()
+    ui.bind_session(session)
+    with _patch_get_storage(storage):
+        ui._publish_intent_verdict_live(
+            _llm_verdict("c1", recommendation="review", confidence=0.9),
+            judge_event=gen_stale,
+        )
+    session._emit_state.assert_not_called()
+
+
+def test_publish_intent_verdict_live_reemits_on_llm_fallback() -> None:
+    """A judge error/timeout delivers an ``llm_fallback`` verdict — that call
+    is no longer judge-pending and fails safe to operator attention."""
+    storage = MagicMock()
+    ui = _make_ui()
+    ui.judge_pending_as_attention = False
+    gen = threading.Event()
+    _register_judge_pending_cycle(ui, ["c1"], judge_event=gen)
+    session = MagicMock()
+    ui.bind_session(session)
+    with _patch_get_storage(storage):
+        ui._publish_intent_verdict_live(
+            _llm_verdict("c1", recommendation="review", confidence=0.9, tier="llm_fallback"),
+            judge_event=gen,
+        )
+    session._emit_state.assert_called_once_with("attention")
+
+
+def test_publish_intent_verdict_live_no_reemit_after_resolution() -> None:
+    """After the cycle resolves, a late verdict for its call does not re-emit
+    ``attention`` (no stale attention after resolution)."""
+    storage = MagicMock()
+    ui = _make_ui()
+    ui.judge_pending_as_attention = False
+    gen = threading.Event()
+    cycle = _register_judge_pending_cycle(ui, ["c1"], judge_event=gen)
+    session = MagicMock()
+    ui.bind_session(session)
+    ui.resolve_approval(True, None, call_id="c1")
+    ui._unregister_approval_cycle(cycle)
+    with _patch_get_storage(storage):
+        ui._publish_intent_verdict_live(
+            _llm_verdict("c1", recommendation="review", confidence=0.9),
+            judge_event=gen,
+        )
+    session._emit_state.assert_not_called()
+
+
+def test_publish_intent_verdict_live_reemits_after_sibling_resolution() -> None:
+    """The multi-cycle gap: after one cycle resolves, a verdict for a
+    still-live sibling cycle (that becomes human-ready) re-emits ``attention``
+    — the workstream is not left stuck in ``running``."""
+    storage = MagicMock()
+    ui = _make_ui()
+    ui.judge_pending_as_attention = False
+    gen_a = threading.Event()
+    gen_b = threading.Event()
+    cycle_a = _register_judge_pending_cycle(ui, ["c1"], judge_event=gen_a)
+    _register_judge_pending_cycle(ui, ["c2"], judge_event=gen_b)
+    session = MagicMock()
+    ui.bind_session(session)
+    # Cycle A resolves (approved) and is unregistered; B is still live and
+    # judge-pending.
+    ui.resolve_approval(True, None, call_id="c1")
+    ui._unregister_approval_cycle(cycle_a)
+    # Cycle B's judge rules → B becomes human-ready → attention re-emitted.
+    with _patch_get_storage(storage):
+        ui._publish_intent_verdict_live(
+            _llm_verdict("c2", recommendation="review", confidence=0.9),
+            judge_event=gen_b,
+        )
+    session._emit_state.assert_called_once_with("attention")
+
+
+def test_commit_manual_prompt_defers_attention_when_judge_pending() -> None:
+    """judge.pending_as_attention=False + a judge-pending call → the activity
+    is NOT tagged ``approval`` (no attention marker) while the approval card
+    is still published with ``judge_pending``."""
+    ui = _make_ui()
+    ui.judge_pending_as_attention = False
+    item = _pending_item("c1")  # heuristic verdict, no cached LLM verdict
+    lq = ui._register_listener()
+    captured: dict[str, Any] = {}
+
+    def _before() -> None:
+        captured["activity_state"] = ui._ws_activity_state
+        captured["activity"] = ui._ws_current_activity
+
+    timer = resolve_when_pending(ui, True, "ok", before=_before)
+    timer.start()
+    try:
+        with _patch_get_storage(MagicMock()), _patch_policies({}):
+            ui.approve_tools([item])
+    finally:
+        timer.cancel()
+    assert captured.get("activity_state") == ""
+    assert "Awaiting approval" not in (captured.get("activity") or "")
+    reqs = [e for e in _drain(lq) if e.get("type") == "approve_request"]
+    assert reqs and reqs[0]["judge_pending"] is True
+
+
+def test_commit_manual_prompt_attention_when_human_ready_mixed_batch() -> None:
+    """A mixed batch where the judge ruled on one item (human-ready) forces the
+    ``approval`` activity marker even while a sibling is still judge-pending."""
+    ui = _SeedingUI(ws_id="ws-1", user_id="u1")
+    ui.judge_pending_as_attention = False
+    item_a = _pending_item("c1")  # judge-pending
+    item_b = _pending_item("c2")  # judge rules during the wait
+    ui.seed_verdicts = [_llm_verdict("c2", recommendation="review", confidence=0.9)]
+    captured: dict[str, Any] = {}
+
+    def _before() -> None:
+        captured["activity_state"] = ui._ws_activity_state
+
+    timer = resolve_when_pending(ui, True, "ok", before=_before)
+    timer.start()
+    try:
+        with _patch_get_storage(MagicMock()), _patch_policies({}):
+            ui.approve_tools([item_a, item_b])
+    finally:
+        timer.cancel()
+    assert captured.get("activity_state") == "approval"
+
+
+def test_commit_manual_prompt_reemits_attention_when_verdict_during_wait() -> None:
+    """If ``_publish_attention`` deferred the state (judge pending) but the
+    judge rules during the Smart Approvals wait, the gate re-emits
+    ``attention`` so the workstream is not left stuck in ``running``."""
+    ui = _SeedingUI(ws_id="ws-1", user_id="u1")
+    ui.judge_pending_as_attention = False
+    session = MagicMock()
+    ui.bind_session(session)
+    item = _pending_item("c1")
+    ui.seed_verdicts = [_llm_verdict("c1", recommendation="review", confidence=0.9)]
+    lq = ui._register_listener()
+    timer = resolve_when_pending(ui, True, "ok")
+    timer.start()
+    try:
+        with _patch_get_storage(MagicMock()), _patch_policies({}):
+            ui.approve_tools([item])
+    finally:
+        timer.cancel()
+    session._emit_state.assert_called_once_with("attention")
+    reqs = [e for e in _drain(lq) if e.get("type") == "approve_request"]
+    assert reqs and reqs[0]["judge_pending"] is False

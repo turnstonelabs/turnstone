@@ -47,12 +47,44 @@ judge.timeout = 120.0               # per judge turn and Smart Approvals wait
 judge.parallel_evaluations = 1      # concurrent calls within one batch, 1-16
 judge.read_only_tools = true        # permit read_file/list_directory evidence
 judge.cancel_on_approval = false    # stop unfinished calls when the gate resolves
+judge.pending_as_attention = true   # pending judge evaluation counts as attention
 ```
 
 `parallel_evaluations = 1` preserves serial evaluation. Raising it reduces the
 latency of wide tool-call batches. The selected judge model alias's
 `max_concurrency` remains the process-wide generation ceiling, so it can reduce
 the actual overlap across judge batches and other roles using that alias.
+
+### Pending judge evaluation as attention
+
+`judge.pending_as_attention` (default `true`) controls whether a tool call whose
+LLM judge verdict is still pending is reported as needing **operator
+attention**. It is backward compatible: the default keeps the historical
+behavior where the workstream enters the `attention` state and the
+dashboard/coordinator raise an "Approval required" marker as soon as the
+approval gate opens, even while the judge is still evaluating.
+
+Set it to `false` to stop that attention noise. When disabled, a pending judge
+evaluation is **not** operator attention:
+
+- The workstream stays in the `running` state (the judge is still working) and
+  does not enter `attention`.
+- The dashboard/coordinator do not raise the "⚑ approval" attention badge or
+  the assertive "Approval required" announcement.
+- The workstream only becomes `attention` — and only then is the operator
+  demanded to act — once the judge has ruled and a human approval is genuinely
+  needed: a `review` / `deny` verdict, a low-confidence verdict, or a judge
+  error/timeout (which degrades to an `llm_fallback` verdict and therefore
+  fails safe to attention).
+
+The approval prompt and its approve/deny buttons remain available in both
+modes — this setting only controls whether the workstream is flagged as
+demanding operator attention while the judge is still evaluating. It is
+especially useful with Smart Approvals enabled, where the judge may
+auto-approve a call and the operator never needed to act at all. Under
+parallel task agents, a single cycle whose judge has ruled (a human decision
+is genuinely needed) still forces the whole workstream to `attention`, so a
+human-pending cycle always beats a judge-pending sibling.
 
 ### Smart Approvals
 

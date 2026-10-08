@@ -2121,6 +2121,104 @@ class TestTaskExec:
 
 
 # ---------------------------------------------------------------------------
+# Judge-pending attention gating (judge.pending_as_attention) — the
+# ``_publish_attention`` state broadcast inside ``_execute_tools``.
+# ---------------------------------------------------------------------------
+
+
+def _drive_attention_gate(
+    session: ChatSession,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    pending_as_attention: bool,
+    human_ready: bool,
+) -> list[str]:
+    """Run one needs_approval bash item through the REAL ``_execute_tools``
+    gate and return the states ``_emit_state`` was called with."""
+    from unittest.mock import PropertyMock
+
+    from tests.test_session_ui_base import _ConcreteUI
+    from turnstone.core.judge import JudgeConfig
+
+    ui = _ConcreteUI(ws_id="ws-1", user_id="u1")
+    session.ui = ui  # type: ignore[assignment]  # bind the SessionUIBase UI so the gate uses it
+    emitted: list[str] = []
+    monkeypatch.setattr(session, "_emit_state", lambda state, **kw: emitted.append(state))
+
+    fake_verdict = MagicMock()
+    fake_verdict.to_dict.return_value = {"verdict_id": "v0", "call_id": "c1", "tier": "heuristic"}
+    fake_judge = MagicMock()
+    fake_judge.evaluate.side_effect = lambda items, *_a, **_kw: [fake_verdict] * len(items)
+    monkeypatch.setattr(session, "_ensure_judge", lambda: fake_judge)
+
+    cfg = JudgeConfig(enabled=True, pending_as_attention=pending_as_attention)
+    item = {
+        "call_id": "c1",
+        "func_name": "bash",
+        "needs_approval": True,
+        "command": "ls",
+        "execute": lambda _it: "ok",
+        "_heuristic_verdict": {
+            "verdict_id": "h-c1",
+            "call_id": "c1",
+            "tier": "heuristic",
+            "recommendation": "review",
+            "confidence": 0.5,
+        },
+    }
+    if human_ready:
+        # The judge already ruled on this call → it is human-ready.
+        ui._llm_verdicts["c1"] = {
+            "verdict_id": "v-c1",
+            "call_id": "c1",
+            "tier": "llm",
+            "recommendation": "review",
+            "confidence": 0.9,
+        }
+    with (
+        patch.object(type(session), "_judge_cfg", new_callable=PropertyMock, return_value=cfg),
+        patch.object(session, "_safe_prepare_tool", return_value=item),
+        patch.object(session.ui, "approve_tools", return_value=(True, None)),
+    ):
+        session._execute_tools(
+            [{"id": "c1", "type": "function", "function": {"name": "bash", "arguments": "{}"}}]
+        )
+    return emitted
+
+
+def test_publish_attention_defers_when_judge_pending(tmp_db, monkeypatch) -> None:
+    """judge.pending_as_attention=False + a judge-pending batch → the state
+    emitted by ``_publish_attention`` is ``running`` (no operator attention
+    demanded yet), NOT ``attention``."""
+    session = _make_session()
+    emitted = _drive_attention_gate(
+        session, monkeypatch, pending_as_attention=False, human_ready=False
+    )
+    assert "running" in emitted
+    assert "attention" not in emitted
+
+
+def test_publish_attention_attention_when_human_ready(tmp_db, monkeypatch) -> None:
+    """judge.pending_as_attention=False but the judge already ruled on the
+    call (human-ready) → ``_publish_attention`` emits ``attention``."""
+    session = _make_session()
+    emitted = _drive_attention_gate(
+        session, monkeypatch, pending_as_attention=False, human_ready=True
+    )
+    assert "attention" in emitted
+
+
+def test_publish_attention_attention_default_true(tmp_db, monkeypatch) -> None:
+    """With the default ``judge.pending_as_attention=True`` the state stays
+    ``attention`` even while the judge is still evaluating."""
+    session = _make_session()
+    emitted = _drive_attention_gate(
+        session, monkeypatch, pending_as_attention=True, human_ready=False
+    )
+    assert "attention" in emitted
+
+
+# ---------------------------------------------------------------------------
 # func_args projection for the intent judge
 # ---------------------------------------------------------------------------
 

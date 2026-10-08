@@ -3983,6 +3983,7 @@ class ChatSession:
             model=jc.model,
             smart_approvals=setting("judge.smart_approvals"),
             confidence_threshold=setting("judge.confidence_threshold"),
+            pending_as_attention=setting("judge.pending_as_attention"),
             max_context_ratio=setting("judge.max_context_ratio"),
             timeout=setting("judge.timeout"),
             parallel_evaluations=parallel_evaluations,
@@ -18754,6 +18755,13 @@ class ChatSession:
                 threshold=jc.confidence_threshold if jc is not None else 0.95,
                 wait_seconds=jc.timeout if jc is not None else 0.0,
             )
+            # Judge-pending attention gating: stamp the live config value on
+            # the UI so the state broadcast (``_publish_attention``) and the
+            # approval gate (``_commit_manual_prompt``) agree.  Defaults to
+            # True (backward compatible) when no judge config is present.
+            self.ui.judge_pending_as_attention = bool(
+                jc.pending_as_attention if jc is not None else True
+            )
             approval_wait_seconds = self._approval_wait_seconds()
             for item in items:
                 item["_smart_approval_config"] = snapshot
@@ -18909,8 +18917,27 @@ class ChatSession:
 
         # Phase 2: approve via UI
         def _publish_attention(durable: list[Callable[[], None]]) -> None:
+            # Judge-pending attention gating (judge.pending_as_attention):
+            # when disabled and the judge is still evaluating this batch (and
+            # no existing live cycle already needs a human), the workstream
+            # stays in the running state instead of demanding operator
+            # attention.  The approval gate still runs and the buttons remain
+            # available; the attention state is re-emitted the moment the
+            # judge rules and a human approval is genuinely needed (see
+            # SessionUIBase._maybe_release_deferred_attention).  A judge
+            # error/timeout delivers an ``llm_fallback`` verdict so those
+            # calls are not judge-pending and fail safe to attention.  A
+            # single human-ready item in this batch — or in any existing live
+            # cycle — forces attention even while a sibling is still
+            # judge-pending.
+            from turnstone.core.session_ui_base import SessionUIBase
+
+            state = "attention"
+            ui = self.ui
+            if isinstance(ui, SessionUIBase):
+                state = ui._attention_state_for(items)
             self._emit_state(
-                "attention",
+                state,
                 deferred_persistence=durable,
             )
 

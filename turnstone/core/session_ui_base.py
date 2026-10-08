@@ -642,6 +642,20 @@ class SessionUIBase:
         # by the judge timeout; the wait returns early the moment every
         # pending call has a verdict.
         self.smart_approval_wait_seconds = 0.0
+        # ``judge.pending_as_attention``: when True (default, backward
+        # compatible) a tool call whose intent-judge verdict is still pending
+        # counts as operator attention.  When False, the workstream stays in
+        # the running state (and the dashboard/coordinator do not raise an
+        # "Approval required" marker) until the judge has ruled and a human
+        # approval is genuinely needed.  ChatSession stamps one immutable
+        # snapshot per gate batch (see ``_push_smart_approval_config``); this
+        # instance default is the legacy/direct-call fallback.
+        self.judge_pending_as_attention = True
+        # One-shot flag set inside ``_commit_manual_prompt`` when a verdict
+        # landed during the Smart Approvals wait after the state was deferred
+        # to ``running``; consumed right after the card is published so the
+        # attention transition is emitted after the approval payload.
+        self._reemit_attention_after = False
         # Per-tool source for configured ``auto_approve_tools`` membership.
         # A skill template's ``allowed_tools`` JSON list lands here through
         # ``server.py``; the operator may not have opted in tool-by-tool.
@@ -2659,8 +2673,6 @@ class SessionUIBase:
             # lookup changes here; durable audit is deferred below.
             self._record_auto_approves(items, deferred=deferred_auto_audit)
             with self._ws_lock:
-                self._ws_current_activity = f"⏳ Awaiting approval: {label} — {preview}"
-                self._ws_activity_state = "approval"
                 # Evict a stale generation that landed after the entry purge
                 # but before this final ownership transaction.
                 if judge_event is not None:
@@ -2674,6 +2686,31 @@ class SessionUIBase:
                     it.get("_heuristic_verdict") and it.get("call_id", "") not in self._llm_verdicts
                     for it in items
                 )
+                # Judge-pending attention gating: while the judge is still
+                # evaluating (``judge_pending``) and ``judge.pending_as_attention``
+                # is False, the workstream is NOT operator attention yet — it
+                # stays in the running state and the activity is not tagged
+                # ``approval`` (so no "Approval required" marker is raised).
+                # The approval prompt and its buttons remain available; only
+                # the attention signal is suppressed.  A judge error/timeout
+                # delivers an ``llm_fallback`` verdict, so those calls are NOT
+                # judge-pending and fail safe to operator attention.  A single
+                # human-ready item (the judge ruled on a call that still needs
+                # human approval) forces the approval marker even while a
+                # sibling item is still judge-pending.
+                batch_human_ready = self._items_human_ready(items)
+                if not self.judge_pending_as_attention and not batch_human_ready:
+                    self._ws_current_activity = f"⏳ Judge evaluating: {label} — {preview}"
+                    self._ws_activity_state = ""
+                else:
+                    self._ws_current_activity = f"⏳ Awaiting approval: {label} — {preview}"
+                    self._ws_activity_state = "approval"
+                    # A verdict may have landed during the Smart Approvals wait
+                    # after ``_publish_attention`` deferred the state to
+                    # ``running``; re-emit attention after the card is published
+                    # so the workstream is not left stuck in ``running``.
+                    if not self.judge_pending_as_attention and batch_human_ready:
+                        self._reemit_attention_after = True
                 pending_cids = {hv.get("call_id") for hv in pending_verdicts}
                 early_llm = [
                     llm_verdict
@@ -2689,6 +2726,13 @@ class SessionUIBase:
             self._enqueue(card)
             self._broadcast_approve_request(card)
             self._replay_pending_verdicts(items)
+            # If the judge already ruled during the Smart Approvals wait, the
+            # state must be ``attention`` (a human decision is genuinely
+            # needed).  Emit it after the card is published so the transport
+            # sees the attention transition after the approval payload.
+            if getattr(self, "_reemit_attention_after", False):
+                self._reemit_attention_after = False
+                self._emit_attention_state()
             prompt_published = True
 
         try:
@@ -2752,6 +2796,121 @@ class SessionUIBase:
                     item["_refused_by"] = "timeout"
 
         return approved, feedback
+
+    # ------------------------------------------------------------------
+    # Judge-pending attention gating (judge.pending_as_attention)
+    # ------------------------------------------------------------------
+    # When ``judge.pending_as_attention`` is False, a tool call whose
+    # intent-judge verdict is still pending must NOT be reported as
+    # operator attention: the workstream stays in the running state and
+    # no "Approval required" marker is raised until the judge has ruled
+    # and a human approval is genuinely needed.  The approval prompt and
+    # its buttons remain available in both modes; this only controls the
+    # attention signal.  The helpers below are the single source of truth
+    # for that decision so the state broadcast, the activity tag and the
+    # serialized card cannot disagree.
+
+    def _item_human_ready(self, item: dict[str, Any]) -> bool:
+        """Whether a single tool item genuinely needs a human decision now.
+
+        An item needs a human decision when it still requires approval and
+        the judge is no longer evaluating it: either it was never judged
+        (no heuristic verdict — fail safe to attention) or its LLM verdict
+        has already arrived.  Auto-approved items (``needs_approval``
+        cleared) never force attention.  Computed live from ``_llm_verdicts``
+        so a verdict landing immediately flips the result — the stale
+        ``card['judge_pending']`` field is never consulted.
+        """
+        if not item.get("needs_approval") or item.get("auto_approved"):
+            return False
+        hv = item.get("_heuristic_verdict")
+        if not hv:
+            return True
+        cid = item.get("call_id", "")
+        return bool(cid and cid in self._llm_verdicts)
+
+    def _items_human_ready(self, items: list[dict[str, Any]]) -> bool:
+        """Whether any of *items* is human-ready (see :meth:`_item_human_ready`)."""
+        return any(self._item_human_ready(it) for it in items)
+
+    def _cycle_human_ready(self, cycle: ApprovalCycle) -> bool:
+        """Whether a live cycle has any human-ready item."""
+        return any(self._item_human_ready(it) for it in cycle.items)
+
+    def _any_live_human_ready_locked(self) -> bool:
+        """Whether any live, unresolved cycle needs a human decision.
+
+        Caller holds ``_ws_lock``.  Resolved cycles are excluded so a late
+        verdict cannot re-emit ``attention`` for an approval that already
+        concluded.  A single human-ready item in any live cycle forces
+        attention even while a sibling cycle is still judge-pending.
+        """
+        return any(
+            not c.resolved and self._cycle_human_ready(c) for c in self._approval_cycles.values()
+        )
+
+    def _any_live_human_ready(self) -> bool:
+        """Whether any live, unresolved cycle needs a human decision."""
+        with self._ws_lock:
+            return self._any_live_human_ready_locked()
+
+    def _attention_state_for(self, items: list[dict[str, Any]]) -> str:
+        """The workstream state to emit for a batch entering the approval gate.
+
+        Returns ``"running"`` (deferred) when ``judge.pending_as_attention``
+        is False and neither this batch nor any existing live cycle has a
+        human-ready item — the judge is still evaluating and no operator
+        action is demanded yet.  Otherwise ``"attention"``.  This is the
+        single source of truth for the state broadcast (``_publish_attention``)
+        and the approval gate (``_commit_manual_prompt``) so they cannot
+        disagree.
+        """
+        if (
+            not self.judge_pending_as_attention
+            and not self._items_human_ready(items)
+            and not self._any_live_human_ready()
+        ):
+            return "running"
+        return "attention"
+
+    def _emit_attention_state(self) -> None:
+        """Re-emit the ``attention`` state once a human decision is needed.
+
+        Called when a judge verdict arrives (or is already present) and a
+        human approval is genuinely needed, after the state was deferred to
+        ``running`` because the judge was still evaluating.  Routes through
+        the bound session's ``_emit_state`` so the workstream state, the
+        storage write and every transport fan-out stay in lockstep.  No-op
+        when no session is bound (unit-test fixtures) or when the session is
+        already shutting down.
+        """
+        session = self._bound_session()
+        if session is None:
+            return
+        try:
+            session._emit_state("attention")
+        except Exception:
+            log.debug("judge_pending.attention_reemit_failed ws=%s", self.ws_id, exc_info=True)
+
+    def _maybe_release_deferred_attention(self) -> None:
+        """Re-emit ``attention`` once a live cycle genuinely needs a human.
+
+        Called from the judge daemon path whenever an LLM verdict lands (see
+        :meth:`_publish_intent_verdict_live`).  When
+        ``judge.pending_as_attention`` is False and a live, unresolved cycle
+        now has a human-ready item (the judge ruled on a call that still
+        needs human approval), re-emit ``attention`` so the workstream is not
+        left stuck in ``running``.  Resolved cycles are excluded, so a late
+        verdict for an already-concluded approval never re-emits.  Safe to
+        call from the judge daemon thread; the cycle check is guarded by
+        ``_ws_lock``.
+        """
+        if self.judge_pending_as_attention:
+            return
+        with self._ws_lock:
+            if not self._any_live_human_ready_locked():
+                return
+        self._emit_attention_state()
 
     # ------------------------------------------------------------------
     # Smart Approvals (judge.smart_approvals)
@@ -3086,6 +3245,11 @@ class SessionUIBase:
         decision_resolver_principal_id = ""
         decision_execution_principal_id = ""
         initial_owner: ApprovalCycle | None = None
+        # Whether this verdict actually landed in ``_llm_verdicts`` (vs. a
+        # persist-only stale-generation delivery).  Only a landed verdict can
+        # flip a live cycle to human-ready, so only then do we consider
+        # re-emitting the deferred ``attention`` state.
+        verdict_cached = False
 
         def _unresolved_owner_locked() -> tuple[ApprovalCycle | None, bool]:
             """Return this generation's owner and whether another owns the id.
@@ -3131,6 +3295,7 @@ class SessionUIBase:
                     self._verdict_origins.pop(oldest_key, None)
                 self._llm_verdicts[call_id] = verdict
                 self._verdict_origins[call_id] = id(judge_event)
+                verdict_cached = True
                 # Wake any Smart Approvals wait parked on this call's
                 # verdict (``_verdict_cond`` shares ``_ws_lock``, so the
                 # notify is valid here and the waiter re-checks its
@@ -3168,6 +3333,8 @@ class SessionUIBase:
         # overwrite it the same way from the round's decision.
         # Skip both so the audit trail keeps the auto-approve reason.
         if auto_reason:
+            if verdict_cached:
+                self._maybe_release_deferred_attention()
             return persist_actions
         with self._ws_lock:
             # Park-or-stamp under ONE lock acquisition so
@@ -3239,6 +3406,8 @@ class SessionUIBase:
                     execution_principal_id=decision_execution_principal_id,
                 )
             )
+        if verdict_cached:
+            self._maybe_release_deferred_attention()
         return persist_actions
 
     def on_superseded_intent_verdict(self, verdict: dict[str, Any]) -> None:

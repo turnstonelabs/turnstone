@@ -195,6 +195,12 @@ class JudgeConfig:
     model: str = ""  # empty = use session model
     smart_approvals: bool = False  # auto-approve high-confidence "approve" LLM verdicts
     confidence_threshold: float = 0.95  # Smart Approvals auto-approve bar (recommendation=approve)
+    # True (default) = a tool call whose LLM verdict is still pending counts
+    # as operator attention.  False = the workstream stays in the running
+    # state (no "Approval required" marker) until the judge rules and a human
+    # approval is genuinely needed; the approval prompt/buttons remain
+    # available in both modes.
+    pending_as_attention: bool = True
     max_context_ratio: float = 0.5
     timeout: float = 120.0  # per-turn timeout in seconds (see class docstring)
     read_only_tools: bool = True

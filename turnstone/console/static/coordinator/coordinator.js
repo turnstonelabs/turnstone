@@ -4878,7 +4878,16 @@ function createCoordinatorPane(root, wsId, opts) {
         s.textContent = "tokens=" + cached.live.tokens;
         meta.appendChild(s);
       }
-      if (cached.live.pending_approval) {
+      // Attention badge — the operator-action signal.  Shows only when the
+      // workstream is genuinely in the attention state (or activity_state=
+      // approval), NOT merely when an approval block is present.  Under
+      // judge.pending_as_attention=false the state stays "running" while the
+      // judge evaluates, so the approval block/buttons are visible but no
+      // "⚑ approval" attention badge is raised until a human decision is
+      // genuinely needed.
+      const needsAttention =
+        state === "attention" || cached.live.activity_state === "approval";
+      if (needsAttention) {
         const s = document.createElement("span");
         s.className = "badge-attention";
         s.textContent = "\u2691 approval";
@@ -5945,6 +5954,17 @@ function createCoordinatorPane(root, wsId, opts) {
             pending_approval_details: prev.live.pending_approval_details,
           });
         }
+        // Derive the operator-action signal from the state/activity (the
+        // bulk block may carry pending_approval=true from live details even
+        // while the judge is still evaluating under
+        // judge.pending_as_attention=false).  needs_attention drives the
+        // attention badge and the assertive announcement; pending_approval
+        // still drives the approval block/buttons.
+        if (mergedLive) {
+          mergedLive.needs_attention =
+            mergedLive.state === "attention" ||
+            mergedLive.activity_state === "approval";
+        }
         _liveBadgeCacheSet(id, {
           live: mergedLive,
           fetched: now,
@@ -6051,25 +6071,37 @@ function createCoordinatorPane(root, wsId, opts) {
     // activity flicker; per-cycle removal happens in
     // handleChildApprovalResolved, and the bulk fetch reconciles a
     // dropped resolution event within its ~2s TTL.
-    const coarsePending =
+    // ``needsAttention`` is the operator-action signal: the workstream is
+    // in the attention state (or activity_state=approval).  ``pendingApproval``
+    // is the broader "an approval block is present" signal (also true when
+    // details are live even before the state transition, and when the
+    // judge is still evaluating under judge.pending_as_attention=false —
+    // where the state stays "running" and the approval block/buttons remain
+    // available but no "Approval required" attention marker is raised).
+    // The block renders off ``pendingApproval``; the attention badge and the
+    // assertive announcement fire off ``needsAttention`` only.
+    const needsAttention =
       existing.state === "attention" || existing.activity_state === "approval";
     const cached = liveBadgeCache.get(childId);
     const cachedLive = (cached && cached.live) || {};
     const pendingApproval =
-      coarsePending || _liveApprovalDetails(cachedLive).length > 0;
+      needsAttention || _liveApprovalDetails(cachedLive).length > 0;
     // Rising-edge detection BEFORE we mutate the cache. The chat-pane
     // tool batches already announce assertively
     // (renderApprovalDock / appendToolBatch); the children-tree was
     // silent for SR users — fixing that here so a blind operator
-    // hears the demand for action.
-    const wasPendingApproval = cachedLive.pending_approval === true;
-    if (pendingApproval && !wasPendingApproval) {
+    // hears the demand for action.  Only fires when the operator is
+    // genuinely needed (needsAttention), not while the judge is still
+    // evaluating a pending call.
+    const wasNeedsAttention = cachedLive.needs_attention === true;
+    if (needsAttention && !wasNeedsAttention) {
       _announceAssertive(
         "Approval required: " + (existing.name || childId.slice(0, 8)),
       );
     }
     const nextLive = Object.assign({}, cachedLive, {
       pending_approval: pendingApproval,
+      needs_attention: needsAttention,
     });
     // Off-approval transition is the ONLY case here that
     // authoritatively writes a value the bulk fetch must not
