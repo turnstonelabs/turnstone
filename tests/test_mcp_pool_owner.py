@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import gc
 import threading
 import time
 from contextlib import asynccontextmanager
@@ -434,6 +435,49 @@ class TestPoolTransportOwnerLifecycle:
 
         assert events == ["transport_enter", "transport_exit"]
         assert mgr._user_pool_entries[key].session is None
+
+    @pytest.mark.parametrize(
+        "first", ["_prime_user_server_logged", "_prime_user_server", "_connect_one_pool"]
+    )
+    def test_collected_connect_closes_cleanly_in_any_order(self, first: str) -> None:
+        """Garbage collection closes a prime that a stopped loop abandoned at the readiness wait,
+        finalizing its coroutines in no set order. With no other prime or dispatch queued on the
+        entry's open lock, whichever it closes first, the close unwinds every frame without
+        raising, and the prime logs no failure (a close says nothing about the server). The
+        transport owner is a stub, so the real owner's own close is not covered here."""
+        mgr = MCPClientManager({})
+        loop = asyncio.new_event_loop()
+        stalled = asyncio.Event()
+
+        async def _owner_stalls(*_args: Any) -> None:
+            stalled.set()
+            await asyncio.Event().wait()
+
+        mgr._pool_transport_owner = _owner_stalls  # type: ignore[method-assign]
+        key = ("user-1", "pool-srv")
+        try:
+            with patch.object(mgr, "_tcp_probe", new=AsyncMock()):
+                task = loop.create_task(
+                    mgr._prime_user_server_logged(key, _http_cfg(), "tok-aaa", "user-1", "pool-srv")
+                )
+                loop.run_until_complete(asyncio.wait_for(stalled.wait(), timeout=5))
+        finally:
+            loop.close()
+        chain: list[Any] = [task.get_coro()]
+        while asyncio.iscoroutine(chain[-1].cr_await):
+            chain.append(chain[-1].cr_await)
+        names = [coro.__name__ for coro in chain]
+        assert names == ["_prime_user_server_logged", "_prime_user_server", "_connect_one_pool"]
+
+        with patch("turnstone.core.mcp_client.log") as log:
+            chain[names.index(first)].close()
+            for coro in chain:
+                coro.close()
+
+        log.warning.assert_not_called()
+        mgr.shutdown()
+        del task, chain
+        gc.collect()  # the abandoned tasks report themselves here, not in a later test
 
 
 # ---------------------------------------------------------------------------
