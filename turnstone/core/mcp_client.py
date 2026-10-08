@@ -1940,6 +1940,11 @@ class MCPClientManager:
             try:
                 async with asyncio.timeout(self._STATIC_RECONNECT_ATTEMPT_TIMEOUT_S):
                     await self._connect_one_locked(name, cfg)
+            except GeneratorExit:
+                # Garbage collection is closing a reconnect that a stopped loop abandoned (see
+                # _connect_one_locked). Like a cancel, that says nothing about the server, and
+                # with the loop gone no teardown can be awaited: let the close unwind.
+                raise
             except BaseException as exc:
                 # ANY non-success exit — an ``except Exception`` connect error,
                 # the converted inner TimeoutError, or a bare CancelledError (a
@@ -2541,6 +2546,12 @@ class MCPClientManager:
                 owner.cancel()
                 await asyncio.wait({owner}, timeout=self._OWNER_CANCEL_GRACE_S)
             raise
+        except GeneratorExit:
+            # Garbage collection is closing a connect that a stopped loop abandoned, and it may
+            # close this coroutine before the ones awaiting it. Nothing can be awaited with the
+            # loop gone, and the owner is that loop's garbage too: re-raise at once, so the close
+            # unwinds every frame cleanly whichever the collector reaches first.
+            raise
         except BaseException:
             # Connect failed: the owner delivered the failure and is unwinding
             # itself in-task. Reap quietly, then surface the error.
@@ -2610,6 +2621,8 @@ class MCPClientManager:
             # be installed behind a dead/replaced transport.
             if owner.done() or state.owner_task is not owner or state.session is not session:
                 raise ConnectionError(f"MCP server '{name}' transport died before catalog commit")
+        except GeneratorExit:
+            raise  # garbage collection is closing an abandoned connect (see the readiness wait)
         except BaseException:
             await self._teardown_static_session(name)
             raise
@@ -5006,12 +5019,17 @@ class MCPClientManager:
         reconnected here syncs on its own, as every connect does.
 
         When garbage collection closes a pass that a stopped loop abandoned,
-        a reconnect suspended in the loop turns the close into an error that
-        reaches the per-server ``except``, on whatever thread collects. That
-        arm returns at once when it is off the pass's own loop: refreshing
-        the other servers there could start a transport on that thread's
-        loop, and the final sync could run while that thread holds the sync
-        lock, after shutdown emptied the catalog.
+        on whatever thread collects, ``GeneratorExit`` unwinds it: no
+        per-server ``except`` catches that, so the pass refreshes no further
+        server and skips its final sync. Refreshing the other servers there
+        could start a transport on that thread's loop, and the final sync
+        could run while that thread holds the sync lock, after shutdown
+        emptied the catalog. The collector may close the coroutines a
+        reconnect awaits before this one, so the connect path re-raises
+        ``GeneratorExit`` without awaiting or recording anything. A frame
+        that awaited as it unwound would turn the close into an error; the
+        per-server ``except`` then returns at once when it is off the pass's
+        own loop.
         """
         results: dict[str, tuple[list[str], list[str]] | None] = {}
         targets = [server_name] if server_name else list(self._server_configs.keys())
