@@ -852,7 +852,7 @@ class TestTextFromOutsideComposedIntoSkippedTurns:
 
         assert output == "implemented and verified"
         replayed = [item for item in requests[1]["input"] if item.get("role") == "assistant"]
-        assert "docs.example.com" in json.dumps(replayed)
+        assert "https://docs.example.com/page" in json.dumps(replayed)
         assert token not in json.dumps(replayed)
 
     def test_a_queued_message_reaches_the_wire_cleaned(self) -> None:
