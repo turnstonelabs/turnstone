@@ -517,6 +517,61 @@ class TestRefreshPassSync:
         assert mgr._static_servers == {}
         assert "srv1" not in mgr._last_refresh
 
+    @pytest.mark.parametrize(
+        "first", ["_refresh_all", "_ensure_static_connected", "_connect_one_locked"]
+    )
+    @pytest.mark.parametrize("stalled_in", ["handshake", "discovery"])
+    def test_stalled_reconnect_closes_cleanly_in_any_order(
+        self, db: Any, stalled_in: str, first: str
+    ) -> None:
+        """Garbage collection finalizes the coroutines of an abandoned pass in no set order, so it
+        may close the reconnect the pass waits on, or the connect under that, before the pass.
+        With no other driver queued on the server's connect lock, whichever it closes first, the
+        close unwinds every frame without raising, records no connect failure (a close says
+        nothing about the server) and syncs nothing. The chain is closed before shutdown, so a
+        teardown on the way out would still find the server."""
+        mgr = _synced_manager(db, {"srv0": ["kept"], "srv1": ["other"]})
+        mgr._static_servers["srv1"].session = None
+        loop = asyncio.new_event_loop()
+        stalled = asyncio.Event()
+
+        async def _stall(*_args: Any, **_kw: Any) -> Any:
+            stalled.set()
+            await asyncio.Event().wait()
+
+        async def _owner(_name: str, _cfg: Any, ready: asyncio.Future[Any], *_args: Any) -> None:
+            if stalled_in == "handshake":
+                await _stall()
+            session = _prompt_session(["other"])
+            session.list_tools = _stall
+            ready.set_result(session)
+            await asyncio.Event().wait()
+
+        mgr._static_transport_owner = _owner  # type: ignore[method-assign]
+        try:
+            task = loop.create_task(mgr._refresh_all())
+            loop.run_until_complete(asyncio.wait_for(stalled.wait(), timeout=5))
+        finally:
+            loop.close()
+        chain: list[Any] = [task.get_coro()]
+        while asyncio.iscoroutine(chain[-1].cr_await):
+            chain.append(chain[-1].cr_await)
+        names = [coro.__name__ for coro in chain]
+        assert names[:3] == ["_refresh_all", "_ensure_static_connected", "_connect_one_locked"]
+
+        with _counting_syncs(mgr) as sync:
+            chain[names.index(first)].close()
+            for coro in chain:
+                coro.close()
+
+        assert sync.call_count == 0
+        assert "srv1" not in mgr._last_error
+        assert "srv1" not in mgr._consecutive_failures
+        assert _mcp_template_names(db) == ["mcp__srv0__kept", "mcp__srv1__other"]
+        mgr.shutdown()
+        del task, chain
+        gc.collect()  # the abandoned tasks report themselves here, not in a later test
+
     def test_sync_after_shutdown_keeps_the_templates(self, db: Any) -> None:
         """Shutdown empties the catalog, so a sync after it would delete every template."""
         mgr = _synced_manager(db, {"srv0": ["kept"]})
