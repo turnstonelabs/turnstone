@@ -119,58 +119,34 @@ class TestCLIPolicyEnforcement:
 
         assert items[0]["error"] == POLICIES_UNREADABLE_DENIAL
 
-    def test_no_policy_settles_the_budget_prompt_in_a_mixed_batch(self):
-        """The budget item takes no policy verdict even beside a call the unreadable policies
-        refuse: this gate reports a refusal as an error on an approved batch, which for the
-        budget item would read as approved."""
+    def test_auto_approve_list_covering_every_call_skips_the_prompt(self):
         ui = TerminalUI()
-        budget, bash = self._make_items("__budget_override__", "bash")
+        ui.auto_approve_tools = {"bash", "read_file"}
+        items = self._make_items("bash", "read_file")
 
         with (
-            patch("turnstone.core.policy.evaluate_loaded_tool_policies", return_value=None),
+            patch("turnstone.core.policy.evaluate_loaded_tool_policies", return_value={}),
             patch("turnstone.core.storage._registry.get_storage", return_value=MagicMock()),
-            patch("builtins.input", return_value="n"),
+            patch("builtins.input", side_effect=AssertionError("prompted")),
         ):
-            approved, _ = ui.approve_tools([budget, bash])
-
-        assert approved is False  # the person was asked, and said no
-        assert not budget.get("error")
-        assert bash["error"] == POLICIES_UNREADABLE_DENIAL
-
-    @pytest.mark.parametrize("verdicts", [None, {"__budget_override__": "allow"}])
-    @pytest.mark.parametrize(
-        ("auto_approve", "auto_approve_tools"),
-        [(False, set()), (True, set()), (False, {"__budget_override__"})],
-        ids=["plain", "skip-permissions", "auto-approve-list"],
-    )
-    def test_the_budget_prompt_always_asks_the_person(
-        self, verdicts, auto_approve, auto_approve_tools
-    ):
-        """As on a node: no policy, skip-permissions or auto-approve list settles it."""
-        ui = TerminalUI()
-        ui.auto_approve = auto_approve
-        ui.auto_approve_tools = set(auto_approve_tools)
-        # The exact item ``ChatSession.send`` builds: no header, call id or label.
-        item = {
-            "func_name": "__budget_override__",
-            "preview": "Token budget (1,000) exhausted. Approve to continue.",
-            "needs_approval": True,
-        }
-        prompts: list[str] = []
-
-        def answer(prompt: str) -> str:
-            prompts.append(prompt)
-            return "y"
-
-        with (
-            patch("turnstone.core.policy.evaluate_loaded_tool_policies", return_value=verdicts),
-            patch("turnstone.core.storage._registry.get_storage", return_value=MagicMock()),
-            patch("builtins.input", side_effect=answer),
-        ):
-            approved, _ = ui.approve_tools([item])
+            approved, _ = ui.approve_tools(items)
 
         assert approved is True
-        assert len(prompts) == 1
+
+    def test_auto_approve_list_missing_a_call_still_prompts(self):
+        ui = TerminalUI()
+        ui.auto_approve_tools = {"read_file"}
+        items = self._make_items("bash", "read_file")
+
+        with (
+            patch("turnstone.core.policy.evaluate_loaded_tool_policies", return_value={}),
+            patch("turnstone.core.storage._registry.get_storage", return_value=MagicMock()),
+            patch("builtins.input", return_value="n") as prompt,
+        ):
+            approved, _ = ui.approve_tools(items)
+
+        prompt.assert_called_once()
+        assert approved is False
 
 
 # ---------------------------------------------------------------------------

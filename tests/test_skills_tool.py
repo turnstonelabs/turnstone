@@ -1,14 +1,16 @@
 """Tests for the unified ``skills`` tool (replaces legacy ``skill`` +
 ``list_skills``).  Covers preparer dispatch, exec behaviour, permission
-gating on writes, projected-risk surfacing on update, the 0-results
-hint pattern, and the skill catalog disclosure in system messages.
+gating on writes, projected-risk surfacing on update, and the 0-results
+hint pattern.
 """
 
 from __future__ import annotations
 
-import threading
+import json
 from typing import Any
 from unittest.mock import MagicMock, patch
+
+import pytest
 
 from tests._session_helpers import provider_shell
 from turnstone.core.model_turn import ModelLane, ResolvedModelBinding
@@ -90,6 +92,7 @@ def _make_session(*, kind: str = "interactive", user_id: str = "test-user") -> A
     session._skill_name = None
     session._skill_content = None
     session._applied_skill_content = None
+    session._active_skill_id = ""
     session.context_window = 128000
     session.messages = []
     session._config = {}
@@ -175,6 +178,19 @@ class TestPrepareSkillsFind:
         session = _make_session()
         item = session._prepare_skills("c", {"action": "find", "limit": 0})
         assert item["limit"] == 100
+
+    def test_find_query_defaults_to_fifty(self) -> None:
+        session = _make_session()
+        item = session._prepare_skills("c", {"action": "find", "query": "deploy"})
+        assert item["limit"] == 50
+
+    @pytest.mark.parametrize(("args", "expected"), [({}, 100), ({"query": "deploy"}, 50)])
+    def test_find_unreadable_limit_falls_back_to_the_default(
+        self, args: dict[str, Any], expected: int
+    ) -> None:
+        session = _make_session()
+        item = session._prepare_skills("c", {"action": "find", "limit": "abc", **args})
+        assert item["limit"] == expected
 
     def test_find_kind_invalid_errors(self) -> None:
         """Typos / unknown values on the `kind` filter return an explicit
@@ -377,7 +393,6 @@ class TestExecSkillsFind:
                     "description": "Review code.",
                     "enabled": True,
                     "risk_level": "low",
-                    "activation": "search",
                     "kind": "any",
                     "allowed_tools": "[]",
                 }
@@ -395,6 +410,112 @@ class TestExecSkillsFind:
         # ``allowed_tools`` omitted when empty — meaningful distinction
         # from "no tools usable" (the field's previous misreading).
         assert "allowed_tools" not in result["skills"][0]
+        assert "activation" not in result["skills"][0]
+
+    def test_find_query_ranks_past_the_first_page(self) -> None:
+        """A query ranks up to the 500-row ceiling skills.json documents before
+        its own limit applies, so a match past the first page is found (#1292)."""
+
+        def _row(name: str, description: str) -> dict[str, Any]:
+            return {"name": name, "description": description, "tags": "[]", "kind": "any"}
+
+        rows = [_row(f"filler-{i:03d}", "unrelated helper") for i in range(150)]
+        rows.append(_row("target", "kubernetes deployment helper"))
+        session = _make_session()
+        storage = self._storage_mock(rows)
+        item = session._prepare_skills("c", {"action": "find", "query": "kubernetes", "limit": 5})
+        with patch("turnstone.core.session.get_storage", return_value=storage):
+            _, output = session._exec_skills(item)
+        assert storage.list_skills_filtered.call_args.kwargs["limit"] == 501
+        result = json.loads(output)
+        assert [s["name"] for s in result["skills"]] == ["target"]
+        assert result["truncated"] is False
+
+    @staticmethod
+    def _rows(matching: int, filler: int) -> list[dict[str, Any]]:
+        rows = [
+            {"name": f"kube-{i:03d}", "description": "kubernetes helper", "tags": "[]"}
+            for i in range(matching)
+        ]
+        rows += [
+            {"name": f"other-{i:03d}", "description": "unrelated helper", "tags": "[]"}
+            for i in range(filler)
+        ]
+        return rows
+
+    def _find(self, rows: list[dict[str, Any]], args: dict[str, Any]) -> dict[str, Any]:
+        session = _make_session()
+        storage = self._storage_mock(rows)
+        item = session._prepare_skills("c", {"action": "find", **args})
+        with patch("turnstone.core.session.get_storage", return_value=storage):
+            _, output = session._exec_skills(item)
+        return json.loads(output)
+
+    def test_find_query_returns_up_to_its_limit(self) -> None:
+        """A query honours ``limit`` (50 by default) and says when more matched (#1292)."""
+        rows = self._rows(120, 200)
+        by_default = self._find(rows, {"query": "kubernetes"})
+        assert len(by_default["skills"]) == 50
+        assert by_default["truncated"] is True
+        raised = self._find(rows, {"query": "kubernetes", "limit": 200})
+        assert len(raised["skills"]) == 120
+        assert raised["truncated"] is False
+
+    def test_find_query_flags_a_cut_ranking_pool(self) -> None:
+        """Only narrower filters get past the fixed 500-row pool, so the summary says so."""
+        session = _make_session()
+        storage = self._storage_mock(self._rows(300, 201))
+        item = session._prepare_skills("c", {"action": "find", "query": "kubernetes", "limit": 500})
+        with (
+            patch("turnstone.core.session.get_storage", return_value=storage),
+            patch.object(session, "_report_tool_result") as report,
+        ):
+            _, output = session._exec_skills(item)
+        result = json.loads(output)
+        assert len(result["skills"]) == 300
+        assert result["truncated"] is True
+        assert report.call_args.args[2] == "300 skills (truncated; narrow filters)"
+
+    def test_find_query_without_a_match_in_a_cut_pool_reports_the_cut(self) -> None:
+        """The zero-result hint's advice to broaden cannot reach skills past the 500-row pool, so
+        the result reports the cut instead (#1292)."""
+        session = _make_session()
+        storage = self._storage_mock(self._rows(0, 501))
+        item = session._prepare_skills("c", {"action": "find", "query": "kubernetes"})
+        with (
+            patch("turnstone.core.session.get_storage", return_value=storage),
+            patch.object(session, "_report_tool_result") as report,
+        ):
+            _, output = session._exec_skills(item)
+        assert json.loads(output) == {"skills": [], "truncated": True}
+        assert report.call_args.args[2] == "0 skills (truncated; narrow filters)"
+        assert not [t for nt, t, _ in session._nudge_queue.drain(TOOL_DRAIN) if nt == "skill_hint"]
+
+    def test_find_reads_only_the_summary_columns(self) -> None:
+        """``list_skills_filtered`` returns only ``SKILL_SUMMARY_COLUMNS``, so the projection and
+        the ranking corpus may read nothing else (#1292)."""
+        from turnstone.core.storage._utils import SKILL_SUMMARY_COLUMNS
+
+        read: set[str] = set()
+
+        class _Row(dict):
+            def get(self, key, default=None):
+                read.add(key)
+                return super().get(key, default)
+
+            def __getitem__(self, key):
+                read.add(key)
+                return super().__getitem__(key)
+
+        row = _Row(dict.fromkeys(SKILL_SUMMARY_COLUMNS, ""), name="kube", description="kubernetes")
+        for args in ({}, {"query": "kubernetes"}):
+            session = _make_session()
+            item = session._prepare_skills("c", {"action": "find", **args})
+            with patch(
+                "turnstone.core.session.get_storage", return_value=self._storage_mock([row])
+            ):
+                session._exec_skills(item)
+        assert read == set(SKILL_SUMMARY_COLUMNS)
 
     def test_find_zero_results_with_filter_emits_hint(self) -> None:
         session = _make_session()
@@ -463,7 +584,6 @@ class TestExecSkillsFind:
                 "description": "interactive-only",
                 "enabled": True,
                 "risk_level": "low",
-                "activation": "named",
                 "kind": "interactive",
                 "allowed_tools": "[]",
             },
@@ -474,7 +594,6 @@ class TestExecSkillsFind:
                 "description": "coord-only",
                 "enabled": True,
                 "risk_level": "low",
-                "activation": "named",
                 "kind": "coordinator",
                 "allowed_tools": "[]",
             },
@@ -506,7 +625,6 @@ class TestExecSkillsFind:
                 "description": "coord-tagged",
                 "enabled": True,
                 "risk_level": "low",
-                "activation": "named",
                 "kind": "coordinator",
                 "allowed_tools": "[]",
             }
@@ -532,7 +650,6 @@ class TestExecSkillsFind:
                 "description": "Git diff and merge helper.",
                 "enabled": True,
                 "risk_level": "low",
-                "activation": "named",
                 "kind": "any",
                 "allowed_tools": "[]",
             },
@@ -543,7 +660,6 @@ class TestExecSkillsFind:
                 "description": "pytest fixtures and parametrize helpers.",
                 "enabled": True,
                 "risk_level": "low",
-                "activation": "named",
                 "kind": "any",
                 "allowed_tools": "[]",
             },
@@ -554,7 +670,6 @@ class TestExecSkillsFind:
                 "description": "Compose API docs.",
                 "enabled": True,
                 "risk_level": "low",
-                "activation": "named",
                 "kind": "any",
                 "allowed_tools": "[]",
             },
@@ -584,7 +699,6 @@ class TestExecSkillsGet:
             "description": "d",
             "enabled": True,
             "risk_level": "low",
-            "activation": "named",
             "kind": "any",
             "content": "Full skill body here.",
             "scan_report": "{}",
@@ -631,7 +745,6 @@ class TestExecSkillsGet:
             "description": "tagged for coord",
             "enabled": True,
             "risk_level": "low",
-            "activation": "named",
             "kind": "coordinator",
             "allowed_tools": "[]",
             "content": "Full body.",
@@ -1019,8 +1132,9 @@ class TestExecSkillsCreate:
         assert "'content' is required" in item.get("error", "")
 
     def test_create_ignores_model_settings(self) -> None:
-        """A skill carries no model alias, sampling settings or task-agent turn cap
-        (#1292): a create naming them proceeds, and none reaches the stored fields."""
+        """A skill carries no model alias, sampling settings, task-agent turn cap,
+        token budget or activation mode (#1292): a create naming them proceeds,
+        and none reaches the stored fields."""
         session = _make_session()
         with patch("turnstone.core.auth.user_has_permission", return_value=True):
             item = session._prepare_skills(
@@ -1035,11 +1149,59 @@ class TestExecSkillsCreate:
                     "reasoning_effort": "max",
                     "max_tokens": 9,
                     "agent_max_turns": 4,
+                    "token_budget": "abc",
+                    "activation": "default",
                 },
             )
         assert "error" not in item, item.get("error")
-        dropped = {"model", "temperature", "reasoning_effort", "max_tokens", "agent_max_turns"}
+        dropped = {
+            "model",
+            "temperature",
+            "reasoning_effort",
+            "max_tokens",
+            "agent_max_turns",
+            "token_budget",
+            "activation",
+        }
         assert not dropped & set(item["session_fields"])
+
+    def test_create_card_shows_notify_targets_whole(self) -> None:
+        """Every workstream created with the skill reports to these targets, so the
+        card shows them in full (#1292)."""
+        targets = [
+            {"channel_type": "discord", "channel_id": f"1000000000000000{i:03d}"} for i in range(4)
+        ]
+        session = _make_session()
+        with patch("turnstone.core.auth.user_has_permission", return_value=True):
+            item = session._prepare_skills(
+                "c",
+                {
+                    "action": "create",
+                    "name": "x",
+                    "content": "b",
+                    "description": "d",
+                    "notify_on_complete": targets,
+                },
+            )
+        shown = f"    notify_on_complete: {json.dumps(targets)}"
+        assert len(shown) > 120
+        assert shown in item["preview"].split("\n")
+
+    def test_create_rejects_notify_targets_workstream_create_would_drop(self) -> None:
+        """The skill takes the check a workstream's notify_targets get (#1292)."""
+        session = _make_session()
+        with patch("turnstone.core.auth.user_has_permission", return_value=True):
+            item = session._prepare_skills(
+                "c",
+                {
+                    "action": "create",
+                    "name": "x",
+                    "content": "b",
+                    "description": "d",
+                    "notify_on_complete": [{"channel_id": "1"}],
+                },
+            )
+        assert "notify_on_complete[0] missing channel_type" in item.get("error", "")
 
     def test_create_invalid_kind_errors(self) -> None:
         """SkillKind ValueError branch — model passes unknown kind, gets
@@ -1185,6 +1347,64 @@ class TestExecSkillsUpdate:
         assert item["projected_risk"] == "medium"
         assert item["current_risk"] == "low"
 
+    def test_update_card_shows_notify_targets_whole(self) -> None:
+        """The update card shows new notify targets in full, as the create card does."""
+        targets = [
+            {"channel_type": "discord", "channel_id": f"1000000000000000{i:03d}"} for i in range(4)
+        ]
+        session = _make_session()
+        storage = MagicMock()
+        storage.get_prompt_template_by_name.return_value = self._existing_row()
+        with (
+            patch("turnstone.core.auth.user_has_permission", return_value=True),
+            patch("turnstone.core.session.get_storage", return_value=storage),
+        ):
+            item = session._prepare_skills(
+                "c", {"action": "update", "name": "existing", "notify_on_complete": targets}
+            )
+        shown = f"    notify_on_complete: {json.dumps(targets)}"
+        assert len(shown) > 120
+        assert shown in item["preview"].split("\n")
+
+    def test_update_null_notify_targets_leaves_them_alone(self) -> None:
+        """A model that sends null for an omitted argument keeps the stored targets."""
+        session = _make_session()
+        storage = MagicMock()
+        storage.get_prompt_template_by_name.return_value = self._existing_row()
+        with (
+            patch("turnstone.core.auth.user_has_permission", return_value=True),
+            patch("turnstone.core.session.get_storage", return_value=storage),
+        ):
+            item = session._prepare_skills(
+                "c",
+                {
+                    "action": "update",
+                    "name": "existing",
+                    "description": "new words",
+                    "notify_on_complete": None,
+                },
+            )
+        assert "error" not in item, item.get("error")
+        assert "notify_on_complete" not in item["updates"]
+
+    @pytest.mark.parametrize("value", [True, "false"])
+    def test_update_refuses_enabled(self, value: Any) -> None:
+        """``enable`` and ``disable`` own the flag, so re-enabling always shows their card
+        (#1292)."""
+        row = {**self._existing_row(), "enabled": False, "auto_approve": True}
+        session = _make_session()
+        storage = MagicMock()
+        storage.get_prompt_template_by_name.return_value = row
+        with (
+            patch("turnstone.core.auth.user_has_permission", return_value=True),
+            patch("turnstone.core.session.get_storage", return_value=storage),
+        ):
+            item = session._prepare_skills(
+                "c", {"action": "update", "name": "existing", "enabled": value}
+            )
+        assert "skills(action='enable')" in item["error"]
+        assert "execute" not in item
+
     def test_update_readonly_filters_to_runtime_fields_only(self) -> None:
         session = _make_session()
         row = self._existing_row()
@@ -1207,7 +1427,7 @@ class TestExecSkillsUpdate:
         hints = [t for nt, t, _ in session._nudge_queue.drain(TOOL_DRAIN) if nt == "skill_hint"]
         assert hints == [
             "Readonly skills preserve external-source fidelity. Editable runtime fields: "
-            "allowed_tools, auto_approve, notify_on_complete, token_budget"
+            "allowed_tools, auto_approve, notify_on_complete"
         ]
 
     def test_update_readonly_applies_every_field_its_hint_names(self) -> None:
@@ -1216,7 +1436,6 @@ class TestExecSkillsUpdate:
             "allowed_tools": ["read_file"],
             "auto_approve": True,
             "notify_on_complete": [],
-            "token_budget": 100,
         }
         session = _make_session()
         row = self._existing_row()
@@ -1256,7 +1475,7 @@ class TestExecSkillsUpdate:
         assert hints == [
             "An admin flipped the readonly flag on this skill after the operator approved the "
             "update. Re-issue the update against only runtime fields: allowed_tools, "
-            "auto_approve, notify_on_complete, token_budget."
+            "auto_approve, notify_on_complete."
         ]
 
     def test_update_snapshots_to_skill_versions(self) -> None:
@@ -1350,6 +1569,59 @@ class TestExecSkillsToggle:
             item = session._prepare_skills("c", {"action": "disable", "name": "x"})
             assert "already disabled" in item.get("error", "")
 
+    def _enable_item(self, stored_notify: str, *, enable: bool = True) -> dict[str, Any]:
+        session = _make_session()
+        storage = MagicMock()
+        storage.get_prompt_template_by_name.return_value = {
+            "template_id": "t1",
+            "name": "x",
+            "enabled": not enable,
+            "notify_on_complete": stored_notify,
+        }
+        with (
+            patch("turnstone.core.auth.user_has_permission", return_value=True),
+            patch("turnstone.core.session.get_storage", return_value=storage),
+        ):
+            action = "enable" if enable else "disable"
+            return session._prepare_skills("c", {"action": action, "name": "x"})
+
+    def test_enable_card_shows_stored_notify_targets(self) -> None:
+        """Re-enabling lets new workstreams report to these targets, so the card and
+        the judge see them whole (#1292)."""
+        targets = '[{"channel_type": "discord", "channel_id": "123"}]'
+        item = self._enable_item(targets)
+        assert f"    notify_on_complete: {targets}" in item["preview"].split("\n")
+        assert item["notify_on_complete"] == targets
+
+    # Workstream create reads blank, ``{}`` and invalid stored targets as none; so does the card.
+    @pytest.mark.parametrize("stored", ["", "[]", "{}", "[ ]", '[{"channel_type": "discord"}]'])
+    def test_enable_card_leaves_out_empty_targets(self, stored: str) -> None:
+        item = self._enable_item(stored)
+        assert "notify_on_complete" not in item["preview"]
+        assert item["notify_on_complete"] == ""
+
+    def test_enable_card_shows_stored_targets_normalized(self) -> None:
+        """An older skills tool stored the value unchecked: extra keys and stray characters
+        stay off the card and away from the judge."""
+        stored = (
+            '[{"channel_type": "discord", "channel_id": "123",'
+            + chr(13)
+            + ' "note": "'
+            + "y" * 5000
+            + '"}]'
+        )
+        item = self._enable_item(stored)
+        target = '[{"channel_type": "discord", "channel_id": "123"}]'
+        assert f"    notify_on_complete: {target}" in item["preview"].split("\n")
+        assert item["notify_on_complete"] == target
+        assert chr(13) not in item["preview"]
+        assert "note" not in item["preview"]
+
+    def test_disable_card_leaves_out_notify_targets(self) -> None:
+        item = self._enable_item('[{"channel_type": "discord", "channel_id": "123"}]', enable=False)
+        assert "notify_on_complete" not in item["preview"]
+        assert item["notify_on_complete"] == ""
+
 
 class TestSkillHintHelper:
     """``_skill_hint`` returns the tool result verbatim and queues the optional
@@ -1385,158 +1657,6 @@ class TestSkillHintHelper:
         out = session._skill_hint("0 results", system_reminder="try a broader query")
         assert out == "0 results"
         assert not [t for nt, t, _ in session._nudge_queue.drain(TOOL_DRAIN) if nt == "skill_hint"]
-
-
-# ---------------------------------------------------------------------------
-# Tests — Skill catalog disclosure in system message (preserved verbatim
-# from the legacy test file; the disclosure path runs against
-# ``list_skills_by_activation`` and is independent of the tool merge).
-# ---------------------------------------------------------------------------
-
-
-class TestSkillCatalogDisclosure:
-    """Verify <available-skills> catalog appears in system messages."""
-
-    def _build_session_with_system_messages(
-        self,
-        search_skills: list[dict[str, Any]] | None = None,
-    ) -> Any:
-        from turnstone.core.session import ChatSession
-
-        session = ChatSession.__new__(ChatSession)
-        ui = MagicMock()
-        session.ui = ui
-        # ``_init_system_messages`` reads capabilities from the coherent
-        # model lane that ``__init__`` normally installs (bypassed here).
-        _seed_test_model_binding(session)
-        session._envelope_nonce = "test1234"
-        session._ws_id = "ws-test"
-        session._node_id = "node-1"
-        session._skill_name = None
-        session._skill_content = None
-        session._skill_resources = {}
-        session._applied_skill_content = None
-        session.context_window = 128000
-        session.messages = []
-        # ``__new__`` bypasses ChatSession's token-accounting defaults. Prefix
-        # publication invalidates any provider anchor when its bytes change,
-        # so mirror the real constructor state at that seam.
-        session._chars_per_token = 4.0
-        session._last_usage = None
-        session._token_calibrations = {}
-        session._active_token_calibration_key = None
-        session._last_usage_calibration_key = None
-        session._msg_tokens = []
-        session._system_tokens = 0
-        session._calibrated_msg_count = 0
-        session._config = {}
-        session.instructions = ""
-        session.system_messages = []
-        session._agent_prompt_components = ()
-        session._memory_index_snapshot = None
-        session.reasoning_effort = "medium"
-        from turnstone.core.nudge_queue import NudgeQueue
-
-        session._nudge_queue = NudgeQueue()
-        session._tool_search = None
-        session._mcp_client = None
-        session._notify_on_complete = "{}"
-        session._tool_error_flags = {}
-        from turnstone.prompts import ClientType
-
-        session._tools = []
-        session._client_type = ClientType.CLI
-        session._username = ""
-        # This __new__-built session skips __init__'s attachment setup.
-        session._memory_attached_project_id = ""
-        session._generation_lock = threading.RLock()
-        session._publication_shutdown = False
-        session._system_prefix_lock = threading.RLock()
-        session._system_prefix_epoch = 0
-        session._system_prefix_dirty = True
-        session._system_prefix_signature = None
-        session._kind = "interactive"
-        # Persona snapshot attrs (set by __init__, bypassed here): open
-        # defaults with no override, unrestricted tools, MCP + memory on.
-        session._persona_name = ""
-        session._persona_prompt = ""
-        session._persona_tools = None
-        session._persona_mcp = True
-        session._persona_memory = True
-
-        session._memory_config = MagicMock()
-        session._memory_config.index_budget_chars = 65_536
-        session._user_id = "test-user"
-        session._acting_user_id = ""
-        # _init_system_messages derives shared-workstream framing from the
-        # session owner (_mcp_user_id); __init__ normally sets it from user_id,
-        # so seed it here for the __new__ build.
-        session._mcp_user_id = "test-user"
-        # Shared-state fields the compose reads; _db_senders_loaded True
-        # short-circuits the full-history storage read this __new__ build has
-        # no ws for, leaving the in-memory (empty) scan -> not shared.
-        session._shared_workstream = False
-        session._known_senders = set()
-        session._db_senders_loaded = True
-        session._sender_label_nonce = "testnonce"
-        storage = MagicMock()
-        storage.get_memory_index_snapshot.return_value = None
-        with (
-            patch("turnstone.core.session.get_storage", return_value=storage),
-            patch(
-                "turnstone.core.session.list_skills_by_activation",
-                return_value=search_skills or [],
-            ),
-        ):
-            session._init_system_messages()
-
-        return session
-
-    def test_catalog_present_with_search_skills(self) -> None:
-        skills = [
-            {"name": "pdf-processing", "description": "Extract PDF text and forms."},
-            {"name": "data-analysis", "description": "Analyze datasets."},
-        ]
-        session = self._build_session_with_system_messages(search_skills=skills)
-        content = session.system_messages[0]["content"]
-        assert "<available-skills>" in content
-        assert "pdf-processing" in content
-        assert "data-analysis" in content
-        assert "</available-skills>" in content
-
-    def test_catalog_omitted_when_no_search_skills(self) -> None:
-        session = self._build_session_with_system_messages(search_skills=[])
-        content = session.system_messages[0]["content"]
-        assert "<available-skills>" not in content
-
-    def test_catalog_capped_at_30(self) -> None:
-        skills = [{"name": f"skill-{i:03d}", "description": f"Desc {i}"} for i in range(50)]
-        session = self._build_session_with_system_messages(search_skills=skills)
-        content = session.system_messages[0]["content"]
-        assert "skill-029" in content
-        assert "skill-030" not in content
-
-    def test_catalog_escapes_html(self) -> None:
-        skills = [
-            {"name": "xss-test", "description": "Handle <script> & 'quotes'."},
-        ]
-        session = self._build_session_with_system_messages(search_skills=skills)
-        content = session.system_messages[0]["content"]
-        assert "&lt;script&gt;" in content
-        assert "<script>" not in content.replace("<available-skills>", "").replace(
-            "</available-skills>", ""
-        ).replace("<skill>", "").replace("</skill>", "").replace("<name>", "").replace(
-            "</name>", ""
-        ).replace("<description>", "").replace("</description>", "")
-
-    def test_catalog_includes_hint(self) -> None:
-        skills = [{"name": "test", "description": "Test skill."}]
-        session = self._build_session_with_system_messages(search_skills=skills)
-        content = session.system_messages[0]["content"]
-        # System message still points at the slash command (the
-        # human-facing path); the tool-facing path is the new
-        # ``skills(action='find')`` flow.
-        assert "/skill" in content
 
 
 # ---------------------------------------------------------------------------

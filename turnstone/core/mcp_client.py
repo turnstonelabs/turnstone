@@ -5671,13 +5671,10 @@ class MCPClientManager:
                     skipped.append(name)
                     continue
                 # Existing MCP template — update content/variables.
-                # Reset is_default to prevent a compromised MCP server from
-                # injecting content into a previously admin-promoted default.
                 storage.update_prompt_template(
                     existing["template_id"],
                     content=content,
                     variables=variables,
-                    is_default=False,
                     token_estimate=len(content) // 4,
                 )
             else:
@@ -5694,14 +5691,12 @@ class MCPClientManager:
                     category="mcp",
                     content=content,
                     variables=variables,
-                    is_default=False,
                     org_id="",
                     created_by="",
                     origin="mcp",
                     mcp_server=server,
                     readonly=True,
                     description=template_description,
-                    activation="named",
                     token_estimate=len(content) // 4,
                 )
                 added.append(name)

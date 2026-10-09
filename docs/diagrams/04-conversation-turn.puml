@@ -21,18 +21,8 @@ database "StorageBackend\n(SQLite / PostgreSQL)" as Storage
 User -> Manager : dispatch send on one Workstream
 Manager -> Session : bind_acting_user(principal)\nsend(text, attachments, send_id)
 activate Session
-Session -> Session : refresh immutable ResolvedModelBinding
-
-opt token budget exhausted
-  Session -> UI : approve_tools(__budget_override__)
-  note right of UI
-    This gate precedes a generation claim but carries
-    a monotonic cancellation witness. Stop cannot be
-    mistaken for a budget-policy denial.
-  end note
-end
-
 Session -> Session : _claim_generation() → generation N\ninstall fresh cancel event
+Session -> Session : refresh immutable ResolvedModelBinding
 Session -> Session : plan memory / participant context
 Session -> Handoff : admit USER row\ncommit_key + prefix revision
 Session -> Storage : ordered durable batch:\nappend canonical user Turn + metadata

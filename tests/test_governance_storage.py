@@ -424,7 +424,6 @@ class TestPromptTemplateCRUD:
             "general",
             "Hello {{name}}!",
             variables='["name"]',
-            is_default=True,
             org_id="org1",
             created_by="admin",
         )
@@ -435,7 +434,7 @@ class TestPromptTemplateCRUD:
         assert tpl["category"] == "general"
         assert tpl["content"] == "Hello {{name}}!"
         assert tpl["variables"] == '["name"]'
-        assert tpl["is_default"] is True
+        assert "is_default" not in tpl
         assert tpl["org_id"] == "org1"
         assert tpl["created_by"] == "admin"
 
@@ -485,18 +484,6 @@ class TestPromptTemplateCRUD:
     def test_delete_prompt_template_nonexistent(self, db):
         assert db.delete_prompt_template("missing") is False
 
-    def test_is_default_as_bool(self, db):
-        db.create_prompt_template("t1", "default_one", "general", "D", is_default=True)
-        db.create_prompt_template("t2", "not_default", "general", "N", is_default=False)
-        t1 = db.get_prompt_template("t1")
-        t2 = db.get_prompt_template("t2")
-        assert t1 is not None
-        assert t2 is not None
-        assert t1["is_default"] is True
-        assert isinstance(t1["is_default"], bool)
-        assert t2["is_default"] is False
-        assert isinstance(t2["is_default"], bool)
-
     def test_create_with_mcp_origin(self, db):
         db.create_prompt_template(
             "t1",
@@ -504,7 +491,6 @@ class TestPromptTemplateCRUD:
             "mcp",
             "content",
             variables="[]",
-            is_default=False,
             org_id="",
             created_by="",
             origin="mcp",
@@ -535,19 +521,6 @@ class TestPromptTemplateCRUD:
 
     def test_get_prompt_template_by_name_nonexistent(self, db):
         assert db.get_prompt_template_by_name("nope") is None
-
-    def test_list_default_templates(self, db):
-        db.create_prompt_template("t1", "alpha", "general", "A", is_default=True)
-        db.create_prompt_template("t2", "beta", "general", "B", is_default=False)
-        db.create_prompt_template("t3", "gamma", "general", "C", is_default=True)
-        result = db.list_default_templates()
-        assert len(result) == 2
-        assert result[0]["name"] == "alpha"
-        assert result[1]["name"] == "gamma"
-
-    def test_list_default_templates_empty(self, db):
-        db.create_prompt_template("t1", "alpha", "general", "A", is_default=False)
-        assert db.list_default_templates() == []
 
     def test_list_prompt_templates_by_origin(self, db):
         db.create_prompt_template("t1", "manual_one", "general", "A", origin="manual")

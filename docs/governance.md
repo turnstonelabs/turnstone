@@ -66,40 +66,57 @@ Admin-defined rules that control tool execution:
 
 ### Skills
 
-Admin-curated system message skills injected at workstream startup. Skills also
-include session configuration (auto-approve, allowed tools, token budget, etc.)
-since workstream templates were merged into the skills system in v0.8.0. A
-skill does not choose the model or set temperature, reasoning effort, max
-tokens or the task-agent turn cap: those come from the workstream's model alias
-and the `tools.agent_max_turns` setting.
+Admin-curated skills: guidance a workstream applies when it names one. Skills
+also include session configuration (auto-approve, allowed tools, completion
+notifications) since workstream templates were merged into the skills system in
+v0.8.0. A skill does not choose the model or set temperature, reasoning effort,
+max tokens or the task-agent turn cap: those come from the workstream's model
+alias and the `tools.agent_max_turns` setting.
 
-- **Runtime behavior**: Skills are loaded once at session creation and injected
-  into the system message *before* user `instructions`. Skills set the baseline;
-  instructions customize per-workstream behavior.
-- **Default skills**: All `is_default=true` skills auto-apply to new
-  workstreams, concatenated in alphabetical order by name. Use name prefixes
-  (e.g. `01-safety`, `02-style`) to control ordering.
+- **Runtime behavior**: A workstream has at most one active skill. Its text
+  arrives as its own message after the system message, which carries the persona
+  prompt, prompt policies and `instructions`; loading another skill replaces it.
+- **Applied only when named**: There are no default skills. Guidance meant for
+  every session belongs in a persona's prompt or a prompt policy; both stay on
+  alongside a named skill.
+- **Kept once committed**: A workstream created with a skill through a node's
+  create API (the console's interactive launcher,
+  `POST /v1/api/workstreams/new`, scheduled tasks, channels and coordinator
+  spawns) keeps that skill's text as it was at creation. A reopen, fork or copy
+  renders the saved text even after the skill is edited, renamed, disabled or
+  deleted, and loads the skill's bundled files (with `scripts/` first on `PATH`)
+  while its row exists: disabling the skill does not stop that, deleting it
+  does. Disabling or deleting a skill only keeps it out of new workstreams. To
+  take a bad skill out of a running workstream, run `/skill clear` and then
+  close the workstream: the clear is saved, so a reopen, fork or copy does not
+  bring the skill back, but it leaves in place the auto-approve and
+  allowed-tools grants and the completion targets the skill applied at creation,
+  and the grants last until the workstream closes. Closing alone only unloads
+  the skill until the next open, fork or copy. A coordinator created from the
+  console launcher, a CLI `--skill` session and a skill loaded mid-conversation
+  with `/skill` or `skills(load)` are looked up by name, so they reopen with the
+  skill's current text (#1312, #1320).
 - **Explicit selection**: `--skill <name>` CLI flag, `skill` field on
   `POST /v1/api/workstreams/new`, console launcher dropdown, scheduled task
-  config, and channel adapter config. An explicit skill *replaces* defaults.
+  config, and channel adapter config.
 - **Variables**: Three built-in placeholders resolved at load time:
   `{{model}}` (active model name), `{{ws_id}}` (workstream ID),
   `{{node_id}}` (server node ID). Unrecognized placeholders are kept as-is.
-- **Runtime switching**: `/skill <name>` to switch, `/skill clear` to revert
-  to defaults, `/skill` to show current. Persisted across resume.
-- **Model-driven loading**: The `skill` built-in tool lets the model
-  discover and activate skills mid-conversation. `search` action finds skills
-  by query (auto-approved); `load` action activates by name (requires user
-  approval since it changes session behavior). Main session only.
+- **Runtime switching**: `/skill <name>` to switch, `/skill clear` to remove the
+  skill, `/skill` to show the current one. A switch or clear persists across
+  resume.
+- **Model-driven loading**: The `skills` built-in tool lets the model discover
+  and activate skills mid-conversation. Its `find` action browses and searches
+  the catalog (auto-approved); `load` activates one by name (requires user
+  approval since it changes session behavior). Task agents do not get it.
 - **Categories**: general, engineering, support, custom, mcp
 - **Content limit**: 32 KB per skill (enforced on create/update)
 - **Storage**: `prompt_templates` table (stores skills) with JSON `variables`
   array. Migration 010 adds `template` column to `scheduled_tasks`.
 - **MCP sync**: MCP server prompts auto-sync into the `prompt_templates` table
   with `origin="mcp"`, `mcp_server` set, and `readonly=True`. Manual skills take
-  precedence on name collision. MCP-synced content updates reset `is_default` to
-  prevent compromised servers from injecting defaults. Admin UI shows origin badge
-  and disables edit/delete for MCP-sourced skills.
+  precedence on name collision. Admin UI shows origin badge and disables
+  edit/delete for MCP-sourced skills.
 - **Spec fields**: Skills support the full Agent Skills standard frontmatter:
   `name`, `description`, `license`, `compatibility`, `metadata` (author, version),
   `allowed-tools`. The `license` and `compatibility` fields are preserved on import
@@ -122,18 +139,17 @@ and the `tools.agent_max_turns` setting.
   - SDK: `discover_skills(q)` and `install_skill(source, skill_id=..., url=...)`
     on both Python and TypeScript console clients.
 - **Runtime config on installed skills**: Installed (readonly) skills can have
-  their runtime configuration edited — token budget, auto-approve, allowed
-  tools, completion notifications, priority, menu visibility, and enabled
-  flag. The server restricts updates to these fields only via
-  `SKILL_RUNTIME_CONFIG_FIELDS` filtering; spec/content fields (name,
-  description, tags, license, compatibility, content, activation) remain
-  immutable. Audit action: `skill.update.config`.
+  their runtime configuration edited — auto-approve, allowed tools, completion
+  notifications, priority, menu visibility, and enabled flag. The server
+  restricts updates to these fields only via `SKILL_RUNTIME_CONFIG_FIELDS`
+  filtering; spec/content fields (name, description, tags, license,
+  compatibility, content) remain immutable. Audit action: `skill.update.config`.
 - **Admin UI**: Create/Edit skill modals use a two-column spec manifest layout
-  (left: Identity / Manifest / Deployment; right: Skill Content editor with
-  monospace font). Runtime Config is a collapsible 3-column grid below.
-  License uses an SPDX identifier dropdown (MIT, Apache-2.0, GPL-3.0, etc.).
-  Installed skills show a cyan origin badge with source URL, spec fields are
-  disabled, and all collapsible sections auto-expand in view mode.
+  (left: Identity / Manifest; right: Skill Content editor with monospace font).
+  Runtime Config is a collapsible section below. License uses an SPDX identifier
+  dropdown (MIT, Apache-2.0, GPL-3.0, etc.). Installed skills show a cyan origin
+  badge with source URL, spec fields are disabled, and all collapsible sections
+  auto-expand in view mode.
 
 ### Usage Tracking
 
@@ -177,7 +193,7 @@ Migration 008 adds 7 tables:
 | `roles` | Named permission bundles (3 builtin + custom) |
 | `user_roles` | User-to-role assignments (composite PK) |
 | `tool_policies` | Per-tool approve/deny/ask rules |
-| `prompt_templates` | Reusable system message skills |
+| `prompt_templates` | Skills: reusable guidance, delivered as its own message after the system message |
 | `usage_events` | Per-request token/tool/cache metrics |
 | `audit_events` | Admin action log |
 

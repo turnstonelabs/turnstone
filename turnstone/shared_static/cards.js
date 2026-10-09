@@ -58,7 +58,7 @@ function _ctxCell(sess) {
 }
 
 /* NAME cell: ellipsised title + an optional skill chip when the workstream
-   launched with a non-default skill (empty for "Use defaults"). */
+   launched with a skill (empty for "No skill"). */
 /* Resolve a project_id to its display name via the shared projects data
    layer (window bridge — cards.js also loads in the classic bundles).
    Unknown / inaccessible ids render empty so callers can show "—". */

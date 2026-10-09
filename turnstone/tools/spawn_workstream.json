@@ -10,7 +10,7 @@
       },
       "skill": {
         "type": "string",
-        "description": "Optional skill name to apply to the new workstream (overrides default skills)."
+        "description": "Optional skill name to apply to the new workstream."
       },
       "name": {
         "type": "string",

@@ -164,6 +164,9 @@ from turnstone.core.storage._utils import (
     SKILL_MUTABLE as _SKILL_MUTABLE,
 )
 from turnstone.core.storage._utils import (
+    SKILL_SUMMARY_COLUMNS as _SKILL_SUMMARY_COLUMNS,
+)
+from turnstone.core.storage._utils import (
     VERDICT_MUTABLE as _VERDICT_MUTABLE,
 )
 from turnstone.core.storage._utils import (
@@ -3835,7 +3838,6 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
         category: str,
         content: str,
         variables: str = "[]",
-        is_default: bool = False,
         org_id: str = "",
         created_by: str = "",
         origin: str = "manual",
@@ -3846,10 +3848,8 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
         source_url: str = "",
         version: str = "1.0.0",
         author: str = "",
-        activation: str = "named",
         token_estimate: int = 0,
         auto_approve: bool = False,
-        token_budget: int = 0,
         notify_on_complete: str = "[]",
         enabled: bool = True,
         allowed_tools: str = "[]",
@@ -3862,9 +3862,6 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
         arguments: str = "[]",
         argument_hint: str = "",
     ) -> None:
-        # Sync is_default from activation when activation is explicitly set
-        if activation == "default":
-            is_default = True
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
 
         # Scan skill content for risk signals
@@ -3882,7 +3879,6 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
                         "category": category,
                         "content": content,
                         "variables": variables,
-                        "is_default": 1 if is_default else 0,
                         "org_id": org_id,
                         "created_by": created_by,
                         "origin": origin,
@@ -3893,7 +3889,6 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
                         "source_url": source_url,
                         "version": version,
                         "author": author,
-                        "activation": activation,
                         "token_estimate": token_estimate,
                         "allowed_tools": allowed_tools,
                         "license": skill_license,
@@ -3903,7 +3898,6 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
                         "scan_report": scan_report,
                         "scan_version": scan_version,
                         "auto_approve": 1 if auto_approve else 0,
-                        "token_budget": token_budget,
                         "notify_on_complete": notify_on_complete,
                         "enabled": 1 if enabled else 0,
                         "priority": priority,
@@ -3929,9 +3923,7 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
                 sa.select(prompt_templates).where(prompt_templates.c.template_id == template_id)
             ).fetchone()
             if row:
-                return _row_to_dict(
-                    row, "is_default", "readonly", "auto_approve", "enabled", "hidden_from_menu"
-                )
+                return _row_to_dict(row, "readonly", "auto_approve", "enabled", "hidden_from_menu")
             return None
 
     def get_prompt_template_by_name(self, name: str) -> dict[str, Any] | None:
@@ -3940,9 +3932,7 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
                 sa.select(prompt_templates).where(prompt_templates.c.name == name)
             ).fetchone()
             if row:
-                return _row_to_dict(
-                    row, "is_default", "readonly", "auto_approve", "enabled", "hidden_from_menu"
-                )
+                return _row_to_dict(row, "readonly", "auto_approve", "enabled", "hidden_from_menu")
             return None
 
     def list_prompt_templates(
@@ -3958,9 +3948,7 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
                 q = q.limit(limit)
             rows = conn.execute(q).fetchall()
             return [
-                _row_to_dict(
-                    r, "is_default", "readonly", "auto_approve", "enabled", "hidden_from_menu"
-                )
+                _row_to_dict(r, "readonly", "auto_approve", "enabled", "hidden_from_menu")
                 for r in rows
             ]
 
@@ -3971,24 +3959,6 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
                 q = q.where(prompt_templates.c.org_id == org_id)
             return conn.execute(q).scalar() or 0
 
-    def list_default_templates(self, org_id: str = "") -> list[dict[str, Any]]:
-        with self._conn() as conn:
-            q = (
-                sa.select(prompt_templates)
-                .where(prompt_templates.c.is_default == 1)
-                .where(prompt_templates.c.enabled == 1)
-                .order_by(prompt_templates.c.priority, prompt_templates.c.name)
-            )
-            if org_id:
-                q = q.where(prompt_templates.c.org_id == org_id)
-            rows = conn.execute(q).fetchall()
-            return [
-                _row_to_dict(
-                    r, "is_default", "readonly", "auto_approve", "enabled", "hidden_from_menu"
-                )
-                for r in rows
-            ]
-
     def list_prompt_templates_by_origin(self, origin: str) -> list[dict[str, Any]]:
         with self._conn() as conn:
             rows = conn.execute(
@@ -3997,9 +3967,7 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
                 .order_by(prompt_templates.c.name)
             ).fetchall()
             return [
-                _row_to_dict(
-                    r, "is_default", "readonly", "auto_approve", "enabled", "hidden_from_menu"
-                )
+                _row_to_dict(r, "readonly", "auto_approve", "enabled", "hidden_from_menu")
                 for r in rows
             ]
 
@@ -4009,13 +3977,6 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
             log.warning("update_prompt_template: ignoring unknown fields: %s", dropped)
         fields = {k: v for k, v in fields.items() if k in _SKILL_MUTABLE}
         fields["updated"] = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
-        if "is_default" in fields:
-            fields["is_default"] = int(fields["is_default"])
-        # Keep activation and is_default in sync
-        if "activation" in fields and "is_default" not in fields:
-            fields["is_default"] = 1 if fields["activation"] == "default" else 0
-        if "is_default" in fields and "activation" not in fields:
-            fields["activation"] = "default" if fields["is_default"] else "named"
         if "auto_approve" in fields:
             fields["auto_approve"] = int(fields["auto_approve"])
         if "enabled" in fields:
@@ -4093,31 +4054,6 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
             conn.commit()
             return result.rowcount > 0
 
-    def list_skills_by_activation(
-        self,
-        activation: str,
-        *,
-        enabled_only: bool = False,
-        limit: int = 0,
-    ) -> list[dict[str, Any]]:
-        with self._conn() as conn:
-            q = (
-                sa.select(prompt_templates)
-                .where(prompt_templates.c.activation == activation)
-                .order_by(prompt_templates.c.priority, prompt_templates.c.name)
-            )
-            if enabled_only:
-                q = q.where(prompt_templates.c.enabled == 1)
-            if limit > 0:
-                q = q.limit(limit)
-            rows = conn.execute(q).fetchall()
-            return [
-                _row_to_dict(
-                    r, "is_default", "readonly", "auto_approve", "enabled", "hidden_from_menu"
-                )
-                for r in rows
-            ]
-
     def list_skills_filtered(
         self,
         *,
@@ -4129,7 +4065,7 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
         limit: int = 100,
     ) -> list[dict[str, Any]]:
         with self._conn() as conn:
-            q = sa.select(prompt_templates).order_by(
+            q = sa.select(*(prompt_templates.c[col] for col in _SKILL_SUMMARY_COLUMNS)).order_by(
                 prompt_templates.c.priority, prompt_templates.c.name
             )
             if category:
@@ -4161,12 +4097,7 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
             if limit > 0:
                 q = q.limit(limit)
             rows = conn.execute(q).fetchall()
-            return [
-                _row_to_dict(
-                    r, "is_default", "readonly", "auto_approve", "enabled", "hidden_from_menu"
-                )
-                for r in rows
-            ]
+            return [_row_to_dict(r, "enabled") for r in rows]
 
     def get_skill_by_name(self, name: str) -> dict[str, Any] | None:
         return self.get_prompt_template_by_name(name)
@@ -4177,9 +4108,7 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
                 sa.select(prompt_templates).where(prompt_templates.c.source_url == source_url)
             ).fetchone()
             if row:
-                return _row_to_dict(
-                    row, "is_default", "readonly", "auto_approve", "enabled", "hidden_from_menu"
-                )
+                return _row_to_dict(row, "readonly", "auto_approve", "enabled", "hidden_from_menu")
             return None
 
     def list_installed_skill_urls(self) -> list[dict[str, str]]:

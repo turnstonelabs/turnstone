@@ -1352,34 +1352,6 @@ def test_a_retraction_during_the_handoff_is_honoured_by_the_restore(tmp_db):
     assert retract_id not in session._queued_messages
 
 
-def test_interjection_handoff_skips_the_pop_when_budget_exhausted(tmp_db):
-    """On the budget latch ``send`` refuses without appending a turn
-    unless a human approves, and a wake is unattended — the handoff
-    must not pop (the message stays queued for the user's next real
-    send) and must fall through to the wake drain so the worker's exit
-    convergence holds."""
-    from tests._helpers import make_chat_session
-
-    session = make_chat_session()
-    session._nudge_queue.enqueue("idle_tasks", "open tasks remain", "wake")
-    _c, _p, msg_id = session.queue_message("held message")
-    session._budget_exhausted = True
-
-    sends: list[tuple[Any, ...]] = []
-
-    def _recording_send(*a: Any, **k: Any) -> None:
-        sends.append((a, k))
-
-    session.send = _recording_send  # type: ignore[method-assign]
-    session.deliver_wake_nudge_from_queue()
-
-    # No interjection dispatch; the wake drain path ran instead (the
-    # wake-eligible entry was drained toward the synthetic wake send).
-    assert msg_id in session._queued_messages
-    assert all(args != ("held message",) for args, _k in sends)
-    assert any(a == ("",) for a, _k in sends)
-
-
 def test_interjection_handoff_skips_the_pop_on_a_gone_workstream(tmp_db):
     """The delivery-site gate must be at least as strong as the claim gate:
     a nudge-driven wake reaches this method without ever consulting
@@ -1405,6 +1377,8 @@ def test_interjection_handoff_skips_the_pop_on_a_gone_workstream(tmp_db):
     assert msg_id in session._queued_messages
     assert session._popped_in_flight == set()
     assert all(args != ("held message",) for args, _k in sends)
+    # It falls through to the wake drain, so the worker's exit keeps its convergence.
+    assert any(a == ("",) for a, _k in sends)
 
 
 def test_interjection_handoff_falls_through_on_content_free_items(tmp_db):

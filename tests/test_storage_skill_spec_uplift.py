@@ -20,7 +20,6 @@ def _create(storage: Any, **kw: Any) -> str:
         category="general",
         content="",
         variables="[]",
-        is_default=False,
         org_id="",
         created_by="test",
         **kw,

@@ -3364,7 +3364,7 @@
           },
           "skill": {
             "default": "",
-            "description": "Skill name (replaces default skills)",
+            "description": "Skill name",
             "title": "Skill",
             "type": "string"
           },
@@ -4825,18 +4825,6 @@
             },
             "title": "Tags",
             "type": "array"
-          },
-          "is_default": {
-            "default": false,
-            "description": "Whether auto-applied to all sessions",
-            "title": "Is Default",
-            "type": "boolean"
-          },
-          "activation": {
-            "default": "named",
-            "description": "Activation mode: default, named, search",
-            "title": "Activation",
-            "type": "string"
           },
           "origin": {
             "default": "manual",

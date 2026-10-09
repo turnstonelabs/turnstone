@@ -335,11 +335,10 @@ scheduled_tasks = sa.Table(
     sa.Column("auto_approve", sa.Integer, nullable=False, server_default="0"),
     sa.Column("auto_approve_tools", sa.Text, nullable=False, server_default=""),
     sa.Column("skill", sa.Text, nullable=False, server_default=""),
-    # persona/project_id: slug + project stamped onto the workstream each firing
-    # creates.  Empty = "kind default persona" / "no project", mirroring how an
-    # empty model/skill means "use the default".  Passed verbatim to
-    # create_workstream at dispatch, where the node resolves the persona and
-    # gates the project attach (scheduler.py::_dispatch_to_node).  Added in
+    # persona/project_id: slug + project stamped onto the workstream each firing creates. Empty =
+    # "kind default persona" / "no project", as an empty model means "use the default alias" and an
+    # empty skill means no skill. Passed verbatim to create_workstream at dispatch, where the node
+    # resolves the persona and gates the project attach (scheduler.py::_dispatch_to_node). Added in
     # migration 066.
     sa.Column("persona", sa.Text, nullable=False, server_default=""),
     sa.Column("project_id", sa.Text, nullable=False, server_default=""),
@@ -606,7 +605,6 @@ prompt_templates = sa.Table(
     sa.Column("category", sa.Text, nullable=False, server_default="general"),
     sa.Column("content", sa.Text, nullable=False),
     sa.Column("variables", sa.Text, nullable=False, server_default="[]"),  # JSON array
-    sa.Column("is_default", sa.Integer, nullable=False, server_default="0"),
     sa.Column("org_id", sa.Text, nullable=False, server_default=""),
     sa.Column("created_by", sa.Text, nullable=False, server_default=""),
     sa.Column("origin", sa.Text, nullable=False, server_default="manual"),
@@ -617,7 +615,6 @@ prompt_templates = sa.Table(
     sa.Column("source_url", sa.Text, nullable=False, server_default=""),
     sa.Column("version", sa.Text, nullable=False, server_default="1.0.0"),
     sa.Column("author", sa.Text, nullable=False, server_default=""),
-    sa.Column("activation", sa.Text, nullable=False, server_default="named"),
     # SKILL.md spec ``user-invocable: false`` — hide from /-menu picker.
     sa.Column("hidden_from_menu", sa.Integer, nullable=False, server_default="0"),
     sa.Column("token_estimate", sa.Integer, nullable=False, server_default="0"),
@@ -645,7 +642,6 @@ prompt_templates = sa.Table(
     # sampling settings come from the workstream's alias and the task-agent
     # turn cap from the operator setting, never a skill (#1292).
     sa.Column("auto_approve", sa.Integer, nullable=False, server_default="0"),
-    sa.Column("token_budget", sa.Integer, nullable=False, server_default="0"),
     sa.Column("notify_on_complete", sa.Text, nullable=False, server_default="[]"),
     sa.Column("enabled", sa.Integer, nullable=False, server_default="1"),
     sa.Column("priority", sa.Integer, nullable=False, server_default="0"),

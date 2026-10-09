@@ -1997,14 +1997,14 @@ Every model call streams (#831). Product callers opt into one completion recover
   Raw callers, including direct eval/optimizer sampling, retain their existing empty-result
   behavior and drain retries. Product tools invoked from eval inherit product behavior.
 - **Accounting and lifecycle** — completed attempts reach their existing usage owner before
-  rejection, including empty attempts. Main recovery respects token-budget exhaustion and
-  generation ownership; discarded reasoning never enters saved history. Judges retain their
-  original deadline and fallback policy, and each output-judge reissue charges its captured
-  rate limiter. Local publication, ingestion, and accounting failures do not drive provider
-  retries, fallback, or compaction; diagnostics identify the stage and exception type without
-  exposing local exception text. A failed task reports failure, with any earlier partial work
-  guarded and explicitly labelled incomplete. Empty title exhaustion preserves the existing
-  title and scheduling latch, so later sends do not repeatedly relaunch automatic titling.
+  rejection, including empty attempts. Main recovery respects generation ownership; discarded
+  reasoning never enters saved history. Judges retain their original deadline and fallback policy,
+  and each output-judge reissue charges its captured rate limiter. Local publication, ingestion, and
+  accounting failures do not drive provider retries, fallback, or compaction; diagnostics identify
+  the stage and exception type without exposing local exception text. A failed task reports failure,
+  with any earlier partial work guarded and explicitly labelled incomplete. Empty title exhaustion
+  preserves the existing title and scheduling latch, so later sends do not repeatedly relaunch
+  automatic titling.
 - **Optional perception** — a failed child description uses the existing parent placeholder.
   Useful results are cached by principal, model binding, and content. A model that produces no
   description after recovery memoizes that empty result for the same binding generation, so
@@ -2414,14 +2414,14 @@ The console has two write-path capabilities:
    create workstreams. Auto-selects the node with the most available capacity
    if no target is specified. When a `skill` field is present, the server
    resolves the skill BEFORE `mgr.create()` and passes its name to it, so the
-   new session starts with the skill's content in its system message. AFTER
-   creation it snapshot-applies the skill's token budget, auto-approve, allowed
-   tools and completion notifications (used when the request names no
-   `notify_targets`) and records the applied skill's id, version and content.
-   The model is the request's `model`, else the default alias; temperature,
-   reasoning effort and max tokens come from that alias, else the global model
-   settings, and the task-agent turn cap from `tools.agent_max_turns`. A skill
-   sets none of these.
+   new session starts with the skill's content as its own message. AFTER
+   creation it snapshot-applies the skill's auto-approve, allowed tools and
+   completion notifications (used when the request names no `notify_targets`)
+   and records the applied skill's id, version and content. The model is the
+   request's `model`, else the default alias; temperature, reasoning effort and
+   max tokens come from that alias, else the global model settings, and the
+   task-agent turn cap from `tools.agent_max_turns`. A skill sets none of
+   these.
 
 2. **Reverse proxy** — serves each node's server UI through the console port at
    `/node/{node_id}/`. Uses `httpx.AsyncClient` to proxy HTTP and SSE traffic.
@@ -2621,17 +2621,20 @@ can be created with any permission subset. JWTs carry both `scopes` and
 
 Tool policies use glob pattern matching (`fnmatch`) with priority-ordered
 first-match-wins evaluation to control tool execution (allow/deny/ask).
-Skills provide reusable system messages with `{{variable}}` substitution
-plus session configuration (auto-approve, allowed tools, token budget,
-etc.); the model and its sampling settings come from the workstream's
-alias. Usage events are recorded per-LLM-request for token accounting.
-An append-only audit log captures all admin mutations.
+Skills provide reusable guidance, delivered as its own message after the system
+message, with `{{variable}}` substitution plus session configuration
+(auto-approve, allowed tools, completion notifications); the model and its
+sampling settings come from the workstream's alias. Usage events are recorded
+per-LLM-request for token accounting. An append-only audit log captures all
+admin mutations.
 
-Skills are snapshot-applied once at workstream creation — not a live binding.
-The `prompt_templates` table (which stores skills) supports auto-versioning,
-and workstreams record which skill and version spawned them. Token budget
-enforcement tracks consumption in `session.send()` with 80% warning and
-100% approval gate via the `__budget_override__` synthetic tool name.
+A workstream created with a skill through a node's create API keeps the text its
+skill had at creation: a reopen, fork or copy renders that saved copy even after
+the skill is edited, renamed, disabled or deleted, and the skill's row, as long as
+it exists, supplies argument names and bundled files. Coordinators created from
+the console and CLI `--skill` sessions look their skill up by name on each reopen.
+The `prompt_templates` table (which stores skills) supports
+auto-versioning, and workstreams record which skill and version spawned them.
 
 The console admin panel exposes these capabilities through permission-gated
 administration surfaces rather than treating navigation visibility as

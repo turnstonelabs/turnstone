@@ -9339,7 +9339,7 @@
           },
           "skill": {
             "default": "",
-            "description": "Skill name (replaces default skills)",
+            "description": "Skill name",
             "title": "Skill",
             "type": "string"
           },
@@ -10416,7 +10416,7 @@
           },
           "skill": {
             "default": "",
-            "description": "Skill name (replaces default skills)",
+            "description": "Skill name",
             "title": "Skill",
             "type": "string"
           },
@@ -14500,15 +14500,6 @@
             "title": "Variables",
             "type": "string"
           },
-          "is_default": {
-            "title": "Is Default",
-            "type": "boolean"
-          },
-          "activation": {
-            "default": "named",
-            "title": "Activation",
-            "type": "string"
-          },
           "org_id": {
             "title": "Org Id",
             "type": "string"
@@ -14556,11 +14547,6 @@
             "default": false,
             "title": "Auto Approve",
             "type": "boolean"
-          },
-          "token_budget": {
-            "default": 0,
-            "title": "Token Budget",
-            "type": "integer"
           },
           "notify_on_complete": {
             "default": "[]",
@@ -14650,7 +14636,6 @@
           "name",
           "category",
           "content",
-          "is_default",
           "org_id",
           "created_by",
           "created",
@@ -14864,16 +14849,6 @@
             "title": "Variables",
             "type": "string"
           },
-          "is_default": {
-            "default": false,
-            "title": "Is Default",
-            "type": "boolean"
-          },
-          "activation": {
-            "default": "named",
-            "title": "Activation",
-            "type": "string"
-          },
           "org_id": {
             "default": "",
             "title": "Org Id",
@@ -14893,11 +14868,6 @@
             "default": false,
             "title": "Auto Approve",
             "type": "boolean"
-          },
-          "token_budget": {
-            "default": 0,
-            "title": "Token Budget",
-            "type": "integer"
           },
           "notify_on_complete": {
             "default": "[]",
@@ -15060,30 +15030,6 @@
             "default": null,
             "title": "Variables"
           },
-          "is_default": {
-            "anyOf": [
-              {
-                "type": "boolean"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "default": null,
-            "title": "Is Default"
-          },
-          "activation": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "default": null,
-            "title": "Activation"
-          },
           "author": {
             "anyOf": [
               {
@@ -15119,18 +15065,6 @@
             ],
             "default": null,
             "title": "Auto Approve"
-          },
-          "token_budget": {
-            "anyOf": [
-              {
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "default": null,
-            "title": "Token Budget"
           },
           "notify_on_complete": {
             "anyOf": [
@@ -15511,7 +15445,7 @@
           },
           "skill": {
             "default": "",
-            "description": "Skill name (replaces default skills)",
+            "description": "Skill name",
             "title": "Skill",
             "type": "string"
           },
@@ -15705,18 +15639,6 @@
             },
             "title": "Tags",
             "type": "array"
-          },
-          "is_default": {
-            "default": false,
-            "description": "Whether auto-applied to all sessions",
-            "title": "Is Default",
-            "type": "boolean"
-          },
-          "activation": {
-            "default": "named",
-            "description": "Activation mode: default, named, search",
-            "title": "Activation",
-            "type": "string"
           },
           "origin": {
             "default": "manual",

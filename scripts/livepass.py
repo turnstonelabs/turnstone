@@ -286,7 +286,7 @@ UI_TEMPLATE = """<!doctype html>
         const canned = {
           "new-ws-model": ["sonnet-4-6", "gpt-5-2", "qwen3-32b"],
           "new-ws-judge-model": ["sonnet-4-6", "qwen3-32b"],
-          "new-ws-skill": ["code-review (default)", "deep-research"],
+          "new-ws-skill": ["code-review", "deep-research"],
         };
         for (const id in canned) {
           const s = document.getElementById(id);

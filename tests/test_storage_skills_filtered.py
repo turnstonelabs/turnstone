@@ -29,7 +29,6 @@ def _create_skill(
         category=category,
         content="",
         variables="[]",
-        is_default=False,
         org_id="",
         created_by="test",
         tags=json.dumps(tags or []),
@@ -54,6 +53,17 @@ def _create_skill(
 
 
 class TestListSkillsFiltered:
+    def test_rows_carry_only_the_summary_find_reads(self, storage):
+        """A ranked ``skills(find)`` reads up to 500 rows, so they skip the body (#1292)."""
+        from turnstone.core.storage._utils import SKILL_SUMMARY_COLUMNS
+
+        _create_skill(storage, template_id="s1", name="lean", tags=["a"])
+        (row,) = storage.list_skills_filtered()
+        assert set(row) == set(SKILL_SUMMARY_COLUMNS)
+        assert not {"content", "scan_report"} & set(row)
+        assert row["name"] == "lean"
+        assert row["enabled"] is True
+
     def test_no_filters_returns_all_ordered_by_priority_then_name(self, storage):
         _create_skill(storage, template_id="s1", name="zebra", priority=10)
         _create_skill(storage, template_id="s2", name="alpha", priority=10)

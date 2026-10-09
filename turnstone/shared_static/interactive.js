@@ -4283,13 +4283,7 @@ class Pane {
       block.appendChild(buildConvStatus({ auto: true }));
     } else {
       const alwaysNames = items
-        .filter(
-          (it) =>
-            it.needs_approval &&
-            it.func_name &&
-            it.func_name !== "__budget_override__" &&
-            !it.error,
-        )
+        .filter((it) => it.needs_approval && it.func_name && !it.error)
         .map((it) => it.approval_label || it.func_name);
       block.dataset.alwaysNames = JSON.stringify(alwaysNames);
       const actions = buildConvActions({

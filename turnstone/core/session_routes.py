@@ -777,12 +777,9 @@ def make_approve_handler(
     Resolves ONE pending approval cycle on the workstream's UI. Both
     kinds expose the same approve / feedback / always / call_id /
     cycle_id body shape and the same cycle-routed
-    ``ui.resolve_approval(...)`` mechanic; differences are auth scope,
-    manager lookup, and the ``__budget_override__`` filter
-    (interactive-only — coord workstreams don't have the
-    budget-override pseudo-tool).  With parallel task agents a
-    workstream can hold several cycles; a body without a selector
-    resolves the oldest.
+    ``ui.resolve_approval(...)`` mechanic; differences are auth scope
+    and manager lookup.  With parallel task agents a workstream can
+    hold several cycles; a body without a selector resolves the oldest.
 
     ``accepted_permissions`` is OR-checked via :func:`require_any_permission`
     only when ``cfg.permission_gate`` is ``None`` — i.e. for the

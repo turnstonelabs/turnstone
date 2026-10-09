@@ -826,10 +826,8 @@ def _run_single_test(
                 category="eval",
                 content=skill["content"],
                 variables="[]",
-                is_default=False,
                 org_id="",
                 created_by="eval",
-                activation="named",
                 enabled=True,
             )
 

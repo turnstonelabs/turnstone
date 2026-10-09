@@ -107,7 +107,6 @@ def _create_skill(db: Any, skill_id: str, name: str, content: str, **kw: Any) ->
         category=kw.get("category", "general"),
         content=content,
         variables=kw.get("variables", "[]"),
-        is_default=kw.get("is_default", False),
         org_id="",
         created_by="test",
         origin="manual",
@@ -118,10 +117,8 @@ def _create_skill(db: Any, skill_id: str, name: str, content: str, **kw: Any) ->
         source_url="",
         version="1.0.0",
         author="",
-        activation=kw.get("activation", "named"),
         token_estimate=0,
         auto_approve=False,
-        token_budget=0,
         notify_on_complete="{}",
         enabled=True,
         allowed_tools="[]",
@@ -315,6 +312,18 @@ class TestSystemMessageHint:
         session = _make_session(skill="plain-skill")
         content = _sys_content(session)
         assert "SKILL_RESOURCES_DIR" not in content
+        session.close()
+
+    def test_large_resources_are_listed_not_inlined(self, tmp_db):
+        db = get_storage()
+        _create_skill(db, "s1", "big-skill", "Use the reference.")
+        db.create_skill_resource("r1", "s1", "references/big.md", "B" * 9000)
+
+        session = _make_session(skill="big-skill")
+        content = _sys_content(session)
+        assert "Resource content omitted (total exceeds 8KB)" in content
+        assert "references/big.md" in content
+        assert "B" * 9000 not in content
         session.close()
 
 

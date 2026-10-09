@@ -447,8 +447,7 @@ class AutoApproveReason:
       ``action='allow'`` matched the tool name (or pattern).
     - :attr:`BLANKET` — workstream-level ``auto_approve=True`` flag
       (server config / skill ``auto_approve``).  Drains every
-      remaining pending tool unconditionally except for
-      ``__budget_override__`` which always prompts.
+      remaining pending tool unconditionally.
     - :attr:`AUTO_APPROVE_TOOLS` — fallback when ``auto_approve_tools``
       contains a name but the per-tool source map was never
       populated (legacy / pre-source-tracking instances).  Visible
@@ -1894,7 +1893,6 @@ class SessionUIBase:
             and not item.get("denied")
         }
         names.discard("")
-        names.discard("__budget_override__")
         return names
 
     @staticmethod
@@ -2254,10 +2252,9 @@ class SessionUIBase:
            policies that cannot be read refuse every call needing approval).
         3. Per-tool auto-approve via configured ``self.auto_approve_tools``
            plus execution-principal-scoped "Approve + Always" grants.
-        4. Budget-override carve-out + blanket ``self.auto_approve``, or a
-           watch restore's unattended grant (:meth:`grant_unattended`, tagged
-           ``unattended_watch``; moot while ``auto_approve`` is on).
-           Synthetic ``__budget_override__`` items always prompt.
+        4. Blanket ``self.auto_approve``, or a watch restore's unattended
+           grant (:meth:`grant_unattended`, tagged ``unattended_watch``; moot
+           while ``auto_approve`` is on).
         5. Activity tagging + ``_broadcast_activity`` so the dashboard
            reflects approval state.
         6. Heuristic verdict persistence (one row per ``_heuristic_verdict``
@@ -2267,12 +2264,6 @@ class SessionUIBase:
            pre-cycle wait/publication, register an :class:`ApprovalCycle`,
            re-check once more, emit its ``approve_request`` card, and block on
            the CYCLE's event up to the batch's configured human wait deadline.
-
-        ``__budget_override__`` is interactive-only today (coord
-        workstreams don't have token budgets), but the carve-out check
-        is cheap (``any(...)`` over pending) and is a no-op on coord;
-        kept unconditional so a future coord-skill path picks it up
-        for free.
 
         Reentrant by design: several gate threads (main loop + parallel
         task agents) run this body concurrently, each against its own
@@ -2379,23 +2370,8 @@ class SessionUIBase:
 
         pending = [it for it in items if it.get("needs_approval") and not it.get("error")]
 
-        # ``__budget_override__`` is a synthetic UI-only pseudo-tool injected
-        # by ChatSession.send when a skill's token budget is exhausted; its
-        # whole purpose is to force an operator prompt before the next turn
-        # spends past the cap. Read from the pre-filter ``items`` list (not
-        # ``pending``) so a wildcard ``*: allow`` policy or a stray entry in
-        # ``auto_approve_tools`` cannot strip the override from ``pending``
-        # before the carve-out gate at the auto-approve fall-through can see
-        # it. Same intent gates the policy block above.
-        has_budget_override = any(it.get("func_name") == "__budget_override__" for it in items)
-
         # -- Tool policy evaluation -----------------------------------------------
         # Check admin-defined tool policies before the auto_approve check.
-        # ``__budget_override__`` is excluded from policy matching: it is a
-        # synthetic UI-only pseudo-tool that exists specifically to force an
-        # operator prompt when a skill's token budget is exhausted, so a
-        # wildcard ``*: allow`` policy must never auto-approve it. Same
-        # rationale gates the carve-out check below at line 470.
         # Calls an "ask" policy matched: the unattended watch grant leaves them
         # to the normal approval flow (ids, since the items are plain dicts).
         policy_asked: set[int] = set()
@@ -2435,7 +2411,7 @@ class SessionUIBase:
                 tool_names = [
                     it.get("approval_label", "") or it.get("func_name", "")
                     for it in pending
-                    if it.get("func_name") and it.get("func_name") != "__budget_override__"
+                    if it.get("func_name")
                 ]
                 if storage is not None and tool_names:
                     verdicts = evaluate_loaded_tool_policies(storage, tool_names)
@@ -2460,12 +2436,6 @@ class SessionUIBase:
             still_pending = []
             for it in pending:
                 policy_name = it.get("approval_label", "") or it.get("func_name", "")
-                # Synthetic budget-override item bypasses policy
-                # matching entirely — falls through to the carve-out
-                # gate so an operator always sees the prompt.
-                if it.get("func_name") == "__budget_override__":
-                    still_pending.append(it)
-                    continue
                 verdict = verdicts.get(policy_name)
                 if verdict == "deny":
                     it["denied"] = True
@@ -2494,16 +2464,12 @@ class SessionUIBase:
         # Per-tool auto-approve check. Template/config grants are shared
         # workstream policy; interactive "Always" grants apply only to calls
         # executing as the same immutable principal that received the grant.
-        # Suppressed when a budget-override item is present so the carve-out
-        # at the next gate stays effective even if ``__budget_override__`` ever
-        # lands in ``auto_approve_tools`` (defensive — listings filter it out
-        # today, but the worker can be configured by a skill template).
         with self._ws_lock:
             principal_grants = set(
                 self._always_approve_tools_by_principal.get(execution_principal_id, set())
             )
         auto_approve_names = set(self.auto_approve_tools) | principal_grants
-        if pending and auto_approve_names and not has_budget_override:
+        if pending and auto_approve_names:
             pending_names = {
                 it.get("approval_label", "") or it.get("func_name", "")
                 for it in pending
@@ -2523,43 +2489,31 @@ class SessionUIBase:
                 )
                 pending = []
 
-        # Budget override requires explicit approval — never auto-approved by
-        # blanket auto_approve (tool policies can still allow it explicitly,
-        # but the policy block above carves out ``__budget_override__`` so
-        # that path is unreachable too). ``has_budget_override`` was computed
-        # from the pre-filter ``items`` list at the top of the function so a
-        # policy/auto-approve pass that drained the override from ``pending``
-        # cannot disarm this gate.
         # Skip-permissions wins the tag: a batch it approves reads as blanket.
         unattended = getattr(self, "_unattended", False) and not self.auto_approve
         # An "ask" policy wants the normal approval flow even while nobody is
         # here: the grant then covers only the calls no "ask" policy matched,
         # after the judge below, and the asked calls the judge does not clear
         # wait at the prompt for a person.
-        grant_unasked_only = (
-            unattended and not has_budget_override and any(id(it) in policy_asked for it in pending)
-        )
+        grant_unasked_only = unattended and any(id(it) in policy_asked for it in pending)
         if grant_unasked_only:
             unattended = False
         smart_commit_actions: list[Callable[[], None]] = []
         auto_deferred: list[Callable[[], None]] = []
-        blanket_active = (self.auto_approve or unattended) and not has_budget_override
+        blanket_active = self.auto_approve or unattended
 
         # -- Smart Approvals (judge.smart_approvals) -----------------------------
-        # Last automatic gate before the human prompt, after the explicit
-        # operator-configured ones (policy / "Always" / blanket): wait
-        # briefly for the async LLM intent verdict and auto-approve every
-        # still-pending call the judge cleared with a high-confidence
-        # ``approve``.  Skipped under blanket auto-approve (everything is
-        # approved already) and when a ``__budget_override__`` pseudo-tool
-        # is present (it must always reach a human).  An unattended batch an
-        # "ask" policy matched is judged whole, as in an attended session (the
+        # Last automatic gate before the human prompt, after the explicit operator-configured ones
+        # (policy / "Always" / blanket): wait briefly for the async LLM intent verdict and
+        # auto-approve every still-pending call the judge cleared with a high-confidence
+        # ``approve``.  Skipped under blanket auto-approve (everything is approved already).  An
+        # unattended batch an "ask" policy matched is judged whole, as in an attended session (the
         # judge's clearance is all or nothing).
         # Smart qualification is read-only.  Its mutations, audit stamps, and
         # visible auto-approval commit join the one terminal admission below;
         # a Stop between the verdict wait and that admission therefore leaves
         # no half-approved batch behind.
-        if pending and smart_config.enabled and not blanket_active and not has_budget_override:
+        if pending and smart_config.enabled and not blanket_active:
             pending = self._apply_smart_approvals(
                 pending,
                 cancelled=_cancelled,
@@ -2796,22 +2750,14 @@ class SessionUIBase:
         is_cancelled = cancelled or (lambda: False)
         if is_cancelled():
             return pending
-        # Only calls the judge actually evaluated carry a heuristic verdict;
-        # the ``__budget_override__`` pseudo-tool is never smart-approved, so
-        # its presence makes ``candidates`` smaller than ``pending`` and the
-        # batch-completeness check below holds the whole batch for a human.
-        candidates = [
-            it
-            for it in pending
-            if it.get("_heuristic_verdict") and it.get("func_name") != "__budget_override__"
-        ]
+        # Only calls the judge actually evaluated carry a heuristic verdict.
+        candidates = [it for it in pending if it.get("_heuristic_verdict")]
         needed = {it.get("call_id", "") for it in candidates if it.get("call_id")}
         if not needed:
             return pending
         # The whole batch must be eligible before we pay the verdict wait:
         #   - every pending call must be a judged candidate — an unjudged
-        #     sibling or the ``__budget_override__`` pseudo-tool makes
-        #     candidates < pending, AND
+        #     sibling makes candidates < pending, AND
         #   - call_ids must be unique — some local models emit duplicate
         #     non-empty tool-call ids (``model_turn.ensure_tool_call_ids`` only fills
         #     MISSING ones), which collapse in the ``needed`` set and would let

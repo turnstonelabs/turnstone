@@ -711,33 +711,48 @@ data.get("mergedAt") is not None
 
 ---
 
-### skill
+### skills
 
-Discover and activate skills at runtime during a conversation. The model can
-search for available skills and load one by name, replacing the current active
-skill. This enables model-driven skill selection without requiring the user to
-pre-configure skills at workstream creation.
+Browse the skill catalog, load a skill into the current session and, with
+permission, write skills. One tool with an `action` argument; each action has
+its own approval rule.
 
-| Parameter | Type   | Required | Description |
-|-----------|--------|----------|-------------|
-| `action`  | string | yes      | `load` or `search`. |
-| `name`    | string | load     | Skill name to activate. |
-| `query`   | string | no       | Search query for finding skills (for `search` action). |
+| Parameter   | Type    | Required      | Description |
+|-------------|---------|---------------|-------------|
+| `action`    | string  | yes           | `find`, `get`, `load`, `create`, `update`, `enable` or `disable`. |
+| `name`      | string  | all but find  | Skill name. |
+| `query`     | string  | no            | For `find`: BM25 query over name, description, tags and category. |
+| `limit`     | integer | no            | For `find`: rows to return, 1-500 (default 100, or 50 with a `query`). |
+| `arguments` | string  | no            | For `load`: invocation arguments for `$ARGUMENTS`, `$N` and `$<name>`. |
+
+`find` also filters by `category`, `tag`, `risk_level`, `kind` and
+`enabled_only`. `create` and `update` take the skill's fields: `content`,
+`description`, `category`, `tags`, `kind`, `auto_approve`, `allowed_tools` and
+`notify_on_complete`.
 
 **Actions:**
 
-- `load` — Activate a skill by name. Calls `set_skill()` which handles content
-  rendering with `{{model}}`/`{{ws_id}}`/`{{node_id}}` variables, system message
-  reinitialization, and config persistence. Returns the skill name, description,
-  and security risk level. Warns on high/critical risk level.
-- `search` — Find available skills by query. Uses BM25 relevance ranking over
-  name, description, tags, and category (same `BM25Index` used by memory
-  relevance and tool search). Returns up to 10 results with name, description,
-  category, risk level, and activation type.
+- `find` — List skills that match the filters, by priority then name. With a
+  `query`, it ranks up to 500 filtered skills by BM25 relevance (the same
+  `BM25Index` memory recall and tool search use) and returns up to `limit` of
+  them. Rows carry the name, description, category, tags, version, kind,
+  enabled flag, risk level and allowed tools, never the skill text.
+- `get` — Fetch one skill: the row `find` returns (allowed tools capped at 20)
+  plus its text, scan report and read-only flag.
+- `load` — Activate a skill by name, replacing the current one. Calls
+  `set_skill()`, which renders the text with `{{model}}`/`{{ws_id}}`/`{{node_id}}`
+  variables, rebuilds the system messages and saves the config. Returns the
+  skill's name, description and risk level. A disabled skill is refused, and so
+  is a high- or critical-risk one: only the operator can load that, with `/skill`.
+- `create`, `update`, `enable`, `disable` — Write the catalog. `enable` and
+  `disable` flip the `enabled` flag; there is no delete action (hard delete stays
+  in the admin UI).
 
-- **Auto-approve**: `load` requires approval (changes session behavior); `search`
-  is auto-approved (read-only).
-- **Agent availability**: Main session only — not available to task sub-agents.
+- **Auto-approve**: `find` and `get` are auto-approved (read-only). `load`
+  requires approval (it changes session behavior). The write actions require
+  approval and the `model.skills.write` permission, which no role has by default.
+- **Agent availability**: Interactive and coordinator sessions; not available to
+  task sub-agents.
 
 ---
 
@@ -764,7 +779,7 @@ metadata-selected `TASK_AGENT_TOOLS` subset.
 | `watch`      | Monitor    | No (create)  | No         | `command`   |
 | `read_resource`| MCP      | No           | Yes        | `uri`       |
 | `use_prompt` | MCP        | No           | Yes        | `name`      |
-| `skill`      | Skills     | No (load)    | No         | `name`      |
+| `skills`     | Skills     | find, get    | No         | `action`    |
 | `tool_search`| Search     | Yes          | No         | `query`     |
 
 ---

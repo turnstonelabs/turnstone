@@ -197,7 +197,7 @@ class TerminalUI(SessionUI):
                 _policy_names = [
                     it.get("approval_label", "") or it.get("func_name", "")
                     for it in pending
-                    if it.get("func_name") and it.get("func_name") != "__budget_override__"
+                    if it.get("func_name")
                 ]
                 if storage is not None and _policy_names:
                     verdicts = evaluate_loaded_tool_policies(storage, _policy_names)
@@ -205,10 +205,6 @@ class TerminalUI(SessionUI):
                 logging.getLogger(__name__).warning("Policy evaluation failed", exc_info=True)
                 verdicts = None
             for it in pending:
-                if it.get("func_name") == "__budget_override__":
-                    # No policy settles the budget prompt. Refusing it here would read as
-                    # approved: this gate reports a refusal as an error on an approved batch.
-                    continue
                 policy_name = it.get("approval_label", "") or it.get("func_name", "")
                 if verdicts is None or verdicts.get(policy_name) == "deny":
                     it["denied"] = True
@@ -231,7 +227,6 @@ class TerminalUI(SessionUI):
         with self._print_lock:
             # Print all headers, previews, and heuristic verdicts
             for item in items:
-                # The token-budget item has no header; its preview says what it asks.
                 header = item.get("header") or item.get("func_name", "")
                 if item.get("error"):
                     sys.stdout.write(f"  {red(header)}\n")
@@ -255,14 +250,11 @@ class TerminalUI(SessionUI):
                         sys.stdout.write(f"  Intent: {summary}\n")
             sys.stdout.flush()
 
-            # The token-budget prompt always reaches the person, as on a node: neither
-            # skip-permissions nor an auto-approve list settles it.
-            has_budget_override = any(it.get("func_name") == "__budget_override__" for it in items)
-            if not pending or (self.auto_approve and not has_budget_override):
+            if not pending or self.auto_approve:
                 return True, None
 
             # Per-tool auto-approve check
-            if self.auto_approve_tools and not has_budget_override:
+            if self.auto_approve_tools:
                 pending_names = {
                     it.get("approval_label", "") or it.get("func_name", "")
                     for it in pending
@@ -306,7 +298,6 @@ class TerminalUI(SessionUI):
                     if it.get("func_name") and not it.get("error")
                 }
                 tool_names.discard("")
-                tool_names.discard("__budget_override__")
                 self.auto_approve_tools.update(tool_names)
                 return True, feedback
             elif decision in ("y", "yes"):
@@ -1459,7 +1450,10 @@ def main() -> None:
     parser.add_argument(
         "--skill",
         default=None,
-        help="Skill name (replaces default skills)",
+        help=(
+            "Skill for each workstream this terminal starts from scratch (/new copies the "
+            "current tab's skill; a resumed workstream keeps its own)"
+        ),
     )
     parser.add_argument(
         "--persona",

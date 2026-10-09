@@ -56,10 +56,8 @@ def _seed_skill(skill: dict[str, str]) -> None:
         category="eval",
         content=skill["content"],
         variables="[]",
-        is_default=False,
         org_id="",
         created_by="eval",
-        activation="named",
         enabled=True,
     )
 

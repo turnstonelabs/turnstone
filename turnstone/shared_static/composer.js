@@ -851,7 +851,7 @@ Composer.prototype.setOptionValue = function (id, value) {
 
 // Replace a select field's <option> list, preserving the first
 // <option> when one already exists (conventionally the "Default /
-// Use defaults" placeholder the caller seeded at construction time).
+// No skill" placeholder the caller seeded at construction time).
 // When the field was constructed without any choices, nothing is
 // preserved — callers get exactly the list they passed in.
 // Used by callers that populate choices asynchronously — e.g. the

@@ -9,7 +9,7 @@
  * RAW ROWS, PER-APP LABEL.  The skill label diverges between apps — the ui
  * pickers append a " [MCP]" suffix for MCP-origin skills, the console
  * launcher does not — so this cache exposes the raw rows via
- * {@link getSkills} (`{name, is_default, origin}`) and each populate helper
+ * {@link getSkills} (`{name, origin}`) and each populate helper
  * formats its own label.  A single pre-formatted `text` here would silently
  * change one app's labels.
  *
@@ -29,7 +29,7 @@ const _core = makeListCache({
   dataKey: "skills",
   name: "skills",
   fpRow: function (s) {
-    return [s.name, s.is_default, s.origin];
+    return [s.name, s.origin];
   },
 });
 
@@ -45,7 +45,7 @@ export function refreshSkills(callOpts) {
   return _core.refresh(callOpts);
 }
 
-/** Cached skill rows (`{name, is_default, origin, ...}`; empty until the
+/** Cached skill rows (`{name, origin, ...}`; empty until the
  *  first refresh resolves).  Raw so each app formats its own label. */
 export function getSkills() {
   return _core.get();

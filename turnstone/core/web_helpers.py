@@ -93,8 +93,6 @@ def skill_summary_rows(storage: Any) -> list[dict[str, Any]]:
                 "category": r.get("category", ""),
                 "description": r.get("description", ""),
                 "tags": tags,
-                "is_default": r.get("is_default", False),
-                "activation": r.get("activation", "named"),
                 "origin": r.get("origin", "manual"),
                 "author": r.get("author", ""),
                 "version": r.get("version", "1.0.0"),

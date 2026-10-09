@@ -732,31 +732,6 @@ def get_skill_by_name(name: str) -> dict[str, Any] | None:
         return None
 
 
-def list_default_skills(org_id: str = "") -> list[dict[str, Any]]:
-    """Return all skills where is_default=True, ordered by name."""
-    try:
-        return get_storage().list_default_templates(org_id)
-    except Exception:
-        log.warning("Failed to list default skills", exc_info=True)
-        return []
-
-
-def list_skills_by_activation(
-    activation: str,
-    *,
-    enabled_only: bool = False,
-    limit: int = 0,
-) -> list[dict[str, Any]]:
-    """Return skills filtered by activation value, ordered by name."""
-    try:
-        return get_storage().list_skills_by_activation(
-            activation, enabled_only=enabled_only, limit=limit
-        )
-    except Exception:
-        log.warning("Failed to list skills by activation=%s", activation, exc_info=True)
-        return []
-
-
 # -- Workstream metadata ------------------------------------------------------
 
 

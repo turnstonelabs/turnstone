@@ -419,36 +419,6 @@ def test_rejected_usage_preserves_conversation_persistence_failure(tmp_db, clean
     assert load_last_error(session._ws_id) == f"ConversationPersistenceError: {error}"
 
 
-@pytest.mark.parametrize("kind", _KINDS)
-def test_rejected_usage_enforces_budget_before_retry_and_next_send(tmp_db, kind):
-    with scripted_session(kind, ["separate"]) as (session, ui, requests):
-        session._token_budget = 1000
-        with pytest.raises(RuntimeError, match="no answer"):
-            session.send("Continue the requested work.")
-        assert len(requests) == 1
-        assert session._budget_warned
-        assert session._budget_exhausted
-        assert len(ui.of("status")) == 1
-        assert not [turn for turn in session.messages if turn.role == "assistant"]
-        with patch.object(ui, "approve_tools", return_value=(False, "")) as approve:
-            session.send("Try again.")
-        assert len(requests) == 1
-        approve.assert_called_once()
-        assert approve.call_args.args[0][0]["func_name"] == "__budget_override__"
-
-
-@pytest.mark.parametrize("budget", [0, 30000])
-def test_rejected_usage_preserves_per_completion_budget_semantics(tmp_db, budget):
-    with scripted_session(WorkstreamKind.INTERACTIVE, ["separate"] * 3) as (session, ui, requests):
-        session._token_budget = budget
-        with pytest.raises(RuntimeError, match="no answer"):
-            session.send("Continue the requested work.")
-        assert len(requests) == 3
-        assert len(ui.of("status")) == 3
-        assert not session._budget_exhausted
-        assert session._budget_warned is (budget > 0)
-
-
 @pytest.mark.parametrize("invalidate", ["supersede", "close"])
 def test_invalidated_empty_attempt_cannot_publish_or_retry(tmp_db, invalidate):
     with scripted_session(WorkstreamKind.INTERACTIVE, ["separate"]) as (session, ui, requests):
