@@ -112,7 +112,19 @@ class MCPSearchClient:
         category = kwargs.get("category")
         if category:
             args["category"] = category
-        return self._mcp.call_tool_sync(self._tool, args, timeout=max(1, math.ceil(self._timeout)))
+        result = self._mcp.call_tool_sync(
+            self._tool, args, timeout=max(1, math.ceil(self._timeout))
+        )
+        if isinstance(result, list):
+            # This adapter's search/reranking contract is text-only. Direct
+            # calls to the MCP tool retain images through the multipart path.
+            return "\n".join(
+                p.get("text", "")
+                if p.get("type") == "text"
+                else "[Image omitted from text-only web search; call the MCP tool directly to view it.]"
+                for p in result
+            )
+        return result
 
 
 # ---------------------------------------------------------------------------

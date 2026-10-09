@@ -204,6 +204,9 @@ def _parse_int(
 _JS_PROXY_SHIM = """\
 (function(){
   var _pfx = "PREFIX_PLACEHOLDER";
+  // Native media src/href requests bypass the fetch/EventSource wrappers.
+  // Publish this trusted page prefix so tool images can target the same node.
+  window.TURNSTONE_PROXY_PREFIX = _pfx;
   var _oF = window.fetch;
   window.fetch = function(u, o){
     if (typeof u === "string" && u.startsWith("/")) u = _pfx + u;

@@ -10961,6 +10961,7 @@ class ChatSession:
         preview: dict[str, Any] | None,
         effect_status: str | None,
         projection_safe: bool,
+        attachments: list[dict[str, Any]] | None = None,
     ) -> int | None:
         """Publish one accepted TOOL row or request exceptional repair.
 
@@ -10987,6 +10988,7 @@ class ChatSession:
                             is_error=is_error,
                             preview=preview,
                             effect_status=effect_status,
+                            **({"attachments": attachments} if attachments else {}),
                         )
                     )
                     if event_id is not None:
@@ -13499,6 +13501,16 @@ class ChatSession:
                             "tool_call_id": tc_id,
                             "content": tool_content,
                         }
+                        if tool_image_atts:
+                            tool_msg["_attachments_meta"] = [
+                                {
+                                    "attachment_id": att.attachment_id,
+                                    "kind": att.kind,
+                                    "filename": att.filename,
+                                    "mime_type": att.mime_type,
+                                }
+                                for att in tool_image_atts
+                            ]
                         tool_is_error = self._tool_error_flags.pop(tc_id, False)
                         if tool_is_error:
                             tool_msg["is_error"] = True
@@ -14313,6 +14325,7 @@ class ChatSession:
                 preview=preview,
                 effect_status=effect_status,
                 projection_safe=projection_safe,
+                attachments=message.get("_attachments_meta"),
             )
             message["_event_id"] = event_id_ref[0]
             turn.meta.event_id = event_id_ref[0]
@@ -24122,7 +24135,7 @@ class ChatSession:
             "mcp_args": args,
         }
 
-    def _exec_mcp_tool(self, item: dict[str, Any]) -> tuple[str, str]:
+    def _exec_mcp_tool(self, item: dict[str, Any]) -> tuple[str, str | list[dict[str, Any]]]:
         """Execute an MCP tool call via the MCPClientManager."""
         self._check_cancelled()
         call_id: str = item["call_id"]
@@ -24155,10 +24168,19 @@ class ChatSession:
             mcp_error = True
             self.ui.on_error(output)
 
+        # Receipts are text-only; pixels must reach the ordinary multipart
+        # fold intact, never the string truncator or the SSE event ring.
+        receipt = output
+        if isinstance(output, list):
+            receipt = "\n".join(
+                p.get("text", "") if p.get("type") == "text" else "[image attached]" for p in output
+            )
+        assert isinstance(receipt, str)
+        mcp_error = mcp_error or receipt.startswith("Error:")
         self._report_tool_result(
             call_id,
             func_name,
-            self._truncate_output(output),
+            self._truncate_output(receipt),
             is_error=mcp_error,
             status=mcp_status,
         )

@@ -7,7 +7,6 @@ of the Chat Completions endpoint.
 
 from __future__ import annotations
 
-import json
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, NoReturn
 
@@ -277,8 +276,8 @@ class OpenAIResponsesProvider:
                 # Tool result → function_call_output
                 output = content
                 if isinstance(content, list):
-                    # Structured content (e.g. vision) — serialize to string
-                    output = json.dumps(content)
+                    # Native multimodal function output, not JSON/base64 text.
+                    output = convert_content_parts(content)
                 items.append(
                     {
                         "type": "function_call_output",

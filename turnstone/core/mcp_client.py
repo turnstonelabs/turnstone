@@ -17,6 +17,7 @@ Refresh: two mechanisms keep tool/resource/prompt lists up-to-date:
 from __future__ import annotations
 
 import asyncio
+import base64
 import concurrent.futures
 import contextlib
 import gc
@@ -44,6 +45,7 @@ from mcp.shared._httpx_utils import (
     McpHttpClientFactory,
 )
 
+from turnstone.core.attachments import ALLOWED_IMAGE_MIMES, IMAGE_SIZE_CAP, sniff_image_mime
 from turnstone.core.config import load_config
 from turnstone.core.log import get_logger
 from turnstone.core.mcp_http_parsers import (
@@ -7143,7 +7145,7 @@ class MCPClientManager:
         user_id: str | None = None,
         timeout: int = 120,
         is_interactive_for_consent: bool = True,
-    ) -> str:
+    ) -> str | list[dict[str, Any]]:
         """Execute an MCP tool call synchronously (blocks the calling thread).
 
         Dispatches an async ``tools/call`` to the background event loop and
@@ -7499,11 +7501,11 @@ class MCPClientManager:
         server_row: dict[str, Any],
         timeout: int,
         is_interactive_for_consent: bool = True,
-    ) -> str:
+    ) -> str | list[dict[str, Any]]:
         """Synchronous wrapper for pool dispatch.
 
         Bridges sync caller → mcp-loop coroutine → result. Returns either
-        the tool output string or a structured-error JSON string when
+        text/multipart tool output or a structured-error JSON string when
         token state forces the call to fail cleanly without raising
         (consent required, key mismatch, etc.). ``server_row`` is the
         row already resolved by ``_resolve_pool_target`` and is reused
@@ -7570,7 +7572,7 @@ class MCPClientManager:
                 arguments=arguments,
                 server_row=server_row,
             )
-        if _is_structured_error(result):
+        if isinstance(result, str) and _is_structured_error(result):
             if not is_interactive_for_consent:
                 self._record_pending_consent_best_effort(
                     user_id=user_id, server_name=server_name, result=result
@@ -7591,7 +7593,7 @@ class MCPClientManager:
         original_name: str,
         arguments: dict[str, Any],
         server_row: dict[str, Any],
-    ) -> str:
+    ) -> str | list[dict[str, Any]]:
         """Schedule one ``_dispatch_pool`` attempt and wait for the result.
 
         Split out of :meth:`_dispatch_pool_sync` so the two retry
@@ -7823,10 +7825,10 @@ class MCPClientManager:
         arguments: dict[str, Any],
         server_row: dict[str, Any],
         retry_count: int = 0,
-    ) -> str:
+    ) -> str | list[dict[str, Any]]:
         """Pool-side coroutine: resolve token, connect-or-reuse, dispatch.
 
-        Returns either the textualized tool output or a structured-error
+        Returns either text/multipart tool output or a structured-error
         JSON string when token state precludes dispatch. ``server_row``
         is supplied by ``_resolve_pool_target`` so this path doesn't
         re-issue the ``mcp_servers`` lookup; it's also pre-validated to
@@ -8622,7 +8624,7 @@ class MCPClientManager:
         access_token: str,
         original_name: str,
         arguments: dict[str, Any],
-    ) -> str:
+    ) -> str | list[dict[str, Any]]:
         """Hold ``entry.open_lock`` across connect-or-reuse AND ``call_tool``.
 
         Thin wrapper over :meth:`_dispatch_pool_with_entry_call` —
@@ -9043,24 +9045,51 @@ class MCPClientManager:
 # ---------------------------------------------------------------------------
 
 
-def _decode_tool_result(result: Any) -> str:
-    """Render an MCP ``tools/call`` result into the string the agent sees.
+def _decode_tool_result(result: Any) -> str | list[dict[str, Any]]:
+    """Preserve MCP images as multipart tool output, not base64 text.
 
-    Walks ``result.content`` collecting text parts and labelling binary
-    parts; an ``isError`` result is prefixed with ``Error: `` so the
-    LLM can narrate the failure. Shared by the static and pool dispatch
-    paths.
+    The session folds images into its existing content-addressed attachment
+    store; providers materialize those references at the wire boundary. Keep
+    text-only results byte-compatible with the static and pooled callers.
+    Image bytes share the upload MIME policy and a per-result byte budget.
     """
-    texts: list[str] = []
+    parts: list[dict[str, Any]] = []
+    image_bytes = 0
     for item in result.content:
-        if hasattr(item, "text"):
-            texts.append(item.text)
+        if isinstance(item, mcp_types.ImageContent):
+            try:
+                if item.mimeType not in ALLOWED_IMAGE_MIMES:
+                    raise ValueError("unsupported image MIME type")
+                remaining = IMAGE_SIZE_CAP - image_bytes
+                if len(item.data) > 4 * ((remaining + 2) // 3):
+                    raise ValueError("image result exceeds byte limit")
+                raw = base64.b64decode(item.data, validate=True)
+                if len(raw) > remaining:
+                    raise ValueError("image result exceeds byte limit")
+                if sniff_image_mime(raw) != item.mimeType:
+                    raise ValueError("image bytes do not match MIME type")
+            except ValueError as exc:
+                parts.append({"type": "text", "text": f"[MCP image omitted: {exc}]"})
+                continue
+            image_bytes += len(raw)
+            parts.append(
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:{item.mimeType};base64,{item.data}"},
+                }
+            )
+        elif hasattr(item, "text"):
+            parts.append({"type": "text", "text": item.text})
         elif hasattr(item, "data"):
             mime = getattr(item, "mimeType", "binary")
-            texts.append(f"[{mime} data, {len(item.data)} bytes]")
+            parts.append({"type": "text", "text": f"[{mime} data, {len(item.data)} bytes]"})
         else:
-            texts.append(str(item))
-    output = "\n".join(texts) if texts else "(no output)"
+            parts.append({"type": "text", "text": str(item)})
+    if image_bytes:
+        if getattr(result, "isError", False):
+            parts.insert(0, {"type": "text", "text": "Error: MCP tool returned an error."})
+        return parts
+    output = "\n".join(p["text"] for p in parts) if parts else "(no output)"
     if getattr(result, "isError", False):
         output = f"Error: {output}"
     return output

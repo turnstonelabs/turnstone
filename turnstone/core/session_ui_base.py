@@ -4111,6 +4111,7 @@ class SessionUIBase:
         is_error: bool = False,
         preview: dict[str, Any] | None = None,
         effect_status: str | None = None,
+        attachments: list[dict[str, Any]] | None = None,
     ) -> int:
         """Publish the canonical accepted TOOL row without replaying metrics.
 
@@ -4140,6 +4141,15 @@ class SessionUIBase:
             event["preview"] = preview
         if effect_status:
             event["effect_status"] = effect_status
+        if attachments:
+            event["attachments"] = [
+                {
+                    k: item[k]
+                    for k in ("attachment_id", "kind", "filename", "mime_type")
+                    if k in item
+                }
+                for item in attachments
+            ]
         return self._enqueue(event)
 
     def on_tool_output_chunk(self, call_id: str, chunk: str) -> None:

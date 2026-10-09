@@ -2152,7 +2152,9 @@ def reconstruct_turns(
                 )
             )
         elif role == "tool":
-            trefs, _tmeta = _reconstruct_attachment_refs(attachments_by_msg, row_id)
+            trefs, tmeta = _reconstruct_attachment_refs(attachments_by_msg, row_id)
+            if tmeta:
+                meta.extra["attachments_meta"] = tmeta
             turns.append(
                 Turn(
                     Role.TOOL,

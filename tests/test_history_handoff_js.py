@@ -23,6 +23,7 @@ _COORDINATOR = _ROOT / "turnstone/console/static/coordinator/coordinator.js"
 _SHARED_HANDOFF = _ROOT / "turnstone/shared_static/history_handoff.js"
 _QUEUE = _ROOT / "turnstone/shared_static/composer_queue.js"
 _TOOL_PROJECTION = _ROOT / "turnstone/shared_static/tool_projection.js"
+_ATTACHMENTS = _ROOT / "turnstone/shared_static/composer_attachments.js"
 _PY_SDK = _ROOT / "turnstone/sdk/server.py"
 _PY_CHANNEL = _ROOT / "turnstone/channels/_sse.py"
 _TS_SDK = _ROOT / "sdk/typescript/src/server.ts"
@@ -482,6 +483,10 @@ import {
   recordAcceptedToolEvent,
   shouldRefreshTasksForToolResult,
 } from %(projection)s;
+globalThis.window = {};
+const { buildToolImages } = await import(%(attachments)s);
+
+const wsId = "ws-tool-projection";
 
 function classList(...initial) {
   const values = new Set(initial);
@@ -771,6 +776,7 @@ if (lateOutputs.length !== 1 || lateOutputs[0].output !== "orphan final")
             "projection": json.dumps(_TOOL_PROJECTION.as_uri()),
             "handle": handle_event,
             "append_result": append_result,
+            "attachments": json.dumps(_ATTACHMENTS.as_uri()),
             "append_to_row": append_to_row,
             "append_batch": append_batch,
         },
@@ -791,6 +797,8 @@ import {
   indexLatestToolRow,
   recordAcceptedToolEvent,
 } from %(projection)s;
+globalThis.window = {};
+const { buildToolImages } = await import(%(attachments)s);
 
 function classList(...initial) {
   const values = new Set(initial);
@@ -1034,6 +1042,7 @@ if (second.batch.children.some((node) => node.output === "old history corruption
             "projection": json.dumps(_TOOL_PROJECTION.as_uri()),
             "handle": handle_event,
             "append": append_output,
+            "attachments": json.dumps(_ATTACHMENTS.as_uri()),
             "announce": announce_block,
             "announce_key": announce_key,
         },
