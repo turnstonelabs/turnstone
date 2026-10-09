@@ -447,7 +447,7 @@ class TestTransportOwnerLifecycle:
         }[failure]
 
         async def _drive() -> None:
-            connect = asyncio.create_task(mgr._connect_one("srv", mgr._server_configs["srv"]))
+            connect = asyncio.create_task(mgr._connect_one("srv"))
             try:
                 async with asyncio.timeout(5):
                     await both_started.wait()
@@ -906,7 +906,6 @@ class TestBaseExceptionGroupHardening:
         with patch.object(mgr, "_connect_one_locked", side_effect=_exploding_connect):
             _run(loop, mgr._connect_all())
 
-        assert mgr._connected.is_set()
         assert "srv" in mgr._last_error
         health = mgr._static_health_task
         sweep = mgr._user_token_sweep_task

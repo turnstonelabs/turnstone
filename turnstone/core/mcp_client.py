@@ -5,8 +5,10 @@ and prompts alongside turnstone's built-in capabilities.
 
 Architecture: the MCP SDK is fully async, but turnstone's ChatSession is
 synchronous.  We bridge the two by running a dedicated asyncio event loop
-in a daemon thread.  ``call_tool_sync`` dispatches coroutines onto that loop
-via ``asyncio.run_coroutine_threadsafe``.
+in a daemon thread.  ``call_tool_sync`` and the other sync entry points
+submit their coroutines to that loop through ``_submit_root``, and primes
+run there as background work (``_submit_prime``); shutdown drains both
+before it stops the loop.
 
 Refresh: two mechanisms keep tool/resource/prompt lists up-to-date:
   1. Push notifications — servers declaring ``listChanged`` on the
@@ -467,13 +469,34 @@ class _TransportClosedError(ConnectionError):
     """The transport owner exited while an operation was waiting for its response."""
 
 
+class MCPShutdownError(RuntimeError):
+    """The MCP client refused or stopped work because it is shutting down or not running.
+
+    ``started`` is True when shutdown cancelled the work after it began on the client's loop, so a
+    tool call may already have reached its server; False when the work was refused before it
+    started. Shutdown is not a server failure: it never counts against a circuit breaker.
+    """
+
+    def __init__(self, message: str = "MCP client is shutting down", *, started: bool = False):
+        super().__init__(message)
+        self.started = started
+
+
+# Timeout for the DELETE that ends a session, which the client sends while its transport's
+# owner unwinds. Shorter than the owner's escalated wait (``_OWNER_CANCEL_GRACE_S``), so a server
+# that never answers it cannot keep the owner running once its one cancel has been spent.
+_SESSION_END_TIMEOUT_S = 3.0
+
+
 def _make_capturing_http_factory(
     capture: _AuthCapture, fired_event: asyncio.Event | None = None
 ) -> McpHttpClientFactory:
     """Return a client factory that records the first relevant HTTP failure into ``capture``.
 
-    The hook is ``async`` because :class:`httpx.AsyncClient` invokes
-    response hooks via ``await hook(response)`` — a sync function would
+    Its clients also give the request that ends a session ``_SESSION_END_TIMEOUT_S``.
+
+    The hooks are ``async`` because :class:`httpx.AsyncClient` invokes
+    event hooks via ``await hook(response)`` — a sync function would
     return ``None`` and ``await None`` raises ``TypeError`` inside the
     SDK's :meth:`client.stream` call. Even though our work is purely
     synchronous (read ``status_code`` and a header), the contract
@@ -485,6 +508,12 @@ def _make_capturing_http_factory(
     via a minimal repro: a sync hook breaks back-to-back connects in
     the same process; the async form does not.
     """
+
+    async def _bound_session_end(request: httpx.Request) -> None:
+        # The DELETE that ends the session goes out while the transport's owner unwinds, at times
+        # after its one cancel was spent: a server that holds it must not keep the owner running.
+        if request.method == "DELETE":
+            request.extensions["timeout"] = httpx.Timeout(_SESSION_END_TIMEOUT_S).as_dict()
 
     async def _hook(response: httpx.Response) -> None:
         # A cleanup response must not replace the failure that caused teardown. Static
@@ -518,7 +547,7 @@ def _make_capturing_http_factory(
     ) -> httpx.AsyncClient:
         kwargs: dict[str, Any] = {
             "follow_redirects": True,
-            "event_hooks": {"response": [_hook]},
+            "event_hooks": {"request": [_bound_session_end], "response": [_hook]},
         }
         if timeout is None:
             kwargs["timeout"] = httpx.Timeout(
@@ -1109,8 +1138,8 @@ class MCPClientManager:
         self._last_refresh: dict[str, tuple[float, str]] = {}
 
         # Per-(user, server) state for auth_type=oauth_user. Loop-bound:
-        # mutated only on the mcp-loop. Sync threads interact via
-        # ``asyncio.run_coroutine_threadsafe``.
+        # mutated only on the mcp-loop. Sync threads reach it through
+        # ``_submit_root``.
         self._user_pool_entries: dict[tuple[str, str], PoolEntryState] = {}
         # (user, server) keys with a session-start prime in flight — collapses
         # concurrent primes (multiple ChatSession starts) before the redundant
@@ -1293,10 +1322,25 @@ class MCPClientManager:
         # as "Task exception was never retrieved" at GC time instead of
         # being logged where it happened.  See ``_spawn_background``.
         self._background_tasks: set[asyncio.Task[Any]] = set()
-        # Serialize prime submission with shutdown admission. The loop
-        # callback allocates the coroutine only if shutdown has not begun.
-        self._prime_submission_lock = threading.Lock()
-        self._accepting_primes = True
+        # Tasks running work that other threads submitted (see ``_submit_root``), and the ones
+        # shutdown cancelled, whose cancellation reaches their callers as ``MCPShutdownError``.
+        # Loop-only.
+        self._root_tasks: set[asyncio.Task[Any]] = set()
+        self._drained: set[asyncio.Task[Any]] = set()
+        # The futures callers wait on for that work: added by ``_submit_root``, dropped as each
+        # resolves. Shutdown fails any still pending once the loop thread has stopped.
+        self._root_futures: set[concurrent.futures.Future[Any]] = set()
+        # Every transport owner still running, with its close event (see ``_track_owner``).
+        # Loop-only.
+        self._owners: dict[asyncio.Task[None], asyncio.Event] = {}
+        # Admission for work on the loop: cleared at the top of ``shutdown``, reset by ``start``.
+        # Submitted work, background spawns and primes are refused while it is clear.
+        # ``_submit_root`` checks it and counts itself in ``_submitting`` under the condition,
+        # then enqueues outside it; shutdown clears it and waits for the count to reach zero, so
+        # everything admitted is queued on the loop ahead of shutdown's drain.
+        self._submission_cond = threading.Condition()
+        self._submitting = 0
+        self._accepting_work = True
 
     def _ensure_static_state(self, name: str) -> StaticServerState:
         """Get or create the StaticServerState for ``name``.
@@ -1340,7 +1384,7 @@ class MCPClientManager:
         on a node where no pool entry materializes, records would
         otherwise accumulate for the process lifetime with no reaper.
         """
-        if self._user_pool_eviction_task is None:
+        if self._user_pool_eviction_task is None and self._accepting_work:
             self._user_pool_eviction_task = asyncio.create_task(self._user_pool_eviction_loop())
 
     def set_app_state(self, app_state: Any) -> None:
@@ -1355,26 +1399,34 @@ class MCPClientManager:
 
     def start(self) -> None:
         """Launch background event loop and connect to all configured servers."""
-        self._accepting_primes = True
+        self._accepting_work = True
         self._prompt_sync_open = True
         self._loop = asyncio.new_event_loop()
         self._thread = threading.Thread(target=self._loop.run_forever, daemon=True, name="mcp-loop")
         self._thread.start()
 
-        future = asyncio.run_coroutine_threadsafe(self._connect_all(), self._loop)
+        future = self._submit_root(self._connect_all)
+        # The pass's future releases the wait, since it resolves however the pass ends: done,
+        # failed, cancelled by shutdown's drain, or refused before its first step.
+        future.add_done_callback(lambda _done: self._connected.set())
         self._connected.wait(timeout=30)
-        # Surface any exception from _connect_all (unlikely — per-server errors are caught)
+        # Surface any exception from _connect_all (unlikely — per-server errors are caught).
+        # A shutdown that stopped it is not an initialization error.
         if future.done() and not future.cancelled():
             exc = future.exception()
-            if exc:
+            if exc and not isinstance(exc, MCPShutdownError):
                 self._error = str(exc)
                 log.error("MCP initialization error: %s", self._error)
 
     async def _connect_all(self) -> None:
         """Connect to every configured server (runs on the background loop)."""
-        for name, cfg in self._server_configs.items():
+        # A reload can add, replace or remove servers while the pass waits on one, so it walks a
+        # copy of the names and connects each server still configured when it gets there.
+        for name in list(self._server_configs):
+            if name not in self._server_configs:
+                continue
             try:
-                await self._connect_one(name, cfg)
+                await self._connect_one(name)
             except asyncio.CancelledError:
                 raise  # propagate so the background task can be cleanly stopped
             except (Exception, BaseExceptionGroup):
@@ -1388,24 +1440,30 @@ class MCPClientManager:
                 # ``_connect_one`` already recorded it, under the connect lock.
                 log.warning("Failed to connect MCP server '%s'", name, exc_info=True)
 
-        self._connected.set()
-
         # Start the background token-freshness sweep (once, on the mcp-loop).
         # Keeps every consented oauth_user grant hot for unattended work and
         # surfaces dead grants proactively. Started here rather than lazily (like
         # the eviction task) because a grant needs keeping-hot even in a
         # deployment that has not yet created a pool entry; the tick self-gates
         # to a no-op when no oauth_user server is configured. Skipped entirely
-        # when disabled via config (cadence <= 0).
-        if self._user_token_sweep_s > 0 and self._user_token_sweep_task is None:
+        # when disabled via config (cadence <= 0), and once shutdown has begun.
+        if (
+            self._user_token_sweep_s > 0
+            and self._user_token_sweep_task is None
+            and self._accepting_work
+        ):
             self._user_token_sweep_task = asyncio.create_task(self._user_token_sweep_loop())
 
         # Start the static-server health loop (once, on the mcp-loop). Self-heals
         # static connections that the SDK's bounded reconnect / other transports
         # abandon — the autonomous trigger Turnstone otherwise lacks (all other
         # reconnect paths are dispatch- or operator-driven). Skipped when disabled
-        # via config (cadence <= 0).
-        if self._static_health_check_s > 0 and self._static_health_task is None:
+        # via config (cadence <= 0), and once shutdown has begun.
+        if (
+            self._static_health_check_s > 0
+            and self._static_health_task is None
+            and self._accepting_work
+        ):
             self._static_health_task = asyncio.create_task(self._static_health_loop())
 
     _CONNECT_TIMEOUT = 30  # seconds — prevents hung connections on broken remotes
@@ -1467,6 +1525,19 @@ class MCPClientManager:
     # SECOND cancel is what must never happen (it abandons anyio scope exits
     # mid-flight, minting the exact zombie this design removes).
     _OWNER_CANCEL_GRACE_S = 5.0
+    # Deadline for shutdown's one loop phase, which cancels the client's work and closes every
+    # transport owner. The slowest unwind of cancelled work (a child reap, then a teardown's
+    # graceful and escalated waits) takes 15s, and an owner that work leaves running still gets its
+    # one cancel and a full escalated wait after it. With the waits below, MCP shutdown stays inside
+    # a 30s stop budget (systemd's TimeoutStopSec, the Kubernetes default).
+    _SHUTDOWN_DEADLINE_S = 20.0
+    # How long shutdown waits for submissions already admitted to finish enqueueing. None of them
+    # blocks, so this bounds only a count an interrupt left behind mid-submission.
+    _ADMISSION_WAIT_S = 1.0
+    # How much longer than the deadline shutdown's thread waits for that phase, and how long it then
+    # waits for the loop thread to stop.
+    _SHUTDOWN_RESULT_MARGIN_S = 2.0
+    _LOOP_JOIN_TIMEOUT_S = 5.0
     # Rate limit for the orphaned-scope disarm sweep (``gc.get_objects`` walk;
     # cheap enough on failure paths, too heavy to run on every suppressed
     # close in a storm).
@@ -1761,13 +1832,14 @@ class MCPClientManager:
     async def _teardown_static_session(self, name: str) -> None:
         """Tear down a static server's session/transport (the ONE canonical order).
 
-        Shared by :meth:`_connect_one_locked`'s stale-guard,
-        :meth:`remove_server_sync`, and shutdown so a future ordering fix lands
-        in one place. MUST run under the per-name connect lock (shutdown is
-        exempt: the health loop and dispatch drivers are already stopped).
-        Callers decide WHEN teardown is safe — live-session reuse and the
-        ``in_flight`` interlock are enforced by :meth:`_ensure_static_connected`,
-        not here. No-op when the server has no state.
+        Shared by :meth:`_connect_one_locked`'s stale-guard and
+        :meth:`remove_server_sync` so a future ordering fix lands in one place;
+        shutdown runs the same protocol for every owner at once in
+        :meth:`_close_owners`, which must change with it. MUST run under the
+        per-name connect lock. Callers decide WHEN teardown is safe —
+        live-session reuse and the ``in_flight`` interlock are enforced by
+        :meth:`_ensure_static_connected`, not here. No-op when the server has
+        no state.
 
         Close protocol (the anyio host-task invariant): the transport +
         ``ClientSession`` cms were entered by the server's OWNER task and can
@@ -1829,7 +1901,21 @@ class MCPClientManager:
             self._static_connect_locks[name] = lock
         return lock
 
-    async def _connect_one(self, name: str, cfg: dict[str, Any]) -> None:
+    def _static_config_if_current(self, name: str, lock: asyncio.Lock) -> dict[str, Any] | None:
+        """Return *name*'s config if *lock* is still its connect lock, else ``None``.
+
+        For a driver that has just acquired *lock*. A removal that ran while it queued popped
+        the config and retired the lock, and connecting from what the driver read before would
+        bring the removed server back; after a re-add the server has a new lock, so a waiter on
+        the old one must not connect alongside the re-add's own connect. Otherwise the freshest
+        config wins.
+        """
+        cfg = self._server_configs.get(name)
+        if cfg is None or self._static_connect_locks.get(name) is not lock:
+            return None
+        return cfg
+
+    async def _connect_one(self, name: str) -> None:
         """Connect to a single MCP server, serialized per server.
 
         Wraps :meth:`_connect_one_locked` in the per-name connect lock so a
@@ -1840,12 +1926,23 @@ class MCPClientManager:
         ``_connect_one`` for the same name, so there is no reentrancy risk.
 
         A failure is recorded before the lock is released, so a removal queued
-        on the lock clears the record instead of being undone by it.
+        on the lock clears the record instead of being undone by it. The config
+        is read under the lock, so a server removed while this queued is
+        skipped, and so is one that another driver connected meanwhile.
         """
         if "__" in name:
             log.error("MCP server name '%s' contains '__' (reserved delimiter), skipping", name)
             return
-        async with self._static_connect_lock_for(name):
+        lock = self._static_connect_lock_for(name)
+        async with lock:
+            cfg = self._static_config_if_current(name, lock)
+            if cfg is None:
+                return
+            # A reload's add or a dispatch's reconnect got here first; rebuilding would tear
+            # down the session it just published.
+            state = self._static_servers.get(name)
+            if state is not None and state.session is not None:
+                return
             try:
                 await self._connect_one_locked(name, cfg)
             except (Exception, BaseExceptionGroup) as exc:
@@ -1863,7 +1960,11 @@ class MCPClientManager:
         per-name lock / session-reuse / ``in_flight`` / config-recheck / breaker
         decisions live in exactly one place. The operator's
         :meth:`reconnect_sync` deliberately does NOT: that is a FORCE rebuild
-        which tears down even a live session by design.
+        which tears down even a live session by design. The startup pass
+        (:meth:`_connect_one`) makes decisions (1) and (2) below the same way,
+        through :meth:`_static_config_if_current` and its own reuse-if-live
+        check, but has never applied (3) or (4); a change to those two
+        decisions must reach it as well.
 
         MUST run on the mcp-loop. All decisions are made UNDER the per-name
         connect lock (concurrent callers QUEUE, then land in the reuse branch):
@@ -1910,12 +2011,12 @@ class MCPClientManager:
             return None
         lock = self._static_connect_lock_for(name)
         async with lock:
-            # (1) Config re-check. The lock-identity check closes the
-            # remove -> re-add race: remove_server_sync retires the lock object
-            # after teardown, so a waiter still holding the OLD lock must not
-            # connect concurrently with a NEW-lock holder after a re-add.
-            fresh_cfg = self._server_configs.get(name)
-            if fresh_cfg is None or self._static_connect_locks.get(name) is not lock:
+            # (1) Config re-check (``_static_config_if_current``). The lock-identity
+            # check closes the remove -> re-add race: remove_server_sync retires the
+            # lock object after teardown, so a waiter still holding the OLD lock must
+            # not connect concurrently with a NEW-lock holder after a re-add.
+            fresh_cfg = self._static_config_if_current(name, lock)
+            if fresh_cfg is None:
                 return None
             cfg = fresh_cfg
             state = self._static_servers.get(name)
@@ -2070,14 +2171,12 @@ class MCPClientManager:
                 f"{label_prefix} {kind} refresh for '{label_target}'",
             )
         except Exception as exc:
-            # Scheduling failed (loop shutting down) — release BOTH the
-            # coalesce marker and the debounce stamp we just wrote, or a
-            # same-kind push landing inside the window afterward is
-            # debounced against a stamp for a refresh that never spawned
-            # (the pool path has no on_debounce_drop recovery). Structured
-            # fields only — ``exc_info=True`` would serialize the chained
-            # ``httpx.Request`` whose headers carry the bearer (configured
-            # for auth_type=static, minted for pool).
+            # Scheduling raised — release BOTH the coalesce marker and the debounce stamp we
+            # just wrote, or a same-kind push landing inside the window afterward is debounced
+            # against a stamp for a refresh that never spawned (the pool path has no
+            # on_debounce_drop recovery). Structured fields only — ``exc_info=True`` would
+            # serialize the chained ``httpx.Request`` whose headers carry the bearer
+            # (configured for auth_type=static, minted for pool).
             pending.discard(marker)
             stamps.pop(marker, None)
             log.warning(
@@ -2535,6 +2634,7 @@ class MCPClientManager:
             name=f"mcp-transport-owner:{name}",
         )
         owner.add_done_callback(lambda t: self._on_static_owner_death(name, t))
+        self._track_owner(owner, close_requested)
         try:
             session = await ready
         except asyncio.CancelledError:
@@ -2884,12 +2984,13 @@ class MCPClientManager:
     async def _teardown_pool_entry(self, key: tuple[str, str]) -> None:
         """Tear down a pool entry's session/transport (the ONE canonical order).
 
-        Shared by :meth:`_connect_one_pool`'s stale-guard,
-        :meth:`_close_pool_entry_if_idle`, and shutdown so a future ordering fix
-        lands in one place. Does NOT pop the entry from ``_user_pool_entries`` —
-        callers own map / catalog cleanup. Safe to call while holding
-        ``entry.open_lock`` (it never takes a lock itself). No-op when the entry
-        is gone.
+        Shared by :meth:`_connect_one_pool`'s stale-guard and
+        :meth:`_close_pool_entry_if_idle` so a future ordering fix lands in one
+        place; shutdown runs the same protocol for every owner at once in
+        :meth:`_close_owners`, which must change with it. Does NOT pop the entry
+        from ``_user_pool_entries`` — callers own map / catalog cleanup. Safe to
+        call while holding ``entry.open_lock`` (it never takes a lock itself).
+        No-op when the entry is gone.
 
         Close protocol (the anyio host-task invariant, shared with
         :meth:`_teardown_static_session`): the transport + ``ClientSession`` cms
@@ -3121,6 +3222,7 @@ class MCPClientManager:
             name=f"mcp-pool-owner:{user_id}:{server_name}",
         )
         owner.add_done_callback(lambda t: self._on_pool_owner_death(key, t))
+        self._track_owner(owner, close_requested)
         try:
             session = await ready
         except asyncio.CancelledError:
@@ -3359,7 +3461,7 @@ class MCPClientManager:
         holding the consent redirect on a slow/unreachable MCP server.
 
         No-op for non-``oauth_user`` servers, before the mcp-loop is running,
-        with no token, or once shutdown closes prime admission. Schedules the
+        with no token, or once shutdown closes work admission. Schedules the
         connect onto the mcp-loop and returns at once; the per-user tool
         listeners deliver the catalog to live sessions when the prime
         completes, and lazy dispatch remains the backstop.
@@ -3376,24 +3478,28 @@ class MCPClientManager:
         )
 
     def _submit_prime(self, factory: Callable[[], Coroutine[Any, Any, None]], label: str) -> None:
-        """Admit a prime before shutdown and track it on the owning loop."""
+        """Admit a prime before shutdown and track it on the owning loop.
+
+        Needs no lock: ``spawn`` checks admission again on the loop before it calls *factory*,
+        so a prime that reaches the loop after shutdown began allocates nothing, and one left on
+        a stopped loop never runs.
+        """
 
         def spawn() -> None:
-            if not self._accepting_primes:
+            if not self._accepting_work:
                 log.debug("MCP %s skipped: shutting down", label)
                 return
             self._spawn_background(factory(), label)
 
-        with self._prime_submission_lock:
-            loop = self._loop
-            if loop is None or not self._accepting_primes:
-                log.debug("MCP %s skipped: shutting down", label)
-                return
-            try:
-                loop.call_soon_threadsafe(spawn)
-            except RuntimeError:
-                # No coroutine was allocated; lazy dispatch is the backstop.
-                log.debug("MCP %s skipped: loop closed", label)
+        loop = self._loop
+        if loop is None or not self._accepting_work:
+            log.debug("MCP %s skipped: shutting down", label)
+            return
+        try:
+            loop.call_soon_threadsafe(spawn)
+        except RuntimeError:
+            # No coroutine was allocated; lazy dispatch is the backstop.
+            log.debug("MCP %s skipped: loop closed", label)
 
     async def _prime_user_server_logged(
         self,
@@ -4159,7 +4265,8 @@ class MCPClientManager:
             await asyncio.wait_for(
                 lock.acquire(), timeout=self._POOL_EVICTION_LOCK_ACQUIRE_TIMEOUT_S
             )
-        except (TimeoutError, asyncio.CancelledError):
+        except TimeoutError:
+            # Only the wait's own expiry: a cancel (shutdown's drain) must end the caller.
             return
         evicted = False
         try:
@@ -5175,8 +5282,7 @@ class MCPClientManager:
         :meth:`last_refresh_outcome` (or the status ``last_refresh_outcome``
         field) to distinguish ``skipped`` from ``error:<Class>``.
         """
-        assert self._loop is not None
-        future = asyncio.run_coroutine_threadsafe(self._refresh_all(server_name), self._loop)
+        future = self._submit_root(lambda: self._refresh_all(server_name))
         try:
             return future.result(timeout=timeout)
         except concurrent.futures.TimeoutError:
@@ -5618,174 +5724,187 @@ class MCPClientManager:
 
     # -- lifecycle (shutdown) ------------------------------------------------
 
+    def _track_owner(self, owner: asyncio.Task[None], close_requested: asyncio.Event) -> None:
+        """Record a transport owner until it finishes (loop only; see ``_drain_and_close``).
+
+        Called where each owner is created, before anything can cancel it. Shutdown's drain
+        closes every owner still recorded once the work it cancelled has unwound, so an owner
+        whose closer that cancel cut short is not left running on the stopped loop.
+        """
+        self._owners[owner] = close_requested
+        owner.add_done_callback(lambda task: self._owners.pop(task, None))
+
+    async def _drain_and_close(self) -> None:
+        """Shutdown's loop phase: stop the client's work and close every transport owner.
+
+        Cancels the dedicated loops (token sweep, static health, pool eviction), every tracked
+        background task and every root still running, asks every owner to close, and detaches
+        the registered pool and static owners while that work unwinds. Then ``_close_owners``
+        closes every owner still running, so nothing is left for garbage collection to close on
+        the stopped loop. All of it shares ``_SHUTDOWN_DEADLINE_S``; work still running then is
+        left to the stopping loop.
+        """
+        began = asyncio.get_running_loop().time()
+        dedicated = (
+            self._user_token_sweep_task,
+            self._static_health_task,
+            self._user_pool_eviction_task,
+        )
+        self._user_token_sweep_task = None
+        self._static_health_task = None
+        self._user_pool_eviction_task = None
+        work = {task for task in dedicated if task is not None and not task.done()}
+        work.update(task for task in self._background_tasks if not task.done())
+        roots = {task for task in self._root_tasks if not task.done()}
+        work |= roots
+        # A root its caller already cancelled is drained too: a second cancel can only cut short
+        # its wait for an owner, which the drain finishes itself.
+        self._drained |= roots
+        for task in work:
+            task.cancel()
+        # Every owner is asked to close here, the one place shutdown signals them, so each
+        # owner's graceful window starts now; ``_close_owners`` escalates from it.
+        for close_requested in self._owners.values():
+            close_requested.set()
+        try:
+            async with asyncio.timeout(self._SHUTDOWN_DEADLINE_S):
+                results = await asyncio.gather(
+                    asyncio.wait(work) if work else asyncio.sleep(0),
+                    self._detach_pool_entries(),
+                    self._detach_static_servers(),
+                    return_exceptions=True,
+                )
+                for result in results:
+                    if isinstance(result, BaseException):
+                        log.debug("Error closing MCP transports at shutdown", exc_info=result)
+                await self._close_owners(began)
+        except TimeoutError:
+            log.warning(
+                "MCP shutdown: %d task(s) still running after %.0fs; left to the stopping loop",
+                sum(1 for task in (*work, *self._owners) if not task.done()),
+                self._SHUTDOWN_DEADLINE_S,
+            )
+        for task in work:
+            if task.done() and not task.cancelled():
+                task.exception()  # retrieved, so it is never reported at garbage collection
+
+    async def _close_owners(self, began: float) -> None:
+        """Close the transport owners still running once shutdown's cancelled work has unwound.
+
+        Shutdown's form of the close protocol in ``_teardown_static_session`` and
+        ``_teardown_pool_entry``, in one place for every owner: the registered ones the drain
+        detached, and any whose closer the drain's cancel cut short, such as a teardown's or a
+        failed connect's wait. The drain asked each to close at *began*; each gets the rest of that
+        graceful window, then ONE cancel unless one is already pending on it, then the rest of the
+        shared deadline. It runs after every other closer has finished (the teardowns and connect
+        cancel arms inside the cancelled work), and nothing withdraws a closer's cancel, so an owner
+        with none pending has never had one: this never cancels an owner twice, which would abandon
+        an anyio scope exit mid-flight.
+        """
+        owners = [owner for owner in self._owners if not owner.done()]
+        if not owners:
+            return
+        grace = began + self._OWNER_CLOSE_GRACE_S - asyncio.get_running_loop().time()
+        _done, pending = await asyncio.wait(owners, timeout=max(grace, 0.0))
+        for owner in pending:
+            if not owner.cancelling():
+                owner.cancel()
+        if pending:
+            await asyncio.wait(pending)  # bounded by the drain's deadline
+
+    async def _detach_pool_entries(self) -> None:
+        """Detach every pool entry's transport owner at shutdown (see ``_drain_and_close``).
+
+        Drops each entry's session and takes its owner off the entry, so nothing reaches either
+        again, and pre-closes its streams so the owner unwinds fast; ``_close_owners`` closes
+        the owners themselves.
+        """
+        for key in list(self._user_pool_entries):
+            entry = self._user_pool_entries.get(key)
+            if entry is None:
+                continue
+            entry.drop_session()
+            entry.owner_task = None
+            entry.close_requested = None
+            # Pre-close streams to unblock the SDK's transport tasks
+            # (anyio zero-buffer send — SDK #2147) so owners unwind fast.
+            await self._pre_close_streams(key)
+        self._user_pool_entries.clear()
+        self._user_pool_last_used.clear()
+        self._user_pool_locks.clear()
+
+    async def _detach_static_servers(self) -> None:
+        """Detach every static server's transport owner at shutdown (see ``_drain_and_close``).
+
+        The static twin of ``_detach_pool_entries``: drops each session, takes the owner off the
+        server's state and pre-closes its streams; ``_close_owners`` closes the owners.
+        """
+        for srv_name, srv_state in list(self._static_servers.items()):
+            self._drop_static_session_and_stamp(srv_name, srv_state)
+            srv_state.owner_task = None
+            srv_state.close_requested = None
+            # Pre-close streams to unblock the SDK's transport tasks
+            # (anyio zero-buffer send — SDK #2147) so owners unwind fast.
+            await self._pre_close_streams(srv_name)
+
     def shutdown(self) -> None:
         """Close all MCP sessions and stop the background loop."""
-        with self._prime_submission_lock:
-            self._accepting_primes = False
-        # Cancel tracked background tasks (catalog refreshes etc.) FIRST —
-        # they are pure auxiliaries, and draining them up front means the
-        # stack teardown below can't race an in-flight refresh.  Submitted
-        # whenever a loop exists — NOT gated on a main-thread truthiness
-        # check of ``_background_tasks``: a spawn queued via
-        # call_soon_threadsafe may not have reached the set yet, but ready
-        # callbacks run in FIFO order, so by the time the drain coroutine
-        # snapshots the set ON the loop, every earlier-queued spawn has
-        # landed.  ``is_running()`` guard: on a stopped loop nothing can
-        # execute the drain — submitting would just stall on the future.
+        with self._submission_cond:
+            self._accepting_work = False
+            # Submissions already admitted finish enqueueing first (none of them blocks), so
+            # their work is queued on the loop ahead of the drain.
+            if not self._submission_cond.wait_for(
+                lambda: not self._submitting, timeout=self._ADMISSION_WAIT_S
+            ):
+                log.warning(
+                    "MCP shutdown: %d submission(s) still counted after %.0fs; draining anyway",
+                    self._submitting,
+                    self._ADMISSION_WAIT_S,
+                )
+        # One phase on the running loop stops all work and closes every transport owner, under
+        # one deadline (see ``_drain_and_close``); no work starts after it takes its snapshot.
+        # Skipped when the loop is not running: nothing could execute the phase, and submitting
+        # it would only stall on the future.
         if self._loop is not None and self._loop.is_running():
-
-            async def _cancel_background() -> None:
-                # The token-freshness sweep is a dedicated handle (not in
-                # _background_tasks); cancel it here so a deployment that never
-                # creates a pool entry — and thus skips the pool-teardown block
-                # below — still stops it cleanly.
-                if self._user_token_sweep_task is not None:
-                    self._user_token_sweep_task.cancel()
-                    with contextlib.suppress(BaseException):
-                        await self._user_token_sweep_task
-                    self._user_token_sweep_task = None
-                # Static health loop is a dedicated handle (not in
-                # _background_tasks); cancel it here so a static-only deployment
-                # — which skips the pool-teardown block below — still stops it.
-                if self._static_health_task is not None:
-                    self._static_health_task.cancel()
-                    with contextlib.suppress(BaseException):
-                        await self._static_health_task
-                    self._static_health_task = None
-                tasks = list(self._background_tasks)
-                for task in tasks:
-                    task.cancel()
-                await asyncio.gather(*tasks, return_exceptions=True)
-
-            future = asyncio.run_coroutine_threadsafe(_cancel_background(), self._loop)
+            future = asyncio.run_coroutine_threadsafe(self._drain_and_close(), self._loop)
             try:
-                future.result(timeout=10)
+                future.result(timeout=self._SHUTDOWN_DEADLINE_S + self._SHUTDOWN_RESULT_MARGIN_S)
             except Exception:
-                log.debug("Error cancelling MCP background tasks", exc_info=True)
-
-        # Cancel the pool eviction task, then close all pool entries
-        # before tearing down static-path state. Both run on the
-        # mcp-loop so dispatcher coroutines can't race them.
-        if self._loop and (self._user_pool_eviction_task is not None or self._user_pool_entries):
-
-            async def _close_all_pool() -> None:
-                if self._user_pool_eviction_task is not None:
-                    self._user_pool_eviction_task.cancel()
-                    with contextlib.suppress(BaseException):
-                        await self._user_pool_eviction_task
-                    self._user_pool_eviction_task = None
-                # Parallel version of ``_teardown_pool_entry``'s close protocol
-                # (mirrors ``_close_all_owners`` for the static path): signal
-                # every owner first, one shared graceful window, then ONE cancel
-                # each for stragglers and a short drain — never a second cancel
-                # (it would abandon an anyio scope exit mid-flight; the owner
-                # completing solo is harmless, and the loop is stopping anyway).
-                owners: list[asyncio.Task[None]] = []
-                for key in list(self._user_pool_entries):
-                    entry = self._user_pool_entries.get(key)
-                    if entry is None:
-                        continue
-                    entry.drop_session()
-                    owner = entry.owner_task
-                    close_requested = entry.close_requested
-                    entry.owner_task = None
-                    entry.close_requested = None
-                    if close_requested is not None:
-                        close_requested.set()
-                    if owner is not None and not owner.done():
-                        owners.append(owner)
-                    # Pre-close streams to unblock the SDK's transport tasks
-                    # (anyio zero-buffer send — SDK #2147) so owners unwind fast.
-                    await self._pre_close_streams(key)
-                if owners:
-                    _done, pending = await asyncio.wait(owners, timeout=self._OWNER_CLOSE_GRACE_S)
-                    for owner in pending:
-                        owner.cancel()
-                    if pending:
-                        _done, pending = await asyncio.wait(
-                            pending, timeout=self._OWNER_CANCEL_GRACE_S / 2
-                        )
-                        if pending:
-                            log.warning(
-                                "MCP shutdown: %d pool transport owner(s) still unwinding; "
-                                "left to the dying loop",
-                                len(pending),
-                            )
-                self._user_pool_entries.clear()
-                self._user_pool_last_used.clear()
-                self._user_pool_locks.clear()
-
-            future = asyncio.run_coroutine_threadsafe(_close_all_pool(), self._loop)
-            try:
-                future.result(timeout=10)
-            except Exception:
-                log.debug("Error closing MCP pool sessions", exc_info=True)
-
-        # Close all per-server transports (owner tasks own the cm stacks).
-        # Parallel version of ``_teardown_static_session``'s close protocol:
-        # signal every owner first, give them one shared graceful window, then
-        # ONE cancel each for stragglers and a short drain — never a second
-        # cancel (it would abandon an anyio scope exit mid-flight; the owner
-        # completing solo is harmless, and the loop is stopping anyway).
-        if self._loop and self._static_servers:
-
-            async def _close_all_owners() -> None:
-                owners: list[asyncio.Task[None]] = []
-                for srv_name, srv_state in list(self._static_servers.items()):
-                    self._drop_static_session_and_stamp(srv_name, srv_state)
-                    owner = srv_state.owner_task
-                    close_requested = srv_state.close_requested
-                    srv_state.owner_task = None
-                    srv_state.close_requested = None
-                    if close_requested is not None:
-                        close_requested.set()
-                    if owner is not None and not owner.done():
-                        owners.append(owner)
-                    # Pre-close streams to unblock the SDK's transport tasks
-                    # (anyio zero-buffer send — SDK #2147) so owners unwind fast.
-                    await self._pre_close_streams(srv_name)
-                if not owners:
-                    return
-                _done, pending = await asyncio.wait(owners, timeout=self._OWNER_CLOSE_GRACE_S)
-                for owner in pending:
-                    owner.cancel()
-                if pending:
-                    _done, pending = await asyncio.wait(
-                        pending, timeout=self._OWNER_CANCEL_GRACE_S / 2
-                    )
-                    if pending:
-                        log.warning(
-                            "MCP shutdown: %d transport owner(s) still unwinding; "
-                            "left to the dying loop",
-                            len(pending),
-                        )
-
-            future = asyncio.run_coroutine_threadsafe(_close_all_owners(), self._loop)
-            try:
-                future.result(timeout=12)
-            except Exception:
-                log.debug("Error closing MCP sessions", exc_info=True)
+                log.debug("Error stopping MCP work at shutdown", exc_info=True)
 
         if self._loop:
             self._loop.call_soon_threadsafe(self._loop.stop)
         if self._thread:
-            self._thread.join(timeout=5)
+            self._thread.join(timeout=self._LOOP_JOIN_TIMEOUT_S)
             if self._thread.is_alive():
                 # Closing a still-running loop raises; the daemon thread dies
                 # with the process, so leaving the loop open is the lesser
                 # evil.  Loud because a stuck loop thread is itself a bug.
-                log.warning("MCP loop thread did not stop within 5s; loop left open")
+                log.warning(
+                    "MCP loop thread did not stop within %.0fs; loop left open",
+                    self._LOOP_JOIN_TIMEOUT_S,
+                )
             else:
                 if self._loop is not None:
                     self._loop.close()
                 self._loop = None
                 self._thread = None
+            # Work still running now never resolves the futures its callers wait on: the loop
+            # is closed, or stuck past every wait above. The callers get the shutdown error now
+            # rather than waiting on, forever in ``add_server_sync``, which has no timeout.
+            for future in list(self._root_futures):
+                with contextlib.suppress(concurrent.futures.InvalidStateError):
+                    future.set_exception(MCPShutdownError(started=True))
         # When no thread was started (tests wire ``_loop`` directly) the loop
         # is not ours to close — the stop above is all the owner needs.
 
         # Clear all state, closing prompt syncs first (see sync_prompts_to_storage)
         self._prompt_sync_open = False
         self._background_tasks.clear()
+        self._root_tasks.clear()
+        self._drained.clear()
+        self._root_futures.clear()
+        self._owners.clear()
         self._static_servers.clear()
         self._db_managed.clear()
         self._tools = []
@@ -5918,12 +6037,11 @@ class MCPClientManager:
                         raise TimeoutError(f"MCP server '{name}' registration timed out") from None
                     raise
 
-        future = asyncio.run_coroutine_threadsafe(_add(), self._loop)
         try:
             # ``_add`` owns both its deadline and rollback. A caller-side
             # timeout here could return a failed result while cleanup is merely
             # queued on a stalled loop, exposing a live unconfigured tool.
-            future.result()
+            self._submit_root(_add).result()
         except concurrent.futures.TimeoutError:
             return {
                 "connected": False,
@@ -5975,8 +6093,6 @@ class MCPClientManager:
                 "error": "MCP event loop not running",
             }
 
-        cfg = self._server_configs[name]
-
         async def _reconnect() -> None:
             self._cb_clear(name)
             # Reset the health loop's clock too: whatever it scheduled (an invalid catalog's
@@ -6007,7 +6123,13 @@ class MCPClientManager:
             # stale-guard runs the identical ``_teardown_static_session`` first
             # thing, and an operator reconnect deliberately rebuilds even a
             # live session (unlike the lazy ``_ensure_static_connected`` path).
-            async with self._static_connect_lock_for(name):
+            lock = self._static_connect_lock_for(name)
+            async with lock:
+                # A removal that ran while this queued must not be undone; the freshest config
+                # otherwise wins (see ``_static_config_if_current``).
+                cfg = self._static_config_if_current(name, lock)
+                if cfg is None:
+                    raise RuntimeError(f"MCP server '{name}' was removed")
                 try:
                     # Bounded connect — mirrors ``_ensure_static_connected``'s
                     # inner timeout. The attempt bound covers discovery (the
@@ -6019,6 +6141,10 @@ class MCPClientManager:
                     # externally cancelled mid-flight.
                     async with asyncio.timeout(self._STATIC_RECONNECT_ATTEMPT_TIMEOUT_S):
                         await self._connect_one_locked(name, cfg)
+                except GeneratorExit:
+                    # Garbage collection is closing a reconnect that a stopped loop abandoned
+                    # (see _connect_one_locked): nothing to record and nothing to rebuild.
+                    raise
                 except BaseException as exc:
                     if not isinstance(exc, asyncio.CancelledError):
                         # The operator's reconnect cleared the breaker; its outcome is theirs.
@@ -6039,8 +6165,8 @@ class MCPClientManager:
                     self._rebuild_prompts()
                     raise
 
-        future = asyncio.run_coroutine_threadsafe(_reconnect(), self._loop)
         try:
+            future = self._submit_root(_reconnect)
             future.result(timeout=timeout)
         except concurrent.futures.TimeoutError:
             future.cancel()
@@ -6162,8 +6288,8 @@ class MCPClientManager:
                         # at their identity checks.
                         self._static_connect_locks.pop(name, None)
 
-            future = asyncio.run_coroutine_threadsafe(_remove(), self._loop)
             try:
+                future = self._submit_root(_remove)
                 future.result(timeout=timeout)
             except concurrent.futures.TimeoutError:
                 # A slow reconnect held the lock past our wait (the session
@@ -6829,7 +6955,71 @@ class MCPClientManager:
             # broken the first failure re-trips the circuit immediately.
             self._circuit_open_until.pop(server_name, None)
 
-    def _spawn_background(self, coro: Coroutine[Any, Any, Any], label: str) -> asyncio.Task[Any]:
+    def _submit_root[T](
+        self, factory: Callable[[], Coroutine[Any, Any, T]]
+    ) -> concurrent.futures.Future[T]:
+        """Run *factory*'s coroutine on the loop for a caller on another thread.
+
+        Every sync entry point that waits on loop work submits it here, and a test keeps every
+        ``run_coroutine_threadsafe`` call in this method or shutdown's own. The work's task is
+        tracked from its first step, so ``shutdown`` cancels it and waits for it on the running loop
+        instead of leaving it for garbage collection to close on a stopped one. Raises
+        ``MCPShutdownError`` when there is no loop or shutdown has begun. The factory runs on the
+        loop, so refused work allocates nothing. Admitted work counts itself in ``_submitting``
+        until it has enqueued, and shutdown waits for that count before it submits its drain, so
+        admitted work is always queued ahead of the drain. The enqueue runs outside the condition:
+        it writes to the loop's wakeup pipe, which releases the GIL, and holding the condition
+        across it would make concurrent submissions queue on it.
+        """
+        with self._submission_cond:
+            loop = self._loop
+            if not self._accepting_work:
+                raise MCPShutdownError()
+            if loop is None:
+                raise MCPShutdownError("MCP client is not running")
+            self._submitting += 1
+        try:
+            coro = self._run_root(factory)
+            try:
+                future = asyncio.run_coroutine_threadsafe(coro, loop)
+            except RuntimeError:  # the loop is closed
+                coro.close()
+                raise MCPShutdownError() from None
+            self._root_futures.add(future)
+            future.add_done_callback(self._root_futures.discard)
+            return future
+        finally:
+            with self._submission_cond:
+                self._submitting -= 1
+                if not self._submitting:
+                    self._submission_cond.notify_all()
+
+    async def _run_root[T](self, factory: Callable[[], Coroutine[Any, Any, T]]) -> T:
+        """Run one unit of submitted work as a tracked root (see ``_submit_root``)."""
+        task = asyncio.current_task()
+        assert task is not None
+        # Admission and registration happen in one step. Shutdown clears admission before it
+        # submits the drain, so work whose first step runs after that is refused unstarted, and
+        # anything earlier is registered before the drain takes its snapshot.
+        if not self._accepting_work:
+            raise MCPShutdownError()
+        self._root_tasks.add(task)
+        try:
+            return await factory()
+        except asyncio.CancelledError:
+            # Only the drain's cancel becomes the shutdown error. Outside shutdown a cancel comes
+            # from a caller that gave up on its own wait and has already cancelled its future,
+            # so nothing would retrieve the error.
+            if task in self._drained:
+                raise MCPShutdownError(started=True) from None
+            raise
+        finally:
+            self._root_tasks.discard(task)
+            self._drained.discard(task)
+
+    def _spawn_background(
+        self, coro: Coroutine[Any, Any, Any], label: str
+    ) -> asyncio.Task[Any] | None:
         """Schedule *coro* as a tracked background task (loop thread only).
 
         Holds a strong reference until completion and retrieves the task's
@@ -6838,7 +7028,15 @@ class MCPClientManager:
         as "Task exception was never retrieved" on whatever stream happens
         to be attached at the time.  ``shutdown()`` cancels anything still
         tracked before stopping the loop.
+
+        Once shutdown has begun, *coro* is closed unrun and ``None`` returned: a task spawned
+        after the drain took its snapshot would be left pending on the stopped loop. Shutdown
+        clears the per-key bookkeeping callers write before spawning.
         """
+        if not self._accepting_work:
+            coro.close()
+            log.debug("MCP background %s skipped: shutting down", label)
+            return None
         task = asyncio.create_task(coro)
         self._background_tasks.add(task)
 
@@ -7200,12 +7398,7 @@ class MCPClientManager:
         # A fresh coroutine/task per attempt: a timed-out attempt is cancelled
         # below, and the next dispatch starts clean instead of re-entering a
         # half-cancelled anyio scope.
-        coro = _reconnect_for_dispatch()
-        try:
-            reconnect_future = asyncio.run_coroutine_threadsafe(coro, loop)
-        except RuntimeError as exc:
-            coro.close()
-            raise RuntimeError(f"MCP server '{server_name}' reconnect failed: {exc}") from None
+        reconnect_future = self._submit_root(_reconnect_for_dispatch)
         try:
             session = reconnect_future.result(timeout=self._STATIC_RECONNECT_CALLER_TIMEOUT_S)
         except concurrent.futures.TimeoutError:
@@ -7213,6 +7406,9 @@ class MCPClientManager:
             # No breaker record: see docstring — lock contention is not a
             # server failure, and this boundary cannot tell the two apart.
             raise RuntimeError(f"MCP server '{server_name}' reconnect timed out") from None
+        except MCPShutdownError:
+            # Shutdown stopped the reconnect; the dispatch it serves has not started.
+            raise MCPShutdownError() from None
         except (Exception, BaseExceptionGroup) as exc:
             # Real connect failures were already recorded by the primitive;
             # recording here again would double-count one outcome.
@@ -7244,7 +7440,10 @@ class MCPClientManager:
                     exc_info=True,
                 )
 
-        loop.call_soon_threadsafe(_schedule_refresh)
+        # A loop shutdown closed since the reconnect gets no refresh; the dispatch that follows
+        # is refused with the shutdown error.
+        with contextlib.suppress(RuntimeError):
+            loop.call_soon_threadsafe(_schedule_refresh)
         return session
 
     def _record_and_evict_on_dead_transport(
@@ -7263,8 +7462,11 @@ class MCPClientManager:
         breaker AND evicts the session (leaving the owner/streams for ``_connect_one_locked``'s
         stale-guard close protocol to reap). Eviction is what lets the next dispatch's
         ``session is None`` check fire ``_cb_auto_reconnect`` instead of re-using the corpse.
-        Auth failures also evict the connection, but remain breaker-neutral.
+        Auth failures also evict the connection, but remain breaker-neutral. A shutdown
+        (``MCPShutdownError``) says nothing about the server and changes nothing.
         """
+        if isinstance(exc, MCPShutdownError):
+            return
         classification = self._classify_failure(exc)
         dead = _is_dead_transport(exc)
         if classification == "transport" or (
@@ -7426,13 +7628,11 @@ class MCPClientManager:
         session = state.session if state is not None else None
         if session is None:
             session = self._cb_auto_reconnect(server_name)
-        assert self._loop is not None
 
-        future = asyncio.run_coroutine_threadsafe(
-            self._static_session_op(
+        future = self._submit_root(
+            lambda: self._static_session_op(
                 server_name, session.call_tool(original_name, arguments), session=session
-            ),
-            self._loop,
+            )
         )
         # exception() waits without raising the operation's own TimeoutError.
         # Only expiry of the caller's wait is neutral for server health.
@@ -7769,7 +7969,6 @@ class MCPClientManager:
         output happens to start with ``{"error":...`` is unaffected;
         only envelopes carrying an ``mcp_*`` code are converted.
         """
-        assert self._loop is not None
         start = time.monotonic()
         try:
             result = self._run_pool_dispatch_attempt(
@@ -7833,17 +8032,15 @@ class MCPClientManager:
         attempt. The ``TimeoutError`` message reports the original so
         callers see the budget they set, not the trimmed window.
         """
-        assert self._loop is not None
-        future = asyncio.run_coroutine_threadsafe(
-            self._dispatch_pool(
+        future = self._submit_root(
+            lambda: self._dispatch_pool(
                 retry_count=retry_count,
                 user_id=user_id,
                 server_name=server_name,
                 original_name=original_name,
                 arguments=arguments,
                 server_row=server_row,
-            ),
-            self._loop,
+            )
         )
         # Async dispatch accounts for operation failures; local expiry can
         # mean waiting for the pool lock without ever contacting the server.
@@ -7882,7 +8079,6 @@ class MCPClientManager:
         the agent-loop's ``except Exception`` handling uniform across
         tool and resource dispatchers.
         """
-        assert self._loop is not None
         start = time.monotonic()
         try:
             result = self._run_pool_dispatch_resource_attempt(
@@ -7927,16 +8123,14 @@ class MCPClientManager:
     ) -> str:
         """Schedule one resource dispatch attempt; same shape as
         :meth:`_run_pool_dispatch_attempt` for tools."""
-        assert self._loop is not None
-        future = asyncio.run_coroutine_threadsafe(
-            self._dispatch_pool_resource(
+        future = self._submit_root(
+            lambda: self._dispatch_pool_resource(
                 retry_count=retry_count,
                 user_id=user_id,
                 server_name=server_name,
                 uri=uri,
                 server_row=server_row,
-            ),
-            self._loop,
+            )
         )
         try:
             future.exception(timeout=timeout)
@@ -7969,7 +8163,6 @@ class MCPClientManager:
         message list would pollute the prompt protocol — open question 1
         in the plan.
         """
-        assert self._loop is not None
         start = time.monotonic()
         try:
             result = self._run_pool_dispatch_prompt_attempt(
@@ -8021,17 +8214,15 @@ class MCPClientManager:
         """Schedule one prompt dispatch attempt; returns either decoded
         messages or a structured-error string. Mirror of
         :meth:`_run_pool_dispatch_attempt` for prompts."""
-        assert self._loop is not None
-        future = asyncio.run_coroutine_threadsafe(
-            self._dispatch_pool_prompt(
+        future = self._submit_root(
+            lambda: self._dispatch_pool_prompt(
                 retry_count=retry_count,
                 user_id=user_id,
                 server_name=server_name,
                 original_name=original_name,
                 arguments=arguments,
                 server_row=server_row,
-            ),
-            self._loop,
+            )
         )
         try:
             future.exception(timeout=timeout)
@@ -9060,11 +9251,11 @@ class MCPClientManager:
         session = state.session if state is not None else None
         if session is None:
             session = self._cb_auto_reconnect(server_name)
-        assert self._loop is not None
 
-        future = asyncio.run_coroutine_threadsafe(
-            self._static_session_op(server_name, session.read_resource(uri), session=session),
-            self._loop,
+        future = self._submit_root(
+            lambda: self._static_session_op(
+                server_name, session.read_resource(uri), session=session
+            )
         )
         try:
             future.exception(timeout=timeout)
@@ -9155,13 +9346,11 @@ class MCPClientManager:
         session = state.session if state is not None else None
         if session is None:
             session = self._cb_auto_reconnect(server_name)
-        assert self._loop is not None
 
-        future = asyncio.run_coroutine_threadsafe(
-            self._static_session_op(
+        future = self._submit_root(
+            lambda: self._static_session_op(
                 server_name, session.get_prompt(original_name, arguments=arguments), session=session
-            ),
-            self._loop,
+            )
         )
         try:
             future.exception(timeout=timeout)
@@ -9207,14 +9396,12 @@ class MCPClientManager:
                 f"revocation catalog drop for '{server_name}'",
             )
 
-        coro = _spawn_tracked()
         try:
             # Locked: an in-flight connect completing its discovery
             # after an unserialized drop would republish (resurrect)
             # the revoked catalog with nothing left to clear it.
-            asyncio.run_coroutine_threadsafe(coro, loop)
-        except RuntimeError as exc:
-            coro.close()
+            self._submit_root(_spawn_tracked)
+        except MCPShutdownError as exc:
             log.info(
                 "mcp_pool.evict_user_session_failed server=%s user=%s error=%s",
                 server_name,

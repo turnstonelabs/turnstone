@@ -960,8 +960,8 @@ adds, removes, or reconnects servers as needed.
 4. `ChatSession.__init__` receives the manager, builds `self._tools` (built-in + MCP),
    and registers a listener callback for tool-change notifications
 5. `_prepare_tool()` routes MCP tools to `_prepare_mcp_tool()` / `_exec_mcp_tool()`
-6. `_exec_mcp_tool()` calls `call_tool_sync()` which dispatches to the async loop
-   via `asyncio.run_coroutine_threadsafe()`
+6. `_exec_mcp_tool()` calls `call_tool_sync()`, which submits the call to the async loop
+   through `_submit_root()`, whose work shutdown drains before it stops the loop
 
 **Tool refresh:** Two mechanisms keep tools up-to-date without restart:
 - **Push:** Servers declaring `tools.listChanged` send `ToolListChangedNotification`;

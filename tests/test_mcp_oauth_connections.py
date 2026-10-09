@@ -886,6 +886,8 @@ class TestEvictUserSession:
         mgr.evict_user_session("user-1", "srv-oauth")
 
     def test_evict_user_session_dispatches_to_loop(self) -> None:
+        import threading
+
         from turnstone.core.mcp_client import MCPClientManager
 
         mgr = MCPClientManager.__new__(MCPClientManager)
@@ -895,6 +897,12 @@ class TestEvictUserSession:
             mgr._user_pool_entries = {}  # type: ignore[attr-defined]
             mgr._last_pool_notification_refresh = {}  # type: ignore[attr-defined]
             mgr._background_tasks = set()  # type: ignore[attr-defined]
+            mgr._accepting_work = True  # type: ignore[attr-defined]
+            mgr._submission_cond = threading.Condition()  # type: ignore[attr-defined]
+            mgr._submitting = 0  # type: ignore[attr-defined]
+            mgr._root_tasks = set()  # type: ignore[attr-defined]
+            mgr._root_futures = set()  # type: ignore[attr-defined]
+            mgr._drained = set()  # type: ignore[attr-defined]
             evicted: list[tuple[str, str]] = []
 
             async def _fake_evict(key: tuple[str, str], **_kwargs: object) -> None:
@@ -908,8 +916,6 @@ class TestEvictUserSession:
             mgr._drop_catalog_locked = _fake_evict  # type: ignore[method-assign]
 
             # Run the dispatch on a separate thread so the loop can drain.
-            import threading
-
             done = threading.Event()
 
             def _run_loop() -> None:

@@ -95,6 +95,14 @@ TIMEOUT_OUTCOME_CLAUSE = (
     "reconcile before re-issuing it."
 )
 
+# The shutdown twin: an MCP tool call that the MCP client's shutdown stopped mid-flight
+# may already have reached its server, so it reads UNKNOWN for the same reason.
+SHUTDOWN_OUTCOME_CLAUSE = (
+    "Outcome UNKNOWN — the call was stopped when the MCP client shut down; it may "
+    "have run partially or had side effects, so do not assume it did not run, and "
+    "reconcile before re-issuing it."
+)
+
 # The synthetic result body for a tool call that never produced output (the
 # last-resort wire-repair for an orphan the session layer didn't synthesize —
 # e.g. a force-abandoned worker).  The neutral turn carries ``is_error=True``;

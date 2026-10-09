@@ -106,6 +106,7 @@ from turnstone.core.edit import find_occurrences, pick_nearest
 from turnstone.core.ip_classify import AddressLane
 from turnstone.core.log import get_logger
 from turnstone.core.lowering import (
+    SHUTDOWN_OUTCOME_CLAUSE,
     TIMEOUT_OUTCOME_CLAUSE,
     UNOBSERVED_OUTCOME_CLAUSE,
     drop_empty_user_turns,
@@ -116,7 +117,7 @@ from turnstone.core.lowering import (
     tool_args_preview,
     wire_valid_arguments,
 )
-from turnstone.core.mcp_client import try_prime_user_pools
+from turnstone.core.mcp_client import MCPShutdownError, try_prime_user_pools
 from turnstone.core.media_materialization import (
     PDF_EXTRACTED_TEXT_PART_OVERHEAD_CHARS,
     PDF_RASTER_TRUNCATION_NOTICE,
@@ -24554,6 +24555,16 @@ class ChatSession:
             output = f"MCP tool timed out after {self.tool_timeout}s. {TIMEOUT_OUTCOME_CLAUSE}"
             mcp_error = True
             mcp_status = EffectStatus.UNKNOWN
+            self.ui.on_error(output)
+        except MCPShutdownError as e:
+            # The MCP client's shutdown stopped the call. One it stopped mid-flight may have
+            # reached the server, so it reads UNKNOWN like a timeout; one refused before it
+            # started did nothing and stays a plain error.
+            output = f"MCP tool error: {e}."
+            if e.started:
+                output = f"{output} {SHUTDOWN_OUTCOME_CLAUSE}"
+                mcp_status = EffectStatus.UNKNOWN
+            mcp_error = True
             self.ui.on_error(output)
         except Exception as e:
             output = _format_mcp_dispatch_error("MCP tool error", e)

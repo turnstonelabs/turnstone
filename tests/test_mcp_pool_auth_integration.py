@@ -864,9 +864,10 @@ def test_integration_static_path_unaffected(
     # Manually configure mgr with a static-path server pointing at the
     # fixture upstream. Use _connect_one (not the pool path).
     cfg = {"type": "streamable-http", "url": url}
+    mgr._server_configs["static-srv"] = cfg
 
     async def _connect_static() -> None:
-        await mgr._connect_one("static-srv", cfg)
+        await mgr._connect_one("static-srv")
 
     fut = asyncio.run_coroutine_threadsafe(_connect_static(), loop)
     fut.result(timeout=15)
@@ -880,8 +881,8 @@ def test_integration_static_path_unaffected(
 
     # Reconnect — the canonical regression check is that the
     # StaticServerState object identity is preserved.
-    fut = asyncio.run_coroutine_threadsafe(_connect_static(), loop)
-    fut.result(timeout=15)
+    reconnected = mgr.reconnect_sync("static-srv", timeout=15)
+    assert reconnected["connected"], reconnected
 
     state_after = mgr._static_servers.get("static-srv")
     assert state_after is not None
@@ -917,9 +918,10 @@ def test_static_dispatch_unaffected_by_consent_url_kwarg(
 
     mgr, loop, _ = running_loop_mgr
     cfg = {"type": "streamable-http", "url": url}
+    mgr._server_configs["static-srv"] = cfg
 
     async def _connect_static() -> None:
-        await mgr._connect_one("static-srv", cfg)
+        await mgr._connect_one("static-srv")
 
     fut = asyncio.run_coroutine_threadsafe(_connect_static(), loop)
     fut.result(timeout=15)

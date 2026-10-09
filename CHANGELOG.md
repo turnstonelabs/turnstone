@@ -260,6 +260,23 @@ frozen.
 
 ### Fixed
 
+- **MCP shutdown stops the work callers wait on.** Shutting down the MCP client left work that a
+  caller was waiting on running, so the caller waited out its own timeout (two minutes for a tool
+  call, forever for adding a server), and garbage collection later closed the abandoned work on
+  whatever thread it ran, reporting "Exception ignored" errors. Shutdown now cancels that work and
+  closes every MCP server connection under one 20-second deadline, which keeps MCP shutdown within
+  a 30-second stop budget, and each waiting caller gets "MCP client is shutting down" at once. A
+  server that never answers the request ending its session gets 3 seconds, so it can no longer
+  hold a connection open through shutdown. A tool call stopped mid-flight is recorded with an
+  unknown outcome, because it may already have reached its server; a shutdown never counts
+  against a server's circuit breaker.
+- **An MCP server removed while a reconnect waited stays removed.** An operator reconnect, or the
+  startup pass that connects every configured server, could wait behind a server's removal and
+  then connect it again from the config it had read, so the removed server's tools stayed in use
+  until the next restart. Both now skip a server removed while they waited. A reload that added or
+  removed a server while the startup pass was still running also stopped the pass, which skipped
+  the remaining servers and never started the health checks that reconnect a dropped server; the
+  pass now reads each server's config when it reaches that server.
 - **Saved sessions list all stored history (#1268).** The saved list returned at most the 50 newest
   sessions of each kind that the caller could see, without a total, so the dashboard's pager and
   search never reached older sessions. It now pages through every session the caller may see, with
