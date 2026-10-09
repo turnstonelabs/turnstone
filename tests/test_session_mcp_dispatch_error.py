@@ -19,8 +19,13 @@ from __future__ import annotations
 import json
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from tests.test_session import _make_session
+from turnstone.core.lowering import SHUTDOWN_OUTCOME_CLAUSE
+from turnstone.core.mcp_client import MCPShutdownError
 from turnstone.core.session import _format_mcp_dispatch_error
+from turnstone.core.trajectory import EffectStatus
 
 # ---------------------------------------------------------------------------
 # Unit tests for the helper
@@ -156,6 +161,41 @@ class TestExecMcpToolDispatchError:
 
         assert captures[0][2] == "MCP tool error: connection lost"
         assert captures[0][3] is True
+
+    @pytest.mark.parametrize("started", [True, False])
+    def test_exec_mcp_tool_shutdown(self, tmp_db, started: bool) -> None:
+        """A call the MCP client's shutdown stopped mid-flight may have reached its server, so it
+        reads UNKNOWN; one refused before it started is a plain error with no effect."""
+        session = _make_session()
+        reports: list[dict[str, object]] = []
+
+        def _capture(call_id: str, name: str, output: str, **kwargs: object) -> None:
+            reports.append({"output": output, **kwargs})
+
+        session._report_tool_result = _capture  # type: ignore[method-assign]
+        mock_client = MagicMock()
+        mock_client.call_tool_sync.side_effect = MCPShutdownError(started=started)
+        session._mcp_client = mock_client
+
+        session._exec_mcp_tool(
+            {
+                "call_id": "tc_3",
+                "mcp_func_name": "mcp__srv__do",
+                "mcp_args": {},
+                "_principal_id": "",
+            }
+        )
+
+        [report] = reports
+        assert report["is_error"] is True
+        if started:
+            assert report["status"] is EffectStatus.UNKNOWN
+            assert report["output"] == (
+                f"MCP tool error: MCP client is shutting down. {SHUTDOWN_OUTCOME_CLAUSE}"
+            )
+        else:
+            assert report["status"] is None
+            assert report["output"] == "MCP tool error: MCP client is shutting down."
 
 
 class TestExecReadResourceDispatchError:

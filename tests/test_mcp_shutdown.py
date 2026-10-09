@@ -2,13 +2,19 @@
 
 from __future__ import annotations
 
+import ast
 import asyncio
+import concurrent.futures
+import contextlib
+import gc
 import json
 import queue
 import threading
+import time
 from collections import deque
+from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from unittest.mock import MagicMock
 
 import httpx
@@ -18,14 +24,23 @@ from starlette.applications import Starlette
 from starlette.middleware import Middleware
 from starlette.routing import Route
 
+from tests._proc_helpers import poll_until
 from tests.conftest import make_mcp_token_cipher
 from tests.test_mcp_oauth_handlers import _InjectAuthMiddleware
-from turnstone.core import mcp_oauth
-from turnstone.core.mcp_client import MCPClientManager
+from turnstone.core import mcp_client, mcp_oauth
+from turnstone.core.mcp_client import (
+    MCPClientManager,
+    MCPShutdownError,
+    PoolEntryState,
+    StaticServerState,
+)
 from turnstone.core.mcp_crypto import MCPTokenStore
 from turnstone.core.oauth.context import oauth_context
 from turnstone.core.oauth.oidc import OIDCConfig
 from turnstone.core.oauth.runtime import shutdown_oauth_runtime
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Coroutine
 
 _KEY = ("user-1", "pool-srv")
 
@@ -37,10 +52,21 @@ async def _until(predicate: Any) -> None:
 
 
 class _Upstream:
-    """An AS and MCP endpoint with event-controlled response boundaries."""
+    """An AS and MCP endpoint with event-controlled response boundaries.
 
-    def __init__(self, phase: str) -> None:
+    With a *session_id*, the MCP endpoint assigns that session at initialize, so a client ends
+    it with a DELETE when its transport closes, and the ``delete`` phase holds that request;
+    *hold_session_end* holds it in every phase. The ``initialize-stream`` phase sends the
+    session's headers and then never the result, so the client holds a session id but no
+    session.
+    """
+
+    def __init__(
+        self, phase: str, *, session_id: str | None = None, hold_session_end: bool = False
+    ) -> None:
         self.phase = phase
+        self.session_id = session_id
+        self.hold_session_end = hold_session_end
         self.entered = asyncio.Event()
         self.release = asyncio.Event()
         self.requests: list[str] = []
@@ -92,23 +118,48 @@ class _Upstream:
             )
         if request.path != "/mcp":
             return web.Response(status=404)
+        if request.method == "DELETE" and self.session_id is not None:
+            if self.hold_session_end:
+                await self.release.wait()
+            else:
+                await self.gate("delete")
+            return web.Response(status=200)
         if request.method != "POST":
             return web.Response(status=405)
         body = await request.json()
         if "id" not in body:
             return web.Response(status=202)
         method = body["method"]
+        if method == "initialize" and self.phase == "initialize-stream":
+            response = web.StreamResponse(
+                status=200,
+                headers={
+                    "Content-Type": "text/event-stream",
+                    "mcp-session-id": self.session_id or "",
+                },
+            )
+            await response.prepare(request)
+            self.entered.set()
+            await self.release.wait()
+            return response
         await self.gate(method)
+        headers: dict[str, str] = {}
         if method == "initialize":
             result = {
                 "protocolVersion": body["params"]["protocolVersion"],
                 "capabilities": {"tools": {}},
                 "serverInfo": {"name": "shutdown-test", "version": "1"},
             }
+            if self.session_id is not None:
+                headers["mcp-session-id"] = self.session_id
+        elif method == "tools/call":
+            result = {"content": [{"type": "text", "text": "ok"}]}
         else:
             assert method == "tools/list"
             result = {"tools": [{"name": "example", "inputSchema": {"type": "object"}}]}
-        return web.json_response({"jsonrpc": "2.0", "id": body["id"], "result": result})
+        return web.json_response(
+            {"jsonrpc": "2.0", "id": body["id"], "result": result}, headers=headers
+        )
 
 
 async def _host(
@@ -691,3 +742,643 @@ def test_revoke_cancellation_budget_is_bounded_and_logged(
         assert not tasks
 
     asyncio.run(run())
+
+
+def _outcome(call: Callable[[], object]) -> object:
+    try:
+        return call()
+    except Exception as exc:
+        return exc
+
+
+@pytest.mark.parametrize(
+    ("entrypoint", "phase"),
+    [
+        ("add", "initialize"),
+        ("reconnect", "initialize"),
+        ("refresh", "tools/list"),
+        ("call_tool", "tools/call"),
+        ("call_tool_reconnect", "initialize"),
+    ],
+)
+def test_shutdown_stops_waiting_sync_calls(
+    entrypoint: str, phase: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Shutdown cancels the work a sync caller waits on, on the running loop: the caller gets
+    the shutdown error at once instead of waiting out its timeout (``add_server_sync`` has
+    none), and nothing is left on the loop for garbage collection to close. A tool call that
+    shutdown stops while it is still reconnecting its server has not started."""
+    monkeypatch.setattr("turnstone.core.mcp_client.load_config", lambda *_: {})
+
+    async def run() -> None:
+        async with _Upstream("none") as upstream:
+            manager = MCPClientManager({})
+            manager._user_token_sweep_s = 0
+            manager._static_health_check_s = 0
+            await asyncio.to_thread(manager.start)
+            loop, thread = manager._loop, manager._thread
+            assert loop is not None and thread is not None
+            cfg = {"type": "http", "url": upstream.origin + "/mcp"}
+            calls: dict[str, Callable[[], object]] = {
+                "add": lambda: manager.add_server_sync("srv", cfg),
+                "reconnect": lambda: manager.reconnect_sync("srv"),
+                "refresh": lambda: manager.refresh_sync("srv"),
+                "call_tool": lambda: manager.call_tool_sync("mcp__srv__example", {}),
+                "call_tool_reconnect": lambda: manager.call_tool_sync("mcp__srv__example", {}),
+            }
+
+            async def evict_session() -> None:
+                # What a dead transport does: the next call reconnects before it is sent.
+                manager._drop_static_session_and_stamp("srv", manager._static_servers["srv"])
+
+            try:
+                if entrypoint != "add":
+                    added = await asyncio.to_thread(manager.add_server_sync, "srv", cfg)
+                    assert added["connected"], added
+                if entrypoint == "call_tool_reconnect":
+                    await asyncio.wrap_future(
+                        asyncio.run_coroutine_threadsafe(evict_session(), loop)
+                    )
+                upstream.phase = phase
+                waiting = asyncio.ensure_future(asyncio.to_thread(_outcome, calls[entrypoint]))
+                await asyncio.wait_for(upstream.entered.wait(), 5)
+                started = time.monotonic()
+                await asyncio.to_thread(manager.shutdown)
+                # Inside an owner's graceful window: no step waits one out.
+                assert time.monotonic() - started < manager._OWNER_CLOSE_GRACE_S
+                outcome = await asyncio.wait_for(waiting, 5)
+                assert loop.is_closed() and not thread.is_alive()
+                assert not asyncio.all_tasks(loop)
+                if entrypoint in ("add", "reconnect"):
+                    assert isinstance(outcome, dict)
+                    assert outcome["connected"] is False
+                    assert outcome["error"] == "MCP client is shutting down"
+                else:
+                    assert isinstance(outcome, MCPShutdownError)
+                    assert outcome.started is (entrypoint != "call_tool_reconnect")
+            finally:
+                upstream.release.set()
+                await asyncio.to_thread(manager.shutdown)
+        gc.collect()  # an abandoned coroutine would be closed here, and fail the test
+
+    asyncio.run(run())
+
+
+def test_shutdown_error_marks_only_work_the_drain_cancelled() -> None:
+    """Work shutdown cancels raises the shutdown error, marked as started. Work its caller gave
+    up on before shutdown stays a plain cancel, since nothing would retrieve an error from it,
+    and work submitted after shutdown is refused before its coroutine is even created."""
+    manager = MCPClientManager({})
+    manager._user_token_sweep_s = 0
+    manager._static_health_check_s = 0
+    manager.start()
+    tasks: list[asyncio.Task[Any]] = []
+
+    async def _forever() -> None:
+        task = asyncio.current_task()
+        assert task is not None
+        tasks.append(task)
+        await asyncio.Event().wait()
+
+    try:
+        abandoned = manager._submit_root(_forever)
+        assert poll_until(lambda: len(tasks) == 1)
+        abandoned.cancel()
+        assert poll_until(tasks[0].done)
+        drained = manager._submit_root(_forever)
+        assert poll_until(lambda: len(tasks) == 2)
+    finally:
+        manager.shutdown()
+    with pytest.raises(MCPShutdownError) as stopped:
+        drained.result(timeout=5)
+    assert stopped.value.started is True
+    # The tasks on the loop, not the callers' futures: a caller's cancel marks its own future
+    # cancelled whatever the task then does.
+    assert tasks[0].cancelled()
+    assert isinstance(tasks[1].exception(), MCPShutdownError)
+    created: list[object] = []
+    with pytest.raises(MCPShutdownError) as refused:
+        manager._submit_root(lambda: created.append(1) or _forever())
+    assert refused.value.started is False
+    assert created == []
+
+
+def test_shutdown_waits_for_an_owner_whose_teardown_it_cut_short(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A removal takes its server's transport owner off state, asks it to close and waits for
+    it. When shutdown cancels that wait, the drain waits for the owner itself: the
+    session-termination request the owner is still sending finishes before the loop closes."""
+    monkeypatch.setattr("turnstone.core.mcp_client.load_config", lambda *_: {})
+
+    async def run() -> None:
+        async with _Upstream("none", session_id="shutdown-session") as upstream:
+            manager = MCPClientManager({})
+            manager._user_token_sweep_s = 0
+            manager._static_health_check_s = 0
+            await asyncio.to_thread(manager.start)
+            loop, thread = manager._loop, manager._thread
+            assert loop is not None and thread is not None
+            cfg = {"type": "http", "url": upstream.origin + "/mcp"}
+            try:
+                added = await asyncio.to_thread(manager.add_server_sync, "srv", cfg)
+                assert added["connected"], added
+                upstream.phase = "delete"
+                removing = asyncio.ensure_future(
+                    asyncio.to_thread(manager.remove_server_sync, "srv")
+                )
+                await asyncio.wait_for(upstream.entered.wait(), 5)
+                stopping = asyncio.ensure_future(asyncio.to_thread(manager.shutdown))
+                await _until(lambda: not manager._accepting_work)
+                await asyncio.sleep(0.1)  # time for the drain to cancel the removal's wait
+                assert not stopping.done()
+                upstream.release.set()
+                await asyncio.wait_for(stopping, 10)
+                assert loop.is_closed() and not thread.is_alive()
+                assert not asyncio.all_tasks(loop)
+                assert await asyncio.wait_for(removing, 5) is False
+            finally:
+                upstream.release.set()
+                await asyncio.to_thread(manager.shutdown)
+        gc.collect()  # an abandoned coroutine would be closed here, and fail the test
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("path", ["static", "pool"])
+def test_shutdown_waits_for_an_owner_whose_connect_its_caller_gave_up_on(
+    path: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Shutdown cancels a connect still waiting for its server's handshake, and the connect's
+    cancel arm cancels the transport owner once and waits for it. When the connect's caller
+    gives up during that wait, its cancel cuts the wait short. The drain still waits for the
+    owner past its graceful window, and never cancels it a second time."""
+    monkeypatch.setattr("turnstone.core.mcp_client.load_config", lambda *_: {})
+    # The owner outlasts its graceful window, so the drain's escalation step meets it.
+    monkeypatch.setattr(MCPClientManager, "_OWNER_CLOSE_GRACE_S", 0.05)
+    cancels: list[int] = []
+    unwound = threading.Event()
+    unwind = asyncio.Event()  # set by the test once the drain has met the owner
+
+    async def owner(
+        self: MCPClientManager, key: Any, settings: Any, ready: Any, close_requested: Any
+    ) -> None:
+        try:
+            await asyncio.Event().wait()  # the server never answers the handshake
+        except asyncio.CancelledError:
+            cancels.append(1)
+            try:
+                await unwind.wait()  # unwinding the transport takes a while
+            except asyncio.CancelledError:
+                cancels.append(2)
+                raise
+            unwound.set()
+            raise
+
+    async def no_probe(self: MCPClientManager, key: Any, url: str) -> None:
+        return None
+
+    monkeypatch.setattr(MCPClientManager, "_static_transport_owner", owner)
+    monkeypatch.setattr(MCPClientManager, "_pool_transport_owner", owner)
+    monkeypatch.setattr(MCPClientManager, "_tcp_probe", no_probe)
+    manager = MCPClientManager({})
+    manager._user_token_sweep_s = 0
+    manager._static_health_check_s = 0
+    manager.start()
+    loop = manager._loop
+    assert loop is not None
+    cfg = {"type": "http", "url": "https://mcp.example.com/mcp"}
+    manager._server_configs["srv"] = cfg
+
+    def connect() -> Coroutine[Any, Any, object]:
+        if path == "static":
+            return manager._connect_one_locked("srv", cfg)
+        return manager._connect_one_pool(("user-1", "srv"), cfg, "synthetic-token")
+
+    try:
+        connecting = manager._submit_root(connect)
+        assert poll_until(lambda: bool(manager._owners))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            stopping = executor.submit(manager.shutdown)
+            assert poll_until(lambda: bool(cancels))
+            assert connecting.cancel()  # the caller's own timeout, while the arm waits
+            assert poll_until(lambda: not manager._root_tasks)
+            time.sleep(0.2)  # the drain's escalation step meets the owner still unwinding
+            with contextlib.suppress(RuntimeError):  # a loop already closed fails below
+                loop.call_soon_threadsafe(unwind.set)
+            stopping.result(timeout=10)
+    finally:
+        manager.shutdown()
+    assert unwound.is_set()
+    assert cancels == [1]
+    assert loop.is_closed()
+    assert not asyncio.all_tasks(loop)
+
+
+def test_shutdown_cancels_a_registered_owner_that_ignores_its_close_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A registered transport owner that does not answer shutdown's request to close gets its
+    graceful window, then exactly one cancel, and the drain waits for its unwind before the
+    loop closes."""
+    monkeypatch.setattr("turnstone.core.mcp_client.load_config", lambda *_: {})
+    monkeypatch.setattr(MCPClientManager, "_OWNER_CLOSE_GRACE_S", 0.05)
+    manager = MCPClientManager({})
+    manager._user_token_sweep_s = 0
+    manager._static_health_check_s = 0
+    manager.start()
+    loop = manager._loop
+    assert loop is not None
+    cancels: list[int] = []
+    unwound = threading.Event()
+
+    async def ignores_its_close() -> None:
+        try:
+            await asyncio.Event().wait()  # never watches its close request
+        except asyncio.CancelledError:
+            cancels.append(1)
+            try:
+                await asyncio.sleep(0.3)  # unwinding the transport takes a while
+            except asyncio.CancelledError:
+                cancels.append(2)
+                raise
+            unwound.set()
+            raise
+
+    async def register() -> None:
+        close_requested = asyncio.Event()
+        owner = asyncio.create_task(ignores_its_close())
+        manager._track_owner(owner, close_requested)
+        manager._static_servers["srv"] = StaticServerState(
+            name="srv", session=MagicMock(), owner_task=owner, close_requested=close_requested
+        )
+
+    try:
+        asyncio.run_coroutine_threadsafe(register(), loop).result(5)
+    finally:
+        manager.shutdown()
+    assert cancels == [1]
+    assert unwound.is_set()
+    assert not asyncio.all_tasks(loop)
+
+
+def test_shutdown_stops_the_health_loop_and_the_token_sweep(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The static health loop and the token sweep run for the manager's life; shutdown stops
+    both, so neither is left on the closed loop."""
+    monkeypatch.setattr("turnstone.core.mcp_client.load_config", lambda *_: {})
+    manager = MCPClientManager({})
+    manager._static_health_check_s = 30.0
+    manager._user_token_sweep_s = 240.0
+    manager.start()
+    loop = manager._loop
+    assert loop is not None
+    assert poll_until(
+        lambda: (
+            manager._static_health_task is not None and manager._user_token_sweep_task is not None
+        )
+    )
+    manager.shutdown()
+    assert loop.is_closed()
+    assert not asyncio.all_tasks(loop)
+
+
+def test_shutdown_releases_a_start_still_connecting(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Shutdown during ``start()``'s connect pass releases ``start()`` at once instead of after
+    its 30s wait, records no initialization error, and leaves nothing on the loop."""
+    monkeypatch.setattr("turnstone.core.mcp_client.load_config", lambda *_: {})
+    entered = threading.Event()
+
+    async def owner(self: MCPClientManager, name: str, cfg: Any, ready: Any, close: Any) -> None:
+        entered.set()
+        await asyncio.Event().wait()  # the server never answers the handshake
+
+    async def no_probe(self: MCPClientManager, key: Any, url: str) -> None:
+        return None
+
+    monkeypatch.setattr(MCPClientManager, "_static_transport_owner", owner)
+    monkeypatch.setattr(MCPClientManager, "_tcp_probe", no_probe)
+    manager = MCPClientManager({"srv": {"type": "http", "url": "https://mcp.example.com/mcp"}})
+    manager._user_token_sweep_s = 60
+    manager._static_health_check_s = 60
+    starting = threading.Thread(target=manager.start, name="mcp-start-test")
+    began = time.monotonic()
+    starting.start()
+    try:
+        assert entered.wait(5)
+        loop = manager._loop
+        assert loop is not None
+        manager.shutdown()
+        starting.join(10)
+        assert not starting.is_alive()
+        assert time.monotonic() - began < 5
+        assert manager._error is None
+        assert loop.is_closed()
+        assert not asyncio.all_tasks(loop)
+    finally:
+        manager.shutdown()
+        starting.join(35)
+
+
+def test_shutdown_starts_no_eviction_loop_for_work_unwinding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Work that asks for the pool eviction loop while shutdown is cancelling it (a prime's
+    failure arm records an error, which starts the loop) gets none: the drain has already taken
+    its snapshot, so a new loop would be left on the closed loop."""
+    monkeypatch.setattr("turnstone.core.mcp_client.load_config", lambda *_: {})
+    manager = MCPClientManager({})
+    manager._user_token_sweep_s = 0
+    manager._static_health_check_s = 0
+    manager.start()
+    loop = manager._loop
+    assert loop is not None
+    entered = threading.Event()
+
+    async def records_a_failure_while_unwinding() -> None:
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            manager._ensure_eviction_loop()
+            raise
+
+    manager._submit_root(records_a_failure_while_unwinding)
+    assert entered.wait(5)
+    manager.shutdown()
+    assert loop.is_closed()
+    assert not asyncio.all_tasks(loop)
+
+
+def test_shutdown_is_not_held_by_a_server_that_never_ends_its_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A server issues a session id, never finishes the handshake, and never answers the DELETE
+    that ends the session. Shutdown cancels the connect, whose cancel arm spends the transport
+    owner's one cancel before that DELETE goes out; the DELETE's own timeout then ends it, so
+    the owner unwinds within its escalated wait instead of holding shutdown to its deadline."""
+    monkeypatch.setattr("turnstone.core.mcp_client.load_config", lambda *_: {})
+    monkeypatch.setattr(mcp_client, "_SESSION_END_TIMEOUT_S", 0.5)
+
+    async def run() -> None:
+        async with _Upstream(
+            "initialize-stream", session_id="held-session", hold_session_end=True
+        ) as upstream:
+            manager = MCPClientManager({})
+            manager._user_token_sweep_s = 0
+            manager._static_health_check_s = 0
+            await asyncio.to_thread(manager.start)
+            loop, thread = manager._loop, manager._thread
+            assert loop is not None and thread is not None
+            cfg = {"type": "http", "url": upstream.origin + "/mcp"}
+            try:
+                adding = asyncio.ensure_future(
+                    asyncio.to_thread(manager.add_server_sync, "srv", cfg)
+                )
+                await asyncio.wait_for(upstream.entered.wait(), 5)
+                started = time.monotonic()
+                await asyncio.to_thread(manager.shutdown)
+                assert time.monotonic() - started < manager._OWNER_CANCEL_GRACE_S
+                assert loop.is_closed() and not thread.is_alive()
+                assert not asyncio.all_tasks(loop)
+                added = await asyncio.wait_for(adding, 5)
+                assert added["error"] == "MCP client is shutting down"
+            finally:
+                upstream.release.set()
+                await asyncio.to_thread(manager.shutdown)
+        gc.collect()  # an abandoned coroutine would be closed here, and fail the test
+
+    asyncio.run(run())
+
+
+def test_shutdown_fails_callers_when_the_loop_thread_is_stuck(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When a synchronous call keeps the loop thread busy past every wait, shutdown leaves the
+    loop open, and the callers still waiting on its work get the shutdown error instead of
+    waiting forever."""
+    monkeypatch.setattr(MCPClientManager, "_SHUTDOWN_DEADLINE_S", 0.2)
+    monkeypatch.setattr(MCPClientManager, "_SHUTDOWN_RESULT_MARGIN_S", 0.1)
+    monkeypatch.setattr(MCPClientManager, "_LOOP_JOIN_TIMEOUT_S", 0.2)
+    manager = MCPClientManager({})
+    manager._user_token_sweep_s = 0
+    manager._static_health_check_s = 0
+    manager.start()
+    loop, thread = manager._loop, manager._thread
+    assert loop is not None and thread is not None
+    entered, unblock = threading.Event(), threading.Event()
+
+    async def _forever() -> None:
+        entered.set()
+        await asyncio.Event().wait()
+
+    waiting = manager._submit_root(_forever)
+    assert entered.wait(5)
+    loop.call_soon_threadsafe(lambda: unblock.wait(10))  # the stuck synchronous call
+    try:
+        manager.shutdown()
+        assert thread.is_alive()  # left open: closing a running loop raises
+        with pytest.raises(MCPShutdownError) as stopped:
+            waiting.result(timeout=0)
+        assert stopped.value.started is True
+    finally:
+        unblock.set()
+        thread.join(5)
+        # Unblocked, the loop ran its queued stop; finish what it left and close it. The root
+        # completing now finds its caller's future already failed, which asyncio logs.
+        left = asyncio.all_tasks(loop)
+        for task in left:
+            task.cancel()
+        loop.run_until_complete(asyncio.gather(*left, return_exceptions=True))
+        loop.close()
+
+
+def test_shutdown_stops_work_whose_own_timeout_is_expiring(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An ``asyncio.timeout`` cancels its task when it expires, and turns that cancel into
+    ``TimeoutError`` when the task resumes. When shutdown's drain runs in between, it still
+    stops the work, which raises the shutdown error instead of catching a timeout and carrying
+    on past the drain."""
+    manager = MCPClientManager({})
+    manager._user_token_sweep_s = 0
+    manager._static_health_check_s = 0
+    manager.start()
+    loop = manager._loop
+    assert loop is not None
+    steps: list[asyncio.Timeout] = []
+    timed_out: list[bool] = []
+    parked, unpark, queued = threading.Event(), threading.Event(), threading.Event()
+
+    async def pass_with_a_bounded_step() -> None:
+        try:
+            async with asyncio.timeout(None) as step:
+                steps.append(step)
+                await asyncio.Event().wait()
+        except TimeoutError:
+            timed_out.append(True)  # a pass carries on with its next step here
+        await asyncio.Event().wait()
+
+    def park() -> None:
+        # The step's bound expires while the loop is parked. Its timer fires once the loop
+        # runs again, after the drain queued meanwhile, so the drain's first step runs between
+        # the expiry and the task resuming.
+        steps[0].reschedule(asyncio.get_running_loop().time() + 0.05)
+        parked.set()
+        assert unpark.wait(5)
+
+    submit = asyncio.run_coroutine_threadsafe
+
+    def submit_noting_the_drain(coro: Any, target: asyncio.AbstractEventLoop) -> Any:
+        future = submit(coro, target)
+        if coro.__qualname__ == "MCPClientManager._drain_and_close":
+            queued.set()
+        return future
+
+    monkeypatch.setattr(asyncio, "run_coroutine_threadsafe", submit_noting_the_drain)
+    try:
+        passing = manager._submit_root(pass_with_a_bounded_step)
+        assert poll_until(lambda: bool(steps))
+        loop.call_soon_threadsafe(park)
+        assert parked.wait(5)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            stopping = executor.submit(manager.shutdown)
+            assert queued.wait(5)
+            time.sleep(0.1)  # past the step's bound, which the parked loop cannot fire yet
+            unpark.set()
+            stopping.result(timeout=30)
+    finally:
+        unpark.set()
+        manager.shutdown()
+    with pytest.raises(MCPShutdownError) as stopped:
+        passing.result(timeout=0)
+    assert stopped.value.started is True
+    assert timed_out == []
+
+
+def test_shutdown_fails_callers_of_work_left_on_the_closed_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Work still unwinding when shutdown's deadline passes is left on the loop, which then
+    closes, so nothing would ever resolve its caller's future (``add_server_sync`` waits without
+    a timeout). Shutdown fails those futures with the shutdown error instead."""
+    monkeypatch.setattr(MCPClientManager, "_SHUTDOWN_DEADLINE_S", 0.2)
+    manager = MCPClientManager({})
+    manager._user_token_sweep_s = 0
+    manager._static_health_check_s = 0
+    manager.start()
+    entered = threading.Event()
+
+    async def slow_to_stop() -> None:
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            await asyncio.sleep(30)  # an unwind that outlasts the deadline
+            raise
+
+    waiting = manager._submit_root(slow_to_stop)
+    assert entered.wait(5)
+    manager.shutdown()
+    with pytest.raises(MCPShutdownError) as stopped:
+        waiting.result(timeout=0)
+    assert stopped.value.started is True
+    del waiting
+    gc.collect()  # the task left on the closed loop reports here, not in a later test
+
+
+class _QueuedLock(asyncio.Lock):
+    """Reads as free, yet an acquire waits: a lock just released to a waiter not yet resumed."""
+
+    def locked(self) -> bool:
+        return False
+
+    async def acquire(self) -> bool:  # type: ignore[override]
+        await asyncio.Event().wait()
+        return True
+
+
+def test_idle_eviction_lets_a_cancel_end_its_lock_wait(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The idle eviction waits briefly for a pool entry's lock and gives up when the wait expires.
+    A cancel during that wait (shutdown's drain) ends the eviction instead of being taken for the
+    wait expiring, which would send the eviction loop back to sleep past the drain's deadline."""
+    monkeypatch.setattr("turnstone.core.mcp_client.load_config", lambda *_: {})
+    manager = MCPClientManager({})
+    key = ("user-1", "pool-srv")
+
+    async def run() -> object:
+        manager._user_pool_entries[key] = PoolEntryState(key=key, open_lock=_QueuedLock())
+        evicting = asyncio.create_task(manager._close_pool_entry_if_idle(key))
+        await asyncio.sleep(0)  # now waiting for the lock
+        evicting.cancel()
+        [outcome] = await asyncio.gather(evicting, return_exceptions=True)
+        return outcome
+
+    assert isinstance(asyncio.run(run()), asyncio.CancelledError)
+
+
+def test_reconnect_on_a_loop_shutdown_closed_still_returns_its_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A dispatch's reconnect that finishes just before shutdown closes the loop returns its
+    session without the catalog refresh it schedules after a reconnect; the dispatch is then
+    refused with the shutdown error instead of failing on the closed loop."""
+    monkeypatch.setattr("turnstone.core.mcp_client.load_config", lambda *_: {})
+    manager = MCPClientManager({"srv": {"type": "stdio", "command": "echo"}})
+    session = MagicMock()
+    reconnected: concurrent.futures.Future[object] = concurrent.futures.Future()
+    reconnected.set_result(session)
+    closed = asyncio.new_event_loop()
+    closed.close()
+    manager._loop = closed
+    monkeypatch.setattr(manager, "_submit_root", lambda _factory: reconnected)
+    assert manager._cb_auto_reconnect("srv") is session
+
+
+def test_shutdown_deadline_fits_the_stop_budget() -> None:
+    """Shutdown's deadline outlasts the slowest unwind of cancelled work (a child reap, then a
+    teardown's graceful and escalated waits) plus a full escalated wait for an owner that work
+    leaves running. With its wait for admitted submissions, the thread's margin on that deadline
+    and its join of the loop thread, MCP shutdown stays inside a 30s stop budget."""
+    slowest_unwind = (
+        MCPClientManager._OWNER_CANCEL_GRACE_S
+        + MCPClientManager._OWNER_CLOSE_GRACE_S
+        + MCPClientManager._OWNER_CANCEL_GRACE_S
+    )
+    assert (
+        slowest_unwind + MCPClientManager._OWNER_CANCEL_GRACE_S
+        <= MCPClientManager._SHUTDOWN_DEADLINE_S
+    )
+    assert (
+        MCPClientManager._ADMISSION_WAIT_S
+        + MCPClientManager._SHUTDOWN_DEADLINE_S
+        + MCPClientManager._SHUTDOWN_RESULT_MARGIN_S
+        + MCPClientManager._LOOP_JOIN_TIMEOUT_S
+        < 30.0
+    )
+    # The request that ends a session cannot keep an owner past its escalated wait.
+    assert mcp_client._SESSION_END_TIMEOUT_S < MCPClientManager._OWNER_CANCEL_GRACE_S
+
+
+def test_loop_work_is_submitted_only_through_the_tracking_helper() -> None:
+    """Only ``_submit_root`` and shutdown's own phase may submit coroutines to the loop: work
+    submitted any other way is invisible to shutdown's drain, and left for garbage collection
+    to close on the stopped loop."""
+    tree = ast.parse(Path(mcp_client.__file__).read_text())
+    sites: list[str] = []
+
+    def visit(node: ast.AST, scope: str) -> None:
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, ast.Call):
+                func = child.func
+                name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
+                if name == "run_coroutine_threadsafe":
+                    sites.append(scope)
+            inner = (
+                child.name if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)) else scope
+            )
+            visit(child, inner)
+
+    visit(tree, "<module>")
+    assert sorted(sites) == ["_submit_root", "shutdown"]

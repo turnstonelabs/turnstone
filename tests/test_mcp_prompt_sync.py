@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import gc
 import weakref
 from typing import TYPE_CHECKING, Any
@@ -568,6 +569,68 @@ class TestRefreshPassSync:
         assert sync.call_count == 0
         assert "srv1" not in mgr._last_error
         assert "srv1" not in mgr._consecutive_failures
+        assert _mcp_template_names(db) == ["mcp__srv0__kept", "mcp__srv1__other"]
+        mgr.shutdown()
+        del task, chain
+        gc.collect()  # the abandoned tasks report themselves here, not in a later test
+
+    @pytest.mark.parametrize("first", ["_run_root", "_reconnect", "_connect_one_locked"])
+    @pytest.mark.parametrize("stalled_in", ["handshake", "discovery"])
+    def test_stalled_operator_reconnect_closes_cleanly_in_any_order(
+        self, db: Any, stalled_in: str, first: str
+    ) -> None:
+        """An operator reconnect runs as submitted work. Garbage collection may close that work,
+        the reconnect or the connect under it first; whichever it closes first, the close unwinds
+        every frame without raising and records nothing: no connect failure, and the server's
+        catalog stays published."""
+        mgr = _synced_manager(db, {"srv0": ["kept"], "srv1": ["other"]})
+        loop = asyncio.new_event_loop()
+        stalled = asyncio.Event()
+        submitted: list[Any] = []
+
+        async def _stall(*_args: Any, **_kw: Any) -> Any:
+            stalled.set()
+            await asyncio.Event().wait()
+
+        async def _owner(_name: str, _cfg: Any, ready: asyncio.Future[Any], *_args: Any) -> None:
+            if stalled_in == "handshake":
+                await _stall()
+            session = _prompt_session(["other"])
+            session.list_tools = _stall
+            ready.set_result(session)
+            await asyncio.Event().wait()
+
+        def _submit(factory: Any) -> concurrent.futures.Future[None]:
+            # Keep the work to run on this test's loop; the caller returns at once.
+            submitted.append(factory)
+            done: concurrent.futures.Future[None] = concurrent.futures.Future()
+            done.set_result(None)
+            return done
+
+        mgr._static_transport_owner = _owner  # type: ignore[method-assign]
+        mgr._submit_root = _submit  # type: ignore[method-assign]
+        mgr._loop = loop
+        try:
+            mgr.reconnect_sync("srv1")
+            task = loop.create_task(mgr._run_root(submitted[0]))
+            loop.run_until_complete(asyncio.wait_for(stalled.wait(), timeout=5))
+        finally:
+            loop.close()
+            mgr._loop = None
+        chain: list[Any] = [task.get_coro()]
+        while asyncio.iscoroutine(chain[-1].cr_await):
+            chain.append(chain[-1].cr_await)
+        names = [coro.__name__ for coro in chain]
+        assert names[:3] == ["_run_root", "_reconnect", "_connect_one_locked"]
+
+        with _counting_syncs(mgr) as sync:
+            chain[names.index(first)].close()
+            for coro in chain:
+                coro.close()
+
+        assert sync.call_count == 0
+        assert "srv1" not in mgr._last_error
+        assert mgr._static_servers["srv1"].prompts
         assert _mcp_template_names(db) == ["mcp__srv0__kept", "mcp__srv1__other"]
         mgr.shutdown()
         del task, chain

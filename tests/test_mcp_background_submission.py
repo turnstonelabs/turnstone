@@ -6,6 +6,7 @@ import asyncio
 import concurrent.futures
 import inspect
 import threading
+import time
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
 from unittest.mock import AsyncMock, MagicMock
@@ -29,9 +30,10 @@ _PRIMES = {"prime_user_pools", "schedule_prime_user_server"}
 class _SubmissionProbe:
     """Observe real submissions, optionally pausing before argument evaluation.
 
-    Pausing attribute lookup allows shutdown to clear the manager's loop between
-    the admission guard and submission. The scheduler itself is never stubbed.
-    Other threads, including the one running shutdown, use asyncio unchanged.
+    Pausing the attribute lookup holds a submission between its admission check
+    and its enqueue, where shutdown must wait for it. The scheduler itself is
+    never stubbed. Other threads, including the one running shutdown, use asyncio
+    unchanged.
     """
 
     def __init__(self) -> None:
@@ -133,7 +135,7 @@ def test_closed_loop_closes_rejected_coroutine(
     manager._server_configs["sample"] = {"url": "https://mcp.example.com"}
     try:
         if bridge == "_cb_auto_reconnect":
-            with pytest.raises(RuntimeError, match="MCP server 'sample' reconnect failed:"):
+            with pytest.raises(mcp_client.MCPShutdownError):
                 _invoke(manager, bridge)
         else:
             assert _invoke(manager, bridge) is None
@@ -176,13 +178,16 @@ def test_successful_submission_runs_on_manager_loop(
 
 
 @pytest.mark.parametrize("bridge", [*sorted(_BODIES.keys() - _PRIMES), "_cb_auto_reconnect"])
-def test_shutdown_between_admission_and_submission(
+def test_shutdown_waits_for_a_submission_in_progress(
     manager: mcp_client.MCPClientManager, probe: _SubmissionProbe, bridge: str
 ) -> None:
+    """A submission counts itself from its admission check until it has enqueued, and shutdown
+    waits for that count after it closes admission, so the work is queued ahead of shutdown's
+    drain. Its first step, run after admission closed, refuses it unstarted."""
     manager.start()
     manager._server_configs["sample"] = {"url": "https://mcp.example.com"}
-    loop, loop_thread = manager._loop, manager._thread
-    assert loop is not None and loop_thread is not None
+    loop = manager._loop
+    assert loop is not None
     probe.coroutines.clear()
     probe.futures.clear()
     entered, release = threading.Event(), threading.Event()
@@ -202,26 +207,73 @@ def test_shutdown_between_admission_and_submission(
     probe.caller = caller
     probe.before_submit = pause
     caller.start()
-    try:
-        assert entered.wait(5), "caller did not reach submission"
-        manager.shutdown()
-        assert manager._loop is None
-        assert loop.is_closed()
-        assert not loop_thread.is_alive()
-    finally:
-        release.set()
-        caller.join(timeout=5)
-        assert not caller.is_alive()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        try:
+            assert entered.wait(5), "caller did not reach submission"
+            shutdown = executor.submit(manager.shutdown)
+            assert poll_until(lambda: not manager._accepting_work)
+            time.sleep(0.2)
+            # Still waiting for the submission in progress, so its drain has not stopped the
+            # loop the work is about to be queued on.
+            assert not shutdown.done()
+            assert loop.is_running()
+            release.set()
+        finally:
+            release.set()
+        shutdown.result(timeout=30)
+    caller.join(timeout=5)
+    assert not caller.is_alive()
 
+    assert len(probe.futures) == 1
+    with pytest.raises(mcp_client.MCPShutdownError) as refused:
+        probe.futures[0].result(timeout=5)
+    assert refused.value.started is False
     if bridge == "_cb_auto_reconnect":
-        with pytest.raises(RuntimeError, match="MCP server 'sample' reconnect failed:"):
+        with pytest.raises(mcp_client.MCPShutdownError):
             result.result(timeout=5)
     else:
         assert result.result(timeout=5) is None
-    assert len(probe.coroutines) == 1
     assert inspect.getcoroutinestate(probe.coroutines[0]) == inspect.CORO_CLOSED
-    assert probe.futures == []
     _assert_no_body_ran(manager)
+
+
+def test_shutdown_refuses_background_work_spawned_after_admission_closes(
+    manager: mcp_client.MCPClientManager,
+) -> None:
+    """Loop code that spawns background work after shutdown closed admission gets no task: the
+    drain may already have taken its snapshot, so the coroutine is closed unrun."""
+    manager.start()
+    loop = manager._loop
+    assert loop is not None
+    parked, release = threading.Event(), threading.Event()
+    spawned: list[object] = []
+    ran: list[bool] = []
+
+    async def body() -> None:
+        ran.append(True)
+
+    work = body()
+
+    def park_loop() -> None:
+        parked.set()
+        assert release.wait(5)
+
+    def spawn() -> None:
+        spawned.append(manager._spawn_background(work, "late background work"))
+
+    loop.call_soon_threadsafe(park_loop)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        try:
+            assert parked.wait(5)
+            loop.call_soon_threadsafe(spawn)  # runs once the loop is released, after admission
+            shutdown = executor.submit(manager.shutdown)
+            assert poll_until(lambda: not manager._accepting_work)
+        finally:
+            release.set()
+        shutdown.result(timeout=5)
+    assert spawned == [None]
+    assert ran == []
+    assert inspect.getcoroutinestate(work) == inspect.CORO_CLOSED
 
 
 @pytest.mark.parametrize("bridge", sorted(_PRIMES))
@@ -243,7 +295,7 @@ def test_shutdown_rejects_queued_and_late_primes(
             assert parked.wait(5)
             _invoke(manager, bridge)  # accepted callback, not executed yet
             shutdown = executor.submit(manager.shutdown)
-            assert poll_until(lambda: not manager._accepting_primes)
+            assert poll_until(lambda: not manager._accepting_work)
             _invoke(manager, bridge)  # loop still exists, admission is closed
         finally:
             release.set()

@@ -17,11 +17,13 @@ import anyio
 import mcp.types as mcp_types
 import pytest
 
+from tests._proc_helpers import poll_until
 from tests.conftest import _drain_background, _run_on_loop, _seed_static_state
 from turnstone.core.mcp_client import (
     _MAX_RESOURCES_PER_SERVER,
     InvalidCatalogError,
     MCPClientManager,
+    MCPShutdownError,
     _db_servers_to_config,
     _is_dead_transport,
     _mcp_to_openai,
@@ -929,7 +931,7 @@ class TestServerNameValidation:
 
         async def _run() -> None:
             mgr = MCPClientManager({"my__bad": {"command": "echo"}})
-            await mgr._connect_one("my__bad", {"command": "echo"})
+            await mgr._connect_one("my__bad")
             # Should not have connected
             assert "my__bad" not in mgr._static_servers
             assert mgr.get_tools() == []
@@ -2694,16 +2696,12 @@ class TestConnectOneUnreachable:
         """Unreachable HTTP MCP server raises ConnectionError without spinning."""
         mgr = MCPClientManager({})
         mgr._loop = asyncio.new_event_loop()
+        cfg = {"type": "http", "url": "http://127.0.0.1:1/mcp"}
+        mgr._server_configs["bad-server"] = cfg
 
         async def _run():
             with pytest.raises(ConnectionError, match="unreachable"):
-                await mgr._connect_one(
-                    "bad-server",
-                    {
-                        "type": "http",
-                        "url": "http://127.0.0.1:1/mcp",
-                    },
-                )
+                await mgr._connect_one("bad-server")
 
         mgr._loop.run_until_complete(_run())
         mgr._loop.close()
@@ -3785,6 +3783,16 @@ class TestStaticNotificationRefresh:
         assert mgr._static_servers["srv"].session is None
         assert ("srv", "tools") not in mgr._last_notification_refresh
 
+    def test_call_stopped_by_shutdown_is_not_a_server_failure(self) -> None:
+        """A call shutdown stopped says nothing about its server: the session stays installed,
+        and the server's circuit breaker counts no failure."""
+        mgr = MCPClientManager({})
+        session = MagicMock()
+        _seed_static_state(mgr, "srv", session=session)
+        mgr._record_and_evict_on_dead_transport("srv", MCPShutdownError(started=True))
+        assert mgr._static_servers["srv"].session is session
+        assert "srv" not in mgr._consecutive_failures
+
     def test_refresh_server_tools_bounded_by_timeout(self) -> None:
         """A wedged server's list call must not hang a spawned refresh
         (and the connect lock it holds) forever — #839's unbounded
@@ -3897,7 +3905,7 @@ class TestStaticNotificationRefresh:
         )
 
     def test_scheduling_failure_rolls_back_stamp_and_marker(self, running_loop_mgr) -> None:
-        """If _spawn_background raises (loop tearing down), BOTH the coalesce
+        """If _spawn_background raises, BOTH the coalesce
         marker and the debounce stamp we just wrote must be rolled back —
         else a same-kind push landing in the window afterward is debounced
         against a stamp for a refresh that never spawned, and (on the pool
@@ -3906,8 +3914,8 @@ class TestStaticNotificationRefresh:
         handler = mgr._make_static_notification_handler("srv")
 
         def _boom(coro: Any, _label: str) -> None:
-            coro.close()  # avoid "coroutine was never awaited" — prod is loop-teardown
-            raise RuntimeError("loop closing")
+            coro.close()  # avoid "coroutine was never awaited"
+            raise RuntimeError("scheduling failed")
 
         async def _fire() -> None:
             mgr._static_connect_lock_for("srv")
@@ -5081,6 +5089,7 @@ class TestStaticHealthLoop:
         """The per-name lock prevents two concurrent ``_connect_one`` for one
         server from interleaving teardown/rebuild on the shared state."""
         mgr, loop, _ = running_loop_mgr
+        mgr._server_configs["x"] = {}
         active = 0
         max_active = 0
 
@@ -5093,7 +5102,7 @@ class TestStaticHealthLoop:
 
         async def _two() -> None:
             with patch.object(mgr, "_connect_one_locked", side_effect=_inner):
-                await asyncio.gather(mgr._connect_one("x", {}), mgr._connect_one("x", {}))
+                await asyncio.gather(mgr._connect_one("x"), mgr._connect_one("x"))
 
         _run_on_loop(loop, _two())
         assert max_active == 1  # serialized, never overlapping
@@ -5379,6 +5388,134 @@ class TestStaticHealthLoop:
         assert result["connected"] is True
         assert held == [True]  # the lock was held while rebuilding
 
+    def test_reconnect_queued_behind_a_removal_does_not_bring_the_server_back(
+        self, running_loop_mgr
+    ) -> None:
+        """A removal that ran while ``reconnect_sync`` waited on the connect lock popped the
+        config and retired the lock: the reconnect must not connect from what it read before,
+        which would republish the removed server, nor record an error for it."""
+        mgr, loop, _ = running_loop_mgr
+        _seed_static_state(mgr, "srv", session=MagicMock())
+
+        async def _hold() -> asyncio.Lock:
+            lock = mgr._static_connect_lock_for("srv")
+            await lock.acquire()
+            return lock
+
+        lock = _run_on_loop(loop, _hold())
+        connects: list[str] = []
+
+        async def _connect(name: str, _cfg: dict[str, Any]) -> None:
+            connects.append(name)
+
+        async def _remove() -> None:
+            # What remove_server_sync's _remove does under the lock.
+            mgr._server_configs.pop("srv", None)
+            mgr._static_servers.pop("srv", None)
+            mgr._static_connect_locks.pop("srv", None)
+            lock.release()
+
+        result: dict[str, Any] = {}
+        with patch.object(mgr, "_connect_one_locked", side_effect=_connect):
+            worker = threading.Thread(target=lambda: result.update(mgr.reconnect_sync("srv")))
+            worker.start()
+            # The reconnect drops the session just before it queues on the lock.
+            assert poll_until(lambda: mgr._static_servers["srv"].session is None)
+            _run_on_loop(loop, _remove())
+            worker.join(timeout=10)
+        assert not worker.is_alive()
+        assert result["connected"] is False
+        assert result["error"] == "MCP server 'srv' was removed"
+        assert connects == []
+        assert "srv" not in mgr._static_servers
+        assert "srv" not in mgr._last_error
+
+    def test_startup_connect_queued_behind_a_removal_does_not_bring_the_server_back(
+        self, running_loop_mgr
+    ) -> None:
+        """A removal that ran while the startup pass waited on a server's connect lock popped
+        the config and retired the lock: the pass must not connect the server it read before."""
+        mgr, loop, _ = running_loop_mgr
+        cfg = {"type": "stdio", "command": "echo"}
+        mgr._server_configs["srv"] = cfg
+
+        async def _hold() -> asyncio.Lock:
+            lock = mgr._static_connect_lock_for("srv")
+            await lock.acquire()
+            return lock
+
+        lock = _run_on_loop(loop, _hold())
+        connects: list[str] = []
+
+        async def _connect(name: str, _cfg: dict[str, Any]) -> None:
+            connects.append(name)
+
+        async def _remove() -> None:
+            # What remove_server_sync's _remove does under the lock.
+            mgr._server_configs.pop("srv", None)
+            mgr._static_connect_locks.pop("srv", None)
+            lock.release()
+
+        with patch.object(mgr, "_connect_one_locked", side_effect=_connect):
+            # Submitted first, so the connect queues on the held lock before the removal runs.
+            connecting = asyncio.run_coroutine_threadsafe(mgr._connect_one("srv"), loop)
+            _run_on_loop(loop, _remove())
+            connecting.result(timeout=10)
+        assert connects == []
+
+    def test_startup_connect_queued_behind_a_removal_and_readd_does_not_connect(
+        self, running_loop_mgr
+    ) -> None:
+        """A server removed and then added again while the startup pass waited on its retired
+        connect lock has its config back but a new lock, which the re-add's own connect holds:
+        the waiter on the old lock must not connect alongside it."""
+        mgr, loop, _ = running_loop_mgr
+        mgr._server_configs["srv"] = {"type": "stdio", "command": "echo"}
+
+        async def _hold() -> asyncio.Lock:
+            lock = mgr._static_connect_lock_for("srv")
+            await lock.acquire()
+            return lock
+
+        lock = _run_on_loop(loop, _hold())
+        connects: list[str] = []
+
+        async def _connect(name: str, _cfg: dict[str, Any]) -> None:
+            connects.append(name)
+
+        async def _remove_and_readd() -> None:
+            mgr._server_configs.pop("srv", None)
+            mgr._static_connect_locks.pop("srv", None)
+            lock.release()
+            # The re-add's config, before its connect mints the server's next lock.
+            mgr._server_configs["srv"] = {"type": "stdio", "command": "echo-again"}
+
+        with patch.object(mgr, "_connect_one_locked", side_effect=_connect):
+            connecting = asyncio.run_coroutine_threadsafe(mgr._connect_one("srv"), loop)
+            _run_on_loop(loop, _remove_and_readd())
+            connecting.result(timeout=10)
+        assert connects == []
+
+    def test_startup_connect_keeps_a_session_another_driver_connected(
+        self, running_loop_mgr
+    ) -> None:
+        """A reload that removes and re-adds a server while the startup pass waits on another
+        connects it itself. When the pass reaches that server it finds the session live and
+        leaves it, instead of tearing down what the reload just published."""
+        mgr, loop, _ = running_loop_mgr
+        mgr._server_configs["srv"] = {"type": "stdio", "command": "echo"}
+        session = MagicMock()
+        _seed_static_state(mgr, "srv", session=session)
+        connects: list[str] = []
+
+        async def _connect(name: str, _cfg: dict[str, Any]) -> None:
+            connects.append(name)
+
+        with patch.object(mgr, "_connect_one_locked", side_effect=_connect):
+            _run_on_loop(loop, mgr._connect_one("srv"))
+        assert connects == []
+        assert mgr._static_servers["srv"].session is session
+
     def test_reconnect_sync_timeout_cleans_catalog(self, running_loop_mgr) -> None:
         """The inner ``asyncio.timeout`` in ``reconnect_sync``'s ``_reconnect``
         fires before the caller-side ``future.result(timeout=...)``, triggers the
@@ -5519,6 +5656,24 @@ class TestStaticHealthLoop:
         mgr2._static_health_check_s = 0  # disabled
         _run_on_loop(loop, mgr2._connect_all())
         assert mgr2._static_health_task is None  # not started
+
+    def test_connect_all_survives_a_removal_during_the_pass(self, running_loop_mgr) -> None:
+        """A reload can remove a server while the startup pass waits on another. The pass skips
+        the removed server, instead of failing on the changed config dict and leaving the health
+        loop unstarted."""
+        mgr, loop, _ = running_loop_mgr
+        mgr._server_configs = {"a": {"command": "a"}, "b": {"command": "b"}}
+        connected: list[str] = []
+
+        async def _connect_one(name: str) -> None:
+            connected.append(name)
+            if name == "a":
+                mgr._server_configs.pop("b")  # the reload, while the pass waits on "a"
+
+        with patch.object(mgr, "_connect_one", side_effect=_connect_one):
+            _run_on_loop(loop, mgr._connect_all())
+        assert connected == ["a"]
+        assert mgr._static_health_task is not None
 
     def test_health_loop_cancel_returns_cleanly(self, running_loop_mgr) -> None:
         mgr, loop, _ = running_loop_mgr
