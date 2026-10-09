@@ -82,14 +82,9 @@ class ParsedSkill:
     # ``list_skills_summary`` filters those rows out of the
     # user-facing picker.  Round-trip works end to end.
     #
-    # ``disable_model_invocation=True`` has NO install consumer today —
-    # Turnstone's install path hardcodes ``activation="named"`` already,
-    # so the spec field's intended translation is a no-op at create
-    # time.  We still parse it for fidelity (surface on the
-    # parse-preview UI, preserve in ``raw_frontmatter``) so an admin
-    # reviewing a SKILL.md sees what the author wrote.  If install
-    # ever supports a non-"named" default activation, this is the
-    # field that gates flipping back.
+    # ``disable_model_invocation=True`` has no consumer: a skill applies only when a workstream
+    # names it. It is parsed (and kept in ``raw_frontmatter``) and echoed in the admin parse
+    # API's response only; no UI reads it and nothing stores it.
     disable_model_invocation: bool = False
     user_invocable: bool = True
     # SKILL.md spec ``arguments:`` — named positional argument slots

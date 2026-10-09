@@ -33,7 +33,7 @@ package "Core Modules" as core #181825 {
 }
 
 package "Session Runtime" as runtime #181825 {
-  rectangle "skill tool\nsession.py" as loadtool
+  rectangle "skills tool\nsession.py" as loadtool
   rectangle "set_skill()\nsession.py" as setskill
   rectangle "_load_skills()\nsession.py" as loadskills
 }
@@ -67,10 +67,10 @@ install --> skills_table : create_prompt_template
 install --> resources_table : create_skill_resource
 
 ' Runtime skill loading flow
-loadtool --> skills_table : search (BM25 ranking)
+loadtool --> skills_table : find (filters, BM25 ranking)
 loadtool --> setskill : load (name)
 setskill --> loadskills : reload + reinit system messages
-loadskills --> skills_table : get_skill_by_name
+loadskills --> skills_table : get_skill_by_name, or\nget_prompt_template\nfor a saved skill
 
 ' UI flow
 pill --> discoverui : switch view
@@ -86,9 +86,12 @@ note right of parser
 end note
 
 note right of loadtool
-  search: auto-approved (read-only)
+  find, get: auto-approved (read-only)
   load: requires user approval
-  Main session only (no sub-agents)
+  create, update, enable, disable:
+    approval + model.skills.write
+  Interactive and coordinator sessions
+  (no task sub-agents)
 end note
 
 note right of scanner

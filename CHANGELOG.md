@@ -53,17 +53,51 @@ frozen.
 > `saved_state_filter` and `saved_loaded_lookup`, and `make_unified_saved_handler` its unused
 > `permission_gate`.
 >
-> **Before upgrading:** migration 080 drops the `model`, `temperature`, `reasoning_effort`,
-> `max_tokens` and `agent_max_turns` columns from skills (`prompt_templates`) and discards their
-> values (see Removed). This query lists the skills that set any of them: `SELECT name, model,
-> temperature, reasoning_effort, max_tokens, agent_max_turns FROM prompt_templates WHERE model <> ''
-> OR temperature IS NOT NULL OR reasoning_effort <> '' OR max_tokens IS NOT NULL OR agent_max_turns
-> IS NOT NULL`. To keep a skill's model settings, put them on a model alias and select that alias
-> where the skill is used. Task agents take their turn cap only from the `tools.agent_max_turns`
-> setting, which is unlimited (-1) by default, so set it if a skill capped task-agent turns.
-> Scheduled tasks, channels and coordinator spawns that relied on a skill's model run on the model
-> they name, else the default alias. Workstreams created before the upgrade keep the model and
-> settings they were saved with.
+> **Before upgrading:** migration 080 drops eight columns from skills (`prompt_templates`) and
+> discards their values (see Removed): the model settings (`model`, `temperature`,
+> `reasoning_effort`, `max_tokens`), the task-agent turn cap (`agent_max_turns`), the activation
+> mode (`activation`, `is_default`) and the token budget (`token_budget`). It also deletes each
+> workstream's saved `token_budget` key. This query lists the skills that set any of them: `SELECT
+> name, model, temperature, reasoning_effort, max_tokens, agent_max_turns, activation, is_default,
+> token_budget FROM prompt_templates WHERE model <> '' OR temperature IS NOT NULL OR
+> reasoning_effort <> '' OR max_tokens IS NOT NULL OR agent_max_turns IS NOT NULL OR activation <>
+> 'named' OR is_default = 1 OR token_budget > 0`.
+>
+> To keep a skill's model settings, put them on a model alias and select that alias where the skill
+> is used. Task agents take their turn cap only from the `tools.agent_max_turns` setting, which is
+> unlimited (-1) by default, so set it if a skill capped task-agent turns. Scheduled tasks, channels
+> and coordinator spawns that relied on a skill's model run on the model they name, else the default
+> alias. Workstreams created before the upgrade keep the model and settings they were saved with.
+>
+> A default skill's text no longer reaches the sessions that name no skill, existing workstreams
+> included when they reopen. To keep it, move the text into a prompt policy, which every session
+> reads live, existing ones too, or into a persona's prompt, which reaches only workstreams created
+> afterwards (each keeps the persona prompt it was created with; a kind's default persona covers
+> sessions that pick none). Unlike a default skill, both stay on when a workstream names a skill, so
+> move only text that suits every such session, skill or not. Search-activated skills leave the
+> system prompt; the model still finds them with the `skills` tool's `find` action. Nothing stops a
+> workstream at a token count any more: a turn a budget prompt held now runs.
+>
+> The migration also fixes two kinds of saved data. A workstream switched to another skill before
+> the upgrade kept the skill it was created with in its saved copy, which would come back on reopen;
+> where the saved skill name is a different existing skill and the skill it was created with still
+> exists, the copy is cleared, so the workstream reopens with the skill it switched to. The saved
+> data cannot tell two rarer cases from that: a skill renamed before the upgrade whose old name a
+> newer skill took is treated as a switch too, and a switch whose original skill was deleted, or
+> whose target skill was later deleted or renamed, keeps the original's copy, shown under the name
+> it switched to. (A skill cleared before the upgrade looks like an older reopen and still comes
+> back.) A skill whose `notify_on_complete` fails the new check (see Changed) has it reset to `[]`;
+> such a list never fired, because workstream create ignored it or could not deliver it. This query
+> lists the skills with targets, to review them first: `SELECT name, notify_on_complete FROM
+> prompt_templates WHERE notify_on_complete NOT IN ('', '[]', '{}')`. Nodes started with
+> `turnstone-server --skill` must drop the flag (see Removed).
+>
+> Upgrade every node and console together: a process from before 080 fails every skill read against
+> a migrated database. Custom storage backends: `create_prompt_template` no longer takes the eight
+> fields (it required `is_default`), and `list_default_templates` and `list_skills_by_activation`
+> are gone, as are the `turnstone.core.memory` helpers `list_default_skills` and
+> `list_skills_by_activation`. Upgrade Python SDK clients too: older ones require `is_default` and
+> fail to read skills.
 
 ### Added
 
@@ -135,6 +169,19 @@ frozen.
 
 ### Changed
 
+- **`/skill` quotes skill names in its operator note (#1292).** The note `/skill` writes into the
+  conversation quotes each skill name as JSON, so a name cannot break the note into extra lines,
+  and says `no skill` where it said `defaults`.
+- **Skills check `notify_on_complete` like a workstream's `notify_targets` (#1292).** At most 10
+  targets, each naming a `channel_type` and one of `channel_id` or `user_id`: a skill can no longer
+  store targets that workstream create then dropped without a word or could not deliver. An explicit
+  `null` leaves the targets unchanged. The `skills` tool's create, update and enable cards show the
+  targets whole, and the approval judge sees them; the tool's `update` no longer sets `enabled`,
+  which only `enable` and `disable` change, with their card. The shared check also refuses a target
+  whose `channel_type` is `null`, so node workstream create (`POST /v1/api/workstreams/new` and the
+  console routes that forward to it) and the console's schedule create and update now answer 400 for
+  one. Such a target was stored without a type: a workstream's notification never arrived, and the
+  node refused every run of a schedule that held one.
 - **Saved sessions page, search and sort on the server (#1268).** `GET /v1/api/workstreams/saved`
   on nodes and the console takes `limit` (default 50, at most 200; `0` returns only the total),
   `offset`, `q` (a case-insensitive substring of at most 256 characters), `sort` and `order`, and
@@ -282,9 +329,43 @@ frozen.
   keys, like any other unsupported key, reversing the 1.6.0 ingestion. Rows of the console's
   `GET /v1/api/models` no longer carry `effort_ladder`, which only the skill editor read; the admin
   model form keeps its ladder through `POST /v1/api/admin/models/effort-ladder`.
+- **Skills lose their activation mode and token budget (#1292)** *(BREAKING)* — default skills
+  (`activation` `default`, mirrored in `is_default`), whose text joined every session that named no
+  skill, are gone, and so is the `<available-skills>` list of search-activated skills in every
+  system prompt: a skill applies only when a workstream names it, and the model finds skills with
+  the `skills` tool's `find` action. The skill `token_budget`, which asked for approval once a
+  single model call passed it, is gone with its `__budget_override__` prompt on nodes and in the
+  CLI. The skill editor's Activation and Default controls and Token Budget field, the admin skill
+  API (`SkillInfo` and the create and update bodies), `GET /v1/api/skills` rows, the `skills` tool's
+  arguments and the Python and TypeScript SDK types lose `activation`, `is_default` and
+  `token_budget`; a request that names them has them ignored. `turnstone.core.skill_search`, which
+  nothing used, is removed.
+- **`turnstone-server --skill` is removed (#1292)** *(BREAKING)* — it gave its skill to every
+  workstream whose create request named none: a node-wide default skill, without the saved copy a
+  named skill gets. A workstream now runs a skill only when its create request, scheduled task,
+  channel or `/skill` names one. The CLI keeps its `--skill`: the skill for each workstream it
+  starts from scratch (`/new` copies the current tab's skill, and a resumed workstream keeps its
+  own).
 
 ### Fixed
 
+- **A reopened workstream keeps its skill (#1292).** Reopening, forking or copying (`/new`) a
+  workstream created with a skill dropped the skill's name and put its saved text, unrendered, in
+  the cached system prompt that task agents inherit: `$ARGUMENTS` and `${TURNSTONE_*}` stayed
+  literal, `/skill` reported no skill, and the next save erased the name. A skill switched or
+  cleared after creation also came back on reopen. The skill now keeps its name and renders like any
+  named skill, with the text it had at creation even after the skill is edited, renamed, disabled
+  or deleted: disabling or deleting a skill only keeps it out of new workstreams. That covers
+  workstreams created through a node's create API (the console's interactive launcher, the API,
+  schedules, channels and coordinator spawns); coordinators created from the console launcher, CLI
+  `--skill` sessions and skills loaded mid-conversation are looked up by name on reopen (#1312,
+  #1320). A switch or clear survives a reopen. `skills(load)` of a skill that was missing when the
+  session loaded it now applies the skill once it exists, where it answered that the skill was
+  already active.
+- **`skills(find)` ranks past the first page (#1292).** A query ranked only the first page of skills
+  in storage order (100 by default), so a better match past it was never found, and it returned at
+  most 50 rows whatever its `limit`. It now ranks up to 500 filtered skills and returns up to
+  `limit` of them (50 by default with a query).
 - **MCP shutdown stops the work callers wait on.** Shutting down the MCP client left work that a
   caller was waiting on running, so the caller waited out its own timeout (two minutes for a tool
   call, forever for adding a server), and garbage collection later closed the abandoned work on
@@ -387,11 +468,11 @@ frozen.
   they now use the warning style.
 - **Hosted search for Astra (#1191).** The capability table now enables native web search
   when the session offers `web_search`, without requiring a model capability override.
-- **Chat search usage no longer inflates replay context (#1191).** Requests with hosted search
-  use the local context estimate instead of anchoring on billed input that includes search
-  results, including automatic search without explicit search options. Raw usage still charges
-  the token budget, and text calibration remains unchanged. Automatic search also marks the
-  request as using native tools, preventing an automatic replay of an accepted response.
+- **Chat search usage no longer inflates replay context (#1191).** Requests with hosted search use
+  the local context estimate instead of anchoring on billed input that includes search results,
+  including automatic search without explicit search options. Text calibration remains unchanged.
+  Automatic search also marks the request as using native tools, preventing an automatic replay of
+  an accepted response.
 
 - **Stream cleanup after callback failures.** Chat and Responses adapters close the underlying
   SDK response when a local chunk callback interrupts generation, preserving the original error.
@@ -521,13 +602,12 @@ frozen.
 - **Context gauge after a server-side tool loop.** When the model ran several web searches inside
   one response, the provider's closing usage reported billing totals summed across its sampling
   passes, and the session took them as its context size. On the Anthropic lane a four-search turn
-  reported three times the real figure: the status bar showed it, the token estimate was
-  calibrated on it, a tool result was dropped for an exhausted budget, and a two-message
-  conversation was compacted. On the OpenAI Responses lane hosted search reported twice the real
-  figure. Adapters now report what the request carried and what the server appended, and flag
-  cumulative counters; one shared rule turns that into the context anchor and the calibration
-  denominator for the session, task agents, and the agent context badge. Reported cache reads
-  still feed the usage records, and the operator token budget is charged the billed total.
+  reported three times the real figure: the status bar showed it, the token estimate was calibrated
+  on it, a tool result was dropped for an exhausted budget, and a two-message conversation was
+  compacted. On the OpenAI Responses lane hosted search reported twice the real figure. Adapters now
+  report what the request carried and what the server appended, and flag cumulative counters; one
+  shared rule turns that into the context anchor and the calibration denominator for the session,
+  task agents, and the agent context badge. Reported cache reads still feed the usage records.
 - **Context estimate on the turns after a server-side search.** The search results the provider
   appends to a response are replayed to it on every later request as opaque blocks the character
   measure cannot see, so from the next turn on the estimate was calibrated about 2.3 times low: new
@@ -679,9 +759,6 @@ frozen.
 - **"Always" approves only what the person approved.** Approving a batch with "Always" also granted
   the always-approval to a call a `deny` rule had refused in that batch, so the call ran without a
   prompt if the rule was later removed or relaxed to `ask`. Refused calls now get no grant.
-- **The CLI's token-budget prompt always asks.** It crashed on every exhausted budget (the budget
-  item has no header), so a CLI session past its token budget could not continue; it now asks, and,
-  as on a node, neither skip-permissions, an auto-approve list nor a tool policy settles it.
 - **URL tools look up a hostname only after approval.** `web_fetch` and `open_preview` screened
   their target while preparing the call, and the screen resolved the hostname. A denied or
   cancelled call had already sent that name to DNS, and a private or unresolvable answer was

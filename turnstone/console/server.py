@@ -7183,14 +7183,14 @@ async def admin_create_schedule(request: Request) -> JSONResponse:
     created_by = getattr(auth_result, "user_id", "") or ""
 
     # Validate notify_targets
-    from turnstone.server import _validate_notify_targets
+    from turnstone.core.notify_targets import validate_notify_targets
 
     raw_nt = body.get("notify_targets", "[]")
     if isinstance(raw_nt, list):
         import json as _json
 
         raw_nt = _json.dumps(raw_nt)
-    notify_targets, nt_err = _validate_notify_targets(raw_nt)
+    notify_targets, nt_err = validate_notify_targets(raw_nt)
     if nt_err:
         return JSONResponse({"error": nt_err}, status_code=400)
 
@@ -7390,14 +7390,14 @@ async def admin_update_schedule(request: Request) -> JSONResponse:
     if "enabled" in body:
         updates["enabled"] = bool(body["enabled"])
     if "notify_targets" in body:
-        from turnstone.server import _validate_notify_targets
+        from turnstone.core.notify_targets import validate_notify_targets
 
         raw_nt = body["notify_targets"]
         if isinstance(raw_nt, list):
             import json as _json
 
             raw_nt = _json.dumps(raw_nt)
-        nt_str, nt_err = _validate_notify_targets(raw_nt)
+        nt_str, nt_err = validate_notify_targets(raw_nt)
         if nt_err:
             return JSONResponse({"error": nt_err}, status_code=400)
         updates["notify_targets"] = nt_str
@@ -8530,8 +8530,6 @@ def _skill_to_response(r: dict[str, Any], resource_count: int = 0) -> dict[str, 
         "description": r.get("description", ""),
         "content": r.get("content", ""),
         "tags": tags,
-        "is_default": r.get("is_default", False),
-        "activation": r.get("activation", "named"),
         "origin": r.get("origin", "manual"),
         "mcp_server": r.get("mcp_server", ""),
         "readonly": r.get("readonly", False),
@@ -8544,7 +8542,6 @@ def _skill_to_response(r: dict[str, Any], resource_count: int = 0) -> dict[str, 
         "created_by": r.get("created_by", ""),
         # Session config fields
         "auto_approve": r.get("auto_approve", False),
-        "token_budget": r.get("token_budget", 0),
         # Coerce the legacy ``"{}"`` sentinel from rows pre-migration 051;
         # the field is contractually a JSON-array string everywhere else.
         "notify_on_complete": (
@@ -8656,7 +8653,6 @@ async def admin_create_skill(request: Request) -> JSONResponse:
         _json.loads(variables)
     except (_json.JSONDecodeError, TypeError):
         return JSONResponse({"error": "variables must be a valid JSON array"}, status_code=400)
-    is_default = bool(body.get("is_default", False))
     org_id = str(body.get("org_id", "")).strip()[:64]
     author = str(body.get("author", "")).strip()[:256]
     version = str(body.get("version", "1.0.0")).strip()[:64]
@@ -8701,13 +8697,6 @@ async def admin_create_skill(request: Request) -> JSONResponse:
     if session_err:
         return session_err
 
-    # Resolve activation / is_default sync
-    activation = session_fields.pop("activation", "")
-    if not activation:
-        activation = "default" if is_default else "named"
-    if activation == "default":
-        is_default = True
-
     try:
         priority = max(-1000, min(1000, int(body.get("priority", 0) or 0)))
     except (ValueError, TypeError):
@@ -8731,7 +8720,6 @@ async def admin_create_skill(request: Request) -> JSONResponse:
         category=category,
         content=content,
         variables=variables,
-        is_default=is_default,
         org_id=org_id,
         created_by=audit_uid,
         description=description,
@@ -8740,7 +8728,6 @@ async def admin_create_skill(request: Request) -> JSONResponse:
         author=author,
         skill_license=license_val,
         compatibility=compatibility,
-        activation=activation,
         token_estimate=token_estimate,
         priority=priority,
         kind=kind,
@@ -8831,10 +8818,6 @@ async def admin_update_skill(request: Request) -> JSONResponse:
         except (_json.JSONDecodeError, TypeError):
             return JSONResponse({"error": "variables must be a valid JSON array"}, status_code=400)
         updates["variables"] = var_str
-    if "is_default" in body:
-        updates["is_default"] = bool(body["is_default"])
-    if "activation" in updates and updates["activation"] == "default":
-        updates["is_default"] = True
     if "author" in body:
         updates["author"] = str(body["author"]).strip()[:256]
     if "version" in body:
@@ -9549,10 +9532,9 @@ async def admin_parse_skill(request: Request) -> JSONResponse:
             # ``description``; surface it separately too so the admin
             # parse-preview UI can show what came from where.
             "when_to_use": parsed.when_to_use,
-            # Invocation-control axes (#571).  Echoed back to the admin
-            # UI so the parse-preview can show what the source SKILL.md
-            # gated; the UI also uses ``user_invocable`` to pre-fill
-            # the ``hidden-from-menu`` checkbox on the create modal.
+            # Invocation-control axes (#571), echoed back to the admin UI, which reads
+            # ``user_invocable`` to pre-fill the ``hidden-from-menu`` checkbox on the create
+            # modal; nothing reads ``disable_model_invocation``.
             "disable_model_invocation": parsed.disable_model_invocation,
             "user_invocable": parsed.user_invocable,
             "arguments": list(parsed.arguments),
@@ -9766,13 +9748,10 @@ async def admin_skill_install(request: Request) -> JSONResponse:
         # operator doesn't control.
         skill_description = parsed.description.strip() or f"Skill: {parsed.name}"
 
-        # Invocation-control axes (#571).  The install
-        # default is ``activation="named"`` already (user invokes by
-        # name); ``disable-model-invocation: true`` reinforces that
-        # but doesn't change the install-time value.  The interesting
-        # axis is ``user-invocable: false`` which sets
-        # ``hidden_from_menu`` so the skill doesn't show up in the
-        # user-facing picker but stays available to the model.
+        # Invocation-control axes (#571).  A skill applies only when named, so
+        # ``disable-model-invocation: true`` changes nothing at install.  The interesting axis is
+        # ``user-invocable: false``, which sets ``hidden_from_menu`` so the skill doesn't show up in
+        # the user-facing picker but stays available to the model.
         install_hidden_from_menu = not parsed.user_invocable
 
         try:
@@ -9782,7 +9761,6 @@ async def admin_skill_install(request: Request) -> JSONResponse:
                 category="general",
                 content=content,
                 variables="[]",
-                is_default=False,
                 org_id="",
                 created_by=audit_uid,
                 origin="source",
@@ -9794,7 +9772,6 @@ async def admin_skill_install(request: Request) -> JSONResponse:
                 author=parsed.author,
                 skill_license=parsed.license,
                 compatibility=parsed.compatibility,
-                activation="named",
                 token_estimate=token_estimate,
                 allowed_tools=allowed_tools_str,
                 paths=paths_str,

@@ -1139,18 +1139,6 @@ function _renderGovSkills(items) {
   let html = "";
   for (let i = 0; i < items.length; i++) {
     const t = items[i];
-    let activationBadge = "";
-    const activation = t.activation || "named";
-    if (activation === "default") {
-      activationBadge =
-        '<span class="scope-badge scope-approve">default</span>';
-    } else if (activation === "search") {
-      activationBadge = '<span class="scope-badge">search</span>';
-    }
-    const defBadge =
-      t.is_default && activation !== "default"
-        ? '<span class="scope-badge scope-approve">default</span>'
-        : "";
     const originBadge =
       t.origin === "mcp"
         ? ' <span class="scope-badge scope-mcp">mcp:' +
@@ -1228,8 +1216,6 @@ function _renderGovSkills(items) {
       '<span class="admin-col admin-col-tmname">' +
       escapeHtml(t.name) +
       " " +
-      activationBadge +
-      defBadge +
       originBadge +
       resBadge +
       (t.description
@@ -1551,9 +1537,7 @@ const _SKILL_SPEC_FIELD_IDS = [
   "skl-paths",
   "skl-arguments",
   "skl-argument-hint",
-  "skl-activation",
   "skl-content",
-  "skl-default",
 ];
 
 // Provenance line for the foot meta — set while an installed/customized
@@ -1680,7 +1664,6 @@ function showCreateTemplateModal() {
   document.getElementById("skl-hidden-from-menu").checked = false;
   document.getElementById("skl-arguments").value = "";
   document.getElementById("skl-argument-hint").value = "";
-  document.getElementById("skl-activation").value = "named";
   // A previous readonly edit render leaves spec fields disabled — the
   // merged shelf reuses one DOM, so create must re-arm them.
   _SKILL_SPEC_FIELD_IDS.forEach(function (id) {
@@ -1697,9 +1680,7 @@ function showCreateTemplateModal() {
   };
   content.setAttribute("aria-describedby", "skl-paste-hint");
   document.getElementById("skl-paste-hint").hidden = false;
-  document.getElementById("skl-default").checked = false;
   // Session config fields
-  document.getElementById("sklc-token-budget").value = "";
   document.getElementById("sklc-auto-approve").checked = false;
   document.getElementById("sklc-allowed-tools").value = "";
   document.getElementById("sklc-allowed-tools").disabled = false;
@@ -1759,7 +1740,6 @@ function submitCreateTemplate() {
         .filter(Boolean)
     : [];
   // Session config fields
-  const csBudget = document.getElementById("sklc-token-budget").value.trim();
   const csAllowed = (
     document.getElementById("sklc-allowed-tools").value || ""
   ).trim();
@@ -1815,12 +1795,9 @@ function submitCreateTemplate() {
     compatibility: (
       document.getElementById("skl-compatibility").value || ""
     ).trim(),
-    activation: document.getElementById("skl-activation").value,
     content: content,
     variables: JSON.stringify(varList),
-    is_default: document.getElementById("skl-default").checked,
     auto_approve: document.getElementById("sklc-auto-approve").checked,
-    token_budget: csBudget ? parseInt(csBudget, 10) : 0,
     allowed_tools: JSON.stringify(csAllowedArr),
     paths: JSON.stringify(csPathsArr),
     hidden_from_menu: document.getElementById("skl-hidden-from-menu").checked,
@@ -1941,17 +1918,12 @@ function showEditTemplateModal(tmplId) {
   }
   document.getElementById("skl-arguments").value = argumentsDisplay;
   document.getElementById("skl-argument-hint").value = tmpl.argument_hint || "";
-  document.getElementById("skl-activation").value = tmpl.activation || "named";
   const content = document.getElementById("skl-content");
   content.value = tmpl.content;
   // Paste-to-parse is a create-mode affordance.
   content.onpaste = null;
   document.getElementById("skl-paste-hint").hidden = true;
-  document.getElementById("skl-default").checked = tmpl.is_default;
   // Session config fields
-  document.getElementById("sklc-token-budget").value = tmpl.token_budget
-    ? tmpl.token_budget
-    : "";
   document.getElementById("sklc-auto-approve").checked =
     tmpl.auto_approve || false;
   // allowed_tools: parse JSON array to comma-separated display
@@ -2098,12 +2070,11 @@ function showEditTemplateModal(tmplId) {
     }
   });
   // Runtime config fields: always editable, even for readonly skills.
-  // Admins should be able to override these local-UX-ish values
-  // (token budget, approvals, hidden-from-menu, ...) on installed
-  // skills without unlocking the row.  Must match
-  // SKILL_RUNTIME_CONFIG_FIELDS in turnstone/core/skill_field_validation.py.
+  // Admins should be able to override these local-UX-ish values (approvals,
+  // hidden-from-menu, ...) on installed skills without unlocking the row.
+  // Must match SKILL_RUNTIME_CONFIG_FIELDS in
+  // turnstone/core/skill_field_validation.py.
   [
-    "sklc-token-budget",
     "sklc-auto-approve",
     "sklc-enabled",
     "skl-hidden-from-menu",
@@ -2462,7 +2433,6 @@ function submitEditTemplate() {
         .filter(Boolean)
     : [];
   // Session config fields
-  const esBudget = document.getElementById("sklc-token-budget").value.trim();
   const esAllowed = (
     document.getElementById("sklc-allowed-tools").value || ""
   ).trim();
@@ -2522,12 +2492,9 @@ function submitEditTemplate() {
     hidden_from_menu: document.getElementById("skl-hidden-from-menu").checked,
     arguments: JSON.stringify(esArgsArr),
     argument_hint: esArgumentHint,
-    activation: document.getElementById("skl-activation").value,
     content: content,
     variables: JSON.stringify(varList),
-    is_default: document.getElementById("skl-default").checked,
     auto_approve: document.getElementById("sklc-auto-approve").checked,
-    token_budget: esBudget ? parseInt(esBudget, 10) : 0,
     allowed_tools: JSON.stringify(esAllowedArr),
     notify_on_complete: esNotifyVal,
     enabled: document.getElementById("sklc-enabled").checked,

@@ -176,37 +176,6 @@ class TestSyncPromptsToStorage:
         assert call_args[0][0] == "existing-id"
         assert "Updated description" in call_args[1]["content"]
         assert "user" in call_args[1]["variables"]
-        # Security: is_default must be reset to prevent compromised MCP server
-        # from injecting content into a previously admin-promoted default
-        assert call_args[1]["is_default"] is False
-
-    def test_sync_resets_is_default_on_promoted_template(self, mgr: MCPClientManager) -> None:
-        """An MCP template promoted to default by admin gets is_default reset on sync."""
-        storage = _make_storage()
-        storage.get_prompt_template_by_name.return_value = {
-            "template_id": "promoted-id",
-            "name": "mcp__test__greeting",
-            "origin": "mcp",
-            "mcp_server": "test",
-            "readonly": True,
-            "is_default": True,  # admin toggled this
-        }
-        mgr.set_storage(storage)
-
-        mgr._prompts = [
-            {
-                "name": "mcp__test__greeting",
-                "original_name": "greeting",
-                "server": "test",
-                "description": "Potentially compromised content",
-                "arguments": [],
-            },
-        ]
-
-        mgr.sync_prompts_to_storage()
-
-        call_args = storage.update_prompt_template.call_args
-        assert call_args[1]["is_default"] is False
 
     def test_sync_removes_deleted_prompts(self, mgr: MCPClientManager) -> None:
         """MCP templates in storage with no matching prompt are deleted."""
@@ -433,15 +402,6 @@ class TestRefreshPassSync:
         asyncio.run(mgr._refresh_all())
 
         assert _mcp_template_names(db) == ["mcp__srv0__new"]
-
-    def test_final_sync_resets_a_promoted_default(self, db: Any) -> None:
-        mgr = _synced_manager(db, {"srv0": ["a"]})
-        row = db.get_prompt_template_by_name("mcp__srv0__a")
-        db.update_prompt_template(row["template_id"], is_default=True)
-
-        asyncio.run(mgr._refresh_all())
-
-        assert db.get_prompt_template_by_name("mcp__srv0__a")["is_default"] is False
 
     @pytest.mark.parametrize("waiting_in", ["prompt_list", "reconnect"])
     def test_abandoned_pass_does_not_sync_when_collected(self, db: Any, waiting_in: str) -> None:
@@ -727,7 +687,6 @@ class TestReadonlyAPIGuards:
             "mcp",
             "content",
             variables="[]",
-            is_default=False,
             org_id="",
             created_by="",
             origin="mcp",
@@ -748,7 +707,6 @@ class TestReadonlyAPIGuards:
             "mcp",
             "content",
             variables="[]",
-            is_default=False,
             org_id="",
             created_by="",
             origin="mcp",

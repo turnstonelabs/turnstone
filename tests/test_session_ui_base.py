@@ -2150,18 +2150,6 @@ def test_smart_approval_holds_batch_when_one_call_has_no_verdict() -> None:
     assert a.get("auto_approved") is not True
 
 
-def test_smart_approval_skips_budget_override_pseudo_tool() -> None:
-    """The synthetic ``__budget_override__`` must always reach a human,
-    never smart-approved."""
-    ui = _smart_ui()
-    item = _pending_item("c1", func_name="__budget_override__")
-    ui._llm_verdicts["c1"] = _llm_verdict("c1", recommendation="approve", confidence=1.0)
-    with _patch_get_storage(MagicMock()):
-        remaining = ui._apply_smart_approvals([item])
-    assert remaining == [item]
-    assert item.get("auto_approved") is not True
-
-
 def test_smart_approval_stamps_verdict_user_decision() -> None:
     """The LLM verdict arrived during the wait (cache-only — no cycle
     exists yet at that point); the smart stage stamps ``smart_approval``

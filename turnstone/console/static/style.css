@@ -1381,7 +1381,7 @@ label.toggle-switch.toggle--flush {
 
 /* ==========================================================================
    Skill shelf — two-column spec body
-   Left: Identity / Manifest / Deployment  |  Right: Skill Content
+   Left: Identity / Manifest  |  Right: Skill Content
    ========================================================================== */
 .skill-spec-body {
   display: grid;
@@ -1479,16 +1479,6 @@ h3.skill-spec-heading {
   line-height: 1.65;
 }
 
-.skill-config-grid {
-  display: grid;
-  grid-template-columns: 1fr 1fr 1fr;
-  gap: 8px 14px;
-  margin: 4px 0 2px;
-}
-.skill-config-grid > div {
-  min-width: 0;
-}
-
 /* Light theme: the off-state track's --bg fill is the same near-white as
    the panel (~1.2:1) — give it real ink so on/off reads without hunting the
    thumb. Dark keeps the recessed --bg + inset ring (visible there). */
@@ -1562,9 +1552,6 @@ h3.skill-spec-heading {
   }
   .skill-spec-col-content {
     padding-left: 0;
-  }
-  .skill-config-grid {
-    grid-template-columns: 1fr 1fr;
   }
 }
 

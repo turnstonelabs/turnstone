@@ -1564,16 +1564,13 @@ SKILL_MUTABLE = frozenset(
         "content",
         "category",
         "variables",
-        "is_default",
         "description",
         "tags",
         "source_url",
         "version",
         "author",
-        "activation",
         "token_estimate",
         "auto_approve",
-        "token_budget",
         "notify_on_complete",
         "enabled",
         "allowed_tools",
@@ -1590,6 +1587,19 @@ SKILL_MUTABLE = frozenset(
         "arguments",
         "argument_hint",
     }
+)
+# What ``list_skills_filtered`` reads: the summary ``skills(find)`` shows and ranks, never the
+# skill body or scan report, since a ranked query reads up to 500 rows.
+SKILL_SUMMARY_COLUMNS = (
+    "name",
+    "description",
+    "tags",
+    "category",
+    "version",
+    "enabled",
+    "risk_level",
+    "kind",
+    "allowed_tools",
 )
 # ``oauth_client_secret_ct`` is intentionally absent from this set.  It has
 # its own dedicated writer (``StorageBackend.set_mcp_oauth_client_secret_ct``)

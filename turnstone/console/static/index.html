@@ -1606,7 +1606,7 @@
                 >Skill <span class="label-hint">optional</span></label
               >
               <select id="sch-template">
-                <option value="">None</option>
+                <option value="">No skill</option>
               </select>
               <label for="sch-persona"
                 >Persona <span class="label-hint">optional</span></label
@@ -3819,45 +3819,6 @@
                       maxlength="128"
                     />
                   </div>
-                  <div class="skill-spec-section">
-                    <h3 class="skill-spec-heading">Deployment</h3>
-                    <label for="skl-activation"
-                      >Activation<button
-                        type="button"
-                        class="settings-help-btn"
-                        data-help-target="skl-activation-help"
-                        aria-label="Help for Activation"
-                        aria-expanded="false"
-                      ></button
-                    ></label>
-                    <div
-                      id="skl-activation-help"
-                      class="settings-help-popover"
-                      style="display: none"
-                    >
-                      How models discover this skill.
-                      <strong>Named</strong> requires explicit
-                      <code>/skill</code> invocation;
-                      <strong>Default</strong> is applied to every session;
-                      <strong>Search</strong> is BM25-discoverable.
-                    </div>
-                    <select id="skl-activation">
-                      <option value="named">
-                        Named — explicit /skill invocation
-                      </option>
-                      <option value="default">
-                        Default — auto-applied to every session
-                      </option>
-                      <option value="search">Search — BM25 discoverable</option>
-                    </select>
-                    <label class="toggle-switch">
-                      <input id="skl-default" type="checkbox" />
-                      <span class="toggle-track" aria-hidden="true"></span>
-                      <span class="toggle-label"
-                        >Apply to new workstreams by default</span
-                      >
-                    </label>
-                  </div>
                 </div>
                 <div class="skill-spec-col skill-spec-col-content">
                   <div class="skill-spec-section skill-spec-section-content">
@@ -3893,20 +3854,9 @@
               <details class="rawhatch">
                 <summary>
                   Runtime Config
-                  <span class="label-hint">token budget, approvals</span>
+                  <span class="label-hint">enabled, approvals, notifications</span>
                 </summary>
                 <div class="rawhatch-body">
-                  <div class="skill-config-grid">
-                    <div>
-                      <label for="sklc-token-budget">Token Budget</label
-                      ><input
-                        id="sklc-token-budget"
-                        type="number"
-                        min="0"
-                        placeholder="0 = unlimited"
-                      />
-                    </div>
-                  </div>
                   <label class="toggle-switch">
                     <input id="sklc-auto-approve" type="checkbox" />
                     <span class="toggle-track" aria-hidden="true"></span>

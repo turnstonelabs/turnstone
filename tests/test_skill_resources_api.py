@@ -108,7 +108,6 @@ def _create_test_skill(storage: SQLiteBackend, *, readonly: bool = False) -> str
         category="general",
         content="Test skill content.",
         variables="[]",
-        is_default=False,
         org_id="",
         created_by="test",
         readonly=readonly,

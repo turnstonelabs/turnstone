@@ -158,7 +158,6 @@ def test_hosted_search_keeps_session_and_agent_context_local(sdk_boundary, tmp_d
     assert ("web_search_options" in requests[0]) is (tools is not None)
     assert request_metrics[0].native_tools_enabled is True
 
-    session._token_budget = 10_000
     before = session._estimated_prompt_tokens(tool_def_chars=0)
     ratio = session._chars_per_token
     session._last_usage = asdict(result.usage)
@@ -168,7 +167,6 @@ def test_hosted_search_keeps_session_and_agent_context_local(sdk_boundary, tmp_d
     assert session._last_usage["billed_prompt_tokens"] == 29_193
     assert session._last_usage["cache_read_tokens"] == 1_234
     assert session._chars_per_token == ratio
-    assert session._budget_exhausted
 
     estimator = PromptTokenEstimator(
         measure=lambda message: (len(message["content"]), 0, 0),

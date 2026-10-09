@@ -391,8 +391,6 @@ export interface SkillSummary {
   category: string;
   description: string;
   tags: string[];
-  is_default: boolean;
-  activation: string;
   origin: string;
   author: string;
   version: string;
@@ -406,8 +404,6 @@ export interface SkillInfo {
   description: string;
   tags: string[];
   variables: string;
-  is_default: boolean;
-  activation: string;
   org_id: string;
   created_by: string;
   origin: string;
@@ -418,7 +414,6 @@ export interface SkillInfo {
   author: string;
   token_estimate: number;
   auto_approve: boolean;
-  token_budget: number;
   notify_on_complete: string;
   enabled: boolean;
   priority: number;
@@ -437,13 +432,10 @@ export interface CreateSkillRequest {
   description?: string;
   tags?: string;
   variables?: string;
-  is_default?: boolean;
-  activation?: string;
   org_id?: string;
   author?: string;
   version?: string;
   auto_approve?: boolean;
-  token_budget?: number;
   notify_on_complete?: string;
   enabled?: boolean;
   priority?: number;
@@ -459,12 +451,9 @@ export interface UpdateSkillRequest {
   description?: string;
   tags?: string;
   variables?: string;
-  is_default?: boolean;
-  activation?: string;
   author?: string;
   version?: string;
   auto_approve?: boolean;
-  token_budget?: number;
   notify_on_complete?: string;
   enabled?: boolean;
   priority?: number;

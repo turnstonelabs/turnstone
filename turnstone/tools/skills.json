@@ -1,6 +1,6 @@
 {
   "name": "skills",
-  "description": "Manage the skill catalog and load skills into the current session. Replaces the legacy `skill` + `list_skills` tools. Each action has its own approval policy: read actions (`find`, `get`) auto-approve; write actions (`create`, `update`, `enable`, `disable`) require approval AND the `model.skills.write` permission on the session user — default-ungranted, operators opt themselves in via the Roles tab.\n\nActions:\n- `find`: list skills filtered by `category`, `tag`, `risk_level`, `kind`, `enabled_only`, `limit`, with optional `query` for BM25 ranking over the filtered set. By default returns skills of every kind; pass `kind='interactive'` or `kind='coordinator'` to narrow the browse (`any`-tagged rows are included alongside the chosen narrowing). Returns a hint when filters yield 0 rows showing what an unfiltered query would have matched.\n- `get`: fetch a single skill by `name`, returning the full row including `content`. Use to inspect before `update`.\n- `load` (requires approval): activate a skill by `name` on the current session — replaces the current skill. Works on both interactive and coordinator sessions and across all kinds (`kind` is authored audience metadata, not an enforcement gate). For assigning a skill to a *child* workstream instead of the current session, use `spawn_workstream(skill=...)`.\n- `create` (requires approval + `model.skills.write`): create a new skill with `name`, `content`, `description`, plus optional `category`, `tags`, `kind`, and session-config fields. Storage authoritatively re-computes `risk_level` from the scanner — caller cannot lie.\n- `update` (requires approval + `model.skills.write`): patch an existing skill identified by `name`. Any subset of writeable fields. Approval card shows the projected risk-tier shift if `content` or `allowed_tools` changes.\n- `enable` / `disable` (requires approval + `model.skills.write`): flip the `enabled` flag on a skill identified by `name`. Disabled skills stay in storage but are hidden from `find` (unless `enabled_only=false`) and rejected by `load` / `spawn_workstream(skill=...)`.\n\nSoft-delete only — there is no `delete` action in this tool. Hard-delete remains admin-UI exclusive to avoid model-proposed mistakes against in-use skills.",
+  "description": "Manage the skill catalog and load skills into the current session. Replaces the legacy `skill` + `list_skills` tools. Each action has its own approval policy: read actions (`find`, `get`) auto-approve; write actions (`create`, `update`, `enable`, `disable`) require approval AND the `model.skills.write` permission on the session user — default-ungranted, operators opt themselves in via the Roles tab.\n\nActions:\n- `find`: list skills filtered by `category`, `tag`, `risk_level`, `kind`, `enabled_only`, `limit`, with optional `query` for BM25 ranking over the filtered set. By default returns skills of every kind; pass `kind='interactive'` or `kind='coordinator'` to narrow the browse (`any`-tagged rows are included alongside the chosen narrowing). Returns a hint when filters yield 0 rows showing what an unfiltered query would have matched.\n- `get`: fetch a single skill by `name`, returning the fields `find` returns plus `content`, `scan_report` and `readonly`. Use to inspect before `update`.\n- `load` (requires approval): activate a skill by `name` on the current session — replaces the current skill. Works on both interactive and coordinator sessions and across all kinds (`kind` is authored audience metadata, not an enforcement gate). For assigning a skill to a *child* workstream instead of the current session, use `spawn_workstream(skill=...)`.\n- `create` (requires approval + `model.skills.write`): create a new skill with `name`, `content`, `description`, plus optional `category`, `tags`, `kind`, and session-config fields. Storage authoritatively re-computes `risk_level` from the scanner — caller cannot lie.\n- `update` (requires approval + `model.skills.write`): patch an existing skill identified by `name`. Any subset of writeable fields. Approval card shows the projected risk-tier shift if `content` or `allowed_tools` changes.\n- `enable` / `disable` (requires approval + `model.skills.write`): flip the `enabled` flag on a skill identified by `name`. Disabled skills stay in storage; `find` lists them (with `enabled: false`) unless `enabled_only=true`, and `load` / `spawn_workstream(skill=...)` reject them.\n\nSoft-delete only — there is no `delete` action in this tool. Hard-delete remains admin-UI exclusive to avoid model-proposed mistakes against in-use skills.",
   "parameters": {
     "type": "object",
     "properties": {
@@ -53,7 +53,7 @@
       },
       "limit": {
         "type": "integer",
-        "description": "For `find`: max rows to return (1-500, default 100). Truncation is signaled in the response."
+        "description": "For `find`: max rows to return (1-500; default 100, or 50 with a `query`). A query ranks up to 500 filtered skills before the limit applies. Truncation is signaled in the response."
       },
       "content": {
         "type": "string",
@@ -68,10 +68,6 @@
         "enum": ["interactive", "coordinator", "any"],
         "description": "Authored audience metadata — passive marker for sorting/grouping, not an enforcement boundary. For `create`/`update`: which session surface this skill was authored for (`interactive`, `coordinator`, or `any`); defaults to `any` on create. For `find`: optional discoverability filter — pass `interactive` or `coordinator` to narrow the browse (rows tagged `any` are included alongside the chosen narrowing); omit to return all kinds."
       },
-      "token_budget": {
-        "type": "integer",
-        "description": "For `create`/`update`: per-turn token budget when this skill is active. 0 = no override."
-      },
       "auto_approve": {
         "type": "boolean",
         "description": "For `create`/`update`: when this skill is loaded into a session, mark its session as auto-approving tools in `allowed_tools` without operator prompt. Operator-visible on the approval card; use sparingly."
@@ -81,15 +77,19 @@
         "items": { "type": "string" },
         "description": "For `create`/`update`: tools auto-approved when this skill is active. Empty / absent = no tools pre-approved (operator approves each call). Editing this field forces a scanner re-run that may shift `risk_level` — diff is shown on the approval card."
       },
-      "activation": {
-        "type": "string",
-        "enum": ["named", "default", "search"],
-        "description": "For `create`/`update`: how the skill becomes discoverable. `named` = explicit load only; `default` = applies to every new session; `search` = listed in the search-activated catalog."
-      },
       "notify_on_complete": {
         "type": "array",
-        "items": { "type": "object" },
-        "description": "For `create`/`update`: list of notify targets to fire when a workstream using this skill completes."
+        "maxItems": 10,
+        "items": {
+          "type": "object",
+          "properties": {
+            "channel_type": { "type": "string" },
+            "channel_id": { "type": "string" },
+            "user_id": { "type": "string" }
+          },
+          "required": ["channel_type"]
+        },
+        "description": "For `create`/`update`: up to 10 notify targets to fire when a workstream created with this skill completes. Each names a `channel_type` and exactly one of `channel_id` or `user_id`."
       }
     },
     "required": ["action"]

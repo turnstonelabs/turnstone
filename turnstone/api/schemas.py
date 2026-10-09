@@ -239,7 +239,7 @@ class CreateScheduleRequest(BaseModel):
     initial_message: str = Field(description="Message sent to the new workstream")
     auto_approve: bool = Field(default=False)
     auto_approve_tools: list[str] = Field(default_factory=list)
-    skill: str = Field(default="", description="Skill name (replaces default skills)")
+    skill: str = Field(default="", description="Skill name")
     persona: str = Field(default="", description="Persona slug (empty = kind default)")
     project_id: str = Field(default="", description="Project to attach the workstream to")
     notify_targets: list[dict[str, str]] = Field(

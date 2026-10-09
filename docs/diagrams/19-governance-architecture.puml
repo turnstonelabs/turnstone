@@ -26,7 +26,6 @@ package "Governance Storage" {
   database "prompt_templates\n(skills)" as pt_db
   database "usage_events" as ue_db
   database "audit_events" as ae_db
-  database "skills" as wt_db
 }
 
 package "Runtime Enforcement" {
@@ -37,16 +36,15 @@ package "Runtime Enforcement" {
 }
 
 package "Template Runtime" {
-  [_load_templates()] as tload
+  [_load_skills()] as tload
   [_render_template()\n{{model}}, {{ws_id}}, {{node_id}}] as trender
   [_init_system_messages()] as tsys
-  [set_template() / /template] as tset
+  [set_skill() / /skill] as tset
 }
 
 package "Skill Runtime" {
-  [resolve_skill()] as wtr
-  [apply settings\n(budget, approvals, prompt)] as wta
-  [budget gate\n(session.send)] as wtb
+  [workstream create\n(skill lookup)] as wtr
+  [apply settings\n(approvals, notify targets,\nsaved skill text)] as wta
 }
 
 package "Console UI" {
@@ -78,8 +76,8 @@ govjs --> pt_db : /v1/api/admin/skills
 govjs --> ue_db : /v1/api/admin/usage
 govjs --> ae_db : /v1/api/admin/audit
 
-tload --> pt_db : list_default_templates()\nor get_by_name()
-tload --> trender : template content
+tload --> pt_db : get_prompt_template()\n(saved skill) or\nget_skill_by_name()
+tload --> trender : skill text
 trender --> tsys : rendered content
 tset --> tload : name or None
 
@@ -89,11 +87,8 @@ note right of pt_db
   (read scope, summary only)
 end note
 
-govjs --> wt_db : /v1/api/admin/skills
-wtr --> wt_db : get_skill_by_name()
+wtr --> pt_db : get_prompt_template_by_name()
 wtr --> wta : skill settings
-wta --> pt_db : skill lookup
-wtb --> approve : __budget_override__
 
 auth -[hidden]-> mw
 mw -[hidden]-> approve

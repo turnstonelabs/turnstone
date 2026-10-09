@@ -123,11 +123,9 @@ class BM25Index:
                 break
             if pos not in seen:
                 out.append(pool[pos])
-        # Matches ranked past the recall pool. A no-op when k <= _RERANK_POOL
-        # (the skills-find path passes k = min(len(rows), 50)); tool_search
-        # passes k = corpus size and DEPENDS on this tail — it counts
-        # matches from the result, and a pool-capped result would floor
-        # that count at the pool size.
+        # Matches ranked past the recall pool. A no-op when k <= _RERANK_POOL. tool_search and
+        # skills-find both pass k = corpus size and DEPEND on this tail — they count matches from
+        # the result, and a pool-capped result would floor that count at the pool size.
         for idx in ranked[len(pool) :]:
             if len(out) >= k:
                 break

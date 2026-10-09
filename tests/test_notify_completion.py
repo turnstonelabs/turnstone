@@ -28,11 +28,11 @@ from turnstone.console.server import (
     admin_update_schedule,
 )
 from turnstone.core.auth import AuthResult
+from turnstone.core.notify_targets import validate_notify_targets
 from turnstone.core.trajectory import final_assistant_text, turns_from_dicts
 from turnstone.server import (
     _deliver_notification,
     _fire_notify_targets,
-    _validate_notify_targets,
 )
 
 # ---------------------------------------------------------------------------
@@ -100,30 +100,35 @@ def _cron_payload(**overrides):
 
 class TestValidateNotifyTargets:
     def test_empty_string(self):
-        result, err = _validate_notify_targets("")
+        result, err = validate_notify_targets("")
         assert result == "[]"
         assert err == ""
 
     def test_none(self):
-        result, err = _validate_notify_targets(None)
+        result, err = validate_notify_targets(None)
         assert result == "[]"
         assert err == ""
 
+    def test_an_object_is_neither_array_nor_string(self):
+        result, err = validate_notify_targets({"channel_type": "discord", "channel_id": "1"})
+        assert result == "[]"
+        assert err == "notify_targets must be a JSON array or string"
+
     def test_valid_channel_id(self):
         targets = [{"channel_type": "discord", "channel_id": "123456"}]
-        result, err = _validate_notify_targets(json.dumps(targets))
+        result, err = validate_notify_targets(json.dumps(targets))
         assert err == ""
         assert json.loads(result) == targets
 
     def test_valid_user_id(self):
         targets = [{"channel_type": "discord", "user_id": "789"}]
-        result, err = _validate_notify_targets(json.dumps(targets))
+        result, err = validate_notify_targets(json.dumps(targets))
         assert err == ""
         assert json.loads(result) == targets
 
     def test_valid_list_input(self):
         targets = [{"channel_type": "discord", "channel_id": "123"}]
-        result, err = _validate_notify_targets(targets)
+        result, err = validate_notify_targets(targets)
         assert err == ""
         assert json.loads(result) == targets
 
@@ -132,72 +137,78 @@ class TestValidateNotifyTargets:
             {"channel_type": "discord", "channel_id": "111"},
             {"channel_type": "discord", "user_id": "222"},
         ]
-        result, err = _validate_notify_targets(json.dumps(targets))
+        result, err = validate_notify_targets(json.dumps(targets))
         assert err == ""
         assert len(json.loads(result)) == 2
 
     def test_invalid_json(self):
-        _, err = _validate_notify_targets("{not json")
+        _, err = validate_notify_targets("{not json")
         assert "valid JSON" in err
 
     def test_not_array(self):
-        _, err = _validate_notify_targets('{"key": "val"}')
+        _, err = validate_notify_targets('{"key": "val"}')
         assert "array" in err
 
     def test_missing_channel_type(self):
         targets = [{"channel_id": "123"}]
-        _, err = _validate_notify_targets(json.dumps(targets))
+        _, err = validate_notify_targets(json.dumps(targets))
         assert "channel_type" in err
+
+    def test_null_channel_type(self):
+        """A null type was stored without one, so its notification could never be delivered."""
+        targets = [{"channel_type": None, "channel_id": "1"}]
+        _, err = validate_notify_targets(json.dumps(targets))
+        assert "missing channel_type" in err
 
     def test_missing_id_field(self):
         targets = [{"channel_type": "discord"}]
-        _, err = _validate_notify_targets(json.dumps(targets))
+        _, err = validate_notify_targets(json.dumps(targets))
         assert "channel_id or user_id" in err
 
     def test_non_object_element(self):
-        _, err = _validate_notify_targets('["string"]')
+        _, err = validate_notify_targets('["string"]')
         assert "object" in err
 
     def test_exceeds_max_targets(self):
         targets = [{"channel_type": "discord", "channel_id": str(i)} for i in range(11)]
-        _, err = _validate_notify_targets(json.dumps(targets))
+        _, err = validate_notify_targets(json.dumps(targets))
         assert "limited to" in err
 
     def test_max_targets_at_limit(self):
         targets = [{"channel_type": "discord", "channel_id": str(i)} for i in range(10)]
-        result, err = _validate_notify_targets(json.dumps(targets))
+        result, err = validate_notify_targets(json.dumps(targets))
         assert err == ""
         assert len(json.loads(result)) == 10
 
     def test_field_too_long(self):
         targets = [{"channel_type": "discord", "channel_id": "x" * 257}]
-        _, err = _validate_notify_targets(json.dumps(targets))
+        _, err = validate_notify_targets(json.dumps(targets))
         assert "256 chars" in err
 
     def test_non_string_field_value(self):
-        _, err = _validate_notify_targets('[{"channel_type": 123, "channel_id": "1"}]')
+        _, err = validate_notify_targets('[{"channel_type": 123, "channel_id": "1"}]')
         assert "string" in err
 
     def test_empty_string_channel_type(self):
         targets = [{"channel_type": "", "channel_id": "123"}]
-        _, err = _validate_notify_targets(json.dumps(targets))
+        _, err = validate_notify_targets(json.dumps(targets))
         assert "non-empty" in err
 
     def test_empty_string_channel_id(self):
         targets = [{"channel_type": "discord", "channel_id": ""}]
-        _, err = _validate_notify_targets(json.dumps(targets))
+        _, err = validate_notify_targets(json.dumps(targets))
         assert "non-empty" in err
 
     def test_whitespace_only_values_stripped(self):
         targets = [{"channel_type": "discord", "channel_id": "  123  "}]
-        result, err = _validate_notify_targets(json.dumps(targets))
+        result, err = validate_notify_targets(json.dumps(targets))
         assert err == ""
         parsed = json.loads(result)
         assert parsed[0]["channel_id"] == "123"
 
     def test_both_channel_id_and_user_id_rejected(self):
         targets = [{"channel_type": "discord", "channel_id": "1", "user_id": "2"}]
-        _, err = _validate_notify_targets(json.dumps(targets))
+        _, err = validate_notify_targets(json.dumps(targets))
         assert "only one of" in err
 
 

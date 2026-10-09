@@ -133,8 +133,6 @@ from turnstone.core.memory import (
     find_structured_memory_scopes,
     get_attachments,
     get_skill_by_name,
-    list_default_skills,
-    list_skills_by_activation,
     list_workstreams_with_history,
     load_workstream_config,
     normalize_memory_name,
@@ -216,6 +214,7 @@ from turnstone.core.model_turn import (
     same_model_lane_binding,
     serialized_tool_chars,
 )
+from turnstone.core.notify_targets import validate_notify_targets
 from turnstone.core.nudge_queue import (
     QUIET_CHANNEL,
     QUIET_DRAIN,
@@ -759,12 +758,11 @@ class _ApprovalCancelWitness:
     wait, sees the registered cycle, or advances the epoch / aborts the
     operation source first and the gate denies itself.
 
-    The epoch arm matters for the token-budget gate, which deliberately runs
-    before a generation is claimed.  A raw session cancel event can still be
-    set by an earlier *idle* Stop at that point; snapshotting the monotonic edge
-    ignores that old Stop while still observing a new one racing this gate.
-    Main and task-agent gates additionally carry their generation-local event
-    or abort ref so supersession and scope cancellation remain visible.
+    The epoch arm is the monotonic half. A generation's cancel event is cleared when send()
+    unwinds after a Stop (``_consume_cancel``) and replaced at the next claim, so an event alone
+    can forget a Stop. The epoch snapshot taken at construction cannot forget it, and it ignores a
+    Stop that predates the witness. Main and task-agent gates additionally carry their
+    generation-local event or abort ref so supersession and scope cancellation remain visible.
     """
 
     __slots__ = ("_cancel_epoch", "_cancel_source", "_session")
@@ -1194,7 +1192,7 @@ def _encode_image_data_uri(raw: bytes, mime: str) -> str:
     return f"data:{mime};base64,{b64}"
 
 
-# Upper bound on total skill content injected into system messages
+# Upper bound on one skill body delivered to the model
 _MAX_SKILL_CONTENT: int = 32768
 _RECALL_RESULT_CONTENT_CAP: int = 2000
 
@@ -1245,6 +1243,16 @@ def _clip_skill_content(text: str) -> str:
         mode="head",
         marker_factory=_skill_marker,
     ).text
+
+
+def _quote_skill_name(name: str) -> str:
+    """Quote a skill name for an operator note: JSON-escaped, readable, and on one line.
+
+    JSON escapes quotes, backslashes and control characters but leaves U+0085, U+2028 and U+2029
+    raw, and each of those ends a line, so a name holding one falls back to the all-ASCII form.
+    """
+    quoted = json.dumps(name, ensure_ascii=False)
+    return quoted if len(quoted.splitlines()) == 1 else json.dumps(name)
 
 
 def _clip_recall_content(text: str) -> str:
@@ -2462,7 +2470,7 @@ def _substitute_skill_args(
     When *substitute_args* is False the invocation-arg forms
     (``$ARGUMENTS`` / ``$ARGUMENTS[N]`` / ``$N`` / ``$<name>``) are left
     LITERAL and only the ``${…}`` env vars resolve — for capability
-    contexts (defaults, ``task_agent``) that are never invoked with args,
+    contexts (``task_agent``) that are never invoked with args,
     where a literal ``$1`` or ``$ARGUMENTS`` in the body is prose or shell
     text, not a placeholder to blank.
 
@@ -2560,7 +2568,7 @@ def _substitute_skill_args(
     # substituted at all — capability contexts (substitute_args=False) ignore
     # invocation args entirely, so they must not append them either.  The
     # literal-$ARGUMENTS scan is only consumed on that path, so defer it behind
-    # the guard rather than scanning every default / task_agent capability body.
+    # the guard rather than scanning every task_agent capability body.
     if substitute_args and arguments_str:
         had_literal_arguments = bool(_SPEC_ARGUMENTS_LITERAL_RE.search(content))
         if not had_literal_arguments:
@@ -3029,7 +3037,6 @@ class _ConfigScalars(NamedTuple):
 
     temperature: float | None
     max_tokens: int
-    token_budget: int
     skill_version: int
 
 
@@ -3410,13 +3417,15 @@ class ChatSession:
         self._msg_tokens: list[int] = []  # parallel to self.messages
         self._system_tokens = 0  # tokens for system_messages
         # Workstream template metadata
-        self._token_budget: int = 0
-        self._budget_warned: bool = False
-        self._budget_exhausted: bool = False
         self._notify_on_complete: str = "[]"
         self._applied_skill_id: str = ""
         self._applied_skill_version: int = 0
         self._applied_skill_content: str = ""  # inline prompt from applied skill
+        # Id of the skill whose text is active: the create-time stamp's id (even once its row is
+        # gone), else the row found by name ("" when none). Unlike _applied_skill_id, which keeps
+        # the create-time id after a switch, this follows /skill and skills(load). In memory only:
+        # saving it would be the per-apply stamp #1312 tracks.
+        self._active_skill_id: str = ""
         self._assistant_pending_tokens = 0
         self._calibrated_msg_count = 0  # len(messages) at last _update_token_table
         self._notify_count = 0
@@ -3617,10 +3626,10 @@ class ChatSession:
         self._conversation_persistence_next_retry_wall_at: datetime | None = None
         self._conversation_persistence_resync_commit_key: str | None = None
         self._conversation_persistence_fatal_revision: int | None = None
-        # Monotonic edge for approval gates that exist before a generation is
-        # claimed (the token-budget override).  Unlike ``_cancel_event``, a
-        # snapshot can distinguish a new Stop from a harmless set event left
-        # by an earlier idle Stop.
+        # Monotonic cancellation edge, advanced by every Stop, close and structural poison. Worker
+        # claims, approval witnesses and the judge's ownership witness snapshot it. Unlike
+        # ``_cancel_event`` (cleared after a Stop unwinds and replaced at each claim), a snapshot
+        # tells a new Stop from an earlier one.
         self._approval_cancel_epoch = 0
         self._generation: int = 0  # monotonic counter; orphaned threads skip cleanup
         self._generation_principals: dict[int, str] = {}
@@ -3818,7 +3827,7 @@ class ChatSession:
         # and search index from the CURRENT maps.
         if self._mcp_client and self._mcp_tools_change_seq != mcp_tools_seq_at_read:
             self._on_mcp_tools_changed()
-        # Skill: explicit name overrides is_default skills.  ``skill_arguments``
+        # Skill: the active skill's name, if any.  ``skill_arguments``
         # carries the spec's $ARGUMENTS payload — set at create/load time,
         # substituted into the skill body by ``_load_skills``.
         self._skill_name: str | None = skill
@@ -4305,9 +4314,13 @@ class ChatSession:
         """Best-effort skill lookup."""
         return get_skill_by_name(name)
 
-    def _list_default_skills(self) -> list[dict[str, Any]]:
-        """Best-effort default-skill catalog."""
-        return list_default_skills()
+    def _get_skill_by_id(self, template_id: str) -> dict[str, Any] | None:
+        """Best-effort lookup of the skill row *template_id*; None when it is gone."""
+        try:
+            return get_storage().get_prompt_template(template_id)
+        except Exception:
+            log.warning("skill.lookup_by_id_failed", template_id=template_id, exc_info=True)
+            return None
 
     def _config_for_save(self) -> dict[str, str]:
         """Snapshot the durable session configuration without writing it."""
@@ -4326,7 +4339,6 @@ class ChatSession:
             # same args the original load supplied — otherwise the
             # rehydrate path would silently swap to empty args.
             "skill_arguments": self._skill_arguments,
-            "token_budget": str(self._token_budget),
             "applied_skill_id": self._applied_skill_id,
             "applied_skill_version": str(self._applied_skill_version),
             # Snapshot isolation: skill content is persisted per-workstream so that
@@ -4368,12 +4380,10 @@ class ChatSession:
         :func:`_substitute_skill_args` is itself single-pass, so those
         values are never swept again.
 
-        Every invocation context routes through here — interactive load,
-        default skills, and ``task_agent`` sub-agents — so a skill reading
-        ``${TURNSTONE_EFFORT}`` resolves identically wherever it runs.
-        *substitute_args* is False for capability contexts that never
-        receive invocation args (defaults, ``task_agent``): there a literal
-        ``$1`` / ``$ARGUMENTS`` is prose or shell text and is left
+        Every invocation context routes through here — interactive load and ``task_agent``
+        sub-agents — so a skill reading ``${TURNSTONE_EFFORT}`` resolves identically wherever it
+        runs. *substitute_args* is False for capability contexts that never receive invocation args
+        (``task_agent``): there a literal ``$1`` / ``$ARGUMENTS`` is prose or shell text and is left
         untouched, while env vars still resolve.
         """
         context = {
@@ -4394,69 +4404,71 @@ class ChatSession:
         )
 
     def _load_skills(self) -> None:
-        """Load the active skill (or defaults) from storage into context.
+        """Load the active skill, if any, from storage into context.
 
-        Called once at init and on ``/skill``.  Resources are loaded and
-        materialized to disk BEFORE the body is substituted, so
-        ``${TURNSTONE_SKILL_DIR}`` resolves to the concrete on-disk path
-        rather than a dangling placeholder.  All bodies go through
-        :meth:`_render_skill_body` — the one substitution path, shared
-        with ``task_agent``.
+        Called once at init, on ``/skill`` and when a saved config is applied. Resources are loaded
+        and materialized to disk BEFORE the body is substituted, so ``${TURNSTONE_SKILL_DIR}``
+        resolves to the concrete on-disk path rather than a dangling placeholder. All bodies go
+        through :meth:`_render_skill_body` — the one substitution path, shared with ``task_agent``.
+
+        The skill a workstream was created with (the ``_applied_skill_*`` stamp) renders its saved
+        text under its saved name whatever happened to the skill since: edited, renamed, disabled,
+        deleted, or replaced by a new skill with the same name. Its row, found by id, supplies the
+        argument names and bundled files while it exists. Any other skill is looked up by name and
+        renders its current text (#1312 tracks stamping those too).
         """
         skill_data: dict[str, Any] | None = None
-        if self._skill_name:
+        body: str | None = None
+        if self._applied_skill_content and self._applied_skill_id:
+            skill_data = self._get_skill_by_id(self._applied_skill_id)
+            body = self._applied_skill_content
+            if not self._skill_name and skill_data:
+                # Before #1292 a reopened workstream saved its skill name empty.
+                self._skill_name = skill_data["name"]
+            self._active_skill_id = self._applied_skill_id
+        elif self._skill_name:
             skill_data = self._get_skill_by_name(self._skill_name)
             if skill_data:
-                self._skill_resources = self._load_skill_resources(
-                    skill_data.get("template_id", "")
-                )
+                body = skill_data["content"]
             else:
                 log.warning("skill.not_found", name=self._skill_name)
-                self._skill_resources = {}
+            self._active_skill_id = str(skill_data.get("template_id") or "") if skill_data else ""
         else:
-            self._skill_resources = {}
+            self._active_skill_id = ""
+        self._skill_resources = (
+            self._load_skill_resources(skill_data.get("template_id", "")) if skill_data else {}
+        )
 
         # Materialize first: the body substitution below reads
         # ``self._skill_resources_dir`` to resolve ``${TURNSTONE_SKILL_DIR}``.
-        # A no-op that clears any stale dir on the not-found / defaults /
-        # no-skill paths.
+        # A no-op that clears any stale dir on the not-found / no-skill paths.
         self._materialize_skill_resources()
 
-        if skill_data:
+        if body is not None:
             self._skill_content = self._render_skill_body(
-                skill_data["content"],
+                body,
                 arguments_str=self._skill_arguments,
-                arg_names=self._skill_arg_names(skill_data),
+                arg_names=self._skill_arg_names(skill_data) if skill_data else [],
                 skill_dir=self._skill_resources_dir,
             )
+        else:
+            # No skill, or a named skill that was not found: resources are already cleared above.
+            self._skill_content = None
+        # The row's size estimate and risk tier describe its current text, which is the text that
+        # renders only while the row still holds it: a stamped skill edited since gets neither.
+        if skill_data and body == skill_data.get("content"):
             self._check_skill_budget(skill_data)
             if skill_data.get("risk_level") in ("high", "critical"):
                 risk_tier = skill_data["risk_level"]
                 log.warning(
                     "skill.high_risk_loaded",
-                    skill=skill_data["name"],
+                    skill=self._skill_name,
                     risk_level=risk_tier,
                 )
                 self.ui.on_info(
-                    f"⚠ Skill '{skill_data['name']}' has risk level: {risk_tier}. "
+                    f"⚠ Skill '{self._skill_name}' has risk level: {risk_tier}. "
                     f"Review scan report in admin panel before enabling in production."
                 )
-        elif self._skill_name:
-            # Named skill not found — resources already cleared above.
-            self._skill_content = None
-        else:
-            defaults = self._list_default_skills()
-            if defaults:
-                # Defaults are always-on and take no invocation args, but env
-                # subs (``${TURNSTONE_SESSION_ID}`` / ``${TURNSTONE_EFFORT}``)
-                # still resolve.  Defaults carry no per-skill resource bundle,
-                # so ``skill_dir`` is omitted.
-                parts = [
-                    self._render_skill_body(t["content"], substitute_args=False) for t in defaults
-                ]
-                self._skill_content = "\n\n".join(parts)
-            else:
-                self._skill_content = None
         self._validate_skill_resources()
 
     @staticmethod
@@ -4506,12 +4518,13 @@ class ChatSession:
     def set_skill(self, name: str | None, arguments: str = "") -> None:
         """Set or clear the active skill, optionally with invocation args.
 
-        ``arguments`` carries the spec's $ARGUMENTS payload — re-set
-        each time ``set_skill`` is called so a reload doesn't smuggle
-        stale args.  Empty string clears them.
+        ``arguments`` carries the spec's $ARGUMENTS payload — re-set each time ``set_skill`` is
+        called so a reload doesn't smuggle stale args. Empty string clears them. An explicit change
+        also drops the create-time snapshot, so the change survives a reopen.
         """
         self._skill_name = name
         self._skill_arguments = arguments
+        self._applied_skill_content = ""
         self._load_skills()
         self._init_system_messages()
         self._save_config()
@@ -4521,7 +4534,7 @@ class ChatSession:
         if skill.get("token_estimate", 0) > self.context_window * 0.25:
             log.warning(
                 "skill.token_budget_warning",
-                skill=skill.get("name", ""),
+                skill=self._skill_name,
                 estimate=skill["token_estimate"],
                 context_window=self.context_window,
             )
@@ -6945,11 +6958,6 @@ class ChatSession:
             max_tokens=(
                 int(config["max_tokens"]) if config and "max_tokens" in config else self.max_tokens
             ),
-            token_budget=(
-                int(config["token_budget"] or "0")
-                if config and "token_budget" in config
-                else self._token_budget
-            ),
             skill_version=(
                 int(config["applied_skill_version"] or "0")
                 if config and "applied_skill_version" in config
@@ -7034,6 +7042,13 @@ class ChatSession:
             self.max_tokens = scalars.max_tokens
         if "instructions" in config:
             self.instructions = config["instructions"] or None
+        # The create-time stamp before the skill: ``_load_skills`` renders it.
+        if "applied_skill_id" in config:
+            self._applied_skill_id = config["applied_skill_id"]
+        if "applied_skill_version" in config:
+            self._applied_skill_version = scalars.skill_version
+        if "applied_skill_content" in config:
+            self._applied_skill_content = config["applied_skill_content"]
         if "skill" in config or "template" in config:
             self._skill_name = config.get("skill") or config.get("template") or None
             # Restore #572's invocation-args payload BEFORE
@@ -7041,27 +7056,15 @@ class ChatSession:
             # the original args instead of an empty default.
             self._skill_arguments = config.get("skill_arguments", "") or ""
             self._load_skills()
-        if "token_budget" in config:
-            self._token_budget = scalars.token_budget
-        if "applied_skill_id" in config:
-            self._applied_skill_id = config["applied_skill_id"]
-        if "applied_skill_version" in config:
-            self._applied_skill_version = scalars.skill_version
-        if "applied_skill_content" in config:
-            self._applied_skill_content = config["applied_skill_content"]
-            if self._applied_skill_content:
-                self._skill_content = self._applied_skill_content
-                self._skill_name = None
         if "notify_on_complete" in config:
             self._notify_on_complete = config["notify_on_complete"]
 
     def adopt_settings(self, config: dict[str, str]) -> None:
         """Take another session's saved settings (``_config_for_save``), as CLI ``/new`` does.
 
-        Applied the way a reopened workstream applies its own config: model,
-        sampling, instructions, skill and its snapshot, token budget and the
-        completion notice. The persona is construction-time and stays this
-        session's own.
+        Applied the way a reopened workstream applies its own config: model, sampling,
+        instructions, and the skill with its create-time stamp. The persona is construction-time
+        and stays this session's own.
         """
         self._apply_persisted_config(config, self._parse_config_scalars(config))
         self._init_system_messages()
@@ -7739,85 +7742,48 @@ class ChatSession:
                     "to invoke the prompts listed above."
                 )
                 dev_parts.append("\n".join(lines))
-        # Applied-skill body is CAPABILITY context, not identity.  A NAMED
-        # applied skill (loaded via /skill or skills(load)) is the only
-        # mid-session-changeable skill and thus the only one that would bust the
-        # cached identity block, so its body is delivered below as a separate
-        # (user-role) message, off the identity system prefix — it never reads
-        # as who-the-agent-is and no longer invalidates the identity cache.
-        # DEFAULT (always-on) skills are set at init, never change mid-session,
-        # and are the standing baseline, so they stay in the identity system
-        # message where their guidance keeps system-level weight.
-        # PRE-MERGE GATE: the §7 Q1 model-adherence eval (this branch vs main)
-        # covers ONLY the named-skill move; it is not run in-tree and must clear
-        # before this branch merges.
+        # Applied-skill body is CAPABILITY context, not identity.  The active skill (named at
+        # create, or loaded via /skill or skills(load)) can change mid-session, so its body is
+        # delivered below as a separate (user-role) message, off the identity system prefix — it
+        # never reads as who-the-agent-is and never invalidates the identity cache.
         skill_context = ""
         if self._skill_content:
             tpl = self._skill_content
             if len(tpl) > _MAX_SKILL_CONTENT:
                 log.warning("skill_content.truncated", length=len(tpl))
                 tpl = _clip_skill_content(tpl)
-            if not self._skill_name:
-                # Default (always-on) skills: keep in the identity system prefix.
-                dev_parts.append("")
-                dev_parts.append(tpl)
-            else:
-                intro = (
-                    f"The following is the guidance for your active skill "
-                    f"'{self._skill_name}'. Apply it throughout this session."
-                )
-                skill_parts = [intro, "", tpl]
-                if self._skill_resources:
-                    lines = ["<skill-resources>"]
-                    total_size = 0
-                    for rpath, rcontent in sorted(self._skill_resources.items()):
-                        size_kb = f"{len(rcontent) / 1024:.1f}KB"
-                        total_size += len(rcontent)
-                        lines.append(f"- {rpath} ({size_kb})")
-                    if total_size <= 8192:
-                        for rpath, rcontent in sorted(self._skill_resources.items()):
-                            lines.append(f"\n--- {rpath} ---")
-                            lines.append(rcontent)
-                    else:
-                        lines.append(
-                            "Resource content omitted (total exceeds 8KB). "
-                            "Resource files are listed above by path and size."
-                        )
-                    if self._skill_resources_dir:
-                        lines.append(
-                            "\nResource files are materialized on disk. "
-                            "Scripts in scripts/ are on PATH and can be run by name. "
-                            "All files are under $SKILL_RESOURCES_DIR."
-                        )
-                    lines.append("</skill-resources>")
-                    skill_parts.append("\n".join(lines))
-                skill_context = "\n".join(skill_parts)
-        # Skill catalog: disclose search-activated skills so the model
-        # knows they exist (Agent Skills standard progressive disclosure).
-        try:
-            search_skills = list_skills_by_activation("search", enabled_only=True, limit=30)
-        except Exception:
-            log.warning("session.skill_catalog_failed", exc_info=True)
-            search_skills = []
-        # Exclude the already-applied skill from the catalog so the model
-        # doesn't suggest activating a skill that is already loaded.
-        applied_name = self._skill_name or ""
-        search_skills = [sk for sk in search_skills if sk.get("name", "") != applied_name]
-        if search_skills:
-            catalog_lines = ["<available-skills>"]
-            for sk in search_skills[:30]:
-                sk_name = _html_escape(sk.get("name", ""))
-                sk_desc = _html_escape(sk.get("description", "")[:200])
-                catalog_lines.append(
-                    f"  <skill><name>{sk_name}</name><description>{sk_desc}</description></skill>"
-                )
-            catalog_lines.append("</available-skills>")
-            catalog_lines.append(
-                "Additional skills are available. When a task matches a skill "
-                "description, ask the user to activate it with `/skill <name>`, "
-                "or use `/skill search <query>` to find relevant skills."
+            # Unnamed only for a create-time skill saved nameless before #1292 and since deleted.
+            named = f" '{self._skill_name}'" if self._skill_name else ""
+            intro = (
+                f"The following is the guidance for your active skill{named}. "
+                "Apply it throughout this session."
             )
-            dev_parts.append("\n".join(catalog_lines))
+            skill_parts = [intro, "", tpl]
+            if self._skill_resources:
+                lines = ["<skill-resources>"]
+                total_size = 0
+                for rpath, rcontent in sorted(self._skill_resources.items()):
+                    size_kb = f"{len(rcontent) / 1024:.1f}KB"
+                    total_size += len(rcontent)
+                    lines.append(f"- {rpath} ({size_kb})")
+                if total_size <= 8192:
+                    for rpath, rcontent in sorted(self._skill_resources.items()):
+                        lines.append(f"\n--- {rpath} ---")
+                        lines.append(rcontent)
+                else:
+                    lines.append(
+                        "Resource content omitted (total exceeds 8KB). "
+                        "Resource files are listed above by path and size."
+                    )
+                if self._skill_resources_dir:
+                    lines.append(
+                        "\nResource files are materialized on disk. "
+                        "Scripts in scripts/ are on PATH and can be run by name. "
+                        "All files are under $SKILL_RESOURCES_DIR."
+                    )
+                lines.append("</skill-resources>")
+                skill_parts.append("\n".join(lines))
+            skill_context = "\n".join(skill_parts)
         if self.instructions:
             dev_parts.append("")
             dev_parts.append(self.instructions)
@@ -7843,8 +7809,7 @@ class ChatSession:
         # and any skill as capability (see _exec_task), so the parent's applied
         # skill no longer leaks into the sub-agent base.
         # Applied-skill body rides its own capability message, off the cached
-        # identity prefix (see skill_context above).  PRE-MERGE GATE: the
-        # model-adherence eval this-vs-main (design §7 Q1) is not run in-tree.
+        # identity prefix (see skill_context above).
         if skill_context:
             new_system_messages.append({"role": "user", "content": skill_context})
 
@@ -12639,10 +12604,6 @@ class ChatSession:
         )
         wire_part_cache: _WirePartCache = {}
         try:
-            with self._generation_lock:
-                if self._generation != my_generation:
-                    raise GenerationCancelled()
-                generation_cancel_event = self._cancel_event
             if turn_principal_id:
                 self._bind_acting_user_for_generation(turn_principal_id, my_generation)
             self._check_generation_admission(my_generation)
@@ -12656,40 +12617,6 @@ class ChatSession:
             # a fallback lane.
             self._activate_token_calibration(self._primary_lane())
             self._check_generation_admission(my_generation)
-            # Token budget approval gate.  The generation-local event is captured
-            # at claim time; consulting ``self._cancel_event`` here could pick up a
-            # force successor's fresh event and strand this stale approval.
-            if self._budget_exhausted:
-                budget_cancel_witness = _ApprovalCancelWitness(
-                    self,
-                    generation_cancel_event,
-                )
-                approved, _ = self.ui.approve_tools(
-                    [
-                        {
-                            "func_name": "__budget_override__",
-                            "preview": (
-                                f"Token budget ({self._token_budget:,}) exhausted. "
-                                "Approve to continue."
-                            ),
-                            "needs_approval": True,
-                            # Synchronization-only state. SessionUIBase projects
-                            # approval items through an explicit wire allowlist,
-                            # so these fields never cross SSE / persistence.
-                            "_approval_cancel_witness": budget_cancel_witness,
-                            "_approval_wait_seconds": self._approval_wait_seconds(),
-                        }
-                    ]
-                )
-                if not approved:
-                    # A Stop is not a budget-policy rejection. The approval cycle
-                    # already emitted its cancelled resolution; return quietly.
-                    if budget_cancel_witness.aborted:
-                        return
-                    self.ui.on_error("Token budget exhausted. Approval required to continue.")
-                    return
-                self._budget_exhausted = False
-                self._budget_warned = False
             # A force successor may claim while its predecessor's accepted
             # assistant row is still waiting on storage.  Claim/cancel remains
             # responsive, but the successor may not append its user row until
@@ -14919,15 +14846,14 @@ class ChatSession:
                     if attempt_provenance is not None and (new_dead or dead_provenance is None):
                         dead_provenance = attempt_provenance
                     if isinstance(e, EmptyCompletionError) and failed_lane is not None:
-                        # This call completed and was billed. A same-generation
-                        # Stop still accounts for it, like an accepted result;
-                        # supersession and shutdown remain fenced. Budget checks
-                        # do not calibrate or append the rejected answer.
+                        # This call completed and was billed. A same-generation Stop still accounts
+                        # for it, like an accepted result; supersession and shutdown remain fenced.
+                        # Its usage is published without calibrating or appending the rejected
+                        # answer.
                         def _commit_usage(
                             durable: list[Callable[[], None]],
                             serving_model: str = failed_lane.model,
                         ) -> None:
-                            self._update_token_budget()
                             self._print_status_line(
                                 model=serving_model,
                                 deferred_persistence=durable,
@@ -15026,7 +14952,6 @@ class ChatSession:
                     terminal = not recovery.consume_reissue(
                         e,
                         retryable=lane_error_is_retryable(serving_lane, e),
-                        stopped=self._budget_exhausted,
                     )
                     if terminal:
                         # Terminal: finalize AND discard, exactly like the
@@ -15476,10 +15401,10 @@ class ChatSession:
         The slot's ``prompt_tokens`` means the context the next request carries, for every reader:
         the status line, the replay preamble, the usage row (whose latest value doubles as the
         saved-list occupancy figure), and the estimate's compatibility branch.  The provider's
-        billed input survives beside it as ``billed_prompt_tokens`` for the spend readers (the
-        token budget here; the ledger column is #1189), and the three resolution facts are cleared
-        so the slot is a self-consistent record that resolves to itself: no later reader can
-        re-derive an anchor from facts about a call the slot no longer describes.
+        billed input survives beside it as ``billed_prompt_tokens`` for the spend ledger (#1189;
+        nothing in the session reads it yet), and the three resolution facts are cleared so the
+        slot is a self-consistent record that resolves to itself: no later reader can re-derive
+        an anchor from facts about a call the slot no longer describes.
         """
         if not self._last_usage:
             return
@@ -15606,22 +15531,6 @@ class ChatSession:
         # Record how many messages were in context at calibration time so
         # _remaining_token_budget() can estimate only the delta.
         self._calibrated_msg_count = len(self.messages)
-
-        self._update_token_budget()
-
-    def _update_token_budget(self) -> None:
-        """Apply the per-completion budget to accepted and rejected responses."""
-        if not self._last_usage or self._token_budget <= 0:
-            return
-        # The budget meters consumption, so it charges what the provider billed when the slot
-        # carries that beside the context figure (a server-side tool loop's summed passes).
-        billed = self._last_usage.get("billed_prompt_tokens", self._last_usage["prompt_tokens"])
-        total = billed + self._last_usage["completion_tokens"]
-        if not self._budget_warned and total >= self._token_budget * 0.8:
-            self._budget_warned = True
-            self.ui.on_info(f"Token budget 80% consumed ({total:,}/{self._token_budget:,})")
-        if total >= self._token_budget:
-            self._budget_exhausted = True
 
     def _print_status_line(
         self,
@@ -17126,8 +17035,10 @@ class ChatSession:
                             fa["allowed_tools"] = sf.get("allowed_tools")
                         if sf.get("auto_approve"):
                             fa["auto_approve"] = True
-                        if sf.get("activation"):
-                            fa["activation"] = sf.get("activation")
+                        # Where every workstream created with the skill reports when it
+                        # finishes: the card shows it, so the judge sees it too.
+                        if sf.get("notify_on_complete") and sf.get("notify_on_complete") != "[]":
+                            fa["notify_on_complete"] = sf.get("notify_on_complete")
                 elif action_val == "update":
                     upd = it.get("updates") or {}
                     fa["updated_fields"] = sorted(upd.keys()) if isinstance(upd, dict) else []
@@ -17138,18 +17049,21 @@ class ChatSession:
                             fa["allowed_tools"] = upd.get("allowed_tools")
                         if "auto_approve" in upd:
                             fa["auto_approve"] = bool(upd.get("auto_approve"))
+                        if upd.get("notify_on_complete") and upd.get("notify_on_complete") != "[]":
+                            fa["notify_on_complete"] = upd.get("notify_on_complete")
                     fa["projected_risk"] = it.get("projected_risk", "")
                     fa["current_risk"] = it.get("current_risk", "")
                 elif action_val in ("enable", "disable"):
-                    # Re-enabling a model-planted high/critical skill is the
-                    # attack this projection must expose: surface the existing
-                    # skill's stored risk tier + auto_approve (stashed by
-                    # ``_prepare_skills_toggle``) so the judge weighs WHAT is
-                    # being re-enabled, not just its name.
+                    # Re-enabling a model-planted high/critical skill is the attack this projection
+                    # must expose: surface the existing skill's stored risk tier, auto_approve and
+                    # (when enabling) completion targets, stashed by ``_prepare_skills_toggle``, so
+                    # the judge weighs WHAT is being re-enabled, not just its name.
                     if it.get("risk_level"):
                         fa["risk_level"] = it.get("risk_level")
                     if it.get("auto_approve"):
                         fa["auto_approve"] = True
+                    if it.get("notify_on_complete"):
+                        fa["notify_on_complete"] = it.get("notify_on_complete")
                 it["func_args"] = fa
             elif name == "watch":
                 it["func_args"] = {
@@ -18172,9 +18086,9 @@ class ChatSession:
     ) -> tuple[tuple[str, tuple[str, ...]], ...] | None:
         """Return one compatible queue snapshot token for an automatic wake.
 
-        Called only from a worker's ownership-clear backstop.  Budget refusal,
-        an abandoned generation, and unresolved durable/structural state all
-        require a later explicit user seam rather than an unattended retry.
+        Called only from a worker's ownership-clear backstop.  An abandoned
+        generation and unresolved durable/structural state require a later
+        explicit user seam rather than an unattended retry.
         ``exclude_signature`` belongs to the exact wake worker now exiting: if
         its failed preamble restored the same popped rows, that attempt is not
         immediately repeated.  The token is otherwise stateless until a wake
@@ -18193,8 +18107,7 @@ class ChatSession:
         take other locks and must not nest inside the queue lock.
         """
         if (
-            self._budget_exhausted
-            or self._generation_abandoned
+            self._generation_abandoned
             or self.is_workstream_gone()
             or self.has_unresolved_conversation_persistence()
         ):
@@ -21197,23 +21110,15 @@ class ChatSession:
         # rides the send's ordinary flush seams — the pre-existing
         # mid-turn interjection behaviour of every send.
         #
-        # ``_budget_exhausted`` is checked BEFORE the pop: on that latch
-        # ``send`` refuses without appending a turn unless a human
-        # approves the override, and a wake is unattended — popping
-        # first would destroy the message on a refusal that raises
-        # nothing.  Skipping the branch (no pop) leaves the interjection
-        # queued for the user's next real send, where the approval
-        # prompt has someone in front of it, and falls through to the
-        # wake drain so this worker's exit keeps its convergence.
-        # The gone latch takes the same rule for the same reason: the
-        # admission refusal surfaces as GenerationCancelled, which
-        # send()'s own cancel finalizer converges INTERNALLY (no
-        # re-raise), so neither except arm below would run and the
-        # popped rows would be destroyed with no restore, no log, no
-        # notice.  This delivery-site gate must be at least as strong as
-        # the claim gate that normally protects it — a nudge-driven wake
-        # reaches here without ever consulting the claim.
-        if not self._budget_exhausted and not self.is_workstream_gone():
+        # The gone latch is checked BEFORE the pop: send's admission refusal surfaces as
+        # GenerationCancelled, which send()'s own cancel finalizer converges INTERNALLY (no
+        # re-raise), so neither except arm below would run and the popped rows would be destroyed
+        # with no restore, no log, no notice. Skipping the branch (no pop) leaves the rows queued
+        # and falls through to the wake drain so this worker's exit keeps its convergence. This
+        # delivery-site gate must cover every claim-gate arm whose refusal send() converges
+        # internally (today only the gone latch): a nudge-driven wake reaches here without ever
+        # consulting the claim.
+        if not self.is_workstream_gone():
             # Partitioned pop: only the wake lane's effective principal's
             # (and unowned) rows fold into the interjection send; another
             # participant's retained rows stay queued for their owner and the
@@ -22619,11 +22524,12 @@ class ChatSession:
                 )
             kind = None if parsed is SkillKind.ANY else parsed.value
         enabled_only = self._coord_bool_arg(args, "enabled_only")
+        default_limit = self._SKILLS_FIND_QUERY_DEFAULT_LIMIT if query else 100
         try:
-            limit = int(args.get("limit") or 100)
+            limit = int(args.get("limit") or default_limit)
         except (TypeError, ValueError):
-            limit = 100
-        limit = max(1, min(limit, 500))
+            limit = default_limit
+        limit = max(1, min(limit, self._SKILLS_FIND_MAX_LIMIT))
         header_bits = ["⚙ skills find"]
         if query:
             header_bits.append(f'query="{query[:40]}"')
@@ -22654,6 +22560,12 @@ class ChatSession:
             "limit": limit,
         }
 
+    # The ``limit`` ceiling skills.json documents, and how many filtered rows a query ranks before
+    # its limit applies.
+    _SKILLS_FIND_MAX_LIMIT: ClassVar[int] = 500
+    # A query's default ``limit``.
+    _SKILLS_FIND_QUERY_DEFAULT_LIMIT: ClassVar[int] = 50
+
     def _exec_skills_find(self, item: dict[str, Any]) -> tuple[str, str]:
         call_id = item["call_id"]
         storage = get_storage()
@@ -22664,6 +22576,10 @@ class ChatSession:
         # entries don't drop out of the narrowed view.
         kind_filter = item.get("kind")
         kinds = [kind_filter, "any"] if kind_filter else None
+        query = item.get("query")
+        # A query ranks up to ``_SKILLS_FIND_MAX_LIMIT`` filtered rows before its own limit applies,
+        # so a match past the first page of the storage order is still found.
+        fetch = self._SKILLS_FIND_MAX_LIMIT if query else item["limit"]
         try:
             rows = storage.list_skills_filtered(
                 category=item["category"],
@@ -22671,15 +22587,17 @@ class ChatSession:
                 risk_level=item["risk_level"],
                 kinds=kinds,
                 enabled_only=item["enabled_only"],
-                limit=item["limit"] + 1,  # +1 to detect truncation
+                limit=fetch + 1,  # +1 to detect truncation
             )
         except Exception as e:
             msg = f"Error: skills find failed: {e}"
             self._report_tool_result(call_id, "skills", msg, is_error=True)
             return call_id, msg
-        truncated = len(rows) > item["limit"]
-        rows = rows[: item["limit"]]
-        query = item.get("query")
+        truncated = len(rows) > fetch
+        # Without a query the limit is the page, so raising it helps; a query ranks a fixed pool
+        # that only narrower filters get past.
+        limit_cut = truncated and not query
+        rows = rows[:fetch]
         if query and rows:
             from turnstone.core.bm25 import BM25Index
 
@@ -22698,8 +22616,11 @@ class ChatSession:
                 for r in rows
             ]
             index = BM25Index(corpus, reranker=self._bm25_reranker())
-            top = index.search(query, k=min(len(rows), 50))
-            rows = [rows[i] for i in top]
+            matches = index.search(query, k=len(rows))
+            shown = matches[: item["limit"]]
+            limit_cut = len(matches) > len(shown)
+            truncated = truncated or limit_cut
+            rows = [rows[i] for i in shown]
         skills = [self._skills_project_row(r) for r in rows]
         result = {"skills": skills, "truncated": truncated}
         any_filter = bool(
@@ -22712,9 +22633,15 @@ class ChatSession:
         )
         summary = f"{len(skills)} skills"
         if truncated:
-            summary += " (truncated; narrow filters or raise limit)"
+            summary += (
+                " (truncated; narrow filters or raise limit)"
+                if limit_cut
+                else " (truncated; narrow filters)"
+            )
         output_msg: str | None = None
-        if not skills and any_filter:
+        # A cut ranking pool with no match keeps its truncation signal: the hint's advice to
+        # broaden cannot reach the skills past the pool.
+        if not skills and any_filter and not truncated:
             try:
                 unfiltered = storage.list_skills_filtered(enabled_only=False, limit=10)
             except Exception:
@@ -22787,7 +22714,6 @@ class ChatSession:
             "description": r.get("description") or "",
             "enabled": bool(r.get("enabled")),
             "risk_level": r.get("risk_level") or "",
-            "activation": r.get("activation") or "",
             "kind": r.get("kind") or "any",
         }
         if allowed_tools:
@@ -22963,10 +22889,15 @@ class ChatSession:
             )
             self._report_tool_result(call_id, "skills", msg, is_error=True)
             return call_id, msg
-        if self._skill_name == name and self._skill_arguments == arguments:
-            # ``arguments`` is load-bearing for the spec's substitution —
-            # an existing load with a DIFFERENT args payload should
-            # re-render, not no-op.  Only short-circuit on full identity.
+        if (
+            self._skill_name == name
+            and self._skill_arguments == arguments
+            and str(skill_data.get("template_id") or "") == self._active_skill_id
+        ):
+            # ``arguments`` is load-bearing for the spec's substitution — an existing load with a
+            # DIFFERENT args payload should re-render, not no-op.  Only short-circuit on full
+            # identity, including the row: after a reopen the active text can be a deleted skill's
+            # saved copy while a newer row holds its name.
             msg = f"Skill '{name}' is already active"
             self._report_tool_result(call_id, "skills", msg)
             return call_id, msg
@@ -23038,6 +22969,11 @@ class ChatSession:
                     "    WARNING: auto_approve + allowed_tools means the "
                     "tools above auto-fire when this skill is loaded"
                 )
+        # Shown whole: every workstream created with the skill reports to these targets
+        # unless its own request names others.
+        nc_str = session_fields.get("notify_on_complete")
+        if nc_str and nc_str != "[]":
+            preview_lines.append(f"    notify_on_complete: {nc_str}")
         header = f"⚙ skills create: {name}"
         if projected_risk in ("high", "critical"):
             header += f" (risk={projected_risk})"
@@ -23084,8 +23020,6 @@ class ChatSession:
             return call_id, msg
         skill_id = uuid.uuid4().hex
         session_fields = dict(item.get("session_fields") or {})
-        activation = session_fields.pop("activation", "named")
-        is_default = activation == "default"
         try:
             storage.create_prompt_template(
                 template_id=skill_id,
@@ -23093,13 +23027,11 @@ class ChatSession:
                 category=item["category"],
                 content=item["content"],
                 variables="[]",
-                is_default=is_default,
                 org_id="",
                 created_by=self._user_id,
                 origin="model",
                 description=item["description"],
                 tags=item["tags"],
-                activation=activation,
                 token_estimate=len(item["content"]) // 4,
                 kind=item["kind"],
                 **session_fields,
@@ -23152,6 +23084,14 @@ class ChatSession:
         name = self._coord_str_arg(args, "name").strip()
         if not name:
             return self._coord_tool_error(call_id, "skills", "update: 'name' is required")
+        if "enabled" in args:
+            # ``enable`` and ``disable`` own the flag: their card shows what re-enabling lets new
+            # workstreams do (risk, auto_approve, completion targets), which this card does not.
+            return self._coord_tool_error(
+                call_id,
+                "skills",
+                "update: change 'enabled' with skills(action='enable') or skills(action='disable')",
+            )
         storage = get_storage()
         existing = storage.get_prompt_template_by_name(name)
         if existing is None:
@@ -23270,8 +23210,9 @@ class ChatSession:
         for k, v in updates.items():
             if k == "content":
                 preview_lines.append(f"    content: <{len(v)} chars>")
-            elif k == "allowed_tools":
-                preview_lines.append(f"    allowed_tools: {v}")
+            elif k in ("allowed_tools", "notify_on_complete"):
+                # Whole: a cut list could hide a tool or a target.
+                preview_lines.append(f"    {k}: {v}")
             else:
                 vstr = str(v)
                 preview_lines.append(f"    {k}: {vstr[:120]}")
@@ -23452,6 +23393,14 @@ class ChatSession:
                 existing_allowed = []
         except (TypeError, ValueError):
             existing_allowed = []
+        # Re-enabling lets new workstreams send their final output to these targets, so the card
+        # and the judge see them whole, as on create and update, read the way workstream create
+        # reads them: the same check, with blank, ``{}`` and invalid values applying as none.
+        existing_notify = ""
+        if enable:
+            normalized = validate_notify_targets(existing.get("notify_on_complete"))[0]
+            if normalized != "[]":
+                existing_notify = normalized
         preview_lines = [
             f"    name: {name}",
             f"    enabled: {bool(existing.get('enabled'))} -> {enable}",
@@ -23460,6 +23409,8 @@ class ChatSession:
             preview_lines.append(f"    risk_level: {existing_risk}")
         if existing_allowed:
             preview_lines.append(f"    allowed_tools: {len(existing_allowed)} entries")
+        if existing_notify:
+            preview_lines.append(f"    notify_on_complete: {existing_notify}")
         if bool(existing.get("auto_approve")) and enable:
             preview_lines.append(
                 "    WARNING: this skill has auto_approve=True; re-enabling "
@@ -23484,6 +23435,7 @@ class ChatSession:
             # the intent judge must be able to see, not just the name.
             "risk_level": existing_risk,
             "auto_approve": bool(existing.get("auto_approve")),
+            "notify_on_complete": existing_notify,
         }
 
     def _exec_skills_toggle(self, item: dict[str, Any], *, enable: bool) -> tuple[str, str]:
@@ -26886,14 +26838,13 @@ class ChatSession:
                 risk_level=skill_data.get("risk_level", ""),
                 ws_id=self._ws_id,
             )
-            # A skill applied to a task_agent is CAPABILITY, not identity:
-            # delivered as a distinct context turn ahead of the task, never
-            # fused into the system identity.  Substituted through the shared
-            # pipeline — a sub-agent has no invocation args, so ``$ARGUMENTS``
-            # and positional ``$N`` forms resolve to empty (identical to the
-            # defaults and spawn-child paths) and ``${TURNSTONE_*}`` env vars
-            # resolve; ``skill_dir`` is unset (sub-agent bundles aren't
-            # materialized yet), leaving ``${TURNSTONE_SKILL_DIR}`` literal.
+            # A skill applied to a task_agent is CAPABILITY, not identity: delivered as a distinct
+            # context turn ahead of the task, never fused into the system identity.  Substituted
+            # through the shared pipeline with ``substitute_args=False``: a sub-agent gets no
+            # invocation args, so ``$ARGUMENTS`` and positional ``$N`` forms stay literal (a
+            # spawned child's named skill blanks them instead), while ``${TURNSTONE_*}`` env vars
+            # resolve; ``skill_dir`` is unset (sub-agent bundles aren't materialized yet), leaving
+            # ``${TURNSTONE_SKILL_DIR}`` literal.
             skill_body = self._render_skill_body(skill_data["content"], substitute_args=False)
             if len(skill_body) > _MAX_SKILL_CONTENT:
                 log.warning(
@@ -28661,26 +28612,40 @@ class ChatSession:
                 self.ui.on_info("Instructions updated.")
 
         elif cmd == "/skill":
-            previous_skill = self._skill_name or "defaults"
+            # Skill names are free text (an MCP server or an approved skills(create) chooses them),
+            # so the operator note below quotes them instead of writing them raw. A create-time
+            # skill saved nameless by an older release whose row is gone stays active, unnamed.
+            if self._skill_name:
+                previous_skill = _quote_skill_name(self._skill_name)
+            elif self._skill_content:
+                previous_skill = "the unnamed skill saved at creation"
+            else:
+                previous_skill = "no skill"
             if not arg:
                 if self._skill_name:
                     self.ui.on_info(f"Active skill: {self._skill_name}")
+                elif self._skill_content:
+                    self.ui.on_info(
+                        "Active skill: the unnamed skill saved at creation. "
+                        "Usage: /skill <name> or /skill clear"
+                    )
                 else:
-                    self.ui.on_info("Using defaults. Usage: /skill <name> or /skill clear")
+                    self.ui.on_info("No skill set. Usage: /skill <name> or /skill clear")
             elif arg.strip().lower() == "clear":
                 self.set_skill(None)
                 self._append_system_turn(
                     "skill_hint",
-                    f"Operator set the active skill from {previous_skill} to defaults.",
+                    f"Operator set the active skill from {previous_skill} to no skill.",
                 )
-                self.ui.on_info("Skill cleared; using defaults.")
+                self.ui.on_info("Skill cleared.")
             else:
                 tpl = self._get_skill_by_name(arg.strip())
                 if tpl:
                     self.set_skill(tpl["name"])
                     self._append_system_turn(
                         "skill_hint",
-                        f"Operator set the active skill from {previous_skill} to {tpl['name']}.",
+                        f"Operator set the active skill from {previous_skill} to "
+                        f"{_quote_skill_name(tpl['name'])}.",
                     )
                     self.ui.on_info(f"Skill set: {tpl['name']}")
                 else:

@@ -757,7 +757,7 @@ function _populateModelSelect(modelSel, judgeSel, opts) {
 }
 
 // Fill a skill <select> from the shared skills cache, keeping the static
-// "Use defaults" placeholder (option 0) and preserving a mid-window pick.  The
+// "No skill" placeholder (option 0) and preserving a mid-window pick.  The
 // ui label appends " [MCP]" for MCP-origin skills (the console launcher does
 // not — which is why the cache returns raw rows).  No-op when the bridge is
 // absent.
@@ -766,10 +766,9 @@ function _populateSkillSelect(sel, opts) {
   const fresh = !!(opts && opts.fresh);
   const previous = fresh ? "" : sel.value;
   sel.replaceChildren();
-  _appendOption(sel, "", "Use defaults", false);
+  _appendOption(sel, "", "No skill", false);
   window.TurnstoneSkills.getSkills().forEach(function (t) {
     let label = t.name;
-    if (t.is_default) label += " (default)";
     if (t.origin === "mcp") label += " [MCP]";
     _appendOption(sel, t.name, label, false);
   });

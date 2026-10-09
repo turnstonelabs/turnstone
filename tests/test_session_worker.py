@@ -1171,7 +1171,7 @@ class TestWorkerExitInterjectionBackstop:
 
     @pytest.mark.parametrize(
         "blocker",
-        ["budget", "abandoned", "unresolved", "foreign_principal", "gone"],
+        ["abandoned", "unresolved", "foreign_principal", "gone"],
     )
     def test_queue_only_wake_refuses_unattended_retry_blockers(self, blocker: str) -> None:
         session = self._session()
@@ -1183,9 +1183,7 @@ class TestWorkerExitInterjectionBackstop:
             interjector_user_id=owner,
             turn_principal_id=owner,
         )
-        if blocker == "budget":
-            session._budget_exhausted = True
-        elif blocker == "abandoned":
+        if blocker == "abandoned":
             session._generation_abandoned = True
         elif blocker == "unresolved":
             session.has_unresolved_conversation_persistence = lambda: True  # type: ignore[method-assign]

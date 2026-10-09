@@ -261,7 +261,7 @@ class CreateWorkstreamRequest(BaseModel):
         default=False,
         description="Require an exact source ID in resume_ws; disable alias and prefix resolution",
     )
-    skill: str = Field(default="", description="Skill name (replaces default skills)")
+    skill: str = Field(default="", description="Skill name")
     persona: str = Field(
         default="",
         description=(
@@ -898,8 +898,6 @@ class SkillSummary(BaseModel):
     category: str = Field(default="", description="Skill category")
     description: str = Field(default="", description="Skill description for discovery")
     tags: list[str] = Field(default_factory=list, description="Semantic tags")
-    is_default: bool = Field(default=False, description="Whether auto-applied to all sessions")
-    activation: str = Field(default="named", description="Activation mode: default, named, search")
     origin: str = Field(default="manual", description="Source: manual, mcp, skills.sh, github")
     author: str = Field(default="", description="Skill author")
     version: str = Field(default="1.0.0", description="Skill version")

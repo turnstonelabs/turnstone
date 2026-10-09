@@ -73,6 +73,7 @@ from turnstone.core.model_turn import (
     resolve_model_binding,
     resolve_temperature_setting,
 )
+from turnstone.core.notify_targets import validate_notify_targets
 from turnstone.core.ratelimit import resolve_client_ip
 from turnstone.core.session import ChatSession, GenerationCancelled, SessionUI  # noqa: F401
 from turnstone.core.session_manager import (
@@ -2473,64 +2474,6 @@ async def command(request: Request) -> JSONResponse:
 # Notification helpers — completion delivery for scheduled workstreams
 # ---------------------------------------------------------------------------
 
-_MAX_NOTIFY_TARGETS = 10
-
-
-def _validate_notify_targets(raw: Any) -> tuple[str, str]:
-    """Validate and normalize notify_targets input.
-
-    Returns (json_string, error_message). Error is empty on success.
-    """
-    if not raw:
-        return "[]", ""
-    if isinstance(raw, str):
-        try:
-            parsed = json.loads(raw)
-        except (json.JSONDecodeError, TypeError):
-            return "[]", "notify_targets must be valid JSON"
-    elif isinstance(raw, list):
-        parsed = raw
-    else:
-        return "[]", "notify_targets must be a JSON array or string"
-
-    if not isinstance(parsed, list):
-        return "[]", "notify_targets must be a JSON array"
-
-    if len(parsed) > _MAX_NOTIFY_TARGETS:
-        return "[]", f"notify_targets limited to {_MAX_NOTIFY_TARGETS} entries"
-
-    normalized: list[dict[str, str]] = []
-    for i, t in enumerate(parsed):
-        if not isinstance(t, dict):
-            return "[]", f"notify_targets[{i}] must be an object"
-        if "channel_type" not in t:
-            return "[]", f"notify_targets[{i}] missing channel_type"
-
-        has_channel_id = "channel_id" in t and t.get("channel_id") is not None
-        has_user_id = "user_id" in t and t.get("user_id") is not None
-        if has_channel_id and has_user_id:
-            return "[]", f"notify_targets[{i}] must specify only one of channel_id or user_id"
-        if not has_channel_id and not has_user_id:
-            return "[]", f"notify_targets[{i}] requires channel_id or user_id"
-
-        normalized_target: dict[str, str] = {}
-        for key in ("channel_type", "channel_id", "user_id"):
-            val = t.get(key)
-            if val is None:
-                continue
-            if not isinstance(val, str):
-                return "[]", f"notify_targets[{i}].{key} must be a non-empty string <= 256 chars"
-            stripped = val.strip()
-            if not stripped:
-                return "[]", f"notify_targets[{i}].{key} must be a non-empty string <= 256 chars"
-            if len(stripped) > 256:
-                return "[]", f"notify_targets[{i}].{key} must be a non-empty string <= 256 chars"
-            normalized_target[key] = stripped
-
-        normalized.append(normalized_target)
-
-    return json.dumps(normalized), ""
-
 
 def _normalize_auto_approve_tools(raw: Any) -> tuple[list[str], str]:
     """Validate and canonicalize create-time per-tool approval input.
@@ -2712,7 +2655,7 @@ async def _interactive_create_validate_request(
       receive that coordinator's child_ws_* SSE events
       (name/state/tokens leak).
     - notify_targets (when supplied) must validate.
-      :func:`_validate_notify_targets` is pure-read and doesn't need
+      :func:`validate_notify_targets` is pure-read and doesn't need
       ``ws`` to be built — gating here preserves pre-lift's 400
       semantic for caller-supplied input. Without this pre-create
       gate a malformed ``notify_targets`` would land in
@@ -2902,7 +2845,7 @@ async def _interactive_create_validate_request(
     notify_targets_raw = body.get("notify_targets", "[]")
     if isinstance(notify_targets_raw, list):
         notify_targets_raw = json.dumps(notify_targets_raw)
-    _, nt_err = _validate_notify_targets(notify_targets_raw)
+    _, nt_err = validate_notify_targets(notify_targets_raw)
     if nt_err:
         return JSONResponse({"error": nt_err}, status_code=400)
     auto_approve_tools, tools_err = _normalize_auto_approve_tools(
@@ -3053,8 +2996,8 @@ async def _interactive_create_prepare_install(
     3. For a pre-committed fork, persist its requested alias.
     4. Prepare bounded clear/create/rename/watch publication data for the
        interactive adapter; nothing is emitted from this phase.
-    5. Apply the skill's session config (token budget / approval
-       policy / metadata).
+    5. Apply the skill's session config (approval policy /
+       metadata).
     6. Resolve notify_targets (schedule targets win over skill
        fallback).
     7. Pin the workstream's routing to this node when no caller-
@@ -3089,8 +3032,6 @@ async def _interactive_create_prepare_install(
     # operator setting the task-agent turn cap; a skill sets none of them.
     if skill_data and not resumed and ws.session:
         sess = ws.session
-        if skill_data.get("token_budget", 0) > 0:
-            sess._token_budget = skill_data["token_budget"]
         if skill_data.get("auto_approve"):
             ws.ui.auto_approve = True
         allowed = skill_data.get("allowed_tools", "")
@@ -3139,13 +3080,10 @@ async def _interactive_create_prepare_install(
     notify_targets_raw = body.get("notify_targets", "[]")
     if isinstance(notify_targets_raw, list):
         notify_targets_raw = json.dumps(notify_targets_raw)
-    nt_str, _ = _validate_notify_targets(notify_targets_raw)
+    nt_str, _ = validate_notify_targets(notify_targets_raw)
     if nt_str == "[]" and skill_data:
-        skill_notify = skill_data.get("notify_on_complete", "[]")
-        if skill_notify and skill_notify != "{}" and skill_notify != "[]":
-            fallback_str, fallback_err = _validate_notify_targets(skill_notify)
-            if not fallback_err:
-                nt_str = fallback_str
+        # The same check: blank, ``{}`` and invalid skill targets apply as none.
+        nt_str = validate_notify_targets(skill_data.get("notify_on_complete"))[0]
     ws.notify_targets = nt_str
 
     # Pin locally-created workstreams so the console routes to this node.
@@ -6205,11 +6143,6 @@ def main() -> None:
         """),
     )
     parser.add_argument(
-        "--skill",
-        default=None,
-        help="Skill name (replaces default skills)",
-    )
-    parser.add_argument(
         "--resume",
         default=None,
         metavar="WS",
@@ -6559,7 +6492,7 @@ def main() -> None:
             tool_search_threshold=config_store.get("tools.search_threshold"),
             tool_search_max_results=config_store.get("tools.search_max_results"),
             web_search_backend=config_store.get("tools.web_search_backend"),
-            skill=skill or args.skill or None,
+            skill=skill or None,
             judge_config=live_judge_config,
             user_id=uid,
             config_store=config_store,

@@ -530,7 +530,7 @@ def test_main_local_publication_fault_cannot_trigger_compaction(tmp_db, site):
     fault = RuntimeError("maximum context length exceeded in local callback")
     target = {
         "finish": "_finalize_stream_result",
-        "rejection_usage": "_update_token_budget",
+        "rejection_usage": "_print_status_line",
         "retry_notice": "on_info",
     }[site]
     shapes = ["answer" if site == "finish" else "empty"]
@@ -683,15 +683,6 @@ def test_main_ingestion_fault_cannot_reopen_native_tool_replay(tmp_db):
         assert len(requests) == 1
         assert "web_search_options" in requests[0]
         compact.assert_not_called()
-
-
-@pytest.mark.parametrize("shape", ["empty", "death"])
-def test_main_budget_stop_blocks_both_replay_shapes(tmp_db, shape):
-    with scripted_session(WorkstreamKind.INTERACTIVE, [shape]) as (session, ui, requests):
-        session._budget_exhausted = True
-        with pytest.raises(CompletionRecoveryError):
-            session._stream_response()
-        assert len(requests) == 1
 
 
 def test_empty_summary_exhaustion_bails_as_empty_summary_not_error(tmp_db):

@@ -2250,7 +2250,6 @@ class StorageBackend(Protocol):
         category: str,
         content: str,
         variables: str,
-        is_default: bool,
         org_id: str,
         created_by: str,
         origin: str = "manual",
@@ -2261,10 +2260,8 @@ class StorageBackend(Protocol):
         source_url: str = "",
         version: str = "1.0.0",
         author: str = "",
-        activation: str = "named",
         token_estimate: int = 0,
         auto_approve: bool = False,
-        token_budget: int = 0,
         notify_on_complete: str = "[]",
         enabled: bool = True,
         allowed_tools: str = "[]",
@@ -2292,10 +2289,6 @@ class StorageBackend(Protocol):
         self, org_id: str = "", limit: int = 0, offset: int = 0
     ) -> list[dict[str, Any]]:
         """Return all prompt templates ordered by name."""
-        ...
-
-    def list_default_templates(self, org_id: str = "") -> list[dict[str, Any]]:
-        """Return all templates where is_default=True, ordered by name."""
         ...
 
     def list_prompt_templates_by_origin(self, origin: str) -> list[dict[str, Any]]:
@@ -2330,16 +2323,6 @@ class StorageBackend(Protocol):
         """Count prompt templates, optionally filtered by org_id."""
         ...
 
-    def list_skills_by_activation(
-        self,
-        activation: str,
-        *,
-        enabled_only: bool = False,
-        limit: int = 0,
-    ) -> list[dict[str, Any]]:
-        """Return prompt templates filtered by activation value, ordered by priority then name."""
-        ...
-
     def list_skills_filtered(
         self,
         *,
@@ -2352,6 +2335,10 @@ class StorageBackend(Protocol):
     ) -> list[dict[str, Any]]:
         """Return prompt templates filtered by optional category/tag/risk_level/kinds,
         ordered by priority then name.
+
+        Each row carries only the summary columns ``skills(find)`` shows and ranks
+        (``SKILL_SUMMARY_COLUMNS`` in ``_utils.py``): never the skill body or the scan
+        report, since a ranked query reads up to 500 rows.
 
         Filters are pushed into SQL — no per-row Python filter loops.  The
         ``tag`` filter matches if the tag string appears in the JSON-array

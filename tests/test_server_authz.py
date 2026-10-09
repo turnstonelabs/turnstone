@@ -3253,9 +3253,7 @@ class TestCreateForkRollback:
             if event.get("type") in {"ws_created", "ws_rename"}
         }
 
-    @pytest.mark.parametrize(
-        "key", ["temperature", "max_tokens", "token_budget", "applied_skill_version"]
-    )
+    @pytest.mark.parametrize("key", ["temperature", "max_tokens", "applied_skill_version"])
     def test_invalid_fork_config_rolls_back_cloned_history_and_attachments(
         self, app_client, monkeypatch, key
     ) -> None:

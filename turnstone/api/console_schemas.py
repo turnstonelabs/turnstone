@@ -163,7 +163,7 @@ class ConsoleCreateWsRequest(BaseModel):
     initial_message: str = Field(
         default="", description="Optional first message sent after creation"
     )
-    skill: str = Field(default="", description="Skill name (replaces default skills)")
+    skill: str = Field(default="", description="Skill name")
     persona: str = Field(
         default="",
         description="Persona slug; resolved and snapshotted at creation, empty = kind default",
@@ -359,8 +359,6 @@ class SkillInfo(BaseModel):
     description: str = ""
     tags: list[str] = Field(default_factory=list)
     variables: str = "[]"
-    is_default: bool
-    activation: str = "named"
     org_id: str
     created_by: str
     origin: str = "manual"
@@ -371,7 +369,6 @@ class SkillInfo(BaseModel):
     author: str = ""
     token_estimate: int = 0
     auto_approve: bool = False
-    token_budget: int = 0
     notify_on_complete: str = "[]"
     enabled: bool = True
     priority: int = 0
@@ -413,13 +410,10 @@ class CreateSkillRequest(BaseModel):
     )
     tags: str = "[]"
     variables: str = "[]"
-    is_default: bool = False
-    activation: str = "named"
     org_id: str = ""
     author: str = ""
     version: str = "1.0.0"
     auto_approve: bool = False
-    token_budget: int = 0
     notify_on_complete: str = "[]"
     enabled: bool = True
     priority: int = 0
@@ -475,12 +469,9 @@ class UpdateSkillRequest(BaseModel):
     )
     tags: str | None = None
     variables: str | None = None
-    is_default: bool | None = None
-    activation: str | None = None
     author: str | None = None
     version: str | None = None
     auto_approve: bool | None = None
-    token_budget: int | None = None
     notify_on_complete: str | None = None
     enabled: bool | None = None
     priority: int | None = None
@@ -947,10 +938,9 @@ class ParseSkillResponse(BaseModel):
     # admin parse-preview UI can show what the source SKILL.md
     # provided in each field.
     when_to_use: str = ""
-    # Invocation-control axes (#571).  The install handler derives
-    # ``hidden_from_menu`` from ``user_invocable`` at the storage
-    # boundary; these raw spec fields surface here so the admin UI
-    # can echo them on the parse-preview.
+    # Invocation-control axes (#571).  The install handler derives ``hidden_from_menu`` from
+    # ``user_invocable`` at the storage boundary, and the admin UI reads ``user_invocable`` to
+    # pre-fill its create modal; ``disable_model_invocation`` is only echoed.
     disable_model_invocation: bool = False
     user_invocable: bool = True
     # SKILL.md spec ``arguments:`` + ``argument-hint:`` (#572).

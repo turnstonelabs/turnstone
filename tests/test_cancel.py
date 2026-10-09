@@ -29,6 +29,7 @@ from turnstone.core.providers import (
 from turnstone.core.session import (
     GenerationCancelled,
     _active_shell_owner,
+    _ApprovalCancelWitness,
     _CancelledToolResult,
     _CancelRef,
     _StreamTurnConsumer,
@@ -325,41 +326,14 @@ class TestCancelEvent:
         # Should complete normally — cancel flag was cleared
         assert "idle" in ui.states
 
-    def test_budget_gate_witness_ignores_old_idle_stop_and_sees_new_cancel(self, tmp_db):
-        """The pre-generation budget gate observes an edge, not stale state."""
-        captured: dict[str, Any] = {}
-
-        class BudgetUI(NullUI):
-            def __init__(self) -> None:
-                super().__init__()
-                self.errors: list[str] = []
-
-            def approve_tools(self, items):
-                witness = items[0]["_approval_cancel_witness"]
-                captured["witness"] = witness
-                # The idle Stop before this send is not a cancellation of this
-                # new gate.  A fresh Stop during it is.
-                assert witness.aborted is False
-                session.cancel()
-                assert witness.aborted is True
-                return False, "Cancelled by user"
-
-            def on_error(self, message):
-                self.errors.append(message)
-
-        ui = BudgetUI()
-        session = _make_session(ui=ui)
-        session.cancel()  # old idle Stop; send has not claimed a generation
-        session._budget_exhausted = True
-        messages_before = list(session.messages)
-
-        session.send("do not append this turn")
-
-        witness = captured["witness"]
+    def test_approval_witness_ignores_an_earlier_stop_and_sees_a_new_one(self, tmp_db):
+        """The witness's epoch arm tells a Stop during its gate from one before it."""
+        session = _make_session()
+        session.cancel()  # an earlier, idle Stop
+        witness = _ApprovalCancelWitness(session)
+        assert witness.aborted is False
+        session.cancel()
         assert witness.aborted is True
-        assert session.messages == messages_before
-        assert ui.errors == []
-        assert session._budget_exhausted is True
 
     def test_old_consumer_cannot_clear_successor_cancel_event(self, tmp_db):
         """Consume and successor claim serialize on the transition lock."""

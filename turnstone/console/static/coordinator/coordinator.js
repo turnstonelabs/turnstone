@@ -2143,13 +2143,7 @@ function createCoordinatorPane(root, wsId, opts) {
 
   function _buildBatchActions(batch, items) {
     const alwaysNames = items
-      .filter(
-        (it) =>
-          it.needs_approval &&
-          it.func_name &&
-          it.func_name !== "__budget_override__" &&
-          !it.error,
-      )
+      .filter((it) => it.needs_approval && it.func_name && !it.error)
       .map((it) => it.approval_label || it.func_name);
     const alwaysLabel = alwaysNames.length
       ? "Always approve " + alwaysNames.join(", ")

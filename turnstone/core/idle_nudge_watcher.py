@@ -100,8 +100,9 @@ def wake_workstream_if_pending(
       user turn (``deliver_wake_nudge_from_queue`` would no-op on them).
       ``"wake"``-channel entries (the coordinator idle nudges) ARE
       gate-eligible: the wake is the only seam that can deliver them.  The
-      interjection claim is session-owned and lock-safe; it refuses budget,
-      abandonment, persistence-poison, and repeated restored-queue attempts.
+      interjection claim is session-owned and lock-safe; it refuses
+      abandonment, a gone workstream, persistence poison, and repeated
+      restored-queue attempts.
 
     Past the gates, exactly one info line is emitted per call:
 

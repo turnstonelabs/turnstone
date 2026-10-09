@@ -1013,8 +1013,8 @@ in UIs or discovering available skills before creating a workstream.
 ```json
 {
   "skills": [
-    {"name": "safety-guidelines", "category": "safety", "is_default": true, "origin": "manual"},
-    {"name": "mcp__server__code", "category": "", "is_default": false, "origin": "mcp"}
+    {"name": "safety-guidelines", "category": "safety", "origin": "manual"},
+    {"name": "mcp__server__code", "category": "", "origin": "mcp"}
   ]
 }
 ```
@@ -1025,7 +1025,6 @@ Each skill summary:
 |--------------|--------|------------------------------------------------------|
 | `name`       | string | Skill name (used in `skill` field on workstream creation) |
 | `category`   | string | Skill category                                       |
-| `is_default` | bool   | Whether skill is auto-applied to all sessions        |
 | `origin`     | string | Skill origin: `manual` or `mcp`                      |
 
 > **Note:** For full skill management (create, update, delete, view content),
@@ -1384,7 +1383,7 @@ An absent or malformed JSON body returns `400`.
 | `resume_ws`       | string        | `""`    | Source workstream ID or alias to fork atomically into this new ID |
 | `resume_ws_exact` | bool          | false   | Require `resume_ws` to match an exact source ID; never resolve an alias or prefix |
 | `required_node_id` | string/null | none | Require execution on this node. Omission inherits the fork source's requirement; a fresh direct create without it stays flexible. |
-| `skill`           | string        | `""`    | Skill name. Applies its system prompt and session configuration. Returns 400 if missing/disabled; ignored for a fork because the source configuration is cloned. |
+| `skill`           | string        | `""`    | Skill name. Delivers its text as its own message after the system message and applies its session configuration. Returns 400 if missing/disabled; ignored for a fork because the source configuration is cloned. |
 | `persona`         | string        | `""`    | Persona slug; empty selects the kind's default. A fork keeps the source persona. |
 | `judge_model`     | string        | `""`    | Optional judge model alias                                     |
 | `initial_message` | string        | `""`    | First user message to dispatch after publication               |
@@ -1398,7 +1397,7 @@ A deleted workstream ID remains reserved while a channel route references it.
 Creating a new workstream with that ID returns `409`; channel recovery forks or
 starts a conversation under a new ID before updating the association.
 
-> **Skill behavior:** When `skill` is specified, the skill's content is injected as a system message and its session config fields (auto-approve, allowed tools, token budget, completion notifications) override system defaults for the new workstream. A skill never chooses the model: the workstream runs on `model`, else the default alias, and that alias supplies temperature, reasoning effort and max tokens. Task agents take their turn cap from the `tools.agent_max_turns` setting.
+> **Skill behavior:** When `skill` is specified, the skill's content is delivered as its own message after the system message, and its session config fields (auto-approve, allowed tools, completion notifications) override system defaults for the new workstream. A skill never chooses the model: the workstream runs on `model`, else the default alias, and that alias supplies temperature, reasoning effort and max tokens. Task agents take their turn cap from the `tools.agent_max_turns` setting.
 
 #### Fork behavior (`resume_ws`)
 

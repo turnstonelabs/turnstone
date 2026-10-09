@@ -99,9 +99,7 @@ class ConsoleCoordinatorUI(SessionUIBase):
     # :class:`SessionUIBase`. The shared body covers
     # tool-policy gating, per-tool auto-approve, blanket auto-approve,
     # heuristic-verdict persistence, and activity tagging the same way
-    # interactive sessions get them. ``__budget_override__`` is
-    # interactive-only today; the carve-out in the shared body is a
-    # no-op on coord (coord workstreams don't have token budgets).
+    # interactive sessions get them.
     # ------------------------------------------------------------------
 
     # ------------------------------------------------------------------

@@ -1890,7 +1890,7 @@ function _mountHomeCoordComposer() {
           id: "skill",
           label: "Skill",
           type: "select",
-          choices: [{ value: "", text: "Use defaults" }],
+          choices: [{ value: "", text: "No skill" }],
         },
         {
           id: "model",
@@ -1985,7 +1985,7 @@ function _populateHomeSkillDropdown() {
   const choices = TS.getSkills().map(function (t) {
     return {
       value: t.name,
-      text: t.is_default ? t.name + " (default)" : t.name,
+      text: t.name,
     };
   });
   _homeCoordComposer.setOptionChoices("skill", choices);

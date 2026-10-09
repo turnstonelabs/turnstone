@@ -844,7 +844,6 @@ def test_create_rejects_disabled_skill(storage):
             category="general",
             content="dormant",
             variables="[]",
-            is_default=False,
             org_id="",
             created_by="test",
             origin="manual",
@@ -855,10 +854,8 @@ def test_create_rejects_disabled_skill(storage):
             source_url="",
             version="1.0.0",
             author="",
-            activation="named",
             token_estimate=0,
             auto_approve=False,
-            token_budget=0,
             notify_on_complete="{}",
             enabled=False,  # the gate under test
             allowed_tools="[]",

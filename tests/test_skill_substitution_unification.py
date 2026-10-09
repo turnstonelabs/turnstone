@@ -1,12 +1,11 @@
 """Skill substitution unification (SKILL.md subsystem refactor, step 1).
 
 Pins the invariant that skill-body placeholder substitution is IDENTICAL
-across every invocation context.  Interactive load, default skills, and
-``task_agent`` sub-agents all route through
-``ChatSession._render_skill_body`` — so a skill reading ``$ARGUMENTS`` or
-``${TURNSTONE_EFFORT}`` resolves the same everywhere, rather than
-rendering literally on the ``task_agent`` path (which previously ran
-``_render_template`` alone).
+across every invocation context.  Interactive load and ``task_agent``
+sub-agents both route through ``ChatSession._render_skill_body`` — so a
+skill reading ``$ARGUMENTS`` or ``${TURNSTONE_EFFORT}`` resolves the same
+everywhere, rather than rendering literally on the ``task_agent`` path
+(which previously ran ``_render_template`` alone).
 
 Also covers the two behaviours the unified path newly guarantees:
 
@@ -35,7 +34,6 @@ def _create_skill(db: Any, skill_id: str, name: str, content: str, **kw: Any) ->
         category=kw.get("category", "general"),
         content=content,
         variables="[]",
-        is_default=kw.get("is_default", False),
         org_id="",
         created_by="test",
         origin="manual",
@@ -46,10 +44,8 @@ def _create_skill(db: Any, skill_id: str, name: str, content: str, **kw: Any) ->
         source_url="",
         version="1.0.0",
         author="",
-        activation=kw.get("activation", "named"),
         token_estimate=0,
         auto_approve=False,
-        token_budget=0,
         notify_on_complete="{}",
         enabled=True,
         allowed_tools="[]",
@@ -61,8 +57,8 @@ class TestRenderSkillBodySharedPath:
     """``_render_skill_body`` is the single substitution path — the one
     ``task_agent`` now calls.  With ``substitute_args=True`` (arg-capable
     invocations: interactive /skill, skills(load)) the spec arg forms
-    resolve; with ``substitute_args=False`` (capability contexts: defaults,
-    task_agent) literal ``$N``/``$ARGUMENTS`` are left untouched.  Env vars
+    resolve; with ``substitute_args=False`` (the task_agent capability
+    context) literal ``$N``/``$ARGUMENTS`` are left untouched.  Env vars
     resolve either way."""
 
     def test_env_vars_resolve(self, tmp_db: str) -> None:
@@ -112,7 +108,7 @@ class TestRenderSkillBodySharedPath:
             session.close()
 
     def test_capability_context_preserves_literal_arg_tokens(self, tmp_db: str) -> None:
-        # Capability contexts (task_agent, defaults) never receive invocation
+        # The task_agent capability context never receives invocation
         # args, so substitute_args=False leaves literal $ARGUMENTS/$N/$name
         # untouched (they are prose/shell text) while env vars still resolve.
         # Pins the review fix that stopped blanking such tokens for sub-agents.
@@ -268,7 +264,7 @@ class TestSkillContextPlacement:
             session.close()
 
     def test_no_skill_no_context_message(self, tmp_db: str) -> None:
-        # No applied skill and no defaults → only the identity system message.
+        # No applied skill → only the identity system message.
         session = make_session()
         try:
             assert all(m["role"] == "system" for m in session.system_messages)

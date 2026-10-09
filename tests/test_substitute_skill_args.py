@@ -242,9 +242,9 @@ class TestIntegration:
 
 
 class TestSubstituteArgsToggle:
-    """``substitute_args=False`` (capability contexts: defaults, task_agent)
-    leaves every invocation-arg form LITERAL while still resolving env vars,
-    so literal ``$1`` / ``$ARGUMENTS`` prose or shell text isn't blanked."""
+    """``substitute_args=False`` (the ``task_agent`` capability context) leaves
+    every invocation-arg form LITERAL while still resolving env vars, so literal
+    ``$1`` / ``$ARGUMENTS`` prose or shell text isn't blanked."""
 
     def test_arg_forms_left_literal(self) -> None:
         out = _substitute_skill_args(
