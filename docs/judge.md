@@ -312,6 +312,11 @@ cancelled operation. A force-cancel successor's newly registered cycle carries
 a fresh operation witness and is not accidentally denied by the predecessor's
 late sweep.
 
+A task agent's gate moves the workstream state as the main loop's does. With
+several gates open, the workstream is in `attention` while any of them waits
+on a person, else in `evaluation` while any waits on the judge, and back in
+`running` once the last one closes.
+
 ---
 
 ## Storage and Audit

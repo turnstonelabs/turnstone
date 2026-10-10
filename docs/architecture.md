@@ -256,6 +256,14 @@ cycles alone. Late judge verdicts are matched by both call ID and
 judge-generation identity; stale verdicts remain audit-only and cannot
 smart-approve a reused call ID.
 
+Task-agent gates move the workstream state through `publish_gate_state` as
+the main loop's gate does, but as counted holds: each gate holds `evaluation`
+or `attention` while it waits, the workstream shows the strongest open hold
+(`attention` over `evaluation`), and it returns to `running` when the last one
+closes, so one card resolving never clears a sibling's. Holds belong to the
+tool batch running the task agents and exist only while it executes, and every
+change commits under the generation lock, fenced to the batch's generation.
+
 ### State Transitions
 
 The engine emits state changes via `_emit_state()` which calls
@@ -2404,11 +2412,12 @@ Main thread                  Background workstream thread
 ```
 
 When a background workstream reaches its approval gate (every main-loop tool
-batch), its `WorkstreamTerminalUI` publishes `attention` and calls
-`_fg_event.wait()`, which blocks the worker thread until the user switches
-to that workstream. The `_bg_attention_notify` callback writes a bell +
-status line to stderr to alert the user. A task agent's gated call is held
-the same way but publishes nothing, so it rings no bell.
+batch, and every task-agent call outside `TASK_AUTO_TOOLS` or with a
+private-network grant, whatever either needs once brought forward), its
+`WorkstreamTerminalUI` publishes `attention` and calls `_fg_event.wait()`,
+which blocks the worker thread until the user switches to that workstream.
+The `_bg_attention_notify` callback writes a bell + status line to stderr to
+alert the user.
 
 ### Cluster Console
 

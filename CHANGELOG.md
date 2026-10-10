@@ -767,6 +767,13 @@ frozen.
   workstream only when the batch waits on the judge (`evaluation`) or on a person (`attention`): an
   approval card, the CLI's prompt, or a background CLI workstream holding a batch until it is
   brought forward.
+- **A task agent waiting for approval shows the workstream as needing attention (#1338).** A task
+  agent's tool call waiting for a person left the workstream in `running`: the sidebar and the
+  conversation tabs stayed green, the dashboards and the CLI's workstream list showed it running,
+  and a background CLI workstream rang no bell. The workstream now enters `attention` while any
+  task agent's call waits for a person (`evaluation` while one waits on the judge in a Smart
+  Approvals wait), as it does for the main loop's calls, and goes back to `running` when the last
+  waiting call is resolved.
 - **Smart Approvals hands a batch to a person sooner (#1325).** The verdict wait ends as soon as
   one verdict rules the batch out (a `review` or `deny`, a judge error, or a confidence below the
   threshold), instead of waiting for every verdict, and a batch with a call the heuristic rules
