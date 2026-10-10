@@ -2740,9 +2740,9 @@ function createCoordinatorPane(root, wsId, opts) {
   // ------------------------------------------------------------------
 
   // Busy reflects whether the worker is mid-turn. SSE state_change
-  // events drive it (running/thinking/attention → busy; idle/error →
-  // idle) so a server-side transition the user didn't initiate
-  // (another tab, judge reset) still keeps the composer in sync.
+  // events drive it (idle/error → idle; every other state → busy) so a
+  // server-side transition the user didn't initiate (another tab, judge
+  // reset) still keeps the composer in sync.
   //
   // composer.setBusy runs unconditionally so the Stop button label /
   // dataset.forceCancel / placeholder stay canonical even on a
@@ -4304,11 +4304,10 @@ function createCoordinatorPane(root, wsId, opts) {
             // and nothing here re-arms the retry, keeping it bounded.
             refetchHistory();
           }
-        } else if (
-          ev.state === "running" ||
-          ev.state === "thinking" ||
-          ev.state === "attention"
-        ) {
+        } else {
+          // Every other state is a turn in flight (thinking, running, or
+          // waiting on the judge or a person): a new transient state needs
+          // no edit here.
           setBusy(true);
           // Fresh state snapshots may precede the first reasoning token and
           // carry no thinking_start event to recreate the waiting indicator.
@@ -4800,6 +4799,8 @@ function createCoordinatorPane(root, wsId, opts) {
         return { glyph: "\u25D0", cls: "ui-glyph ui-glyph-thinking" };
       case "attention":
         return { glyph: "\u26A0", cls: "ui-glyph ui-glyph-attention" };
+      case "evaluation":
+        return { glyph: "\u2696", cls: "ui-glyph ui-glyph-evaluation" };
       case "error":
         return { glyph: "\u2717", cls: "ui-glyph ui-glyph-error" };
       case "closed":
@@ -4846,6 +4847,13 @@ function createCoordinatorPane(root, wsId, opts) {
     const glyphSpan = document.createElement("span");
     glyphSpan.className = g.cls;
     glyphSpan.textContent = g.glyph;
+    // The glyph is decoration: the link's own label names the state in
+    // words (the meta line's ``state=`` text sits outside the link).
+    glyphSpan.setAttribute("aria-hidden", "true");
+    a.setAttribute(
+      "aria-label",
+      (child.name || child.ws_id || "?") + ", " + state,
+    );
     a.appendChild(glyphSpan);
     const nameSpan = document.createElement("span");
     nameSpan.className = "name";

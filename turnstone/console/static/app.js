@@ -96,6 +96,8 @@ const STATE_DISPLAY = {
   running: { symbol: "\u25b8", label: "run" },
   thinking: { symbol: "\u25cc", label: "think" },
   attention: { symbol: "\u25c6", label: "attn" },
+  // The intent judge holds the tool batch (a Smart Approvals wait).
+  evaluation: { symbol: "\u2696", label: "eval", aria: "judge evaluation" },
   idle: { symbol: "\u00b7", label: "idle" },
   error: { symbol: "\u2716", label: "err" },
 };
@@ -259,9 +261,14 @@ function scheduleRender() {
   });
 }
 
+// A zero count for every state the dashboard shows.
+function zeroStateCounts() {
+  return Object.fromEntries(Object.keys(STATE_DISPLAY).map((s) => [s, 0]));
+}
+
 function recomputeOverview() {
   if (!clusterState) return;
-  const states = { running: 0, thinking: 0, attention: 0, idle: 0, error: 0 };
+  const states = zeroStateCounts();
   let totalTokens = 0,
     totalToolCalls = 0,
     totalWs = 0;
@@ -318,7 +325,7 @@ function recomputeOverview() {
 }
 
 function buildNodeInfoFromSnapshot(node) {
-  const states = { running: 0, thinking: 0, attention: 0, idle: 0, error: 0 };
+  const states = zeroStateCounts();
   const ws = node.workstreams || [];
   ws.forEach(function (w) {
     const s = w.state || "idle";
@@ -334,11 +341,11 @@ function buildNodeInfoFromSnapshot(node) {
     node_id: node.node_id,
     server_url: node.server_url || "",
     ws_total: ws.length,
-    ws_running: states.running,
-    ws_thinking: states.thinking,
-    ws_attention: states.attention,
-    ws_idle: states.idle,
-    ws_error: states.error,
+    // ws_<state> for every state the dashboard shows (the collector's rows
+    // carry the same keys).
+    ...Object.fromEntries(
+      Object.keys(STATE_DISPLAY).map((s) => ["ws_" + s, states[s]]),
+    ),
     total_tokens: aggTokens,
     ws_tokens: aggTokens,
     max_ws: node.max_ws || 10,
@@ -373,11 +380,13 @@ function renderFromState() {
       running: 0,
       thinking: 1,
       attention: 2,
+      evaluation: 2,
       error: 3,
       idle: 4,
     };
+    // ``??``, not ``||``: running's rank is 0.
     allWs.sort(function (a, b) {
-      return (stateOrder[a.state] || 9) - (stateOrder[b.state] || 9);
+      return (stateOrder[a.state] ?? 9) - (stateOrder[b.state] ?? 9);
     });
     const total = allWs.length;
     const perPage = currentFilter.per_page || 50;
@@ -770,7 +779,8 @@ function _renderWsRow(ws, opts, container) {
   row.dataset.state = state;
   row.setAttribute("tabindex", "0");
   row.setAttribute("role", "button");
-  let ariaLabel = sd.label + ": " + (ws.name || ws.id || "unnamed");
+  let ariaLabel =
+    (sd.aria || sd.label) + ": " + (ws.name || ws.id || "unnamed");
   if (ws.model_alias || ws.model)
     ariaLabel += ", model: " + (ws.model_alias || ws.model);
   if (ws.node) ariaLabel += " on " + ws.node;

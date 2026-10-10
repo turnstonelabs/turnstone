@@ -1914,19 +1914,37 @@ def test_concurrent_writer_and_register_with_snapshot_no_loss_no_dup() -> None:
 # ---------------------------------------------------------------------------
 
 
+class _ObservedVerdictCondition(threading.Condition):
+    """Expose the instant a Smart Approval gate enters its real wait."""
+
+    def __init__(self, lock: threading.Lock, waiting: threading.Event) -> None:
+        super().__init__(lock)
+        self._waiting = waiting
+
+    def wait(self, timeout: float | None = None) -> bool:
+        self._waiting.set()
+        return super().wait(timeout)
+
+
 class _SeedingUI(_ConcreteUI):
-    """Re-delivers seeded LLM verdicts right after the per-round purge
-    evicts the entering batch's ids — simulates the async judge daemon
-    delivering them via ``on_intent_verdict`` during the Smart Approvals
-    wait, which is the only point at which they can land and survive
-    the purge.  ``seed_judge_event`` optionally tags the deliveries with
-    a generation, for window tests that need a STALE-generation arrival
-    between the purge and the cycle registration."""
+    """Delivers ``seed_verdicts`` through ``on_intent_verdict`` at one of two
+    points.  By default, right after the per-round purge evicts the entering
+    batch's ids: the judge answered before the Smart wait starts, or, with
+    ``seed_judge_event`` naming another generation, a STALE arrival in the
+    purge-to-registration window.  With ``seed_during_wait``, from a separate
+    thread once the gate is parked in the wait, so the verdict must wake it."""
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self.seed_verdicts: list[dict[str, Any]] = []
         self.seed_judge_event: threading.Event | None = None
+        self.seed_during_wait = False
+        self._parked = threading.Event()
+        self._verdict_cond = _ObservedVerdictCondition(self._ws_lock, self._parked)
+
+    def _deliver_seeds(self) -> None:
+        for verdict in self.seed_verdicts:
+            self.on_intent_verdict(dict(verdict), judge_event=self.seed_judge_event)
 
     def _purge_round_verdicts(
         self,
@@ -1934,8 +1952,47 @@ class _SeedingUI(_ConcreteUI):
         keep_origin: threading.Event | None = None,
     ) -> None:
         super()._purge_round_verdicts(call_ids, keep_origin=keep_origin)
-        for verdict in self.seed_verdicts:
-            self.on_intent_verdict(dict(verdict), judge_event=self.seed_judge_event)
+        if not self.seed_during_wait:
+            self._deliver_seeds()
+
+    def _await_llm_verdicts(
+        self,
+        needed: set[str],
+        budget_seconds: float,
+        *,
+        stop: Callable[[], bool] | None = None,
+        before_wait: Callable[[], None] | None = None,
+        delivered: Callable[[], bool] | None = None,
+    ) -> None:
+        if not self.seed_during_wait:
+            super()._await_llm_verdicts(
+                needed, budget_seconds, stop=stop, before_wait=before_wait, delivered=delivered
+            )
+            return
+        self._parked.clear()
+
+        def _deliver_once_parked() -> None:
+            if self._parked.wait(timeout=budget_seconds):
+                self._deliver_seeds()
+
+        judge = threading.Thread(target=_deliver_once_parked, name="seeding-judge")
+
+        def _publish_then_seed() -> None:
+            if before_wait is not None:
+                before_wait()
+            judge.start()
+
+        try:
+            super()._await_llm_verdicts(
+                needed,
+                budget_seconds,
+                stop=stop,
+                before_wait=_publish_then_seed,
+                delivered=delivered,
+            )
+        finally:
+            if judge.is_alive():
+                judge.join()
 
 
 def _patch_policies(verdicts: dict[str, str]):  # type: ignore[no-untyped-def]
@@ -2308,13 +2365,301 @@ def test_await_llm_verdicts_returns_when_verdict_delivered() -> None:
             ui.on_intent_verdict(_llm_verdict("c1"))
 
     timer = threading.Timer(0.02, _deliver)
+    started = time.monotonic()
     timer.start()
     try:
         # Generous budget; should return on the notify, not the timeout.
         ui._await_llm_verdicts({"c1"}, 5.0)
     finally:
         timer.cancel()
+        timer.join()
     assert "c1" in ui._llm_verdicts
+    assert time.monotonic() - started < 1.0
+
+
+# ---------------------------------------------------------------------------
+# Where the gate moves the workstream: ``evaluation`` and ``attention``
+# ---------------------------------------------------------------------------
+
+
+def _smart_seeding_ui(*, smart: bool = True, seed_during_wait: bool = False) -> _SeedingUI:
+    ui = _SeedingUI(ws_id="ws-1", user_id="u1")
+    ui.seed_during_wait = seed_during_wait
+    ui.smart_approvals_enabled = smart
+    ui.smart_approval_threshold = 0.95
+    ui.smart_approval_wait_seconds = 1.0
+    return ui
+
+
+def _stamp_publisher(ui: SessionUIBase, items: list[dict[str, Any]]) -> list[tuple[str, bool]]:
+    """Stamp a recording ``_publish_gate_state`` the way the session does.
+
+    Each publication records the state and whether a card for a person
+    already existed at that moment."""
+    published: list[tuple[str, bool]] = []
+
+    def _publish(state: str) -> None:
+        published.append((state, ui._pending_approval is not None))
+
+    for item in items:
+        item["_publish_gate_state"] = _publish
+    return published
+
+
+def _run_gate(  # type: ignore[no-untyped-def]
+    ui: SessionUIBase,
+    items: list[dict[str, Any]],
+    policies: dict[str, str],
+    *,
+    deadline: float = 3.0,
+):
+    """Drive ``approve_tools``; a person approves if a card appears within *deadline*."""
+    timer = resolve_when_pending(ui, True, "ok", deadline=deadline)
+    timer.start()
+    try:
+        with _patch_get_storage(MagicMock()), _patch_policies(policies):
+            return ui.approve_tools(items)
+    finally:
+        timer.cancel()
+
+
+def test_judge_wait_publishes_evaluation_then_attention_before_the_card() -> None:
+    """Under Smart Approvals the workstream waits on the judge first; when a
+    person is needed it moves to ``attention`` before the card goes out."""
+    ui = _smart_seeding_ui(seed_during_wait=True)
+    item = _pending_item("c1")
+    published = _stamp_publisher(ui, [item])
+    ui.seed_verdicts = [_llm_verdict("c1", recommendation="review")]
+
+    approved, _feedback = _run_gate(ui, [item], {})
+
+    assert approved is True
+    assert published == [("evaluation", False), ("attention", False)]
+
+
+def test_smart_auto_approval_publishes_only_evaluation() -> None:
+    """An approved batch never needed a person: ``evaluation``, then the
+    ``running`` the session emits after the gate."""
+    ui = _smart_seeding_ui(seed_during_wait=True)
+    ui.smart_approval_wait_seconds = 5.0
+    item = _pending_item("c1")
+    published = _stamp_publisher(ui, [item])
+    ui.seed_verdicts = [_llm_verdict("c1", recommendation="approve", confidence=0.99)]
+
+    started = time.monotonic()
+    approved, _feedback = _run_gate(ui, [item], {})
+
+    assert approved is True
+    assert time.monotonic() - started < 2.5  # the verdict woke the wait
+    assert item["auto_approve_reason"] == "smart_approval"
+    assert published == [("evaluation", False)]
+
+
+def test_without_smart_approvals_the_gate_goes_straight_to_attention() -> None:
+    ui = _smart_seeding_ui(smart=False)
+    item = _pending_item("c1")
+    published = _stamp_publisher(ui, [item])
+
+    approved, _feedback = _run_gate(ui, [item], {})
+
+    assert approved is True
+    assert published == [("attention", False)]
+
+
+def test_batch_the_judge_cannot_clear_alone_goes_straight_to_attention() -> None:
+    """An unjudged sibling makes the batch ineligible for Smart Approvals:
+    no wait, so no ``evaluation``."""
+    ui = _smart_seeding_ui()
+    judged, unjudged = _pending_item("c1"), _pending_item("c2")
+    del unjudged["_heuristic_verdict"]
+    published = _stamp_publisher(ui, [judged, unjudged])
+
+    approved, _feedback = _run_gate(ui, [judged, unjudged], {})
+
+    assert approved is True
+    assert published == [("attention", False)]
+
+
+@pytest.mark.parametrize(
+    "settled_by",
+    ["policy_allow", "policy_deny", "always_grant", "configured_auto_approve", "blanket"],
+)
+def test_batches_settled_without_anyone_stay_running(settled_by: str) -> None:
+    """Policies, "Always" grants, configured auto-approve and blanket
+    auto-approve decide before anyone could: the gate publishes no state, so
+    no flash and no "Approval required" announcement."""
+    ui = _smart_seeding_ui()
+    item = _pending_item("c1")
+    published = _stamp_publisher(ui, [item])
+    policies: dict[str, str] = {}
+    if settled_by == "policy_allow":
+        policies = {"bash": "allow"}
+    elif settled_by == "policy_deny":
+        policies = {"bash": "deny"}
+    elif settled_by == "always_grant":
+        ui._always_approve_tools_by_principal[""] = {"bash"}
+    elif settled_by == "configured_auto_approve":
+        ui.auto_approve_tools = {"bash"}
+    else:
+        ui.auto_approve = True
+
+    approved, _feedback = _run_gate(ui, [item], policies)
+
+    assert approved is (settled_by != "policy_deny")
+    assert published == []
+    assert ui._approval_cycles == {}
+
+
+@pytest.mark.parametrize("flag", ["deny", "critical"])
+def test_heuristic_danger_skips_the_judge_wait(flag: str) -> None:
+    """A call the pattern rules flag deny/critical can never be cleared by the
+    LLM: no wait, no ``evaluation``, straight to ``attention`` and the card."""
+    ui = _smart_seeding_ui()
+    item = _pending_item("c1")
+    if flag == "deny":
+        item["_heuristic_verdict"]["recommendation"] = "deny"
+    else:
+        item["_heuristic_verdict"]["risk_level"] = "critical"
+    published = _stamp_publisher(ui, [item])
+    waited: list[bool] = []
+    ui._await_llm_verdicts = lambda *_a, **_kw: waited.append(True)  # type: ignore[method-assign]
+
+    approved, _feedback = _run_gate(ui, [item], {})
+
+    assert approved is True  # the person approved
+    assert waited == []
+    assert published == [("attention", False)]
+
+
+def test_the_wait_ends_at_the_first_verdict_that_rules_the_batch_out() -> None:
+    """One ``review`` verdict already sends the batch to a person: the gate
+    stops waiting for the sibling's verdict instead of sitting in
+    ``evaluation`` until the budget runs out."""
+    ui = _smart_seeding_ui(seed_during_wait=True)
+    ui.smart_approval_wait_seconds = 5.0
+    first, second = _pending_item("c1"), _pending_item("c2")
+    published = _stamp_publisher(ui, [first, second])
+    ui.seed_verdicts = [_llm_verdict("c1", recommendation="review")]  # c2 never arrives
+
+    started = time.monotonic()
+    # The person outlasts the 5 s wait, so a missing early stop fails the
+    # timing below instead of parking the gate on its hour-long human wait.
+    approved, _feedback = _run_gate(ui, [first, second], {}, deadline=10.0)
+
+    assert approved is True
+    assert time.monotonic() - started < 2.5  # well inside the 5 s wait
+    assert published == [("evaluation", False), ("attention", False)]
+
+
+@pytest.mark.parametrize("outcome", ["already_approved", "already_ruled_out"])
+def test_a_batch_already_decided_never_enters_evaluation(outcome: str) -> None:
+    """Verdicts that are in before the wait starts (a fast or failing judge)
+    leave nothing to wait for: no ``evaluation`` flash, straight to the
+    outcome."""
+    ui = _smart_seeding_ui()  # verdicts land right after the purge, pre-wait
+    ui.smart_approval_wait_seconds = 5.0
+    if outcome == "already_approved":
+        items = [_pending_item("c1")]
+        ui.seed_verdicts = [_llm_verdict("c1", recommendation="approve", confidence=0.99)]
+    else:
+        items = [_pending_item("c1"), _pending_item("c2")]  # c2 never arrives
+        ui.seed_verdicts = [_llm_verdict("c1", recommendation="review")]
+    published = _stamp_publisher(ui, items)
+
+    started = time.monotonic()
+    approved, _feedback = _run_gate(ui, items, {}, deadline=10.0)
+
+    assert approved is True
+    assert time.monotonic() - started < 2.5
+    if outcome == "already_approved":
+        assert published == []
+        assert items[0]["auto_approve_reason"] == "smart_approval"
+    else:
+        assert published == [("attention", False)]
+
+
+@pytest.mark.parametrize("call_ids", [("c1",), ("c1", "c2")])
+def test_a_stale_generation_verdict_does_not_end_the_wait(call_ids: tuple[str, ...]) -> None:
+    """A verdict left by an earlier judge generation (a provider reusing
+    call_ids) is not this batch's: it must neither stop the wait early nor
+    count as delivered, since this generation's verdict for that call could
+    still approve.  (No verdict of this generation ever arrives, so only a
+    stale verdict could end the wait before the budget.)"""
+    ui = _smart_seeding_ui()
+    ui.smart_approval_wait_seconds = 0.3
+    generation = threading.Event()
+    items = [_pending_item(cid) for cid in call_ids]
+    for item in items:
+        item["_judge_event"] = generation
+    ui.seed_judge_event = threading.Event()  # an earlier generation
+    ui.seed_verdicts = [_llm_verdict("c1", recommendation="review")]
+    published = _stamp_publisher(ui, items)
+
+    started = time.monotonic()
+    approved, _feedback = _run_gate(ui, items, {})
+
+    assert approved is True
+    assert time.monotonic() - started >= 0.3  # waited the full budget
+    assert published == [("evaluation", False), ("attention", False)]
+
+
+def test_this_generation_s_verdict_replaces_a_stale_one_and_approves() -> None:
+    """A stale verdict for a reused call_id holds the wait open; this
+    generation's verdict then lands, replaces it, and approves the batch with
+    no person."""
+    ui = _smart_seeding_ui()
+    ui.smart_approval_wait_seconds = 5.0
+    generation = threading.Event()
+    item = _pending_item("c1")
+    item["_judge_event"] = generation
+    ui.seed_judge_event = threading.Event()  # an earlier generation, pre-wait
+    ui.seed_verdicts = [_llm_verdict("c1", recommendation="review")]
+    published = _stamp_publisher(ui, [item])
+
+    def _own_verdict_once_parked() -> None:
+        if ui._parked.wait(timeout=5.0):
+            ui.on_intent_verdict(
+                _llm_verdict("c1", recommendation="approve", confidence=0.99),
+                judge_event=generation,
+            )
+
+    judge = threading.Thread(target=_own_verdict_once_parked, name="own-judge")
+    judge.start()
+    started = time.monotonic()
+    try:
+        approved, _feedback = _run_gate(ui, [item], {})
+    finally:
+        judge.join()
+
+    assert approved is True
+    assert time.monotonic() - started < 2.5
+    assert item["auto_approve_reason"] == "smart_approval"
+    assert published == [("evaluation", False)]
+
+
+def test_refused_state_publication_stops_the_gate() -> None:
+    """The session's publisher raises when the batch's generation moved on:
+    the gate stops there, before the judge wait blocks and with no card."""
+    from turnstone.core.session import GenerationCancelled
+
+    ui = _smart_seeding_ui()
+    ui.smart_approval_wait_seconds = 5.0
+    item = _pending_item("c1")  # no verdict ever arrives: the wait would block
+
+    def _refuse(_state: str) -> None:
+        raise GenerationCancelled()
+
+    item["_publish_gate_state"] = _refuse
+    started = time.monotonic()
+    with (
+        _patch_get_storage(MagicMock()),
+        _patch_policies({}),
+        pytest.raises(GenerationCancelled),
+    ):
+        ui.approve_tools([item])
+
+    assert time.monotonic() - started < 2.5  # it never parked in the wait
+    assert ui._approval_cycles == {}
 
 
 def test_smart_approval_respects_heuristic_deny_floor() -> None:
@@ -3276,18 +3621,6 @@ class _TestApprovalCancelWitness:
     @property
     def aborted(self) -> bool:
         return self.event.is_set()
-
-
-class _ObservedVerdictCondition(threading.Condition):
-    """Expose the instant a Smart Approval gate enters its real wait."""
-
-    def __init__(self, lock: threading.Lock, waiting: threading.Event) -> None:
-        super().__init__(lock)
-        self._waiting = waiting
-
-    def wait(self, timeout: float | None = None) -> bool:
-        self._waiting.set()
-        return super().wait(timeout)
 
 
 class _ApprovalSurfaceProbeUI(_ConcreteUI):

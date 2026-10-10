@@ -103,6 +103,7 @@
                 "running",
                 "thinking",
                 "attention",
+                "evaluation",
                 "idle",
                 "error"
               ]
@@ -8847,6 +8848,7 @@
               "running": 0,
               "thinking": 0,
               "attention": 0,
+              "evaluation": 0,
               "idle": 0,
               "error": 0
             }
@@ -8906,6 +8908,11 @@
           "attention": {
             "default": 0,
             "title": "Attention",
+            "type": "integer"
+          },
+          "evaluation": {
+            "default": 0,
+            "title": "Evaluation",
             "type": "integer"
           },
           "idle": {
@@ -8972,6 +8979,11 @@
           "ws_attention": {
             "default": 0,
             "title": "Ws Attention",
+            "type": "integer"
+          },
+          "ws_evaluation": {
+            "default": 0,
+            "title": "Ws Evaluation",
             "type": "integer"
           },
           "ws_idle": {

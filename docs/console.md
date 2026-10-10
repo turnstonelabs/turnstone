@@ -70,7 +70,7 @@ Cluster-wide state counts and aggregate metrics.
 {
   "nodes": 847,
   "workstreams": 4219,
-  "states": {"running": 1847, "thinking": 312, "attention": 89, "idle": 1940, "error": 31},
+  "states": {"running": 1847, "thinking": 312, "attention": 89, "evaluation": 4, "idle": 1940, "error": 31},
   "aggregate": {"total_tokens": 12400000, "total_tool_calls": 34200},
   "version_drift": true,
   "versions": ["0.3.0", "0.3.1"]
@@ -81,7 +81,7 @@ Cluster-wide state counts and aggregate metrics.
 
 ### `GET /v1/api/cluster/nodes?sort=activity&limit=100&offset=0`
 
-Paginated node list. Sort options: `activity` (default, by running+attention count), `tokens`, `name`.
+Paginated node list. Sort options: `activity` (default, by running+attention+evaluation count), `tokens`, `name`.
 
 ```json
 {
@@ -89,7 +89,7 @@ Paginated node list. Sort options: `activity` (default, by running+attention cou
     {
       "node_id": "db-west-04",
       "server_url": "http://10.0.3.4:8080",
-      "ws_total": 6, "ws_running": 4, "ws_thinking": 0, "ws_attention": 1, "ws_idle": 1, "ws_error": 0,
+      "ws_total": 6, "ws_running": 4, "ws_thinking": 0, "ws_attention": 1, "ws_evaluation": 0, "ws_idle": 1, "ws_error": 0,
       "total_tokens": 48200,
       "started": 1709294400.0,
       "reachable": true,
@@ -155,7 +155,7 @@ Full cluster state in a single response — all nodes with their workstreams plu
   "overview": {
     "nodes": 847,
     "workstreams": 4219,
-    "states": {"running": 1847, "thinking": 312, "attention": 89, "idle": 1940, "error": 31},
+    "states": {"running": 1847, "thinking": 312, "attention": 89, "evaluation": 4, "idle": 1940, "error": 31},
     "aggregate": {"total_tokens": 12400000, "total_tool_calls": 34200},
     "version_drift": false,
     "versions": ["0.3.0"]

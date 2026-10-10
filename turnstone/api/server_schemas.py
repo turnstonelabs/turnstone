@@ -762,6 +762,7 @@ class WorkstreamCounts(BaseModel):
     thinking: int = 0
     running: int = 0
     attention: int = 0
+    evaluation: int = 0
     error: int = 0
 
 

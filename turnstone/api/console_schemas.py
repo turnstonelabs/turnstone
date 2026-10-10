@@ -28,6 +28,7 @@ class StateCounts(BaseModel):
     running: int = 0
     thinking: int = 0
     attention: int = 0
+    evaluation: int = 0
     idle: int = 0
     error: int = 0
 
@@ -58,6 +59,7 @@ class ClusterNodeInfo(BaseModel):
     ws_running: int = 0
     ws_thinking: int = 0
     ws_attention: int = 0
+    ws_evaluation: int = 0
     ws_idle: int = 0
     ws_error: int = 0
     total_tokens: int = 0

@@ -26,6 +26,7 @@ from turnstone.core.session_manager import (
     CloseOutcome,
     SessionManager,
 )
+from turnstone.core.session_ui_base import publish_gate_state
 from turnstone.core.workstream import (
     Workstream,
     WorkstreamKind,
@@ -218,13 +219,35 @@ class TerminalUI(SessionUI):
                     it["needs_approval"] = False
             pending = [it for it in items if it.get("needs_approval") and not it.get("error")]
 
-        # Policy lookup is the one potentially blocking step before the prompt.
-        # Recheck ownership so a close that landed during storage I/O cannot
-        # paint or solicit approval for a retired tool batch.
+        # Policy lookup can block before the prompt.  Recheck ownership so a
+        # close that landed during storage I/O cannot paint or solicit approval
+        # for a retired tool batch.
         if self._approval_was_cancelled(items):
             return False, "Cancelled by user"
 
+        def _settled() -> bool:
+            """No call here waits on a person: none needs approval, or blanket
+            or per-tool auto-approve covers every one."""
+            if not pending or self.auto_approve:
+                return True
+            pending_names = {
+                it.get("approval_label", "") or it.get("func_name", "")
+                for it in pending
+                if it.get("func_name")
+            }
+            return bool(pending_names) and pending_names.issubset(self.auto_approve_tools)
+
+        # The prompt below waits on a person, so the workstream says so first.
+        # Outside the print lock: the publish takes the session's generation
+        # and state locks.
+        if not _settled():
+            publish_gate_state(items, "attention")
+
         with self._print_lock:
+            # The publish above (storage I/O) and the wait for this lock can
+            # block too: recheck before painting the batch.
+            if self._approval_was_cancelled(items):
+                return False, "Cancelled by user"
             # Print all headers, previews, and heuristic verdicts
             for item in items:
                 header = item.get("header") or item.get("func_name", "")
@@ -250,18 +273,10 @@ class TerminalUI(SessionUI):
                         sys.stdout.write(f"  Intent: {summary}\n")
             sys.stdout.flush()
 
-            if not pending or self.auto_approve:
+            # Rechecked: a concurrent prompt's "always" may have covered this
+            # batch since.
+            if _settled():
                 return True, None
-
-            # Per-tool auto-approve check
-            if self.auto_approve_tools:
-                pending_names = {
-                    it.get("approval_label", "") or it.get("func_name", "")
-                    for it in pending
-                    if it.get("func_name")
-                }
-                if pending_names and pending_names.issubset(self.auto_approve_tools):
-                    return True, None
 
             # Prompt
             try:
@@ -435,14 +450,24 @@ class TerminalUI(SessionUI):
 # ─── WorkstreamTerminalUI ─────────────────────────────────────────────────
 
 
-# State display config: (symbol, color_fn, label)
+# State display config: (symbol, color_fn, label), in the order the
+# cluster overview lists the states.
 _STATE_DISPLAY: dict[WorkstreamState, tuple[str, Callable[[str], str], str]] = {
-    WorkstreamState.IDLE: ("·", dim, "idle"),
-    WorkstreamState.THINKING: ("◌", cyan, "thinking"),
     WorkstreamState.RUNNING: ("▸", green, "running"),
+    WorkstreamState.THINKING: ("◌", cyan, "thinking"),
     WorkstreamState.ATTENTION: ("◆", yellow, "attention"),
+    WorkstreamState.EVALUATION: ("⚖", cyan, "evaluation"),
+    WorkstreamState.IDLE: ("·", dim, "idle"),
     WorkstreamState.ERROR: ("✖", red, "error"),
 }
+
+
+def _state_from_wire(value: str) -> WorkstreamState:
+    """A workstream state from a wire string; ``closed`` and unknown values read as idle."""
+    try:
+        return WorkstreamState(value)
+    except ValueError:
+        return WorkstreamState.IDLE
 
 
 class WorkstreamTerminalUI(TerminalUI):
@@ -578,6 +603,9 @@ class WorkstreamTerminalUI(TerminalUI):
     def approve_tools(self, items: list[dict[str, Any]]) -> tuple[bool, str | None]:
         """Block until foregrounded if in background, then show approval prompt."""
         if not self.is_foreground:
+            # Every background batch waits here for a person to bring the
+            # workstream forward, whatever it needs once it is.
+            publish_gate_state(items, "attention")
             tool_names = ", ".join(
                 it.get("approval_label", it.get("func_name", "?"))
                 for it in items
@@ -794,18 +822,8 @@ def _handle_cluster_command(cmd_line: str, console_url: str | None) -> None:
                 f"Workstreams: {cyan(str(data.get('workstreams', 0)))}"
             )
             print()
-            for state_name in ["running", "thinking", "attention", "idle", "error"]:
-                count = states.get(state_name, 0)
-                sym, color_fn, label = _STATE_DISPLAY.get(
-                    {
-                        "running": WorkstreamState.RUNNING,
-                        "thinking": WorkstreamState.THINKING,
-                        "attention": WorkstreamState.ATTENTION,
-                        "idle": WorkstreamState.IDLE,
-                        "error": WorkstreamState.ERROR,
-                    }[state_name],
-                    ("?", dim, state_name),
-                )
+            for ws_state, (sym, color_fn, label) in _STATE_DISPLAY.items():
+                count = states.get(ws_state.value, 0)
                 print(f"    {color_fn(f'{sym} {label}')}: {count}")
             print()
             tokens = agg.get("total_tokens", 0)
@@ -830,19 +848,28 @@ def _handle_cluster_command(cmd_line: str, console_url: str | None) -> None:
             # Column widths
             max_name = max(len(n["node_id"]) for n in nodes)
             print(
-                f"\n  {'NODE'.ljust(max_name)}  {'WS':>4}  {'RUN':>4}  {'ATTN':>4}  {'TOKENS':>8}"
+                f"\n  {'NODE'.ljust(max_name)}  {'WS':>4}  {'RUN':>4}  {'ATTN':>4}  {'EVAL':>4}"
+                f"  {'TOKENS':>8}"
             )
-            print(f"  {'-' * max_name}  {'----':>4}  {'----':>4}  {'----':>4}  {'--------':>8}")
+            print(
+                f"  {'-' * max_name}  {'----':>4}  {'----':>4}  {'----':>4}  {'----':>4}"
+                f"  {'--------':>8}"
+            )
             for n in nodes:
                 name = n["node_id"].ljust(max_name)
                 ws = str(n.get("ws_total", 0))
                 run = n.get("ws_running", 0)
                 attn = n.get("ws_attention", 0)
+                evaluation = n.get("ws_evaluation", 0)
                 tok = n.get("total_tokens", 0)
                 tok_str = f"{tok / 1000:.1f}k" if tok >= 1000 else str(tok)
                 run_str = green(str(run)) if run else dim("0")
                 attn_str = yellow(str(attn)) if attn else dim("0")
-                print(f"  {cyan(name)}  {ws:>4}  {run_str:>4}  {attn_str:>4}  {dim(tok_str):>8}")
+                eval_str = cyan(str(evaluation)) if evaluation else dim("0")
+                print(
+                    f"  {cyan(name)}  {ws:>4}  {run_str:>4}  {attn_str:>4}  {eval_str:>4}"
+                    f"  {dim(tok_str):>8}"
+                )
             if total > len(nodes):
                 print(dim(f"\n  Showing {len(nodes)} of {total} nodes"))
             print()
@@ -874,14 +901,7 @@ def _handle_cluster_command(cmd_line: str, console_url: str | None) -> None:
                 f"\n  {'STATE':<8}  {'NAME'.ljust(max_name)}  {'NODE'.ljust(max_node)}  {'TOKENS':>8}  {'CTX':>4}"
             )
             for w in ws_list:
-                state = w.get("state", "idle")
-                ws_state = {
-                    "running": WorkstreamState.RUNNING,
-                    "thinking": WorkstreamState.THINKING,
-                    "attention": WorkstreamState.ATTENTION,
-                    "idle": WorkstreamState.IDLE,
-                    "error": WorkstreamState.ERROR,
-                }.get(state, WorkstreamState.IDLE)
+                ws_state = _state_from_wire(w.get("state", "idle"))
                 sym, color_fn, label = _STATE_DISPLAY[ws_state]
                 name = w.get("name", "")[:20].ljust(max_name)
                 node = w.get("node", "")[:16].ljust(max_node)
@@ -914,14 +934,7 @@ def _handle_cluster_command(cmd_line: str, console_url: str | None) -> None:
                 print(dim("  No workstreams."))
                 return
             for w in ws_list:
-                state = w.get("state", "idle")
-                ws_state = {
-                    "running": WorkstreamState.RUNNING,
-                    "thinking": WorkstreamState.THINKING,
-                    "attention": WorkstreamState.ATTENTION,
-                    "idle": WorkstreamState.IDLE,
-                    "error": WorkstreamState.ERROR,
-                }.get(state, WorkstreamState.IDLE)
+                ws_state = _state_from_wire(w.get("state", "idle"))
                 sym, color_fn, _ = _STATE_DISPLAY[ws_state]
                 name = w.get("name", "")
                 title = w.get("title", "")

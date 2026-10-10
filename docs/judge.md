@@ -78,8 +78,22 @@ wakes a batch still waiting for verdicts and is linearized against the final
 auto-approval commit: if Stop wins, no `smart_approval` decision or audit row
 is recorded for tools that did not cross the gate.
 
-The verdict wait is capped by the snapshot's `judge.timeout`; the judge may
-continue evaluating advisory verdicts after that gate falls back to a human.
+The verdict wait is capped by the snapshot's `judge.timeout`, and it ends as
+soon as one verdict rules the batch out: the batch then needs a person whatever
+the other verdicts say. A batch with a call the heuristic rules flagged `deny`
+or `critical` skips the wait, since no verdict can clear it. The judge may
+continue evaluating advisory verdicts after the gate falls back to a human;
+they appear on the approval card as they land.
+
+While the wait runs, the workstream is in the `evaluation` state, shown as ⚖
+in the judge colour on the dashboards, the sidebar and a coordinator's child
+tree: the judge may still approve the batch with no person. It moves to
+`attention` when a card is published for a person (a verdict ruled the batch
+out, or the wait timed out), and to `running` when the batch is approved. A
+batch its verdicts have already decided when the gate reaches the wait (a fast
+or failing judge) never enters `evaluation`; it goes straight to its outcome.
+With Smart Approvals off, the judge's verdict is advice and the workstream
+goes straight to `attention`.
 
 Requires the judge to be enabled. Auto-approved calls are tagged
 `smart_approval` in the dashboard and audit trail. Smart Approvals applies to

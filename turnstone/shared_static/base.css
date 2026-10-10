@@ -412,6 +412,11 @@ body {
 .dash-row[data-state="attention"] {
   border-left-color: var(--yellow);
 }
+/* Evaluation: the intent judge holds the tool batch (Smart Approvals wait).
+   The judge hue, never the running green. */
+.dash-row[data-state="evaluation"] {
+  border-left-color: var(--think);
+}
 .dash-row[data-state="idle"] {
   border-left-color: var(--fg-dim);
   opacity: 0.6;
@@ -472,6 +477,13 @@ body {
   animation: pulse 1.8s infinite;
   will-change: opacity;
 }
+/* Same diamond as attention (the workstream is blocked), in the judge hue
+   and without the pulse: nothing is asked of a person yet. */
+.dash-state-dot[data-state="evaluation"] {
+  background: var(--think);
+  border-radius: 1px;
+  transform: rotate(45deg);
+}
 .dash-state-dot[data-state="idle"] {
   background: var(--fg-dim);
   opacity: 0.4;
@@ -504,6 +516,9 @@ body {
 }
 .dash-state-label[data-state="attention"] {
   color: var(--yellow);
+}
+.dash-state-label[data-state="evaluation"] {
+  color: var(--think);
 }
 .dash-state-label[data-state="idle"] {
   color: var(--fg-dim);

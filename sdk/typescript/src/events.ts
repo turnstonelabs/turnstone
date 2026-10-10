@@ -113,7 +113,7 @@ export interface AgentContextEvent {
 
 export interface StateChangeEvent {
   type: "state_change";
-  state: "idle" | "thinking" | "running" | "attention" | "error";
+  state: "idle" | "thinking" | "running" | "attention" | "evaluation" | "error";
 }
 
 export interface ToolInfoEvent {

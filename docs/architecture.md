@@ -211,9 +211,14 @@ Phase 1: PREPARE (serial)
       -> return item dict with: header, preview, needs_approval, execute fn
 
 Phase 2: APPROVE (blocking per batch; reentrant across agents)
-  _emit_state("attention")
   ui.approve_tools(items)
-    -> apply policy, explicit auto-approval, and Smart Approvals
+    -> apply policy and explicit auto-approval (the state stays "running"
+       for what they settle)
+    -> every gate, through publish_gate_state (the session's fenced
+       publisher): "evaluation" before a Smart Approvals wait, "attention"
+       where it waits on a person (a card, the CLI's prompt, or a
+       background CLI workstream's hold)
+    -> Smart Approvals wait
     -> register one ApprovalCycle with its own cycle_id/event/result
     -> publish one complete approve_request card
     -> resolve by cycle_id/call_id (legacy clients select the oldest cycle)
@@ -268,7 +273,8 @@ The engine emits state changes via `_emit_state()` which calls
       |
       v
   "attention"  --->  waiting for user approval
-      |
+      |                (or "evaluation" first: waiting for the intent judge,
+      |                 which may approve the batch with no person)
       v
   "running"   --->  executing approved tools
       |
@@ -425,14 +431,15 @@ behind adapters.
 
 > See also: [Workstream States diagram](diagrams/png/09-workstream-states.png)
 
-Defined in `turnstone.core.workstream.WorkstreamState` (5 states):
+Defined in `turnstone.core.workstream.WorkstreamState`:
 
 ```
-IDLE       waiting for user input
-THINKING   LLM is streaming a response
-RUNNING    tools are executing
-ATTENTION  blocked on user approval or plan review
-ERROR      last operation failed
+IDLE        waiting for user input
+THINKING    LLM is streaming a response
+RUNNING     tools are executing
+ATTENTION   blocked on user approval or plan review
+EVALUATION  a Smart Approvals wait: the intent judge may still approve the batch
+ERROR       last operation failed
 ```
 
 ### Data Model
@@ -2374,10 +2381,12 @@ Main thread                  Background workstream thread
        +-- _fg_event.set() unblocks --->+
 ```
 
-When a background workstream needs approval, its `WorkstreamTerminalUI`
-calls `_fg_event.wait()`, which blocks the worker thread until the user
-switches to that workstream. The `_bg_attention_notify` callback writes a
-bell + status line to stderr to alert the user.
+When a background workstream reaches its approval gate (every main-loop tool
+batch), its `WorkstreamTerminalUI` publishes `attention` and calls
+`_fg_event.wait()`, which blocks the worker thread until the user switches
+to that workstream. The `_bg_attention_notify` callback writes a bell +
+status line to stderr to alert the user. A task agent's gated call is held
+the same way but publishes nothing, so it rings no bell.
 
 ### Cluster Console
 

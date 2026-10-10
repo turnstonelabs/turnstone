@@ -134,7 +134,7 @@ with a `type` field.  The recurring shapes a UI has to handle:
 | `tool_output_chunk` | Streaming tool output (e.g. long bash command)                                             | `call_id`, `chunk` |
 | `approve_request`   | One approval cycle needs operator action; several cycles may coexist                       | `cycle_id`, `items: [{call_id, header, preview, func_name, approval_label, needs_approval}]` |
 | `approval_resolved` | One identified approval cycle was answered                                                 | `cycle_id`, `call_ids`, `approved`, `feedback`, `always` |
-| `state_change`      | Worker-thread state transition (also re-emitted with the current state on every fresh subscribe so refresh-mid-stream restores composer mode) | `state` ∈ `running`, `thinking`, `attention`, `idle`, `error` |
+| `state_change`      | Worker-thread state transition (also re-emitted with the current state on every fresh subscribe so refresh-mid-stream restores composer mode) | `state` ∈ `running`, `thinking`, `attention`, `evaluation`, `idle`, `error` |
 | `in_progress_snapshot` | One-shot replay of the in-progress turn's content + reasoning when this client connects mid-stream                              | `content`, `reasoning` |
 | `status`            | Token usage + context-window snapshot (fires on every streaming tick)                      | `prompt_tokens`, `completion_tokens`, `total_tokens`, `context_window`, `pct`, `effort`, `cache_creation_tokens`, `cache_read_tokens` |
 | `rename`            | Session's display name changed                                                             | `name` |

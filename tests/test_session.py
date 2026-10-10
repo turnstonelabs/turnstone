@@ -2166,6 +2166,288 @@ class TestTaskExec:
         assert event.is_set()
 
 
+class TestGateStates:
+    """Every gate, the CLI's included, moves the workstream only when someone
+    must act: ``evaluation`` while the intent judge holds a Smart Approvals
+    batch, ``attention`` when a person must decide on it or, for a background
+    CLI workstream, bring it forward."""
+
+    def _drive(
+        self,
+        session: ChatSession,
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        needs_approval: bool = True,
+        smart_approvals: bool = False,
+        policies: Any = None,
+        configure: Any = None,
+        my_generation: int = 0,
+        emitted: list[str] | None = None,
+        ui: Any = None,
+    ) -> list[str]:
+        """Run one bash item through the real ``_execute_tools`` and gate.
+
+        Returns the states ``_emit_state`` saw (also appended to *emitted*,
+        which outlives a raise).  *policies* is the policy verdict map, or a
+        callable standing in for the policy read.  A person approves if a
+        card appears.  *ui* defaults to a shared-gate UI; a CLI UI runs its
+        own gate (patch ``input`` for its prompt)."""
+        from unittest.mock import PropertyMock
+
+        from tests.conftest import resolve_when_pending
+        from tests.test_session_ui_base import _ConcreteUI
+        from turnstone.core.judge import JudgeConfig
+
+        if ui is None:
+            ui = _ConcreteUI(ws_id="ws-1", user_id="u1")
+        if configure is not None:
+            configure(ui)
+        session.ui = ui  # type: ignore[assignment]
+        if emitted is None:
+            emitted = []
+        monkeypatch.setattr(session, "_emit_state", lambda state, **_kw: emitted.append(state))
+        read_policies = (
+            policies if callable(policies) else lambda _storage, _names: dict(policies or {})
+        )
+        fake_verdict = MagicMock()
+        fake_verdict.to_dict.return_value = {
+            "verdict_id": "h-c1",
+            "call_id": "c1",
+            "tier": "heuristic",
+            "recommendation": "review",
+        }
+        fake_judge = MagicMock()
+        fake_judge.evaluate.side_effect = lambda items, *_a, **_kw: [fake_verdict] * len(items)
+        monkeypatch.setattr(session, "_ensure_judge", lambda: fake_judge)
+        # A short Smart Approvals wait: no LLM verdict arrives, so a card follows.
+        cfg = JudgeConfig(enabled=True, smart_approvals=smart_approvals, timeout=0.05)
+        item = {
+            "call_id": "c1",
+            "func_name": "bash",
+            "approval_label": "bash",
+            "needs_approval": needs_approval,
+            "command": "ls",
+            "execute": lambda _it: "ok",
+        }
+        timer = resolve_when_pending(ui, True, "ok", deadline=3.0)
+        timer.start()
+        try:
+            with (
+                patch.object(
+                    type(session), "_judge_cfg", new_callable=PropertyMock, return_value=cfg
+                ),
+                patch.object(session, "_safe_prepare_tool", return_value=item),
+                patch("turnstone.core.storage._registry.get_storage", return_value=MagicMock()),
+                patch(
+                    "turnstone.core.policy.evaluate_loaded_tool_policies",
+                    side_effect=read_policies,
+                ),
+            ):
+                session._execute_tools(
+                    [
+                        {
+                            "id": "c1",
+                            "type": "function",
+                            "function": {"name": "bash", "arguments": "{}"},
+                        }
+                    ],
+                    my_generation=my_generation,
+                )
+        finally:
+            timer.cancel()
+        return emitted
+
+    def test_a_call_waiting_for_a_person_enters_attention(self, tmp_db, monkeypatch) -> None:
+        assert self._drive(_make_session(), monkeypatch) == ["attention", "running"]
+
+    def test_a_smart_batch_waits_in_evaluation_first(self, tmp_db, monkeypatch) -> None:
+        """No verdict arrives within the wait, so the card follows: the
+        workstream goes ``evaluation`` -> ``attention`` -> ``running``."""
+        emitted = self._drive(_make_session(), monkeypatch, smart_approvals=True)
+        assert emitted == ["evaluation", "attention", "running"]
+
+    @pytest.mark.parametrize(
+        "settled_by",
+        ["no_approval_needed", "blanket", "always_grant", "policy_allow", "policy_deny"],
+    )
+    def test_a_batch_settled_without_anyone_stays_running(
+        self, tmp_db, monkeypatch, settled_by: str
+    ) -> None:
+        kwargs: dict[str, Any] = {"smart_approvals": True}
+        if settled_by == "no_approval_needed":
+            kwargs["needs_approval"] = False
+        elif settled_by == "blanket":
+            kwargs["configure"] = lambda ui: setattr(ui, "auto_approve", True)
+        elif settled_by == "always_grant":
+            kwargs["configure"] = lambda ui: ui._always_approve_tools_by_principal.__setitem__(
+                "", {"bash"}
+            )
+        else:
+            kwargs["policies"] = {"bash": settled_by.removeprefix("policy_")}
+        assert self._drive(_make_session(), monkeypatch, **kwargs) == ["running"]
+
+    @pytest.mark.parametrize(
+        "settled_by",
+        ["no_approval_needed", "auto_approve", "auto_approve_tools", "policy_allow", "policy_deny"],
+    )
+    def test_a_cli_batch_settled_without_anyone_stays_running(
+        self, tmp_db, monkeypatch, settled_by: str
+    ) -> None:
+        from turnstone.cli import TerminalUI
+
+        kwargs: dict[str, Any] = {}
+        if settled_by == "no_approval_needed":
+            kwargs["needs_approval"] = False
+        elif settled_by == "auto_approve":
+            kwargs["configure"] = lambda ui: setattr(ui, "auto_approve", True)
+        elif settled_by == "auto_approve_tools":
+            kwargs["configure"] = lambda ui: ui.auto_approve_tools.add("bash")
+        else:
+            kwargs["policies"] = {"bash": settled_by.removeprefix("policy_")}
+        with patch("builtins.input") as prompt:
+            emitted = self._drive(_make_session(), monkeypatch, ui=TerminalUI(), **kwargs)
+        assert emitted == ["running"]
+        prompt.assert_not_called()
+
+    def test_the_cli_prompt_enters_attention_first(self, tmp_db, monkeypatch) -> None:
+        from turnstone.cli import TerminalUI
+
+        emitted: list[str] = []
+
+        def _answer(_prompt: str) -> str:
+            emitted.append("prompt")
+            return "y"
+
+        with patch("builtins.input", side_effect=_answer):
+            self._drive(_make_session(), monkeypatch, ui=TerminalUI(), emitted=emitted)
+        assert emitted == ["attention", "prompt", "running"]
+
+    @pytest.mark.parametrize(
+        ("batch", "expected"),
+        [
+            ("no_approval_needed", ["attention", "running"]),
+            ("auto_approve", ["attention", "running"]),
+            # Brought forward, it still needs a person: the prompt publishes
+            # ``attention`` again (no visible change; the bell ignores the
+            # active workstream).
+            ("needs_approval", ["attention", "attention", "running"]),
+        ],
+    )
+    def test_a_background_cli_batch_waits_in_attention(
+        self, tmp_db, monkeypatch, batch: str, expected: list[str]
+    ) -> None:
+        """A background CLI workstream holds every batch until a person brings
+        it forward, whatever the batch needs once it is: ``attention`` before
+        that wait, then whatever the foreground gate needs."""
+        from turnstone.cli import WorkstreamTerminalUI
+
+        manager = MagicMock()
+        manager.active_id = "another-workstream"
+        cli_ui = WorkstreamTerminalUI("ws-1", manager)
+        cli_ui.set_foreground(False)
+        cli_ui.auto_approve = batch == "auto_approve"
+
+        class _BringForwardOnAttention(list[str]):
+            def append(self, state: str) -> None:
+                super().append(state)
+                if state == "attention":
+                    cli_ui.set_foreground(True)
+
+        emitted = _BringForwardOnAttention()
+        # Fallback, so a missing publish fails the assertion instead of hanging.
+        fallback = threading.Timer(2.0, cli_ui.set_foreground, args=(True,))
+        fallback.start()
+        try:
+            with patch("builtins.input", return_value="y") as prompt:
+                self._drive(
+                    _make_session(),
+                    monkeypatch,
+                    needs_approval=batch != "no_approval_needed",
+                    ui=cli_ui,
+                    emitted=emitted,
+                )
+        finally:
+            fallback.cancel()
+            fallback.join()
+        assert list(emitted) == expected
+        assert prompt.called is (batch == "needs_approval")
+
+    def test_a_cli_close_during_the_attention_publish_skips_the_prompt(
+        self, tmp_db, monkeypatch, capsys
+    ) -> None:
+        """The publish is blocking I/O, so a Stop or close can land during it:
+        the CLI rechecks the batch before painting it and never prompts for a
+        retired batch."""
+        from turnstone.cli import TerminalUI
+
+        session = _make_session()
+
+        class _StopDuringAttention(list[str]):
+            def append(self, state: str) -> None:
+                super().append(state)
+                if state == "attention":
+                    session._approval_cancel_epoch += 1  # a Stop lands mid-publish
+
+        emitted = _StopDuringAttention()
+        with patch("builtins.input", return_value="y") as prompt:
+            self._drive(session, monkeypatch, ui=TerminalUI(), emitted=emitted)
+        assert emitted[0] == "attention"
+        prompt.assert_not_called()
+        assert capsys.readouterr().out == ""  # nothing painted for the retired batch
+
+    def test_a_refused_cli_attention_cancels_before_the_prompt(self, tmp_db, monkeypatch) -> None:
+        """The CLI's prompt publishes through the same fenced publisher: a
+        successor that claims the generation during the policy read cancels
+        the batch before anyone is asked."""
+        from turnstone.cli import TerminalUI
+        from turnstone.core.session import GenerationCancelled
+
+        session = _make_session()
+        generation = session._claim_generation()
+
+        def _successor_claims(_storage: Any, _names: Any) -> dict[str, str]:
+            session._generation += 1
+            return {}
+
+        emitted: list[str] = []
+        with patch("builtins.input") as prompt, pytest.raises(GenerationCancelled):
+            self._drive(
+                session,
+                monkeypatch,
+                policies=_successor_claims,
+                my_generation=generation,
+                emitted=emitted,
+                ui=TerminalUI(),
+            )
+        assert emitted == []
+        prompt.assert_not_called()
+
+    def test_a_refused_gate_state_cancels_the_batch(self, tmp_db, monkeypatch) -> None:
+        """A successor claims the generation while the gate reads the policies:
+        the gate's fenced state publication refuses, the batch is cancelled,
+        and no state from the stale batch reaches the dashboards."""
+        from turnstone.core.session import GenerationCancelled
+
+        session = _make_session()
+        generation = session._claim_generation()
+
+        def _successor_claims(_storage: Any, _names: Any) -> dict[str, str]:
+            session._generation += 1
+            return {}
+
+        emitted: list[str] = []
+        with pytest.raises(GenerationCancelled):
+            self._drive(
+                session,
+                monkeypatch,
+                smart_approvals=True,
+                policies=_successor_claims,
+                my_generation=generation,
+                emitted=emitted,
+            )
+        assert emitted == []
+
+
 # ---------------------------------------------------------------------------
 # func_args projection for the intent judge
 # ---------------------------------------------------------------------------

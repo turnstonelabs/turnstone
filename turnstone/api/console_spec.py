@@ -200,7 +200,7 @@ CONSOLE_ENDPOINTS: list[EndpointSpec] = [
             QueryParam(
                 "state",
                 "Filter by state",
-                enum=["running", "thinking", "attention", "idle", "error"],
+                enum=["running", "thinking", "attention", "evaluation", "idle", "error"],
             ),
             QueryParam("node", "Filter by node_id"),
             QueryParam("search", "Search in name/title/node"),

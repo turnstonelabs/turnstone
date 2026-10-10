@@ -8,6 +8,7 @@ skinparam state {
     BackgroundColor<<thinking>> #E3F2FD
     BackgroundColor<<running>> #FFF3E0
     BackgroundColor<<attention>> #FCE4EC
+    BackgroundColor<<evaluation>> #E0F7FA
     BackgroundColor<<error>> #FFCDD2
 }
 
@@ -16,6 +17,7 @@ state "IDLE" as idle <<idle>> : Waiting for user input.\nNo active LLM call or t
 state "THINKING" as thinking <<thinking>> : LLM streaming response.\nTokens flowing (reasoning + content).
 state "RUNNING" as running <<running>> : Tools executing.\nThreadPoolExecutor active.
 state "ATTENTION" as attention <<attention>> : Blocked on user action.\nTool approval needed.
+state "EVALUATION" as evaluation <<evaluation>> : Smart Approvals wait.\nThe intent judge may still\napprove the batch.
 state "ERROR" as error <<error>> : Exception occurred.\nRecoverable on next send().
 state "CLOSED (persisted only)" as closed <<lifecycle>> : Unloaded, explicitly reopenable row.\nNot a live WorkstreamState member.
 
@@ -32,7 +34,13 @@ thinking --> idle : No tool calls\n(final answer)\n_emit_state("idle")
 
 thinking --> error : Exception during\nstreaming
 
-running --> attention : approve_tools() called\n_emit_state("attention")
+running --> evaluation : Smart Approvals wait\n(shared gate)\n_emit_state("evaluation")
+
+evaluation --> running : Judge approves\n(tools execute)\n_emit_state("running")
+
+evaluation --> attention : A person is needed\n_emit_state("attention")
+
+running --> attention : A person must decide\n(CLI background:\nevery main-loop batch)\n_emit_state("attention")
 
 attention --> running : User approves\n(tools execute)\n_emit_state("running")
 
@@ -49,6 +57,7 @@ error --> closed : close\n[journal reconciled]
 thinking --> closed : close\n[journal reconciled]
 running --> closed : close\n[journal reconciled]
 attention --> closed : close\n[journal reconciled]
+evaluation --> closed : close\n[journal reconciled]
 closed --> [*] : hard delete
 closed --> idle : open / rehydrate
 
@@ -71,6 +80,8 @@ thinking --> idle : cancel() called\nstream aborted\n_emit_state("idle")
 running --> idle : cancel() called\n_emit_state("idle")
 
 attention --> idle : cancel() unblocks\napproval wait\n_emit_state("idle")
+
+evaluation --> idle : cancel() ends\nthe judge wait\n_emit_state("idle")
 
 note left of idle
   **Generation-scoped Stop:**
@@ -125,7 +136,7 @@ note right of creating
   CREATING and CLOSED are storage lifecycle
   values, not members of WorkstreamState. The
   live enum remains IDLE / THINKING / RUNNING /
-  ATTENTION / ERROR.
+  ATTENTION / EVALUATION / ERROR.
 
   **Crash-abandoned CREATING recovery:**
   • Boot pass, then every 5 min even when idle

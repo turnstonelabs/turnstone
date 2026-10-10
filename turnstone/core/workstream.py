@@ -140,6 +140,10 @@ class WorkstreamState(enum.Enum):
     THINKING = "thinking"  # LLM is streaming
     RUNNING = "running"  # tools executing
     ATTENTION = "attention"  # blocked on approval / plan review
+    # Blocked on the intent judge: a Smart Approvals wait, which may still
+    # approve the tool batch with no person.  Becomes ATTENTION if a person
+    # is needed, RUNNING if the judge approves.
+    EVALUATION = "evaluation"
     ERROR = "error"  # last operation failed
 
 
@@ -158,6 +162,7 @@ BULK_CLOSE_STATE_VALUES: frozenset[str] = frozenset(
         WorkstreamState.THINKING.value,
         WorkstreamState.RUNNING.value,
         WorkstreamState.ATTENTION.value,
+        WorkstreamState.EVALUATION.value,
     }
 )
 

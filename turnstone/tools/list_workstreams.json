@@ -10,7 +10,7 @@
       },
       "state": {
         "type": "string",
-        "description": "Optional state filter — 'idle', 'thinking', 'running', 'attention', 'error', 'closed'. Matched exactly. An explicit state filter OVERRIDES the default-exclude-closed behavior, so state=\"closed\" still returns closed rows. Deleted workstreams are not stored, so 'deleted' is not a valid filter."
+        "description": "Optional state filter — 'idle', 'thinking', 'running', 'attention', 'evaluation', 'error', 'closed'. 'evaluation' means the intent judge holds a tool batch and may still approve it with no person; it becomes 'attention' if a person must decide. Matched exactly. An explicit state filter OVERRIDES the default-exclude-closed behavior, so state=\"closed\" still returns closed rows. Deleted workstreams are not stored, so 'deleted' is not a valid filter."
       },
       "skill": {
         "type": "string",

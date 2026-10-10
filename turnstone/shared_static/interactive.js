@@ -2536,11 +2536,10 @@ class Pane {
           if (this._host.isFocused(this) && !this.pendingApproval) {
             this.inputEl.focus();
           }
-        } else if (
-          evt.state === "thinking" ||
-          evt.state === "running" ||
-          evt.state === "attention"
-        ) {
+        } else {
+          // Every other state is a turn in flight (thinking, running, or
+          // waiting on the judge or a person), as the acting-user check above
+          // already assumes: a new transient state needs no edit here.
           this.setBusy(true);
           // A reconnect before the first token has only the current state,
           // not the earlier thinking_start. Restore its waiting affordance.

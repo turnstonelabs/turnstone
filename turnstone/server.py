@@ -2009,7 +2009,7 @@ async def text_to_speech(request: Request) -> Response:
 
 def _count_ws_states(wss: list[Workstream]) -> dict[str, int]:
     """Count workstream states for health/metrics endpoints."""
-    counts = dict.fromkeys(("idle", "thinking", "running", "attention", "error"), 0)
+    counts = dict.fromkeys((state.value for state in WorkstreamState), 0)
     for ws in wss:
         counts[ws.state.value] = counts.get(ws.state.value, 0) + 1
     return counts

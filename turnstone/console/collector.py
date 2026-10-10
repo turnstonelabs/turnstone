@@ -24,6 +24,7 @@ import httpx_sse
 
 from turnstone.core.workstream import (
     WorkstreamKind,
+    WorkstreamState,
     normalize_conversation_persistence_state,
 )
 
@@ -38,6 +39,21 @@ if TYPE_CHECKING:
     from turnstone.core.storage._protocol import StorageBackend
 
 log = logging.getLogger("turnstone.console.collector")
+
+# Every workstream state, for the per-state counts: the enum is the one list.
+_STATE_KEYS: tuple[str, ...] = tuple(state.value for state in WorkstreamState)
+
+# ``sort=state`` rank for the cluster workstream list.  The console table
+# sorts with its own copy (``stateOrder`` in console/static/app.js); a test
+# keeps the two in agreement.
+_STATE_SORT_RANK: dict[str, int] = {
+    "running": 0,
+    "thinking": 1,
+    "attention": 2,
+    "evaluation": 2,
+    "error": 3,
+    "idle": 4,
+}
 
 
 @dataclass
@@ -892,7 +908,7 @@ class ClusterCollector:
         cluster summary.  The rail's Workspaces tree + the saved-sessions
         list surface coordinators instead.
         """
-        states = {"running": 0, "thinking": 0, "attention": 0, "idle": 0, "error": 0}
+        states = dict.fromkeys(_STATE_KEYS, 0)
         total_tokens = 0
         total_tool_calls = 0
         total_ws = 0
@@ -972,13 +988,7 @@ class ClusterCollector:
                     continue
                 if node_ids is not None and node.node_id not in node_ids:
                     continue
-                ws_states = {
-                    "running": 0,
-                    "thinking": 0,
-                    "attention": 0,
-                    "idle": 0,
-                    "error": 0,
-                }
+                ws_states = dict.fromkeys(_STATE_KEYS, 0)
                 for ws in node.workstreams.values():
                     s = ws.get("state", "idle")
                     ws_states[s] = ws_states.get(s, 0) + 1
@@ -991,11 +1001,7 @@ class ClusterCollector:
                         "node_id": node.node_id,
                         "server_url": node.server_url,
                         "ws_total": len(node.workstreams),
-                        "ws_running": ws_states["running"],
-                        "ws_thinking": ws_states["thinking"],
-                        "ws_attention": ws_states["attention"],
-                        "ws_idle": ws_states["idle"],
-                        "ws_error": ws_states["error"],
+                        **{f"ws_{state}": ws_states[state] for state in _STATE_KEYS},
                         "total_tokens": agg_tokens,
                         "ws_tokens": agg_tokens,
                         "max_ws": node.max_ws,
@@ -1011,7 +1017,12 @@ class ClusterCollector:
 
         # Sort (secondary key: node_id for stable ordering)
         if sort_by == "activity":
-            items.sort(key=lambda n: (-(n["ws_running"] + n["ws_attention"]), n["node_id"]))
+            items.sort(
+                key=lambda n: (
+                    -(n["ws_running"] + n["ws_attention"] + n["ws_evaluation"]),
+                    n["node_id"],
+                )
+            )
         elif sort_by == "tokens":
             items.sort(key=lambda n: (-n["total_tokens"], n["node_id"]))
         elif sort_by == "name":
@@ -1083,15 +1094,8 @@ class ClusterCollector:
             ]
 
         # Sort
-        state_order = {
-            "running": 0,
-            "thinking": 1,
-            "attention": 2,
-            "error": 3,
-            "idle": 4,
-        }
         if sort_by == "state":
-            all_ws.sort(key=lambda ws: state_order.get(ws.get("state", "idle"), 9))
+            all_ws.sort(key=lambda ws: _STATE_SORT_RANK.get(ws.get("state", "idle"), 9))
         elif sort_by == "tokens":
             all_ws.sort(key=lambda ws: ws.get("tokens", 0), reverse=True)
         elif sort_by == "name":
@@ -1144,13 +1148,7 @@ class ClusterCollector:
     def _build_snapshot_locked(self) -> dict[str, Any]:
         """Build snapshot data — caller must hold ``_lock``."""
         nodes_out = []
-        states: dict[str, int] = {
-            "running": 0,
-            "thinking": 0,
-            "attention": 0,
-            "idle": 0,
-            "error": 0,
-        }
+        states = dict.fromkeys(_STATE_KEYS, 0)
         total_tokens = 0
         total_tool_calls = 0
         total_ws = 0

@@ -477,7 +477,7 @@ state without waiting for the next live transition).
 
 | Field    | Type   | Description                                                          |
 |----------|--------|----------------------------------------------------------------------|
-| `state`  | string | One of `"running"`, `"thinking"`, `"attention"`, `"idle"`, `"error"` |
+| `state`  | string | One of `"running"`, `"thinking"`, `"attention"`, `"evaluation"`, `"idle"`, `"error"` |
 
 **`in_progress_snapshot`** -- one-shot replay of the in-progress turn's
 content + reasoning text-so-far when this client connects mid-stream.
@@ -897,6 +897,7 @@ Possible `state` values:
 | `thinking`  | Model is generating a response                  |
 | `running`   | Tool execution in progress                      |
 | `attention` | Waiting for user input (approval or plan review)|
+| `evaluation` | Waiting for the intent judge: Smart Approvals may still approve the tool batch with no person |
 | `error`     | An error occurred                               |
 
 **Fan-out pattern:** Each connected client receives its own bounded queue
@@ -2783,6 +2784,7 @@ liveness probes.
     "thinking": 1,
     "running": 0,
     "attention": 0,
+    "evaluation": 0,
     "error": 0
   },
   "backend": {
@@ -2835,7 +2837,7 @@ scrape_configs:
 | `turnstone_build_info` | gauge | `version`, `model` | Always 1; carries version/model as labels |
 | `turnstone_uptime_seconds` | gauge | — | Seconds since server start |
 | `turnstone_workstreams_active_total` | gauge | — | Number of active workstreams |
-| `turnstone_workstreams_by_state` | gauge | `state` | Workstream count per state (`idle`, `thinking`, `running`, `attention`, `error`) |
+| `turnstone_workstreams_by_state` | gauge | `state` | Workstream count per state (`idle`, `thinking`, `running`, `attention`, `evaluation`, `error`) |
 | `turnstone_http_requests_total` | counter | `method`, `endpoint`, `status_code` | Total HTTP requests handled |
 | `turnstone_http_request_duration_seconds` | histogram | `method`, `endpoint` | Request latency distribution (11 buckets: 5ms–10s) |
 | `turnstone_messages_sent_total` | counter | — | User messages dispatched to the AI |

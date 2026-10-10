@@ -98,6 +98,10 @@ frozen.
 > are gone, as are the `turnstone.core.memory` helpers `list_default_skills` and
 > `list_skills_by_activation`. Upgrade Python SDK clients too: older ones require `is_default` and
 > fail to read skills.
+>
+> **Before upgrading:** migration 081 rebuilds the orphan reaper's partial index
+> (`idx_workstreams_reaper`) to cover the new `evaluation` state, concurrently on PostgreSQL. The
+> reaper runs without the index for the length of the build.
 
 ### Added
 
@@ -166,6 +170,16 @@ frozen.
 - **`turnstone-doctor` flags a Caddy running an outdated Caddyfile.** On a Docker install, the
   report compares the config Caddy loaded with the Caddyfile on disk and, when they differ, gives
   the `docker compose restart caddy` command that applies it.
+- **`evaluation` workstream state (#1325).** While Smart Approvals waits for the intent judge's
+  verdicts, a web or coordinator workstream is in the new `evaluation` state instead of
+  `attention`: the judge may still approve the batch with no person. The dashboards, the sidebar,
+  the tabs and a coordinator's child tree show it as ⚖ in the judge colour, and the cluster summary
+  counts it separately. It moves to `attention` when a card is published for a person (including
+  after the wait times out), or to `running` when the batch is approved. With Smart Approvals off
+  the verdict is advice, and the workstream goes straight to `attention`. State events, counts,
+  filters and the `turnstone_workstreams_by_state` metric can now carry `evaluation`; clients
+  that list the states should add it. The CLI's `/cluster nodes` table gains an EVAL column, and a
+  sidebar row's hover text now names its state when it is not idle or running.
 
 ### Changed
 
@@ -701,6 +715,22 @@ frozen.
   otherwise run `docker compose restart caddy`. Certificates already issued are replaced as they
   come due. Caddy also closes open dashboard streams within 5 seconds when it stops; before, a
   restart with the dashboard open waited out Docker's 10-second stop timeout and was killed.
+- **`attention` now means someone must decide (#1325).** Every tool batch moved a workstream to
+  `attention` before the approval gate ran, so dashboards and the CLI's workstream list flashed it,
+  and a coordinator's child tree announced "Approval required", for calls that needed no approval
+  or that a tool policy, an "Always" grant or auto-approve then settled. The gate now moves the
+  workstream only when the batch waits on the judge (`evaluation`) or on a person (`attention`): an
+  approval card, the CLI's prompt, or a background CLI workstream holding a batch until it is
+  brought forward.
+- **Smart Approvals hands a batch to a person sooner (#1325).** The verdict wait ends as soon as
+  one verdict rules the batch out (a `review` or `deny`, a judge error, or a confidence below the
+  threshold), instead of waiting for every verdict, and a batch with a call the heuristic rules
+  flagged `deny` or `critical` skips the wait, since no verdict can clear it. The approval card
+  appears sooner; verdicts still arriving fill it in. A verdict another judge run left for a reused
+  call ID no longer ends the wait early: only the batch's own verdicts count.
+- **A node's workstream list in the console puts running workstreams first.** It ranked running
+  workstreams below idle ones, the opposite of the cluster API's `sort=state`, so on a long list
+  they fell off the first page.
 
 ### Security
 
