@@ -165,7 +165,6 @@ from turnstone.core.metacognition import (
     NUDGE_TASK_COMPACTION_RESUME,
     TASK_NOTE_MAX,
     TASK_TITLE_MAX,
-    RepeatDetector,
     detect_completion,
     detect_correction,
     format_nudge,
@@ -1698,20 +1697,6 @@ _active_tool_prepare_offer: contextvars.ContextVar[frozenset[str] | None] = cont
 _active_commit_origin_generation: contextvars.ContextVar[int] = contextvars.ContextVar(
     "turnstone_active_commit_origin_generation", default=0
 )
-
-
-# Tools exempt from consecutive-identical-call repeat detection: delta-cursor
-# readers whose repeated identical call is the documented polling pattern.
-_REPEAT_EXEMPT_TOOLS: frozenset[str] = frozenset({"bash_output"})
-_REPEAT_WARNING: str = (
-    "\n\n⚠ Warning: this is an identical repeat of a previous tool call. "
-    "The result is the same. Try a different approach."
-)
-
-
-# A JSON-shaped result starts with ``{`` or ``[`` after optional whitespace.
-# Matched in place: ``lstrip()`` on a ``str`` subclass copies the rendering.
-_LEADING_JSON_RE = re.compile(r"\s*[\[{]")
 
 
 # Automatic main-session tool-result share: one fifth of the batch's remaining
@@ -3534,12 +3519,6 @@ class ChatSession:
         # ends the wait at once instead of queuing behind it.  Registered and
         # removed by ``_exec_wait_for_workstream``; guarded by ``_queued_lock``.
         self._wait_wakers: set[threading.Event] = set()
-        # Repeat detection: streak counter over tool-call signatures.
-        # Fires when a (name, args) signature has been seen N times in
-        # a row; recording any different signature resets the streak.
-        # Also cleared after a write tool succeeds (state changed) or
-        # after a warning fires (clean slate, re-fire on the next streak).
-        self._repeat_detector = RepeatDetector()
         # Tool error tracking: call_id → is_error for message persistence
         self._tool_error_flags: dict[str, bool] = {}
         # Typed effect disposition: call_id → EffectStatus, set by the producer
@@ -6288,22 +6267,6 @@ class ChatSession:
 
         return max((self.tool_truncation + 1) // 2, _AGENT_GUARD_WINDOW_CHARS)
 
-    def _bounded_result(self, output: str) -> str:
-        """``output`` with at most the executor retention held at each edge.
-
-        A plain result larger than the two edges is projected to the edges the
-        streaming executors keep, so controller text can be added to it
-        without copying the whole result; the fold still renders from those
-        edges with the true size.
-        """
-
-        retention = self._executor_capture_chars()
-        if isinstance(output, ProjectedText) or len(output) <= 2 * retention:
-            return output
-        return TextProjectionSource(output[:retention], output[-retention:], len(output)).projected(
-            retention
-        )
-
     def _executor_cap_estimate(self) -> int:
         """The cap an executor sizes its own output to before the fold sees it.
 
@@ -6928,7 +6891,6 @@ class ChatSession:
         # composed prefix was built from.
         self._invalidate_system_prefix()
         self._read_files.clear()
-        self._repeat_detector.clear()
         self._last_usage = None
         self._invalidate_token_calibration_anchors()
         self._title_generated = bool(turns)  # don't re-title a saved conversation
@@ -13207,8 +13169,8 @@ class ChatSession:
                 if self._generation != my_generation:
                     return
                 # Results the framework wrote itself (a denial) pass the guard by
-                # (``ControllerText``).  The repeat warning and admission rebuild
-                # strings, which drops the mark, so note them as they arrive.
+                # (``ControllerText``).  Admission rebuilds the strings, which
+                # drops the mark, so note them as they arrive.
                 _controller_ids = {
                     tc_id for tc_id, output in results if isinstance(output, ControllerText)
                 }
@@ -13237,19 +13199,15 @@ class ChatSession:
                         f"{unexpected_ids}"
                     )
 
-                # Repeat-detection + tool-error nudge.  Mutates *results*
-                # in place to inject inline warning text on identical
-                # repeats; queues advisories for the next drain pass.
-                needs_tool_error_memory = self._nudges_enabled("tool_error") and any(
-                    self._tool_error_flags.get(tc_id) for tc_id, _ in results
-                )
+                # Tool-error nudge: queues an advisory for the next drain pass.
+                has_tool_error = any(self._tool_error_flags.get(tc_id) for tc_id, _ in results)
+                needs_tool_error_memory = self._nudges_enabled("tool_error") and has_tool_error
                 tool_error_memory_count = (
                     self._visible_memory_count() if needs_tool_error_memory else 0
                 )
                 apply_post_execute_advisories = functools.partial(
                     self._apply_post_execute_advisories,
-                    tool_calls,
-                    results,
+                    has_tool_error=has_tool_error,
                     tool_error_memory_count=tool_error_memory_count,
                 )
                 if not self._publish_for_generation(
@@ -13258,9 +13216,6 @@ class ChatSession:
                     allow_cancelled=False,
                 ):
                     raise GenerationCancelled()
-                # The partial captured the raw result list; release it so the
-                # executors' complete outputs do not outlive their admission.
-                del apply_post_execute_advisories
 
                 # Map tool_call_id → tool name for logging
                 # Providers may pad a name with whitespace; dispatch strips it,
@@ -13980,7 +13935,7 @@ class ChatSession:
     def _drain_pending_advisories(self) -> None:
         """Drop the abandoned generation's advisory nudges — not external events.
 
-        Tool-channel nudges (``tool_error``, ``repeat``, ``denial``)
+        Tool-channel nudges (``tool_error``, ``denial``)
         queued earlier in this batch and user-channel nudges
         (``correction``, …) queued during ``_check_metacognitive_nudge``
         are commentary ABOUT the generation being abandoned (cancel,
@@ -16471,9 +16426,8 @@ class ChatSession:
         def _publish_compaction(durable: list[Callable[[], None]]) -> None:
             self.messages = compacted_messages
             # File contents are gone after compaction — force re-read before
-            # edit_file, and reset repeat detection against the new transcript.
+            # edit_file.
             self._read_files.clear()
-            self._repeat_detector.clear()
             self._msg_tokens = compacted_tokens
             self._calibrated_msg_count = len(compacted_messages)
 
@@ -18594,7 +18548,7 @@ class ChatSession:
           distinctly.  Cancel / exception / no-tool-call paths drain the
           queue as a real user row instead (Seams 2 and 3).
         - **Metacognitive tool-channel nudges** (``tool_error`` /
-          ``repeat`` / ``denial``) and any-channel nudges
+          ``denial``) and any-channel nudges
           (``watch_triggered`` / ``idle_children``) — drained on the last
           result.  ``meta`` carries the producer's optional fields
           (e.g. ``watch_triggered``'s ``watch_name``).
@@ -18675,8 +18629,8 @@ class ChatSession:
                 self._close_pop_window(popped)
 
             # Metacognitive tool-channel drain.  Queued by
-            # ``_queue_tool_advisory`` from the tool_error / repeat
-            # detection paths just before this loop.
+            # ``_queue_tool_advisory`` from the tool_error / denial
+            # paths just before this loop.
             for nt, text, meta in self._nudge_queue.drain(TOOL_DRAIN):
                 specs.append((nt, text, dict(meta) if meta else {}))
 
@@ -20985,7 +20939,7 @@ class ChatSession:
         No-ops while the session is inside a wake-driven turn
         (``_wake_source_tag`` set) so model behaviour during the wake
         send (e.g. denying a tool the wake suggested, hitting a
-        repeat / tool_error) doesn't queue a nudge that would land on
+        tool_error) doesn't queue a nudge that would land on
         top of the wake's own turn or on the user's next real
         turn referencing a context the user never saw.
         """
@@ -21065,9 +21019,9 @@ class ChatSession:
         Drains in ``_collect_advisories`` alongside guard findings, then is
         emitted as a first-class ``{"role": "system"}`` turn AFTER the tool
         batch (see the per-result loop in ``_run_loop``).  Used for nudges
-        that respond to a tool batch: ``tool_error``, ``repeat`` (model
-        behaviour), and ``denial`` (the operator rejected the batch — the
-        nudge belongs next to the denied results it explains).
+        that respond to a tool batch: ``tool_error`` and ``denial`` (the
+        operator rejected the batch — the nudge belongs next to the denied
+        results it explains).
 
         No-ops while the session is inside a wake-driven turn (see
         ``_queue_user_advisory`` for the rationale).
@@ -21349,88 +21303,30 @@ class ChatSession:
 
     def _apply_post_execute_advisories(
         self,
-        tool_calls: list[dict[str, Any]],
-        results: list[tuple[str, str | list[dict[str, Any]]]],
         *,
+        has_tool_error: bool,
         tool_error_memory_count: int | None = None,
     ) -> None:
-        """Run repeat detection + tool-error nudge over a freshly-executed batch.
+        """Queue the tool-error nudge for a freshly-executed batch.
 
-        Mutates *results* in place when an identical-repeat warning is
-        appended to a tool's text output.  Updates ``self._repeat_detector``,
-        ``self._nudge_queue`` (via ``_queue_tool_advisory``), and
+        Updates ``self._nudge_queue`` (via ``_queue_tool_advisory``) and
         ``self._metacog_state`` (cooldown timestamp via ``should_nudge``).
         The operator-visible signal is the first-class operator-context
         ``{"role": "system"}`` turn the per-result loop downstream emits
         after the tool batch when the drained metacog nudges flush.
 
-        Repeat detection's job is to nudge a flaky local model out of a
-        loop where it keeps making the same tool call ("``bash(cmd='echo
-        test')`` × 3" being the canonical example).  It fires on the
-        consecutive-streak signal alone, with no regard for the tool's
-        success / failure / output content — same (name, args) for N
-        turns in a row is by definition stuck.  ``RepeatDetector.record``
-        already resets the streak on any different signature, so an
-        intervening tool call (read, write, anything different) breaks
-        the streak naturally without an explicit clear here.
-
-        ``_tool_error_flags`` is the authoritative is_error signal —
-        consumed below for the tool-error nudge gate; the per-result
-        loop in ``_run_loop`` ``.pop``s it after this returns.
+        ``has_tool_error`` says whether any result in the batch carries a
+        ``_tool_error_flags`` mark, the authoritative is_error signal.  The
+        caller reads the flags; the per-result loop in ``_run_loop``
+        ``.pop``s them after this returns.
         """
-        # Repeat detection: warn when a tool is called with identical
-        # args N times in a row.  Independent of success/failure — the
-        # stuck-loop pattern is sig-driven, not state-driven.  JSON
-        # outputs (MCP structured results) are tracked but exempt from
-        # the inline warning text (appending text would corrupt the
-        # payload).
-        _tc_by_id = {c["id"]: c for c in tool_calls}
-        _repeat_detected = False
-
-        for i, (tc_id, output) in enumerate(results):
-            tc = _tc_by_id.get(tc_id)
-            if tc and isinstance(output, str):
-                # Delta-cursor readers (``_REPEAT_EXEMPT_TOOLS``): identical
-                # args ARE the documented usage (poll the same handle) and
-                # the result differs by construction — a "result is the
-                # same" warning would be factually false.  They are still
-                # RECORDED (never skipped): the detector's contract is that
-                # any different signature breaks a streak, so an exempt call
-                # interleaved between identical bash calls must keep those
-                # bash calls from reading as consecutive.
-                exempt = str(tc["function"]["name"] or "").strip() in _REPEAT_EXEMPT_TOOLS
-                raw = str(tc["function"]["name"] or "").strip() + ":" + tc["function"]["arguments"]
-                sig = hashlib.sha256(raw.encode()).hexdigest()
-                is_json = _LEADING_JSON_RE.match(output) is not None
-                if self._repeat_detector.record(sig) and not exempt:
-                    _repeat_detected = True
-                    if not is_json:
-                        output = self._bounded_result(output) + _REPEAT_WARNING
-                        results[i] = (tc_id, output)
-                    # The operator-context system turn after the tool batch
-                    # carries the operator-visible signal; the tool-name
-                    # context comes from the tool block above it, so a
-                    # separate diagnostic info line would just duplicate it.
-
-        if _repeat_detected:
-            # Reset so the model gets a clean slate after the warning.
-            # If it repeats again, a new warning fires.
-            self._repeat_detector.clear()
-            if self._nudges_enabled("repeat") and should_nudge(
-                "repeat",
-                self._metacog_state,
-                message_count=len(self.messages),
-                cooldown_secs=self._mem_cfg.nudge_cooldown,
-            ):
-                self._queue_tool_advisory("repeat", format_nudge("repeat"))
-
         # Tool-error nudge — queued so it rides the same _collect_advisories
         # drain pass as guard findings and is emitted as a system turn after
         # the tool batch.  Cooldown gating in should_nudge keeps this to one
         # nudge per batch even with many failing tools.
         if (
             self._nudges_enabled("tool_error")
-            and any(self._tool_error_flags.get(tc_id) for tc_id, _ in results)
+            and has_tool_error
             and should_nudge(
                 "tool_error",
                 self._metacog_state,
@@ -28722,7 +28618,6 @@ class ChatSession:
         elif cmd == "/clear":
             self.messages.clear()
             self._read_files.clear()
-            self._repeat_detector.clear()
             self._last_usage = None
             self._invalidate_token_calibration_anchors()
             self._msg_tokens = []

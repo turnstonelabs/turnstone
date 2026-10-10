@@ -427,61 +427,6 @@ def test_registries_are_isolated_per_session():
         session_b.close()
 
 
-def test_bash_output_polling_is_repeat_exempt(session):
-    """Repeated identical bash_output calls ARE the documented monitoring
-    pattern — the repeat detector must not brand them 'identical repeat'
-    (the delta result differs by construction) nor queue a repeat nudge."""
-    import json as _json
-
-    _start_background(session, "sleep 30")
-    shell = _only_shell(session)
-    args = _json.dumps({"id": shell.shell_id})
-    for i in range(5):
-        tool_calls = [{"id": f"t{i}", "function": {"name": "bash_output", "arguments": args}}]
-        results = [(f"t{i}", "bash_1 (running)\nNo new output since the last read.")]
-        session._apply_post_execute_advisories(tool_calls, results)
-        assert "identical repeat" not in results[0][1]
-    assert not any(t == "repeat" for t, _ in session._nudge_queue.pending())
-
-
-def test_repeat_exempt_calls_still_break_other_streaks(session):
-    """The exemption suppresses the WARNING, not the recording: a
-    bash_output poll interleaved between identical bash calls must reset
-    the bash streak — otherwise the documented monitor-and-probe loop
-    (poll, curl health, poll, curl health…) draws a false 'identical
-    repeat' on the probe."""
-    import json as _json
-
-    _start_background(session, "sleep 30")
-    shell = _only_shell(session)
-    poll_args = _json.dumps({"id": shell.shell_id})
-    probe_args = _json.dumps({"command": "curl -s localhost:8080/health"})
-    for i in range(6):
-        probe = [{"id": f"p{i}", "function": {"name": "bash", "arguments": probe_args}}]
-        probe_results = [(f"p{i}", "ok")]
-        session._apply_post_execute_advisories(probe, probe_results)
-        assert "identical repeat" not in probe_results[0][1], (
-            "interleaved probes are not a stuck loop"
-        )
-        poll = [{"id": f"q{i}", "function": {"name": "bash_output", "arguments": poll_args}}]
-        session._apply_post_execute_advisories(poll, [(f"q{i}", "no new output")])
-
-
-def test_bash_repeats_still_warn(session):
-    """The exemption is bash_output-specific: a genuinely stuck identical
-    bash loop still gets the warning."""
-    import json as _json
-
-    args = _json.dumps({"command": "echo test"})
-    warned = False
-    for i in range(5):
-        tool_calls = [{"id": f"b{i}", "function": {"name": "bash", "arguments": args}}]
-        results = [(f"b{i}", "test")]
-        session._apply_post_execute_advisories(tool_calls, results)
-        warned = warned or "identical repeat" in results[0][1]
-    assert warned
-
-
 def test_quiet_only_entries_do_not_trigger_wake_delivery(session, monkeypatch):
     """A dispatched wake whose wake-eligible entries all evaporated must be
     a no-op: quiet entries alone never resume a stopped workstream, and

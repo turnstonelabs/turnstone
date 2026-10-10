@@ -10174,7 +10174,7 @@ class TestMetacognitiveBuffers:
 
     def test_collect_advisories_holds_tool_buffer_until_last_result(self, tmp_db):
         session = _make_session()
-        session._queue_tool_advisory("repeat", "STOP_REPEATING")
+        session._queue_tool_advisory("tool_error", "CHECK_MEMORY")
         specs = session._collect_advisories(
             assessment=None, func_name="bash", received=None, result_index=1, result_count=2
         )
@@ -10553,7 +10553,7 @@ class TestMetacognitiveBuffers:
 
         def mock_execute(_tool_calls, *, principal_id: str = "", my_generation: int = 0):
             # Queue a tool-channel nudge during the batch (what
-            # _apply_post_execute_advisories does on tool_error/repeat).
+            # _apply_post_execute_advisories does on tool_error).
             assert principal_id == ""
             session._queue_tool_advisory("tool_error", "you hit an error; check memory")
             return [("call_x", "boom")], None
@@ -11152,7 +11152,7 @@ class TestMetacognitiveBuffers:
         assert _user_pending(session) == []
 
     def test_cancel_handler_clears_tool_advisory_buffer(self, tmp_db):
-        """A tool_error/repeat advisory queued before a cancel must not
+        """A tool_error advisory queued before a cancel must not
         leak into the next generation's batch."""
         from turnstone.core.session import GenerationCancelled
 
@@ -11170,14 +11170,9 @@ class TestMetacognitiveBuffers:
 
 class TestApplyPostExecuteAdvisories:
     """End-to-end coverage of the per-batch advisory hook in _run_loop —
-    repeat detection (with the streak semantics restored after the split)
-    and tool-error nudge.  Drives ``_apply_post_execute_advisories``
+    the tool-error nudge.  Drives ``_apply_post_execute_advisories``
     directly, simulating the post-_execute_tools state.
     """
-
-    @staticmethod
-    def _tc(tc_id: str, name: str, args: str) -> dict:
-        return {"id": tc_id, "function": {"name": name, "arguments": args}}
 
     @staticmethod
     def _prime(session) -> None:
@@ -11196,10 +11191,10 @@ class TestApplyPostExecuteAdvisories:
 
         The predecessor pauses immediately before the generation publication
         fence for ``_apply_post_execute_advisories``.  Stop and a force claim
-        then install deliberately distinct successor-owned repeat, cooldown,
-        and nudge state.  Releasing the predecessor must refuse the whole old
-        advisory transaction rather than partially recording its signature or
-        queuing its tool-error nudge.
+        then install deliberately distinct successor-owned cooldown and nudge
+        state.  Releasing the predecessor must refuse the whole old advisory
+        transaction rather than partially recording its cooldown or queuing
+        its tool-error nudge.
         """
         session = _make_session()
         session._title_generated = True
@@ -11284,17 +11279,10 @@ class TestApplyPostExecuteAdvisories:
                 assert persistence_error is None
                 successor_generation = session._generation
 
-                session._repeat_detector.clear()
-                session._repeat_detector.record("successor-signature")
-                session._repeat_detector.record("successor-signature")
                 session._metacog_state.clear()
                 session._metacog_state["successor-marker"] = 123.0
                 session._nudge_queue.clear_channels({"any", "quiet", "tool", "user", "wake"})
                 session._queue_tool_advisory("successor", "successor-owned advisory")
-                repeat_snapshot = (
-                    session._repeat_detector._sig,
-                    session._repeat_detector._count,
-                )
                 metacog_snapshot = dict(session._metacog_state)
                 nudge_snapshot = session._nudge_queue.pending()
 
@@ -11307,170 +11295,55 @@ class TestApplyPostExecuteAdvisories:
         assert send_errors == []
         assert old_generation and successor_generation == old_generation[0] + 1
         assert session._generation == successor_generation
-        assert (
-            session._repeat_detector._sig,
-            session._repeat_detector._count,
-        ) == repeat_snapshot
         assert session._metacog_state == metacog_snapshot
         assert session._nudge_queue.pending() == nudge_snapshot
         assert nudge_snapshot == [("successor", "successor-owned advisory")]
-        assert old_results == [("call-old", "old tool failure")]
 
-    def test_three_identical_calls_fire_warning_and_advisory(self, tmp_db):
+    def test_a_flagged_tool_result_queues_the_tool_error_nudge(self, tmp_db) -> None:
+        """Through the run loop: a batch whose executor flags a result as an
+        error reaches the advisory with ``has_tool_error`` set, and the
+        tool-error nudge is queued for the drain pass."""
         session = _make_session()
-        self._prime(session)
-        for i in range(3):
-            tc_id = f"tc_{i}"
-            results = [(tc_id, "file contents")]
-            session._apply_post_execute_advisories(
-                [self._tc(tc_id, "read_file", '{"path": "x"}')],
-                results,
-            )
-            if i < 2:
-                # Streak below threshold — no inline warning, no advisory yet.
-                assert results[0][1] == "file contents"
-                assert all(t != "repeat" for t, _ in _tool_pending(session))
-            else:
-                assert "⚠ Warning: this is an identical repeat" in results[0][1]
-        assert any(t == "repeat" for t, _ in _tool_pending(session))
-
-    def test_errored_calls_count_toward_streak(self, tmp_db):
-        """Regression: when metacog was split out of the system message,
-        errored tool calls stopped counting toward repeats — so a model
-        stuck on a failing call wouldn't get warned. Three identical
-        bash failures must still fire the streak."""
-        session = _make_session()
-        self._prime(session)
-        with patch.object(session, "_visible_memory_count", return_value=0):
-            for i in range(3):
-                tc_id = f"tc_{i}"
-                session._tool_error_flags[tc_id] = True
-                session._apply_post_execute_advisories(
-                    [self._tc(tc_id, "bash", '{"command": "ls /missing"}')],
-                    [(tc_id, "ls: cannot access /missing")],
-                )
-        assert any(t == "repeat" for t, _ in _tool_pending(session))
-
-    def test_intervening_different_sig_resets_streak(self, tmp_db):
-        """Streak semantics: [A, A, B, A] does NOT fire — B breaks the run."""
-        session = _make_session()
-        self._prime(session)
-        sequence = [
-            ("read_file", '{"path": "a"}'),
-            ("read_file", '{"path": "a"}'),
-            ("read_file", '{"path": "b"}'),  # different — resets
-            ("read_file", '{"path": "a"}'),
+        session._title_generated = True
+        session._mem_cfg.nudges = True
+        responses = [
+            make_result(
+                "calling tool",
+                tool_calls=[
+                    {
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {"name": "bash", "arguments": '{"command":"false"}'},
+                    }
+                ],
+            ),
+            make_result("done"),
         ]
-        with patch.object(session, "_visible_memory_count", return_value=0):
-            for i, (name, args) in enumerate(sequence):
-                tc_id = f"tc_{i}"
-                session._apply_post_execute_advisories(
-                    [self._tc(tc_id, name, args)],
-                    [(tc_id, "ok")],
-                )
-        assert all(t != "repeat" for t, _ in _tool_pending(session))
+        original_apply = session._apply_post_execute_advisories
 
-    def test_intervening_different_call_resets_streak(self, tmp_db):
-        """Streak detection is consecutive-only: any intervening call
-        with a different signature resets the streak naturally via
-        ``RepeatDetector.record``.  Simulates 2 reads → 1 write → 2
-        reads — five calls but no streak ever hits the threshold of
-        three because the write breaks the read streak and the second
-        run of reads only reaches 2."""
-        session = _make_session()
-        self._prime(session)
-        with patch.object(session, "_visible_memory_count", return_value=0):
-            for i in range(2):
-                tc_id = f"r_{i}"
-                session._apply_post_execute_advisories(
-                    [self._tc(tc_id, "read_file", '{"path": "x"}')],
-                    [(tc_id, "contents")],
-                )
-            # Different signature — write_file(...) — resets the
-            # ``read_file:x`` streak by virtue of being a different sig.
-            session._apply_post_execute_advisories(
-                [self._tc("w", "write_file", '{"path": "x", "content": "y"}')],
-                [("w", "ok")],
-            )
-            for i in range(2):
-                tc_id = f"r2_{i}"
-                session._apply_post_execute_advisories(
-                    [self._tc(tc_id, "read_file", '{"path": "x"}')],
-                    [(tc_id, "contents")],
-                )
-        assert all(t != "repeat" for t, _ in _tool_pending(session))
+        def execute(_tool_calls, *, principal_id: str = "", my_generation: int = 0):
+            del principal_id, my_generation
+            session._tool_error_flags["call-1"] = True
+            return [("call-1", "command failed")], None
 
-    def test_sequential_bash_same_command_fires_repeat(self, tmp_db):
-        """Regression: small local models flaking out and looping on the
-        same call across sequential turns must trigger the nudge,
-        independent of whether the tool ``is_error``.  Pre-fix a
-        write-tool-success-clear branch dropped the streak between
-        turns whenever the call succeeded, so ``bash('echo test') × 3``
-        across three turns never fired even though it's the canonical
-        stuck-loop pattern.
-        """
-        session = _make_session()
-        self._prime(session)
-        with patch.object(session, "_visible_memory_count", return_value=0):
-            # Three sequential successful bash calls (no _tool_error_flags
-            # set), one batch each.  Pre-fix: streak cleared on every
-            # turn because bash is in the write_tools set.  Post-fix:
-            # streak builds 1, 2, 3 and fires on the third.
-            for i in range(3):
-                tc_id = f"b_{i}"
-                session._apply_post_execute_advisories(
-                    [self._tc(tc_id, "bash", '{"command": "echo test"}')],
-                    [(tc_id, "test\n")],
-                )
-        assert any(t == "repeat" for t, _ in _tool_pending(session))
+        with (
+            _send_with_mocks(session, responses, execute),
+            patch.object(session, "_apply_post_execute_advisories", original_apply),
+            patch.object(session, "_nudges_enabled", return_value=True),
+            patch.object(session, "_visible_memory_count", return_value=3),
+            patch.object(
+                session, "_queue_tool_advisory", wraps=session._queue_tool_advisory
+            ) as queue_tool_advisory,
+        ):
+            session.send("run the tool")
 
-    def test_sequential_bash_failures_fire_repeat(self, tmp_db):
-        """Same shape as the success case, but with each call setting
-        ``_tool_error_flags`` (e.g. ``ls /missing`` exiting non-zero).
-        Errors must count toward the streak — a model stuck on the
-        same broken command is exactly the pattern the nudge is meant
-        to catch."""
-        session = _make_session()
-        self._prime(session)
-        with patch.object(session, "_visible_memory_count", return_value=0):
-            for i in range(3):
-                tc_id = f"b_{i}"
-                session._tool_error_flags[tc_id] = True
-                session._apply_post_execute_advisories(
-                    [self._tc(tc_id, "bash", '{"command": "ls /missing"}')],
-                    [(tc_id, "ls: cannot access /missing")],
-                )
-        assert any(t == "repeat" for t, _ in _tool_pending(session))
-
-    def test_json_output_tracked_but_not_inline_warned(self, tmp_db):
-        """MCP-shape JSON outputs are tracked toward the streak but the
-        warning text is NOT appended — that would corrupt the payload."""
-        session = _make_session()
-        self._prime(session)
-        json_out = '{"result": "data"}'
-        with patch.object(session, "_visible_memory_count", return_value=0):
-            for i in range(3):
-                tc_id = f"j_{i}"
-                results = [(tc_id, json_out)]
-                session._apply_post_execute_advisories(
-                    [self._tc(tc_id, "search", '{"q": "x"}')],
-                    results,
-                )
-                if i == 2:
-                    # JSON content untouched even though streak fired.
-                    assert results[0][1] == json_out
-        assert any(t == "repeat" for t, _ in _tool_pending(session))
+        assert "tool_error" in [c.args[0] for c in queue_tool_advisory.call_args_list]
 
     def test_tool_error_nudge_fires_when_memories_exist(self, tmp_db):
         session = _make_session()
         self._prime(session)
-        tc_id = "tc"
-        session._tool_error_flags[tc_id] = True
         with patch.object(session, "_visible_memory_count", return_value=3):
-            session._apply_post_execute_advisories(
-                [self._tc(tc_id, "bash", '{"command": "false"}')],
-                [(tc_id, "command failed")],
-            )
+            session._apply_post_execute_advisories(has_tool_error=True)
         assert any(t == "tool_error" for t, _ in _tool_pending(session))
 
     def test_tool_error_nudge_skipped_with_zero_memories(self, tmp_db):
@@ -11478,38 +11351,9 @@ class TestApplyPostExecuteAdvisories:
         at — should_nudge gates it off."""
         session = _make_session()
         self._prime(session)
-        tc_id = "tc"
-        session._tool_error_flags[tc_id] = True
         with patch.object(session, "_visible_memory_count", return_value=0):
-            session._apply_post_execute_advisories(
-                [self._tc(tc_id, "bash", '{"command": "false"}')],
-                [(tc_id, "command failed")],
-            )
+            session._apply_post_execute_advisories(has_tool_error=True)
         assert all(t != "tool_error" for t, _ in _tool_pending(session))
-
-    def test_no_legacy_repeat_info_line_on_streak_fire(self, tmp_db):
-        """The legacy gray ``[repeat: tool() called with same arguments]``
-        info line is gone — the themed ``tool_reminder`` bubble below
-        the tool block is the canonical operator signal now (and the
-        tool name comes from the visible tool block right above the
-        bubble, not a duplicate diagnostic line).
-        """
-        session = _make_session()
-        self._prime(session)
-        with (
-            patch.object(session.ui, "on_info") as m_info,
-            patch.object(session, "_visible_memory_count", return_value=0),
-        ):
-            for i in range(3):
-                tc_id = f"tc_{i}"
-                session._apply_post_execute_advisories(
-                    [self._tc(tc_id, "read_file", '{"path": "x"}')],
-                    [(tc_id, "ok")],
-                )
-        msgs = [c.args[0] for c in m_info.call_args_list if c.args]
-        assert not any("[repeat:" in m for m in msgs), (
-            f"expected no legacy repeat info line, got {msgs!r}"
-        )
 
 
 class TestUpdateTokenTableMsgsParam:

@@ -329,6 +329,13 @@ frozen.
 
 ### Removed
 
+- **The identical-repeat warning and its nudge are gone (#1339).** A tool called three times in a
+  row with the same arguments no longer has "⚠ Warning: this is an identical repeat of a previous
+  tool call" appended to its output, and the model no longer gets the "stop and reconsider your
+  approach" nudge. The check was written for an early model that looped on the same call, and it
+  fired on calls whose repetition is the documented usage: re-issuing `wait_for_workstream` after a
+  timeout or a user message, and polling `bash_output`, which needed its own exemption. Persisted
+  `repeat` turns in existing transcripts still render.
 - **Skills no longer choose the model, its settings or the task-agent turn cap (#1292)**
   *(BREAKING)* — a skill's model alias, temperature, reasoning effort, max tokens and agent max
   turns are gone from the skill editor, the admin skill API (`SkillInfo`, the create and update

@@ -225,7 +225,6 @@ SYSTEM_TURN_SOURCES: Final = frozenset(
         "denial",
         "completion",
         "tool_error",
-        "repeat",
         "compaction_pending",
         "idle_children",
         "idle_tasks",
