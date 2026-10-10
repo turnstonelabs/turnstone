@@ -67,8 +67,8 @@ from turnstone.console.coordinator_client import (
     WAIT_MAX_TIMEOUT,
     WAIT_REAL_TERMINAL_STATES,
     CoordinatorClient,
+    _enrich_wait_results,
     _last_assistant_text,
-    _wait_message_for,
     load_task_envelope,
 )
 from turnstone.console.coordinator_idle_observer import (
@@ -417,17 +417,19 @@ class _StubCoordinatorClient(CoordinatorClient):
         had completed, so the pair arms measured a stub-invented
         completion instead of the seeded state.
 
-        Messages ride the real ``_wait_message_for`` over the temp DB,
-        where the run seeder wrote each child's fixture transcript —
-        so an idle child's ``message`` is its own last assistant turn,
-        its findings, exactly what production's wait would carry for a
-        finished child.  (An idle child WITHOUT such a turn is refused
-        at sweep start: resolving a wait ``complete`` while showing
-        nothing was produced sends the model back to redo work the
-        world claims is done, and the forbidden rate then measures the
-        fixture's hollowness — the round-8 voided cells.)
-        ``_scripted`` still takes precedence, for tests that need a
-        specific payload.
+        Messages ride production's ``_enrich_wait_results`` over the
+        temp DB, where the run seeder wrote each child's fixture
+        transcript — so an idle child's ``message`` is its own last
+        assistant turn, its findings, exactly what production's wait
+        would carry for a finished child, and a wait that does not
+        resolve (an idle child beside a running one under
+        ``mode='all'``) carries states only, as production's does.
+        (An idle child WITHOUT such a turn is refused at sweep start:
+        resolving a wait ``complete`` while showing nothing was produced
+        sends the model back to redo work the world claims is done, and
+        the forbidden rate then measures the fixture's hollowness — the
+        round-8 voided cells.)  ``_scripted`` still takes precedence,
+        for tests that need a specific payload.
         """
         scripted = self._scripted("wait_for_workstream")
         if scripted is not None:
@@ -456,7 +458,7 @@ class _StubCoordinatorClient(CoordinatorClient):
             timeout_f = 60.0
         timeout_f = max(0.0, min(timeout_f, WAIT_MAX_TIMEOUT))
         rows = {str(c.get("ws_id") or ""): c for c in self._stub_children}
-        results: dict[str, dict[str, Any]] = {}
+        snaps: dict[str, dict[str, Any]] = {}
         for ws in requested:
             row = rows.get(ws)
             if row is None:
@@ -478,15 +480,16 @@ class _StubCoordinatorClient(CoordinatorClient):
                     # raise out of the one consumer that reads it.
                     "name": str(row.get("name", "child")),
                 }
-            message, truncated = _wait_message_for(self._storage, ws, str(snap["state"]))
-            results[ws] = {**snap, "message": message, "truncated": truncated}
-        missing = [ws for ws, snap in results.items() if snap["state"] == "not_found"]
+            snaps[ws] = snap
+        missing = [ws for ws, snap in snaps.items() if snap["state"] == "not_found"]
         complete = False
         if not missing:
-            terminal = [s["state"] in WAIT_REAL_TERMINAL_STATES for s in results.values()]
+            terminal = [s["state"] in WAIT_REAL_TERMINAL_STATES for s in snaps.values()]
             complete = all(terminal) if mode == "all" else any(terminal)
         out: dict[str, Any] = {
-            "results": results,
+            "results": _enrich_wait_results(
+                self._storage, snaps, complete=complete, not_found=bool(missing)
+            ),
             "complete": complete,
             # Approximate in production's favour: a resolved or aborted
             # wait returns within a tick, an unresolved one burns the

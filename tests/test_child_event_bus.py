@@ -213,3 +213,16 @@ def test_notify_silently_ignores_falsy_ws_id(ws_id: object) -> None:
     event = bus.register_waiter(["ws-1"])
     bus.notify(ws_id)  # type: ignore[arg-type]
     assert not event.is_set()
+
+
+def test_register_waiter_registers_a_caller_owned_event() -> None:
+    """``event=`` registers the caller's Event rather than minting one, so
+    something besides the bus (a user message ending a coordinator's wait)
+    can wake the same waiter; notify and unregister act on that Event."""
+    bus = ChildEventBus()
+    own = threading.Event()
+    assert bus.register_waiter(["ws-1", "ws-2"], event=own) is own
+    bus.notify("ws-2")
+    assert own.is_set()
+    bus.unregister_waiter(["ws-1", "ws-2"], own)
+    assert bus._waiters == {}

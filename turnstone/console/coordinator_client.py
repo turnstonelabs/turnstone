@@ -84,10 +84,10 @@ WAIT_MAX_TIMEOUT: float = 600.0
 # A long-running stuck child would otherwise look dead in the sidebar UI
 # because the ``wait_progress`` SSE emission piggybacks on the wait loop
 # — capping at 2 s keeps the heartbeat visible without flooding storage.
-# Today's polling effectively snapshots every 500 ms; 2 s preserves a
-# similar liveness feel while cutting per-listener SSE traffic ~4x in the
-# steady-state-quiescent case.  Tunable post-merge if profiling shows
-# storage-read pressure on state-change wakes.
+# The pre-bus loop polled every 500 ms; 2 s preserves a similar liveness
+# feel while cutting per-listener SSE traffic ~4x in the
+# steady-state-quiescent case.  Tunable if profiling shows storage-read
+# pressure on state-change wakes.
 #
 # **Worst-case completion latency**: 2 s.  ``SessionManager.set_state``
 # buffers non-ERROR storage writes through ``StateWriter`` (async-flushed
@@ -1010,6 +1010,8 @@ class CoordinatorClient:
         mode: str = "any",
         since: dict[str, dict[str, Any]] | None = None,
         progress_callback: Callable[[dict[str, dict[str, Any]], float], None] | None = None,
+        interrupt: Callable[[], str | None] | None = None,
+        wake_event: threading.Event | None = None,
     ) -> dict[str, Any]:
         """Block until child workstreams reach a terminal state.
 
@@ -1025,8 +1027,8 @@ class CoordinatorClient:
         ``{"results": {ws_id: {state, tokens, updated, name, message,
         truncated}}, "elapsed": float, "complete": bool, "mode": mode}``.
         ``complete`` is True when the wait condition was met before the
-        deadline, False when the timeout fired (results carry whatever
-        last state was observed).
+        deadline, False when the timeout fired or ``interrupt`` ended the
+        wait (results carry whatever last state was observed).
 
         ``message`` carries the child's last assistant message text for
         ``idle`` / ``error`` states, or a short status sentinel for
@@ -1039,7 +1041,15 @@ class CoordinatorClient:
         triggers, ``truncated`` is ``True`` so the model can opt into a
         follow-up ``inspect_workstream`` for the rest.  Bundled inline
         so the coordinator LLM doesn't need an extra round-trip per
-        child to see what came back.
+        child to see what came back.  Only a completed wait (or a
+        not_found abort) bundles messages: a wait that times out or is
+        interrupted returns states only, ``None`` for every entry and no
+        storage read for them (#1339).  The model waits again after
+        either, and the wait that completes carries the finished
+        children's messages, so a re-issued wait never repeats a child's
+        text in the model's context.  A child that closed before the
+        completing wait carries only the ``closed`` sentinel there;
+        ``inspect_workstream`` still reads its transcript.
 
         ``since`` — optional prior snapshot (typically the ``results``
         dict from an earlier ``wait_for_workstream`` call).  When
@@ -1084,6 +1094,22 @@ class CoordinatorClient:
         by the coordinator-side wait dashboard (#14) to emit
         ``wait_progress`` SSE events; tests pass it to assert loop
         cadence.
+
+        ``interrupt`` ends the wait early for a reason outside the
+        children (#1339).  It is consulted once per tick, after the
+        completion checks and the deadline, right before the loop would
+        block; a non-empty return stops the wait with ``complete=False``,
+        that tick's states (without messages, as on a timeout), and the
+        returned string as the response's ``interrupted`` field.  The
+        coordinator session passes ``"user_message"`` when the user has
+        sent a message the next tool-result seam will deliver.  A tick
+        that also meets the wait condition reports ``complete=True`` and
+        no ``interrupted``.  ``wake_event`` is the Event the loop blocks
+        on, registered on the child-event bus in place of a fresh one, so
+        a caller that sets it cuts the block short.  The loop clears it at
+        the top of every tick and consults ``interrupt`` after the clear,
+        so a caller that makes ``interrupt`` return its reason before
+        setting the Event never loses the wake.
 
         Performance: each tick issues exactly two storage calls
         (``get_workstreams_batch`` + ``sum_workstream_tokens_batch``),
@@ -1250,13 +1276,16 @@ class CoordinatorClient:
 
         last_results: dict[str, dict[str, Any]] = {}
         complete = False
+        interrupted: str | None = None
         not_found_ids: list[str] = []
         # Subscribe to in-process state-change events for the watched
-        # ws_ids when the bus is wired.  ``register_waiter`` returns a
-        # single ``threading.Event`` registered against every id so a
-        # wait on [A, B, C] wakes on any of A/B/C changing.  Bus is
-        # optional so test fixtures that don't wire it fall back to the
-        # legacy ``time.sleep`` cadence with no behaviour change.
+        # ws_ids.  ``register_waiter`` registers a single
+        # ``threading.Event`` against every id so a wait on [A, B, C]
+        # wakes on any of A/B/C changing.  The Event is the caller's
+        # ``wake_event`` when it brought one, so the caller can cut the
+        # block short too; otherwise a private one.  With no own-subtree
+        # id registered, nothing but the caller sets it and the heartbeat
+        # timeout alone paces the loop.
         #
         # **Defense-in-depth ownership filter**: ``_dispatch_child_event``
         # fires ``bus.notify(ws_id)`` for every ws_id in *any* coord's
@@ -1278,16 +1307,20 @@ class CoordinatorClient:
             pre_rows = {wid: None for wid in cleaned}
         own_subtree = [wid for wid in cleaned if self._row_in_own_subtree(wid, pre_rows.get(wid))]
         bus = self._child_event_bus
-        wake_event = bus.register_waiter(own_subtree) if own_subtree else None
+        if wake_event is None:
+            wake_event = threading.Event()
+        if own_subtree:
+            bus.register_waiter(own_subtree, event=wake_event)
         try:
             while True:
                 # Clear BEFORE the storage snapshot to close the
                 # subscribe/check race: any ``notify`` between clear
                 # and the next ``wake_event.wait`` leaves the Event
                 # set, so the wait returns immediately and the loop
-                # re-snapshots without losing the wake-up.
-                if wake_event is not None:
-                    wake_event.clear()
+                # re-snapshots without losing the wake-up.  The same
+                # holds for the caller's ``interrupt``, consulted after
+                # this clear.
+                wake_event.clear()
                 results = _snapshot_all()
                 last_results = results
                 if progress_callback is not None:
@@ -1341,25 +1374,24 @@ class CoordinatorClient:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     break
-                if wake_event is not None:
-                    # Block until a child state-change notify fires OR
-                    # the heartbeat cap expires (so a stuck child still
-                    # emits a periodic ``wait_progress`` for the
-                    # sidebar UX).  Heartbeat cap is the only timer —
-                    # the bus is the wake source.  See
-                    # ``WAIT_HEARTBEAT_INTERVAL`` (module top) for the
-                    # worst-case completion-latency rationale: 2 s is
-                    # a deliberate 4x trade vs the pre-bus 0.5 s poll.
-                    wake_event.wait(min(remaining, self._WAIT_HEARTBEAT_INTERVAL))
-                else:
-                    # No wake source for this wait (no registered own-
-                    # subtree ids — e.g. a bus-less test fixture).  Fall
-                    # back to the heartbeat cadence so
-                    # ``progress_callback`` keeps firing.  Foreign /
-                    # missing ids can't park here past one tick: the
-                    # not_found fail-fast above exits on the tick that
-                    # observes them.
-                    time.sleep(min(self._WAIT_HEARTBEAT_INTERVAL, remaining))
+                # The caller's reason to stop early, consulted only where
+                # the loop would otherwise block: a tick that met the
+                # wait condition broke above and reports complete.
+                reason = interrupt() if interrupt is not None else None
+                if reason:
+                    interrupted = reason
+                    break
+                # Block until a child state-change notify fires, the
+                # caller sets the Event, or the heartbeat cap expires (so
+                # a stuck child still emits a periodic ``wait_progress``
+                # for the sidebar UX).  Heartbeat cap is the only timer.
+                # See ``WAIT_HEARTBEAT_INTERVAL`` (module top) for the
+                # worst-case completion-latency rationale: 2 s is a
+                # deliberate 4x trade vs the pre-bus 0.5 s poll.  Foreign
+                # / missing ids can't park here past one tick: the
+                # not_found fail-fast above exits on the tick that
+                # observes them.
+                wake_event.wait(min(remaining, self._WAIT_HEARTBEAT_INTERVAL))
         finally:
             # Always unregister so a crash mid-wait can't leak the
             # registration past one wait's lifetime.  Bus discards
@@ -1368,62 +1400,24 @@ class CoordinatorClient:
             # ``own_subtree`` list the register call used — passing
             # ``cleaned`` here would silently no-op for foreign ids
             # but pass an unknown bucket to ``unregister_waiter``.
-            if wake_event is not None:
+            if own_subtree:
                 bus.unregister_waiter(own_subtree, wake_event)
-        # Bundle each terminal child's last assistant message inline so the
-        # coordinator LLM doesn't have to follow up with one
-        # ``inspect_workstream`` per ws.  Only ``idle`` / ``error`` ws_ids
-        # actually hit storage (``closed`` / ``not_found`` return a sentinel
-        # without I/O), so split them and parallelize the storage-bound
-        # subset across a small thread pool — at the WAIT_MAX_WS_IDS=32
-        # cap, 8 workers cuts a worst-case all-idle fan-out from 32
-        # sequential storage round-trips down to 4 batches, which lands
-        # inside the WAIT_HEARTBEAT_INTERVAL the model already tolerates
-        # between ticks.  Storage backends use SQLAlchemy with
-        # ``check_same_thread=False`` (SQLite) / a connection pool
-        # (Postgres), so concurrent reads from the worker pool are safe.
-        io_wids = [
-            wid
-            for wid, snap in last_results.items()
-            if str(snap.get("state") or "") in ("idle", "error")
-        ]
-        io_pairs: dict[str, tuple[str | None, bool]] = {}
-        if io_wids:
-
-            def _enrich(wid: str) -> tuple[str, str | None, bool]:
-                state = str(last_results[wid].get("state") or "")
-                msg, trunc = _wait_message_for(self._storage, wid, state)
-                return wid, msg, trunc
-
-            with concurrent.futures.ThreadPoolExecutor(
-                max_workers=min(8, len(io_wids)),
-                thread_name_prefix="coord-wait-enrich",
-            ) as ex:
-                for wid, msg, trunc in ex.map(_enrich, io_wids):
-                    io_pairs[wid] = (msg, trunc)
-
-        # Build the final dict.  Fresh per-ws dicts (not in-place
-        # mutation) so any in-flight ``wait_progress`` SSE event still
-        # holds a reference to the tick's pre-enrichment snapshot — its
-        # shape is documented as separate from the returned tool result
-        # and must not silently grow new fields just because the wait
-        # completed.
-        enriched_results: dict[str, dict[str, Any]] = {}
-        for wid, snap in last_results.items():
-            state = str(snap.get("state") or "")
-            if wid in io_pairs:
-                msg, trunc = io_pairs[wid]
-            elif state in WAIT_TERMINAL_STATES:
-                msg, trunc = _wait_message_for(self._storage, wid, state)
-            else:
-                msg, trunc = None, False
-            enriched_results[wid] = {**snap, "message": msg, "truncated": trunc}
+        # Fresh per-ws dicts (the helper never mutates ``last_results``) so
+        # any in-flight ``wait_progress`` SSE event still holds a reference
+        # to the tick's pre-enrichment snapshot — its shape is documented as
+        # separate from the returned tool result and must not silently grow
+        # new fields just because the wait completed.
+        enriched_results = _enrich_wait_results(
+            self._storage, last_results, complete=complete, not_found=bool(not_found_ids)
+        )
         response: dict[str, Any] = {
             "results": enriched_results,
             "complete": complete,
             "elapsed": round(time.monotonic() - start, 3),
             "mode": mode,
         }
+        if interrupted:
+            response["interrupted"] = interrupted
         if not_found_ids:
             # The wait aborted on unobservable members — surface a loud
             # top-level error with recovery hints (did-you-mean + child
@@ -2638,3 +2632,69 @@ def _wait_message_for(
             return _WAIT_SENTINEL_NO_RECENT_ASSISTANT, False
         return _truncate_wait_message(text, max_bytes)
     return None, False
+
+
+def _enrich_wait_results(
+    storage: Any,
+    snaps: dict[str, dict[str, Any]],
+    *,
+    complete: bool,
+    not_found: bool,
+) -> dict[str, dict[str, Any]]:
+    """Return a fresh copy of each wait snapshot with ``message`` and ``truncated``.
+
+    Only a wait that completed, or one that aborted on not_found ids, carries
+    messages.  A wait that timed out or was interrupted returns states only
+    (#1339): no child's message and no storage read.  The model waits again,
+    and the wait that completes bundles the finished children's messages, so
+    each child's text enters context once however many timeouts or user
+    messages come first.  The not_found abort keeps its messages: it is an
+    error the model fixes, not a wait it re-issues as it stands.
+
+    :meth:`CoordinatorClient.wait_for_workstream` and the eval harness's stub
+    client both build their results here, so the synthesized wait follows the
+    same rule as the real one.  ``snaps`` is never mutated.
+    """
+    if not complete and not not_found:
+        return {wid: {**snap, "message": None, "truncated": False} for wid, snap in snaps.items()}
+    # Bundle each terminal child's last assistant message inline so the
+    # coordinator LLM doesn't have to follow up with one
+    # ``inspect_workstream`` per ws.  Only ``idle`` / ``error`` ws_ids
+    # actually hit storage (``closed`` / ``not_found`` return a sentinel
+    # without I/O), so split them and parallelize the storage-bound subset
+    # across a small thread pool — at the WAIT_MAX_WS_IDS=32 cap, 8 workers
+    # cuts a worst-case all-idle fan-out from 32 sequential storage
+    # round-trips down to 4 batches, which lands inside the
+    # WAIT_HEARTBEAT_INTERVAL the model already tolerates between ticks.
+    # Storage backends use SQLAlchemy with ``check_same_thread=False``
+    # (SQLite) / a connection pool (Postgres), so concurrent reads from the
+    # worker pool are safe.
+    io_wids = [
+        wid for wid, snap in snaps.items() if str(snap.get("state") or "") in ("idle", "error")
+    ]
+    io_pairs: dict[str, tuple[str | None, bool]] = {}
+    if io_wids:
+
+        def _enrich(wid: str) -> tuple[str, str | None, bool]:
+            state = str(snaps[wid].get("state") or "")
+            msg, trunc = _wait_message_for(storage, wid, state)
+            return wid, msg, trunc
+
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=min(8, len(io_wids)),
+            thread_name_prefix="coord-wait-enrich",
+        ) as ex:
+            for wid, msg, trunc in ex.map(_enrich, io_wids):
+                io_pairs[wid] = (msg, trunc)
+
+    enriched: dict[str, dict[str, Any]] = {}
+    for wid, snap in snaps.items():
+        state = str(snap.get("state") or "")
+        if wid in io_pairs:
+            msg, trunc = io_pairs[wid]
+        elif state in WAIT_TERMINAL_STATES:
+            msg, trunc = _wait_message_for(storage, wid, state)
+        else:
+            msg, trunc = None, False
+        enriched[wid] = {**snap, "message": msg, "truncated": trunc}
+    return enriched

@@ -3008,6 +3008,29 @@ def _queued_row_client_send_id(row: tuple[str, ...]) -> str:
     return row[3] if len(row) >= 4 and row[3] else ""
 
 
+def _queued_row_pops_for(row: tuple[str, ...], principal: str) -> bool:
+    """Whether the partitioned pop takes *row* while *principal* acts.
+
+    THE owner partition of the queue's drains: the acting principal's rows and
+    unowned/legacy rows pop, another participant's rows stay queued, and an
+    empty *principal* pops everything.  :meth:`ChatSession._pop_queued_messages`
+    and :meth:`ChatSession._prepare_queued_flush` select with it, and the
+    wait-interrupt check reads it so a row no drain delivers never ends a wait.
+    """
+    owner = _queued_row_owner(row)
+    return not (principal and owner and owner != principal)
+
+
+def _queued_row_has_text(row: tuple[str, ...]) -> bool:
+    """Whether *row* has text left after its priority prefix was stripped.
+
+    A content-free row (a bare ``!!!``) delivers nothing: the tool-result
+    seam skips it, :meth:`ChatSession._render_queued_messages` drops it from
+    a combined turn, and it never ends a ``wait_for_workstream``.
+    """
+    return bool(row[0].strip())
+
+
 @dataclasses.dataclass(frozen=True)
 class _GenuineUserTurnPlan:
     """One admitted human turn and its derived, body-free memory pointer."""
@@ -3506,6 +3529,11 @@ class ChatSession:
             str, tuple[str, str] | tuple[str, str, str] | tuple[str, str, str, str]
         ] = collections.OrderedDict()
         self._queued_lock = threading.Lock()
+        # Wake events of the ``wait_for_workstream`` calls blocked right now
+        # (#1339): ``queue_message`` sets each one so a message the user sends
+        # ends the wait at once instead of queuing behind it.  Registered and
+        # removed by ``_exec_wait_for_workstream``; guarded by ``_queued_lock``.
+        self._wait_wakers: set[threading.Event] = set()
         # Repeat detection: streak counter over tool-call signatures.
         # Fires when a (name, args) signature has been seen N times in
         # a row; recording any different signature resets the streak.
@@ -18064,6 +18092,11 @@ class ChatSession:
                 if client_send_id
                 else (cleaned, priority, owner)
             )
+            wait_wakers = tuple(self._wait_wakers)
+        # After the row is visible: a woken wait re-reads the queue through
+        # ``_wait_interrupt_reason`` and must find it there.
+        for waker in wait_wakers:
+            waker.set()
         return cleaned, priority, msg_id
 
     def has_foreign_queued_messages(self, principal_id: str) -> bool:
@@ -18304,7 +18337,7 @@ class ChatSession:
                 items = tuple(
                     (message_id, row)
                     for message_id, row in self._queued_messages.items()
-                    if not principal or not (owner := _queued_row_owner(row)) or owner == principal
+                    if _queued_row_pops_for(row, principal)
                 )
         owners = {_queued_row_owner(row) for _message_id, row in items}
         owners.discard("")
@@ -18407,12 +18440,11 @@ class ChatSession:
         with self._queued_lock:
             popped: dict[
                 str, tuple[str, str] | tuple[str, str, str] | tuple[str, str, str, str]
-            ] = {}
-            for mid, row in self._queued_messages.items():
-                owner = _queued_row_owner(row)
-                if principal and owner and owner != principal:
-                    continue
-                popped[mid] = row
+            ] = {
+                mid: row
+                for mid, row in self._queued_messages.items()
+                if _queued_row_pops_for(row, principal)
+            }
             for mid in popped:
                 del self._queued_messages[mid]
                 self._retracted_while_popped.discard(mid)
@@ -18424,6 +18456,26 @@ class ChatSession:
                 # success / deliberate-discard / exception exit.
                 self._popped_in_flight.add(mid)
         return popped
+
+    def _wait_interrupt_reason(self) -> str | None:
+        """Why a blocked ``wait_for_workstream`` should end now, if it should.
+
+        ``"user_message"`` when the queue holds a message the next tool-result
+        seam will deliver: a row :meth:`_pop_queued_messages` takes with text
+        left after the priority strip (the seam's own two predicates).  Read
+        from the queue on every call rather than from a flag set at queue time,
+        so a message retracted before the wait looks again never ends it, and
+        another participant's retained row can never end every wait the model
+        re-issues.
+        """
+        principal = (self._mcp_effective_user_id or "").strip()
+        with self._queued_lock:
+            if any(
+                _queued_row_has_text(row) and _queued_row_pops_for(row, principal)
+                for row in self._queued_messages.values()
+            ):
+                return "user_message"
+        return None
 
     def _restore_queued_messages(
         self,
@@ -18492,18 +18544,18 @@ class ChatSession:
         handoff in :meth:`deliver_wake_nudge_from_queue`, so the two
         dispatch shapes cannot drift.
 
-        Content-free items are SKIPPED, mirroring ``_collect_advisories``:
-        a priority prefix with nothing behind it (a bare ``!!!``) must
-        not become a turn — rendered alone it would read as a truthy
-        ``"[IMPORTANT] "`` and buy a content-free user turn.  Returns
-        ``""`` when nothing renderable was queued.
+        Content-free items are SKIPPED (:func:`_queued_row_has_text`, the
+        rule ``_collect_advisories`` applies): a priority prefix with nothing
+        behind it (a bare ``!!!``) must not become a turn — rendered alone it
+        would read as a truthy ``"[IMPORTANT] "`` and buy a content-free user
+        turn.  Returns ``""`` when nothing renderable was queued.
         """
         from turnstone.core.tool_advisory import PRIORITY_IMPORTANT
 
         return "\n\n".join(
             f"[IMPORTANT] {row[0]}" if row[1] == PRIORITY_IMPORTANT else row[0]
             for row in items.values()
-            if row[0].strip()
+            if _queued_row_has_text(row)
         )
 
     @staticmethod
@@ -18593,7 +18645,7 @@ class ChatSession:
                     # words so the turn keeps user (not operator) authority,
                     # including on the native path where it enters as a real
                     # role=system message.
-                    if not text.strip():
+                    if not _queued_row_has_text(row):
                         continue
                     # ``framed`` (preamble + "User message: …") is the
                     # model-facing content — it keeps the user's authority
@@ -24013,17 +24065,17 @@ class ChatSession:
             },
         )
 
-        # Throttle wait_progress emission (#perf-3).  The wait loop polls
-        # every 0.5s; emitting on every tick with the full results dict
-        # would flood each SSE listener's maxsize=500 queue — a 600s
-        # wait produces 1200 events per listener, pushing out unrelated
-        # state_change / content events via put_nowait drop.  Emit only
-        # when the polled snapshot actually differs from the last
-        # emitted snapshot, OR when at least ~5s has elapsed since the
-        # last emission (so a stuck wait still shows a heartbeat for
-        # the operator).  The sidebar indicator only needs
-        # seconds-granularity elapsed; the full results dict is only
-        # useful on transitions, so dropping redundant ticks is free.
+        # Throttle wait_progress emission (#perf-3).  The wait loop ticks on
+        # every child state change and every queued user message, and at
+        # least every 2s (``WAIT_HEARTBEAT_INTERVAL``); emitting on every
+        # tick with the full results dict would send each SSE listener ~300
+        # events over a quiet 600s wait, nearly all of them repeats.  Emit
+        # only when the polled snapshot actually differs from the last
+        # emitted snapshot, OR when at least ~5s has elapsed since the last
+        # emission (so a stuck wait still shows a heartbeat for the
+        # operator).  The sidebar indicator only needs seconds-granularity
+        # elapsed; the full results dict is only useful on transitions, so
+        # dropping redundant ticks is free.
         progress_state: dict[str, Any] = {
             "last_snap": None,
             "last_emit_mono": 0.0,
@@ -24033,13 +24085,14 @@ class ChatSession:
         def _progress(snap: dict[str, Any], elapsed: float) -> None:
             # Cooperative cancel seam.  ``wait_for_workstream`` holds no
             # cancel handle and its wait loop blocks on the ChildEventBus
-            # (woken only by *child* state changes), so without this a
-            # cancelled coordinator parked in a wait stays pinned for up to
-            # WAIT_MAX_TIMEOUT (600s).  The loop calls this callback every
-            # ~2s heartbeat and wraps it in ``except Exception`` — but
-            # ``GenerationCancelled`` is a ``BaseException``, so raising
-            # here propagates cleanly out of the wait into the send() cancel
-            # handler.  ~2s abort instead of up to 600s.
+            # (woken by child state changes and queued user messages, never
+            # by a cancel), so without this a cancelled coordinator parked
+            # in a wait stays pinned for up to WAIT_MAX_TIMEOUT (600s).  The
+            # loop calls this callback every ~2s heartbeat and wraps it in
+            # ``except Exception`` — but ``GenerationCancelled`` is a
+            # ``BaseException``, so raising here propagates cleanly out of
+            # the wait into the send() cancel handler.  ~2s abort instead of
+            # up to 600s.
             self._check_cancelled()
             now = time.monotonic()
             changed = snap != progress_state["last_snap"]
@@ -24059,6 +24112,15 @@ class ChatSession:
             progress_state["last_snap"] = snap
             progress_state["last_emit_mono"] = now
 
+        # A message the user sends while this wait blocks ends it at once
+        # (#1339): ``queue_message`` sets ``waker``, the client's loop wakes,
+        # finds ``_wait_interrupt_reason`` non-empty and returns the current
+        # snapshot marked ``interrupted``; the message then drains at the
+        # tool-result seam like any interjection.  Registered for this call
+        # only and removed on every exit, a cancel's raise included.
+        waker = threading.Event()
+        with self._queued_lock:
+            self._wait_wakers.add(waker)
         try:
             result = self._coord_client.wait_for_workstream(
                 clean_ws_ids,
@@ -24066,6 +24128,8 @@ class ChatSession:
                 mode=mode_val,
                 since=item.get("since"),
                 progress_callback=_progress,
+                interrupt=self._wait_interrupt_reason,
+                wake_event=waker,
             )
         except Exception as e:
             msg = f"Error: wait_for_workstream failed: {e}"
@@ -24075,6 +24139,9 @@ class ChatSession:
                 {"call_id": call_id, "complete": False, "error": str(e)},
             )
             return call_id, msg
+        finally:
+            with self._queued_lock:
+                self._wait_wakers.discard(waker)
         # Surface client-side validation errors as tool errors rather
         # than rendering them as a "successful" wait result.
         if result.get("error"):
@@ -24113,21 +24180,22 @@ class ChatSession:
             for snap in results_dict.values()
             if isinstance(snap, dict) and snap.get("state") in WAIT_REAL_TERMINAL_STATES
         )
-        verb = "complete" if complete else "timeout"
+        interrupted = result.get("interrupted")
+        verb = "complete" if complete else ("interrupted" if interrupted else "timeout")
         # Denominator = polled set (not raw item['ws_ids']) so the ratio
         # stays coherent with what the client actually tracked after dedup.
         summary = f"{verb} after {elapsed}s ({resolved_count}/{len(results_dict)} resolved)"
         self._report_tool_result(call_id, "wait_for_workstream", summary)
-        self._emit_wait_event(
-            "wait_ended",
-            {
-                "call_id": call_id,
-                "complete": complete,
-                "elapsed": elapsed,
-                "results": results_dict,
-                "resolved": resolved_count,
-            },
-        )
+        ended: dict[str, Any] = {
+            "call_id": call_id,
+            "complete": complete,
+            "elapsed": elapsed,
+            "results": results_dict,
+            "resolved": resolved_count,
+        }
+        if interrupted:
+            ended["interrupted"] = interrupted
+        self._emit_wait_event("wait_ended", ended)
         return call_id, output
 
     def _emit_wait_event(self, event_type: str, payload: dict[str, Any]) -> None:

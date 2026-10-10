@@ -2086,8 +2086,10 @@ class TestStubClient:
         """The old stub returned a hardcoded terminal blob — every child
         "completed its work", including ones seeded RUNNING, so the pair
         arms measured a stub-invented completion.  Now: a running child
-        is the still-running timeout shape, an idle one resolves, and
-        the mode semantics are production's over the real terminal set.
+        is the still-running timeout shape, an idle one resolves, the
+        mode semantics are production's over the real terminal set, and
+        a wait that does not resolve carries states only, as
+        production's does (#1339).
         """
         client = _StubCoordinatorClient(
             eval_storage,
@@ -2109,7 +2111,11 @@ class TestStubClient:
         assert idle["results"]["ws-idle"]["state"] == "idle"
 
         assert client.wait_for_workstream(["ws-idle", "ws-run"], mode="any")["complete"] is True
-        assert client.wait_for_workstream(["ws-idle", "ws-run"], mode="all")["complete"] is False
+        unresolved = client.wait_for_workstream(["ws-idle", "ws-run"], mode="all")
+        assert unresolved["complete"] is False
+        assert unresolved["results"]["ws-idle"]["state"] == "idle"
+        assert unresolved["results"]["ws-idle"]["message"] is None
+        assert unresolved["results"]["ws-idle"]["truncated"] is False
 
     def test_wait_carries_the_seeded_childs_findings(self, eval_storage):
         """The pin the deepened world turns on: with the C6b child's

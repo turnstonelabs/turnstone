@@ -144,7 +144,7 @@ with a `type` field.  The recurring shapes a UI has to handle:
 | `child_ws_state`    | A direct child transitioned state                                                          | `child_ws_id`, `state` |
 | `child_ws_closed`   | A direct child closed                                                                      | `child_ws_id` |
 | `child_ws_rename`   | A direct child's name changed                                                              | `child_ws_id`, `name` |
-| `wait_started` / `wait_progress` / `wait_ended` | `wait_for_workstream` tool lifecycle (see §6)                  | `call_id`, `ws_ids`, `elapsed`, `results`, `complete` |
+| `wait_started` / `wait_progress` / `wait_ended` | `wait_for_workstream` tool lifecycle (see §6)                  | `call_id`, `ws_ids`, `elapsed`, `results`, `complete`, `interrupted` |
 | `batch_started` / `batch_ended` | `spawn_batch` / `close_all_children` tool lifecycle                            | `call_id`, `op`, `total`/`succeeded`/`denied`/`closed`/`failed`/`skipped` |
 | `info` / `error`    | Operational messages                                                                       | `message` |
 | `history_resync`    | The rendered history token no longer names the accepted row prefix                         | `ws_id`, `reason` |
@@ -263,9 +263,11 @@ Key properties:
   real terminal state (`idle` / `error` / `closed` / `deleted`);
   `mode="all"` waits for every polled child to reach a real
   terminal state.
-- **Progress throttling** — the poll loop runs every 500 ms but the
+- **Progress throttling** — the wait loop wakes on each child state
+  change and each queued user message, and at least every 2 s, but the
   SSE emission is diff-on-state-change plus a 5-second heartbeat.  A
-  600 s wait generates O(dozens) of progress events, not 1200.
+  quiet 600 s wait ticks about 300 times and emits about 100 progress
+  events.
 - **Unresolvable ids** — ws_ids are validated up front (exactly
   32 hex chars; copy them verbatim): a malformed id fails the call
   immediately with did-you-mean suggestions and a roster of the
@@ -276,6 +278,24 @@ Key properties:
   LLM should fix the id and re-issue, not conclude the child died.
   Foreign and missing collapse into one shape, so the wait can't be
   used as an existence oracle.
+- **Messages come with a completed wait** — `message` carries each
+  finished child's last assistant text only when the wait completes
+  (or aborts on `not_found`).  A wait that times out or is
+  interrupted returns states only, with `message` null for every
+  child, so a coordinator that waits again never receives the same
+  output twice.  A child that closed before the completing wait
+  shows only the `closed` sentinel there; `inspect_workstream` still
+  reads what it produced.
+- **A user message ends the wait** — when the user sends the
+  coordinator a message while it waits, the wait returns at once with
+  `complete=false`, `interrupted="user_message"` and states only, and
+  the message reaches the LLM right after the tool result unless the
+  user withdrew it first (`wait_ended` carries the same `interrupted`
+  field).  The LLM re-issues the wait if it still needs one.  A
+  message that can't join a running turn still waits for the turn to
+  end: `/send` refuses one with attachments (`attachments_busy`) or
+  from a second signed-in user (409 `cross_user_interjection`), and
+  the sender resends once the coordinator is idle.
 
 Prefer `wait_for_workstream` over polling `inspect_workstream` in a
 loop — a wait consumes one assistant turn regardless of how long the
