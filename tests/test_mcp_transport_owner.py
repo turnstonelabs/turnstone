@@ -377,8 +377,11 @@ class TestTransportOwnerLifecycle:
             )
 
         assert result["connected"] is False
-        assert "Method not found" in result["error"]
-        assert "new" not in mgr._server_configs
+        assert result["error"] == "The server answered with MCP error -32602: Method not found"
+        # Kept, with no catalog, as a failed startup connect is: its status says why and the
+        # health loop retries it.
+        assert mgr._server_configs["new"] == {"type": "stdio", "command": "fake-cmd"}
+        assert mgr.get_server_status("new")["error"] == result["error"]
         state = mgr._static_servers["new"]
         assert state.session is None
         assert state.owner_task is None
@@ -530,7 +533,8 @@ class TestTransportOwnerLifecycle:
             "prompts": 0,
             "error": "MCP server 'new' registration timed out",
         }
-        assert "new" not in mgr._server_configs
+        assert mgr._server_configs["new"] == {"type": "stdio", "command": "fake-cmd"}
+        assert mgr.get_server_status("new")["error"] == "The server did not answer in time"
         state = mgr._static_servers["new"]
         assert state.session is None
         assert state.owner_task is None
@@ -754,7 +758,8 @@ class TestTransportOwnerLifecycle:
 
         assert result["connected"] is False
         assert "died during discovery" in result["error"]
-        assert "new" not in mgr._server_configs
+        assert mgr._server_configs["new"] == {"type": "stdio", "command": "fake-cmd"}
+        assert mgr.get_server_status("new")["error"] == result["error"]
         state = mgr._static_servers["new"]
         assert state.session is None
         assert state.owner_task is None

@@ -77,18 +77,13 @@ class TestAddServerSync:
         assert result["prompts"] == 0
 
     def test_fails_without_event_loop(self) -> None:
-        """Adding a server without starting the event loop should fail gracefully."""
+        """Adding a server without starting the event loop fails gracefully, before it registers
+        the server."""
         mgr = MCPClientManager({})
         result = mgr.add_server_sync("test", {"command": "echo"})
         assert result["connected"] is False
         assert "loop" in result["error"].lower()
-
-    def test_config_removed_on_failure(self) -> None:
-        """add_server_sync removes the config entry when connection fails."""
-        mgr = MCPClientManager({})
-        mgr.add_server_sync("new-srv", {"command": "echo"})
-        # Since the loop isn't running, it fails and config is cleaned up
-        assert "new-srv" not in mgr._server_configs
+        assert "test" not in mgr._server_configs
 
 
 # ---------------------------------------------------------------------------

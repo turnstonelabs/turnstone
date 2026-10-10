@@ -191,6 +191,8 @@ export type {
   CreateMcpServerRequest,
   UpdateMcpServerRequest,
   ImportMcpConfigResponse,
+  McpConnectionTestRequest,
+  McpConnectionTestResponse,
   // MCP registry types
   RegistryRemoteInfo,
   RegistryPackageInfo,

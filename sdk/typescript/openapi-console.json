@@ -3913,6 +3913,57 @@
         }
       }
     },
+    "/v1/api/admin/mcp-servers/test": {
+      "post": {
+        "summary": "Test a Streamable HTTP server's connection from the console with unsaved values, listing its tools; nothing is saved",
+        "operationId": "v1_api_admin_mcp-servers_test_post",
+        "tags": [
+          "Admin"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/McpConnectionTestRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/McpConnectionTestResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Error 400",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Error 429",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/api/admin/model-definitions": {
       "get": {
         "summary": "List model definitions with live status from cluster nodes",
@@ -12313,6 +12364,11 @@
             "title": "Error",
             "type": "string"
           },
+          "has_error": {
+            "default": false,
+            "title": "Has Error",
+            "type": "boolean"
+          },
           "transport": {
             "default": "",
             "title": "Transport",
@@ -12751,6 +12807,115 @@
           }
         },
         "title": "McpReloadResponse",
+        "type": "object"
+      },
+      "McpConnectionTestRequest": {
+        "properties": {
+          "url": {
+            "title": "Url",
+            "type": "string"
+          },
+          "headers": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "title": "Headers",
+            "type": "object"
+          },
+          "auth_type": {
+            "default": "static",
+            "title": "Auth Type",
+            "type": "string"
+          },
+          "transport": {
+            "default": "streamable-http",
+            "title": "Transport",
+            "type": "string"
+          },
+          "name": {
+            "default": "",
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "url"
+        ],
+        "title": "McpConnectionTestRequest",
+        "type": "object"
+      },
+      "McpConnectionTestResponse": {
+        "properties": {
+          "ok": {
+            "default": false,
+            "title": "Ok",
+            "type": "boolean"
+          },
+          "tools": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Tools",
+            "type": "array"
+          },
+          "resources": {
+            "default": 0,
+            "title": "Resources",
+            "type": "integer"
+          },
+          "prompts": {
+            "default": 0,
+            "title": "Prompts",
+            "type": "integer"
+          },
+          "error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Error"
+          },
+          "kind": {
+            "anyOf": [
+              {
+                "enum": [
+                  "unreachable",
+                  "tls",
+                  "http",
+                  "timeout",
+                  "not_mcp",
+                  "protocol",
+                  "invalid_catalog",
+                  "error"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Kind"
+          },
+          "status": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Status"
+          }
+        },
+        "title": "McpConnectionTestResponse",
         "type": "object"
       },
       "ModelDefinitionInfo": {

@@ -85,6 +85,62 @@ async def test_memory_description_update_and_index_health():
 
 
 # ---------------------------------------------------------------------------
+# MCP connection test (#1328)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("client_read", "read"),
+    [(10.0, 75.0), (120.0, 120.0), (None, None)],
+    ids=["raised", "already-longer", "unbounded"],
+)
+@pytest.mark.anyio
+async def test_mcp_server_connection_test_sends_the_unsaved_values(client_read, read):
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return _json_response(
+            {
+                "ok": True,
+                "tools": ["search", "fetch"],
+                "resources": 0,
+                "prompts": 1,
+                "error": None,
+                "kind": None,
+                "status": None,
+            }
+        )
+
+    transport = httpx.MockTransport(handler)
+    limits = httpx.Timeout(10.0, read=client_read, write=20.0)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test", timeout=limits) as hc:
+        client = AsyncTurnstoneConsole(httpx_client=hc)
+        result = await client.test_mcp_server(
+            "https://mcp.example/mcp", headers={"Authorization": "Bearer abc"}, name="docs"
+        )
+
+    assert captured[0].method == "POST"
+    assert captured[0].url.path == "/v1/api/admin/mcp-servers/test"
+    assert json.loads(captured[0].content) == {
+        "url": "https://mcp.example/mcp",
+        "auth_type": "static",
+        "headers": {"Authorization": "Bearer abc"},
+        "name": "docs",
+    }
+    # At least long enough for the console's wait for a test, which outlasts the client's
+    # default; a longer or unbounded read, and the client's other limits, stay.
+    assert captured[0].extensions["timeout"] == {
+        "connect": 10.0,
+        "read": read,
+        "write": 20.0,
+        "pool": 10.0,
+    }
+    assert result.ok is True
+    assert result.tools == ["search", "fetch"]
+
+
+# ---------------------------------------------------------------------------
 # Routing proxy — rewind / retry (#549)
 # ---------------------------------------------------------------------------
 

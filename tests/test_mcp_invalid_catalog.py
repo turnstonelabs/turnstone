@@ -157,7 +157,7 @@ def test_static_connect_reports_the_invalid_tool(upstream_server: tuple[str, Ups
         published = mgr.is_mcp_tool("mcp__srv__good")
 
     assert status["connected"] is False
-    assert status["error"] == f"InvalidCatalogError: {NO_SCHEMA_ERROR}"
+    assert status["error"] == NO_SCHEMA_ERROR
     assert status["consecutive_failures"] == 0
     assert status["circuit_open"] is False
     assert upstream.list_requests == 1
@@ -187,7 +187,7 @@ def test_health_loop_retries_slowly_and_publishes_once_fixed(
         assert _poll_until(lambda: mgr.is_mcp_tool("mcp__srv__broken"), 10)
         fixed = mgr.get_server_status("srv")
 
-    assert failing["error"] == f"InvalidCatalogError: {NO_SCHEMA_ERROR}"
+    assert failing["error"] == NO_SCHEMA_ERROR
     assert failing["consecutive_failures"] == 0
     assert fixed["connected"] is True
     assert fixed["tools"] == 2
@@ -226,7 +226,7 @@ def test_kept_tools_leave_after_a_reconnect_finds_an_invalid_catalog(
 
     assert reconnects == 1
     assert retry_in > mgr._INVALID_CATALOG_RETRY_S - 10
-    assert status["error"] == f"InvalidCatalogError: {NO_SCHEMA_ERROR}"
+    assert status["error"] == NO_SCHEMA_ERROR
     assert status["consecutive_failures"] == 0
 
 
@@ -307,7 +307,7 @@ def test_pool_prime_shows_the_invalid_tool_in_the_users_status(
             _run_on_loop(mgr._loop, mgr._prime_user_pools("user-1"))
         status = mgr.get_server_status("srv", user_id="user-1")
 
-    assert status["discovery_error"] == f"InvalidCatalogError: {NO_SCHEMA_ERROR}"
+    assert status["discovery_error"] == NO_SCHEMA_ERROR
     assert status["tools"] == 0
     assert status["consecutive_failures"] == 0
 

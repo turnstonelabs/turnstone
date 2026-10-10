@@ -85,6 +85,7 @@ class _BaseClient:
         params: dict[str, Any] | None = ...,
         files: list[tuple[str, tuple[str, bytes, str]]] | None = ...,
         data: dict[str, Any] | None = ...,
+        timeout: httpx.Timeout | None = ...,
         response_model: type[T],
     ) -> T: ...
 
@@ -98,6 +99,7 @@ class _BaseClient:
         params: dict[str, Any] | None = ...,
         files: list[tuple[str, tuple[str, bytes, str]]] | None = ...,
         data: dict[str, Any] | None = ...,
+        timeout: httpx.Timeout | None = ...,
         response_model: None = ...,
     ) -> dict[str, Any]: ...
 
@@ -110,6 +112,7 @@ class _BaseClient:
         params: dict[str, Any] | None = None,
         files: list[tuple[str, tuple[str, bytes, str]]] | None = None,
         data: dict[str, Any] | None = None,
+        timeout: httpx.Timeout | None = None,
         response_model: type[Any] | None = None,
     ) -> Any:
         """Execute an HTTP request and return parsed response data.
@@ -117,9 +120,11 @@ class _BaseClient:
         When *files* is provided, the request is sent as
         ``multipart/form-data`` with the named file parts (and any
         *data* fields as plain form fields).  Mutually exclusive with
-        *json_body*.  Raises :class:`TurnstoneAPIError` on non-2xx
-        responses.
+        *json_body*.  *timeout* replaces the client's for this request;
+        None keeps the client's.  Raises :class:`TurnstoneAPIError` on
+        non-2xx responses.
         """
+        limits = httpx.USE_CLIENT_DEFAULT if timeout is None else timeout
         headers: dict[str, str] | None = None
         if self._token_factory is not None:
             headers = {"Authorization": f"Bearer {self._token_factory()}"}
@@ -133,6 +138,7 @@ class _BaseClient:
                 data=data,
                 params=params,
                 headers=headers,
+                timeout=limits,
             )
         else:
             resp = await self._client.request(
@@ -141,6 +147,7 @@ class _BaseClient:
                 json=json_body,
                 params=params,
                 headers=headers,
+                timeout=limits,
             )
         if resp.status_code >= 400:
             # Try to extract error message from JSON body

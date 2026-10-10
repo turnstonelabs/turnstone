@@ -4478,9 +4478,9 @@ function _renderMcpServers(items) {
         totalRes += ns.resources || 0;
         totalPrompts += ns.prompts || 0;
       }
-      if (ns.error) {
+      if (ns.error || ns.has_error) {
         anyError = true;
-        if (!firstError) firstError = ns.error;
+        if (!firstError && ns.error) firstError = ns.error;
       }
       if (
         typeof ns.last_refresh_at === "number" &&
@@ -4864,6 +4864,16 @@ function toggleMcpAuthFields() {
     headersInput.hidden = !show;
     if (headersLabel) headersLabel.hidden = !show;
   }
+  // The connection test covers Streamable HTTP with no auth or static
+  // headers; OAuth needs a sign-in first. A transport or auth change also
+  // makes an earlier result stale.
+  const testBtn = document.getElementById("mcp-test-btn");
+  if (testBtn)
+    testBtn.hidden = !(
+      document.getElementById("mcp-transport").value === "streamable-http" &&
+      (authType === "none" || authType === "static")
+    );
+  _clearMcpTestResult();
 }
 
 function _wireMcpAudienceAutofill() {
@@ -4911,6 +4921,16 @@ function _mcpWire() {
   document
     .getElementById("mcp-create-submit")
     .addEventListener("click", submitCreateMcp);
+  document
+    .getElementById("mcp-test-btn")
+    .addEventListener("click", testMcpConnection);
+  // A result describes the values it tested: editing them clears it.
+  document
+    .getElementById("mcp-url")
+    .addEventListener("input", _clearMcpTestResult);
+  document
+    .getElementById("mcp-headers")
+    .addEventListener("input", _clearMcpTestResult);
   _wireMcpAudienceAutofill();
 }
 
@@ -5033,6 +5053,22 @@ function hideCreateMcpModal() {
   window.TurnstoneHatch.closeShelf(document.getElementById("mcp-shelf"));
 }
 
+// The Headers textarea as an object: "Key: Value" lines, others skipped.
+function _parseMcpHeaders() {
+  const hdrText = document.getElementById("mcp-headers").value.trim();
+  const hdrObj = {};
+  if (hdrText) {
+    hdrText.split("\n").forEach(function (line) {
+      const colon = line.indexOf(":");
+      if (colon > 0)
+        hdrObj[line.substring(0, colon).trim()] = line
+          .substring(colon + 1)
+          .trim();
+    });
+  }
+  return hdrObj;
+}
+
 function _parseMcpForm() {
   const name = document.getElementById("mcp-name").value.trim();
   const transport = document.getElementById("mcp-transport").value;
@@ -5074,18 +5110,7 @@ function _parseMcpForm() {
   } else {
     payload.url = document.getElementById("mcp-url").value.trim();
     if (authType === "static") {
-      const hdrText = document.getElementById("mcp-headers").value.trim();
-      const hdrObj = {};
-      if (hdrText) {
-        hdrText.split("\n").forEach(function (line) {
-          const colon = line.indexOf(":");
-          if (colon > 0)
-            hdrObj[line.substring(0, colon).trim()] = line
-              .substring(colon + 1)
-              .trim();
-        });
-      }
-      payload.headers = hdrObj;
+      payload.headers = _parseMcpHeaders();
     } else {
       // 'none' / 'oauth_user' / 'oauth_obo' — clear static headers state.
       payload.headers = {};
@@ -5172,6 +5197,105 @@ function submitCreateMcp() {
       window.TurnstoneHatch.setBusy(shelf, false);
       errEl.textContent = e.message;
       errEl.classList.add("is-visible");
+    });
+}
+
+// Bumped by every clear, so a test that answers after its form changed is
+// dropped instead of describing values it never tested.
+let _mcpTestSeq = 0;
+
+function _clearMcpTestResult() {
+  _mcpTestSeq++;
+  const rd = document.getElementById("mcp-test-result");
+  if (rd) {
+    rd.hidden = true;
+    rd.textContent = "";
+  }
+}
+
+function _mcpCount(n, noun) {
+  return n + " " + noun + (n === 1 ? "" : "s");
+}
+
+// Connect once with the form's values and list the server's tools, saving
+// nothing. The console runs the test, so the result says so: nodes connect
+// from their own network position, which may reach different hosts.
+function testMcpConnection() {
+  const btn = document.getElementById("mcp-test-btn");
+  const resultDiv = document.getElementById("mcp-test-result");
+  const authType = _selectedMcpAuthType();
+  const payload = {
+    name: document.getElementById("mcp-name").value.trim(),
+    transport: "streamable-http",
+    url: document.getElementById("mcp-url").value.trim(),
+    auth_type: authType,
+    headers: authType === "static" ? _parseMcpHeaders() : {},
+  };
+  _clearMcpTestResult();
+  const seq = _mcpTestSeq;
+  if (!payload.url) {
+    resultDiv.appendChild(
+      _detectResultLine("✗ Enter the server's URL to test it", "red"),
+    );
+    resultDiv.hidden = false;
+    return;
+  }
+  btn.disabled = true;
+  btn.setAttribute("aria-busy", "true");
+  btn.textContent = "Testing…";
+  authFetch("/v1/api/admin/mcp-servers/test", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  })
+    .then(function (r) {
+      if (!r.ok)
+        return r.json().then(function (d) {
+          throw new Error(d.error || "Test failed");
+        });
+      return r.json();
+    })
+    .then(function (d) {
+      if (seq !== _mcpTestSeq) return;
+      if (d.ok) {
+        resultDiv.appendChild(
+          _detectResultLine(
+            "✓ Connected: " +
+              _mcpCount(d.tools.length, "tool") +
+              ", " +
+              _mcpCount(d.resources, "resource") +
+              ", " +
+              _mcpCount(d.prompts, "prompt"),
+            "green",
+          ),
+        );
+        if (d.tools.length)
+          resultDiv.appendChild(_detectResultLine(d.tools.join(", ")));
+      } else {
+        resultDiv.appendChild(_detectResultLine("✗ " + d.error, "red"));
+      }
+      resultDiv.appendChild(
+        _detectResultLine(
+          "Tested from the console; nodes connect from their own network.",
+          "fg-dim",
+        ),
+      );
+      resultDiv.hidden = false;
+      // The panel ends the scrolling body while the button sits in the
+      // sticky foot: bring it into view.
+      if (resultDiv.scrollIntoView)
+        resultDiv.scrollIntoView({ block: "nearest" });
+    })
+    .catch(function (e) {
+      if (e.message === "auth" || e.message === "auth changed") return;
+      if (seq !== _mcpTestSeq) return;
+      resultDiv.appendChild(_detectResultLine("✗ " + e.message, "red"));
+      resultDiv.hidden = false;
+    })
+    .finally(function () {
+      btn.disabled = false;
+      btn.removeAttribute("aria-busy");
+      btn.textContent = "Test connection";
     });
 }
 

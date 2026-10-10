@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import threading
 import uuid
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
@@ -42,6 +43,7 @@ from turnstone.console.server import (
     admin_mcp_reconnect_one,
     admin_mcp_refresh_one,
     admin_mcp_reload,
+    admin_test_mcp_server,
     admin_update_mcp_server,
 )
 from turnstone.core.auth import AuthResult
@@ -92,6 +94,21 @@ class _InjectAuthNoMcpMiddleware(BaseHTTPMiddleware):
         return resp
 
 
+class _InjectReadTokenWithMcpMiddleware(BaseHTTPMiddleware):
+    """A read-scoped token whose owner holds admin.mcp: a DB token carries its owner's
+    permissions whatever its scopes."""
+
+    async def dispatch(self, request: Request, call_next: Any) -> Response:
+        request.state.auth_result = AuthResult(
+            user_id="test-user",
+            scopes=frozenset({"read"}),
+            token_source="database",
+            permissions=frozenset({"read", "write", "approve", "admin.mcp"}),
+        )
+        resp: Response = await call_next(request)
+        return resp
+
+
 class _InjectServiceAuthMiddleware(BaseHTTPMiddleware):
     """Inject the cluster service identity used for internal cache eviction."""
 
@@ -127,6 +144,11 @@ _ROUTES = [
             Route(
                 "/api/admin/mcp-servers/reload",
                 admin_mcp_reload,
+                methods=["POST"],
+            ),
+            Route(
+                "/api/admin/mcp-servers/test",
+                admin_test_mcp_server,
                 methods=["POST"],
             ),
             Route(
@@ -376,6 +398,15 @@ class TestCreateMcpServer:
         assert r.status_code == 400
         assert "__" in r.json()["error"]
 
+    def test_create_rejects_a_name_ending_in_a_newline(self, client, storage):
+        # Cut to 64 characters, the name ends in the newline, before which "$" would match.
+        r = client.post(
+            "/v1/api/admin/mcp-servers",
+            json={"name": "a" * 63 + "\nb", "transport": "stdio", "command": "x"},
+        )
+        assert r.status_code == 400
+        assert storage.get_mcp_server_by_name("a" * 63 + "\n") is None
+
     def test_create_invalid_transport(self, client):
         r = client.post(
             "/v1/api/admin/mcp-servers",
@@ -383,6 +414,59 @@ class TestCreateMcpServer:
         )
         assert r.status_code == 400
         assert "transport" in r.json()["error"].lower()
+
+    @pytest.mark.parametrize(
+        ("url", "error"),
+        [
+            ("http://[::1/mcp", "url: Invalid IPv6 URL"),
+            (
+                "http://[mcp-host]/mcp",
+                "url: 'mcp-host' does not appear to be an IPv4 or IPv6 address",
+            ),
+            ("http://mcp.example:99999/mcp", "url: Port out of range 0-65535"),
+            ("mcp.example/mcp", "url must be an http:// or https:// URL with a host"),
+            ("ftp://mcp.example/mcp", "url must be an http:// or https:// URL with a host"),
+            # urllib would quote the part of the password before the "/" as the port.
+            ("http://user:s3cret/x@mcp.example/mcp", "url has an invalid host or port"),
+            # urllib would quote the whole userinfo.
+            (
+                "http://user:s3cret" + chr(0x2100) + "@mcp.example/mcp",
+                "url has an invalid host or port",
+            ),
+        ],
+        ids=[
+            "unclosed-bracket",
+            "bracketed-name",
+            "bad-port",
+            "no-scheme",
+            "other-scheme",
+            "password-with-a-slash",
+            "userinfo-that-normalizes",
+        ],
+    )
+    def test_create_rejects_a_url_that_cannot_connect(self, client, storage, url, error):
+        r = client.post(
+            "/v1/api/admin/mcp-servers",
+            json={"name": "bad-url", "transport": "streamable-http", "url": url},
+        )
+        assert r.status_code == 400
+        assert r.json() == {"error": error}
+        assert storage.get_mcp_server_by_name("bad-url") is None
+
+    def test_create_rejects_a_header_httpx_would_not_send(self, client, storage):
+        r = client.post(
+            "/v1/api/admin/mcp-servers",
+            json={
+                "name": "bad-header",
+                "transport": "streamable-http",
+                "url": "http://mcp.example/mcp",
+                "headers": {"X-Api-Key": "k3y-s3cret "},
+            },
+        )
+        assert r.status_code == 400
+        assert r.json() == {"error": _BAD_VALUE.format("X-Api-Key")}
+        assert "s3cret" not in r.text
+        assert storage.get_mcp_server_by_name("bad-header") is None
 
     def test_create_duplicate_name(self, client):
         _create_server(client, name="dup-test")
@@ -618,6 +702,52 @@ class TestUpdateMcpServer:
         )
         assert r.status_code == 400
         assert "transport" in r.json()["error"].lower()
+
+    def test_update_rejects_a_changed_url_that_cannot_connect(self, client, storage):
+        created = _create_server(client, name="url-update", transport="streamable-http")
+        sid = created["server_id"]
+        r = client.put(f"/v1/api/admin/mcp-servers/{sid}", json={"url": "http://[::1/mcp"})
+        assert r.status_code == 400
+        assert r.json() == {"error": "url: Invalid IPv6 URL"}
+        assert storage.get_mcp_server(sid)["url"] == "http://localhost:8080/mcp"
+
+    def test_update_keeps_a_row_with_an_unchanged_bad_url_editable(self, client, storage):
+        # A row stored before the URL check existed. The admin form re-sends every field, the
+        # unchanged URL included.
+        created = _create_server(client, name="legacy-url", transport="streamable-http")
+        sid = created["server_id"]
+        storage.update_mcp_server(sid, url="http://[::1/mcp")
+        r = client.put(
+            f"/v1/api/admin/mcp-servers/{sid}",
+            json={"url": "http://[::1/mcp", "enabled": False},
+        )
+        assert r.status_code == 200
+        assert r.json()["enabled"] is False
+
+    def test_update_checks_only_the_headers_it_changes(self, client, storage):
+        created = _create_server(client, name="header-update", transport="streamable-http")
+        sid = created["server_id"]
+        # A row stored before the check existed; the form re-sends its headers unchanged.
+        storage.update_mcp_server(sid, headers=json.dumps({"X-Old": "v1 "}))
+        kept = client.put(
+            f"/v1/api/admin/mcp-servers/{sid}",
+            json={"headers": {"X-Old": "v1 ", "X-New": "v2"}, "enabled": False},
+        )
+        refused = client.put(
+            f"/v1/api/admin/mcp-servers/{sid}",
+            json={"headers": {"X-Old": "v1 ", "X-New": " v3"}},
+        )
+        assert kept.status_code == 200
+        assert refused.status_code == 400
+        assert refused.json() == {"error": _BAD_VALUE.format("X-New")}
+        assert json.loads(storage.get_mcp_server(sid)["headers"]) == {"X-Old": "v1 ", "X-New": "v2"}
+
+    def test_update_checks_the_url_when_moving_onto_streamable_http(self, client):
+        created = _create_server(client, name="stdio-to-http")
+        sid = created["server_id"]
+        r = client.put(f"/v1/api/admin/mcp-servers/{sid}", json={"transport": "streamable-http"})
+        assert r.status_code == 400
+        assert r.json() == {"error": "url must be an http:// or https:// URL with a host"}
 
     def test_admin_update_auth_type_static_to_oauth(self, client):
         """An existing static row can be flipped to oauth_user with
@@ -1979,6 +2109,33 @@ class TestImportMcpConfig:
         assert data["skipped"] == []
         assert data["errors"] == []
 
+    def test_import_refuses_a_remote_that_cannot_connect(self, client, storage):
+        """Each such server is an error of its own; the others import."""
+        config = {
+            "mcpServers": {
+                "bad-url": {"url": "http://[::1/mcp"},
+                "bad-header": {"url": "http://mcp.example/mcp", "headers": {"X-Key": "k3y "}},
+                "good": {"url": " http://mcp.example/mcp "},
+            },
+        }
+        r = client.post("/v1/api/admin/mcp-servers/import", json={"config": config})
+        assert r.status_code == 200
+        data = r.json()
+        assert data["imported"] == ["good"]
+        assert data["errors"] == [
+            "bad-url: url: Invalid IPv6 URL",
+            f"bad-header: {_BAD_VALUE.format('X-Key')}",
+        ]
+        assert storage.get_mcp_server_by_name("good")["url"] == "http://mcp.example/mcp"
+        assert storage.get_mcp_server_by_name("bad-url") is None
+
+    def test_import_refuses_a_name_ending_in_a_newline(self, client, storage):
+        config = {"mcpServers": {"a" * 63 + "\nb": {"command": "x"}}}
+        r = client.post("/v1/api/admin/mcp-servers/import", json={"config": config})
+        assert r.status_code == 200
+        assert r.json()["imported"] == []
+        assert storage.get_mcp_server_by_name("a" * 63 + "\n") is None
+
     def test_import_not_a_dict(self, client):
         r = client.post(
             "/v1/api/admin/mcp-servers/import",
@@ -2076,6 +2233,233 @@ class TestPermission:
     def test_delete_without_permission(self, client_no_perm):
         r = client_no_perm.delete(f"/v1/api/admin/mcp-servers/{uuid.uuid4().hex}")
         assert r.status_code == 403
+
+    def test_connection_test_without_permission(self, client_no_perm):
+        with patch("turnstone.core.mcp_client.probe_http_server") as probe:
+            r = client_no_perm.post(
+                "/v1/api/admin/mcp-servers/test", json={"url": "http://mcp.example/mcp"}
+            )
+        assert r.status_code == 403
+        probe.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# POST /v1/api/admin/mcp-servers/test (#1328)
+# ---------------------------------------------------------------------------
+
+
+_BAD_VALUE = (
+    "headers: the value of '{}' has a space at either end, a control character, or a character "
+    "outside ASCII"
+)
+
+
+class TestConnectionTestEndpoint:
+    """Input checks and the response shape; the probe itself runs against real servers in
+    test_mcp_connection_probe.py."""
+
+    _URL = "http://mcp.example/mcp"
+
+    @pytest.mark.parametrize(
+        ("body", "error"),
+        [
+            (
+                {"url": _URL, "transport": "stdio"},
+                "Only streamable-http servers can be tested",
+            ),
+            (
+                {"url": _URL, "auth_type": "oauth_user"},
+                "Servers with auth_type 'oauth_user' or 'oauth_obo' cannot be tested",
+            ),
+            (
+                {"url": _URL, "auth_type": "oauth_obo"},
+                "Servers with auth_type 'oauth_user' or 'oauth_obo' cannot be tested",
+            ),
+            (
+                {"url": _URL, "auth_type": "bogus"},
+                "auth_type must be 'none', 'static', 'oauth_user', or 'oauth_obo'",
+            ),
+            ({}, "url must be an http:// or https:// URL with a host"),
+            (
+                {"url": "ftp://mcp.example/mcp"},
+                "url must be an http:// or https:// URL with a host",
+            ),
+            ({"url": "http:///mcp"}, "url must be an http:// or https:// URL with a host"),
+            ({"url": "http://mcp.example:99999/mcp"}, "url: Port out of range 0-65535"),
+            ({"url": "http://[::1/mcp"}, "url: Invalid IPv6 URL"),
+            (
+                {"url": "http://[mcp-host]/mcp"},
+                "url: 'mcp-host' does not appear to be an IPv4 or IPv6 address",
+            ),
+            ({"url": _URL, "headers": ["Authorization: x"]}, "headers must be an object"),
+            (
+                {"url": _URL, "headers": {"X-Count": 3}},
+                "headers: the value of 'X-Count' must be a string",
+            ),
+            (
+                {"url": _URL, "headers": {"Authorization": "Bearer a\r\nX-Injected: 1"}},
+                _BAD_VALUE.format("Authorization"),
+            ),
+            ({"url": _URL, "headers": {"X-Api-Key": "k3y "}}, _BAD_VALUE.format("X-Api-Key")),
+            (
+                {"url": _URL, "headers": {"Authorization: Bearer k3y": ""}},
+                "headers: a header name is not a valid HTTP header name",
+            ),
+            ({"url": _URL, "name": "my server"}, "name must match [a-zA-Z0-9._-]+"),
+            (
+                {"url": _URL, "name": "my__server"},
+                "name must not contain '__' (reserved delimiter)",
+            ),
+        ],
+        ids=[
+            "stdio",
+            "oauth-user",
+            "oauth-obo",
+            "unknown-auth",
+            "no-url",
+            "other-scheme",
+            "no-host",
+            "bad-port",
+            "unclosed-bracket",
+            "bracketed-name",
+            "header-list",
+            "header-number",
+            "header-newline",
+            "header-padded",
+            "header-line-as-name",
+            "name-with-space",
+            "name-with-delimiter",
+        ],
+    )
+    def test_rejects_what_cannot_be_tested(self, client, body, error):
+        with patch("turnstone.core.mcp_client.probe_http_server") as probe:
+            r = client.post("/v1/api/admin/mcp-servers/test", json=body)
+        assert r.status_code == 400
+        assert r.json() == {"error": error}
+        probe.assert_not_called()
+
+    def test_reports_the_catalog_and_saves_nothing(self, client, storage):
+        from turnstone.core.mcp_client import ConnectionProbe
+
+        found = ConnectionProbe(tools=["search", "fetch"], resources=1, prompts=0)
+        with patch("turnstone.core.mcp_client.probe_http_server", return_value=found) as probe:
+            r = client.post(
+                "/v1/api/admin/mcp-servers/test",
+                json={
+                    "name": "docs",
+                    "url": self._URL,
+                    "auth_type": "static",
+                    "headers": {"Authorization": "Bearer abc"},
+                },
+            )
+        assert r.status_code == 200
+        assert r.json() == {
+            "ok": True,
+            "tools": ["search", "fetch"],
+            "resources": 1,
+            "prompts": 0,
+            "error": None,
+            "kind": None,
+            "status": None,
+        }
+        probe.assert_called_once_with(self._URL, {"Authorization": "Bearer abc"}, name="docs")
+        assert storage.list_mcp_servers() == []
+        (event,) = storage.list_audit_events(action="mcp_server.test")
+        assert event["resource_id"] == "docs"
+        assert "Bearer" not in str(event)
+
+    def test_reports_why_the_connect_failed(self, client):
+        from turnstone.core.mcp_client import ConnectFailure, ConnectionProbe
+
+        failure = ConnectFailure("http", "HTTP 404 Not Found: no MCP endpoint at this URL", 404)
+        with patch(
+            "turnstone.core.mcp_client.probe_http_server",
+            return_value=ConnectionProbe(failure=failure),
+        ):
+            r = client.post(
+                "/v1/api/admin/mcp-servers/test", json={"url": self._URL, "auth_type": "none"}
+            )
+        assert r.status_code == 200
+        assert r.json() == {
+            "ok": False,
+            "tools": [],
+            "resources": 0,
+            "prompts": 0,
+            "error": "HTTP 404 Not Found: no MCP endpoint at this URL",
+            "kind": "http",
+            "status": 404,
+        }
+
+    def test_tests_beyond_the_running_limit_are_refused(self, client, monkeypatch):
+        """A bounded number run at once, each on a thread of its own; a test past the limit is
+        refused at once, before it takes a thread."""
+        import turnstone.console.server as console_server
+
+        slots = threading.BoundedSemaphore(1)
+        monkeypatch.setattr(console_server, "_MCP_TEST_SLOTS", slots)
+        assert slots.acquire(blocking=False)  # one test already running
+        try:
+            with patch("turnstone.core.mcp_client.probe_http_server") as probe:
+                r = client.post("/v1/api/admin/mcp-servers/test", json={"url": self._URL})
+        finally:
+            slots.release()
+        assert r.status_code == 429
+        assert r.json() == {"error": "Other connection tests are still running; try again shortly"}
+        probe.assert_not_called()
+        assert slots.acquire(blocking=False)  # the refused request took no slot
+        slots.release()
+
+    def test_a_test_that_never_finishes_is_reported(self, client, monkeypatch):
+        """The wait is bounded even if a test thread wedges inside the SDK, and the test's slot
+        comes back when the thread ends."""
+        import turnstone.console.server as console_server
+
+        slots = threading.BoundedSemaphore(1)
+        monkeypatch.setattr(console_server, "_MCP_TEST_SLOTS", slots)
+        monkeypatch.setattr(console_server, "_MCP_TEST_WAIT_HEADROOM_S", 0.05)
+        release = threading.Event()
+
+        def _wedged(*_args: Any, **_kwargs: Any) -> None:
+            release.wait(5)
+
+        try:
+            with (
+                patch("turnstone.core.mcp_client.probe_http_server_max_s", return_value=0.0),
+                patch("turnstone.core.mcp_client.probe_http_server", side_effect=_wedged),
+            ):
+                r = client.post("/v1/api/admin/mcp-servers/test", json={"url": self._URL})
+            assert not slots.acquire(blocking=False)  # the wedged test still holds it
+        finally:
+            release.set()
+        assert r.status_code == 200
+        assert r.json()["kind"] == "timeout"
+        assert r.json()["error"] == "The connection test did not finish in time"
+        assert slots.acquire(timeout=5)
+        slots.release()
+
+    def test_every_kind_is_in_the_typescript_sdk(self) -> None:
+        """types.ts is written by hand, and nothing else ties its union to the kinds; the spec
+        and the Python SDK follow the schema's annotation."""
+        import re
+        from pathlib import Path
+        from typing import get_args
+
+        from turnstone.core.mcp_utils import ConnectFailureKind
+
+        source = (Path(__file__).parent.parent / "sdk/typescript/src/types.ts").read_text()
+        block = source.split("export interface McpConnectionTestResponse", 1)[1].split("}", 1)[0]
+        union = block.split("kind:", 1)[1].split(";", 1)[0]
+        assert set(re.findall(r'"([a-z_]+)"', union)) == set(get_args(ConnectFailureKind))
+
+    def test_the_sdk_outwaits_the_console(self) -> None:
+        """The Python SDK's request outlasts the console's longest wait for a test, so a caller
+        hears the test's outcome rather than a client timeout."""
+        import turnstone.console.server as console_server
+        import turnstone.sdk.console as sdk_console
+        from turnstone.core.mcp_client import probe_http_server_max_s
+
+        console_wait = probe_http_server_max_s() + console_server._MCP_TEST_WAIT_HEADROOM_S
+        assert console_wait < sdk_console._MCP_TEST_TIMEOUT_S
 
 
 # ---------------------------------------------------------------------------
@@ -2186,9 +2570,9 @@ class TestCollectMcpStatus:
 
     @pytest.mark.anyio
     async def test_console_manager_reports_projected(self):
-        """Console arm (#725): the console's rows ride the read-scope
-        projection node rows get — has_error present; command/url/verbose
-        error absent."""
+        """Console arm (#725): the console's rows ride the admin projection
+        node rows give the admin's forwarded request — has_error and the
+        error text present; command/url absent."""
         req = _fake_request()
         mgr = MagicMock()
         mgr.get_all_server_status.return_value = {
@@ -2209,7 +2593,7 @@ class TestCollectMcpStatus:
         result = await _collect_mcp_status(req)
         row = result["console"]["srv"]
         assert row["has_error"] is True
-        assert "error" not in row
+        assert row["error"] == "ConnectError: https://internal.example"
         assert "command" not in row
         assert "url" not in row
         # Admin path mirror of internal_mcp_status: cross-user aggregate.
@@ -3417,10 +3801,10 @@ class TestInternalMcpStatusEndpoint:
 
     @pytest.fixture()
     def node_app_factory(self, storage: SQLiteBackend):
-        def _make(mgr: Any) -> TestClient:
+        def _make(mgr: Any, middleware_cls: type = _InjectAuthMiddleware) -> TestClient:
             app = Starlette(
                 routes=_routes_with_internal(),
-                middleware=[Middleware(_InjectAuthMiddleware)],
+                middleware=[Middleware(middleware_cls)],
             )
             app.state.auth_storage = storage
             if mgr is not None:
@@ -3429,9 +3813,9 @@ class TestInternalMcpStatusEndpoint:
 
         return _make
 
-    def test_status_strips_command_url_and_error(self, node_app_factory) -> None:
-        mgr = MagicMock()
-        mgr.get_all_server_status.return_value = {
+    @staticmethod
+    def _status_with_secrets() -> dict[str, dict[str, Any]]:
+        return {
             "srv-stdio": {
                 "connected": False,
                 "tools": 0,
@@ -3460,7 +3844,12 @@ class TestInternalMcpStatusEndpoint:
                 "consecutive_failures": 0,
             },
         }
-        c = node_app_factory(mgr)
+
+    def test_status_strips_command_url_and_error(self, node_app_factory) -> None:
+        """A read-scope caller without admin.mcp (a dashboard) gets no error text."""
+        mgr = MagicMock()
+        mgr.get_all_server_status.return_value = self._status_with_secrets()
+        c = node_app_factory(mgr, _InjectAuthNoMcpMiddleware)
         r = c.get("/v1/api/_internal/mcp-status")
         assert r.status_code == 200
         servers = r.json()["servers"]
@@ -3481,6 +3870,39 @@ class TestInternalMcpStatusEndpoint:
         assert servers["srv-http"]["transport"] == "streamable-http"
         assert servers["srv-stdio"]["circuit_open"] is True
         # No leaked binary path anywhere in the rendered response.
+        assert "secret-mcp-bin" not in r.text
+
+    def test_status_gives_admins_the_error_text(self, node_app_factory) -> None:
+        """An admin.mcp caller (the console's MCP list) also gets why a server failed; it
+        already sees every server's command and url through the admin API."""
+        mgr = MagicMock()
+        mgr.get_all_server_status.return_value = self._status_with_secrets()
+        c = node_app_factory(mgr)
+        r = c.get("/v1/api/_internal/mcp-status")
+        assert r.status_code == 200
+        servers = r.json()["servers"]
+        assert servers["srv-stdio"]["error"] == (
+            "FileNotFoundError: [Errno 2] No such file or directory: "
+            "'/usr/local/bin/secret-mcp-bin'"
+        )
+        assert servers["srv-stdio"]["has_error"] is True
+        assert servers["srv-http"]["error"] == ""
+        assert servers["srv-http"]["has_error"] is False
+        for entry in servers.values():
+            assert "command" not in entry
+            assert "url" not in entry
+
+    def test_status_gives_a_read_scoped_token_no_error_text(self, node_app_factory) -> None:
+        """A read-only monitoring token an admin minted gets the dashboard's view: the error
+        text needs the approve scope as well as admin.mcp."""
+        mgr = MagicMock()
+        mgr.get_all_server_status.return_value = self._status_with_secrets()
+        c = node_app_factory(mgr, _InjectReadTokenWithMcpMiddleware)
+        r = c.get("/v1/api/_internal/mcp-status")
+        assert r.status_code == 200
+        servers = r.json()["servers"]
+        assert all("error" not in entry for entry in servers.values())
+        assert servers["srv-stdio"]["has_error"] is True
         assert "secret-mcp-bin" not in r.text
 
     def test_status_no_mcp_client_returns_empty_servers(self, node_app_factory) -> None:

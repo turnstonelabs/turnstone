@@ -27,6 +27,7 @@ from turnstone.core.mcp_client import (
     _db_servers_to_config,
     _is_dead_transport,
     _mcp_to_openai,
+    _reap_cancelled,
     load_mcp_config,
 )
 from turnstone.core.tools import INTERACTIVE_TOOLS, TOOLS, merge_mcp_tools
@@ -4576,12 +4577,11 @@ class TestStaticNotificationRefresh:
         assert raised.value.error.code == mcp_types.INVALID_PARAMS
         assert state.resources is old_resources
 
-    def test_reap_bounded_reraises_external_cancel(self) -> None:
+    def test_reap_cancelled_reraises_external_cancel(self) -> None:
         """An EXTERNAL cancel delivered during the reap window must be
         HONOURED (re-raised), not swallowed — else a shutdown/cancel of
         the refresh runner is silently dropped and the frame completes via
         its original error path instead."""
-        mgr = MCPClientManager({})
 
         async def _run() -> None:
             async def _quick() -> None:
@@ -4596,7 +4596,7 @@ class TestStaticNotificationRefresh:
                 patch("asyncio.wait", side_effect=asyncio.CancelledError()),
                 pytest.raises(asyncio.CancelledError),
             ):
-                await mgr._reap_bounded((t1, t2))
+                await _reap_cancelled((t1, t2), MCPClientManager._OWNER_CANCEL_GRACE_S)
 
         asyncio.run(_run())
 

@@ -427,7 +427,8 @@ def test_grouped_prime_failure_keeps_attribution_and_sibling_ownership(
                         )
                     )
                     status = manager.get_server_status(_KEY[1], user_id=_KEY[0])
-                    assert "BaseExceptionGroup" in status["discovery_error"]
+                    # The failure the group carries, not the cancellation beside it.
+                    assert status["discovery_error"] == "RuntimeError: closed"
                     assert manager._background_tasks
                 else:
                     manager.schedule_prime_user_server(

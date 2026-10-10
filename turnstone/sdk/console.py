@@ -14,6 +14,8 @@ from __future__ import annotations
 import secrets
 from typing import TYPE_CHECKING, Any
 
+import httpx
+
 from turnstone.api.console_schemas import (
     AdminMemoryInfo,
     AdminMemorySummary,
@@ -36,6 +38,7 @@ from turnstone.api.console_schemas import (
     ListSkillsResponse,
     ListToolPoliciesResponse,
     ListUserRolesResponse,
+    McpConnectionTestResponse,
     McpServerDetail,
     MemoryIndexHealthResponse,
     NodeDetailResponse,
@@ -72,11 +75,12 @@ from turnstone.sdk._sync import _SyncRunner
 from turnstone.sdk.events import ClusterEvent
 
 _UNSET: Any = object()
+# The wait for a connection test's answer, longer than this client's default timeout. It must
+# outlast the console's own wait for the test, which the console's tests check.
+_MCP_TEST_TIMEOUT_S = 75.0
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Callable, Iterator
-
-    import httpx
 
     from turnstone.sdk._types import AttachmentUpload
 
@@ -1130,6 +1134,38 @@ class AsyncTurnstoneConsole(_BaseClient):
             response_model=ImportMcpConfigResponse,
         )
 
+    async def test_mcp_server(
+        self,
+        url: str,
+        *,
+        headers: dict[str, str] | None = None,
+        auth_type: str = "static",
+        name: str = "",
+    ) -> McpConnectionTestResponse:
+        """Test a Streamable HTTP server's connection from the console, saving nothing.
+
+        The console connects once with these values and lists the server's tools; when it
+        cannot, ``ok`` is False and ``error`` and ``kind`` say why. Auth ``none`` or ``static``
+        only.
+        """
+        body: dict[str, Any] = {"url": url, "auth_type": auth_type}
+        if headers:
+            body["headers"] = headers
+        if name:
+            body["name"] = name
+        # Only the wait for the answer grows; the client's other limits stay as they are.
+        limits = self._client.timeout
+        read = None if limits.read is None else max(limits.read, _MCP_TEST_TIMEOUT_S)
+        return await self._request(
+            "POST",
+            "/v1/api/admin/mcp-servers/test",
+            json_body=body,
+            timeout=httpx.Timeout(
+                connect=limits.connect, read=read, write=limits.write, pool=limits.pool
+            ),
+            response_model=McpConnectionTestResponse,
+        )
+
     # -- MCP registry --------------------------------------------------------
 
     async def search_mcp_registry(
@@ -1832,6 +1868,18 @@ class TurnstoneConsole:
 
     def import_mcp_config(self, config: dict[str, Any]) -> ImportMcpConfigResponse:
         return self._runner.run(self._async.import_mcp_config(config))
+
+    def test_mcp_server(
+        self,
+        url: str,
+        *,
+        headers: dict[str, str] | None = None,
+        auth_type: str = "static",
+        name: str = "",
+    ) -> McpConnectionTestResponse:
+        return self._runner.run(
+            self._async.test_mcp_server(url, headers=headers, auth_type=auth_type, name=name)
+        )
 
     # -- MCP registry --------------------------------------------------------
 

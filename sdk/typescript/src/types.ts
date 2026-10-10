@@ -1028,6 +1028,8 @@ export interface McpServerStatus {
   resources: number;
   prompts: number;
   error: string;
+  /** Present on status reads; absent from the refresh and reconnect results. */
+  has_error?: boolean;
 }
 
 export interface McpServerDetail {
@@ -1082,6 +1084,37 @@ export interface ImportMcpConfigResponse {
   imported: string[];
   skipped: string[];
   errors: string[];
+}
+
+/** Unsaved values for a connection test: Streamable HTTP, auth "none" or "static". */
+export interface McpConnectionTestRequest {
+  url: string;
+  headers?: Record<string, string>;
+  auth_type?: string;
+  transport?: string;
+  /** Labels the server in error messages; the URL's host stands in when empty. */
+  name?: string;
+}
+
+export interface McpConnectionTestResponse {
+  ok: boolean;
+  /** The server's tool names, and how many resources and prompts it lists. */
+  tools: string[];
+  resources: number;
+  prompts: number;
+  error: string | null;
+  kind:
+    | "unreachable"
+    | "tls"
+    | "http"
+    | "timeout"
+    | "not_mcp"
+    | "protocol"
+    | "invalid_catalog"
+    | "error"
+    | null;
+  /** The HTTP status the server answered with, for kind "http". */
+  status: number | null;
 }
 
 // -- Console API: MCP Registry ----------------------------------------------

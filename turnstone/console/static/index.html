@@ -2750,9 +2750,24 @@
                   <span class="toggle-label">Enabled</span>
                 </label>
               </div>
+              <div
+                id="mcp-test-result"
+                role="status"
+                aria-live="polite"
+                hidden
+              ></div>
             </div>
             <footer class="sh-foot">
               <div class="sh-foot-meta"></div>
+              <button
+                type="button"
+                id="mcp-test-btn"
+                class="sh-btn sh-btn--quiet"
+                title="Connect once with these values and list the server's tools, without saving"
+                hidden
+              >
+                Test connection
+              </button>
               <button class="sh-btn" data-close>Cancel</button>
               <button id="mcp-create-submit" class="sh-btn sh-btn--primary">
                 Create

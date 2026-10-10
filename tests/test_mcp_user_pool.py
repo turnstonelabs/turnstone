@@ -34,7 +34,7 @@ from tests.conftest import (
     make_mcp_token_cipher,
     stop_loop_thread,
 )
-from turnstone.core.mcp_client import MCPClientManager, PoolEntryState
+from turnstone.core.mcp_client import _MAX_ERROR_TEXT_LEN, MCPClientManager, PoolEntryState
 from turnstone.core.mcp_crypto import MCPTokenStore
 from turnstone.core.oauth.context import OAuthContext, TokenCoordination, oauth_context
 
@@ -2115,13 +2115,13 @@ class TestOboPriming:
         assert mgr._user_pool_eviction_task is not None
 
     def test_prime_failure_detail_capped_at_max_error_len(self, running_loop_mgr, storage) -> None:
-        """The recorded detail honors ``_MAX_ERROR_LEN`` — the same bound
+        """The recorded detail honors ``_MAX_ERROR_TEXT_LEN`` — the same bound
         every other recorded server error uses, not a diverging literal."""
         mgr, loop, _ = running_loop_mgr
         _run_failing_prime(mgr, loop, storage, RuntimeError("x" * 1000))
         recorded = mgr._pool_discovery_error[("user-1", "pool-srv")]
-        assert len(recorded) == mgr._MAX_ERROR_LEN
-        assert recorded == ("RuntimeError: " + "x" * 1000)[: mgr._MAX_ERROR_LEN]
+        assert len(recorded) == _MAX_ERROR_TEXT_LEN
+        assert recorded == ("RuntimeError: " + "x" * 1000)[:_MAX_ERROR_TEXT_LEN]
 
     def test_discovery_error_is_scoped_to_the_failing_user(self, running_loop_mgr, storage) -> None:
         """The record and its status surface are per-(user, server): the

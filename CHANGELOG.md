@@ -105,6 +105,15 @@ frozen.
 
 ### Added
 
+- **Test an MCP server's connection before saving it (#1328).** The MCP Servers add and edit forms
+  have a **Test connection** button for Streamable HTTP servers with no authorization or static
+  headers. The console connects once with the form's values, the way a save would, and shows the
+  server's tools and its resource and prompt counts, or why it could not connect: the HTTP status, a
+  TLS failure, a timeout, a URL that serves a web page or other non-MCP content, or the catalog
+  entry that fails validation. Nothing is saved. The test runs from the console; nodes connect from
+  their own network. Each test is audited as `mcp_server.test`, with the scheme, host, port and
+  outcome. Scripts can call `POST /v1/api/admin/mcp-servers/test` (`admin.mcp`), or
+  `test_mcp_server` (which waits up to 75 s) / `testMcpServer` in the SDKs.
 - **Output-guard evals in `turnstone-eval` (#1291).** `--output-guard judge` scores the LLM stage on
   tool outputs with directives planted at known lines: detection, false positives, whether its flags
   stay inside the fixed vocabulary, citation precision and recall, and failed verdicts.
@@ -193,6 +202,32 @@ frozen.
   `wait_ended` event carries the same `interrupted` field, and the tool row reads "interrupted after
   Ns". A message that `/send` refuses while the coordinator works still waits for the turn to end:
   one with attachments, or one from a second signed-in user.
+- **A failed MCP connect says what went wrong (#1328).** A server's recorded error and the connect
+  logs name the HTTP status, the TLS failure or the timeout instead of `ExceptionGroup: unhandled
+  errors in a TaskGroup (1 sub-exception)`, and a wrong URL path reads `HTTP 404 Not Found: no MCP
+  endpoint at this URL` instead of `McpError: Session terminated`, while a 404 after the session
+  opened reads as a dropped session (a restart, or replicas without session affinity). An invalid
+  catalog entry is recorded without its `InvalidCatalogError:` prefix. A connect that fails at
+  startup is logged in those words, without the exception chain; a failure none of those words fit
+  adds its traceback at debug level. The health loop's per-attempt `reconnecting` line drops to
+  debug after three attempts, as its failure line already did. A refresh that cannot reach its
+  server records `ServerUnreachableError` where it recorded `ConnectionError`. A host name that
+  cannot be looked up as written, such as one with an empty label (`mcp..example.com`), reads as
+  unreachable at that host.
+- **An MCP URL that serves something other than MCP fails at once (#1328).** A server that answers
+  initialize with neither an MCP message nor an event stream, such as a docs page, a proxy's sign-in
+  page or a REST API's JSON, fails the connect immediately, saying what came back, instead of after
+  the 30 s connect timeout. So does one that answers with a JSON-RPC error the SDK cannot read (one
+  with a null id), giving the server's error code and message.
+- **Saving an MCP server checks its URL and headers (#1328).** Creating, importing or installing a
+  Streamable HTTP server, or changing its URL or headers, answers `400` (an import lists the server
+  among its errors) when the URL is not `http://` or `https://` with a host or does not parse (a
+  malformed bracketed IPv6 host, a port out of range), or when a header name is not an HTTP token or
+  a value has a space at either end, a control character or a character outside ASCII, instead of
+  saving a server that can never connect. An edit that leaves a saved row's URL and headers
+  unchanged still saves. A URL whose parse error would quote part of it before the host, where a
+  password can sit, is refused as `url has an invalid host or port`. A server name that ends in a
+  line break once cut to 64 characters is refused too, where it could be saved before.
 - **`/skill` quotes skill names in its operator note (#1292).** The note `/skill` writes into the
   conversation quotes each skill name as JSON, so a name cannot break the note into extra lines,
   and says `no skill` where it said `defaults`.
@@ -380,6 +415,16 @@ frozen.
 
 ### Fixed
 
+- **The MCP Servers list shows connect errors again (#1328).** Since the node status read stopped
+  carrying error text, a server that failed to connect showed **idle**, and a newly saved one
+  showed **connecting** forever. The list marks a failing server as **error**, and admins
+  (`admin.mcp`, with the approve scope) see the reason on each node; read-scope dashboards and
+  read-only tokens still see only `has_error`.
+- **A saved MCP server whose first connect fails stays registered (#1328).** It used to be dropped
+  until the next save or reload, even after the server came up. It now keeps its error in its status
+  and the health loop retries it, as it does a server that fails at startup; disable or delete the
+  server to stop the retries. With the health check turned off, every reload, including the one
+  each save starts, retries the database's servers that are not connected instead.
 - **An open dialog no longer covers the sign-in screen (#1332).** A dialog left open when a session
   expired or someone signed out, here or in another tab, stayed on top of the sign-in screen,
   readable, and the sign-in form took no input until it was dismissed. Showing the sign-in screen

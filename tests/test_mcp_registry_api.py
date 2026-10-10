@@ -308,6 +308,32 @@ class TestRegistryInstall:
         assert s is not None
         assert s["transport"] == "streamable-http"
 
+    def test_install_refuses_a_header_that_cannot_be_sent(
+        self, client: TestClient, storage: SQLiteBackend
+    ) -> None:
+        """A remote gets the checks a save gives its URL and headers."""
+        srv = _sample_remote_server()
+        with patch("turnstone.core.mcp_registry.MCPRegistryClient") as mock_client:
+            instance = AsyncMock()
+            instance.search.return_value = _mock_search_result([srv])
+            instance.__aenter__ = AsyncMock(return_value=instance)
+            instance.__aexit__ = AsyncMock(return_value=False)
+            mock_client.return_value = instance
+
+            resp = client.post(
+                "/v1/api/admin/mcp-registry/install",
+                json={
+                    "registry_name": "io.example/test-server",
+                    "source": "remote",
+                    "headers": {"Authorization": "Bearer sk-123 "},
+                },
+            )
+
+        assert resp.status_code == 400
+        assert resp.json()["error"].startswith("headers: the value of 'Authorization'")
+        assert "sk-123" not in resp.text
+        assert storage.get_mcp_server_by_registry_name("io.example/test-server") is None
+
     def test_install_package_server(self, client: TestClient, storage: SQLiteBackend) -> None:
         srv = _sample_package_server()
         mock_result = _mock_search_result([srv])

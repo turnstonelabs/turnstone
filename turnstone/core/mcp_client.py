@@ -22,18 +22,21 @@ import asyncio
 import concurrent.futures
 import contextlib
 import contextvars
+import functools
 import gc
 import json
 import os
 import random
 import signal
+import ssl
 import threading
 import time
 import urllib.parse
 import uuid
 from contextlib import AsyncExitStack
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
+from http import HTTPStatus
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Protocol
 
@@ -71,6 +74,8 @@ from turnstone.core.oauth.context import oauth_context
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Coroutine
+
+    from turnstone.core.mcp_utils import ConnectFailureKind
 
 log = get_logger("turnstone.mcp")
 
@@ -215,7 +220,7 @@ async def _stop_stdio_server_group(pgid: int) -> None:
 # catalog, across all its pages; it also bounds how many pages are read (see ``_list_catalog``).
 # Real servers expose at most a few dozen tools; a misconfigured or hostile upstream returning
 # thousands would amplify both memory (one OpenAI tool dict per entry) and downstream BM25 reindex
-# cost. Mirrors the ``_MAX_ERROR_LEN`` / ``MAX_INSUFFICIENT_SCOPE_REPORTED`` defensive ceilings: we
+# cost. Mirrors the ``_MAX_ERROR_TEXT_LEN`` / ``MAX_INSUFFICIENT_SCOPE_REPORTED`` ceilings: we
 # truncate rather than reject so partial visibility beats zero visibility, and emit a warning so
 # operators can investigate.
 _MAX_TOOLS_PER_SERVER = 1000
@@ -440,10 +445,21 @@ def _is_dead_transport(exc: BaseException) -> bool:
 
 @dataclass
 class _AuthCapture:
-    """Observed auth, held-session 404, or 5xx failure, before the SDK loses its status."""
+    """Observed auth, held-session 404, or 5xx failure, before the SDK loses its status.
+
+    ``first_error`` is the first JSON-RPC message the server answered with an error status (400
+    and up), with whether it carried a session id: what a failed connect is worded from
+    (:func:`classify_connect_failure`) whatever exception the SDK raises for it. It leaves out a
+    404 on anything but a request, which the SDK ignores; every other error status fails the
+    transport, a notification's or the client's own answer's included. Only a carrier new to its
+    connection can explain a connect that way (a static connection's and the connection test's);
+    a pool entry keeps one carrier across its connects and dispatches, and nothing resets this
+    field.
+    """
 
     status: int | None = None
     www_authenticate: str | None = None
+    first_error: tuple[int, bool] | None = None
 
 
 class _PoolDispatchRetryRequested(BaseException):  # noqa: N818
@@ -465,6 +481,49 @@ class _CapturedHTTPError(ConnectionError):
         super().__init__(f"MCP server returned HTTP {capture.status}")
 
 
+class _NotMcpResponseError(Exception):
+    """An initialize request answered with something other than an MCP message.
+
+    ``answer`` describes what came back, for the operator: the content type, or what was wrong
+    with a JSON answer.
+    """
+
+    def __init__(self, answer: str) -> None:
+        self.answer = answer
+        super().__init__(answer)
+
+
+class _ErrorAnswerError(Exception):
+    """An initialize request answered with a JSON-RPC error the SDK cannot read.
+
+    JSON-RPC 2.0 answers a request it cannot parse or read with an error whose id is null, and the
+    SDK's schema requires an id. ``code`` and ``message`` are the server's.
+    """
+
+    def __init__(self, code: int, message: str) -> None:
+        self.code = code
+        self.message = message
+        super().__init__(f"{code}: {message}")
+
+
+def _error_answer(content: bytes) -> _ErrorAnswerError | None:
+    """The JSON-RPC error *content* holds, or None when it holds none or not one JSON-RPC allows
+    (an integer code and a string message)."""
+    try:
+        body = json.loads(content)
+    except ValueError:
+        return None
+    if not isinstance(body, dict) or body.get("jsonrpc") != "2.0":
+        return None
+    error = body.get("error")
+    if not isinstance(error, dict):
+        return None
+    code, message = error.get("code"), error.get("message", "")
+    if not isinstance(code, int) or isinstance(code, bool) or not isinstance(message, str):
+        return None
+    return _ErrorAnswerError(code, message)
+
+
 class _TransportClosedError(ConnectionError):
     """The transport owner exited while an operation was waiting for its response."""
 
@@ -482,10 +541,23 @@ class MCPShutdownError(RuntimeError):
         self.started = started
 
 
-# Timeout for the DELETE that ends a session, which the client sends while its transport's
-# owner unwinds. Shorter than the owner's escalated wait (``_OWNER_CANCEL_GRACE_S``), so a server
-# that never answers it cannot keep the owner running once its one cancel has been spent.
+# Timeout for each read of the DELETE that ends a session, which the client sends while its
+# transport's owner unwinds. Shorter than the owner's escalated wait (``_OWNER_CANCEL_GRACE_S``),
+# so a server that never answers it cannot keep the owner running once its one cancel has been
+# spent. It bounds each read, not the request: a server that trickles its answer is cut off only
+# by the connection test's own bound, and a saved server's owner is left to finish on its own.
 _SESSION_END_TIMEOUT_S = 3.0
+
+
+def _jsonrpc_body(request: httpx.Request) -> dict[str, Any] | None:
+    """The JSON-RPC message *request* POSTs, or None for any other request."""
+    if request.method != "POST":
+        return None
+    try:
+        body = json.loads(request.content)
+    except (ValueError, httpx.RequestNotRead):
+        return None
+    return body if isinstance(body, dict) else None
 
 
 def _make_capturing_http_factory(
@@ -493,7 +565,8 @@ def _make_capturing_http_factory(
 ) -> McpHttpClientFactory:
     """Return a client factory that records the first relevant HTTP failure into ``capture``.
 
-    Its clients also give the request that ends a session ``_SESSION_END_TIMEOUT_S``.
+    Its clients also give the request that ends a session ``_SESSION_END_TIMEOUT_S``, and fail an
+    initialize answered with something other than an MCP message (:class:`_NotMcpResponseError`).
 
     The hooks are ``async`` because :class:`httpx.AsyncClient` invokes
     event hooks via ``await hook(response)`` — a sync function would
@@ -511,9 +584,16 @@ def _make_capturing_http_factory(
 
     async def _bound_session_end(request: httpx.Request) -> None:
         # The DELETE that ends the session goes out while the transport's owner unwinds, at times
-        # after its one cancel was spent: a server that holds it must not keep the owner running.
+        # after its one cancel was spent: a server that never answers it must not keep the owner
+        # running (see _SESSION_END_TIMEOUT_S for what this does not bound).
         if request.method == "DELETE":
             request.extensions["timeout"] = httpx.Timeout(_SESSION_END_TIMEOUT_S).as_dict()
+
+    async def _load_body(request: httpx.Request) -> None:
+        # A redirected request reaches the hooks with its body unread. Load it, so the response
+        # hooks can tell which message it carried.
+        if request.method == "POST" and isinstance(request.stream, httpx.ByteStream):
+            await request.aread()
 
     async def _hook(response: httpx.Response) -> None:
         # A cleanup response must not replace the failure that caused teardown. Static
@@ -530,15 +610,50 @@ def _make_capturing_http_factory(
         # discard every challenge after the first; defence-in-depth
         # mirror lives in ``parse_www_authenticate_bearer``.
         status = response.status_code
-        if capture.status is not None or response.request.method == "DELETE":
+        if response.request.method == "DELETE":
             return
         held_session = bool(response.request.headers.get("mcp-session-id"))
+        if capture.first_error is None and status >= 400:
+            body = _jsonrpc_body(response.request)
+            # As the SDK does: a 404 on anything but a request (it has a method and an id) is
+            # ignored, and any other error status fails the transport.
+            if body is not None and (status != 404 or ("method" in body and "id" in body)):
+                capture.first_error = (status, held_session)
+        if capture.status is not None:
+            return
         if status in (401, 403) or (status == 404 and held_session) or 500 <= status < 600:
             capture.status = status
             headers = response.headers.get_list("www-authenticate") if status in (401, 403) else []
             capture.www_authenticate = headers[0] if headers else None
             if fired_event is not None:
                 fired_event.set()
+
+    async def _reject_non_mcp(response: httpx.Response) -> None:
+        # The SDK logs an initialize answered with something other than MCP (a web page at the
+        # URL, a proxy's sign-in page, a REST API's JSON) and leaves it waiting out the connect
+        # timeout. Fail it at once, saying what came back. Only initialize: later answers keep the
+        # SDK's handling.
+        if response.status_code == 202 or not response.is_success:
+            return
+        content_type = response.headers.get("content-type", "").lower()
+        if content_type.startswith("text/event-stream"):
+            return
+        body = _jsonrpc_body(response.request)
+        if body is None or body.get("method") != "initialize":
+            return
+        if not content_type.startswith("application/json"):
+            raise _NotMcpResponseError(
+                content_type.split(";", 1)[0].strip()[:100] or "no content type"
+            )
+        # The SDK reads the whole answer next, and gets it from httpx's copy.
+        content = await response.aread()
+        try:
+            mcp_types.JSONRPCMessage.model_validate_json(content)
+        except ValueError:
+            error = _error_answer(content)
+            if error is not None:
+                raise error from None
+            raise _NotMcpResponseError("application/json that is not a JSON-RPC message") from None
 
     def _factory(
         headers: dict[str, str] | None = None,
@@ -547,7 +662,10 @@ def _make_capturing_http_factory(
     ) -> httpx.AsyncClient:
         kwargs: dict[str, Any] = {
             "follow_redirects": True,
-            "event_hooks": {"request": [_bound_session_end], "response": [_hook]},
+            "event_hooks": {
+                "request": [_bound_session_end, _load_body],
+                "response": [_hook, _reject_non_mcp],
+            },
         }
         if timeout is None:
             kwargs["timeout"] = httpx.Timeout(
@@ -813,6 +931,128 @@ async def _list_all_resource_templates(
     )
 
 
+async def _reap_cancelled(tasks: tuple[asyncio.Task[Any], ...], grace: float) -> None:
+    """Await already-cancelled *tasks* for at most *grace* seconds.
+
+    ``asyncio.wait`` with a timeout so a child that refuses to honour
+    ``cancel()`` cannot block indefinitely — the expired outer
+    ``asyncio.timeout`` fires only once, so this await would otherwise
+    be unbounded on a wedged child. Exceptions on done tasks are
+    retrieved (marking them handled); a straggler is logged and
+    abandoned (a cancelled local task the loop will GC).
+
+    An EXTERNAL ``CancelledError`` (shutdown, an operator cancel of
+    the refresh runner) is honoured, NOT swallowed: it is re-raised
+    after a best-effort retrieval of any already-done task's
+    exception, so a shutdown signal delivered during the reap window
+    is not dropped on the floor.
+    """
+    try:
+        _done, pending = await asyncio.wait(set(tasks), timeout=grace)
+    except asyncio.CancelledError:
+        for task in tasks:
+            if task.done():
+                with contextlib.suppress(BaseException):
+                    task.exception()
+        raise
+    for task in tasks:
+        if task.done():
+            with contextlib.suppress(BaseException):
+                task.exception()
+    if pending:
+        log.warning(
+            "MCP resource-list reap: %d task(s) ignored cancellation; abandoning",
+            len(pending),
+        )
+
+
+async def _list_resources_and_templates(
+    session: ClientSession, server_name: str, *, timeout: float, reap_grace: float
+) -> tuple[list[mcp_types.Resource], list[mcp_types.ResourceTemplate]]:
+    """Every page of ``list_resources`` and ``list_resource_templates``, concurrently.
+
+    Shared by every connect and refresh: the static connect and the connection test through
+    :func:`_discover_catalogs`, the pool connect and the refreshes through
+    :meth:`MCPClientManager._list_resource_pair`. Both walks share the *timeout* budget and target
+    disjoint catalogs (resources vs. templates), so ordering is irrelevant.
+
+    Each method independently treats an exact JSON-RPC METHOD_NOT_FOUND as
+    an empty half-catalog. Fail-FAST on the first remaining real error — a
+    fast, meaningful failure (for example auth or invalid params) must
+    surface as ITSELF, not be
+    masked behind a hung sibling's eventual ``TimeoutError`` — but
+    with the surviving sibling CANCELLED and REAPED inside this
+    scope before the error re-raises: bare fail-fast ``gather``
+    leaves the survivor running detached — outside the timeout scope
+    and outside the lock serialization — as an unbounded in-flight
+    request on the shared session. On timeout expiry both tasks are
+    cancelled together and the caller sees ``TimeoutError``.
+
+    The reap is BOUNDED by its own grace deadline (*reap_grace*), NOT left inside the
+    outer ``asyncio.timeout`` (which fires exactly once — after it has
+    fired, awaiting the cancelled children there is unbounded). The
+    pinned SDK (mcp>=1.27,<2) honours cancellation promptly, so this
+    is belt-and-braces against a future regression: a child that
+    ignores ``cancel()`` must not wedge this runner while it holds the
+    per-server connect lock — the #839 deadlock class. A child still
+    pending after the grace is logged and abandoned (a cancelled local
+    task, GC-reaped) rather than held onto.
+    """
+    async with asyncio.timeout(timeout):
+        res_task = asyncio.create_task(_list_all_resources(session, server_name))
+        tmpl_task = asyncio.create_task(_list_all_resource_templates(session, server_name))
+        try:
+            resources, templates = await asyncio.gather(res_task, tmpl_task)
+        except BaseException:
+            # First failure (or our own cancellation, incl. the
+            # timeout's): cancel the pair — a done task ignores it —
+            # and REAP within a bounded grace so nothing survives
+            # detached and no exception goes unretrieved, then surface
+            # the original.
+            for task in (res_task, tmpl_task):
+                task.cancel()
+            await _reap_cancelled((res_task, tmpl_task), reap_grace)
+            raise
+        return resources, templates
+
+
+async def _discover_catalogs(
+    session: ClientSession,
+    server_name: str,
+    run: Callable[[Coroutine[Any, Any, Any]], Awaitable[Any]],
+    *,
+    timeout: float,
+    reap_grace: float,
+) -> tuple[
+    list[mcp_types.Tool],
+    list[mcp_types.Resource],
+    list[mcp_types.ResourceTemplate],
+    list[mcp_types.Prompt],
+]:
+    """A connect's discovery: the tools, then the resources, templates and prompts the server
+    advertises. Shared by the static connect and the connection test.
+
+    *run* awaits each listing; the static connect races it against the transport's owner. The
+    resource pair shares the *timeout* budget (:func:`_list_resources_and_templates`). One
+    capability advertises the pair, but either list method may still be absent: the list helpers
+    read only -32601 as an empty catalog.
+    """
+    caps = session.get_server_capabilities()
+    tools = await run(_list_all_tools(session, server_name))
+    resources: list[mcp_types.Resource] = []
+    templates: list[mcp_types.ResourceTemplate] = []
+    if caps is not None and caps.resources is not None:
+        resources, templates = await run(
+            _list_resources_and_templates(
+                session, server_name, timeout=timeout, reap_grace=reap_grace
+            )
+        )
+    prompts: list[mcp_types.Prompt] = []
+    if caps is not None and caps.prompts is not None:
+        prompts = await run(_list_all_prompts(session, server_name))
+    return tools, resources, templates, prompts
+
+
 def _resource_entries(
     server_name: str,
     resources: list[mcp_types.Resource],
@@ -866,6 +1106,365 @@ def _prompt_entries(server_name: str, prompts: list[mcp_types.Prompt]) -> list[d
         }
         for p in prompts
     ]
+
+
+# ---------------------------------------------------------------------------
+# Connect failures, and the connection test
+# ---------------------------------------------------------------------------
+
+# Longest recorded or reported server-error text; see :func:`_sanitize_error_text`.
+_MAX_ERROR_TEXT_LEN = 256
+# A server's error text can carry control characters, which would rewrite a terminal that shows
+# the log or forge a line in it: each reads as a space, and a carriage return as nothing.
+_ERROR_TEXT_CONTROLS: dict[int, str | None] = {
+    **dict.fromkeys([*range(0x20), *range(0x7F, 0xA0), 0x2028, 0x2029], " "),
+    0x0D: None,
+}
+
+
+def _sanitize_error_text(msg: str, limit: int = _MAX_ERROR_TEXT_LEN) -> str:
+    """Single-line, bounded rendering of a server's error text, with no control characters.
+
+    ONE pipeline for every surface that reports one (``_last_error``, the pool discovery record,
+    the connection test) so a future sanitizer hardening cannot land on one and silently miss
+    another.
+    """
+    return msg.translate(_ERROR_TEXT_CONTROLS).strip()[:limit]
+
+
+class ServerUnreachableError(ConnectionError):
+    """The TCP pre-flight could not open a connection to an HTTP server's host and port."""
+
+
+async def _tcp_preflight(label: str, url: str, timeout: float) -> None:
+    """Open and close one TCP connection to *url*'s host and port, before entering the SDK.
+
+    Fails fast when the server is unreachable, avoiding the anyio cancel-scope orphan bug that
+    causes 100% CPU spin. *label* names the server in the error. A connect and the connection test
+    both run it with the same timeout, so the test fails a host that a save would fail.
+    """
+    parsed = urllib.parse.urlparse(url)
+    host = parsed.hostname
+    if not host:
+        raise ConnectionError(f"MCP server '{label}' has invalid URL (no hostname): {url}")
+    try:
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    except ValueError:
+        raise ConnectionError(f"MCP server '{label}' has invalid port in URL: {url}") from None
+    try:
+        _, writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout=timeout)
+        writer.close()
+        await writer.wait_closed()
+    except (TimeoutError, OSError, UnicodeError) as exc:
+        # A UnicodeError is a host name that cannot be encoded for lookup, such as an empty label.
+        raise ServerUnreachableError(
+            f"MCP server '{label}' unreachable at {host}:{port}: {str(exc) or 'timed out'}"
+        ) from None
+
+
+@dataclass(frozen=True)
+class ConnectFailure:
+    """Why a connection to an MCP server failed, worded for the operator who configured it.
+
+    ``kind`` sorts the failure by what to check: the host and port (``unreachable``), the server's
+    certificate (``tls``), the URL path, the credentials or the server's sessions (``http``, with
+    the ``status``), a server that never answers (``timeout``), a URL that serves something other
+    than MCP (``not_mcp``), the server's own protocol error (``protocol``), or its catalog
+    (``invalid_catalog``). Anything else is ``error``. ``recognized`` is False when the classifier
+    knew nothing of the exception and reports its type and message, which a caller may log with
+    the traceback; it is no part of the failure itself. The message can span lines (the SDK's
+    redirect text does); every surface that reports it passes it through
+    :func:`_sanitize_error_text`.
+    """
+
+    kind: ConnectFailureKind
+    message: str
+    status: int | None = None
+    recognized: bool = field(default=True, compare=False)
+
+
+def _failure_leaves(exc: BaseException) -> list[BaseException]:
+    """The exceptions inside *exc*'s task groups, in order, leaving out cancellations.
+
+    A request that fails inside the SDK's transport fails the transport's task group, which
+    cancels the rest, so the failure can sit in nested groups beside the cancellations it caused.
+    """
+    if not isinstance(exc, BaseExceptionGroup):
+        return [] if isinstance(exc, asyncio.CancelledError) else [exc]
+    return [leaf for sub in exc.exceptions for leaf in _failure_leaves(sub)]
+
+
+def _tls_error(exc: BaseException) -> ssl.SSLError | None:
+    """The TLS error *exc* was raised from, when a TLS handshake is what failed."""
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        if isinstance(current, ssl.SSLError):
+            return current
+        seen.add(id(current))
+        current = current.__cause__ or current.__context__
+    return None
+
+
+def _tls_reason(err: ssl.SSLError) -> str:
+    """*err* in words: the certificate check's verdict, or the TLS library's reason."""
+    if isinstance(err, ssl.SSLCertVerificationError) and err.verify_message:
+        return f"certificate verify failed: {err.verify_message}"
+    if err.reason:
+        return str(err.reason).lower().replace("_", " ")
+    return str(err)
+
+
+_SESSION_DROPPED = (
+    "the server dropped the session it had just opened (a restart, or several replicas without "
+    "session affinity)"
+)
+_HEADER_REFUSED = (
+    "A header is not valid HTTP, so no request was sent: check the header names and values for "
+    "spaces at either end, control characters or characters outside ASCII"
+)
+_CONNECTION_CLOSED = "The connection closed before the server answered"
+
+
+def _http_failure(status: int, detail: str = "") -> ConnectFailure:
+    """A connect the server answered with HTTP *status*, naming what to check for common ones."""
+    try:
+        message = f"HTTP {status} {HTTPStatus(status).phrase}"
+    except ValueError:  # a code outside the standard
+        message = f"HTTP {status}"
+    if not detail:
+        if status == 401:
+            detail = "the server requires authorization"
+        elif status == 403:
+            detail = "the server refused access"
+        elif status in (404, 405):
+            detail = "no MCP endpoint at this URL"
+    return ConnectFailure("http", f"{message}: {detail}" if detail else message, status)
+
+
+def _recorded_failure(capture: _AuthCapture | None) -> ConnectFailure | None:
+    """The failure *capture* recorded off the wire: the first message the server answered with an
+    error status. A 404 on a request that carried a session id means the server dropped the
+    session it had just opened."""
+    if capture is None or capture.first_error is None:
+        return None
+    status, held_session = capture.first_error
+    return _http_failure(status, _SESSION_DROPPED if status == 404 and held_session else "")
+
+
+def _protocol_failure(code: object, message: object) -> ConnectFailure:
+    """The server's own JSON-RPC error *code* and *message*, worded."""
+    text = f"The server answered with MCP error {code}"
+    return ConnectFailure("protocol", f"{text}: {message}" if message else text)
+
+
+def _refuses_header(leaf: BaseException) -> bool:
+    """Whether *leaf* is the HTTP client refusing to send a header: h11 names the header it
+    refuses, value and all, and httpx encodes every header name and value as ASCII."""
+    if isinstance(leaf, httpx.LocalProtocolError | httpx2.LocalProtocolError):
+        return str(leaf).startswith("Illegal header")
+    return isinstance(leaf, UnicodeEncodeError) and leaf.encoding == "ascii"
+
+
+def _classify_leaf(leaf: BaseException, capture: _AuthCapture | None) -> ConnectFailure | None:
+    """One exception out of a failed connect, worded, or None when it does not say why; see
+    :func:`classify_connect_failure`."""
+    if isinstance(leaf, InvalidCatalogError):
+        return ConnectFailure("invalid_catalog", str(leaf))
+    if isinstance(leaf, ServerUnreachableError):
+        return ConnectFailure("unreachable", str(leaf))
+    if isinstance(leaf, _NotMcpResponseError):
+        return ConnectFailure(
+            "not_mcp", f"Not an MCP endpoint: the server answered with {leaf.answer}"
+        )
+    if isinstance(leaf, _ErrorAnswerError):
+        return _protocol_failure(leaf.code, leaf.message)
+    if isinstance(leaf, McpError) and leaf.error.code == mcp_types.CONNECTION_CLOSED:
+        return None  # what the teardown leaves behind, not why it began
+    if isinstance(leaf, httpx.HTTPStatusError | httpx2.HTTPStatusError | McpError):
+        # The status the server answered with, read off the wire: the SDK reports it as a status
+        # error, its own "Session terminated" stand-in for a 404 or a generic MCP error,
+        # depending on its version.
+        recorded = _recorded_failure(capture)
+        if recorded is not None:
+            return recorded
+    if isinstance(leaf, httpx.HTTPStatusError | httpx2.HTTPStatusError):
+        status = leaf.response.status_code
+        # The SDK raises a redirect it did not follow with its own text, naming the location to
+        # use instead with no userinfo or query. Any other status error is httpx's, whose text
+        # names the whole request URL, so it is worded from the status alone.
+        sdk_redirect = 300 <= status < 400 and str(leaf).startswith("Redirect to ")
+        return _http_failure(status, str(leaf) if sdk_redirect else "")
+    if isinstance(leaf, McpError):
+        if leaf.error.code == _SDK_SESSION_TERMINATED_CODE:
+            return _http_failure(404)  # with no recorded status, the v1 SDK's stand-in for a 404
+        return _protocol_failure(leaf.error.code, leaf.error.message)
+    tls = _tls_error(leaf)
+    if tls is not None:
+        return ConnectFailure("tls", f"TLS handshake failed: {_tls_reason(tls)}")
+    if isinstance(leaf, TimeoutError | httpx.TimeoutException | httpx2.TimeoutException):
+        detail = str(leaf) if isinstance(leaf, TimeoutError) else ""
+        return ConnectFailure("timeout", detail or "The server did not answer in time")
+    if _refuses_header(leaf):
+        # Raised before the request leaves, quoting the header it refused.
+        return ConnectFailure("error", _HEADER_REFUSED)
+    if isinstance(leaf, httpx.TransportError | httpx2.TransportError):
+        # Only a failed connect means the host or port; the pre-flight reached both, so a
+        # connection dropped or refused after it (a server or proxy that closes without
+        # answering, plain HTTP to a TLS port) is something else.
+        kind: ConnectFailureKind = (
+            "unreachable" if isinstance(leaf, httpx.ConnectError | httpx2.ConnectError) else "error"
+        )
+        return ConnectFailure(
+            kind, f"Connection failed: {leaf}" if str(leaf) else "Connection failed"
+        )
+    return None
+
+
+def classify_connect_failure(
+    exc: BaseException, capture: _AuthCapture | None = None
+) -> ConnectFailure:
+    """Why connecting to an MCP server failed, from what the connect raised.
+
+    The SDK's task groups can hold the cause beside the side effects of the teardown it set off,
+    in any order. The answer is, first to apply: the client's own shutdown; a failure recognized
+    here with a kind of its own; the status *capture* recorded off the wire; a failure recognized
+    here as a plain ``error``; a connection that closed under the requests; and last the first
+    exception's type and message, not ``recognized``. *capture* is the connection's HTTP failure
+    carrier, for connect failures only and when it is new to the connection: its status words an
+    HTTP failure whatever the SDK raises for it, and tells a 404 on a held session from one on
+    initialize. No message carries request headers: HTTP failures are worded here from the
+    status, a refused header is never quoted, and the SDK's redirect text names only the
+    redirect's location.
+    """
+    leaves = _failure_leaves(exc)
+    for leaf in leaves:
+        if isinstance(leaf, MCPShutdownError):
+            return ConnectFailure("error", str(leaf))  # already in words
+    failures = [f for f in (_classify_leaf(leaf, capture) for leaf in leaves) if f is not None]
+    for failure in failures:
+        if failure.kind != "error":
+            return failure
+    recorded = _recorded_failure(capture)
+    if recorded is not None:
+        return recorded
+    if failures:
+        return failures[0]
+    if any(
+        isinstance(leaf, McpError) and leaf.error.code == mcp_types.CONNECTION_CLOSED
+        for leaf in leaves
+    ):
+        return ConnectFailure("error", _CONNECTION_CLOSED)
+    return ConnectFailure(
+        "error", _exception_summary(leaves[0] if leaves else exc), recognized=False
+    )
+
+
+@dataclass(frozen=True)
+class ConnectionProbe:
+    """What one connection test found: the server's catalog, or why it could not be read."""
+
+    tools: list[str] = field(default_factory=list)
+    resources: int = 0
+    prompts: int = 0
+    failure: ConnectFailure | None = None
+
+
+# How long a finished connection test waits for tasks the SDK left running to unwind.
+_PROBE_TEARDOWN_S = 5.0
+# Longest error text a connection test reports. Longer than a server's recorded error: the
+# test's reader is the admin who typed the URL, and the SDK's redirect advice ends the text.
+_PROBE_ERROR_MAX_LEN = 1024
+
+
+async def _probe_http_server(url: str, headers: dict[str, str], label: str) -> ConnectionProbe:
+    """Connect, initialize and list the catalogs once; see :func:`probe_http_server`."""
+    deadline = asyncio.get_running_loop().time() + MCPClientManager._CONNECT_TIMEOUT
+    capture = _AuthCapture()
+    try:
+        await _tcp_preflight(label, url, MCPClientManager._TCP_PROBE_TIMEOUT)
+        async with (
+            streamablehttp_client(
+                url=url, headers=headers, httpx_client_factory=_make_capturing_http_factory(capture)
+            ) as (read, write, _),
+            ClientSession(read, write) as session,
+        ):
+            # The deadline covers the requests, never the unwind after them: a cancel landing in
+            # the SDK's exit could leave an anyio cancel scope half-exited. An unwind that runs
+            # over (a server that trickles its answer to the request ending the session) is cut
+            # off by probe_http_server, on this loop of the test's own, closed right after.
+            async with asyncio.timeout_at(deadline):
+                await session.initialize()
+                tools, resources, templates, prompts = await _discover_catalogs(
+                    session,
+                    label,
+                    lambda listing: listing,
+                    timeout=MCPClientManager._CONNECT_TIMEOUT,
+                    reap_grace=MCPClientManager._OWNER_CANCEL_GRACE_S,
+                )
+    except (Exception, BaseExceptionGroup) as exc:
+        failure = classify_connect_failure(exc, capture)
+        message = _sanitize_error_text(failure.message, _PROBE_ERROR_MAX_LEN)
+        return ConnectionProbe(failure=replace(failure, message=message))
+    return ConnectionProbe(
+        tools=[tool.name for tool in tools],
+        resources=len(resources) + len(templates),
+        prompts=len(prompts),
+    )
+
+
+def probe_http_server(
+    url: str, headers: dict[str, str] | None = None, *, name: str = ""
+) -> ConnectionProbe:
+    """Test a Streamable HTTP MCP server the way a connect would reach it, publishing nothing.
+
+    Runs the connect's TCP pre-flight, then connects with the connect's HTTP client, initializes,
+    and lists the tools, plus the resources and prompts when the server advertises them, all within
+    the connect timeout. Nothing is recorded or published, and nothing outlives the call. *name*
+    labels the server in error messages; the URL's host stands in when it is empty.
+
+    Blocks the calling thread for up to :func:`probe_http_server_max_s`. The test runs on an event
+    loop of its own, so a fault inside the SDK stays in this thread instead of stalling the
+    caller's loop.
+    """
+    label = name or urllib.parse.urlparse(url).hostname or url
+    loop = asyncio.new_event_loop()
+    try:
+        test = loop.create_task(_probe_http_server(url, dict(headers or {}), label))
+        # The SDK bounds each read of the request that ends the session, not the request: held
+        # here to the bound as a whole, and the teardown below has the rest of it.
+        loop.run_until_complete(
+            asyncio.wait({test}, timeout=probe_http_server_max_s() - _PROBE_TEARDOWN_S)
+        )
+        if not test.done():
+            return ConnectionProbe(
+                failure=ConnectFailure("timeout", "The server did not answer in time")
+            )
+        return test.result()
+    finally:
+        try:
+            # Let a task the SDK left behind unwind in its own task, as ``asyncio.run`` does, but
+            # never close leftover async generators the way it also does: that runs their cleanup
+            # in another task, exiting their anyio cancel scopes cross-task.
+            leftover = asyncio.all_tasks(loop)
+            for task in leftover:
+                task.cancel()
+            if leftover:
+                loop.run_until_complete(asyncio.wait(leftover, timeout=_PROBE_TEARDOWN_S))
+        finally:
+            # Also shuts down the resolver threads, without waiting on a lookup in flight.
+            loop.close()
+
+
+def probe_http_server_max_s() -> float:
+    """The longest :func:`probe_http_server` blocks: the connect timeout, the grace a cancelled
+    resource listing has to unwind, the request that ends the session, and the teardown."""
+    return (
+        MCPClientManager._CONNECT_TIMEOUT
+        + MCPClientManager._OWNER_CANCEL_GRACE_S
+        + _SESSION_END_TIMEOUT_S
+        + _PROBE_TEARDOWN_S
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1042,6 +1641,9 @@ class MCPClientManager:
         # Config-file servers loaded at startup are NOT in this set and
         # will never be removed by reconcile_sync.
         self._db_managed: set[str] = set()
+        # A reload's retry of a DB server that is down, by name (``_start_reconnect_down``), for a
+        # removal of the server to cancel.
+        self._reload_retries: dict[str, concurrent.futures.Future[None]] = {}
         # Per-server last-error tracking (set on failure, cleared on success)
         self._last_error: dict[str, str] = {}
         # Last tool-DISCOVERY error for pool (oauth_user / oauth_obo) servers,
@@ -1056,7 +1658,6 @@ class MCPClientManager:
         # user's results), and another user's success must not erase a signal
         # that is still true for this one.
         self._pool_discovery_error: dict[tuple[str, str], str] = {}
-        self._MAX_ERROR_LEN = 256
 
         # Listener infrastructure (tool-change callbacks for ChatSession).
         # Each entry is ``(user_id, callback)``: ``user_id=None`` is the
@@ -1429,7 +2030,7 @@ class MCPClientManager:
                 await self._connect_one(name)
             except asyncio.CancelledError:
                 raise  # propagate so the background task can be cleanly stopped
-            except (Exception, BaseExceptionGroup):
+            except (Exception, BaseExceptionGroup) as exc:
                 # ``BaseExceptionGroup`` explicitly: anyio task groups wrap a
                 # transport failure that includes a stray CancelledError (an
                 # accept-then-RST server, a cancel-scope collapse) into a
@@ -1438,7 +2039,19 @@ class MCPClientManager:
                 # ``_connect_all`` before the health/sweep loops below were
                 # ever created — silently disabling all autonomous recovery.
                 # ``_connect_one`` already recorded it, under the connect lock.
-                log.warning("Failed to connect MCP server '%s'", name, exc_info=True)
+                # The warning carries the recorded words (worded again from the
+                # same carrier, with no await since), not the exception chain
+                # (the redaction policy of ``_record_refresh_failure``). A
+                # failure the classifier does not recognize is likelier a bug
+                # here than at the server: its traceback goes to debug.
+                failure = self._connect_failure(name, exc)
+                log.warning(
+                    "Failed to connect MCP server '%s': %s",
+                    name,
+                    _sanitize_error_text(failure.message),
+                )
+                if not failure.recognized:
+                    log.debug("MCP server '%s' connect failure", name, exc_info=True)
 
         # Start the background token-freshness sweep (once, on the mcp-loop).
         # Keeps every consented oauth_user grant hot for unattended work and
@@ -1683,28 +2296,8 @@ class MCPClientManager:
         Accepts either a static server name or a pool key; only the error
         message differs (the probe itself is keyless).
         """
-        from urllib.parse import urlparse
-
         label = f"{key[1]}@{key[0]}" if isinstance(key, tuple) else key
-        parsed = urlparse(url)
-        host = parsed.hostname
-        if not host:
-            raise ConnectionError(f"MCP server '{label}' has invalid URL (no hostname): {url}")
-        try:
-            port = parsed.port or (443 if parsed.scheme == "https" else 80)
-        except ValueError:
-            raise ConnectionError(f"MCP server '{label}' has invalid port in URL: {url}") from None
-        try:
-            _, writer = await asyncio.wait_for(
-                asyncio.open_connection(host, port),
-                timeout=self._TCP_PROBE_TIMEOUT,
-            )
-            writer.close()
-            await writer.wait_closed()
-        except (TimeoutError, OSError) as exc:
-            raise ConnectionError(
-                f"MCP server '{label}' unreachable at {host}:{port}: {exc}"
-            ) from None
+        await _tcp_preflight(label, url, self._TCP_PROBE_TIMEOUT)
 
     def _maybe_disarm_orphaned_scopes(self, context: str) -> int:
         """Disarm anyio cancel scopes that can never drain (rate-limited backstop).
@@ -2611,6 +3204,9 @@ class MCPClientManager:
         # owner (and its open transport) behind; the close protocol clears
         # both (and is a no-op on a brand new entry).
         await self._teardown_static_session(name)
+        # The owner gives each attempt a carrier of its own. Until it does, a failure (the
+        # pre-flight's) is worded with none, never with the last connection's.
+        state.http_capture = None
 
         transport = cfg.get("type", "stdio")
         if transport in ("http", "streamable-http") or "url" in cfg:
@@ -2689,30 +3285,20 @@ class MCPClientManager:
             supports_prompts = prompts_cap is not None
             supports_prompt_list_changed = prompts_cap is not None and bool(prompts_cap.listChanged)
 
-            # Discover tools. Discovery runs in THIS caller task while the
-            # transport is hosted by the owner, so a transport collapse
-            # mid-discovery cancels the OWNER, not us — ``_await_owner_discovery``
-            # races the owner so that death surfaces as a prompt ConnectionError
-            # instead of hanging to the caller-side attempt timeout.
-            tools = await self._await_owner_discovery(owner, _list_all_tools(session, name))
+            # Discovery runs in THIS caller task while the transport is hosted by the owner, so a
+            # transport collapse mid-discovery cancels the OWNER, not us: each listing races the
+            # owner (``_await_owner_discovery``) so that death surfaces as a prompt
+            # ConnectionError instead of hanging to the caller-side attempt timeout.
+            tools, resources, templates, prompts = await _discover_catalogs(
+                session,
+                name,
+                lambda listing: self._await_owner_discovery(owner, listing),
+                timeout=self._CONNECT_TIMEOUT,
+                reap_grace=self._OWNER_CANCEL_GRACE_S,
+            )
             server_tools: list[dict[str, Any]] = [_mcp_to_openai(name, tool) for tool in tools]
-
-            # Discover resources. The protocol advertises the pair with one
-            # aggregate capability, but either list method may independently be
-            # absent; the list helpers read only -32601 as an empty catalog.
-            # Both walks share one _CONNECT_TIMEOUT budget, including startup.
-            server_resources: list[dict[str, Any]] = []
-            if resources_cap is not None:
-                resources, templates = await self._await_owner_discovery(
-                    owner, self._list_resource_pair(session, name)
-                )
-                server_resources = _resource_entries(name, resources, templates)
-
-            # Discover prompts.
-            server_prompts: list[dict[str, Any]] = []
-            if prompts_cap is not None:
-                prompts = await self._await_owner_discovery(owner, _list_all_prompts(session, name))
-                server_prompts = _prompt_entries(name, prompts)
+            server_resources = _resource_entries(name, resources, templates)
+            server_prompts = _prompt_entries(name, prompts)
 
             # The owner done-callback can evict the session in the same loop
             # turn that the final discovery call completes. Revalidate the
@@ -3664,8 +4250,9 @@ class MCPClientManager:
                         # Token-level outcomes (missing / dead grant) return
                         # earlier and never reach here, so this is a genuine
                         # connect/discovery failure (transport, 5xx, timeout).
-                        self._pool_discovery_error[key] = self._sanitize_error_detail(
-                            _exception_summary(exc)
+                        # No carrier: a pool entry's outlives this connect (see _AuthCapture).
+                        self._pool_discovery_error[key] = _sanitize_error_text(
+                            classify_connect_failure(exc).message
                         )
                         self._ensure_eviction_loop()
                         log.debug(
@@ -4650,84 +5237,14 @@ class MCPClientManager:
     async def _list_resource_pair(
         self, session: ClientSession, server_name: str
     ) -> tuple[list[mcp_types.Resource], list[mcp_types.ResourceTemplate]]:
-        """Every page of ``list_resources`` and ``list_resource_templates``, concurrently.
-
-        Shared by static and pool connect and refresh. Both walks share the
-        timeout budget and target disjoint catalogs (resources vs.
-        templates), so ordering is irrelevant.
-
-        Each method independently treats an exact JSON-RPC METHOD_NOT_FOUND as
-        an empty half-catalog. Fail-FAST on the first remaining real error — a
-        fast, meaningful failure (for example auth or invalid params) must
-        surface as ITSELF, not be
-        masked behind a hung sibling's eventual ``TimeoutError`` — but
-        with the surviving sibling CANCELLED and REAPED inside this
-        scope before the error re-raises: bare fail-fast ``gather``
-        leaves the survivor running detached — outside the timeout scope
-        and outside the lock serialization — as an unbounded in-flight
-        request on the shared session. On timeout expiry both tasks are
-        cancelled together and the caller sees ``TimeoutError``.
-
-        The reap is BOUNDED by its own grace deadline, NOT left inside the
-        outer ``asyncio.timeout`` (which fires exactly once — after it has
-        fired, awaiting the cancelled children there is unbounded). The
-        pinned SDK (mcp>=1.27,<2) honours cancellation promptly, so this
-        is belt-and-braces against a future regression: a child that
-        ignores ``cancel()`` must not wedge this runner while it holds the
-        per-server connect lock — the #839 deadlock class. A child still
-        pending after the grace is logged and abandoned (a cancelled local
-        task, GC-reaped) rather than held onto.
-        """
-        async with asyncio.timeout(self._CONNECT_TIMEOUT):
-            res_task = asyncio.create_task(_list_all_resources(session, server_name))
-            tmpl_task = asyncio.create_task(_list_all_resource_templates(session, server_name))
-            try:
-                resources, templates = await asyncio.gather(res_task, tmpl_task)
-            except BaseException:
-                # First failure (or our own cancellation, incl. the
-                # timeout's): cancel the pair — a done task ignores it —
-                # and REAP within a bounded grace so nothing survives
-                # detached and no exception goes unretrieved, then surface
-                # the original.
-                for task in (res_task, tmpl_task):
-                    task.cancel()
-                await self._reap_bounded((res_task, tmpl_task))
-                raise
-            return resources, templates
-
-    async def _reap_bounded(self, tasks: tuple[asyncio.Task[Any], ...]) -> None:
-        """Await already-cancelled *tasks* under a grace deadline.
-
-        ``asyncio.wait`` with a timeout so a child that refuses to honour
-        ``cancel()`` cannot block indefinitely — the expired outer
-        ``asyncio.timeout`` fires only once, so this await would otherwise
-        be unbounded on a wedged child. Exceptions on done tasks are
-        retrieved (marking them handled); a straggler is logged and
-        abandoned (a cancelled local task the loop will GC).
-
-        An EXTERNAL ``CancelledError`` (shutdown, an operator cancel of
-        the refresh runner) is honoured, NOT swallowed: it is re-raised
-        after a best-effort retrieval of any already-done task's
-        exception, so a shutdown signal delivered during the reap window
-        is not dropped on the floor.
-        """
-        try:
-            _done, pending = await asyncio.wait(set(tasks), timeout=self._OWNER_CANCEL_GRACE_S)
-        except asyncio.CancelledError:
-            for task in tasks:
-                if task.done():
-                    with contextlib.suppress(BaseException):
-                        task.exception()
-            raise
-        for task in tasks:
-            if task.done():
-                with contextlib.suppress(BaseException):
-                    task.exception()
-        if pending:
-            log.warning(
-                "MCP resource-list reap: %d task(s) ignored cancellation; abandoning",
-                len(pending),
-            )
+        """Every page of ``list_resources`` and ``list_resource_templates``, concurrently, under
+        this manager's connect timeout; see :func:`_list_resources_and_templates`."""
+        return await _list_resources_and_templates(
+            session,
+            server_name,
+            timeout=self._CONNECT_TIMEOUT,
+            reap_grace=self._OWNER_CANCEL_GRACE_S,
+        )
 
     async def _refresh_pool_server_resources(
         self, key: tuple[str, str]
@@ -5954,6 +6471,11 @@ class MCPClientManager:
 
         Returns status dict with keys: connected, tools, resources, prompts, error.
 
+        A server whose connect fails stays registered, with no catalog, as one that fails at
+        startup does: its status carries the recorded error and the health loop keeps retrying
+        it. A connect that shutdown cancels removes the registration, and one it refuses never
+        makes it.
+
         Note on ``_oauth_user_server_names``: this method does NOT update
         the oauth_user-name cache. ``_db_servers_to_config`` strips
         ``auth_type='oauth_user'`` rows before this method is reached, so
@@ -5981,12 +6503,11 @@ class MCPClientManager:
                 "error": "MCP event loop not running",
             }
 
-        # Add to config so _refresh_all can reconnect on failure.
-        self._server_configs[name] = cfg
+        recorded = ""  # the failure _add recorded; read here after its outcome
 
-        def _clear_failed_add_state() -> None:
-            """Remove this registration's config and every public catalog."""
-            if self._server_configs.get(name) is cfg:
+        def _clear_failed_add_state(*, keep_registration: bool) -> None:
+            """Withdraw every public catalog, and this registration's config unless it is kept."""
+            if not keep_registration and self._server_configs.get(name) is cfg:
                 self._server_configs.pop(name, None)
             failed_state = self._static_servers.get(name)
             tools_changed = bool(failed_state and failed_state.tools)
@@ -6009,6 +6530,10 @@ class MCPClientManager:
                 self._rebuild_prompts()
 
         async def _add() -> None:
+            nonlocal recorded
+            # Registered as the add starts and kept when the connect fails, like a server that
+            # fails at startup: its status shows the error, and the health loop keeps retrying it.
+            self._server_configs[name] = cfg
             # Keep failure rollback under the SAME per-name lock as connect.
             # The timeout is loop-owned: the sync bridge waits for a definitive
             # outcome instead of racing a second wall-clock deadline against
@@ -6020,14 +6545,21 @@ class MCPClientManager:
                     async with asyncio.timeout(timeout):
                         await self._connect_one_locked(name, cfg)
                 except BaseException as exc:
+                    # A failed connect keeps the registration and records why, under the lock
+                    # like every connect driver; a cancelled one (shutdown) removes it. A newer
+                    # concurrent add may already have replaced the config while waiting on this
+                    # lock: the registration is then its successor's, which runs after this
+                    # cleanup releases the lock.
+                    keep = (
+                        isinstance(exc, Exception | BaseExceptionGroup)
+                        and self._server_configs.get(name) is cfg
+                    )
                     try:
                         await self._teardown_static_session(name)
                     finally:
-                        # A newer concurrent add may already have replaced the
-                        # config while waiting on this lock. Remove only the
-                        # registration this coroutine owns; its successor will
-                        # run after this cleanup releases the lock.
-                        _clear_failed_add_state()
+                        _clear_failed_add_state(keep_registration=keep)
+                        if keep:
+                            recorded = self._record_connect_failure(name, exc, breaker=True)
                     if isinstance(exc, TimeoutError):
                         raise TimeoutError(f"MCP server '{name}' registration timed out") from None
                     raise
@@ -6037,20 +6569,20 @@ class MCPClientManager:
             # timeout here could return a failed result while cleanup is merely
             # queued on a stalled loop, exposing a live unconfigured tool.
             self._submit_root(_add).result()
-        except concurrent.futures.TimeoutError:
+        except (Exception, BaseExceptionGroup) as exc:
+            # The words _add recorded, read once; a timeout keeps its own. Anything else never
+            # reached the record: shutdown refused the add or cancelled it.
+            if isinstance(exc, TimeoutError):
+                error = str(exc)
+            else:
+                error = recorded or _sanitize_error_text(classify_connect_failure(exc).message)
             return {
                 "connected": False,
                 "tools": 0,
                 "resources": 0,
                 "prompts": 0,
-                "error": f"MCP server '{name}' registration timed out",
+                "error": error,
             }
-        except Exception as exc:
-            # The loop-side rollback normally removed this exact registration;
-            # retain a defensive cleanup for failures before _add could start.
-            if self._server_configs.get(name) is cfg:
-                self._server_configs.pop(name, None)
-            return {"connected": False, "tools": 0, "resources": 0, "prompts": 0, "error": str(exc)}
 
         state = self._static_servers.get(name)
         return {
@@ -6208,6 +6740,12 @@ class MCPClientManager:
         existing = self._static_servers.get(name)
         was_connected = existing is not None and existing.session is not None
 
+        # A reload's retry of this server holds the connect lock this removal queues on for its
+        # whole attempt: cancel it, and its attempt unwinds now.
+        retry = self._reload_retries.pop(name, None)
+        if retry is not None:
+            retry.cancel()
+
         if self._loop is not None:
 
             async def _remove() -> None:
@@ -6323,27 +6861,30 @@ class MCPClientManager:
         log.info("Removed MCP server '%s'", name)
         return was_connected
 
-    def _sanitize_error_detail(self, msg: str) -> str:
-        """Single-line, bounded rendering for recorded server-error text.
-
-        ONE pipeline for every recorded surface (``_last_error``, the pool
-        discovery record) so a future sanitizer hardening cannot land on
-        one and silently miss the other.
-        """
-        return msg.replace("\n", " ").replace("\r", "").strip()[: self._MAX_ERROR_LEN]
-
     def _set_error(self, name: str, msg: str) -> None:
         """Store a sanitized error string for a server."""
-        self._last_error[name] = self._sanitize_error_detail(msg)
+        self._last_error[name] = _sanitize_error_text(msg)
 
-    def _record_connect_failure(self, name: str, exc: BaseException, *, breaker: bool) -> None:
+    def _connect_failure(self, name: str, exc: BaseException) -> ConnectFailure:
+        """Static server *name*'s failed connect *exc*, classified with the HTTP failure carrier
+        of the server's last connection, the one that failed (:func:`classify_connect_failure`)."""
+        state = self._static_servers.get(name)
+        capture = state.http_capture if state is not None else None
+        return classify_connect_failure(exc, capture)
+
+    def _connect_failure_text(self, name: str, exc: BaseException) -> str:
+        """Static server *name*'s failed connect *exc* in words, on one bounded line."""
+        return _sanitize_error_text(self._connect_failure(name, exc).message)
+
+    def _record_connect_failure(self, name: str, exc: BaseException, *, breaker: bool) -> str:
         """Record a failed static connect: the ONE place that decides what the failure means.
 
         Every static connect driver records here, under the per-name connect lock: startup
-        (:meth:`_connect_one`), the health loop and a dispatch's reconnect (through
-        :meth:`_ensure_static_connected`), and an operator reconnect. A failed add records nothing,
-        because it removes the registration. The error shows in the server's status until a
-        connect succeeds, and with *breaker* the failure counts against the circuit breaker.
+        (:meth:`_connect_one`), a reload's add (:meth:`add_server_sync`), the health loop and a
+        dispatch's reconnect (through :meth:`_ensure_static_connected`), and an operator
+        reconnect. The error, worded by :func:`classify_connect_failure`, shows in the server's
+        status until a connect succeeds, and with *breaker* the failure counts against the circuit
+        breaker. Returns the recorded words, for a driver that reports them.
 
         An :class:`InvalidCatalogError` never counts against the breaker: the server answered, so
         it says nothing about the transport (#1224). It schedules the health loop's next attempt
@@ -6355,15 +6896,16 @@ class MCPClientManager:
         next one anywhere would delete the server's rows anyway, at a time set by unrelated events.
         The rows come back when the server does.
         """
-        self._set_error(name, _exception_summary(exc))
+        text = self._connect_failure_text(name, exc)
+        self._set_error(name, text)
         if not isinstance(exc, InvalidCatalogError):
             if breaker:
                 self._cb_record_failure(name)
-            return
+            return text
         self._static_reconnect_next[name] = time.monotonic() + self._INVALID_CATALOG_RETRY_S
         state = self._static_servers.get(name)
         if state is None:
-            return
+            return text
         tools, resources, prompts = state.tools, state.resources, state.prompts
         state.tools, state.resources, state.prompts = [], [], []
         if tools:
@@ -6376,6 +6918,7 @@ class MCPClientManager:
                 self.sync_prompts_to_storage()
             except Exception:
                 log.warning("Prompt sync after withdrawing '%s' failed", name, exc_info=True)
+        return text
 
     def _drop_pool_discovery_errors(self, server_name: str) -> None:
         """Drop every user's recorded discovery failure for *server_name*.
@@ -6547,6 +7090,44 @@ class MCPClientManager:
                 result[name] = self.get_server_status(name, user_id, aggregate=aggregate)
         return result
 
+    def _start_reconnect_down(self, names: list[str]) -> None:
+        """Start reconnecting the static servers among *names* that are registered but not
+        connected, all at once as a health tick does, without waiting for the outcome.
+
+        Each goes through :meth:`_ensure_static_connected`, which bounds the attempt and records a
+        failure in the server's status. A server another driver is connecting is left to it, as
+        :meth:`_refresh_all` leaves it, and so is one whose retry from an earlier reload is still
+        running. Each retry is a root task, so shutdown drains it, and a removal of its server
+        cancels it (:meth:`remove_server_sync`), so an edit or delete never waits out its attempt.
+        """
+        if self._loop is None:
+            return
+
+        async def _reconnect(name: str) -> None:
+            state = self._static_servers.get(name)
+            cfg = self._server_configs.get(name)
+            if not cfg or (state is not None and state.session is not None):
+                return
+            if self._static_connect_lock_for(name).locked():
+                return
+            try:
+                if await self._ensure_static_connected(name, cfg) is None:
+                    return
+            except (Exception, BaseExceptionGroup):
+                return  # recorded in the server's status
+            log.info("MCP reload: reconnected '%s'", name)
+
+        for name in names:
+            running = self._reload_retries.get(name)
+            if running is not None and not running.done():
+                # Kept on the running attempt, which may hold the connect lock: it is the one a
+                # removal must cancel. A new retry would return at once and take its place.
+                continue
+            try:
+                self._reload_retries[name] = self._submit_root(functools.partial(_reconnect, name))
+            except MCPShutdownError:
+                return
+
     def reconcile_sync(self, storage: Any, timeout: int = 30) -> dict[str, Any]:
         """Reconcile DB-managed servers against DB state.
 
@@ -6554,6 +7135,9 @@ class MCPClientManager:
         - Connects servers in DB but not currently running.
         - Disconnects DB-managed servers no longer in DB (or disabled).
         - Reconnects DB-managed servers whose config has changed.
+        - With the health check turned off, starts a retry of DB-managed servers that are
+          registered but not connected (a connect that failed when they were added, a session
+          that dropped since), as a health tick would, without waiting for it.
 
         Config-file servers (loaded at startup, not in ``_db_managed``)
         are never touched — only servers previously added via DB are
@@ -6627,14 +7211,22 @@ class MCPClientManager:
             self._db_managed.discard(name)
             removed.append(name)
 
-        # Add servers in DB but not running
-        for name in desired_names - set(self._server_configs):
+        # Add servers in DB but not running. A failed add stays registered with its error, for the
+        # health loop to retry, so the DB owns the name whenever the registration is there: a
+        # later delete or edit must still reach it.
+        attempted = desired_names - set(self._server_configs)
+        for name in attempted:
             result = self.add_server_sync(name, desired[name], timeout=timeout)
+            if name in self._server_configs:
+                self._db_managed.add(name)
             if result.get("connected"):
                 added.append(name)
-                self._db_managed.add(name)
             else:
-                log.warning("reconcile_sync: failed to add '%s': %s", name, result.get("error", ""))
+                log.warning(
+                    "reconcile_sync: failed to add '%s': %s",
+                    name,
+                    result.get("error", ""),
+                )
 
         # Update DB-managed servers whose config has changed (cycle: remove + add).
         # Config-file servers with the same name as a DB server are left untouched.
@@ -6642,32 +7234,41 @@ class MCPClientManager:
             if name not in self._db_managed:
                 continue  # config-file server — DB doesn't own it
             if desired[name] != self._server_configs.get(name):
+                attempted.add(name)
                 log.info("Config changed for MCP server '%s', reconnecting", name)
                 self.remove_server_sync(name, timeout=timeout)
                 if name in self._server_configs:
                     # Removal timed out (nothing mutated) — defer the update
-                    # rather than layering the new config via add: a
-                    # subsequently timed-out add pops the config outright,
-                    # stranding the still-live OLD session as exactly the
-                    # half-removed ghost the locked removal exists to
-                    # prevent. The DB row is unchanged, so the next pass
-                    # sees the same drift and retries.
+                    # rather than layering the new config over the still-live
+                    # OLD session, which the locked removal exists to retire
+                    # first. The DB row is unchanged, so the next pass sees
+                    # the same drift and retries.
                     log.warning(
                         "reconcile_sync: config update for '%s' deferred (removal timed out)",
                         name,
                     )
                     continue
                 result = self.add_server_sync(name, desired[name], timeout=timeout)
-                if result.get("connected"):
-                    updated.append(name)
+                # As for an add: a failed reconnect stays registered under the new config.
+                if name in self._server_configs:
                     self._db_managed.add(name)
                 else:
                     self._db_managed.discard(name)
+                if result.get("connected"):
+                    updated.append(name)
+                else:
                     log.warning(
                         "reconcile_sync: failed to reconnect '%s': %s",
                         name,
                         result.get("error", ""),
                     )
+
+        # With the health check off nothing else retries the DB's servers that are down, so the
+        # reload starts a retry of those this pass did not try, and does not wait for it: a hung
+        # server would hold the reload past its caller's wait. With it on, the health loop's
+        # backoff retries them.
+        if self._static_health_check_s <= 0:
+            self._start_reconnect_down(sorted((self._db_managed & desired_names) - attempted))
 
         if added or removed or updated:
             log.info(
@@ -7211,7 +7812,11 @@ class MCPClientManager:
         if not cfg:
             return time.monotonic() + self._static_health_check_s
         try:
-            log.info("MCP static health: reconnecting '%s'", name)
+            # Loud for the first few attempts, then debug, like the failure line below: a server
+            # that stays down is retried forever.
+            attempt = self._static_reconnect_attempt.get(name, 0) + 1
+            log_fn = log.info if attempt <= self._CB_FAILURE_THRESHOLD else log.debug
+            log_fn("MCP static health: reconnecting '%s'", name)
             session = await self._ensure_static_connected(name, cfg)
         except (Exception, BaseExceptionGroup) as exc:
             # The primitive already recorded the breaker failure and dropped
@@ -7239,7 +7844,7 @@ class MCPClientManager:
                 name,
                 attempt,
                 delay,
-                exc,
+                self._connect_failure_text(name, exc),
             )
             return next_due
         if session is None:
