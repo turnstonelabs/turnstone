@@ -8,34 +8,13 @@ from typing import Any
 
 import pytest
 
+from tests._secret_refs_helpers import FakeBackend, install_fake_resolver
 from turnstone.core.mcp_client import (
     MCPClientManager,
     MCPSecretReferenceError,
     _db_servers_to_config,
     _pool_cfg_from_row,
 )
-from turnstone.core.secret_refs import SecretResolver, reset_for_tests
-from turnstone.core.secret_refs import _resolver as resolver_module
-from turnstone.core.secret_refs._config import parse_secrets_config
-from turnstone.core.secret_refs._errors import SecretBackendError
-
-
-class FakeBackend:
-    name = "fake"
-
-    def __init__(self) -> None:
-        self.values: dict[str, str] = {"/mcp/token": "Bearer live-token"}
-        self.fail: SecretBackendError | None = None
-
-    def fetch(self, path: str, key: str | None) -> str:
-        if self.fail is not None:
-            raise self.fail
-        if path not in self.values:
-            raise SecretBackendError(f"{path.strip('/')!r} not found", retryable=False)
-        return self.values[path]
-
-    def close(self) -> None:
-        pass
 
 
 class _FakeStorage:
@@ -47,12 +26,8 @@ class _FakeStorage:
 
 
 @pytest.fixture
-def fake_store(monkeypatch: pytest.MonkeyPatch) -> Any:
-    backend = FakeBackend()
-    resolver = SecretResolver(parse_secrets_config({}), backends={"fake": backend})
-    monkeypatch.setattr(resolver_module, "_instance", resolver)
-    yield backend
-    reset_for_tests()
+def fake_store(monkeypatch: pytest.MonkeyPatch) -> FakeBackend:
+    return install_fake_resolver(monkeypatch, {"/mcp/token": "Bearer live-token"})
 
 
 HEADERS = {"Authorization": "secret://fake/mcp/token", "X-Plain": "v"}
@@ -82,15 +57,15 @@ class TestResolvedCopyAtConnect:
         }
         resolved = asyncio.run(mgr._with_resolved_headers("srv", cfg))
         assert resolved["headers"] == {"Authorization": "Bearer live-token", "X-Plain": "v"}
-        assert cfg["headers"] == HEADERS
-        assert resolved is not cfg
+        assert cfg["headers"] == HEADERS  # the stored config keeps the reference text
 
-    def test_cfg_without_references_is_returned_as_is(self, fake_store: FakeBackend) -> None:
+    def test_cfg_without_references_is_unchanged(self, fake_store: FakeBackend) -> None:
         mgr = MCPClientManager({})
         cfg = {"type": "stdio", "command": "echo"}
-        assert asyncio.run(mgr._with_resolved_headers("srv", cfg)) is cfg
+        assert asyncio.run(mgr._with_resolved_headers("srv", cfg)) == cfg
         cfg2 = {"type": "streamable-http", "url": "u", "headers": {"X": "y"}}
-        assert asyncio.run(mgr._with_resolved_headers("srv", cfg2)) is cfg2
+        assert asyncio.run(mgr._with_resolved_headers("srv", cfg2)) == cfg2
+        assert fake_store.calls == 0
 
     def test_failure_names_the_reference_not_the_value(self, fake_store: FakeBackend) -> None:
         mgr = MCPClientManager({})
@@ -107,11 +82,19 @@ class TestResolvedCopyAtConnect:
 
 
 class TestOperatorTriggeredReloadsAskTheStoreAgain:
-    def test_reconcile_invalidates_the_cache(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        import turnstone.core.secret_refs as pkg
-
-        calls: list[str] = []
-        monkeypatch.setattr(pkg, "invalidate_cache", lambda: calls.append("invalidate"))
+    def test_reconcile_picks_up_a_rotated_header_value(self, fake_store: FakeBackend) -> None:
         mgr = MCPClientManager({})
+        cfg = {"transport": "streamable-http", "url": "http://x", "headers": dict(HEADERS)}
+        assert asyncio.run(mgr._with_resolved_headers("srv", cfg))["headers"]["Authorization"] == (
+            "Bearer live-token"
+        )
+        fake_store.values["/mcp/token"] = "Bearer rotated"
+        # Inside the cache TTL the old value is still served...
+        assert asyncio.run(mgr._with_resolved_headers("srv", cfg))["headers"]["Authorization"] == (
+            "Bearer live-token"
+        )
+        # ...until an operator-triggered reconcile asks the store again.
         mgr.reconcile_sync(_FakeStorage([]))
-        assert calls == ["invalidate"]
+        assert asyncio.run(mgr._with_resolved_headers("srv", cfg))["headers"]["Authorization"] == (
+            "Bearer rotated"
+        )

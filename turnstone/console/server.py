@@ -5858,7 +5858,6 @@ def _load_and_bootstrap_coord_subsystem(app: Starlette, storage: Any, config_sto
             # admin panel (see :func:`_maybe_bootstrap_coord_subsystem`).
             app.state.coord_registry_error = str(exc)
             return
-        app.state.coord_registry_skipped = dict(coord_registry.skipped_aliases)
         # Console-side twin of initialize_mcp_crypto_state's dynamic-auth key
         # requirement: that guard runs before this registry exists and can
         # only see the MCP half. Non-fatal by design — the subsystem reports
@@ -6080,12 +6079,13 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None]:
     # OAuth client secrets, so it needs the cipher even when no node
     # currently dispatches.
     from turnstone.core.mcp_crypto import initialize_mcp_crypto_state
-    from turnstone.core.secret_refs import SecretConfigError, load_secrets_config
+    from turnstone.core.secret_refs import SecretConfigError, get_resolver
 
-    # A malformed [secrets] table is a boot failure, like a malformed keyring,
-    # not a per-row surprise at the first secret:// reference.
+    # A malformed [secrets] table (or a CA bundle that cannot be loaded) is a
+    # boot failure, like a malformed keyring, not a per-row surprise at the
+    # first secret:// reference. Building the resolver touches no store.
     try:
-        load_secrets_config()
+        get_resolver()
     except SecretConfigError as exc:
         log.error("secret_refs.config_invalid: %s", exc)
         raise SystemExit(1) from exc
@@ -10688,7 +10688,7 @@ async def admin_registry_install(request: Request) -> JSONResponse:
     merged_headers = config.get("headers", {})
     if isinstance(header_values, dict):
         merged_headers.update(header_values)
-    err = await _check_mcp_secret_fields(merged_headers, merged_env)
+    err = await _check_mcp_secret_fields(request, merged_headers, merged_env)
     if err is not None:
         return err
 
@@ -10712,13 +10712,20 @@ async def admin_registry_install(request: Request) -> JSONResponse:
         registry_meta=json.dumps(config["registry_meta"]),
     )
 
+    install_detail: dict[str, Any] = {
+        "name": name,
+        "registry_name": registry_name,
+        "source": source,
+    }
+    if header_refs := _header_references(merged_headers):
+        install_detail["header_references"] = header_refs
     record_audit(
         storage,
         audit_uid,
         "mcp_server.registry_install",
         "mcp_server",
         server_id,
-        {"name": name, "registry_name": registry_name, "source": source},
+        install_detail,
         ip,
     )
 
@@ -11257,18 +11264,11 @@ async def _secret_reference_problem(value: str) -> tuple[str, int] | None:
     and for a definitive answer (not found, denied, missing field), 503 while
     the store cannot answer. ``None`` means the reference resolved.
     """
-    from turnstone.core.secret_refs import (
-        SecretConfigError,
-        SecretReferenceError,
-        SecretResolveError,
-        resolve,
-    )
+    from turnstone.core.secret_refs import SecretError, resolve
 
     try:
         await asyncio.to_thread(resolve, value)
-    except (SecretReferenceError, SecretConfigError) as exc:
-        return str(exc), 400
-    except SecretResolveError as exc:
+    except SecretError as exc:
         return str(exc), (503 if exc.retryable else 400)
     return None
 
@@ -11290,15 +11290,11 @@ async def _mcp_secret_fields_problem(headers: Any, env: Any) -> tuple[str, int] 
     stdio ``env`` takes no references at all: its values reach a child
     process unresolved.
     """
-    from turnstone.core.secret_refs import (
-        REFERENCE_SCHEME,
-        contains_reference_text,
-        is_reference,
-    )
+    from turnstone.core.secret_refs import contains_reference_text, is_reference
 
     if isinstance(env, dict):
         for key, value in env.items():
-            if isinstance(value, str) and REFERENCE_SCHEME in value:
+            if is_reference(value):
                 return f"env {key!r}: env does not take secret:// references", 400
     if isinstance(headers, dict):
         for key, value in headers.items():
@@ -11316,8 +11312,42 @@ async def _mcp_secret_fields_problem(headers: Any, env: Any) -> tuple[str, int] 
     return None
 
 
-async def _check_mcp_secret_fields(headers: Any, env: Any) -> JSONResponse | None:
-    """JSON-response form of :func:`_mcp_secret_fields_problem`."""
+def _stored_headers(row: dict[str, Any]) -> dict[str, Any]:
+    """The header map an MCP server row stores (JSON text), or ``{}``."""
+    try:
+        parsed = json.loads(row.get("headers") or "{}")
+    except (json.JSONDecodeError, TypeError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _header_references(headers: Any) -> dict[str, str]:
+    """The header names of *headers* that hold a ``secret://`` reference, with the text.
+
+    A reference is not secret, and which store entry a server was pointed at is
+    the one fact an audit reader needs, so it goes into the audit row verbatim.
+    """
+    from turnstone.core.secret_refs import is_reference
+
+    if not isinstance(headers, dict):
+        return {}
+    return {str(k): v for k, v in headers.items() if is_reference(v)}
+
+
+async def _check_mcp_secret_fields(request: Request, headers: Any, env: Any) -> JSONResponse | None:
+    """JSON-response form of :func:`_mcp_secret_fields_problem`, behind the reference gate.
+
+    A header reference lets its holder read whatever the store allows and send
+    it to the server's URL, so introducing one takes ``admin.mcp`` without the
+    service-token bypass, as it does for a model definition's api_key.
+    """
+    from turnstone.core.auth import require_permission
+    from turnstone.core.secret_refs import has_reference
+
+    if isinstance(headers, dict) and has_reference(headers):
+        err = require_permission(request, "admin.mcp", allow_service_bypass=False)
+        if err:
+            return err
     problem = await _mcp_secret_fields_problem(headers, env)
     if problem is None:
         return None
@@ -11328,13 +11358,12 @@ async def _check_mcp_secret_fields(headers: Any, env: Any) -> JSONResponse | Non
 async def _materialize_probe_key(value: str) -> tuple[str, JSONResponse | None]:
     """Turn a stored or submitted api_key into the value a probe sends, off the loop."""
     from turnstone.core.model_registry import materialize_api_key
-    from turnstone.core.secret_refs import SecretError, SecretResolveError
+    from turnstone.core.secret_refs import SecretError
 
     try:
         return await asyncio.to_thread(materialize_api_key, value), None
     except SecretError as exc:
-        retryable = isinstance(exc, SecretResolveError) and exc.retryable
-        return "", JSONResponse({"error": str(exc)}, status_code=503 if retryable else 400)
+        return "", JSONResponse({"error": str(exc)}, status_code=503 if exc.retryable else 400)
 
 
 def _coord_registry_warning(app_state: Any) -> str:
@@ -11346,7 +11375,8 @@ def _coord_registry_warning(app_state: Any) -> str:
     error = str(getattr(app_state, "coord_registry_error", "") or "")
     if error:
         return error
-    skipped = getattr(app_state, "coord_registry_skipped", None) or {}
+    registry = getattr(app_state, "coord_registry", None)
+    skipped = getattr(registry, "skipped_aliases", None) or {}
     if not skipped:
         return ""
     return "model definitions skipped on the console: " + "; ".join(
@@ -11651,7 +11681,7 @@ async def admin_create_mcp_server(request: Request) -> JSONResponse:
     args_list = body.get("args", [])
     headers_dict = body.get("headers", {})
     env_dict = body.get("env", {})
-    err = await _check_mcp_secret_fields(headers_dict, env_dict)
+    err = await _check_mcp_secret_fields(request, headers_dict, env_dict)
     if err is not None:
         return err
 
@@ -11704,6 +11734,8 @@ async def admin_create_mcp_server(request: Request) -> JSONResponse:
         return err_resp
 
     audit_detail: dict[str, Any] = {"name": name, "auth_type": auth_type}
+    if header_refs := _header_references(headers_dict):
+        audit_detail["header_references"] = header_refs
     if "oauth_client_secret" in body:
         audit_detail["oauth_client_secret"] = "(redacted)"
         if secret_set_state is not None:
@@ -11821,7 +11853,14 @@ async def admin_update_mcp_server(request: Request) -> JSONResponse:
     if "env" in body:
         updates["env"] = json.dumps(body["env"]) if isinstance(body["env"], dict) else "{}"
     if "headers" in body or "env" in body:
-        err = await _check_mcp_secret_fields(body.get("headers"), body.get("env"))
+        headers = body.get("headers")
+        if isinstance(headers, dict):
+            # A stored reference echoed back unchanged (GET shows it verbatim)
+            # is keep-existing: only new or changed values face the gate and
+            # the store round trip.
+            stored = _stored_headers(existing)
+            headers = {k: v for k, v in headers.items() if stored.get(k) != v}
+        err = await _check_mcp_secret_fields(request, headers, body.get("env"))
         if err is not None:
             return err
     if "auto_approve" in body:
@@ -12106,6 +12145,8 @@ async def admin_update_mcp_server(request: Request) -> JSONResponse:
     for _secret_key in ("env", "headers"):
         if _secret_key in audit_detail:
             audit_detail[_secret_key] = "(updated)"
+    if header_refs := _header_references(body.get("headers")):
+        audit_detail["header_references"] = header_refs
     if "oauth_client_secret" in body:
         audit_detail["oauth_client_secret"] = "(redacted)"
         if secret_set_state is not None:
@@ -12696,9 +12737,19 @@ async def admin_import_mcp_config(request: Request) -> JSONResponse:
     imported: list[str] = []
     skipped: list[str] = []
     errors: list[str] = []
+    header_references: dict[str, dict[str, str]] = {}
     audit_uid, ip = _audit_context(request)
     current_count = len(storage.list_mcp_servers())
     max_servers = _get_mcp_max_servers(request)
+
+    # Introducing a header reference takes admin.mcp without the service-token
+    # bypass, as on every other MCP write (see ``_check_mcp_secret_fields``).
+    if any(
+        _header_references(cfg.get("headers")) for cfg in servers.values() if isinstance(cfg, dict)
+    ):
+        err = require_permission(request, "admin.mcp", allow_service_bypass=False)
+        if err:
+            return err
 
     for srv_name, cfg in servers.items():
         srv_name = str(srv_name).strip()[:64]
@@ -12733,6 +12784,8 @@ async def admin_import_mcp_config(request: Request) -> JSONResponse:
         if secret_problem is not None:
             errors.append(f"{srv_name}: {secret_problem[0]}")
             continue
+        if refs := _header_references(raw_headers):
+            header_references[srv_name] = refs
 
         server_id = uuid.uuid4().hex
         try:
@@ -12755,13 +12808,16 @@ async def admin_import_mcp_config(request: Request) -> JSONResponse:
             errors.append(f"{srv_name}: {exc}")
 
     if imported:
+        import_detail: dict[str, Any] = {"imported": imported, "skipped": skipped}
+        if imported_refs := {n: r for n, r in header_references.items() if n in imported}:
+            import_detail["header_references"] = imported_refs
         record_audit(
             storage,
             audit_uid,
             "mcp_server.import",
             "mcp_server",
             "",
-            {"imported": imported, "skipped": skipped},
+            import_detail,
             ip,
         )
 
@@ -13462,6 +13518,10 @@ def _refresh_coord_registry_locked(app_state: Any, storage: Any) -> None:
         new_registry = load_model_registry(
             storage=storage,
             strict=True,
+            # Nothing loading (every row disabled or dropped over its reference)
+            # keeps the live registry, below, but must still name the dropped
+            # aliases rather than raise into a warning log.
+            allow_empty=True,
             detect_context_windows=True,
             prior=existing.models,
         )
@@ -13475,6 +13535,13 @@ def _refresh_coord_registry_locked(app_state: Any, storage: Any) -> None:
         return
     except Exception:
         log.warning("console.coord_registry_refresh_load_failed", exc_info=True)
+        return
+    if not new_registry.models:
+        existing.skipped_aliases = dict(new_registry.skipped_aliases)
+        log.warning(
+            "console.coord_registry_refresh_skipped reason=no model definitions loaded skipped=%s",
+            existing.skipped_aliases,
+        )
         return
     try:
         existing.reload(
@@ -13500,7 +13567,7 @@ def _refresh_coord_registry_locked(app_state: Any, storage: Any) -> None:
         # as the refusal arm, in the recovery direction (pinned:
         # test_refresh_clears_key_refusal_after_recovery).
         app_state.coord_registry_error = ""
-        app_state.coord_registry_skipped = dict(new_registry.skipped_aliases)
+        existing.skipped_aliases = dict(new_registry.skipped_aliases)
         model_client = get_model_token_client(app_state)
         coord_mgr = getattr(app_state, "coord_mgr", None)
         if coord_mgr is not None:
@@ -13980,6 +14047,10 @@ async def admin_create_model_definition(request: Request) -> JSONResponse:
     # capability-escalating choice, so the audit trail must cover the request
     # that INTRODUCES it, not only later edits.
     audit_detail: dict[str, Any] = {"alias": alias}
+    if is_secret_reference(api_key):
+        # Not a secret, and the one fact a later reader needs: which store
+        # entry this definition was pointed at.
+        audit_detail["api_key"] = api_key
     if auth_mode != "static":
         audit_detail["auth_mode"] = auth_mode
         audit_detail["obo_audience"] = obo_audience
@@ -14114,8 +14185,14 @@ async def admin_update_model_definition(request: Request) -> JSONResponse:
             )
     if "api_key" in body:
         api_key = str(body["api_key"]).strip()
-        # Sentinel "***" or empty string means "keep existing"
-        if api_key and api_key != "***":
+        # Sentinel "***" or empty string means "keep existing"; so does the
+        # stored reference echoed back unchanged (GET shows it verbatim, and
+        # a read-modify-write client sends it back). A literal is written
+        # whether or not it changed, as it always was.
+        echoed_reference = is_secret_reference(api_key) and api_key == str(
+            existing.get("api_key") or ""
+        )
+        if api_key and api_key != "***" and not echoed_reference:
             if is_secret_reference(api_key):
                 # Same gate as the create twin: a reference widens what this
                 # definition can send to its endpoint.
@@ -14294,7 +14371,7 @@ async def admin_update_model_definition(request: Request) -> JSONResponse:
 
     audit_uid, ip = _audit_context(request)
     audit_detail = dict(updates)
-    if "api_key" in audit_detail:
+    if "api_key" in audit_detail and not is_secret_reference(audit_detail["api_key"]):
         audit_detail["api_key"] = "(updated)"
     if gate.auth_config_changed:
         # Make the gate decision reconstructable from the audit row alone.
@@ -14464,6 +14541,7 @@ async def admin_detect_model(request: Request) -> JSONResponse:
 
     from turnstone.core.auth import require_permission
     from turnstone.core.model_registry import probe_model_endpoint
+    from turnstone.core.secret_refs import is_reference as is_secret_reference
     from turnstone.core.web_helpers import read_json_or_400, require_storage_or_503
 
     storage, err = require_storage_or_503(request)
@@ -14507,6 +14585,14 @@ async def admin_detect_model(request: Request) -> JSONResponse:
                 },
                 status_code=400,
             )
+
+    if is_secret_reference(api_key):
+        # A typed reference is resolved with the console's store role and sent
+        # to the base_url in this same body: the gate a save would apply. A
+        # stored reference (below) was introduced through that gate already.
+        err = require_permission(request, "admin.mcp", allow_service_bypass=False)
+        if err:
+            return err
 
     # Resolve api_key from DB when the UI sends the masked sentinel
     if (not api_key or api_key == "***") and definition_id:

@@ -15,9 +15,11 @@ class FileBackend:
     Without that check anyone allowed to edit a model definition or an MCP
     server could make the process read any file it can open and send the
     contents to an endpoint of their choosing. The reference path is the
-    file's absolute path (``secret://file/run/secrets/openai``). The whole
-    file is the value, minus one trailing newline. Error messages name the path
-    from the reference, never the root or the resolved location.
+    file's absolute path as it appears under the configured root
+    (``secret://file/run/secrets/openai``). The whole file is the value, minus
+    one trailing newline. Error messages name the path from the reference,
+    never the root or the resolved location, and a path outside the root gets
+    the same answer whether or not it exists.
     """
 
     name = "file"
@@ -34,6 +36,12 @@ class FileBackend:
                 "a file reference names a whole file; '#field' is not supported "
                 "(secret://file/<absolute path>)"
             )
+        requested = Path(path)
+        # Containment is checked on the path as written, before anything on
+        # disk is consulted, and again after symlinks are followed; existence
+        # is checked only once the target is known to lie inside the root.
+        if not _inside(self._root, requested):
+            raise SecretBackendError(f"{path}: not under the [secrets.file] root", retryable=False)
         try:
             root = self._root.resolve(strict=True)
         except OSError as exc:
@@ -41,12 +49,10 @@ class FileBackend:
                 f"the [secrets.file] root is not readable: {exc.strerror or exc}", retryable=False
             ) from exc
         try:
-            target = Path(path).resolve(strict=True)
-        except OSError as exc:
-            raise SecretBackendError(
-                f"{path}: {exc.strerror or 'cannot be resolved'}", retryable=False
-            ) from exc
-        if target == root or not target.is_relative_to(root):
+            target = requested.resolve()
+        except (OSError, RuntimeError) as exc:
+            raise SecretBackendError(f"{path}: cannot be resolved", retryable=False) from exc
+        if not _inside(root, target):
             raise SecretBackendError(f"{path}: not under the [secrets.file] root", retryable=False)
         if not target.is_file():
             raise SecretBackendError(f"{path}: not a file", retryable=False)
@@ -59,3 +65,7 @@ class FileBackend:
         # Mounted secret files usually end with one newline that is not part of
         # the value; everything else is kept verbatim.
         return text.removesuffix("\n").removesuffix("\r")
+
+
+def _inside(root: Path, candidate: Path) -> bool:
+    return candidate != root and candidate.is_relative_to(root)

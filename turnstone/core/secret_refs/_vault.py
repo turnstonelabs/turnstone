@@ -24,7 +24,11 @@ from typing import TYPE_CHECKING, Any
 import httpx2
 
 from turnstone.core.log import get_logger
-from turnstone.core.secret_refs._errors import SecretBackendError, SecretReferenceError
+from turnstone.core.secret_refs._errors import (
+    SecretBackendError,
+    SecretConfigError,
+    SecretReferenceError,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -35,6 +39,8 @@ log = get_logger(__name__)
 
 # Log in again once this share of the lease has elapsed.
 _RELOGIN_AT_FRACTION = 0.75
+# When that early login fails, keep using the token and try again this much later.
+_RELOGIN_RETRY_SECONDS = 30.0
 
 
 def _read_credential_file(path: str, *, what: str) -> str:
@@ -67,12 +73,12 @@ class VaultBackend:
 
     One backend instance holds one client token for the process. The token is
     obtained with the configured auth method on first use and replaced by a
-    fresh login once three quarters of its lease have elapsed or the store
-    rejects it (one re-login, then one retry). Every method is thread-safe; a
-    login happens under the token lock so concurrent resolutions share one
-    round trip. Messages raised to callers name the path and a category only;
-    the store address and the store's own error text go to the log through
-    ``detail``.
+    fresh login once three quarters of its lease have elapsed (a failed early
+    login keeps the token until the lease ends) or the store rejects it (one
+    re-login, then one retry). Every method is thread-safe; a login happens
+    under the token lock so concurrent resolutions share one round trip.
+    Messages raised to callers name the path and a category only; the store
+    address and the store's own error text go to the log through ``detail``.
     """
 
     name = "vault"
@@ -89,9 +95,16 @@ class VaultBackend:
         self._lock = threading.Lock()
         self._token = ""
         self._relogin_at: float | None = None
-        verify: ssl.SSLContext | bool = (
-            ssl.create_default_context(cafile=config.ca_cert) if config.ca_cert else True
-        )
+        self._expires_at: float | None = None
+        verify: ssl.SSLContext | bool = True
+        if config.ca_cert:
+            try:
+                verify = ssl.create_default_context(cafile=config.ca_cert)
+            except (OSError, ValueError) as exc:
+                raise SecretConfigError(
+                    f"config.toml [secrets.vault] ca_cert: {config.ca_cert} cannot be loaded "
+                    f"as a certificate bundle ({exc})"
+                ) from exc
         # The store address and CA come from config.toml: no proxy or SSL_CERT
         # environment, like the other httpx2 clients that carry credentials.
         self._client = httpx2.Client(
@@ -112,13 +125,13 @@ class VaultBackend:
         relative = path.strip("/")
         mount = self._config.mount
         url = f"/v1/{mount}/data/{relative}"
-        response = self._get(url)
+        token = self._ensure_token()
+        response = self._get(url, token)
         if response.status_code == 403:
             # The token may have been revoked or may have expired early: log
             # in once more and retry once. A denied path answers 403 as well,
             # so a misconfigured reference costs one extra login per resolve.
-            self._forget_token()
-            response = self._get(url)
+            response = self._get(url, self._relogin(token))
         if response.status_code == 404:
             raise SecretBackendError(
                 f"{relative!r} not found in mount {mount!r}",
@@ -172,8 +185,7 @@ class VaultBackend:
             headers["X-Vault-Namespace"] = self._config.namespace
         return headers
 
-    def _get(self, url: str) -> httpx2.Response:
-        token = self._ensure_token()
+    def _get(self, url: str, token: str) -> httpx2.Response:
         try:
             return self._client.get(url, headers=self._headers(token))
         except httpx2.HTTPError as exc:
@@ -183,24 +195,52 @@ class VaultBackend:
                 detail=f"{self._config.address}: {type(exc).__name__}: {exc}",
             ) from exc
 
-    def _forget_token(self) -> None:
+    def _relogin(self, token: str) -> str:
+        """Return a fresh token after the store rejected *token*.
+
+        Another thread may have logged in since; its token is used. When the
+        login itself fails, the rejected token is kept (a denied path answers
+        403 as well, so it may still be good for every other reference) and
+        the login failure is raised.
+        """
         with self._lock:
-            self._token = ""
-            self._relogin_at = None
+            if self._token != token:
+                return self._token
+            self._install(self._login(), self._clock())
+            return self._token
 
     def _ensure_token(self) -> str:
         with self._lock:
             now = self._clock()
             if self._token and (self._relogin_at is None or now < self._relogin_at):
                 return self._token
-            auth = self._login()
-            self._token = str(auth["client_token"])
-            lease = auth.get("lease_duration") or 0
-            lease_seconds = float(lease) if isinstance(lease, (int, float)) else 0.0
-            self._relogin_at = (
-                now + lease_seconds * _RELOGIN_AT_FRACTION if lease_seconds > 0 else None
-            )
+            try:
+                auth = self._login()
+            except SecretBackendError as exc:
+                if self._token and self._expires_at is not None and now < self._expires_at:
+                    # An early renewal failed; the token itself is still good.
+                    log.warning(
+                        "secret_refs.vault_relogin_failed_keeping_token",
+                        error=str(exc),
+                        detail=exc.detail,
+                    )
+                    self._relogin_at = min(self._expires_at, now + _RELOGIN_RETRY_SECONDS)
+                    return self._token
+                raise
+            self._install(auth, now)
             return self._token
+
+    def _install(self, auth: dict[str, Any], now: float) -> None:
+        """Adopt a login answer; the caller holds the lock."""
+        self._token = str(auth["client_token"])
+        lease = auth.get("lease_duration") or 0
+        lease_seconds = float(lease) if isinstance(lease, (int, float)) else 0.0
+        if lease_seconds > 0:
+            self._relogin_at = now + lease_seconds * _RELOGIN_AT_FRACTION
+            self._expires_at = now + lease_seconds
+        else:
+            self._relogin_at = None
+            self._expires_at = None
 
     def _login(self) -> dict[str, Any]:
         cfg = self._config

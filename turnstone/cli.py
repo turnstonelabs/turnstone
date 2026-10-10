@@ -1698,11 +1698,12 @@ def main() -> None:
         context_window = 32768
 
     # A malformed [secrets] table is a startup failure, like a malformed keyring:
-    # [models.*] keys and MCP headers may hold secret:// references.
-    from turnstone.core.secret_refs import SecretConfigError, load_secrets_config
+    # [models.*] keys and MCP headers may hold secret:// references. Building
+    # the resolver touches no store.
+    from turnstone.core.secret_refs import SecretConfigError, get_resolver
 
     try:
-        load_secrets_config()
+        get_resolver()
     except SecretConfigError as exc:
         print(f"config.toml: {exc}", file=sys.stderr)
         sys.exit(1)

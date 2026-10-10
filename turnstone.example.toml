@@ -185,7 +185,7 @@
 # auth = "approle"             # "approle" (role_id + secret_id/secret_id_file)
 #                              # or "jwt" (role + jwt_path; Kubernetes: auth_mount = "kubernetes")
 # role_id = ""
-# secret_id_file = "/run/secrets/vault-secret-id"
+# secret_id_file = "/etc/turnstone/vault-secret-id"   # must lie outside [secrets.file] root
 # mount = "secret"             # secret://vault/turnstone/openai#api_key
 # namespace = ""               # Sent only when set
 # ca_cert = ""                 # CA bundle for a private certificate authority

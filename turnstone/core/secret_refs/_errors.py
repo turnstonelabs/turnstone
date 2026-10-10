@@ -4,7 +4,15 @@ from __future__ import annotations
 
 
 class SecretError(Exception):
-    """Base class for every secret-reference failure."""
+    """Base class for every secret-reference failure.
+
+    ``retryable`` is True only for a failure that says nothing about the secret
+    itself (the store is unreachable, sealed, rate-limited, or refused the
+    login): the caller may try again later and the resolver may serve the value
+    it fetched last. Configuration and reference errors are never retryable.
+    """
+
+    retryable: bool = False
 
 
 class SecretConfigError(SecretError):
@@ -18,11 +26,8 @@ class SecretReferenceError(SecretError):
 class SecretBackendError(SecretError):
     """A backend could not produce the referenced value.
 
-    ``retryable`` is True for failures that say nothing about the secret itself
-    (the store is unreachable, sealed, rate-limited, or refused the login): the
-    resolver may then serve the value it last fetched. It is False for a
-    definitive answer (not found, permission denied, the field is absent or not
-    a string).
+    ``retryable`` is False for a definitive answer (not found, permission
+    denied, the field is absent or not a string).
 
     The message is safe to show to an operator through an API response: a
     category and the path from the reference. ``detail`` carries what only the

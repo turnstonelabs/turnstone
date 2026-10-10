@@ -6,35 +6,12 @@ from typing import Any
 
 import pytest
 
-from turnstone.core.model_registry import (
-    ModelConfig,
-    load_model_registry,
-    materialize_api_key,
-)
-from turnstone.core.secret_refs import SecretReferenceError, SecretResolver, reset_for_tests
-from turnstone.core.secret_refs import _resolver as resolver_module
-from turnstone.core.secret_refs._config import parse_secrets_config
+from tests._secret_refs_helpers import FakeBackend, install_fake_resolver
+from turnstone.core.model_registry import load_model_registry, materialize_api_key
+from turnstone.core.secret_refs import SecretReferenceError, invalidate_cache
 from turnstone.core.secret_refs._errors import SecretBackendError
 
-
-class FakeBackend:
-    name = "fake"
-
-    def __init__(self) -> None:
-        self.values: dict[str, str] = {"/openai": "sk-from-store", "/other": "sk-other"}
-        self.fail: SecretBackendError | None = None
-        self.calls = 0
-
-    def fetch(self, path: str, key: str | None) -> str:
-        self.calls += 1
-        if self.fail is not None:
-            raise self.fail
-        if path not in self.values:
-            raise SecretBackendError(f"{path.strip('/')!r} not found", retryable=False)
-        return self.values[path]
-
-    def close(self) -> None:
-        pass
+VALUES = {"/openai": "sk-from-store", "/other": "sk-other", "/third": "sk-third"}
 
 
 class _MockStorage:
@@ -70,12 +47,8 @@ def _no_host_config(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture
-def fake_store(monkeypatch: pytest.MonkeyPatch) -> Any:
-    backend = FakeBackend()
-    resolver = SecretResolver(parse_secrets_config({}), backends={"fake": backend})
-    monkeypatch.setattr(resolver_module, "_instance", resolver)
-    yield backend
-    reset_for_tests()
+def fake_store(monkeypatch: pytest.MonkeyPatch) -> FakeBackend:
+    return install_fake_resolver(monkeypatch, VALUES)
 
 
 class TestMaterializeApiKey:
@@ -112,23 +85,23 @@ class TestLoadWithReferences:
         assert "not found" in registry.skipped_aliases["bad"]
         assert "secret://fake/missing" in registry.skipped_aliases["bad"]
 
-    def test_retryable_failure_carries_the_prior_key_forward(self, fake_store: FakeBackend) -> None:
+    def test_outage_keeps_resolved_keys_and_skips_only_unresolved_references(
+        self, fake_store: FakeBackend
+    ) -> None:
+        rows = [_row("a", "secret://fake/openai"), _row("b", "secret://fake/other")]
+        load_model_registry(storage=_MockStorage(rows), strict=True)
+        # A reload asks the store again; the store is down. The values fetched
+        # before stay in use, whatever endpoint the row now names; a reference
+        # this process never resolved is skipped with a retryable reason.
+        invalidate_cache()
         fake_store.fail = SecretBackendError("store unavailable", retryable=True)
-        prior = {
-            "a": ModelConfig(
-                alias="a",
-                base_url="https://api.openai.com/v1",
-                api_key="sk-previous",
-                model="gpt-5",
-            )
-        }
-        storage = _MockStorage(
-            [_row("a", "secret://fake/openai"), _row("new", "secret://fake/other")]
-        )
-        registry = load_model_registry(storage=storage, strict=True, prior=prior)
-        assert registry.get_config("a").api_key == "sk-previous"
-        assert registry.list_aliases() == ["a"]
-        assert "new" in registry.skipped_aliases  # no prior value to fall back on
+        rows[0]["base_url"] = "https://llm-gw.internal/v1"
+        rows.append(_row("fresh", "secret://fake/third"))
+        registry = load_model_registry(storage=_MockStorage(rows), strict=True)
+        assert registry.get_config("a").api_key == "sk-from-store"
+        assert registry.get_config("b").api_key == "sk-other"
+        assert registry.list_aliases() == ["a", "b"]
+        assert "store unavailable" in registry.skipped_aliases["fresh"]
 
     def test_every_row_skipped_gives_an_empty_registry_that_names_them(
         self, fake_store: FakeBackend
@@ -137,6 +110,11 @@ class TestLoadWithReferences:
         registry = load_model_registry(storage=storage, allow_empty=True)
         assert registry.list_aliases() == []
         assert set(registry.skipped_aliases) == {"a"}
+        # A host that needs models says why there are none.
+        with pytest.raises(
+            ValueError, match="Skipped over their api_key reference: a: .*not found"
+        ):
+            load_model_registry(storage=storage)
 
     def test_config_toml_entry_reference(
         self, fake_store: FakeBackend, monkeypatch: pytest.MonkeyPatch
@@ -147,16 +125,21 @@ class TestLoadWithReferences:
             "models": {
                 "c": {"model": "m", "provider": "openai", "api_key": "secret://fake/openai"},
                 "d": {"model": "m", "provider": "openai", "api_key": "secret://fake/missing"},
+                "e": {"model": "m", "provider": "openai", "api_key": "sk-config-literal"},
             }
         }
         monkeypatch.setattr(mr, "load_config", lambda section=None: entries)
-        storage = _MockStorage([_row("d", "sk-db-literal")])
+        storage = _MockStorage([_row("d", "sk-db-literal"), _row("e", "secret://fake/missing")])
         registry = load_model_registry(storage=storage)
         assert registry.get_config("c").api_key == "sk-from-store"
-        # The failing config entry is skipped and the database row of the same
-        # alias stays in force.
-        assert registry.get_config("d").api_key == "sk-db-literal"
+        # config.toml has the last word on an alias it names: when its reference
+        # fails the alias is skipped outright, and the database row of the same
+        # alias does not take over.
+        assert "d" not in registry.list_aliases()
         assert "d" in registry.skipped_aliases
+        # The other way round the alias is served, so it is not reported skipped.
+        assert registry.get_config("e").api_key == "sk-config-literal"
+        assert "e" not in registry.skipped_aliases
 
     def test_one_fetch_per_distinct_reference(self, fake_store: FakeBackend) -> None:
         storage = _MockStorage(

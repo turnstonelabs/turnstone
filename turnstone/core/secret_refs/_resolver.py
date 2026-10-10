@@ -11,15 +11,23 @@ from turnstone.core.log import get_logger
 from turnstone.core.secret_refs._config import SecretsConfig, parse_secrets_config
 from turnstone.core.secret_refs._errors import (
     SecretBackendError,
+    SecretConfigError,
+    SecretError,
     SecretReferenceError,
     SecretResolveError,
 )
-from turnstone.core.secret_refs._reference import is_reference, parse_reference
+from turnstone.core.secret_refs._reference import parse_reference
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
 
 log = get_logger(__name__)
+
+# After a backend fails in a retryable way, further references to it are
+# answered from the cache (or refused) without a round trip for this long, so
+# a registry load during a store outage costs one timeout, not one per
+# reference.
+FAILURE_COOLDOWN_SECONDS = 5.0
 
 
 class SecretBackend(Protocol):
@@ -36,19 +44,24 @@ class SecretBackend(Protocol):
 class _Entry:
     value: str
     fetched_at: float
+    # False once invalidated: the store is asked again before the value is
+    # reused, but the value stays as the fallback should the store not answer.
+    fresh: bool = True
 
 
 class SecretResolver:
     """Resolve references through the configured backends with a TTL cache.
 
-    A value that is not a reference is returned unchanged. A reference is
-    fetched at most once per ``cache_ttl_seconds``, so one Sync or one MCP
-    reconnect round costs one round trip per distinct reference. When a
-    backend fails in a way that says nothing about the secret itself (the
-    store is unreachable, sealed, rate-limited, or refused the login), the
-    value fetched last is served with a warning, until the process restarts
-    or the store answers definitively; a definitive answer (not found,
-    permission denied, a missing field) raises and forgets the cached value.
+    A reference is fetched at most once per ``cache_ttl_seconds``, so one Sync
+    or one MCP reconnect round costs one round trip per distinct reference.
+    When a backend fails in a way that says nothing about the secret itself
+    (the store is unreachable, sealed, rate-limited, or refused the login), the
+    value fetched last is served with a warning, until the process restarts or
+    the store answers definitively; a definitive answer (not found, permission
+    denied, a missing field) raises and forgets the cached value.
+    :meth:`invalidate` makes the next resolve ask the store again but keeps the
+    last value as that fallback, so an operator-triggered reload during an
+    outage degrades to the values already in use instead of losing them.
     Thread-safe.
     """
 
@@ -63,35 +76,20 @@ class SecretResolver:
         self._clock = clock
         self._lock = threading.Lock()
         self._cache: dict[str, _Entry] = {}
+        # Bumped by invalidate(): a fetch that was already in flight stores its
+        # value as not fresh, so a value read just before a rotation is asked
+        # for again rather than cached for a full TTL.
+        self._generation = 0
+        # Backend name -> (clock time before which the backend is not asked,
+        # the failure that started the cool-down).
+        self._retry_after: dict[str, tuple[float, SecretBackendError]] = {}
         self._backends: dict[str, SecretBackend] = (
             dict(backends) if backends is not None else _build_backends(config)
         )
 
     @property
-    def config(self) -> SecretsConfig:
-        return self._config
-
-    @property
     def backend_names(self) -> tuple[str, ...]:
         return tuple(sorted(self._backends))
-
-    def resolve(self, value: str) -> str:
-        """Return the secret a reference names, or *value* itself when it is not one."""
-        if not is_reference(value):
-            return value
-        return self.fetch(value)
-
-    def resolve_mapping(self, mapping: Mapping[str, Any]) -> dict[str, Any]:
-        """Resolve every string value of *mapping* that is a reference; copy the rest."""
-        return {
-            key: self.resolve(value) if isinstance(value, str) else value
-            for key, value in mapping.items()
-        }
-
-    def validate(self, value: str) -> None:
-        """Raise :class:`SecretReferenceError` unless *value* is a well-formed
-        reference to a configured backend. Does not fetch anything."""
-        self._backend_for(parse_reference(value))
 
     def fetch(self, reference: str) -> str:
         ref = parse_reference(reference)
@@ -99,27 +97,32 @@ class SecretResolver:
         now = self._clock()
         with self._lock:
             entry = self._cache.get(ref.text)
-        if entry is not None and now - entry.fetched_at < self._config.cache_ttl_seconds:
+            generation = self._generation
+            cooling = self._retry_after.get(ref.backend)
+        if (
+            entry is not None
+            and entry.fresh
+            and now - entry.fetched_at < self._config.cache_ttl_seconds
+        ):
             return entry.value
+        if cooling is not None and now < cooling[0]:
+            return self._serve_stale(ref, entry, cooling[1], now)
         try:
             value = backend.fetch(ref.path, ref.key)
         except SecretBackendError as exc:
-            if entry is not None and exc.retryable:
-                log.warning(
-                    "secret_refs.resolve_failed_serving_cached",
-                    reference=ref.text,
-                    error=str(exc),
-                    detail=exc.detail,
-                    cached_age_seconds=round(now - entry.fetched_at, 1),
-                )
-                return entry.value
-            if entry is not None:
+            if exc.retryable:
+                # Read the clock again: a timeout has just consumed as long as
+                # the cool-down itself.
+                failed_at = self._clock()
                 with self._lock:
-                    self._cache.pop(ref.text, None)
+                    self._retry_after[ref.backend] = (failed_at + FAILURE_COOLDOWN_SECONDS, exc)
+                return self._serve_stale(ref, entry, exc, failed_at)
+            with self._lock:
+                self._cache.pop(ref.text, None)
             log.error(
                 "secret_refs.resolve_failed", reference=ref.text, error=str(exc), detail=exc.detail
             )
-            raise SecretResolveError(f"{ref.text}: {exc}", retryable=exc.retryable) from exc
+            raise SecretResolveError(f"{ref.text}: {exc}", retryable=False) from exc
         except SecretReferenceError as exc:
             raise SecretResolveError(f"{ref.text}: {exc}") from exc
         if not value:
@@ -127,16 +130,37 @@ class SecretResolver:
                 self._cache.pop(ref.text, None)
             raise SecretResolveError(f"{ref.text}: resolved to an empty value")
         with self._lock:
-            self._cache[ref.text] = _Entry(value=value, fetched_at=now)
+            self._retry_after.pop(ref.backend, None)
+            self._cache[ref.text] = _Entry(
+                value=value, fetched_at=now, fresh=generation == self._generation
+            )
         return value
 
-    def invalidate(self, reference: str | None = None) -> None:
-        """Forget cached values so the next resolve asks the store again."""
+    def _serve_stale(
+        self, ref: Any, entry: _Entry | None, exc: SecretBackendError, now: float
+    ) -> str:
+        """Answer a retryable failure from the cache, or raise when it is empty."""
+        if entry is not None:
+            log.warning(
+                "secret_refs.resolve_failed_serving_cached",
+                reference=ref.text,
+                error=str(exc),
+                detail=exc.detail,
+                cached_age_seconds=round(now - entry.fetched_at, 1),
+            )
+            return entry.value
+        log.error(
+            "secret_refs.resolve_failed", reference=ref.text, error=str(exc), detail=exc.detail
+        )
+        raise SecretResolveError(f"{ref.text}: {exc}", retryable=True) from exc
+
+    def invalidate(self) -> None:
+        """Ask the store again at the next resolve; keep the last values as the fallback."""
         with self._lock:
-            if reference is None:
-                self._cache.clear()
-            else:
-                self._cache.pop(reference, None)
+            self._generation += 1
+            self._retry_after.clear()
+            for entry in self._cache.values():
+                entry.fresh = False
 
     def close(self) -> None:
         for backend in self._backends.values():
@@ -186,21 +210,32 @@ def load_secrets_config() -> SecretsConfig:
 def get_resolver() -> SecretResolver:
     """Return the resolver built from ``[secrets]`` in config.toml.
 
-    Built once, on first use: config.toml is read once per process, so there
-    is nothing to rebuild for. Raises :class:`SecretConfigError` when the
-    section is malformed; hosts call :func:`load_secrets_config` at startup so
-    that surfaces as a boot failure rather than at the first reference.
+    Built once: config.toml is read once per process, so there is nothing to
+    rebuild for. Building it parses the section and constructs the backends
+    without touching any store, and raises :class:`SecretConfigError` for
+    anything wrong with the configuration (a malformed table, an unreadable CA
+    bundle). The hosts call it at startup so that surfaces as a boot failure
+    rather than at the first reference.
     """
     global _instance
     with _instance_lock:
         if _instance is None:
-            _instance = SecretResolver(load_secrets_config())
-            log.info("secret_refs.resolver_built", backends=list(_instance.backend_names))
+            config = load_secrets_config()
+            try:
+                _instance = SecretResolver(config)
+            except SecretError:
+                raise
+            except Exception as exc:
+                raise SecretConfigError(
+                    f"config.toml [secrets]: cannot set up the backends: {exc}"
+                ) from exc
+            if _instance.backend_names:
+                log.info("secret_refs.resolver_built", backends=list(_instance.backend_names))
         return _instance
 
 
 def invalidate_cache() -> None:
-    """Forget every cached value, if a resolver was built; never builds one."""
+    """Make the next resolve ask the store again, if a resolver was built; never builds one."""
     with _instance_lock:
         instance = _instance
     if instance is not None:

@@ -6255,12 +6255,13 @@ def main() -> None:
 
     warn_migrated_settings()
 
-    # A malformed [secrets] table is a boot failure, like a malformed keyring,
-    # not a per-row surprise at the first secret:// reference.
-    from turnstone.core.secret_refs import SecretConfigError, load_secrets_config
+    # A malformed [secrets] table (or a CA bundle that cannot be loaded) is a
+    # boot failure, like a malformed keyring, not a per-row surprise at the
+    # first secret:// reference. Building the resolver touches no store.
+    from turnstone.core.secret_refs import SecretConfigError, get_resolver
 
     try:
-        load_secrets_config()
+        get_resolver()
     except SecretConfigError as exc:
         log.error("secret_refs.config_invalid: %s", exc)
         raise SystemExit(1) from exc

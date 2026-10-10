@@ -51,9 +51,9 @@ def resolve(value: str) -> str:
 
 def resolve_mapping(mapping: Mapping[str, Any]) -> dict[str, Any]:
     """Resolve every string value of *mapping* that is a reference; copy the rest."""
-    if not has_reference(mapping):
-        return dict(mapping)
-    return get_resolver().resolve_mapping(mapping)
+    return {
+        key: resolve(value) if isinstance(value, str) else value for key, value in mapping.items()
+    }
 
 
 def has_reference(mapping: Mapping[str, Any]) -> bool:
@@ -68,12 +68,6 @@ def contains_reference_text(value: object) -> bool:
     ``Bearer secret://...`` would be sent verbatim, so the console refuses it.
     """
     return isinstance(value, str) and REFERENCE_SCHEME in value and not is_reference(value)
-
-
-def validate_reference(value: str) -> None:
-    """Raise :class:`SecretReferenceError` (or :class:`SecretConfigError`) unless
-    *value* is a well-formed reference to a backend configured on this process."""
-    get_resolver().validate(value)
 
 
 __all__ = [
@@ -95,5 +89,4 @@ __all__ = [
     "reset_for_tests",
     "resolve",
     "resolve_mapping",
-    "validate_reference",
 ]

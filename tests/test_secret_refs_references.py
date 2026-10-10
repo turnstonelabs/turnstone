@@ -102,6 +102,35 @@ class TestParseSecretsConfig:
         ok = parse_secrets_config({"file": {"root": str(tmp_path / "run")}}, config_path=config)
         assert ok.file is not None
 
+    def test_vault_credential_file_may_not_live_under_the_file_root(self, tmp_path: Path) -> None:
+        vault = {"address": "https://v", "auth": "approle", "role_id": "r"}
+        with pytest.raises(SecretConfigError, match="secret_id_file: must not be under"):
+            parse_secrets_config(
+                {
+                    "file": {"root": str(tmp_path)},
+                    "vault": {**vault, "secret_id_file": str(tmp_path / "vault-secret-id")},
+                }
+            )
+        with pytest.raises(SecretConfigError, match="jwt_path: must not be under"):
+            parse_secrets_config(
+                {
+                    "file": {"root": str(tmp_path / "secrets")},
+                    "vault": {
+                        "address": "https://v",
+                        "auth": "jwt",
+                        "role": "t",
+                        "jwt_path": str(tmp_path / "secrets" / "token"),
+                    },
+                }
+            )
+        cfg = parse_secrets_config(
+            {
+                "file": {"root": str(tmp_path / "secrets")},
+                "vault": {**vault, "secret_id_file": str(tmp_path / "vault-secret-id")},
+            }
+        )
+        assert cfg.file is not None and cfg.vault is not None
+
     def test_vault_jwt_defaults(self, tmp_path: Path) -> None:
         cfg = parse_secrets_config(
             {

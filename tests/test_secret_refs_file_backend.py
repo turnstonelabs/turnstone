@@ -44,8 +44,15 @@ class TestFileBackend:
         outside = tmp_path / "etc-passwd"
         outside.write_text("root:x")
         backend = FileBackend(str(root))
-        with pytest.raises(SecretBackendError, match="not under the"):
+        with pytest.raises(SecretBackendError, match="not under the") as existing:
             backend.fetch(str(outside), None)
+        # The answer does not depend on whether the path exists, so a reference
+        # cannot be used to map the host's filesystem.
+        with pytest.raises(SecretBackendError, match="not under the") as missing:
+            backend.fetch(str(tmp_path / "nonexistent" / "id_ed25519"), None)
+        assert str(existing.value).replace("etc-passwd", "X") == str(missing.value).replace(
+            "nonexistent/id_ed25519", "X"
+        )
 
     def test_symlink_escape_is_refused(self, root: Path, tmp_path: Path) -> None:
         outside = tmp_path / "outside"
@@ -54,6 +61,22 @@ class TestFileBackend:
         backend = FileBackend(str(root))
         with pytest.raises(SecretBackendError, match="not under the"):
             backend.fetch(f"{root}/link", None)
+
+    def test_escaping_symlinked_directory_answers_alike_for_any_target(
+        self, root: Path, tmp_path: Path
+    ) -> None:
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (outside / "present").write_text("leak")
+        os.symlink(outside, root / "certs")
+        backend = FileBackend(str(root))
+        with pytest.raises(SecretBackendError, match="not under the") as present:
+            backend.fetch(f"{root}/certs/present", None)
+        with pytest.raises(SecretBackendError, match="not under the") as absent:
+            backend.fetch(f"{root}/certs/absent", None)
+        assert str(present.value).replace("present", "X") == str(absent.value).replace(
+            "absent", "X"
+        )
 
     def test_root_itself_and_directories_are_refused(self, root: Path) -> None:
         backend = FileBackend(str(root))
@@ -72,4 +95,4 @@ class TestFileBackend:
     def test_missing_root(self, tmp_path: Path) -> None:
         backend = FileBackend(str(tmp_path / "absent"))
         with pytest.raises(SecretBackendError, match="root is not readable"):
-            backend.fetch("/whatever", None)
+            backend.fetch(str(tmp_path / "absent" / "x"), None)

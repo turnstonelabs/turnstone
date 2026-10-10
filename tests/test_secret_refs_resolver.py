@@ -1,4 +1,4 @@
-"""The resolver: cache, stale serving, validation and the process-wide instance."""
+"""The resolver: cache, stale serving, invalidation and the process-wide instance."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any
 
 import pytest
 
+from tests._secret_refs_helpers import FakeBackend, FakeClock, make_resolver
 from turnstone.core.secret_refs import (
     SecretConfigError,
     SecretReferenceError,
@@ -19,110 +20,74 @@ from turnstone.core.secret_refs import (
     reset_for_tests,
     resolve,
     resolve_mapping,
-    validate_reference,
 )
 from turnstone.core.secret_refs._config import parse_secrets_config
 from turnstone.core.secret_refs._errors import SecretBackendError
+from turnstone.core.secret_refs._resolver import FAILURE_COOLDOWN_SECONDS
 
 if TYPE_CHECKING:
     from pathlib import Path
 
-
-class FakeBackend:
-    name = "fake"
-
-    def __init__(self) -> None:
-        self.values: dict[str, str] = {"/a": "alpha", "/empty": ""}
-        self.fail: SecretBackendError | None = None
-        self.calls = 0
-        self.closed = False
-
-    def fetch(self, path: str, key: str | None) -> str:
-        self.calls += 1
-        if self.fail is not None:
-            raise self.fail
-        if path not in self.values:
-            raise SecretBackendError(f"{path}: not found", retryable=False)
-        return self.values[path]
-
-    def close(self) -> None:
-        self.closed = True
+VALUES = {"/a": "alpha", "/b": "bravo", "/empty": ""}
+OUTAGE = SecretBackendError("store unavailable", retryable=True, detail="HTTP 503")
 
 
-class FakeClock:
-    def __init__(self) -> None:
-        self.now = 0.0
-
-    def __call__(self) -> float:
-        return self.now
-
-
-def _resolver(backend: FakeBackend, clock: FakeClock, ttl: float = 300.0) -> SecretResolver:
-    cfg = parse_secrets_config({"cache_ttl_seconds": ttl})
-    return SecretResolver(cfg, backends={"fake": backend}, clock=clock)
+def _resolver(ttl: float = 300.0) -> tuple[SecretResolver, FakeBackend, FakeClock]:
+    backend, clock = FakeBackend(VALUES), FakeClock()
+    return make_resolver(backend, ttl=ttl, clock=clock), backend, clock
 
 
 class TestResolver:
-    def test_literal_passes_through_without_a_fetch(self) -> None:
-        backend, clock = FakeBackend(), FakeClock()
-        r = _resolver(backend, clock)
-        assert r.resolve("sk-literal") == "sk-literal"
-        assert r.resolve("") == ""
-        assert backend.calls == 0
-
     def test_reference_is_cached_for_the_ttl(self) -> None:
-        backend, clock = FakeBackend(), FakeClock()
-        r = _resolver(backend, clock, ttl=60)
-        assert r.resolve("secret://fake/a") == "alpha"
+        r, backend, clock = _resolver(ttl=60)
+        assert r.fetch("secret://fake/a") == "alpha"
         backend.values["/a"] = "beta"
         clock.now = 59
-        assert r.resolve("secret://fake/a") == "alpha"
+        assert r.fetch("secret://fake/a") == "alpha"
         clock.now = 61
-        assert r.resolve("secret://fake/a") == "beta"
+        assert r.fetch("secret://fake/a") == "beta"
         assert backend.calls == 2
 
     def test_retryable_failure_serves_the_last_value(
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
-        backend, clock = FakeBackend(), FakeClock()
-        r = _resolver(backend, clock, ttl=10)
-        assert r.resolve("secret://fake/a") == "alpha"
+        r, backend, clock = _resolver(ttl=10)
+        assert r.fetch("secret://fake/a") == "alpha"
         clock.now = 11
-        backend.fail = SecretBackendError("store unavailable", retryable=True, detail="HTTP 503")
+        backend.fail = OUTAGE
         with caplog.at_level(logging.WARNING, logger="turnstone.core.secret_refs._resolver"):
-            assert r.resolve("secret://fake/a") == "alpha"
+            assert r.fetch("secret://fake/a") == "alpha"
         assert "secret_refs.resolve_failed_serving_cached" in caplog.text
 
     def test_retryable_failure_without_a_cached_value_raises(self) -> None:
-        backend, clock = FakeBackend(), FakeClock()
-        backend.fail = SecretBackendError("store unavailable", retryable=True)
-        with pytest.raises(SecretResolveError, match="secret://fake/a: store unavailable"):
-            _resolver(backend, clock).resolve("secret://fake/a")
+        r, backend, _ = _resolver()
+        backend.fail = OUTAGE
+        with pytest.raises(SecretResolveError, match="secret://fake/a: store unavailable") as info:
+            r.fetch("secret://fake/a")
+        assert info.value.retryable is True
 
     def test_definitive_failure_raises_and_drops_the_entry(self) -> None:
-        backend, clock = FakeBackend(), FakeClock()
-        r = _resolver(backend, clock, ttl=10)
-        assert r.resolve("secret://fake/a") == "alpha"
+        r, backend, clock = _resolver(ttl=10)
+        assert r.fetch("secret://fake/a") == "alpha"
         clock.now = 11
         backend.fail = SecretBackendError("permission denied", retryable=False)
-        with pytest.raises(SecretResolveError, match="permission denied"):
-            r.resolve("secret://fake/a")
-        backend.fail = SecretBackendError("store unavailable", retryable=True)
+        with pytest.raises(SecretResolveError, match="permission denied") as info:
+            r.fetch("secret://fake/a")
+        assert info.value.retryable is False
+        backend.fail = OUTAGE
+        clock.now += FAILURE_COOLDOWN_SECONDS + 1
         with pytest.raises(SecretResolveError):  # nothing cached any more
-            r.resolve("secret://fake/a")
+            r.fetch("secret://fake/a")
 
     def test_empty_value_is_an_error(self) -> None:
-        backend, clock = FakeBackend(), FakeClock()
+        r, _, _ = _resolver()
         with pytest.raises(SecretResolveError, match="empty value"):
-            _resolver(backend, clock).resolve("secret://fake/empty")
+            r.fetch("secret://fake/empty")
 
     def test_unconfigured_backend(self) -> None:
-        r = _resolver(FakeBackend(), FakeClock())
+        r, _, _ = _resolver()
         with pytest.raises(SecretReferenceError, match="backend 'vault' is not configured"):
-            r.resolve("secret://vault/x#k")
-        with pytest.raises(SecretReferenceError):
-            r.validate("secret://vault/x#k")
-        r.validate("secret://fake/a")
+            r.fetch("secret://vault/x#k")
 
     def test_backend_level_reference_error_becomes_resolve_error(self) -> None:
         class Picky(FakeBackend):
@@ -131,22 +96,75 @@ class TestResolver:
 
         r = SecretResolver(parse_secrets_config({}), backends={"fake": Picky()}, clock=FakeClock())
         with pytest.raises(SecretResolveError, match="needs a field"):
-            r.resolve("secret://fake/a")
+            r.fetch("secret://fake/a")
 
-    def test_resolve_mapping_copies_non_references(self) -> None:
-        r = _resolver(FakeBackend(), FakeClock())
-        out = r.resolve_mapping({"Authorization": "secret://fake/a", "X-Plain": "v", "n": 3})
-        assert out == {"Authorization": "alpha", "X-Plain": "v", "n": 3}
-
-    def test_invalidate_and_close(self) -> None:
-        backend, clock = FakeBackend(), FakeClock()
-        r = _resolver(backend, clock)
-        r.resolve("secret://fake/a")
-        r.invalidate("secret://fake/a")
-        r.resolve("secret://fake/a")
+    def test_invalidate_asks_the_store_again_but_keeps_the_fallback(self) -> None:
+        r, backend, clock = _resolver()
+        assert r.fetch("secret://fake/a") == "alpha"
+        backend.values["/a"] = "rotated"
+        assert r.fetch("secret://fake/a") == "alpha"  # within the TTL
         r.invalidate()
-        r.resolve("secret://fake/a")
-        assert backend.calls == 3
+        assert r.fetch("secret://fake/a") == "rotated"  # asked again
+        # An operator reload during an outage keeps the values already in use.
+        r.invalidate()
+        backend.fail = OUTAGE
+        assert r.fetch("secret://fake/a") == "rotated"
+        clock.now += FAILURE_COOLDOWN_SECONDS + 1
+        assert r.fetch("secret://fake/a") == "rotated"
+        assert backend.calls == 4
+
+    def test_one_failure_cools_the_backend_down(self) -> None:
+        r, backend, clock = _resolver()
+        assert r.fetch("secret://fake/a") == "alpha"
+        r.invalidate()
+        backend.fail = OUTAGE
+        assert r.fetch("secret://fake/a") == "alpha"  # one round trip fails
+        with pytest.raises(SecretResolveError, match="store unavailable") as info:
+            r.fetch("secret://fake/b")  # never fetched: refused without a round trip
+        assert info.value.retryable is True
+        assert r.fetch("secret://fake/a") == "alpha"
+        assert backend.calls == 2
+        clock.now += FAILURE_COOLDOWN_SECONDS + 1
+        backend.fail = None
+        assert r.fetch("secret://fake/b") == "bravo"  # asked again once the cool-down ends
+        assert r.fetch("secret://fake/a") == "alpha"
+        assert backend.calls == 4
+
+    def test_cool_down_starts_when_a_slow_failure_comes_back(self) -> None:
+        clock = FakeClock()
+
+        class SlowBackend(FakeBackend):
+            def fetch(self, path: str, key: str | None) -> str:
+                self.calls += 1
+                clock.now += FAILURE_COOLDOWN_SECONDS  # a timeout as long as the cool-down
+                raise OUTAGE
+
+        slow = SlowBackend(VALUES)
+        r = make_resolver(slow, clock=clock)
+        with pytest.raises(SecretResolveError):
+            r.fetch("secret://fake/a")
+        with pytest.raises(SecretResolveError, match="store unavailable"):
+            r.fetch("secret://fake/b")  # still cooling down: no second timeout
+        assert slow.calls == 1
+
+    def test_a_fetch_in_flight_during_invalidate_is_not_trusted_for_a_ttl(self) -> None:
+        r, backend, clock = _resolver()
+
+        class RacyBackend(FakeBackend):
+            def fetch(self, path: str, key: str | None) -> str:
+                value = super().fetch(path, key)
+                r.invalidate()  # a rotation lands while this read is in flight
+                return value
+
+        racy = RacyBackend(VALUES)
+        r = make_resolver(racy, clock=clock)
+        assert r.fetch("secret://fake/a") == "alpha"
+        racy.values["/a"] = "rotated"
+        assert r.fetch("secret://fake/a") == "rotated"
+        assert racy.calls == 2
+
+    def test_close_closes_the_backends(self) -> None:
+        r, backend, _ = _resolver()
         r.close()
         assert backend.closed
 
@@ -176,7 +194,8 @@ class TestProcessWideInstance:
 
         monkeypatch.setattr(config_mod, "load_config", explode)
         assert resolve("sk-literal") == "sk-literal"
-        assert resolve_mapping({"a": "b"}) == {"a": "b"}
+        assert resolve("") == ""
+        assert resolve_mapping({"a": "b", "n": 3}) == {"a": "b", "n": 3}
         assert not has_reference({"a": "b"})
         invalidate_cache()  # never builds a resolver either
 
@@ -190,7 +209,39 @@ class TestProcessWideInstance:
     def test_no_backends_means_unconfigured(self, monkeypatch: pytest.MonkeyPatch) -> None:
         self._patch(monkeypatch, {})
         with pytest.raises(SecretReferenceError, match="not configured"):
-            validate_reference("secret://file/run/secrets/x")
+            resolve("secret://file/run/secrets/x")
+
+    def test_backend_setup_failure_is_a_config_error(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        junk = tmp_path / "ca.pem"
+        junk.write_text("not a certificate")
+        self._patch(
+            monkeypatch,
+            {
+                "vault": {
+                    "address": "https://vault.example.com",
+                    "auth": "approle",
+                    "role_id": "r",
+                    "secret_id": "s",
+                    "ca_cert": str(junk),
+                }
+            },
+        )
+        with pytest.raises(SecretConfigError, match="ca_cert"):
+            get_resolver()
+        # Anything else that breaks while the backends are built is reported the
+        # same way, so a host's startup check catches it.
+        from turnstone.core.secret_refs import _resolver as resolver_module
+
+        self._patch(monkeypatch, {"file": {"root": str(tmp_path)}})
+        monkeypatch.setattr(
+            resolver_module,
+            "_build_backends",
+            lambda _cfg: (_ for _ in ()).throw(RuntimeError("x")),
+        )
+        with pytest.raises(SecretConfigError, match="cannot set up the backends"):
+            get_resolver()
 
     def test_instance_is_built_once(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         self._patch(monkeypatch, {"file": {"root": str(tmp_path)}})
@@ -210,6 +261,7 @@ class TestProcessWideInstance:
         assert resolve(f"secret://file{tmp_path}/openai") == "sk-file"  # cached
         invalidate_cache()
         assert resolve(f"secret://file{tmp_path}/openai") == "sk-rotated"
-        assert resolve_mapping({"Authorization": f"secret://file{tmp_path}/openai"}) == {
-            "Authorization": "sk-rotated"
+        assert resolve_mapping({"Authorization": f"secret://file{tmp_path}/openai", "n": 1}) == {
+            "Authorization": "sk-rotated",
+            "n": 1,
         }

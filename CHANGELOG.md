@@ -108,10 +108,11 @@ frozen.
   reused for `cache_ttl_seconds`, and is never written to the database. Two backends ship: `file`
   (a file under a dedicated root, for container and Kubernetes secret mounts) and `vault` (Vault or
   OpenBao KV v2 with `jwt` or `approle` login). The console shows a reference verbatim where it
-  masks a literal, validates it when it is saved, and requires `admin.mcp` to introduce one; a
-  reference in MCP stdio `env` is refused. A reference that the store rejects leaves only that
-  model out of the registry (named in the Sync reply) or fails only that MCP connect. Rotate by
-  changing the store, then Sync to Nodes or Reconnect. See
+  masks a literal, validates it when it is saved, and requires `admin.mcp` to introduce or probe
+  one; a reference in MCP stdio `env` is refused. A reference that the store rejects leaves only
+  that model out of the registry (named in the Sync reply) or fails only that MCP connect; while
+  the store is down, values already fetched stay in use. Rotate by changing the store, then Sync
+  to Nodes or Reconnect. See
   [Secret references](docs/security.md#secret-references).
 - **Output-guard evals in `turnstone-eval` (#1291).** `--output-guard judge` scores the LLM stage on
   tool outputs with directives planted at known lines: detection, false positives, whether its flags

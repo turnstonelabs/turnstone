@@ -575,26 +575,28 @@ root = "/run/secrets"            # secret://file/run/secrets/openai reads this f
 address = "https://vault.example.com:8200"
 auth = "approle"                 # or "jwt"
 role_id = "..."
-secret_id_file = "/run/secrets/vault-secret-id"
+secret_id_file = "/etc/turnstone/vault-secret-id"   # outside the file root
 mount = "secret"                 # secret://vault/turnstone/openai#api_key
 # namespace = "team-a"           # sent only when set (OpenBao enforces it)
 # ca_cert = "/etc/ssl/private-ca.pem"
 # timeout_seconds = 5
 ```
 
-- **file** reads a whole file (minus one trailing newline) whose absolute path
-  lies under `root`, following symlinks. Container and Kubernetes secret mounts
-  fit this shape. The root must be a dedicated directory: it must not contain
-  config.toml, and it should not be a mount that also holds a service-account
-  token.
+- **file** reads a whole file (minus one trailing newline) whose absolute path,
+  as written and after symlinks are followed, lies under `root`. Container and
+  Kubernetes secret mounts fit this shape. The root must be a dedicated
+  directory: it may not contain config.toml or the Vault login credential
+  (`secret_id_file`, `jwt_path`), both refused at startup, and it should not be
+  a mount that also holds a service-account token.
 - **vault** reads one field of a KV v2 secret at `<mount>/<path>`. The process
   logs in with `jwt` (`role` plus `jwt_path`, the file holding the workload's
   token; a Kubernetes workload sets `auth_mount = "kubernetes"` and points
   `jwt_path` at its projected service-account token) or `approle` (`role_id`
   plus `secret_id` or `secret_id_file`), logs in again once three quarters of
-  the token's lease have elapsed or once after the store rejects the token,
-  and trusts the operating system's certificate store unless `ca_cert` names a
-  bundle. The address comes from config.toml only; proxy and `SSL_CERT_*`
+  the token's lease have elapsed (keeping the token if that early login fails)
+  or once after the store rejects the token, and trusts the operating system's
+  certificate store unless `ca_cert` names a bundle (one that cannot be loaded
+  stops the process at startup). The address comes from config.toml only; proxy and `SSL_CERT_*`
   environment variables are ignored. Point `address` at the active node or a
   load balancer: redirects are not followed.
 
@@ -611,23 +613,31 @@ reload at one round trip per distinct reference.
 
 When the store is unreachable, sealed or refuses the login, the value fetched
 last is served with a warning until the process restarts or the store answers
-definitively. When the store answers that the secret does not exist, access is
-denied or the field is missing, that model definition is left out of the
-registry (the node's Sync reply and the console's warning name it, with the
-reason) or that MCP server fails to connect; the other definitions and servers
-are unaffected. If the store is unreachable while a process starts, the
-definitions that reference it are left out until the next Sync to Nodes.
+definitively; a Sync or Reconnect during the outage keeps the values already in
+use, and further references to the store are answered from that cache for a
+few seconds rather than each waiting for the store to time out. When the store
+answers that the secret does not exist, access is denied or the field is
+missing, that model definition is left out of the registry (the node's Sync
+reply and the console's warning name it, with the reason) or that MCP server
+fails to connect; the other definitions and servers are unaffected. A
+`[models.*]` entry in config.toml that is left out takes the same alias's
+database definition with it: the file has the last word on an alias it names.
+If the store is unreachable while a process starts, the definitions that
+reference it are left out until the next Sync to Nodes.
 
 ### Permissions and scoping
 
-Introducing or changing a reference requires the `admin.mcp` permission, the
-same gate as the other capability-widening choices (dynamic model auth, an MCP
-OAuth audience), because a reference lets its holder read whatever the store
-allows the Turnstone identity to read and send it to the endpoint they
-configure. Scope the store accordingly: give Turnstone a dedicated Vault role
-whose policy covers only its runtime secrets, and a dedicated file root. The
-console validates a reference when it is saved (syntax, a configured backend,
-and one resolution), so a typo never reaches the database.
+Introducing or changing a reference, or probing a typed one with **Detect**,
+requires the `admin.mcp` permission held explicitly (a service token does not
+pass), the same gate as the other capability-widening choices (dynamic model
+auth, an MCP OAuth audience), because a reference lets its holder read whatever
+the store allows the Turnstone identity to read and send it to the endpoint
+they configure. Scope the store accordingly: give Turnstone a dedicated Vault
+role whose policy covers only its runtime secrets, and a dedicated file root.
+The console validates a reference when it is saved (syntax, a configured
+backend, and one resolution), so a typo never reaches the database, and the
+audit row of the save records the reference. Sending a definition back
+unchanged, reference included, needs neither the gate nor the store.
 
 The Helm chart and the Terraform deployment pass configuration through the
 environment and mount no config.toml today, so `[secrets]` cannot be set

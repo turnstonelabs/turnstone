@@ -9,8 +9,13 @@ from typing import TYPE_CHECKING, Any
 import httpx2
 import pytest
 
+from tests._secret_refs_helpers import FakeClock
 from turnstone.core.secret_refs._config import VaultBackendConfig, parse_secrets_config
-from turnstone.core.secret_refs._errors import SecretBackendError, SecretReferenceError
+from turnstone.core.secret_refs._errors import (
+    SecretBackendError,
+    SecretConfigError,
+    SecretReferenceError,
+)
 from turnstone.core.secret_refs._vault import VaultBackend
 
 if TYPE_CHECKING:
@@ -24,6 +29,7 @@ class FakeStore:
         self.kv2: dict[str, dict[str, Any]] = {"turnstone/openai": {"api_key": "sk-v2", "n": 1}}
         self.policy_paths = {"turnstone/"}
         self.sealed = False
+        self.login_down = False
         self.lease = 1200
         self.tokens: dict[str, bool] = {}
         self.logins: list[tuple[str, dict[str, Any]]] = []
@@ -44,6 +50,8 @@ class FakeStore:
         if path.startswith("/v1/auth/") and path.endswith("/login"):
             body = json.loads(request.content or b"{}")
             self.logins.append((path, body))
+            if self.login_down:
+                return httpx2.Response(502, json={"errors": ["auth backend unavailable"]})
             if path == "/v1/auth/approle/login":
                 if body.get("secret_id") != "good-secret":
                     return httpx2.Response(400, json={"errors": ["invalid role or secret ID"]})
@@ -88,14 +96,6 @@ def _config(**overrides: Any) -> VaultBackendConfig:
     return cfg.vault
 
 
-class FakeClock:
-    def __init__(self) -> None:
-        self.now = 1000.0
-
-    def __call__(self) -> float:
-        return self.now
-
-
 @pytest.fixture
 def store() -> FakeStore:
     return FakeStore()
@@ -107,7 +107,7 @@ def _backend(
     return VaultBackend(
         config or _config(),
         transport=httpx2.MockTransport(store.handle),
-        clock=clock or FakeClock(),
+        clock=clock or FakeClock(1000.0),
     )
 
 
@@ -163,7 +163,9 @@ class TestReads:
         def boom(request: httpx2.Request) -> httpx2.Response:
             raise httpx2.ConnectError("refused", request=request)
 
-        backend = VaultBackend(_config(), transport=httpx2.MockTransport(boom), clock=FakeClock())
+        backend = VaultBackend(
+            _config(), transport=httpx2.MockTransport(boom), clock=FakeClock(1000.0)
+        )
         with pytest.raises(SecretBackendError, match="unreachable") as info:
             backend.fetch("turnstone/openai", "api_key")
         assert info.value.retryable is True
@@ -180,7 +182,9 @@ class TestReads:
             state["n"] += 1
             return httpx2.Response(429, json={"errors": ["rate limit"]})
 
-        backend = VaultBackend(_config(), transport=httpx2.MockTransport(handle), clock=FakeClock())
+        backend = VaultBackend(
+            _config(), transport=httpx2.MockTransport(handle), clock=FakeClock(1000.0)
+        )
         with pytest.raises(SecretBackendError, match="store unavailable") as info:
             backend.fetch("turnstone/openai", "api_key")
         assert info.value.retryable is True
@@ -262,7 +266,7 @@ class TestLogins:
         assert len(store.logins) == 2
 
     def test_logs_in_again_at_three_quarters_of_the_lease(self, store: FakeStore) -> None:
-        clock = FakeClock()
+        clock = FakeClock(1000.0)
         backend = _backend(store, clock=clock)
         backend.fetch("turnstone/openai", "api_key")
         clock.now += 1200 * 0.5
@@ -273,9 +277,54 @@ class TestLogins:
         assert len(store.logins) == 2
         assert not any(r.url.path == "/v1/auth/token/renew-self" for r in store.requests)
 
+    def test_failed_early_relogin_keeps_the_valid_token(self, store: FakeStore) -> None:
+        clock = FakeClock(1000.0)
+        backend = _backend(store, clock=clock)
+        backend.fetch("turnstone/openai", "api_key")
+        store.login_down = True
+        clock.now += 1200 * 0.8
+        assert backend.fetch("turnstone/openai", "api_key") == "sk-v2"  # login failed, token good
+        assert len(store.logins) == 2
+        clock.now += 10
+        backend.fetch("turnstone/openai", "api_key")
+        assert len(store.logins) == 2  # not retried on every resolve
+        clock.now += 25
+        backend.fetch("turnstone/openai", "api_key")
+        assert len(store.logins) == 3
+        clock.now += 1200
+        with pytest.raises(SecretBackendError, match="login failed") as info:
+            backend.fetch("turnstone/openai", "api_key")  # the lease is over now
+        assert info.value.retryable is True
+
+    def test_relogin_after_a_stale_token_reuses_a_newer_one(self, store: FakeStore) -> None:
+        backend = _backend(store)
+        backend.fetch("turnstone/openai", "api_key")
+        assert backend._relogin("s.some-earlier-token") == "s.login1"
+        assert len(store.logins) == 1
+
+    def test_denied_path_with_the_login_down_keeps_the_token(self, store: FakeStore) -> None:
+        backend = _backend(store)
+        backend.fetch("turnstone/openai", "api_key")
+        store.kv2["other/db"] = {"password": "pw"}
+        store.login_down = True
+        # The 403 may mean a revoked token or a denied path; the re-login that
+        # would tell them apart fails, which is what is reported...
+        with pytest.raises(SecretBackendError, match="login failed") as info:
+            backend.fetch("other/db", "password")
+        assert info.value.retryable is True
+        # ...and the token, still valid, keeps serving every other reference.
+        assert backend.fetch("turnstone/openai", "api_key") == "sk-v2"
+        assert len(store.logins) == 2
+
+    def test_unloadable_ca_cert_is_a_config_error(self, store: FakeStore, tmp_path: Path) -> None:
+        junk = tmp_path / "ca.pem"
+        junk.write_text("not a certificate")
+        with pytest.raises(SecretConfigError, match="ca_cert"):
+            _backend(store, _config(ca_cert=str(junk)))
+
     def test_token_without_lease_is_kept(self, store: FakeStore) -> None:
         store.lease = 0
-        clock = FakeClock()
+        clock = FakeClock(1000.0)
         backend = _backend(store, clock=clock)
         backend.fetch("turnstone/openai", "api_key")
         clock.now += 10_000

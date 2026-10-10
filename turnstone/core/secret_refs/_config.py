@@ -91,17 +91,11 @@ def _file_config(section: Any, *, config_path: Path | None) -> FileBackendConfig
     # The root is the trust boundary for everyone allowed to edit a model or
     # MCP server, so it must never contain the file that holds the keyring,
     # the JWT secret and the database URL.
-    if config_path is not None:
-        try:
-            real_root = Path(root).resolve()
-            real_config = config_path.resolve()
-        except OSError:
-            real_root, real_config = Path(root), config_path
-        if real_config == real_root or real_config.is_relative_to(real_root):
-            raise SecretConfigError(
-                "config.toml [secrets.file] root: must not contain config.toml itself; "
-                "use a dedicated directory for secret files"
-            )
+    if config_path is not None and _under(root, str(config_path)):
+        raise SecretConfigError(
+            "config.toml [secrets.file] root: must not contain config.toml itself; "
+            "use a dedicated directory for secret files"
+        )
     return FileBackendConfig(root=root)
 
 
@@ -208,10 +202,33 @@ def parse_secrets_config(section: Any, *, config_path: Path | None = None) -> Se
             f"config.toml [secrets]: unknown key(s) {', '.join(unknown)}; known: "
             f"{', '.join(sorted(known))}"
         )
+    file = _file_config(section.get("file"), config_path=config_path)
+    vault = _vault_config(section.get("vault"))
+    if file is not None and vault is not None:
+        # The store's own login credential must stay out of reach of a
+        # reference, or a reference could hand it to an endpoint of its author's
+        # choosing.
+        for key, credential in (
+            ("secret_id_file", vault.secret_id_file),
+            ("jwt_path", vault.jwt_path),
+        ):
+            if credential and _under(file.root, credential):
+                raise SecretConfigError(
+                    f"config.toml [secrets.vault] {key}: must not be under the [secrets.file] "
+                    "root, where a secret://file reference could read it"
+                )
     return SecretsConfig(
         cache_ttl_seconds=_number(
             section, "cache_ttl_seconds", where="secrets", default=DEFAULT_CACHE_TTL_SECONDS
         ),
-        file=_file_config(section.get("file"), config_path=config_path),
-        vault=_vault_config(section.get("vault")),
+        file=file,
+        vault=vault,
     )
+
+
+def _under(root: str, path: str) -> bool:
+    try:
+        real_root, real_path = Path(root).resolve(), Path(path).resolve()
+    except OSError:
+        real_root, real_path = Path(root), Path(path)
+    return real_path == real_root or real_path.is_relative_to(real_root)
