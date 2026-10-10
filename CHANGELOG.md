@@ -169,6 +169,16 @@ frozen.
 
 ### Changed
 
+- **A message to a waiting coordinator ends the wait at once (#1339).** A message the user sends
+  while the coordinator blocks in `wait_for_workstream` no longer queues until the wait ends (up to
+  600 seconds): the wait returns at once with `complete: false` and `interrupted: "user_message"`,
+  the message reaches the coordinator right after the tool result unless the user withdrew it first,
+  and the coordinator waits again if it still needs to. A wait that times out or is interrupted now
+  returns the children's states without their last messages; only the wait that completes carries
+  those, so a coordinator that waits again no longer receives the same output each time. The
+  `wait_ended` event carries the same `interrupted` field, and the tool row reads "interrupted after
+  Ns". A message that `/send` refuses while the coordinator works still waits for the turn to end:
+  one with attachments, or one from a second signed-in user.
 - **`/skill` quotes skill names in its operator note (#1292).** The note `/skill` writes into the
   conversation quotes each skill name as JSON, so a name cannot break the note into extra lines,
   and says `no skill` where it said `defaults`.

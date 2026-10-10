@@ -54,16 +54,25 @@ class ChildEventBus:
         self._waiters: dict[str, set[threading.Event]] = {}
         self._lock = threading.Lock()
 
-    def register_waiter(self, child_ws_ids: Iterable[str]) -> threading.Event:
-        """Return a fresh Event registered against every listed ws_id.
+    def register_waiter(
+        self,
+        child_ws_ids: Iterable[str],
+        event: threading.Event | None = None,
+    ) -> threading.Event:
+        """Return an Event registered against every listed ws_id.
 
         A wait on ``[A, B, C]`` returns a single Event that fires when
         *any* of A/B/C changes. The caller's snapshot re-read resolves
         which one. Empty / falsy ids are silently skipped — callers that
         clean their input upstream (e.g. ``wait_for_workstream``'s
         dedup + cap) don't need to filter again here.
+
+        ``event`` registers a caller-owned Event instead of a fresh one,
+        for a waiter that something besides the bus can also set (a user
+        message ending a coordinator's wait sets the Event the bus does).
         """
-        event = threading.Event()
+        if event is None:
+            event = threading.Event()
         with self._lock:
             for wid in child_ws_ids:
                 if not wid:

@@ -1944,6 +1944,245 @@ def test_wait_with_bus_multi_waiter_independence(populated_storage):
 
 
 # ---------------------------------------------------------------------------
+# wait_for_workstream — ending early for the caller (#1339)
+# ---------------------------------------------------------------------------
+#
+# ``interrupt`` is the caller's reason to stop, consulted where the loop would
+# block; ``wake_event`` is the caller's Event the loop blocks on (registered on
+# the bus), so setting it cuts the block short.  The coordinator session ends
+# a wait this way when the user sends a message.  The wake tests act from the
+# loop's first check, which is past the first tick, and raise the heartbeat to
+# 30 s, so a prompt second tick can only come from the Event.
+
+
+class _Reason:
+    """The caller's ``interrupt`` predicate: returns ``reason``.
+
+    ``on_first_call`` runs inside the loop's first check, after the first
+    tick's clear and snapshot and just before the loop blocks; that check
+    still returns the value ``reason`` held before the hook ran, so whatever
+    the hook sets can only be seen through another tick.
+    """
+
+    def __init__(self, on_first_call: Callable[[], None] | None = None) -> None:
+        self.reason: str | None = None
+        self.calls = 0
+        self._on_first_call = on_first_call
+
+    def __call__(self) -> str | None:
+        self.calls += 1
+        reason = self.reason
+        if self.calls == 1 and self._on_first_call is not None:
+            self._on_first_call()
+        return reason
+
+
+def test_wait_interrupt_ends_a_blocked_wait_promptly(populated_storage):
+    """A reason that appears once the loop is past its first tick, followed
+    by a set of the caller's Event, ends the wait on the next tick:
+    ``complete`` is False, ``interrupted`` carries the caller's reason, and
+    the results are the children's current states."""
+    bus = ChildEventBus()
+    client = _make_read_client_with_bus(populated_storage, bus)
+    client._WAIT_HEARTBEAT_INTERVAL = 30.0  # type: ignore[misc]
+    wake = threading.Event()
+
+    def _message_arrives() -> None:
+        reason.reason = "user_message"
+        wake.set()
+
+    reason = _Reason(on_first_call=_message_arrives)
+    start = time.monotonic()
+    result = client.wait_for_workstream(
+        ["child-b"], timeout=20, mode="all", interrupt=reason, wake_event=wake
+    )
+    elapsed = time.monotonic() - start
+    assert result["complete"] is False
+    assert result["interrupted"] == "user_message"
+    assert result["results"]["child-b"]["state"] == "running"
+    assert reason.calls == 2
+    assert elapsed < 1.0, f"the wake did not end the block: {elapsed}s"
+    assert bus._waiters == {}, "caller's Event stayed registered on the bus"
+
+
+@pytest.mark.parametrize("ended_by", ["interrupt", "timeout"])
+def test_wait_that_does_not_complete_carries_states_without_messages(
+    populated_storage, monkeypatch, ended_by
+):
+    """A wait that is interrupted or times out returns states only: a
+    finished child's message is left out (``None``) and nothing is read for
+    it.  The model waits again after either, so only the wait that
+    completes carries the child's text, once."""
+    import turnstone.console.coordinator_client as coordinator_client
+
+    reads: list[str] = []
+    real_message_for = coordinator_client._wait_message_for
+
+    def _counting_message_for(storage, wid, state):
+        reads.append(wid)
+        return real_message_for(storage, wid, state)
+
+    monkeypatch.setattr(coordinator_client, "_wait_message_for", _counting_message_for)
+    populated_storage.save_message("child-a", "assistant", "child-a's findings")
+    client = _make_read_client_with_bus(populated_storage, ChildEventBus())
+    reason = _Reason()
+    if ended_by == "interrupt":
+        reason.reason = "user_message"
+    result = client.wait_for_workstream(
+        ["child-a", "child-b"],
+        timeout=20 if ended_by == "interrupt" else 0,
+        mode="all",
+        interrupt=reason,
+    )
+    assert result["complete"] is False
+    assert result.get("interrupted") == ("user_message" if ended_by == "interrupt" else None)
+    assert result["results"]["child-a"]["state"] == "idle"
+    assert result["results"]["child-a"]["message"] is None
+    assert result["results"]["child-a"]["truncated"] is False
+    assert result["results"]["child-b"]["message"] is None
+    assert reads == []
+    # The wait that completes carries the finished children's text.
+    populated_storage.update_workstream_state("child-b", "idle")
+    completed = client.wait_for_workstream(["child-a", "child-b"], timeout=0, mode="all")
+    assert completed["complete"] is True
+    assert completed["results"]["child-a"]["message"] == "child-a's findings"
+    assert sorted(reads) == ["child-a", "child-b"]
+
+
+def test_wait_interrupt_pending_at_start_returns_on_the_first_tick(populated_storage):
+    """A reason that already holds when the wait starts (the user typed
+    while the model was writing the call) ends it on the first tick."""
+    client = _make_read_client_with_bus(populated_storage, ChildEventBus())
+    reason = _Reason()
+    reason.reason = "user_message"
+    ticks: list[float] = []
+    result = client.wait_for_workstream(
+        ["child-b"],
+        timeout=20,
+        mode="all",
+        interrupt=reason,
+        progress_callback=lambda _snap, elapsed: ticks.append(elapsed),
+    )
+    assert result["interrupted"] == "user_message"
+    assert result["complete"] is False
+    assert len(ticks) == 1
+    assert result["elapsed"] < 1.0
+
+
+def test_wait_completion_on_the_same_tick_wins_over_interrupt(populated_storage):
+    """A tick that meets the wait condition reports a complete wait, not an
+    interrupted one: the reason is consulted only where the loop would
+    otherwise block."""
+    client = _make_read_client_with_bus(populated_storage, ChildEventBus())
+    reason = _Reason()
+    reason.reason = "user_message"
+    result = client.wait_for_workstream(["child-a"], timeout=20, mode="any", interrupt=reason)
+    assert result["complete"] is True
+    assert "interrupted" not in result
+    assert reason.calls == 0
+
+
+def test_wait_timeout_zero_never_consults_interrupt(populated_storage):
+    """A one-shot poll (``timeout=0``) still reports a timeout: the deadline
+    check precedes the interrupt."""
+    client = _make_read_client_with_bus(populated_storage, ChildEventBus())
+    reason = _Reason()
+    reason.reason = "user_message"
+    result = client.wait_for_workstream(["child-b"], timeout=0, mode="all", interrupt=reason)
+    assert result["complete"] is False
+    assert "interrupted" not in result
+    assert reason.calls == 0
+
+
+def test_wait_wake_without_a_reason_keeps_waiting(populated_storage):
+    """Setting the Event with no reason pending is a spurious wake: the loop
+    re-ticks once and goes back to waiting until the timeout."""
+    client = _make_read_client_with_bus(populated_storage, ChildEventBus())
+    client._WAIT_HEARTBEAT_INTERVAL = 30.0  # type: ignore[misc]
+    wake = threading.Event()
+    reason = _Reason(on_first_call=wake.set)
+    ticks: list[float] = []
+    result = client.wait_for_workstream(
+        ["child-b"],
+        timeout=0.6,
+        mode="all",
+        interrupt=reason,
+        wake_event=wake,
+        progress_callback=lambda _snap, elapsed: ticks.append(elapsed),
+    )
+    assert result["complete"] is False
+    assert "interrupted" not in result
+    assert result["elapsed"] >= 0.6
+    # The first tick, the wake's re-tick, and the tick that finds the deadline.
+    assert len(ticks) == 3, ticks
+    assert reason.calls == 2
+
+
+def test_wait_caller_event_still_wakes_on_child_notify(populated_storage):
+    """The caller's Event replaces the bus's own, so a child state change
+    still wakes the wait through it."""
+    bus = ChildEventBus()
+    client = _make_read_client_with_bus(populated_storage, bus)
+    client._WAIT_HEARTBEAT_INTERVAL = 30.0  # type: ignore[misc]
+    caller_event = threading.Event()
+    set_by_notify: list[bool] = []
+
+    def _child_finishes() -> None:
+        populated_storage.update_workstream_state("child-b", "idle")
+        bus.notify("child-b")
+        set_by_notify.append(caller_event.is_set())
+
+    reason = _Reason(on_first_call=_child_finishes)
+    start = time.monotonic()
+    result = client.wait_for_workstream(
+        ["child-b"], timeout=20, mode="any", interrupt=reason, wake_event=caller_event
+    )
+    elapsed = time.monotonic() - start
+    assert set_by_notify == [True], "the bus did not set the caller's Event"
+    assert result["complete"] is True
+    assert reason.calls == 1
+    assert elapsed < 1.0, f"child notify did not reach the caller's Event: {elapsed}s"
+    assert bus._waiters == {}
+
+
+def test_wait_caller_event_wakes_a_wait_with_no_registered_ids(populated_storage, monkeypatch):
+    """When the ownership pre-read fails no id is registered on the bus, yet
+    the wait still blocks on the caller's Event, so the caller can end it."""
+    bus = ChildEventBus()
+    client = _make_read_client_with_bus(populated_storage, bus)
+    client._WAIT_HEARTBEAT_INTERVAL = 30.0  # type: ignore[misc]
+    real_batch = populated_storage.get_workstreams_batch
+    calls = {"n": 0}
+
+    def _first_read_fails(ws_ids):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("storage blip")
+        return real_batch(ws_ids)
+
+    monkeypatch.setattr(populated_storage, "get_workstreams_batch", _first_read_fails)
+    wake = threading.Event()
+    registered_mid_wait: list[dict[str, Any]] = []
+
+    def _message_arrives() -> None:
+        registered_mid_wait.append(dict(bus._waiters))
+        reason.reason = "user_message"
+        wake.set()
+
+    reason = _Reason(on_first_call=_message_arrives)
+    start = time.monotonic()
+    result = client.wait_for_workstream(
+        ["child-b"], timeout=20, mode="all", interrupt=reason, wake_event=wake
+    )
+    elapsed = time.monotonic() - start
+    assert registered_mid_wait == [{}], "pre-read failure should leave nothing registered"
+    assert result["interrupted"] == "user_message"
+    assert result["results"]["child-b"]["state"] == "running"
+    assert reason.calls == 2
+    assert elapsed < 1.0, f"the wake did not end the block: {elapsed}s"
+
+
+# ---------------------------------------------------------------------------
 # wait_for_workstream — last-message bundling
 # ---------------------------------------------------------------------------
 #
@@ -2113,15 +2352,18 @@ def test_wait_for_workstream_not_found_returns_sentinel(hex_storage):
 
 
 def test_wait_for_workstream_running_child_message_is_null(populated_storage):
-    """A still-running child after a timeout must report
-    ``message=None`` — anything else would be a partial last message
-    pretending to be a final answer.  The coord uses null to know
-    'still working, inspect later'."""
+    """In a result that bundles messages, a still-running child must
+    report ``message=None`` — anything else would be a partial last
+    message pretending to be a final answer.  mode='any' completes on
+    the idle child-a beside the running child-b, so the bundling path
+    runs for both rows; null marks the one still working."""
+    populated_storage.save_message("child-a", "user", "hi")
+    populated_storage.save_message("child-a", "assistant", "child-a's findings")
+    populated_storage.save_message("child-b", "assistant", "child-b mid-thought")
     client = _make_read_client(populated_storage)
-    result = client.wait_for_workstream(["child-a", "child-b"], timeout=1.0, mode="all")
-    # mode='all' on (idle, running) hits the timeout — child-b is still
-    # running and must come back with message=None.
-    assert result["complete"] is False
+    result = client.wait_for_workstream(["child-a", "child-b"], timeout=5, mode="any")
+    assert result["complete"] is True
+    assert result["results"]["child-a"]["message"] == "child-a's findings"
     assert result["results"]["child-b"]["state"] == "running"
     assert result["results"]["child-b"]["message"] is None
     assert result["results"]["child-b"]["truncated"] is False

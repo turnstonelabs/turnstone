@@ -235,7 +235,13 @@ Two distinct semantics, different cost profiles:
   `closed`, `deleted`).  The worker thread blocks up to `timeout`
   seconds; the assistant turn remains a single round-trip regardless
   of how long the wait actually takes.  Prefer this for "the plan
-  needs child X to finish before the next step."
+  needs child X to finish before the next step."  A message the user
+  sends meanwhile ends the wait early (`complete=false`,
+  `interrupted="user_message"`).  A wait that times out or is
+  interrupted returns states only; the wait that completes returns
+  the children's messages, so a skill that needs the children
+  finished re-issues the wait (after handling the user's message,
+  when one ended it).
 - **`inspect_workstream(ws_id=...)`** — single read of the child's
   state + tail.  Costs a full assistant turn (judge, tokens, stream).
   Prefer this for "what does the final message say?" after the child

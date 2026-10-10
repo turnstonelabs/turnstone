@@ -547,9 +547,16 @@ def test_wait_exec_dispatches_raw_args_to_client(coord_session):
     # handles the float coerce + clamp.  ``since`` + ``progress_callback``
     # are optional observability kwargs added for the wait dashboard /
     # diff-hint items (#14, #18); match them via ANY so this assertion
-    # stays focused on the raw dispatch.
+    # stays focused on the raw dispatch.  ``interrupt`` + ``wake_event``
+    # let a user message end the wait (#1339; covered below).
     coord.wait_for_workstream.assert_called_once_with(
-        ["a"], timeout=30, mode="any", since=None, progress_callback=ANY
+        ["a"],
+        timeout=30,
+        mode="any",
+        since=None,
+        progress_callback=ANY,
+        interrupt=sess._wait_interrupt_reason,
+        wake_event=ANY,
     )
     parsed = json.loads(output)
     assert parsed["complete"] is True
@@ -567,7 +574,7 @@ def test_wait_exec_progress_callback_observes_cancel(coord_session):
 
     sess, coord, _ui = coord_session
 
-    def _wait(ws_ids, *, timeout, mode, since, progress_callback):
+    def _wait(ws_ids, *, timeout, mode, since, progress_callback, interrupt, wake_event):
         # Simulate the wait loop's ~2s heartbeat firing after the owner cancels.
         sess._cancel_event.set()
         progress_callback({"a": {"state": "running"}}, 0.1)  # must raise
@@ -577,6 +584,8 @@ def test_wait_exec_progress_callback_observes_cancel(coord_session):
     item = sess._prepare_tool(_tc("wait_for_workstream", {"ws_ids": ["a"]}))
     with pytest.raises(GenerationCancelled):
         sess._exec_wait_for_workstream(item)
+    # The cancel's raise still removes the wait's wake event.
+    assert sess._wait_wakers == set()
 
 
 def test_wait_exec_default_timeout_when_omitted(coord_session):
@@ -593,7 +602,13 @@ def test_wait_exec_default_timeout_when_omitted(coord_session):
     item = sess._prepare_tool(_tc("wait_for_workstream", {"ws_ids": ["a"]}))
     sess._exec_wait_for_workstream(item)
     coord.wait_for_workstream.assert_called_once_with(
-        ["a"], timeout=60.0, mode="any", since=None, progress_callback=ANY
+        ["a"],
+        timeout=60.0,
+        mode="any",
+        since=None,
+        progress_callback=ANY,
+        interrupt=sess._wait_interrupt_reason,
+        wake_event=ANY,
     )
 
 
@@ -609,8 +624,232 @@ def test_wait_exec_preserves_explicit_zero_timeout(coord_session):
     item = sess._prepare_tool(_tc("wait_for_workstream", {"ws_ids": ["a"], "timeout": 0}))
     sess._exec_wait_for_workstream(item)
     coord.wait_for_workstream.assert_called_once_with(
-        ["a"], timeout=0, mode="any", since=None, progress_callback=ANY
+        ["a"],
+        timeout=0,
+        mode="any",
+        since=None,
+        progress_callback=ANY,
+        interrupt=sess._wait_interrupt_reason,
+        wake_event=ANY,
     )
+
+
+# ---------------------------------------------------------------------------
+# wait_for_workstream — a user message ends the wait (#1339)
+# ---------------------------------------------------------------------------
+
+
+def _wait_result(*, complete: bool, interrupted: str | None = None) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "results": {
+            "a": {
+                "state": "idle" if complete else "running",
+                "tokens": 3,
+                "message": None,
+                "truncated": False,
+            }
+        },
+        "complete": complete,
+        "elapsed": 1.25,
+        "mode": "all",
+    }
+    if interrupted:
+        result["interrupted"] = interrupted
+    return result
+
+
+def test_queue_message_wakes_the_blocked_wait(coord_session):
+    """While the wait blocks, its wake event is registered on the session;
+    ``queue_message`` sets it once the row is queued, so the reason the
+    client then reads back already holds.  The event is gone once the wait
+    returns."""
+    sess, coord, _ui = coord_session
+    seen: dict[str, Any] = {}
+
+    def _wait(ws_ids, *, timeout, mode, since, progress_callback, interrupt, wake_event):
+        seen["registered"] = wake_event in sess._wait_wakers
+        seen["before"] = interrupt()
+        sess.queue_message("how far along?")
+        seen["woken"] = wake_event.is_set()
+        seen["after"] = interrupt()
+        return _wait_result(complete=False, interrupted="user_message")
+
+    coord.wait_for_workstream.side_effect = _wait
+    item = sess._prepare_tool(_tc("wait_for_workstream", {"ws_ids": ["a"], "mode": "all"}))
+    _call_id, output = sess._exec_wait_for_workstream(item)
+    assert seen == {"registered": True, "before": None, "woken": True, "after": "user_message"}
+    assert sess._wait_wakers == set()
+    assert json.loads(output)["interrupted"] == "user_message"
+
+
+def test_wait_interrupt_reason_reads_only_rows_the_seam_delivers(coord_session):
+    """The reason holds only for a row the next tool-result seam delivers.
+    Another participant's retained row stays queued, so it must never end
+    the waits the model re-issues; a content-free row (a bare ``!!!``) is
+    dropped at the seam, so it delivers nothing to end a wait for."""
+    sess, _coord, _ui = coord_session
+    assert sess._mcp_effective_user_id == "user-1"
+    sess._queued_messages["foreign"] = ("from someone else", "notice", "user-2")
+    sess._queued_messages["empty"] = ("", "important", "user-1")
+    assert sess._wait_interrupt_reason() is None
+    sess._queued_messages["own"] = ("status?", "notice", "user-1")
+    assert sess._wait_interrupt_reason() == "user_message"
+    del sess._queued_messages["own"]
+    sess._queued_messages["legacy"] = ("an unowned lane", "important")
+    assert sess._wait_interrupt_reason() == "user_message"
+    # The seam's pop agrees: everything but the foreign row leaves the queue.
+    assert set(sess._pop_queued_messages()) == {"empty", "legacy"}
+    assert list(sess._queued_messages) == ["foreign"]
+
+
+@pytest.mark.parametrize(
+    ("complete", "interrupted", "verb"),
+    [(True, None, "complete"), (False, None, "timeout"), (False, "user_message", "interrupted")],
+)
+def test_wait_summary_and_wait_ended_name_how_the_wait_ended(
+    coord_session, complete, interrupted, verb
+):
+    """The tool row's summary names an interrupted wait as such, and the
+    ``wait_ended`` event carries ``interrupted`` only when it applies."""
+    sess, coord, ui = coord_session
+    events: list[dict[str, Any]] = []
+    ui._enqueue = events.append  # type: ignore[attr-defined]
+    coord.wait_for_workstream.return_value = _wait_result(
+        complete=complete, interrupted=interrupted
+    )
+    item = sess._prepare_tool(_tc("wait_for_workstream", {"ws_ids": ["a"]}))
+    sess._exec_wait_for_workstream(item)
+    resolved = 1 if complete else 0
+    assert ui.tool_results[-1][2] == f"{verb} after 1.25s ({resolved}/1 resolved)"
+    assert ui.tool_results[-1][3] is False
+    (ended,) = [e for e in events if e["type"] == "wait_ended"]
+    assert ended["complete"] is complete
+    assert ended.get("interrupted") == interrupted
+
+
+def test_a_queued_message_ends_a_real_wait_and_reaches_the_model(
+    monkeypatch, tmp_path, tmp_db, sqlite_backend_factory
+):
+    """End to end on the real pieces: the model's wait blocks in a real
+    ``CoordinatorClient`` on a running child, with the heartbeat raised to
+    30 s so only the wake can end it promptly.  The user's message ends it,
+    and the next model call sees the interrupted result followed by the
+    message as a ``user_interjection`` turn."""
+    import contextlib
+    import threading
+    import time
+    import uuid
+
+    import httpx
+
+    from tests._session_helpers import NullUI, make_result
+    from turnstone.console.coordinator_client import CoordinatorClient
+    from turnstone.core.child_event_bus import ChildEventBus
+    from turnstone.core.trajectory import dicts_from_turns
+
+    monkeypatch.setattr(ChatSession, "_load_skills", lambda self: None)
+    monkeypatch.setattr(ChatSession, "_init_system_messages", lambda self: None)
+    monkeypatch.setattr(ChatSession, "_save_config", lambda self: None)
+    storage = sqlite_backend_factory(str(tmp_path / "wait.db"))
+    storage.register_workstream("coord-1", kind="coordinator", user_id="user-1")
+    child = uuid.uuid4().hex
+    storage.register_workstream(
+        child, kind="interactive", parent_ws_id="coord-1", state="running", user_id="user-1"
+    )
+    bus = ChildEventBus()
+    client = CoordinatorClient(
+        console_base_url="http://x",
+        storage=storage,
+        token_factory=lambda: "t",
+        coord_ws_id="coord-1",
+        user_id="user-1",
+        http_client=httpx.Client(transport=httpx.MockTransport(lambda r: httpx.Response(200))),
+        child_event_bus=bus,
+    )
+    client._WAIT_HEARTBEAT_INTERVAL = 30.0  # type: ignore[misc]
+    sess = ChatSession(
+        client=MagicMock(),
+        model="gpt-test",
+        ui=NullUI(),
+        instructions=None,
+        temperature=0.0,
+        max_tokens=1024,
+        tool_timeout=30,
+        context_window=16384,
+        ws_id="coord-1",
+        user_id="user-1",
+        client_type=ClientType.WEB,
+        kind="coordinator",
+        coord_client=client,
+    )
+    wait_args = json.dumps({"ws_ids": [child], "mode": "all", "timeout": 60})
+    responses = [
+        make_result(
+            "",
+            tool_calls=[
+                {
+                    "id": "call_wait",
+                    "type": "function",
+                    "function": {"name": "wait_for_workstream", "arguments": wait_args},
+                }
+            ],
+        ),
+        make_result("It is still running."),
+    ]
+    # The user's message goes out only once the wait loop has made its first
+    # check, which comes after its first tick and just before it blocks on
+    # the 30 s heartbeat, so a prompt end can only come from the wake (a
+    # message queued before the first tick would be caught by that tick).
+    first_check_done = threading.Event()
+    real_reason = sess._wait_interrupt_reason
+    checks: list[str | None] = []
+
+    def _reason_signalling_first_check() -> str | None:
+        reason = real_reason()
+        checks.append(reason)
+        first_check_done.set()
+        return reason
+
+    sess._wait_interrupt_reason = _reason_signalling_first_check  # type: ignore[method-assign]
+    sent_after_first_check: list[bool] = []
+
+    def _send_after_first_check() -> None:
+        sent_after_first_check.append(first_check_done.wait(10))
+        sess.queue_message("how far along?")
+
+    sender = threading.Thread(target=_send_after_first_check)
+    with contextlib.ExitStack() as stack:
+        stack.enter_context(
+            patch.object(sess, "_stream_response", side_effect=lambda _gen: responses.pop(0))
+        )
+        stack.enter_context(patch.object(sess, "_full_messages", return_value=[]))
+        stack.enter_context(patch.object(sess, "_update_token_table"))
+        stack.enter_context(patch.object(sess, "_print_status_line"))
+        stack.enter_context(patch.object(sess, "_emit_state"))
+        stack.enter_context(patch.object(sess, "_visible_memory_count", return_value=0))
+        stack.enter_context(patch("turnstone.core.session.save_message"))
+        sess._title_generated = True
+        sender.start()
+        start = time.monotonic()
+        try:
+            sess.send("check on the child")
+        finally:
+            sender.join()
+        elapsed = time.monotonic() - start
+    assert sent_after_first_check == [True]
+    assert checks == [None, "user_message"]
+    assert elapsed < 5.0, f"the message did not end the wait: {elapsed}s"
+    assert responses == []
+    msgs = dicts_from_turns(sess.messages)
+    assert [m["role"] for m in msgs] == ["user", "assistant", "tool", "system", "assistant"]
+    result = json.loads(msgs[2]["content"])
+    assert result["interrupted"] == "user_message"
+    assert result["complete"] is False
+    assert result["results"][child]["state"] == "running"
+    assert msgs[3]["_source"] == "user_interjection"
+    assert msgs[3]["content"].endswith("User message: how far along?")
+    assert sess._queued_messages == {}
+    assert sess._wait_wakers == set()
 
 
 def test_delete_prepare_needs_approval(coord_session):

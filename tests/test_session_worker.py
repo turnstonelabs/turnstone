@@ -128,6 +128,7 @@ def _make_blocked_principal_session(
     session._queued_messages = collections.OrderedDict()
     session._retracted_while_popped = set()
     session._popped_in_flight = set()
+    session._wait_wakers = set()
     # The worker-slot claim these tests are about is captured from real
     # lifecycle state, so seed the fields ``__init__`` would: an open session
     # with no cancel edge, no close in flight, and no owed TOOL receipts.
