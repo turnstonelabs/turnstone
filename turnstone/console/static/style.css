@@ -2158,14 +2158,49 @@ h3.skill-spec-heading {
   background: var(--bg-highlight);
   border-radius: 2px;
   overflow: hidden;
+  display: flex;
+  gap: 2px;
 }
 .usage-bar-fill {
   height: 100%;
-  background: var(--accent);
-  border-radius: 2px;
   min-width: 2px;
   transition: width 0.3s ease;
+}
+/* Stacked prompt/completion segments: prompt keeps the accent color, completion the neutral ink */
+.usage-bar-prompt {
+  background: var(--accent);
   box-shadow: 0 0 6px var(--accent-glow);
+}
+.usage-bar-completion {
+  background: var(--ink-4);
+}
+.usage-legend {
+  display: flex;
+  gap: 14px;
+  justify-content: flex-end;
+  padding: 6px 0 4px;
+}
+.usage-legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 10px;
+  font-family: var(--font-ui);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--fg-dim);
+}
+.usage-legend-swatch {
+  width: 8px;
+  height: 8px;
+  border-radius: 2px;
+}
+.usage-legend-swatch-prompt {
+  background: var(--accent);
+}
+.usage-legend-swatch-completion {
+  background: var(--ink-4);
 }
 .usage-bar-value {
   font-size: 11px;

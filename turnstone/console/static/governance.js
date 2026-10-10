@@ -2690,19 +2690,48 @@ function _renderGovUsage(data) {
       if (v > maxVal) maxVal = v;
     }
     html += '<div class="usage-chart">';
+    html +=
+      '<div class="usage-legend">' +
+      '<span class="usage-legend-item"><span class="usage-legend-swatch usage-legend-swatch-prompt"></span>prompt</span>' +
+      '<span class="usage-legend-item"><span class="usage-legend-swatch usage-legend-swatch-completion"></span>completion</span>' +
+      "</div>";
     for (let j = 0; j < items.length; j++) {
       const item = items[j];
-      const val = (item.prompt_tokens || 0) + (item.completion_tokens || 0);
-      const pct = maxVal > 0 ? Math.round((val / maxVal) * 100) : 0;
+      const promptVal = item.prompt_tokens || 0;
+      const completionVal = item.completion_tokens || 0;
+      const val = promptVal + completionVal;
+      const promptPct = maxVal > 0 ? Math.round((promptVal / maxVal) * 100) : 0;
+      const completionPct =
+        maxVal > 0 ? Math.round((completionVal / maxVal) * 100) : 0;
       const label = item.key || "\u2014";
+      // Stacked segments: prompt (accent) then completion (neutral ink). A segment is
+      // skipped when empty, except a zero-total row keeps a minimal prompt
+      // sliver so the row still reads as present.
+      let fill = "";
+      if (promptVal > 0 || completionVal === 0) {
+        fill +=
+          '<div class="usage-bar-fill usage-bar-prompt" style="width:' +
+          promptPct +
+          '%"></div>';
+      }
+      if (completionVal > 0) {
+        fill +=
+          '<div class="usage-bar-fill usage-bar-completion" style="width:' +
+          completionPct +
+          '%"></div>';
+      }
       html +=
         '<div class="usage-bar-row">' +
         '<span class="usage-bar-label">' +
         escapeHtml(label) +
         "</span>" +
-        '<div class="usage-bar-track"><div class="usage-bar-fill" style="width:' +
-        pct +
-        '%"></div></div>' +
+        '<div class="usage-bar-track" role="img" title="prompt ' +
+        formatTokens(promptVal) +
+        ", completion " +
+        formatTokens(completionVal) +
+        '">' +
+        fill +
+        "</div>" +
         '<span class="usage-bar-value">' +
         formatTokens(val) +
         "</span>" +
