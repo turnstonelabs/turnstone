@@ -43,6 +43,9 @@ server:
   service:
     type: ClusterIP
     port: 8080
+    annotations: {}
+    labels: {}
+    externalTrafficPolicy: ""
   # -- Node scheduling constraints
   nodeSelector: {}
   affinity: {}
@@ -61,6 +64,9 @@ console:
   service:
     type: ClusterIP
     port: 8090
+    annotations: {}
+    labels: {}
+    externalTrafficPolicy: ""
   # -- Node scheduling constraints
   nodeSelector: {}
   affinity: {}

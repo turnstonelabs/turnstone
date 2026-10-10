@@ -5,8 +5,18 @@ metadata:
   labels:
     {{- include "turnstone.labels" . | nindent 4 }}
     app.kubernetes.io/component: console
+    {{- with .Values.console.service.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- with .Values.console.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
 spec:
   type: {{ .Values.console.service.type }}
+  {{- with .Values.console.service.externalTrafficPolicy }}
+  externalTrafficPolicy: {{ . }}
+  {{- end }}
   ports:
     - port: {{ .Values.console.service.port }}
       targetPort: http
