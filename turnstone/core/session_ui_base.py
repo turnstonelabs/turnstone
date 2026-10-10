@@ -223,6 +223,24 @@ def _execution_principal_for_items(items: list[dict[str, Any]]) -> str:
     return next(iter(principals), "")
 
 
+def publish_gate_state(items: list[dict[str, Any]], state: str) -> None:
+    """Move the workstream to *state* for this tool batch, from inside its gate.
+
+    The session stamps each batch's items with a generation-fenced publisher
+    (``_publish_gate_state``; it raises ``GenerationCancelled`` when the
+    batch's generation moved on).  Every gate calls this where it actually
+    waits: ``evaluation`` before a Smart Approvals wait, ``attention`` before
+    a person decides.  Items with no stamp (direct callers, task-agent gates)
+    publish nothing.
+    """
+    publish = next(
+        (it["_publish_gate_state"] for it in items if callable(it.get("_publish_gate_state"))),
+        None,
+    )
+    if publish is not None:
+        publish(state)
+
+
 class ApprovalCycle:
     """One in-flight human-approval round on a workstream.
 
@@ -2265,6 +2283,11 @@ class SessionUIBase:
            re-check once more, emit its ``approve_request`` card, and block on
            the CYCLE's event up to the batch's configured human wait deadline.
 
+        The workstream state moves (through :func:`publish_gate_state`) only
+        past steps 2-4: to ``evaluation`` just before a Smart Approvals wait,
+        to ``attention`` just before a card.  A batch those steps settle stays
+        ``running``.
+
         Reentrant by design: several gate threads (main loop + parallel
         task agents) run this body concurrently, each against its own
         :class:`ApprovalCycle`.  Shared state is touched only under
@@ -2521,6 +2544,8 @@ class SessionUIBase:
                 wait_seconds=smart_config.wait_seconds,
                 commit_actions=smart_commit_actions,
                 persistence_actions=auto_deferred,
+                # The judge, not a person, holds the batch for the wait.
+                before_wait=lambda: publish_gate_state(items, "evaluation"),
             )
         if grant_unasked_only:
             granted = [it for it in pending if id(it) not in policy_asked]
@@ -2569,6 +2594,10 @@ class SessionUIBase:
             for persist in auto_deferred:
                 persist()
             return True, None
+
+        # A person must decide: ``attention`` goes out before the card, as it
+        # always has (from ``evaluation`` when a judge wait came first).
+        publish_gate_state(items, "attention")
 
         # Prepare the manual gate locally.  Shared activity, mixed automatic
         # bookkeeping, cycle registration, and the entire prompt bundle commit
@@ -2721,6 +2750,7 @@ class SessionUIBase:
         wait_seconds: float | None = None,
         commit_actions: list[Callable[[], None]] | None = None,
         persistence_actions: list[Callable[[], None]] | None = None,
+        before_wait: Callable[[], None] | None = None,
     ) -> list[dict[str, Any]]:
         """Auto-approve a tool batch the LLM judge cleared confidently.
 
@@ -2742,6 +2772,12 @@ class SessionUIBase:
         job, so ``review`` is not a floor.  But a call the pattern rules
         matched as ``deny`` / ``critical`` (e.g. ``rm -rf /``) is never
         cleared by the (promptable) LLM — those always reach a human.
+
+        A batch the heuristic flags ``deny`` / ``critical`` skips the wait
+        (no LLM verdict can clear it), and the wait ends early once any of
+        this generation's verdicts fails, since the batch then needs a person
+        whatever the rest say.  *before_wait* runs only when the wait will
+        actually block.
 
         Returns ``[]`` when the whole batch is auto-approved, or *pending*
         unchanged when anything is uncertain (review/deny/low-confidence/
@@ -2773,13 +2809,15 @@ class SessionUIBase:
         if len(needed) > self._LLM_VERDICT_CACHE_MAX:
             log.info("judge.smart_approval.batch_too_large", ws_id=self.ws_id, count=len(needed))
             return pending
-        self._await_llm_verdicts(
-            needed,
-            self.smart_approval_wait_seconds if wait_seconds is None else wait_seconds,
-            cancelled=is_cancelled,
-        )
-        if is_cancelled():
-            return pending
+        # A call the deterministic pattern rules explicitly flagged ``deny`` /
+        # ``critical`` (e.g. ``rm -rf /``) is never cleared by the (promptable)
+        # LLM, so such a batch always reaches a person: there is nothing to wait
+        # for, and the workstream must not claim the judge may still approve it.
+        # The heuristic verdict is stamped before the gate and never changes.
+        for it in candidates:
+            hv = it.get("_heuristic_verdict") or {}
+            if hv.get("recommendation") == "deny" or hv.get("risk_level") == "critical":
+                return pending
 
         effective_threshold = self.smart_approval_threshold if threshold is None else threshold
         # This batch's judge generation — every cached verdict must have
@@ -2792,6 +2830,47 @@ class SessionUIBase:
             (it.get("_judge_event") for it in candidates if it.get("_judge_event") is not None),
             None,
         )
+
+        def _own(cid: str) -> bool:
+            """The cached verdict for *cid* came from this batch's judge generation."""
+            return expected_gen is None or self._verdict_origins.get(cid) == id(expected_gen)
+
+        def _qualifies(v: dict[str, Any]) -> bool:
+            # A COMPLETED LLM verdict — tier "llm", not the "llm_fallback" error
+            # carry-over ("heuristic" never lands in this cache) — recommending
+            # "approve" at/above threshold.
+            return (
+                v.get("tier") == "llm"
+                and v.get("recommendation") == "approve"
+                and self._verdict_confidence(v) >= effective_threshold
+            )
+
+        def _ruled_out() -> bool:
+            # One of this generation's verdicts already fails: the batch goes to
+            # a person whatever the rest say, so stop waiting for them.  A stale
+            # generation's verdict does not count; this generation's verdict for
+            # the same call_id replaces it.  Runs under ``_verdict_cond``.
+            return any(
+                cid in self._llm_verdicts and _own(cid) and not _qualifies(self._llm_verdicts[cid])
+                for cid in needed
+            )
+
+        def _delivered() -> bool:
+            # Every call holds THIS generation's verdict; a stale or sibling
+            # verdict for a reused call_id decides nothing.  Runs under
+            # ``_verdict_cond``.
+            return all(cid in self._llm_verdicts and _own(cid) for cid in needed)
+
+        self._await_llm_verdicts(
+            needed,
+            self.smart_approval_wait_seconds if wait_seconds is None else wait_seconds,
+            stop=lambda: is_cancelled() or _ruled_out(),
+            before_wait=before_wait,
+            delivered=_delivered,
+        )
+        if is_cancelled():
+            return pending
+
         qualified: dict[str, dict[str, Any]] = {}
         with self._ws_lock:
             if is_cancelled():
@@ -2799,24 +2878,9 @@ class SessionUIBase:
             for it in candidates:
                 cid = it.get("call_id", "")
                 v = self._llm_verdicts.get(cid)
-                # Require a COMPLETED LLM verdict — tier "llm", not the
-                # "llm_fallback" error carry-over ("heuristic" never lands in
-                # this cache) — recommending "approve" at/above threshold,
-                # delivered by this batch's own judge generation.
-                if (
-                    v is None
-                    or v.get("tier") != "llm"
-                    or v.get("recommendation") != "approve"
-                    or self._verdict_confidence(v) < effective_threshold
-                    or (
-                        expected_gen is not None
-                        and self._verdict_origins.get(cid) != id(expected_gen)
-                    )
-                ):
+                # Delivered by this batch's own judge generation, and qualifying.
+                if v is None or not _own(cid) or not _qualifies(v):
                     return pending  # one fails → none of the batch auto-approves
-                hv = it.get("_heuristic_verdict") or {}
-                if hv.get("recommendation") == "deny" or hv.get("risk_level") == "critical":
-                    return pending  # explicit deterministic danger flag → human
                 v.setdefault(
                     "execution_principal_id",
                     str(it.get("_principal_id") or "").strip(),
@@ -2878,25 +2942,46 @@ class SessionUIBase:
         needed: set[str],
         budget_seconds: float,
         *,
-        cancelled: Callable[[], bool] | None = None,
+        stop: Callable[[], bool] | None = None,
+        before_wait: Callable[[], None] | None = None,
+        delivered: Callable[[], bool] | None = None,
     ) -> None:
         """Block until every call_id in *needed* has an LLM verdict cached.
 
         Returns the instant the last verdict lands; otherwise gives up
         after *budget_seconds* and leaves the missing calls for the human
-        gate (fail-closed).  A cancelled operation also returns immediately;
-        workstream-wide approval sweeps wake this pre-cycle wait even when no
-        :class:`ApprovalCycle` exists yet.  ``on_intent_verdict`` notifies
-        ``_verdict_cond`` on every cache write, and the judge delivers exactly
-        one verdict (LLM or ``llm_fallback``) per call, so the common case is
-        an early return at real judge latency rather than a full-budget wait.
+        gate (fail-closed).  *stop* (checked under ``_verdict_cond``) ends
+        the wait the moment it returns true: a cancelled operation, or a
+        verdict that already decides the batch.  Workstream-wide approval
+        sweeps wake this pre-cycle wait even when no :class:`ApprovalCycle`
+        exists yet.  ``on_intent_verdict`` notifies ``_verdict_cond`` on
+        every cache write, and the judge delivers exactly one verdict (LLM or
+        ``llm_fallback``) per call, so the common case is an early return at
+        real judge latency rather than a full-budget wait.
+
+        *delivered* (checked under ``_verdict_cond``) replaces the test that
+        every call_id has a verdict cached: the Smart gate counts only its own
+        judge generation's verdicts.  *before_wait* runs only when the wait
+        will actually block, outside the lock (it may publish a workstream
+        state): a batch whose verdicts are already in, or already decided,
+        never announces a wait.
         """
         if budget_seconds <= 0 or not needed:
             return
-        is_cancelled = cancelled or (lambda: False)
+        should_stop = stop or (lambda: False)
+        is_delivered = delivered or (lambda: needed.issubset(self._llm_verdicts.keys()))
+
+        def _done() -> bool:  # under _verdict_cond
+            return is_delivered() or should_stop()
+
+        with self._verdict_cond:
+            if _done():
+                return
+        if before_wait is not None:
+            before_wait()
         deadline = time.monotonic() + budget_seconds
         with self._verdict_cond:
-            while not needed.issubset(self._llm_verdicts.keys()) and not is_cancelled():
+            while not _done():
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     return

@@ -22,6 +22,7 @@ const GLYPH = {
   running: "●",
   thinking: "◐",
   attention: "⚠",
+  evaluation: "⚖",
   error: "✗",
   idle: "○",
 };
@@ -29,6 +30,7 @@ const STATE_LABEL = {
   running: "running",
   thinking: "thinking",
   attention: "attention",
+  evaluation: "evaluation",
   error: "error",
   idle: "idle",
 };
@@ -71,6 +73,7 @@ function nodeState(info) {
   if (info.ws_running > 0) return "running";
   if (info.ws_thinking > 0) return "thinking";
   if (info.ws_attention > 0) return "attention";
+  if (info.ws_evaluation > 0) return "evaluation";
   return "idle";
 }
 
@@ -100,7 +103,7 @@ function renderCluster(root, cs, TS) {
   const row = document.createElement("div");
   row.className = "cluster-row";
   const pillStates = ["running", "thinking", "idle"];
-  for (const st of ["attention", "error"]) {
+  for (const st of ["attention", "evaluation", "error"]) {
     if ((states[st] || 0) > 0) pillStates.splice(2, 0, st);
   }
   for (const st of pillStates) {
@@ -230,21 +233,24 @@ function sessionRow(ws, childCount, isChild, TS, paneManager, active) {
   // the full PERSONA column.  personaLabel falls back to the raw slug for a
   // since-archived persona, so the label never silently disappears.
   const persona = personaLabel(ws.persona || "");
+  const state = ws.state || "idle";
   btn.setAttribute(
     "aria-label",
     (ws.name || ws.title || ws.id) +
       ", " +
-      (ws.state || "idle") +
+      state +
       ", " +
       kind +
       (persona ? ", persona " + persona : ""),
   );
   // Hover name — the expanded row ellipsizes long names; the collapsed rail
   // shows only the state glyph, so the title is the whole label there.
+  // Name the state on hover for the ones the glyph alone may not explain.
   btn.title =
     (ws.name || ws.title || ws.id || "session") +
-    (persona ? " · " + persona : "");
-  btn.append(glyph(ws.state || "idle"));
+    (persona ? " · " + persona : "") +
+    (state !== "idle" && state !== "running" ? " · " + state : "");
+  btn.append(glyph(state));
   const nm = document.createElement("span");
   nm.className = "nm";
   nm.textContent = ws.name || ws.title || ws.id || "session";

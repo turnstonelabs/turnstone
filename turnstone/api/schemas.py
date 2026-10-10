@@ -20,6 +20,7 @@ class WorkstreamState(StrEnum):
     thinking = "thinking"
     running = "running"
     attention = "attention"
+    evaluation = "evaluation"
     error = "error"
 
 

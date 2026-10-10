@@ -139,8 +139,9 @@
 
 /* ==========================================================================
    State glyphs — unified vocabulary (● running / ◐ thinking / ⚠ attention /
-   ✗ error / ○ idle).  Pages that render tree rows use these directly; the
-   existing LED-dot .dash-state-dot (base.css) remains for tabular views.
+   ⚖ evaluation / ✗ error / ○ idle).  Pages that render tree rows use
+   these directly; the existing LED-dot .dash-state-dot (base.css) remains for
+   tabular views.
    ========================================================================== */
 .ui-glyph {
   width: 14px;
@@ -156,6 +157,12 @@
 }
 .ui-glyph-attention {
   color: var(--yellow);
+  font-weight: 700;
+}
+/* Evaluation: the intent judge holds the tool batch (Smart Approvals wait).
+   The judge hue, never the running green — blocked, just not on a person. */
+.ui-glyph-evaluation {
+  color: var(--think);
   font-weight: 700;
 }
 .ui-glyph-error {

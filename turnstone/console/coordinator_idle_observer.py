@@ -144,36 +144,33 @@ if TYPE_CHECKING:
 
 log = get_logger(__name__)
 
-# Active = the model can act on the child (it's still working,
-# streaming, or waiting on user attention).  Excludes "idle" (the
-# child is now waiting and can't be unblocked by the coord), "closed"
-# (gone), "deleted" (gone), and "error" (the model can't unblock an
-# errored child without operator intervention; the per-bracket cap
-# handles repeat fires for stuck-error children).
-_ACTIVE_CHILD_STATES: frozenset[str] = frozenset(
-    {
-        WorkstreamState.THINKING.value,
-        WorkstreamState.RUNNING.value,
-        WorkstreamState.ATTENTION.value,
-    }
-)
-
 # LIVE = the row still describes a child this coordinator has.  A
-# different question from the one above — "can the model act on it?" —
-# and the one the tasks body's children fact lines speak about, so it
-# is a strict superset: ``idle`` is in it precisely because an idle
-# child may hold results nobody collected — the stopped-child fact
-# line exists for exactly that row — and ``error`` is in it because an
-# errored child still owns the work it was given (and is stopped in
-# the same wait-terminal sense).
+# different question from the one ``_ACTIVE_CHILD_STATES`` below answers
+# — "can the model act on it?" — and the one the tasks body's children
+# fact lines speak about, so it is a strict superset: ``idle`` is in it
+# precisely because an idle child may hold results nobody collected —
+# the stopped-child fact line exists for exactly that row — and
+# ``error`` is in it because an errored child still owns the work it was
+# given (and is stopped in the same wait-terminal sense).
 #
-# Enum-derived rather than typed out.  ``WorkstreamState`` is exactly
-# {idle, thinking, running, attention, error}, and the terminal strings
-# the close and reap paths write — ``closed``, and the ``deleted``
-# tombstone that today has readers but no writer — are NOT members, so
-# "a row in a live state" needs no exclusion list to maintain and a
-# state added to the enum joins this set with no edit here.
+# Enum-derived rather than typed out.  ``WorkstreamState`` holds only
+# live states: the terminal strings the close and reap paths write —
+# ``closed``, and the ``deleted`` tombstone that today has readers but no
+# writer — are NOT members, so "a row in a live state" needs no exclusion
+# list to maintain and a state added to the enum joins this set with no
+# edit here.
 _LIVE_CHILD_STATES: frozenset[str] = frozenset(s.value for s in WorkstreamState)
+
+# Active = the model can act on the child (it's still working,
+# streaming, or waiting on the judge or a person): every live state but
+# "idle" (the child is now waiting and can't be unblocked by the coord)
+# and "error" (the model can't unblock an errored child without operator
+# intervention; the per-bracket cap handles repeat fires for stuck-error
+# children).  The same rule the panes use for "busy".
+_ACTIVE_CHILD_STATES: frozenset[str] = _LIVE_CHILD_STATES - {
+    WorkstreamState.IDLE.value,
+    WorkstreamState.ERROR.value,
+}
 
 # ONE fire per type per idle bracket.
 #

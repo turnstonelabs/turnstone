@@ -815,7 +815,8 @@ def test_coordinator_history_stale_latch_contract():
         "the staleness backstop must be the else-if sibling of the "
         "pendingTruncatedResync consumer, never an independent if."
     )
-    idle_block_end = body.index('ev.state === "running"', backstop)
+    # The idle/error branch ends where the busy ``else`` begins.
+    idle_block_end = body.index("Every other state is a turn in flight", backstop)
     # Comment-stripped: the arm's at-site ruling comments name every
     # guard term, so raw-window presence asserts would go vacuous.
     backstop_arm = _strip_comments(body[backstop:idle_block_end])
@@ -1022,7 +1023,7 @@ def test_coordinator_history_stale_latch_contract():
     )
     settle_block = body[
         body.index('if (ev.state === "idle" || ev.state === "error") {') : body.index(
-            'ev.state === "running"'
+            "Every other state is a turn in flight"
         )
     ]
     assert "liveToolCalls.clear()" in settle_block, (

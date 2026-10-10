@@ -18821,20 +18821,38 @@ class ChatSession:
 
         self._push_smart_approval_config(items)
 
-        # Phase 2: approve via UI
-        def _publish_attention(durable: list[Callable[[], None]]) -> None:
-            self._emit_state(
-                "attention",
-                deferred_persistence=durable,
-            )
+        # Phase 2: approve via UI.  ``attention`` tells dashboards that a person
+        # must decide on the batch, ``evaluation`` that the intent judge may
+        # still approve it with no person (a Smart Approvals wait).  Each gate
+        # publishes them itself, through the ``_publish_gate_state`` stamped
+        # below (``publish_gate_state`` in session_ui_base), where it actually
+        # waits: a batch that policies, "Always" grants or auto-approve settle
+        # never leaves ``running``, except that a background CLI workstream
+        # holds every batch in ``attention`` until it is brought forward.  The
+        # generation-fenced commit runs first: it is the cancel boundary before
+        # the gate opens.
 
-        if not self._commit_for_generation(
-            my_generation,
-            _publish_attention,
-            allow_cancelled=False,
-        ):
+        def _publish_gate_state(state: str | None) -> None:
+            """Commit *state* for this batch; ``None`` is the generation fence alone."""
+
+            def _emit(durable: list[Callable[[], None]]) -> None:
+                if state is not None:
+                    self._emit_state(state, deferred_persistence=durable)
+
+            if not self._commit_for_generation(
+                my_generation,
+                _emit,
+                allow_cancelled=False,
+            ):
+                raise GenerationCancelled()
+
+        try:
+            _publish_gate_state(None)
+        except GenerationCancelled:
             _stage_unstarted_tool_calls()
-            raise GenerationCancelled()
+            raise
+        for item in items:
+            item["_publish_gate_state"] = _publish_gate_state
         try:
             approved, user_feedback = self.ui.approve_tools(items)
         except GenerationCancelled:

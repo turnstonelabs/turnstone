@@ -938,12 +938,10 @@ class TestBulkCloseStaleOrphans:
         assert closed == []
 
     def test_closes_all_non_terminal_states(self, backend):
-        for ws_id, state in [
-            ("o-idle", "idle"),
-            ("o-thinking", "thinking"),
-            ("o-attention", "attention"),
-            ("o-running", "running"),
-        ]:
+        from turnstone.core.workstream import BULK_CLOSE_STATE_VALUES
+
+        for state in sorted(BULK_CLOSE_STATE_VALUES):
+            ws_id = f"o-{state}"
             backend.register_workstream(ws_id, kind="interactive")
             if state != "idle":
                 backend.update_workstream_state(ws_id, state)
@@ -953,7 +951,7 @@ class TestBulkCloseStaleOrphans:
             "interactive", cutoff="2024-01-01T00:00:00", exclude_ws_ids=[]
         )
 
-        assert set(closed) == {"o-idle", "o-thinking", "o-attention", "o-running"}
+        assert set(closed) == {f"o-{state}" for state in BULK_CLOSE_STATE_VALUES}
 
     def test_keeps_updated_on_close(self, backend):
         """Closing an abandoned row is maintenance, not activity: ``updated``

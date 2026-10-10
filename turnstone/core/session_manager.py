@@ -2887,14 +2887,15 @@ class SessionManager:
           ``ws.last_active`` (monotonic) is past timeout.  Closes only
           ``IDLE`` so legitimately-attentive rows (waiting for user
           response) stay live.
-        - Pass 2 (DB orphans): bulk-close DB rows of this manager's
-          kind whose ``updated`` is past the wall-clock cutoff and
-          which are not currently loaded.  This catches workstreams
-          left behind by prior process incarnations — a process crash
-          /restart leaves rows in non-terminal states forever
-          otherwise.  Closes ``idle/thinking/attention/running``
-          because any matching row is by definition not loaded by any
-          live process and cannot be in a live interaction.
+        - Pass 2 (DB orphans): bulk-close DB rows of this manager's kind
+          whose ``updated`` is past the wall-clock cutoff and which are
+          not currently loaded.  This catches workstreams left behind by
+          prior process incarnations — a process crash /restart leaves
+          rows in non-terminal states forever otherwise.  Closes every
+          live state but ``error`` (``BULK_CLOSE_STATE_VALUES``; error
+          rows stay for the user to investigate) because any matching
+          row is by definition not loaded by any live process and cannot
+          be in a live interaction.
 
           **Liveness scoping**: a workstream loaded by any live process
           carries a renewed owner lease, and the backend never closes a

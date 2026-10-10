@@ -34,6 +34,8 @@ const STATE_DISPLAY = {
   running: { symbol: "\u25b8", label: "run" },
   thinking: { symbol: "\u25cc", label: "think" },
   attention: { symbol: "\u25c6", label: "attn" },
+  // The intent judge holds the tool batch (a Smart Approvals wait).
+  evaluation: { symbol: "\u2696", label: "eval", aria: "judge evaluation" },
   idle: { symbol: "\u00b7", label: "idle" },
   error: { symbol: "\u2716", label: "err" },
 };
@@ -77,6 +79,22 @@ function renderDashboardSubline(container, ws) {
     if (container.childNodes.length) container.append(" \u00b7 ");
     container.append(ws.activity);
   }
+}
+
+// Paint a dashboard row's spoken label from the parts stored on the row, so
+// the first render and every live update compose it the same way and the
+// state it names never goes stale.
+function paintDashRowAria(row, sd, persistenceState) {
+  const d = row.dataset;
+  const tokens = Number(d.ariaTokens) || 0;
+  const ctx = Number(d.ariaCtx) || 0;
+  let label = (d.ariaName || d.wsId || "") + " \u2014 " + (sd.aria || sd.label);
+  if (d.ariaModel) label += ", model: " + d.ariaModel;
+  if (d.ariaTask) label += ", task: " + d.ariaTask;
+  if (tokens) label += ", " + formatTokens(tokens) + " tokens";
+  if (ctx > 0) label += ", " + Math.round(ctx * 100) + "% context";
+  d.baseAriaLabel = label;
+  setPersistenceRowAria(row, persistenceState);
 }
 
 function setPersistenceRowAria(row, persistenceState) {
@@ -1113,15 +1131,13 @@ function renderDashboardTable(wsList, agg) {
     row.dataset.state = liveState;
     row.setAttribute("role", "button");
     row.setAttribute("tabindex", "0");
-    let ariaLabel = liveName + " \u2014 " + sd.label;
-    if (ws.model_alias || ws.model)
-      ariaLabel += ", model: " + (ws.model_alias || ws.model);
-    if (ws.title) ariaLabel += ", task: " + ws.title;
-    if (ws.tokens) ariaLabel += ", " + formatTokens(ws.tokens) + " tokens";
-    if (ws.context_ratio > 0)
-      ariaLabel += ", " + Math.round(ws.context_ratio * 100) + "% context";
-    row.dataset.baseAriaLabel = ariaLabel;
-    setPersistenceRowAria(row, ws.persistence_state);
+    // The label's parts ride on the row so a live update can rebuild it.
+    row.dataset.ariaName = liveName;
+    row.dataset.ariaModel = ws.model_alias || ws.model || "";
+    row.dataset.ariaTask = ws.title || "";
+    row.dataset.ariaTokens = String(ws.tokens || 0);
+    row.dataset.ariaCtx = String(ws.context_ratio || 0);
+    paintDashRowAria(row, sd, ws.persistence_state);
 
     const main = document.createElement("div");
     main.className = "dash-row-main";
@@ -2879,6 +2895,16 @@ function updateTabIndicator(wsId, state, extra) {
     label.dataset.state = state;
     label.textContent = sd.symbol + " " + sd.label;
   }
+  if (roster && roster.name) row.dataset.ariaName = roster.name;
+  if (extra && extra.tokens !== undefined)
+    row.dataset.ariaTokens = String(extra.tokens || 0);
+  if (extra && extra.context_ratio !== undefined)
+    row.dataset.ariaCtx = String(extra.context_ratio || 0);
+  paintDashRowAria(
+    row,
+    sd,
+    roster ? roster.persistence_state : extra && extra.persistence_state,
+  );
   if (!extra) return;
   if (extra.tokens !== undefined) {
     const tokEl = row.querySelector(".dash-cell-tokens");
@@ -2899,8 +2925,6 @@ function updateTabIndicator(wsId, state, extra) {
     const sub = row.querySelector(".dash-row-sub");
     if (sub) renderDashboardSubline(sub, roster || extra);
   }
-  if (extra.persistence_state !== undefined)
-    setPersistenceRowAria(row, (roster || extra).persistence_state);
 }
 
 // Synthesize the one-node clusterState shape the rail consumes

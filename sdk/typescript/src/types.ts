@@ -500,6 +500,7 @@ export interface WorkstreamCounts {
   thinking?: number;
   running?: number;
   attention?: number;
+  evaluation?: number;
   error?: number;
 }
 
@@ -527,6 +528,7 @@ export interface StateCounts {
   running?: number;
   thinking?: number;
   attention?: number;
+  evaluation?: number;
   idle?: number;
   error?: number;
 }
@@ -552,6 +554,7 @@ export interface ClusterNodeInfo {
   ws_running: number;
   ws_thinking: number;
   ws_attention: number;
+  ws_evaluation: number;
   ws_idle: number;
   ws_error: number;
   total_tokens: number;
