@@ -43,6 +43,11 @@ def _resolve_config_path() -> Path:
     return _DEFAULT_CONFIG_PATH
 
 
+def config_file_path() -> Path:
+    """Return the config.toml path this process reads (it need not exist)."""
+    return _resolve_config_path()
+
+
 def set_config_path(path: str) -> None:
     """Override the config file path.
 
