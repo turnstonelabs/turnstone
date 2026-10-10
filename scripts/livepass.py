@@ -28,7 +28,9 @@ Console harness (?open=): schedule-create · schedule-edit · model-create ·
   <shown|hidden>, the note being the "saving removes it" warning;
   &provider=<id> switches the provider first) · model-save (drives a Save
   click; document.title becomes PUT-OK-<n>-ws-<saved workspace> on success)
-  · policy · confirm · token
+  · policy · confirm · token · mcp-test (fills the MCP shelf for Streamable
+  HTTP and clicks Test connection; &result=fail answers with an HTTP 401;
+  stamps MCP-TEST-<ok|fail|none>-btn-<shown|hidden>)
   Plus &tall=1 (90-row users panel — the .admin-content scroll state; the
   synthetic rows wrap to two lines, so judge overflow geometry, not row
   cadence) · &scrolled=1 lands mid-list, &scrolled=bottom shows the 24px
@@ -505,6 +507,20 @@ CONSOLE_TEMPLATE = """<!doctype html>
               "-ws-" + (putCompat.anthropic_workspace_id || "none");
             return reply({ ok: true });
           }
+          if (url.indexOf("/mcp-servers/test") >= 0)
+            return reply(
+              new URLSearchParams(location.search).get("result") === "fail"
+                ? {
+                    ok: false, tools: [], resources: 0, prompts: 0,
+                    error: "HTTP 401 Unauthorized: the server requires authorization",
+                    kind: "http", status: 401,
+                  }
+                : {
+                    ok: true,
+                    tools: ["search_issues", "get_issue", "create_issue", "list_pull_requests"],
+                    resources: 2, prompts: 1, error: null, kind: null, status: null,
+                  },
+            );
           if (url.indexOf("/schedules/preview") >= 0)
             return reply({
               valid: true, error: "",
@@ -644,6 +660,7 @@ CONSOLE_TEMPLATE = """<!doctype html>
                 "Delete",
                 function () {},
               );
+            else if (open === "mcp-test") showCreateMcpModal();
             else if (open === "token")
               showTokenCreatedModal(
                 "tsk_9f2e41c7a8b35d60e1f4a2b89c7d3e5f6a1b0c9d8e7f6a5b4c3d2e1f0a9b8c7d",
@@ -657,6 +674,29 @@ CONSOLE_TEMPLATE = """<!doctype html>
             setTimeout(function () {
               document.getElementById("model-create-submit").click();
             }, 900);
+          // mcp-test switches the shelf to Streamable HTTP (firing change, so
+          // the button's visibility rule is driven, not assumed), fills it,
+          // clicks Test connection, and stamps what the result panel shows.
+          if (open === "mcp-test")
+            setTimeout(function () {
+              var transport = document.getElementById("mcp-transport");
+              transport.value = "streamable-http";
+              transport.dispatchEvent(new Event("change"));
+              document.getElementById("mcp-name").value = "issues";
+              document.getElementById("mcp-url").value = "https://mcp.example/mcp";
+              document.getElementById("mcp-headers").value =
+                "Authorization: Bearer example-token";
+              var btn = document.getElementById("mcp-test-btn");
+              btn.click();
+              setTimeout(function () {
+                var result = document.getElementById("mcp-test-result");
+                var shown = result && !result.hidden;
+                var ok = shown && result.textContent.indexOf("Connected") >= 0;
+                document.title =
+                  "MCP-TEST-" + (shown ? (ok ? "ok" : "fail") : "none") +
+                  "-btn-" + (btn.hidden ? "hidden" : "shown");
+              }, 300);
+            }, 400);
           // model-edit stamps the Anthropic workspace field's state after the
           // row populated; &provider=<id> first switches the provider select
           // (firing change) so the visibility rule is driven, not assumed.

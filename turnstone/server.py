@@ -65,6 +65,9 @@ from turnstone.core.mcp_utils import (
     public_server_status as _public_server_status,
 )
 from turnstone.core.mcp_utils import (
+    strip_server_status_for_admin as _strip_server_status_for_admin,
+)
+from turnstone.core.mcp_utils import (
     strip_server_status_for_read as _strip_server_status_for_read,
 )
 from turnstone.core.metrics import metrics as _metrics
@@ -4625,7 +4628,11 @@ def internal_mcp_status(request: Request) -> JSONResponse:
     in favour of ``has_error`` (see :func:`_strip_server_status_for_read`)
     because error strings can carry stdio binary paths or internal
     MCP URLs. Per-server error detail and ``command``/``url`` remain
-    on the approve-scoped ``mcp-refresh``/``mcp-reconnect`` endpoints.
+    on the approve-scoped ``mcp-refresh``/``mcp-reconnect`` endpoints,
+    and an approve-scoped caller holding admin.mcp gets the error text
+    here too (the admin MCP list). A read-scoped token does not, even
+    one its admin owner minted: a DB token carries its owner's
+    permissions whatever its scopes.
     """
     mcp_mgr = getattr(request.app.state, "mcp_client", None)
     if mcp_mgr is None:
@@ -4642,13 +4649,11 @@ def internal_mcp_status(request: Request) -> JSONResponse:
     auth_result = getattr(getattr(request, "state", None), "auth_result", None)
     is_admin = auth_result is not None and auth_result.has_permission("admin.mcp")
     all_status = mcp_mgr.get_all_server_status(_auth_user_id(request), aggregate=is_admin)
-    return JSONResponse(
-        {
-            "servers": {
-                name: _strip_server_status_for_read(status) for name, status in all_status.items()
-            }
-        }
+    approves = auth_result is not None and auth_result.has_scope("approve")
+    project = (
+        _strip_server_status_for_admin if is_admin and approves else _strip_server_status_for_read
     )
+    return JSONResponse({"servers": {name: project(status) for name, status in all_status.items()}})
 
 
 def internal_mcp_refresh_one(request: Request) -> JSONResponse:

@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import contextvars
 import functools
 import hashlib
 import json
@@ -10661,7 +10662,7 @@ async def admin_registry_install(request: Request) -> JSONResponse:
         name = custom_name or sanitize_registry_name(registry_name)
     except MCPRegistryError as exc:
         return JSONResponse({"error": f"{exc}; provide a custom 'name'"}, status_code=400)
-    if not name or not _MCP_NAME_RE.match(name) or "__" in name:
+    if not name or _mcp_name_error(name):
         return JSONResponse(
             {"error": f"Name '{name}' is invalid; provide a custom 'name'"},
             status_code=400,
@@ -10679,6 +10680,10 @@ async def admin_registry_install(request: Request) -> JSONResponse:
     merged_headers = config.get("headers", {})
     if isinstance(header_values, dict):
         merged_headers.update(header_values)
+    if config["transport"] == "streamable-http":
+        input_error = _mcp_url_error(config.get("url", "")) or _mcp_headers_error(merged_headers)
+        if input_error:
+            return JSONResponse({"error": input_error}, status_code=400)
 
     server_id = uuid.uuid4().hex
     audit_uid, ip = _audit_context(request)
@@ -10723,7 +10728,7 @@ async def admin_registry_install(request: Request) -> JSONResponse:
 # Admin: MCP Servers
 # ---------------------------------------------------------------------------
 
-_MCP_NAME_RE = re.compile(r"^[a-zA-Z0-9._-]+$")
+_MCP_NAME_RE = re.compile(r"[a-zA-Z0-9._-]+")
 _MCP_MAX_SERVERS = 200  # fallback; prefer cluster.mcp_max_servers from storage
 _MCP_AUTH_TYPES = frozenset({"none", "static", "oauth_user", "oauth_obo"})
 
@@ -10831,6 +10836,87 @@ def _parse_auth_type(body: dict[str, Any]) -> tuple[str | None, JSONResponse | N
             status_code=400,
         )
     return auth_type, None
+
+
+def _mcp_name_error(name: str) -> str | None:
+    """Why *name* cannot name an MCP server, or None when it can (presence is checked apart)."""
+    if not _MCP_NAME_RE.fullmatch(name):
+        return "name must match [a-zA-Z0-9._-]+"
+    if "__" in name:
+        return "name must not contain '__' (reserved delimiter)"
+    return None
+
+
+# urllib's errors that quote nothing of a URL before its host, where a password can sit. Its
+# others can (the netloc whole, or a port cut from a password with a "/" in it), so they are not
+# echoed.
+_SAFE_URL_ERRORS = (
+    "Invalid IPv6 URL",
+    "Port out of range 0-65535",
+    "IPvFuture address is invalid",
+    "An IPv4 address cannot be in brackets",
+)
+
+
+def _mcp_url_error(url: str) -> str | None:
+    """Why *url* cannot be a streamable-http MCP server's URL, or None when it can.
+
+    Every write of an MCP server (create, update, import, registry install) and the connection
+    test share it, so a test refuses the URLs a save refuses. It checks the URL's form only, with
+    no address screening.
+    """
+    try:
+        parsed = urllib.parse.urlparse(url)
+        hostname = parsed.hostname
+        parsed.port  # noqa: B018 - raises ValueError for a port out of range
+    except ValueError as exc:
+        reason = str(exc)
+        # The address check quotes only the bracketed host.
+        if reason in _SAFE_URL_ERRORS or reason.endswith(
+            "does not appear to be an IPv4 or IPv6 address"
+        ):
+            return f"url: {reason}"
+        return "url has an invalid host or port"
+    if parsed.scheme not in ("http", "https") or not hostname:
+        return "url must be an http:// or https:// URL with a host"
+    return None
+
+
+_HTTP_TOKEN_RE = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+")
+# Printable ASCII with spaces and tabs inside, never at either end.
+_HTTP_HEADER_VALUE_RE = re.compile(r"(?:[!-~](?:[ \x09!-~]*[!-~])?)?")
+
+
+def _mcp_headers_error(headers: dict[Any, Any]) -> str | None:
+    """Why *headers* cannot go out on an MCP server's requests, or None when they can.
+
+    Names must be HTTP tokens and values printable ASCII with no space or tab at either end:
+    httpx refuses to send anything else, so the server could never connect, and its error would
+    quote the value. Shared like :func:`_mcp_url_error`. The message names a valid header, never
+    its value, and never an invalid name, which can be a pasted ``Name: value`` line.
+    """
+    for name, value in headers.items():
+        if not isinstance(name, str) or not _HTTP_TOKEN_RE.fullmatch(name):
+            return "headers: a header name is not a valid HTTP header name"
+        if not isinstance(value, str):
+            return f"headers: the value of '{name}' must be a string"
+        if not _HTTP_HEADER_VALUE_RE.fullmatch(value):
+            return (
+                f"headers: the value of '{name}' has a space at either end, a control character, "
+                "or a character outside ASCII"
+            )
+    return None
+
+
+def _json_object(raw: Any) -> dict[str, Any]:
+    """A stored JSON column (``headers``, ``env``) as a dict, or an empty one."""
+    if isinstance(raw, dict):
+        return raw
+    try:
+        value = json.loads(raw or "{}")
+    except (TypeError, ValueError):
+        return {}
+    return value if isinstance(value, dict) else {}
 
 
 def _enforce_oauth_user_https(auth_type: str, url: str | None) -> JSONResponse | None:
@@ -11259,9 +11345,10 @@ async def _collect_mcp_status(
     Returns {node_id: {server_name: status}}.  The console's manager
     reports under the collector's console pseudo-node id (#725): the
     admin MCP view must show the surface coordinators actually dispatch
-    through.  Its rows carry the same read-scope projection node rows
-    get (``has_error``, no command/url/verbose error); on failure the
-    console key is omitted, matching ``_fetch``'s None contract.
+    through.  Its rows carry the same admin projection node rows give
+    the forwarded admin.mcp caller (``has_error`` and the ``error`` text,
+    no command/url); on failure the console key is omitted, matching
+    ``_fetch``'s None contract.
     """
     collector: ClusterCollector = request.app.state.collector
     nodes = collector.get_all_nodes()
@@ -11295,15 +11382,15 @@ async def _collect_mcp_status(
         mgr = getattr(request.app.state, "mcp_client", None)
         if mgr is None:
             return console_id, None
-        from turnstone.core.mcp_utils import strip_server_status_for_read
+        from turnstone.core.mcp_utils import strip_server_status_for_admin
 
         # Mirrors internal_mcp_status's admin path: cross-user aggregate
-        # view scoped to the requesting admin.
+        # view scoped to the requesting admin, with the error text.
         uid = _auth_user_id(request)
 
         def _status() -> dict[str, dict[str, Any]]:
             all_status = mgr.get_all_server_status(uid, aggregate=True)
-            return {n: strip_server_status_for_read(s) for n, s in all_status.items()}
+            return {n: strip_server_status_for_admin(s) for n, s in all_status.items()}
 
         try:
             return console_id, await asyncio.to_thread(_status)
@@ -11446,16 +11533,9 @@ async def admin_create_mcp_server(request: Request) -> JSONResponse:
     transport = str(body.get("transport", "")).strip()
     if not name:
         return JSONResponse({"error": "name is required"}, status_code=400)
-    if not _MCP_NAME_RE.match(name):
-        return JSONResponse(
-            {"error": "name must match [a-zA-Z0-9._-]+"},
-            status_code=400,
-        )
-    if "__" in name:
-        return JSONResponse(
-            {"error": "name must not contain '__' (reserved delimiter)"},
-            status_code=400,
-        )
+    name_error = _mcp_name_error(name)
+    if name_error:
+        return JSONResponse({"error": name_error}, status_code=400)
     if transport not in ("stdio", "streamable-http"):
         return JSONResponse(
             {"error": "transport must be 'stdio' or 'streamable-http'"},
@@ -11467,6 +11547,13 @@ async def admin_create_mcp_server(request: Request) -> JSONResponse:
         return JSONResponse(
             {"error": "url is required for streamable-http transport"}, status_code=400
         )
+    if transport == "streamable-http":
+        raw_headers = body.get("headers")
+        input_error = _mcp_url_error(str(body.get("url", "")).strip()) or (
+            _mcp_headers_error(raw_headers) if isinstance(raw_headers, dict) else None
+        )
+        if input_error:
+            return JSONResponse({"error": input_error}, status_code=400)
 
     auth_type_value, err_resp = _parse_auth_type(body)
     if err_resp is not None:
@@ -11659,16 +11746,9 @@ async def admin_update_mcp_server(request: Request) -> JSONResponse:
         name = str(body["name"]).strip()[:64]
         if not name:
             return JSONResponse({"error": "name cannot be empty"}, status_code=400)
-        if not _MCP_NAME_RE.match(name):
-            return JSONResponse(
-                {"error": "name must match [a-zA-Z0-9._-]+"},
-                status_code=400,
-            )
-        if "__" in name:
-            return JSONResponse(
-                {"error": "name must not contain '__'"},
-                status_code=400,
-            )
+        name_error = _mcp_name_error(name)
+        if name_error:
+            return JSONResponse({"error": name_error}, status_code=400)
         if name != existing["name"] and storage.get_mcp_server_by_name(name):
             return JSONResponse(
                 {"error": f"Server '{name}' already exists"},
@@ -11717,6 +11797,22 @@ async def admin_update_mcp_server(request: Request) -> JSONResponse:
     ):
         if _oauth_url_key in body:
             updates[_oauth_url_key] = _clean_oauth_text(body[_oauth_url_key], max_length=2048)
+    # A streamable-http row's URL and headers are checked where this request changes them, and
+    # the URL also when the row moves onto streamable-http. The admin form re-sends every field,
+    # so checking an unchanged value would make a row stored before the check uneditable.
+    transport_after = updates.get("transport", existing.get("transport"))
+    if transport_after == "streamable-http":
+        url_after = str(updates.get("url", existing.get("url")) or "")
+        moved = transport_after != existing.get("transport")
+        input_error = None
+        if moved or url_after != (existing.get("url") or ""):
+            input_error = _mcp_url_error(url_after)
+        if not input_error and isinstance(body.get("headers"), dict):
+            stored = _json_object(existing.get("headers"))
+            changed = {k: v for k, v in body["headers"].items() if stored.get(k) != v}
+            input_error = _mcp_headers_error(changed)
+        if input_error:
+            return JSONResponse({"error": input_error}, status_code=400)
 
     old_auth = existing.get("auth_type")
     new_auth = updates.get("auth_type")
@@ -12365,6 +12461,142 @@ async def _notify_nodes_mcp_reconnect_one(request: Request, name: str) -> dict[s
     return await _notify_nodes_mcp_action(request, "reconnect", name)
 
 
+# Headroom over the longest a connection test blocks (``probe_http_server_max_s``), so a test
+# that ends in time reports its own outcome rather than this wait's.
+_MCP_TEST_WAIT_HEADROOM_S = 15.0
+# Connection tests running at once. Each runs on a thread of its own, never one the console's other
+# work shares; a test past its wait keeps its slot until it ends.
+_MCP_TEST_SLOTS = threading.BoundedSemaphore(2)
+
+
+def _mcp_test_input_error(url: str, headers: Any) -> str | None:
+    """Why a connection test cannot run with *url* and *headers*, or None when it can."""
+    url_error = _mcp_url_error(url)
+    if url_error:
+        return url_error
+    if not isinstance(headers, dict):
+        return "headers must be an object"
+    return _mcp_headers_error(headers)
+
+
+async def admin_test_mcp_server(request: Request) -> JSONResponse:
+    """POST /v1/api/admin/mcp-servers/test — test a server's connection without saving it.
+
+    Connects once from the console, with the form's unsaved values, the way a save's connect
+    would, and reports the server's tool names and its resource and prompt counts, or why the
+    connect failed. Nothing is stored and no catalog is published; the test itself is audited.
+    Streamable HTTP servers with auth ``none`` or ``static`` only. The name, URL and headers get
+    the checks a save gives them (:func:`_mcp_name_error`, :func:`_mcp_url_error`,
+    :func:`_mcp_headers_error`), which judge their form alone. There is no address screening:
+    the admin.mcp gate is the control here, as it is on the save that makes the console and every
+    node connect to the URL.
+    """
+    from turnstone.core.audit import record_audit
+    from turnstone.core.auth import require_permission
+    from turnstone.core.mcp_client import (
+        ConnectFailure,
+        ConnectionProbe,
+        probe_http_server,
+        probe_http_server_max_s,
+    )
+    from turnstone.core.web_helpers import read_json_or_400, require_storage_or_503
+
+    storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    err = require_permission(request, "admin.mcp")
+    if err:
+        return err
+    body = await read_json_or_400(request)
+    if isinstance(body, JSONResponse):
+        return body
+
+    transport = str(body.get("transport", "streamable-http")).strip()
+    if transport != "streamable-http":
+        return JSONResponse(
+            {"error": "Only streamable-http servers can be tested"}, status_code=400
+        )
+    auth_type, err_resp = _parse_auth_type(body)
+    if err_resp is not None:
+        return err_resp
+    if auth_type not in (None, "none", "static"):
+        return JSONResponse(
+            {"error": "Servers with auth_type 'oauth_user' or 'oauth_obo' cannot be tested"},
+            status_code=400,
+        )
+    url = str(body.get("url", "")).strip()
+    headers = body.get("headers") or {}
+    name = str(body.get("name", "")).strip()[:64]
+    input_error = _mcp_test_input_error(url, headers) or (_mcp_name_error(name) if name else None)
+    if input_error:
+        return JSONResponse({"error": input_error}, status_code=400)
+
+    if not _MCP_TEST_SLOTS.acquire(blocking=False):
+        return JSONResponse(
+            {"error": "Other connection tests are still running; try again shortly"},
+            status_code=429,
+        )
+    loop = asyncio.get_running_loop()
+    finished: asyncio.Future[ConnectionProbe] = loop.create_future()
+    context = contextvars.copy_context()  # the request's log fields, as asyncio.to_thread copies
+
+    def _deliver(outcome: ConnectionProbe | BaseException) -> None:
+        if finished.done():  # the wait ran out first
+            return
+        if isinstance(outcome, BaseException):
+            finished.set_exception(outcome)
+        else:
+            finished.set_result(outcome)
+
+    def _test() -> None:
+        outcome: ConnectionProbe | BaseException
+        try:
+            outcome = context.run(probe_http_server, url, headers, name=name)
+        except BaseException as exc:
+            outcome = exc
+        finally:
+            _MCP_TEST_SLOTS.release()
+        with contextlib.suppress(RuntimeError):  # the console's loop closed meanwhile
+            loop.call_soon_threadsafe(_deliver, outcome)
+
+    try:
+        threading.Thread(target=_test, name="mcp-connection-test", daemon=True).start()
+    except BaseException:
+        _MCP_TEST_SLOTS.release()
+        raise
+    try:
+        async with asyncio.timeout(probe_http_server_max_s() + _MCP_TEST_WAIT_HEADROOM_S):
+            probe = await finished
+    except TimeoutError:
+        message = "The connection test did not finish in time"
+        probe = ConnectionProbe(failure=ConnectFailure("timeout", message))
+    failure = probe.failure
+    # The test sent a request on the admin's behalf: audit where and how it ended, never the
+    # headers or the full URL (its path or query can carry a credential).
+    parsed = urllib.parse.urlparse(url)
+    audit_detail: dict[str, Any] = {
+        "scheme": parsed.scheme,
+        "host": parsed.hostname or "",
+        "port": parsed.port or (443 if parsed.scheme == "https" else 80),
+        "outcome": failure.kind if failure else "ok",
+    }
+    if failure is not None and failure.status is not None:
+        audit_detail["status"] = failure.status
+    audit_uid, ip = _audit_context(request)
+    record_audit(storage, audit_uid, "mcp_server.test", "mcp_server", name, audit_detail, ip)
+    return JSONResponse(
+        {
+            "ok": failure is None,
+            "tools": probe.tools,
+            "resources": probe.resources,
+            "prompts": probe.prompts,
+            "error": failure.message if failure else None,
+            "kind": failure.kind if failure else None,
+            "status": failure.status if failure else None,
+        }
+    )
+
+
 async def admin_mcp_reload(request: Request) -> JSONResponse:
     """POST /v1/api/admin/mcp-servers/reload — tell nodes to re-read DB."""
     from turnstone.core.auth import require_permission
@@ -12573,7 +12805,7 @@ async def admin_import_mcp_config(request: Request) -> JSONResponse:
 
     for srv_name, cfg in servers.items():
         srv_name = str(srv_name).strip()[:64]
-        if not srv_name or not _MCP_NAME_RE.match(srv_name) or "__" in srv_name:
+        if not srv_name or _mcp_name_error(srv_name):
             errors.append(f"{srv_name}: invalid server name")
             continue
         if storage.get_mcp_server_by_name(srv_name):
@@ -12600,6 +12832,12 @@ async def admin_import_mcp_config(request: Request) -> JSONResponse:
         if not isinstance(raw_env, dict):
             errors.append(f"{srv_name}: env must be an object")
             continue
+        url = str(cfg.get("url", "")).strip()
+        if transport == "streamable-http":
+            input_error = _mcp_url_error(url) or _mcp_headers_error(raw_headers)
+            if input_error:
+                errors.append(f"{srv_name}: {input_error}")
+                continue
 
         server_id = uuid.uuid4().hex
         try:
@@ -12609,7 +12847,7 @@ async def admin_import_mcp_config(request: Request) -> JSONResponse:
                 transport=transport,
                 command=str(cfg.get("command", "")),
                 args=json.dumps(raw_args),
-                url=str(cfg.get("url", "")),
+                url=url,
                 headers=json.dumps(raw_headers),
                 env=json.dumps(raw_env),
                 auto_approve=False,
@@ -17073,6 +17311,11 @@ def create_app(
                     Route(
                         "/api/admin/mcp-servers/reload",
                         admin_mcp_reload,
+                        methods=["POST"],
+                    ),
+                    Route(
+                        "/api/admin/mcp-servers/test",
+                        admin_test_mcp_server,
                         methods=["POST"],
                     ),
                     Route(

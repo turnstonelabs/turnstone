@@ -9,7 +9,14 @@ logging) stays with the callers.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
+
+# Why a connection to an MCP server failed, sorted by what to check
+# (:class:`turnstone.core.mcp_client.ConnectFailure`). The connection test's API returns it, so
+# its schema and the SDKs' types follow this one list.
+ConnectFailureKind = Literal[
+    "unreachable", "tls", "http", "timeout", "not_mcp", "protocol", "invalid_catalog", "error"
+]
 
 _SERVER_STATUS_PUBLIC_KEYS: tuple[str, ...] = (
     "connected",
@@ -54,6 +61,18 @@ def strip_server_status_for_read(full: dict[str, Any]) -> dict[str, Any]:
     out = {k: full[k] for k in _READ_STATUS_PUBLIC_KEYS if k in full}
     out["has_error"] = bool(full.get("error"))
     return out
+
+
+def strip_server_status_for_admin(full: dict[str, Any]) -> dict[str, Any]:
+    """Project a status dict for a status read by an approve-scoped caller holding ``admin.mcp``.
+
+    The approve projection (:func:`strip_server_status`, verbose ``error`` text included) plus the
+    read projection's ``has_error``. The read projection drops that text because it can name a
+    stdio binary or an internal MCP URL. The approve-scoped refresh and reconnect endpoints
+    already return it for every server, config-file servers included, so it discloses nothing new
+    to such a caller, and it is how the admin MCP list says why a server is not connected.
+    """
+    return {**strip_server_status(full), "has_error": bool(full.get("error"))}
 
 
 def public_server_status(mcp_mgr: Any, name: str) -> dict[str, Any]:

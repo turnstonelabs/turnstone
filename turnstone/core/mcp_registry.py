@@ -20,9 +20,6 @@ _SEARCH_PATH = "/v0.1/servers"
 _REQUEST_TIMEOUT = 15.0
 _MAX_LIMIT = 100
 
-# Valid MCP server name pattern (must match _MCP_NAME_RE in console/server.py)
-_MCP_NAME_RE = re.compile(r"^[a-zA-Z0-9._-]+$")
-
 
 class MCPRegistryError(Exception):
     """Error communicating with or parsing responses from the MCP Registry."""
@@ -488,8 +485,6 @@ def sanitize_registry_name(name: str) -> str:
 
     if not sanitized:
         raise MCPRegistryError(f"Cannot derive a valid server name from '{name}'")
-    if not _MCP_NAME_RE.match(sanitized):
-        raise MCPRegistryError(f"Sanitized name '{sanitized}' is invalid")
     if "__" in sanitized:
         raise MCPRegistryError(f"Sanitized name '{sanitized}' contains reserved '__'")
 

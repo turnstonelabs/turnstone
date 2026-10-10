@@ -1005,9 +1005,31 @@ clear the circuit breaker and run a fresh handshake. Transport stream
 references are pre-closed before stack teardown to work around the MCP SDK's
 anyio cancel-scope CPU busy-loop (SDK #2147).
 
-**Error isolation:** Per-server connection/refresh failures are caught and logged; other
-servers are unaffected. Tool execution errors return error strings to the LLM
-rather than crashing the session.
+**Error isolation:** Per-server connection/refresh failures are caught and logged; other servers
+are unaffected. Tool execution errors return error strings to the LLM rather than crashing the
+session. `classify_connect_failure` words a failed connect for the server's status and logs: it
+digs the failure out of the SDK's task groups, puts a cause ahead of the teardown's side effects
+(a closed stream, a closed connection), and names the HTTP status recorded off the wire (so the
+wording does not depend on how the SDK reports it, and a status that ended the transport under a
+later request or notification still shows), the TLS failure, the timeout or the invalid catalog
+entry. It tells a dropped session from a URL with no MCP endpoint, and never quotes a header
+httpx refused to send. Every connect's HTTP client fails an initialize answered with something
+other than an MCP message (a web page, a proxy's sign-in page, a REST API's JSON) at once,
+saying what came back (for a JSON-RPC error the SDK cannot read, the server's own error), where
+the SDK would wait out the connect timeout; both checks also see a request redirected within its
+origin. A server whose connect fails when a reload adds it stays registered with that error; the
+health loop retries it as it does a server that failed at startup. With the health check turned
+off, every reload starts a retry of the DB's servers that are not connected, without waiting for
+it; removing or editing such a server cancels its retry first.
+
+**Connection test:** `probe_http_server` (behind `POST /v1/api/admin/mcp-servers/test`) connects
+once to a Streamable HTTP server with unsaved values, the way a static connect would: the same
+TCP pre-flight, HTTP client, connect timeout and catalog discovery, run on a thread and event
+loop of its own so an SDK fault cannot reach the console's loop, two at a time. A wall-clock
+bound on that loop ends a test that a server holds past the connect timeout, such as by
+trickling its answer to the request that ends the session. It records and publishes nothing. The
+console checks a test's name, URL and headers as it checks a saved server's, at every write
+(create, update, import, registry install).
 
 **Registry discovery:** The console admin panel provides a registry discovery
 surface backed by the official MCP Registry (registry.modelcontextprotocol.io).

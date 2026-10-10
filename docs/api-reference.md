@@ -2577,12 +2577,82 @@ the `admin.settings` permission.
 | GET | `/v1/api/admin/mcp-servers/{server_id}` | Get a single MCP server with per-node connection status. |
 | PUT | `/v1/api/admin/mcp-servers/{server_id}` | Update an MCP server definition. Partial updates supported. |
 | DELETE | `/v1/api/admin/mcp-servers/{server_id}` | Delete an MCP server definition. |
-| POST | `/v1/api/admin/mcp-servers/reload` | Tell all cluster nodes to re-read the `mcp_servers` DB table and reconcile (add new, remove stale, reconnect changed). |
+| POST | `/v1/api/admin/mcp-servers/reload` | Tell all cluster nodes to re-read the `mcp_servers` DB table and reconcile (add new, remove stale, reconnect changed; with the static health check off, also retry the ones not connected). |
 | POST | `/v1/api/admin/mcp-servers/import` | Import servers from a pasted JSON config. Body: `{config: {mcpServers: {...}}}`. Skips existing names. |
+| POST | `/v1/api/admin/mcp-servers/test` | Test a Streamable HTTP server's connection with unsaved values, saving nothing. See [Test connection](#test-connection). |
 
 Permission: `admin.mcp`
 
 Secrets (`env`, `headers` fields) are masked with `***` by default. Use `?reveal=true` on GET endpoints to see actual values.
+
+Create and update answer `400` when a Streamable HTTP server's `url` is not an `http://` or
+`https://` URL with a host, or does not parse (for example a malformed bracketed IPv6 host or a
+port out of range), or when a header name is not an HTTP token or a header value is not printable
+ASCII with no space at either end: no request could carry them. An update checks the URL only when
+it changes it or switches the transport to `streamable-http`, and only the header values it
+changes, so a row saved before these checks stays editable. Import reports such a server among its
+`errors` and imports the rest; a registry install answers `400`. When the URL's parse error would
+quote any of it before the host, where a password can sit, the error reads
+`url has an invalid host or port` instead.
+
+Each server's `status` maps a node id (and `console`, for the console's own connection) to that
+connection's state. `has_error` is true while the last connect failed, and `error` says why.
+
+#### Test connection
+
+`POST /v1/api/admin/mcp-servers/test`
+
+Connects once to a Streamable HTTP server with auth `none` or `static`, the way a saved server's
+connect would, and lists its tools, resources and prompts. Nothing is saved and no catalog is
+published. The console runs the test from its own network position; nodes connect from theirs.
+Each test writes an `mcp_server.test` audit event with the scheme, host, port and outcome,
+never the headers or the rest of the URL.
+
+```json
+{
+  "name": "issues",
+  "url": "https://mcp.example/mcp",
+  "auth_type": "static",
+  "headers": {"Authorization": "Bearer ..."}
+}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `url` | string | yes | `http://` or `https://` URL with a host, checked as a save checks it. |
+| `headers` | object | no | Header names to values, checked as a save checks them. |
+| `auth_type` | string | no (default `"static"`) | `"none"` or `"static"`. |
+| `transport` | string | no (default `"streamable-http"`) | Only `"streamable-http"` can be tested. |
+| `name` | string | no | Labels the server in error messages, and must be a valid server name; the URL's host stands in when empty. |
+
+**Response:** `200` whether or not the server connected.
+
+```json
+{
+  "ok": false,
+  "tools": [],
+  "resources": 0,
+  "prompts": 0,
+  "error": "HTTP 401 Unauthorized: the server requires authorization",
+  "kind": "http",
+  "status": 401
+}
+```
+
+On success `ok` is true, `tools` holds the tool names, and `error`, `kind` and `status` are null.
+`kind` says what to check: `unreachable` (host or port), `tls` (certificate or scheme), `http`
+(URL path, credentials or the server's sessions, with the HTTP `status`), `timeout` (no answer
+within the connect timeout), `not_mcp` (the URL answers with something else, such as a web page
+or a REST API's JSON),
+`protocol` (the server answered with an MCP error), `invalid_catalog` (a tool, resource or prompt
+fails validation) or `error` (anything else).
+
+The request can take up to about a minute (the connect timeout, the session's teardown and a
+margin), so a client's timeout should be longer; a test still running then comes back with
+`kind` `timeout`.
+
+**Errors:** `400` (stdio transport, OAuth auth type, invalid name, URL or headers), `403` (no
+`admin.mcp`), `429` (two tests are already running; the console runs at most two at once).
 
 ---
 

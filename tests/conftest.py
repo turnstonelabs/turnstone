@@ -70,6 +70,39 @@ def serve_until_exit(server: Any) -> None:
         loop.close()
 
 
+@contextlib.contextmanager
+def serve_asgi(app: Any, **config: Any) -> Iterator[int]:
+    """Serve *app* with uvicorn on a thread, at a free localhost port, for the ``with`` block.
+
+    Yields the port once it accepts TCP connections. *config* goes to ``uvicorn.Config`` (for
+    example ``ssl_certfile`` and ``ssl_keyfile``). On exit the server stops at once and its thread
+    is joined.
+    """
+    import uvicorn
+
+    port = _free_port()
+    server = uvicorn.Server(
+        uvicorn.Config(
+            app,
+            host="127.0.0.1",
+            port=port,
+            log_level="critical",
+            access_log=False,
+            timeout_graceful_shutdown=0,
+            **config,
+        )
+    )
+    thread = threading.Thread(target=serve_until_exit, args=(server,), daemon=True)
+    thread.start()
+    try:
+        assert _wait_tcp_ready(port, 5), "test server did not start"
+        yield port
+    finally:
+        server.should_exit = True
+        server.force_exit = True
+        thread.join(timeout=5)
+
+
 class _PendingResolver:
     """Race-free drop-in for ``threading.Timer(delay, ui.resolve_approval)``.
 

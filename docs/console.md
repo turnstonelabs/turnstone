@@ -567,7 +567,29 @@ The tab has two views toggled via a pill control: **Servers** and
 - **Servers view** -- lists all installed MCP servers with source badges
   (CONFIG, MANUAL, REGISTRY), transport badges, tool/resource/prompt
   counts, per-node connection status, and CRUD actions for DB-managed
-  servers
+  servers. A server that fails to connect shows **error**, and its row
+  details give the reason on each node (the console's own connection for
+  coordinator sessions included). A saved server whose connect fails stays
+  in the list and is retried until it connects, as at startup: by the
+  health check, or, with the health check turned off, by every reload,
+  including the one each save starts. Disable or delete it to stop the
+  retries. Saving refuses a Streamable HTTP URL that cannot be parsed and
+  a header that no request could carry (a stray space at either end of a
+  value, a character outside ASCII), whether the server comes from the
+  form, an import or the registry
+- **Test connection** -- the add and edit forms test a Streamable HTTP
+  server with no authorization or static headers before you save it. The
+  console connects once with the form's values, the way a save would, and
+  shows the server's tools and its resource and prompt counts, or why the
+  connection failed: the HTTP status, a TLS failure, a timeout, a URL that
+  serves a web page or other non-MCP content, or the catalog entry that
+  fails validation. Nothing is saved. The test runs from the console's
+  network position; nodes connect from their own, so a host that only
+  nodes can reach fails the test but works once saved. OAuth servers need
+  a sign-in first and stdio servers run on each node, so neither can be
+  tested. The console runs two tests at a time and turns away a third
+  until one ends. Each test is audited (`mcp_server.test`, with the
+  scheme, host, port and outcome)
 - **Registry view** -- search the official MCP Registry to discover and
   install servers. Results show server name, description, version, source
   type badges (remote/npm/pypi), and Install/Installed/Update buttons.

@@ -12,6 +12,7 @@ from pydantic import BaseModel, Field, field_validator
 from pydantic.json_schema import SkipJsonSchema  # noqa: TC002
 
 from turnstone.api.server_schemas import CreateWorkstreamRequest, CreateWorkstreamResponse
+from turnstone.core.mcp_utils import ConnectFailureKind  # noqa: TC001
 from turnstone.core.model_registry import MAX_MODEL_CONCURRENCY
 from turnstone.core.skill_kind import SkillKind
 from turnstone.core.skill_parser import MAX_SKILL_DESCRIPTION_LEN
@@ -810,6 +811,7 @@ class McpServerStatus(BaseModel):
     resources: int = 0
     prompts: int = 0
     error: str = ""
+    has_error: bool = False
     transport: str = ""
     command: str = ""
     url: str = ""
@@ -878,6 +880,28 @@ class ImportMcpConfigResponse(BaseModel):
 class McpReloadResponse(BaseModel):
     status: str = "ok"
     results: dict[str, Any] = Field(default_factory=dict)
+
+
+class McpConnectionTestRequest(BaseModel):
+    # Unsaved values. Only Streamable HTTP servers with auth "none" or "static" can be tested.
+    url: str
+    headers: dict[str, str] = Field(default_factory=dict)
+    auth_type: str = "static"
+    transport: str = "streamable-http"
+    # Labels the server in error messages; the URL's host stands in when empty.
+    name: str = ""
+
+
+class McpConnectionTestResponse(BaseModel):
+    ok: bool = False
+    # The server's tool names, and how many resources and prompts it lists.
+    tools: list[str] = Field(default_factory=list)
+    resources: int = 0
+    prompts: int = 0
+    error: str | None = None
+    kind: ConnectFailureKind | None = None
+    # The HTTP status the server answered with, for kind "http".
+    status: int | None = None
 
 
 # ---------------------------------------------------------------------------

@@ -291,7 +291,8 @@ class TestCarrierLifecycle:
         client = factory()
         try:
             hooks = client.event_hooks["response"]
-            assert len(hooks) == 1
+            # The capture, then the initialize check, which raises and never records.
+            assert [h.__name__ for h in hooks] == ["_hook", "_reject_non_mcp"]
             hook = hooks[0]
 
             req = httpx.Request("POST", "https://mcp.example.com/")

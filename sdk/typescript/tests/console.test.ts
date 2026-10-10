@@ -66,6 +66,39 @@ describe("TurnstoneConsole", () => {
     expect(health.budget_chars).toBe(65536);
   });
 
+  it("tests an MCP server's connection with unsaved values", async () => {
+    const fetchFn = mockFetch({
+      ok: false,
+      tools: [],
+      resources: 0,
+      prompts: 0,
+      error: "HTTP 404 Not Found: no MCP endpoint at this URL",
+      kind: "http",
+      status: 404,
+    });
+    const client = new TurnstoneConsole({
+      baseUrl: "http://test",
+      fetch: fetchFn,
+    });
+
+    const result = await client.testMcpServer({
+      url: "https://mcp.example/mcp",
+      auth_type: "static",
+      headers: { Authorization: "Bearer abc" },
+    });
+
+    const [url, init] = (fetchFn as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(url).toBe("http://test/v1/api/admin/mcp-servers/test");
+    expect(init.method).toBe("POST");
+    expect(JSON.parse(init.body)).toEqual({
+      url: "https://mcp.example/mcp",
+      auth_type: "static",
+      headers: { Authorization: "Bearer abc" },
+    });
+    expect(result.kind).toBe("http");
+    expect(result.status).toBe(404);
+  });
+
   it("overview returns parsed response", async () => {
     const fetchFn = mockFetch({
       nodes: 2,

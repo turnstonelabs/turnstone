@@ -37,6 +37,8 @@ import type {
   ListSkillResourcesResponse,
   ListSkillsResponse,
   MemoryIndexHealthResponse,
+  McpConnectionTestRequest,
+  McpConnectionTestResponse,
   McpServerDetail,
   RegistryInstallRequest,
   RegistrySearchResponse,
@@ -577,6 +579,15 @@ export class TurnstoneConsole extends BaseClient {
   ): Promise<ImportMcpConfigResponse> {
     return this.request("POST", "/v1/api/admin/mcp-servers/import", {
       json: { config },
+    });
+  }
+
+  /** Test a server's connection from the console with unsaved values; nothing is saved. */
+  async testMcpServer(
+    body: McpConnectionTestRequest,
+  ): Promise<McpConnectionTestResponse> {
+    return this.request("POST", "/v1/api/admin/mcp-servers/test", {
+      json: body,
     });
   }
 
