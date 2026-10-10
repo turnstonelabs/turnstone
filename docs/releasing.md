@@ -67,7 +67,10 @@ package:
 updates `pyproject.toml`, `turnstone/__init__.py` and the Helm chart's
 `appVersion`, regenerates `uv.lock`, commits, and creates the `vX.Y.Z` tag. With
 `--push`, it pushes the branch and tag atomically so CI never observes only half
-of a release.
+of a release. Use `--push` only for pre-releases. A stable release points its
+branch's chart at its own image, which exists only after the tag's CI passes and
+the Docker publish finishes, so push a stable release's tag first and its branch
+once both publish runs succeed.
 
 The chart's `appVersion` is its default image tag. A stable release sets it to
 that release on its own branch (`main` or `stable/X.Y`). A pre-release sets
@@ -75,8 +78,8 @@ that release on its own branch (`main` or `stable/X.Y`). A pre-release sets
 `dev`, the default branch, never selects a pre-release image; fetch tags before
 cutting one. The helper refuses to move `appVersion` backwards, which catches a
 clone that is missing the newest stable tag. `dev`'s default can trail `main`'s
-newest patch until the next pre-release or forward merge. Pin `image.tag` to
-deploy anything else.
+newest patch until the next pre-release, forward merge, or `dev` chart update
+(see the stable patch steps below). Pin `image.tag` to deploy anything else.
 
 When a release changes `appVersion`, it also bumps the chart's patch `version`,
 because a deployment that follows the chart from Git may rebuild it only when
@@ -103,19 +106,40 @@ scripts/release.sh 1.9.0rc1 --push
 ```bash
 git switch main
 git pull --ff-only origin main
-scripts/release.sh 1.8.1 --push
+scripts/release.sh 1.8.1
+git push origin v1.8.1
 ```
 
-After publication, forward-merge the release commit from `main` into `dev`,
-retaining the development version in the release metadata files and taking
-`main`'s newer chart `appVersion`.
+The tag's CI starts the PyPI and Docker publish workflows. Push `main` only
+after both succeed: the release commit moves the chart's default image to
+`1.8.1`, and until that image is published, an install or upgrade that follows
+`main`'s chart cannot pull it. If the tag's CI fails, rerun its failed jobs
+rather than pushing `main`.
+
+```bash
+git push origin main
+```
+
+Then bring the new default image to `dev`. While stable fixes land on `main`,
+forward-merge the release commit from `main` into `dev`, retaining the
+development version in the release metadata files and taking `main`'s newer
+chart `appVersion`. While fixes land on `dev` and reach `main` as backports,
+nothing merges `main` into `dev`, so open a `dev` pull request that sets the
+chart's `appVersion` to the release and bumps its patch `version` instead.
 
 ### Prior stable patch
 
 ```bash
 git switch stable/1.8
 git pull --ff-only origin stable/1.8
-scripts/release.sh 1.8.2 --push
+scripts/release.sh 1.8.2
+git push origin v1.8.2
+```
+
+Push the branch once both publish runs succeed, for the same reason:
+
+```bash
+git push origin stable/1.8
 ```
 
 Then merge `stable/1.8` into `main` and `main` into `dev`, retaining each
@@ -131,7 +155,11 @@ For a 1.8 to 1.9 promotion:
 3. Create `stable/1.8` from the current `main` tip. It becomes the prior-line
    maintenance branch only when `main` advances.
 4. Merge `dev` into `main` with ancestry preserved.
-5. From `main`, run `scripts/release.sh 1.9.0 --push`.
+5. From `main`, run `scripts/release.sh 1.9.0`, push the `v1.9.0` tag, and push
+   `main` once both publish runs succeed. The publish workflows compare `main`'s
+   minor version with the tag's to decide whether 1.9.0 is marked the latest
+   release and moves the `stable` and `latest` image tags, so step 4 must leave
+   `main` on `dev`'s 1.9 version.
 6. Fast-forward `dev` to the 1.9.0 release commit, then begin the next
    pre-release cycle there.
 
