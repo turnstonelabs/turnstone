@@ -349,6 +349,12 @@ frozen.
 
 ### Fixed
 
+- **An open dialog no longer covers the sign-in screen (#1332).** A dialog left open when a session
+  expired or someone signed out, here or in another tab, stayed on top of the sign-in screen,
+  readable, and the sign-in form took no input until it was dismissed. Showing the sign-in screen
+  now closes any open dialog, as dismissing it would, so a newly created token still on screen goes
+  with it. Shelves stay open behind the sign-in screen, and Escape pressed in its form no longer
+  closes one.
 - **Typing in the sign-in form, dialogs and shelves no longer lags.** The sign-in screen, the
   backdrop behind a modal dialog, the scrim behind a pane's shelf and the keyboard-shortcuts overlay
   blurred what lay behind them, and the browser redraws that blur over the whole area on every frame

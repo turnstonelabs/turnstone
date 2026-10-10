@@ -3343,6 +3343,8 @@ function showTokenCreatedModal(token) {
     {
       onClose: function () {
         _lastCreatedToken = "";
+        // Show-once: a closed dialog keeps no copy, whatever closed it.
+        document.getElementById("token-created-value").textContent = "";
       },
     },
   );
