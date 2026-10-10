@@ -55,12 +55,10 @@
   position: absolute;
   inset: 0;
   z-index: 40;
-  background: rgba(0, 0, 0, 0.45);
-  backdrop-filter: blur(2px);
-  -webkit-backdrop-filter: blur(2px);
+  background: rgba(0, 0, 0, 0.55);
   animation: pane-scrim-in 0.18s ease-out;
 }
-/* light scrim needs more ink to read as "this pane is parked" */
+/* light: a slate tint; on a light page a lower alpha already reads as "this pane is parked" */
 [data-theme="light"] .pane-scrim {
   background: rgba(30, 33, 40, 0.35);
 }
@@ -192,8 +190,6 @@
     rgba(0, 0, 0, 0.58) 0%,
     rgba(0, 0, 0, 0.78) 100%
   );
-  backdrop-filter: blur(6px);
-  -webkit-backdrop-filter: blur(6px);
 }
 /* ::backdrop cannot see [data-theme] on <html> in all engines; the dark
    scrim is acceptable on light theme (it reads as a focus vignette). */

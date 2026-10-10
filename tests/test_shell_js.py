@@ -1423,6 +1423,16 @@ def test_mobile_drawer_off_canvas() -> None:
     )
 
 
+def _first_party_files(suffix: str) -> list[Path]:
+    """Every ``suffix`` file the pages load from the tree, less the vendored minified ones."""
+    return [
+        path
+        for root in (_SHARED, _ROOT / "turnstone/console/static", _ROOT / "turnstone/ui/static")
+        for path in sorted(root.rglob(f"*{suffix}"))
+        if not path.name.endswith(f".min{suffix}")
+    ]
+
+
 def test_shell_grid_rows_are_definite() -> None:
     """Typing lag in long sessions: an implicit auto row on the shell grids asks for the content's
     max-content height, so every layout pass under it (each composer keystroke, each streamed
@@ -1449,12 +1459,7 @@ def test_shell_grid_rows_are_definite() -> None:
         )
 
     # Any first-party sheet the pages load can override the grids, not just this one.
-    sheets = [
-        path
-        for root in (_SHARED, _ROOT / "turnstone/console/static", _ROOT / "turnstone/ui/static")
-        for path in sorted(root.rglob("*.css"))
-        if not path.name.endswith(".min.css")
-    ]
+    sheets = _first_party_files(".css")
     assert _SHELL_CSS in sheets
     for sheet in sheets:
         text = re.sub(r"/\*.*?\*/", "", sheet.read_text(encoding="utf-8"), flags=re.S)
@@ -1470,6 +1475,34 @@ def test_shell_grid_rows_are_definite() -> None:
                     f"{sheet.name}: {selectors.strip()} must keep a definite row, "
                     f"not {prop}: {value.strip()}"
                 )
+
+
+def test_no_backdrop_filter() -> None:
+    """Typing lag under overlays: the engine re-runs a backdrop-filter over its whole area on every
+    frame in which anything changes, including each keystroke and caret blink in a field drawn
+    above it.  The login overlay, the dialog backdrop, the shelf scrim and the shortcuts overlay
+    all blurred, so typing in a field over one lagged: with software compositing at 1440x761 @2x
+    a frame took ~130ms (~8 fps) against ~1ms without the blur, and even @1x the frame rate
+    halved.  Moving the blur to its own layer behind the field does not help, and the cost scales
+    with the area, not the radius.  Dim with a translucent background instead, whether the style
+    lives in a stylesheet, a page or a script."""
+    sheets = _first_party_files(".css")
+    pages = _first_party_files(".html")
+    scripts = _first_party_files(".js")
+    assert {_SHARED / "base.css", _SHARED / "hatch.css"} <= set(sheets)
+    assert _ROOT / "turnstone/console/static/coordinator/index.html" in pages
+    assert _SHARED / "auth.js" in scripts
+    for path in [*sheets, *pages, *scripts]:
+        text = path.read_text(encoding="utf-8")
+        if path.suffix == ".js":
+            text = strip_js_comments(text)
+        else:
+            text = re.sub(r"/\*.*?\*/|<!--.*?-->", "", text, flags=re.S)
+        # The property in CSS (prefixed or not) and its scripted spellings: backdropFilter,
+        # WebkitBackdropFilter, setProperty("backdrop-filter", ...).
+        assert not re.search(r"backdrop-?filter", text, re.I), (
+            f"{path.name} must not use backdrop-filter: dim with a translucent background"
+        )
 
 
 def test_popup_menu_shared_helper() -> None:

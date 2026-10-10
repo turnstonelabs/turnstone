@@ -725,12 +725,15 @@ body {
 /* ==========================================================================
    Login overlay
    ========================================================================== */
+/* Opaque: the overlay also opens over a live conversation (an expired session,
+   a sign-out here or in another tab), and nothing behind it may show through.
+   The literal is for an engine without color-mix(), which drops the mix: the
+   overlay stays opaque, never transparent. */
 #login-overlay {
   position: fixed;
   inset: 0;
-  background: rgba(0, 0, 0, 0.85);
-  backdrop-filter: blur(8px);
-  -webkit-backdrop-filter: blur(8px);
+  background: #020203;
+  background: color-mix(in srgb, #000 85%, var(--bg));
   display: flex;
   align-items: center;
   justify-content: center;
@@ -926,8 +929,6 @@ body {
   position: fixed;
   inset: 0;
   background: rgba(0, 0, 0, 0.75);
-  backdrop-filter: blur(4px);
-  -webkit-backdrop-filter: blur(4px);
   display: flex;
   align-items: center;
   justify-content: center;

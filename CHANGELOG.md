@@ -349,6 +349,13 @@ frozen.
 
 ### Fixed
 
+- **Typing in the sign-in form, dialogs and shelves no longer lags.** The sign-in screen, the
+  backdrop behind a modal dialog, the scrim behind a pane's shelf and the keyboard-shortcuts overlay
+  blurred what lay behind them, and the browser redraws that blur over the whole area on every frame
+  in which anything changes, each keystroke included. On a HiDPI display with software rendering,
+  typing in the sign-in form fell to about 8 frames a second. They now dim with a plain tint. The
+  sign-in screen is opaque: it also opens over the conversation when a session expires or after a
+  sign-out, and without the blur that conversation showed through.
 - **A reopened workstream keeps its skill (#1292).** Reopening, forking or copying (`/new`) a
   workstream created with a skill dropped the skill's name and put its saved text, unrendered, in
   the cached system prompt that task agents inherit: `$ARGUMENTS` and `${TURNSTONE_*}` stayed
