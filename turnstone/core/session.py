@@ -3640,6 +3640,10 @@ class ChatSession:
         self._approval_cancel_epoch = 0
         self._generation: int = 0  # monotonic counter; orphaned threads skip cleanup
         self._generation_principals: dict[int, str] = {}
+        # The waits of open task-agent approval gates (``_agent_gate_hold``), by the generation
+        # whose tool batch runs them: ``_execute_tools`` keeps a batch's entry only while the batch
+        # executes.  token -> the state the gate waits in.  Guarded by ``_generation_lock``.
+        self._tool_batch_gate_holds: dict[int, dict[object, str]] = {}
         # Compaction attempts are concurrent with one another (parallel task
         # agents) and may repeat inside one send generation. Give each attempt
         # its own correlation id; generation remains only the publication owner.
@@ -8821,6 +8825,64 @@ class ChatSession:
             deferred_persistence.append(_publish_legacy_if_owned)
         else:
             self.ui.on_state_change(state)
+
+    @contextlib.contextmanager
+    def _agent_gate_hold(self, item: dict[str, Any], origin_generation: int) -> Iterator[None]:
+        """Let one task-agent approval gate move the workstream state while it waits.
+
+        Stamps *item* with the ``_publish_gate_state`` its gate calls where it waits: ``evaluation``
+        before a Smart Approvals wait, ``attention`` before a person decides.  The main loop's stamp
+        publishes that state directly, but parallel task agents run their gates at once, and one
+        card resolving would repaint the workstream ``running`` while a sibling's card still waited.
+        So each call records the wait as this gate's hold, and the workstream shows the strongest
+        open hold, ``attention`` over ``evaluation``.  Leaving the block removes the stamp and drops
+        the hold; dropping the last one publishes ``running`` again.
+
+        Holds belong to the tool batch that runs the task agent (``_tool_batch_gate_holds``), and
+        the workstream is ``running`` while that batch executes.  A gate with no executing batch
+        moves no state, so a task agent that outlived its batch could never leave a finished turn
+        showing ``running``.  A hold changes and publishes in one commit fenced to
+        *origin_generation*, so the state always matches the open holds and a Stop or successor
+        is never repainted.  A refused publish raises ``GenerationCancelled``, as the main loop's
+        stamp does; a refused release still drops the hold but publishes nothing, since the
+        cancellation path publishes the state.
+        """
+        token = object()
+
+        def _strongest(holds: dict[object, str]) -> str | None:
+            waits = set(holds.values())
+            return next((state for state in ("attention", "evaluation") if state in waits), None)
+
+        def _commit_hold(state: str | None) -> bool:
+            def _commit(durable: list[Callable[[], None]]) -> None:
+                holds = self._tool_batch_gate_holds.get(origin_generation)
+                if holds is None:
+                    return
+                before = _strongest(holds)
+                if state is None:
+                    holds.pop(token, None)
+                else:
+                    holds[token] = state
+                after = _strongest(holds)
+                if after != before:
+                    self._emit_state(after or "running", deferred_persistence=durable)
+
+            return self._commit_for_generation(origin_generation, _commit, allow_cancelled=False)
+
+        def _publish(state: str) -> None:
+            if not _commit_hold(state):
+                raise GenerationCancelled()
+
+        item["_publish_gate_state"] = _publish
+        try:
+            yield
+        finally:
+            item.pop("_publish_gate_state", None)
+            if not _commit_hold(None):
+                # Refused: the cancellation path publishes the state, but the hold still goes, so
+                # no sibling's release can count it.
+                with self._generation_lock:
+                    self._tool_batch_gate_holds.get(origin_generation, {}).pop(token, None)
 
     def _remember_serving_failure_context(
         self,
@@ -19088,6 +19150,10 @@ class ChatSession:
             finally:
                 _active_tool_origin_generation.reset(origin_token)
 
+        # Task agents run inside this batch: their approval gates hold the workstream state in its
+        # entry, which exists only while the batch executes (``_agent_gate_hold``).
+        with self._generation_lock:
+            self._tool_batch_gate_holds[my_generation] = {}
         try:
             if len(items) == 1:
                 results = [run_one(items[0])]
@@ -19109,6 +19175,9 @@ class ChatSession:
         except GenerationCancelled:
             _stage_unstarted_tool_calls()
             raise
+        finally:
+            with self._generation_lock:
+                self._tool_batch_gate_holds.pop(my_generation, None)
 
         return results, user_feedback
 
@@ -26503,7 +26572,10 @@ class ChatSession:
                         self._push_smart_approval_config([prepared])
                         cancel_scope.check()
                         try:
-                            approved, denial_feedback = self.ui.approve_tools([prepared])
+                            # The gate's wait shows as the workstream state,
+                            # counted with parallel siblings' gates.
+                            with self._agent_gate_hold(prepared, origin_generation):
+                                approved, denial_feedback = self.ui.approve_tools([prepared])
                         finally:
                             # Mirror the main gate's post-decision policy:
                             # fire the abort only when the operator opted

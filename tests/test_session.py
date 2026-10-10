@@ -2448,6 +2448,345 @@ class TestGateStates:
         assert emitted == []
 
 
+class TestTaskAgentGateStates:
+    """A task agent's approval gate moves the workstream like the main loop's
+    (#1338).  Parallel task agents run their gates at once, so each gate holds
+    its wait and the workstream shows the strongest open hold (``attention``
+    over ``evaluation``) until the last one closes."""
+
+    @staticmethod
+    def _record(session: ChatSession, monkeypatch: pytest.MonkeyPatch) -> list[str]:
+        emitted: list[str] = []
+        monkeypatch.setattr(session, "_emit_state", lambda state, **_kw: emitted.append(state))
+        return emitted
+
+    @staticmethod
+    def _open_hold(session: ChatSession, item: dict[str, Any], generation: int = 0) -> Any:
+        """Enter one gate's hold; the caller exits it, in any order."""
+        hold = session._agent_gate_hold(item, generation)
+        hold.__enter__()
+        return hold
+
+    @staticmethod
+    def _run_batch(session: ChatSession, items: dict[str, dict[str, Any]]) -> Any:
+        """Run prepared *items* (by call id) as one tool batch of a claimed generation, as
+        send() runs it: ``_execute_tools`` stamps that generation on each task agent."""
+        with (
+            patch.object(session, "_safe_prepare_tool", side_effect=lambda tc: items[tc["id"]]),
+            patch("turnstone.core.storage._registry.get_storage", return_value=MagicMock()),
+        ):
+            return session._execute_tools(
+                [
+                    {
+                        "id": cid,
+                        "type": "function",
+                        "function": {"name": "task_agent", "arguments": "{}"},
+                    }
+                    for cid in items
+                ],
+                my_generation=session._claim_generation(),
+            )
+
+    def _drive(
+        self,
+        session: ChatSession,
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        needs_approval: bool = True,
+        smart_approvals: bool = False,
+        ui: Any = None,
+        emitted: list[str] | None = None,
+    ) -> list[str]:
+        """Run the real task_agent call in a claimed generation's tool batch, as send() does.
+
+        The agent's one ``write_file`` call goes through its own gate, and a
+        person approves if a card appears.  Returns the states ``_emit_state``
+        saw (also appended to *emitted*).  *ui* defaults to a shared-gate UI;
+        a CLI UI runs its own gate (patch ``input`` for its prompt)."""
+        from unittest.mock import PropertyMock
+
+        from tests.conftest import resolve_when_pending
+        from tests.test_session_ui_base import _ConcreteUI
+        from turnstone.core.judge import JudgeConfig
+        from turnstone.core.providers._openai_chat import OpenAIChatCompletionsProvider
+
+        if ui is None:
+            ui = _ConcreteUI(ws_id="ws-1", user_id="u1")
+        session.ui = ui  # type: ignore[assignment]
+        if emitted is None:
+            emitted = []
+        monkeypatch.setattr(session, "_emit_state", lambda state, **_kw: emitted.append(state))
+        client = replace_session_lane(session, provider=OpenAIChatCompletionsProvider()).client
+        client.chat.completions.create = scripted_chat_client(
+            {
+                "tool_calls": [{"id": "call_w", "name": "write_file", "arguments": "{}"}],
+                "finish_reason": "tool_calls",
+            },
+            {"content": "Done"},
+        )
+
+        def _heuristic(item: dict[str, Any]) -> MagicMock:
+            verdict = MagicMock()
+            verdict.to_dict.return_value = {
+                "verdict_id": f"h-{item['call_id']}",
+                "call_id": item["call_id"],
+                "tier": "heuristic",
+                "recommendation": "review",
+            }
+            return verdict
+
+        fake_judge = MagicMock()
+        fake_judge.evaluate.side_effect = lambda items, *_a, **_kw: [_heuristic(i) for i in items]
+        fake_judge.arg_budget_chars.return_value = 200_000
+        monkeypatch.setattr(session, "_ensure_judge", lambda: fake_judge)
+        # A short Smart Approvals wait: no LLM verdict arrives, so a card follows.
+        cfg = JudgeConfig(enabled=True, smart_approvals=smart_approvals, timeout=0.05)
+        agent_call = {
+            "call_id": "call_w",
+            "func_name": "write_file",
+            "approval_label": "write_file",
+            "needs_approval": needs_approval,
+            "execute": lambda prepared: (prepared["call_id"], "written"),
+        }
+
+        # The real task_agent call: ``_exec_task`` reaches the agent's gate with the generation
+        # ``_execute_tools`` stamps on it.  The main gate settles the call itself, as an allow
+        # policy would, so the only card is the agent's.
+        task_call = session._prepare_task("t1", {"prompt": "Write the file."})
+        task_call["needs_approval"] = False
+        timer = resolve_when_pending(ui, True, "ok", deadline=3.0)
+        timer.start()
+        try:
+            with (
+                patch.object(
+                    type(session), "_judge_cfg", new_callable=PropertyMock, return_value=cfg
+                ),
+                patch.object(session, "_prepare_tool", side_effect=lambda _tc: dict(agent_call)),
+                patch("turnstone.core.policy.evaluate_loaded_tool_policies", return_value={}),
+            ):
+                self._run_batch(session, {"t1": task_call})
+        finally:
+            timer.cancel()
+        return emitted
+
+    def test_a_task_agent_call_waiting_for_a_person_enters_attention(
+        self, tmp_db, monkeypatch
+    ) -> None:
+        """The task agent runs in the batch the main loop moved to ``running``;
+        its card moves the workstream to ``attention`` and back, and the batch
+        leaves no hold behind."""
+        session = _make_session()
+        assert self._drive(session, monkeypatch) == ["running", "attention", "running"]
+        assert session._tool_batch_gate_holds == {}
+
+    def test_a_task_agent_smart_wait_enters_evaluation_first(self, tmp_db, monkeypatch) -> None:
+        emitted = self._drive(_make_session(), monkeypatch, smart_approvals=True)
+        assert emitted == ["running", "evaluation", "attention", "running"]
+
+    def test_a_task_agent_call_settled_without_anyone_stays_running(
+        self, tmp_db, monkeypatch
+    ) -> None:
+        emitted = self._drive(_make_session(), monkeypatch, needs_approval=False)
+        assert emitted == ["running"]
+
+    def test_the_cli_prompts_for_a_task_agent_call_in_attention(self, tmp_db, monkeypatch) -> None:
+        from turnstone.cli import TerminalUI
+
+        emitted: list[str] = []
+
+        def _answer(_prompt: str) -> str:
+            emitted.append("prompt")
+            return "y"
+
+        with patch("builtins.input", side_effect=_answer):
+            self._drive(_make_session(), monkeypatch, ui=TerminalUI(), emitted=emitted)
+        assert emitted == ["running", "attention", "prompt", "running"]
+
+    def test_a_background_cli_workstream_holds_a_task_agent_call_in_attention(
+        self, tmp_db, monkeypatch
+    ) -> None:
+        """A background CLI workstream holds the task agent's call until a person
+        brings it forward, in ``attention``, so the bell rings for it as for the
+        main loop's batch (which is held first, whatever it needs)."""
+        from turnstone.cli import WorkstreamTerminalUI
+
+        manager = MagicMock()
+        manager.active_id = "another-workstream"
+        cli_ui = WorkstreamTerminalUI("ws-1", manager)
+        cli_ui.set_foreground(False)
+
+        class _ForwardOnAttention(list[str]):
+            """A person brings the workstream forward when it asks, and leaves again."""
+
+            def append(self, state: str) -> None:
+                super().append(state)
+                cli_ui.set_foreground(state == "attention")
+
+        emitted = _ForwardOnAttention()
+        # Fallback, so a missing publish fails the assertion instead of hanging.
+        fallback = threading.Timer(2.0, cli_ui.set_foreground, args=(True,))
+        fallback.start()
+        try:
+            with patch("builtins.input", return_value="y") as prompt:
+                self._drive(_make_session(), monkeypatch, ui=cli_ui, emitted=emitted)
+        finally:
+            fallback.cancel()
+            fallback.join()
+        assert list(emitted) == ["attention", "running", "attention", "running"]
+        prompt.assert_called_once()
+
+    def test_one_card_resolving_keeps_a_siblings_attention(self, tmp_db, monkeypatch) -> None:
+        session = _make_session()
+        emitted = self._record(session, monkeypatch)
+        session._tool_batch_gate_holds[0] = {}  # as ``_execute_tools`` keeps it for its batch
+        first: dict[str, Any] = {}
+        second: dict[str, Any] = {}
+        first_hold = self._open_hold(session, first)
+        second_hold = self._open_hold(session, second)
+        first["_publish_gate_state"]("attention")
+        second["_publish_gate_state"]("attention")
+        first_hold.__exit__(None, None, None)
+        assert emitted == ["attention"]
+        second_hold.__exit__(None, None, None)
+        assert emitted == ["attention", "running"]
+        # The stamp lives only inside the block, so a late publish cannot reopen a hold.
+        assert "_publish_gate_state" not in first
+        assert "_publish_gate_state" not in second
+
+    def test_parallel_task_agents_count_their_holds_in_one_batch(self, tmp_db, monkeypatch) -> None:
+        """Two task agents run their gates at once on the batch's pool: the first card
+        resolving keeps ``attention`` while the second waits, and the last one returns the
+        workstream to ``running``.  The batch owns the holds' entry, not each call."""
+        session = _make_session()
+        emitted = self._record(session, monkeypatch)
+        opened = {cid: threading.Event() for cid in "ab"}
+        decide = {cid: threading.Event() for cid in "ab"}
+        closed = {cid: threading.Event() for cid in "ab"}
+
+        def _task_agent(cid: str) -> Any:
+            def _execute(execute_item: dict[str, Any]) -> tuple[str, str]:
+                prepared: dict[str, Any] = {}
+                with session._agent_gate_hold(prepared, execute_item["_origin_generation"]):
+                    prepared["_publish_gate_state"]("attention")
+                    opened[cid].set()
+                    decide[cid].wait(5)
+                closed[cid].set()
+                return cid, "ok"
+
+            return _execute
+
+        items = {
+            cid: {
+                "call_id": cid,
+                "func_name": "task_agent",
+                "needs_approval": False,
+                "execute": _task_agent(cid),
+                "_needs_origin_context": True,
+            }
+            for cid in "ab"
+        }
+        batch = threading.Thread(target=self._run_batch, args=(session, items))
+        batch.start()
+        try:
+            assert opened["a"].wait(5) and opened["b"].wait(5)
+            assert emitted == ["running", "attention"]
+            decide["a"].set()
+            assert closed["a"].wait(5)
+            assert emitted == ["running", "attention"]  # b's card still waits
+            decide["b"].set()
+            assert closed["b"].wait(5)
+        finally:
+            decide["a"].set()
+            decide["b"].set()
+            batch.join(10)
+        assert emitted == ["running", "attention", "running"]
+        assert session._tool_batch_gate_holds == {}
+
+    def test_attention_outranks_evaluation(self, tmp_db, monkeypatch) -> None:
+        """One gate waits on the judge and a sibling on a person: the workstream
+        shows ``attention`` until that card resolves, then ``evaluation``."""
+        session = _make_session()
+        emitted = self._record(session, monkeypatch)
+        session._tool_batch_gate_holds[0] = {}
+        judged: dict[str, Any] = {}
+        asked: dict[str, Any] = {}
+        judged_hold = self._open_hold(session, judged)
+        asked_hold = self._open_hold(session, asked)
+        judged["_publish_gate_state"]("evaluation")
+        asked["_publish_gate_state"]("attention")
+        asked_hold.__exit__(None, None, None)
+        judged_hold.__exit__(None, None, None)
+        assert emitted == ["evaluation", "attention", "evaluation", "running"]
+
+    def test_a_gate_outside_its_tool_batch_moves_no_state(self, tmp_db, monkeypatch) -> None:
+        """Task agents run inside their parent's tool batch, which is ``running``
+        while it executes.  A gate whose batch never ran or has ended moves no
+        state, so it can never leave a finished turn showing ``running``."""
+        session = _make_session()
+        emitted = self._record(session, monkeypatch)
+        outside: dict[str, Any] = {}
+        with session._agent_gate_hold(outside, 0):
+            outside["_publish_gate_state"]("attention")
+        assert emitted == []
+
+        session._tool_batch_gate_holds[0] = {}
+        outlived: dict[str, Any] = {}
+        with session._agent_gate_hold(outlived, 0):
+            outlived["_publish_gate_state"]("attention")
+            del session._tool_batch_gate_holds[0]  # the batch ends first
+        assert emitted == ["attention"]
+
+    def test_a_refused_hold_cancels_the_gate(self, tmp_db, monkeypatch) -> None:
+        """A successor that claims the generation refuses the gate's hold, as it
+        refuses the main loop's publish: the gate is cancelled, and no state
+        from the stale batch reaches the dashboards."""
+        from turnstone.core.session import GenerationCancelled
+
+        session = _make_session()
+        emitted = self._record(session, monkeypatch)
+        generation = session._claim_generation()
+        session._tool_batch_gate_holds[generation] = {}
+        item: dict[str, Any] = {}
+        with session._agent_gate_hold(item, generation):
+            session._generation += 1
+            with pytest.raises(GenerationCancelled):
+                item["_publish_gate_state"]("attention")
+        assert emitted == []
+
+    def test_a_stop_leaves_the_state_to_the_cancellation_path(self, tmp_db, monkeypatch) -> None:
+        """Stop while a card waits: the hold's release publishes nothing, since
+        the main loop's cancellation path publishes the workstream's state, and
+        it still drops the hold."""
+        session = _make_session()
+        emitted = self._record(session, monkeypatch)
+        generation = session._claim_generation()
+        session._tool_batch_gate_holds[generation] = {}
+        item: dict[str, Any] = {}
+        with session._agent_gate_hold(item, generation):
+            item["_publish_gate_state"]("attention")
+            session.cancel()
+        assert emitted == ["attention"]
+        assert session._tool_batch_gate_holds[generation] == {}
+
+    def test_a_persistence_poison_raises_from_the_release(self, tmp_db) -> None:
+        """A conversation row that failed to persist poisons later commits.  The release's
+        ``running`` raises it, as the main loop's post-gate publish does, so the call a person
+        approved never runs behind the missing row; the hold is gone all the same."""
+        from turnstone.core.session import ConversationPersistenceError
+
+        session = _make_session()  # its UI stages each state change behind a durability ticket
+        generation = session._claim_generation()
+        session._tool_batch_gate_holds[generation] = {}
+        item: dict[str, Any] = {}
+        with (
+            pytest.raises(ConversationPersistenceError),
+            session._agent_gate_hold(item, generation),
+        ):
+            item["_publish_gate_state"]("attention")
+            session._conversation_persistence_error = ConversationPersistenceError("lost row")
+        assert session._tool_batch_gate_holds[generation] == {}
+
+
 # ---------------------------------------------------------------------------
 # func_args projection for the intent judge
 # ---------------------------------------------------------------------------

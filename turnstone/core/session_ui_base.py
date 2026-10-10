@@ -230,8 +230,9 @@ def publish_gate_state(items: list[dict[str, Any]], state: str) -> None:
     (``_publish_gate_state``; it raises ``GenerationCancelled`` when the
     batch's generation moved on).  Every gate calls this where it actually
     waits: ``evaluation`` before a Smart Approvals wait, ``attention`` before
-    a person decides.  Items with no stamp (direct callers, task-agent gates)
-    publish nothing.
+    a person decides.  A task-agent gate's stamp counts its wait with its
+    parallel siblings' (``ChatSession._agent_gate_hold``).  Items with no
+    stamp (direct callers) publish nothing.
     """
     publish = next(
         (it["_publish_gate_state"] for it in items if callable(it.get("_publish_gate_state"))),
