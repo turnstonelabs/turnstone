@@ -14,3 +14,12 @@ repos:
         args: [--config-file=pyproject.toml]
         pass_filenames: false
         entry: mypy turnstone/
+
+  - repo: local
+    hooks:
+      - id: lint-hypothesis
+        name: HYPOTHESIS.md math delimiters and residues
+        entry: python lint_hypothesis.py --check
+        language: python
+        files: ^(HYPOTHESIS\.md|lint_hypothesis\.py)$
+        pass_filenames: false
