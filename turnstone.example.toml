@@ -168,6 +168,29 @@
 # mcp_token_encryption_key = "" # Generate once; keep a private backup
 # python -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())'
 
+# --- Secret references (console and every server node) ---
+# A model api_key or MCP header may hold secret://<backend>/<path>[#<field>]
+# instead of the value; the value is fetched from the store when needed and
+# never stored. Keep this table identical on every process sharing the
+# database. See docs/security.md#secret-references.
+
+[secrets]
+# cache_ttl_seconds = 300      # How long a fetched value is reused
+
+# [secrets.file]
+# root = "/run/secrets"        # secret://file/run/secrets/openai reads that file
+
+# [secrets.vault]              # Vault or OpenBao, KV v2
+# address = "https://vault.example.com:8200"
+# auth = "approle"             # "approle" (role_id + secret_id/secret_id_file)
+#                              # or "jwt" (role + jwt_path; Kubernetes: auth_mount = "kubernetes")
+# role_id = ""
+# secret_id_file = "/run/secrets/vault-secret-id"
+# mount = "secret"             # secret://vault/turnstone/openai#api_key
+# namespace = ""               # Sent only when set
+# ca_cert = ""                 # CA bundle for a private certificate authority
+# timeout_seconds = 5
+
 [oidc]
 # Shared origin for SSO login and per-user MCP OAuth; setting it alone enables neither.
 # redirect_base = "https://turnstone.example.com" # Origin only, no path/query/fragment

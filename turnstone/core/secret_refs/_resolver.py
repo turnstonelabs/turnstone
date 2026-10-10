@@ -119,7 +119,7 @@ class SecretResolver:
             log.error(
                 "secret_refs.resolve_failed", reference=ref.text, error=str(exc), detail=exc.detail
             )
-            raise SecretResolveError(f"{ref.text}: {exc}") from exc
+            raise SecretResolveError(f"{ref.text}: {exc}", retryable=exc.retryable) from exc
         except SecretReferenceError as exc:
             raise SecretResolveError(f"{ref.text}: {exc}") from exc
         if not value:

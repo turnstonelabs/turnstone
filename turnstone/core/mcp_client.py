@@ -590,6 +590,10 @@ def _mcp_to_openai(server_name: str, tool: mcp_types.Tool) -> dict[str, Any]:
     }
 
 
+class MCPSecretReferenceError(RuntimeError):
+    """A static header's ``secret://`` reference could not be resolved for a connect."""
+
+
 class InvalidCatalogError(Exception):
     """A catalog page from an MCP server that fails the SDK's result validation.
 
@@ -1915,6 +1919,24 @@ class MCPClientManager:
             return None
         return cfg
 
+    async def _with_resolved_headers(self, name: str, cfg: dict[str, Any]) -> dict[str, Any]:
+        """Return *cfg*, or a copy whose ``secret://`` header values are resolved.
+
+        The store round trip runs off the loop. A reference that cannot be
+        resolved fails this connect like any other connect error; the message
+        names the reference and a category, never a value.
+        """
+        from turnstone.core.secret_refs import SecretError, has_reference, resolve_mapping
+
+        headers = cfg.get("headers")
+        if not isinstance(headers, dict) or not has_reference(headers):
+            return cfg
+        try:
+            resolved = await asyncio.to_thread(resolve_mapping, headers)
+        except SecretError as exc:
+            raise MCPSecretReferenceError(f"MCP server '{name}': {exc}") from exc
+        return {**cfg, "headers": resolved}
+
     async def _connect_one(self, name: str) -> None:
         """Connect to a single MCP server, serialized per server.
 
@@ -2626,6 +2648,11 @@ class MCPClientManager:
             log.warning("MCP server '%s' has no command configured", name)
             return
 
+        # Header values may be secret:// references. The owner gets a copy with
+        # the resolved values; ``_server_configs`` keeps the stored text, so
+        # reconcile equality and the admin view never see a resolved secret.
+        cfg = await self._with_resolved_headers(name, cfg)
+
         loop = asyncio.get_running_loop()
         ready: asyncio.Future[Any] = loop.create_future()
         close_requested = asyncio.Event()
@@ -3191,8 +3218,10 @@ class MCPClientManager:
         # error boundary; this catch is for any callers that bypass it.
         _validate_oauth_user_url(url)
 
-        # Merge operator-supplied headers with the per-user bearer.
-        headers: dict[str, str] = dict(cfg.get("headers") or {})
+        # Merge operator-supplied headers (secret:// references resolved) with
+        # the per-user bearer.
+        resolved_cfg = await self._with_resolved_headers(server_name, cfg)
+        headers: dict[str, str] = dict(resolved_cfg.get("headers") or {})
         headers["Authorization"] = f"Bearer {access_token}"
 
         client_kwargs: dict[str, Any] = {
@@ -6071,6 +6100,9 @@ class MCPClientManager:
         keys: connected, tools, resources, prompts, error (parity with
         ``add_server_sync``).
         """
+        from turnstone.core.secret_refs import invalidate_cache
+
+        invalidate_cache()
         if name not in self._server_configs:
             return {
                 "connected": False,
@@ -6561,6 +6593,11 @@ class MCPClientManager:
 
         Returns ``{"added": [...], "removed": [...], "updated": [...]}``.
         """
+        from turnstone.core.secret_refs import invalidate_cache
+
+        # An operator-triggered reconcile asks the secret store again, so a header
+        # value rotated in the store reaches the next reconnect.
+        invalidate_cache()
         try:
             rows = storage.list_mcp_servers(enabled_only=True)
         except Exception:

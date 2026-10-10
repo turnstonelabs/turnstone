@@ -108,7 +108,7 @@ Model definitions support four backend credential modes:
 
 | `auth_mode` | Identity sent to the model gateway |
 |-------------|------------------------------------|
-| `static` | The definition's stored `api_key`. |
+| `static` | The definition's stored `api_key`: a literal, or a `secret://` reference resolved when the registry loads (see [Secret references](security.md#secret-references)). |
 | `entra_obo` | A caller-delegated Entra access token minted from that user's captured OIDC credential. |
 | `entra_app` | A shared app-identity token minted with Turnstone's OIDC client credentials. |
 | `rfc8693_obo` | A caller-delegated access token minted from the captured credential via RFC 8693 token exchange, requesting the definition's `obo_scopes`. |
@@ -477,7 +477,9 @@ The registry currently defines no production secret system setting. The generic
 machinery nevertheless treats any future `is_secret=True` entry as write-only:
 list and write responses return `"***"`, and submitting that sentinel preserves
 the stored value. Model API keys are fields on model definitions—not
-`judge.*` system settings—and use the Models tab's separate write-only flow.
+`judge.*` system settings—and use the Models tab's separate write-only flow. A
+model key or MCP header may also hold a `secret://` reference, which is not
+secret and is shown verbatim; see [Secret references](security.md#secret-references).
 
 ---
 

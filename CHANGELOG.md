@@ -101,6 +101,18 @@ frozen.
 
 ### Added
 
+- **Secret references for model API keys and MCP headers (#1329).** A model definition's
+  `api_key` and a `streamable-http` MCP server's headers can hold
+  `secret://<backend>/<path>[#<field>]` instead of the value. The value is fetched from the store
+  configured under `[secrets]` in config.toml when the registry loads or the server connects, is
+  reused for `cache_ttl_seconds`, and is never written to the database. Two backends ship: `file`
+  (a file under a dedicated root, for container and Kubernetes secret mounts) and `vault` (Vault or
+  OpenBao KV v2 with `jwt` or `approle` login). The console shows a reference verbatim where it
+  masks a literal, validates it when it is saved, and requires `admin.mcp` to introduce one; a
+  reference in MCP stdio `env` is refused. A reference that the store rejects leaves only that
+  model out of the registry (named in the Sync reply) or fails only that MCP connect. Rotate by
+  changing the store, then Sync to Nodes or Reconnect. See
+  [Secret references](docs/security.md#secret-references).
 - **Output-guard evals in `turnstone-eval` (#1291).** `--output-guard judge` scores the LLM stage on
   tool outputs with directives planted at known lines: detection, false positives, whether its flags
   stay inside the fixed vocabulary, citation precision and recall, and failed verdicts.

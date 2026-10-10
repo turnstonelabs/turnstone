@@ -654,6 +654,9 @@ class ModelRegistry:
         # unchanged, and future auth-relevant columns are covered by
         # construction.
         self._generation = 0
+        # Aliases the loader dropped because their api_key reference could not be
+        # materialised, with the reason; empty for a registry built directly.
+        self.skipped_aliases: dict[str, str] = {}
 
     # -- query methods -------------------------------------------------------
 
@@ -1097,6 +1100,61 @@ def _resolve_env_vars(value: str) -> str:
     return re.sub(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}", _replace, value)
 
 
+def materialize_api_key(value: str) -> str:
+    """Turn a stored ``api_key`` into the value a client sends.
+
+    A ``secret://`` reference resolves through the store configured under
+    ``[secrets]``; ``${VAR}`` is never expanded inside a reference (an unset
+    variable would quietly select a different secret). Anything else keeps the
+    ``${VAR}`` expansion stored values have always had. Raises
+    :class:`turnstone.core.secret_refs.SecretError` when a reference cannot be
+    resolved; the message names the reference and a category, never the value.
+    """
+    from turnstone.core.secret_refs import is_reference, resolve
+
+    if is_reference(value):
+        return resolve(value)
+    return _resolve_env_vars(value)
+
+
+def _materialize_row_key(
+    alias: str,
+    raw: str,
+    *,
+    source: str,
+    prior: Mapping[str, ModelConfig] | None,
+    skipped: dict[str, str],
+) -> str | None:
+    """Materialise one definition's key, isolating a failure to that alias.
+
+    When the store answers definitively (the reference is malformed, the
+    secret is missing, access is denied) the alias is dropped from this load
+    and recorded in *skipped*. When the store may answer later and the running
+    registry (*prior*) already holds the alias, its key is carried forward so a
+    store outage never removes a working model. Returns ``None`` for a dropped
+    alias.
+    """
+    from turnstone.core.secret_refs import SecretError, SecretResolveError
+
+    try:
+        return materialize_api_key(raw)
+    except SecretError as exc:
+        retryable = isinstance(exc, SecretResolveError) and exc.retryable
+        previous = prior.get(alias) if prior else None
+        if retryable and previous is not None:
+            log.warning(
+                "model_registry.api_key_reference_stale",
+                alias=alias,
+                source=source,
+                error=str(exc),
+            )
+            return previous.api_key
+        reason = str(exc)
+        skipped[alias] = reason
+        log.error("model_registry.alias_skipped", alias=alias, source=source, error=reason)
+        return None
+
+
 def _resolve_openai_provider(provider: str, base_url: str) -> str:
     """Distinguish commercial OpenAI from local OpenAI-compatible servers.
 
@@ -1332,6 +1390,17 @@ def _resolve_context_windows(
     return configs
 
 
+def _log_skipped_aliases(skipped: Mapping[str, str]) -> None:
+    """One boot or reload line naming every alias dropped over its api_key reference."""
+    if skipped:
+        log.error(
+            "model_registry.aliases_skipped",
+            aliases=sorted(skipped),
+            reasons=dict(skipped),
+            hint="fix the reference or the [secrets] store, then Sync to Nodes",
+        )
+
+
 def load_model_registry(
     base_url: str = "",
     api_key: str = "",
@@ -1396,6 +1465,10 @@ def load_model_registry(
     api_base_url_present = isinstance(api_section, dict) and bool(api_section.get("base_url"))
 
     configs: dict[str, ModelConfig] = {}
+    # Aliases dropped from this load because their api_key reference could not be
+    # materialised; the registry carries them so reload replies and the console
+    # can name them (see ``_materialize_row_key``).
+    skipped_aliases: dict[str, str] = {}
 
     # 1. Load DB model definitions (lowest priority, overridden by config.toml)
     if storage is not None:
@@ -1457,10 +1530,19 @@ def load_model_registry(
                     row.get("obo_audience"),
                     row.get("obo_scopes"),
                 )
+                row_api_key = _materialize_row_key(
+                    alias,
+                    row.get("api_key") or api_key,
+                    source="db",
+                    prior=prior,
+                    skipped=skipped_aliases,
+                )
+                if row_api_key is None:
+                    continue
                 configs[alias] = ModelConfig(
                     alias=alias,
                     base_url=row_base_url,
-                    api_key=_resolve_env_vars(row.get("api_key") or api_key),
+                    api_key=row_api_key,
                     model=row_model,
                     context_window=row_ctx,
                     provider=row_provider,
@@ -1614,10 +1696,20 @@ def load_model_registry(
             entry.get("obo_audience", ""),
             entry.get("obo_scopes", ""),
         )
+        entry_api_key = _materialize_row_key(
+            alias,
+            entry.get("api_key", api_key),
+            source="config",
+            prior=prior,
+            skipped=skipped_aliases,
+        )
+        if entry_api_key is None:
+            # The database definition of the same alias, if any, stays in force.
+            continue
         configs[alias] = ModelConfig(
             alias=alias,
             base_url=entry_base_url,
-            api_key=_resolve_env_vars(entry.get("api_key", api_key)),
+            api_key=entry_api_key,
             model=model_name,
             # 0 = auto-detect, resolved per definition below
             context_window=_coerce_context_window(entry.get("context_window"), alias),
@@ -1666,7 +1758,10 @@ def load_model_registry(
             "No model definitions found — starting with an empty registry. "
             "Add models in the admin panel; they load without a restart."
         )
-        return ModelRegistry(models={}, default="")
+        _log_skipped_aliases(skipped_aliases)
+        empty = ModelRegistry(models={}, default="")
+        empty.skipped_aliases = dict(skipped_aliases)
+        return empty
 
     configs = _resolve_context_windows(
         configs, detect=detect_context_windows, inherited=context_window, prior=prior
@@ -1734,7 +1829,8 @@ def load_model_registry(
 
     task_effort = _validate_effort(model_section.get("task_effort"), "task_effort")
 
-    return ModelRegistry(
+    _log_skipped_aliases(skipped_aliases)
+    registry = ModelRegistry(
         models=configs,
         default=default_alias,
         fallback=fallback,
@@ -1742,6 +1838,8 @@ def load_model_registry(
         task_model=task_model,
         task_effort=task_effort,
     )
+    registry.skipped_aliases = dict(skipped_aliases)
+    return registry
 
 
 # ---------------------------------------------------------------------------

@@ -36,4 +36,13 @@ class SecretBackendError(SecretError):
 
 
 class SecretResolveError(SecretError):
-    """A reference could not be resolved and nothing cached could stand in."""
+    """A reference could not be resolved and nothing cached could stand in.
+
+    ``retryable`` mirrors the backend failure that caused it: True when the
+    store may answer later (unreachable, sealed, login refused), False for a
+    definitive answer about the reference itself.
+    """
+
+    def __init__(self, message: str, *, retryable: bool = False) -> None:
+        super().__init__(message)
+        self.retryable = retryable

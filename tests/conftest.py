@@ -682,6 +682,21 @@ def make_config_store():
 
 
 @pytest.fixture(autouse=True)
+def _reset_secret_refs():
+    """Drop the process-wide secret:// resolver between tests.
+
+    It is built lazily from config.toml on the first reference and would
+    otherwise carry one test's patched ``[secrets]`` (or a developer's real
+    one) into the next. A no-op when nothing built it.
+    """
+    from turnstone.core.secret_refs import reset_for_tests
+
+    reset_for_tests()
+    yield
+    reset_for_tests()
+
+
+@pytest.fixture(autouse=True)
 def _clear_policy_cache():
     """Drop the in-process tool-policy cache between tests.
 

@@ -5858,6 +5858,7 @@ def _load_and_bootstrap_coord_subsystem(app: Starlette, storage: Any, config_sto
             # admin panel (see :func:`_maybe_bootstrap_coord_subsystem`).
             app.state.coord_registry_error = str(exc)
             return
+        app.state.coord_registry_skipped = dict(coord_registry.skipped_aliases)
         # Console-side twin of initialize_mcp_crypto_state's dynamic-auth key
         # requirement: that guard runs before this registry exists and can
         # only see the MCP half. Non-fatal by design — the subsystem reports
@@ -6079,7 +6080,15 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None]:
     # OAuth client secrets, so it needs the cipher even when no node
     # currently dispatches.
     from turnstone.core.mcp_crypto import initialize_mcp_crypto_state
+    from turnstone.core.secret_refs import SecretConfigError, load_secrets_config
 
+    # A malformed [secrets] table is a boot failure, like a malformed keyring,
+    # not a per-row surprise at the first secret:// reference.
+    try:
+        load_secrets_config()
+    except SecretConfigError as exc:
+        log.error("secret_refs.config_invalid: %s", exc)
+        raise SystemExit(1) from exc
     initialize_mcp_crypto_state(app.state, node_id="console")
     get_model_token_client(app.state)
 
@@ -10679,6 +10688,9 @@ async def admin_registry_install(request: Request) -> JSONResponse:
     merged_headers = config.get("headers", {})
     if isinstance(header_values, dict):
         merged_headers.update(header_values)
+    err = await _check_mcp_secret_fields(merged_headers, merged_env)
+    if err is not None:
+        return err
 
     server_id = uuid.uuid4().hex
     audit_uid, ip = _audit_context(request)
@@ -11224,12 +11236,122 @@ def _mask_mcp_secrets(server: dict[str, Any], reveal: bool = False) -> dict[str,
         except (json.JSONDecodeError, TypeError):
             s["env"] = "{}"
     if s.get("headers") and s["headers"] != "{}":
+        from turnstone.core.secret_refs import is_reference
+
         try:
             hdr_dict = json.loads(s["headers"]) if isinstance(s["headers"], str) else s["headers"]
-            s["headers"] = json.dumps({k: "***" for k in hdr_dict})
+            # A secret:// reference is not itself a secret; it stays visible.
+            s["headers"] = json.dumps(
+                {k: (v if is_reference(v) else "***") for k, v in hdr_dict.items()}
+            )
         except (json.JSONDecodeError, TypeError):
             s["headers"] = "{}"
     return s
+
+
+async def _secret_reference_problem(value: str) -> tuple[str, int] | None:
+    """Resolve a ``secret://`` reference once, off the event loop, before it is stored.
+
+    Returns ``(message, status)`` for a reference the store rejects, so a typo
+    never reaches the database: 400 for a malformed or unconfigured reference
+    and for a definitive answer (not found, denied, missing field), 503 while
+    the store cannot answer. ``None`` means the reference resolved.
+    """
+    from turnstone.core.secret_refs import (
+        SecretConfigError,
+        SecretReferenceError,
+        SecretResolveError,
+        resolve,
+    )
+
+    try:
+        await asyncio.to_thread(resolve, value)
+    except (SecretReferenceError, SecretConfigError) as exc:
+        return str(exc), 400
+    except SecretResolveError as exc:
+        return str(exc), (503 if exc.retryable else 400)
+    return None
+
+
+async def _check_secret_reference(value: str) -> JSONResponse | None:
+    """JSON-response form of :func:`_secret_reference_problem`."""
+    problem = await _secret_reference_problem(value)
+    if problem is None:
+        return None
+    message, status = problem
+    return JSONResponse({"error": message}, status_code=status)
+
+
+async def _mcp_secret_fields_problem(headers: Any, env: Any) -> tuple[str, int] | None:
+    """Validate ``secret://`` use in an MCP server's headers and env before a write.
+
+    A header value is either a whole reference (resolved once here) or a
+    literal; ``Bearer secret://...`` would be sent verbatim, so it is refused.
+    stdio ``env`` takes no references at all: its values reach a child
+    process unresolved.
+    """
+    from turnstone.core.secret_refs import (
+        REFERENCE_SCHEME,
+        contains_reference_text,
+        is_reference,
+    )
+
+    if isinstance(env, dict):
+        for key, value in env.items():
+            if isinstance(value, str) and REFERENCE_SCHEME in value:
+                return f"env {key!r}: env does not take secret:// references", 400
+    if isinstance(headers, dict):
+        for key, value in headers.items():
+            if contains_reference_text(value):
+                return (
+                    f"header {key!r}: a secret:// reference must be the whole value; "
+                    "store the complete header value (for example 'Bearer ...') in the secret",
+                    400,
+                )
+            if is_reference(value):
+                problem = await _secret_reference_problem(value)
+                if problem is not None:
+                    message, status = problem
+                    return f"header {key!r}: {message}", status
+    return None
+
+
+async def _check_mcp_secret_fields(headers: Any, env: Any) -> JSONResponse | None:
+    """JSON-response form of :func:`_mcp_secret_fields_problem`."""
+    problem = await _mcp_secret_fields_problem(headers, env)
+    if problem is None:
+        return None
+    message, status = problem
+    return JSONResponse({"error": message}, status_code=status)
+
+
+async def _materialize_probe_key(value: str) -> tuple[str, JSONResponse | None]:
+    """Turn a stored or submitted api_key into the value a probe sends, off the loop."""
+    from turnstone.core.model_registry import materialize_api_key
+    from turnstone.core.secret_refs import SecretError, SecretResolveError
+
+    try:
+        return await asyncio.to_thread(materialize_api_key, value), None
+    except SecretError as exc:
+        retryable = isinstance(exc, SecretResolveError) and exc.retryable
+        return "", JSONResponse({"error": str(exc)}, status_code=503 if retryable else 400)
+
+
+def _coord_registry_warning(app_state: Any) -> str:
+    """The console registry's current problem, if any, for write and reload replies.
+
+    A refused swap (``coord_registry_error``) comes first; otherwise the aliases
+    the last load dropped over their api_key reference are named.
+    """
+    error = str(getattr(app_state, "coord_registry_error", "") or "")
+    if error:
+        return error
+    skipped = getattr(app_state, "coord_registry_skipped", None) or {}
+    if not skipped:
+        return ""
+    return "model definitions skipped on the console: " + "; ".join(
+        f"{alias}: {reason}" for alias, reason in sorted(skipped.items())
+    )
 
 
 def _mcp_server_to_detail(
@@ -11529,6 +11651,9 @@ async def admin_create_mcp_server(request: Request) -> JSONResponse:
     args_list = body.get("args", [])
     headers_dict = body.get("headers", {})
     env_dict = body.get("env", {})
+    err = await _check_mcp_secret_fields(headers_dict, env_dict)
+    if err is not None:
+        return err
 
     # Column policy — the SAME ``_oauth_columns_to_clear`` rule the update
     # handler applies on a flip: persist only the OAuth columns the target
@@ -11695,6 +11820,10 @@ async def admin_update_mcp_server(request: Request) -> JSONResponse:
         )
     if "env" in body:
         updates["env"] = json.dumps(body["env"]) if isinstance(body["env"], dict) else "{}"
+    if "headers" in body or "env" in body:
+        err = await _check_mcp_secret_fields(body.get("headers"), body.get("env"))
+        if err is not None:
+            return err
     if "auto_approve" in body:
         updates["auto_approve"] = bool(body["auto_approve"])
     if "enabled" in body:
@@ -12600,6 +12729,10 @@ async def admin_import_mcp_config(request: Request) -> JSONResponse:
         if not isinstance(raw_env, dict):
             errors.append(f"{srv_name}: env must be an object")
             continue
+        secret_problem = await _mcp_secret_fields_problem(raw_headers, raw_env)
+        if secret_problem is not None:
+            errors.append(f"{srv_name}: {secret_problem[0]}")
+            continue
 
         server_id = uuid.uuid4().hex
         try:
@@ -13223,9 +13356,15 @@ _PROVIDER_DEFAULT_URLS: dict[str, str] = {
 
 
 def _mask_model_secrets(model: dict[str, Any]) -> dict[str, Any]:
-    """Replace api_key with '***' (unconditional, write-only)."""
+    """Replace a literal api_key with '***' (write-only).
+
+    A ``secret://`` reference is not itself a secret: it is returned verbatim so
+    the operator can see which store entry the definition uses.
+    """
+    from turnstone.core.secret_refs import is_reference
+
     m = dict(model)
-    if m.get("api_key"):
+    if m.get("api_key") and not is_reference(m["api_key"]):
         m["api_key"] = "***"
     return m
 
@@ -13304,6 +13443,7 @@ def _refresh_coord_registry_locked(app_state: Any, storage: Any) -> None:
     :func:`_record_coord_key_refusal`.
     """
     from turnstone.core.model_registry import load_model_registry
+    from turnstone.core.secret_refs import invalidate_cache as invalidate_secret_cache
 
     existing = getattr(app_state, "coord_registry", None)
     if existing is None:
@@ -13316,6 +13456,9 @@ def _refresh_coord_registry_locked(app_state: Any, storage: Any) -> None:
         # Without it, the loader degrades to a config.toml-only registry
         # and ``existing.reload()`` would silently drop every DB-sourced
         # alias.
+        # An operator-triggered refresh asks the secret store again, so a value
+        # rotated in the store is picked up now, not after the cache TTL.
+        invalidate_secret_cache()
         new_registry = load_model_registry(
             storage=storage,
             strict=True,
@@ -13357,6 +13500,7 @@ def _refresh_coord_registry_locked(app_state: Any, storage: Any) -> None:
         # as the refusal arm, in the recovery direction (pinned:
         # test_refresh_clears_key_refusal_after_recovery).
         app_state.coord_registry_error = ""
+        app_state.coord_registry_skipped = dict(new_registry.skipped_aliases)
         model_client = get_model_token_client(app_state)
         coord_mgr = getattr(app_state, "coord_mgr", None)
         if coord_mgr is not None:
@@ -13644,6 +13788,7 @@ async def admin_create_model_definition(request: Request) -> JSONResponse:
 
     from turnstone.core.audit import record_audit
     from turnstone.core.auth import require_permission
+    from turnstone.core.secret_refs import is_reference as is_secret_reference
     from turnstone.core.web_helpers import read_json_or_400, require_storage_or_503
 
     storage, err = require_storage_or_503(request)
@@ -13696,6 +13841,16 @@ async def admin_create_model_definition(request: Request) -> JSONResponse:
             {"error": f"base_url is required for provider {provider!r}"}, status_code=400
         )
     api_key = str(body.get("api_key", "")).strip()
+    if is_secret_reference(api_key):
+        # A reference lets its holder read whatever the store's role allows and
+        # send it to the definition's endpoint: the same capability-widening
+        # choice as a dynamic auth mode, gated the same way.
+        err = require_permission(request, "admin.mcp", allow_service_bypass=False)
+        if err:
+            return err
+        err = await _check_secret_reference(api_key)
+        if err is not None:
+            return err
     ctx_raw = body.get("context_window", 0)  # omitted = auto-detect
     # json admits NaN/Infinity literals, which pass the isinstance check but
     # crash int(); refuse non-finite floats as invalid values instead.
@@ -13850,7 +14005,7 @@ async def admin_create_model_definition(request: Request) -> JSONResponse:
     # Same refused-swap surfacing as the update twin (see its comment): the
     # row is stored, but a keyless console's live registry may have refused
     # to adopt it, so the shelf warns instead of toasting success.
-    registry_warning = str(getattr(request.app.state, "coord_registry_error", "") or "")
+    registry_warning = _coord_registry_warning(request.app.state)
 
     created = storage.get_model_definition(definition_id)
     if created is None:
@@ -13888,6 +14043,7 @@ async def admin_update_model_definition(request: Request) -> JSONResponse:
     """PUT /v1/api/admin/model-definitions/{definition_id}."""
     from turnstone.core.audit import record_audit
     from turnstone.core.auth import require_permission
+    from turnstone.core.secret_refs import is_reference as is_secret_reference
     from turnstone.core.web_helpers import read_json_or_400, require_storage_or_503
 
     storage, err = require_storage_or_503(request)
@@ -13960,6 +14116,15 @@ async def admin_update_model_definition(request: Request) -> JSONResponse:
         api_key = str(body["api_key"]).strip()
         # Sentinel "***" or empty string means "keep existing"
         if api_key and api_key != "***":
+            if is_secret_reference(api_key):
+                # Same gate as the create twin: a reference widens what this
+                # definition can send to its endpoint.
+                err = require_permission(request, "admin.mcp", allow_service_bypass=False)
+                if err:
+                    return err
+                err = await _check_secret_reference(api_key)
+                if err is not None:
+                    return err
             updates["api_key"] = api_key
     if "context_window" in body:
         ctx_raw = body["context_window"]
@@ -14165,7 +14330,7 @@ async def admin_update_model_definition(request: Request) -> JSONResponse:
         # coordinator did NOT adopt this write. With the subsystem UP the 503
         # remediation path never renders, so surfacing it on the response is
         # the only evidence the shelf can show.
-        registry_warning = str(getattr(request.app.state, "coord_registry_error", "") or "")
+        registry_warning = _coord_registry_warning(request.app.state)
 
     model_def = storage.get_model_definition(definition_id)
     payload = _mask_model_secrets(model_def or {})
@@ -14218,7 +14383,7 @@ async def admin_delete_model_definition(request: Request) -> JSONResponse:
     # Same refused-swap surfacing as the create/update twins: the row is gone
     # from the DB, but a keyless console's refused swap keeps SERVING the
     # deleted alias to running and new coordinator sessions.
-    registry_warning = str(getattr(request.app.state, "coord_registry_error", "") or "")
+    registry_warning = _coord_registry_warning(request.app.state)
     payload: dict[str, Any] = {"status": "ok", "definition_id": definition_id}
     if registry_warning:
         payload["registry_warning"] = registry_warning
@@ -14254,7 +14419,7 @@ async def admin_model_reload(request: Request) -> JSONResponse:
     # This route's whole purpose is "make the live registry match the DB", so
     # a refused console swap is the one outcome it must not report as
     # unqualified success. Same surfacing as the create/update twins.
-    registry_warning = str(getattr(request.app.state, "coord_registry_error", "") or "")
+    registry_warning = _coord_registry_warning(request.app.state)
     payload: dict[str, Any] = {"status": "ok", "results": results}
     if registry_warning:
         payload["registry_warning"] = registry_warning
@@ -14357,6 +14522,12 @@ async def admin_detect_model(request: Request) -> JSONResponse:
                 # cleared field must probe unscoped, exactly as the save that
                 # follows will run.
                 workspace_id = _stored_workspace_id(row, provider)
+
+    # A secret:// reference (stored or submitted) and ${VAR} resolve here, off
+    # the loop, exactly as the registry materialises the key at load.
+    api_key, key_err = await _materialize_probe_key(api_key)
+    if key_err is not None:
+        return key_err
 
     # Reranker endpoints speak the Cohere/Jina ``POST <url>`` protocol, not
     # ``/v1/models`` — their base_url is the full rerank path, which the OpenAI
@@ -14504,6 +14675,9 @@ async def admin_calibrate_model_definition(request: Request) -> JSONResponse:
         )
 
     instruction = _global_rerank_instruction(request.app.state)
+    stored_key, key_err = await _materialize_probe_key(str(existing.get("api_key") or ""))
+    if key_err is not None:
+        return key_err
     loop = asyncio.get_running_loop()
     try:
         async with asyncio.timeout(90):
@@ -14512,7 +14686,7 @@ async def admin_calibrate_model_definition(request: Request) -> JSONResponse:
                 _run_rerank_calibration,
                 base_url,
                 str(existing.get("model") or ""),
-                str(existing.get("api_key") or ""),
+                stored_key,
                 instruction,
             )
     except TimeoutError:
@@ -14621,7 +14795,7 @@ async def admin_calibrate_model_definition(request: Request) -> JSONResponse:
     # Same refused-swap surfacing as the create/update twins: the
     # calibration is stored, but a keyless console's live registry may
     # have refused to adopt it.
-    registry_warning = str(getattr(request.app.state, "coord_registry_error", "") or "")
+    registry_warning = _coord_registry_warning(request.app.state)
     payload = {
         "separated": cal.separated,
         "suggested_threshold": cal.suggested_threshold,

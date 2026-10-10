@@ -2581,7 +2581,7 @@ the `admin.settings` permission.
 
 Permission: `admin.mcp`
 
-Secrets (`env`, `headers` fields) are masked with `***` by default. Use `?reveal=true` on GET endpoints to see actual values.
+Secrets (`env`, `headers` fields) are masked with `***` by default. Use `?reveal=true` on GET endpoints to see actual values. A header value that is a `secret://` reference is not a secret and is returned verbatim either way; a reference in `env` is refused on write (see [Secret references](security.md#secret-references)).
 
 ---
 

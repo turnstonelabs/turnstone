@@ -4857,6 +4857,11 @@ def _internal_model_reload_locked(request: Request) -> JSONResponse:
         return JSONResponse({"status": "error", "reason": "no registry"}, status_code=503)
 
     storage = get_storage()
+    # An operator-triggered reload asks the secret store again, so a value
+    # rotated in the store is picked up by this Sync, not after the cache TTL.
+    from turnstone.core.secret_refs import invalidate_cache
+
+    invalidate_cache()
     try:
         new_registry = load_model_registry(
             storage=storage,
@@ -4922,9 +4927,15 @@ def _internal_model_reload_locked(request: Request) -> JSONResponse:
         and eff_task_model == registry.task_model
         and eff_task_effort == registry.task_effort
     )
+    # Aliases the loader dropped over their api_key reference ride every reply,
+    # so the console's Sync result names them per node.
+    skipped = dict(new_registry.skipped_aliases)
     if unchanged:
         new_registry.shutdown()
-        return JSONResponse({"status": "ok", "aliases": registry.list_aliases(), "noop": True})
+        payload: dict[str, Any] = {"status": "ok", "aliases": registry.list_aliases(), "noop": True}
+        if skipped:
+            payload["skipped"] = skipped
+        return JSONResponse(payload)
 
     try:
         registry.reload(
@@ -4974,7 +4985,10 @@ def _internal_model_reload_locked(request: Request) -> JSONResponse:
     if node_id:
         _publish_models_metadata(request.app.state, storage, node_id)
 
-    return JSONResponse({"status": "ok", "aliases": registry.list_aliases()})
+    payload = {"status": "ok", "aliases": registry.list_aliases()}
+    if skipped:
+        payload["skipped"] = skipped
+    return JSONResponse(payload)
 
 
 def internal_model_status(request: Request) -> JSONResponse:
@@ -6240,6 +6254,16 @@ def main() -> None:
     from turnstone.core.config import warn_migrated_settings
 
     warn_migrated_settings()
+
+    # A malformed [secrets] table is a boot failure, like a malformed keyring,
+    # not a per-row surprise at the first secret:// reference.
+    from turnstone.core.secret_refs import SecretConfigError, load_secrets_config
+
+    try:
+        load_secrets_config()
+    except SecretConfigError as exc:
+        log.error("secret_refs.config_invalid: %s", exc)
+        raise SystemExit(1) from exc
 
     # Prune stale / empty workstreams on startup
     from turnstone.core.memory import prune_workstreams

@@ -673,11 +673,21 @@ def _cmd_rerank_calibrate(args: argparse.Namespace) -> None:
     # Calibration is a manual, one-shot op against a possibly-cold endpoint, so a
     # generous timeout (vs the per-turn 15s cap) keeps a first-request compile
     # from failing it; calibrate() also warms the endpoint up first.
+    # A secret:// reference (and ${VAR}) resolves the same way the registry
+    # materialises the key at load.
+    from turnstone.core.model_registry import materialize_api_key
+    from turnstone.core.secret_refs import SecretError
+
+    try:
+        api_key = materialize_api_key(str(row.get("api_key") or ""))
+    except SecretError as e:
+        print(f"Model {alias!r}: api_key could not be resolved: {e}", file=sys.stderr)
+        sys.exit(1)
     try:
         result = calibrate_model(
             base_url,
             str(row.get("model") or ""),
-            str(row.get("api_key") or ""),
+            api_key,
             instruction=instruction,
             timeout=60.0,
         )

@@ -7556,8 +7556,13 @@ function showEditModelModal(definitionId) {
       document.getElementById("model-provider").value = m.provider || "openai";
       document.getElementById("model-base-url").value = m.base_url || "";
       document.getElementById("model-api-key").value = "";
+      // A secret:// reference is not itself secret, so the API returns it verbatim.
+      // It is shown as the placeholder (rendered as text even in a password
+      // input, never submitted): saving keeps it, detect uses the stored key.
       document.getElementById("model-api-key").placeholder =
-        "\u2022\u2022\u2022 (leave blank to keep existing)";
+        typeof m.api_key === "string" && m.api_key.startsWith("secret://")
+          ? m.api_key + " (saved reference; type to replace)"
+          : "\u2022\u2022\u2022 (leave blank to keep existing)";
       document.getElementById("model-ctx-window").value =
         m.context_window != null ? m.context_window : 0;
       document.getElementById("model-max-concurrency").value =
