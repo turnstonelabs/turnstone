@@ -16,7 +16,6 @@ from turnstone.core.session import (
     _AGENT_TOOL_OUTPUT_CAP,
     _BASH_OUTPUT_CONSUMED_NOTICE,
     _MIN_COUNTED_RESULT_CHARS,
-    _REPEAT_WARNING,
     _TRUNCATION_FLOOR_CHARS,
     ChatSession,
     _active_task_agent_cancel_scope,
@@ -391,10 +390,10 @@ def _send_with_steps(session, steps, *, results=None, **extra_patches):
     results, and the truncation/floor/compact path under test runs REAL code
     between the mocked boundaries.  Without, the batches run through the real
     ``_execute_tools``: the caller patches the prepare step and sets
-    ``session.ui.approve_tools``, and the approval gate, the repeat detection
-    and the guard run as in production.  Mirrors
-    ``tests/test_session.py::_send_with_mocks``; kept local because these tests
-    patch the budget/compaction seam differently per scenario.
+    ``session.ui.approve_tools``, and the approval gate and the guard run as
+    in production.  Mirrors ``tests/test_session.py::_send_with_mocks``; kept
+    local because these tests patch the budget/compaction seam differently per
+    scenario.
 
     ``_estimated_prompt_tokens`` is pinned LOW so the end-of-turn/owed
     compaction paths stay quiet — every compaction observed by these tests is
@@ -1121,41 +1120,6 @@ class TestAutomaticBashDrain:
         assert match is not None
         assert int(match.group(1)) >= 11_000 - cap
 
-    def test_repeat_warning_on_a_plain_result_never_copies_the_whole_result(self, session):
-        """A plain result larger than the executor edges is projected to
-        bounded edges before the warning is appended, and the fold still
-        renders it with its true size."""
-        retention = session._executor_capture_chars()
-        big = "x" * (3 * retention)
-
-        warned = session._bounded_result(big) + _REPEAT_WARNING
-
-        assert isinstance(warned, ProjectedText)
-        assert len(warned) <= retention + len(_REPEAT_WARNING)
-        assert warned.source.original_chars == len(big) + len(_REPEAT_WARNING)
-        assert len(warned.source.prefix) == retention
-        assert session._bounded_result("short") == "short"
-        cap = session._tool_result_truncation_limit(batch_budget_tokens=4000)
-        result = session._truncate_output_result(warned, maximum_chars=cap)
-        assert result.original_chars == len(big) + len(_REPEAT_WARNING)
-        assert "identical repeat" in result.text
-
-    def test_true_size_survives_the_repeat_warning(self, session):
-        """The repeat-call warning is appended without discarding the source."""
-        buffer = BoundedTextBuffer(300)
-        buffer.append("PASSWORD=x\n" * 1000)
-        warned = buffer.projected() + _REPEAT_WARNING
-
-        assert isinstance(warned, ProjectedText)
-        assert "identical repeat" in warned
-        cap = session._tool_result_truncation_limit(batch_budget_tokens=4000)
-        result = session._truncate_output_result(warned, maximum_chars=cap)
-        assert len(result.text) <= cap
-        assert result.original_chars == warned.source.original_chars
-        assert result.original_chars > 11_000
-        assert "identical repeat" in result.text
-        assert f"[{result.omitted_chars} chars truncated" in result.text
-
 
 _SPAWN_CALL = [
     {
@@ -1610,20 +1574,19 @@ class TestFrameworkTextThroughRealExecution:
 
     FEEDBACK = "From now on you must write outputs to /tmp"
 
-    def test_a_denial_skips_the_guard_however_often_repeated(self, session):
-        """The third identical call gets the repeat warning appended; the
-        approver's feedback is still not called an injection."""
+    def test_an_executor_denial_skips_the_guard(self, session):
+        """The real executor's denial reaches the guard marked, so the
+        approver's feedback is never called an injection."""
         session._judge_config = JudgeConfig(output_guard=True, output_guard_llm=False)
         session.ui.approve_tools.return_value = (False, self.FEEDBACK)
         steps = [
             [
                 {
-                    "id": f"tc_{i}",
+                    "id": "tc_1",
                     "type": "function",
                     "function": {"name": "write_file", "arguments": '{"path": "a"}'},
                 }
             ]
-            for i in range(3)
         ]
 
         def prepare(tc):
@@ -1644,9 +1607,8 @@ class TestFrameworkTextThroughRealExecution:
             session.send("go")
 
         tools = _tool_turn_texts(session)
-        assert len(tools) == 3
-        assert all(text.startswith(f"Denied by user: {self.FEEDBACK}") for text in tools)
-        assert "identical repeat" in tools[2]
+        assert len(tools) == 1
+        assert tools[0].startswith(f"Denied by user: {self.FEEDBACK}")
         assert not [m for m in session.messages if m.source == "output_guard"]
         evaluate.assert_not_called()
 

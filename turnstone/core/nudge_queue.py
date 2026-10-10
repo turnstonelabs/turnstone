@@ -330,7 +330,7 @@ class NudgeQueue:
 
         The abandoned-generation paths use this instead of :meth:`clear`:
         ``"tool"``/``"user"`` advisories are generation-scoped commentary
-        (a stale ``repeat`` nudge must not bleed into the next send), but
+        (a stale ``tool_error`` nudge must not bleed into the next send), but
         ``"any"``-channel entries are EXTERNAL events — a watch fire or a
         background-shell exit that happened during the doomed generation
         still happened, and dropping it would silently break the "you will

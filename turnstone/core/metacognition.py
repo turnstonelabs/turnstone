@@ -1,10 +1,10 @@
 """Metacognitive prompting — situational nudges for proactive memory use.
 
 Static nudge text templates (``NUDGE_*``), detection heuristics
-(``detect_correction``, ``detect_completion``), the :class:`RepeatDetector`
-streak counter, and the cooldown-aware :func:`should_nudge` /
-:func:`format_nudge` / :func:`format_idle_children_nudge` /
-:func:`format_idle_tasks_nudge` helpers.
+(``detect_correction``, ``detect_completion``), and the cooldown-aware
+:func:`should_nudge` / :func:`format_nudge` /
+:func:`format_idle_children_nudge` / :func:`format_idle_tasks_nudge`
+helpers.
 
 The wake-trigger lifecycle (``IdleNudgeWatcher`` plus the
 ``install_idle_nudge_watcher`` / ``shutdown_idle_nudge_watchers``
@@ -26,42 +26,6 @@ from turnstone.core.workstream import WorkstreamState
 # callers without a ``MemoryConfig`` and is kept aligned with that
 # canonical default so both paths behave the same.
 _COOLDOWN_SECS = 300
-
-# Repeat-detection threshold — number of *consecutive* identical tool
-# calls (same name + same arguments) before a repeat warning fires.
-# Two-in-a-row is too noisy because legitimate retries on transient
-# failures look identical; three-in-a-row is the cheapest signal that
-# the model is stuck on the same call.
-_REPEAT_THRESHOLD = 3
-
-
-class RepeatDetector:
-    """Detect a streak of identical tool-call signatures.
-
-    ``record(sig)`` returns ``True`` once *sig* has been recorded
-    ``threshold`` times in a row (default 3).  Recording a different
-    signature resets the streak — interleaved tool calls aren't a
-    stuck loop, only repeated identical ones are.  After a fire, the
-    caller is expected to call ``clear()`` to start a fresh streak.
-    """
-
-    def __init__(self, threshold: int = _REPEAT_THRESHOLD) -> None:
-        self._threshold = threshold
-        self._sig: str | None = None
-        self._count = 0
-
-    def record(self, sig: str) -> bool:
-        """Record *sig*; return ``True`` when the streak hits the threshold."""
-        if sig == self._sig:
-            self._count += 1
-        else:
-            self._sig = sig
-            self._count = 1
-        return self._count >= self._threshold
-
-    def clear(self) -> None:
-        self._sig = None
-        self._count = 0
 
 
 # ---------------------------------------------------------------------------
@@ -92,13 +56,6 @@ NUDGE_TOOL_ERROR = (
     "A tool just returned an error. Before retrying, check your memories — "
     "the user may have given feedback about this tool or error pattern in a "
     "previous session. Use memory(action='search') to find relevant guidance."
-)
-
-NUDGE_REPEAT = (
-    "You just called the same tool with the same arguments as a previous "
-    "call in this conversation. Repeating the exact same action will produce "
-    "the same result. Stop and reconsider your approach — try a different "
-    "tool, different arguments, or ask the user for clarification."
 )
 
 NUDGE_COMPACTION = (
@@ -147,7 +104,6 @@ _NUDGE_MAP: dict[str, str] = {
     "denial": NUDGE_DENIAL,
     "completion": NUDGE_COMPLETION,
     "tool_error": NUDGE_TOOL_ERROR,
-    "repeat": NUDGE_REPEAT,
     "compaction_pending": NUDGE_COMPACTION,
     # idle_children, idle_tasks and watch_triggered carry no static body
     # — the per-fire text comes from a producer
@@ -180,8 +136,8 @@ _NUDGE_MAP: dict[str, str] = {
 # as a feedback memory", "use memory(action='search')").  A memory-off
 # persona suppresses these — advertising a tool the persona hides produces
 # the same "I don't have access" apologies the memory-advisory gating
-# fixed — while behavioural nudges (repeat, compaction_pending,
-# idle_children, watch_triggered) keep firing.
+# fixed — while behavioural nudges (compaction_pending, idle_children,
+# watch_triggered) keep firing.
 MEMORY_NUDGE_TYPES: frozenset[str] = frozenset({"correction", "denial", "completion", "tool_error"})
 
 # Nudge types whose copy names a specific tool the model is told to call,

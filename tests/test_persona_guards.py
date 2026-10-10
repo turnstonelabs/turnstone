@@ -355,7 +355,6 @@ class TestMemoryOff:
         session._memory_config.nudges = True
         assert not session._nudges_enabled("correction")
         assert not session._nudges_enabled("tool_error")
-        assert session._nudges_enabled("repeat")
         assert session._nudges_enabled("compaction_pending")
 
     def test_allowlist_hiding_memory_tool_also_gates_nudges(
@@ -369,7 +368,7 @@ class TestMemoryOff:
         )
         session._memory_config.nudges = True
         assert not session._nudges_enabled("correction")
-        assert session._nudges_enabled("repeat")
+        assert session._nudges_enabled("compaction_pending")
 
     def test_recall_pointer_gates_on_visibility(self, tmp_db, mock_openai_client) -> None:
         # scribe-shaped: empty toolset hides recall — the compaction pointer

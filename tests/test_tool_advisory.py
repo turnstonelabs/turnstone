@@ -58,9 +58,9 @@ class TestMakeSystemTurn:
         # mirrors a reserved top-level key (``role`` / ``_source``) lands inside
         # the dict and cannot overwrite the validated turn fields — so the old
         # collision guard is no longer needed (the shape makes it impossible).
-        turn = make_system_turn("repeat", "x", role="evil", _source="spoof")
+        turn = make_system_turn("tool_error", "x", role="evil", _source="spoof")
         assert turn["role"] == "system"
-        assert turn["_source"] == "repeat"
+        assert turn["_source"] == "tool_error"
         assert turn["_source_meta"] == {"role": "evil", "_source": "spoof"}
 
     def test_vocabulary_mirrors_nudge_map_both_directions(self) -> None:
