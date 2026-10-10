@@ -41,8 +41,11 @@ repository's normal merge policy.
 Release-only metadata belongs to the destination branch. When a forward merge
 touches `pyproject.toml`, `turnstone/__init__.py`, `uv.lock`, or the changelog
 header, keep the destination line's version and release state while accepting
-the source branch's code and documentation changes. The release commit itself
-should still become an ancestor of newer branches.
+the source branch's code and documentation changes. The Helm chart's
+`appVersion` is the exception: keep whichever side names the newer stable
+release, because every branch's chart defaults to a stable image, and if that
+changes the destination's `appVersion`, bump the chart's patch `version` too.
+The release commit itself should still become an ancestor of newer branches.
 
 Never merge `dev` backward into a stable branch outside the deliberate promotion
 process.
@@ -61,9 +64,24 @@ package:
 ## Release Helper
 
 `scripts/release.sh` validates the version and branch, requires a clean worktree,
-updates `pyproject.toml` and `turnstone/__init__.py`, regenerates `uv.lock`,
-commits, and creates the `vX.Y.Z` tag. With `--push`, it pushes the branch and
-tag atomically so CI never observes only half of a release.
+updates `pyproject.toml`, `turnstone/__init__.py` and the Helm chart's
+`appVersion`, regenerates `uv.lock`, commits, and creates the `vX.Y.Z` tag. With
+`--push`, it pushes the branch and tag atomically so CI never observes only half
+of a release.
+
+The chart's `appVersion` is its default image tag. A stable release sets it to
+that release on its own branch (`main` or `stable/X.Y`). A pre-release sets
+`dev`'s to the newest stable `vX.Y.Z` tag instead, so installing the chart from
+`dev`, the default branch, never selects a pre-release image; fetch tags before
+cutting one. The helper refuses to move `appVersion` backwards, which catches a
+clone that is missing the newest stable tag. `dev`'s default can trail `main`'s
+newest patch until the next pre-release or forward merge. Pin `image.tag` to
+deploy anything else.
+
+When a release changes `appVersion`, it also bumps the chart's patch `version`,
+because a deployment that follows the chart from Git may rebuild it only when
+that version changes. Chart changes between releases should bump the chart
+`version` for the same reason.
 
 The helper enforces these release locations:
 
@@ -76,6 +94,7 @@ The helper enforces these release locations:
 ```bash
 git switch dev
 git pull --ff-only origin dev
+git fetch --tags origin
 scripts/release.sh 1.9.0rc1 --push
 ```
 
@@ -88,7 +107,8 @@ scripts/release.sh 1.8.1 --push
 ```
 
 After publication, forward-merge the release commit from `main` into `dev`,
-retaining the development version in the release metadata files.
+retaining the development version in the release metadata files and taking
+`main`'s newer chart `appVersion`.
 
 ### Prior stable patch
 

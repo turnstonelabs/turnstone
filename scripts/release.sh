@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 #
-# Bump version, regenerate lockfile, commit, and tag.
+# Bump version (package and Helm chart appVersion), regenerate lockfile, commit,
+# and tag.
 #
 # Usage:
 #   scripts/release.sh 1.8.1 --push   # stable release from main
@@ -70,20 +71,62 @@ if git rev-parse "$TAG" >/dev/null 2>&1; then
     exit 1
 fi
 
+# The chart's appVersion is its default image tag. A stable release points the
+# chart on its own branch at itself. A pre-release points dev's chart at the
+# newest stable release instead, so installing the chart from dev, the default
+# branch, never selects a pre-release image.
+CHART="deploy/helm/turnstone/Chart.yaml"
+if ! grep -q '^appVersion: ' "$CHART" 2>/dev/null; then
+    echo "error: $CHART has no appVersion line" >&2
+    exit 1
+fi
+if echo "$VERSION" | grep -qE '(a|b|rc)[0-9]+$'; then
+    CHART_APP_VERSION=$(git tag -l 'v*' \
+        | sed -n 's/^v\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\)$/\1/p' \
+        | sort -V | tail -n 1)
+    if [ -z "$CHART_APP_VERSION" ]; then
+        echo "error: no stable vX.Y.Z tag for the chart's appVersion; fetch tags first" >&2
+        exit 1
+    fi
+else
+    CHART_APP_VERSION="$VERSION"
+fi
+# Never move the default image backwards: a clone missing the newest stable tag
+# would otherwise quietly downgrade dev's chart.
+CURRENT_APP_VERSION=$(sed -n 's/^appVersion: "\{0,1\}\([^"]*\)"\{0,1\}$/\1/p' "$CHART")
+if ! printf '%s\n%s\n' "$CURRENT_APP_VERSION" "$CHART_APP_VERSION" | sort -V -C; then
+    echo "error: the chart's appVersion would move back from $CURRENT_APP_VERSION to $CHART_APP_VERSION; fetch tags first" >&2
+    exit 1
+fi
+# A changed default image is a changed chart, so its patch version moves too:
+# deployments that follow the chart from Git may rebuild it only when the
+# chart's version changes.
+CHART_VERSION=$(sed -n 's/^version: \([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\)$/\1/p' "$CHART")
+if [ -z "$CHART_VERSION" ]; then
+    echo "error: $CHART version is not a plain X.Y.Z" >&2
+    exit 1
+fi
+NEW_CHART_VERSION="$CHART_VERSION"
+if [ "$CURRENT_APP_VERSION" != "$CHART_APP_VERSION" ]; then
+    NEW_CHART_VERSION="${CHART_VERSION%.*}.$(( ${CHART_VERSION##*.} + 1 ))"
+fi
+
 # Detect current version
 CURRENT=$(grep -oP '(?<=^version = ")[^"]+' pyproject.toml)
-echo "Bumping $CURRENT → $VERSION"
+echo "Bumping $CURRENT → $VERSION (chart $NEW_CHART_VERSION, appVersion $CHART_APP_VERSION)"
 
-# Update version in both files
+# Update the version in the package files and the chart
 sed -i "s/^version = \".*\"/version = \"$VERSION\"/" pyproject.toml
 sed -i "s/^__version__ = \".*\"/__version__ = \"$VERSION\"/" turnstone/__init__.py
+sed -i "s/^appVersion: .*/appVersion: \"$CHART_APP_VERSION\"/" "$CHART"
+sed -i "s/^version: .*/version: $NEW_CHART_VERSION/" "$CHART"
 
 # Regenerate lockfile
 echo "Regenerating uv.lock..."
 uv lock
 
 # Commit and tag
-git add pyproject.toml turnstone/__init__.py uv.lock
+git add pyproject.toml turnstone/__init__.py uv.lock "$CHART"
 git commit -m "chore: bump version to $VERSION"
 git tag "$TAG"
 
