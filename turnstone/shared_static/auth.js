@@ -542,13 +542,15 @@ function _bindLoginEvents() {
     _handleSubmit();
   });
 
-  // Escape key clears errors
-  const inputs = document.querySelectorAll("#login-box input");
-  for (let i = 0; i < inputs.length; i++) {
-    inputs[i].addEventListener("keydown", function (e) {
-      if (e.key === "Escape") _clearError();
+  // Escape clears errors and stops at the overlay: page shortcuts and an open
+  // shelf behind the sign-in screen must not act on it.
+  document
+    .getElementById("login-overlay")
+    .addEventListener("keydown", function (e) {
+      if (e.key !== "Escape") return;
+      e.stopPropagation();
+      _clearError();
     });
-  }
 
   // Mode toggle
   document.getElementById("toggle-token").onclick = function () {
@@ -649,6 +651,18 @@ export function showLogin(reason, oidcError) {
   _invalidateAuth();
   const overlay = document.getElementById("login-overlay");
   if (!overlay) return;
+  // A modal dialog sits in the top layer, above this overlay at any z-index,
+  // and while one is open the sign-in form takes no input.  Close each one:
+  // its own close handling runs (busy lock cleared, focus returned, onClose),
+  // as for any dismissal.  Non-modal shelves stay; the overlay covers them.
+  let modals = [];
+  try {
+    modals = document.querySelectorAll("dialog:modal");
+  } catch (e) {
+    // An engine without :modal rejects the selector: leave its dialogs open
+    // rather than fail to show the sign-in screen.
+  }
+  for (const dlg of modals) dlg.close();
   overlay.style.display = "flex";
   document.body.style.overflow = "hidden";
   const logoutBtn = document.getElementById("logout-btn");

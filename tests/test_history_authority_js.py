@@ -22,6 +22,7 @@ globalThis.AbortController = undefined;
 const elements = new Map();
 document.getElementById = id => elements.get(id) || null;
 document.addEventListener = document.removeEventListener = () => {};
+document.querySelectorAll = () => [];
 document.body = new FakeElement('body');
 document.createTextNode = text => Object.assign(new FakeElement('text'), {textContent: text});
 globalThis.Node = FakeElement;
@@ -221,7 +222,6 @@ def test_whoami_auth_loss_before_login_mount_preserves_upgrade_prompt():
     _run(r"""
 function escapeHtml(text) { return text; }
 function setSafeHtml(el, html) { el.textContent = html; }
-document.querySelectorAll = () => [];
 const append = document.body.appendChild.bind(document.body);
 document.body.appendChild = el => { elements.set(el.id, el); return append(el); };
 window.location = {search:'', pathname:'/', reload:() => { reloads++; }};
@@ -238,6 +238,68 @@ const status = requests.shift(); assert.equal(status.url, '/v1/api/auth/status')
 reply(status, {setup_required:false}); await drain();
 assert.match(elements.get('login-subtitle').textContent, /server was updated/);
 _onSuccess(); assert.equal(reloads, 1);
+""")
+
+
+def test_sign_in_screen_closes_modal_dialogs_only():
+    """A modal dialog sits in the top layer, above the sign-in overlay, and while it is open the
+    sign-in form takes no input (#1332), so showing the overlay closes every modal dialog.  A
+    non-modal shelf stays open: the opaque overlay already covers it, and closing it here would
+    bypass the shelf controller's own bookkeeping (inert siblings, scrim, Escape listener)."""
+    _run(r"""
+const closed = [];
+const modal = {close() { closed.push('modal'); }};
+const shelf = {close() { closed.push('shelf'); }};
+// Answers as the engine would: both are open dialogs, only the first is modal.
+document.querySelectorAll = sel =>
+  sel.includes(':modal') ? [modal] : sel.startsWith('dialog') ? [modal, shelf] : [];
+element('login-overlay');
+showLogin();
+assert.deepEqual(closed, ['modal']);
+assert.equal(elements.get('login-overlay').style.display, 'flex');
+""")
+
+
+def test_sign_in_screen_shows_on_an_engine_without_the_modal_selector():
+    """An engine without :modal rejects the selector.  The sign-in screen must still show; its
+    dialogs stay open, as they did before the screen closed them."""
+    _run(r"""
+document.querySelectorAll = sel => {
+  if (sel.includes(':modal')) throw new SyntaxError(`'${sel}' is not a valid selector`);
+  return [];
+};
+element('login-overlay');
+showLogin();
+assert.equal(elements.get('login-overlay').style.display, 'flex');
+""")
+
+
+def test_escape_in_the_sign_in_screen_stays_there():
+    """Escape pressed in the sign-in screen clears its error and stops at the overlay.  Page
+    shortcuts and an open shelf behind it must not act on it: the shelf controller closes the
+    topmost shelf on any Escape that reaches the document."""
+    _run(r"""
+function escapeHtml(text) { return text; }
+function setSafeHtml(el, html) { el.textContent = html; }
+const append = document.body.appendChild.bind(document.body);
+document.body.appendChild = el => { elements.set(el.id, el); return append(el); };
+window.location = {search:'', pathname:'/'};
+['login-box', 'toggle-token', 'setup-fields', 'login-fields', 'token-fields',
+ 'login-toggle', 'login-subtitle', 'login-submit'].forEach(element);
+const error = element('login-error');
+initLogin();
+error.style.display = 'block'; error.textContent = 'Invalid credentials';
+function press(key) {
+  let stopped = 0;
+  for (const {fn} of elements.get('login-overlay')._listeners.get('keydown'))
+    fn({key, stopPropagation() { stopped++; }});
+  return stopped;
+}
+assert.equal(press('a'), 0);
+assert.equal(error.textContent, 'Invalid credentials');
+assert.equal(press('Escape'), 1);
+assert.equal(error.style.display, 'none');
+assert.equal(error.textContent, '');
 """)
 
 
