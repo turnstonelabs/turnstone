@@ -190,6 +190,12 @@ def extract_dialogs(index: Path, only_id: str | None = None) -> list[str]:
     return blocks
 
 
+def extract_templates(index: Path) -> list[str]:
+    """Every <template> block, verbatim from the tree."""
+    html = index.read_text(encoding="utf-8")
+    return re.findall(r"[ \t]*<template\b[^>]*>.*?</template>", html, re.S)
+
+
 def extract_admin_fragment() -> str:
     """The console admin pane — the hatch-host all shelves live inside."""
     html = CONSOLE_INDEX.read_text(encoding="utf-8")
@@ -416,7 +422,8 @@ CONSOLE_TEMPLATE = """<!doctype html>
     <!-- Body-level dialog tier (confirm / install / coord-delete): their
          markup sits OUTSIDE #admin-layout in index.html, so the fragment
          extraction misses them — build() injects every hatch dialog the
-         fragment does not already contain. -->
+         fragment does not already contain, and every <template> (the
+         schedule builder's among them). -->
     <!-- RIDERS:BEGIN -->
     <!-- RIDERS:END -->
     <div id="toast" role="status" aria-live="polite"></div>
@@ -575,6 +582,9 @@ CONSOLE_TEMPLATE = """<!doctype html>
          Backend-auth section renders read-only/hidden, and the
          auth-constraints stub above is dead code in every pass. -->
     <script type="module" src="shared/auth.js"></script>
+    <!-- Ahead of admin.js, as in index.html: the schedule shelf mounts its
+         "When" control from window.TurnstoneScheduleBuilder. -->
+    <script src="console-static/schedule_builder.js"></script>
     <script src="console-static/admin.js"></script>
     <script src="console-static/governance.js"></script>
     <script>
@@ -2220,10 +2230,13 @@ def build(out: Path) -> None:
     # coord-delete) would otherwise be silently absent — and ?open=confirm
     # would screenshot a dialog-less page while the gate stayed green.
     riders = [b for b in extract_dialogs(CONSOLE_INDEX) if b not in frag]
+    # So would every <template> outside it: the schedule shelf's "When"
+    # control (schedule_builder.js) clones one on mount and throws without it.
+    riders += [t for t in extract_templates(CONSOLE_INDEX) if t not in frag]
     page = inject(CONSOLE_TEMPLATE, "FRAGMENT", frag)
     page = inject(page, "RIDERS", "\n".join(riders))
     (con / "livepass.html").write_text(page, encoding="utf-8")
-    print(f"{con}/livepass.html — admin fragment + {len(riders)} rider dialogs")
+    print(f"{con}/livepass.html — admin fragment + {len(riders)} riders")
 
     sh = out / "shell"
     sh.mkdir(parents=True, exist_ok=True)
