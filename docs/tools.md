@@ -227,8 +227,9 @@ Execute a bash command and return stdout + stderr.
 | `command` | string | yes      | The bash command to execute. |
 | `timeout` | integer | no      | Timeout in seconds (1-600). Omit to use the global `tools.timeout` setting (typically 120s). |
 | `stop_on_error` | boolean | no | Enable `set -e` so the script exits on the first command failure. Default false. |
+| `run_in_background` | boolean | no | Start the command as a detached background shell and return its shell id (e.g. `bash_1`) at once. Read its new output with `bash_output`, stop it with `kill_shell`; `timeout` does not apply. Default false. |
 
-- **What it does**: Runs the command in a subprocess with a configurable timeout. Commands are sanitized and checked against a blocklist (e.g. `rm -rf /`). Environment variables containing secrets are scrubbed (`*_KEY`, `*_SECRET`, `*_TOKEN`, etc.).
+- **What it does**: Runs the command in a subprocess with a configurable timeout. Commands are sanitized and checked against a blocklist (e.g. `rm -rf /`). Environment variables containing secrets are scrubbed (`*_KEY`, `*_SECRET`, `*_TOKEN`, etc.). Stdin never takes input from the CLI's terminal: a command gets `/dev/null`, so one that reads it gets end-of-file at once. A background shell (`run_in_background`) gets `/dev/null` too, unless the process's own stdin is a terminal (the CLI): then it gets a pseudo-terminal of its own that nothing is typed into, so a long-running program keeps running, and one that waits for input waits until `kill_shell` stops it.
 - **Output format**: Stdout is returned directly. Stderr lines are prefixed with `[stderr]` so the model can distinguish them. When the command itself redirects stderr to stdout (`2>&1`), no prefix is added. Output exceeding 256KB is truncated (head + tail preserved, middle replaced with a truncation notice).
 - **Auto-approve**: No -- requires user confirmation.
 - **Agent availability**: `task_agent` only.

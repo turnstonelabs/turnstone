@@ -49,6 +49,7 @@ from turnstone.core.log import get_logger
 from turnstone.core.truncation import BoundedTextBuffer
 
 if TYPE_CHECKING:
+    import io
     from collections.abc import Callable
 
 log = get_logger(__name__)
@@ -312,7 +313,11 @@ def drain_pipe_logical_lines(
 
 
 def spawn_group_leader(
-    command: str, *, stop_on_error: bool, env: dict[str, str] | None
+    command: str,
+    *,
+    stop_on_error: bool,
+    env: dict[str, str] | None,
+    stdin: int = subprocess.DEVNULL,
 ) -> tuple[subprocess.Popen[str], int, str]:
     """Write the script, fork the detached group leader, snapshot its pgid.
 
@@ -320,13 +325,16 @@ def spawn_group_leader(
     foreground executor (``ChatSession._exec_bash``) and this registry — so
     the two variants of one tool cannot drift: same ``pipefail``/``set -e``
     preamble, same decode policy (``errors="replace"``), same session-group
-    discipline.  The script file exists because bash reads scripts lazily
-    (robust to quoting/length; unlinking early could truncate a long script
-    mid-run) — the CALLER owns the unlink on its own exit path.  On a
-    failed fork the script is unlinked here and the error propagates.  The
-    pgid snapshot happens while the leader is alive (``start_new_session``
-    makes ``pgid == pid``); the microseconds-wide pid-wraparound TOCTOU is
-    the same accepted one as always.
+    discipline.  Neither reads the terminal: *stdin* is ``/dev/null`` for a
+    command that runs to completion, so a prompt nobody could answer fails
+    at once instead of hanging, and the registry passes a background shell's
+    own (``_background_stdin``).  The script file exists because bash reads
+    scripts lazily (robust to quoting/length; unlinking early could truncate
+    a long script mid-run) — the CALLER owns the unlink on its own exit
+    path.  On a failed fork the script is unlinked here and the error
+    propagates.  The pgid snapshot happens while the leader is alive
+    (``start_new_session`` makes ``pgid == pid``); the microseconds-wide
+    pid-wraparound TOCTOU is the same accepted one as always.
     """
     with tempfile.NamedTemporaryFile(mode="w", suffix=".sh", delete=False) as f:
         preamble = "set -o pipefail\n"
@@ -337,6 +345,7 @@ def spawn_group_leader(
     try:
         proc = subprocess.Popen(
             ["bash", script_path],
+            stdin=stdin,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -353,6 +362,36 @@ def spawn_group_leader(
     except OSError:
         pgid = proc.pid
     return proc, pgid, script_path
+
+
+def _background_stdin() -> tuple[int, io.FileIO | None]:
+    """A background shell's stdin: the fd the child gets, and the pty master to hold.
+
+    Where this process's own stdin is a terminal (the CLI), the shell gets a
+    pseudo-terminal of its own, as it once shared the CLI's: a program finds a
+    terminal there and input that never ends, so a long-running program keeps
+    running, but nothing typed into the CLI reaches it.  That terminal has no
+    window size (``stty size`` reads ``0 0``), so a program that sizes its output
+    by it uses its default width, as a ``bash`` command with ``/dev/null`` does.
+    Anywhere else it gets ``/dev/null``, whatever this process's stdin is
+    (``/dev/null`` on a server, a pipe, a file), and so does a host that cannot
+    open a pseudo-terminal.
+    """
+    if not os.isatty(0):
+        return subprocess.DEVNULL, None
+    try:
+        master_fd, slave_fd = os.openpty()
+    except OSError:
+        log.debug("bg_shell.no_pty", exc_info=True)
+        return subprocess.DEVNULL, None
+    return slave_fd, open(master_fd, "rb", buffering=0)
+
+
+def _release_stdin(master: io.FileIO | None) -> None:
+    """Close a background shell's pty master once its leader is gone; safe to repeat."""
+    if master is not None:
+        with contextlib.suppress(OSError):
+            master.close()
 
 
 @dataclass
@@ -399,6 +438,7 @@ class BackgroundShell:
         owner: str | None,
         script_path: str,
         max_buffer_chars: int,
+        stdin_master: io.FileIO | None,
     ) -> None:
         self.shell_id = shell_id
         self.command = command
@@ -410,6 +450,9 @@ class BackgroundShell:
         self.exit_code: int | None = None
         self.lock = threading.Lock()
         self._script_path = script_path
+        # The pty master behind the shell's stdin, when it has one; the
+        # waiter releases it once the leader is gone.
+        self._stdin_master = stdin_master
         self._max_buffer_chars = max_buffer_chars
         # Rolling buffer over the logical line stream: ``_buffer`` holds the
         # retained tail; ``_dropped_total``/``_total_lines`` are absolute
@@ -534,8 +577,18 @@ class BackgroundShellRegistry:
         with self._lock:
             self._check_capacity_locked(owner)
         # Shared prologue with the foreground bash tool — the waiter unlinks
-        # the script after exit.
-        proc, pgid, script_path = spawn_group_leader(command, stop_on_error=stop_on_error, env=env)
+        # the script after exit and releases the shell's stdin.
+        stdin_fd, stdin_master = _background_stdin()
+        try:
+            proc, pgid, script_path = spawn_group_leader(
+                command, stop_on_error=stop_on_error, env=env, stdin=stdin_fd
+            )
+        except BaseException:
+            _release_stdin(stdin_master)
+            raise
+        finally:
+            if stdin_master is not None:
+                os.close(stdin_fd)  # the pty slave: the child holds its own copy as fd 0
         try:
             with self._lock:
                 # Authoritative re-check: a concurrent spawn/close may have
@@ -552,6 +605,7 @@ class BackgroundShellRegistry:
                     owner=owner,
                     script_path=script_path,
                     max_buffer_chars=self._max_buffer_chars,
+                    stdin_master=stdin_master,
                 )
                 # Publish, wire and START the threads under the registry
                 # lock: close()/reap() take the same lock, so they can never
@@ -601,6 +655,7 @@ class BackgroundShellRegistry:
                 os.killpg(pgid, signal.SIGKILL)
             with contextlib.suppress(subprocess.TimeoutExpired):
                 proc.wait(timeout=5)
+            _release_stdin(stdin_master)
             with contextlib.suppress(OSError):
                 os.unlink(script_path)
             raise
@@ -662,6 +717,7 @@ class BackgroundShellRegistry:
         promptly instead of hanging on an inherited pipe write-end.
         """
         shell.proc.wait()
+        _release_stdin(shell._stdin_master)
         with contextlib.suppress(OSError, ProcessLookupError):
             os.killpg(shell.pgid, signal.SIGKILL)
         out_thread.join(timeout=_DRAIN_JOIN_TIMEOUT_S)

@@ -1,9 +1,10 @@
 """A CLI workstream another process takes over: the user is told, and the prompt moves on.
 
 The manager retires a workstream whose lease another process took. Its notice
-must reach the terminal while the workstream is still the one in front (a
-notice buffered into a workstream that already left the prompt is never
-shown), and the REPL then says where the next input goes.
+must reach the terminal while the workstream is still the one in front (kept in
+the buffer of a workstream that already left the prompt, it would show only in
+the replay printed when that workstream closes), and the REPL then says where
+the next input goes.
 """
 
 from __future__ import annotations

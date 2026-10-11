@@ -11,7 +11,9 @@ Pure registry tests — no ChatSession.  Session wiring is covered in
 ``test_bash_background_tool.py``.
 """
 
+import os
 import re
+import shutil
 import sys
 import threading
 import time
@@ -21,6 +23,7 @@ import pytest
 from tests._proc_helpers import kill_pid as _kill_pid
 from tests._proc_helpers import pid_alive as _pid_alive
 from tests._proc_helpers import poll_until as _wait_until
+from tests.conftest import stdin_from_pipe, stdin_from_pty
 
 # Module alias (from-style, matching the symbol imports below) for tests
 # that monkeypatch module attributes (os.killpg, subprocess.Popen, ...).
@@ -49,6 +52,151 @@ def registry():
 # ---------------------------------------------------------------------------
 # Handles + spawning
 # ---------------------------------------------------------------------------
+
+
+def test_a_command_reads_eof_not_the_keys_typed_into_the_terminal():
+    """A bash tool command gets EOF on stdin, never what a person types into the
+    CLI's terminal (``spawn_group_leader`` is the foreground tool's prologue)."""
+    with stdin_from_pipe(b"keys typed for another workstream\n"):
+        proc, _pgid, script_path = bg_mod.spawn_group_leader("cat", stop_on_error=False, env=None)
+    try:
+        out, _err = proc.communicate(timeout=10)
+    finally:
+        os.unlink(script_path)
+    assert out == ""
+    assert proc.returncode == 0
+
+
+def _lines(registry, shell):
+    return [line.rstrip("\n") for line in registry.read(shell.shell_id).lines]
+
+
+def test_a_background_shell_gets_a_terminal_of_its_own_where_the_process_has_one(registry):
+    """Where this process's stdin is a terminal, as the CLI's is, a background
+    shell gets a pseudo-terminal of its own.  A program there finds a terminal
+    and input that never ends, so it keeps running (a watcher that stops at the
+    end of its input does not stop), and a line typed into this process's
+    terminal never reaches it.  The pseudo-terminal is let go once the shell
+    exits."""
+    seen: list[str] = []
+    with stdin_from_pty() as terminal:
+        shell = registry.spawn("[ -t 0 ] && echo terminal; cat")
+
+        def _saw_terminal() -> bool:
+            seen.extend(_lines(registry, shell))
+            return "terminal" in seen
+
+        assert _wait_until(_saw_terminal, timeout=5)
+        os.write(terminal, b"typed into this process's terminal\n")
+        assert not _wait_status(shell, "completed", timeout=0.5)  # still running
+        seen.extend(_lines(registry, shell))
+    assert seen == ["terminal"]
+    registry.kill(shell.shell_id)
+    assert _wait_status(shell, "killed")
+    assert _wait_until(lambda: shell._stdin_master.closed, timeout=5)
+
+
+def test_a_background_shell_gets_dev_null_where_the_process_has_no_terminal(registry):
+    """Anywhere else (a server, whose stdin is ``/dev/null``) a background shell
+    gets ``/dev/null``: a program that reads its input ends at once, and none of
+    this process's own input reaches it."""
+    with stdin_from_pipe(b"input meant for this process\n"):
+        shell = registry.spawn("cat; [ -t 0 ] || echo not-a-terminal")
+    assert _wait_status(shell, "completed")
+    assert _lines(registry, shell) == ["not-a-terminal"]
+    assert shell._stdin_master is None
+
+
+@pytest.mark.skipif(shutil.which("rg") is None, reason="ripgrep is not installed")
+def test_a_background_rg_with_no_path_searches_the_working_directory(
+    registry, tmp_path, monkeypatch
+):
+    """ripgrep given no path reads stdin when stdin is a pipe, a file or a
+    socket, and searches the working directory otherwise.  A background shell's
+    stdin is neither kind, so the search ends, in the CLI too."""
+    (tmp_path / "hit.txt").write_text("needle\n")
+    monkeypatch.chdir(tmp_path)
+    with stdin_from_pty():
+        shell = registry.spawn("rg -l needle")
+        assert _wait_status(shell, "completed", timeout=10)
+    assert _lines(registry, shell) == ["hit.txt"]
+
+
+def test_a_host_that_cannot_open_a_pseudo_terminal_gives_dev_null(registry, monkeypatch):
+    """When no pseudo-terminal can be opened, the shell still runs, with
+    ``/dev/null`` as a server would give it."""
+
+    def _no_pty() -> tuple[int, int]:
+        raise OSError("no pseudo-terminal")
+
+    with stdin_from_pty():
+        monkeypatch.setattr(bg_mod.os, "openpty", _no_pty)
+        shell = registry.spawn("[ -t 0 ] || echo not-a-terminal")
+    assert _wait_status(shell, "completed")
+    assert _lines(registry, shell) == ["not-a-terminal"]
+    assert shell._stdin_master is None
+
+
+@pytest.fixture
+def opened_background_stdins(monkeypatch):
+    """Each background shell's stdin as opened: the child's fd and the pty master.
+
+    Holding the master here, as an exception's traceback can, shows whether the
+    registry closes it itself rather than leaving that to garbage collection."""
+    opened = []
+    real_background_stdin = bg_mod._background_stdin
+
+    def _recording_background_stdin():
+        stdin_fd, master = real_background_stdin()
+        opened.append((stdin_fd, master))
+        return stdin_fd, master
+
+    monkeypatch.setattr(bg_mod, "_background_stdin", _recording_background_stdin)
+    return opened
+
+
+def test_a_failed_fork_leaves_no_pseudo_terminal_open(
+    registry, monkeypatch, opened_background_stdins
+):
+    """A spawn whose fork fails closes both ends of the pseudo-terminal it
+    opened for the shell."""
+
+    def _fork_fails(*_args, **_kwargs):
+        raise OSError("fork failed")
+
+    monkeypatch.setattr(bg_mod.subprocess, "Popen", _fork_fails)
+    with stdin_from_pty(), pytest.raises(OSError, match="fork failed"):
+        registry.spawn("true")
+    assert len(opened_background_stdins) == 1
+    slave, master = opened_background_stdins[0]
+    assert master is not None
+    assert master.closed
+    with pytest.raises(OSError):
+        os.fstat(slave)
+
+
+def test_a_spawn_refused_after_the_fork_lets_its_pseudo_terminal_go(
+    registry, monkeypatch, opened_background_stdins
+):
+    """A spawn the capacity re-check refuses after the fork reaps the new group
+    and closes the pseudo-terminal it opened for the shell."""
+    checks = 0
+    real_check = registry._check_capacity_locked
+
+    def _refuse_after_the_fork(owner):
+        nonlocal checks
+        checks += 1
+        if checks == 2:
+            raise TooManyShellsError("refused after the fork")
+        real_check(owner)
+
+    monkeypatch.setattr(registry, "_check_capacity_locked", _refuse_after_the_fork)
+    with stdin_from_pty(), pytest.raises(TooManyShellsError, match="after the fork"):
+        registry.spawn("sleep 30")
+    assert len(opened_background_stdins) == 1
+    _slave, master = opened_background_stdins[0]
+    assert master is not None
+    assert master.closed
 
 
 def test_spawn_returns_incrementing_bash_handles(registry):

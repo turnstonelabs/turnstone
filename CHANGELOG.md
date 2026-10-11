@@ -192,6 +192,15 @@ frozen.
 
 ### Changed
 
+- **Bash commands no longer read the CLI's terminal.** They inherited the stdin of the process that
+  ran them, so in the CLI a command that read its input took keys typed into the terminal, perhaps
+  for another workstream, and one that prompted waited until its timeout for an answer nobody
+  could give. A `bash` command now gets `/dev/null`: it reads end-of-file at once and finds that
+  stdin is not a terminal. A background shell gets `/dev/null` too, unless the process's own stdin
+  is a terminal, as the CLI's is: then it gets a terminal of its own that nothing is typed into,
+  so a long-running program keeps running as before, and one that waits for input waits until the
+  shell is killed. That terminal has no window size, so a program that sizes its output by it uses
+  its default width, as a `bash` command now does.
 - **A message to a waiting coordinator ends the wait at once (#1339).** A message the user sends
   while the coordinator blocks in `wait_for_workstream` no longer queues until the wait ends (up to
   600 seconds): the wait returns at once with `complete: false` and `interrupted: "user_message"`,
@@ -774,6 +783,28 @@ frozen.
   task agent's call waits for a person (`evaluation` while one waits on the judge in a Smart
   Approvals wait), as it does for the main loop's calls, and goes back to `running` when the last
   waiting call is resolved.
+- **A background CLI workstream waits only for tool calls that need a person (#1342).** Its
+  approval gate held every tool batch until the workstream was brought forward, before tool
+  policies and auto-approve had run, so calls that need no approval and calls that a policy, an
+  "Always" answer or `--skip-permissions` settles waited too. A batch they settle now runs at once.
+  No current CLI flow makes a gate wait in the background, since the CLI runs each turn in the
+  workstream in front.
+- **CLI output no longer prints over the workstream in front.** The intent judge keeps working
+  after a call is approved, so a verdict could land after a switch to another workstream and print
+  over its prompt. A background workstream now keeps its judge verdicts, tool errors, output
+  warnings, task-agent steps and operator messages with its buffered output, shown when you switch
+  back to it (tool errors on stderr); before, its tool errors were dropped and the rest printed over
+  the workstream in front. In front, a tool error now prints at once even while a task agent's
+  approval prompt is open, instead of waiting for that prompt's answer.
+- **The first Ctrl-C stops a parallel batch in the CLI.** During a batch of tool calls run in
+  parallel (several task agents, say), the first Ctrl-C waited for every call to finish, and a
+  second ended that wait but left the calls running, out of sight. The first Ctrl-C now stops the
+  batch as Stop does: running commands are killed, task agents stop, every intent judge still
+  running in the workstream stops (late verdicts are not shown), and calls that had not started
+  are recorded as not run; the turn then ends as interrupted. A call that cannot stop part-way (an
+  MCP call, a web search, a page still downloading) still runs until it returns or times out.
+  Ctrl-C reaches only the main thread, so an approval prompt already open on a task agent's thread
+  still takes the next line typed: that answer is not used, and the CLI says so.
 - **Smart Approvals hands a batch to a person sooner (#1325).** The verdict wait ends as soon as
   one verdict rules the batch out (a `review` or `deny`, a judge error, or a confidence below the
   threshold), instead of waiting for every verdict, and a batch with a call the heuristic rules

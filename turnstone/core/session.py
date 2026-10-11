@@ -557,6 +557,30 @@ def _generation_superseded(session: ChatSession, my_generation: int) -> bool:
     return bool(my_generation and session._generation != my_generation)
 
 
+@contextlib.contextmanager
+def _further_ctrl_c_ignored() -> Iterator[None]:
+    """Let a further Ctrl-C do nothing while the block runs.
+
+    The block runs under a SIGINT handler that does nothing: a handler, not ``SIG_IGN``, which a
+    process started meanwhile would keep.  Only the main thread may set one, and only a handler
+    Python installed can be put back (``getsignal`` gives ``None`` for any other), so anywhere
+    else the block runs as it is.
+    """
+    previous = (
+        signal.getsignal(signal.SIGINT)
+        if threading.current_thread() is threading.main_thread()
+        else None
+    )
+    if previous is None:
+        yield
+        return
+    signal.signal(signal.SIGINT, lambda _signum, _frame: None)
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGINT, previous)
+
+
 class _CancelRef(list[Any]):
     """List proxy handed to ``create_streaming`` as its ``cancel_ref``.
 
@@ -762,6 +786,11 @@ class _ApprovalCancelWitness:
     can forget a Stop. The epoch snapshot taken at construction cannot forget it, and it ignores a
     Stop that predates the witness. Main and task-agent gates additionally carry their
     generation-local event or abort ref so supersession and scope cancellation remain visible.
+
+    A tool batch's witness is read after its gate too: when the executor admits each call
+    (``_run_one_body``), and when a call of the batch registers its model stream
+    (``_registered_parallel_model_cancel_scope``). A Stop that reached the batch therefore refuses
+    a call that starts late, even after ``send()`` cleared the event.
     """
 
     __slots__ = ("_cancel_epoch", "_cancel_source", "_session")
@@ -10059,6 +10088,7 @@ class ChatSession:
         self,
         origin_event: threading.Event,
         origin_generation: int,
+        origin_witness: _ApprovalCancelWitness | None,
     ) -> Iterator[_ParallelModelCancelScope]:
         """Register one parallel child model call for Stop/close propagation.
 
@@ -10066,7 +10096,12 @@ class ChatSession:
         run is therefore either in the snapshot or observes the already-set
         originating event/shutdown latch and is born aborted.  The generation
         comparison also rejects a queued predecessor that starts only after a
-        force-cancel successor claimed the session.  Removal stays in
+        force-cancel successor claimed the session.  *origin_witness* is the
+        launching batch's approval witness, None only for a call no batch
+        launched, and every caller names it: once a Stop has reached the batch
+        it reads aborted for good, after ``send()`` cleared the generation's
+        event on its way out too (a second Ctrl-C can end the batch's wait
+        for a call that has not registered yet).  Removal stays in
         ``finally`` so completed and failed operations never accumulate stale
         handles.
         """
@@ -10077,6 +10112,7 @@ class ChatSession:
                 self._parallel_model_cancel_shutdown
                 or origin_event.is_set()
                 or bool(origin_generation and self._generation != origin_generation)
+                or (origin_witness is not None and origin_witness.aborted)
             )
             if not refused:
                 self._parallel_model_cancel_scopes[token] = scope
@@ -18895,10 +18931,8 @@ class ChatSession:
         # publishes them itself, through the ``_publish_gate_state`` stamped
         # below (``publish_gate_state`` in session_ui_base), where it actually
         # waits: a batch that policies, "Always" grants or auto-approve settle
-        # never leaves ``running``, except that a background CLI workstream
-        # holds every batch in ``attention`` until it is brought forward.  The
-        # generation-fenced commit runs first: it is the cancel boundary before
-        # the gate opens.
+        # never leaves ``running``.  The generation-fenced commit runs first: it
+        # is the cancel boundary before the gate opens.
 
         def _publish_gate_state(state: str | None) -> None:
             """Commit *state* for this batch; ``None`` is the generation fence alone."""
@@ -19083,12 +19117,16 @@ class ChatSession:
                 # Mark the final executor-admission boundary atomically with a
                 # last owner/cancel check.  A queued parallel sibling remains
                 # absent and is later staged NONE; once this marker lands, a
-                # missing result is conservatively UNKNOWN.
+                # missing result is conservatively UNKNOWN.  The batch's
+                # witness keeps a stopped batch's calls out for good: send()
+                # clears the generation's event on its way out, and a second
+                # Ctrl-C can end the pool's wait before a queued call starts.
                 with self._generation_lock:
                     if (
                         self._publication_shutdown
                         or (my_generation and self._generation != my_generation)
                         or self._cancel_event.is_set()
+                        or approval_cancel_witness.aborted
                     ):
                         raise GenerationCancelled()
                     started_call_ids.add(str(item.get("call_id") or ""))
@@ -19171,7 +19209,20 @@ class ChatSession:
                     results = [run_one(it) for it in items]
                 else:
                     with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
-                        results = list(pool.map(run_one, items))
+                        try:
+                            results = list(pool.map(run_one, items))
+                        except KeyboardInterrupt:
+                            # Ctrl-C reaches only this thread, and leaving the pool waits for every
+                            # call still running.  Stop the batch first, as Stop does, so that wait
+                            # is short and nothing outlives the turn; calls the pool never started
+                            # are recorded as not run.  A call that cannot stop part-way (an MCP
+                            # call, a web search, a page still downloading) finishes or times out
+                            # first.  A further Ctrl-C would cut the stop short.
+                            with _further_ctrl_c_ignored():
+                                if not _generation_superseded(self, my_generation):
+                                    self.cancel()
+                                    _stage_unstarted_tool_calls()
+                            raise
         except GenerationCancelled:
             _stage_unstarted_tool_calls()
             raise
@@ -25440,6 +25491,7 @@ class ChatSession:
 
         proc = subprocess.Popen(
             args,
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             env=scrubbed_env(),
@@ -25786,18 +25838,22 @@ class ChatSession:
         origin_cancel_event: threading.Event | None = None,
         origin_generation: int = 0,
         execution_journal: _TaskExecutionJournal | None = None,
+        origin_witness: _ApprovalCancelWitness | None = None,
     ) -> str:
         """Run one autonomous child under an independently abortable scope.
 
         The wrapper owns registration, ContextVar propagation to child tools,
         and exact cleanup.  The loop below never observes a task-agent run
-        without a registered provider-stream handle.
+        without a registered provider-stream handle.  *origin_witness* is the
+        launching batch's approval witness (see
+        ``_registered_parallel_model_cancel_scope``).
         """
         parent_event = self._cancel_event if origin_cancel_event is None else origin_cancel_event
         journal = execution_journal or _TaskExecutionJournal(agent_turns)
         with self._registered_parallel_model_cancel_scope(
             parent_event,
             origin_generation,
+            origin_witness,
         ) as cancel_scope:
             context_token = _active_task_agent_cancel_scope.set(cancel_scope)
             try:
@@ -26935,6 +26991,7 @@ class ChatSession:
                 origin_cancel_event=item.get("_origin_cancel_event"),
                 origin_generation=origin_generation,
                 execution_journal=execution_journal,
+                origin_witness=item.get("_approval_cancel_witness"),
             )
 
             # Self-report the task_agent's OWN result.  The parent run-loop only
@@ -28092,6 +28149,7 @@ class ChatSession:
             with self._registered_parallel_model_cancel_scope(
                 origin_event,
                 origin_generation,
+                item.get("_approval_cancel_witness"),
             ) as cancel_scope:
                 return self._exec_web_fetch(
                     {

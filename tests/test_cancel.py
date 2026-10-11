@@ -2,6 +2,7 @@
 
 import contextlib
 import json
+import signal
 import threading
 import time
 from typing import Any
@@ -32,6 +33,7 @@ from turnstone.core.session import (
     _ApprovalCancelWitness,
     _CancelledToolResult,
     _CancelRef,
+    _ParallelModelCancelScope,
     _StreamTurnConsumer,
     _TaskExecutionJournal,
     _tool_turn_meta,
@@ -822,6 +824,316 @@ class TestTaskAgentStreamAbort:
         main_stream.close.assert_called()
         assert session._parallel_model_cancel_scopes == {}
 
+    @staticmethod
+    def _run_batch(session, items, *, my_generation):
+        """Run *items* (prepared items by call id) through ``_execute_tools`` as one batch."""
+        with (
+            patch.object(session, "_safe_prepare_tool", side_effect=lambda tc: items[tc["id"]]),
+            patch("turnstone.core.storage._registry.get_storage", return_value=MagicMock()),
+        ):
+            session._execute_tools(
+                [
+                    {
+                        "id": cid,
+                        "type": "function",
+                        "function": {"name": item["func_name"], "arguments": "{}"},
+                    }
+                    for cid, item in items.items()
+                ],
+                my_generation=my_generation,
+            )
+
+    @staticmethod
+    @contextlib.contextmanager
+    def _ctrl_c_once(ready):
+        """Send the main thread a SIGINT, as a Ctrl-C does, if ``ready()`` returns true.
+
+        ``ready()`` is called once, on another thread, so it should block until
+        the batch is running, as ``Event.wait`` with a timeout does.
+        """
+
+        def _interrupt() -> None:
+            if ready():
+                signal.pthread_kill(threading.main_thread().ident, signal.SIGINT)
+
+        interrupter = threading.Thread(target=_interrupt)
+        interrupter.start()
+        try:
+            yield
+        finally:
+            interrupter.join(3)
+
+    @classmethod
+    def _run_parallel_task_agents(cls, session, outcomes, *, my_generation):
+        """Run two task agents as one parallel batch, on this (the main) thread."""
+
+        def _agent(execute_item: dict[str, Any]) -> tuple[str, str]:
+            try:
+                session._run_agent(
+                    [Turn.user("start")],
+                    label="task",
+                    origin_cancel_event=execute_item["_origin_cancel_event"],
+                    origin_generation=execute_item["_origin_generation"],
+                    origin_witness=execute_item["_approval_cancel_witness"],
+                )
+            except BaseException as exc:
+                outcomes.append(exc)
+                raise
+            return execute_item["call_id"], "done"
+
+        items = {
+            cid: {
+                "call_id": cid,
+                "func_name": "task_agent",
+                "needs_approval": False,
+                "execute": _agent,
+                "_needs_origin_context": True,
+            }
+            for cid in ("agent_a", "agent_b")
+        }
+        cls._run_batch(session, items, my_generation=my_generation)
+
+    def test_the_first_ctrl_c_stops_a_parallel_batch_as_stop_does(self, tmp_db):
+        """Ctrl-C reaches only the main thread, which waits on the batch's pool,
+        and leaving the pool waits for every call still running.  The first
+        Ctrl-C therefore stops the batch as Stop does before that wait: both
+        task agents' streams close at once and the turn unwinds as an
+        interrupt, instead of waiting for the agents to finish."""
+        session = _make_session()
+        streams = [_BlockingAgentStream(), _BlockingAgentStream()]
+        self._install_blocking_provider(session, streams)
+        outcomes: list[object] = []
+        with (
+            self._ctrl_c_once(lambda: all(stream.read_started.wait(2) for stream in streams)),
+            pytest.raises(KeyboardInterrupt),
+        ):
+            self._run_parallel_task_agents(
+                session, outcomes, my_generation=session._claim_generation()
+            )
+        assert all(stream.closed.is_set() for stream in streams)
+        assert len(outcomes) == 2
+        assert all(isinstance(outcome, GenerationCancelled) for outcome in outcomes)
+        assert session._cancel_event.is_set()  # Stop's own signal; send() would consume it
+        assert session._parallel_model_cancel_scopes == {}
+
+    def test_a_second_ctrl_c_during_the_stop_does_not_cut_it_short(self, tmp_db):
+        """A second Ctrl-C can land while the first one's stop is still running,
+        here as it aborts the first agent's stream.  The stop finishes all the
+        same: both agents' streams close and the output guard's judge stops.
+        The Ctrl-C handler in force before is back afterwards."""
+        session = _make_session()
+        streams = [_BlockingAgentStream(), _BlockingAgentStream()]
+        self._install_blocking_provider(session, streams)
+        guard, guard_cancel = MagicMock(), threading.Event()
+        session._output_guard_judge = guard
+        session._output_guard_judge_cancel = guard_cancel
+        handler_before = signal.getsignal(signal.SIGINT)
+        outcomes: list[object] = []
+        abort = _ParallelModelCancelScope.abort
+        second_ctrl_c = threading.Event()
+
+        def _abort_after_a_second_ctrl_c(scope: _ParallelModelCancelScope) -> None:
+            if threading.current_thread() is threading.main_thread() and not second_ctrl_c.is_set():
+                second_ctrl_c.set()
+                signal.pthread_kill(threading.main_thread().ident, signal.SIGINT)
+            abort(scope)
+
+        with (
+            self._ctrl_c_once(lambda: all(stream.read_started.wait(2) for stream in streams)),
+            patch.object(_ParallelModelCancelScope, "abort", _abort_after_a_second_ctrl_c),
+            pytest.raises(KeyboardInterrupt),
+        ):
+            self._run_parallel_task_agents(
+                session, outcomes, my_generation=session._claim_generation()
+            )
+        assert second_ctrl_c.is_set()
+        assert all(stream.closed.is_set() for stream in streams)
+        assert all(isinstance(outcome, GenerationCancelled) for outcome in outcomes)
+        assert guard_cancel.is_set()
+        guard.retire.assert_called_once()
+        assert signal.getsignal(signal.SIGINT) is handler_before
+
+    def test_a_ctrl_c_records_the_calls_the_pool_never_started_as_not_run(self, tmp_db):
+        """The pool runs four calls at once; a fifth waits for a free thread.
+        The first Ctrl-C drops the waiting call, and its receipt says it never
+        ran (as Stop records it), not that it may have."""
+        session = _make_session()
+        started = {cid: threading.Event() for cid in ("c1", "c2", "c3", "c4")}
+        ran_late: list[str] = []
+
+        def _until_stopped(execute_item: dict[str, Any]) -> tuple[str, str]:
+            cid = execute_item["call_id"]
+            if cid not in started:
+                ran_late.append(cid)
+                return cid, "ran"
+            started[cid].set()
+            execute_item["_origin_cancel_event"].wait(2)
+            return cid, "stopped"
+
+        items = {
+            cid: {
+                "call_id": cid,
+                "func_name": "read_file",
+                "needs_approval": False,
+                "execute": _until_stopped,
+                "_needs_origin_context": True,
+            }
+            for cid in ("c1", "c2", "c3", "c4", "c5")
+        }
+        with (
+            self._ctrl_c_once(lambda: all(event.wait(2) for event in started.values())),
+            pytest.raises(KeyboardInterrupt),
+        ):
+            self._run_batch(session, items, my_generation=session._claim_generation())
+        assert ran_late == []
+        assert session._cancelled_tool_results["c5"].effect_status is EffectStatus.NONE
+        assert not any(cid in session._cancelled_tool_results for cid in started)
+
+    def test_a_ctrl_c_after_a_successor_claimed_the_session_stops_nothing(self, tmp_db):
+        """The batch's generation lost the session to a successor (a force
+        Stop) before the Ctrl-C: the interrupt cancels nothing, since the
+        session's live work is now the successor's."""
+        session = _make_session()
+        streams = [_BlockingAgentStream(), _BlockingAgentStream()]
+        self._install_blocking_provider(session, streams)
+        outcomes: list[object] = []
+        closed_by_the_interrupt: list[bool] = []
+
+        def _successor_then_ctrl_c() -> None:
+            if not all(stream.read_started.wait(2) for stream in streams):
+                return
+            with session._generation_lock:
+                session._generation += 1  # a force successor claimed the session
+            signal.pthread_kill(threading.main_thread().ident, signal.SIGINT)
+            time.sleep(0.2)
+            closed_by_the_interrupt.extend(stream.closed.is_set() for stream in streams)
+            for stream in streams:  # let the agents end
+                stream.close()
+
+        interrupter = threading.Thread(target=_successor_then_ctrl_c)
+        interrupter.start()
+        try:
+            with pytest.raises(KeyboardInterrupt):
+                self._run_parallel_task_agents(
+                    session, outcomes, my_generation=session._claim_generation()
+                )
+        finally:
+            interrupter.join(3)
+        assert closed_by_the_interrupt == [False, False]
+        assert not session._cancel_event.is_set()
+
+    def test_a_stopped_batchs_queued_call_never_starts(self, tmp_db):
+        """A Stop moves the batch's witness for good, so a call of the batch
+        reaching admission after send() cleared the generation's event (as a
+        queued call can, once a second Ctrl-C ends the pool's wait) never
+        starts.  A serialized batch admits its calls in order, on this thread."""
+        session = _make_session()
+        generation = session._claim_generation()
+        ran_late: list[str] = []
+
+        def _stop_and_unwind(execute_item: dict[str, Any]) -> tuple[str, str]:
+            session.cancel()
+            session._consume_cancel(generation)
+            return execute_item["call_id"], "stopped"
+
+        def _late(execute_item: dict[str, Any]) -> tuple[str, str]:
+            ran_late.append(execute_item["call_id"])
+            return execute_item["call_id"], "ran"
+
+        items = {
+            cid: {
+                "call_id": cid,
+                "func_name": "read_file",
+                "needs_approval": False,
+                "execute": execute,
+                "_batch_policy": {"serialize": True},
+            }
+            for cid, execute in (("first", _stop_and_unwind), ("queued", _late))
+        }
+        with pytest.raises(GenerationCancelled):
+            self._run_batch(session, items, my_generation=generation)
+        assert ran_late == []
+
+    @staticmethod
+    def _stopped_batch(session):
+        """A batch's origin, its witness, and the batch stopped and unwound: a
+        Stop, then send() clearing the generation's event on its way out.  The
+        event refuses nothing after that; the witness still does."""
+        generation = session._claim_generation()
+        origin_event = session._cancel_event
+        witness = _ApprovalCancelWitness(session, origin_event)
+        session.cancel()
+        session._consume_cancel(generation)
+        return {
+            "_origin_cancel_event": origin_event,
+            "_origin_generation": generation,
+            "_approval_cancel_witness": witness,
+        }
+
+    def test_a_stopped_batchs_late_task_agent_never_opens_a_stream(self, tmp_db):
+        """The batch's witness reaches the task agent's registration through the
+        real ``_exec_task``: an agent of a stopped batch that starts late opens no
+        model stream."""
+        session = _make_session()
+        provider = self._install_blocking_provider(session, [_BlockingAgentStream()])
+        item = {"call_id": "late-agent", "prompt": "inspect", **self._stopped_batch(session)}
+        with contextlib.suppress(GenerationCancelled):
+            session._exec_task(item)
+        provider.create_streaming.assert_not_called()
+        assert session._parallel_model_cancel_scopes == {}
+
+    def test_a_stopped_batchs_late_web_fetch_never_fetches(self, tmp_db):
+        """The same through the real ``_exec_web_fetch``: a fetch of a stopped
+        batch that starts late fetches nothing."""
+        session = _make_session()
+        item = {
+            "call_id": "late-fetch",
+            "url": "https://example.com/late",
+            "question": "summarize",
+            "allow_private_origin": False,
+            **self._stopped_batch(session),
+        }
+        with (
+            patch("turnstone.core.session.fetch_with_ssrf_guard") as fetch,
+            patch.object(session, "_report_tool_result"),
+            contextlib.suppress(GenerationCancelled),
+        ):
+            session._exec_web_fetch(item)
+        fetch.assert_not_called()
+        assert session._parallel_model_cancel_scopes == {}
+
+    def test_every_run_agent_call_names_the_batch_witness(self):
+        """``_run_agent``'s ``origin_witness`` defaults to None, for an agent no
+        batch launched.  A call from a batch that left it out would lose the
+        refusal of a stopped batch's late calls without any error, so every call
+        in the package names it, or forwards ``**kwargs`` from a caller that
+        does."""
+        import ast
+        from pathlib import Path
+
+        import turnstone
+
+        root = Path(turnstone.__file__).parent
+        calls = 0
+        unnamed: list[str] = []
+        for path in sorted(root.rglob("*.py")):
+            text = path.read_text(encoding="utf-8")
+            if "_run_agent" not in text:
+                continue
+            for node in ast.walk(ast.parse(text)):
+                if not isinstance(node, ast.Call):
+                    continue
+                func = node.func
+                name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", None)
+                if name != "_run_agent":
+                    continue
+                calls += 1
+                keywords = {keyword.arg for keyword in node.keywords}
+                if "origin_witness" not in keywords and None not in keywords:
+                    unnamed.append(f"{path.relative_to(root)}:{node.lineno}")
+        assert calls > 0
+        assert unnamed == []
+
     def test_close_unblocks_task_agent_waiting_for_approval(self, tmp_db):
         """Direct close denies a registered task-agent gate without timeout."""
         from turnstone.core.providers._openai_chat import OpenAIChatCompletionsProvider
@@ -1031,10 +1343,10 @@ class TestTaskAgentStreamAbort:
                 deadline = time.monotonic() + 2
                 waiting = False
                 while time.monotonic() < deadline:
-                    with ui._print_lock:
+                    with ui._buffer_lock:
                         waiting = any(
-                            event_type == "info" and "Waiting for approval" in text
-                            for event_type, text in ui._output_buffer
+                            not stderr and "Waiting for approval" in text
+                            for stderr, text in ui._output_buffer
                         )
                     if waiting and session.has_tool_structural_debt():
                         break
@@ -2831,6 +3143,7 @@ class TestSendGenerationInitializationPublication:
         with session._registered_parallel_model_cancel_scope(
             session._cancel_event,
             generation,
+            None,
         ) as child_scope:
             child_scope.cancel_ref.append(child_handle)
             _CancelRef(session, generation).append(main_handle)

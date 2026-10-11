@@ -1576,6 +1576,7 @@ class TestTaskExec:
             session._registered_parallel_model_cancel_scope(
                 session._cancel_event,
                 origin_generation=0,
+                origin_witness=None,
             ) as child_scope,
         ):
             child_scope.cancel_ref.append(child_stream)
@@ -2166,11 +2167,68 @@ class TestTaskExec:
         assert event.is_set()
 
 
+# Each way a CLI batch is settled with no one asked (``TestGateStates._drive``).
+_CLI_SETTLED_BY = [
+    "no_approval_needed",
+    "auto_approve",
+    "auto_approve_tools",
+    "policy_allow",
+    "policy_deny",
+]
+
+
+def _cli_settle_kwargs(settled_by: str) -> dict[str, Any]:
+    """The ``TestGateStates._drive`` arguments that settle its bash call *settled_by*."""
+    if settled_by == "no_approval_needed":
+        return {"needs_approval": False}
+    if settled_by == "auto_approve":
+        return {"configure": lambda ui: setattr(ui, "auto_approve", True)}
+    if settled_by == "auto_approve_tools":
+        return {"configure": lambda ui: ui.auto_approve_tools.add("bash")}
+    return {"policies": {"bash": settled_by.removeprefix("policy_")}}
+
+
+class _BroughtForwardOnWait(threading.Event):
+    """A background CLI workstream's foreground event whose first wait brings the
+    workstream forward as ``/ws <N>`` does: the manager's active workstream moves to
+    it, then the event is set.  Records what the workstream had buffered then."""
+
+    def __init__(self, ui: Any) -> None:
+        super().__init__()
+        self._ui = ui
+        self.buffered_at_wait: list[str] | None = None
+
+    def wait(self, timeout: float | None = None) -> bool:
+        if self.buffered_at_wait is None:
+            with self._ui._buffer_lock:
+                self.buffered_at_wait = [text for _stderr, text in self._ui._output_buffer]
+            self._ui.manager.active_id = self._ui.ws_id
+            self.set()
+        return super().wait(timeout)
+
+
+def _background_cli_ui(*, brought_forward_on_wait: bool = False) -> Any:
+    """A CLI workstream's terminal UI in the background, as ``/ws`` leaves one.
+
+    With *brought_forward_on_wait*, the user brings it forward the first time its
+    gate waits (:class:`_BroughtForwardOnWait`).
+    """
+    from turnstone.cli import WorkstreamTerminalUI
+
+    manager = MagicMock()
+    manager.active_id = "another-workstream"
+    ui = WorkstreamTerminalUI("ws-1", manager)
+    ui.set_foreground(False)
+    if brought_forward_on_wait:
+        ui._fg_event = _BroughtForwardOnWait(ui)
+    return ui
+
+
 class TestGateStates:
     """Every gate, the CLI's included, moves the workstream only when someone
     must act: ``evaluation`` while the intent judge holds a Smart Approvals
-    batch, ``attention`` when a person must decide on it or, for a background
-    CLI workstream, bring it forward."""
+    batch, ``attention`` when a person must decide on it (a background CLI
+    workstream then waits for them to bring it forward)."""
 
     def _drive(
         self,
@@ -2286,26 +2344,16 @@ class TestGateStates:
             kwargs["policies"] = {"bash": settled_by.removeprefix("policy_")}
         assert self._drive(_make_session(), monkeypatch, **kwargs) == ["running"]
 
-    @pytest.mark.parametrize(
-        "settled_by",
-        ["no_approval_needed", "auto_approve", "auto_approve_tools", "policy_allow", "policy_deny"],
-    )
+    @pytest.mark.parametrize("settled_by", _CLI_SETTLED_BY)
     def test_a_cli_batch_settled_without_anyone_stays_running(
         self, tmp_db, monkeypatch, settled_by: str
     ) -> None:
         from turnstone.cli import TerminalUI
 
-        kwargs: dict[str, Any] = {}
-        if settled_by == "no_approval_needed":
-            kwargs["needs_approval"] = False
-        elif settled_by == "auto_approve":
-            kwargs["configure"] = lambda ui: setattr(ui, "auto_approve", True)
-        elif settled_by == "auto_approve_tools":
-            kwargs["configure"] = lambda ui: ui.auto_approve_tools.add("bash")
-        else:
-            kwargs["policies"] = {"bash": settled_by.removeprefix("policy_")}
         with patch("builtins.input") as prompt:
-            emitted = self._drive(_make_session(), monkeypatch, ui=TerminalUI(), **kwargs)
+            emitted = self._drive(
+                _make_session(), monkeypatch, ui=TerminalUI(), **_cli_settle_kwargs(settled_by)
+            )
         assert emitted == ["running"]
         prompt.assert_not_called()
 
@@ -2322,55 +2370,44 @@ class TestGateStates:
             self._drive(_make_session(), monkeypatch, ui=TerminalUI(), emitted=emitted)
         assert emitted == ["attention", "prompt", "running"]
 
-    @pytest.mark.parametrize(
-        ("batch", "expected"),
-        [
-            ("no_approval_needed", ["attention", "running"]),
-            ("auto_approve", ["attention", "running"]),
-            # Brought forward, it still needs a person: the prompt publishes
-            # ``attention`` again (no visible change; the bell ignores the
-            # active workstream).
-            ("needs_approval", ["attention", "attention", "running"]),
-        ],
-    )
-    def test_a_background_cli_batch_waits_in_attention(
-        self, tmp_db, monkeypatch, batch: str, expected: list[str]
+    @pytest.mark.parametrize("settled_by", _CLI_SETTLED_BY)
+    def test_a_background_cli_batch_settled_without_anyone_runs_at_once(
+        self, tmp_db, monkeypatch, capsys, settled_by: str
     ) -> None:
-        """A background CLI workstream holds every batch until a person brings
-        it forward, whatever the batch needs once it is: ``attention`` before
-        that wait, then whatever the foreground gate needs."""
-        from turnstone.cli import WorkstreamTerminalUI
+        """A background CLI workstream runs a batch that policies or auto-approve
+        settle without waiting to be brought forward, and rings no bell (#1342).
+        The batch's lines wait in its buffer instead of painting over the
+        workstream in front."""
+        cli_ui = _background_cli_ui(brought_forward_on_wait=True)
+        with patch("builtins.input") as prompt:
+            emitted = self._drive(
+                _make_session(), monkeypatch, ui=cli_ui, **_cli_settle_kwargs(settled_by)
+            )
+        assert emitted == ["running"]
+        prompt.assert_not_called()
+        assert cli_ui._fg_event.buffered_at_wait is None  # it never waited
+        assert "bash" not in "".join(capsys.readouterr())
+        assert any("bash" in text for stderr, text in cli_ui._output_buffer if not stderr)
 
-        manager = MagicMock()
-        manager.active_id = "another-workstream"
-        cli_ui = WorkstreamTerminalUI("ws-1", manager)
-        cli_ui.set_foreground(False)
-        cli_ui.auto_approve = batch == "auto_approve"
+    def test_a_background_cli_batch_waits_in_attention_for_a_person(
+        self, tmp_db, monkeypatch, capsys
+    ) -> None:
+        """A background CLI batch that still needs a person once policies and
+        auto-approve have run enters ``attention`` and waits until the user
+        brings the workstream forward, then prompts there under its card."""
+        cli_ui = _background_cli_ui(brought_forward_on_wait=True)
+        prompted_in_front: list[bool] = []
 
-        class _BringForwardOnAttention(list[str]):
-            def append(self, state: str) -> None:
-                super().append(state)
-                if state == "attention":
-                    cli_ui.set_foreground(True)
+        def _answer(_prompt: str) -> str:
+            prompted_in_front.append(cli_ui.is_foreground)
+            return "y"
 
-        emitted = _BringForwardOnAttention()
-        # Fallback, so a missing publish fails the assertion instead of hanging.
-        fallback = threading.Timer(2.0, cli_ui.set_foreground, args=(True,))
-        fallback.start()
-        try:
-            with patch("builtins.input", return_value="y") as prompt:
-                self._drive(
-                    _make_session(),
-                    monkeypatch,
-                    needs_approval=batch != "no_approval_needed",
-                    ui=cli_ui,
-                    emitted=emitted,
-                )
-        finally:
-            fallback.cancel()
-            fallback.join()
-        assert list(emitted) == expected
-        assert prompt.called is (batch == "needs_approval")
+        with patch("builtins.input", side_effect=_answer):
+            emitted = self._drive(_make_session(), monkeypatch, ui=cli_ui)
+        assert emitted == ["attention", "running"]
+        assert "Waiting for approval: bash" in "".join(cli_ui._fg_event.buffered_at_wait or [])
+        assert prompted_in_front == [True]
+        assert "bash" in capsys.readouterr().out  # the card, painted in front
 
     def test_a_cli_close_during_the_attention_publish_skips_the_prompt(
         self, tmp_db, monkeypatch, capsys
@@ -2603,17 +2640,17 @@ class TestTaskAgentGateStates:
         assert emitted == ["running", "attention", "prompt", "running"]
 
     def test_a_background_cli_workstream_holds_a_task_agent_call_in_attention(
-        self, tmp_db, monkeypatch
+        self, tmp_db, monkeypatch, capsys
     ) -> None:
         """A background CLI workstream holds the task agent's call until a person
         brings it forward, in ``attention``, so the bell rings for it as for the
-        main loop's batch (which is held first, whatever it needs)."""
-        from turnstone.cli import WorkstreamTerminalUI
+        main loop's batch.  The ``task_agent`` call itself needs no one, so it
+        runs without waiting (#1342).
 
-        manager = MagicMock()
-        manager.active_id = "another-workstream"
-        cli_ui = WorkstreamTerminalUI("ws-1", manager)
-        cli_ui.set_foreground(False)
+        Only the foreground event moves here, while the manager's active
+        workstream stays elsewhere (as while ``/ws <N>`` moves the front): the
+        call's card still goes where its prompt does."""
+        cli_ui = _background_cli_ui()
 
         class _ForwardOnAttention(list[str]):
             """A person brings the workstream forward when it asks, and leaves again."""
@@ -2632,8 +2669,9 @@ class TestTaskAgentGateStates:
         finally:
             fallback.cancel()
             fallback.join()
-        assert list(emitted) == ["attention", "running", "attention", "running"]
+        assert list(emitted) == ["running", "attention", "running"]
         prompt.assert_called_once()
+        assert "write_file" in capsys.readouterr().out  # the card, beside its prompt
 
     def test_one_card_resolving_keeps_a_siblings_attention(self, tmp_db, monkeypatch) -> None:
         session = _make_session()
@@ -6860,6 +6898,7 @@ class TestEvaluateOutputLLMStage:
         with session._registered_parallel_model_cancel_scope(
             session._cancel_event,
             generation,
+            None,
         ) as child_scope:
             child_scope.cancel_ref.append(child_handle)
             with session._generation_lock:
@@ -13457,6 +13496,22 @@ class TestSearchCaptureStreaming:
     they spawn small ``python -c`` writers so the byte-cap, last-newline
     trim, and timeout paths actually execute in real OS processes.
     """
+
+    def test_the_capture_subprocess_has_dev_null_as_stdin(self):
+        """The subprocess's stdin is ``/dev/null``."""
+        import sys
+
+        from tests.conftest import stdin_from_pipe
+
+        session = _make_session()
+        probe = (
+            "import os\n"
+            "fd, null = os.fstat(0), os.stat(os.devnull)\n"
+            "print(fd.st_dev == null.st_dev and fd.st_ino == null.st_ino)\n"
+        )
+        with stdin_from_pipe():
+            stdout, _rc, _stderr, _capped = session._search_capture([sys.executable, "-c", probe])
+        assert stdout.strip() == b"True"
 
     def test_byte_cap_trims_to_last_newline(self):
         """Writer emits >cap bytes of well-formed lines; capture caps and

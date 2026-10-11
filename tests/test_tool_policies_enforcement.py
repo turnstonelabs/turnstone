@@ -9,7 +9,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from tests.conftest import resolve_when_pending
-from turnstone.cli import TerminalUI
+from turnstone.cli import TerminalUI, WorkstreamTerminalUI
 from turnstone.core.policy import POLICIES_UNREADABLE_DENIAL
 from turnstone.server import WebUI
 
@@ -147,6 +147,36 @@ class TestCLIPolicyEnforcement:
 
         prompt.assert_called_once()
         assert approved is False
+
+    @pytest.mark.parametrize("terminal", ["lone", "workstream_leaving_the_front"])
+    def test_an_answer_to_a_stopped_prompt_is_not_used(self, capsys, terminal: str):
+        """A Stop (a Ctrl-C, a close) can retire the batch while its prompt
+        waits; the line typed next still lands there.  None of it is used: no
+        approval, no "Always" grant, and the person is told, on the terminal
+        where the prompt is, even by a workstream whose front has moved."""
+        if terminal == "lone":
+            ui: TerminalUI = TerminalUI()
+        else:
+            manager = MagicMock()
+            manager.active_id = "another-workstream"
+            ui = WorkstreamTerminalUI("ws-1", manager)  # its foreground event is still set
+        items = self._make_items("bash")
+        witness = MagicMock(aborted=False)
+        items[0]["_approval_cancel_witness"] = witness
+
+        def _stopped_while_waiting(_prompt: str) -> str:
+            witness.aborted = True
+            return "a quick question about the build"
+
+        with (
+            patch("turnstone.core.policy.evaluate_loaded_tool_policies", return_value={}),
+            patch("turnstone.core.storage._registry.get_storage", return_value=MagicMock()),
+            patch("builtins.input", side_effect=_stopped_while_waiting),
+        ):
+            assert ui.approve_tools(items) == (False, "Cancelled by user")
+
+        assert ui.auto_approve_tools == set()
+        assert "that answer was not used" in capsys.readouterr().out
 
 
 # ---------------------------------------------------------------------------

@@ -40,7 +40,7 @@ evaluation --> running : Judge approves\n(tools execute)\n_emit_state("running")
 
 evaluation --> attention : A person is needed\n_emit_state("attention")
 
-running --> attention : A person must decide\n(CLI background:\nevery main-loop batch)\n_emit_state("attention")
+running --> attention : A person must decide\n_emit_state("attention")
 
 attention --> running : User approves\n(tools execute)\n_emit_state("running")
 

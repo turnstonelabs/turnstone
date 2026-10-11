@@ -413,17 +413,32 @@ identity used to reject stale verdicts from a prior approval round.
 `WorkstreamTerminalUI` (in `turnstone.cli`) extends `TerminalUI` with workstream
 awareness:
 
-- **Output buffering**: When in background (`is_foreground` is False), tokens
-  are appended to `_output_buffer` instead of written to stdout. When the user
-  switches to this workstream, `flush_buffer()` replays them.
+- **Output buffering**: When in background (`is_foreground` is False),
+  everything `TerminalUI` writes through `_show()` (the rendered reply,
+  reasoning, info and error lines, a settled tool batch's card, tool errors,
+  judge verdicts, output warnings, task-agent steps, operator turns) is
+  appended to `_output_buffer` instead of written to the terminal. `_show()`
+  decides under `_buffer_lock`, so a write that races a switch lands in the
+  replay or on the terminal. When the user switches to this workstream,
+  `flush_buffer()` replays the buffer, each write on the stream it was meant
+  for (stderr for tool errors, stdout for the rest). A workstream that leaves
+  the CLI without coming forward (a close, a lost lease, an eviction, `/exit`)
+  shows its buffer as it goes (`on_workstream_closed()`).
 
-- **Approval blocking**: `approve_tools()` calls `_fg_event.wait()` when in
-  background, blocking the worker thread until the workstream is foregrounded.
-  This ensures the user sees the approval prompt in the correct context.
+- **Approval blocking**: `approve_tools()` runs tool policies and auto-approve
+  first. A batch they settle runs at once, in the background too. When a batch
+  still needs a person, the gate publishes `attention` and, in background,
+  `_wait_for_foreground()` blocks on `_fg_event` until the workstream is
+  foregrounded, and the gate then paints the batch's card on the terminal with
+  its prompt. If a Stop retires the batch while the prompt waits, the gate does
+  not use the answer typed next.
 
-- **Foreground/background toggle**: `set_foreground(bool)` sets or clears
-  `_fg_event` (a `threading.Event`). The manager calls this during `/ws <N>`
-  switches.
+- **Foreground/background toggle**: `is_foreground` is
+  `manager.active_id == ws_id`, and it alone decides whether a write is
+  buffered. `set_foreground(bool)` sets or clears `_fg_event` (a
+  `threading.Event`), which gates only the approval wait; `_bring_to_front()`
+  calls it whenever the front moves (a `/ws` command, `/resume`, `/new`, or a
+  close).
 
 ---
 
@@ -826,9 +841,16 @@ non-idle background workstreams above the input prompt.
 - `SessionUIBase._ws_lock` protects concurrent approval cycles, verdict caches,
   and SSE projection state; approval admission uses a separate condition so
   Stop never waits on database I/O.
-- `WorkstreamTerminalUI._print_lock`: guards `_output_buffer` access.
-- `WorkstreamTerminalUI._fg_event`: `threading.Event` that blocks background
-  approval until the workstream is foregrounded.
+- `TerminalUI._print_lock`: one per workstream UI; held while that
+  workstream's tool-batch card and prompt are up and while `flush_buffer()`
+  replays its buffered output, so those two never interleave. The replay as a
+  workstream closes (`on_workstream_closed()`) never takes it: the close can
+  run on a lease keeper's thread while a prompt holds it.
+- `WorkstreamTerminalUI._buffer_lock`: guards `_output_buffer`. It is held only
+  to append or take the buffer, never across I/O, so a write from a thread that
+  holds session locks never waits behind an open prompt.
+- `WorkstreamTerminalUI._fg_event`: `threading.Event` that blocks a background
+  batch that needs a person until the workstream is foregrounded.
 
 ---
 
@@ -2395,29 +2417,47 @@ The SSE handlers bridge these sync queues to async via
 ### Workstream Threading (CLI)
 
 ```
-Main thread                  Background workstream thread
-+------------------+         +---------------------------+
-| REPL input()     |         | session.send()            |
-| /ws commands     |         | streams response          |
-| active workstream|         | executes tools            |
-| send() inline   |         | approve_tools() ->        |
-+------------------+         |   _fg_event.wait() BLOCKS |
-       |                     +---------------------------+
-       |                                ^
-       +-- /ws <N> switch ------------->|
-       |   old.set_foreground(False)    |
-       |   new.set_foreground(True)     |
-       |   new.flush_buffer()           |
-       +-- _fg_event.set() unblocks --->+
+Main thread                     Other threads, background workstream
++------------------------+      +--------------------------------------+
+| REPL input()           |      | judge daemon: a verdict landing      |
+| /ws commands           |      |   after the turn                     |
+| send() inline: the     |      |     -> _output_buffer                |
+|   workstream in front  |      +--------------------------------------+
++------------------------+                          |
+       |                                            |
+       +-- /ws <N> switch                           |
+           manager.switch_by_index(N)               |
+             (moves active_id)                      |
+           old.set_foreground(False)                |
+           new.set_foreground(True)                 |
+           new.flush_buffer() <---------------------+
+             (replays the buffer)
 ```
 
-When a background workstream reaches its approval gate (every main-loop tool
-batch, and every task-agent call outside `TASK_AUTO_TOOLS` or with a
-private-network grant, whatever either needs once brought forward), its
-`WorkstreamTerminalUI` publishes `attention` and calls `_fg_event.wait()`,
-which blocks the worker thread until the user switches to that workstream.
-The `_bg_attention_notify` callback writes a bell + status line to stderr to
-alert the user.
+The REPL runs each turn inline on the main thread, so the workstream in front
+is the one running a turn; the CLI starts none in a background workstream (it
+wires no wake or watch runner). Other threads can still reach a background
+workstream's `WorkstreamTerminalUI`: the judge's daemon finishes its batch
+after the approval resolves, so a verdict can land after the user has switched
+away, and it waits in `_output_buffer` until the user switches back.
+
+A parallel batch's calls run on a thread pool, and Ctrl-C reaches only the main
+thread, which waits on that pool. Leaving the pool waits for every call still
+running, so on the first Ctrl-C `_execute_tools` stops the batch as Stop does
+(`cancel()`): commands are killed, task agents stop, a web fetch's model step
+aborts, every intent judge still running in the workstream stops, and the calls
+the pool never started are recorded as not run. A call that cannot stop
+part-way (an MCP call, a web search, a page still downloading) runs until it
+returns or times out, which is why a second Ctrl-C can end the pool's wait
+early; a call of the stopped batch that starts or registers after that is
+refused, since the batch's approval witness reads aborted for good. An approval
+prompt already open on a task agent's thread still takes the next line typed,
+and the gate does not use it.
+
+No CLI flow makes a gate wait in the background today. A gate reached there
+still runs tool policies and auto-approve first: a call they settle runs at
+once, and one that still needs a person publishes `attention` and blocks on
+`_fg_event` until the user switches to that workstream.
 
 ### Cluster Console
 

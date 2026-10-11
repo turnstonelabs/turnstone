@@ -28,9 +28,11 @@ def cleanup_session_ui(ws: Workstream) -> None:
     Marks the workstream object dead (``ws._closed``) FIRST, under
     ``ws._lock``, then unblocks pending approval / plan / foreground
     events on the workstream's UI, broadcasts ``ws_closed`` to per-UI
-    listener queues, and cancels + closes the session. The ``hasattr``
-    checks guard stub UIs used in tests — the real ``WebUI`` /
-    ``ConsoleCoordinatorUI`` always have these attributes.
+    listener queues, and cancels + closes the session; last, a UI that
+    keeps output while its workstream is in the background (the CLI's
+    ``on_workstream_closed``) shows it. The ``hasattr`` checks guard stub
+    UIs used in tests — the real ``WebUI`` / ``ConsoleCoordinatorUI``
+    always have these attributes.
 
     The flag write lives HERE because every teardown path funnels
     through this function — ``close``, ``close_idle``, EVICTION,
@@ -78,8 +80,18 @@ def cleanup_session_ui(ws: Workstream) -> None:
             ui._fg_event.set()
         if hasattr(ui, "_listeners_lock"):
             _broadcast_ws_closed_to_listeners(ui)
-    if ws.session is not None and hasattr(ws.session, "close"):
-        ws.session.close()
+    try:
+        if ws.session is not None and hasattr(ws.session, "close"):
+            ws.session.close()
+    finally:
+        # The workstream will not come forward again, so output its UI kept for
+        # that moment shows now: after the session's close, which has stopped
+        # what could still write to it, and also when the close raised, since
+        # nothing would show it later.
+        closed = concrete_method(ui, "on_workstream_closed") if ui is not None else None
+        if closed is not None:
+            with contextlib.suppress(Exception):
+                closed(ws.name)
 
 
 def _broadcast_ws_closed_to_listeners(ui: SessionUI) -> None:
