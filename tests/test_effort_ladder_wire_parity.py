@@ -37,6 +37,7 @@ import pytest
 
 from tests._wire_capture import RecordingClient
 from turnstone.core.providers import create_provider
+from turnstone.core.providers._anthropic import _ANTHROPIC_DEFAULT
 from turnstone.core.providers._protocol import (
     EFFORT_TEMPLATE_FALLBACK_PARAM,
     ModelCapabilities,
@@ -230,6 +231,14 @@ SHAPES: tuple[Shape, ...] = (
         ModelCapabilities(thinking_mode="adaptive"),
         model="claude-fable-5",
     ),
+    # The row an id without one takes: adaptive, effort snapped onto
+    # low..high, thinking display requested.
+    Shape(
+        "anthropic-default-row",
+        "anthropic",
+        _ANTHROPIC_DEFAULT,
+        model="claude-unknown-9",
+    ),
     Shape(
         "anthropic-manual-budgets",
         "anthropic",
@@ -350,7 +359,10 @@ def _decode_native(caps: ModelCapabilities, token: str) -> dict[str, Any]:
     if caps.thinking_mode == "adaptive":
         # Thinking is unconditionally adaptive; a non-"adaptive" token is
         # the output_config effort level riding on top.
-        expected: dict[str, Any] = {"thinking": {"type": "adaptive"}}
+        thinking: dict[str, Any] = {"type": "adaptive"}
+        if caps.thinking_display:
+            thinking["display"] = caps.thinking_display
+        expected: dict[str, Any] = {"thinking": thinking}
         if token != "adaptive":
             expected["output_effort"] = token
         return expected

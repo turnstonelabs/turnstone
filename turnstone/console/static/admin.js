@@ -20,7 +20,7 @@ const ALIAS_SETTING_KEYS = [
 
 // Settings whose empty option means "inherit from a fallback chain", as
 // opposed to "no value" — distinct from the literal "none" choice (e.g.
-// reasoning_effort="none" actually disables reasoning, very different
+// reasoning_effort="none" asks for no reasoning, very different
 // from leaving it unset).
 const INHERIT_EMPTY_LABEL_KEYS = [
   "model.task_effort",
@@ -6246,9 +6246,10 @@ let _modelAuthPersisted = { mode: "static", audience: "", scopes: "" };
 let _rerankCalFields = {};
 
 // Capability tile matrix — sparse-override semantics. The tiles display
-// merge(dataclass defaults, known-model table baseline, explicit overrides);
-// only EXPLICIT keys persist (saved keys + tiles the user toggled), so a
-// known model keeps tracking future table updates instead of being pinned.
+// merge(dataclass defaults, baseline, explicit overrides), where the
+// baseline is the model's table row, else the provider's default row; only
+// EXPLICIT keys persist (saved keys + tiles the user toggled), so a known
+// model keeps tracking future table updates instead of being pinned.
 const _MODEL_CAP_KEYS = [
   "supports_tools",
   "supports_vision",
@@ -6310,7 +6311,7 @@ function _capBool(value) {
   }
   return undefined;
 }
-let _modelCapsBaseline = {}; // known-model table values (display + delta base)
+let _modelCapsBaseline = {}; // model's table row, else provider default
 let _modelCapsExplicit = {}; // keys that persist: saved-in-JSON + user-toggled
 
 function _modelTileEl(key) {
@@ -7558,6 +7559,71 @@ function _isPlainObject(v) {
   return v !== null && typeof v === "object" && !Array.isArray(v);
 }
 
+/* The two local-server lanes: the only providers whose form shows the
+   chat-template fields (Thinking mode, its param, Effort param) and whose
+   save writes them. */
+function _isCompatLane(provider) {
+  return (
+    provider === "openai-compatible" || provider === "anthropic-compatible"
+  );
+}
+
+/* Edit-load: move the chat-template fields out of a stored capabilities
+   object into the form, on the compat lanes only, where
+   _overlayModelFormCaps writes them back on save.  thinking_mode moves only
+   when the dropdown can represent it ("", "manual" = effort-knob
+   controlled, "adaptive" = always on), and a stored thinking_param leaves
+   the object only along with a mode, since with no mode the save writes
+   neither key.  Whatever stays in the object stays in the raw JSON,
+   visible and kept on save. */
+function _liftModelTemplateFields(capsObj, provider) {
+  const compatLane = _isCompatLane(provider);
+  const tmVal = capsObj.thinking_mode || "";
+  const tmCaptured =
+    compatLane && (tmVal === "" || tmVal === "manual" || tmVal === "adaptive");
+  const tmEl = document.getElementById("model-thinking-mode");
+  const tpEl = document.getElementById("model-thinking-param");
+  const epEl = document.getElementById("model-effort-param");
+  tmEl.value = tmCaptured ? tmVal : "";
+  tpEl.value = tmCaptured ? capsObj.thinking_param || "" : "";
+  epEl.value = compatLane ? capsObj.effort_param || "" : "";
+  if (tmCaptured) {
+    delete capsObj.thinking_mode;
+    if (tmVal) delete capsObj.thinking_param;
+  }
+  if (compatLane) delete capsObj.effort_param;
+}
+
+/* Save and the effort-ladder preview: lay the chat-template fields and the
+   capability tiles over the raw capabilities JSON, so the preview annotates
+   what a save persists.  The chat-template fields count on the compat lanes
+   only: they are hidden for other providers, so a value left there by a
+   provider switch must never persist.  There thinking_mode maps the session
+   effort knob onto the template's thinking toggle via chat_template_kwargs
+   (merge_reasoning_template_kwargs), and effort_param names the graded
+   chat-template effort key (e.g. gpt-oss "reasoning_effort").  Then the
+   tiles: exactly the explicit keys (saved in the JSON or toggled), where a
+   key typed into the raw JSON wins as an operator override. */
+function _overlayModelFormCaps(caps, provider) {
+  if (_isCompatLane(provider)) {
+    const thinkingMode = document.getElementById("model-thinking-mode").value;
+    if (thinkingMode) {
+      caps.thinking_mode = thinkingMode;
+      // Preserve thinking_param so Granite/DeepSeek "thinking" key
+      // isn't silently reverted to the default "enable_thinking".
+      const savedParam = document.getElementById("model-thinking-param").value;
+      if (savedParam) caps.thinking_param = savedParam;
+    }
+    const effortParam = document
+      .getElementById("model-effort-param")
+      .value.trim();
+    if (effortParam) caps.effort_param = effortParam;
+  }
+  Object.keys(_modelCapsExplicit).forEach(function (k) {
+    if (!(k in caps)) caps[k] = _modelGetTile(k);
+  });
+}
+
 function _toggleThinkingParam() {
   const mode = document.getElementById("model-thinking-mode").value;
   const row = document.getElementById("model-thinking-param-row");
@@ -7740,29 +7806,8 @@ function showEditModelModal(definitionId) {
       const sc = _isPlainObject(capsObj.server_compat)
         ? capsObj.server_compat
         : {};
-      // Only extract thinking_mode into the dropdown when the UI can
-      // represent it ("", "manual" = effort-knob controlled, "adaptive" =
-      // always on).  Unrepresentable/garbage values keep thinking_mode in
-      // the raw capabilities JSON so they aren't silently lost on save.
-      // Both compat lanes round-trip the dropdown: it drives the
-      // effort-knob → chat_template_kwargs mapping
-      // (merge_reasoning_template_kwargs).
-      const tmVal = capsObj.thinking_mode || "";
-      const tmCaptured =
-        tmVal === "" || tmVal === "manual" || tmVal === "adaptive";
-      if (tmCaptured) {
-        document.getElementById("model-thinking-mode").value = tmVal;
-        document.getElementById("model-thinking-param").value =
-          capsObj.thinking_param || "";
-      } else {
-        document.getElementById("model-thinking-mode").value = "";
-        document.getElementById("model-thinking-param").value = "";
-      }
+      _liftModelTemplateFields(capsObj, m.provider);
       _toggleThinkingParam();
-      // effort_param is a plain string — always representable, so it lifts
-      // into its field unconditionally (stripped from the raw JSON below).
-      document.getElementById("model-effort-param").value =
-        capsObj.effort_param || "";
       // Server compat: server_type, api_surface, and extra_body workarounds
       document.getElementById("model-server-type").value = sc.server_type || "";
       document.getElementById("model-api-surface").value = sc.api_surface || "";
@@ -7803,27 +7848,8 @@ function showEditModelModal(definitionId) {
       _modelRenderTiles();
       _modelCapsRefreshBaseline();
       _scheduleEffortLadder();
-      // Remove structured fields from capabilities display — only delete
-      // thinking_mode/thinking_param when the UI successfully captured them.
+      // Remove structured fields from capabilities display.
       delete capsObj.server_compat;
-      if (tmCaptured) {
-        delete capsObj.thinking_mode;
-        // Strip thinking_param only when a mode value round-trips through
-        // the dropdown. With mode unset the save path writes neither key,
-        // so a stored thinking_param must stay in the raw JSON — deleting
-        // it here would silently drop it on the next unrelated edit-save.
-        if (tmVal) delete capsObj.thinking_param;
-      }
-      // Strip effort_param only for the lanes whose save path re-adds it
-      // (the same provider gate) — on other providers the field is
-      // hidden and the save path never writes it, so deleting it here
-      // would silently drop a stored key on an unrelated edit-save.
-      if (
-        m.provider === "openai-compatible" ||
-        m.provider === "anthropic-compatible"
-      ) {
-        delete capsObj.effort_param;
-      }
       const capsText = JSON.stringify(capsObj, null, 2);
       document.getElementById("model-capabilities").value =
         capsText === "{}" ? "" : capsText;
@@ -7904,35 +7930,6 @@ function submitCreateModel() {
     }
   }
 
-  // Thinking mode → capabilities.  thinking_mode round-trips through the
-  // dropdown for every provider, including anthropic-compatible (where
-  // manual mode maps the session effort knob onto the template's
-  // thinking toggle via chat_template_kwargs —
-  // merge_reasoning_template_kwargs).
-  const thinkingMode = document.getElementById("model-thinking-mode").value;
-  if (thinkingMode) {
-    caps.thinking_mode = thinkingMode;
-    // Preserve thinking_param so Granite/DeepSeek "thinking" key
-    // isn't silently reverted to the default "enable_thinking".
-    const savedParam = document.getElementById("model-thinking-param").value;
-    if (savedParam) caps.thinking_param = savedParam;
-  }
-  // Effort param (graded chat-template effort key, e.g. gpt-oss
-  // "reasoning_effort") round-trips like thinking_param: lifted out of
-  // the raw JSON on edit-load, re-added here when the field is set.
-  // Gated on the local-server lanes (like the server_compat block
-  // below): the field is hidden for other providers, so a lingering
-  // value from a provider switch must never persist.
-  if (
-    providerVal === "openai-compatible" ||
-    providerVal === "anthropic-compatible"
-  ) {
-    const effortParam = document
-      .getElementById("model-effort-param")
-      .value.trim();
-    if (effortParam) caps.effort_param = effortParam;
-  }
-
   // Build server_compat from structured fields.  Only meaningful for the
   // compat lanes (openai-compatible: all fields; anthropic-compatible: the
   // extra-body JSON only) — for other providers the section is hidden
@@ -7982,12 +7979,9 @@ function submitCreateModel() {
     caps.server_compat = serverCompat;
   }
 
-  // Capability tiles: persist exactly the explicit keys (saved-in-JSON +
-  // user-toggled). A key typed directly into the raw JSON wins (operator
-  // override) — same philosophy as the calibration re-merge below.
-  Object.keys(_modelCapsExplicit).forEach(function (k) {
-    if (!(k in caps)) caps[k] = _modelGetTile(k);
-  });
+  // The chat-template fields and the capability tiles, shared with the
+  // effort-ladder preview.
+  _overlayModelFormCaps(caps, providerVal);
   _mergeModelResponseControls(caps);
 
   // Re-merge reranker calibration fields extracted on edit so an unrelated edit
@@ -8592,7 +8586,8 @@ function _onModelFieldChange() {
    (providers/effort_ladder.py — equal "effective" tokens ⇒ identical
    requests).  A position whose delivered level matches its name stays
    plain ("Max"); a snapped position says so ("Low — sends high"); the
-   adaptive none position warns "thinking stays on"; budget detail
+   none position warns "thinking stays on" on a local adaptive lane and
+   says "model sets effort" on the native Anthropic one; budget detail
    lives in the tooltip.  Never label a position after a sibling that
    shares its token — that rendered "Max (= minimal)", implying a
    downgrade the wire doesn't contain. */
@@ -8655,9 +8650,9 @@ function _refreshModelEffortLadder() {
     _annotateEffortSelect(sel, null);
     return;
   }
-  // Assemble the same capabilities the save path would persist: raw
-  // JSON base, structured thinking/effort fields overlaid.  Mid-edit
-  // invalid JSON annotates from the structured fields alone.
+  // Assemble the capabilities a save would persist: the raw JSON with the
+  // form's fields laid over it.  Mid-edit invalid JSON annotates from the
+  // form's fields alone.
   let caps = {};
   const rawText = document.getElementById("model-capabilities").value.trim();
   if (rawText) {
@@ -8668,14 +8663,7 @@ function _refreshModelEffortLadder() {
       /* fall through */
     }
   }
-  const tm = document.getElementById("model-thinking-mode").value;
-  if (tm) {
-    caps.thinking_mode = tm;
-    const tp = document.getElementById("model-thinking-param").value;
-    if (tp) caps.thinking_param = tp;
-  }
-  const ep = document.getElementById("model-effort-param").value.trim();
-  if (ep) caps.effort_param = ep;
+  _overlayModelFormCaps(caps, provider);
   const seq = ++_effortLadderSeq;
   authFetch("/v1/api/admin/models/effort-ladder", {
     method: "POST",
@@ -8684,7 +8672,10 @@ function _refreshModelEffortLadder() {
       provider: provider,
       model: modelName,
       capabilities: caps,
-      api_surface: document.getElementById("model-api-surface").value || "",
+      api_surface:
+        provider === "openai-compatible"
+          ? document.getElementById("model-api-surface").value
+          : "",
     }),
   })
     .then(function (r) {
@@ -8699,10 +8690,14 @@ function _refreshModelEffortLadder() {
     });
 }
 
-/* Known-model lookup feeding the tile matrix: the table becomes the display
-   BASELINE (with the provenance banner), explicit overrides stay on top, and
-   nothing is written into the raw JSON — known models keep tracking the
-   table at runtime instead of being pinned at save time. */
+/* Capability lookup feeding the tile matrix: the model's table row, or for
+   an id with no row the provider's default row it runs on, becomes the
+   display BASELINE, explicit overrides stay on top, and nothing is written
+   into the raw JSON — known models keep tracking the table at runtime
+   instead of being pinned at save time.  Only a table row brings the
+   provenance banner and the context-window autofill: for an id with no row,
+   a filled-in window would persist in place of the fallback the registry
+   gives an unlisted model. */
 function _modelCapsRefreshBaseline() {
   const shelf = document.getElementById("model-shelf");
   if (!shelf || !shelf.open) return;
@@ -8734,22 +8729,20 @@ function _modelCapsRefreshBaseline() {
     })
     .then(function (d) {
       if (seq !== _modelCapsSeq) return; // superseded by a newer edit
-      if (!d.known || !d.capabilities) {
-        _modelCapsBaseline = {};
-        banner.hidden = true;
-        _modelRenderTiles();
-        return;
-      }
-      const ctxInput = document.getElementById("model-ctx-window");
-      if (parseInt(ctxInput.value, 10) === 0 && d.capabilities.context_window) {
-        ctxInput.value = d.capabilities.context_window;
+      const known = !!(d.known && d.capabilities);
+      const row = known ? d.capabilities : d.defaults || {};
+      if (known) {
+        const ctxInput = document.getElementById("model-ctx-window");
+        if (parseInt(ctxInput.value, 10) === 0 && row.context_window) {
+          ctxInput.value = row.context_window;
+        }
+        document.getElementById("model-autofill-name").textContent = modelName;
       }
       _modelCapsBaseline = {};
       _MODEL_CAP_KEYS.forEach(function (k) {
-        if (k in d.capabilities) _modelCapsBaseline[k] = !!d.capabilities[k];
+        if (k in row) _modelCapsBaseline[k] = !!row[k];
       });
-      document.getElementById("model-autofill-name").textContent = modelName;
-      banner.hidden = false;
+      banner.hidden = !known;
       _modelRenderTiles();
     })
     .catch(function () {
@@ -8911,6 +8904,7 @@ function _refreshModelSuggestions() {
       if (!cap) return;
       // a toggle IS the override decision — the key persists from here on
       _modelCapsExplicit[cap] = e.target.checked;
+      _scheduleEffortLadder(); // the preview carries every explicit tile
       if (cap === "supports_verbosity" || cap === "supports_pro_mode") {
         const spec = _MODEL_RESPONSE_CONTROLS.find(function (item) {
           return item.supportKey === cap;

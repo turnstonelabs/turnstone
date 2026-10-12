@@ -467,14 +467,33 @@ DEFAULT_THINKING_BUDGET = 4096
 
 # -- model capabilities -------------------------------------------------------
 
+# The row a Claude model id gets when no entry in the table below matches it
+# (``_lookup_capabilities``), such as the first model of a new line.  The
+# models the API still serves that take a thinking budget each have a row, so
+# every served model that lands here under its Anthropic id thinks
+# adaptively, and the row sends only what all of them accept: adaptive
+# thinking with ``display: "summarized"`` (newer models return thinking
+# blocks with empty text without it), the ``low``..``high`` effort ladder (a
+# knob of ``xhigh`` or ``max`` rides ``high``; an unset knob still omits
+# ``output_config.effort``), and no temperature (newer models reject any
+# non-default value).  A budget model reached under another name, such as a
+# gateway's, lands here too and needs its own row's ``thinking_mode``,
+# ``supports_temperature`` and ``supports_effort`` in its definition's
+# capabilities.  Limits stay conservative, and features some models lack stay
+# off: native mid-conversation system messages, the prefix-binding control
+# and tool search.  A model's real limits and features belong in its own row.
 _ANTHROPIC_DEFAULT = ModelCapabilities(
     context_window=200000,
     max_output_tokens=64000,
     token_param="max_tokens",
-    thinking_mode="manual",
+    thinking_mode="adaptive",
+    supports_effort=True,
+    effort_levels=("low", "medium", "high"),
     supports_web_search=True,
     supports_vision=True,
     supports_pdf=True,
+    supports_temperature=False,
+    thinking_display="summarized",
     supports_reasoning_replay=True,
 )
 

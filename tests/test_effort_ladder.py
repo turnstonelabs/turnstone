@@ -109,6 +109,15 @@ class TestNativeAnthropicLane:
         assert eff["xhigh"] == "max"
         assert eff["max"] == "max"
 
+    def test_unlisted_id_takes_the_default_ladder(self) -> None:
+        """#1366: an id with no row shows the default's effort levels, not
+        thinking budgets; knob positions above high ride high."""
+        eff = _as_map(effort_ladder_for_model("anthropic", "claude-unknown-9", None))
+        assert eff["none"] == "adaptive"
+        assert eff["minimal"] == eff["low"] == "low"
+        assert eff["medium"] == "medium"
+        assert eff["high"] == eff["xhigh"] == eff["max"] == "high"
+
     def test_manual_budget_ladder(self) -> None:
         """Budgets are monotone over the whole knob domain."""
         caps = ModelCapabilities(thinking_mode="manual")

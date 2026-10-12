@@ -538,8 +538,9 @@ whatever the alias sets. The judge reads untrusted output, so that output can
 push each verdict toward the cap, and each judged result can take up to
 `judge.output_guard_llm_timeout`. The main loop judges up to four results of a
 batch at once; a task agent judges its results one at a time. To bound the
-cost and the wait, set the guard alias's effort (or `none`) and a smaller
-`max_tokens`.
+cost and the wait, give the guard alias a smaller `max_tokens` and a low
+effort; `none` turns thinking off on a model that takes a fixed budget, but an
+adaptive model still thinks under `none`, at its own default effort.
 
 ### Merge semantics (heuristic + LLM judge)
 

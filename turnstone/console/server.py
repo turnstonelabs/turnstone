@@ -15222,7 +15222,7 @@ async def admin_calibrate_model_definition(request: Request) -> JSONResponse:
 async def admin_model_capabilities(request: Request) -> JSONResponse:
     """GET /v1/api/admin/model-capabilities — static capability lookup."""
     from turnstone.core.auth import require_permission
-    from turnstone.core.providers import lookup_model_capabilities
+    from turnstone.core.providers import lookup_model_capabilities, static_model_capabilities
 
     err = require_permission(request, "admin.models")
     if err:
@@ -15237,12 +15237,17 @@ async def admin_model_capabilities(request: Request) -> JSONResponse:
         return JSONResponse({"error": "model is required"}, status_code=400)
 
     caps = lookup_model_capabilities(provider, model)
+    # An id with no row still runs on the provider's default row: return that
+    # row for display, while ``known`` stays false so the form fills nothing in
+    # from it.
+    defaults = static_model_capabilities(provider, model) if caps is None else None
     return JSONResponse(
         {
             "model": model,
             "provider": provider,
             "known": caps is not None,
             "capabilities": caps or {},
+            "defaults": defaults or {},
         }
     )
 

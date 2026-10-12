@@ -269,6 +269,17 @@ def create_client(
     )
 
 
+def _capabilities_dict(caps: ModelCapabilities) -> dict[str, Any]:
+    """*caps* as a dict with JSON-friendly values (tuples converted to lists)."""
+    import dataclasses
+
+    result = dataclasses.asdict(caps)
+    for key, val in result.items():
+        if isinstance(val, tuple):
+            result[key] = list(val)
+    return result
+
+
 def lookup_model_capabilities(provider: str, model: str) -> dict[str, Any] | None:
     """Return static capabilities for a known model, or ``None`` if unknown.
 
@@ -276,8 +287,6 @@ def lookup_model_capabilities(provider: str, model: str) -> dict[str, Any] | Non
     Returns ``None`` for ``openai-compatible`` and ``anthropic-compatible``
     (no static table for local models).
     """
-    import dataclasses
-
     if provider in LOCAL_PROVIDERS:
         return None
     prov = create_provider(provider)
@@ -285,12 +294,22 @@ def lookup_model_capabilities(provider: str, model: str) -> dict[str, Any] | Non
     default = prov.get_capabilities("")
     if caps is default:
         return None
-    result = dataclasses.asdict(caps)
-    # Convert tuples to lists for JSON serialisation
-    for key, val in result.items():
-        if isinstance(val, tuple):
-            result[key] = list(val)
-    return result
+    return _capabilities_dict(caps)
+
+
+def static_model_capabilities(provider: str, model: str) -> dict[str, Any] | None:
+    """The provider's static row for *model*, as a JSON-friendly dict, for display.
+
+    Unlike :func:`lookup_model_capabilities`, an id with no table row gets the
+    provider's default row rather than ``None``.  Operator capability overrides
+    are not applied; a stored definition's effective capabilities come from
+    :func:`turnstone.core.model_turn.resolve_capabilities`.  Returns ``None``
+    for ``openai-compatible`` and ``anthropic-compatible`` (no static table for
+    local models).
+    """
+    if provider in LOCAL_PROVIDERS:
+        return None
+    return _capabilities_dict(create_provider(provider).get_capabilities(model))
 
 
 def list_known_models(provider: str) -> list[str]:

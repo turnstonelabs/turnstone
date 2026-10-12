@@ -1363,8 +1363,10 @@ ConfigStore. When unset (`NULL`), the global default is used.
   reasoning blocks are sent back to the provider on subsequent turns.
   Capability-gated: `ModelCapabilities.supports_reasoning_replay` must
   also be `True` for the wire path to actually replay (canonical OpenAI
-  gpt-5*/o-series and Anthropic Claude entries set it; unknown / local-
-  server models default to `False`).
+  gpt-5*/o-series, Grok and Anthropic Claude entries set it, as do the
+  default rows of `anthropic`, for any id with no row, and of
+  `anthropic-compatible`; models on `google` or `openai-compatible`,
+  and unknown ones on `openai` or `xai`, default to `False`).
 
 Three reasoning paths are recognised:
 
@@ -1518,8 +1520,9 @@ The console surfaces this projection as an *effective effort ladder*:
 the admin model form's per-model effort select annotates each position
 with what the request will carry, in plain words — a position whose
 delivered level matches its name stays plain ("Max"), a snapped
-position says so ("Low — sends high"), the adaptive lanes' none
-position warns "thinking stays on", and budget detail lives in the
+position says so ("Low — sends high"), the none position warns
+"thinking stays on" on a local adaptive lane and says "model sets
+effort" on the native Anthropic one, and budget detail lives in the
 tooltip. A position is never labeled after a sibling that shares its
 wire (that rendered "Max (= minimal)", implying a downgrade the wire
 doesn't contain). Computed server-side by `providers/effort_ladder.py`
@@ -1536,7 +1539,15 @@ models keep native thinking, budget mapping, and `output_config`
 effort. A gateway fronting *real* Claude on a Messages-shaped URL
 (e.g. a LiteLLM `anthropic/` route to the Claude API) should use
 `provider = "anthropic"` with a custom `base_url`, which keeps the
-native thinking params.
+native thinking params; any other model behind a Messages-shaped API
+belongs on `anthropic-compatible`. The capability row comes from the
+model name the definition sends, so a gateway name that no row
+matches gets the default row, which thinks adaptively: a model that
+takes a thinking budget needs a name its own row matches, such as
+its Anthropic id, or `thinking_mode` set to `manual` and
+`supports_temperature` to `true` in the definition's capabilities,
+plus `supports_effort` set to `false` unless the model accepts
+`output_config` effort.
 
 Verified quirks of vLLM's Anthropic endpoint:
 

@@ -211,6 +211,30 @@ frozen.
 
 ### Changed
 
+- **Claude models without a capability row get adaptive thinking (#1366).** An Anthropic model id
+  with no row, such as the first model of a new line, took a default shaped for models that take a
+  thinking budget: any configured reasoning effort sent `budget_tokens`, which adaptive-only models
+  reject with a 400, and with no effort set a configured temperature was sent, which Claude 4.7 and
+  later models also reject. The default now sends adaptive thinking with summarized display, effort
+  on the `low` through `high` ladder (`xhigh` and `max` ride `high`; left unset, the model's own
+  default applies) and no temperature. It keeps the 200K context and 64K output limits, and tool
+  search, native mid-conversation system messages and the binding control for thinking bound to the
+  conversation prefix stay off until the model has its own row; a model definition on auto-detect
+  keeps the 32,768-token fallback window. An id with no row that names a model which thinks only
+  when asked, such as a gateway's name for Claude Opus 4.6 to 4.8 or Sonnet 4.6, now thinks on every
+  request, at the model's own default effort when none is set: a `low` effort on the alias bounds
+  that, and a `thinking_mode` of `none` in the definition's capabilities turns it off. In the admin
+  model form, the effort ladder for any id with no row on the `anthropic` provider lists effort
+  levels instead of thinking budgets, and its capability tiles show the default row's flags, as they
+  now do on every commercial provider (they showed generic defaults). Claude Haiku 4.5, Sonnet 4.5
+  and Opus 4.5 take a thinking budget and reject adaptive thinking, so a name for one of them that
+  no row matches, such as a gateway's own, now fails every request with a 400: use the model's
+  Anthropic id as that name, or set `thinking_mode` to `manual` and `supports_temperature` to `true`
+  in the definition's capabilities, plus `supports_effort` to `false` for Haiku 4.5 and Sonnet 4.5.
+  A non-Claude model behind an Anthropic-style API on the `anthropic` provider now gets adaptive
+  thinking on every request, which its server may reject; move it to the `anthropic-compatible`
+  provider, which sends no native thinking params, and set its vision and PDF capabilities there if
+  the model takes them.
 - **Bash commands no longer read the CLI's terminal.** They inherited the stdin of the process that
   ran them, so in the CLI a command that read its input took keys typed into the terminal, perhaps
   for another workstream, and one that prompted waited until its timeout for an answer nobody
@@ -443,8 +467,15 @@ frozen.
 
 ### Fixed
 
+- **The model form no longer saves a hidden thinking mode (#1366).** The Thinking mode field shows
+  only for the two compatible providers, but every save wrote its value back for any provider, and
+  editing a definition moved a stored `thinking_mode` out of the raw capabilities JSON into that
+  hidden field: a value left there after switching provider was saved, and a stored one could not be
+  seen or removed. The field, and the effort annotations it feeds, now apply only on the compatible
+  lanes; on other providers `thinking_mode` stays in the raw capabilities JSON. The effort
+  annotations now also follow the capability tiles, as a save does.
 - **Claude Haiku 5.5 requests rejected (#1362).** `claude-haiku-5-5` had no capability row and fell
-  through to the default Anthropic row, which still describes models that take a thinking budget.
+  through to the default Anthropic row, which then described models that take a thinking budget.
   Any configured reasoning effort sent `budget_tokens`, which this model rejects with a 400, and
   with no effort set a configured temperature was sent, which it also rejects. With no effort set
   the model still thinks by default, so with reasoning replay enabled, on Anthropic organizations

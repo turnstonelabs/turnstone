@@ -154,7 +154,7 @@ def _build_registry() -> dict[str, SettingDef]:
             "[model].task_effort in config.toml, then inherits the session\u2019s effort. "
             "Set to \u2018low\u2019 or \u2018minimal\u2019 if your task_agent runs many "
             "fast subtasks where deep reasoning is wasteful. (Empty here means \u201cinherit\u201d "
-            "\u2014 use \u2018none\u2019 to actually disable reasoning.)",
+            "\u2014 use \u2018none\u2019 to disable reasoning where the model supports that.)",
         ),
         # -- session --------------------------------------------------------
         SettingDef(
@@ -979,7 +979,7 @@ def _build_registry() -> dict[str, SettingDef]:
             "the alias wins, then model.reasoning_effort, then the model's own "
             "declared or serving-side default. Coordinators juggling many child "
             "workstreams often benefit from an explicit medium-or-higher value here. "
-            "Use ‘none’ to actually disable reasoning.",
+            "Use ‘none’ to disable reasoning where the model supports that.",
         ),
         SettingDef(
             "coordinator.max_active",

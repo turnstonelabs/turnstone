@@ -4379,7 +4379,7 @@
     },
     "/v1/api/admin/model-capabilities": {
       "get": {
-        "summary": "Look up static capabilities for a known model",
+        "summary": "Look up a model's static capabilities, or the provider's default row",
         "operationId": "v1_api_admin_model-capabilities_get",
         "tags": [
           "Admin"
@@ -14198,6 +14198,12 @@
           "capabilities": {
             "additionalProperties": true,
             "title": "Capabilities",
+            "type": "object"
+          },
+          "defaults": {
+            "additionalProperties": true,
+            "description": "Set when `known` is false on a commercial provider (not the local-server lanes): the provider's default row, which requests for the model run with.",
+            "title": "Defaults",
             "type": "object"
           }
         },

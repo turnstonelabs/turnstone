@@ -242,7 +242,7 @@ reasoning text round-trips per model:
 | Flag | Default | Effect |
 |------|---------|--------|
 | `surface_persisted_reasoning` | `True` | Surface stored reasoning text on `/history` payloads so a page reload re-renders the reasoning bubble. **Storage of reasoning bytes is independent of this flag** — they ride in `provider_data` regardless. |
-| `replay_reasoning_to_model` | `False` | Send stored reasoning blocks back to the provider on subsequent turns. Capability-gated: only takes effect when the model's `ModelCapabilities.supports_reasoning_replay` is also `True`. Set on canonical OpenAI gpt-5*/o-series and Anthropic Claude entries; unknown / local-server models default to `False` so an operator who flips the flag on a model whose API doesn't understand reasoning replay silently no-ops rather than 400-ing. |
+| `replay_reasoning_to_model` | `False` | Send stored reasoning blocks back to the provider on subsequent turns. Capability-gated: only takes effect when the model's `ModelCapabilities.supports_reasoning_replay` is also `True`. Set on canonical OpenAI gpt-5*/o-series, Grok and Anthropic Claude entries, and on the default rows of `anthropic`, for any id with no row, and of `anthropic-compatible`, so the flag takes effect there too. Models on `google` or `openai-compatible`, and unknown ones on `openai` or `xai`, default to `False`, so an operator who flips the flag on a model whose API doesn't understand reasoning replay silently no-ops rather than 400-ing. |
 
 Edit both via the admin Models tab. See the architecture doc for the
 provider-side mechanics (Anthropic `thinking`, OpenAI Responses

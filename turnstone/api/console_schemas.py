@@ -1425,6 +1425,14 @@ class ModelCapabilitiesResponse(BaseModel):
     provider: str
     known: bool = False
     capabilities: dict[str, Any] = Field(default_factory=dict)
+    defaults: dict[str, Any] = Field(
+        default_factory=dict,
+        description=(
+            "Set when `known` is false on a commercial provider (not the "
+            "local-server lanes): the provider's default row, which requests "
+            "for the model run with."
+        ),
+    )
 
 
 class KnownModelsResponse(BaseModel):

@@ -1076,7 +1076,7 @@ CONSOLE_ENDPOINTS: list[EndpointSpec] = [
     EndpointSpec(
         "/v1/api/admin/model-capabilities",
         "GET",
-        "Look up static capabilities for a known model",
+        "Look up a model's static capabilities, or the provider's default row",
         response_model=ModelCapabilitiesResponse,
         query_params=[
             QueryParam(name="provider", description="Provider name", required=True),
