@@ -130,7 +130,7 @@ class TestLoadWithReferences:
         monkeypatch.setattr(mr, "load_config", lambda section=None: entries)
         # The CLI always passes its --base-url/--model; with every configured
         # model skipped it must fail and name them, not serve a "default" alias.
-        with pytest.raises(ValueError, match="Skipped over their api_key reference: gw"):
+        with pytest.raises(ValueError, match="Skipped: gw"):
             load_model_registry(
                 base_url="http://localhost:8000/v1", api_key="dummy", model="local-model"
             )
@@ -143,9 +143,7 @@ class TestLoadWithReferences:
         assert registry.list_aliases() == []
         assert set(registry.skipped_aliases) == {"a"}
         # A host that needs models says why there are none.
-        with pytest.raises(
-            ValueError, match="Skipped over their api_key reference: a: .*not found"
-        ):
+        with pytest.raises(ValueError, match="Skipped: a: .*not found"):
             load_model_registry(storage=storage)
 
     def test_config_toml_entry_reference(

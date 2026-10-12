@@ -235,6 +235,14 @@ frozen.
   thinking on every request, which its server may reject; move it to the `anthropic-compatible`
   provider, which sends no native thinking params, and set its vision and PDF capabilities there if
   the model takes them.
+- **Model definitions saved in the console no longer expand `${VAR}`** *(BREAKING)* — a `${NAME}`
+  placeholder in a definition's `api_key` or `base_url` is no longer filled in from the environment;
+  only config.toml `[models.*]` entries expand one. The console refuses a placeholder in either
+  field when a definition is saved, and a definition saved with one earlier is skipped when models
+  load, named with its field in the console's save and Sync to Nodes replies (and in
+  `turnstone-doctor`'s report when it cannot resolve its model). Edit such a definition to hold the
+  key or URL itself, or a `secret://` reference for the key, or define the model in config.toml,
+  where a URL that carries a credential belongs.
 - **Bash commands no longer read the CLI's terminal.** They inherited the stdin of the process that
   ran them, so in the CLI a command that read its input took keys typed into the terminal, perhaps
   for another workstream, and one that prompted waited until its timeout for an answer nobody
@@ -489,6 +497,9 @@ frozen.
   proceeds. Like Opus 5.5 and Sonnet 5.5, it also receives operator notes as native mid-conversation
   system messages. A Haiku 5.5 model definition whose window was saved as 32,768 from the Models
   tab's Detect result keeps that value until it is set to 0 (auto-detect) or 1,000,000.
+- **A model definition saved with a non-string `api_key` or `base_url`, JSON `null` included, is
+  refused.** The console stored the value's text (`None`, `False`, `123`) and sent that as the key
+  or URL; it now answers 400.
 - **The MCP Servers list shows connect errors again (#1328).** Since the node status read stopped
   carrying error text, a server that failed to connect showed **idle**, and a newly saved one
   showed **connecting** forever. The list marks a failing server as **error**, and admins

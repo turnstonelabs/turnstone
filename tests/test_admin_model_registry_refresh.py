@@ -4460,3 +4460,113 @@ def test_detect_reports_fallback_only_when_reachable_and_silent(
 
     down = client.post("/v1/api/admin/model-definitions/detect", json=body).json()
     assert "fallback_context_window" not in down  # transient; nothing to correct yet
+
+
+# ---------------------------------------------------------------------------
+# ${VAR} in a definition saved here: refused on save, skipped and named on load
+# ---------------------------------------------------------------------------
+
+_PLACEHOLDER_CASES = [
+    ("api_key", "${TS_PLACEHOLDER_VALUE}"),
+    ("base_url", "https://models.example.com/${TS_PLACEHOLDER_VALUE}/v1"),
+]
+
+
+@pytest.mark.parametrize(("field", "value"), _PLACEHOLDER_CASES)
+def test_create_refuses_a_placeholder_before_storing_anything(
+    storage: SQLiteBackend, field: str, value: str
+) -> None:
+    _seed_model_def(storage, definition_id="m1", alias="local", model="m")
+    client = _make_client(storage, _make_registry(alias="local", model="m"))
+    body = {
+        "alias": "new",
+        "model": "m",
+        "provider": "openai-compatible",
+        "base_url": "https://models.example.com/v1",
+        "api_key": "sk-literal",
+        field: value,
+    }
+
+    resp = client.post("/v1/api/admin/model-definitions", json=body)
+
+    assert resp.status_code == 400
+    assert resp.json()["error"].startswith(field + " contains ${TS_PLACEHOLDER_VALUE}")
+    assert storage.get_model_definition_by_alias("new") is None
+
+
+@pytest.mark.parametrize(("field", "value"), _PLACEHOLDER_CASES)
+def test_update_refuses_a_placeholder_and_leaves_the_row(
+    storage: SQLiteBackend, field: str, value: str
+) -> None:
+    """Refused even when a client re-sends the value the row already holds, as
+    the form does for base_url (GET masks a literal key, so no form echoes one)."""
+    _seed_model_def(storage, definition_id="m1", alias="local", model="m")
+    storage.update_model_definition("m1", **{field: value})
+    client = _make_client(storage, _make_registry(alias="local", model="m"))
+    before = storage.get_model_definition("m1")
+
+    resp = client.put("/v1/api/admin/model-definitions/m1", json={field: value, "enabled": False})
+
+    assert resp.status_code == 400
+    assert resp.json()["error"].startswith(field + " contains ${TS_PLACEHOLDER_VALUE}")
+    assert storage.get_model_definition("m1") == before
+
+
+def test_a_row_saved_with_a_placeholder_is_skipped_and_named(storage: SQLiteBackend) -> None:
+    """A definition stored before the console refused ${VAR} stays in the
+    database, but the registry skips it and every later write reply names it,
+    a save that changes nothing included."""
+    _seed_model_def(storage, definition_id="m1", alias="local", model="m")
+    _seed_model_def(storage, definition_id="m2", alias="older", model="m")
+    storage.update_model_definition("m2", api_key="${TS_PLACEHOLDER_VALUE}")
+    client = _make_client(storage, _make_registry(alias="local", model="m"))
+
+    resp = client.put("/v1/api/admin/model-definitions/m1", json={"temperature": 0.7})
+    unchanged = client.put("/v1/api/admin/model-definitions/m2", json={"api_key": "***"})
+
+    assert resp.status_code == unchanged.status_code == 200, (resp.text, unchanged.text)
+    for reply in (resp, unchanged):
+        assert "older: api_key contains ${TS_PLACEHOLDER_VALUE}" in reply.json()["registry_warning"]
+
+
+@pytest.mark.parametrize(
+    "body", [{"temperature": 0.7}, {"api_key": "***", "temperature": 0.7}], ids=["form", "masked"]
+)
+def test_saving_a_row_whose_key_holds_a_placeholder_keeps_it_and_names_it(
+    storage: SQLiteBackend, body: dict[str, Any]
+) -> None:
+    """The form omits a blank key and a read-modify-write client sends the mask,
+    so either save keeps the stored ${VAR}; the reply names the row."""
+    _seed_model_def(storage, definition_id="m1", alias="local", model="m")
+    _seed_model_def(storage, definition_id="m2", alias="older", model="m")
+    storage.update_model_definition("m2", api_key="${TS_PLACEHOLDER_VALUE}")
+    client = _make_client(storage, _make_registry(alias="local", model="m"))
+
+    resp = client.put("/v1/api/admin/model-definitions/m2", json=body)
+
+    assert resp.status_code == 200, resp.text
+    assert storage.get_model_definition("m2")["api_key"] == "${TS_PLACEHOLDER_VALUE}"
+    assert "older: api_key contains ${TS_PLACEHOLDER_VALUE}" in resp.json()["registry_warning"]
+
+
+@pytest.mark.parametrize("field", ["api_key", "base_url"])
+def test_create_and_update_refuse_a_null_key_or_url(storage: SQLiteBackend, field: str) -> None:
+    """str() would store a JSON null as the text "None"; both twins refuse it."""
+    _seed_model_def(storage, definition_id="m1", alias="local", model="m")
+    client = _make_client(storage, _make_registry(alias="local", model="m"))
+    before = storage.get_model_definition("m1")
+    body = {
+        "alias": "new",
+        "model": "m",
+        "provider": "openai-compatible",
+        "base_url": "https://models.example.com/v1",
+        field: None,
+    }
+
+    created = client.post("/v1/api/admin/model-definitions", json=body)
+    updated = client.put("/v1/api/admin/model-definitions/m1", json={field: None})
+
+    assert (created.status_code, updated.status_code) == (400, 400)
+    assert created.json()["error"] == updated.json()["error"] == field + " must be a string"
+    assert storage.get_model_definition_by_alias("new") is None
+    assert storage.get_model_definition("m1") == before

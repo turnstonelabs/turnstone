@@ -1095,13 +1095,13 @@ class ModelDefinitionInfo(BaseModel):
 class ModelDefinitionWriteResponse(ModelDefinitionInfo):
     """Create/update response: the stored row plus an optional caveat.
 
-    ``registry_warning`` is present only when the DB write succeeded but
-    THIS console's live coordinator registry refused to adopt it (keyless
-    host with dynamic-auth rows): the row is saved, yet running sessions
-    keep the previous config until the deployment fault is remedied.
-    Clients should surface it as a warning beside the success, never as a
-    failure. Absent on a clean save (SkipJsonSchema: the server omits the
-    key rather than sending null).
+    ``registry_warning`` is present when the DB write succeeded but THIS console's live coordinator
+    registry refused to adopt it (keyless host with dynamic-auth rows): the row is saved, yet
+    running sessions keep the previous config until the deployment fault is remedied. It is also
+    present while the console's last load skipped stored definitions, and then names each one with
+    the reason, unless a refused swap's text takes precedence. Clients should surface it as a
+    warning beside the success, never as a failure. Absent on a clean save (SkipJsonSchema: the
+    server omits the key rather than sending null).
     """
 
     registry_warning: str | SkipJsonSchema[None] = Field(
@@ -1109,7 +1109,10 @@ class ModelDefinitionWriteResponse(ModelDefinitionInfo):
         description=(
             "Set when the save landed but this console's live registry refused "
             "the swap (e.g. dynamic auth configured without the startup "
-            "encryption key); carries the operator-facing remediation text."
+            "encryption key), or while its last load skipped stored definitions; "
+            "carries the operator-facing remediation text, naming each skipped "
+            "definition with the reason unless a refused swap's text takes "
+            "precedence."
         ),
     )
 
@@ -1118,8 +1121,20 @@ class CreateModelDefinitionRequest(BaseModel):
     alias: str
     model: str
     provider: str = "openai"
-    base_url: str = ""
-    api_key: str = ""
+    base_url: str = Field(
+        default="",
+        description=(
+            "A ${NAME} placeholder is refused (400): definitions saved here do not "
+            "expand environment variables."
+        ),
+    )
+    api_key: str = Field(
+        default="",
+        description=(
+            "A literal key or a secret:// reference. A ${NAME} placeholder outside a "
+            "reference is refused (400)."
+        ),
+    )
     context_window: int = 32768
     max_concurrency: ModelMaxConcurrency = 0
     capabilities: dict[str, Any] = Field(default_factory=dict)
@@ -1138,8 +1153,22 @@ class UpdateModelDefinitionRequest(BaseModel):
     alias: str | None = None
     model: str | None = None
     provider: str | None = None
-    base_url: str | None = None
-    api_key: str | None = None
+    # Presence-keyed like max_concurrency below: the handler refuses an explicit
+    # JSON null for these two, so null stays out of the advertised union.
+    base_url: str | SkipJsonSchema[None] = Field(
+        default_factory=lambda: None,
+        description=(
+            "Omit to leave the stored value unchanged. A ${NAME} placeholder or JSON "
+            "null is refused (400)."
+        ),
+    )
+    api_key: str | SkipJsonSchema[None] = Field(
+        default_factory=lambda: None,
+        description=(
+            "Omit, or send '' or '***', to keep the stored key. A ${NAME} placeholder "
+            "outside a secret:// reference, or JSON null, is refused (400)."
+        ),
+    )
     context_window: int | None = None
     # The runtime update handler is presence-keyed.  Keep null out of the
     # advertised union because explicit JSON null is refused; clients clear a
@@ -1343,8 +1372,10 @@ class ModelReloadResponse(BaseModel):
         description=(
             "Set when the node fan-out ran but THIS console's live registry "
             "refused the swap (e.g. dynamic auth configured without the "
-            "startup encryption key); carries the operator-facing "
-            "remediation text."
+            "startup encryption key), or while its last load skipped stored "
+            "definitions; carries the operator-facing remediation text, naming "
+            "each skipped definition with the reason unless a refused swap's "
+            "text takes precedence."
         ),
     )
 
@@ -1352,10 +1383,10 @@ class ModelReloadResponse(BaseModel):
 class DeleteModelDefinitionResponse(BaseModel):
     """Delete response: the removed row id plus an optional caveat.
 
-    ``registry_warning`` mirrors ModelDefinitionWriteResponse: the DB row
-    is gone, but a keyless console's live registry refused the swap and
-    keeps SERVING the deleted alias to running and new coordinator
-    sessions until the deployment fault is remedied.
+    ``registry_warning`` mirrors ModelDefinitionWriteResponse: the DB row is gone, but a keyless
+    console's live registry refused the swap and keeps SERVING the deleted alias to running and new
+    coordinator sessions until the deployment fault is remedied. It also names the stored
+    definitions the console's last load skipped, unless a refused swap's text takes precedence.
     """
 
     status: str = "ok"
@@ -1364,8 +1395,9 @@ class DeleteModelDefinitionResponse(BaseModel):
         default=None,
         description=(
             "Set when the delete landed but this console's live registry "
-            "refused the swap and keeps serving the deleted alias; carries "
-            "the operator-facing remediation text."
+            "refused the swap and keeps serving the deleted alias, or while its "
+            "last load skipped stored definitions; carries the operator-facing "
+            "remediation text."
         ),
     )
 
@@ -1414,8 +1446,8 @@ class CalibrateModelResponse(BaseModel):
         default=None,
         description=(
             "Set when the calibration was stored but this console's live "
-            "registry refused the swap; carries the operator-facing "
-            "remediation text."
+            "registry refused the swap, or while its last load skipped stored "
+            "definitions; carries the operator-facing remediation text."
         ),
     )
 

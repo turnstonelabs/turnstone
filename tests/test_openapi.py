@@ -440,6 +440,20 @@ def test_model_max_concurrency_schema_is_strict_non_nullable_integer() -> None:
     assert "default" not in update_prop
 
 
+def test_model_update_key_and_url_schemas_offer_no_null() -> None:
+    """The update handler refuses a JSON null base_url or api_key (400), so the
+    advertised schema must not offer one."""
+    from turnstone.api.console_spec import build_console_spec
+
+    props = build_console_spec()["components"]["schemas"]["UpdateModelDefinitionRequest"][
+        "properties"
+    ]
+    for name in ("base_url", "api_key"):
+        assert props[name]["type"] == "string"
+        assert "anyOf" not in props[name]
+        assert "default" not in props[name]
+
+
 class TestCheckedInArtifactFreshness:
     """The checked-in `sdk/typescript/*.json` specs must match their source.
 

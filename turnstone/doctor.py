@@ -1118,6 +1118,8 @@ def resolve_doctor_brain(
     if storage is None:
         return None, BackendVerdict(False, f"storage unreachable: {storage_err}")
 
+    # Bound before the try: the loader can raise past its own skip handling.
+    skipped: dict[str, str] = {}
     try:
         from turnstone.core.config import load_config, set_config_path
         from turnstone.core.config_store import ConfigStore
@@ -1140,9 +1142,20 @@ def resolve_doctor_brain(
         registry = load_model_registry(
             storage=storage, allow_empty=True, detect_context_windows=True
         )
+        skipped = registry.skipped_aliases
         client, model_name, cfg, _ = registry.resolve(alias or None)
     except Exception as exc:  # noqa: BLE001 - any failure means "no usable model"
-        return None, BackendVerdict(False, f"no usable model configured: {exc}")
+        from turnstone.core.model_registry import UnknownModelAliasError, describe_skipped
+
+        # An empty registry has no default, so resolving it names an empty alias.
+        empty = isinstance(exc, UnknownModelAliasError) and not exc.alias
+        detail = f"no usable model configured: {'no model loaded' if empty else exc}"
+        if skipped:
+            # Named here rather than left to the loader's no-model error: the
+            # configured default can be skipped while other aliases load, and
+            # that error never reports it.
+            detail += "; skipped: " + describe_skipped(skipped)
+        return None, BackendVerdict(False, detail)
 
     fam = family_of(cfg.provider)
     if fam is None:

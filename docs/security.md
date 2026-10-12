@@ -556,7 +556,10 @@ the `[security]` keyring, `[oidc] client_secret`).
 A reference must be the whole value: store `Bearer xyz` in the secret and
 reference it, rather than writing `Bearer secret://...`. `${VAR}` is never
 expanded inside a reference (an unset variable would quietly select a
-different secret); literal values keep their `${VAR}` expansion.
+different secret). Outside one, only config.toml `[models.*]` entries expand
+`${VAR}`: a model definition saved in the console never does, so the console
+refuses one on save, and the loader skips a definition saved with one earlier
+and names it.
 
 ### Backends
 

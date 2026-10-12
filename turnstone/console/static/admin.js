@@ -7540,7 +7540,8 @@ function _renderModels(items) {
             })
             .then(function (d) {
               // Amber when the live registry refused the swap and keeps
-              // serving the deleted alias (same caveat as save).
+              // serving the deleted alias, or its last load skipped stored
+              // definitions (same caveat as save).
               const toast = _modelActionToast("Model deleted", d);
               showToast(toast.message, toast.type);
               _flagModelSyncPending();
@@ -8153,9 +8154,9 @@ function _authSubmitFields(
 
 // Toast shape for any model action whose 200 can carry registry_warning
 // (create/update/delete/reload/calibrate), pure. The warning means the DB
-// write landed but THIS console's live registry refused the swap, so amber
-// with the server's text rather than plain success while the running
-// coordinator keeps streaming to the old config.
+// write landed but THIS console's live registry refused the swap, or that
+// its last load skipped stored definitions, so amber with the server's text
+// rather than plain success.
 function _modelActionToast(baseMsg, body) {
   const warning = body && body.registry_warning;
   if (warning) {
@@ -8528,8 +8529,9 @@ function recalibrateModel() {
         ? "var(--green)"
         : "var(--yellow)";
       if (d.registry_warning) {
-        // Stored, but this console's live registry refused to adopt it —
-        // same amber caveat as the other model actions.
+        // Stored, but this console's live registry refused to adopt it, or
+        // its last load skipped stored definitions — same amber caveat as
+        // the other model actions.
         const toast = _modelActionToast("Calibration saved", d);
         showToast(toast.message, toast.type);
       }
@@ -8980,7 +8982,8 @@ function reloadModelNodes() {
     })
     .then(function (d) {
       // The button's whole purpose is DB→live sync: amber when this
-      // console's own registry refused the swap.
+      // console's own registry refused the swap, or its last load skipped
+      // stored definitions.
       const toast = _modelActionToast("Model reload dispatched", d);
       showToast(toast.message, toast.type);
       _clearModelSyncPending();

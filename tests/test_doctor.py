@@ -957,6 +957,81 @@ base_url = "http://laptop:8000/v1"
         finally:
             reset_storage()
 
+    def test_names_a_skipped_definition_when_nothing_loads(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from turnstone.core.storage import init_storage, reset_storage
+
+        monkeypatch.setattr("turnstone.core.config.load_config", lambda section=None: {})
+        monkeypatch.setattr("turnstone.core.model_registry.load_config", lambda section=None: {})
+        db_path = str(tmp_path / "doctor.db")
+        reset_storage()
+        st = init_storage("sqlite", path=db_path, run_migrations=True)
+        try:
+            st.create_model_definition(
+                "def1",
+                "default",
+                "test-model",
+                provider="openai-compatible",
+                base_url="http://localhost:9/v1",
+                api_key="${TS_DOCTOR_KEY}",
+                context_window=8192,
+                enabled=True,
+            )
+            profile = _make_profile(
+                tmp_path, db_config={"backend": "sqlite", "url": "", "path": db_path}
+            )
+            brain, verdict = resolve_doctor_brain(profile, st, "")
+            assert brain is None
+            assert verdict.detail.startswith(
+                "no usable model configured: no model loaded; "
+                "skipped: default: api_key contains ${TS_DOCTOR_KEY}"
+            )
+        finally:
+            reset_storage()
+
+    def test_names_a_skipped_default_while_other_models_load(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The case doctor keeps its own skip summary for: the loader raises no
+        error when the configured default is skipped and another alias loads."""
+        from turnstone.core.config_store import ConfigStore
+        from turnstone.core.storage import init_storage, reset_storage
+
+        monkeypatch.setattr("turnstone.core.config.load_config", lambda section=None: {})
+        monkeypatch.setattr("turnstone.core.model_registry.load_config", lambda section=None: {})
+        monkeypatch.setattr("turnstone.doctor._validate_connection", lambda llm: (True, ""))
+        db_path = str(tmp_path / "doctor.db")
+        reset_storage()
+        st = init_storage("sqlite", path=db_path, run_migrations=True)
+        try:
+            for definition_id, alias, api_key in (
+                ("def1", "older", "${TS_DOCTOR_KEY}"),
+                ("def2", "ok", "dummy"),
+            ):
+                st.create_model_definition(
+                    definition_id,
+                    alias,
+                    "test-model",
+                    provider="openai-compatible",
+                    base_url="http://localhost:9/v1",
+                    api_key=api_key,
+                    context_window=8192,
+                    enabled=True,
+                )
+            ConfigStore(storage=st, node_id="").set("model.default_alias", "older")
+            profile = _make_profile(
+                tmp_path, db_config={"backend": "sqlite", "url": "", "path": db_path}
+            )
+            brain, verdict = resolve_doctor_brain(profile, st, "")
+            assert brain is None
+            assert (
+                "Unknown model alias: older; skipped: older: api_key contains ${TS_DOCTOR_KEY}"
+                in verdict.detail
+            )
+        finally:
+            reset_storage()
+
 
 # ---------------------------------------------------------------------------
 # Version check (§4)

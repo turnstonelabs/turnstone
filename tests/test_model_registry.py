@@ -25,6 +25,7 @@ from turnstone.core.model_registry import (
     _resolve_env_vars,
     detect_model,
     load_model_registry,
+    stored_definition_error,
 )
 from turnstone.core.model_turn import resolve_model_binding
 from turnstone.core.oauth.context import OAuthContext, oauth_context
@@ -1028,6 +1029,134 @@ class TestResolveEnvVars:
 
     def test_empty_string(self) -> None:
         assert _resolve_env_vars("") == ""
+
+
+class TestStoredDefinitionError:
+    def test_names_the_field_the_placeholder_and_what_to_do(self) -> None:
+        key_error = stored_definition_error({"api_key": "sk-${OPENAI_API_KEY}"})
+        assert key_error.startswith("api_key contains ${OPENAI_API_KEY}, which")
+        assert "enter the key itself" in key_error and "secret://" in key_error
+        url_error = stored_definition_error({"base_url": "https://${HOST}/v1"})
+        assert url_error.startswith("base_url contains ${HOST}, which")
+        assert "enter the URL itself" in url_error
+        assert "config.toml, where a URL that carries a credential belongs" in url_error
+
+    def test_an_api_key_reference_is_left_to_its_resolver(self) -> None:
+        assert stored_definition_error({"api_key": "secret://file/${TEAM}"}) == ""
+        # A base_url has no resolver, so a reference-shaped one is checked like any other.
+        assert stored_definition_error({"base_url": "secret://file/${HOST}/v1"})
+
+    @pytest.mark.parametrize(
+        "value", ["${A}", "x${A_1}y", "${A}${A}", "$A", "${}", "${1A}", "${A", "plain", ""]
+    )
+    def test_refuses_exactly_what_the_expansion_would_change(self, value: str) -> None:
+        """The check and ``_resolve_env_vars`` share one pattern, so a stored
+        value is refused when, and only when, expanding it would change it."""
+        with patch.dict("os.environ", {"A": "1", "A_1": "2"}):
+            would_expand = _resolve_env_vars(value) != value
+        assert bool(stored_definition_error({"api_key": value})) is would_expand
+
+
+class TestStoredPlaceholders:
+    """A database row is never expanded from the environment: one whose api_key
+    or base_url holds a ${VAR} is skipped and named, even with the variable set,
+    while config.toml entries and the CLI's default key keep their expansion."""
+
+    @staticmethod
+    def _row(**overrides: Any) -> dict[str, Any]:
+        row: dict[str, Any] = {
+            "alias": "row",
+            "model": "m1",
+            "provider": "openai-compatible",
+            "base_url": "https://models.example.com/v1",
+            "api_key": "sk-literal",
+            "context_window": 0,
+            "capabilities": "{}",
+            "enabled": True,
+        }
+        row.update(overrides)
+        return row
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [
+            ("api_key", "${TS_STORED_VALUE}"),
+            ("base_url", "https://models.example.com/v1/${TS_STORED_VALUE}"),
+        ],
+    )
+    def test_row_is_skipped_named_and_never_probed(
+        self, monkeypatch: pytest.MonkeyPatch, field: str, value: str
+    ) -> None:
+        monkeypatch.setenv("TS_STORED_VALUE", "env-value")
+        seen: list[tuple[str, str]] = []
+
+        def record(provider: str, base_url: str, api_key: str, *a: Any, **kw: Any) -> Any:
+            seen.append((base_url, api_key))
+            return {"reachable": True, "model_found": True, "context_window": 4096}
+
+        monkeypatch.setattr(mr_module, "probe_model_endpoint", record)
+        storage = _MockStorage([self._row(**{field: value}), self._row(alias="ok")])
+        with patch("turnstone.core.model_registry.load_config", return_value={}):
+            reg = load_model_registry(
+                storage=storage, allow_empty=True, detect_context_windows=True
+            )
+        assert reg.list_aliases() == ["ok"]
+        assert reg.skipped_aliases["row"].startswith(field + " contains ${TS_STORED_VALUE}")
+        assert seen and set(seen) == {("https://models.example.com/v1", "sk-literal")}
+
+    def test_config_entries_keep_their_expansion(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("TS_CONFIG_KEY", "sk-from-env")
+        monkeypatch.setenv("TS_CONFIG_URL", "https://models.example.com/v1")
+        entry = {
+            "model": "m1",
+            "provider": "openai-compatible",
+            "base_url": "${TS_CONFIG_URL}",
+            "api_key": "${TS_CONFIG_KEY}",
+            "context_window": 8192,
+        }
+        fake_cfg: dict[str, Any] = {"models": {"cfg": entry}}
+        with patch("turnstone.core.model_registry.load_config", return_value=fake_cfg):
+            reg = load_model_registry(allow_empty=True)
+        cfg = reg.get_config("cfg")
+        assert (cfg.base_url, cfg.api_key) == ("https://models.example.com/v1", "sk-from-env")
+
+    def test_the_cli_default_key_keeps_its_expansion(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A config.toml entry without a key takes the CLI's, which the operator supplies."""
+        monkeypatch.setenv("TS_CLI_KEY", "sk-from-env")
+        entry = {"model": "m1", "base_url": "http://x/v1", "context_window": 8192}
+        fake_cfg: dict[str, Any] = {"models": {"cfg": entry}}
+        with patch("turnstone.core.model_registry.load_config", return_value=fake_cfg):
+            reg = load_model_registry("http://x/v1", "${TS_CLI_KEY}", "x")
+        assert reg.get_config("cfg").api_key == "sk-from-env"
+
+    def test_only_a_row_still_skipped_after_config_toml_is_logged(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A row whose alias config.toml serves is of no consequence: no ERROR for it."""
+        entry = {
+            "model": "m1",
+            "provider": "openai-compatible",
+            "base_url": "https://models.example.com/v1",
+            "api_key": "sk-from-config",
+            "context_window": 8192,
+        }
+        fake_cfg: dict[str, Any] = {"models": {"served": entry}}
+        storage = _MockStorage(
+            [
+                self._row(alias="served", api_key="${TS_STORED_VALUE}", context_window=8192),
+                self._row(alias="absent", api_key="${TS_STORED_VALUE}", context_window=8192),
+            ]
+        )
+        with (
+            patch("turnstone.core.model_registry.load_config", return_value=fake_cfg),
+            caplog.at_level(logging.ERROR),
+        ):
+            reg = load_model_registry(storage=storage, allow_empty=True)
+        assert set(reg.skipped_aliases) == {"absent"}
+        logged = [
+            _rendered(r) for r in caplog.records if "model_registry.alias_skipped" in _rendered(r)
+        ]
+        assert len(logged) == 1 and "absent" in logged[0]
 
 
 # ---------------------------------------------------------------------------
@@ -5316,8 +5445,10 @@ class TestEntryWithoutEndpoint:
         assert sum("without a base_url" in _rendered(r) for r in caplog.records) == 2
 
     def test_db_row_with_unset_url_variable_is_skipped(
-        self, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+        self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        """Resolving to nothing would send the row to the provider's public
+        endpoint; a stored ${VAR} is skipped whether or not it is set."""
         monkeypatch.delenv("TURNSTONE_TEST_UNSET_URL", raising=False)
         storage = _MockStorage(
             [
@@ -5333,13 +5464,12 @@ class TestEntryWithoutEndpoint:
                 }
             ]
         )
-        with (
-            patch("turnstone.core.model_registry.load_config", return_value={}),
-            caplog.at_level(logging.WARNING),
-        ):
+        with patch("turnstone.core.model_registry.load_config", return_value={}):
             reg = load_model_registry(storage=storage, allow_empty=True)
         assert reg.list_aliases() == []
-        assert any("${VAR} is unset" in _rendered(r) for r in caplog.records)
+        assert reg.skipped_aliases["row"].startswith(
+            "base_url contains ${TURNSTONE_TEST_UNSET_URL}"
+        )
 
     def test_table_provider_entry_that_relied_on_api_section_loads_with_warning(
         self, caplog: pytest.LogCaptureFixture

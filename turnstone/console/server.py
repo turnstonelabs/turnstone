@@ -79,8 +79,10 @@ from turnstone.core.model_registry import (
     MODEL_AUTH_TEXT_MAX_LEN,
     SCOPES_MODEL_AUTH_MODES,
     DynamicAuthKeyError,
+    describe_skipped,
     dynamic_auth_key_error,
     sanitize_backend_auth_scopes,
+    stored_definition_error,
     strip_control_characters,
 )
 from turnstone.core.model_registry import MODEL_AUTH_MODES as _MODEL_AUTH_MODES
@@ -11487,7 +11489,7 @@ def _coord_registry_warning(app_state: Any) -> str:
     """The console registry's current problem, if any, for write and reload replies.
 
     A refused swap (``coord_registry_error``) comes first; otherwise the aliases
-    the last load dropped over their api_key reference are named.
+    the last load recorded in ``skipped_aliases`` are named.
     """
     error = str(getattr(app_state, "coord_registry_error", "") or "")
     if error:
@@ -11496,9 +11498,7 @@ def _coord_registry_warning(app_state: Any) -> str:
     skipped = getattr(registry, "skipped_aliases", None) or {}
     if not skipped:
         return ""
-    return "model definitions skipped on the console: " + "; ".join(
-        f"{alias}: {reason}" for alias, reason in sorted(skipped.items())
-    )
+    return "model definitions skipped on the console: " + describe_skipped(skipped)
 
 
 def _mcp_server_to_detail(
@@ -13812,9 +13812,9 @@ def _refresh_coord_registry_locked(
         new_registry = load_model_registry(
             storage=storage,
             strict=True,
-            # Nothing loading (every row disabled or dropped over its reference)
-            # keeps the live registry, below, but must still name the dropped
-            # aliases rather than raise into a warning log.
+            # Nothing loading (every row disabled or skipped) keeps the live
+            # registry, below, but must still name the aliases recorded in
+            # skipped_aliases rather than raise into a warning log.
             allow_empty=True,
             detect_context_windows=True,
             prior=existing.models,
@@ -14223,6 +14223,10 @@ async def admin_create_model_definition(request: Request) -> JSONResponse:
         )
     from turnstone.core.providers import LOCAL_PROVIDERS
 
+    for field in ("base_url", "api_key"):
+        # str() would store a JSON null as the text "None"; twin of the update check.
+        if not isinstance(body.get(field, ""), str):
+            return JSONResponse({"error": f"{field} must be a string"}, status_code=400)
     base_url = str(body.get("base_url", "")).strip()
     if provider in LOCAL_PROVIDERS and not base_url:
         # Fully knowable at save time; without it the SDK client would target
@@ -14232,6 +14236,10 @@ async def admin_create_model_definition(request: Request) -> JSONResponse:
             {"error": f"base_url is required for provider {provider!r}"}, status_code=400
         )
     api_key = str(body.get("api_key", "")).strip()
+    # The loader's own check, so a definition saved here is one it would load.
+    placeholder_error = stored_definition_error({"api_key": api_key, "base_url": base_url})
+    if placeholder_error:
+        return JSONResponse({"error": placeholder_error}, status_code=400)
     if is_secret_reference(api_key):
         # A reference lets its holder read whatever the store's role allows and
         # send it to the definition's endpoint: the same capability-widening
@@ -14397,9 +14405,10 @@ async def admin_create_model_definition(request: Request) -> JSONResponse:
     await asyncio.to_thread(_maybe_bootstrap_coord_subsystem, request.app, storage)
     await asyncio.to_thread(_ensure_console_mcp_client, request.app)
     _emit_models_changed(request)
-    # Same refused-swap surfacing as the update twin (see its comment): the
-    # row is stored, but a keyless console's live registry may have refused
-    # to adopt it, so the shelf warns instead of toasting success.
+    # Same surfacing as the update twin (see its comment): the row is stored,
+    # but a keyless console's live registry may have refused to adopt it, or
+    # its load skipped stored definitions, so the shelf warns instead of
+    # toasting success.
     registry_warning = _coord_registry_warning(request.app.state)
 
     created = storage.get_model_definition(definition_id)
@@ -14486,6 +14495,19 @@ async def admin_update_model_definition(request: Request) -> JSONResponse:
                 status_code=400,
             )
         updates["provider"] = prov
+    for field in ("base_url", "api_key"):
+        # str() would store a JSON null as the text "None"; twin of the create check.
+        if not isinstance(body.get(field, ""), str):
+            return JSONResponse({"error": f"{field} must be a string"}, status_code=400)
+    # The loader's own check, run before any gate as in the create twin. A value
+    # echoing the stored one is refused too: the loader skips such a row, so a
+    # form save names what to fix instead of storing it again. "", "***" and an
+    # echoed reference pass, as the key branch below keeps the stored key for them.
+    placeholder_error = stored_definition_error(
+        {field: body[field].strip() for field in ("api_key", "base_url") if field in body}
+    )
+    if placeholder_error:
+        return JSONResponse({"error": placeholder_error}, status_code=400)
     if "base_url" in body:
         updates["base_url"] = str(body["base_url"]).strip()
     if "provider" in body or "base_url" in body:
@@ -14718,20 +14740,20 @@ async def admin_update_model_definition(request: Request) -> JSONResponse:
         ip,
     )
 
-    registry_warning = ""
     if updates:
         await asyncio.to_thread(_refresh_coord_registry, request.app.state, storage)
         await asyncio.to_thread(_maybe_bootstrap_coord_subsystem, request.app, storage)
         await asyncio.to_thread(_ensure_console_mcp_client, request.app)
         _emit_models_changed(request)
-        # The DB write is committed either way, but THIS console's live
-        # registry swap may have been refused (keyless host + dynamic rows).
-        # The refresh's refusal arm records ``coord_registry_error`` and its
-        # success arm clears it, so a non-empty value here means the running
-        # coordinator did NOT adopt this write. With the subsystem UP the 503
-        # remediation path never renders, so surfacing it on the response is
-        # the only evidence the shelf can show.
-        registry_warning = _coord_registry_warning(request.app.state)
+
+    # Read outside the block: a save that changed nothing still reports the console's standing
+    # problem. The DB write is committed either way, but THIS console's live registry swap may
+    # have been refused (keyless host + dynamic rows), or its load may have skipped stored
+    # definitions. The refresh's refusal arm records ``coord_registry_error`` and its success arm
+    # clears it; the warning names that refusal first, else the skipped aliases. With the
+    # subsystem UP the 503 remediation path never renders, so surfacing it on the response is the
+    # only evidence the shelf can show.
+    registry_warning = _coord_registry_warning(request.app.state)
 
     model_def = storage.get_model_definition(definition_id)
     payload = _mask_model_secrets(model_def or {})
@@ -14781,9 +14803,10 @@ async def admin_delete_model_definition(request: Request) -> JSONResponse:
     await asyncio.to_thread(_maybe_bootstrap_coord_subsystem, request.app, storage)
     _emit_models_changed(request)
 
-    # Same refused-swap surfacing as the create/update twins: the row is gone
-    # from the DB, but a keyless console's refused swap keeps SERVING the
-    # deleted alias to running and new coordinator sessions.
+    # Same surfacing as the create/update twins: the row is gone from the DB,
+    # but a keyless console's refused swap keeps SERVING the deleted alias to
+    # running and new coordinator sessions; the warning also names the stored
+    # definitions the console's last load skipped.
     registry_warning = _coord_registry_warning(request.app.state)
     payload: dict[str, Any] = {"status": "ok", "definition_id": definition_id}
     if registry_warning:
@@ -14818,8 +14841,8 @@ async def admin_model_reload(request: Request) -> JSONResponse:
 
     results = await _notify_nodes_model_reload(request)
     # This route's whole purpose is "make the live registry match the DB", so
-    # a refused console swap is the one outcome it must not report as
-    # unqualified success. Same surfacing as the create/update twins.
+    # a refused console swap, or a load that skipped stored definitions, must
+    # not read as unqualified success. Same surfacing as the create/update twins.
     registry_warning = _coord_registry_warning(request.app.state)
     payload: dict[str, Any] = {"status": "ok", "results": results}
     if registry_warning:
@@ -15201,9 +15224,9 @@ async def admin_calibrate_model_definition(request: Request) -> JSONResponse:
     await asyncio.to_thread(_refresh_coord_registry, request.app.state, storage)
     _emit_models_changed(request)
 
-    # Same refused-swap surfacing as the create/update twins: the
-    # calibration is stored, but a keyless console's live registry may
-    # have refused to adopt it.
+    # Same surfacing as the create/update twins: the calibration is stored,
+    # but a keyless console's live registry may have refused to adopt it, or
+    # its load skipped stored definitions.
     registry_warning = _coord_registry_warning(request.app.state)
     payload = {
         "separated": cal.separated,

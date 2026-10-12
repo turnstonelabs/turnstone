@@ -4961,8 +4961,8 @@ def _reload_model_registry_locked(app_state: Any, *, from_timer: bool = False) -
         and eff_task_model == registry.task_model
         and eff_task_effort == registry.task_effort
     )
-    # Aliases the loader dropped over their api_key reference ride every reply,
-    # so the console's Sync result names them per node.
+    # Aliases the loader recorded in skipped_aliases ride every reply, so the
+    # console's Sync result names them per node.
     skipped = dict(new_registry.skipped_aliases)
     if unchanged:
         new_registry.shutdown()

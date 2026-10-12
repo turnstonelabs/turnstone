@@ -655,8 +655,8 @@ class ModelRegistry:
         # unchanged, and future auth-relevant columns are covered by
         # construction.
         self._generation = 0
-        # Aliases the loader dropped because their api_key reference could not be
-        # materialised, with the reason; empty for a registry built directly.
+        # Aliases the loader recorded as skipped (see ``load_model_registry``), with
+        # the reason; empty for a registry built directly.
         self.skipped_aliases: dict[str, str] = dict(skipped_aliases or {})
 
     # -- query methods -------------------------------------------------------
@@ -1087,29 +1087,76 @@ class ModelRegistry:
 # ---------------------------------------------------------------------------
 
 
+# ``${NAME}``: what :func:`_resolve_env_vars` expands and :func:`stored_definition_error` refuses.
+_ENV_PLACEHOLDER_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+
+
 def _resolve_env_vars(value: str) -> str:
     """Expand ``${VAR}`` patterns in *value* using environment variables.
 
     Unresolved variables are replaced with empty strings.
     """
     import os
-    import re
 
     def _replace(m: re.Match[str]) -> str:
         return os.environ.get(m.group(1), "")
 
-    return re.sub(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}", _replace, value)
+    return _ENV_PLACEHOLDER_RE.sub(_replace, value)
+
+
+def stored_definition_error(row: Mapping[str, Any]) -> str:
+    """Why a stored model definition *row* cannot load, or ``""``.
+
+    A definition saved through the console is never expanded from the process
+    environment: ``${VAR}`` belongs to what the operator writes (config.toml, the
+    CLI). The console refuses a ``${VAR}`` in ``api_key`` or ``base_url`` on save,
+    and the loader skips a database row that still holds one; both report this
+    message. An api_key ``secret://`` reference is left to its resolver, which
+    refuses ``${VAR}`` inside one.
+    """
+    from turnstone.core.secret_refs import is_reference
+
+    for name, instead in (
+        (
+            "api_key",
+            "enter the key itself, store a secret:// reference, or define the model in config.toml",
+        ),
+        (
+            "base_url",
+            "enter the URL itself, or define the model in config.toml, where a URL that"
+            " carries a credential belongs",
+        ),
+    ):
+        value = str(row.get(name) or "")
+        match = _ENV_PLACEHOLDER_RE.search(value)
+        if match is None or (name == "api_key" and is_reference(value)):
+            continue
+        return (
+            f"{name} contains {match.group(0)}, which model definitions saved in the "
+            f"console do not expand ({instead})"
+        )
+    return ""
+
+
+def describe_skipped(skipped: Mapping[str, str]) -> str:
+    """``alias: reason`` for each skipped alias, sorted and joined by ``; ``.
+
+    The one summary of ``skipped_aliases`` that the loader's empty-registry error,
+    the console's write and reload replies and turnstone-doctor's verdict print.
+    """
+    return "; ".join(f"{alias}: {reason}" for alias, reason in sorted(skipped.items()))
 
 
 def materialize_api_key(value: str) -> str:
-    """Turn a stored ``api_key`` into the value a client sends.
+    """Turn an ``api_key`` into the value a client sends.
 
-    A ``secret://`` reference resolves through the store configured under
-    ``[secrets]``; ``${VAR}`` is never expanded inside a reference (an unset
-    variable would quietly select a different secret). Anything else keeps the
-    ``${VAR}`` expansion stored values have always had. Raises
-    :class:`turnstone.core.secret_refs.SecretError` when a reference cannot be
-    resolved; the message names the reference and a category, never the value.
+    A ``secret://`` reference resolves through the store configured under ``[secrets]``; ``${VAR}``
+    is never expanded inside a reference (an unset variable would quietly select a different
+    secret). Anything else has its ``${VAR}`` expanded, so a key read from a stored model definition
+    must pass :func:`stored_definition_error` first, as :func:`load_model_registry` does; only
+    config.toml entries and the CLI's default key may reach the expansion. Raises
+    :class:`turnstone.core.secret_refs.SecretError` when a reference cannot be resolved; the message
+    names the reference and a category, never the value.
     """
     from turnstone.core.secret_refs import is_reference, resolve
 
@@ -1493,9 +1540,12 @@ def load_model_registry(
 
     configs: dict[str, ModelConfig] = {}
     # Aliases dropped from this load because their api_key reference could not be
-    # materialised; the registry carries them so reload replies and the console
-    # can name them (see ``_materialize_row_key``).
+    # materialised (see ``_materialize_row_key``) or their stored row holds a
+    # ${VAR} (see ``stored_definition_error``); the registry carries them so
+    # reload replies and the console can name them.
     skipped_aliases: dict[str, str] = {}
+    # The ${VAR} skips among them, logged once config.toml has had its say.
+    placeholder_skips: dict[str, str] = {}
 
     # 1. Load DB model definitions (lowest priority, overridden by config.toml)
     if storage is not None:
@@ -1514,16 +1564,13 @@ def load_model_registry(
                 row_server_compat = caps.pop("server_compat", {})
                 if not isinstance(row_server_compat, dict):
                     row_server_compat = {}
-                raw_row_base_url = str(row.get("base_url") or "")
-                row_base_url = _resolve_env_vars(raw_row_base_url)
-                if raw_row_base_url and not row_base_url:
-                    # An unset ${VAR} would resolve to the provider's public
-                    # endpoint under a credential meant for the local server.
-                    log.warning(
-                        "Model '%s' has a base_url whose ${VAR} is unset — export it or "
-                        "set the URL in the Models tab; skipping",
-                        alias,
-                    )
+                row_base_url = str(row.get("base_url") or "")
+                # A stored row is never expanded from the environment: one still
+                # holding a ${VAR} is skipped, named, so expansion further down
+                # can reach only a caller's default key (the ``or api_key``).
+                placeholder_error = stored_definition_error(row)
+                if placeholder_error:
+                    skipped_aliases[alias] = placeholder_skips[alias] = placeholder_error
                     continue
                 row_provider = _resolve_openai_provider(row.get("provider", "openai"), row_base_url)
                 row_server_compat = _normalize_workspace_id(alias, row_server_compat, row_provider)
@@ -1757,8 +1804,8 @@ def load_model_registry(
     # ``model=`` and silently bypasses the operator's per-role
     # task_alias override (the "default" alias points at
     # whatever --base-url was at boot, not at the configured default).
-    # Models that exist but were skipped over their api_key reference do not
-    # count as absent: the empty-registry error below names them instead.
+    # Models recorded in skipped_aliases do not count as absent: the
+    # empty-registry error below names them instead.
     if not configs and model and not skipped_aliases:
         configs["default"] = ModelConfig(
             alias="default",
@@ -1769,20 +1816,19 @@ def load_model_registry(
             provider=_resolve_openai_provider(provider, base_url),
         )
 
-    # A database row dropped over its reference is of no consequence when
-    # config.toml serves the alias; only aliases that are really absent count.
+    # A database row recorded as skipped is of no consequence when config.toml
+    # serves the alias; only aliases that are really absent count.
     for alias in configs:
         skipped_aliases.pop(alias, None)
+    for alias, reason in placeholder_skips.items():
+        if alias in skipped_aliases:
+            log.error("model_registry.alias_skipped", alias=alias, source="db", error=reason)
 
     if not configs:
         if not allow_empty:
             if skipped_aliases:
-                message = (
-                    "No model definitions could be loaded. Skipped over their api_key "
-                    "reference: "
-                    + "; ".join(
-                        f"{alias}: {reason}" for alias, reason in sorted(skipped_aliases.items())
-                    )
+                message = "No model definitions could be loaded. Skipped: " + describe_skipped(
+                    skipped_aliases
                 )
             else:
                 message = (
