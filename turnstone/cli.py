@@ -1709,11 +1709,18 @@ def main() -> None:
 
     # Create client and detect model
     provider_name = args.provider
-    api_key = (
-        args.api_key
-        or os.environ.get("ANTHROPIC_API_KEY" if provider_name == "anthropic" else "OPENAI_API_KEY")
-        or "dummy"
-    )
+    key_variable = "ANTHROPIC_API_KEY" if provider_name == "anthropic" else "OPENAI_API_KEY"
+    api_key = args.api_key or os.environ.get(key_variable) or "dummy"
+    # Checked before its first use below, by the rule every model key follows.
+    from turnstone.core.http_headers import HeaderValueError, checked_header_value
+
+    try:
+        api_key = checked_header_value(
+            api_key, "--api-key (or [api] api_key)" if args.api_key else f"${key_variable}"
+        )
+    except HeaderValueError as exc:
+        print(f"turnstone: {exc}", file=sys.stderr)
+        sys.exit(1)
     base_url = args.base_url
     if provider_name == "anthropic" and base_url == "http://localhost:8000/v1":
         # Override local default to Anthropic API

@@ -183,3 +183,23 @@ def test_only_a_stored_reference_is_resolved(tmp_path, monkeypatch, stored, sent
     monkeypatch.setattr("turnstone.core.rerank_calibrate.calibrate_model", fake)
     _cmd_rerank_calibrate(_args(db, apply=False))
     assert seen["api_key"] == sent
+
+
+def test_a_stored_key_a_header_cannot_carry_is_refused_unquoted(tmp_path, monkeypatch, capsys):
+    """Refused before the probe, as the console's Re-calibrate refuses it, so no client error can
+    quote it."""
+    db = str(tmp_path / "t.db")
+    _seed_reranker(db, api_key="rk" + chr(1) + "keymarker")
+    called: list[str] = []
+
+    def fake(base_url, model, api_key, *, instruction="", timeout=60.0):
+        called.append(api_key)
+        return _result(separated=True, threshold=0.37)
+
+    monkeypatch.setattr("turnstone.core.rerank_calibrate.calibrate_model", fake)
+    with pytest.raises(SystemExit) as ei:
+        _cmd_rerank_calibrate(_args(db, apply=False))
+    assert ei.value.code == 1
+    err = capsys.readouterr().err
+    assert "api_key is a value an HTTP header cannot carry" in err and "keymarker" not in err
+    assert called == []

@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 import pytest
 
 from tests._secret_refs_helpers import FakeBackend, install_fake_resolver
+from turnstone.core.http_headers import HeaderValueError
 from turnstone.core.model_registry import load_model_registry, materialize_api_key
 from turnstone.core.secret_refs import SecretReferenceError, invalidate_cache
 from turnstone.core.secret_refs._errors import SecretBackendError
@@ -65,6 +67,87 @@ class TestMaterializeApiKey:
         assert materialize_api_key("secret://fake/openai") == "sk-from-store"
         with pytest.raises(SecretReferenceError, match="not expanded inside a reference"):
             materialize_api_key("secret://fake/${TEAM}")
+
+    def test_literal_drops_one_trailing_line_break(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # A variable filled from a file keeps the file's line break, which is not part of the key.
+        monkeypatch.setenv("TS_TEST_KEY", "sk-from-file" + chr(10))
+        assert materialize_api_key("${TS_TEST_KEY}") == "sk-from-file"
+        assert materialize_api_key("sk-literal" + chr(13) + chr(10)) == "sk-literal"
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "sk-padded ",
+            "sk-two-breaks" + chr(10) * 2,
+            "sk-inner" + chr(10) + "break",
+            "sk-caf" + chr(0xE9),
+        ],
+        ids=["space", "two-breaks", "inner-break", "non-ascii"],
+    )
+    def test_literal_a_header_cannot_carry_is_refused_unquoted(self, value: str) -> None:
+        with pytest.raises(HeaderValueError, match="cannot carry") as excinfo:
+            materialize_api_key(value)
+        assert value.strip() not in str(excinfo.value)
+
+    def test_literal_that_is_only_a_line_break_is_refused(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Empty once the line break is dropped, it would select the SDK's own variable instead.
+        monkeypatch.setenv("TS_TEST_KEY", chr(13) + chr(10))
+        for value in (chr(10), "${TS_TEST_KEY}"):
+            with pytest.raises(HeaderValueError, match="^api_key is a value an HTTP header"):
+                materialize_api_key(value)
+        assert materialize_api_key("") == ""
+
+    def test_literal_that_is_not_text_is_refused(self) -> None:
+        # A config.toml key written without quotes.
+        with pytest.raises(HeaderValueError, match="^api_key must be a string$"):
+            materialize_api_key(12345)
+
+    def test_literal_a_variable_empties_is_refused(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # The empty key would select the provider SDK's own variable, a different credential.
+        monkeypatch.delenv("TS_UNSET_KEY", raising=False)
+        monkeypatch.setenv("TS_EMPTY_KEY", "")
+        for value in ("${TS_UNSET_KEY}", "${TS_EMPTY_KEY}"):
+            with pytest.raises(HeaderValueError, match="^api_key expands to nothing"):
+                materialize_api_key(value)
+
+
+class TestLoadWithLiteralKeys:
+    def test_a_literal_key_a_header_cannot_carry_skips_its_alias(self) -> None:
+        storage = _MockStorage([_row("bad", "sk-padded "), _row("ok", "sk-from-file" + chr(10))])
+        registry = load_model_registry(storage=storage, strict=True)
+        assert registry.list_aliases() == ["ok"]
+        assert registry.get_config("ok").api_key == "sk-from-file"
+        assert "cannot carry" in registry.skipped_aliases["bad"]
+        assert "sk-padded" not in registry.skipped_aliases["bad"]
+
+    def test_config_toml_keys_follow_the_same_rule(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        from turnstone.core import model_registry as mr
+
+        monkeypatch.setenv("TS_TEST_KEY", "sk-from-file" + chr(10))
+        entries = {
+            "models": {
+                "env": {"model": "m", "provider": "openai", "api_key": "${TS_TEST_KEY}"},
+                "bad": {"model": "m", "provider": "openai", "api_key": "sk-padded "},
+                "unquoted": {"model": "m", "provider": "openai", "api_key": 12345},
+                "unset": {"model": "m", "provider": "openai", "api_key": "${TS_UNSET_KEY}"},
+            }
+        }
+        monkeypatch.delenv("TS_UNSET_KEY", raising=False)
+        monkeypatch.setattr(mr, "load_config", lambda section=None: entries)
+        with caplog.at_level(logging.ERROR):
+            registry = load_model_registry(storage=_MockStorage([]), allow_empty=True)
+        assert registry.list_aliases() == ["env"]
+        assert registry.get_config("env").api_key == "sk-from-file"
+        assert "cannot carry" in registry.skipped_aliases["bad"]
+        assert registry.skipped_aliases["unquoted"] == "api_key must be a string"
+        assert registry.skipped_aliases["unset"].startswith("api_key expands to nothing")
+        # The file and the environment are read once per process: Sync would refuse it again.
+        skips = [r.getMessage() for r in caplog.records if "alias_skipped" in r.getMessage()]
+        assert len(skips) == 3 and all("then restart" in m for m in skips)
 
 
 class TestLoadWithReferences:

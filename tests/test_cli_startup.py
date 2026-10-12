@@ -228,6 +228,82 @@ cli.main()
     assert "Goodbye." in result.stdout, output
 
 
+_UNFIT_VARIABLE = "turnstone: $OPENAI_API_KEY is a value an HTTP header cannot carry"
+
+
+@pytest.mark.parametrize(
+    ("api_key", "config", "refusal"),
+    [
+        ("sk-from-file" + chr(10), "", None),
+        ("sk-padded ", "", _UNFIT_VARIABLE),
+        # Empty once the line break is dropped, it would select the SDK's own variable instead.
+        (chr(10), "", _UNFIT_VARIABLE),
+        ("sk-unused", "[api]\napi_key = 12345\n", "--api-key (or [api] api_key) must be a string"),
+    ],
+    ids=["line-break", "space", "only-a-line-break", "unquoted-config-key"],
+)
+def test_the_cli_key_follows_the_model_key_rule(
+    tmp_path: Path, api_key: str, config: str, refusal: str | None
+) -> None:
+    """Before its first use, the key drops one trailing line break; a key a header still cannot
+    carry stops the CLI with a message that names where the key came from, never the key."""
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(config, encoding="utf-8")
+    config_path.chmod(0o600)
+    script = """
+from turnstone import cli
+from turnstone.core import providers
+
+original = providers.create_client
+
+def create_client(provider, **kwargs):
+    print("KEY", repr(kwargs.get("api_key")), flush=True)
+    return original(provider, **kwargs)
+
+providers.create_client = create_client
+cli.main()
+"""
+    env = {key: value for key, value in os.environ.items() if not key.startswith("TURNSTONE_")}
+    env.update(
+        {
+            "OPENAI_API_KEY": api_key,
+            "TURNSTONE_DB_BACKEND": "sqlite",
+            "TURNSTONE_DB_PATH": str(tmp_path / "turnstone.db"),
+        }
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            script,
+            "--config",
+            str(config_path),
+            "--model",
+            "startup-test-model",
+            "--retention-days",
+            "0",
+            "--no-judge",
+        ],
+        input="/exit\n",
+        text=True,
+        capture_output=True,
+        cwd=Path(__file__).resolve().parents[1],
+        env=env,
+        timeout=60,
+        check=False,
+    )
+
+    output = result.stdout + result.stderr
+    if refusal is None:
+        assert result.returncode == 0, output
+        assert "KEY 'sk-from-file'" in result.stdout, output
+    else:
+        assert result.returncode == 1, output
+        assert refusal in result.stderr, output
+        assert "KEY" not in result.stdout and "sk-padded" not in output
+
+
 @pytest.mark.parametrize("oauth_pool", [False, True], ids=["model-only", "web-user-pool"])
 def test_cli_model_auth_with_mcp_disabled_persona(
     tmp_path: Path, sqlite_backend_factory: Callable[[str], SQLiteBackend], oauth_pool: bool

@@ -195,6 +195,27 @@ def test_calibrate_resolves_only_a_stored_reference(
     assert seen == [sent]
 
 
+def test_calibrate_refuses_a_stored_key_a_header_cannot_carry(
+    storage: SQLiteBackend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Refused before the probe, as the loader refuses it, so no client error can quote it."""
+    seen: list[str] = []
+
+    def _calibrate(
+        base_url: str, model: str, api_key: str, *, instruction: str = "", timeout: float = 60.0
+    ) -> CalibrationResult:
+        seen.append(api_key)
+        return _result(separated=True, threshold=0.42)
+
+    monkeypatch.setattr("turnstone.core.rerank_calibrate.calibrate_model", _calibrate)
+    _seed_reranker(storage, api_key="rk" + chr(1) + "keymarker")
+    client = _make_client(storage, _make_registry())
+    resp = client.post("/v1/api/admin/model-definitions/r1/calibrate")
+    assert resp.status_code == 400, resp.text
+    assert "cannot carry" in resp.json()["error"] and "keymarker" not in resp.text
+    assert seen == []
+
+
 def test_concurrent_capabilities_put_survives_calibrate(
     storage: SQLiteBackend, monkeypatch: pytest.MonkeyPatch
 ) -> None:

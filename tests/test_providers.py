@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import logging
 from types import SimpleNamespace
-from typing import Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar
 from unittest.mock import MagicMock, PropertyMock, patch
 
 import pytest
@@ -40,6 +40,9 @@ from turnstone.core.providers._protocol import (
     request_uses_native_tools,
     serialized_tool_chars,
 )
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 # ---------------------------------------------------------------------------
 # Prepared request facts
@@ -3095,8 +3098,34 @@ class TestAnthropicHelpers:
 # ===========================================================================
 
 
+_SDK_KEY_VARIABLES = ("OPENAI_API_KEY", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")
+_ANTHROPIC_OTHER_CREDENTIAL_VARIABLES = (
+    "ANTHROPIC_PROFILE",
+    "ANTHROPIC_IDENTITY_TOKEN",
+    "ANTHROPIC_IDENTITY_TOKEN_FILE",
+    "ANTHROPIC_FEDERATION_RULE_ID",
+    "ANTHROPIC_ORGANIZATION_ID",
+    "ANTHROPIC_SERVICE_ACCOUNT_ID",
+    "ANTHROPIC_SCOPE",
+)
+_OPENAI_LANES = ("openai", "openai-compatible", "google", "xai")
+_ANTHROPIC_LANES = ("anthropic", "anthropic-compatible")
+_LANE_URL = {
+    "openai-compatible": "http://llm.example.com/v1",
+    "anthropic-compatible": "http://llm.example.com",
+}
+_LF = chr(10)
+_UNFIT = "bad" + chr(1)
+
+
 class TestProviderFactory:
     """Tests for create_provider and create_client factory functions."""
+
+    @pytest.fixture(autouse=True)
+    def _no_sdk_key_variables(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # With no key passed, create_client reads the SDKs' own variables; tests set what they use.
+        for name in _SDK_KEY_VARIABLES:
+            monkeypatch.delenv(name, raising=False)
 
     def test_create_provider_openai(self) -> None:
         from turnstone.core.providers import OpenAIResponsesProvider, create_provider
@@ -3157,6 +3186,104 @@ class TestProviderFactory:
 
         create_client("anthropic", base_url="", api_key="")
         mock_anthropic_cls.assert_called_once_with()
+
+    @pytest.fixture
+    def real_sdk(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        """Keep the Anthropic SDK off this machine's profiles and other credential sources.
+
+        An empty home, not ANTHROPIC_CONFIG_DIR, which the SDK reads as a chosen profile.
+        """
+        monkeypatch.setenv("HOME", str(tmp_path))
+        for name in (*_ANTHROPIC_OTHER_CREDENTIAL_VARIABLES, "ANTHROPIC_CONFIG_DIR"):
+            monkeypatch.delenv(name, raising=False)
+
+    @pytest.mark.parametrize(
+        ("lane", "env", "headers"),
+        [
+            # The other SDK's variables, unfit, are never read on these lanes.
+            *[
+                (
+                    lane,
+                    {"OPENAI_API_KEY": "sk" + _LF, "ANTHROPIC_API_KEY": _UNFIT},
+                    {"Authorization": "Bearer sk"},
+                )
+                for lane in _OPENAI_LANES
+            ],
+            # Once one variable is passed, the SDK reads neither, so both go, cleaned.
+            *[
+                (
+                    lane,
+                    {"ANTHROPIC_API_KEY": "sk" + _LF, "ANTHROPIC_AUTH_TOKEN": "tok"},
+                    {"X-Api-Key": "sk", "Authorization": "Bearer tok"},
+                )
+                for lane in _ANTHROPIC_LANES
+            ],
+            *[
+                (
+                    lane,
+                    {"ANTHROPIC_API_KEY": "sk", "ANTHROPIC_AUTH_TOKEN": "tok" + _LF},
+                    {"X-Api-Key": "sk", "Authorization": "Bearer tok"},
+                )
+                for lane in _ANTHROPIC_LANES
+            ],
+            ("anthropic", {"ANTHROPIC_AUTH_TOKEN": "tok" + _LF}, {"Authorization": "Bearer tok"}),
+            # No ANTHROPIC_API_KEY: the placeholder goes, and the SDK never reads the token.
+            ("anthropic-compatible", {"ANTHROPIC_AUTH_TOKEN": _UNFIT}, {"X-Api-Key": "dummy"}),
+        ],
+    )
+    def test_create_client_sends_the_sdk_variables_cleaned(
+        self,
+        real_sdk: None,
+        monkeypatch: pytest.MonkeyPatch,
+        lane: str,
+        env: dict[str, str],
+        headers: dict[str, str],
+    ) -> None:
+        """Through the real SDK clients (building one sends nothing): a variable read from a file
+        keeps its line break, which the SDK would send as it is."""
+        from turnstone.core.providers import create_client
+
+        for name, value in env.items():
+            monkeypatch.setenv(name, value)
+        client = create_client(lane, base_url=_LANE_URL.get(lane, ""), api_key="")
+        assert client.auth_headers == headers
+
+    @pytest.mark.parametrize(
+        ("lane", "env", "variable"),
+        [
+            *[(lane, {"OPENAI_API_KEY": _UNFIT}, "OPENAI_API_KEY") for lane in _OPENAI_LANES],
+            # Empty once the line break is dropped, it would no longer be the variable's key.
+            ("openai", {"OPENAI_API_KEY": _LF}, "OPENAI_API_KEY"),
+            *[
+                (lane, {"ANTHROPIC_API_KEY": _UNFIT}, "ANTHROPIC_API_KEY")
+                for lane in _ANTHROPIC_LANES
+            ],
+            *[
+                (
+                    lane,
+                    {"ANTHROPIC_API_KEY": "sk", "ANTHROPIC_AUTH_TOKEN": _UNFIT},
+                    "ANTHROPIC_AUTH_TOKEN",
+                )
+                for lane in _ANTHROPIC_LANES
+            ],
+        ],
+    )
+    def test_create_client_refuses_an_sdk_variable_it_would_send(
+        self,
+        real_sdk: None,
+        monkeypatch: pytest.MonkeyPatch,
+        lane: str,
+        env: dict[str, str],
+        variable: str,
+    ) -> None:
+        from turnstone.core.http_headers import UNFIT_HEADER_VALUE, HeaderValueError
+        from turnstone.core.providers import create_client
+
+        for name, value in env.items():
+            monkeypatch.setenv(name, value)
+        with pytest.raises(HeaderValueError) as excinfo:
+            create_client(lane, base_url=_LANE_URL.get(lane, ""), api_key="")
+        assert str(excinfo.value) == f"{variable} is {UNFIT_HEADER_VALUE}"
 
     @patch("turnstone.core.providers._anthropic._ensure_anthropic")
     def test_create_client_anthropic_nonempty_api_key_passes_kwarg(

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from turnstone.core.http_headers import drop_line_break
 from turnstone.core.secret_refs._errors import SecretBackendError, SecretReferenceError
 
 
@@ -64,7 +65,7 @@ class FileBackend:
             ) from exc
         # Mounted secret files usually end with one newline that is not part of
         # the value; everything else is kept verbatim.
-        return text.removesuffix("\n").removesuffix("\r")
+        return drop_line_break(text)
 
 
 def _inside(root: Path, candidate: Path) -> bool:

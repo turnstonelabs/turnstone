@@ -358,6 +358,41 @@ class TestModelEndpoints:
         assert resp.status_code == 200, resp.text
         assert seen["api_key"] == "${TS_CONSOLE_ONLY_VALUE}"
 
+    def test_detect_refuses_a_stored_key_a_header_cannot_carry(
+        self, storage: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Refused before the probe, as the loader refuses it, so no client error can quote it."""
+        storage.create_model_definition(
+            definition_id="d1",
+            alias="a",
+            model="gpt-5",
+            provider="openai",
+            base_url="https://probe.example.com/v1",
+            api_key="sk" + chr(1) + "keymarker",
+            context_window=8192,
+        )
+        probed: list[Any] = []
+
+        def fake_probe(*args: Any, **kwargs: Any) -> dict[str, Any]:
+            probed.append(args)
+            return {"reachable": True, "model_found": True, "context_window": 200000}
+
+        monkeypatch.setattr("turnstone.core.model_registry.probe_model_endpoint", fake_probe)
+        plain = _make_client(storage, "admin.models")
+        resp = plain.post(
+            "/v1/api/admin/model-definitions/detect",
+            json={
+                "provider": "openai",
+                "base_url": "",
+                "api_key": "***",
+                "model": "gpt-5",
+                "definition_id": "d1",
+            },
+        )
+        assert resp.status_code == 400, resp.text
+        assert "cannot carry" in resp.json()["error"] and "keymarker" not in resp.text
+        assert probed == []
+
     def test_detect_materialises_the_stored_reference(
         self, storage: Any, fake_store: FakeBackend, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -745,6 +780,35 @@ class TestConsoleRefresh:
         assert live.get_config("b").api_key == "sk-o2"
         _refresh_coord_registry(state, storage)  # a Sync or a save applies the refusal
         assert live.list_aliases() == ["b"]
+
+    def test_a_tick_keeps_a_model_whose_saved_literal_key_a_header_cannot_carry(
+        self, storage: Any, fake_store: FakeBackend
+    ) -> None:
+        """Held back as a refused reference is, endpoint and key as they serve, until a Sync."""
+        from turnstone.console.server import _refresh_coord_registry
+        from turnstone.core.model_registry import load_model_registry
+
+        for alias in ("a", "b"):
+            storage.create_model_definition(
+                definition_id=f"d-{alias}",
+                alias=alias,
+                model="gpt-5",
+                provider="openai-compatible",
+                base_url="https://llm.example.com/v1",
+                api_key="sk-good",
+                context_window=8192,
+            )
+        live = load_model_registry(storage=storage, strict=True)
+        state = SimpleNamespace(coord_registry=live, coord_registry_error="")
+        storage.update_model_definition(
+            "d-a", api_key="sk" + chr(1) + "x", base_url="https://other.example.com/v1"
+        )
+        _refresh_coord_registry(state, storage, from_timer=True)
+        assert live.get_config("a").api_key == "sk-good"
+        assert live.get_config("a").base_url == "https://llm.example.com/v1"
+        _refresh_coord_registry(state, storage)  # a Sync or a save applies the refusal
+        assert live.list_aliases() == ["b"]
+        assert "cannot carry" in live.skipped_aliases["a"]
 
     def test_a_tick_with_nothing_changed_leaves_the_registry_alone(
         self, storage: Any, fake_store: FakeBackend

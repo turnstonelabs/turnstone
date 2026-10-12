@@ -243,6 +243,12 @@ frozen.
   `turnstone-doctor`'s report when it cannot resolve its model). Edit such a definition to hold the
   key or URL itself, or a `secret://` reference for the key, or define the model in config.toml,
   where a URL that carries a credential belongs.
+- **Two kinds of model key that loaded no longer do** *(BREAKING)* — a config.toml `[models.*]`
+  `api_key` whose `${VAR}` expands to nothing, and a reranker key with a space at either end. The
+  first fell back to the provider SDK's own variable, which then went to that entry's endpoint (or,
+  on a local server with that variable unset, to the placeholder key); the second was trimmed. Both
+  now follow the model key rule (under Fixed): the model is skipped and named with the reason. Set
+  the variable, or remove the `api_key` line for a server without auth, and trim the key.
 - **Bash commands no longer read the CLI's terminal.** They inherited the stdin of the process that
   ran them, so in the CLI a command that read its input took keys typed into the terminal, perhaps
   for another workstream, and one that prompted waited until its timeout for an answer nobody
@@ -500,6 +506,19 @@ frozen.
 - **A model definition saved with a non-string `api_key` or `base_url`, JSON `null` included, is
   refused.** The console stored the value's text (`None`, `False`, `123`) and sent that as the key
   or URL; it now answers 400.
+- **A model key follows the rule a `secret://` key does.** One trailing line break is dropped, so a
+  key read from a file works wherever it is written: a model definition, a config.toml `[models.*]`
+  entry (after `${VAR}` expansion), the CLI's `--api-key`, `[api] api_key` or provider key variable,
+  and the provider SDK's own variable (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`,
+  `ANTHROPIC_AUTH_TOKEN`) that a model with an empty key uses, as the compose and Helm setups do. A
+  key an HTTP header still cannot carry is refused, and so is one that was only a line break or
+  written without quotes in config.toml; such a key failed every request or, depending on the
+  provider, was sent. The message names where the key came from, never the key: a model definition
+  or `[models.*]` entry is skipped and named with the reason, the CLI's own key stops the CLI at
+  startup, a provider variable fails the models that use it when their client is built, and the
+  console's Detect and Re-calibrate and `turnstone-admin rerank-calibrate` refuse the key.
+  turnstone-doctor's backend check, given no key, sends a placeholder rather than the provider
+  variable.
 - **The MCP Servers list shows connect errors again (#1328).** Since the node status read stopped
   carrying error text, a server that failed to connect showed **idle**, and a newly saved one
   showed **connecting** forever. The list marks a failing server as **error**, and admins

@@ -4,6 +4,7 @@ import ast
 import base64
 import contextlib
 import json
+import logging
 import os
 import subprocess
 import threading
@@ -3967,6 +3968,33 @@ class TestTitleRetry:
         update.assert_not_called()
         assert session._generation != origin_generation
         assert session._title_generated is False
+
+    def test_a_failed_title_logs_its_traceback_only_at_debug(self, tmp_db, caplog):
+        session = _make_session()
+        _bind_mock_storage(session)
+        session.messages = [Turn.user("Review the parser.")]
+
+        def fail(*_args, **_kwargs):
+            try:
+                raise ValueError("cause text: title-cause-marker")
+            except ValueError as cause:
+                raise ConnectionError("Connection error.") from cause
+
+        with (
+            patch.object(session, "_utility_completion", side_effect=fail),
+            caplog.at_level(logging.DEBUG, logger="turnstone.core.session"),
+        ):
+            session._generate_title()
+
+        failed = [r for r in caplog.records if "ws.title.fail" in r.getMessage()]
+        warnings = [r for r in failed if r.levelno == logging.WARNING]
+        assert len(warnings) == 1
+        assert "ConnectionError" in warnings[0].getMessage()
+        assert "title-cause-marker" not in warnings[0].getMessage()
+        # The chained cause is rendered at DEBUG only.
+        assert any(
+            r.levelno == logging.DEBUG and "title-cause-marker" in r.getMessage() for r in failed
+        )
 
     def test_title_generated_stays_true_on_success(self, tmp_db):
         from turnstone.core.providers._protocol import ModelCapabilities

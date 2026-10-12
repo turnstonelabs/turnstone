@@ -611,6 +611,22 @@ spaces and tabs only between other characters. Any other value is refused as a
 secret that does not exist is, and the message names the reference, never the
 value.
 
+A literal model key follows the same rule: one in a model definition, in a
+config.toml `[models.*]` entry (after `${VAR}` expansion), the CLI's own key
+(`--api-key`, `[api] api_key` or the provider key variable), and the provider
+SDK's own variable (`OPENAI_API_KEY`, or `ANTHROPIC_API_KEY` and
+`ANTHROPIC_AUTH_TOKEN`) that a model with an empty key uses. One trailing line
+break is dropped. A key that still cannot go in a header is refused, and so is
+one that was only a line break or, in a `[models.*]` entry, one whose `${VAR}`
+expands to nothing (the empty key would select the provider variable instead).
+The message names where the key came from, never the key: a model definition or
+`[models.*]` entry leaves its model out, which the console names with the
+reason; the CLI's own key stops the CLI at startup; a provider variable fails
+the models that use it when their client is built (Detect reports it). A running
+model whose saved key is refused keeps running as it is through the timed
+reloads, as one whose reference the store refuses does (below); Sync to Nodes
+applies the refusal.
+
 ### When values are fetched
 
 A model definition's reference is resolved when the registry loads: at
@@ -651,9 +667,10 @@ are unaffected. If the store is unreachable while a process starts, the
 definitions that reference it load at the next timed reload or Sync after it
 comes back. An MCP server whose header the store refuses is retried every five
 minutes instead of on the usual reconnect backoff. A `[models.*]` entry in
-config.toml whose reference is left out takes the same alias's database
-definition with it: the file has the last word on an alias it names. Other
-problems with a `[models.*]` entry leave the database definition in force.
+config.toml whose key is refused, for any of the reasons above, takes the same
+alias's database definition with it: the file has the last word on an alias it
+names. Other problems with a `[models.*]` entry leave the database definition in
+force.
 
 ### Permissions and scoping
 

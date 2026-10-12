@@ -463,6 +463,36 @@ class TestCheckLlmBackendTool:
         assert "Refused" in out
         probe.assert_not_called()
 
+    def test_sends_the_placeholder_rather_than_the_operators_key(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The model chooses the host, so a probe without a key never falls back to the provider
+        SDK's own variable. The real client is built (which sends nothing) and its headers read."""
+        import turnstone.core.providers as providers
+        from turnstone.core.providers import LOCAL_PLACEHOLDER_API_KEY
+        from turnstone.doctor import _tool_check_llm_backend
+
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-operator")
+        real_create_client = providers.create_client
+        sent: list[dict[str, str]] = []
+
+        def headers_then_stop(*args: Any, **kwargs: Any) -> Any:
+            sent.append(dict(real_create_client(*args, **kwargs).auth_headers))
+            raise RuntimeError("stopped before any request")
+
+        # probe_model_endpoint imports create_client when it runs.
+        monkeypatch.setattr(providers, "create_client", headers_then_stop)
+        out = _tool_check_llm_backend({"provider": "openai", "base_url": "http://127.0.0.1/v1"})
+        _tool_check_llm_backend(
+            {"provider": "openai", "base_url": "http://127.0.0.1/v1", "api_key": "sk-given"}
+        )
+        assert sent == [
+            {"Authorization": f"Bearer {LOCAL_PLACEHOLDER_API_KEY}"},
+            {"Authorization": "Bearer sk-given"},
+        ]
+        # The model learns that an authentication error there says nothing about the real key.
+        assert "a placeholder key was sent" in out
+
 
 class TestNodeHealth:
     def _capture_cmd(self, tmp_path: Path, kind: str, args: dict[str, object]) -> list[str]:
@@ -1589,6 +1619,34 @@ class TestSelectProvider:
         ):
             provider, _client, model = _select_provider()
         assert provider == "openai" and model == "my-model"
+
+    def test_an_env_key_is_offered_without_its_line_break(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A variable filled from a file keeps the file's line break, which is not part of the key.
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-from-file" + chr(10))
+        with (
+            patch("builtins.input", side_effect=["1", "", ""]),
+            patch("openai.OpenAI", return_value=MagicMock()) as openai_cls,
+        ):
+            _select_provider()
+        assert openai_cls.call_args.kwargs["api_key"] == "sk-from-file"
+
+    def test_an_env_key_a_header_cannot_carry_is_not_offered(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        monkeypatch.setenv("OPENAI_API_KEY", "sk" + chr(1) + "keymarker")
+        with (
+            patch("builtins.input", side_effect=["3", "http://localhost:8000/v1", "my-model"]),
+            patch("getpass.getpass", return_value="none") as prompt,
+            patch("openai.OpenAI", return_value=MagicMock()) as openai_cls,
+        ):
+            _select_provider()
+        prompt.assert_called_once()
+        assert openai_cls.call_args.kwargs["api_key"] == "none"
+        out = capsys.readouterr().out
+        assert "$OPENAI_API_KEY is a value an HTTP header cannot carry" in out
+        assert "keymarker" not in out
 
 
 # ---------------------------------------------------------------------------

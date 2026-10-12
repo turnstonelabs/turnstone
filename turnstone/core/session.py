@@ -6789,7 +6789,12 @@ class ChatSession:
                 # Broadcast current name so the UI resets the "refreshing" indicator
                 if current_title:
                     self.ui.on_rename(current_title)
-            log.warning("ws.title.failed", ws_id=ws_id[:8], error=str(e), exc_info=True)
+            # The traceback only at DEBUG, as the request retry ("API error details") and
+            # fallback ("fallback failure detail") logs do.
+            log.warning(
+                "ws.title.failed", ws_id=ws_id[:8], error_type=type(e).__name__, error=str(e)
+            )
+            log.debug("ws.title.failure_detail", ws_id=ws_id[:8], exc_info=True)
 
     def _title_owner_is_valid(
         self,

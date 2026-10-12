@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, Any
 
 import httpx2
 
+from turnstone.core.http_headers import drop_line_break
 from turnstone.core.log import get_logger
 from turnstone.core.secret_refs._errors import (
     SecretBackendError,
@@ -176,7 +177,7 @@ class VaultBackend:
         # A field written from a file (``field=@file``) keeps the file's trailing
         # newline, which is not part of the value; one is dropped, as the file
         # backend does, and everything else is kept verbatim.
-        return value.removesuffix("\n").removesuffix("\r")
+        return drop_line_break(value)
 
     def close(self) -> None:
         self._client.close()

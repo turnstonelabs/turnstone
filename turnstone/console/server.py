@@ -66,7 +66,7 @@ from turnstone.core.auth import (
     require_permission,
 )
 from turnstone.core.deadline import DeadlineExceededError, run_with_deadline
-from turnstone.core.http_headers import HEADER_VALUE_RE
+from turnstone.core.http_headers import HEADER_VALUE_RE, HeaderValueError
 from turnstone.core.mcp_oauth import is_user_scoped_auth
 from turnstone.core.memory import get_workstream_display_names
 from turnstone.core.metacognition import field_str, sanitize_display
@@ -11468,14 +11468,28 @@ async def _check_mcp_secret_fields(request: Request, headers: Any, env: Any) -> 
     return JSONResponse({"error": message}, status_code=status)
 
 
-async def _materialize_probe_key(value: str) -> tuple[str, JSONResponse | None]:
-    """Turn a stored or submitted api_key or MCP header value into the value a probe sends.
+async def _probe_model_key(value: str) -> tuple[str, JSONResponse | None]:
+    """A model's stored or submitted api_key as Detect and Re-calibrate send it, or the refusal.
 
-    The store round trip runs off the loop.
+    :func:`turnstone.core.model_registry.probe_api_key` off the loop: a ``secret://`` reference
+    resolves, and the value follows the rule every key does, so a probe agrees with the loader.
+    """
+    from turnstone.core.model_registry import probe_api_key
+    from turnstone.core.secret_refs import SecretError
 
-    Only a ``secret://`` reference is resolved. ``${VAR}`` is sent as written,
-    as it always was here, rather than expanded from the console's environment
-    for an endpoint the request may choose.
+    try:
+        return await asyncio.to_thread(probe_api_key, value), None
+    except SecretError as exc:
+        return "", JSONResponse({"error": str(exc)}, status_code=503 if exc.retryable else 400)
+    except HeaderValueError as exc:
+        return "", JSONResponse({"error": str(exc)}, status_code=400)
+
+
+async def _resolve_mcp_header_reference(value: str) -> tuple[str, JSONResponse | None]:
+    """An MCP header's ``secret://`` reference resolved for a connection test, or the refusal.
+
+    The store round trip runs off the loop. The caller passes references only; a model key
+    goes through :func:`_probe_model_key` instead.
     """
     from turnstone.core.secret_refs import SecretError, resolve
 
@@ -12738,7 +12752,7 @@ async def admin_test_mcp_server(request: Request) -> JSONResponse:
     header_references = _header_references(headers)
     headers = dict(headers)
     for key, reference in header_references.items():
-        headers[key], err = await _materialize_probe_key(reference)
+        headers[key], err = await _resolve_mcp_header_reference(reference)
         if err is not None:
             return err
     if header_references and loop.time() >= deadline:
@@ -13757,8 +13771,8 @@ def _refresh_coord_registry_locked(
     *from_timer* marks the secret refresh timer's tick: it probes for a
     context window only definitions not already detected from the same
     endpoint, leaves the live registry alone when nothing changed, and a model
-    whose reference the store refuses keeps the config it is running with (a
-    Sync or a save applies the refusal).
+    whose key the loader refuses (see ``model_registry._materialize_row_key``)
+    keeps the config it is running with (a Sync or a save applies the refusal).
 
     Caller holds :data:`_COORD_REGISTRY_REFRESH_LOCK` across both the strict
     snapshot load and ``ModelRegistry.reload``.  Keeping the lock outside the
@@ -14957,7 +14971,7 @@ async def admin_detect_model(request: Request) -> JSONResponse:
                 workspace_id = _stored_workspace_id(row, provider)
 
     # A secret:// reference (stored or submitted) resolves here, off the loop.
-    api_key, key_err = await _materialize_probe_key(api_key)
+    api_key, key_err = await _probe_model_key(api_key)
     if key_err is not None:
         return key_err
 
@@ -15107,7 +15121,7 @@ async def admin_calibrate_model_definition(request: Request) -> JSONResponse:
         )
 
     instruction = _global_rerank_instruction(request.app.state)
-    stored_key, key_err = await _materialize_probe_key(str(existing.get("api_key") or ""))
+    stored_key, key_err = await _probe_model_key(str(existing.get("api_key") or ""))
     if key_err is not None:
         return key_err
     loop = asyncio.get_running_loop()

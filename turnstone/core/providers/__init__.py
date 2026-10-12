@@ -6,6 +6,7 @@ import os
 import threading
 from typing import Any
 
+from turnstone.core.http_headers import checked_header_value
 from turnstone.core.providers._openai import OpenAIProvider
 from turnstone.core.providers._openai_chat import OpenAIChatCompletionsProvider
 from turnstone.core.providers._openai_responses import OpenAIResponsesProvider
@@ -185,6 +186,32 @@ LOCAL_PLACEHOLDER_API_KEY = "dummy"
 ANTHROPIC_WORKSPACE_HEADER = "anthropic-workspace-id"
 
 
+# The variables each SDK reads its credential from when it is passed none, and the client
+# argument each one goes in when passed explicitly.
+_OPENAI_SDK_VARIABLES = {"OPENAI_API_KEY": "api_key"}
+_ANTHROPIC_SDK_VARIABLES = {"ANTHROPIC_API_KEY": "api_key", "ANTHROPIC_AUTH_TOKEN": "auth_token"}
+
+
+def _sdk_variable_credentials(variables: dict[str, str]) -> dict[str, str]:
+    """The SDK's credential *variables*, cleaned, as client arguments; ``{}`` when none needs it.
+
+    The SDK reads these verbatim, and a value read from a file keeps a line break no header can
+    carry, so such a value follows the rule every key does
+    (:func:`~turnstone.core.http_headers.checked_header_value`) and goes to the SDK explicitly, the
+    other variables with it (an explicit credential stops the Anthropic SDK reading either one).
+    Values already fit, or unset, stay the SDK's to read. A value the rule refuses raises
+    :class:`~turnstone.core.http_headers.HeaderValueError` (a ``ValueError``) naming the variable.
+    """
+    cleaned: dict[str, str] = {}
+    changed = False
+    for variable, argument in variables.items():
+        value = os.environ.get(variable, "")
+        if value:
+            cleaned[argument] = checked_header_value(value, variable)
+            changed = changed or cleaned[argument] != value
+    return cleaned if changed else {}
+
+
 def create_client(
     provider_name: str, *, base_url: str, api_key: str, workspace_id: str = ""
 ) -> Any:
@@ -198,7 +225,9 @@ def create_client(
 
     A local provider with neither a key nor the env var gets
     :data:`LOCAL_PLACEHOLDER_API_KEY` so the client still constructs; a
-    commercial provider in that state fails the way the SDK dictates.
+    commercial provider in that state fails the way the SDK dictates. An env
+    var a header cannot carry as it is gets the rule every key follows
+    (:func:`_sdk_variable_credentials`).
 
     *workspace_id* (the definition's ``server_compat.anthropic_workspace_id``)
     pins the :data:`ANTHROPIC_WORKSPACE_HEADER` on the Anthropic-protocol
@@ -207,12 +236,6 @@ def create_client(
     console refuses to store it there.
     """
     resolved_key: str | None = api_key if api_key else None
-    if resolved_key is None and provider_name in LOCAL_PROVIDERS:
-        env_name = (
-            "ANTHROPIC_API_KEY" if provider_name == "anthropic-compatible" else "OPENAI_API_KEY"
-        )
-        if not os.environ.get(env_name):
-            resolved_key = LOCAL_PLACEHOLDER_API_KEY
     if provider_name in ("openai", "openai-compatible", "google", "xai"):
         from openai import OpenAI
 
@@ -231,16 +254,29 @@ def create_client(
             base_url = GOOGLE_DEFAULT_BASE_URL
         elif not base_url and provider_name == "xai":
             base_url = XAI_DEFAULT_BASE_URL
+        local_without_key = provider_name in LOCAL_PROVIDERS and not os.environ.get(
+            "OPENAI_API_KEY"
+        )
+        if resolved_key is None and local_without_key:
+            resolved_key = LOCAL_PLACEHOLDER_API_KEY
+        openai_key = resolved_key or _sdk_variable_credentials(_OPENAI_SDK_VARIABLES).get("api_key")
         if base_url:
-            return OpenAI(base_url=base_url, api_key=resolved_key)
-        return OpenAI(api_key=resolved_key)
+            return OpenAI(base_url=base_url, api_key=openai_key)
+        return OpenAI(api_key=openai_key)
     if provider_name in ("anthropic", "anthropic-compatible"):
         from turnstone.core.providers._anthropic import _ensure_anthropic
 
         anthropic = _ensure_anthropic()
+        local_without_key = provider_name in LOCAL_PROVIDERS and not os.environ.get(
+            "ANTHROPIC_API_KEY"
+        )
+        if resolved_key is None and local_without_key:
+            resolved_key = LOCAL_PLACEHOLDER_API_KEY
         kwargs: dict[str, Any] = {}
         if resolved_key is not None:
             kwargs["api_key"] = resolved_key
+        else:
+            kwargs.update(_sdk_variable_credentials(_ANTHROPIC_SDK_VARIABLES))
         if workspace_id:
             kwargs["default_headers"] = {ANTHROPIC_WORKSPACE_HEADER: workspace_id}
         if provider_name == "anthropic-compatible":

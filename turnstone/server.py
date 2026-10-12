@@ -4872,9 +4872,10 @@ def _reload_model_registry_locked(app_state: Any, *, from_timer: bool = False) -
     operator's Sync in three ways: it probes for a context window only the
     definitions whose window is not already detected from the same endpoint
     (a new or changed one), it does not reload the settings, and a model whose
-    reference the store refuses keeps the config it is running with, so a
-    policy mistake neither takes models away nor moves the default while
-    everything else the tick finds is applied; Sync applies the refusal.
+    key the loader refuses (see ``model_registry._materialize_row_key``) keeps
+    the config it is running with, so a refusal neither takes models away nor
+    moves the default while everything else the tick finds is applied; Sync
+    applies the refusal.
     """
     from turnstone.core.model_registry import (
         DynamicAuthKeyError,

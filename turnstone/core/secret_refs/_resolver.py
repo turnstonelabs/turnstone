@@ -7,7 +7,7 @@ import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol
 
-from turnstone.core.http_headers import HEADER_VALUE_RE
+from turnstone.core.http_headers import HEADER_VALUE_RE, UNFIT_HEADER_VALUE
 from turnstone.core.log import get_logger
 from turnstone.core.secret_refs._config import SecretsConfig, parse_secrets_config
 from turnstone.core.secret_refs._errors import (
@@ -198,10 +198,7 @@ def _value_problem(value: str) -> str | None:
     if not value:
         return "resolved to an empty value"
     if not HEADER_VALUE_RE.fullmatch(value):
-        return (
-            "resolved to a value an HTTP header cannot carry: a space at either end, a control "
-            "character such as a trailing line break, or a character outside ASCII"
-        )
+        return f"resolved to {UNFIT_HEADER_VALUE}"
     return None
 
 

@@ -673,14 +673,19 @@ def _cmd_rerank_calibrate(args: argparse.Namespace) -> None:
     # Calibration is a manual, one-shot op against a possibly-cold endpoint, so a
     # generous timeout (vs the per-turn 15s cap) keeps a first-request compile
     # from failing it; calibrate() also warms the endpoint up first.
-    # A secret:// reference resolves through the store; anything else is sent as
-    # stored, as the console's calibrate does.
-    from turnstone.core.secret_refs import SecretError, resolve
+    # The key the console's Re-calibrate sends: a secret:// reference resolves through the store,
+    # and the value follows the rule every model key does. Neither refusal quotes the key.
+    from turnstone.core.http_headers import HeaderValueError
+    from turnstone.core.model_registry import probe_api_key
+    from turnstone.core.secret_refs import SecretError
 
     try:
-        api_key = resolve(str(row.get("api_key") or ""))
+        api_key = probe_api_key(str(row.get("api_key") or ""))
     except SecretError as e:
         print(f"Model {alias!r}: api_key could not be resolved: {e}", file=sys.stderr)
+        sys.exit(1)
+    except HeaderValueError as e:
+        print(f"Model {alias!r}: {e}", file=sys.stderr)
         sys.exit(1)
     try:
         result = calibrate_model(

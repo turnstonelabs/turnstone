@@ -24,6 +24,7 @@ if TYPE_CHECKING:
 
 from turnstone.core.admission import ModelAdmission
 from turnstone.core.config import load_config
+from turnstone.core.http_headers import HeaderValueError, checked_header_value
 from turnstone.core.log import get_logger
 from turnstone.core.providers import (
     ANTHROPIC_PROTOCOL_PROVIDERS as ANTHROPIC_PROTOCOL_PROVIDERS,
@@ -1147,50 +1148,79 @@ def describe_skipped(skipped: Mapping[str, str]) -> str:
     return "; ".join(f"{alias}: {reason}" for alias, reason in sorted(skipped.items()))
 
 
-def materialize_api_key(value: str) -> str:
+def materialize_api_key(value: object) -> str:
     """Turn an ``api_key`` into the value a client sends.
 
     A ``secret://`` reference resolves through the store configured under ``[secrets]``; ``${VAR}``
     is never expanded inside a reference (an unset variable would quietly select a different
     secret). Anything else has its ``${VAR}`` expanded, so a key read from a stored model definition
     must pass :func:`stored_definition_error` first, as :func:`load_model_registry` does; only
-    config.toml entries and the CLI's default key may reach the expansion. Raises
-    :class:`turnstone.core.secret_refs.SecretError` when a reference cannot be resolved; the message
-    names the reference and a category, never the value.
+    config.toml entries and the CLI's default key may reach the expansion, and a key it empties is
+    refused (the empty key would select the provider SDK's own variable, a different credential).
+    The result then follows the rule a reference's value does
+    (:func:`turnstone.core.http_headers.checked_header_value`). Raises
+    :class:`turnstone.core.secret_refs.SecretError` when a reference cannot be resolved, and
+    :class:`turnstone.core.http_headers.HeaderValueError` when a literal key cannot be sent; neither
+    message quotes the value.
     """
     from turnstone.core.secret_refs import is_reference, resolve
 
-    if is_reference(value):
-        return resolve(value)
-    return _resolve_env_vars(value)
+    if isinstance(value, str):
+        if is_reference(value):
+            return resolve(value)
+        expanded = _resolve_env_vars(value)
+        if value and not expanded:
+            raise HeaderValueError(
+                "api_key expands to nothing: a ${VAR} it names is unset or empty"
+            )
+        value = expanded
+    return checked_header_value(value, "api_key")
+
+
+def probe_api_key(value: str) -> str:
+    """The key a one-off probe sends: console Detect and Re-calibrate, admin rerank-calibrate.
+
+    A ``secret://`` reference resolves; ``${VAR}`` is sent as written, never expanded, since a
+    probe can aim at an endpoint its caller chose. The value then follows the rule every key does
+    (:func:`turnstone.core.http_headers.checked_header_value`). Raises
+    :class:`turnstone.core.secret_refs.SecretError` or
+    :class:`turnstone.core.http_headers.HeaderValueError`; neither message quotes the value.
+    """
+    from turnstone.core.secret_refs import resolve
+
+    return checked_header_value(resolve(value), "api_key")
 
 
 def _materialize_row_key(
-    alias: str, raw: str, *, source: str, skipped: dict[str, str]
+    alias: str, raw: object, *, source: str, skipped: dict[str, str]
 ) -> str | None:
     """Materialise one definition's key, isolating a failure to that alias.
 
-    A reference that cannot be resolved drops the alias from this load and
-    records the reason in *skipped*; ``None`` is returned for it. A store
-    outage is covered one level down: the resolver keeps serving the value it
-    fetched last while the store cannot answer, so only a reference this
-    process never resolved is dropped by an outage.
+    A key :func:`materialize_api_key` refuses (a reference that cannot be resolved, a literal key
+    :func:`turnstone.core.http_headers.checked_header_value` refuses, or one whose ``${VAR}``
+    expands to nothing) drops the alias from this load and records the reason in *skipped*; ``None``
+    is returned for it. A store outage is covered one level down: the resolver keeps serving the
+    value it fetched last while the store cannot answer, so only a reference this process never
+    resolved is dropped by an outage.
     """
     from turnstone.core.secret_refs import SecretError
 
     try:
         return materialize_api_key(raw)
+    except HeaderValueError as exc:
+        reason = str(exc)
+        # config.toml and the environment are read once per process; a stored row reloads.
+        hint = (
+            "fix the key in config.toml or its environment variable, then restart"
+            if source == "config"
+            else "fix the key in the Models tab, then Sync to Nodes"
+        )
     except SecretError as exc:
         reason = str(exc)
-        skipped[alias] = reason
-        log.error(
-            "model_registry.alias_skipped",
-            alias=alias,
-            source=source,
-            error=reason,
-            hint="fix the reference or the [secrets] store, then Sync to Nodes",
-        )
-        return None
+        hint = "fix the reference or the [secrets] store, then Sync to Nodes"
+    skipped[alias] = reason
+    log.error("model_registry.alias_skipped", alias=alias, source=source, error=reason, hint=hint)
+    return None
 
 
 def _keep_running_config(
@@ -1207,7 +1237,10 @@ def _keep_running_config(
         log.warning(
             "model_registry.alias_kept_running",
             alias=alias,
-            hint="the secret store refused this alias's reference; Sync to Nodes applies it",
+            hint=(
+                "this alias's key could not be materialised (see model_registry.alias_skipped); "
+                "Sync to Nodes applies the refusal"
+            ),
         )
 
 
@@ -1525,10 +1558,10 @@ def load_model_registry(
     same endpoint; an operator's reload re-probes them all.
 
     ``keep_refused``: the running registry's models, passed by the secret
-    refresh timer. An alias in it whose api_key reference cannot be resolved
-    keeps that running config whole (endpoint and key as they are serving)
-    instead of being left out, so a store refusal changes nothing until an
-    operator's Sync applies it.
+    refresh timer. An alias in it whose api_key this load refuses (see
+    :func:`_materialize_row_key`) keeps that running config whole (endpoint and
+    key as they are serving) instead of being left out, so a refusal changes
+    nothing until an operator's Sync applies it.
     """
     import json as _json
 
@@ -1539,7 +1572,7 @@ def load_model_registry(
     api_base_url_present = isinstance(api_section, dict) and bool(api_section.get("base_url"))
 
     configs: dict[str, ModelConfig] = {}
-    # Aliases dropped from this load because their api_key reference could not be
+    # Aliases dropped from this load because their api_key could not be
     # materialised (see ``_materialize_row_key``) or their stored row holds a
     # ${VAR} (see ``stored_definition_error``); the registry carries them so
     # reload replies and the console can name them.
