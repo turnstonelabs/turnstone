@@ -1991,8 +1991,7 @@ def _prompt_api_key(env_var: str, label: str) -> str:
     """Prompt for an API key, checking the env var first."""
     env_val = _env_api_key(env_var)
     if env_val:
-        prefix = env_val[:4] + "..." if len(env_val) > 4 else env_val
-        print(f"\n Found {CYAN}${env_var}{RESET} in environment ({DIM}{prefix}{RESET})")
+        print(f"\n Found {CYAN}${env_var}{RESET} in environment")
         try:
             use_env = input(f" Use it? {BOLD}[Y/n]{RESET} ").strip().lower()
         except (EOFError, KeyboardInterrupt):

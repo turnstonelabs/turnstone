@@ -469,7 +469,6 @@ class TestCheckLlmBackendTool:
         """The model chooses the host, so a probe without a key never falls back to the provider
         SDK's own variable. The real client is built (which sends nothing) and its headers read."""
         import turnstone.core.providers as providers
-        from turnstone.core.providers import LOCAL_PLACEHOLDER_API_KEY
         from turnstone.doctor import _tool_check_llm_backend
 
         monkeypatch.setenv("OPENAI_API_KEY", "sk-operator")
@@ -487,7 +486,7 @@ class TestCheckLlmBackendTool:
             {"provider": "openai", "base_url": "http://127.0.0.1/v1", "api_key": "sk-given"}
         )
         assert sent == [
-            {"Authorization": f"Bearer {LOCAL_PLACEHOLDER_API_KEY}"},
+            {"Authorization": f"Bearer {providers.LOCAL_PLACEHOLDER_API_KEY}"},
             {"Authorization": "Bearer sk-given"},
         ]
         # The model learns that an authentication error there says nothing about the real key.
