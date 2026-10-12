@@ -289,7 +289,12 @@ def apply_capability_overrides(caps: ModelCapabilities, overrides_raw: Any) -> M
 # membership test — shared by :func:`provider_extra_params` and the
 # callers that layer their own pins onto a resolved lane, so the two
 # cannot disagree about which lanes accept extra_body at all.
-EXTRA_BODY_PROVIDERS: tuple[str, ...] = ("openai", "openai-compatible", "anthropic-compatible")
+EXTRA_BODY_PROVIDERS: tuple[str, ...] = (
+    "openai",
+    "openai-compatible",
+    "switchyard",
+    "anthropic-compatible",
+)
 
 
 def provider_extra_params(
