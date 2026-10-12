@@ -2990,6 +2990,26 @@ class TestAnthropicHelpers:
         assert caps.supports_mid_conversation_system is True
         assert caps.thinking_prefix_bound is True
 
+    def test_capabilities_haiku_5_5(self) -> None:
+        from turnstone.core.providers._anthropic import AnthropicProvider
+
+        provider = AnthropicProvider()
+        caps = provider.get_capabilities("claude-haiku-5-5")
+        assert caps.context_window == 1000000
+        assert caps.max_output_tokens == 128000
+        assert caps.thinking_mode == "adaptive"
+        assert caps.supports_effort is True
+        assert caps.effort_levels == ("low", "medium", "high", "xhigh", "max")
+        assert caps.supports_temperature is False
+        assert caps.thinking_display == "summarized"
+        assert caps.supports_web_search is True
+        assert caps.supports_tool_search is True
+        assert caps.supports_vision is True
+        assert caps.supports_pdf is True
+        assert caps.supports_reasoning_replay is True
+        assert caps.supports_mid_conversation_system is True
+        assert caps.thinking_prefix_bound is True
+
     def test_capabilities_opus_4_8(self) -> None:
         from turnstone.core.providers._anthropic import AnthropicProvider
 
@@ -5662,6 +5682,33 @@ class TestAnthropicPromptCaching:
         assert "temperature" not in kwargs
         assert "extra_body" not in kwargs
 
+    def test_haiku_5_5_sends_adaptive_thinking_and_no_temperature(self) -> None:
+        """#1362: with no row of its own, Haiku 5.5 took the manual default row,
+        so an effort sent ``thinking.type="enabled"`` with a budget, and with no
+        effort set a configured temperature reached the wire; the model rejects
+        both with a 400.  The row sends adaptive thinking, and no temperature
+        even when one is configured."""
+        caps = self.provider.get_capabilities("claude-haiku-5-5")
+        kwargs = self.provider._build_thinking_and_kwargs(
+            caps=caps,
+            reasoning_effort="high",
+            extra_params=None,
+            max_tokens=8192,
+            temperature=0.7,
+            converted_msgs=[{"role": "user", "content": "hi"}],
+            system_prompt="",
+            model="claude-haiku-5-5",
+            tools=None,
+        )
+        assert kwargs["thinking"] == {
+            "type": "adaptive",
+            "display": "summarized",
+            "block_binding": {"prefix_mismatch_behavior": "drop_block"},
+        }
+        assert kwargs["output_config"] == {"effort": "high"}
+        assert "temperature" not in kwargs
+        assert "extra_body" not in kwargs
+
     def test_xhigh_effort_snaps_to_max_on_opus_4_6(self) -> None:
         """Opus 4.6 declares (low, medium, high, max) — a knob of xhigh
         rounds up to max instead of silently dropping output_config."""
@@ -7731,6 +7778,15 @@ class TestAnthropicThinkingPrefixBinding:
         kwargs = self._kwargs("claude-sonnet-5")
         assert kwargs["thinking"] == {"type": "adaptive", "display": "summarized"}
         assert "extra_headers" not in kwargs
+
+    def test_haiku_5_5_sends_drop_block_and_beta(self) -> None:
+        kwargs = self._kwargs("claude-haiku-5-5")
+        assert kwargs["thinking"] == {
+            "type": "adaptive",
+            "display": "summarized",
+            "block_binding": {"prefix_mismatch_behavior": "drop_block"},
+        }
+        assert kwargs["extra_headers"] == {"anthropic-beta": self._BETA}
 
     def test_caller_beta_header_is_joined_not_replaced(self) -> None:
         from tests._wire_capture import RecordingClient

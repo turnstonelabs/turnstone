@@ -443,6 +443,21 @@ frozen.
 
 ### Fixed
 
+- **Claude Haiku 5.5 requests rejected (#1362).** `claude-haiku-5-5` had no capability row and fell
+  through to the default Anthropic row, which still describes models that take a thinking budget.
+  Any configured reasoning effort sent `budget_tokens`, which this model rejects with a 400, and
+  with no effort set a configured temperature was sent, which it also rejects. With no effort set
+  the model still thinks by default, so with reasoning replay enabled, on Anthropic organizations
+  created on or after 2026-08-31, a replayed thinking block whose earlier conversation had since
+  changed, for example after compaction, failed the whole request with a 400. A model definition
+  left on auto-detect also ran with the 32,768-token fallback context window instead of 1M, and tool
+  search ran client-side instead of through the API's search tool. The model now has its own row:
+  adaptive thinking, the documented `low` through `max` effort ladder (left unset, the model's own
+  default, `medium`, applies), no temperature, the API's tool search, and the binding control, so a
+  thinking block bound to a changed conversation is dropped server-side, unbilled, and the request
+  proceeds. Like Opus 5.5 and Sonnet 5.5, it also receives operator notes as native mid-conversation
+  system messages. A Haiku 5.5 model definition whose window was saved as 32,768 from the Models
+  tab's Detect result keeps that value until it is set to 0 (auto-detect) or 1,000,000.
 - **The MCP Servers list shows connect errors again (#1328).** Since the node status read stopped
   carrying error text, a server that failed to connect showed **idle**, and a newly saved one
   showed **connecting** forever. The list marks a failing server as **error**, and admins
