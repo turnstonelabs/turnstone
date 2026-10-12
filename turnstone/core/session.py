@@ -558,27 +558,50 @@ def _generation_superseded(session: ChatSession, my_generation: int) -> bool:
 
 
 @contextlib.contextmanager
-def _further_ctrl_c_ignored() -> Iterator[None]:
-    """Let a further Ctrl-C do nothing while the block runs.
+def _ctrl_c_held() -> Iterator[None]:
+    """Hold a Ctrl-C that lands while the block runs, and deliver it once the block is done.
 
-    The block runs under a SIGINT handler that does nothing: a handler, not ``SIG_IGN``, which a
-    process started meanwhile would keep.  Only the main thread may set one, and only a handler
-    Python installed can be put back (``getsignal`` gives ``None`` for any other), so anywhere
-    else the block runs as it is.
+    For a block a ``KeyboardInterrupt`` must not cut short part-way.  The block runs under a SIGINT
+    handler that only records the Ctrl-C: a function rather than ``SIG_IGN``, which a process
+    started meanwhile would keep.  The held Ctrl-C then reaches the handler that was in force
+    before the block.  Only a Python handler on the main thread is replaced: ``SIG_IGN`` and
+    ``SIG_DFL`` raise nothing to hold, and replacing ``SIG_IGN`` would take a process started
+    meanwhile off it; ``getsignal`` gives ``None`` for a handler Python did not install; and only
+    the main thread may set a handler.  Anywhere else the block runs as it is.
     """
     previous = (
         signal.getsignal(signal.SIGINT)
         if threading.current_thread() is threading.main_thread()
         else None
     )
-    if previous is None:
+    if not callable(previous):
         yield
         return
-    signal.signal(signal.SIGINT, lambda _signum, _frame: None)
+    held: list[int] = []
+    signal.signal(signal.SIGINT, lambda signum, _frame: held.append(signum))
     try:
         yield
     finally:
         signal.signal(signal.SIGINT, previous)
+        if held:
+            signal.raise_signal(signal.SIGINT)
+
+
+class _CtrlCSafeThreadPool(concurrent.futures.ThreadPoolExecutor):
+    """Thread pool whose ``submit`` a Ctrl-C cannot cut short.
+
+    ``submit`` may start a thread for the call and wait until it runs.  A ``KeyboardInterrupt``
+    raised in that wait leaves the thread running unknown to the pool, and leaving the pool does
+    not wait for it.  A Ctrl-C there is held until ``submit`` returns, so it lands between calls:
+    the call being handed over runs, the stop that follows ends or waits for it with the rest, and
+    no call after it is handed over.
+    """
+
+    def submit[**P, T](
+        self, fn: Callable[P, T], /, *args: P.args, **kwargs: P.kwargs
+    ) -> concurrent.futures.Future[T]:
+        with _ctrl_c_held():
+            return super().submit(fn, *args, **kwargs)
 
 
 class _CancelRef(list[Any]):
@@ -19119,8 +19142,10 @@ class ChatSession:
                 # absent and is later staged NONE; once this marker lands, a
                 # missing result is conservatively UNKNOWN.  The batch's
                 # witness keeps a stopped batch's calls out for good: send()
-                # clears the generation's event on its way out, and a second
-                # Ctrl-C can end the pool's wait before a queued call starts.
+                # clears the generation's event on its way out, and a call can
+                # reach this check after that, as one a worker took just as the
+                # stop dropped the rest can once a second Ctrl-C ends the
+                # pool's wait.
                 with self._generation_lock:
                     if (
                         self._publication_shutdown
@@ -19208,18 +19233,21 @@ class ChatSession:
                 if serialize_batch:
                     results = [run_one(it) for it in items]
                 else:
-                    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+                    with _CtrlCSafeThreadPool(max_workers=4) as pool:
                         try:
                             results = list(pool.map(run_one, items))
                         except KeyboardInterrupt:
                             # Ctrl-C reaches only this thread, and leaving the pool waits for every
                             # call still running.  Stop the batch first, as Stop does, so that wait
-                            # is short and nothing outlives the turn; calls the pool never started
-                            # are recorded as not run.  A call that cannot stop part-way (an MCP
-                            # call, a web search, a page still downloading) finishes or times out
-                            # first.  A further Ctrl-C would cut the stop short.
-                            with _further_ctrl_c_ignored():
+                            # is short and nothing outlives the turn: drop the calls the pool has
+                            # not started (a Ctrl-C that came out of ``submit`` never reached
+                            # ``map``'s own cancel) and record them as not run.  A call that cannot
+                            # stop part-way (an MCP call, a web search, a page still downloading)
+                            # finishes or times out first.  A further Ctrl-C is held until the
+                            # stop is done.
+                            with _ctrl_c_held():
                                 if not _generation_superseded(self, my_generation):
+                                    pool.shutdown(wait=False, cancel_futures=True)
                                     self.cancel()
                                     _stage_unstarted_tool_calls()
                             raise

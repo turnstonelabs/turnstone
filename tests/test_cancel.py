@@ -1,5 +1,6 @@
 """Tests for generation cancellation (cooperative cancel via threading.Event)."""
 
+import concurrent.futures
 import contextlib
 import json
 import signal
@@ -920,7 +921,8 @@ class TestTaskAgentStreamAbort:
         """A second Ctrl-C can land while the first one's stop is still running,
         here as it aborts the first agent's stream.  The stop finishes all the
         same: both agents' streams close and the output guard's judge stops.
-        The Ctrl-C handler in force before is back afterwards."""
+        The second Ctrl-C arrives once the stop is done, and the Ctrl-C handler
+        in force before is back afterwards."""
         session = _make_session()
         streams = [_BlockingAgentStream(), _BlockingAgentStream()]
         self._install_blocking_provider(session, streams)
@@ -941,12 +943,14 @@ class TestTaskAgentStreamAbort:
         with (
             self._ctrl_c_once(lambda: all(stream.read_started.wait(2) for stream in streams)),
             patch.object(_ParallelModelCancelScope, "abort", _abort_after_a_second_ctrl_c),
-            pytest.raises(KeyboardInterrupt),
+            pytest.raises(KeyboardInterrupt) as interrupted,
         ):
             self._run_parallel_task_agents(
                 session, outcomes, my_generation=session._claim_generation()
             )
         assert second_ctrl_c.is_set()
+        # The second Ctrl-C, raised after the stop while the first was handled.
+        assert isinstance(interrupted.value.__context__, KeyboardInterrupt)
         assert all(stream.closed.is_set() for stream in streams)
         assert all(isinstance(outcome, GenerationCancelled) for outcome in outcomes)
         assert guard_cancel.is_set()
@@ -989,6 +993,155 @@ class TestTaskAgentStreamAbort:
         assert session._cancelled_tool_results["c5"].effect_status is EffectStatus.NONE
         assert not any(cid in session._cancelled_tool_results for cid in started)
 
+    def test_a_ctrl_c_while_the_pool_starts_a_thread_still_waits_for_its_call(self, tmp_db):
+        """Starting a call's thread waits for the thread to run, so a Ctrl-C can
+        land there after that call began.  The Ctrl-C still stops the batch, the
+        stop waits for that call as for the rest of the batch, and the pool takes
+        no further call: no thread of the batch outlives the turn, and the call
+        never handed over is recorded as not run."""
+        session = _make_session()
+        started = {cid: threading.Event() for cid in ("first", "second", "third")}
+        returned: list[str] = []
+
+        def _stops(execute_item: dict[str, Any]) -> tuple[str, str]:
+            cid = execute_item["call_id"]
+            started[cid].set()
+            execute_item["_origin_cancel_event"].wait(2)
+            if cid == "second":
+                time.sleep(0.5)  # a call that takes a moment to stop
+            returned.append(cid)
+            return cid, "stopped"
+
+        items = {
+            cid: {
+                "call_id": cid,
+                "func_name": "read_file",
+                "needs_approval": False,
+                "execute": _stops,
+                "_needs_origin_context": True,
+            }
+            for cid in started
+        }
+        start = threading.Thread.start
+        pool_threads: list[threading.Thread] = []
+
+        def _start_then_ctrl_c(thread: threading.Thread) -> None:
+            start(thread)
+            if not thread.name.startswith("ThreadPoolExecutor"):
+                return
+            pool_threads.append(thread)
+            if len(pool_threads) == 1:
+                started["first"].wait(2)  # the first thread holds the first call
+            elif len(pool_threads) == 2 and started["second"].wait(2):
+                signal.raise_signal(signal.SIGINT)  # before the pool knows of this thread
+
+        with (
+            patch.object(threading.Thread, "start", _start_then_ctrl_c),
+            pytest.raises(KeyboardInterrupt),
+        ):
+            self._run_batch(session, items, my_generation=session._claim_generation())
+        assert session._cancel_event.is_set()  # the Ctrl-C stopped the batch
+        assert "third" not in returned
+        assert returned == ["first", "second"]
+        assert not any(thread.is_alive() for thread in pool_threads)
+        assert session._cancelled_tool_results["third"].effect_status is EffectStatus.NONE
+
+    def test_a_ctrl_c_out_of_handing_over_the_calls_drops_the_queued_ones(self, tmp_db):
+        """The pool runs four calls at once; a fifth waits for a free thread.  A
+        Ctrl-C that comes out of handing the calls to the pool never reaches the
+        pool's own result wait, so the stop drops the waiting call itself.  It
+        never runs, not even after send() has cleared the generation's event (as
+        it does once a second Ctrl-C ends the pool's wait), and its receipt says
+        it never ran."""
+        session = _make_session()
+        generation = session._claim_generation()
+        started = {cid: threading.Event() for cid in ("c1", "c2", "c3", "c4")}
+        unwound = threading.Event()
+        reported: list[str] = []
+
+        def _until_unwound(execute_item: dict[str, Any]) -> tuple[str, str]:
+            cid = execute_item["call_id"]
+            started[cid].set()
+            if cid == "c1":
+                execute_item["_origin_cancel_event"].wait(2)
+                session._consume_cancel(generation)  # send() on its way out
+                unwound.set()
+            unwound.wait(2)
+            return cid, "stopped"
+
+        items = {
+            cid: {
+                "call_id": cid,
+                "func_name": "read_file",
+                "needs_approval": False,
+                "execute": _until_unwound,
+                "_needs_origin_context": True,
+            }
+            for cid in (*started, "c5")
+        }
+        # An error item reports before the admission check, which would keep an
+        # ordinary call of the stopped batch out even without the drop.
+        items["c5"]["error"] = "Error: path is required"
+        submit = concurrent.futures.ThreadPoolExecutor.submit
+
+        def _submit_then_ctrl_c(pool, fn, /, *args, **kwargs):
+            future = submit(pool, fn, *args, **kwargs)
+            item = args[0] if args else None
+            if (
+                isinstance(item, dict)
+                and item.get("call_id") == "c5"
+                and all(event.wait(2) for event in started.values())
+            ):
+                signal.raise_signal(signal.SIGINT)  # the fifth call waits in the pool
+            return future
+
+        report = session._report_tool_result
+
+        def _report(call_id: str, *args: Any, **kwargs: Any) -> Any:
+            reported.append(call_id)
+            return report(call_id, *args, **kwargs)
+
+        with (
+            patch.object(concurrent.futures.ThreadPoolExecutor, "submit", _submit_then_ctrl_c),
+            patch.object(session, "_report_tool_result", _report),
+            pytest.raises(KeyboardInterrupt),
+        ):
+            self._run_batch(session, items, my_generation=generation)
+        assert "c5" not in reported
+        assert session._cancelled_tool_results["c5"].effect_status is EffectStatus.NONE
+
+    def test_with_ctrl_c_ignored_the_pool_leaves_it_ignored(self, tmp_db):
+        """A process started with Ctrl-C ignored (in the background of a script,
+        say) has nothing to hold, so the pool leaves SIGINT ignored while it
+        starts threads: a process a running call starts meanwhile inherits the
+        ignore, as it would anywhere else."""
+        session = _make_session()
+        handlers: list[object] = []
+        start = threading.Thread.start
+
+        def _start(thread: threading.Thread) -> None:
+            if thread.name.startswith("ThreadPoolExecutor"):
+                handlers.append(signal.getsignal(signal.SIGINT))
+            start(thread)
+
+        items = {
+            cid: {
+                "call_id": cid,
+                "func_name": "read_file",
+                "needs_approval": False,
+                "execute": lambda execute_item: (execute_item["call_id"], "read"),
+            }
+            for cid in ("c1", "c2")
+        }
+        handler_before = signal.signal(signal.SIGINT, signal.SIG_IGN)
+        try:
+            with patch.object(threading.Thread, "start", _start):
+                self._run_batch(session, items, my_generation=session._claim_generation())
+        finally:
+            signal.signal(signal.SIGINT, handler_before)
+        assert handlers
+        assert all(handler is signal.SIG_IGN for handler in handlers)
+
     def test_a_ctrl_c_after_a_successor_claimed_the_session_stops_nothing(self, tmp_db):
         """The batch's generation lost the session to a successor (a force
         Stop) before the Ctrl-C: the interrupt cancels nothing, since the
@@ -1024,8 +1177,7 @@ class TestTaskAgentStreamAbort:
 
     def test_a_stopped_batchs_queued_call_never_starts(self, tmp_db):
         """A Stop moves the batch's witness for good, so a call of the batch
-        reaching admission after send() cleared the generation's event (as a
-        queued call can, once a second Ctrl-C ends the pool's wait) never
+        reaching admission after send() cleared the generation's event never
         starts.  A serialized batch admits its calls in order, on this thread."""
         session = _make_session()
         generation = session._claim_generation()
