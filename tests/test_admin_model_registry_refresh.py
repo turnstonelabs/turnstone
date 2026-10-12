@@ -1060,7 +1060,7 @@ def test_list_carries_no_auth_constraints(storage: SQLiteBackend) -> None:
 
     assert resp.status_code == 200, resp.text
     body = resp.json()
-    assert set(body.keys()) == {"models", "default_alias"}
+    assert set(body.keys()) == {"models", "default_alias", "auto_sync_seconds"}
 
 
 def test_auth_constraints_requires_admin_mcp(storage: SQLiteBackend) -> None:

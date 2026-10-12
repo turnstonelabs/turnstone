@@ -708,6 +708,20 @@ def _mcp_to_openai(server_name: str, tool: mcp_types.Tool) -> dict[str, Any]:
     }
 
 
+class MCPSecretReferenceError(RuntimeError):
+    """A static header's ``secret://`` reference could not be resolved for a connect.
+
+    ``retryable`` is False when the store answered about the secret itself (not
+    found, permission denied): only a change to the store or to the server's
+    configuration fixes that, so the static health loop retries it on
+    ``_REFUSED_SECRET_RETRY_S`` rather than the reconnect backoff.
+    """
+
+    def __init__(self, message: str, *, retryable: bool) -> None:
+        super().__init__(message)
+        self.retryable = retryable
+
+
 class InvalidCatalogError(Exception):
     """A catalog page from an MCP server that fails the SDK's result validation.
 
@@ -1273,6 +1287,8 @@ def _classify_leaf(leaf: BaseException, capture: _AuthCapture | None) -> Connect
         return ConnectFailure("invalid_catalog", str(leaf))
     if isinstance(leaf, ServerUnreachableError):
         return ConnectFailure("unreachable", str(leaf))
+    if isinstance(leaf, MCPSecretReferenceError):
+        return ConnectFailure("error", str(leaf))  # names the reference, never its value
     if isinstance(leaf, _NotMcpResponseError):
         return ConnectFailure(
             "not_mcp", f"Not an MCP endpoint: the server answered with {leaf.answer}"
@@ -2100,6 +2116,11 @@ class MCPClientManager:
     # retrying it at the reconnect cadence only repeats a full connect; an operator reconnect
     # still retries at once.
     _INVALID_CATALOG_RETRY_S = 300.0
+    # Health-loop retry for a static server whose header ``secret://`` reference the store
+    # refuses outright (not found, permission denied): the refusal stays until the store or
+    # the server's configuration changes, and each attempt costs the store a login. An
+    # operator reconnect still retries at once.
+    _REFUSED_SECRET_RETRY_S = 300.0
     # Liveness-ping timeout. Deliberately generous (a slow-but-working server
     # must not churn): a ping that times out is treated as "slow, not dead" —
     # rescheduled, NOT evicted (only a ``_is_dead_transport`` failure evicts).
@@ -2507,6 +2528,26 @@ class MCPClientManager:
         if cfg is None or self._static_connect_locks.get(name) is not lock:
             return None
         return cfg
+
+    async def _with_resolved_headers(self, name: str, cfg: dict[str, Any]) -> dict[str, Any]:
+        """Return *cfg*, or a copy whose ``secret://`` header values are resolved.
+
+        The store round trip runs off the loop. A reference that cannot be
+        resolved fails this connect like any other connect error; the message
+        names the reference and a category, never a value.
+        """
+        from turnstone.core.secret_refs import SecretError, has_reference, resolve_mapping
+
+        headers = cfg.get("headers")
+        if not isinstance(headers, dict) or not has_reference(headers):
+            return cfg
+        try:
+            resolved = await asyncio.to_thread(resolve_mapping, headers)
+        except SecretError as exc:
+            raise MCPSecretReferenceError(
+                f"MCP server '{name}': {exc}", retryable=exc.retryable
+            ) from exc
+        return {**cfg, "headers": resolved}
 
     async def _connect_one(self, name: str) -> None:
         """Connect to a single MCP server, serialized per server.
@@ -3222,6 +3263,11 @@ class MCPClientManager:
             log.warning("MCP server '%s' has no command configured", name)
             return
 
+        # Header values may be secret:// references. The owner gets a copy with
+        # the resolved values; ``_server_configs`` keeps the stored text, so
+        # reconcile equality and the admin view never see a resolved secret.
+        cfg = await self._with_resolved_headers(name, cfg)
+
         loop = asyncio.get_running_loop()
         ready: asyncio.Future[Any] = loop.create_future()
         close_requested = asyncio.Event()
@@ -3777,8 +3823,10 @@ class MCPClientManager:
         # error boundary; this catch is for any callers that bypass it.
         _validate_oauth_user_url(url)
 
-        # Merge operator-supplied headers with the per-user bearer.
-        headers: dict[str, str] = dict(cfg.get("headers") or {})
+        # Merge operator-supplied headers (secret:// references resolved) with
+        # the per-user bearer.
+        resolved_cfg = await self._with_resolved_headers(server_name, cfg)
+        headers: dict[str, str] = dict(resolved_cfg.get("headers") or {})
         headers["Authorization"] = f"Bearer {access_token}"
 
         client_kwargs: dict[str, Any] = {
@@ -6603,6 +6651,9 @@ class MCPClientManager:
         keys: connected, tools, resources, prompts, error (parity with
         ``add_server_sync``).
         """
+        from turnstone.core.secret_refs import invalidate_cache
+
+        invalidate_cache()
         if name not in self._server_configs:
             return {
                 "connected": False,
@@ -7145,6 +7196,11 @@ class MCPClientManager:
 
         Returns ``{"added": [...], "removed": [...], "updated": [...]}``.
         """
+        from turnstone.core.secret_refs import invalidate_cache
+
+        # An operator-triggered reconcile asks the secret store again, so a header
+        # value rotated in the store reaches the next reconnect.
+        invalidate_cache()
         try:
             rows = storage.list_mcp_servers(enabled_only=True)
         except Exception:
@@ -7666,7 +7722,8 @@ class MCPClientManager:
           * a DISCONNECTED server (``session is None``) is reconnected on a
             capped, jittered, forever backoff (:meth:`_static_reconnect_delay`),
             or every ``_INVALID_CATALOG_RETRY_S`` while its catalog fails
-            validation;
+            validation, or every ``_REFUSED_SECRET_RETRY_S`` while the secret
+            store refuses one of its header references;
           * a CONNECTED server is liveness-pinged (:meth:`_static_ping_one`) and a
             dead-but-idle one — which the SDK leaves as a non-None session with
             closed streams, so nothing else notices until a dispatch fails — is
@@ -7832,6 +7889,10 @@ class MCPClientManager:
                 # not rewritten here, so a removal that ran meanwhile is not undone.
                 delay = self._INVALID_CATALOG_RETRY_S
                 next_due = self._static_reconnect_next.get(name, time.monotonic() + delay)
+            elif isinstance(exc, MCPSecretReferenceError) and not exc.retryable:
+                delay = self._REFUSED_SECRET_RETRY_S
+                next_due = time.monotonic() + delay
+                self._static_reconnect_next[name] = next_due
             else:
                 delay = self._static_reconnect_delay(attempt)
                 next_due = time.monotonic() + delay

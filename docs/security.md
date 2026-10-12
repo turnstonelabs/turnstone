@@ -535,6 +535,146 @@ channel gateway endpoint, and vice versa.
 
 ---
 
+## Secret References
+
+A model definition's `api_key` and an MCP server's static headers can hold a
+reference to a secret store instead of the value itself:
+
+```
+secret://<backend>/<path>[#<field>]
+```
+
+The reference is not a secret. The console shows it verbatim where a literal
+value would be masked, and the value it names is fetched when it is needed and
+kept only in memory: the database never holds it. References work in the
+Models tab, in the MCP Servers tab (headers of a `streamable-http` server,
+including those installed from the registry or imported), and in config.toml
+`[models.*]` entries. They do not work for MCP stdio `env` values or for the
+bootstrap secrets in config.toml itself (`[auth] jwt_secret`, `[database] url`,
+the `[security]` keyring, `[oidc] client_secret`).
+
+A reference must be the whole value: store `Bearer xyz` in the secret and
+reference it, rather than writing `Bearer secret://...`. `${VAR}` is never
+expanded inside a reference (an unset variable would quietly select a
+different secret); literal values keep their `${VAR}` expansion.
+
+### Backends
+
+Backends are configured under `[secrets]` in config.toml, and the table must be
+the same on the console and every node that shares the database. A malformed
+table stops the process at startup.
+
+```toml
+[secrets]
+cache_ttl_seconds = 300          # how long a fetched value is reused
+
+[secrets.file]
+root = "/run/secrets"            # secret://file/run/secrets/openai reads this file
+
+[secrets.vault]                  # Vault or OpenBao, KV v2
+address = "https://vault.example.com:8200"
+auth = "approle"                 # or "jwt"
+role_id = "..."
+secret_id_file = "/etc/turnstone/vault-secret-id"   # outside the file root
+mount = "secret"                 # secret://vault/turnstone/openai#api_key
+# namespace = "team-a"           # sent only when set (OpenBao enforces it)
+# ca_cert = "/etc/ssl/private-ca.pem"
+# timeout_seconds = 5
+```
+
+- **file** reads a whole file (minus one trailing newline) whose absolute path,
+  as written and after symlinks are followed, lies under `root`. Container and
+  Kubernetes secret mounts fit this shape. The root must be a dedicated
+  directory: it may not contain config.toml or the Vault login credential
+  (`secret_id_file`, `jwt_path`), both refused at startup, and it should not be
+  a mount that also holds a service-account token.
+- **vault** reads one field of a KV v2 secret at `<mount>/<path>`. The process
+  logs in with `jwt` (`role` plus `jwt_path`, the file holding the workload's
+  token; a Kubernetes workload sets `auth_mount = "kubernetes"` and points
+  `jwt_path` at its projected service-account token) or `approle` (`role_id`
+  plus `secret_id` or `secret_id_file`), logs in again when the token's lease
+  ends or once after the store rejects the token (revoking the token it
+  replaces), and trusts the operating system's certificate store unless
+  `ca_cert` names a bundle (one that cannot be loaded stops the process at
+  startup). The address comes from config.toml only; proxy and `SSL_CERT_*`
+  environment variables are ignored. Point `address` at the active node or a
+  load balancer: redirects are not followed.
+
+Both backends drop one trailing line break from a value: a mounted file usually
+ends with one, and a Vault field written from a file (`vault kv put` with
+`field=@file`) keeps the file's. What remains goes out in an HTTP header (a
+model's API key, an MCP server's header), so it must be printable ASCII, with
+spaces and tabs only between other characters. Any other value is refused as a
+secret that does not exist is, and the message names the reference, never the
+value.
+
+### When values are fetched
+
+A model definition's reference is resolved when the registry loads: at
+startup, on **Sync to Nodes**, when the console saves a definition, and, while
+`[secrets]` configures a store, every `cache_ttl_seconds` (at least every 60
+seconds) on each node and on the console, which then reload their models as
+Sync to Nodes does. A value rotated in the store therefore reaches every model
+within that interval, and so does a model definition saved since the last Sync;
+Sync to Nodes applies both at once, and the Models tab stops marking it pending
+once the interval has passed. A timed reload asks an endpoint for its
+context window only for a definition whose window has not been detected yet (a
+new definition, or one whose endpoint changed); Sync to Nodes asks again for
+all of them. An MCP header reference is resolved when the server connects or
+reconnects, so open MCP connections keep the old value until **Reconnect**.
+Inside `cache_ttl_seconds` a fetched value is reused, which keeps a reload at
+one round trip per distinct reference.
+
+When the store is unreachable, sealed or refuses the login, the value fetched
+last is served with a warning until the store answers; a Sync, a timed reload
+or a Reconnect during the outage keeps the values already in use, and further
+references to the store are answered from that cache for a few seconds rather
+than each waiting for the store to time out. When the store answers that the
+secret does not exist, access is denied or the field is missing, the value is
+no longer served to anything new: a save, a **Detect** probe, a definition that
+was not running, and an MCP connect all get the refusal at once. A model that
+a node or the console is running keeps running as it is through the timed
+reloads, which log the refusal, so a policy mistake neither takes models away
+nor moves the default model; **Sync to Nodes** applies the refusal and leaves
+the definition out (the reply names it, with the reason). To stop using a
+value, remove or deny it in the store and press Sync to Nodes (models) or
+Reconnect (MCP servers), or disable or delete what references it.
+
+A reference that never resolved leaves its model definition out of the
+registry (the node logs it and names it in its reply to Sync to Nodes; the
+console's warning names the ones the console leaves out) or fails that MCP
+server's connect, until the store answers; the other definitions and servers
+are unaffected. If the store is unreachable while a process starts, the
+definitions that reference it load at the next timed reload or Sync after it
+comes back. An MCP server whose header the store refuses is retried every five
+minutes instead of on the usual reconnect backoff. A `[models.*]` entry in
+config.toml whose reference is left out takes the same alias's database
+definition with it: the file has the last word on an alias it names. Other
+problems with a `[models.*]` entry leave the database definition in force.
+
+### Permissions and scoping
+
+Introducing or changing a reference, probing a typed one with **Detect**, or
+testing an MCP server's connection with one requires the `admin.mcp` permission
+held explicitly (a service token does not pass), as dynamic model auth does,
+because a reference chooses which entry of the store Turnstone reads on its
+author's behalf. Where a saved reference's value goes is decided as it is for a
+literal key: `admin.models` can change a definition's endpoint, or Detect
+another endpoint with its saved key, and `admin.mcp` can change an MCP server's
+URL. Scope the store accordingly: give Turnstone a dedicated Vault role whose
+policy covers only its runtime secrets, and a dedicated file root. The console
+validates a reference when it is saved (syntax, a configured backend, and one
+resolution), so a typo never reaches the database, and the audit row of the
+save, or of a connection test, records the reference. Sending a definition back
+unchanged, reference included, needs neither the gate nor the store.
+
+The Helm chart and the Terraform deployment pass configuration through the
+environment and mount no config.toml today, so `[secrets]` cannot be set
+there yet; references are for deployments that ship a config.toml (systemd,
+compose).
+
+---
+
 ## Configuration Reference
 
 ### config.toml

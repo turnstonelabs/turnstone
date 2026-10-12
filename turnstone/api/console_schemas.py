@@ -1177,6 +1177,12 @@ class ListModelDefinitionsResponse(BaseModel):
     default_alias: str = Field(
         description="Effective default alias after the config/enabled-list fallbacks",
     )
+    auto_sync_seconds: float | None = Field(
+        description=(
+            "While a secret store is configured, how often nodes and the console reload "
+            "model definitions on their own; null when only Sync to Nodes does"
+        ),
+    )
 
 
 class ModelAuthConstraintsResponse(BaseModel):

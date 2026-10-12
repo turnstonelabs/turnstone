@@ -114,6 +114,25 @@ frozen.
   their own network. Each test is audited as `mcp_server.test`, with the scheme, host, port and
   outcome. Scripts can call `POST /v1/api/admin/mcp-servers/test` (`admin.mcp`), or
   `test_mcp_server` (which waits up to 75 s) / `testMcpServer` in the SDKs.
+- **Secret references for model API keys and MCP headers (#1329).** A model definition's `api_key`
+  and a `streamable-http` MCP server's headers can hold `secret://<backend>/<path>[#<field>]`
+  instead of the value. The value is fetched from the store configured under `[secrets]` in
+  config.toml when the registry loads or the server connects, is reused for `cache_ttl_seconds`, and
+  is never written to the database. Two backends ship: `file` (a file under a dedicated root, for
+  container and Kubernetes secret mounts) and `vault` (Vault or OpenBao KV v2 with `jwt` or
+  `approle` login). Both backends drop one trailing line break; what remains must be printable
+  ASCII, with spaces and tabs only between other characters, as an HTTP header value must, or it is
+  refused without being quoted. The console shows a reference verbatim where it masks a literal,
+  validates it when it is saved, and requires `admin.mcp`, held explicitly, to introduce one, to
+  probe a typed one with Detect, or to test an MCP server's connection with one; a reference in MCP
+  stdio `env` is refused. While the store is down, values already fetched stay in use. With a store
+  configured, nodes and the console reload their models every `cache_ttl_seconds` (at least 60 s),
+  so a rotated key, and any model definition saved since the last Sync to Nodes, reaches them within
+  that interval (the Models tab then clears its pending-Sync marker); MCP connections pick a
+  rotation up on Reconnect. When the store refuses a reference (not found, denied), anything new
+  gets the refusal at once, a model already running keeps running until Sync to Nodes leaves it out,
+  and an MCP server whose header is refused is retried every five minutes. See [Secret
+  references](docs/security.md#secret-references).
 - **Output-guard evals in `turnstone-eval` (#1291).** `--output-guard judge` scores the LLM stage on
   tool outputs with directives planted at known lines: detection, false positives, whether its flags
   stay inside the fixed vocabulary, citation precision and recall, and failed verdicts.

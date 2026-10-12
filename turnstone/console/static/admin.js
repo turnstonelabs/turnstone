@@ -6217,6 +6217,10 @@ function _pollInstallStatus(serverId, serverName, attempt) {
 
 let _modelDefs = [];
 let _modelDefaultAlias = "";
+// Seconds between the timed reloads nodes run while a secret store is
+// configured (0 when only Sync to Nodes reloads them).
+let _modelAutoSyncSeconds = 0;
+let _modelSyncPendingTimer = null;
 // Dynamic-auth affordance data, fetched from the admin.mcp-gated
 // auth-constraints route on each shelf open — never from the list endpoint,
 // so an admin.models-only caller is not handed the deployment's approved
@@ -7000,6 +7004,8 @@ function loadAdminModels() {
     .then(function (data) {
       _modelDefs = data.models || [];
       _modelDefaultAlias = data.default_alias || "";
+      _modelAutoSyncSeconds =
+        typeof data.auto_sync_seconds === "number" ? data.auto_sync_seconds : 0;
       // Auth constraints deliberately do NOT ride on this response — the shelf
       // fetches them from the admin.mcp-gated auth-constraints route on open,
       // so a background list refresh can never restyle an open shelf.
@@ -7682,8 +7688,13 @@ function showEditModelModal(definitionId) {
       document.getElementById("model-provider").value = m.provider || "openai";
       document.getElementById("model-base-url").value = m.base_url || "";
       document.getElementById("model-api-key").value = "";
+      // A secret:// reference is not itself secret, so the API returns it verbatim.
+      // It is shown as the placeholder (rendered as text even in a password
+      // input, never submitted): saving keeps it, detect uses the stored key.
       document.getElementById("model-api-key").placeholder =
-        "\u2022\u2022\u2022 (leave blank to keep existing)";
+        typeof m.api_key === "string" && m.api_key.startsWith("secret://")
+          ? m.api_key + " (saved reference; type to replace)"
+          : "\u2022\u2022\u2022 (leave blank to keep existing)";
       document.getElementById("model-ctx-window").value =
         m.context_window != null ? m.context_window : 0;
       document.getElementById("model-max-concurrency").value =
@@ -8949,8 +8960,17 @@ function _refreshModelSuggestions() {
 function _flagModelSyncPending() {
   const btn = document.getElementById("model-sync-btn");
   if (btn) btn.classList.add("model-sync-pending");
+  // With timed reloads, the change reaches every node within one interval
+  // (each node's wait varies by up to a tenth), plus the reload itself.
+  clearTimeout(_modelSyncPendingTimer);
+  _modelSyncPendingTimer =
+    _modelAutoSyncSeconds > 0
+      ? setTimeout(_clearModelSyncPending, _modelAutoSyncSeconds * 1100 + 15000)
+      : null;
 }
 function _clearModelSyncPending() {
+  clearTimeout(_modelSyncPendingTimer);
+  _modelSyncPendingTimer = null;
   const btn = document.getElementById("model-sync-btn");
   if (btn) btn.classList.remove("model-sync-pending");
 }

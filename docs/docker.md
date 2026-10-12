@@ -348,7 +348,7 @@ provider and consent steps.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `OPENAI_API_KEY` | `dummy` | API key used by model definitions that leave `api_key` empty, and by `${OPENAI_API_KEY}` placeholders in a definition |
+| `OPENAI_API_KEY` | `dummy` | API key used by model definitions that leave `api_key` empty, and by `${OPENAI_API_KEY}` placeholders in a definition. To keep a key out of the environment and the database, mount it as a compose secret and store `secret://file/run/secrets/<name>` in the definition, with `[secrets.file] root = "/run/secrets"` in the shared config (see [Secret references](security.md#secret-references)) |
 | `TURNSTONE_SEARXNG_URL` | `http://searxng:8080` | SearxNG URL for the `web_search` tool (local/vLLM models only; Anthropic/OpenAI use native search). Defaults to the bundled `searxng` service; set to an external instance's URL. To turn web search off, clear `tools.searxng_url` in the admin Settings tab. |
 | `SEARXNG_IMAGE_TAG` | `latest` | Tag for the bundled `searxng/searxng` image |
 

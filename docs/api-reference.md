@@ -2583,7 +2583,7 @@ the `admin.settings` permission.
 
 Permission: `admin.mcp`
 
-Secrets (`env`, `headers` fields) are masked with `***` by default. Use `?reveal=true` on GET endpoints to see actual values.
+Secrets (`env`, `headers` fields) are masked with `***` by default. Use `?reveal=true` on GET endpoints to see actual values. A header value that is a `secret://` reference is not a secret and is returned verbatim either way; a reference in `env` is refused on write (see [Secret references](security.md#secret-references)).
 
 Create and update answer `400` when a Streamable HTTP server's `url` is not an `http://` or
 `https://` URL with a host, or does not parse (for example a malformed bracketed IPv6 host or a
@@ -2604,9 +2604,10 @@ connection's state. `has_error` is true while the last connect failed, and `erro
 
 Connects once to a Streamable HTTP server with auth `none` or `static`, the way a saved server's
 connect would, and lists its tools, resources and prompts. Nothing is saved and no catalog is
-published. The console runs the test from its own network position; nodes connect from theirs.
-Each test writes an `mcp_server.test` audit event with the scheme, host, port and outcome,
-never the headers or the rest of the URL.
+published. The console runs the test from its own network position; nodes connect from theirs. Each
+test writes an `mcp_server.test` audit event with the scheme, host, port and outcome, never a header
+value or the rest of the URL; a header holding a `secret://` reference is recorded by name with the
+reference (`header_references`).
 
 ```json
 {
@@ -2620,7 +2621,7 @@ never the headers or the rest of the URL.
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `url` | string | yes | `http://` or `https://` URL with a host, checked as a save checks it. |
-| `headers` | object | no | Header names to values, checked as a save checks them. |
+| `headers` | object | no | Header names to values, checked as a save checks them. A value may be a whole `secret://` reference, which gets a save's checks; the test sends the value it names. |
 | `auth_type` | string | no (default `"static"`) | `"none"` or `"static"`. |
 | `transport` | string | no (default `"streamable-http"`) | Only `"streamable-http"` can be tested. |
 | `name` | string | no | Labels the server in error messages, and must be a valid server name; the URL's host stands in when empty. |
@@ -2651,8 +2652,11 @@ The request can take up to about a minute (the connect timeout, the session's te
 margin), so a client's timeout should be longer; a test still running then comes back with
 `kind` `timeout`.
 
-**Errors:** `400` (stdio transport, OAuth auth type, invalid name, URL or headers), `403` (no
-`admin.mcp`), `429` (two tests are already running; the console runs at most two at once).
+**Errors:** `400` (stdio transport, OAuth auth type, invalid name, URL or headers, or a `secret://`
+reference that is malformed, not the whole value, or refused by the store), `403` (no `admin.mcp`,
+or a `secret://` header without `admin.mcp` held explicitly, as from a service token), `429` (two
+tests are already running; the console runs at most two at once), `503` (the secret store cannot
+answer for a `secret://` header).
 
 ---
 

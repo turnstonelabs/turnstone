@@ -631,6 +631,7 @@ class ModelRegistry:
         agent_model: str | None = None,
         task_model: str | None = None,
         task_effort: str | None = None,
+        skipped_aliases: Mapping[str, str] | None = None,
     ) -> None:
         _validate_registry_args(models, default, fallback, agent_model, task_model)
 
@@ -654,6 +655,9 @@ class ModelRegistry:
         # unchanged, and future auth-relevant columns are covered by
         # construction.
         self._generation = 0
+        # Aliases the loader dropped because their api_key reference could not be
+        # materialised, with the reason; empty for a registry built directly.
+        self.skipped_aliases: dict[str, str] = dict(skipped_aliases or {})
 
     # -- query methods -------------------------------------------------------
 
@@ -1097,6 +1101,69 @@ def _resolve_env_vars(value: str) -> str:
     return re.sub(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}", _replace, value)
 
 
+def materialize_api_key(value: str) -> str:
+    """Turn a stored ``api_key`` into the value a client sends.
+
+    A ``secret://`` reference resolves through the store configured under
+    ``[secrets]``; ``${VAR}`` is never expanded inside a reference (an unset
+    variable would quietly select a different secret). Anything else keeps the
+    ``${VAR}`` expansion stored values have always had. Raises
+    :class:`turnstone.core.secret_refs.SecretError` when a reference cannot be
+    resolved; the message names the reference and a category, never the value.
+    """
+    from turnstone.core.secret_refs import is_reference, resolve
+
+    if is_reference(value):
+        return resolve(value)
+    return _resolve_env_vars(value)
+
+
+def _materialize_row_key(
+    alias: str, raw: str, *, source: str, skipped: dict[str, str]
+) -> str | None:
+    """Materialise one definition's key, isolating a failure to that alias.
+
+    A reference that cannot be resolved drops the alias from this load and
+    records the reason in *skipped*; ``None`` is returned for it. A store
+    outage is covered one level down: the resolver keeps serving the value it
+    fetched last while the store cannot answer, so only a reference this
+    process never resolved is dropped by an outage.
+    """
+    from turnstone.core.secret_refs import SecretError
+
+    try:
+        return materialize_api_key(raw)
+    except SecretError as exc:
+        reason = str(exc)
+        skipped[alias] = reason
+        log.error(
+            "model_registry.alias_skipped",
+            alias=alias,
+            source=source,
+            error=reason,
+            hint="fix the reference or the [secrets] store, then Sync to Nodes",
+        )
+        return None
+
+
+def _keep_running_config(
+    alias: str, keep: Mapping[str, ModelConfig] | None, configs: dict[str, ModelConfig]
+) -> None:
+    """Keep *alias*'s running config, whole, when its key could not be materialised.
+
+    Only the secret refresh timer passes *keep*. The config is the one serving
+    now, so no key is ever paired with a changed endpoint; the alias then
+    counts as loaded, so it is not reported skipped and routing does not move.
+    """
+    if keep is not None and alias in keep:
+        configs[alias] = keep[alias]
+        log.warning(
+            "model_registry.alias_kept_running",
+            alias=alias,
+            hint="the secret store refused this alias's reference; Sync to Nodes applies it",
+        )
+
+
 def _resolve_openai_provider(provider: str, base_url: str) -> str:
     """Distinguish commercial OpenAI from local OpenAI-compatible servers.
 
@@ -1191,14 +1258,29 @@ def _same_endpoint(a: ModelConfig, b: ModelConfig) -> bool:
     )
 
 
+def _detected_before(
+    prior: Mapping[str, ModelConfig] | None, alias: str, cfg: ModelConfig
+) -> int | None:
+    """The window *prior* detected for *alias* from *cfg*'s endpoint, if any."""
+    previous = prior.get(alias) if prior else None
+    if previous is not None and previous.context_window_detected and _same_endpoint(previous, cfg):
+        return previous.context_window
+    return None
+
+
 def _resolve_context_windows(
     configs: dict[str, ModelConfig],
     *,
     detect: bool,
     inherited: int = 0,
     prior: Mapping[str, ModelConfig] | None = None,
+    reprobe: bool = True,
 ) -> dict[str, ModelConfig]:
     """Replace every ``context_window == 0`` with an auto-detected window.
+
+    With *reprobe* False, a definition that *prior* already detected from the
+    same endpoint keeps that window without a probe; only new or changed ones
+    are asked.
 
     ``0`` is the Models tab's "auto-detect" sentinel. In order:
 
@@ -1258,6 +1340,8 @@ def _resolve_context_windows(
             unresolved[alias] = "the definition has no base_url"
         elif not detect:
             unresolved[alias] = "endpoint detection is off in this process"
+        elif not reprobe and (detected := _detected_before(prior, alias, cfg)) is not None:
+            configs[alias] = replace(cfg, context_window=detected, context_window_detected=True)
         else:
             to_probe.append(alias)
 
@@ -1343,6 +1427,8 @@ def load_model_registry(
     allow_empty: bool = False,
     detect_context_windows: bool = False,
     prior: Mapping[str, ModelConfig] | None = None,
+    keep_refused: Mapping[str, ModelConfig] | None = None,
+    reprobe_known_windows: bool = True,
 ) -> ModelRegistry:
     """Build a ModelRegistry from CLI args, ``config.toml``, and database.
 
@@ -1386,6 +1472,16 @@ def load_model_registry(
     ``detect_context_windows`` is set (server boot and hot-reload, console,
     doctor). Callers that must not touch the network leave it False and
     unresolved local definitions fall back to :data:`FALLBACK_CONTEXT_WINDOW`.
+
+    ``reprobe_known_windows``: False (the secret refresh timer) probes only
+    the definitions whose window *prior* has not already detected from the
+    same endpoint; an operator's reload re-probes them all.
+
+    ``keep_refused``: the running registry's models, passed by the secret
+    refresh timer. An alias in it whose api_key reference cannot be resolved
+    keeps that running config whole (endpoint and key as they are serving)
+    instead of being left out, so a store refusal changes nothing until an
+    operator's Sync applies it.
     """
     import json as _json
 
@@ -1396,6 +1492,10 @@ def load_model_registry(
     api_base_url_present = isinstance(api_section, dict) and bool(api_section.get("base_url"))
 
     configs: dict[str, ModelConfig] = {}
+    # Aliases dropped from this load because their api_key reference could not be
+    # materialised; the registry carries them so reload replies and the console
+    # can name them (see ``_materialize_row_key``).
+    skipped_aliases: dict[str, str] = {}
 
     # 1. Load DB model definitions (lowest priority, overridden by config.toml)
     if storage is not None:
@@ -1457,10 +1557,16 @@ def load_model_registry(
                     row.get("obo_audience"),
                     row.get("obo_scopes"),
                 )
+                row_api_key = _materialize_row_key(
+                    alias, row.get("api_key") or api_key, source="db", skipped=skipped_aliases
+                )
+                if row_api_key is None:
+                    _keep_running_config(alias, keep_refused, configs)
+                    continue
                 configs[alias] = ModelConfig(
                     alias=alias,
                     base_url=row_base_url,
-                    api_key=_resolve_env_vars(row.get("api_key") or api_key),
+                    api_key=row_api_key,
                     model=row_model,
                     context_window=row_ctx,
                     provider=row_provider,
@@ -1614,10 +1720,20 @@ def load_model_registry(
             entry.get("obo_audience", ""),
             entry.get("obo_scopes", ""),
         )
+        entry_api_key = _materialize_row_key(
+            alias, entry.get("api_key", api_key), source="config", skipped=skipped_aliases
+        )
+        if entry_api_key is None:
+            # config.toml overrides the database for this alias even when its key
+            # cannot be materialised: a database row must not quietly take over
+            # the routing the operator pinned in the file.
+            configs.pop(alias, None)
+            _keep_running_config(alias, keep_refused, configs)
+            continue
         configs[alias] = ModelConfig(
             alias=alias,
             base_url=entry_base_url,
-            api_key=_resolve_env_vars(entry.get("api_key", api_key)),
+            api_key=entry_api_key,
             model=model_name,
             # 0 = auto-detect, resolved per definition below
             context_window=_coerce_context_window(entry.get("context_window"), alias),
@@ -1641,7 +1757,9 @@ def load_model_registry(
     # ``model=`` and silently bypasses the operator's per-role
     # task_alias override (the "default" alias points at
     # whatever --base-url was at boot, not at the configured default).
-    if not configs and model:
+    # Models that exist but were skipped over their api_key reference do not
+    # count as absent: the empty-registry error below names them instead.
+    if not configs and model and not skipped_aliases:
         configs["default"] = ModelConfig(
             alias="default",
             base_url=base_url,
@@ -1651,12 +1769,27 @@ def load_model_registry(
             provider=_resolve_openai_provider(provider, base_url),
         )
 
+    # A database row dropped over its reference is of no consequence when
+    # config.toml serves the alias; only aliases that are really absent count.
+    for alias in configs:
+        skipped_aliases.pop(alias, None)
+
     if not configs:
         if not allow_empty:
-            raise ValueError(
-                "No model definitions found. Provide --model, configure [models.*] "
-                "in config.toml, or add model definitions in the admin panel."
-            )
+            if skipped_aliases:
+                message = (
+                    "No model definitions could be loaded. Skipped over their api_key "
+                    "reference: "
+                    + "; ".join(
+                        f"{alias}: {reason}" for alias, reason in sorted(skipped_aliases.items())
+                    )
+                )
+            else:
+                message = (
+                    "No model definitions found. Provide --model, configure [models.*] "
+                    "in config.toml, or add model definitions in the admin panel."
+                )
+            raise ValueError(message)
         # Degraded boot: the server starts with no models configured yet and
         # registers normally. Models added via the admin panel hot-reload in
         # without a restart (POST /v1/api/_internal/model-reload). Until then
@@ -1666,10 +1799,14 @@ def load_model_registry(
             "No model definitions found — starting with an empty registry. "
             "Add models in the admin panel; they load without a restart."
         )
-        return ModelRegistry(models={}, default="")
+        return ModelRegistry(models={}, default="", skipped_aliases=skipped_aliases)
 
     configs = _resolve_context_windows(
-        configs, detect=detect_context_windows, inherited=context_window, prior=prior
+        configs,
+        detect=detect_context_windows,
+        inherited=context_window,
+        prior=prior,
+        reprobe=reprobe_known_windows,
     )
 
     # Determine default alias
@@ -1741,6 +1878,7 @@ def load_model_registry(
         agent_model=agent_model,
         task_model=task_model,
         task_effort=task_effort,
+        skipped_aliases=skipped_aliases,
     )
 
 

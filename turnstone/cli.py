@@ -1710,16 +1710,31 @@ def main() -> None:
     elif not context_window:
         context_window = 32768
 
+    # A malformed [secrets] table is a startup failure, like a malformed keyring:
+    # [models.*] keys and MCP headers may hold secret:// references. Building
+    # the resolver touches no store.
+    from turnstone.core.secret_refs import SecretConfigError, get_resolver
+
+    try:
+        get_resolver()
+    except SecretConfigError as exc:
+        print(f"config.toml: {exc}", file=sys.stderr)
+        sys.exit(1)
+
     # Build model registry (reads [models.*] sections from config.toml)
     from turnstone.core.model_registry import load_model_registry
 
-    registry = load_model_registry(
-        base_url=base_url,
-        api_key=api_key,
-        model=model,
-        context_window=context_window,
-        provider=provider_name,
-    )
+    try:
+        registry = load_model_registry(
+            base_url=base_url,
+            api_key=api_key,
+            model=model,
+            context_window=context_window,
+            provider=provider_name,
+        )
+    except ValueError as exc:  # a configuration problem, reported like the [secrets] check
+        print(f"turnstone: {exc}", file=sys.stderr)
+        sys.exit(1)
 
     # Initialize MCP client (connects to configured MCP servers, if any)
     from turnstone.core.mcp_client import create_mcp_client

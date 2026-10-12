@@ -53,6 +53,7 @@ def _seed_reranker(
     alias: str = "reranker",
     base_url: str = "http://localhost:9999/rerank",
     caps: dict[str, Any] | None = None,
+    api_key: str = "sk-test",
 ) -> None:
     storage.create_model_definition(
         definition_id=definition_id,
@@ -60,7 +61,7 @@ def _seed_reranker(
         model="bge-reranker",
         provider="openai-compatible",
         base_url=base_url,
-        api_key="sk-test",
+        api_key=api_key,
         context_window=0,
         capabilities=json.dumps(caps if caps is not None else {"supports_rerank": True}),
         created_by="admin",
@@ -162,6 +163,36 @@ def test_calibrate_persists_and_returns_verdict(
     assert caps["rerank_scale"] == "logit (sigmoid-normalised)"
     assert caps["rerank_separated"] is True
     assert caps["supports_rerank"] is True  # merge, not replace
+
+
+@pytest.mark.parametrize(
+    ("stored", "sent"),
+    [
+        ("secret://fake/reranker", "rk-from-store"),
+        ("${TS_CONSOLE_ONLY_VALUE}", "${TS_CONSOLE_ONLY_VALUE}"),
+    ],
+)
+def test_calibrate_resolves_only_a_stored_reference(
+    storage: SQLiteBackend, monkeypatch: pytest.MonkeyPatch, stored: str, sent: str
+) -> None:
+    from tests._secret_refs_helpers import install_fake_resolver
+
+    install_fake_resolver(monkeypatch, {"/reranker": "rk-from-store"})
+    monkeypatch.setenv("TS_CONSOLE_ONLY_VALUE", "console-env-value")
+    seen: list[str] = []
+
+    def _calibrate(
+        base_url: str, model: str, api_key: str, *, instruction: str = "", timeout: float = 60.0
+    ) -> CalibrationResult:
+        seen.append(api_key)
+        return _result(separated=True, threshold=0.42)
+
+    monkeypatch.setattr("turnstone.core.rerank_calibrate.calibrate_model", _calibrate)
+    _seed_reranker(storage, api_key=stored)
+    client = _make_client(storage, _make_registry())
+    resp = client.post("/v1/api/admin/model-definitions/r1/calibrate")
+    assert resp.status_code == 200, resp.text
+    assert seen == [sent]
 
 
 def test_concurrent_capabilities_put_survives_calibrate(

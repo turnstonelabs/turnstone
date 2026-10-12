@@ -205,6 +205,7 @@ UML diagrams in [`docs/diagrams/`](docs/diagrams/):
 | Intent validation (judge) | [docs/judge.md](docs/judge.md) |
 | Governance & RBAC | [docs/governance.md](docs/governance.md) |
 | OIDC SSO | [docs/oidc.md](docs/oidc.md) |
+| Security, tokens & secret references | [docs/security.md](docs/security.md) |
 | TLS / mTLS | [docs/tls.md](docs/tls.md) |
 | Channel integrations | [docs/channels.md](docs/channels.md) |
 | Console dashboard | [docs/console.md](docs/console.md) |

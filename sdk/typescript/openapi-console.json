@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "turnstone Console API",
-    "version": "1.8.3",
+    "version": "1.9.0",
     "description": "Cluster-wide visibility and control across all turnstone nodes."
   },
   "paths": {
@@ -13530,11 +13530,24 @@
             "description": "Effective default alias after the config/enabled-list fallbacks",
             "title": "Default Alias",
             "type": "string"
+          },
+          "auto_sync_seconds": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "While a secret store is configured, how often nodes and the console reload model definitions on their own; null when only Sync to Nodes does",
+            "title": "Auto Sync Seconds"
           }
         },
         "required": [
           "models",
-          "default_alias"
+          "default_alias",
+          "auto_sync_seconds"
         ],
         "title": "ListModelDefinitionsResponse",
         "type": "object"

@@ -63,7 +63,9 @@ def _result(*, separated: bool, threshold: float | None) -> CalibrationResult:
     )
 
 
-def _seed_reranker(db_path: str, *, base_url: str = "http://localhost:9999/rerank") -> str:
+def _seed_reranker(
+    db_path: str, *, base_url: str = "http://localhost:9999/rerank", api_key: str = ""
+) -> str:
     """Create a reranker model definition; return its db_path-backed alias."""
     reset_storage()
     storage = init_storage("sqlite", path=db_path)
@@ -74,7 +76,7 @@ def _seed_reranker(db_path: str, *, base_url: str = "http://localhost:9999/reran
             model="bge-reranker",
             provider="openai-compatible",
             base_url=base_url,
-            api_key="",
+            api_key=api_key,
             context_window=0,
             capabilities=json.dumps({"supports_rerank": True}),
         )
@@ -156,3 +158,28 @@ def test_model_without_base_url_errors(tmp_path, monkeypatch):
     with pytest.raises(SystemExit) as ei:
         _cmd_rerank_calibrate(_args(db, apply=False))
     assert ei.value.code == 1
+
+
+@pytest.mark.parametrize(
+    ("stored", "sent"),
+    [
+        ("secret://fake/reranker", "rk-from-store"),
+        ("${TS_CONSOLE_ONLY_VALUE}", "${TS_CONSOLE_ONLY_VALUE}"),
+    ],
+)
+def test_only_a_stored_reference_is_resolved(tmp_path, monkeypatch, stored, sent):
+    from tests._secret_refs_helpers import install_fake_resolver
+
+    db = str(tmp_path / "t.db")
+    _seed_reranker(db, api_key=stored)
+    install_fake_resolver(monkeypatch, {"/reranker": "rk-from-store"})
+    monkeypatch.setenv("TS_CONSOLE_ONLY_VALUE", "console-env-value")
+    seen: dict[str, str] = {}
+
+    def fake(base_url, model, api_key, *, instruction="", timeout=60.0):
+        seen["api_key"] = api_key
+        return _result(separated=True, threshold=0.37)
+
+    monkeypatch.setattr("turnstone.core.rerank_calibrate.calibrate_model", fake)
+    _cmd_rerank_calibrate(_args(db, apply=False))
+    assert seen["api_key"] == sent

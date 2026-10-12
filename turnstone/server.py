@@ -4845,10 +4845,37 @@ _MODEL_RELOAD_LOCK = threading.Lock()
 def internal_model_reload(request: Request) -> JSONResponse:
     """POST /v1/api/_internal/model-reload — rebuild registry from DB + config."""
     with _MODEL_RELOAD_LOCK:
-        return _internal_model_reload_locked(request)
+        return _reload_model_registry_locked(request.app.state)
 
 
-def _internal_model_reload_locked(request: Request) -> JSONResponse:
+def _refresh_models_from_store(app_state: Any) -> None:
+    """One tick of the secret refresh timer: the reload Sync to Nodes runs.
+
+    Runs while ``[secrets]`` configures a store, so a value rotated there, and
+    any model definition saved since, reach this node within the interval.
+    See :func:`_reload_model_registry_locked` for what a tick leaves out.
+    """
+    with _MODEL_RELOAD_LOCK:
+        response = _reload_model_registry_locked(app_state, from_timer=True)
+    if response.status_code != 200:
+        log.warning(
+            "server.model_refresh_failed",
+            status=response.status_code,
+            reply=bytes(response.body).decode("utf-8", "replace")[:300],
+        )
+
+
+def _reload_model_registry_locked(app_state: Any, *, from_timer: bool = False) -> JSONResponse:
+    """Rebuild the node's registry from the database and config.toml; hold ``_MODEL_RELOAD_LOCK``.
+
+    *from_timer* marks the secret refresh timer's tick, which differs from an
+    operator's Sync in three ways: it probes for a context window only the
+    definitions whose window is not already detected from the same endpoint
+    (a new or changed one), it does not reload the settings, and a model whose
+    reference the store refuses keeps the config it is running with, so a
+    policy mistake neither takes models away nor moves the default while
+    everything else the tick finds is applied; Sync applies the refusal.
+    """
     from turnstone.core.model_registry import (
         DynamicAuthKeyError,
         ModelAuthConfigError,
@@ -4857,11 +4884,16 @@ def _internal_model_reload_locked(request: Request) -> JSONResponse:
     )
     from turnstone.core.storage._registry import get_storage
 
-    registry = getattr(request.app.state, "registry", None)
+    registry = getattr(app_state, "registry", None)
     if registry is None:
         return JSONResponse({"status": "error", "reason": "no registry"}, status_code=503)
 
     storage = get_storage()
+    # An operator-triggered reload asks the secret store again, so a value
+    # rotated in the store is picked up by this Sync, not after the cache TTL.
+    from turnstone.core.secret_refs import invalidate_cache
+
+    invalidate_cache()
     try:
         new_registry = load_model_registry(
             storage=storage,
@@ -4873,9 +4905,11 @@ def _internal_model_reload_locked(request: Request) -> JSONResponse:
             # alias — the same posture as the console's refresh.
             strict=True,
             detect_context_windows=True,
-            # A definition the running registry already resolved keeps its
-            # window; only new or changed definitions are probed.
+            # A probe that misses keeps the window the running registry
+            # detected from the same endpoint; a tick does not re-probe those.
             prior=registry.models,
+            reprobe_known_windows=not from_timer,
+            keep_refused=registry.models if from_timer else None,
         )
     except (ModelAuthConfigError, ModelConcurrencyConfigError) as exc:
         # A row whose auth or concurrency fields violate registry validation,
@@ -4896,8 +4930,8 @@ def _internal_model_reload_locked(request: Request) -> JSONResponse:
             },
             status_code=503,
         )
-    cs = getattr(request.app.state, "config_store", None)
-    if cs is not None:
+    cs = getattr(app_state, "config_store", None)
+    if cs is not None and not from_timer:
         cs.reload()  # Ensure latest settings from DB
     eff_default, eff_task_model, eff_task_effort = _effective_routing(
         cs,
@@ -4927,9 +4961,15 @@ def _internal_model_reload_locked(request: Request) -> JSONResponse:
         and eff_task_model == registry.task_model
         and eff_task_effort == registry.task_effort
     )
+    # Aliases the loader dropped over their api_key reference ride every reply,
+    # so the console's Sync result names them per node.
+    skipped = dict(new_registry.skipped_aliases)
     if unchanged:
         new_registry.shutdown()
-        return JSONResponse({"status": "ok", "aliases": registry.list_aliases(), "noop": True})
+        payload: dict[str, Any] = {"status": "ok", "aliases": registry.list_aliases(), "noop": True}
+        if skipped:
+            payload["skipped"] = skipped
+        return JSONResponse(payload)
 
     try:
         registry.reload(
@@ -4937,7 +4977,7 @@ def _internal_model_reload_locked(request: Request) -> JSONResponse:
             eff_default,
             new_registry.fallback,
             new_registry.agent_model,
-            app_state=request.app.state,
+            app_state=app_state,
             task_model=eff_task_model,
             task_effort=eff_task_effort,
         )
@@ -4952,8 +4992,8 @@ def _internal_model_reload_locked(request: Request) -> JSONResponse:
 
     # The process-owned model client survives registry changes, including
     # enabling dynamic authentication on a host with no MCP manager.
-    model_client = get_model_token_client(request.app.state)
-    workstreams = getattr(request.app.state, "workstreams", None)
+    model_client = get_model_token_client(app_state)
+    workstreams = getattr(app_state, "workstreams", None)
     if workstreams is not None:
         with contextlib.suppress(Exception):
             for ws in workstreams.list_all():
@@ -4962,7 +5002,7 @@ def _internal_model_reload_locked(request: Request) -> JSONResponse:
                     session.set_model_mint_client(model_client)
 
     # Ensure health trackers exist for any newly-added backends
-    health_reg = getattr(request.app.state, "health_registry", None)
+    health_reg = getattr(app_state, "health_registry", None)
     if health_reg:
         for alias in registry.list_aliases():
             cfg = registry.get_config(alias)
@@ -4970,16 +5010,19 @@ def _internal_model_reload_locked(request: Request) -> JSONResponse:
 
     # Push the new alias list into active sessions so the task_agent
     # `model` parameter description reflects the current registry.
-    _broadcast_agent_tool_schema_refresh(request.app.state)
+    _broadcast_agent_tool_schema_refresh(app_state)
 
     # Refresh the per-node ``models`` metadata entry the coord reads on
     # ``list_nodes``.  Without this, the heartbeat loop's 30s tick would
     # be the coord's first chance to see new aliases an admin just added.
-    node_id = getattr(request.app.state, "node_id", "")
+    node_id = getattr(app_state, "node_id", "")
     if node_id:
-        _publish_models_metadata(request.app.state, storage, node_id)
+        _publish_models_metadata(app_state, storage, node_id)
 
-    return JSONResponse({"status": "ok", "aliases": registry.list_aliases()})
+    payload = {"status": "ok", "aliases": registry.list_aliases()}
+    if skipped:
+        payload["skipped"] = skipped
+    return JSONResponse(payload)
 
 
 def internal_model_status(request: Request) -> JSONResponse:
@@ -5564,8 +5607,21 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None]:
 
         _heartbeat_task = asyncio.create_task(_heartbeat_loop())
 
+    # With a secret store configured, models reload on its cache interval as
+    # Sync to Nodes would, so a key rotated in the store reaches this node
+    # without an operator.
+    from turnstone.core.secret_refs import start_refresh
+
+    _secret_refresh_task = start_refresh(
+        lambda: _refresh_models_from_store(app.state), what="models"
+    )
+
     yield
     # Shutdown
+    if _secret_refresh_task is not None:
+        _secret_refresh_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await _secret_refresh_task
     if _heartbeat_task is not None:
         _heartbeat_task.cancel()
         # Wait for the cancel to land before we run the metadata
@@ -6245,6 +6301,17 @@ def main() -> None:
     from turnstone.core.config import warn_migrated_settings
 
     warn_migrated_settings()
+
+    # A malformed [secrets] table (or a CA bundle that cannot be loaded) is a
+    # boot failure, like a malformed keyring, not a per-row surprise at the
+    # first secret:// reference. Building the resolver touches no store.
+    from turnstone.core.secret_refs import SecretConfigError, get_resolver
+
+    try:
+        get_resolver()
+    except SecretConfigError as exc:
+        log.error("secret_refs.config_invalid: %s", exc)
+        raise SystemExit(1) from exc
 
     # Prune stale / empty workstreams on startup
     from turnstone.core.memory import prune_workstreams
