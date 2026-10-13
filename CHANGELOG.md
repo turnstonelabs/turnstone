@@ -102,6 +102,14 @@ frozen.
 > **Before upgrading:** migration 081 rebuilds the orphan reaper's partial index
 > (`idx_workstreams_reaper`) to cover the new `evaluation` state, concurrently on PostgreSQL. The
 > reaper runs without the index for the length of the build.
+>
+> **Before upgrading:** migration 082 stores the default model in the `model.default_alias` setting
+> when that setting has no value yet and the database holds enabled chat model definitions
+> (rerankers and speech models are skipped): the one named `default`, else the first in alias order,
+> which is the model the Models tab showed as the default. A node or console whose config.toml sets
+> `[model] default` while the database holds model definitions follows the stored setting from now
+> on, because the setting outranks config.toml; clear `model.default_alias` in the Settings tab to
+> go back to the config.toml default.
 
 ### Added
 
@@ -211,6 +219,39 @@ frozen.
 
 ### Changed
 
+- **A model that isn't loaded is never replaced by another (#1359)** *(BREAKING)* — when the default
+  model, the task model, the coordinator model or the channel model names a definition that isn't
+  loaded (deleted, disabled, misspelled, or left out of a reload because its secret reference
+  couldn't be read), whatever relies on it now fails instead of quietly running on another model,
+  possibly a different provider. Creating a workstream without a model returns 503 with `"code":
+  "model_not_loaded"` and a message naming the model, which the console launcher, the CLI and the
+  Slack and Discord bots turn into their own wording; `task_agent` refuses the call before asking
+  for approval, saying why and suggesting a retry only when the secret store didn't answer (never
+  another model), and no longer falls through to `[model].agent_model`; the CLI exits at startup
+  naming the model. The coordinator check now blocks only creating a coordinator, so list, open,
+  events, send and close keep working while its model is missing. With nothing stored or configured,
+  the default is `[model].default`, else the model named `default`, else the first chat model
+  defined (not a reranker or speech model), whether or not it loaded. Adding or enabling the first
+  chat model in the Models tab stores it as `model.default_alias` when nothing is stored there;
+  nothing else stores it, so a reset in the Settings tab stays reset. Nodes read it with their model
+  definitions, at a Sync or at the secret-store refresh, which now also reloads settings that
+  changed. It outranks each node's config.toml default, so a cluster's default is uniform. The
+  Models tab refuses to delete, disable or rename a model that `model.default_alias`,
+  `model.task_alias`, `coordinator.model_alias` or `channels.default_model_alias` names, saying
+  which setting to change first; deleting or disabling the last enabled model clears them. A changed
+  or cleared `model.default_alias` or `model.task_alias` now takes effect at once on running nodes;
+  before, a node kept the previous value until the next Sync or restart. The model pickers name a
+  default their list doesn't hold instead of showing a bare "Default model", and the node's picker
+  marks one the node didn't load as not available.
+- **Slack uses the channel adapter model (#1359).** New Slack conversations run on
+  `channels.default_model_alias`, as the Roles tab says, instead of always the server default;
+  before, only Discord used it.
+- **A node's health says when its default model isn't loaded (#1359).** `/health` and the console's
+  node status are `degraded` while the node's default model isn't loaded, since every create that
+  relies on it fails, and `/health` gains `default_model` (`alias`, `loaded`); it still answers 200.
+  The console now shows the status the node computes (its default model's backend, and whether that
+  model is loaded) instead of the state of whichever backend changed last, so an outage of a backend
+  other than the default's no longer marks the node degraded there, as it never did in `/health`.
 - **Claude models without a capability row get adaptive thinking (#1366).** An Anthropic model id
   with no row, such as the first model of a new line, took a default shaped for models that take a
   thinking budget: any configured reasoning effort sent `budget_tokens`, which adaptive-only models

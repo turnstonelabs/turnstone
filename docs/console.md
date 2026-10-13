@@ -186,7 +186,7 @@ All fields are optional:
   - **`"pool"`** — compatibility alias for automatic placement on the reachable node with the most headroom.
   - **specific node ID** — requires execution on that node, including after restart or close.
 - `name` — workstream display name. Auto-generated if omitted.
-- `model` — model alias from the target node's registry. Uses the node's default model if omitted.
+- `model` — model alias from the target node's registry. Uses the node's default model if omitted. When that model isn't loaded on the node, the create fails with 503 and `"code": "model_not_loaded"`; no other model is used.
 - `judge_model` — optional judge-model alias for this workstream.
 - `initial_message` — first message dispatched after the workstream is published.
 - `skill` — enabled profile/skill to snapshot onto a fresh workstream.

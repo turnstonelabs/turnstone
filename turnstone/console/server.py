@@ -97,6 +97,7 @@ from turnstone.core.session_replay import (
     session_replay_preamble,
 )
 from turnstone.core.session_routes import (
+    MODEL_NOT_LOADED_CODE,
     AttachmentUploadHelpers,
     CoordOnlyVerbHandlers,
     SessionEndpointConfig,
@@ -1667,44 +1668,37 @@ async def list_available_models(request: Request) -> JSONResponse:
     # Only expose alias/model/provider — rows also contain api_key, base_url, etc.
     models = [{"alias": r["alias"], "model": r["model"], "provider": r["provider"]} for r in rows]
 
-    # Include effective defaults for clients (web UI, channel gateway).
+    # Include effective defaults for clients (web UI, channel gateway). The
+    # default, channel and coordinator aliases are reported as configured even
+    # when no enabled row matches: a create that relies on one fails with
+    # ``model_not_loaded`` rather than moving to another model (#1359). The
+    # pickers name it rather than hide it; ``models`` holds only stored
+    # definitions, so a config.toml model isn't in it and nothing here can say
+    # whether the alias is loaded.
     default_alias = ""
     channel_default_alias = ""
     coordinator_default_alias = ""
     judge_default_alias = ""
     cs = getattr(request.app.state, "config_store", None)
     if cs is not None:
-        default_alias = cs.get("model.default_alias") or ""
-        channel_default_alias = cs.get("channels.default_model_alias") or ""
+        default_alias = (cs.get("model.default_alias") or "").strip()
+        channel_default_alias = (cs.get("channels.default_model_alias") or "").strip()
         judge_default_alias = (cs.get("judge.model") or "").strip()
     enabled_aliases = {r["alias"] for r in rows}
-    if default_alias and default_alias not in enabled_aliases:
-        default_alias = ""
-    if channel_default_alias and channel_default_alias not in enabled_aliases:
-        channel_default_alias = ""
     # Coordinator default walks the standard three-tier chain (see
-    # :func:`turnstone.console.coordinator_alias.resolve_coordinator_alias`).
-    # The placeholder restricts every tier to enabled DB rows so the home
-    # composer doesn't advertise a model the workstream-creation picker
-    # can't actually offer — the session factory uses the same chain
-    # without that filter so explicit operator pins surface as 503 at
-    # ``registry.resolve`` instead of being silently swapped out.
+    # :func:`turnstone.console.coordinator_alias.resolve_coordinator_alias`),
+    # the same one the session factory walks.
     coord_registry = getattr(request.app.state, "coord_registry", None)
     if cs is not None and coord_registry is not None:
         coordinator_default_alias = resolve_coordinator_alias(
             explicit=cs.get("coordinator.model_alias"),
             config_store=cs,
             registry=coord_registry,
-            alias_filter=lambda a: a in enabled_aliases,
         )
     elif coord_registry is not None:
         # ConfigStore failed lifespan but coord_registry is still bound —
-        # fall through to ``registry.default`` (filtered) so the home
-        # composer isn't blank.  Mirrors the helper's tier 3 with the
-        # placeholder's enabled-rows filter applied.
-        registry_default = getattr(coord_registry, "default", "") or ""
-        if registry_default in enabled_aliases:
-            coordinator_default_alias = registry_default
+        # report the helper's tier 3 so the home composer isn't blank.
+        coordinator_default_alias = getattr(coord_registry, "default", "") or ""
     # Judge falls back to the resolved coordinator alias when
     # ``judge.model`` is empty *or* not a registered alias — judge.model
     # is alias-only (matches IntentJudge.__init__), so an unknown value is
@@ -1965,6 +1959,36 @@ async def create_workstream(request: Request) -> JSONResponse:
         if required:
             error = NodeAffinityError(required)
             return JSONResponse(error.as_dict(), status_code=error.status_code)
+
+    if (
+        resp.status_code == 503
+        and node_body is not None
+        and node_body.get("code") == MODEL_NOT_LOADED_CODE
+    ):
+        # The node holds no model this create can use and substitutes none
+        # (#1359). Console-owned wording, as for require_project: only the
+        # node's alias crosses this boundary, and only in an alias's shape.
+        alias_raw = node_body.get("alias")
+        alias = (
+            alias_raw
+            if isinstance(alias_raw, str)
+            and len(alias_raw) <= 64
+            and _MODEL_ALIAS_RE.match(alias_raw)
+            else ""
+        )
+        noun = "The model" if model.strip() else "The default model"
+        named = f" '{alias}'" if alias else ""
+        log.info("Workstream dispatch to %s refused: model %r not loaded", node_id, alias)
+        return JSONResponse(
+            {
+                "error": (
+                    f"{noun}{named} isn't loaded on node {node_id}. Choose another model, "
+                    "or check it in the Models tab."
+                ),
+                "code": MODEL_NOT_LOADED_CODE,
+            },
+            status_code=503,
+        )
 
     if (
         resp.status_code == 400
@@ -3852,10 +3876,6 @@ def _require_coord_mgr(request: Request) -> tuple[Any, JSONResponse | None]:
         return None, JSONResponse({"error": msg}, status_code=503)
     if config_store is None:
         return None, JSONResponse({"error": "ConfigStore unavailable"}, status_code=503)
-    alias = (config_store.get("coordinator.model_alias") or "").strip()
-    # Empty alias falls back to the registry's default model — operators
-    # get a working coordinator on a freshly-provisioned console without
-    # an extra manual setting.
     registry = getattr(request.app.state, "coord_registry", None)
     if registry is None:
         return None, JSONResponse(
@@ -3867,22 +3887,10 @@ def _require_coord_mgr(request: Request) -> tuple[Any, JSONResponse | None]:
             },
             status_code=503,
         )
-    try:
-        # ``resolve(None)`` uses ``registry.default``; the registry
-        # raises when neither the explicit alias nor the default is
-        # configured, which we translate to a 503 with remediation.
-        registry.resolve(alias or None)
-    except Exception as exc:
-        hint = f"coordinator.model_alias '{alias}'" if alias else "the registry default alias"
-        return None, JSONResponse(
-            {
-                "error": (
-                    f"{hint} does not resolve: {exc}. "
-                    "Add or enable a model in the admin Models tab."
-                )
-            },
-            status_code=503,
-        )
+    # The coordinator's model is not resolved here: every coordinator verb
+    # passes this gate, and an unloaded default must not take list, open,
+    # events, send or close down with it. Only a create needs the model; its
+    # factory raises, and the create route answers ``model_not_loaded`` (#1359).
     return coord_mgr, None
 
 
@@ -13795,10 +13803,10 @@ def _refresh_coord_registry_locked(
 
     Errors are logged + swallowed.  The DB write that triggered this
     refresh has already succeeded, and the explicit reload button
-    remains the user-facing recovery path.  Validation failures
-    (e.g. admin deleted the alias that ``registry.default`` points at)
-    leave the existing registry intact rather than tearing down a
-    working coordinator.
+    remains the user-facing recovery path.  Validation failures leave
+    the existing registry intact rather than tearing down a working
+    coordinator; a default whose model was deleted is not one of them,
+    since the default names its model whether or not it loaded (#1359).
 
     The swap runs through the chokepoint in ``ModelRegistry.reload``: a
     keyless console must not acquire dynamic aliases through a peer
@@ -13847,7 +13855,7 @@ def _refresh_coord_registry_locked(
         log.warning("console.coord_registry_refresh_load_failed", exc_info=True)
         return
     if not new_registry.models:
-        existing.skipped_aliases = dict(new_registry.skipped_aliases)
+        existing.adopt_skips(new_registry)
         log.warning(
             "console.coord_registry_refresh_skipped reason=no model definitions loaded skipped=%s",
             existing.skipped_aliases,
@@ -13865,7 +13873,7 @@ def _refresh_coord_registry_locked(
             and new_registry.task_effort == existing.task_effort
         )
         if unchanged:
-            existing.skipped_aliases = dict(new_registry.skipped_aliases)
+            existing.adopt_skips(new_registry)
             try:
                 new_registry.shutdown()
             except Exception:
@@ -13895,7 +13903,7 @@ def _refresh_coord_registry_locked(
         # as the refusal arm, in the recovery direction (pinned:
         # test_refresh_clears_key_refusal_after_recovery).
         app_state.coord_registry_error = ""
-        existing.skipped_aliases = dict(new_registry.skipped_aliases)
+        existing.adopt_skips(new_registry)
         model_client = get_model_token_client(app_state)
         coord_mgr = getattr(app_state, "coord_mgr", None)
         if coord_mgr is not None:
@@ -14031,6 +14039,188 @@ async def _notify_nodes_model_reload(request: Request) -> dict[str, Any]:
     return {nid: data for nid, data in results if data is not None}
 
 
+# The routing settings that name one model and fail closed when it isn't
+# loaded (#1359). The Models tab refuses to delete, disable or rename a
+# definition one of them names: a routine swap (add a model, delete the old
+# default) would otherwise block every create that relies on the setting,
+# every new Slack conversation included, until someone repoints it.
+_FAIL_CLOSED_ROUTING_KEYS: tuple[str, ...] = (
+    "model.default_alias",
+    "model.task_alias",
+    "coordinator.model_alias",
+    "channels.default_model_alias",
+)
+
+
+def _routing_settings_naming(storage: Any, alias: str) -> list[tuple[str, str]]:
+    """``(key, node_id)`` of each fail-closed routing setting that names *alias*.
+
+    Global and per-node rows alike, read from storage rather than a cache. A
+    row whose value won't decode names nothing.
+    """
+    from turnstone.core.settings_registry import deserialize_value
+
+    named: list[tuple[str, str]] = []
+    for row in storage.list_system_settings():
+        key = row.get("key")
+        if key not in _FAIL_CLOSED_ROUTING_KEYS:
+            continue
+        try:
+            value = deserialize_value(key, str(row.get("value") or ""))
+        except (ValueError, TypeError):
+            continue
+        if isinstance(value, str) and value.strip() == alias:
+            named.append((key, str(row.get("node_id") or "")))
+    return named
+
+
+def _console_config_default() -> str:
+    """The ``[model] default`` in this console's config.toml, or ``""``."""
+    from turnstone.core.config import load_config
+
+    return str(load_config("model").get("default") or "").strip()
+
+
+def _row_serves_chat(row: dict[str, Any]) -> bool:
+    """:func:`~turnstone.core.model_registry.serves_chat` for a stored row,
+    whose capabilities are JSON text (or ``{}`` for a node-reported entry)."""
+    from turnstone.core.model_registry import serves_chat
+
+    raw = row.get("capabilities") or "{}"
+    try:
+        caps = json.loads(raw) if isinstance(raw, str) else raw
+    except (json.JSONDecodeError, TypeError):
+        caps = {}
+    return serves_chat(caps if isinstance(caps, dict) else {}, str(row.get("model") or ""))
+
+
+def _is_only_enabled_definition(storage: Any, definition_id: str) -> bool:
+    rows = storage.list_model_definitions(enabled_only=True)
+    return len(rows) == 1 and rows[0].get("definition_id") == definition_id
+
+
+def _model_in_use_refusal(storage: Any, alias: str, action: str) -> JSONResponse | None:
+    """The 409 for removing a model a fail-closed routing setting names, else ``None``.
+
+    *action* is the verb the message uses ("delete", "disable", "rename").
+    """
+    named = _routing_settings_naming(storage, alias)
+    sources = [f"{key} (node {node_id})" if node_id else key for key, node_id in named]
+    if _console_config_default() == alias:
+        sources.append("[model] default in the console's config.toml")
+    if not sources:
+        return None
+    if len(sources) == 1:
+        tail = "Point that setting at another model, or clear it"
+    else:
+        tail = "Point those settings at another model, or clear them"
+    return JSONResponse(
+        {
+            "error": (
+                f"'{alias}' is still named by {', '.join(sources)}. {tail}, before you "
+                f"{action} it: creates that rely on a setting naming a missing model fail."
+            ),
+            "code": "model_in_use",
+            "settings": sorted({key for key, _ in named}),
+        },
+        status_code=409,
+    )
+
+
+def _clear_routing_settings(
+    storage: Any, named: list[tuple[str, str]], audit_uid: str, ip: str
+) -> None:
+    """Clear the routing settings naming the last enabled model as it goes.
+
+    Nothing is left to route to, so the settings would only name a missing model.
+    """
+    from turnstone.core.audit import record_audit
+
+    for key, node_id in named:
+        if storage.delete_system_setting(key, node_id=node_id):
+            record_audit(
+                storage,
+                audit_uid,
+                "setting.delete",
+                "setting",
+                key,
+                {"node_id": node_id, "reason": "last enabled model removed"},
+                ip,
+            )
+
+
+def _enabled_chat_aliases(storage: Any) -> list[str]:
+    """Aliases of the enabled stored definitions that can hold a chat
+    (:func:`_row_serves_chat`), in alias order."""
+    return [
+        str(r.get("alias") or "")
+        for r in storage.list_model_definitions(enabled_only=True)
+        if r.get("alias") and _row_serves_chat(r)
+    ]
+
+
+def _pin_first_chat_model(storage: Any, audit_uid: str, ip: str) -> str:
+    """Store the cluster's first chat model as its default model (#1359).
+
+    Called after an add or edit that found no enabled chat model before its
+    write. Among the enabled chat definitions (:func:`_enabled_chat_aliases`),
+    the one named ``default``, else the first in alias order, becomes
+    ``model.default_alias``, unless a global row exists, cleared or not, or this
+    console's config.toml names a default (that operator routes through
+    config). Nothing else stores it, Sync and the timers included, so a Reset in
+    the Settings tab stays reset until the cluster is left with no chat model
+    and gets one again. Nothing is pushed to the nodes: they read the setting
+    together with the model definitions it names, at a Sync or at their timer's
+    settings reload (a settings push from another change, before then, sends it
+    early). It outranks every node's config.toml default, which keeps a
+    cluster's default uniform. Returns the alias stored, or ``""``.
+    """
+    from turnstone.core.audit import record_audit
+    from turnstone.core.model_registry import pick_default_alias
+    from turnstone.core.settings_registry import serialize_value
+
+    if storage.get_system_setting("model.default_alias", node_id="") is not None:
+        return ""
+    if _console_config_default():
+        return ""
+    alias = pick_default_alias("", _enabled_chat_aliases(storage))
+    if not alias:
+        return ""
+    storage.upsert_system_setting(
+        key="model.default_alias",
+        value=serialize_value(alias),
+        node_id="",
+        changed_by=audit_uid,
+    )
+    record_audit(
+        storage,
+        audit_uid,
+        "setting.update",
+        "setting",
+        "model.default_alias",
+        {"value": alias, "node_id": "", "reason": "first chat model added or enabled"},
+        ip,
+    )
+    log.info("console.default_model_pinned alias=%s", alias)
+    return alias
+
+
+def _pin_default_and_reload(app_state: Any, storage: Any, audit_uid: str, ip: str) -> str:
+    """:func:`_pin_first_chat_model`, best-effort; when a default was stored,
+    this console's settings cache is reloaded so its coordinators use it. A
+    failure is logged, and the add or edit that called it still stands."""
+    try:
+        alias = _pin_first_chat_model(storage, audit_uid, ip)
+    except Exception:
+        log.warning("console.default_model_pin_failed", exc_info=True)
+        return ""
+    if alias:
+        cs = getattr(app_state, "config_store", None)
+        if cs is not None:
+            cs.reload()
+    return alias
+
+
 async def admin_list_model_definitions(request: Request) -> JSONResponse:
     """GET /v1/api/admin/model-definitions — list all model definitions."""
     from turnstone.core.auth import require_permission
@@ -14100,29 +14290,26 @@ async def admin_list_model_definitions(request: Request) -> JSONResponse:
             }
         )
 
-    # Include the effective default alias so the UI can highlight it.
-    # Prefer ConfigStore override, fall back to config.toml [model].default,
-    # then validate against the actual enabled model list (same fallback
-    # rules as load_model_registry).
+    # Include the effective default alias so the UI can highlight it: the
+    # ``model.default_alias`` setting, else config.toml [model].default, else
+    # the rule the loader applies to the defined models (pick_default_alias).
+    # A configured default is reported even when no enabled row matches, so
+    # the tab can flag it instead of highlighting another model (#1359).
+    from turnstone.core.model_registry import pick_default_alias
+
     configured_default = ""
     cs = getattr(request.app.state, "config_store", None)
     if cs:
-        configured_default = cs.get("model.default_alias") or ""
+        configured_default = (cs.get("model.default_alias") or "").strip()
     if not configured_default:
-        from turnstone.core.config import load_config as _load_cfg
+        configured_default = _console_config_default()
 
-        configured_default = _load_cfg().get("model", {}).get("default", "default")
-
-    enabled_aliases = [m["alias"] for m in result if m.get("alias") and m.get("enabled", True)]
-    enabled_set = set(enabled_aliases)
-    if configured_default in enabled_set:
-        default_alias = configured_default
-    elif "default" in enabled_set:
-        default_alias = "default"
-    elif enabled_aliases:
-        default_alias = enabled_aliases[0]
-    else:
-        default_alias = ""
+    chat_aliases = [
+        m["alias"]
+        for m in result
+        if m.get("alias") and m.get("enabled", True) and _row_serves_chat(m)
+    ]
+    default_alias = pick_default_alias(configured_default, chat_aliases)
 
     # Deliberately NO auth constraints here: serving the allow-list and grant
     # profile under admin.models (or to a service token via the bypass) hands
@@ -14367,6 +14554,9 @@ async def admin_create_model_definition(request: Request) -> JSONResponse:
     if dynamic_auth_error is not None:
         return dynamic_auth_error
 
+    # Read before the write: the cluster's first chat model becomes its stored
+    # default (#1359).
+    had_chat_model = bool(_enabled_chat_aliases(storage))
     storage.create_model_definition(
         definition_id=definition_id,
         alias=alias,
@@ -14411,6 +14601,11 @@ async def admin_create_model_definition(request: Request) -> JSONResponse:
         audit_detail,
         ip,
     )
+    pinned = ""
+    if not had_chat_model:
+        pinned = await asyncio.to_thread(
+            _pin_default_and_reload, request.app.state, storage, audit_uid, ip
+        )
 
     await asyncio.to_thread(_refresh_coord_registry, request.app.state, storage)
     # First-row bootstrap on a freshly-installed console: a runtime-added
@@ -14432,6 +14627,8 @@ async def admin_create_model_definition(request: Request) -> JSONResponse:
             status_code=409,
         )
     payload = _mask_model_secrets(created)
+    if pinned:
+        payload["default_pinned"] = pinned
     if registry_warning:
         payload["registry_warning"] = registry_warning
     return JSONResponse(payload)
@@ -14716,7 +14913,28 @@ async def admin_update_model_definition(request: Request) -> JSONResponse:
         if dynamic_auth_error is not None:
             return dynamic_auth_error
 
+    # A model a fail-closed routing setting names can't be renamed or disabled
+    # out from under it (#1359). Disabling the last enabled model is allowed:
+    # nothing is left to route to, and the settings naming it are cleared.
+    existing_alias = str(existing.get("alias") or "")
+    clear_after_update: list[tuple[str, str]] = []
+    if existing.get("enabled", True):
+        renaming = "alias" in updates and updates["alias"] != existing_alias
+        disabling = updates.get("enabled") is False
+        if disabling and _is_only_enabled_definition(storage, definition_id):
+            clear_after_update = _routing_settings_naming(storage, existing_alias)
+        elif renaming or disabling:
+            refusal = _model_in_use_refusal(
+                storage, existing_alias, "rename" if renaming else "disable"
+            )
+            if refusal is not None:
+                return refusal
+
+    had_chat_model = True
     if updates:
+        # Read before the write: an edit that gives the cluster its first
+        # enabled chat model (enabling one, say) stores it as the default.
+        had_chat_model = bool(_enabled_chat_aliases(storage))
         storage.update_model_definition(definition_id, **updates)
         old_alias = str(existing.get("alias") or "")
         alias_changed = "alias" in updates and updates["alias"] != old_alias
@@ -14753,6 +14971,14 @@ async def admin_update_model_definition(request: Request) -> JSONResponse:
         audit_detail,
         ip,
     )
+    if clear_after_update:
+        _clear_routing_settings(storage, clear_after_update, audit_uid, ip)
+        await _publish_config_change(request)
+    pinned = ""
+    if not had_chat_model:
+        pinned = await asyncio.to_thread(
+            _pin_default_and_reload, request.app.state, storage, audit_uid, ip
+        )
 
     if updates:
         await asyncio.to_thread(_refresh_coord_registry, request.app.state, storage)
@@ -14771,6 +14997,8 @@ async def admin_update_model_definition(request: Request) -> JSONResponse:
 
     model_def = storage.get_model_definition(definition_id)
     payload = _mask_model_secrets(model_def or {})
+    if pinned:
+        payload["default_pinned"] = pinned
     if registry_warning:
         payload["registry_warning"] = registry_warning
     return JSONResponse(payload)
@@ -14794,6 +15022,19 @@ async def admin_delete_model_definition(request: Request) -> JSONResponse:
     if existing is None:
         return JSONResponse({"error": "Model definition not found"}, status_code=404)
 
+    # A model a fail-closed routing setting names can't be deleted out from
+    # under it (#1359), unless it is the last enabled model: then nothing is
+    # left to route to, and the settings naming it are cleared with it.
+    existing_alias = str(existing.get("alias") or "")
+    clear_after_delete: list[tuple[str, str]] = []
+    if existing.get("enabled", True):
+        if _is_only_enabled_definition(storage, definition_id):
+            clear_after_delete = _routing_settings_naming(storage, existing_alias)
+        else:
+            refusal = _model_in_use_refusal(storage, existing_alias, "delete")
+            if refusal is not None:
+                return refusal
+
     # Purge the definition's mint-cache rows before the row goes away —
     # after the delete, nothing owns the alias's identity keys and their
     # encrypted bearers would persist at rest until another definition
@@ -14812,6 +15053,9 @@ async def admin_delete_model_definition(request: Request) -> JSONResponse:
         {"alias": existing.get("alias", "")},
         ip,
     )
+    if clear_after_delete:
+        _clear_routing_settings(storage, clear_after_delete, audit_uid, ip)
+        await _publish_config_change(request)
 
     await asyncio.to_thread(_refresh_coord_registry, request.app.state, storage)
     await asyncio.to_thread(_maybe_bootstrap_coord_subsystem, request.app, storage)

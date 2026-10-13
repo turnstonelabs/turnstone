@@ -12,6 +12,7 @@ from collections import OrderedDict, deque
 from typing import TYPE_CHECKING
 from weakref import WeakValueDictionary
 
+from turnstone.channels._routing import model_unavailable_reply
 from turnstone.core.log import get_logger
 
 if TYPE_CHECKING:
@@ -183,15 +184,22 @@ class MessageCog:
             mention_model = await self.ts.router.get_channel_default_alias()
             if not mention_model:
                 mention_model = self.ts.config.model
-            ws_id, _is_new = await self.ts.router.get_or_create_workstream(
-                channel_type="discord",
-                channel_id=str(thread.id),
-                name=thread_name,
-                model=mention_model,
-                initial_message="",
-                client_type="chat",
-                channel_user_id=str(message.author.id),
-            )
+            try:
+                ws_id, _is_new = await self.ts.router.get_or_create_workstream(
+                    channel_type="discord",
+                    channel_id=str(thread.id),
+                    name=thread_name,
+                    model=mention_model,
+                    initial_message="",
+                    client_type="chat",
+                    channel_user_id=str(message.author.id),
+                )
+            except Exception as exc:
+                reply = model_unavailable_reply(exc)
+                if reply is None:
+                    raise
+                await thread.send(reply)
+                return
 
             await self.ts.subscribe_ws(ws_id, thread)
             await self.ts.router.send_message(ws_id, content)
@@ -264,10 +272,11 @@ class MessageCog:
                 channel_user_id=str(message.author.id),
                 require_existing=True,
             )
-        except Exception:
+        except Exception as exc:
             log.warning("discord.ws_reactivation_failed", thread_id=channel.id, exc_info=True)
             await channel.send(
-                "I couldn't recover this conversation. Please try your message again."
+                model_unavailable_reply(exc)
+                or "I couldn't recover this conversation. Please try your message again."
             )
             return
 
@@ -501,15 +510,22 @@ class MessageCog:
         if not effective_model:
             effective_model = self.ts.config.model
 
-        ws_id, _is_new = await self.ts.router.get_or_create_workstream(
-            channel_type="discord",
-            channel_id=str(thread.id),
-            name=thread_name,
-            model=effective_model,
-            initial_message="",
-            client_type="chat",
-            channel_user_id=str(interaction.user.id),
-        )
+        try:
+            ws_id, _is_new = await self.ts.router.get_or_create_workstream(
+                channel_type="discord",
+                channel_id=str(thread.id),
+                name=thread_name,
+                model=effective_model,
+                initial_message="",
+                client_type="chat",
+                channel_user_id=str(interaction.user.id),
+            )
+        except Exception as exc:
+            reply = model_unavailable_reply(exc)
+            if reply is None:
+                raise
+            await interaction.followup.send(reply)
+            return
 
         await self.ts.subscribe_ws(ws_id, thread)
         await self.ts.router.send_message(ws_id, message)

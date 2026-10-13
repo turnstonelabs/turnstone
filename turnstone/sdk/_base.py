@@ -16,6 +16,24 @@ if TYPE_CHECKING:
 T = TypeVar("T")
 
 
+def _error_fields(resp: httpx.Response) -> tuple[str, str]:
+    """``(message, code)`` for a non-2xx response.
+
+    The message is the JSON body's ``error`` (or ``detail``), else the first 200
+    characters of the text; ``code`` is the body's string ``code``, else ``""``.
+    """
+    msg = ""
+    code = ""
+    with contextlib.suppress(Exception):
+        body = resp.json()
+        msg = body.get("error", body.get("detail", ""))
+        raw_code = body.get("code", "")
+        code = raw_code if isinstance(raw_code, str) else ""
+    if not msg:
+        msg = resp.text[:200]
+    return msg, code
+
+
 class _BaseClient:
     """Async HTTP client base shared by server and console clients."""
 
@@ -151,13 +169,8 @@ class _BaseClient:
             )
         if resp.status_code >= 400:
             # Try to extract error message from JSON body
-            msg = ""
-            with contextlib.suppress(Exception):
-                body = resp.json()
-                msg = body.get("error", body.get("detail", ""))
-            if not msg:
-                msg = resp.text[:200]
-            raise TurnstoneAPIError(resp.status_code, msg)
+            msg, code = _error_fields(resp)
+            raise TurnstoneAPIError(resp.status_code, msg, code)
         body_data: dict[str, Any] = resp.json()
         if response_model is not None:
             return response_model.model_validate(body_data)
@@ -181,13 +194,8 @@ class _BaseClient:
             headers = {"Authorization": f"Bearer {self._token_factory()}"}
         resp = await self._client.request(method, path, params=params, headers=headers)
         if resp.status_code >= 400:
-            msg = ""
-            with contextlib.suppress(Exception):
-                body = resp.json()
-                msg = body.get("error", body.get("detail", ""))
-            if not msg:
-                msg = resp.text[:200]
-            raise TurnstoneAPIError(resp.status_code, msg)
+            msg, code = _error_fields(resp)
+            raise TurnstoneAPIError(resp.status_code, msg, code)
         return resp.content
 
     async def _stream_sse(

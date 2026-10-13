@@ -81,8 +81,9 @@ Content-Type: application/json
 
 All three body fields are optional — an empty body still creates a
 coordinator with an auto-generated name and no initial message.
-Returns **503** with a remediation message when the cluster isn't
-configured with a coordinator model; see
+Returns **503** with `"code": "model_not_loaded"` when the coordinator's
+model isn't loaded: `coordinator.model_alias`, else `model.default_alias`,
+else the console's `[model].default`. No other model is used; see
 [`coordinator.model_alias`](settings.md) to set one.
 
 **SSE implication:** the `ws_created` event fires on the cluster-wide

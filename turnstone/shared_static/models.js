@@ -100,7 +100,10 @@ export function modelChoices() {
 export function modelLabel(alias) {
   if (!alias) return "";
   const row = _core.getByKey(alias);
-  return row ? _fmtLabel(row) : "";
+  // An alias the list doesn't hold is named, not hidden. Whether it is
+  // available is the caller's to say: a console list holds only stored
+  // definitions, not models a config.toml defines.
+  return row ? _fmtLabel(row) : alias;
 }
 
 /** The resolved default aliases the local server reported:

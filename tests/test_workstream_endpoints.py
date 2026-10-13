@@ -2740,6 +2740,23 @@ class TestDetailInteractive:
         assert r.status_code == 503
         assert "alias 'gone' no longer resolves" in r.json()["error"]
 
+    def test_503_with_code_when_no_model_is_loaded_for_the_reopen(self):
+        """#1359: a reopen whose saved model and default both miss answers 503
+        with ``model_not_loaded``; no other model is substituted."""
+        from turnstone.core.model_registry import UnknownModelAliasError
+
+        mock_mgr = MagicMock()
+        mock_mgr.get.return_value = None
+        mock_mgr.open_with_outcome.side_effect = UnknownModelAliasError("local-qwen")
+        client = _build_detail_app(mock_mgr)
+
+        r = client.get("/v1/api/workstreams/ws-unloaded")
+        assert r.status_code == 503
+        body = r.json()
+        assert body["code"] == "model_not_loaded"
+        assert body["alias"] == "local-qwen"
+        assert "the default model 'local-qwen' is loaded" in body["error"]
+
     def test_correlation_id_on_unexpected_rehydrate_failure(self):
         """Bare ``Exception`` from ``mgr.open`` → 500 + correlation_id +
         per-kind noun in user-facing message. Exception text is NOT

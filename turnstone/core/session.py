@@ -20532,6 +20532,32 @@ class ChatSession:
             }
         return alias, None
 
+    def _unloaded_task_model_error(self, call_id: str) -> dict[str, Any] | None:
+        """Refuse a task_agent call whose configured task model isn't loaded.
+
+        Checked at prep, before the approval prompt, so nobody is asked to
+        approve a call that can't run. Nothing substitutes another model
+        (#1359), and the error doesn't steer the caller to one: it says why the
+        model isn't available and whether trying again may work. An explicit
+        ``model=`` stays allowed; it just isn't suggested.
+        """
+        registry = self._registry
+        if registry is None:
+            return None
+        alias = registry.resolve_agent_alias("task", self._config_store)
+        if not alias or registry.has_alias(alias):
+            return None
+        reason, retryable = registry.unavailable_reason(alias)
+        remedy = "Try the task again shortly." if retryable else "An operator has to fix it."
+        return {
+            "call_id": call_id,
+            "func_name": "task_agent",
+            "header": f"✗ task_agent: task model '{alias}' is not available",
+            "preview": "",
+            "needs_approval": False,
+            "error": f"Error: the task model '{alias}' is not available: {reason}. {remedy}",
+        }
+
     def _prepare_task(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
         """Prepare a general-purpose sub-agent task for approval."""
         prompt = (args.get("prompt") or "").strip()
@@ -20547,6 +20573,10 @@ class ChatSession:
         model_override, err = self._validate_agent_model_override(call_id, "task_agent", args)
         if err is not None:
             return err
+        if model_override is None:
+            err = self._unloaded_task_model_error(call_id)
+            if err is not None:
+                return err
         skill_arg = (args.get("skill") or "").strip()
         skill_data: dict[str, Any] | None = None
         if skill_arg:
@@ -25980,13 +26010,19 @@ class ChatSession:
         agent_prefix = tuple(agent_turns)
 
         # Resolve agent model: explicit per-call override wins, then the
-        # per-kind registry override (task_model), then the session-wide
-        # agent_model fallback, then the session's primary model.
+        # model.task_alias setting, then the per-kind registry override
+        # (task_model), then the session-wide agent_model fallback, then the
+        # session's primary model. A configured alias that isn't loaded raises
+        # from resolve_model_binding rather than running another model (#1359).
         if agent_alias is not None:
             if self._registry is None or not self._registry.has_alias(agent_alias):
                 raise ValueError(f"Unknown agent_alias '{agent_alias}'")
         else:
-            agent_alias = self._registry.resolve_agent_alias(label) if self._registry else None
+            agent_alias = (
+                self._registry.resolve_agent_alias(label, self._config_store)
+                if self._registry
+                else None
+            )
         primary_lane = self._primary_lane()
         if self._registry and agent_alias and agent_alias != self._model_alias:
             agent_binding = resolve_model_binding(
@@ -26009,7 +26045,7 @@ class ChatSession:
         # delegate to the registry which knows the per-kind default (task
         # returns None to inherit the session).
         if reasoning_effort is None and self._registry:
-            reasoning_effort = self._registry.resolve_agent_effort(label)
+            reasoning_effort = self._registry.resolve_agent_effort(label, self._config_store)
 
         # Gate web_search: remove when no backend exists for the agent model
         agent_caps = require_lane_capabilities(lane)

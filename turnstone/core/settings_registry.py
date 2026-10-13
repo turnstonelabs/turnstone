@@ -61,8 +61,13 @@ def _build_registry() -> dict[str, SettingDef]:
             "",
             "Default model alias for new sessions (empty = use config.toml [model].default)",
             "model",
-            help="Which named model alias to use for new sessions. When empty, falls back to "
-            "the [model].default setting in config.toml (which defaults to 'default'). "
+            help="Which named model alias new sessions use when they name none. When empty, "
+            "falls back to [model].default in config.toml, then the model named 'default', "
+            "then the first chat model defined (not a reranker or speech model). Adding "
+            "or enabling the first chat model in the Models tab stores it here when nothing "
+            "is stored, so a cluster's default is uniform; nodes read it with their model "
+            "definitions. Nothing else stores one, so a reset stays reset. When this model "
+            "isn't loaded, creates that rely on it fail instead of using another model. "
             "Change this at runtime to switch all new sessions to a different model "
             "without restarting.",
         ),
@@ -140,8 +145,9 @@ def _build_registry() -> dict[str, SettingDef]:
             "model",
             help="Which model the task_agent sub-agent uses. When empty, falls back to "
             "[model].task_model in config.toml, then [model].agent_model, then the session "
-            "model. Task_agent fires frequently for autonomous subtasks \u2014 point this "
-            "at a cheaper/faster model than your conversation model.",
+            "model. When this model isn't loaded, task_agent refuses the call instead of "
+            "using another model. Task_agent fires frequently for autonomous subtasks "
+            "\u2014 point this at a cheaper/faster model than your conversation model.",
         ),
         SettingDef(
             "model.task_effort",
@@ -477,9 +483,10 @@ def _build_registry() -> dict[str, SettingDef]:
             "",
             "Default model alias for channel workstreams (empty = use server default)",
             "channels",
-            help="Which model alias to use when a channel adapter (Discord, etc.) "
-            "creates a new workstream without an explicit model. When empty, falls "
-            "back to the server-wide model.default_alias.",
+            help="Which model alias Discord and Slack use when they create a new workstream "
+            "without an explicit model. When empty, falls back to the server-wide default. "
+            "When this model isn't loaded, new conversations fail with a reply saying the "
+            "model isn't available, instead of using another model.",
         ),
         # -- mcp ------------------------------------------------------------
         SettingDef(
@@ -964,8 +971,9 @@ def _build_registry() -> dict[str, SettingDef]:
             help="Which model alias the console-hosted coordinator sessions run on. "
             "Must match an entry in the Models tab. Coordinator sessions create and "
             "drive child workstreams on your server nodes; point this at a capable "
-            "model so the orchestration reasoning is solid. When empty, "
-            "POST /v1/api/workstreams/new returns 503 with a remediation message.",
+            "model so the orchestration reasoning is solid. When empty, coordinators use "
+            "model.default_alias, then the console's [model].default. When this model isn't "
+            "loaded, creating a coordinator fails instead of using another model.",
         ),
         SettingDef(
             "coordinator.reasoning_effort",

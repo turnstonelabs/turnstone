@@ -632,6 +632,46 @@ async def test_api_error_raised():
             await client.send("hi", "bad_ws")
         assert exc_info.value.status_code == 404
         assert "Unknown workstream" in exc_info.value.message
+        assert exc_info.value.code == ""
+
+
+@pytest.mark.anyio
+async def test_api_error_carries_the_body_code():
+    transport = _mock_transport(
+        {
+            "POST /v1/api/workstreams/new": httpx.Response(
+                503,
+                json={
+                    "error": "The default model 'x' isn't loaded",
+                    "code": "model_not_loaded",
+                    "alias": "x",
+                },
+            )
+        }
+    )
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as hc:
+        client = AsyncTurnstoneServer(httpx_client=hc)
+        with pytest.raises(TurnstoneAPIError) as exc_info:
+            await client.create_workstream(name="w")
+        assert exc_info.value.status_code == 503
+        assert exc_info.value.code == "model_not_loaded"
+        assert "isn't loaded" in exc_info.value.message
+
+
+@pytest.mark.anyio
+async def test_api_error_ignores_a_non_string_code():
+    transport = _mock_transport(
+        {
+            "POST /v1/api/workstreams/new": httpx.Response(
+                503, json={"error": "boom", "code": {"nested": True}}
+            )
+        }
+    )
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as hc:
+        client = AsyncTurnstoneServer(httpx_client=hc)
+        with pytest.raises(TurnstoneAPIError) as exc_info:
+            await client.create_workstream(name="w")
+        assert exc_info.value.code == ""
 
 
 @pytest.mark.anyio

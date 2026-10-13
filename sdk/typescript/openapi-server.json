@@ -4423,6 +4423,17 @@
             ],
             "default": null
           },
+          "default_model": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DefaultModelStatus"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
           "mcp": {
             "anyOf": [
               {
@@ -4456,6 +4467,24 @@
           "status"
         ],
         "title": "BackendStatus",
+        "type": "object"
+      },
+      "DefaultModelStatus": {
+        "properties": {
+          "alias": {
+            "default": "",
+            "description": "The model alias a workstream that names none runs on",
+            "title": "Alias",
+            "type": "string"
+          },
+          "loaded": {
+            "default": false,
+            "description": "Whether this node loaded it; when false, creates that rely on it fail and status is degraded",
+            "title": "Loaded",
+            "type": "boolean"
+          }
+        },
+        "title": "DefaultModelStatus",
         "type": "object"
       },
       "McpStatus": {

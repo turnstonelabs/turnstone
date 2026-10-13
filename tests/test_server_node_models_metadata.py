@@ -486,9 +486,10 @@ def test_model_reload_maps_concurrency_config_error_to_422(
     assert old_reg.has_alias("a")
 
 
-def test_config_reload_maps_dynamic_auth_key_error_to_503(monkeypatch, tmp_path, caplog):
-    """Every caller of the reload chokepoint handles its refusal the same
-    way: the settings fan-out answers 503, not an unhandled 500."""
+def test_config_reload_leaves_the_registry_alone():
+    """The routing settings apply where they are read (#1359): the settings
+    fan-out refreshes the cache and never swaps the registry, so it has no
+    reload to refuse, and a changed default reaches the next create at once."""
     from turnstone.server import config_reload
 
     old_reg = ModelRegistry(
@@ -508,23 +509,24 @@ def test_config_reload_maps_dynamic_auth_key_error_to_503(monkeypatch, tmp_path,
         },
         default="a",
     )
+    generation = old_reg.generation
+    values = {"model.default_alias": "gw"}
     config_store = MagicMock()
-    config_store.get.side_effect = lambda key, default=None: (
-        "gw" if key == "model.default_alias" else default
-    )
+    config_store.get.side_effect = lambda key, default=None: values.get(key, default)
     app_state = SimpleNamespace(
         registry=old_reg, config_store=config_store, oauth_context=OAuthContext(token_store=None)
     )
     request = SimpleNamespace(app=SimpleNamespace(state=app_state))
 
-    with caplog.at_level("ERROR", logger="turnstone.server"):
-        response = config_reload(request)  # type: ignore[arg-type]
+    response = config_reload(request)  # type: ignore[arg-type]
 
-    assert response.status_code == 503
-    assert "mcp_token_encryption" in json.loads(response.body)["reason"]
-    # Refused without mutating: the routing override did NOT apply.
+    assert response.status_code == 200
+    config_store.reload.assert_called_once()
+    assert old_reg.generation == generation
     assert old_reg.default == "a"
-    assert any("model_auth_key_missing" in r.message for r in caplog.records)
+    assert old_reg.effective_default(config_store) == "gw"
+    values["model.default_alias"] = ""
+    assert old_reg.effective_default(config_store) == "a"
 
 
 # ---------------------------------------------------------------------------

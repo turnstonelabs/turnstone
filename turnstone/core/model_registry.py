@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING, Any
 from turnstone.core.oauth.context import oauth_context
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterator, Mapping
+    from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 
     from turnstone.core.rerank import RerankLane, RerankRuntime
 
@@ -182,10 +182,13 @@ class UnknownModelAliasError(ValueError):
     The ``ValueError`` base preserves route and caller compatibility while the
     structured ``alias`` field lets lifecycle code distinguish an alias-removal
     race from unrelated validation failures without parsing exception text.
+    ``retryable`` is True when the alias was left out because its secret store
+    didn't answer, so it may load by itself (see ``ModelRegistry.unavailable_reason``).
     """
 
-    def __init__(self, alias: str) -> None:
+    def __init__(self, alias: str, *, retryable: bool = False) -> None:
         self.alias = alias
+        self.retryable = retryable
         super().__init__(f"Unknown model alias: {alias}")
 
 
@@ -536,36 +539,54 @@ def _api_surface_of(cfg: ModelConfig) -> str | None:
 # ---------------------------------------------------------------------------
 
 
-def _validate_registry_args(
-    models: dict[str, ModelConfig],
-    default: str,
-    fallback: list[str] | None,
-    agent_model: str | None,
-    task_model: str | None,
-) -> None:
-    """Validate ModelRegistry construction / reload arguments.
+def _validate_fallback(models: Mapping[str, ModelConfig], fallback: list[str] | None) -> None:
+    """Refuse a fallback list that names an alias this registry doesn't hold.
 
-    An empty ``models`` is permitted: it is the degraded "no models configured
-    yet" state a server boots into before any model definition exists (models
-    are added later via the admin panel and picked up by a hot reload — see
-    ``internal_model_reload``).  In that state ``default`` must be unset (``""``)
-    and every alias lookup raises until a model is added.  A non-empty registry
-    validates exactly as before: ``default`` and any routing alias must exist.
+    The routing aliases (``default``, ``task_model``, ``agent_model``) are not
+    checked here: they name what the operator configured, loaded or not, and
+    resolving one that isn't loaded raises :class:`UnknownModelAliasError` instead
+    of quietly running another model (#1359). An empty ``models`` is the degraded
+    "no models configured yet" state a server boots into before any definition
+    exists; every lookup raises until a hot reload adds one.
     """
-    if not models:
-        if default:
-            raise ValueError(f"Default model '{default}' not found in empty registry")
-        return
-    if default not in models:
-        raise ValueError(f"Default model '{default}' not found in registry")
-    if fallback:
-        for alias in fallback:
-            if alias not in models:
-                raise ValueError(f"Fallback model '{alias}' not found in registry")
-    if agent_model and agent_model not in models:
-        raise ValueError(f"Agent model '{agent_model}' not found in registry")
-    if task_model and task_model not in models:
-        raise ValueError(f"Task model '{task_model}' not found in registry")
+    for alias in fallback or ():
+        if alias not in models:
+            raise ValueError(f"Fallback model '{alias}' not found in registry")
+
+
+def serves_chat(capabilities: Mapping[str, Any], model: str) -> bool:
+    """Whether a definition can hold a chat, and so be picked as the default.
+
+    Definitions carry no kind, so the capabilities decide: a reranker
+    (``supports_rerank``) or a dedicated speech model
+    (:func:`turnstone.core.audio.is_speech_only_model`) can't. Shared by every
+    automatic default pick (the loader, the Models tab, the console's first
+    model); an alias an operator configures is taken as given.
+    """
+    if capabilities.get("supports_rerank"):
+        return False
+    # Imported here: audio imports model_turn, which reaches back to this module.
+    from turnstone.core.audio import is_speech_only_model
+
+    return not is_speech_only_model(capabilities, model)
+
+
+def pick_default_alias(configured: str, defined: Sequence[str]) -> str:
+    """The default alias that configuration and the defined models name.
+
+    *configured* (config.toml ``[model] default``) when set, else the model named
+    ``default`` when one is defined, else the first defined model, else ``""``,
+    all among the chat models.
+    *defined* lists every chat model an operator defined (see :func:`serves_chat`),
+    in definition order, whether or not it loaded: a load that leaves a
+    definition out never moves the default to another model (#1359). Shared by
+    the loader and the console's Models tab so the two pick the same alias.
+    """
+    if configured:
+        return configured
+    if "default" in defined:
+        return "default"
+    return defined[0] if defined else ""
 
 
 @dataclass(frozen=True)
@@ -612,9 +633,17 @@ class _RerankRuntimeEntry:
 class ModelRegistry:
     """Holds named model configurations with thread-safe lazy client creation.
 
+    The routing fields hold what configuration names, loaded or not, and never
+    the settings: :meth:`effective_default`, :meth:`resolve_agent_alias` and
+    :meth:`resolve_agent_effort` apply the ``model.*`` settings when they are
+    read, so a changed or cleared setting takes effect at once.
+
     Args:
         models: Mapping of alias → ModelConfig.
-        default: Alias of the default model.
+        default: The loader's default alias (config.toml ``[model] default``, else
+            the model named ``default``, else the first defined chat model). It may
+            name a model that isn't loaded; the ``model.default_alias`` setting
+            overrides it (see :meth:`effective_default`).
         fallback: Ordered list of aliases to try when the primary model fails.
         agent_model: Optional alias for the task_agent sub-agent (single-knob
             fallback used when ``task_model`` is unset).
@@ -633,8 +662,9 @@ class ModelRegistry:
         task_model: str | None = None,
         task_effort: str | None = None,
         skipped_aliases: Mapping[str, str] | None = None,
+        retryable_skips: Collection[str] | None = None,
     ) -> None:
-        _validate_registry_args(models, default, fallback, agent_model, task_model)
+        _validate_fallback(models, fallback)
 
         self._models = dict(models)
         self.default = default
@@ -657,8 +687,11 @@ class ModelRegistry:
         # construction.
         self._generation = 0
         # Aliases the loader recorded as skipped (see ``load_model_registry``), with
-        # the reason; empty for a registry built directly.
+        # the reason; empty for a registry built directly. ``adopt_skips`` keeps
+        # them current across reloads.
         self.skipped_aliases: dict[str, str] = dict(skipped_aliases or {})
+        # The skipped aliases whose failure was the secret store not answering.
+        self.retryable_skips: frozenset[str] = frozenset(retryable_skips or ())
 
     # -- query methods -------------------------------------------------------
 
@@ -842,7 +875,9 @@ class ModelRegistry:
     def resolve(self, alias: str | None = None) -> tuple[Any, str, ModelConfig, int]:
         """Resolve *alias* to ``(client, model_name, config, generation)``.
 
-        Uses the default alias when *alias* is ``None``. One lock
+        Uses :attr:`default` when *alias* is ``None``; a caller that wants the
+        ``model.default_alias`` setting applied passes :meth:`effective_default`.
+        Raises :class:`UnknownModelAliasError` for an alias that isn't loaded. One lock
         acquisition, so config, client and generation all come from the same
         registry snapshot and a caller stamping the returned generation
         beside the returned client holds an exactly-paired binding.
@@ -851,7 +886,7 @@ class ModelRegistry:
             alias = alias or self.default
             cfg = self._models.get(alias)
             if cfg is None:
-                raise UnknownModelAliasError(alias)
+                raise UnknownModelAliasError(alias, retryable=alias in self.retryable_skips)
             return self._get_client_locked(alias), cfg.model, cfg, self._generation
 
     def resolve_binding(
@@ -875,7 +910,7 @@ class ModelRegistry:
             alias = alias or self.default
             cfg = self._models.get(alias)
             if cfg is None:
-                raise UnknownModelAliasError(alias)
+                raise UnknownModelAliasError(alias, retryable=alias in self.retryable_skips)
             client = self._get_client_locked(alias)
             try:
                 provider = self._get_provider_locked(alias)
@@ -892,28 +927,75 @@ class ModelRegistry:
                 self._generation,
             )
 
-    def resolve_agent_alias(self, kind: str) -> str | None:
+    def adopt_skips(self, other: ModelRegistry) -> None:
+        """Take *other*'s skip record: the load a reload or refresh just ran.
+
+        A reload swaps models and routing, not this record, so every swap site
+        calls this with the registry its load built, keeping the reasons current
+        for :meth:`unavailable_reason` and the replies that name them.
+        """
+        with self._client_lock:
+            self.skipped_aliases = dict(other.skipped_aliases)
+            self.retryable_skips = other.retryable_skips
+
+    def unavailable_reason(self, alias: str) -> tuple[str, bool]:
+        """Why *alias* isn't loaded, in words any reader may see, and whether it
+        may load by itself (the secret store not answering).
+
+        The loader's own reason names secret reference paths and store mounts,
+        so it stays where admins read it (the Sync result, doctor, the node
+        log); this names only the kind of failure.
+        """
+        if alias in self.retryable_skips:
+            return "the secret store holding its API key can't be reached", True
+        if alias in self.skipped_aliases:
+            return "its definition couldn't be loaded", False
+        return "no enabled model definition by that name is loaded", False
+
+    def effective_default(self, config_store: Any | None) -> str:
+        """The alias a session that names no model runs on.
+
+        The ``model.default_alias`` setting when it is set, else :attr:`default`.
+        Read at use time and never checked against what loaded: resolving an
+        alias that isn't loaded raises :class:`UnknownModelAliasError` rather
+        than running another model (#1359).
+        """
+        if config_store is not None:
+            setting = str(config_store.get("model.default_alias") or "").strip()
+            if setting:
+                return setting
+        return self.default
+
+    def resolve_agent_alias(self, kind: str, config_store: Any | None = None) -> str | None:
         """Return the configured alias for a sub-agent ``kind``.
 
-        The per-kind override (``task_model``) wins over the legacy
-        single-knob ``agent_model``.  Returns ``None`` when nothing is
-        configured (caller should fall back to the session model).
-
-        Recognised kind: ``"task"``.  Any other value (e.g. ``"agent"``,
-        eval/utility paths) returns the legacy ``agent_model`` as-is —
-        preserves prior behaviour for non-task callers.
+        For ``"task"``: the ``model.task_alias`` setting (read from
+        *config_store* when one is given), else ``task_model``, else the legacy
+        single-knob ``agent_model``.  Any other kind (e.g. ``"agent"``,
+        eval/utility paths) returns ``agent_model`` as-is.  ``None`` means
+        nothing is configured and the caller runs the sub-agent on the session's
+        own model.  The alias is not checked against what loaded.
         """
         if kind == "task":
+            if config_store is not None:
+                setting = str(config_store.get("model.task_alias") or "").strip()
+                if setting:
+                    return setting
             return self.task_model or self.agent_model
         return self.agent_model
 
-    def resolve_agent_effort(self, kind: str) -> str | None:
+    def resolve_agent_effort(self, kind: str, config_store: Any | None = None) -> str | None:
         """Return the reasoning effort for a sub-agent ``kind``.
 
-        Task returns ``None`` to indicate the caller should fall through
-        to the session default.
+        For ``"task"``: the ``model.task_effort`` setting (read from
+        *config_store* when one is given), else ``task_effort``.  ``None``
+        tells the caller to inherit the session's effort.
         """
         if kind == "task":
+            if config_store is not None:
+                setting = str(config_store.get("model.task_effort") or "").strip()
+                if setting:
+                    return setting
             return self.task_effort
         return None
 
@@ -977,7 +1059,7 @@ class ModelRegistry:
             # other grant dialect stays valid to keep, but its mint always
             # refuses on this deployment — say so at every swap chokepoint.
             warn_profile_mismatched_aliases(models, app_state)
-        _validate_registry_args(models, default, fallback, agent_model, task_model)
+        _validate_fallback(models, fallback)
         rerank_close_actions: list[Callable[[], None]] = []
         with _deferred_close_actions(rerank_close_actions), self._client_lock:
             # FIRST write inside the lock, deliberately BEFORE the map swap
@@ -1192,16 +1274,22 @@ def probe_api_key(value: str) -> str:
 
 
 def _materialize_row_key(
-    alias: str, raw: object, *, source: str, skipped: dict[str, str]
+    alias: str,
+    raw: object,
+    *,
+    source: str,
+    skipped: dict[str, str],
+    retryable: set[str],
 ) -> str | None:
     """Materialise one definition's key, isolating a failure to that alias.
 
     A key :func:`materialize_api_key` refuses (a reference that cannot be resolved, a literal key
     :func:`turnstone.core.http_headers.checked_header_value` refuses, or one whose ``${VAR}``
     expands to nothing) drops the alias from this load and records the reason in *skipped*; ``None``
-    is returned for it. A store outage is covered one level down: the resolver keeps serving the
-    value it fetched last while the store cannot answer, so only a reference this process never
-    resolved is dropped by an outage.
+    is returned for it. An alias whose failure was the store not answering (``SecretError.retryable``)
+    also goes in *retryable*: it may load by itself once the store answers. A store outage is
+    covered one level down: the resolver keeps serving the value it fetched last while the store
+    cannot answer, so only a reference this process never resolved is dropped by an outage.
     """
     from turnstone.core.secret_refs import SecretError
 
@@ -1218,6 +1306,8 @@ def _materialize_row_key(
     except SecretError as exc:
         reason = str(exc)
         hint = "fix the reference or the [secrets] store, then Sync to Nodes"
+        if exc.retryable:
+            retryable.add(alias)
     skipped[alias] = reason
     log.error("model_registry.alias_skipped", alias=alias, source=source, error=reason, hint=hint)
     return None
@@ -1525,7 +1615,10 @@ def load_model_registry(
     4. ``[model].default``, ``[model].fallback``, ``[model].agent_model``,
        ``[model].task_model``, ``[model].task_effort`` control routing.
        ``task_model`` overrides ``agent_model`` for the task sub-agent;
-       it falls back to ``agent_model`` when unset.
+       it falls back to ``agent_model`` when unset. With ``[model].default``
+       unset, the default is the model named ``default``, else the first
+       defined (:func:`pick_default_alias`). Routing aliases are kept as
+       configured even when their model didn't load (#1359).
 
     ``strict``: when True, a storage read failure during the DB-rows step
     re-raises instead of degrading to a config.toml-only registry.
@@ -1579,6 +1672,13 @@ def load_model_registry(
     skipped_aliases: dict[str, str] = {}
     # The ${VAR} skips among them, logged once config.toml has had its say.
     placeholder_skips: dict[str, str] = {}
+    # The skips whose failure was the secret store not answering.
+    retryable_skips: set[str] = set()
+    # Every alias an operator defined, in definition order, whether or not it
+    # loads, mapped to whether it can hold a chat: the default is picked from
+    # the chat ones, so a load that leaves the first definition out does not
+    # move the default to the next one (#1359).
+    defined: dict[str, bool] = {}
 
     # 1. Load DB model definitions (lowest priority, overridden by config.toml)
     if storage is not None:
@@ -1593,6 +1693,7 @@ def load_model_registry(
                             caps = parsed
                     except (_json.JSONDecodeError, TypeError):
                         pass  # falls back to empty capabilities
+                defined.setdefault(alias, serves_chat(caps, str(row.get("model") or "")))
                 # Extract server_compat from capabilities (namespaced key)
                 row_server_compat = caps.pop("server_compat", {})
                 if not isinstance(row_server_compat, dict):
@@ -1638,7 +1739,11 @@ def load_model_registry(
                     row.get("obo_scopes"),
                 )
                 row_api_key = _materialize_row_key(
-                    alias, row.get("api_key") or api_key, source="db", skipped=skipped_aliases
+                    alias,
+                    row.get("api_key") or api_key,
+                    source="db",
+                    skipped=skipped_aliases,
+                    retryable=retryable_skips,
                 )
                 if row_api_key is None:
                     _keep_running_config(alias, keep_refused, configs)
@@ -1679,6 +1784,14 @@ def load_model_registry(
     for alias, entry in models_section.items():
         if not isinstance(entry, dict):
             continue
+        entry_caps_raw = entry.get("capabilities")
+        defined.setdefault(
+            alias,
+            serves_chat(
+                entry_caps_raw if isinstance(entry_caps_raw, dict) else {},
+                str(entry.get("model") or ""),
+            ),
+        )
         model_name = entry.get("model", "")
         if not model_name:
             log.warning("Model entry '%s' has no model name, skipping", alias)
@@ -1801,7 +1914,11 @@ def load_model_registry(
             entry.get("obo_scopes", ""),
         )
         entry_api_key = _materialize_row_key(
-            alias, entry.get("api_key", api_key), source="config", skipped=skipped_aliases
+            alias,
+            entry.get("api_key", api_key),
+            source="config",
+            skipped=skipped_aliases,
+            retryable=retryable_skips,
         )
         if entry_api_key is None:
             # config.toml overrides the database for this alias even when its key
@@ -1848,80 +1965,41 @@ def load_model_registry(
             context_window=context_window,
             provider=_resolve_openai_provider(provider, base_url),
         )
+        defined.setdefault("default", serves_chat({}, model))
 
     # A database row recorded as skipped is of no consequence when config.toml
     # serves the alias; only aliases that are really absent count.
     for alias in configs:
         skipped_aliases.pop(alias, None)
+    retryable_skips.intersection_update(skipped_aliases)
     for alias, reason in placeholder_skips.items():
         if alias in skipped_aliases:
             log.error("model_registry.alias_skipped", alias=alias, source="db", error=reason)
 
-    if not configs:
-        if not allow_empty:
-            if skipped_aliases:
-                message = "No model definitions could be loaded. Skipped: " + describe_skipped(
-                    skipped_aliases
-                )
-            else:
-                message = (
-                    "No model definitions found. Provide --model, configure [models.*] "
-                    "in config.toml, or add model definitions in the admin panel."
-                )
-            raise ValueError(message)
-        # Degraded boot: the server starts with no models configured yet and
-        # registers normally. Models added via the admin panel hot-reload in
-        # without a restart (POST /v1/api/_internal/model-reload). Until then
-        # every model lookup raises, so requests fail cleanly rather than the
-        # process refusing to start.
-        log.warning(
-            "No model definitions found — starting with an empty registry. "
-            "Add models in the admin panel; they load without a restart."
-        )
-        return ModelRegistry(models={}, default="", skipped_aliases=skipped_aliases)
-
-    configs = _resolve_context_windows(
-        configs,
-        detect=detect_context_windows,
-        inherited=context_window,
-        prior=prior,
-        reprobe=reprobe_known_windows,
+    # Routing names what configuration says, loaded or not (#1359). The default
+    # comes from config.toml and the defined models, never from the set that
+    # loaded, and a routing alias that didn't load is kept: resolving it raises
+    # UnknownModelAliasError instead of quietly running another model.
+    default_alias = pick_default_alias(
+        str(model_section.get("default") or "").strip(),
+        [alias for alias, chat in defined.items() if chat],
     )
-
-    # Determine default alias
-    default_alias = model_section.get("default", "default")
-    if default_alias not in configs:
-        if "default" in configs:
-            default_alias = "default"
-        else:
-            default_alias = next(iter(configs))
-            log.debug(
-                "No '%s' model alias; using '%s' as default",
-                model_section.get("default", "default"),
-                default_alias,
-            )
-
-    # Fallback chain
-    fallback_raw = model_section.get("fallback", [])
-    fallback: list[str] = []
-    if isinstance(fallback_raw, list):
-        for alias in fallback_raw:
-            if alias in configs:
-                fallback.append(alias)
-            else:
-                log.warning("Fallback alias '%s' not found in models, ignoring", alias)
-
     # Agent model (legacy single-knob fallback for the task_agent sub-agent)
-    agent_model = model_section.get("agent_model")
-    if agent_model and agent_model not in configs:
-        log.warning("Configured agent_model '%s' not found, ignoring", agent_model)
-        agent_model = None
-
+    agent_model = str(model_section.get("agent_model") or "").strip() or None
     # Per-kind sub-agent model — overrides agent_model for the task role
-    task_model = model_section.get("task_model")
-    if task_model and task_model not in configs:
-        log.warning("Configured task_model '%s' not found, ignoring", task_model)
-        task_model = None
+    task_model = str(model_section.get("task_model") or "").strip() or None
+    for role, routed in (
+        ("default", default_alias),
+        ("agent_model", agent_model),
+        ("task_model", task_model),
+    ):
+        if routed and routed not in configs:
+            log.warning(
+                "model_registry.routing_alias_not_loaded",
+                role=role,
+                alias=routed,
+                defined=routed in defined,
+            )
 
     # Per-kind reasoning effort.  None means task inherits the session.
     # Typos in config.toml shouldn't silently flow to the provider — log and
@@ -1950,6 +2028,55 @@ def load_model_registry(
 
     task_effort = _validate_effort(model_section.get("task_effort"), "task_effort")
 
+    if not configs:
+        if not allow_empty:
+            if skipped_aliases:
+                message = "No model definitions could be loaded. Skipped: " + describe_skipped(
+                    skipped_aliases
+                )
+            else:
+                message = (
+                    "No model definitions found. Provide --model, configure [models.*] "
+                    "in config.toml, or add model definitions in the admin panel."
+                )
+            raise ValueError(message)
+        # Degraded boot: the server starts with no models configured yet and
+        # registers normally. Models added via the admin panel hot-reload in
+        # without a restart (POST /v1/api/_internal/model-reload). Until then
+        # every model lookup raises, so requests fail cleanly rather than the
+        # process refusing to start.
+        log.warning(
+            "No model definitions found — starting with an empty registry. "
+            "Add models in the admin panel; they load without a restart."
+        )
+        return ModelRegistry(
+            models={},
+            default=default_alias,
+            agent_model=agent_model,
+            task_model=task_model,
+            task_effort=task_effort,
+            skipped_aliases=skipped_aliases,
+            retryable_skips=retryable_skips,
+        )
+
+    configs = _resolve_context_windows(
+        configs,
+        detect=detect_context_windows,
+        inherited=context_window,
+        prior=prior,
+        reprobe=reprobe_known_windows,
+    )
+
+    # Fallback chain
+    fallback_raw = model_section.get("fallback", [])
+    fallback: list[str] = []
+    if isinstance(fallback_raw, list):
+        for alias in fallback_raw:
+            if alias in configs:
+                fallback.append(alias)
+            else:
+                log.warning("Fallback alias '%s' not found in models, ignoring", alias)
+
     return ModelRegistry(
         models=configs,
         default=default_alias,
@@ -1958,6 +2085,7 @@ def load_model_registry(
         task_model=task_model,
         task_effort=task_effort,
         skipped_aliases=skipped_aliases,
+        retryable_skips=retryable_skips,
     )
 
 

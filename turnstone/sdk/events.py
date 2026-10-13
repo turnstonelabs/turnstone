@@ -544,10 +544,14 @@ class NodeSnapshotEvent(ClusterEvent):
 
 @dataclass
 class HealthChangedEvent(ClusterEvent):
-    """Backend health state transition on a server node."""
+    """A server node's health changed: a backend's state transition, or a reload
+    that loaded or dropped its default model."""
 
     type: str = "health_changed"
-    backend_status: str = ""  # "healthy" or "degraded"
+    backend_status: str = ""  # the backend that changed: "healthy" or "degraded"; "" on a reload
+    status: str = ""  # the node's verdict: "ok" or "degraded"
+    backend: dict[str, Any] = field(default_factory=dict)  # the default model's backend
+    default_model: dict[str, Any] = field(default_factory=dict)  # {"alias", "loaded"}
 
 
 @dataclass

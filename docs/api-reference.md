@@ -1491,7 +1491,7 @@ source was not resumed in place.
 | 409 | Caller-selected ID collision, source availability/construction context changed during fork, or destination reservation was superseded |
 | 413 | Upload exceeds the configured request/file cap |
 | 429 | Workstream manager is at capacity; retry after capacity frees |
-| 503 | Storage/factory/model configuration unavailable, or the fork transaction failed operationally |
+| 503 | Storage/factory/model configuration unavailable, or the fork transaction failed operationally. When the model the request names, or the default when it names none, isn't loaded, the body is `{"error": ..., "code": "model_not_loaded", "alias": ...}` and no other model is used |
 | 500 | Unexpected create failure; response includes a correlation ID for server logs |
 
 ---
@@ -2839,9 +2839,10 @@ must keep the repair latched and must not open a cursorless or tokenless stream.
 ### `GET /health`
 
 Returns server health status. Always returns `200 OK` while the server process
-is running. `"status": "degraded"` indicates the server is up but the LLM
-backend is unreachable. Suitable for load-balancer health checks and Kubernetes
-liveness probes.
+is running. `"status": "degraded"` indicates the server is up but the default
+model's LLM backend is unreachable, or the default model isn't loaded on this
+node, so every create that relies on it fails until it loads. Suitable for
+load-balancer health checks and Kubernetes liveness probes.
 
 **Response:** `application/json`
 
@@ -2864,13 +2865,17 @@ liveness probes.
   "backend": {
     "status": "up",
     "circuit_state": "closed"
+  },
+  "default_model": {
+    "alias": "llama",
+    "loaded": true
   }
 }
 ```
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `status` | string | `"ok"` or `"degraded"` (degraded when backend unreachable) |
+| `status` | string | `"ok"` or `"degraded"` (degraded when the default model's backend is unreachable, or the default model isn't loaded) |
 | `version` | string | turnstone server version |
 | `node_id` | string | Server-generated node identity (`{hostname}_{4hex}`) |
 | `uptime_seconds` | number | Seconds since the server process started |
@@ -2883,6 +2888,8 @@ liveness probes.
 | `workstreams.error` | integer | Workstreams in error state |
 | `backend.status` | string | `"up"` or `"down"` — LLM backend reachability |
 | `backend.circuit_state` | string | `"closed"`, `"open"`, or `"half_open"` |
+| `default_model.alias` | string | The model alias a workstream that names none runs on (`""` when none is set) |
+| `default_model.loaded` | boolean | Whether this node loaded it; `false` makes `status` `"degraded"` |
 
 ---
 

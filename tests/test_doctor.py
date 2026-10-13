@@ -1013,9 +1013,46 @@ base_url = "http://laptop:8000/v1"
             brain, verdict = resolve_doctor_brain(profile, st, "")
             assert brain is None
             assert verdict.detail.startswith(
-                "no usable model configured: no model loaded; "
+                "no usable model configured: the default model 'default' isn't loaded; "
                 "skipped: default: api_key contains ${TS_DOCTOR_KEY}"
             )
+        finally:
+            reset_storage()
+
+    def test_an_unconfigured_default_left_out_is_not_replaced(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """With nothing configured the default is the first defined model; one
+        a load leaves out fails doctor instead of handing it the next (#1359)."""
+        from turnstone.core.storage import init_storage, reset_storage
+
+        monkeypatch.setattr("turnstone.core.config.load_config", lambda section=None: {})
+        monkeypatch.setattr("turnstone.core.model_registry.load_config", lambda section=None: {})
+        monkeypatch.setattr("turnstone.doctor._validate_connection", lambda llm: (True, ""))
+        db_path = str(tmp_path / "doctor.db")
+        reset_storage()
+        st = init_storage("sqlite", path=db_path, run_migrations=True)
+        try:
+            for definition_id, alias, api_key in (
+                ("def1", "alpha", "${TS_DOCTOR_KEY}"),
+                ("def2", "beta", "dummy"),
+            ):
+                st.create_model_definition(
+                    definition_id,
+                    alias,
+                    "test-model",
+                    provider="openai-compatible",
+                    base_url="http://localhost:9/v1",
+                    api_key=api_key,
+                    context_window=8192,
+                    enabled=True,
+                )
+            profile = _make_profile(
+                tmp_path, db_config={"backend": "sqlite", "url": "", "path": db_path}
+            )
+            brain, verdict = resolve_doctor_brain(profile, st, "")
+            assert brain is None
+            assert "the default model 'alpha' isn't loaded" in verdict.detail
         finally:
             reset_storage()
 
@@ -1023,7 +1060,8 @@ base_url = "http://laptop:8000/v1"
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """The case doctor keeps its own skip summary for: the loader raises no
-        error when the configured default is skipped and another alias loads."""
+        error when the configured default is skipped and another alias loads,
+        and doctor fails on that default rather than using the other (#1359)."""
         from turnstone.core.config_store import ConfigStore
         from turnstone.core.storage import init_storage, reset_storage
 
@@ -1055,8 +1093,8 @@ base_url = "http://laptop:8000/v1"
             brain, verdict = resolve_doctor_brain(profile, st, "")
             assert brain is None
             assert (
-                "Unknown model alias: older; skipped: older: api_key contains ${TS_DOCTOR_KEY}"
-                in verdict.detail
+                "the default model 'older' isn't loaded; "
+                "skipped: older: api_key contains ${TS_DOCTOR_KEY}" in verdict.detail
             )
         finally:
             reset_storage()

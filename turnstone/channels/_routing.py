@@ -51,6 +51,24 @@ log = get_logger(__name__)
 
 _WS_CREATE_TIMEOUT = 30.0  # seconds
 _CHANNEL_DEFAULT_TTL = 300.0  # cache channel default alias for 5 minutes
+
+#: What a channel adapter replies when a conversation can't start because its
+#: model isn't loaded. Nothing substitutes another model (#1359); the chat user
+#: usually can't fix it, so the reply points at whoever can.
+MODEL_UNAVAILABLE_REPLY = (
+    "The model for this conversation isn't available right now. "
+    "Ask a Turnstone admin to check it in the Models tab, then try again."
+)
+
+
+def model_unavailable_reply(exc: BaseException) -> str | None:
+    """:data:`MODEL_UNAVAILABLE_REPLY` when *exc* is a create refused with
+    ``model_not_loaded``, else ``None`` (the caller keeps its own reply)."""
+    if isinstance(exc, TurnstoneAPIError) and exc.code == "model_not_loaded":
+        return MODEL_UNAVAILABLE_REPLY
+    return None
+
+
 _MODELS_CACHE_TTL = 30.0  # cache model list for autocomplete
 _FORK_SOURCE_NOT_FOUND = "Workstream not found"
 _STARTUP_PROBE_CONCURRENCY = 8

@@ -7299,6 +7299,25 @@ function _renderModels(items) {
     el.appendChild(empty);
     return;
   }
+  // A default the list can't match is named, not hidden. The list holds the
+  // stored definitions and the config.toml models nodes report, so say only
+  // what that shows: disabled, or defined nowhere this tab can see.
+  const defaultRow = items.find(function (m) {
+    return m.alias === _modelDefaultAlias;
+  });
+  if (_modelDefaultAlias && !(defaultRow && defaultRow.enabled)) {
+    const note = document.createElement("div");
+    note.className = "dashboard-empty";
+    note.textContent = defaultRow
+      ? "The default model '" +
+        _modelDefaultAlias +
+        "' is disabled. Enable it, or set another default."
+      : "The default model '" +
+        _modelDefaultAlias +
+        "' is not stored here or reported by any node. " +
+        "Add it, or set another default.";
+    el.appendChild(note);
+  }
   for (let i = 0; i < items.length; i++) {
     const m = items[i];
     const isConfig = m.source === "config";
@@ -8158,11 +8177,17 @@ function _authSubmitFields(
 // its last load skipped stored definitions, so amber with the server's text
 // rather than plain success.
 function _modelActionToast(baseMsg, body) {
+  // Adding or enabling the cluster's first chat model stores it as the
+  // default model; say which, since every node follows it.
+  const pinned = body && body.default_pinned;
+  const msg = pinned
+    ? baseMsg + "; '" + pinned + "' is now the default model"
+    : baseMsg;
   const warning = body && body.registry_warning;
   if (warning) {
-    return { message: baseMsg + " — " + warning, type: "warn" };
+    return { message: msg + " — " + warning, type: "warn" };
   }
-  return { message: baseMsg, type: undefined };
+  return { message: msg, type: undefined };
 }
 
 // Toast for a successful model save, pure — the create/update variant of

@@ -780,6 +780,7 @@ class TestConsoleRefresh:
         assert live.get_config("b").api_key == "sk-o2"
         _refresh_coord_registry(state, storage)  # a Sync or a save applies the refusal
         assert live.list_aliases() == ["b"]
+        assert live.default == "a"  # not moved to "b" (#1359)
 
     def test_a_tick_keeps_a_model_whose_saved_literal_key_a_header_cannot_carry(
         self, storage: Any, fake_store: FakeBackend

@@ -11,8 +11,11 @@ Tier order (highest priority first):
    ConfigStore setting (admin-pinned coordinator-specific override).
 2. ``model.default_alias`` ConfigStore setting (admin-managed system
    default surfaced in the Models tab).
-3. ``registry.default`` (config.toml ``[model].default``, the boot-time
-   fallback).
+3. ``registry.default`` (config.toml ``[model].default``, else the model
+   named ``default``, else the first defined chat model).
+
+No tier is checked against what loaded (#1359): the first configured alias
+reaches ``registry.resolve_binding``, which raises for one that isn't loaded.
 
 These tests pin each branch by intercepting ``registry.resolve_binding`` —
 they short-circuit before ChatSession construction so the test never
@@ -28,6 +31,7 @@ import pytest
 
 from tests._coord_test_helpers import _FakeConfigStore
 from turnstone.console.session_factory import build_console_session_factory
+from turnstone.core.model_registry import ModelRegistry
 
 
 class _StopBeforeChatSessionError(Exception):
@@ -55,6 +59,9 @@ class _CapturingRegistry:
 
     def has_alias(self, alias: str) -> bool:
         return alias in self._known
+
+    def effective_default(self, config_store: Any) -> str:
+        return ModelRegistry.effective_default(self, config_store)  # type: ignore[arg-type]
 
     def resolve_binding(self, alias: str) -> Any:
         self.captured_alias = alias
@@ -178,17 +185,17 @@ def test_model_default_alias_used_when_coordinator_unset() -> None:
     assert registry.captured_alias == "admin-default"
 
 
-def test_unknown_model_default_alias_falls_through_to_registry_default() -> None:
-    """Tier 2 is *not* an explicit pin — operators set
-    ``model.default_alias`` once in the UI and forget about it; an alias
-    that's later disabled or typo'd should not 503 the coordinator,
-    since tier 3 (``registry.default``) is guaranteed to resolve."""
+def test_unloaded_model_default_alias_passed_through() -> None:
+    """Tier 2 names the system default, loaded or not: a disabled or typo'd
+    alias reaches ``registry.resolve_binding`` and fails the create with
+    ``model_not_loaded`` rather than launching on ``registry.default``
+    (#1359)."""
     factory, registry = _build_factory(
         known_aliases={"registry-default"},  # admin-default got removed
         settings={"model.default_alias": "admin-default"},
     )
     _invoke(factory)
-    assert registry.captured_alias == "registry-default"
+    assert registry.captured_alias == "admin-default"
 
 
 def test_blank_model_default_alias_falls_through_to_registry_default() -> None:

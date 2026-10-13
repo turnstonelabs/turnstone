@@ -527,3 +527,41 @@ def test_deleting_a_workstream_a_tab_has_open_says_to_close_it_first(
     # Anything else goes on to the session's own /delete.
     assert _refuse_deleting_an_open_tab(mgr, "/delete nope") is False
     assert _refuse_deleting_an_open_tab(mgr, "/history") is False
+
+
+# -- a default model that isn't loaded (#1359) ------------------------------------
+
+
+def test_ws_new_reports_an_unloaded_default_and_keeps_the_repl(
+    storage_backend: Any, capsys: Any
+) -> None:
+    from turnstone.core.model_registry import UnknownModelAliasError
+
+    def session_factory(
+        ui: Any, model_alias: str | None = None, ws_id: str | None = None, **_kw: Any
+    ) -> ChatSession:
+        raise UnknownModelAliasError(model_alias or "gone")
+
+    mgr = _build_cli_manager(session_factory, lambda alias: False)
+
+    assert _handle_ws_command(mgr, "/ws new", False) is False
+
+    out = capsys.readouterr().out
+    assert "Can't create a workstream: the default model 'gone' isn't loaded." in out
+    assert mgr.list_all() == []
+
+
+def test_default_model_message_names_the_reason_and_the_loaded_models() -> None:
+    from turnstone.cli import _default_model_not_loaded
+    from turnstone.core.model_registry import ModelConfig, ModelRegistry
+
+    registry = ModelRegistry(
+        {"spare": ModelConfig("spare", "http://models.example.com/v1", "k", "m")},
+        default="main",
+        skipped_aliases={"main": "secret://vault/llm: not found"},
+    )
+    assert _default_model_not_loaded("main", registry) == (
+        "the default model 'main' isn't loaded (secret://vault/llm: not found). "
+        "Check [models.main] in config.toml, or set [model] default to one of: spare."
+    )
+    assert _default_model_not_loaded("").startswith("no default chat model is configured")

@@ -32,7 +32,7 @@ from turnstone.core.providers._protocol import refuse_aborted_request
 from turnstone.core.server_compat import merge_server_compat
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterator
+    from collections.abc import Callable, Iterator, Mapping
 
     from turnstone.core.model_registry import ModelConfig
 
@@ -210,6 +210,25 @@ def model_supports_role(cfg: Any, role: str) -> bool:
     if flag in caps:
         return bool(caps.get(flag))
     return _infer_audio_capability(getattr(cfg, "model", ""), role)
+
+
+def is_speech_only_model(capabilities: Mapping[str, Any], model: str) -> bool:
+    """Whether a definition is a dedicated speech model, which can't hold a chat.
+
+    A transcription or speech-synthesis flag decides when set; otherwise the
+    known-name inference does, as for :func:`model_supports_role`. A model that
+    takes audio in chat (``supports_audio_input``) is a chat model even when it
+    also transcribes.
+    """
+    if capabilities.get("supports_audio_input"):
+        return False
+    for role, flag in _ROLE_CAPABILITY.items():
+        if flag in capabilities:
+            if capabilities.get(flag):
+                return True
+        elif _infer_audio_capability(model, role):
+            return True
+    return False
 
 
 def resolve_role_alias(*, config_store: Any | None, registry: Any | None, role: str) -> str | None:

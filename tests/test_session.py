@@ -659,6 +659,72 @@ class TestTaskExec:
         assert len(turns) == 2
         assert turns[-1].text == "do x"
 
+    @staticmethod
+    def _routing_registry(**routing: Any) -> Any:
+        from turnstone.core.model_registry import ModelConfig, ModelRegistry
+
+        models = {
+            alias: ModelConfig(alias, "http://models.example.com/v1", "k", "m-" + alias)
+            for alias in ("main", "spare")
+        }
+        return ModelRegistry(models=models, default="main", **routing)
+
+    def test_unloaded_task_model_is_refused_before_approval(self, tmp_db) -> None:
+        """#1359: a configured task model that isn't loaded refuses the call at
+        prep, so nobody approves a call that can't run, and agent_model does
+        not take over. The error says why and never points at another model."""
+        session = _make_session()
+        session._registry = self._routing_registry(task_model="gone", agent_model="spare")
+        item = session._prepare_task("c1", {"prompt": "do x"})
+        assert item["needs_approval"] is False
+        assert item["error"] == (
+            "Error: the task model 'gone' is not available: no enabled model "
+            "definition by that name is loaded. An operator has to fix it."
+        )
+        assert "spare" not in item["error"] and "model=" not in item["error"]
+
+    def test_a_store_outage_suggests_trying_again(self, tmp_db) -> None:
+        session = _make_session()
+        session._registry = self._routing_registry(
+            task_model="gone",
+            skipped_aliases={"gone": "secret://vault/llm: store unreachable"},
+            retryable_skips={"gone"},
+        )
+        error = session._prepare_task("c1", {"prompt": "do x"})["error"]
+        assert error == (
+            "Error: the task model 'gone' is not available: the secret store holding "
+            "its API key can't be reached. Try the task again shortly."
+        )
+
+    def test_a_skipped_definition_keeps_its_reason_out(self, tmp_db) -> None:
+        # The loader's reason names secret paths and mounts: admins read it in
+        # the Sync result and the log, not the model.
+        session = _make_session()
+        session._registry = self._routing_registry(
+            task_model="gone",
+            skipped_aliases={"gone": "secret://vault/llm: 'llm' not found in mount 'kv'"},
+        )
+        error = session._prepare_task("c1", {"prompt": "do x"})["error"]
+        assert "its definition couldn't be loaded. An operator has to fix it." in error
+        assert "secret://" not in error and "kv" not in error
+
+    def test_the_task_alias_setting_is_checked_too(self, tmp_db) -> None:
+        session = _make_session()
+        session._registry = self._routing_registry(task_model="spare")
+        session._config_store = MagicMock()
+        session._config_store.get.side_effect = lambda key, default=None: (
+            "gone" if key == "model.task_alias" else default
+        )
+        item = session._prepare_task("c1", {"prompt": "do x"})
+        assert "task model 'gone'" in item["error"]
+
+    def test_an_explicit_model_skips_the_configured_task_model(self, tmp_db) -> None:
+        session = _make_session()
+        session._registry = self._routing_registry(task_model="gone")
+        item = session._prepare_task("c1", {"prompt": "do x", "model": "spare"})
+        assert "error" not in item
+        assert item["model_override"] == "spare"
+
     def test_default_production_task_lane_suppresses_parent_memory_index(self, tmp_db) -> None:
         from turnstone.core.memory import save_structured_memory_strict
 

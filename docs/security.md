@@ -629,17 +629,19 @@ applies the refusal.
 
 ### When values are fetched
 
-A model definition's reference is resolved when the registry loads: at
-startup, on **Sync to Nodes**, when the console saves a definition, and, while
+A model definition's reference is resolved when the registry loads: at startup,
+on **Sync to Nodes**, when the console saves a definition, and, while
 `[secrets]` configures a store, every `cache_ttl_seconds` (at least every 60
 seconds) on each node and on the console, which then reload their models as
 Sync to Nodes does. A value rotated in the store therefore reaches every model
 within that interval, and so does a model definition saved since the last Sync;
 Sync to Nodes applies both at once, and the Models tab stops marking it pending
-once the interval has passed. A timed reload asks an endpoint for its
-context window only for a definition whose window has not been detected yet (a
-new definition, or one whose endpoint changed); Sync to Nodes asks again for
-all of them. An MCP header reference is resolved when the server connects or
+once the interval has passed. A timed reload also reads the settings when they
+changed, so the cluster's stored default model reaches a node together with the
+model definitions it names. A timed reload asks an endpoint for its context
+window only for a definition whose window has not been detected yet (a new
+definition, or one whose endpoint changed); Sync to Nodes asks again for all of
+them. An MCP header reference is resolved when the server connects or
 reconnects, so open MCP connections keep the old value until **Reconnect**.
 Inside `cache_ttl_seconds` a fetched value is reused, which keeps a reload at
 one round trip per distinct reference.

@@ -666,6 +666,22 @@ class TestServerHealthMetrics:
         mock_mgr.list_all.return_value = [mock_ws]
         mock_mgr.max_active = 10
 
+        from turnstone.core.model_registry import ModelConfig, ModelRegistry
+
+        # A loaded default model: without one the node is degraded (#1359).
+        registry = ModelRegistry(
+            {
+                "default": ModelConfig(
+                    alias="default",
+                    base_url="http://localhost:8000/v1",
+                    api_key="sk-test",
+                    model="test-model",
+                    context_window=8192,
+                    provider="openai-compatible",
+                )
+            },
+            default="default",
+        )
         app = srv_mod.create_app(
             workstreams=mock_mgr,
             global_queue=queue.Queue(),
@@ -673,6 +689,7 @@ class TestServerHealthMetrics:
             global_listeners_lock=threading.Lock(),
             skip_permissions=False,
             jwt_secret=_TEST_JWT_SECRET,
+            registry=registry,
         )
         cls.client = TestClient(app, raise_server_exceptions=False)
 

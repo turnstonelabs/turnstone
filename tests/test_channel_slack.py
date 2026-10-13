@@ -66,6 +66,7 @@ def _make_bot() -> tuple[object, MagicMock, MagicMock]:
 
     router = MagicMock()
     router.get_or_create_workstream = AsyncMock(return_value=("ws-1", True))
+    router.get_channel_default_alias = AsyncMock(return_value="")
     router.get_live_workstream_ids = AsyncMock(side_effect=lambda ws_ids: set(ws_ids))
     router.send_message = AsyncMock()
     router.send_approval = AsyncMock()
@@ -1375,3 +1376,72 @@ class TestChannelCLI:
         assert "discord" in created_adapters
         assert "slack" in created_adapters
         assert len(created_adapters) == 2
+
+
+# ---------------------------------------------------------------------------
+# #1359: Slack honors the channel model and says when it isn't available
+# ---------------------------------------------------------------------------
+
+
+class TestChannelModel:
+    def _model_not_loaded(self) -> Exception:
+        from turnstone.sdk._types import TurnstoneAPIError
+
+        return TurnstoneAPIError(503, "node text", code="model_not_loaded")
+
+    def test_slash_command_creates_on_the_channel_model(self) -> None:
+        bot, router, _ = _make_bot()
+        router.get_channel_default_alias = AsyncMock(return_value="slack-model")
+        router.get_or_create_workstream = AsyncMock(return_value=("ws-new", True))
+
+        body = {"channel_id": "C01SAPU5414", "user_id": "U777", "text": ""}
+        _run(bot._on_slash_command(AsyncMock(), body))  # type: ignore[attr-defined]
+
+        assert router.get_or_create_workstream.await_args.kwargs["model"] == "slack-model"
+
+    def test_dm_creates_on_the_channel_model(self) -> None:
+        bot, router, _ = _make_bot()
+        router.get_channel_default_alias = AsyncMock(return_value="slack-model")
+        router.get_or_create_workstream = AsyncMock(return_value=("ws-dm", True))
+
+        event = _make_slack_event(channel="D12345", channel_type="im", thread_ts="")
+        _run(bot._on_message(event, AsyncMock()))  # type: ignore[attr-defined]
+
+        assert router.get_or_create_workstream.await_args.kwargs["model"] == "slack-model"
+
+    def test_slash_command_says_the_model_is_not_available(self) -> None:
+        from turnstone.channels._routing import MODEL_UNAVAILABLE_REPLY
+
+        bot, router, client = _make_bot()
+        router.get_or_create_workstream = AsyncMock(side_effect=self._model_not_loaded())
+
+        body = {"channel_id": "C01SAPU5414", "user_id": "U777", "text": ""}
+        _run(bot._on_slash_command(AsyncMock(), body))  # type: ignore[attr-defined]
+
+        texts = [c.kwargs.get("text", "") for c in client.chat_postMessage.call_args_list]
+        assert MODEL_UNAVAILABLE_REPLY in texts
+        router.send_message.assert_not_awaited()
+
+    def test_dm_says_the_model_is_not_available(self) -> None:
+        from turnstone.channels._routing import MODEL_UNAVAILABLE_REPLY
+
+        bot, router, _ = _make_bot()
+        router.get_or_create_workstream = AsyncMock(side_effect=self._model_not_loaded())
+        say = AsyncMock()
+
+        event = _make_slack_event(channel="D12345", channel_type="im", thread_ts="")
+        _run(bot._on_message(event, say))  # type: ignore[attr-defined]
+
+        assert say.await_args.kwargs["text"] == MODEL_UNAVAILABLE_REPLY
+
+    def test_other_failures_keep_the_generic_reply(self) -> None:
+        from turnstone.sdk._types import TurnstoneAPIError
+
+        bot, router, _ = _make_bot()
+        router.get_or_create_workstream = AsyncMock(side_effect=TurnstoneAPIError(503, "x"))
+        say = AsyncMock()
+
+        event = _make_slack_event(channel="D12345", channel_type="im", thread_ts="")
+        _run(bot._on_message(event, say))  # type: ignore[attr-defined]
+
+        assert say.await_args.kwargs["text"] == "Sorry, something went wrong routing your message."

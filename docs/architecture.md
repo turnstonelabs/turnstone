@@ -1592,12 +1592,29 @@ rows are never modified).
    parameters
 6. `_model_turn_with_fallback()` tries the primary lane, then each fallback
    alias's lane in order if the primary is unreachable
-7. `_run_agent()` resolves `registry.agent_model` (if set) for task
-   sub-agents, allowing a cheaper model for autonomous loops
+7. `_run_agent()` resolves the task model (the `model.task_alias` setting,
+   else `[model].task_model`, else `[model].agent_model`) for task sub-agents,
+   allowing a cheaper model for autonomous loops
 
 **Per-workstream selection:** `POST /v1/api/workstreams/new` accepts an optional
 `"model"` field; without one the workstream runs on the default alias. A
 `skill` never selects the model or its sampling settings.
+
+**Routing never substitutes a model.** The default is the `model.default_alias`
+setting, else `[model].default`, else the model named `default`, else the first
+chat model defined (`serves_chat`: not a reranker or speech model), whether or
+not it loaded; adding or enabling the first chat model in the Models tab stores
+it as the setting when none is stored (nothing else does, so a reset stays
+reset), and nodes read it with their model definitions (at a Sync, or at the
+secret-store refresh, which reloads changed settings too), so a cluster's
+default is uniform. The registry holds only the loader's values, and the
+settings apply where they are read (`ModelRegistry.effective_default`,
+`resolve_agent_alias`, `resolve_agent_effort`), so a changed or cleared setting
+takes effect at once. When a routing alias (the default, the task model, the
+coordinator model, the channel model) isn't loaded, a create that relies on it
+fails with a 503 whose body carries `"code": "model_not_loaded"`, and no other
+model is used. The console refuses to delete, disable or rename a model one of
+those settings names, unless it is the last enabled model.
 
 ### Tool Output Truncation
 
@@ -2185,8 +2202,12 @@ degraded ──(any success)─────────────────�
   primary lane is always dialed.
 - `HealthTrackerRegistry` keys trackers by `(provider, base_url)` so aliases
   sharing a backend share one tracker. The `/health` endpoint projects the
-  same trackers: `"status": "ok"` when the backend is healthy, `"degraded"`
-  otherwise.
+  default model's tracker: `"status": "ok"` when that backend is healthy and
+  the default model is loaded, `"degraded"` otherwise (`default_model` says
+  which alias and whether it loaded). One summary (`_health_summary`) feeds
+  `/health`, the global snapshot and every `health_changed` event, which a
+  backend transition or a reload that changes the summary sends; the console
+  stores the node's verdict instead of deriving its own.
 
 ### Rate Limiting
 

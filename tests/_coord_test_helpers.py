@@ -21,7 +21,7 @@ from turnstone.console.collector import ClusterCollector
 from turnstone.console.coordinator_adapter import CoordinatorAdapter
 from turnstone.console.coordinator_ui import ConsoleCoordinatorUI
 from turnstone.core.auth import AuthResult
-from turnstone.core.model_registry import ModelConfig
+from turnstone.core.model_registry import ModelConfig, ModelRegistry
 from turnstone.core.providers import ModelCapabilities
 from turnstone.core.session_manager import SessionManager
 
@@ -87,6 +87,9 @@ def _fake_registry() -> MagicMock:
     provider.get_capabilities.return_value = ModelCapabilities()
     reg = MagicMock()
     reg.default = "default"
+    # The real resolution over the mock's ``default``, so the console's
+    # coordinator tiers resolve as they do against a ModelRegistry.
+    reg.effective_default.side_effect = lambda cs: ModelRegistry.effective_default(reg, cs)
     reg.resolve.return_value = (client, cfg.model, cfg, 0)
     reg.resolve_binding.return_value = (client, cfg.model, cfg, provider, 0)
     return reg

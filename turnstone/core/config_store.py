@@ -75,14 +75,21 @@ class ConfigStore:
         with self._lock:
             return self._version
 
-    def reload(self) -> None:
-        """Load all settings from storage into the in-memory cache."""
+    def reload(self, *, if_changed: bool = False) -> bool:
+        """Load all settings from storage into the in-memory cache.
+
+        Every reload publishes a new :attr:`version`, so snapshots taken before
+        it count as stale. *if_changed* publishes only when the stored settings
+        differ from the cache: a periodic caller (the model refresh timer) must
+        not make every in-flight snapshot stale when nothing changed. Returns
+        whether a new cache was published.
+        """
         with self._mutation_lock:
             try:
                 raw = self._storage.get_system_settings_bulk(node_id=self._node_id)
             except Exception:
                 log.warning("Failed to load settings from storage", exc_info=True)
-                return
+                return False
             new_cache: dict[str, Any] = {}
             for key, json_val in raw.items():
                 try:
@@ -103,9 +110,12 @@ class ConfigStore:
                         # otherwise repeat the warning.
                         self._clamp_warned.add(key)
                         log.warning("Clamped out-of-range setting %s to %r", key, value)
+            if if_changed and new_cache == self._cache:
+                return False
             with self._lock:
                 self._cache = new_cache
                 self._version += 1
+            return True
 
     def get(self, key: str, default: Any = _UNSET) -> Any:
         """Get a setting value from cache.

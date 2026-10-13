@@ -49,9 +49,14 @@ class TurnResult:
 
 
 class TurnstoneAPIError(Exception):
-    """Raised when a server returns a non-2xx response."""
+    """Raised when a server returns a non-2xx response.
 
-    def __init__(self, status_code: int, message: str) -> None:
+    ``code`` is the body's machine-readable ``code`` when it sent one (e.g.
+    ``model_not_loaded``), else ``""``.
+    """
+
+    def __init__(self, status_code: int, message: str, code: str = "") -> None:
         self.status_code = status_code
         self.message = message
+        self.code = code
         super().__init__(f"HTTP {status_code}: {message}")

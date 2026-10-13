@@ -423,6 +423,29 @@ class TestMessageCog:
         ts.router.send_message.assert_not_awaited()
         dm_channel.send.assert_awaited_once()
 
+    def test_mention_says_when_the_model_is_not_available(self):
+        """#1359: a mention whose create is refused with ``model_not_loaded``
+        gets the model-unavailable reply in its new thread."""
+        from turnstone.channels._routing import MODEL_UNAVAILABLE_REPLY
+        from turnstone.sdk._types import TurnstoneAPIError
+
+        cog, ts, bot = self._make_cog()
+        bot.user.mentioned_in = MagicMock(return_value=True)
+        ts.router.get_channel_default_alias = AsyncMock(return_value="")
+        ts.router.get_or_create_workstream = AsyncMock(
+            side_effect=TurnstoneAPIError(503, "node text", code="model_not_loaded")
+        )
+        ts.config.model = ""
+        ts.config.thread_auto_archive = 1440
+        thread = AsyncMock(spec=discord.Thread)
+        msg = _make_message(content="<@99999> hi", channel=MagicMock(spec=discord.TextChannel))
+        msg.create_thread = AsyncMock(return_value=thread)
+
+        _run(cog._on_message(msg))
+
+        thread.send.assert_awaited_once_with(MODEL_UNAVAILABLE_REPLY)
+        ts.router.send_message.assert_not_awaited()
+
     def test_ignores_non_allowed_channels(self):
         cog, ts, _bot = self._make_cog()
         ts._is_allowed_channel = MagicMock(return_value=False)
@@ -527,6 +550,31 @@ class TestAskModelSelection:
 
         _, kwargs = ts.router.get_or_create_workstream.call_args
         assert kwargs["model"] == ""
+
+    def test_ask_says_when_the_model_is_not_available(self):
+        """#1359: a create refused with ``model_not_loaded`` gets the
+        model-unavailable reply, and nothing is sent to a workstream."""
+        from turnstone.channels._routing import MODEL_UNAVAILABLE_REPLY
+        from turnstone.sdk._types import TurnstoneAPIError
+
+        cog, ts, interaction = self._make_cog_and_interaction()
+        ts.router.get_or_create_workstream = AsyncMock(
+            side_effect=TurnstoneAPIError(503, "node text", code="model_not_loaded")
+        )
+
+        _run(cog._cmd_ask(interaction, "hello"))
+
+        interaction.followup.send.assert_awaited_once_with(MODEL_UNAVAILABLE_REPLY)
+        ts.router.send_message.assert_not_awaited()
+
+    def test_ask_lets_other_failures_raise(self):
+        from turnstone.sdk._types import TurnstoneAPIError
+
+        cog, ts, interaction = self._make_cog_and_interaction()
+        ts.router.get_or_create_workstream = AsyncMock(side_effect=TurnstoneAPIError(503, "x"))
+
+        with pytest.raises(TurnstoneAPIError):
+            _run(cog._cmd_ask(interaction, "hello"))
 
 
 # ---------------------------------------------------------------------------
@@ -2129,6 +2177,22 @@ class TestDiscordThreadOwnerCheck:
         ts.storage.delete_channel_route.assert_not_called()
         ts.router.send_message.assert_not_awaited()
         assert "try your message again" in thread.send.call_args.args[0]
+
+    def test_unavailable_model_on_recovery_says_so(self):
+        from turnstone.channels._routing import MODEL_UNAVAILABLE_REPLY
+        from turnstone.sdk._types import TurnstoneAPIError
+
+        cog, ts = self._make_cog_and_ts()
+        thread = MagicMock(spec=discord.Thread)
+        thread.id, thread.parent_id, thread.owner_id = 555, 222, 111
+        thread.send = AsyncMock()
+        ts.router.get_or_create_workstream.side_effect = TurnstoneAPIError(
+            503, "node text", code="model_not_loaded"
+        )
+        msg = _make_message(guild=True, channel=thread)
+        msg.author.id = 111
+        _run(cog._on_message(msg))
+        thread.send.assert_awaited_once_with(MODEL_UNAVAILABLE_REPLY)
 
     def test_ask_thread_followup_allowed_when_invoker_registered(self):
         """/ask creates threads with owner_id=bot; follow-ups from the

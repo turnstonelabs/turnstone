@@ -876,14 +876,14 @@ class ClusterCollector:
                     )
 
             elif etype == "health_changed":
-                # Update the health dict's backend status in-place
-                bstatus = data.get("backend_status", "")
-                if bstatus:
-                    if not node.health:
-                        node.health = {}
-                    backend = node.health.setdefault("backend", {})
-                    backend["status"] = "up" if bstatus == "healthy" else "down"
-                    node.health["status"] = "ok" if bstatus == "healthy" else "degraded"
+                # The node's own verdict (its default model's backend, and
+                # whether that model is loaded), not the state of whichever
+                # backend changed, which may not be the default's (#1359).
+                if not node.health:
+                    node.health = {}
+                for key in ("status", "backend", "default_model"):
+                    if key in data:
+                        node.health[key] = data[key]
                 # Not forwarded to cluster SSE — next snapshot refreshes UI
 
             elif etype == "aggregate":

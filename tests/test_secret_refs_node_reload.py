@@ -5,14 +5,13 @@ from __future__ import annotations
 
 import json
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any
+from typing import Any
+
+import pytest
 
 from tests._secret_refs_helpers import install_fake_resolver
 from turnstone.core.healthcheck import HealthTrackerRegistry
 from turnstone.core.model_registry import ModelConfig, ModelRegistry, load_model_registry
-
-if TYPE_CHECKING:
-    import pytest
 
 
 def _cfg(alias: str) -> ModelConfig:
@@ -181,6 +180,15 @@ def test_a_tick_keeps_a_refused_model_running_and_applies_the_rest(
     payload = json.loads(internal_model_reload(request).body)  # type: ignore[arg-type]
     assert app_state.registry.list_aliases() == ["b"]  # Sync applies the refusal
     assert "not found" in payload["skipped"]["a"]
+    # The default stays on the refused model instead of moving to "b" (#1359).
+    assert app_state.registry.default == "a"
+    # The live registry keeps the skip record the Sync's load made, so what a
+    # session says about "a" is current (it held the boot load's record before).
+    assert "not found" in app_state.registry.skipped_aliases["a"]
+    assert app_state.registry.unavailable_reason("a") == (
+        "its definition couldn't be loaded",
+        False,
+    )
 
 
 def test_a_tick_detects_only_windows_it_has_not_detected_yet(
@@ -230,3 +238,73 @@ def test_a_tick_detects_only_windows_it_has_not_detected_yet(
     internal_model_reload(SimpleNamespace(app=SimpleNamespace(state=app_state)))  # type: ignore[arg-type]
     probed = sorted(probes)
     assert probed == ["fresh", "known"]  # an operator's Sync re-probes them all
+
+
+def test_a_store_outage_marks_the_skip_as_one_that_may_clear(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any, sqlite_backend_factory: Any
+) -> None:
+    """A store that doesn't answer leaves the alias out as retryable, so what a
+    session or a create refusal says suggests trying again; a definite answer
+    (not found) does not."""
+    import turnstone.core.config as cfg_mod
+    from turnstone.core import model_registry as mr
+    from turnstone.core.model_registry import UnknownModelAliasError
+    from turnstone.core.secret_refs._errors import SecretBackendError
+
+    monkeypatch.setattr(cfg_mod, "load_config", lambda section=None: {})
+    monkeypatch.setattr(mr, "load_config", lambda section=None: {})
+    backend = install_fake_resolver(monkeypatch, {})
+    backend.fail = SecretBackendError("store unreachable", retryable=True)
+    storage = sqlite_backend_factory(str(tmp_path / "outage.db"))
+    for alias, key in (("a", "secret://fake/openai"), ("b", "sk-literal")):
+        storage.create_model_definition(
+            definition_id=f"def-{alias}",
+            alias=alias,
+            model="gpt-5",
+            provider="openai-compatible",
+            base_url="https://llm.example.com/v1",
+            api_key=key,
+            context_window=8192,
+        )
+
+    reg = load_model_registry(storage=storage, strict=True)
+
+    assert reg.list_aliases() == ["b"]
+    assert reg.retryable_skips == frozenset({"a"})
+    assert reg.unavailable_reason("a") == (
+        "the secret store holding its API key can't be reached",
+        True,
+    )
+    with pytest.raises(UnknownModelAliasError) as exc_info:
+        reg.resolve("a")
+    assert exc_info.value.retryable is True
+
+
+def test_a_tick_reads_changed_settings_and_leaves_quiet_ones_alone(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any, sqlite_backend_factory: Any
+) -> None:
+    """On a secret-store cluster nobody may press Sync, so the timer tick reads
+    the settings too: the cluster's stored default reaches the node with the
+    models it names (#1359). A tick with nothing changed publishes nothing."""
+    import turnstone.core.config as cfg_mod
+    from turnstone.core import model_registry as mr
+    from turnstone.core.config_store import ConfigStore
+    from turnstone.server import _refresh_models_from_store
+
+    monkeypatch.setattr(cfg_mod, "load_config", lambda section=None: {})
+    monkeypatch.setattr(mr, "load_config", lambda section=None: {})
+    install_fake_resolver(monkeypatch, {"/openai": "sk-v1", "/other": "sk-o1"})
+    storage = sqlite_backend_factory(str(tmp_path / "tick.db"))
+    _two_definitions(storage)
+    monkeypatch.setattr("turnstone.core.storage._registry.get_storage", lambda: storage)
+    monkeypatch.setattr("turnstone.server._broadcast_agent_tool_schema_refresh", lambda _s: None)
+    app_state = _app_state(load_model_registry(storage=storage, strict=True))
+    app_state.config_store = ConfigStore(storage=storage, node_id="")
+
+    storage.upsert_system_setting(key="model.default_alias", value=json.dumps("b"))
+    _refresh_models_from_store(app_state)
+    assert app_state.registry.effective_default(app_state.config_store) == "b"
+
+    version = app_state.config_store.version
+    _refresh_models_from_store(app_state)
+    assert app_state.config_store.version == version

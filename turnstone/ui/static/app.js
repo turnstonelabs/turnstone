@@ -742,7 +742,16 @@ function _populateModelSelect(modelSel, judgeSel, opts) {
   const defaults = M.modelDefaults();
   const prevModel = fresh ? "" : modelSel.value;
   const prevJudge = fresh || !judgeSel ? "" : judgeSel.value;
-  const modelDefault = M.modelLabel(defaults.default_alias || "");
+  // This node lists every model it loaded, so a default it doesn't list isn't
+  // loaded here: a create that relies on it fails rather than using another.
+  const defaultAlias = defaults.default_alias || "";
+  const defaultListed = choices.some(function (c) {
+    return c.value === defaultAlias;
+  });
+  const modelDefault =
+    defaultAlias && !defaultListed
+      ? defaultAlias + " (not available)"
+      : M.modelLabel(defaultAlias);
   const judgeDefault = M.modelLabel(defaults.judge_default_alias || "");
   modelSel.replaceChildren();
   _appendOption(

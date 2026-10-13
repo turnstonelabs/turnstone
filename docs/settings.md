@@ -256,7 +256,7 @@ so operators can pick a cheaper/faster model for autonomous loops:
 
 | Setting | Purpose |
 |---------|---------|
-| `model.task_alias` | Alias used for `task_agent` sub-sessions. Falls back to `[model].agent_model` in config.toml, then the session's active model. |
+| `model.task_alias` | Alias used for `task_agent` sub-sessions. Falls back to `[model].task_model` in config.toml, then `[model].agent_model`, then the session's active model. When the alias isn't loaded, `task_agent` refuses the call before asking for approval instead of using another model. |
 | `model.task_effort` | Reasoning effort for `task_agent`. Empty string means "inherit from the session". |
 
 Both are live-editable from the Settings tab and take effect on the

@@ -5,9 +5,14 @@ model list:
 
 * ``default_alias`` ← ``model.default_alias``
 * ``channel_default_alias`` ← ``channels.default_model_alias``
-* ``coordinator_default_alias`` ← ``coordinator.model_alias``, falling
-  back to ``default_alias`` when empty *or* pointing at a disabled /
-  removed alias (mirrors :mod:`turnstone.console.session_factory`).
+* ``coordinator_default_alias`` ← ``coordinator.model_alias``, else
+  ``model.default_alias``, else ``registry.default`` (the chain
+  :mod:`turnstone.console.session_factory` walks).
+
+The default, channel and coordinator aliases are reported as configured
+even when no enabled row matches: a create that relies on one fails with
+``model_not_loaded`` rather than moving to another model (#1359), and the
+pickers name it rather than hide it.
 * ``judge_default_alias`` ← ``judge.model``, falling back to the
   resolved coordinator alias when empty *or* pointing at a value that
   isn't an enabled alias.  ``judge.model`` is alias-only — same
@@ -33,6 +38,7 @@ from starlette.testclient import TestClient
 
 from tests._coord_test_helpers import _AuthMiddleware, _FakeConfigStore
 from turnstone.console.server import list_available_models
+from turnstone.core.model_registry import ModelRegistry
 
 if TYPE_CHECKING:
     from turnstone.core.storage._sqlite import SQLiteBackend
@@ -83,6 +89,9 @@ class _StubRegistry:
 
     def has_alias(self, alias: str) -> bool:
         return alias in self._known
+
+    def effective_default(self, config_store: Any) -> str:
+        return ModelRegistry.effective_default(self, config_store)  # type: ignore[arg-type]
 
 
 def _make_client(
@@ -159,12 +168,11 @@ def test_coordinator_explicit_enabled_alias_passes_through(
     assert body["coordinator_default_alias"] == "fast"
 
 
-def test_coordinator_set_to_disabled_alias_falls_back_to_default(
+def test_coordinator_set_to_disabled_alias_is_reported(
     storage: SQLiteBackend,
 ) -> None:
-    """Operator disabled the alias the coordinator was pinned to —
-    fall back to the registry default rather than advertising a model
-    that workstream creation would refuse to use."""
+    """Operator disabled the alias the coordinator was pinned to: a create
+    fails on it, so the placeholder names it rather than the default."""
     _seed_model(storage, definition_id="m1", alias="primary")
     _seed_model(storage, definition_id="m2", alias="legacy", enabled=False)
     body = _get_models(
@@ -176,10 +184,10 @@ def test_coordinator_set_to_disabled_alias_falls_back_to_default(
             },
         )
     )
-    assert body["coordinator_default_alias"] == "primary"
+    assert body["coordinator_default_alias"] == "legacy"
 
 
-def test_coordinator_set_to_unknown_alias_falls_back_to_default(
+def test_coordinator_set_to_unknown_alias_is_reported(
     storage: SQLiteBackend,
 ) -> None:
     _seed_model(storage, definition_id="m1", alias="primary")
@@ -192,7 +200,7 @@ def test_coordinator_set_to_unknown_alias_falls_back_to_default(
             },
         )
     )
-    assert body["coordinator_default_alias"] == "primary"
+    assert body["coordinator_default_alias"] == "ghost"
 
 
 def test_coordinator_falls_back_to_registry_default_when_config_store_empty(
@@ -212,15 +220,15 @@ def test_coordinator_falls_back_to_registry_default_when_config_store_empty(
     assert body["judge_default_alias"] == "primary"
 
 
-def test_coordinator_skips_registry_default_when_alias_disabled(
+def test_coordinator_reports_a_disabled_registry_default(
     storage: SQLiteBackend,
 ) -> None:
-    """Registry default points at an alias that's been disabled in the DB
-    — the placeholder stays blank rather than advertising a model that
-    workstream creation would refuse to use."""
+    """Registry default points at an alias that's been disabled in the DB:
+    a create fails on it, so the placeholder names it (labelled not
+    available) rather than going blank."""
     _seed_model(storage, definition_id="m1", alias="legacy", enabled=False)
     body = _get_models(_make_client(storage, registry_default="legacy"))
-    assert body["coordinator_default_alias"] == ""
+    assert body["coordinator_default_alias"] == "legacy"
 
 
 def test_coordinator_falls_back_to_registry_default_when_config_store_missing(
@@ -324,9 +332,11 @@ def test_judge_set_to_disabled_alias_inherits_coordinator(
 # ---------------------------------------------------------------------------
 
 
-def test_channel_default_alias_blanked_when_disabled(
+def test_channel_default_alias_reported_when_disabled(
     storage: SQLiteBackend,
 ) -> None:
+    """Slack and Discord create on the channel model; a disabled one fails
+    the conversation rather than moving it to the default (#1359)."""
     _seed_model(storage, definition_id="m1", alias="primary", enabled=False)
     body = _get_models(
         _make_client(
@@ -334,7 +344,7 @@ def test_channel_default_alias_blanked_when_disabled(
             settings={"channels.default_model_alias": "primary"},
         )
     )
-    assert body["channel_default_alias"] == ""
+    assert body["channel_default_alias"] == "primary"
 
 
 def test_models_payload_strips_secret_fields(storage: SQLiteBackend) -> None:

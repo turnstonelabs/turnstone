@@ -1126,7 +1126,6 @@ def resolve_doctor_brain(
         from turnstone.core.model_registry import load_model_registry
 
         cs = ConfigStore(storage=storage, node_id="")
-        alias = str(cs.get("model.default_alias", "") or "")
         # The same sources a node uses — DB definitions overlaid with
         # config.toml [models.*] — and nothing else: a node has no bootstrap
         # endpoint, so doctor must not invent one from [api] or the env. When
@@ -1143,13 +1142,18 @@ def resolve_doctor_brain(
             storage=storage, allow_empty=True, detect_context_windows=True
         )
         skipped = registry.skipped_aliases
-        client, model_name, cfg, _ = registry.resolve(alias or None)
+        # The default a node uses: the setting, else the loader's pick, which
+        # names the configured model even when it isn't loaded (#1359).
+        client, model_name, cfg, _ = registry.resolve(registry.effective_default(cs))
     except Exception as exc:  # noqa: BLE001 - any failure means "no usable model"
         from turnstone.core.model_registry import UnknownModelAliasError, describe_skipped
 
-        # An empty registry has no default, so resolving it names an empty alias.
-        empty = isinstance(exc, UnknownModelAliasError) and not exc.alias
-        detail = f"no usable model configured: {'no model loaded' if empty else exc}"
+        if isinstance(exc, UnknownModelAliasError):
+            # An empty alias: no chat model is defined, so there is no default.
+            missing = f"the default model '{exc.alias}' isn't loaded" if exc.alias else ""
+            detail = f"no usable model configured: {missing or 'no default chat model'}"
+        else:
+            detail = f"no usable model configured: {exc}"
         if skipped:
             # Named here rather than left to the loader's no-model error: the
             # configured default can be skipped while other aliases load, and

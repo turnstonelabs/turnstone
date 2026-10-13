@@ -235,3 +235,73 @@ def test_console_create_app_only_mounts_unified_workstream_paths() -> None:
     # And one from the coord-only registrar.
     assert any(p.endswith("/api/workstreams/{ws_id}/trust") for p in paths)
     assert any(p.endswith("/api/workstreams/{ws_id}/close_all_children") for p in paths)
+
+
+# ---------------------------------------------------------------------------
+# model_not_loaded_response (#1359)
+# ---------------------------------------------------------------------------
+
+
+def _not_loaded(alias: str, **kwargs: Any) -> dict[str, Any]:
+    import json
+
+    from turnstone.core.model_registry import UnknownModelAliasError
+    from turnstone.core.session_routes import model_not_loaded_response
+
+    resp = model_not_loaded_response(UnknownModelAliasError(alias), **kwargs)
+    assert resp.status_code == 503
+    body: dict[str, Any] = json.loads(bytes(resp.body))
+    assert body["code"] == "model_not_loaded"
+    return body
+
+
+def test_not_loaded_names_the_default() -> None:
+    body = _not_loaded("local-qwen", requested=False)
+    assert body["alias"] == "local-qwen"
+    assert body["error"] == (
+        "The default model 'local-qwen' isn't loaded on this node. "
+        "Ask an admin to check its definition."
+    )
+
+
+def test_not_loaded_never_points_at_another_model() -> None:
+    # A coordinator reads this through its spawn tool.
+    for kwargs in ({"requested": False}, {"requested": True}, {"requested": False, "reopen": True}):
+        assert "another model" not in _not_loaded("x", **kwargs)["error"]
+    assert "Choose" not in _not_loaded("", requested=False)["error"]
+
+
+def test_not_loaded_suggests_retrying_a_store_outage() -> None:
+    import json
+
+    from turnstone.core.model_registry import UnknownModelAliasError
+    from turnstone.core.session_routes import model_not_loaded_response
+
+    resp = model_not_loaded_response(
+        UnknownModelAliasError("local-qwen", retryable=True), requested=False
+    )
+    assert json.loads(bytes(resp.body))["error"] == (
+        "The default model 'local-qwen' isn't loaded on this node. "
+        "Its secret store can't be reached; try again shortly."
+    )
+
+
+def test_not_loaded_names_a_requested_model() -> None:
+    assert _not_loaded("picked", requested=True)["error"].startswith(
+        "The model 'picked' isn't loaded"
+    )
+
+
+def test_not_loaded_echoes_only_an_alias_shaped_name() -> None:
+    body = _not_loaded("<script>x</script>", requested=True)
+    assert body["alias"] == ""
+    assert "<script>" not in body["error"]
+    assert body["error"].startswith("The model isn't loaded")
+
+
+def test_not_loaded_stays_under_the_echo_cap() -> None:
+    assert len(_not_loaded("a" * 64, requested=False)["error"]) <= 200
+
+
+def test_not_loaded_with_nothing_configured() -> None:
+    assert _not_loaded("", requested=False)["error"].startswith("No default model is set")

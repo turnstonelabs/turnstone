@@ -756,6 +756,17 @@ class BackendStatus(BaseModel):
     status: str = Field(examples=["up", "down"])
 
 
+class DefaultModelStatus(BaseModel):
+    alias: str = Field(
+        default="", description="The model alias a workstream that names none runs on"
+    )
+    loaded: bool = Field(
+        default=False,
+        description="Whether this node loaded it; when false, creates that rely on it fail "
+        "and status is degraded",
+    )
+
+
 class WorkstreamCounts(BaseModel):
     total: int = 0
     idle: int = 0
@@ -781,6 +792,7 @@ class HealthResponse(BaseModel):
     max_ws: int = Field(default=10, description="Maximum concurrent workstreams")
     workstreams: WorkstreamCounts = WorkstreamCounts()
     backend: BackendStatus | None = None
+    default_model: DefaultModelStatus | None = None
     mcp: McpStatus | None = None
 
 

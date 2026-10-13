@@ -903,14 +903,40 @@ class TestCollectorDelta:
         c._nodes["node-a"] = NodeSnapshot(
             node_id="node-a",
             server_url="http://a:8080",
+            health={"status": "ok", "backend": {"status": "up"}, "version": "1.9"},
+        )
+
+        # The node's verdict wins over the state of whichever backend changed:
+        # here a healthy backend, while the default model isn't loaded (#1359).
+        c._apply_delta(
+            "node-a",
+            {
+                "type": "health_changed",
+                "backend_status": "healthy",
+                "status": "degraded",
+                "backend": {"status": "up"},
+                "default_model": {"alias": "gone", "loaded": False},
+            },
+        )
+
+        health = c._nodes["node-a"].health
+        assert health["status"] == "degraded"
+        assert health["backend"] == {"status": "up"}
+        assert health["default_model"] == {"alias": "gone", "loaded": False}
+        assert health["version"] == "1.9"
+
+    def test_apply_delta_health_changed_ignores_a_bare_backend_status(self):
+        # A non-default backend's transition doesn't decide the node's health.
+        c = _make_collector()
+        c._nodes["node-a"] = NodeSnapshot(
+            node_id="node-a",
+            server_url="http://a:8080",
             health={"status": "ok", "backend": {"status": "up"}},
         )
 
         c._apply_delta("node-a", {"type": "health_changed", "backend_status": "degraded"})
 
-        health = c._nodes["node-a"].health
-        assert health["backend"]["status"] == "down"
-        assert health["status"] == "degraded"
+        assert c._nodes["node-a"].health == {"status": "ok", "backend": {"status": "up"}}
 
     def test_apply_delta_aggregate(self):
         c = _make_collector()
@@ -1509,6 +1535,62 @@ class TestConsoleWorkstreamCreation:
         assert "http://a:8080/v1/api/workstreams/new" in call_args[0]
         body = call_args[1]["json"]
         assert body["name"] == "test-ws"
+
+    @staticmethod
+    def _node_answers(mock_post, status, body):
+        import httpx
+
+        async def _post(*args, **kwargs):
+            return httpx.Response(
+                status,
+                json=body,
+                request=httpx.Request("POST", args[0] if args else "http://test"),
+            )
+
+        mock_post.side_effect = _post
+
+    def test_create_model_not_loaded_gets_console_wording(self, client_and_mock):
+        """#1359: the node's coded refusal crosses the dispatch boundary as the
+        console's own wording; the node's text does not."""
+        client, mock_post = client_and_mock
+        self._node_answers(
+            mock_post,
+            503,
+            {"error": "node text /etc/secret", "code": "model_not_loaded", "alias": "local-qwen"},
+        )
+        resp = client.post("/v1/api/cluster/workstreams/new", json={"node_id": "node-a"})
+        assert resp.status_code == 503
+        body = resp.json()
+        assert body == {
+            "error": (
+                "The default model 'local-qwen' isn't loaded on node node-a. "
+                "Choose another model, or check it in the Models tab."
+            ),
+            "code": "model_not_loaded",
+        }
+
+    def test_create_model_not_loaded_names_a_requested_model(self, client_and_mock):
+        client, mock_post = client_and_mock
+        self._node_answers(mock_post, 503, {"code": "model_not_loaded", "alias": "picked"})
+        resp = client.post(
+            "/v1/api/cluster/workstreams/new", json={"node_id": "node-a", "model": "picked"}
+        )
+        assert resp.status_code == 503
+        assert resp.json()["error"].startswith("The model 'picked' isn't loaded on node node-a")
+
+    def test_create_model_not_loaded_drops_an_alias_out_of_shape(self, client_and_mock):
+        client, mock_post = client_and_mock
+        self._node_answers(mock_post, 503, {"code": "model_not_loaded", "alias": "<b>x y</b>"})
+        resp = client.post("/v1/api/cluster/workstreams/new", json={"node_id": "node-a"})
+        assert resp.status_code == 503
+        assert resp.json()["error"].startswith("The default model isn't loaded on node node-a")
+
+    def test_other_node_503s_stay_masked(self, client_and_mock):
+        client, mock_post = client_and_mock
+        self._node_answers(mock_post, 503, {"error": "factory text"})
+        resp = client.post("/v1/api/cluster/workstreams/new", json={"node_id": "node-a"})
+        assert resp.status_code == 502
+        assert resp.json() == {"error": "Dispatch to node node-a failed"}
 
     def test_create_with_model(self, client_and_mock, mock_collector):
         client, mock_post = client_and_mock

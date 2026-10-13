@@ -42,6 +42,7 @@ from starlette.responses import JSONResponse
 from starlette.routing import Route
 
 from turnstone.core.log import get_logger
+from turnstone.core.model_registry import UnknownModelAliasError
 from turnstone.core.node_affinity import NodeAffinityError
 from turnstone.core.session_manager import (
     CloseOutcome,
@@ -115,6 +116,52 @@ def _safe_factory_misconfig_message(exc: BaseException) -> str:
         # MAX_LEN+1.
         cleaned = cleaned[: _FACTORY_MISCONFIG_MAX_LEN - 1] + "…"
     return cleaned
+
+
+#: The ``code`` a create or open refusal carries when its model isn't loaded.
+MODEL_NOT_LOADED_CODE = "model_not_loaded"
+
+# An alias is echoed back only in the shape a stored definition's alias takes,
+# so text a client sent as ``model`` never reaches a body unchecked.
+_ECHOABLE_ALIAS_RE = re.compile(r"[A-Za-z0-9._-]{1,64}\Z")
+
+
+def model_not_loaded_response(
+    exc: UnknownModelAliasError, *, requested: bool, reopen: bool = False
+) -> JSONResponse:
+    """The 503 for a create or open whose model isn't loaded on this node.
+
+    Nothing substitutes another model (#1359), so the body says which one is
+    missing and what to do. ``code`` lets a console or channel adapter word it
+    its own way; ``alias`` is echoed only in a definition alias's shape.
+    *requested* is whether the request named the model itself (otherwise it is
+    the default); *reopen* marks an open whose saved model and default both
+    missed. The loader's reason stays out of the text: it can name secret
+    reference paths, and admins see it in the Sync result, doctor and the node
+    log.
+    """
+    alias = exc.alias if _ECHOABLE_ALIAS_RE.match(exc.alias or "") else ""
+    quoted = f" '{alias}'" if alias else ""
+    # A coordinator reads this through its spawn tool, so it says why and
+    # whether trying again may help, and never points at another model.
+    if exc.retryable:
+        remedy = "Its secret store can't be reached; try again shortly."
+    else:
+        remedy = "Ask an admin to check its definition."
+    if not exc.alias:
+        error = "No default model is set on this node. Ask an admin to set one."
+    elif reopen:
+        error = (
+            f"Neither this workstream's model nor the default model{quoted} is loaded "
+            "on this node. Try again once one of them loads, or ask an admin to check them."
+        )
+    else:
+        noun = "The model" if requested else "The default model"
+        error = f"{noun}{quoted} isn't loaded on this node. {remedy}"
+    return JSONResponse(
+        {"error": error, "code": MODEL_NOT_LOADED_CODE, "alias": alias},
+        status_code=503,
+    )
 
 
 Handler = Callable[["Request"], Awaitable["Response"]]
@@ -2085,6 +2132,11 @@ async def _open_or_refusal(
     except WorkstreamHistoryUnavailableError as exc:
         # A storage blip reading the history or settings: transient, never served empty.
         return JSONResponse({"error": str(exc)}, status_code=503)
+    except UnknownModelAliasError as exc:
+        # The saved model isn't loaded and neither is the default the reopen
+        # falls back to: nothing else is substituted (#1359).
+        log.warning(misconfig_log, ws_id[:8], exc)
+        return model_not_loaded_response(exc, requested=False, reopen=True)
     except ValueError as exc:
         # Session factory misconfig (e.g., a model alias that no longer
         # exists). Surface the factory's remediation text as a 503 so the
@@ -3515,6 +3567,12 @@ def make_create_handler(
             # "manager at capacity" — translate to 429 (rate-limit /
             # try-later) on both kinds.
             return JSONResponse({"error": str(exc)}, status_code=429)
+        except UnknownModelAliasError as exc:
+            # The model the request names, or the default when it names none,
+            # isn't loaded here; nothing else is substituted (#1359).
+            log.warning("ws.create.model_not_loaded alias=%r", exc.alias)
+            requested = isinstance(body.get("model"), str) and bool(body["model"].strip())
+            return model_not_loaded_response(exc, requested=requested)
         except ValueError as exc:
             # Session factory raises ValueError on misconfigured alias
             # (model alias points at a model that no longer exists,

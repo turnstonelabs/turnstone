@@ -4248,3 +4248,26 @@ def test_admin_js_auth_mode_fallbacks_match_registry() -> None:
     index_body = _CONSOLE_INDEX.read_text(encoding="utf-8")
     for mode in sorted(MODEL_AUTH_MODES):
         assert f'value="{mode}"' in index_body, f"index.html option missing {mode}"
+
+
+def test_default_labels_name_a_model_the_list_lacks() -> None:
+    """#1359: a configured default a model list doesn't hold is named, never
+    hidden behind a bare "Default model". Only the node's list is complete (every
+    model it loaded), so only the node's picker calls it not available; a console
+    list holds stored definitions alone and can't vouch for config.toml models."""
+    models_src = _MODELS_JS.read_text(encoding="utf-8")
+    label_fn = models_src.split("export function modelLabel(", 1)[1].split("\n}\n", 1)[0]
+    assert "return row ? _fmtLabel(row) : alias;" in label_fn
+    assert "not available" not in label_fn
+    node_src = _APP_JS.read_text(encoding="utf-8")
+    picker_fn = node_src.split("function _populateModelSelect(", 1)[1].split("\n}\n", 1)[0]
+    assert 'defaultAlias + " (not available)"' in picker_fn
+    admin_src = _CONSOLE_ADMIN_JS.read_text(encoding="utf-8")
+    schedule_fn = admin_src.split("function _decorateScheduleModelPlaceholder(", 1)[1].split(
+        "\n}\n", 1
+    )[0]
+    assert "label = alias;" in schedule_fn
+    assert "not available" not in schedule_fn
+    models_fn = admin_src.split("function _renderModels(", 1)[1].split("\n}\n", 1)[0]
+    assert "' is disabled. Enable it, or set another default." in models_fn
+    assert "' is not stored here or reported by any node. " in models_fn

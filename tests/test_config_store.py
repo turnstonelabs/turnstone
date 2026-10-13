@@ -486,3 +486,14 @@ class TestVersion:
         v0 = store.version
         store.reload()
         assert store.version == v0 + 1
+
+    def test_reload_if_changed_publishes_only_a_change(self, store):
+        # The model refresh timer reloads every tick; a quiet tick must not make
+        # every in-flight settings snapshot stale.
+        v0 = store.version
+        assert store.reload(if_changed=True) is False
+        assert store.version == v0
+        store._storage.upsert_system_setting(key="tools.timeout", value="45")
+        assert store.reload(if_changed=True) is True
+        assert store.version == v0 + 1
+        assert store.get("tools.timeout") == 45

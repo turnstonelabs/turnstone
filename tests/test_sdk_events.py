@@ -16,6 +16,7 @@ from turnstone.sdk.events import (
     ConnectedEvent,
     ContentEvent,
     ErrorEvent,
+    HealthChangedEvent,
     HistoryEvent,
     HistoryResyncEvent,
     InfoEvent,
@@ -361,6 +362,22 @@ def test_node_lost_event():
     e = ClusterEvent.from_dict({"type": "node_lost", "node_id": "host2_def"})
     assert isinstance(e, NodeLostEvent)
     assert e.node_id == "host2_def"
+
+
+def test_health_changed_event_carries_the_node_verdict():
+    e = ClusterEvent.from_dict(
+        {
+            "type": "health_changed",
+            "status": "degraded",
+            "backend": {"status": "up"},
+            "default_model": {"alias": "gone", "loaded": False},
+        }
+    )
+    assert isinstance(e, HealthChangedEvent)
+    assert e.backend_status == ""  # a reload, not a backend transition
+    assert e.status == "degraded"
+    assert e.backend == {"status": "up"}
+    assert e.default_model == {"alias": "gone", "loaded": False}
 
 
 def test_cluster_state_event():

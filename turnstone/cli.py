@@ -688,6 +688,32 @@ def _print_ws_status_line(manager: SessionManager) -> None:
         sys.stderr.flush()
 
 
+def _default_model_not_loaded(alias: str, registry: Any = None) -> str:
+    """CLI wording for a default model that isn't loaded (#1359).
+
+    Nothing substitutes another model. The CLI reads only its own config.toml,
+    so the reason the loader recorded is the operator's and is shown.
+    """
+    if not alias:
+        return (
+            "no default chat model is configured: set [model] default in config.toml, "
+            "or add a chat model under [models.*]."
+        )
+    reason = ""
+    others = ""
+    if registry is not None:
+        why = registry.skipped_aliases.get(alias)
+        if why:
+            reason = f" ({why})"
+        loaded = registry.list_aliases()
+        if loaded:
+            others = f", or set [model] default to one of: {', '.join(loaded)}"
+    return (
+        f"the default model '{alias}' isn't loaded{reason}. "
+        f"Check [models.{alias}] in config.toml{others}."
+    )
+
+
 def _handle_ws_command(
     manager: SessionManager,
     cmd_line: str,
@@ -710,11 +736,16 @@ def _handle_ws_command(
         return False
 
     elif sub == "new":
+        from turnstone.core.model_registry import UnknownModelAliasError
+
         name = parts[2] if len(parts) > 2 else ""
         try:
             ws = manager.create(user_id="", name=name)
         except RuntimeError as e:
             print(red(str(e)))
+            return False
+        except UnknownModelAliasError as e:
+            print(red(f"Can't create a workstream: {_default_model_not_loaded(e.alias)}"))
             return False
         if skip_permissions and isinstance(ws.ui, TerminalUI):
             ws.ui.auto_approve = True
@@ -1925,7 +1956,13 @@ def main() -> None:
             print(yellow("--persona is ignored with --resume (the stamped persona applies)"))
         ws = _open_for_cli_resume(manager, resume_target, args.resume)
     else:
-        ws = manager.create(user_id="", **resolve_cli_persona_kwargs(cli_storage, args.persona))
+        from turnstone.core.model_registry import UnknownModelAliasError
+
+        try:
+            ws = manager.create(user_id="", **resolve_cli_persona_kwargs(cli_storage, args.persona))
+        except UnknownModelAliasError as exc:
+            print(f"turnstone: {_default_model_not_loaded(exc.alias, registry)}", file=sys.stderr)
+            sys.exit(1)
     if args.skip_permissions and isinstance(ws.ui, TerminalUI):
         ws.ui.auto_approve = True
     if resume_target:

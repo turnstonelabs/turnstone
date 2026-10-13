@@ -39,6 +39,7 @@ from turnstone.channels._formatter import chunk_message
 from turnstone.channels._routing import (
     ChannelRouter,
     get_cycle_entry,
+    model_unavailable_reply,
     pop_cycle_entry,
     pop_ws_entries,
 )
@@ -485,12 +486,24 @@ class TurnstoneSlackBot:
             thread_ts=opener_ts,
         )
 
-        ws_id, _ = await self.router.get_or_create_workstream(
-            channel_type="slack",
-            channel_id=route.to_channel_id(),
-            name=f"slack-{slack_channel[:8]}",
-            client_type="chat",
-        )
+        try:
+            ws_id, _ = await self.router.get_or_create_workstream(
+                channel_type="slack",
+                channel_id=route.to_channel_id(),
+                name=f"slack-{slack_channel[:8]}",
+                # The channel adapter model (the Roles tab's), else the server
+                # default; a model that isn't loaded fails the create.
+                model=await self.router.get_channel_default_alias(),
+                client_type="chat",
+            )
+        except Exception as exc:
+            reply = model_unavailable_reply(exc)
+            if reply is None:
+                raise
+            await self._client.chat_postMessage(
+                channel=slack_channel, thread_ts=opener_ts, text=reply
+            )
+            return
         await self.subscribe_ws(ws_id, route.to_channel_id())
         self._channel_sessions[(slack_channel, user_id)] = (ws_id, opener_ts)
 
@@ -841,10 +854,11 @@ class TurnstoneSlackBot:
             await self.subscribe_ws(ws_id, route.to_channel_id())
             await self.router.send_message(ws_id, text)
             log.info("slack.message_dispatched", ws_id=ws_id, channel=channel_id)
-        except Exception:
+        except Exception as exc:
             log.exception("slack.message_dispatch_failed", channel=channel_id)
             await say(
-                text="Sorry, something went wrong routing your message.",
+                text=model_unavailable_reply(exc)
+                or "Sorry, something went wrong routing your message.",
                 thread_ts=thread_ts,
             )
 
@@ -878,15 +892,19 @@ class TurnstoneSlackBot:
                 channel_type="slack",
                 channel_id=route.to_channel_id(),
                 name=f"slack-dm-{user_id[:8]}",
+                model=await self.router.get_channel_default_alias(),
                 client_type="chat",
             )
             await self.subscribe_ws(ws_id, route.to_channel_id())
 
             await self.router.send_message(ws_id, text)
             log.info("slack.dm_dispatched", ws_id=ws_id, user=user_id)
-        except Exception:
+        except Exception as exc:
             log.exception("slack.dm_dispatch_failed", user=user_id)
-            await say(text="Sorry, something went wrong routing your message.")
+            await say(
+                text=model_unavailable_reply(exc)
+                or "Sorry, something went wrong routing your message."
+            )
 
     async def _resolve_approval(
         self,

@@ -4570,3 +4570,312 @@ def test_create_and_update_refuse_a_null_key_or_url(storage: SQLiteBackend, fiel
     assert created.json()["error"] == updated.json()["error"] == field + " must be a string"
     assert storage.get_model_definition_by_alias("new") is None
     assert storage.get_model_definition("m1") == before
+
+
+# ---------------------------------------------------------------------------
+# #1359: the default is stored, and a routing setting's model can't vanish
+# ---------------------------------------------------------------------------
+
+
+def _routing_client(storage: SQLiteBackend, registry: ModelRegistry | None = None) -> TestClient:
+    """The CRUD client over a real ConfigStore, so the first-model write and the
+    guard read and write the settings rows themselves."""
+    from turnstone.core.config_store import ConfigStore
+
+    client = _make_client(storage, registry)
+    app: Any = client.app
+    app.state.config_store = ConfigStore(storage=storage, node_id="")
+    return client
+
+
+def _setting(storage: SQLiteBackend, key: str, node_id: str = "") -> Any:
+    from turnstone.core.settings_registry import deserialize_value
+
+    row = storage.get_system_setting(key, node_id=node_id)
+    return None if row is None else deserialize_value(key, row["value"])
+
+
+def _put_setting(storage: SQLiteBackend, key: str, value: str, node_id: str = "") -> None:
+    storage.upsert_system_setting(key=key, value=json.dumps(value), node_id=node_id)
+
+
+def _create(client: TestClient, alias: str) -> Any:
+    return client.post(
+        "/v1/api/admin/model-definitions",
+        json={"alias": alias, "model": "gpt-4o", "provider": "openai"},
+    )
+
+
+def _sync(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> Any:
+    """Press Sync to Nodes with the cluster fan-out stubbed."""
+
+    async def _noop_publish(_request: Any) -> None:
+        return None
+
+    async def _noop_notify(_request: Any) -> dict[str, Any]:
+        return {}
+
+    monkeypatch.setattr("turnstone.console.server._publish_config_change", _noop_publish)
+    monkeypatch.setattr("turnstone.console.server._notify_nodes_model_reload", _noop_notify)
+    resp = client.post("/v1/api/admin/model-definitions/reload")
+    assert resp.status_code == 200, resp.text
+    return resp.json()
+
+
+def test_the_first_chat_model_added_is_stored_as_the_default(
+    storage: SQLiteBackend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Stored when the first chat model is added, and pushed to no node: nodes
+    read it with the model definitions, at a Sync or their timer tick."""
+    published: list[str] = []
+
+    async def _record_publish(_request: Any) -> None:
+        published.append("config")
+
+    monkeypatch.setattr("turnstone.console.server._publish_config_change", _record_publish)
+    client = _routing_client(storage, _make_registry(alias="first"))
+
+    created = _create(client, "first")
+    assert created.status_code == 200
+    assert created.json()["default_pinned"] == "first"
+    assert _setting(storage, "model.default_alias") == "first"
+    assert published == []
+    # The console's own cache sees it, for its coordinators.
+    assert client.app.state.config_store.get("model.default_alias") == "first"  # type: ignore[attr-defined]
+
+    # A later model whose alias sorts first does not take the default over.
+    later = _create(client, "aaa")
+    assert "default_pinned" not in later.json()
+    assert _setting(storage, "model.default_alias") == "first"
+
+
+def test_enabling_the_first_chat_model_stores_it(storage: SQLiteBackend) -> None:
+    _seed_model_def(storage, definition_id="m1", alias="chat", model="m", enabled=False)
+    client = _routing_client(storage, _make_registry(alias="chat"))
+    resp = client.put("/v1/api/admin/model-definitions/m1", json={"enabled": True})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["default_pinned"] == "chat"
+    assert _setting(storage, "model.default_alias") == "chat"
+
+
+def test_sync_edits_and_deletes_never_store_the_default(
+    storage: SQLiteBackend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Rows written straight into the database get no stored default; the
+    # ladder routes them.
+    _seed_model_def(storage, definition_id="m1", alias="chat", model="m")
+    _seed_model_def(storage, definition_id="m2", alias="spare", model="m")
+    client = _routing_client(storage, _make_registry(alias="chat", extras={"spare": "m"}))
+
+    assert "default_pinned" not in _sync(client, monkeypatch)
+    edited = client.put("/v1/api/admin/model-definitions/m1", json={"temperature": 0.5})
+    assert edited.status_code == 200, edited.text
+    assert "default_pinned" not in edited.json()
+    deleted = client.delete("/v1/api/admin/model-definitions/m2")
+    assert deleted.status_code == 200, deleted.text
+    assert "default_pinned" not in deleted.json()
+    assert _setting(storage, "model.default_alias") is None
+
+
+def test_a_reset_default_stays_reset(
+    storage: SQLiteBackend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client = _routing_client(storage, _make_registry(alias="first", extras={"second": "m"}))
+    assert _create(client, "first").json()["default_pinned"] == "first"
+    # The Settings tab's Reset deletes the row.
+    assert storage.delete_system_setting("model.default_alias", node_id="")
+
+    assert "default_pinned" not in _create(client, "second").json()
+    row = storage.get_model_definition_by_alias("first")
+    assert row is not None
+    edited = client.put(
+        f"/v1/api/admin/model-definitions/{row['definition_id']}", json={"temperature": 0.5}
+    )
+    assert edited.status_code == 200, edited.text
+    assert "default_pinned" not in _sync(client, monkeypatch)
+    assert _setting(storage, "model.default_alias") is None
+
+
+def test_the_next_chat_model_after_the_last_one_goes_is_stored(storage: SQLiteBackend) -> None:
+    client = _routing_client(storage, _make_registry(alias="first", extras={"second": "m"}))
+    created = _create(client, "first")
+    assert created.json()["default_pinned"] == "first"
+
+    # The last enabled model goes, and the setting naming it with it.
+    gone = client.delete(f"/v1/api/admin/model-definitions/{created.json()['definition_id']}")
+    assert gone.status_code == 200, gone.text
+    assert _setting(storage, "model.default_alias") is None
+
+    assert _create(client, "second").json()["default_pinned"] == "second"
+    assert _setting(storage, "model.default_alias") == "second"
+
+
+def test_the_pin_helper_is_best_effort(storage: SQLiteBackend) -> None:
+    from turnstone.console.server import _pin_default_and_reload
+
+    broken = MagicMock()
+    broken.get_system_setting.side_effect = RuntimeError("db down")
+    assert _pin_default_and_reload(SimpleNamespace(config_store=None), broken, "", "") == ""
+
+
+@pytest.mark.parametrize("stored", ["elsewhere", ""])
+def test_the_first_chat_model_leaves_a_set_or_cleared_default_alone(
+    storage: SQLiteBackend, stored: str
+) -> None:
+    _put_setting(storage, "model.default_alias", stored)
+    client = _routing_client(storage, _make_registry(alias="first"))
+    created = _create(client, "first")
+    assert created.status_code == 200, created.text
+    assert "default_pinned" not in created.json()
+    assert _setting(storage, "model.default_alias") == stored
+
+
+def test_the_first_chat_model_defers_to_a_console_config_default(
+    storage: SQLiteBackend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import turnstone.core.config as _cfg
+
+    monkeypatch.setattr(
+        _cfg, "load_config", lambda section=None: {"default": "cfg"} if section == "model" else {}
+    )
+    client = _routing_client(storage, _make_registry(alias="first"))
+    created = _create(client, "first")
+    assert created.status_code == 200, created.text
+    assert "default_pinned" not in created.json()
+    assert _setting(storage, "model.default_alias") is None
+
+
+def test_a_reranker_or_speech_model_is_never_stored(storage: SQLiteBackend) -> None:
+    """The stored default outranks every node's config.toml default, so a
+    reranker or speech model never becomes it; the first chat model does."""
+    client = _routing_client(storage, _make_registry(alias="c-chat"))
+    for alias, model, caps in (
+        ("a-rerank", "bge-reranker", {"supports_rerank": True}),
+        ("b-stt", "whisper-1", {}),
+    ):
+        resp = client.post(
+            "/v1/api/admin/model-definitions",
+            json={"alias": alias, "model": model, "provider": "openai", "capabilities": caps},
+        )
+        assert resp.status_code == 200, resp.text
+        assert "default_pinned" not in resp.json()
+    assert _setting(storage, "model.default_alias") is None
+
+    assert _create(client, "c-chat").json()["default_pinned"] == "c-chat"
+
+
+def test_deleting_the_default_model_is_refused(storage: SQLiteBackend) -> None:
+    _seed_model_def(storage, definition_id="m1", alias="primary", model="m")
+    _seed_model_def(storage, definition_id="m2", alias="spare", model="m")
+    _put_setting(storage, "model.default_alias", "primary")
+    client = _routing_client(storage, _make_registry(alias="primary", extras={"spare": "m"}))
+
+    resp = client.delete("/v1/api/admin/model-definitions/m1")
+
+    assert resp.status_code == 409, resp.text
+    body = resp.json()
+    assert body["code"] == "model_in_use"
+    assert body["settings"] == ["model.default_alias"]
+    assert "model.default_alias" in body["error"]
+    assert storage.get_model_definition("m1") is not None
+
+
+def test_disabling_or_renaming_a_named_model_is_refused(storage: SQLiteBackend) -> None:
+    _seed_model_def(storage, definition_id="m1", alias="chat", model="m")
+    _seed_model_def(storage, definition_id="m2", alias="spare", model="m")
+    _put_setting(storage, "channels.default_model_alias", "chat")
+    _put_setting(storage, "model.task_alias", "chat", node_id="node-1")
+    client = _routing_client(storage, _make_registry(alias="chat", extras={"spare": "m"}))
+
+    disabled = client.put("/v1/api/admin/model-definitions/m1", json={"enabled": False})
+    renamed = client.put("/v1/api/admin/model-definitions/m1", json={"alias": "chat2"})
+
+    for resp in (disabled, renamed):
+        assert resp.status_code == 409, resp.text
+        assert resp.json()["settings"] == ["channels.default_model_alias", "model.task_alias"]
+    assert "model.task_alias (node node-1)" in disabled.json()["error"]
+    row = storage.get_model_definition("m1")
+    assert row is not None and row["alias"] == "chat" and row["enabled"]
+
+
+def test_other_edits_to_a_named_model_go_through(storage: SQLiteBackend) -> None:
+    _seed_model_def(storage, definition_id="m1", alias="primary", model="m")
+    _seed_model_def(storage, definition_id="m2", alias="spare", model="m")
+    _put_setting(storage, "model.default_alias", "primary")
+    client = _routing_client(storage, _make_registry(alias="primary", extras={"spare": "m"}))
+
+    resp = client.put("/v1/api/admin/model-definitions/m1", json={"temperature": 0.5})
+
+    assert resp.status_code == 200, resp.text
+
+
+def test_removing_an_unnamed_model_goes_through(storage: SQLiteBackend) -> None:
+    _seed_model_def(storage, definition_id="m1", alias="primary", model="m")
+    _seed_model_def(storage, definition_id="m2", alias="spare", model="m")
+    _put_setting(storage, "model.default_alias", "primary")
+    client = _routing_client(storage, _make_registry(alias="primary", extras={"spare": "m"}))
+
+    assert client.delete("/v1/api/admin/model-definitions/m2").status_code == 200
+
+
+def test_removing_the_last_enabled_model_clears_the_settings_naming_it(
+    storage: SQLiteBackend,
+) -> None:
+    _seed_model_def(storage, definition_id="m1", alias="only", model="m")
+    _seed_model_def(storage, definition_id="m2", alias="off", model="m", enabled=False)
+    _put_setting(storage, "model.default_alias", "only")
+    _put_setting(storage, "coordinator.model_alias", "only", node_id="node-1")
+    _put_setting(storage, "model.task_alias", "off")
+    client = _routing_client(storage, _make_registry(alias="only"))
+
+    resp = client.delete("/v1/api/admin/model-definitions/m1")
+
+    assert resp.status_code == 200, resp.text
+    assert storage.get_system_setting("model.default_alias") is None
+    assert storage.get_system_setting("coordinator.model_alias", node_id="node-1") is None
+    assert _setting(storage, "model.task_alias") == "off"  # names another model
+
+
+def test_disabling_the_last_enabled_model_clears_the_settings_naming_it(
+    storage: SQLiteBackend,
+) -> None:
+    _seed_model_def(storage, definition_id="m1", alias="only", model="m")
+    _put_setting(storage, "model.default_alias", "only")
+    client = _routing_client(storage, _make_registry(alias="only"))
+
+    resp = client.put("/v1/api/admin/model-definitions/m1", json={"enabled": False})
+
+    assert resp.status_code == 200, resp.text
+    assert storage.get_system_setting("model.default_alias") is None
+
+
+def test_the_models_tab_reports_a_default_with_no_enabled_row(storage: SQLiteBackend) -> None:
+    _seed_model_def(storage, definition_id="m1", alias="primary", model="m")
+    _put_setting(storage, "model.default_alias", "ghost")
+    client = _routing_client(storage, _make_registry(alias="primary"))
+
+    body = client.get("/v1/api/admin/model-definitions").json()
+
+    assert body["default_alias"] == "ghost"
+
+
+def test_the_models_tab_pick_counts_disabled_rows_out(storage: SQLiteBackend) -> None:
+    _seed_model_def(storage, definition_id="m1", alias="alpha", model="m", enabled=False)
+    _seed_model_def(storage, definition_id="m2", alias="beta", model="m")
+    client = _routing_client(storage, _make_registry(alias="beta"))
+
+    assert client.get("/v1/api/admin/model-definitions").json()["default_alias"] == "beta"
+
+
+def test_the_models_tab_pick_skips_a_reranker(storage: SQLiteBackend) -> None:
+    _seed_model_def(
+        storage,
+        definition_id="m1",
+        alias="a-rerank",
+        model="bge-reranker",
+        capabilities='{"supports_rerank": true}',
+    )
+    _seed_model_def(storage, definition_id="m2", alias="b-chat", model="m")
+    client = _routing_client(storage, _make_registry(alias="b-chat"))
+
+    assert client.get("/v1/api/admin/model-definitions").json()["default_alias"] == "b-chat"
