@@ -75,6 +75,84 @@ export function kindIcon(kind) {
   return "📄"; // pdf + text
 }
 
+// Tool pixels stay out of SSE/history JSON. Resolve only stored, ws-scoped
+// image references. Show them by default, with native lazy loading for offscreen
+// frames. Brief retries cover an event arriving before its blob commits;
+// reopening allows a manual retry after longer outages.
+export function buildToolImages(attachments, opts) {
+  const images = Array.isArray(attachments)
+    ? attachments.filter((a) => a && a.kind === "image" && a.attachment_id)
+    : [];
+  if (!images.length || !opts.wsId) return null;
+  const details = document.createElement("details");
+  details.className = "tool-images";
+  const summary = document.createElement("summary");
+  summary.textContent =
+    images.length === 1 ? "View image" : "View " + images.length + " images";
+  details.appendChild(summary);
+  const body = document.createElement("div");
+  details.appendChild(body);
+  // Explicit pane routing wins. A proxied standalone worker page instead
+  // receives its prefix from the console shim: native img/link loads do not
+  // pass through the shim's fetch() wrapper. Never infer a node from wsId.
+  const base =
+    opts.base ||
+    (typeof window !== "undefined" && window.TURNSTONE_PROXY_PREFIX) ||
+    "";
+  function renderImages() {
+    body.replaceChildren();
+    images.forEach((a) => {
+      const url = _attachUrl(base, opts.wsId, a.attachment_id, "/content");
+      const link = document.createElement("a");
+      link.href = url;
+      link.target = "_blank";
+      link.rel = "noopener noreferrer";
+      link.title = "Open full image";
+      const img = document.createElement("img");
+      img.alt = a.filename || "Tool image";
+      img.loading = "lazy";
+      img.decoding = "async";
+      img.style.maxWidth = "100%";
+      img.style.maxHeight = "480px";
+      img.style.objectFit = "contain";
+      const retryDelays = [250, 750, 2000];
+      let retries = 0;
+      let retryTimer = null;
+      img.addEventListener("load", () => {
+        if (retryTimer !== null) clearTimeout(retryTimer);
+        retryTimer = null;
+      });
+      img.src = url;
+      img.addEventListener("error", () => {
+        if (retryTimer !== null) return;
+        if (retries < retryDelays.length) {
+          retryTimer = setTimeout(() => {
+            retryTimer = null;
+            // A closed, replaced, or removed result must not keep fetching.
+            if (!details.open || !img.isConnected) return;
+            img.src = url;
+          }, retryDelays[retries++]);
+          return;
+        }
+        link.textContent = "Image unavailable. Close and reopen to retry.";
+      });
+      link.appendChild(img);
+      body.appendChild(link);
+    });
+  }
+  details.open = true;
+  renderImages();
+  // Opening programmatically queues a toggle too. Avoid replacing/loading the
+  // initial images twice, but render fresh nodes after a collapse/reopen retry.
+  let wasOpen = true;
+  details.addEventListener("toggle", () => {
+    if (details.open === wasOpen) return;
+    wasOpen = details.open;
+    if (details.open) renderImages();
+  });
+  return details;
+}
+
 // Build an inline preview node for a committed attachment (real id), or null.
 // image/pdf → server-rendered thumbnail; audio → <audio> player; text → a lazy
 // snippet.  Auth is cookie-based, so a plain media `src` works same-origin.

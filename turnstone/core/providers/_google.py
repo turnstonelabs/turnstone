@@ -25,7 +25,6 @@ if TYPE_CHECKING:
 
 from turnstone.core.lowering import legalize_tool_call_entry
 from turnstone.core.providers._openai_chat import OpenAIChatCompletionsProvider
-from turnstone.core.providers._openai_common import sanitize_messages
 from turnstone.core.providers._protocol import (
     ModelCapabilities,
     StreamChunk,
@@ -137,7 +136,7 @@ class GoogleProvider(OpenAIChatCompletionsProvider):
                     # ids and ``thought_signature`` stay untouched.
                     msg["tool_calls"] = [legalize_tool_call_entry(b) or b for b in raw_tcs]
             cleaned.append(msg)
-        return sanitize_messages(cleaned)
+        return super()._prepare_messages(cleaned)
 
     # -- streaming -----------------------------------------------------------
 

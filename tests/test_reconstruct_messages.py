@@ -555,8 +555,17 @@ class TestRoleAgnosticAttachments:
         assert isinstance(tool_msg["content"], list)
         assert tool_msg["content"][0] == {"type": "text", "text": "Image file: dog.png"}
         assert tool_msg["content"][1]["type"] == "image_url"
-        # Tool rows do NOT carry _attachments_meta (that's a user-display sibling).
-        assert "_attachments_meta" not in tool_msg
+        # Tool history needs the same display metadata as live image results.
+        # Keep image bytes in the content block, not in the preview descriptor.
+        assert tool_msg["_attachments_meta"] == [
+            {
+                "attachment_id": "i1",
+                "kind": "image",
+                "filename": "dog.png",
+                "mime_type": "image/png",
+                "size_bytes": 0,
+            }
+        ]
 
     def test_tool_row_without_attachments_stays_string(self):
         trow = _row("tool", "plain", tc_id="c1")

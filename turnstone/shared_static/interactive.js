@@ -61,6 +61,7 @@ import { authFetch } from "./auth.js";
 import { showToast } from "./toast.js";
 import { Composer } from "./composer.js";
 import {
+  buildToolImages,
   createAttachmentController,
   kindIcon,
 } from "./composer_attachments.js";
@@ -2643,6 +2644,7 @@ class Pane {
               accepted: evt.accepted === true,
               eventId: evt._event_id,
               effectStatus: evt.effect_status,
+              attachments: evt.attachments,
             },
           )
         ) {
@@ -3967,6 +3969,13 @@ class Pane {
               insertChained(renderCollapsibleOutput(stripped, isToolError));
             }
           }
+          if (!isDenied) {
+            const images = buildToolImages(msg.attachments, {
+              wsId: this.wsId,
+              base: this._base,
+            });
+            if (images) insertChained(images);
+          }
           // Replayed preview descriptor: chip only — a reload must never
           // auto-open panes for every historical preview (the live path's
           // focused auto-open already happened when it was current).  Error
@@ -5078,6 +5087,14 @@ class Pane {
         resultNode = renderCollapsibleOutput(stripped, isError);
       }
       insertResult(resultNode);
+    }
+
+    if (!isDenied) {
+      const images = buildToolImages(opts.attachments, {
+        wsId: this.wsId,
+        base: this._base,
+      });
+      if (images) insertResult(images);
     }
 
     // Mark the parent approval block as errored. Idempotent badge construction
