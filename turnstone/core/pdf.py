@@ -27,10 +27,11 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from turnstone.core._pdf_worker import (
+    EXIT_BACKEND_UNAVAILABLE,
     EXIT_INVALID_PDF,
+    EXIT_LIMITS_UNAVAILABLE,
     EXIT_OK,
     EXIT_RESOURCE_LIMIT,
-    EXIT_UNAVAILABLE,
     MAX_FILE_BYTES,
     MAX_RASTER_PAGES,
     MAX_SOURCE_BYTES,
@@ -63,6 +64,19 @@ _PDF_WORKER_SLOT = threading.BoundedSemaphore(1)
 
 class PdfWorkLimitError(RuntimeError):
     """Local PDF work could not complete inside its safety envelope."""
+
+
+class PdfHostUnavailableError(PdfWorkLimitError):
+    """This host can't run the local PDF worker at all.
+
+    Raised when the OS refuses the worker's resource limits, when no temporary
+    directory can be made, or when the worker can't be started. A subclass, so
+    every handler that treats a work-limit error as terminal treats this one the
+    same way; a caller that wants to say why catches it first.
+
+    A missing PDF backend (pypdfium2 or Pillow) is reported separately and is not
+    this error.
+    """
 
 
 class PdfRasterizedPages(list[bytes]):
@@ -113,7 +127,6 @@ def _worker_bytes(
 
     deadline = time.monotonic() + _MAX_WALL_SECONDS
     acquired = False
-    process: subprocess.Popen[bytes] | None = None
     try:
         while not acquired:
             _check_cancelled(check_cancelled)
@@ -122,17 +135,24 @@ def _worker_bytes(
                 raise PdfWorkLimitError("PDF worker queue deadline exceeded")
             acquired = _PDF_WORKER_SLOT.acquire(timeout=min(_POLL_SECONDS, remaining))
 
+        # A failure to set up or start the worker happens before it touches the
+        # PDF, so it says the host can't run it, whatever the errno.
         try:
-            temp_context = tempfile.TemporaryDirectory(prefix="turnstone-pdf-")
+            temp_context = tempfile.TemporaryDirectory(
+                prefix="turnstone-pdf-", ignore_cleanup_errors=True
+            )
         except OSError as exc:
-            raise PdfWorkLimitError("PDF worker directory could not be created") from exc
-        with temp_context as temp_name:
+            log.warning("pdf.worker_unavailable", step="directory", error=str(exc))
+            raise PdfHostUnavailableError("PDF worker directory could not be created") from exc
+        with temp_context as temp_name, contextlib.ExitStack() as before_cleanup:
             root = Path(temp_name)
             input_path = root / "input.pdf"
             output_path = root / "output.bin"
             try:
                 input_path.write_bytes(data)
             except OSError as exc:
+                # Unlike the directory and the spawn, this write can fail because of
+                # the PDF itself (its size against free space or RLIMIT_FSIZE).
                 raise PdfWorkLimitError("PDF worker input could not be created") from exc
             _check_cancelled(check_cancelled)
             if time.monotonic() >= deadline:
@@ -165,7 +185,11 @@ def _worker_bytes(
                     start_new_session=os.name == "posix",
                 )
             except (OSError, subprocess.SubprocessError) as exc:
-                raise PdfWorkLimitError("PDF worker could not be started") from exc
+                log.warning("pdf.worker_unavailable", step="start", error=str(exc))
+                raise PdfHostUnavailableError("PDF worker could not be started") from exc
+            # This stack closes before the directory, so a worker still running on
+            # a deadline or cancellation is killed before its files are removed.
+            before_cleanup.callback(_terminate_worker, process)
             while process.poll() is None:
                 _check_cancelled(check_cancelled)
                 remaining = deadline - time.monotonic()
@@ -177,8 +201,15 @@ def _worker_bytes(
 
             if process.returncode == EXIT_INVALID_PDF:
                 raise _PdfInvalidError
-            if process.returncode == EXIT_UNAVAILABLE:
+            if process.returncode == EXIT_BACKEND_UNAVAILABLE:
                 raise _PdfBackendUnavailableError
+            if process.returncode == EXIT_LIMITS_UNAVAILABLE:
+                log.warning(
+                    "pdf.worker_unavailable",
+                    step="limits",
+                    error="the OS refused the worker's resource limits",
+                )
+                raise PdfHostUnavailableError("this host refuses the PDF worker's resource limits")
             if process.returncode == EXIT_RESOURCE_LIMIT:
                 raise PdfWorkLimitError("PDF worker exceeded its safety envelope")
             if process.returncode != EXIT_OK:
@@ -195,10 +226,6 @@ def _worker_bytes(
                 return output_path.read_bytes()
             except OSError as exc:
                 raise PdfWorkLimitError("PDF worker result could not be read") from exc
-    except BaseException:
-        if process is not None:
-            _terminate_worker(process)
-        raise
     finally:
         if acquired:
             _PDF_WORKER_SLOT.release()
@@ -239,7 +266,9 @@ def extract_pdf_text(
 
     Returns ``""`` on a parse failure or a scanned PDF with no text layer.  Walks
     at most 100 pages. Resource-envelope exhaustion raises
-    :class:`PdfWorkLimitError`; cancellation callbacks propagate unchanged.
+    :class:`PdfWorkLimitError`, and a host that can't run the worker raises its
+    subclass :class:`PdfHostUnavailableError`; cancellation callbacks propagate
+    unchanged.
     """
     try:
         limit = MAX_TEXT_CHARS if max_chars is None else min(max(max_chars, 0), MAX_TEXT_CHARS)
@@ -276,8 +305,10 @@ def rasterize_pdf(
     For vision-capable models that can't read PDF natively. The returned
     list-compatible object sets ``truncated`` when another source page was
     observed beyond the limit. Returns an empty result on a parse/render
-    failure. Resource-envelope exhaustion raises
-    :class:`PdfWorkLimitError`; cancellation callbacks propagate unchanged.
+    failure. Resource-envelope exhaustion raises :class:`PdfWorkLimitError`,
+    and a host that can't run the worker raises its subclass
+    :class:`PdfHostUnavailableError`; cancellation callbacks propagate
+    unchanged.
     """
     if max_pages < 0 or not (0 < scale <= 100):
         return PdfRasterizedPages()

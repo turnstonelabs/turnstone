@@ -29,6 +29,7 @@ PdfMode = Literal[
     "perceived",
     "extracted_text",
     "resource_limited",
+    "host_unavailable",
     "unreadable",
 ]
 PdfContent = dict[str, Any] | list[dict[str, Any]]
@@ -74,7 +75,9 @@ class PdfMaterialization:
 
     @property
     def readable(self) -> bool:
-        return self.mode not in ("resource_limited", "unreadable")
+        # Name the modes that carry the PDF, so a new placeholder mode reads as
+        # unreadable until someone decides otherwise.
+        return self.mode in ("native", "rasterized", "perceived", "extracted_text")
 
 
 PdfPerceiver = Callable[[PdfSource, PdfRasterizedParts], str | None]
@@ -160,16 +163,7 @@ def _extracted_or_unreadable(
         kwargs["check_cancelled"] = check_cancelled
     text = pdf_ops.extract_pdf_text(source.data, **kwargs)
     if not text:
-        return _materialization(
-            {
-                "type": "text",
-                "text": (
-                    f"[PDF attachment '{safe_attachment_label(raw_name)}' — no extractable "
-                    "text; this model cannot read PDFs natively]"
-                ),
-            },
-            "unreadable",
-        )
+        return _placeholder(source, "no extractable text", "unreadable")
     return _materialization(
         {
             "type": "document",
@@ -183,17 +177,18 @@ def _extracted_or_unreadable(
     )
 
 
-def _resource_limited(source: PdfSource) -> PdfMaterialization:
+def _placeholder(source: PdfSource, reason: str, mode: PdfMode) -> PdfMaterialization:
+    """The note a model gets in place of a PDF it can't be given."""
     name = source.filename or "document.pdf"
     return _materialization(
         {
             "type": "text",
             "text": (
-                f"[PDF attachment '{safe_attachment_label(name)}' — local processing "
-                "exceeded safety limits; this model cannot read PDFs natively]"
+                f"[PDF attachment '{safe_attachment_label(name)}' — {reason}; "
+                "this model cannot read PDFs natively]"
             ),
         },
-        "resource_limited",
+        mode,
     )
 
 
@@ -261,8 +256,14 @@ def materialize_pdf(
             check_cancelled=check_cancelled,
             tokens=tokens,
         )
+    except pdf_ops.PdfHostUnavailableError:
+        # This host can't run the worker at all (its limits are refused, or it
+        # can't be started), so say that rather than blaming the PDF.
+        return _placeholder(
+            source, "local PDF processing isn't available on this host", "host_unavailable"
+        )
     except pdf_ops.PdfWorkLimitError:
         # Resource exhaustion is terminal for this request. Retrying another
         # local PDFium operation would spend the same attacker-controlled work
         # twice and weaken the shared safety envelope.
-        return _resource_limited(source)
+        return _placeholder(source, "local processing exceeded safety limits", "resource_limited")

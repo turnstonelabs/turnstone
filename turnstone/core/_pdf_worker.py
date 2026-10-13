@@ -20,7 +20,8 @@ from typing import BinaryIO, Protocol
 EXIT_OK = 0
 EXIT_INVALID_PDF = 2
 EXIT_RESOURCE_LIMIT = 3
-EXIT_UNAVAILABLE = 4
+EXIT_BACKEND_UNAVAILABLE = 4
+EXIT_LIMITS_UNAVAILABLE = 5
 
 MAX_ADDRESS_SPACE_BYTES = 384 * 1024 * 1024
 MAX_CPU_SECONDS = 20
@@ -40,12 +41,20 @@ _WHITESPACE_RUN = re.compile(r"\s+|\S+")
 RASTER_LENGTH = struct.Struct("!I")
 # Text output: the true character count, then the bounded UTF-8 prefix.
 TEXT_LENGTH = struct.Struct("!Q")
+# Errnos that mean a resource ran out (storage, memory, file descriptors,
+# processes) during PDF work, not a bad PDF.
 _RESOURCE_LIMIT_ERRNOS = frozenset(
-    getattr(errno, name) for name in ("EFBIG", "ENOMEM", "ENOSPC", "EDQUOT") if hasattr(errno, name)
+    getattr(errno, name)
+    for name in ("EFBIG", "ENOMEM", "ENOSPC", "EDQUOT", "EAGAIN", "EMFILE", "ENFILE")
+    if hasattr(errno, name)
 )
 
 
 class _ResourceLimitError(RuntimeError):
+    pass
+
+
+class _LimitsUnavailableError(RuntimeError):
     pass
 
 
@@ -71,7 +80,9 @@ def _apply_resource_limits() -> None:
     """Apply the hard availability envelope before loading native code.
 
     Local PDF fallback fails closed on platforms that cannot provide all four
-    limits.  The native-PDF path never starts this worker.
+    limits (macOS refuses any finite ``RLIMIT_AS``), and reports that as the
+    limits being unavailable rather than as a PDF exceeding them. The
+    native-PDF path never starts this worker.
     """
     try:
         import resource
@@ -81,7 +92,7 @@ def _apply_resource_limits() -> None:
         _tighten_limit(resource, "RLIMIT_FSIZE", MAX_FILE_BYTES)
         _tighten_limit(resource, "RLIMIT_CORE", 0)
     except Exception as exc:
-        raise _ResourceLimitError("OS resource limits unavailable") from exc
+        raise _LimitsUnavailableError("OS resource limits unavailable") from exc
 
 
 def _append_prefix(
@@ -293,6 +304,8 @@ def main(argv: list[str] | None = None) -> int:
                 scale=args.scale,
             )
         return EXIT_OK
+    except _LimitsUnavailableError:
+        return EXIT_LIMITS_UNAVAILABLE
     except _ResourceLimitError:
         return EXIT_RESOURCE_LIMIT
     except MemoryError:
@@ -302,7 +315,7 @@ def main(argv: list[str] | None = None) -> int:
             return EXIT_RESOURCE_LIMIT
         return EXIT_INVALID_PDF
     except ImportError:
-        return EXIT_UNAVAILABLE
+        return EXIT_BACKEND_UNAVAILABLE
     except Exception:
         return EXIT_INVALID_PDF
 

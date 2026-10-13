@@ -344,19 +344,19 @@ Fetch a web page or PDF and extract specific information from it.
   the tool returns an explicit error instead of asking the model to infer from
   an empty document. Local PDF rendering and text extraction run in a one-shot
   child under memory, CPU, wall-time, and output limits; exceeding that shared
-  attachment safety envelope fails the fetch explicitly. Decoded HTML/plain
-  text and locally extracted PDF text use at most half the active model lane's
-  calibrated context after prompt, response, and safety reserves; the final
-  request is checked again before provider I/O. If no document allowance
-  remains, the tool returns an error instead of invoking extraction without
-  source content. The fixed worker output envelope is an additional PDF-only
-  host-safety ceiling. Rasterization supplies at most ten pages and explicitly
-  tells the model when later pages were omitted; that notice survives the
-  perception cache. Fetched PDFs are request-local and are not added to
-  conversation history or attachment storage. Every hop, the URL itself
-  included, is SSRF-screened before it is requested, and a hostname is looked
-  up only once its call is approved, so a denied call makes no DNS query.
-  Private/internal addresses are refused by default; enable
+  attachment safety envelope fails the fetch explicitly, and so does a host that
+  can't run that child. Decoded HTML/plain text and locally extracted PDF text
+  use at most half the active model lane's calibrated context after prompt,
+  response, and safety reserves; the final request is checked again before
+  provider I/O. If no document allowance remains, the tool returns an error
+  instead of invoking extraction without source content. The fixed worker output
+  envelope is an additional PDF-only host-safety ceiling. Rasterization supplies
+  at most ten pages and explicitly tells the model when later pages were
+  omitted; that notice survives the perception cache. Fetched PDFs are
+  request-local and are not added to conversation history or attachment storage.
+  Every hop, the URL itself included, is SSRF-screened before it is requested,
+  and a hostname is looked up only once its call is approved, so a denied call
+  makes no DNS query. Private/internal addresses are refused by default; enable
   `tools.allow_private_network` (console Settings → Tools) to make them
   approvable for self-hosted setups whose services live on the local network.
   The approval prompt marks such requests. A private IP address is marked from
@@ -405,7 +405,11 @@ Fetch a web page or PDF and extract specific information from it.
   so venv, system-site, and ordinary default user-site dependencies work, but
   dependencies reachable only through a custom `PYTHONUSERBASE` do not. Install
   Turnstone and its PDF dependencies into the same venv or a standard site
-  directory instead. Models receiving PDFs natively do not start this worker.
+  directory instead. A host that can't create the temporary directory, start the
+  child process or apply its resource limits, such as macOS, which refuses a
+  finite address-space limit, cannot run the worker; there, models without
+  native PDF input are told that local PDF processing isn't available. Models
+  receiving PDFs natively do not start this worker.
 - **Auto-approve**: No -- requires user confirmation (makes network requests).
 - **Agent availability**: `task_agent`.
 

@@ -16,7 +16,7 @@ from turnstone.core.media_materialization import (
     materialize_pdf,
 )
 from turnstone.core.model_turn import ModelCapabilities
-from turnstone.core.pdf import PdfRasterizedPages, PdfWorkLimitError
+from turnstone.core.pdf import PdfHostUnavailableError, PdfRasterizedPages, PdfWorkLimitError
 
 
 def _source(*, data: bytes = b"%PDF-1.4 body", filename: str = "report.pdf") -> PdfSource:
@@ -340,6 +340,29 @@ def test_resource_limit_is_terminal_without_second_pdfium_attempt(
     assert result.mode == "resource_limited"
     assert not result.readable
     assert "exceeded safety limits" in result.content["text"]
+    rasterize.assert_called_once()
+    extract.assert_not_called()
+
+
+def test_refused_limits_say_unavailable_without_second_pdfium_attempt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rasterize = Mock(side_effect=PdfHostUnavailableError("limits refused"))
+    extract = Mock(side_effect=AssertionError("refused limits must not retry text extraction"))
+    monkeypatch.setattr("turnstone.core.pdf.rasterize_pdf", rasterize)
+    monkeypatch.setattr("turnstone.core.pdf.extract_pdf_text", extract)
+
+    result = materialize_pdf(
+        _source(),
+        ModelCapabilities(supports_vision=True),
+        perceive=_no_perception,
+        tokens=(),
+    )
+
+    assert result.mode == "host_unavailable"
+    assert not result.readable
+    assert "isn't available on this host" in result.content["text"]
+    assert "exceeded" not in result.content["text"]
     rasterize.assert_called_once()
     extract.assert_not_called()
 

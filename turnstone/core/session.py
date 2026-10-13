@@ -28371,6 +28371,10 @@ class ChatSession:
                     msg = "Error: fetched PDF exceeded local processing safety limits"
                     _report_fetch_result(msg, is_error=True)
                     return call_id, msg
+                if materialized.mode == "host_unavailable":
+                    msg = "Error: local PDF processing isn't available on this host"
+                    _report_fetch_result(msg, is_error=True)
+                    return call_id, msg
                 if max_content <= 0 and materialized.mode == "extracted_text":
                     # Native, rasterized, and perceived modes still contain
                     # source material even when the local-text allowance is

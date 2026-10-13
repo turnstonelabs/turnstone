@@ -481,6 +481,17 @@ frozen.
 
 ### Fixed
 
+- **A host that can't run the PDF worker says so.** On macOS, which refuses a finite address-space
+  limit, on any host whose sandbox blocks `setrlimit`, and on a host where the worker's temporary
+  directory can't be created or the worker can't start, every PDF that needed local processing was
+  reported as having exceeded the safety limits. Models without native PDF input are now told that
+  local PDF processing isn't available on this host, `web_fetch` returns the same error, and a
+  server-log warning names the step that failed. The worker still never touches the PDF in those
+  cases, and models that take PDFs natively are unaffected. Inside the worker, running out of file
+  descriptors or processes is now reported as a limit rather than as an unreadable PDF. A temporary
+  directory that can't be cleaned up no longer hides the error that stopped the work, and a worker
+  cut off by a deadline or cancellation is killed before its temporary directory is removed; killing
+  it after could leave a `turnstone-pdf-*` directory behind.
 - **The model form no longer saves a hidden thinking mode (#1366).** The Thinking mode field shows
   only for the two compatible providers, but every save wrote its value back for any provider, and
   editing a definition moved a stored `thinking_mode` out of the raw capabilities JSON into that

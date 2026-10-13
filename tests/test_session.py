@@ -14875,6 +14875,35 @@ class TestWebFetchPdf:
         assert answer == "Error: fetched PDF exceeded local processing safety limits"
         utility.assert_not_called()
 
+    def test_web_fetch_pdf_refused_limits_say_unavailable(
+        self,
+        monkeypatch,
+    ) -> None:
+        from turnstone.core.pdf import PdfHostUnavailableError
+        from turnstone.core.providers._protocol import ModelCapabilities
+
+        session = _make_session()
+        replace_session_lane(session, capabilities=ModelCapabilities())
+
+        def refused(_data, **_kwargs):
+            raise PdfHostUnavailableError("limits refused")
+
+        monkeypatch.setattr("turnstone.core.pdf.extract_pdf_text", refused)
+
+        with (
+            patch(
+                "turnstone.core.session.fetch_with_ssrf_guard",
+                return_value=_pdf_fetch_response(),
+            ),
+            patch.object(session, "_utility_completion") as utility,
+        ):
+            _, answer = session._exec_web_fetch(
+                {"call_id": "pdf-unavailable", "url": "https://example.com/a"}
+            )
+
+        assert answer == "Error: local PDF processing isn't available on this host"
+        utility.assert_not_called()
+
     def test_web_fetch_pdf_snapshot_survives_mutable_session_changes(
         self,
         monkeypatch,
