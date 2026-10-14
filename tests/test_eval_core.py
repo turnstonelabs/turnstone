@@ -267,7 +267,7 @@ class TestRunResourceLifecycle:
 
         assert "raised" not in made, made.get("raised")
         assert made["result"]["message_count"] == 1
-        assert made["cwd_in_run"] == made["workdir"]  # it really did chdir in
+        assert made["cwd_in_run"] == os.path.realpath(made["workdir"])  # it really did chdir in
         # The session's close ran to completion: the background-shell
         # registry is its last-but-one step and latches closed.
         assert made["session"]._background_shells._closed is True
@@ -359,7 +359,7 @@ class TestRunResourceLifecycle:
         made = self._drive(monkeypatch, close_raises=KeyboardInterrupt)
 
         assert isinstance(made["raised"], KeyboardInterrupt)
-        assert made["cwd_in_run"] == made["workdir"]
+        assert made["cwd_in_run"] == os.path.realpath(made["workdir"])
         assert os.getcwd() == cwd_before  # survived the abort — it ran first
         # The honest cost of an abort mid-block, asserted rather than
         # implied: everything after the interrupt is skipped.
@@ -392,7 +392,8 @@ class TestRunResourceLifecycle:
 
         assert "raised" not in made, made.get("raised")  # contained, not propagated
         assert made["result"]["message_count"] == 1  # and the measurement survived
-        assert made["cwd_in_run"] == made["workdir"]  # the restore really was the failing call
+        # the restore really was the failing call
+        assert made["cwd_in_run"] == os.path.realpath(made["workdir"])
         # Everything the unguarded chdir used to skip:
         assert made["session"]._background_shells._closed is True
         assert made["run_client"].is_closed(), "the per-attempt client leaked its pool"

@@ -13,6 +13,7 @@ from unittest.mock import ANY, MagicMock
 
 import pytest
 
+from tests._pdf_helpers import pdf_worker_skip
 from turnstone.core import _pdf_worker
 from turnstone.core import pdf as pdf_ops
 from turnstone.core.pdf import (
@@ -76,18 +77,23 @@ def _blank_pdf(page_count: int) -> bytes:
 
 
 class TestExtractPdfText:
+    @pdf_worker_skip
     def test_extracts_text(self) -> None:
         assert "Hello PDF" in extract_pdf_text(_minimal_pdf("Hello PDF"))
 
+    @pdf_worker_skip
     def test_garbage_returns_empty_no_raise(self) -> None:
         assert extract_pdf_text(b"not a pdf at all") == ""
 
+    @pdf_worker_skip
     def test_empty_returns_empty(self) -> None:
         assert extract_pdf_text(b"") == ""
 
+    @pdf_worker_skip
     def test_character_cap_is_applied_inside_worker(self) -> None:
         assert extract_pdf_text(_minimal_pdf("abcdefghij"), max_chars=4) == "abc…"
 
+    @pdf_worker_skip
     def test_character_marker_fits_inside_nontrivial_cap(self) -> None:
         result = extract_pdf_text(_minimal_pdf("x" * 100), max_chars=64)
 
@@ -265,9 +271,11 @@ class TestExtractPdfText:
 
 
 class TestTextHeaderProtocol:
+    @pdf_worker_skip
     def test_parent_renders_the_marker_from_the_worker_prefix(self) -> None:
         assert extract_pdf_text(_minimal_pdf("abcdefghij"), max_chars=8) == "abcdefg…"
 
+    @pdf_worker_skip
     def test_zero_allowance_returns_the_marker_as_a_receipt(self) -> None:
         result = extract_pdf_text(_minimal_pdf("abcdefghij"), max_chars=0)
 
@@ -288,6 +296,7 @@ class TestTextHeaderProtocol:
         assert extract_pdf_text(_minimal_pdf("abcdefghij")) == ""
 
 
+@pdf_worker_skip
 class TestRasterizePdf:
     def test_renders_pages_to_png(self) -> None:
         pages = rasterize_pdf(_minimal_pdf("Hello PDF"))
@@ -320,6 +329,7 @@ class TestPdfWorkerEnvelope:
         expected = (_pdf_worker.MAX_FILE_BYTES - _pdf_worker._TEXT_OUTPUT_HEADER_RESERVE_BYTES) // 4
         assert expected == _pdf_worker.MAX_TEXT_CHARS
 
+    @pdf_worker_skip
     def test_worker_retains_user_site_dependencies(
         self,
         monkeypatch: pytest.MonkeyPatch,

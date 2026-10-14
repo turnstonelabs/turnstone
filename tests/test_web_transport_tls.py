@@ -90,7 +90,11 @@ def test_configured_ca_bundle_is_trusted(monkeypatch, issue, serve):
 def test_certificate_outside_the_system_trust_store_is_rejected(issue, serve):
     url = serve(issue(_HOST))
 
-    with pytest.raises(httpx2.ConnectError, match="(?i)certificate verify failed"):
+    # OpenSSL says "certificate verify failed"; macOS's Security framework,
+    # which truststore consults there, says "certificate is not trusted".
+    with pytest.raises(
+        httpx2.ConnectError, match="(?i)certificate verify failed|certificate is not trusted"
+    ):
         fetch_with_ssrf_guard(url, timeout=5, allow_private_origin=True)
 
 

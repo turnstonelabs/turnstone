@@ -42,6 +42,7 @@ payloads are byte-exact regardless of source-encoding handling.
 import contextlib
 import json
 import socket
+import sys
 import threading
 import time
 from types import SimpleNamespace
@@ -940,6 +941,10 @@ def _loopback_lane(lane: str, port: int) -> tuple[Any, Any]:
     return client, create_provider("openai-compatible", api_surface=lane)
 
 
+@pytest.mark.skipif(
+    sys.platform == "darwin",
+    reason="macOS leaves the read blocked after the wire release until the read timeout (#1350)",
+)
 @pytest.mark.parametrize(
     ("lane", "payload"),
     [("chat", CHAT_CHUNK), ("responses", RESPONSES_EVENT), ("anthropic", ANTHROPIC_EVENTS)],

@@ -298,6 +298,10 @@ def test_noninteractive_installer_defaults_to_no_shared_config(tmp_path):
     assert not (tmp_path / "config.toml").exists()
 
 
+@pytest.mark.skipif(
+    subprocess.run(["mv", "--version"], capture_output=True).returncode != 0,
+    reason="run.sh installs the config with GNU mv -T",
+)
 @pytest.mark.parametrize("existing", [False, True])
 def test_installer_private_staging_and_no_clobber(tmp_path, existing):
     path = tmp_path / "config.toml"
