@@ -385,7 +385,7 @@ class PdfDocument:
     ) -> None:
         events: list[str] = []
 
-        def apply_limits() -> None:
+        def apply_limits(*, memory_supervised: bool) -> None:
             events.append("limits")
 
         def extract(input_path, output_path, max_chars) -> None:
@@ -521,6 +521,19 @@ runpy.run_path(worker_path, run_name="__main__")
 
         assert result.returncode == _pdf_worker.EXIT_LIMITS_UNAVAILABLE, result.stderr
 
+    def test_memory_supervised_worker_hands_only_address_space_to_parent(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        applied: list[str] = []
+        monkeypatch.setattr(
+            _pdf_worker, "_tighten_limit", lambda _resource, name, _target: applied.append(name)
+        )
+
+        _pdf_worker._apply_resource_limits(memory_supervised=True)
+
+        assert applied == ["RLIMIT_CPU", "RLIMIT_FSIZE", "RLIMIT_CORE"]
+
     @pytest.mark.parametrize(
         "error_name",
         [
@@ -537,7 +550,7 @@ runpy.run_path(worker_path, run_name="__main__")
     ) -> None:
         error_code = getattr(errno, error_name)
 
-        monkeypatch.setattr(_pdf_worker, "_apply_resource_limits", lambda: None)
+        monkeypatch.setattr(_pdf_worker, "_apply_resource_limits", lambda **_: None)
 
         def resource_exhausted(*_args, **_kwargs) -> None:
             raise OSError(error_code, "worker ran out of a resource")
@@ -550,4 +563,71 @@ runpy.run_path(worker_path, run_name="__main__")
         assert (
             _pdf_worker.main(["text", str(input_path), str(output_path)])
             == _pdf_worker.EXIT_RESOURCE_LIMIT
+        )
+
+
+class TestParentMemorySupervision:
+    def test_footprint_over_ceiling_kills_worker(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        seen: list[int] = []
+
+        def footprint(pid: int) -> int:
+            seen.append(pid)
+            return _pdf_worker.MAX_ADDRESS_SPACE_BYTES + 1
+
+        monkeypatch.setattr(pdf_ops, "_worker_footprint", footprint)
+        started: list[subprocess.Popen[bytes]] = []
+        real_popen = subprocess.Popen
+
+        def popen(argv, **kwargs):
+            started.append(real_popen([sys.executable, "-c", "import time; time.sleep(30)"]))
+            assert argv[-1] == "--memory-supervised"
+            return started[-1]
+
+        monkeypatch.setattr(pdf_ops.subprocess, "Popen", popen)
+
+        with pytest.raises(PdfWorkLimitError, match="safety envelope"):
+            extract_pdf_text(_minimal_pdf())
+
+        assert seen == [started[0].pid]
+        assert started[0].poll() is not None
+
+    def test_unmeasurable_live_worker_fails_closed(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(pdf_ops, "_worker_footprint", lambda _pid: None)
+        started: list[subprocess.Popen[bytes]] = []
+        real_popen = subprocess.Popen
+
+        def popen(_argv, **_kwargs):
+            started.append(real_popen([sys.executable, "-c", "import time; time.sleep(30)"]))
+            return started[-1]
+
+        monkeypatch.setattr(pdf_ops.subprocess, "Popen", popen)
+
+        with pytest.raises(PdfWorkLimitError, match="could not be measured"):
+            extract_pdf_text(_minimal_pdf())
+
+        assert started[0].poll() is not None
+
+    @pytest.mark.skipif(sys.platform != "darwin", reason="exercises the macOS footprint reader")
+    def test_real_worker_over_ceiling_is_killed_on_macos(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(pdf_ops, "MAX_ADDRESS_SPACE_BYTES", 1)
+
+        with pytest.raises(PdfWorkLimitError, match="safety envelope"):
+            extract_pdf_text(_minimal_pdf())
+
+    def test_unsupervised_worker_still_fails_closed_without_rlimit_as(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ) -> None:
+        def tighten(_resource, name: str, _target: int) -> None:
+            if name == "RLIMIT_AS":
+                raise ValueError("current limit exceeds maximum limit")
+
+        monkeypatch.setattr(_pdf_worker, "_tighten_limit", tighten)
+        input_path = tmp_path / "input.pdf"
+        input_path.write_bytes(_minimal_pdf())
+
+        assert (
+            _pdf_worker.main(["text", str(input_path), str(tmp_path / "out.bin")])
+            == _pdf_worker.EXIT_LIMITS_UNAVAILABLE
         )

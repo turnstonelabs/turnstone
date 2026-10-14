@@ -76,18 +76,21 @@ def _tighten_limit(resource_module: _ResourceModule, name: str, target: int) -> 
     resource_module.setrlimit(kind, (new_soft, new_hard))
 
 
-def _apply_resource_limits() -> None:
+def _apply_resource_limits(*, memory_supervised: bool = False) -> None:
     """Apply the hard availability envelope before loading native code.
 
     Local PDF fallback fails closed on platforms that cannot provide all four
     limits (macOS refuses any finite ``RLIMIT_AS``), and reports that as the
-    limits being unavailable rather than as a PDF exceeding them. The
-    native-PDF path never starts this worker.
+    limits being unavailable rather than as a PDF exceeding them.
+    ``memory_supervised`` hands only the address-space ceiling to the parent,
+    which enforces it on the child's footprint where the kernel rejects a
+    finite ``RLIMIT_AS`` (macOS).  The native-PDF path never starts this worker.
     """
     try:
         import resource
 
-        _tighten_limit(resource, "RLIMIT_AS", MAX_ADDRESS_SPACE_BYTES)
+        if not memory_supervised:
+            _tighten_limit(resource, "RLIMIT_AS", MAX_ADDRESS_SPACE_BYTES)
         _tighten_limit(resource, "RLIMIT_CPU", MAX_CPU_SECONDS)
         _tighten_limit(resource, "RLIMIT_FSIZE", MAX_FILE_BYTES)
         _tighten_limit(resource, "RLIMIT_CORE", 0)
@@ -282,13 +285,14 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-chars", type=int, default=MAX_TEXT_CHARS)
     parser.add_argument("--max-pages", type=int, default=MAX_RASTER_PAGES)
     parser.add_argument("--scale", type=float, default=2.0)
+    parser.add_argument("--memory-supervised", action="store_true")
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
-        _apply_resource_limits()
+        _apply_resource_limits(memory_supervised=args.memory_supervised)
         if args.input_path.stat().st_size > MAX_SOURCE_BYTES:
             raise _ResourceLimitError("PDF source exceeds byte cap")
         if args.operation == "text":

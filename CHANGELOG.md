@@ -531,6 +531,11 @@ frozen.
 
 ### Fixed
 
+- **Local PDF processing works on macOS.** macOS refuses the address-space limit the PDF worker sets
+  on itself, so every local PDF text extraction, page render and thumbnail there failed. On macOS the
+  parent now watches the worker's memory footprint and stops it at the same 384 MiB ceiling the kernel
+  enforces elsewhere; the worker's other limits are unchanged, and a host that refuses those still
+  reports that local PDF processing is unavailable. Linux behaviour is unchanged.
 - **A host that can't run the PDF worker says so.** On macOS, which refuses a finite address-space
   limit, on any host whose sandbox blocks `setrlimit`, and on a host where the worker's temporary
   directory can't be created or the worker can't start, every PDF that needed local processing was

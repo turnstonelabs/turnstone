@@ -17,6 +17,8 @@ hold PDFs.  See the attachments design brief; that store is deferred.
 from __future__ import annotations
 
 import contextlib
+import ctypes
+import ctypes.util
 import os
 import subprocess
 import sys
@@ -32,6 +34,7 @@ from turnstone.core._pdf_worker import (
     EXIT_LIMITS_UNAVAILABLE,
     EXIT_OK,
     EXIT_RESOURCE_LIMIT,
+    MAX_ADDRESS_SPACE_BYTES,
     MAX_FILE_BYTES,
     MAX_RASTER_PAGES,
     MAX_SOURCE_BYTES,
@@ -49,6 +52,8 @@ log = get_logger(__name__)
 
 _MAX_WALL_SECONDS = 30.0
 _POLL_SECONDS = 0.05
+# Parent-enforced memory is only as tight as its sampling, so sample faster.
+_MEMORY_POLL_SECONDS = 0.01
 _PDF_WORKER_PATH = Path(__file__).with_name("_pdf_worker.py").resolve(strict=True)
 
 # Public safety ceiling for callers that layer a narrower presentation budget
@@ -77,6 +82,57 @@ class PdfHostUnavailableError(PdfWorkLimitError):
     A missing PDF backend (pypdfium2 or Pillow) is reported separately and is not
     this error.
     """
+
+
+class _RUsageInfoV2(ctypes.Structure):
+    _fields_ = [("ri_uuid", ctypes.c_uint8 * 16)] + [
+        (name, ctypes.c_uint64)
+        for name in (
+            "ri_user_time",
+            "ri_system_time",
+            "ri_pkg_idle_wkups",
+            "ri_interrupt_wkups",
+            "ri_pageins",
+            "ri_wired_size",
+            "ri_resident_size",
+            "ri_phys_footprint",
+            "ri_proc_start_abstime",
+            "ri_proc_exit_abstime",
+            "ri_child_user_time",
+            "ri_child_system_time",
+            "ri_child_pkg_idle_wkups",
+            "ri_child_interrupt_wkups",
+            "ri_child_pageins",
+            "ri_child_elapsed_abstime",
+            "ri_diskio_bytesread",
+            "ri_diskio_byteswritten",
+        )
+    ]
+
+
+_RUSAGE_INFO_V2 = 2
+
+
+class _DarwinFootprint:
+    """Read a child's physical footprint, the figure macOS itself caps memory by."""
+
+    def __init__(self) -> None:
+        self._proc_pid_rusage = ctypes.CDLL(
+            ctypes.util.find_library("System"), use_errno=True
+        ).proc_pid_rusage
+
+    def __call__(self, pid: int) -> int | None:
+        info = _RUsageInfoV2()
+        if self._proc_pid_rusage(pid, _RUSAGE_INFO_V2, ctypes.byref(info)) != 0:
+            return None
+        return int(info.ri_phys_footprint)
+
+
+# macOS rejects any finite RLIMIT_AS, so there the parent enforces the worker's
+# address-space ceiling on its footprint instead; elsewhere the kernel does.
+_worker_footprint: Callable[[int], int | None] | None = (
+    _DarwinFootprint() if sys.platform == "darwin" else None
+)
 
 
 class PdfRasterizedPages(list[bytes]):
@@ -158,6 +214,10 @@ def _worker_bytes(
             if time.monotonic() >= deadline:
                 raise PdfWorkLimitError("PDF worker deadline exceeded")
 
+            footprint = _worker_footprint
+            if footprint is not None:
+                arguments = [*arguments, "--memory-supervised"]
+            poll_seconds = _POLL_SECONDS if footprint is None else _MEMORY_POLL_SECONDS
             try:
                 process = subprocess.Popen(
                     [
@@ -195,8 +255,14 @@ def _worker_bytes(
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise PdfWorkLimitError("PDF worker wall deadline exceeded")
+                if footprint is not None:
+                    used = footprint(process.pid)
+                    if used is None and process.poll() is None:
+                        raise PdfWorkLimitError("PDF worker memory could not be measured")
+                    if used is not None and used > MAX_ADDRESS_SPACE_BYTES:
+                        raise PdfWorkLimitError("PDF worker exceeded its safety envelope")
                 with contextlib.suppress(subprocess.TimeoutExpired):
-                    process.wait(timeout=min(_POLL_SECONDS, remaining))
+                    process.wait(timeout=min(poll_seconds, remaining))
             _check_cancelled(check_cancelled)
 
             if process.returncode == EXIT_INVALID_PDF:
