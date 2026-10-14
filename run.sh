@@ -483,11 +483,19 @@ create_shared_config() {
         rm -rf -- "$scratch"
         die "Could not create shared config. Check the HTTPS origin and Docker's write access to the install directory."
     fi
-    # Rename within the same filesystem: hard links can be refused when the
-    # image's UID differs from the installing user's UID.
-    if ! mv -nT -- "$scratch/output/config.toml" "$f" || [ -e "$scratch/output/config.toml" ]; then
+    # Claim the destination only if nothing is there yet: noclobber opens it
+    # exclusively, so a concurrent install or an existing file is refused rather
+    # than replaced. BSD mv has no -n or -T, and GNU mv -n exits 0 when it skips.
+    if ! (set -C; : >"$f") 2>/dev/null; then
         rm -rf -- "$scratch"
         die "Could not install $f. Check directory permissions and whether the destination already exists."
+    fi
+    # Rename within the same filesystem: hard links can be refused when the
+    # image's UID differs from the installing user's UID.
+    if ! mv -f -- "$scratch/output/config.toml" "$f"; then
+        rm -f -- "$f"
+        rm -rf -- "$scratch"
+        die "Could not install $f. Check directory permissions."
     fi
     rm -rf -- "$scratch"
     info "Created $f (mode 600, owned by the container's turnstone user). Back it up privately."
