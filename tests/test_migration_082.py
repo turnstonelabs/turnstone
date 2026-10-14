@@ -2,10 +2,9 @@
 
 A load no longer hands the default to another model when its definition is
 left out, and the console now stores the first chat model added as the
-default. Setups that never set ``model.default_alias`` get the default the
-Models tab showed stored here: among the enabled chat definitions, the one
-named ``default``, else the first in alias order. A global row already
-present, cleared or not, is left alone.
+default. Setups that never set ``model.default_alias`` get one stored here:
+among the enabled chat definitions, the one named ``default``, else the first
+in alias order. A global row already present, cleared or not, is left alone.
 """
 
 from __future__ import annotations

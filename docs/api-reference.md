@@ -1491,7 +1491,7 @@ source was not resumed in place.
 | 409 | Caller-selected ID collision, source availability/construction context changed during fork, or destination reservation was superseded |
 | 413 | Upload exceeds the configured request/file cap |
 | 429 | Workstream manager is at capacity; retry after capacity frees |
-| 503 | Storage/factory/model configuration unavailable, or the fork transaction failed operationally. When the model the request names, or the default when it names none, isn't loaded, the body is `{"error": ..., "code": "model_not_loaded", "alias": ...}` and no other model is used |
+| 503 | Storage/factory/model configuration unavailable, or the fork transaction failed operationally. When the model the create builds on isn't loaded (a fork's source model, else the one the request names, else the default), the body is `{"error": ..., "code": "model_not_loaded", "alias": ...}` and no other model is used |
 | 500 | Unexpected create failure; response includes a correlation ID for server logs |
 
 ---

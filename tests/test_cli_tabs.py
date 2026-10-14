@@ -68,7 +68,7 @@ def make_cli(storage_backend: Any) -> Any:
                 workstream_lease=workstream_lease,
             )
 
-        manager = _build_cli_manager(session_factory, KNOWN_ALIASES.__contains__)
+        manager = _build_cli_manager(session_factory, KNOWN_ALIASES.__contains__, lambda: "default")
         managers.append(manager)
         return manager
 
@@ -542,7 +542,7 @@ def test_ws_new_reports_an_unloaded_default_and_keeps_the_repl(
     ) -> ChatSession:
         raise UnknownModelAliasError(model_alias or "gone")
 
-    mgr = _build_cli_manager(session_factory, lambda alias: False)
+    mgr = _build_cli_manager(session_factory, lambda alias: False, lambda: "gone")
 
     assert _handle_ws_command(mgr, "/ws new", False) is False
 
@@ -556,7 +556,17 @@ def test_default_model_message_names_the_reason_and_the_loaded_models() -> None:
     from turnstone.core.model_registry import ModelConfig, ModelRegistry
 
     registry = ModelRegistry(
-        {"spare": ModelConfig("spare", "http://models.example.com/v1", "k", "m")},
+        {
+            "spare": ModelConfig("spare", "http://models.example.com/v1", "k", "m"),
+            # Never suggested as the default: it can't hold a chat.
+            "rerank": ModelConfig(
+                "rerank",
+                "http://models.example.com/v1",
+                "k",
+                "bge-reranker",
+                capabilities={"supports_rerank": True},
+            ),
+        },
         default="main",
         skipped_aliases={"main": "secret://vault/llm: not found"},
     )
@@ -565,3 +575,44 @@ def test_default_model_message_names_the_reason_and_the_loaded_models() -> None:
         "Check [models.main] in config.toml, or set [model] default to one of: spare."
     )
     assert _default_model_not_loaded("").startswith("no default chat model is configured")
+
+
+def test_resume_on_a_default_that_stays_unloaded_builds_once(
+    storage_backend: Any, caplog: Any
+) -> None:
+    # The CLI wires the default reader, so a reopen whose default stays
+    # unloaded fails at once instead of retrying as if it raced (#1359).
+    import logging
+
+    from turnstone.core.model_registry import UnknownModelAliasError
+
+    builds: list[str | None] = []
+    broken = False
+
+    def session_factory(
+        ui: Any, model_alias: str | None = None, ws_id: str | None = None, **kw: Any
+    ) -> ChatSession:
+        builds.append(model_alias)
+        if broken:
+            raise UnknownModelAliasError(model_alias or "gone")
+        return make_session(
+            ui=ui,
+            ws_id=ws_id,
+            model_alias=model_alias or "gone",
+            workstream_lease=kw.get("workstream_lease"),
+        )
+
+    mgr = _build_cli_manager(session_factory, lambda alias: False, lambda: "gone")
+    ws = mgr.create(user_id="")
+    mgr.close(ws.id)
+    builds.clear()
+    broken = True
+
+    with (
+        caplog.at_level(logging.WARNING, logger="turnstone.core.session_manager"),
+        pytest.raises(UnknownModelAliasError),
+    ):
+        mgr.open(ws.id)
+
+    assert builds == [None]
+    assert not [r for r in caplog.records if "stale_alias_raced" in r.getMessage()]

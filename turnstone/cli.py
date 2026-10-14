@@ -702,10 +702,17 @@ def _default_model_not_loaded(alias: str, registry: Any = None) -> str:
     reason = ""
     others = ""
     if registry is not None:
+        from turnstone.core.model_registry import serves_chat
+
         why = registry.skipped_aliases.get(alias)
         if why:
             reason = f" ({why})"
-        loaded = registry.list_aliases()
+        # Only models that can hold a chat, as every automatic pick takes.
+        loaded = [
+            a
+            for a in registry.list_aliases()
+            if serves_chat(registry.get_config(a).capabilities, registry.get_config(a).model)
+        ]
         if loaded:
             others = f", or set [model] default to one of: {', '.join(loaded)}"
     return (
@@ -1440,12 +1447,16 @@ def _open_for_cli_resume(manager: SessionManager, target_id: str, requested: str
 
 
 def _build_cli_manager(
-    session_factory: Callable[..., ChatSession], has_alias: Callable[[str], bool]
+    session_factory: Callable[..., ChatSession],
+    has_alias: Callable[[str], bool],
+    default_alias: Callable[[], str],
 ) -> SessionManager:
     """The CLI's workstream manager: a terminal UI per workstream, sessions from *session_factory*.
 
     Opening a workstream saved with an alias this CLI does not define falls
     back to the default model instead of failing (*has_alias* tells).
+    *default_alias* reads that default, so a reopen whose default stays
+    unloaded fails at once instead of retrying as if it raced (#1359).
     """
     import queue
 
@@ -1461,7 +1472,11 @@ def _build_cli_manager(
         session_factory=session_factory,
     )
     manager = SessionManager(
-        adapter, storage=get_storage(), max_active=50, model_validator=has_alias
+        adapter,
+        storage=get_storage(),
+        max_active=50,
+        model_validator=has_alias,
+        default_alias_reader=default_alias,
     )
     adapter.attach(manager)
     return manager
@@ -1931,7 +1946,8 @@ def main() -> None:
             workstream_lease=workstream_lease,
         )
 
-    manager = _build_cli_manager(session_factory, registry.has_alias)
+    # The factory builds ``model_alias or registry.default``; the reader names the same.
+    manager = _build_cli_manager(session_factory, registry.has_alias, lambda: registry.default)
     # Renew the owner leases of the workstreams this REPL has open (#988).
     manager.start_lease_keeper()
     # CLI has no background maintenance lifespan. Recover crash-abandoned

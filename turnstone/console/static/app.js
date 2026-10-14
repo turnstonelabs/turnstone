@@ -2667,6 +2667,25 @@ window.TS_APP.resolveInteractiveNode = function (wsId, hintNodeId) {
           canContinue: true,
         };
       }
+      if (r.status === 503 && data.code === "model_not_loaded") {
+        // The node holds neither this session's model nor its own default, and
+        // substitutes none (#1359). Console-owned wording: only the alias
+        // crosses, and only in an alias's shape.
+        const alias =
+          typeof data.alias === "string" && /^[A-Za-z0-9._-]{1,64}$/.test(data.alias)
+            ? " ('" + data.alias + "')"
+            : "";
+        return {
+          status: r.status,
+          code: data.code,
+          error:
+            "Neither this session's model nor the node's default model" +
+            alias +
+            " is loaded there. Ask an admin to check them in the Models tab, or " +
+            "continue elsewhere from saved history.",
+          canContinue: true,
+        };
+      }
       if (refusal.where) {
         // Another node owns the session's lease; the route lookup leads to it.
         return {

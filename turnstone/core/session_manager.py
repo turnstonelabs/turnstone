@@ -368,6 +368,7 @@ class SessionManager:
         state_writer: StateWriter | None = None,
         event_emitter: SessionEventEmitter | None = None,
         model_validator: Callable[[str], bool] | None = None,
+        default_alias_reader: Callable[[], str] | None = None,
     ) -> None:
         if max_active < 1:
             raise ValueError(f"max_active must be >= 1, got {max_active}")
@@ -396,6 +397,11 @@ class SessionManager:
         # than raising.  Restricted to the rehydrate path — fresh
         # creates still want unknown aliases to surface as 503.
         self._model_validator = model_validator
+        # Optional: the alias a session that names no model gets now. A
+        # reopen that falls back to a default that isn't loaded retries only
+        # when the default has moved since; a default that stays unloaded is
+        # a steady state, not a race (#1359).
+        self._default_alias_reader = default_alias_reader
         self._node_id = node_id
         # Owner leases (#988): this manager instance is one lease holder.
         # Every loaded incarnation holds a lease the keeper renews, and storage
@@ -1435,11 +1441,18 @@ class SessionManager:
                             # ``model=None``, extract the concrete default the
                             # factory raced on.  In both cases a fresh validator
                             # miss is required before retrying; unrelated and
-                            # indeterminate failures remain visible.
+                            # indeterminate failures remain visible.  A default
+                            # that still names the alias that missed hasn't
+                            # moved: it isn't loaded, and retrying can't change
+                            # that (#1359).
                             raced_alias = self._raced_unknown_alias(exc, requested_alias)
                             if (
                                 raced_alias is None
                                 or not self._model_alias_disappeared(raced_alias)
+                                or (
+                                    requested_alias is None
+                                    and self._default_still_names(raced_alias)
+                                )
                                 or bind_attempt + 1 >= self._REHYDRATE_BIND_ATTEMPTS
                             ):
                                 raise
@@ -1560,6 +1573,35 @@ class SessionManager:
                 return ws, True
         finally:
             self._release_open_lock(ws_id)
+
+    def has_loaded_model(self, alias: str) -> bool:
+        """Whether *alias* is loaded, as the model validator reads it.
+
+        ``False`` when no validator is wired or it fails, so a caller keeps its
+        own fallback instead of trusting an alias nothing vouched for.
+        """
+        validator = self._model_validator
+        if not alias or validator is None:
+            return False
+        try:
+            return bool(validator(alias))
+        except Exception:
+            log.debug("session_mgr.model_check_failed alias=%s", alias, exc_info=True)
+            return False
+
+    def _default_still_names(self, alias: str) -> bool:
+        """Whether the default a session that names no model gets is still *alias*.
+
+        ``False`` when no reader is wired or it fails, which keeps the retry.
+        """
+        reader = self._default_alias_reader
+        if reader is None:
+            return False
+        try:
+            return reader() == alias
+        except Exception:
+            log.debug("session_mgr.default_alias_read_failed", exc_info=True)
+            return False
 
     def _model_alias_disappeared(self, alias: str | None) -> bool:
         """Whether a fresh validator read proves *alias* is now absent.

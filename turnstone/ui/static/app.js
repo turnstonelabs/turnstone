@@ -1590,19 +1590,20 @@ function dashboardResumeSession(wsId) {
     headers: { "Content-Type": "application/json" },
   })
     .then(function (r) {
-      if (r.status === 409) {
+      // Every refusal says why: a lease held elsewhere (409), or a model
+      // that isn't loaded (503 model_not_loaded), among others.
+      if (!r.ok) {
         return readRefusal(r).then(function (refusal) {
           showToast(
             refusal.where
               ? "This workstream is open " + refusal.where + ". Retry once it closes there."
               : (typeof refusal.data.error === "string" && refusal.data.error) ||
                   "Failed to open workstream",
-            "warn",
+            r.status === 409 ? "warn" : "error",
           );
           return {};
         });
       }
-      if (!r.ok) throw new Error("HTTP " + r.status);
       return r.json();
     })
     .then(function (data) {

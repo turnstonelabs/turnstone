@@ -7547,28 +7547,7 @@ function _renderModels(items) {
         'Delete model "' + dalias + '"?',
         "Delete",
         function () {
-          authFetch(
-            "/v1/api/admin/model-definitions/" + encodeURIComponent(did),
-            {
-              method: "DELETE",
-            },
-          )
-            .then(function (r) {
-              if (!r.ok) throw new Error();
-              return r.json();
-            })
-            .then(function (d) {
-              // Amber when the live registry refused the swap and keeps
-              // serving the deleted alias, or its last load skipped stored
-              // definitions (same caveat as save).
-              const toast = _modelActionToast("Model deleted", d);
-              showToast(toast.message, toast.type);
-              _flagModelSyncPending();
-              loadAdminModels();
-            })
-            .catch(function () {
-              showToast("Failed to delete model");
-            });
+          _deleteModelDefinition(did);
         },
       );
     });
@@ -8169,6 +8148,52 @@ function _authSubmitFields(
     fields.obo_scopes = oboScopes;
   }
   return fields;
+}
+
+// Delete one model definition and toast the outcome. A refusal shows its own
+// text: the guard's 409 names the setting to change first (#1359).
+function _deleteModelDefinition(did) {
+  return authFetch(
+    "/v1/api/admin/model-definitions/" + encodeURIComponent(did),
+    {
+      method: "DELETE",
+    },
+  )
+    .then(function (r) {
+      if (!r.ok) return _modelRefusal(r, "Failed to delete model");
+      return r.json();
+    })
+    .then(function (d) {
+      // Amber when the live registry refused the swap and keeps serving the
+      // deleted alias, or its last load skipped stored definitions (same
+      // caveat as save).
+      const toast = _modelActionToast("Model deleted", d);
+      showToast(toast.message, toast.type);
+      _flagModelSyncPending();
+      loadAdminModels();
+    })
+    .catch(function (e) {
+      showToast(e && e.refusal ? e.message : "Failed to delete model");
+    });
+}
+
+// A refused model action as a rejected promise whose Error carries the
+// server's own text (the delete guard's 409 names the setting to change
+// first), else *fallback*; a body that isn't JSON falls back too. ``refusal``
+// marks it, so a caller shows its message and not a network error's.
+function _modelRefusal(r, fallback) {
+  return r
+    .json()
+    .catch(function () {
+      return {};
+    })
+    .then(function (d) {
+      const err = new Error(
+        (d && typeof d.error === "string" && d.error) || fallback,
+      );
+      err.refusal = true;
+      throw err;
+    });
 }
 
 // Toast shape for any model action whose 200 can carry registry_warning

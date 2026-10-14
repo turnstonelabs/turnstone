@@ -105,11 +105,11 @@ frozen.
 >
 > **Before upgrading:** migration 082 stores the default model in the `model.default_alias` setting
 > when that setting has no value yet and the database holds enabled chat model definitions
-> (rerankers and speech models are skipped): the one named `default`, else the first in alias order,
-> which is the model the Models tab showed as the default. A node or console whose config.toml sets
-> `[model] default` while the database holds model definitions follows the stored setting from now
-> on, because the setting outranks config.toml; clear `model.default_alias` in the Settings tab to
-> go back to the config.toml default.
+> (rerankers and speech models are skipped): the one named `default`, else the first in alias order.
+> A node or console whose config.toml picks its default itself, with `[model] default` or a model
+> named `default` under `[models.*]`, while the database holds model definitions, follows the stored
+> setting from now on, because the setting outranks config.toml; clear `model.default_alias` in the
+> Settings tab to go back to the config.toml default.
 
 ### Added
 
@@ -229,11 +229,15 @@ frozen.
   for approval, saying why and suggesting a retry only when the secret store didn't answer (never
   another model), and no longer falls through to `[model].agent_model`; the CLI exits at startup
   naming the model. The coordinator check now blocks only creating a coordinator, so list, open,
-  events, send and close keep working while its model is missing. With nothing stored or configured,
-  the default is `[model].default`, else the model named `default`, else the first chat model
-  defined (not a reranker or speech model), whether or not it loaded. Adding or enabling the first
-  chat model in the Models tab stores it as `model.default_alias` when nothing is stored there;
-  nothing else stores it, so a reset in the Settings tab stays reset. Nodes read it with their model
+  events, send and close keep working while its model is missing. A fork (the node's Fork,
+  continuing elsewhere, a channel conversation's recovery) builds on its source's model when that
+  model is loaded, and fails if that model's client can't be built, as a reopen does; otherwise it
+  builds on the model the request names (for a channel recovery, the channel's model), else the
+  default, and fails when that one isn't loaded either. With nothing stored or configured, the
+  default is `[model].default`, else the model named `default`, else the first chat model defined
+  (not a reranker or speech model), whether or not it loaded. Adding or enabling the first chat
+  model in the Models tab stores it as `model.default_alias` when nothing is stored there; nothing
+  else stores it, so a reset in the Settings tab stays reset. Nodes read it with their model
   definitions, at a Sync or at the secret-store refresh, which now also reloads settings that
   changed. It outranks each node's config.toml default, so a cluster's default is uniform. The
   Models tab refuses to delete, disable or rename a model that `model.default_alias`,
@@ -245,7 +249,12 @@ frozen.
   marks one the node didn't load as not available.
 - **Slack uses the channel adapter model (#1359).** New Slack conversations run on
   `channels.default_model_alias`, as the Roles tab says, instead of always the server default;
-  before, only Discord used it.
+  before, only Discord used it. Both bots now re-read the setting every 30 seconds instead of every
+  5 minutes, since a channel model that was removed fails new conversations until they do.
+- **A coordinator create ignores `resume_ws` (#1359).** Coordinators can't be forked, but a
+  coordinator create carrying `resume_ws` read the named workstream, without checking that the
+  caller could see it, and stamped that workstream's persona onto the new coordinator. Only a create
+  endpoint that forks (the node's) now reads a fork source.
 - **A node's health says when its default model isn't loaded (#1359).** `/health` and the console's
   node status are `degraded` while the node's default model isn't loaded, since every create that
   relies on it fails, and `/health` gains `default_model` (`alias`, `loaded`); it still answers 200.

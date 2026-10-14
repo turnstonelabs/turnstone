@@ -126,38 +126,68 @@ MODEL_NOT_LOADED_CODE = "model_not_loaded"
 _ECHOABLE_ALIAS_RE = re.compile(r"[A-Za-z0-9._-]{1,64}\Z")
 
 
+def echoable_alias(value: object) -> str:
+    """*value* when it has a definition alias's shape, else ``""``: the one
+    check before an alias is echoed into a response body."""
+    return value if isinstance(value, str) and _ECHOABLE_ALIAS_RE.match(value) else ""
+
+
+@dataclass(frozen=True)
+class ModelWording:
+    """How a kind words a create or open whose model isn't loaded (#1359): what
+    the model is called when the request names none, where it isn't loaded, and
+    what a person can do about it."""
+
+    noun: str
+    host: str
+    remedy: str
+
+
+#: The interactive kind's wording, on a node.
+NODE_MODEL_WORDING = ModelWording(
+    noun="The default model",
+    host="this node",
+    remedy="Ask an admin to check its definition.",
+)
+
+
 def model_not_loaded_response(
-    exc: UnknownModelAliasError, *, requested: bool, reopen: bool = False
+    exc: UnknownModelAliasError,
+    *,
+    requested: bool,
+    wording: ModelWording,
+    reopen: bool = False,
 ) -> JSONResponse:
-    """The 503 for a create or open whose model isn't loaded on this node.
+    """The 503 for a create or open whose model isn't loaded.
 
     Nothing substitutes another model (#1359), so the body says which one is
-    missing and what to do. ``code`` lets a console or channel adapter word it
-    its own way; ``alias`` is echoed only in a definition alias's shape.
-    *requested* is whether the request named the model itself (otherwise it is
-    the default); *reopen* marks an open whose saved model and default both
-    missed. The loader's reason stays out of the text: it can name secret
-    reference paths, and admins see it in the Sync result, doctor and the node
-    log.
+    missing, why and what to do. The why is the registry's category
+    (``exc.reason``), never the loader's own reason, which can name secret
+    reference paths; admins see that in the Sync result, doctor and the node
+    log. ``code`` lets a console or channel adapter word it its own way;
+    ``alias`` is echoed only in a definition alias's shape. *requested* is
+    whether the request named the model itself, else the model is
+    *wording*'s noun; *reopen* marks an open whose saved model and default
+    both missed. *wording* is the kind's (:attr:`SessionEndpointConfig.model_wording`).
     """
-    alias = exc.alias if _ECHOABLE_ALIAS_RE.match(exc.alias or "") else ""
+    noun, host, remedy = wording.noun, wording.host, wording.remedy
+    alias = echoable_alias(exc.alias)
     quoted = f" '{alias}'" if alias else ""
-    # A coordinator reads this through its spawn tool, so it says why and
-    # whether trying again may help, and never points at another model.
-    if exc.retryable:
-        remedy = "Its secret store can't be reached; try again shortly."
-    else:
-        remedy = "Ask an admin to check its definition."
+    why = f": {exc.reason}" if exc.reason else ""
+    # A coordinator reads this through its spawn tool, so it says why,
+    # suggests trying again only when the failure may clear by itself, and
+    # never points at another model.
     if not exc.alias:
-        error = "No default model is set on this node. Ask an admin to set one."
+        error = f"No default model is set on {host}. Ask an admin to set one."
     elif reopen:
+        fix = "Try again shortly." if exc.retryable else "Ask an admin to check them."
         error = (
-            f"Neither this workstream's model nor the default model{quoted} is loaded "
-            "on this node. Try again once one of them loads, or ask an admin to check them."
+            f"Neither this workstream's model nor {noun[:1].lower()}{noun[1:]}{quoted} "
+            f"is loaded on {host}{why}. {fix}"
         )
     else:
-        noun = "The model" if requested else "The default model"
-        error = f"{noun}{quoted} isn't loaded on this node. {remedy}"
+        fix = "Try again shortly." if exc.retryable else remedy
+        error = f"{'The model' if requested else noun}{quoted} isn't loaded on {host}{why}. {fix}"
     return JSONResponse(
         {"error": error, "code": MODEL_NOT_LOADED_CODE, "alias": alias},
         status_code=503,
@@ -521,6 +551,13 @@ class SessionEndpointConfig:
     # wires ``False`` — coord create runs only on the console process
     # and the operator's auth result is the source of truth.
     create_supports_user_id_override: bool = False
+    # When ``True``, a create carrying ``resume_ws`` forks that workstream:
+    # the lifted body reads the source's config for its persona stamp and,
+    # when loaded, its model, and skips skill resolution. Only a mount whose
+    # validator checks the source's visibility and whose pre-commit forks it
+    # may set this; interactive wires ``True``. Coord has no fork and wires
+    # ``False``, so its creates ignore ``resume_ws`` (#1359).
+    create_supports_resume: bool = False
     # When ``True`` the shared create handler applies the ``server.require_project``
     # gate (refuse a projectless create). Declarative per-mount capability —
     # both current kinds wire ``True`` (interactive on the node mount,
@@ -574,6 +611,10 @@ class SessionEndpointConfig:
     # kind doesn't have to overload the audit prefix as a filter. ``None``
     # is allowed only for kinds that mount none of them.
     list_kind: WorkstreamKind | None = None
+    # Wording for a create or open whose model isn't loaded
+    # (:func:`model_not_loaded_response`). The coordinator kind runs on the
+    # console and takes ``coordinator.model_alias``, so it wires its own.
+    model_wording: ModelWording = NODE_MODEL_WORDING
 
 
 @dataclass(frozen=True)
@@ -2136,12 +2177,18 @@ async def _open_or_refusal(
         # The saved model isn't loaded and neither is the default the reopen
         # falls back to: nothing else is substituted (#1359).
         log.warning(misconfig_log, ws_id[:8], exc)
-        return model_not_loaded_response(exc, requested=False, reopen=True)
+        return model_not_loaded_response(
+            exc,
+            requested=False,
+            reopen=True,
+            wording=cfg.model_wording,
+        )
     except ValueError as exc:
-        # Session factory misconfig (e.g., a model alias that no longer
-        # exists). Surface the factory's remediation text as a 503 so the
-        # operator can fix it without digging through stack traces. Same
-        # shape coord used pre-lift; standardised across both kinds here.
+        # Other session factory misconfiguration (a model that isn't loaded
+        # is the arm above), e.g. the console factory refusing a kind. Surface
+        # the factory's remediation text as a 503 so the operator can fix it
+        # without digging through stack traces. Same shape coord used
+        # pre-lift; standardised across both kinds here.
         log.warning(misconfig_log, ws_id[:8], exc)
         return JSONResponse({"error": _safe_factory_misconfig_message(exc)}, status_code=503)
     except Exception:
@@ -3269,8 +3316,9 @@ def make_create_handler(
         # is still allowed). To preserve that exact pre-lift skip on
         # interactive, the validator may stash a sentinel — but
         # simplest: re-read resume_ws_id here and skip skill lookup
-        # when both kinds see a non-empty resume_ws_id (coord doesn't
-        # support resume_ws today; the field is silently ignored).
+        # when it is non-empty. Only a mount with
+        # ``create_supports_resume`` reads it; any other ignores the
+        # field (coord has no fork).
         # Strip whitespace on the skill name so a caller passing
         # ``"skill": "  "`` is treated identically to ``"skill": ""``
         # (skip skill resolution). Pre-lift coord explicitly stripped
@@ -3280,7 +3328,10 @@ def make_create_handler(
         # behaviour avoids a misleading 400 for an inert payload.
         body_skill_raw = body.get("skill") or ""
         body_skill = body_skill_raw.strip() if isinstance(body_skill_raw, str) else ""
-        resume_ws_id_raw = body.get("resume_ws") or ""
+        # A mount that doesn't fork never reads a fork source: its validator
+        # checks no visibility, so the source's persona and model would
+        # leak into the new workstream (#1359).
+        resume_ws_id_raw = (body.get("resume_ws") or "") if cfg.create_supports_resume else ""
         skill_data: dict[str, Any] | None = None
         applied_skill_version = 0
 
@@ -3378,6 +3429,7 @@ def make_create_handler(
             if not removed:
                 return
 
+        fork_model = ""
         try:
             if body_skill and not (isinstance(resume_ws_id_raw, str) and resume_ws_id_raw):
                 from turnstone.core.storage._registry import get_storage as _get_storage
@@ -3462,14 +3514,24 @@ def make_create_handler(
                 resume_target = resume_ws_id_raw
                 if _st is not None:
                     try:
-                        persona_snapshot = snapshot_from_config(
+                        source_cfg = (
                             await asyncio.to_thread(_st.load_workstream_config, resume_target) or {}
                         )
+                        persona_snapshot = snapshot_from_config(source_cfg)
                     except ValueError as exc:
                         return JSONResponse(
                             {"error": f"cannot fork {resume_ws_id_raw}: {exc}"},
                             status_code=400,
                         )
+                    # The clone rebinds the fork to the source's model when that
+                    # model is loaded, so build on it too: building on the
+                    # default would fail the fork whenever the default isn't
+                    # loaded here, though the conversation's own model is
+                    # (#1359). A source model that isn't loaded keeps the
+                    # request's model, else the default.
+                    source_alias = source_cfg.get("model_alias") or ""
+                    if isinstance(source_alias, str) and mgr.has_loaded_model(source_alias):
+                        fork_model = source_alias
             else:
                 from turnstone.core.personas import (
                     resolve_persona_for_kind,
@@ -3512,6 +3574,8 @@ def make_create_handler(
             kwargs = cfg.create_build_kwargs(
                 request, body, uid, skill_data, skill_id_resolved, applied_skill_version
             )
+            if fork_model:
+                kwargs["model"] = fork_model
             if persona_snapshot is not None:
                 # ``persona`` is SessionManager.create's explicit param
                 # (Workstream attr + workstreams row); the snapshot rides
@@ -3568,19 +3632,26 @@ def make_create_handler(
             # try-later) on both kinds.
             return JSONResponse({"error": str(exc)}, status_code=429)
         except UnknownModelAliasError as exc:
-            # The model the request names, or the default when it names none,
-            # isn't loaded here; nothing else is substituted (#1359).
+            # The model this create builds on isn't loaded here: a fork's
+            # source model, else the one the request names, else the
+            # default. Nothing else is substituted (#1359).
             log.warning("ws.create.model_not_loaded alias=%r", exc.alias)
-            requested = isinstance(body.get("model"), str) and bool(body["model"].strip())
-            return model_not_loaded_response(exc, requested=requested)
+            requested = bool(fork_model) or (
+                isinstance(body.get("model"), str) and bool(body["model"].strip())
+            )
+            return model_not_loaded_response(
+                exc,
+                requested=requested,
+                wording=cfg.model_wording,
+            )
         except ValueError as exc:
-            # Session factory raises ValueError on misconfigured alias
-            # (model alias points at a model that no longer exists,
-            # etc.). Surface the factory's remediation text as 503 so
-            # operators get the actionable message instead of a
-            # stack-traced 500. Sanitiser caps + scrubs the echoed
-            # text since the alias is user-controlled on the create
-            # path (body ``model`` / ``judge_model``).
+            # Session factory raises ValueError on other misconfiguration (a
+            # model that isn't loaded is the arm above), e.g. the console
+            # factory refusing a kind. Surface the factory's remediation text
+            # as 503 so operators get the actionable message instead of a
+            # stack-traced 500. Sanitiser caps + scrubs the echoed text since
+            # the alias is user-controlled on the create path (body ``model``
+            # / ``judge_model``).
             log.warning("ws.create.factory_misconfig exc=%r", exc)
             return JSONResponse({"error": _safe_factory_misconfig_message(exc)}, status_code=503)
         except Exception:

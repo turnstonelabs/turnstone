@@ -50,7 +50,12 @@ if TYPE_CHECKING:
 log = get_logger(__name__)
 
 _WS_CREATE_TIMEOUT = 30.0  # seconds
-_CHANNEL_DEFAULT_TTL = 300.0  # cache channel default alias for 5 minutes
+_MODELS_CACHE_TTL = 30.0  # cache model list for autocomplete
+# Cache the channel default alias as long as the model list. A model that isn't
+# loaded fails the conversation instead of running another (#1359), so after
+# the channel model is repointed and the old one removed, a stale alias fails
+# new conversations until it expires.
+_CHANNEL_DEFAULT_TTL = _MODELS_CACHE_TTL
 
 #: What a channel adapter replies when a conversation can't start because its
 #: model isn't loaded. Nothing substitutes another model (#1359); the chat user
@@ -69,7 +74,6 @@ def model_unavailable_reply(exc: BaseException) -> str | None:
     return None
 
 
-_MODELS_CACHE_TTL = 30.0  # cache model list for autocomplete
 _FORK_SOURCE_NOT_FOUND = "Workstream not found"
 _STARTUP_PROBE_CONCURRENCY = 8
 _STARTUP_PROBE_TIMEOUT = 10.0
@@ -182,7 +186,7 @@ class ChannelRouter:
         # Cached channel default alias (TTL-based).
         self._channel_default_alias: str = ""
         self._channel_default_ts: float = 0.0
-        # Cached model list for autocomplete (shorter TTL).
+        # Cached model list for autocomplete (TTL-based).
         self._models_cache: dict[str, Any] = {}
         self._models_cache_ts: float = 0.0
 

@@ -288,3 +288,106 @@ assert.equal(paneCloses + toasts + dashboards, 0);
 """
     )
     assert result.returncode == 0, result.stderr
+
+
+def test_a_node_without_the_model_reads_as_model_not_loaded():
+    # The node substitutes no model (#1359); the pane says so in the console's
+    # own words, echoes the alias only in an alias's shape, and offers to
+    # continue elsewhere.
+    source = _APP.read_text()
+    seam = source[
+        source.index("window.TS_APP.resolveInteractiveNode = function") : source.index(
+            "// === MCP consent badge"
+        )
+    ]
+    result = run_node_source(
+        """
+import assert from 'node:assert/strict';
+const window = {TS_APP:{}};
+let authFetch;
+"""
+        + _refusal_helpers()
+        + seam
+        + """
+const response = (status, body={}) => ({status, ok:status===200, json:async()=>body});
+for (const [alias, shown] of [['gpt', "('gpt')"], ['<b>x</b>', null]]) {
+  authFetch=async()=>response(503,{code:'model_not_loaded',alias,error:'node text'});
+  const result=await window.TS_APP.resolveInteractiveNode('saved','node-1');
+  assert.equal(result.code,'model_not_loaded');
+  assert.equal(result.canContinue,true);
+  assert.ok(result.error.startsWith("Neither this session's model nor the node's default model"));
+  if (shown) assert.ok(result.error.includes(shown));
+  else assert.ok(!result.error.includes('<b>'));
+}
+"""
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_a_standalone_revive_shows_any_refusals_own_text():
+    shell_path = Path(__file__).resolve().parents[1] / "turnstone/shared_static/shell.js"
+    shell = shell_path.read_text()
+    body = slice_braced_block(shell, shell.index("function ensureInteractiveNode("))
+    assert body is not None
+    result = run_node_source(
+        """
+import assert from 'node:assert/strict';
+let authFetch;
+"""
+        + _refusal_helpers()
+        + "function ensureInteractiveNode(caps, wsId, hint, openFirst) "
+        + body
+        + """
+const response = (status, body) => ({status, ok: status === 200, json: async () => body});
+const refusal = "Neither this workstream's model nor the default model 'gpt' is loaded here.";
+authFetch = async () => response(503, {code: 'model_not_loaded', error: refusal});
+assert.deepEqual(await ensureInteractiveNode({cluster: false}, 'ws', null, true), {error: refusal});
+authFetch = async () => ({status: 500, ok: false, json: async () => { throw Error('html'); }});
+assert.deepEqual(
+  await ensureInteractiveNode({cluster: false}, 'ws', null, true),
+  {error: 'Could not reopen this session (500).'},
+);
+authFetch = async () => response(409, {code: 'workstream_lease_held', holder_node_id: 'node-b'});
+assert.deepEqual(
+  await ensureInteractiveNode({cluster: false}, 'ws', null, true),
+  {error: "This session is open on node 'node-b'. Retry once it closes there."},
+);
+"""
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_the_node_ui_resume_shows_any_refusals_own_text():
+    source = _NODE_APP.read_text()
+    body = slice_braced_block(source, source.index("function dashboardResumeSession("))
+    assert body is not None
+    result = run_node_source(
+        """
+import assert from 'node:assert/strict';
+let authFetch;
+const toasts = [];
+const showToast = (message, type) => toasts.push([message, type]);
+const workstreams = {};
+const switchTab = () => {};
+const hideDashboard = () => {};
+"""
+        + _refusal_helpers()
+        + "function dashboardResumeSession(wsId) "
+        + body
+        + """
+const response = (status, body) => ({status, ok: status === 200, json: async () => body});
+const settle = () => new Promise((resolve) => setTimeout(resolve, 10));
+const refusal = "Neither this workstream's model nor the default model 'gpt' is loaded here.";
+authFetch = async () => response(503, {code: 'model_not_loaded', error: refusal});
+dashboardResumeSession('ws');
+await settle();
+authFetch = async () => response(409, {code: 'workstream_lease_held', holder_node_id: 'node-b'});
+dashboardResumeSession('ws');
+await settle();
+assert.deepEqual(toasts, [
+  [refusal, 'error'],
+  ["This workstream is open on node 'node-b'. Retry once it closes there.", 'warn'],
+]);
+"""
+    )
+    assert result.returncode == 0, result.stderr

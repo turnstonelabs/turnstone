@@ -16,7 +16,6 @@ from tests._oidc_test_helpers import keyed_app_state
 from tests._session_helpers import scripted_chat_client
 from turnstone.core import model_registry as mr_module
 from turnstone.core.model_registry import (
-    KEY_GUARD_DEFERRED_TO_LIFESPAN,
     DynamicAuthKeyError,
     ModelConcurrencyConfigError,
     ModelConfig,
@@ -1596,12 +1595,6 @@ class TestReloadKeyGuard:
         keyless = SimpleNamespace(oauth_context=OAuthContext(token_store=None))
         reg.reload({"b": ModelConfig("b", "http://y/v1", "key", "m")}, "b", app_state=keyless)
         assert reg.has_alias("b")
-
-    def test_reload_boot_sentinel_defers_key_guard(self) -> None:
-        """Boot defers to ``initialize_mcp_crypto_state``, not a bypass."""
-        reg = ModelRegistry(models=self._static_models(), default="a")
-        reg.reload(self._dynamic_models(), "a", app_state=KEY_GUARD_DEFERRED_TO_LIFESPAN)
-        assert reg.has_dynamic_auth()
 
 
 class TestProfileMismatchVisibility:
@@ -4399,6 +4392,9 @@ class TestDefaultNeverMovesOnALoad:
         with pytest.raises(UnknownModelAliasError) as exc_info:
             reg.resolve()
         assert exc_info.value.alias == "alpha"
+        # The category every reader may see, the same one task_agent reports.
+        assert exc_info.value.reason == "its definition couldn't be loaded"
+        assert exc_info.value.retryable is False
 
     def test_configured_default_left_out_stays_default(self) -> None:
         storage = _MockStorage(
@@ -4409,6 +4405,60 @@ class TestDefaultNeverMovesOnALoad:
             reg = load_model_registry(storage=storage, allow_empty=True)
         assert reg.default == "beta"
         assert reg.has_alias("alpha")
+
+    def test_the_retryable_mark_follows_the_reason_kept(self) -> None:
+        # A stored row's key fails retryably, then the config.toml entry that
+        # overrides it fails for good: retrying can't help, so nothing says so.
+        from turnstone.core.http_headers import HeaderValueError
+        from turnstone.core.secret_refs import SecretBackendError
+
+        def _materialize(value: object) -> str:
+            if value == "secret://store/x":
+                raise SecretBackendError("store unreachable", retryable=True)
+            if value == "BAD":
+                raise HeaderValueError("literal key cannot be sent")
+            return str(value)
+
+        storage = _MockStorage([self._row("x", api_key="secret://store/x"), self._row("y")])
+        fake_cfg: dict[str, Any] = {
+            "models": {
+                "x": {"model": "m-x", "base_url": "https://models.example.com/v1", "api_key": "BAD"}
+            }
+        }
+        with (
+            patch("turnstone.core.model_registry.load_config", return_value=fake_cfg),
+            patch("turnstone.core.model_registry.materialize_api_key", _materialize),
+        ):
+            reg = load_model_registry(storage=storage, allow_empty=True)
+        assert "x" in reg.skipped_aliases
+        assert "x" not in reg.retryable_skips
+        assert reg.unavailable_reason("x") == ("its definition couldn't be loaded", False)
+
+    def test_config_tomls_kind_replaces_a_stored_rows(self) -> None:
+        # The default pick reads the definition in force: config.toml's entry,
+        # once it takes over the alias.
+        rerank = '{"supports_rerank": true}'
+        chat_entry = {"model": "m-a", "base_url": "https://models.example.com/v1", "api_key": "k"}
+        storage = _MockStorage([self._row("a", capabilities=rerank)])
+        with patch(
+            "turnstone.core.model_registry.load_config",
+            return_value={"models": {"a": chat_entry}},
+        ):
+            reg = load_model_registry(storage=storage, allow_empty=True)
+        assert reg.default == "a"
+
+        storage = _MockStorage([self._row("a"), self._row("b")])
+        rerank_entry = {
+            **chat_entry,
+            "model": "bge-reranker",
+            "capabilities": {"supports_rerank": True},
+        }
+        with patch(
+            "turnstone.core.model_registry.load_config",
+            return_value={"models": {"a": rerank_entry}},
+        ):
+            reg = load_model_registry(storage=storage, allow_empty=True)
+        assert reg.default == "b"
 
     def test_nothing_loaded_still_names_the_default(self) -> None:
         storage = _MockStorage([self._row("only", api_key="${TS_STORED_VALUE}")])

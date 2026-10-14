@@ -100,8 +100,10 @@ from turnstone.core.session_routes import (
     MODEL_NOT_LOADED_CODE,
     AttachmentUploadHelpers,
     CoordOnlyVerbHandlers,
+    ModelWording,
     SessionEndpointConfig,
     SharedSessionVerbHandlers,
+    echoable_alias,
     make_approve_handler,
     make_attachment_handlers,
     make_cancel_handler,
@@ -1968,14 +1970,7 @@ async def create_workstream(request: Request) -> JSONResponse:
         # The node holds no model this create can use and substitutes none
         # (#1359). Console-owned wording, as for require_project: only the
         # node's alias crosses this boundary, and only in an alias's shape.
-        alias_raw = node_body.get("alias")
-        alias = (
-            alias_raw
-            if isinstance(alias_raw, str)
-            and len(alias_raw) <= 64
-            and _MODEL_ALIAS_RE.match(alias_raw)
-            else ""
-        )
+        alias = echoable_alias(node_body.get("alias"))
         noun = "The model" if model.strip() else "The default model"
         named = f" '{alias}'" if alias else ""
         log.info("Workstream dispatch to %s refused: model %r not loaded", node_id, alias)
@@ -3867,26 +3862,18 @@ def _require_coord_mgr(request: Request) -> tuple[Any, JSONResponse | None]:
     when the coordinator subsystem isn't configured.
     """
     coord_mgr = getattr(request.app.state, "coord_mgr", None)
-    config_store = getattr(request.app.state, "config_store", None)
     if coord_mgr is None:
-        registry_err = getattr(request.app.state, "coord_registry_error", "") or ""
-        msg = "Coordinator subsystem not initialized. " + (
-            registry_err or "Add a model definition in the admin Models tab."
+        # One message for every down state. The recorded cause
+        # (``coord_registry_error``) can be the loader's own text, which names
+        # secret reference paths, and every coordinator verb's caller reads
+        # this; admins see the cause in the Models tab's replies
+        # (:func:`_coord_registry_warning`) and the console log (#1359).
+        msg = (
+            "Coordinator subsystem not initialized. Add a model definition in the "
+            "admin Models tab; if one exists, an admin can see why by pressing Sync "
+            "to Nodes there, or in the console log."
         )
         return None, JSONResponse({"error": msg}, status_code=503)
-    if config_store is None:
-        return None, JSONResponse({"error": "ConfigStore unavailable"}, status_code=503)
-    registry = getattr(request.app.state, "coord_registry", None)
-    if registry is None:
-        return None, JSONResponse(
-            {
-                "error": (
-                    "ModelRegistry unavailable for coordinator sessions. "
-                    "Restart the console after adding a model definition."
-                )
-            },
-            status_code=503,
-        )
     # The coordinator's model is not resolved here: every coordinator verb
     # passes this gate, and an unloaded default must not take list, open,
     # events, send or close down with it. Only a create needs the model; its
@@ -4185,6 +4172,15 @@ def _coord_events_replay(
                 cached_verdicts = list(llm_verdicts.values())
             for v in cached_verdicts:
                 yield {"type": "intent_verdict", **v}
+
+
+#: How a coordinator create or reopen words a model that isn't loaded (#1359): a
+#: coordinator runs on this console, on ``coordinator.model_alias`` when set.
+COORDINATOR_MODEL_WORDING = ModelWording(
+    noun="The coordinator model",
+    host="the console",
+    remedy="Ask an admin to check its definition, or to set coordinator.model_alias.",
+)
 
 
 async def _coord_create_validate_request(
@@ -5682,6 +5678,9 @@ def _bootstrap_coord_subsystem(
         # coordinator pinned to a since-removed alias still rehydrates
         # (on the registry default) instead of 500-ing on every reopen.
         model_validator=coord_registry.has_alias,
+        default_alias_reader=lambda: resolve_coordinator_alias(
+            explicit="", config_store=config_store, registry=coord_registry
+        ),
     )
     # Late-bind the manager onto the adapter so
     # ``_rebuild_children_registry`` / ``send`` / fan-out dispatch can
@@ -5778,9 +5777,9 @@ def _bootstrap_coord_subsystem(
         raise
 
     # Atomic commit phase: stamp ``app.state`` and class attrs.  Order
-    # matters — :func:`_require_coord_mgr` reads ``coord_mgr`` first
-    # and only then reads ``coord_registry``, so ``coord_registry``
-    # MUST land BEFORE ``coord_mgr``.  Under CPython's GIL each
+    # matters — readers gate on ``coord_mgr`` and only then read the
+    # rest (``coord_registry`` included), so everything MUST land
+    # BEFORE ``coord_mgr``.  Under CPython's GIL each
     # individual ``setattr`` is atomic and ordering is preserved, so
     # any concurrent reader observing a populated ``coord_mgr`` is
     # guaranteed to see all the prior commits including the registry.
@@ -5815,8 +5814,9 @@ def _record_coord_key_refusal(app_state: Any, key_err: str) -> None:
 
     Shared by the lifespan bootstrap, the CRUD-triggered runtime bootstrap
     and :func:`_refresh_coord_registry` so the three cannot drift: an ERROR
-    log (the observable while the coordinator is live) plus the
-    ``coord_registry_error`` banner (rendered by the 503 path while down).
+    log (the observable while the coordinator is live) plus
+    ``coord_registry_error``, which the Models tab's replies show admins
+    (:func:`_coord_registry_warning`); the coordinator 503 stays neutral.
     """
     log.error("console.model_auth_key_missing: %s", key_err)
     app_state.coord_registry_error = key_err
@@ -5864,8 +5864,8 @@ def _load_and_bootstrap_coord_subsystem(app: Starlette, storage: Any, config_sto
         try:
             coord_registry = load_model_registry(storage=storage, detect_context_windows=True)
         except ValueError as exc:
-            # No model rows configured.  Endpoint returns 503 with the
-            # error text so admin sees remediation in the UI; the
+            # No model rows configured.  Recorded for the Models tab's
+            # replies (the coordinator 503 says to add a model); the
             # operator can recover at runtime by adding a model in the
             # admin panel (see :func:`_maybe_bootstrap_coord_subsystem`).
             app.state.coord_registry_error = str(exc)
@@ -13973,9 +13973,9 @@ def _maybe_bootstrap_coord_subsystem(app: Any, storage: Any) -> None:
         try:
             coord_registry = load_model_registry(storage=storage, detect_context_windows=True)
         except ValueError as exc:
-            # Still no usable rows (e.g. all disabled).  Surface the
-            # reason via the same channel the lifespan path uses so
-            # ``_require_coord_mgr``'s 503 message stays accurate.
+            # Still no usable rows (e.g. all disabled).  Record the
+            # reason via the same channel the lifespan path uses, for
+            # the Models tab's replies.
             app.state.coord_registry_error = str(exc)
             return
         except Exception:
@@ -14002,8 +14002,8 @@ def _maybe_bootstrap_coord_subsystem(app: Any, storage: Any) -> None:
             # The "no models found" message captured at boot is
             # demonstrably stale — load_model_registry just succeeded
             # against N>0 rows.  Replace it with a builder-specific
-            # diagnosis so the dashboard's 503 banner reflects the
-            # actual cause (operators can grep logs for the type name).
+            # diagnosis so the Models tab's replies name the actual
+            # cause (operators can grep logs for the type name).
             app.state.coord_registry_error = (
                 f"Coordinator subsystem failed to initialise "
                 f"({type(exc).__name__}). See console logs and retry."
@@ -14081,6 +14081,20 @@ def _console_config_default() -> str:
     return str(load_config("model").get("default") or "").strip()
 
 
+def _stored_default_alias(storage: Any) -> str:
+    """The global ``model.default_alias`` value, or ``""`` (absent, cleared or unreadable)."""
+    from turnstone.core.settings_registry import deserialize_value
+
+    row = storage.get_system_setting("model.default_alias", node_id="")
+    if row is None:
+        return ""
+    try:
+        value = deserialize_value("model.default_alias", str(row.get("value") or ""))
+    except (ValueError, TypeError):
+        return ""
+    return value.strip() if isinstance(value, str) else ""
+
+
 def _row_serves_chat(row: dict[str, Any]) -> bool:
     """:func:`~turnstone.core.model_registry.serves_chat` for a stored row,
     whose capabilities are JSON text (or ``{}`` for a node-reported entry)."""
@@ -14106,19 +14120,32 @@ def _model_in_use_refusal(storage: Any, alias: str, action: str) -> JSONResponse
     """
     named = _routing_settings_naming(storage, alias)
     sources = [f"{key} (node {node_id})" if node_id else key for key, node_id in named]
-    if _console_config_default() == alias:
+    steps = []
+    if len(sources) == 1:
+        steps.append("Point that setting at another model, or clear it.")
+    elif sources:
+        steps.append("Point those settings at another model, or clear them.")
+    # The console's config.toml default routes while no stored default
+    # outranks it, and takes over when a stored default naming this same
+    # model is cleared.
+    stored = _stored_default_alias(storage)
+    if _console_config_default() == alias and stored in ("", alias):
         sources.append("[model] default in the console's config.toml")
+        if stored:
+            steps.append(
+                "Clearing model.default_alias hands the default to that config.toml line, "
+                "which names it too: change the line and restart the console."
+            )
+        else:
+            steps.append("Change that config.toml line and restart the console.")
     if not sources:
         return None
-    if len(sources) == 1:
-        tail = "Point that setting at another model, or clear it"
-    else:
-        tail = "Point those settings at another model, or clear them"
     return JSONResponse(
         {
             "error": (
-                f"'{alias}' is still named by {', '.join(sources)}. {tail}, before you "
-                f"{action} it: creates that rely on a setting naming a missing model fail."
+                f"'{alias}' is still named by {', '.join(sources)}. {' '.join(steps)} "
+                f"Do this before you {action} it: creates that rely on a setting naming "
+                "a missing model fail."
             ),
             "code": "model_in_use",
             "settings": sorted({key for key, _ in named}),
@@ -14157,6 +14184,17 @@ def _enabled_chat_aliases(storage: Any) -> list[str]:
         for r in storage.list_model_definitions(enabled_only=True)
         if r.get("alias") and _row_serves_chat(r)
     ]
+
+
+def _first_chat_model_pending(storage: Any) -> bool:
+    """Whether a write could give the cluster its first chat model with no
+    default stored, read before the write. The cheap checks run first, so
+    the usual state (a stored default) never lists the definitions."""
+    if storage.get_system_setting("model.default_alias", node_id="") is not None:
+        return False
+    if _console_config_default():
+        return False
+    return not _enabled_chat_aliases(storage)
 
 
 def _pin_first_chat_model(storage: Any, audit_uid: str, ip: str) -> str:
@@ -14556,7 +14594,7 @@ async def admin_create_model_definition(request: Request) -> JSONResponse:
 
     # Read before the write: the cluster's first chat model becomes its stored
     # default (#1359).
-    had_chat_model = bool(_enabled_chat_aliases(storage))
+    could_pin = _first_chat_model_pending(storage)
     storage.create_model_definition(
         definition_id=definition_id,
         alias=alias,
@@ -14601,18 +14639,19 @@ async def admin_create_model_definition(request: Request) -> JSONResponse:
         audit_detail,
         ip,
     )
-    pinned = ""
-    if not had_chat_model:
-        pinned = await asyncio.to_thread(
-            _pin_default_and_reload, request.app.state, storage, audit_uid, ip
-        )
-
     await asyncio.to_thread(_refresh_coord_registry, request.app.state, storage)
     # First-row bootstrap on a freshly-installed console: a runtime-added
     # model promotes the coord subsystem from "not initialized" to ready
     # without a console restart.  No-op when already built.
     await asyncio.to_thread(_maybe_bootstrap_coord_subsystem, request.app, storage)
     await asyncio.to_thread(_ensure_console_mcp_client, request.app)
+    # After the refresh, so this console has loaded the model before its
+    # coordinators route to it.
+    pinned = ""
+    if could_pin:
+        pinned = await asyncio.to_thread(
+            _pin_default_and_reload, request.app.state, storage, audit_uid, ip
+        )
     _emit_models_changed(request)
     # Same surfacing as the update twin (see its comment): the row is stored,
     # but a keyless console's live registry may have refused to adopt it, or
@@ -14930,11 +14969,17 @@ async def admin_update_model_definition(request: Request) -> JSONResponse:
             if refusal is not None:
                 return refusal
 
-    had_chat_model = True
+    could_pin = False
     if updates:
-        # Read before the write: an edit that gives the cluster its first
-        # enabled chat model (enabling one, say) stores it as the default.
-        had_chat_model = bool(_enabled_chat_aliases(storage))
+        # Read before the write: an edit that leaves this row an enabled chat
+        # model (enabling one, say), on a cluster that had none, stores it as
+        # the default. The row's after-state decides, as the pin does.
+        after = {**existing, **updates}
+        could_pin = (
+            bool(after.get("enabled", True))
+            and _row_serves_chat(after)
+            and _first_chat_model_pending(storage)
+        )
         storage.update_model_definition(definition_id, **updates)
         old_alias = str(existing.get("alias") or "")
         alias_changed = "alias" in updates and updates["alias"] != old_alias
@@ -14975,15 +15020,15 @@ async def admin_update_model_definition(request: Request) -> JSONResponse:
         _clear_routing_settings(storage, clear_after_update, audit_uid, ip)
         await _publish_config_change(request)
     pinned = ""
-    if not had_chat_model:
-        pinned = await asyncio.to_thread(
-            _pin_default_and_reload, request.app.state, storage, audit_uid, ip
-        )
-
     if updates:
         await asyncio.to_thread(_refresh_coord_registry, request.app.state, storage)
         await asyncio.to_thread(_maybe_bootstrap_coord_subsystem, request.app, storage)
         await asyncio.to_thread(_ensure_console_mcp_client, request.app)
+        # After the refresh, as on create.
+        if could_pin:
+            pinned = await asyncio.to_thread(
+                _pin_default_and_reload, request.app.state, storage, audit_uid, ip
+            )
         _emit_models_changed(request)
 
     # Read outside the block: a save that changed nothing still reports the console's standing
@@ -15084,20 +15129,28 @@ async def admin_model_reload(request: Request) -> JSONResponse:
     if err:
         return err
 
-    # Ensure config (including model.default_alias) is fresh on all nodes
-    # before they rebuild their model registries.
-    await _publish_config_change(request)
-
     # Refresh the console's own coord_registry first.  The node fan-out
     # below carries DB→nodes propagation; the console hosts coordinator
     # sessions itself and must mutate its in-process registry too —
     # otherwise the coord LLM keeps calling the prior model name even
     # after a successful reload.
     await asyncio.to_thread(_refresh_coord_registry, request.app.state, storage)
+    # This console's own settings next: after its registry refresh, so its
+    # coordinators route to a stored default only once this console has loaded
+    # the model, and before the bootstrap and models_changed, so a setting
+    # another console wrote is read here first.
+    config_store = getattr(request.app.state, "config_store", None)
+    if config_store:
+        config_store.reload()
     await asyncio.to_thread(_maybe_bootstrap_coord_subsystem, request.app, storage)
     _emit_models_changed(request)
 
+    # Each node reloads its settings with the model definitions (after a
+    # successful load, before the swap), so a stored default arrives with the
+    # model it names; pushing the settings first switched nodes to a model they
+    # hadn't loaded yet (#1359). The push follows, for a node whose load failed.
     results = await _notify_nodes_model_reload(request)
+    await _publish_config_change(request)
     # This route's whole purpose is "make the live registry match the DB", so
     # a refused console swap, or a load that skipped stored definitions, must
     # not read as unqualified success. Same surfacing as the create/update twins.
@@ -17520,6 +17573,7 @@ def create_app(
         # ``sse_executor_lookup`` wiring on ``interactive_endpoint_config``
         # in ``turnstone/server.py``.
         sse_executor_lookup=lambda request: request.app.state.coord_sse_executor,
+        model_wording=COORDINATOR_MODEL_WORDING,
     )
     # Minimal interactive cfg used ONLY by the unified saved-list handler
     # so the console's L-shell dashboard can show a single saved list

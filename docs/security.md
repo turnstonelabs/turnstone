@@ -690,6 +690,13 @@ resolution), so a typo never reaches the database, and the audit row of the
 save, or of a connection test, records the reference. Sending a definition back
 unchanged, reference included, needs neither the gate nor the store.
 
+`admin.models` also decides the cluster's default model in one case: adding or
+enabling the cluster's first chat model stores it as `model.default_alias` when
+no default is stored, and that setting outranks every node's config.toml
+default. Setting the default directly needs `admin.settings`, but this grants
+nothing new: `admin.models` can always change the endpoint of the model that is
+the default.
+
 The Helm chart and the Terraform deployment pass configuration through the
 environment and mount no config.toml today, so `[secrets]` cannot be set
 there yet; references are for deployments that ship a config.toml (systemd,

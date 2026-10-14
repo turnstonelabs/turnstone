@@ -1,4 +1,4 @@
-"""Store the default model that existing setups route to today.
+"""Store a default model for existing setups that never set one.
 
 A registry load no longer picks another model when the default's definition is
 left out of it: a default that isn't loaded fails the creates that rely on it
@@ -7,20 +7,20 @@ left out of it: a default that isn't loaded fails the creates that rely on it
 a setting rather than a pick that a later model, whose alias sorts first,
 could take over.
 
-Existing setups that never set ``model.default_alias`` get it stored here, as
-the model the Models tab showed as their default: among the enabled
-definitions that can hold a chat, the one named ``default``, else the first in
-alias order (the storage list order). A reranker or speech model is never
-picked: the setting outranks every node's config.toml default, so a setup whose
-chat models live in config.toml and whose Models tab holds only a reranker must
-not route its chats there. Nothing is written when a global
-``model.default_alias`` row already exists, cleared or not, or when no enabled
-chat definition exists.
+Existing setups that never set ``model.default_alias`` get one stored here:
+among the enabled definitions that can hold a chat, the one named ``default``,
+else the first in alias order (the storage list order). A reranker or speech
+model is never picked: the setting outranks every node's config.toml default,
+so a setup whose chat models live in config.toml and whose Models tab holds
+only a reranker must not route its chats there. Nothing is written when a
+global ``model.default_alias`` row already exists, cleared or not, or when no
+enabled chat definition exists.
 
-A migration cannot read config.toml. A host whose config.toml sets
-``[model] default`` while the database holds model rows now follows the stored
-setting instead, which outranks config.toml; clearing the setting restores the
-config.toml default (CHANGELOG).
+A migration cannot read config.toml. A host whose config.toml picks its
+default itself (``[model] default``, or a ``[models.default]`` entry) while
+the database holds model rows now follows the stored setting instead, which
+outranks config.toml; clearing the setting restores the config.toml default
+(CHANGELOG).
 
 Downgrade leaves the row in place: it cannot tell this migration's row from
 one an operator wrote, and the older loader reads it the same way.

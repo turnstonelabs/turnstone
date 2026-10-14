@@ -1777,6 +1777,7 @@ class TestSkillConfigAppliedToWorkstream:
             audit_action_prefix="workstream",
             create_supports_attachments=True,
             create_supports_user_id_override=True,
+            create_supports_resume=True,
             create_validate_request=_interactive_create_validate_request,
             create_build_kwargs=_interactive_create_build_kwargs,
             create_pre_commit=_interactive_create_pre_commit,

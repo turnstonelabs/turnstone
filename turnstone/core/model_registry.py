@@ -183,12 +183,15 @@ class UnknownModelAliasError(ValueError):
     structured ``alias`` field lets lifecycle code distinguish an alias-removal
     race from unrelated validation failures without parsing exception text.
     ``retryable`` is True when the alias was left out because its secret store
-    didn't answer, so it may load by itself (see ``ModelRegistry.unavailable_reason``).
+    didn't answer, so it may load by itself; ``reason`` names the kind of
+    failure in words any reader may see (both from
+    ``ModelRegistry.unavailable_reason``; empty when the raiser didn't say).
     """
 
-    def __init__(self, alias: str, *, retryable: bool = False) -> None:
+    def __init__(self, alias: str, *, retryable: bool = False, reason: str = "") -> None:
         self.alias = alias
         self.retryable = retryable
+        self.reason = reason
         super().__init__(f"Unknown model alias: {alias}")
 
 
@@ -201,17 +204,6 @@ class DynamicAuthKeyError(RuntimeError):
     gives the identical state. A distinct type keeps the two exits from being
     conflated by a broad ``except`` arm.
     """
-
-
-# Pre-lifespan swaps only. The node builds and re-shapes its registry in
-# ``main()`` before the app exists, so there is no token store to check yet —
-# ``initialize_mcp_crypto_state`` (SystemExit at boot) owns key enforcement
-# for that process phase moments later. Passing this sentinel says exactly
-# that and nothing else: every post-lifespan caller hands the real
-# ``app.state`` so :meth:`ModelRegistry.reload` can refuse. The parameter is
-# required rather than defaulted so a new call site must actively choose —
-# fail-safe defaults, not fail-open ones.
-KEY_GUARD_DEFERRED_TO_LIFESPAN: Any = object()
 
 
 def dynamic_auth_key_error(models: Mapping[str, ModelConfig], app_state: Any) -> str:
@@ -886,7 +878,8 @@ class ModelRegistry:
             alias = alias or self.default
             cfg = self._models.get(alias)
             if cfg is None:
-                raise UnknownModelAliasError(alias, retryable=alias in self.retryable_skips)
+                reason, retryable = self.unavailable_reason(alias)
+                raise UnknownModelAliasError(alias, retryable=retryable, reason=reason)
             return self._get_client_locked(alias), cfg.model, cfg, self._generation
 
     def resolve_binding(
@@ -910,7 +903,8 @@ class ModelRegistry:
             alias = alias or self.default
             cfg = self._models.get(alias)
             if cfg is None:
-                raise UnknownModelAliasError(alias, retryable=alias in self.retryable_skips)
+                reason, retryable = self.unavailable_reason(alias)
+                raise UnknownModelAliasError(alias, retryable=retryable, reason=reason)
             client = self._get_client_locked(alias)
             try:
                 provider = self._get_provider_locked(alias)
@@ -1037,11 +1031,10 @@ class ModelRegistry:
         THE model-registry swap chokepoint (complete mediation): every
         live-registry swap on every host routes through here, so the
         dynamic-auth-needs-key refusal below cannot be forgotten at a call
-        site (fail-safe defaults). ``app_state`` is required; pre-lifespan
-        boot paths pass :data:`KEY_GUARD_DEFERRED_TO_LIFESPAN` (see its
-        comment for why that is not a bypass). Raises
-        :class:`DynamicAuthKeyError` WITHOUT mutating when refused, and the
-        caller applies per-host policy.
+        site (fail-safe defaults). ``app_state`` is required, so a new call
+        site must hand the real one. Raises :class:`DynamicAuthKeyError`
+        WITHOUT mutating when refused, and the caller applies per-host
+        policy.
 
         Validates arguments before mutating state so a bad reload
         does not leave the registry in an inconsistent state.
@@ -1051,14 +1044,13 @@ class ModelRegistry:
         when an alias keeps its backend model id (see
         ``ChatSession._refresh_model_from_registry``).
         """
-        if app_state is not KEY_GUARD_DEFERRED_TO_LIFESPAN:
-            key_err = dynamic_auth_key_error(models, app_state)
-            if key_err:
-                raise DynamicAuthKeyError(key_err)
-            # Visibility, not a gate: a persisted row whose mode names the
-            # other grant dialect stays valid to keep, but its mint always
-            # refuses on this deployment — say so at every swap chokepoint.
-            warn_profile_mismatched_aliases(models, app_state)
+        key_err = dynamic_auth_key_error(models, app_state)
+        if key_err:
+            raise DynamicAuthKeyError(key_err)
+        # Visibility, not a gate: a persisted row whose mode names the other
+        # grant dialect stays valid to keep, but its mint always refuses on
+        # this deployment — say so at every swap chokepoint.
+        warn_profile_mismatched_aliases(models, app_state)
         _validate_fallback(models, fallback)
         rerank_close_actions: list[Callable[[], None]] = []
         with _deferred_close_actions(rerank_close_actions), self._client_lock:
@@ -1286,10 +1278,11 @@ def _materialize_row_key(
     A key :func:`materialize_api_key` refuses (a reference that cannot be resolved, a literal key
     :func:`turnstone.core.http_headers.checked_header_value` refuses, or one whose ``${VAR}``
     expands to nothing) drops the alias from this load and records the reason in *skipped*; ``None``
-    is returned for it. An alias whose failure was the store not answering (``SecretError.retryable``)
-    also goes in *retryable*: it may load by itself once the store answers. A store outage is
-    covered one level down: the resolver keeps serving the value it fetched last while the store
-    cannot answer, so only a reference this process never resolved is dropped by an outage.
+    is returned for it. An alias whose failure was the store not answering
+    (``SecretError.retryable``) also goes in *retryable*, since it may load by itself once the store
+    answers; any other failure takes it out. A store outage is covered one level down: the resolver
+    keeps serving the value it fetched last while the store cannot answer, so only a reference this
+    process never resolved is dropped by an outage.
     """
     from turnstone.core.secret_refs import SecretError
 
@@ -1297,6 +1290,7 @@ def _materialize_row_key(
         return materialize_api_key(raw)
     except HeaderValueError as exc:
         reason = str(exc)
+        may_clear = False
         # config.toml and the environment are read once per process; a stored row reloads.
         hint = (
             "fix the key in config.toml or its environment variable, then restart"
@@ -1305,9 +1299,15 @@ def _materialize_row_key(
         )
     except SecretError as exc:
         reason = str(exc)
+        may_clear = exc.retryable
         hint = "fix the reference or the [secrets] store, then Sync to Nodes"
-        if exc.retryable:
-            retryable.add(alias)
+    # The mark follows the reason kept: a config.toml entry overrides a stored
+    # row of the same alias, so its definitive failure replaces the row's
+    # retryable one.
+    if may_clear:
+        retryable.add(alias)
+    else:
+        retryable.discard(alias)
     skipped[alias] = reason
     log.error("model_registry.alias_skipped", alias=alias, source=source, error=reason, hint=hint)
     return None
@@ -1913,6 +1913,11 @@ def load_model_registry(
             entry.get("obo_audience", ""),
             entry.get("obo_scopes", ""),
         )
+        # From here config.toml's entry is the alias's definition, key or no
+        # key, so its kind replaces a stored row's (the row's place is kept).
+        defined[alias] = serves_chat(
+            entry_caps_raw if isinstance(entry_caps_raw, dict) else {}, str(model_name)
+        )
         entry_api_key = _materialize_row_key(
             alias,
             entry.get("api_key", api_key),
@@ -2003,7 +2008,8 @@ def load_model_registry(
 
     # Per-kind reasoning effort.  None means task inherits the session.
     # Typos in config.toml shouldn't silently flow to the provider — log and
-    # drop unknown values, mirroring the model-not-found warning above.
+    # drop unknown values (unlike the routing aliases above, which are kept
+    # and fail where they're used).
     valid_efforts = {"none", "minimal", "low", "medium", "high", "xhigh", "max"}
 
     def _validate_effort(value: Any, key: str) -> str | None:

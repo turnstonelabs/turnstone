@@ -2205,9 +2205,11 @@ degraded ──(any success)─────────────────�
   default model's tracker: `"status": "ok"` when that backend is healthy and
   the default model is loaded, `"degraded"` otherwise (`default_model` says
   which alias and whether it loaded). One summary (`_health_summary`) feeds
-  `/health`, the global snapshot and every `health_changed` event, which a
-  backend transition or a reload that changes the summary sends; the console
-  stores the node's verdict instead of deriving its own.
+  `/health`, the global snapshot, every `health_changed` event and the
+  `turnstone_backend_up` metric. A backend transition sends the event; a
+  reload, or the 10-second aggregate tick, sends it when the summary changed,
+  so a path that changes it without saying so reaches the console within a
+  tick. The console stores the node's verdict instead of deriving its own.
 
 ### Rate Limiting
 

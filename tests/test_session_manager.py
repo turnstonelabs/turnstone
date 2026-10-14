@@ -645,6 +645,7 @@ def _make_manager(
     event_emitter: Any = _EMITTER_DEFAULT,
     node_id: str | None = None,
     model_validator: Callable[[str], bool] | None = None,
+    default_alias_reader: Callable[[], str] | None = None,
 ) -> tuple[SessionManager, FakeAdapter, FakeStorage]:
     """Build a SessionManager wired to a FakeAdapter for both Protocols.
 
@@ -665,6 +666,7 @@ def _make_manager(
         event_emitter=emitter,
         node_id=node_id,
         model_validator=model_validator,
+        default_alias_reader=default_alias_reader,
     )
     return mgr, adapter, storage
 
@@ -1430,6 +1432,59 @@ def test_open_retries_when_factory_default_disappears_during_resolution() -> Non
     assert adapter.build_models == [None, None]
     assert reopened.session is adapter.built_sessions[-1]
     assert reopened.session.model_alias == "default-b"  # type: ignore[union-attr]
+
+
+def test_open_still_retries_a_default_that_moved_with_the_reader_wired() -> None:
+    """The default reader names the new default, so the race retry stands."""
+    live_aliases = {"default-a"}
+    mgr, adapter, storage = _make_manager(
+        model_validator=lambda alias: alias in live_aliases,
+        default_alias_reader=lambda: next(iter(live_aliases)),
+    )
+    ws = mgr.create(user_id="u1")
+    ws_id = ws.id
+    mgr.close(ws_id)
+    adapter.build_models.clear()
+
+    def build(_ws: Workstream, model: object | None) -> FakeSession:
+        if len(adapter.build_models) == 1:
+            live_aliases.clear()
+            live_aliases.add("default-b")
+            raise UnknownModelAliasError("default-a")
+        return FakeSession(ws_id, model_alias="default-b")
+
+    adapter.build_session_hook = build
+    reopened = mgr.open(ws_id)
+
+    assert reopened is not None
+    assert adapter.build_models == [None, None]
+
+
+def test_a_reopen_on_a_default_that_stays_unloaded_builds_once(caplog: Any) -> None:
+    """An unloaded default is a steady state (#1359): no retries, no race warning."""
+    import logging
+
+    mgr, adapter, storage = _make_manager(
+        model_validator=lambda alias: alias == "loaded",
+        default_alias_reader=lambda: "gone",
+    )
+    ws = mgr.create(user_id="u1")
+    ws_id = ws.id
+    mgr.close(ws_id)
+    adapter.build_models.clear()
+
+    def build(_ws: Workstream, model: object | None) -> FakeSession:
+        raise UnknownModelAliasError("gone")
+
+    adapter.build_session_hook = build
+    with (
+        caplog.at_level(logging.WARNING, logger="turnstone.core.session_manager"),
+        pytest.raises(UnknownModelAliasError),
+    ):
+        mgr.open(ws_id)
+
+    assert adapter.build_models == [None]
+    assert not [r for r in caplog.records if "stale_alias_raced" in r.getMessage()]
 
 
 def test_open_replaces_default_candidate_removed_before_resume() -> None:

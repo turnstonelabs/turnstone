@@ -204,3 +204,58 @@ def test_a_model_reload_that_loads_the_default_sends_ok(monkeypatch: pytest.Monk
     events = _events(state)
     assert [e["status"] for e in events] == ["ok"]
     assert events[0]["default_model"] == {"alias": "b", "loaded": True}
+
+
+def test_the_backend_gauge_follows_the_summary(monkeypatch: pytest.MonkeyPatch) -> None:
+    import turnstone.server as server
+    from turnstone.core.metrics import MetricsCollector
+
+    metrics = MetricsCollector()
+    monkeypatch.setattr(server, "_metrics", metrics)
+    health = HealthTrackerRegistry(failure_threshold=1)
+    registry = _registry("a", "b")
+    for alias in ("a", "b"):
+        health.get_tracker(provider="openai-compatible", base_url=f"http://{alias}.example.com/v1")
+    health.get_tracker_for_alias(registry, "b").record_failure()  # type: ignore[union-attr]
+    state = _state(registry, health=health)
+
+    # A settings change moves the default onto the backend that is down.
+    state.config_store.default = "b"
+    server._send_health(state)
+    assert metrics._backend_up is False
+    state.config_store.default = "a"
+    server._send_health(state)
+    assert metrics._backend_up is True
+
+
+class _OneTick:
+    """A stop event whose first wait lets one tick run."""
+
+    def __init__(self) -> None:
+        self.waits = 0
+
+    def wait(self, _interval: float) -> bool:
+        self.waits += 1
+        return self.waits > 1
+
+
+def test_each_aggregate_tick_sends_a_changed_summary() -> None:
+    from turnstone.server import _aggregate_emitter_thread
+
+    # A path that changed the summary without sending it (here: nothing sent
+    # yet while the default isn't loaded) reaches the console at the next tick.
+    state = _state(_registry("a"), _Settings("added-not-synced"))
+    mgr = MagicMock()
+    mgr.list_all.return_value = []
+
+    _aggregate_emitter_thread(
+        mgr,
+        state.global_queue,
+        interval=0,
+        stop=_OneTick(),  # type: ignore[arg-type]
+        app_state=state,
+    )
+
+    events = _events(state)
+    assert [e["type"] for e in events] == ["aggregate", "health_changed"]
+    assert events[1]["status"] == "degraded"

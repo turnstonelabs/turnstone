@@ -5125,17 +5125,14 @@ def _emit_health_changed(
     """Push a health_changed event onto the global SSE queue.
 
     Called from the BackendHealthTracker callback on state transitions.
-    *status* is ``"healthy"`` or ``"degraded"``.
-
-    Also updates the global ``turnstone_backend_up`` metric using the
-    effective default backend's health (not the backend that triggered
-    this callback, which may be a non-default fallback).
+    *status* is ``"healthy"`` or ``"degraded"``. The event, and the
+    ``turnstone_backend_up`` metric :func:`_send_health` sets, follow the
+    effective default's backend, not the one that triggered this callback.
     """
     if app_state is None:
         with contextlib.suppress(queue.Full):
             gq.put_nowait({"type": "health_changed", "backend_status": status})
         return
-    _update_backend_metric(app_state)
     _send_health(app_state, gq, backend_status=status)
 
 
@@ -5147,12 +5144,14 @@ _HEALTH_EVENT_LOCK = threading.Lock()
 def _send_health(
     app_state: Any, gq: queue.Queue[dict[str, Any]] | None = None, *, backend_status: str = ""
 ) -> None:
-    """Queue a ``health_changed`` event carrying :func:`_health_summary`.
+    """Queue a ``health_changed`` event carrying :func:`_health_summary`, and set
+    the ``turnstone_backend_up`` metric from the same summary.
 
-    A backend transition (*backend_status*) always sends one; a reload sends one
-    only when the summary changed since the last event, since a settings or
-    model reload can load or drop the default model without any backend
-    changing state.
+    A backend transition (*backend_status*) always sends one; otherwise one is
+    sent only when the summary changed since the last event, since a settings
+    or model reload can load or drop the default model without any backend
+    changing state. The aggregate thread calls this every tick, so a path that
+    changes the summary without calling it reaches the console within one.
     """
     if gq is None:
         gq = getattr(app_state, "global_queue", None)
@@ -5160,6 +5159,7 @@ def _send_health(
         return
     with _HEALTH_EVENT_LOCK:
         summary = _health_summary(app_state)
+        _metrics.set_backend_status(summary["backend"]["status"] == "up")
         if not backend_status and summary == getattr(app_state, "health_summary_sent", None):
             return
         app_state.health_summary_sent = summary
@@ -5170,29 +5170,12 @@ def _send_health(
             gq.put_nowait(event)
 
 
-def _update_backend_metric(app_state: Any) -> None:
-    """Update ``turnstone_backend_up`` from the effective default's tracker.
-
-    Called on any backend state change.  Only the effective default
-    backend drives this global metric — fallback backend transitions
-    do not affect it.
-    """
-    health_reg = getattr(app_state, "health_registry", None)
-    registry = getattr(app_state, "registry", None)
-    if not health_reg or not registry:
-        return
-    config_store = getattr(app_state, "config_store", None)
-    effective = registry.effective_default(config_store)
-    tracker = health_reg.get_tracker_for_alias(registry, effective) if effective else None
-    if tracker is not None:
-        _metrics.set_backend_status(tracker.is_healthy)
-
-
 def _aggregate_emitter_thread(
     mgr: SessionManager,
     global_queue: queue.Queue[dict[str, Any]],
     interval: float = 10.0,
     stop: threading.Event | None = None,
+    app_state: Any = None,
 ) -> None:
     """Periodically emit aggregate token/tool_call totals on the global SSE queue.
 
@@ -5200,7 +5183,9 @@ def _aggregate_emitter_thread(
     having to poll ``/v1/api/dashboard``.  ``stop`` (#885) is the lifespan
     shutdown signal — ``wait(interval)`` doubles as the tick sleep, so a
     set wakes the thread immediately instead of stranding shutdown behind
-    a sleep.
+    a sleep.  With *app_state*, each tick also sends the health summary when it
+    changed (:func:`_send_health`), the backstop for any path that changes it
+    without saying so.
     """
     if stop is None:
         stop = threading.Event()
@@ -5234,6 +5219,11 @@ def _aggregate_emitter_thread(
                 )
         except Exception:
             log.debug("Aggregate emitter error", exc_info=True)
+        if app_state is not None:
+            try:
+                _send_health(app_state, global_queue)
+            except Exception:
+                log.debug("Health backstop error", exc_info=True)
 
 
 def _idle_cleanup_thread(
@@ -5387,7 +5377,7 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None]:
     agg_emitter = threading.Thread(
         target=_aggregate_emitter_thread,
         args=(app.state.workstreams, app.state.global_queue),
-        kwargs={"stop": daemon_stop},
+        kwargs={"stop": daemon_stop, "app_state": app.state},
         daemon=True,
     )
     agg_emitter.start()
@@ -5804,6 +5794,8 @@ def create_app(
         sse_executor_lookup=lambda request: request.app.state.sse_executor,
         create_supports_attachments=True,
         create_supports_user_id_override=True,
+        # The validator checks the source's visibility; the pre-commit forks it.
+        create_supports_resume=True,
         create_gate_require_project=True,
         create_validate_request=_interactive_create_validate_request,
         create_build_kwargs=_interactive_create_build_kwargs,
@@ -6392,13 +6384,13 @@ def main() -> None:
         assert ui is not None
         # Resolve the effective alias once and use it consistently
         # for both client resolution and ChatSession.model_alias.
-        # Unknown aliases here raise ValueError — the create handler
-        # maps that to a 503 with operator-friendly text so a typo or
-        # removed alias in body.model surfaces instead of silently
-        # starting on the default. SessionManager.open's rehydrate
-        # path is the one place where unknown aliases must NOT fail
-        # loud; the manager filters those out via its model_validator
-        # before the alias reaches this factory.
+        # An alias that isn't loaded raises UnknownModelAliasError — the
+        # create handler maps that to a 503 model_not_loaded naming it, so a
+        # typo or removed alias in body.model surfaces instead of silently
+        # starting on the default. SessionManager.open's rehydrate path
+        # passes a saved alias only when its model_validator finds it
+        # loaded, else falls back to the default here, which fails the same
+        # way when it isn't loaded either (#1359).
         model_alias = model_alias or _effective_default_alias()
         # Resolve every stable model facet under one registry lock hold.  Passing
         # the same immutable binding through to ChatSession prevents a reload in
@@ -6545,6 +6537,7 @@ def main() -> None:
         # workstream pinned to a since-removed alias still rehydrates
         # (on the registry default) instead of 500-ing on every reopen.
         model_validator=registry.has_alias,
+        default_alias_reader=_effective_default_alias,
     )
     interactive_adapter.attach(manager)
     # Renew from here on: a startup ``--resume`` takes leases long before the

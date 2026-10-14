@@ -11,13 +11,10 @@ if TYPE_CHECKING:
     import pytest
 
 import turnstone.core.admission as admission_mod
+from tests._oidc_test_helpers import keyed_app_state
 from turnstone.core.admission import ModelAdmission
 from turnstone.core.deadline import DeadlineCancelledError, StreamAbortRef
-from turnstone.core.model_registry import (
-    KEY_GUARD_DEFERRED_TO_LIFESPAN,
-    ModelConfig,
-    ModelRegistry,
-)
+from turnstone.core.model_registry import ModelConfig, ModelRegistry
 
 
 def _wait_until(predicate: Any, *, timeout: float = 2.0) -> None:
@@ -146,7 +143,7 @@ def test_registry_keeps_one_gate_per_alias_across_resize_remove_and_readd() -> N
     registry.reload(
         {"alpha": _config("alpha", 2)},
         default="alpha",
-        app_state=KEY_GUARD_DEFERRED_TO_LIFESPAN,
+        app_state=keyed_app_state(),
     )
     assert registry.get_admission("alpha") is alpha
     assert alpha.limit == 2
@@ -154,12 +151,12 @@ def test_registry_keeps_one_gate_per_alias_across_resize_remove_and_readd() -> N
     registry.reload(
         {},
         default="",
-        app_state=KEY_GUARD_DEFERRED_TO_LIFESPAN,
+        app_state=keyed_app_state(),
     )
     registry.reload(
         {"alpha": _config("alpha", 4)},
         default="alpha",
-        app_state=KEY_GUARD_DEFERRED_TO_LIFESPAN,
+        app_state=keyed_app_state(),
     )
     assert registry.get_admission("alpha") is alpha
     assert alpha.limit == 4

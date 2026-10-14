@@ -210,18 +210,16 @@ function ensureInteractiveNode(caps, wsId, hint, openFirst) {
     )
       .then((r) => {
         if (r.ok) return { nodeId: null };
-        if (r.status !== 409) {
-          return { error: "Could not reopen this session (" + r.status + ")." };
-        }
         return readRefusal(r).then(({ data, where }) => {
           if (where) {
             return { error: "This session is open " + where + ". Retry once it closes there." };
           }
-          // Another 409 (a node requirement): its own message says why.
+          // Any other refusal (a node requirement, a model that isn't
+          // loaded): its own message says why.
           return {
             error:
               (typeof data.error === "string" && data.error) ||
-              "Could not reopen this session (409).",
+              "Could not reopen this session (" + r.status + ").",
           };
         });
       })

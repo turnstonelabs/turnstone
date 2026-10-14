@@ -2727,9 +2727,9 @@ class TestDetailInteractive:
         assert r.json()["error"] == "Workstream not found"
 
     def test_503_on_session_factory_misconfig(self):
-        """``ValueError`` from ``mgr.open`` (e.g. a model alias that no
-        longer resolves) surfaces as 503 with the factory's
-        remediation text — not a correlation-id'd 500. Mirrors
+        """``ValueError`` from ``mgr.open`` (other factory misconfiguration;
+        a model that isn't loaded has its own arm) surfaces as 503 with the
+        factory's remediation text — not a correlation-id'd 500. Mirrors
         :func:`make_open_handler`."""
         mock_mgr = MagicMock()
         mock_mgr.get.return_value = None

@@ -242,13 +242,23 @@ def test_console_create_app_only_mounts_unified_workstream_paths() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _not_loaded(alias: str, **kwargs: Any) -> dict[str, Any]:
+def _not_loaded(
+    alias: str,
+    *,
+    reason: str = "",
+    retryable: bool = False,
+    wording: Any = None,
+    **kwargs: Any,
+) -> dict[str, Any]:
+    """The refusal body for *alias*, built as production builds it: the error
+    carries the registry's reason, and the wording is a kind's own constant."""
     import json
 
     from turnstone.core.model_registry import UnknownModelAliasError
-    from turnstone.core.session_routes import model_not_loaded_response
+    from turnstone.core.session_routes import NODE_MODEL_WORDING, model_not_loaded_response
 
-    resp = model_not_loaded_response(UnknownModelAliasError(alias), **kwargs)
+    exc = UnknownModelAliasError(alias, retryable=retryable, reason=reason)
+    resp = model_not_loaded_response(exc, wording=wording or NODE_MODEL_WORDING, **kwargs)
     assert resp.status_code == 503
     body: dict[str, Any] = json.loads(bytes(resp.body))
     assert body["code"] == "model_not_loaded"
@@ -272,17 +282,48 @@ def test_not_loaded_never_points_at_another_model() -> None:
 
 
 def test_not_loaded_suggests_retrying_a_store_outage() -> None:
-    import json
-
-    from turnstone.core.model_registry import UnknownModelAliasError
-    from turnstone.core.session_routes import model_not_loaded_response
-
-    resp = model_not_loaded_response(
-        UnknownModelAliasError("local-qwen", retryable=True), requested=False
+    body = _not_loaded(
+        "local-qwen",
+        requested=False,
+        retryable=True,
+        reason="the secret store holding its API key can't be reached",
     )
-    assert json.loads(bytes(resp.body))["error"] == (
-        "The default model 'local-qwen' isn't loaded on this node. "
-        "Its secret store can't be reached; try again shortly."
+    assert body["error"] == (
+        "The default model 'local-qwen' isn't loaded on this node: the secret store "
+        "holding its API key can't be reached. Try again shortly."
+    )
+
+
+def test_not_loaded_names_the_registrys_reason() -> None:
+    body = _not_loaded(
+        "typo", requested=True, reason="no enabled model definition by that name is loaded"
+    )
+    assert body["error"] == (
+        "The model 'typo' isn't loaded on this node: no enabled model definition by that "
+        "name is loaded. Ask an admin to check its definition."
+    )
+
+
+def test_a_reopen_suggests_a_retry_only_when_it_may_clear() -> None:
+    def _reopen(retryable: bool) -> str:
+        body = _not_loaded("gone", requested=False, reopen=True, retryable=retryable)
+        return str(body["error"])
+
+    assert _reopen(False) == (
+        "Neither this workstream's model nor the default model 'gone' is loaded on "
+        "this node. Ask an admin to check them."
+    )
+    assert _reopen(True).endswith("Try again shortly.")
+
+
+def test_the_kind_names_its_own_model_and_host() -> None:
+    # The constant the console wires into its coordinator endpoint config.
+    from turnstone.console.server import COORDINATOR_MODEL_WORDING
+
+    body = _not_loaded("ghost", requested=False, wording=COORDINATOR_MODEL_WORDING)
+    assert body["error"] == (
+        "The coordinator model 'ghost' isn't loaded on the console. Ask an admin to "
+        "check its definition, or to set coordinator.model_alias."
     )
 
 
@@ -299,9 +340,113 @@ def test_not_loaded_echoes_only_an_alias_shaped_name() -> None:
     assert body["error"].startswith("The model isn't loaded")
 
 
-def test_not_loaded_stays_under_the_echo_cap() -> None:
-    assert len(_not_loaded("a" * 64, requested=False)["error"]) <= 200
+def test_not_loaded_stays_bounded_at_the_echo_cap() -> None:
+    # The longest alias echoed (64 characters) with the longest reason, in each
+    # kind's wording, create and reopen alike.
+    from turnstone.console.server import COORDINATOR_MODEL_WORDING
+    from turnstone.core.session_routes import NODE_MODEL_WORDING
+
+    reason = "no enabled model definition by that name is loaded"
+    for wording in (NODE_MODEL_WORDING, COORDINATOR_MODEL_WORDING):
+        for reopen in (False, True):
+            body = _not_loaded(
+                "a" * 64, requested=False, reopen=reopen, reason=reason, wording=wording
+            )
+            assert len(body["error"]) <= 300
 
 
 def test_not_loaded_with_nothing_configured() -> None:
     assert _not_loaded("", requested=False)["error"].startswith("No default model is set")
+
+
+# ---------------------------------------------------------------------------
+# A fork builds on its source's model when that model is loaded (#1359)
+# ---------------------------------------------------------------------------
+
+
+def _fork_create(
+    monkeypatch: Any,
+    *,
+    source_loaded: bool,
+    create_error: Exception,
+    supports_resume: bool = True,
+) -> tuple[dict[str, Any], Any, Any]:
+    """POST a fork create; return the kwargs ``mgr.create`` saw, the response and
+    the storage double."""
+    from unittest.mock import MagicMock
+
+    from starlette.applications import Starlette
+    from starlette.routing import Route
+    from starlette.testclient import TestClient
+
+    from turnstone.core.session_routes import SessionEndpointConfig, make_create_handler
+
+    storage = MagicMock()
+    storage.load_workstream_config.return_value = {"model_alias": "src"}
+    monkeypatch.setattr("turnstone.core.storage._registry.get_storage", lambda: storage)
+    mgr = MagicMock()
+    mgr.has_loaded_model.side_effect = lambda alias: source_loaded and alias == "src"
+    seen: dict[str, Any] = {}
+
+    def _create(**kwargs: Any) -> Any:
+        seen.update(kwargs)
+        raise create_error
+
+    mgr.create.side_effect = _create
+    cfg = SessionEndpointConfig(
+        permission_gate=None,
+        manager_lookup=lambda _request: (mgr, None),
+        tenant_check=None,
+        not_found_label="Workstream not found",
+        audit_action_prefix="workstream",
+        create_build_kwargs=lambda _r, body, uid, *_a: {
+            "user_id": uid,
+            "model": body.get("model") or None,
+        },
+        create_supports_resume=supports_resume,
+    )
+    app = Starlette(routes=[Route("/new", make_create_handler(cfg), methods=["POST"])])
+    with TestClient(app) as client:
+        resp = client.post("/new", json={"resume_ws": "source-ws", "model": "chan"})
+    return seen, resp, storage
+
+
+def test_a_fork_builds_on_its_sources_loaded_model(monkeypatch: Any) -> None:
+    # The clone rebinds to the source's model anyway; building on it keeps an
+    # unloaded default (or channel model) from failing the fork.
+    seen, resp, _storage = _fork_create(
+        monkeypatch, source_loaded=True, create_error=RuntimeError("stop")
+    )
+    assert seen["model"] == "src"
+    assert resp.status_code == 429
+
+
+def test_a_fork_whose_source_model_isnt_loaded_keeps_the_request_model(monkeypatch: Any) -> None:
+    seen, _resp, _storage = _fork_create(
+        monkeypatch, source_loaded=False, create_error=RuntimeError("stop")
+    )
+    assert seen["model"] == "chan"
+
+
+def test_a_fork_refusal_names_the_sources_model(monkeypatch: Any) -> None:
+    from turnstone.core.model_registry import UnknownModelAliasError
+
+    _seen, resp, _storage = _fork_create(
+        monkeypatch, source_loaded=True, create_error=UnknownModelAliasError("src")
+    )
+    assert resp.status_code == 503
+    assert resp.json()["error"].startswith("The model 'src' isn't loaded on this node")
+
+
+def test_a_mount_that_doesnt_fork_ignores_resume_ws(monkeypatch: Any) -> None:
+    # The coordinator mount checks no source visibility and has no fork, so a
+    # resume_ws there must not lend the new workstream the source's model or
+    # persona: the source is never read (#1359).
+    seen, _resp, storage = _fork_create(
+        monkeypatch,
+        source_loaded=True,
+        create_error=RuntimeError("stop"),
+        supports_resume=False,
+    )
+    assert seen["model"] == "chan"
+    storage.load_workstream_config.assert_not_called()

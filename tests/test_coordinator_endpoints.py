@@ -36,6 +36,7 @@ from tests._coord_test_helpers import (
 )
 from turnstone.console.coordinator_ui import ConsoleCoordinatorUI
 from turnstone.console.server import (
+    COORDINATOR_MODEL_WORDING,
     _audit_cancel_coordinator,
     _audit_close_coordinator,
     _audit_coordinator_create,
@@ -132,6 +133,8 @@ _coord_endpoint_config = SessionEndpointConfig(
     create_post_install=_coord_create_post_install,
     list_resolve_titles=None,
     list_kind=WorkstreamKind.COORDINATOR,
+    # As the console wires it (#1359).
+    model_wording=COORDINATOR_MODEL_WORDING,
 )
 
 
@@ -339,6 +342,38 @@ def test_missing_coord_mgr_returns_503(storage):
     assert "not initialized" in body["error"]
 
 
+@pytest.mark.parametrize(
+    "recorded",
+    [
+        # Every stored definition was skipped: the loader's text names the reference.
+        "No model definitions could be loaded. Skipped: main: secret://vault/kv/team#key: not found",
+        # A fresh console with no definitions at all.
+        "No model definitions found. Provide --model, configure [models.*] in config.toml, "
+        "or add model definitions in the admin panel.",
+        # The definitions loaded, but the builder failed.
+        "Coordinator subsystem failed to initialise (RuntimeError). See console logs and retry.",
+        "",
+    ],
+)
+def test_the_503_is_the_same_neutral_text_whatever_the_cause(storage, recorded):
+    # The recorded cause can name secret reference paths, and any
+    # admin.coordinator holder reads this 503, so it never carries it; and it
+    # asserts no cause that may be false (#1359).
+    client = _make_client(storage, coord_mgr=None)
+    client.app.state.coord_registry_error = recorded  # type: ignore[attr-defined]
+    resp = client.post(
+        "/v1/api/workstreams/new",
+        json={"name": "c1"},
+        headers={"X-Test-User": "user-1", "X-Test-Perms": "admin.coordinator"},
+    )
+    assert resp.status_code == 503
+    assert resp.json()["error"] == (
+        "Coordinator subsystem not initialized. Add a model definition in the admin "
+        "Models tab; if one exists, an admin can see why by pressing Sync to Nodes "
+        "there, or in the console log."
+    )
+
+
 def test_missing_model_alias_falls_back_to_registry_default(storage):
     """``coordinator.model_alias`` unset → resolve through the
     registry's default alias rather than 503-ing.  Operators get a
@@ -375,7 +410,10 @@ def test_unloaded_coordinator_model_fails_only_the_create(storage):
     body = resp.json()
     assert body["code"] == "model_not_loaded"
     assert body["alias"] == "ghost"
-    assert "isn't loaded" in body["error"]
+    assert body["error"] == (
+        "The coordinator model 'ghost' isn't loaded on the console. Ask an admin to "
+        "check its definition, or to set coordinator.model_alias."
+    )
     broken_registry.resolve.assert_not_called()
     assert client.get("/v1/api/workstreams", headers=headers).status_code == 200
 

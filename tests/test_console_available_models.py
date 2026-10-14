@@ -224,8 +224,8 @@ def test_coordinator_reports_a_disabled_registry_default(
     storage: SQLiteBackend,
 ) -> None:
     """Registry default points at an alias that's been disabled in the DB:
-    a create fails on it, so the placeholder names it (labelled not
-    available) rather than going blank."""
+    a create fails on it, so the placeholder names it rather than going
+    blank."""
     _seed_model(storage, definition_id="m1", alias="legacy", enabled=False)
     body = _get_models(_make_client(storage, registry_default="legacy"))
     assert body["coordinator_default_alias"] == "legacy"
