@@ -20,6 +20,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from tests._sdk_clients import anthropic_module_mock, assert_built_with
 from tests._session_helpers import make_session as _make_session
 from turnstone.core.providers._anthropic import AnthropicProvider
 from turnstone.core.providers._protocol import ModelCapabilities
@@ -421,19 +422,19 @@ class TestCompatFactory:
         from turnstone.core.providers import LOCAL_PLACEHOLDER_API_KEY, create_client
 
         mock_anthropic_cls = MagicMock()
-        mock_mod = MagicMock()
+        mock_mod = anthropic_module_mock()
         mock_mod.Anthropic = mock_anthropic_cls
         mock_ensure.return_value = mock_mod
 
         monkeypatch.setenv("ANTHROPIC_API_KEY", "from-env")
         create_client("anthropic-compatible", base_url="http://vllm-host:8000", api_key="")
-        mock_anthropic_cls.assert_called_once_with(base_url="http://vllm-host:8000")
+        assert_built_with(mock_anthropic_cls, base_url="http://vllm-host:8000")
 
         mock_anthropic_cls.reset_mock()
         monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
         create_client("anthropic-compatible", base_url="http://vllm-host:8000", api_key="")
-        mock_anthropic_cls.assert_called_once_with(
-            api_key=LOCAL_PLACEHOLDER_API_KEY, base_url="http://vllm-host:8000"
+        assert_built_with(
+            mock_anthropic_cls, api_key=LOCAL_PLACEHOLDER_API_KEY, base_url="http://vllm-host:8000"
         )
 
     @patch("turnstone.core.providers._anthropic._ensure_anthropic")
@@ -447,21 +448,21 @@ class TestCompatFactory:
 
         monkeypatch.setenv("ANTHROPIC_API_KEY", "from-env")
         mock_anthropic_cls = MagicMock()
-        mock_mod = MagicMock()
+        mock_mod = anthropic_module_mock()
         mock_mod.Anthropic = mock_anthropic_cls
         mock_ensure.return_value = mock_mod
 
         for suffixed in ("http://vllm-host:8000/v1", "http://vllm-host:8000/v1/"):
             mock_anthropic_cls.reset_mock()
             create_client("anthropic-compatible", base_url=suffixed, api_key="")
-            mock_anthropic_cls.assert_called_once_with(base_url="http://vllm-host:8000")
+            assert_built_with(mock_anthropic_cls, base_url="http://vllm-host:8000")
 
         # A base_url that strips to nothing stays verbatim so the typo
         # fails loudly in httpx instead of silently targeting the SDK's
         # prod default.
         mock_anthropic_cls.reset_mock()
         create_client("anthropic-compatible", base_url="/v1", api_key="")
-        mock_anthropic_cls.assert_called_once_with(base_url="/v1")
+        assert_built_with(mock_anthropic_cls, base_url="/v1")
 
     @patch("turnstone.core.providers._anthropic._ensure_anthropic")
     def test_create_client_requires_base_url(self, mock_ensure: MagicMock) -> None:
@@ -480,12 +481,12 @@ class TestCompatFactory:
         from turnstone.core.providers import create_client
 
         mock_anthropic_cls = MagicMock()
-        mock_mod = MagicMock()
+        mock_mod = anthropic_module_mock()
         mock_mod.Anthropic = mock_anthropic_cls
         mock_ensure.return_value = mock_mod
 
         create_client("anthropic", base_url="http://proxy:9000/v1", api_key="k")
-        mock_anthropic_cls.assert_called_once_with(api_key="k", base_url="http://proxy:9000/v1")
+        assert_built_with(mock_anthropic_cls, api_key="k", base_url="http://proxy:9000/v1")
 
 
 # ===========================================================================

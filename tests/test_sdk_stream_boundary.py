@@ -922,22 +922,22 @@ def test_closed_v3_default_client_creation_stays_unarmed(surface: str):
 
 
 def _loopback_lane(lane: str, port: int) -> tuple[Any, Any]:
-    """Real SDK client + provider for one streaming lane on a loopback server.
+    """Turnstone's own SDK client + provider for one streaming lane on a loopback server.
 
-    The Anthropic SDK appends ``/v1/messages`` to ``base_url`` itself; the
-    OpenAI SDK expects the ``/v1`` root.
+    Built through ``create_client`` so the HTTP client is the one production
+    closes during a registry reload. The Anthropic SDK appends ``/v1/messages``
+    to ``base_url`` itself; the OpenAI SDK expects the ``/v1`` root.
     """
-    from turnstone.core.providers import create_provider
+    from turnstone.core.providers import create_client, create_provider
 
+    origin = f"http://127.0.0.1:{port}"
     if lane == "anthropic":
-        client = anthropic.Anthropic(
-            api_key="probe", base_url=f"http://127.0.0.1:{port}", max_retries=0, timeout=5.0
-        )
-        return client, create_provider("anthropic")
-    client = openai.OpenAI(
-        api_key="probe", base_url=f"http://127.0.0.1:{port}/v1", max_retries=0, timeout=5.0
-    )
-    return client, create_provider("openai-compatible", api_surface=lane)
+        client = create_client("anthropic-compatible", base_url=origin, api_key="probe")
+        provider = create_provider("anthropic")
+    else:
+        client = create_client("openai-compatible", base_url=f"{origin}/v1", api_key="probe")
+        provider = create_provider("openai-compatible", api_surface=lane)
+    return client.with_options(max_retries=0, timeout=5.0), provider
 
 
 @pytest.mark.parametrize(

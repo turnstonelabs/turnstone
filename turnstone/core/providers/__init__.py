@@ -7,6 +7,7 @@ import threading
 from typing import Any
 
 from turnstone.core.http_headers import checked_header_value
+from turnstone.core.providers._http_client import shutdown_on_close
 from turnstone.core.providers._openai import OpenAIProvider
 from turnstone.core.providers._openai_chat import OpenAIChatCompletionsProvider
 from turnstone.core.providers._openai_responses import OpenAIResponsesProvider
@@ -237,7 +238,7 @@ def create_client(
     """
     resolved_key: str | None = api_key if api_key else None
     if provider_name in ("openai", "openai-compatible", "google", "xai"):
-        from openai import OpenAI
+        from openai import DefaultHttpxClient, OpenAI
 
         if provider_name == "openai-compatible" and not base_url:
             # The lane targets an operator-run server; without a base_url the
@@ -260,9 +261,10 @@ def create_client(
         if resolved_key is None and local_without_key:
             resolved_key = LOCAL_PLACEHOLDER_API_KEY
         openai_key = resolved_key or _sdk_variable_credentials(_OPENAI_SDK_VARIABLES).get("api_key")
+        http_client = shutdown_on_close(DefaultHttpxClient())
         if base_url:
-            return OpenAI(base_url=base_url, api_key=openai_key)
-        return OpenAI(api_key=openai_key)
+            return OpenAI(base_url=base_url, api_key=openai_key, http_client=http_client)
+        return OpenAI(api_key=openai_key, http_client=http_client)
     if provider_name in ("anthropic", "anthropic-compatible"):
         from turnstone.core.providers._anthropic import _ensure_anthropic
 
@@ -298,6 +300,7 @@ def create_client(
             base_url = stripped or base_url
         if base_url and base_url != "https://api.anthropic.com":
             kwargs["base_url"] = base_url
+        kwargs["http_client"] = shutdown_on_close(anthropic.DefaultHttpxClient())
         return anthropic.Anthropic(**kwargs)
     raise ValueError(
         f"Unknown provider: {provider_name!r}. "

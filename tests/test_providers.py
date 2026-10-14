@@ -10,6 +10,7 @@ from unittest.mock import MagicMock, PropertyMock, patch
 
 import pytest
 
+from tests._sdk_clients import anthropic_module_mock, assert_built_with
 from tests._session_helpers import fake_anthropic_stream, fake_chat_stream
 from turnstone.core.compaction import resolve_context_usage
 from turnstone.core.deadline import DeadlineCancelledError, StreamAbortRef
@@ -3152,9 +3153,7 @@ class TestProviderFactory:
 
         mock_openai_cls.return_value = MagicMock()
         client = create_client("openai", base_url="http://localhost:8000/v1", api_key="test-key")
-        mock_openai_cls.assert_called_once_with(
-            base_url="http://localhost:8000/v1", api_key="test-key"
-        )
+        assert_built_with(mock_openai_cls, base_url="http://localhost:8000/v1", api_key="test-key")
         assert client is mock_openai_cls.return_value
 
     @patch("openai.OpenAI")
@@ -3163,7 +3162,7 @@ class TestProviderFactory:
 
         mock_openai_cls.return_value = MagicMock()
         create_client("openai", base_url="http://localhost:8000/v1", api_key="")
-        mock_openai_cls.assert_called_once_with(base_url="http://localhost:8000/v1", api_key=None)
+        assert_built_with(mock_openai_cls, base_url="http://localhost:8000/v1", api_key=None)
 
     @patch("openai.OpenAI")
     def test_create_client_empty_api_key_no_base_url(self, mock_openai_cls: MagicMock) -> None:
@@ -3171,7 +3170,7 @@ class TestProviderFactory:
 
         mock_openai_cls.return_value = MagicMock()
         create_client("openai", base_url="", api_key="")
-        mock_openai_cls.assert_called_once_with(api_key=None)
+        assert_built_with(mock_openai_cls, api_key=None)
 
     @patch("turnstone.core.providers._anthropic._ensure_anthropic")
     def test_create_client_anthropic_empty_api_key_omits_kwarg(
@@ -3180,12 +3179,14 @@ class TestProviderFactory:
         from turnstone.core.providers import create_client
 
         mock_anthropic_cls = MagicMock()
-        mock_mod = MagicMock()
+        mock_mod = anthropic_module_mock()
         mock_mod.Anthropic = mock_anthropic_cls
         mock_ensure.return_value = mock_mod
 
         create_client("anthropic", base_url="", api_key="")
-        mock_anthropic_cls.assert_called_once_with()
+        assert_built_with(
+            mock_anthropic_cls,
+        )
 
     @pytest.fixture
     def real_sdk(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -3292,12 +3293,12 @@ class TestProviderFactory:
         from turnstone.core.providers import create_client
 
         mock_anthropic_cls = MagicMock()
-        mock_mod = MagicMock()
+        mock_mod = anthropic_module_mock()
         mock_mod.Anthropic = mock_anthropic_cls
         mock_ensure.return_value = mock_mod
 
         create_client("anthropic", base_url="", api_key="sk-ant-test")
-        mock_anthropic_cls.assert_called_once_with(api_key="sk-ant-test")
+        assert_built_with(mock_anthropic_cls, api_key="sk-ant-test")
 
     @patch("turnstone.core.providers._anthropic._ensure_anthropic")
     def test_create_client_anthropic_empty_api_key_with_custom_base_url(
@@ -3306,12 +3307,12 @@ class TestProviderFactory:
         from turnstone.core.providers import create_client
 
         mock_anthropic_cls = MagicMock()
-        mock_mod = MagicMock()
+        mock_mod = anthropic_module_mock()
         mock_mod.Anthropic = mock_anthropic_cls
         mock_ensure.return_value = mock_mod
 
         create_client("anthropic", base_url="http://my-proxy:8000", api_key="")
-        mock_anthropic_cls.assert_called_once_with(base_url="http://my-proxy:8000")
+        assert_built_with(mock_anthropic_cls, base_url="http://my-proxy:8000")
 
     def test_create_client_unknown(self) -> None:
         from turnstone.core.providers import create_client
@@ -3428,9 +3429,7 @@ class TestProviderFactory:
 
         mock_openai_cls.return_value = MagicMock()
         create_client("google", base_url="", api_key="test-key")
-        mock_openai_cls.assert_called_once_with(
-            base_url=GOOGLE_DEFAULT_BASE_URL, api_key="test-key"
-        )
+        assert_built_with(mock_openai_cls, base_url=GOOGLE_DEFAULT_BASE_URL, api_key="test-key")
 
     @patch("openai.OpenAI")
     def test_create_client_google_custom_base_url(self, mock_openai_cls: MagicMock) -> None:
@@ -3438,7 +3437,7 @@ class TestProviderFactory:
 
         mock_openai_cls.return_value = MagicMock()
         create_client("google", base_url="http://custom:8080/v1", api_key="k")
-        mock_openai_cls.assert_called_once_with(base_url="http://custom:8080/v1", api_key="k")
+        assert_built_with(mock_openai_cls, base_url="http://custom:8080/v1", api_key="k")
 
     def test_google_capabilities_defaults(self) -> None:
         from turnstone.core.providers import create_provider
