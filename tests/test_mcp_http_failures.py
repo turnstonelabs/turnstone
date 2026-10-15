@@ -88,6 +88,18 @@ class FailOperations(BaseHTTPMiddleware):
         return await call_next(request)
 
 
+class RefuseDiscover(BaseHTTPMiddleware):
+    """Answers ``server/discover`` as a 2025-11-25 server does, so the client falls back to
+    ``initialize`` and the session gets its results as SSE events."""
+
+    async def dispatch(self, request: Request, call_next: Callable[..., Any]) -> Response:
+        if request.method == "POST":
+            body = await request.json()
+            if body.get("method") == "server/discover":
+                return JSONResponse({"error": "unknown method"}, status_code=404)
+        return await call_next(request)
+
+
 def _build_server() -> Server[Any]:
     async def tools(_ctx: Any, _params: Any) -> mcp_types.ListToolsResult:
         return mcp_types.ListToolsResult(
@@ -589,7 +601,10 @@ async def test_completed_call_wins_but_failed_call_uses_http_status(succeeded):
 
 
 def test_large_sse_tool_result_exceeding_sdk_default_1mb_limit() -> None:
-    """SSE tool results >1 MiB (the SDK default max_sse_event_size) succeed up to 16 MiB (#679 S8)."""
+    """A result over the SDK's 1 MiB default SSE event size arrives, up to the 16 MiB we set
+    (#679 S8). Only SSE-framed answers are capped, so the server refuses server/discover: the
+    session is then 2025-11-25 and gets its results as SSE events, where a 2026-07-28 session
+    would get plain JSON."""
     sessions = StreamableHTTPSessionManager(app=_build_server(), json_response=False)
 
     @contextlib.asynccontextmanager
@@ -598,6 +613,7 @@ def test_large_sse_tool_result_exceeding_sdk_default_1mb_limit() -> None:
             yield
 
     app = Starlette(routes=[Mount("/", app=sessions.handle_request)], lifespan=lifespan)
+    app.add_middleware(RefuseDiscover)
     port = _free_port()
     server = uvicorn.Server(
         uvicorn.Config(
@@ -620,6 +636,7 @@ def test_large_sse_tool_result_exceeding_sdk_default_1mb_limit() -> None:
             mgr = MCPClientManager({"srv": {"type": "http", "url": url}})
         mgr.start()
         try:
+            assert mgr._static_servers["srv"].session.protocol_version == "2025-11-25"
             size = 2 * 1024 * 1024 + 1024  # >2 MiB, well over the SDK's 1 MiB default
             output = mgr.call_tool_sync("mcp__srv__op", {"size": size}, timeout=15)
             assert len(output) == size
