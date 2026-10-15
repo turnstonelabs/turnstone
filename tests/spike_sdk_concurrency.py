@@ -33,10 +33,11 @@ import time
 from collections import defaultdict
 from typing import TYPE_CHECKING
 
+import httpx2
 import uvicorn
 from mcp import ClientSession
-from mcp.client.streamable_http import streamablehttp_client
-from mcp.server.fastmcp import FastMCP
+from mcp.client.streamable_http import streamable_http_client
+from mcp.server.mcpserver import MCPServer
 from starlette.middleware.base import BaseHTTPMiddleware
 
 if TYPE_CHECKING:
@@ -79,8 +80,8 @@ def find_free_port() -> int:
 
 
 def build_server(port: int) -> uvicorn.Server:
-    """Create a minimal FastMCP server with one echo tool."""
-    mcp = FastMCP(name="spike-target", streamable_http_path="/mcp")
+    """Create a minimal MCPServer with one echo tool."""
+    mcp = MCPServer(name="spike-target")
 
     @mcp.tool()
     async def echo(payload: str) -> str:
@@ -91,7 +92,7 @@ def build_server(port: int) -> uvicorn.Server:
         await asyncio.sleep(0.05)
         return f"echoed:{payload}"
 
-    app = mcp.streamable_http_app()
+    app = mcp.streamable_http_app(streamable_http_path="/mcp")
     app.add_middleware(AuthHeaderRecorder)
 
     config = uvicorn.Config(
@@ -155,7 +156,8 @@ async def scenario_1_concurrent_sessions(url: str, n: int = 20) -> dict:
     async def one_session(idx: int) -> dict:
         headers = {"Authorization": f"Bearer test-token-{idx}"}
         async with (
-            streamablehttp_client(url=url, headers=headers) as (read, write, _),
+            httpx2.AsyncClient(headers=headers) as http_client,
+            streamable_http_client(url, http_client=http_client) as (read, write),
             ClientSession(read, write) as session,
         ):
             await session.initialize()
@@ -219,7 +221,8 @@ async def scenario_2_concurrent_calls_shared_session(url: str) -> dict:
 
     headers = {"Authorization": "Bearer shared-session-token"}
     async with (
-        streamablehttp_client(url=url, headers=headers) as (read, write, _),
+        httpx2.AsyncClient(headers=headers) as http_client,
+        streamable_http_client(url, http_client=http_client) as (read, write),
         ClientSession(read, write) as session,
     ):
         await session.initialize()
@@ -284,7 +287,8 @@ async def scenario_3_header_isolation(url: str, n: int = 5) -> dict:
     async def one_session(idx: int) -> str | None:
         headers = {"Authorization": f"Bearer iso-token-{idx}"}
         async with (
-            streamablehttp_client(url=url, headers=headers) as (read, write, _),
+            httpx2.AsyncClient(headers=headers) as http_client,
+            streamable_http_client(url, http_client=http_client) as (read, write),
             ClientSession(read, write) as session,
         ):
             await session.initialize()

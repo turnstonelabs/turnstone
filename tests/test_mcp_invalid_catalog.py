@@ -23,7 +23,7 @@ import pytest
 import uvicorn
 from mcp.server.lowlevel import Server
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
-from pydantic import BaseModel, ConfigDict, ValidationError
+from pydantic import BaseModel, ValidationError
 from starlette.applications import Starlette
 from starlette.routing import Mount
 
@@ -50,12 +50,6 @@ NO_SCHEMA_ERROR = (
 )
 
 
-class _Loose(BaseModel):
-    """A result the server sends as given, so it can break the protocol's schema."""
-
-    model_config = ConfigDict(extra="allow")
-
-
 class Upstream:
     """What the server lists, how it pages the list, and what a tool call returns."""
 
@@ -65,28 +59,45 @@ class Upstream:
         self.call_result: dict[str, Any] = {"content": [{"type": "text", "text": "ok"}]}
         self.list_requests = 0
 
-    def page(self, cursor: str | None) -> _Loose:
+    def page(self, cursor: str | None) -> dict[str, Any]:
         self.list_requests += 1
         start = int(cursor or 0)
         end = start + self.page_size
         page: dict[str, Any] = {"tools": self.tools[start:end]}
         if end < len(self.tools):
             page["nextCursor"] = str(end)
-        return _Loose.model_validate(page)
+        return page
 
 
-def _build_server(upstream: Upstream) -> Server[Any, Any]:
-    server: Server[Any, Any] = Server("upstream")
+def _build_server(upstream: Upstream) -> Server[Any]:
+    async def _raw_middleware(ctx: Any, call_next: Any) -> Any:
+        # Short-circuiting without call_next sends the raw dict on the wire,
+        # bypassing the server's outbound result validation so the client sees
+        # the malformed catalog or tool result.
+        if ctx.method == "tools/list":
+            cursor = (ctx.params or {}).get("cursor")
+            return {
+                "resultType": "tools/list",
+                "cacheScope": "public",
+                "ttlMs": 0,
+                **upstream.page(cursor),
+            }
+        if ctx.method == "tools/call":
+            return {"resultType": "tools/call", **upstream.call_result}
+        return await call_next(ctx)
 
-    async def _list_tools(request: mcp_types.ListToolsRequest) -> _Loose:
-        return upstream.page(request.params.cursor if request.params is not None else None)
+    async def _noop_list(_ctx: Any, _params: Any) -> mcp_types.ListToolsResult:
+        return mcp_types.ListToolsResult(tools=[])
 
-    async def _call_tool(request: mcp_types.CallToolRequest) -> _Loose:
-        return _Loose.model_validate(upstream.call_result)
+    async def _noop_call(_ctx: Any, _params: Any) -> mcp_types.CallToolResult:
+        return mcp_types.CallToolResult(content=[])
 
-    # The server sends whatever a handler returns, so these skip its result types.
-    server.request_handlers[mcp_types.ListToolsRequest] = _list_tools  # type: ignore[assignment]
-    server.request_handlers[mcp_types.CallToolRequest] = _call_tool  # type: ignore[assignment]
+    server = Server(
+        "upstream",
+        on_list_tools=_noop_list,
+        on_call_tool=_noop_call,
+    )
+    server.middleware.append(_raw_middleware)
     return server
 
 

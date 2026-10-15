@@ -19,7 +19,7 @@ import threading
 import time
 from contextlib import asynccontextmanager
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
 import mcp.types as mcp_types
 import pytest
@@ -89,7 +89,7 @@ def _make_pool_session_mock() -> AsyncMock:
     session = AsyncMock()
     session.initialize = AsyncMock()
     # None caps → resources/prompts discovery is skipped; only list_tools runs.
-    session.get_server_capabilities = MagicMock(return_value=None)
+    session.server_capabilities = None
     session.list_tools = AsyncMock(return_value=mcp_types.ListToolsResult(tools=[]))
     return session
 
@@ -98,7 +98,7 @@ def _fake_transport_and_session(patches: dict[str, Any]) -> dict[str, Any]:
     """Build fake streamable-http transport + ClientSession cms.
 
     Records enter/exit events and captures the kwargs that reach
-    ``streamablehttp_client`` (so the bearer-header / factory contract is
+    ``streamable_http_client`` (so the bearer-header / client contract is
     observable).
     """
     events: list[str] = []
@@ -106,12 +106,13 @@ def _fake_transport_and_session(patches: dict[str, Any]) -> dict[str, Any]:
     session = _make_pool_session_mock()
 
     @asynccontextmanager
-    async def fake_streamablehttp_client(**kwargs: Any):
+    async def fake_streamable_http_client(url: str = "", **kwargs: Any):
         captured_kwargs.clear()
+        captured_kwargs["url"] = url
         captured_kwargs.update(kwargs)
         events.append("transport_enter")
         try:
-            yield (AsyncMock(), AsyncMock(), lambda: None)
+            yield (AsyncMock(), AsyncMock())
         finally:
             events.append("transport_exit")
 
@@ -126,7 +127,7 @@ def _fake_transport_and_session(patches: dict[str, Any]) -> dict[str, Any]:
     def fake_client_session(_read: Any, _write: Any, message_handler: Any = None):
         return fake_client_session_cm()
 
-    patches["streamablehttp_client"] = fake_streamablehttp_client
+    patches["streamable_http_client"] = fake_streamable_http_client
     patches["ClientSession"] = fake_client_session
     return {"events": events, "session": session, "kwargs": captured_kwargs}
 
@@ -154,7 +155,8 @@ class TestPoolTransportOwnerLifecycle:
 
         with (
             patch(
-                "turnstone.core.mcp_client.streamablehttp_client", patches["streamablehttp_client"]
+                "turnstone.core.mcp_client.streamable_http_client",
+                patches["streamable_http_client"],
             ),
             patch("turnstone.core.mcp_client.ClientSession", patches["ClientSession"]),
             patch.object(mgr, "_tcp_probe", new=AsyncMock()),
@@ -231,7 +233,8 @@ class TestPoolTransportOwnerLifecycle:
 
         with (
             patch(
-                "turnstone.core.mcp_client.streamablehttp_client", patches["streamablehttp_client"]
+                "turnstone.core.mcp_client.streamable_http_client",
+                patches["streamable_http_client"],
             ),
             patch("turnstone.core.mcp_client.ClientSession", patches["ClientSession"]),
             patch.object(mgr, "_tcp_probe", new=AsyncMock()),
@@ -298,10 +301,10 @@ class TestPoolTransportOwnerLifecycle:
         session = _make_pool_session_mock()
 
         @asynccontextmanager
-        async def fake_streamablehttp_client(**_kwargs: Any):
+        async def fake_streamable_http_client(_url: str = "", **_kwargs: Any):
             events.append("transport_enter")
             try:
-                yield (AsyncMock(), AsyncMock(), lambda: None)
+                yield (AsyncMock(), AsyncMock())
             finally:
                 events.append("transport_exit")
 
@@ -326,7 +329,7 @@ class TestPoolTransportOwnerLifecycle:
 
         key = ("user-1", "pool-srv")
         with (
-            patch("turnstone.core.mcp_client.streamablehttp_client", fake_streamablehttp_client),
+            patch("turnstone.core.mcp_client.streamable_http_client", fake_streamable_http_client),
             patch("turnstone.core.mcp_client.ClientSession", fake_session),
             patch.object(mgr, "_tcp_probe", new=AsyncMock()),
         ):
@@ -351,7 +354,8 @@ class TestPoolTransportOwnerLifecycle:
 
         with (
             patch(
-                "turnstone.core.mcp_client.streamablehttp_client", patches["streamablehttp_client"]
+                "turnstone.core.mcp_client.streamable_http_client",
+                patches["streamable_http_client"],
             ),
             patch("turnstone.core.mcp_client.ClientSession", patches["ClientSession"]),
             patch.object(mgr, "_tcp_probe", new=AsyncMock()),
@@ -393,12 +397,12 @@ class TestPoolTransportOwnerLifecycle:
         key = ("user-1", "pool-srv")
 
         @asynccontextmanager
-        async def hanging_streamablehttp_client(**_kwargs: Any):
+        async def hanging_streamable_http_client(_url: str = "", **_kwargs: Any):
             events.append("transport_enter")
             try:
                 entered.set()
                 await asyncio.sleep(3600)  # server accepted, then stalled
-                yield (AsyncMock(), AsyncMock(), lambda: None)
+                yield (AsyncMock(), AsyncMock())
             finally:
                 events.append("transport_exit")
 
@@ -428,7 +432,10 @@ class TestPoolTransportOwnerLifecycle:
             raise AssertionError("owner task still alive after caller cancel")
 
         with (
-            patch("turnstone.core.mcp_client.streamablehttp_client", hanging_streamablehttp_client),
+            patch(
+                "turnstone.core.mcp_client.streamable_http_client",
+                hanging_streamable_http_client,
+            ),
             patch.object(mgr, "_tcp_probe", new=AsyncMock()),
         ):
             _run(loop, _drive(), timeout=15)
@@ -491,20 +498,26 @@ class TestPoolOwnerClientKwargs:
         mgr, loop, _ = running_loop_mgr
         key = ("user-1", "pool-srv")
 
-        # With auth_capture → factory present.
+        # With auth_capture → http_client present with response hook and bearer.
         patches_a: dict[str, Any] = {}
         fake_a = _fake_transport_and_session(patches_a)
         with (
             patch(
-                "turnstone.core.mcp_client.streamablehttp_client",
-                patches_a["streamablehttp_client"],
+                "turnstone.core.mcp_client.streamable_http_client",
+                patches_a["streamable_http_client"],
             ),
             patch("turnstone.core.mcp_client.ClientSession", patches_a["ClientSession"]),
             patch.object(mgr, "_tcp_probe", new=AsyncMock()),
         ):
             _run(loop, _connect_under_lock(mgr, key, _http_cfg(), auth_capture=_AuthCapture()))
-            assert "httpx_client_factory" in fake_a["kwargs"]
-            assert fake_a["kwargs"]["headers"]["Authorization"] == "Bearer tok-aaa"
+            assert "http_client" in fake_a["kwargs"]
+            assert [
+                h.__name__ for h in fake_a["kwargs"]["http_client"].event_hooks["response"]
+            ] == [
+                "_hook",
+                "_reject_non_mcp",
+            ]
+            assert fake_a["kwargs"]["http_client"].headers["Authorization"] == "Bearer tok-aaa"
             _run(loop, mgr._teardown_pool_entry(key))
 
         # Without an explicit carrier, use the entry's carrier and still install the hook.
@@ -512,13 +525,19 @@ class TestPoolOwnerClientKwargs:
         fake_b = _fake_transport_and_session(patches_b)
         with (
             patch(
-                "turnstone.core.mcp_client.streamablehttp_client",
-                patches_b["streamablehttp_client"],
+                "turnstone.core.mcp_client.streamable_http_client",
+                patches_b["streamable_http_client"],
             ),
             patch("turnstone.core.mcp_client.ClientSession", patches_b["ClientSession"]),
             patch.object(mgr, "_tcp_probe", new=AsyncMock()),
         ):
             _run(loop, _connect_under_lock(mgr, key, _http_cfg()))
-            assert "httpx_client_factory" in fake_b["kwargs"]
-            assert fake_b["kwargs"]["headers"]["Authorization"] == "Bearer tok-aaa"
+            assert "http_client" in fake_b["kwargs"]
+            assert [
+                h.__name__ for h in fake_b["kwargs"]["http_client"].event_hooks["response"]
+            ] == [
+                "_hook",
+                "_reject_non_mcp",
+            ]
+            assert fake_b["kwargs"]["http_client"].headers["Authorization"] == "Bearer tok-aaa"
             _run(loop, mgr._teardown_pool_entry(key))

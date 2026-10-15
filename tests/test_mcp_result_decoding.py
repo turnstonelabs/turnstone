@@ -24,7 +24,7 @@ from turnstone.core.mcp_client import (
 def test_tool_text_and_error_results(texts: list[str], is_error: bool, expected: str) -> None:
     result = mcp_types.CallToolResult(
         content=[mcp_types.TextContent(type="text", text=text) for text in texts],
-        isError=is_error,
+        is_error=is_error,
     )
     assert _decode_tool_result(result) == expected
 
@@ -33,9 +33,9 @@ def test_tool_mixed_content_retains_order_and_mime_types() -> None:
     result = mcp_types.CallToolResult(
         content=[
             mcp_types.TextContent(type="text", text="before"),
-            mcp_types.ImageContent(type="image", data="aGVsbG8=", mimeType="image/png"),
+            mcp_types.ImageContent(type="image", data="aGVsbG8=", mime_type="image/png"),
             mcp_types.TextContent(type="text", text="between"),
-            mcp_types.AudioContent(type="audio", data="AQID", mimeType="audio/wav"),
+            mcp_types.AudioContent(type="audio", data="AQID", mime_type="audio/wav"),
         ]
     )
     assert _decode_tool_result(result) == (
@@ -76,7 +76,7 @@ def test_empty_resource() -> None:
 
 
 def test_prompt_roles_and_content() -> None:
-    image = mcp_types.ImageContent(type="image", data="AQID", mimeType="image/png")
+    image = mcp_types.ImageContent(type="image", data="AQID", mime_type="image/png")
     result = mcp_types.GetPromptResult(
         messages=[
             mcp_types.PromptMessage(

@@ -25,6 +25,7 @@ import contextvars
 import functools
 import gc
 import json
+import logging
 import os
 import random
 import signal
@@ -33,6 +34,7 @@ import threading
 import time
 import urllib.parse
 import uuid
+import weakref
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
@@ -45,13 +47,32 @@ import httpx
 import httpx2
 import mcp.client.stdio as mcp_stdio
 import mcp.types as mcp_types
-from mcp import ClientSession, McpError, StdioServerParameters
+from mcp import ClientSession, MCPError, StdioServerParameters
+from mcp.client.caching import (
+    MAX_TTL_MS,
+    ClientResponseCache,
+    InMemoryResponseCacheStore,
+)
+from mcp.client.extension import UnexpectedClaimedResult
 from mcp.client.stdio import stdio_client
-from mcp.client.streamable_http import streamablehttp_client
+from mcp.client.streamable_http import streamable_http_client
+from mcp.client.subscriptions import (
+    ListenNotSupportedError,
+    Subscription,
+    SubscriptionLost,
+    listen,
+)
 from mcp.shared._httpx_utils import (
     MCP_DEFAULT_SSE_READ_TIMEOUT,
     MCP_DEFAULT_TIMEOUT,
     McpHttpClientFactory,
+    _within_origin,
+)
+from mcp.shared.subscriptions import SUBSCRIPTION_ID_META_KEY
+from mcp_types.version import (
+    HANDSHAKE_PROTOCOL_VERSIONS,
+    LATEST_MODERN_VERSION,
+    MODERN_PROTOCOL_VERSIONS,
 )
 from pydantic import ValidationError
 
@@ -73,7 +94,7 @@ from turnstone.core.mcp_oauth import (
 from turnstone.core.oauth.context import oauth_context
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable, Coroutine
+    from collections.abc import Awaitable, Callable, Coroutine, Sequence
 
     from turnstone.core.mcp_utils import ConnectFailureKind
 
@@ -350,13 +371,21 @@ def _classify_http_status(
     return None
 
 
+def _has_established_session(headers: httpx.Headers | httpx2.Headers) -> bool:
+    """True when *headers* belong to a post-handshake request (legacy ``mcp-session-id`` or modern envelope)."""
+    return bool(headers.get("mcp-session-id")) or (
+        headers.get("mcp-protocol-version") in MODERN_PROTOCOL_VERSIONS
+        and headers.get("mcp-method") not in (None, "server/discover")
+    )
+
+
 def _classify_http_exception(
     exc: BaseException,
 ) -> Literal["auth_401", "auth_403", "transport"] | None:
     """Keep HTTP exception families at one boundary while both clients are in use."""
     if isinstance(exc, httpx.HTTPStatusError | httpx2.HTTPStatusError):
         status = exc.response.status_code
-        if status == 404 and not exc.request.headers.get("mcp-session-id"):
+        if status == 404 and not _has_established_session(exc.request.headers):
             return None
         return _classify_http_status(status)
     if isinstance(
@@ -377,7 +406,7 @@ def _classify_http_exception(
     return None
 
 
-def _is_dead_transport(exc: BaseException) -> bool:
+def _is_dead_transport(exc: BaseException, *, capture: _AuthCapture | None = None) -> bool:
     """True when *exc* means the MCP session's transport is dead and the
     session must be torn down and rebuilt (vs a protocol-level rejection
     from a still-healthy connection).
@@ -412,6 +441,8 @@ def _is_dead_transport(exc: BaseException) -> bool:
     The raw-socket variants (``BrokenPipeError`` / ``ConnectionResetError`` /
     ``EOFError``) are kept for the stdio transport and defense-in-depth.
     """
+    if capture is not None and _classify_http_status(capture.status) == "transport":
+        return True
     if isinstance(
         exc,
         anyio.ClosedResourceError
@@ -425,19 +456,13 @@ def _is_dead_transport(exc: BaseException) -> bool:
         return True
     if _classify_http_exception(exc) == "transport":
         return True
-    if isinstance(exc, McpError):
+    if isinstance(exc, MCPError):
         code = exc.error.code
         if code == mcp_types.CONNECTION_CLOSED:
             return True
-        # Server-restarted-session loss: match the SDK's deterministic synthesized
-        # code ALONE. The message is application-controlled — a healthy
-        # session-owning server (e.g. a game/shell MCP server) can legitimately
-        # reject a stale id with a protocol error whose message is
-        # "Session terminated" / "session not found", and matching on it would
-        # tear down that live session and trip the shared per-server breaker for
-        # every user. The client never sees those messages for a REAL dead
-        # transport (the SDK discards the server's 404 body and synthesizes code
-        # 32600), so keying off the code loses no coverage.
+        # Server-restarted-session loss (v1 SDK fallback when no HTTP capture is present):
+        # match only the v1 SDK's deterministic positive 32600 code; on v2, held-session
+        # HTTP 404s are captured off the wire via capture.status == 404 above.
         if code == _SDK_SESSION_TERMINATED_CODE:
             return True
     return False
@@ -447,19 +472,24 @@ def _is_dead_transport(exc: BaseException) -> bool:
 class _AuthCapture:
     """Observed auth, held-session 404, or 5xx failure, before the SDK loses its status.
 
-    ``first_error`` is the first JSON-RPC message the server answered with an error status (400
+    ``first_error`` is the first JSON-RPC request the server answered with an error status (400
     and up), with whether it carried a session id: what a failed connect is worded from
-    (:func:`classify_connect_failure`) whatever exception the SDK raises for it. It leaves out a
-    404 on anything but a request, which the SDK ignores; every other error status fails the
-    transport, a notification's or the client's own answer's included. Only a carrier new to its
-    connection can explain a connect that way (a static connection's and the connection test's);
-    a pool entry keeps one carrier across its connects and dispatches, and nothing resets this
-    field.
+    (:func:`classify_connect_failure`) whatever exception the SDK raises for it. It leaves out
+    anything but a request (a notification or the client's own answer), whose error status the SDK
+    ignores.
     """
 
     status: int | None = None
     www_authenticate: str | None = None
     first_error: tuple[int, bool] | None = None
+    negotiated: bool = False
+
+    def reset(self, *, negotiated: bool = False) -> None:
+        """Reset captured status fields; preserve *negotiated* when reusing a session."""
+        self.status = None
+        self.www_authenticate = None
+        self.first_error = None
+        self.negotiated = negotiated
 
 
 class _PoolDispatchRetryRequested(BaseException):  # noqa: N818
@@ -500,9 +530,10 @@ class _ErrorAnswerError(Exception):
     SDK's schema requires an id. ``code`` and ``message`` are the server's.
     """
 
-    def __init__(self, code: int, message: str) -> None:
+    def __init__(self, code: int, message: str, data: Any = None) -> None:
         self.code = code
         self.message = message
+        self.data = data
         super().__init__(f"{code}: {message}")
 
 
@@ -521,7 +552,43 @@ def _error_answer(content: bytes) -> _ErrorAnswerError | None:
     code, message = error.get("code"), error.get("message", "")
     if not isinstance(code, int) or isinstance(code, bool) or not isinstance(message, str):
         return None
-    return _ErrorAnswerError(code, message)
+    return _ErrorAnswerError(code, message, error.get("data"))
+
+
+def _inject_jsonrpc_error_id(content: bytes, request_id: Any) -> mcp_types.JSONRPCError | None:
+    """Build a valid :class:`mcp_types.JSONRPCError` with *request_id* from an id-less JSON-RPC
+    error payload in *content*, or return ``None``."""
+    if not isinstance(request_id, str | int) or isinstance(request_id, bool):
+        return None
+    err = _error_answer(content)
+    if err is None:
+        return None
+    return mcp_types.JSONRPCError(
+        jsonrpc="2.0",
+        id=request_id,
+        error=mcp_types.ErrorData(code=err.code, message=err.message, data=err.data),
+    )
+
+
+def _is_sdk_result_error(exc: BaseException) -> bool:
+    """Return True when *exc* is a client-side tool/schema validation or extension result error
+    raised by :class:`ClientSession` after receiving a valid server response.
+
+    That includes the SDK's refusal of a request for input (a 2026-07-28 ``InputRequiredResult``),
+    which it raises as a plain ``RuntimeError``. Its text is the only discriminator, so
+    ``test_an_input_request_is_breaker_neutral`` drives one through a real server.
+    """
+    if isinstance(exc, ValidationError | UnexpectedClaimedResult):
+        return True
+    if type(exc) is RuntimeError:
+        msg = str(exc)
+        return (
+            "has an output schema but did not return structured content" in msg
+            or msg.startswith("Invalid structured content returned by tool ")
+            or msg.startswith("Invalid schema for tool ")
+            or msg.startswith("Server returned InputRequiredResult;")
+        )
+    return False
 
 
 class _TransportClosedError(ConnectionError):
@@ -547,17 +614,39 @@ class MCPShutdownError(RuntimeError):
 # spent. It bounds each read, not the request: a server that trickles its answer is cut off only
 # by the connection test's own bound, and a saved server's owner is left to finish on its own.
 _SESSION_END_TIMEOUT_S = 3.0
+# S8 (#679): httpx2.EventSource caps a single SSE event at 1 MiB by default,
+# which truncates large tool outputs (screenshots, multi-MB text/resource reads)
+# as a -32000 CONNECTION_CLOSED error. 16 MiB accommodates multi-MB tool results
+# while retaining a bounded frame ceiling against runaway streams.
+_MCP_MAX_SSE_EVENT_SIZE = 16 * 1024 * 1024
 
 
-def _jsonrpc_body(request: httpx.Request) -> dict[str, Any] | None:
+def _jsonrpc_body(request: httpx.Request | httpx2.Request) -> dict[str, Any] | None:
     """The JSON-RPC message *request* POSTs, or None for any other request."""
     if request.method != "POST":
         return None
     try:
         body = json.loads(request.content)
-    except (ValueError, httpx.RequestNotRead):
+    except (ValueError, httpx.RequestNotRead, httpx2.RequestNotRead):
         return None
     return body if isinstance(body, dict) else None
+
+
+def _is_followed_post_redirect(response: httpx2.Response) -> bool:
+    """Return True if *response* is a 307/308 POST redirect that ``stream_within_origin`` follows."""
+    if response.status_code not in (307, 308):
+        return False
+    location = response.headers.get("location")
+    if not location:
+        return False
+    sent_url = response.request.url
+    try:
+        target = sent_url.join(location)
+    except Exception:
+        return False
+    if target.userinfo and target.userinfo != sent_url.userinfo:
+        return False
+    return _within_origin(sent_url, target)
 
 
 def _make_capturing_http_factory(
@@ -568,7 +657,7 @@ def _make_capturing_http_factory(
     Its clients also give the request that ends a session ``_SESSION_END_TIMEOUT_S``, and fail an
     initialize answered with something other than an MCP message (:class:`_NotMcpResponseError`).
 
-    The hooks are ``async`` because :class:`httpx.AsyncClient` invokes
+    The hooks are ``async`` because :class:`httpx2.AsyncClient` invokes
     event hooks via ``await hook(response)`` — a sync function would
     return ``None`` and ``await None`` raises ``TypeError`` inside the
     SDK's :meth:`client.stream` call. Even though our work is purely
@@ -576,29 +665,31 @@ def _make_capturing_http_factory(
     requires an awaitable. The first attempt's hook would still
     populate the carrier (the body runs before the ``await``), but the
     ``TypeError`` poisons the SDK's anyio TaskGroup teardown so the
-    next ``streamablehttp_client(...)`` invocation surfaces a stray
+    next ``streamable_http_client(...)`` invocation surfaces a stray
     ``CancelledError`` from inside its own scope. Empirically verified
     via a minimal repro: a sync hook breaks back-to-back connects in
     the same process; the async form does not.
     """
 
-    async def _bound_session_end(request: httpx.Request) -> None:
+    async def _bound_session_end(request: httpx2.Request) -> None:
         # The DELETE that ends the session goes out while the transport's owner unwinds, at times
         # after its one cancel was spent: a server that never answers it must not keep the owner
         # running (see _SESSION_END_TIMEOUT_S for what this does not bound).
         if request.method == "DELETE":
-            request.extensions["timeout"] = httpx.Timeout(_SESSION_END_TIMEOUT_S).as_dict()
+            request.extensions["timeout"] = httpx2.Timeout(_SESSION_END_TIMEOUT_S).as_dict()
 
-    async def _load_body(request: httpx.Request) -> None:
+    async def _load_body(request: httpx2.Request) -> None:
         # A redirected request reaches the hooks with its body unread. Load it, so the response
         # hooks can tell which message it carried.
-        if request.method == "POST" and isinstance(request.stream, httpx.ByteStream):
+        if request.method == "POST" and isinstance(
+            request.stream, httpx.ByteStream | httpx2.ByteStream
+        ):
             await request.aread()
 
-    async def _hook(response: httpx.Response) -> None:
-        # A cleanup response must not replace the failure that caused teardown. Static
-        # captures last for one connection; pool captures reset under the dispatch lock.
-        # No I/O or other awaits: recording the status and waking callers is atomic.
+    async def _hook(response: httpx2.Response) -> None:
+        # A cleanup response or optional background GET SSE probe must not replace the failure
+        # that caused teardown or poison a healthy session. Static captures last for one
+        # connection; pool captures reset under the dispatch lock.
         #
         # Use ``get_list(...)[0]`` rather than ``get(...)`` so a
         # malicious upstream that emits multiple ``WWW-Authenticate``
@@ -610,15 +701,67 @@ def _make_capturing_http_factory(
         # discard every challenge after the first; defence-in-depth
         # mirror lives in ``parse_www_authenticate_bearer``.
         status = response.status_code
-        if response.request.method == "DELETE":
+        if response.request.method != "POST":
             return
-        held_session = bool(response.request.headers.get("mcp-session-id"))
-        if capture.first_error is None and status >= 400:
-            body = _jsonrpc_body(response.request)
-            # As the SDK does: a 404 on anything but a request (it has a method and an id) is
-            # ignored, and any other error status fails the transport.
-            if body is not None and (status != 404 or ("method" in body and "id" in body)):
-                capture.first_error = (status, held_session)
+        held_session = capture.negotiated or _has_established_session(response.request.headers)
+        unfollowed_redirect = 300 <= status < 400 and not _is_followed_post_redirect(response)
+        req_body = (
+            _jsonrpc_body(response.request) if (status >= 400 or unfollowed_redirect) else None
+        )
+        req_method = req_body.get("method") if req_body is not None else None
+        if req_method == "subscriptions/listen":
+            return
+        # A 2025-11-25 server answers the pre-negotiation server/discover probe with whatever
+        # status it gives a method it does not know (400, 404, 405, 422, a 500...). None of them
+        # may latch first_error or status: _negotiate_session falls back to initialize(), which
+        # records any failure the server really has. A 401 or 403 does latch, because initialize
+        # would meet the same challenge and the auth flow needs this one.
+        if (
+            not capture.negotiated
+            and req_method == "server/discover"
+            and status >= 400
+            and status not in (401, 403)
+        ):
+            return
+        # In MCP 2026-07-28, protocol-level JSON-RPC errors are returned with HTTP 400 (or HTTP 404
+        # for METHOD_NOT_FOUND -32601 on stateless 2026-07-28 connections). Let the SDK parse and
+        # route those JSON-RPC errors without poisoning the transport carrier.
+        stateless_404 = status == 404 and not response.request.headers.get("mcp-session-id")
+        if status == 400 or stateless_404:
+            parsed_err: Any = None
+            if response.headers.get("content-type", "").lower().startswith("application/json"):
+                with contextlib.suppress(httpx.HTTPError, httpx2.HTTPError):
+                    raw_err = await response.aread()
+                    try:
+                        parsed_err = mcp_types.jsonrpc_message_adapter.validate_json(
+                            raw_err, by_name=False
+                        )
+                    except ValueError:
+                        if req_body is not None:
+                            rewritten = _inject_jsonrpc_error_id(raw_err, req_body.get("id"))
+                            if rewritten is not None:
+                                response._content = rewritten.model_dump_json().encode()
+                                parsed_err = rewritten
+                    if isinstance(parsed_err, mcp_types.JSONRPCError) and (
+                        status == 400 or parsed_err.error.code == mcp_types.METHOD_NOT_FOUND
+                    ):
+                        return
+            if (
+                stateless_404
+                and req_method in ("resources/list", "resources/templates/list")
+                and not isinstance(parsed_err, mcp_types.JSONRPCError)
+            ):
+                return
+        # As the SDK does: an error status on anything but a request (it has a method and an
+        # id) is ignored, and an error status on a request fails it.
+        if (
+            capture.first_error is None
+            and (status >= 400 or unfollowed_redirect)
+            and req_body is not None
+            and "method" in req_body
+            and "id" in req_body
+        ):
+            capture.first_error = (status, held_session)
         if capture.status is not None:
             return
         if status in (401, 403) or (status == 404 and held_session) or 500 <= status < 600:
@@ -628,18 +771,18 @@ def _make_capturing_http_factory(
             if fired_event is not None:
                 fired_event.set()
 
-    async def _reject_non_mcp(response: httpx.Response) -> None:
-        # The SDK logs an initialize answered with something other than MCP (a web page at the
-        # URL, a proxy's sign-in page, a REST API's JSON) and leaves it waiting out the connect
-        # timeout. Fail it at once, saying what came back. Only initialize: later answers keep the
-        # SDK's handling.
-        if response.status_code == 202 or not response.is_success:
+    async def _reject_non_mcp(response: httpx2.Response) -> None:
+        # The SDK logs an initialize/discover answered with something other than MCP (a web page at
+        # the URL, a proxy's sign-in page, a REST API's JSON) and leaves it waiting out the connect
+        # timeout. Fail it at once, saying what came back. Only the opening handshake/discover:
+        # later answers (including post-negotiation liveness pings) keep the SDK's handling.
+        if capture.negotiated or response.status_code == 202 or not response.is_success:
             return
         content_type = response.headers.get("content-type", "").lower()
         if content_type.startswith("text/event-stream"):
             return
         body = _jsonrpc_body(response.request)
-        if body is None or body.get("method") != "initialize":
+        if body is None or body.get("method") not in ("initialize", "server/discover"):
             return
         if not content_type.startswith("application/json"):
             raise _NotMcpResponseError(
@@ -648,27 +791,37 @@ def _make_capturing_http_factory(
         # The SDK reads the whole answer next, and gets it from httpx's copy.
         content = await response.aread()
         try:
-            mcp_types.JSONRPCMessage.model_validate_json(content)
+            parsed = mcp_types.jsonrpc_message_adapter.validate_json(content, by_name=False)
         except ValueError:
             error = _error_answer(content)
-            if error is not None:
-                raise error from None
-            raise _NotMcpResponseError("application/json that is not a JSON-RPC message") from None
+            if error is None:
+                raise _NotMcpResponseError(
+                    "application/json that is not a JSON-RPC message"
+                ) from None
+        else:
+            if not (isinstance(parsed, mcp_types.JSONRPCError) and parsed.id is None):
+                return
+            error = _ErrorAnswerError(parsed.error.code, parsed.error.message, parsed.error.data)
+        if body.get("method") == "server/discover":
+            rewritten = _inject_jsonrpc_error_id(content, body.get("id"))
+            if rewritten is not None:
+                response._content = rewritten.model_dump_json().encode()
+                return
+        raise error from None
 
     def _factory(
         headers: dict[str, str] | None = None,
-        timeout: httpx.Timeout | None = None,
-        auth: httpx.Auth | None = None,
-    ) -> httpx.AsyncClient:
+        timeout: httpx2.Timeout | None = None,
+        auth: httpx2.Auth | None = None,
+    ) -> httpx2.AsyncClient:
         kwargs: dict[str, Any] = {
-            "follow_redirects": True,
             "event_hooks": {
                 "request": [_bound_session_end, _load_body],
                 "response": [_hook, _reject_non_mcp],
             },
         }
         if timeout is None:
-            kwargs["timeout"] = httpx.Timeout(
+            kwargs["timeout"] = httpx2.Timeout(
                 MCP_DEFAULT_TIMEOUT, read=MCP_DEFAULT_SSE_READ_TIMEOUT
             )
         else:
@@ -677,7 +830,7 @@ def _make_capturing_http_factory(
             kwargs["headers"] = headers
         if auth is not None:
             kwargs["auth"] = auth
-        return httpx.AsyncClient(**kwargs)
+        return httpx2.AsyncClient(**kwargs)
 
     return _factory
 
@@ -693,7 +846,7 @@ def _mcp_to_openai(server_name: str, tool: mcp_types.Tool) -> dict[str, Any]:
     The tool name is prefixed ``mcp__{server}__{original}`` to avoid
     collisions with built-in tools and to identify the owning server.
     """
-    input_schema = tool.inputSchema or {
+    input_schema = tool.input_schema or {
         "type": "object",
         "properties": {},
     }
@@ -769,6 +922,112 @@ class _ListPage[P](Protocol):
         ...
 
 
+_MCP_LOG_LEVEL_MAP: dict[str, int] = {
+    "debug": logging.DEBUG,
+    "info": logging.INFO,
+    "notice": logging.INFO,
+    "warning": logging.WARNING,
+    "error": logging.ERROR,
+    "critical": logging.CRITICAL,
+    "alert": logging.CRITICAL,
+    "emergency": logging.CRITICAL,
+}
+
+_MCP_LOG_SEVERITY_ORDER: dict[str, int] = {
+    "debug": 0,
+    "info": 1,
+    "notice": 2,
+    "warning": 3,
+    "error": 4,
+    "critical": 5,
+    "alert": 6,
+    "emergency": 7,
+}
+
+_VALID_MCP_LOG_LEVELS: dict[str, mcp_types.LoggingLevel] = {
+    "debug": "debug",
+    "info": "info",
+    "notice": "notice",
+    "warning": "warning",
+    "error": "error",
+    "critical": "critical",
+    "alert": "alert",
+    "emergency": "emergency",
+}
+
+
+def _normalize_log_level(level: Any) -> mcp_types.LoggingLevel | None:
+    """Validate and normalize an MCP logging level string, or return ``None``."""
+    if not isinstance(level, str):
+        return None
+    return _VALID_MCP_LOG_LEVELS.get(level.strip().lower())
+
+
+def _session_protocol_version(session: Any) -> str | None:
+    """Return *session*'s negotiated protocol version string, or ``None``."""
+    if session is None:
+        return None
+    ver = getattr(session, "protocol_version", None)
+    return ver if isinstance(ver, str) else None
+
+
+_MIN_CATALOG_TTL_MS = 5_000
+_session_catalog_ttls: weakref.WeakKeyDictionary[Any, dict[str, float]] = (
+    weakref.WeakKeyDictionary()
+)
+_session_http_captures: weakref.WeakKeyDictionary[Any, _AuthCapture] = weakref.WeakKeyDictionary()
+
+
+def _pop_session_catalog_ttl(session: Any, kind: str) -> None:
+    """Remove any recorded catalog TTL for *kind* on *session* before fetching."""
+    if session is None:
+        return
+    with contextlib.suppress(TypeError):
+        ttls = _session_catalog_ttls.get(session)
+        if ttls is not None:
+            ttls.pop(kind, None)
+
+
+def _record_session_catalog_ttl(session: Any, kind: str, page: Any) -> None:
+    """Record or clear the monotonic expiry of *kind*'s catalog on *session* from *page*'s ``ttlMs``."""
+    if _session_protocol_version(session) not in MODERN_PROTOCOL_VERSIONS or not isinstance(
+        page, mcp_types.CacheableResult
+    ):
+        return
+    with contextlib.suppress(TypeError):
+        if "ttl_ms" in page.model_fields_set and page.ttl_ms > 0:
+            ttl_s = max(_MIN_CATALOG_TTL_MS, min(page.ttl_ms, MAX_TTL_MS)) / 1000.0
+            _session_catalog_ttls.setdefault(session, {})[kind] = time.monotonic() + ttl_s
+        elif session in _session_catalog_ttls:
+            _session_catalog_ttls[session].pop(kind, None)
+
+
+def _catalog_expires_at(session: Any) -> float | None:
+    """Return the earliest catalog TTL expiry timestamp on *session*, or ``None``."""
+    if session is None:
+        return None
+    with contextlib.suppress(TypeError):
+        ttls = _session_catalog_ttls.get(session)
+        if ttls:
+            return min(ttls.values())
+    return None
+
+
+def _clear_catalog_ttls(session: Any, *, now: float | None = None) -> None:
+    """Clear recorded catalog TTL expiry timestamps on *session* (or only those expired by *now*)."""
+    if session is None:
+        return
+    with contextlib.suppress(TypeError):
+        ttls = _session_catalog_ttls.get(session)
+        if ttls is not None:
+            if now is None:
+                ttls.clear()
+            else:
+                for k, exp in list(ttls.items()):
+                    if exp <= now:
+                        ttls.pop(k, None)
+
+
 async def _list_catalog[P: mcp_types.PaginatedResult, T](
     server_name: str,
     kind: str,
@@ -778,6 +1037,7 @@ async def _list_catalog[P: mcp_types.PaginatedResult, T](
     cap: int,
     *,
     missing_ok: bool = False,
+    on_complete: Callable[[dict[str, T]], None] | None = None,
 ) -> list[T]:
     """Every item one catalog lists, across its pages, deduplicated and capped at *cap*.
 
@@ -812,10 +1072,20 @@ async def _list_catalog[P: mcp_types.PaginatedResult, T](
     run it under ``asyncio.timeout`` and the static reconnect and add paths under an attempt
     timeout, while the static connect at startup is unbounded, as its single list call was.
     """
+    session_obj = getattr(list_page, "__self__", None)
+    capture: _AuthCapture | None = None
+    if session_obj is not None:
+        with contextlib.suppress(TypeError):
+            capture = _session_http_captures.get(session_obj)
+    _pop_session_catalog_ttl(session_obj, kind)
     try:
         page = await list_page(params=None)
-    except McpError as exc:
-        if not missing_ok or exc.error.code != mcp_types.METHOD_NOT_FOUND:
+    except MCPError as exc:
+        if (
+            not missing_ok
+            or exc.error.code != mcp_types.METHOD_NOT_FOUND
+            or _is_dead_transport(exc, capture=capture)
+        ):
             raise
         log.debug(
             "MCP server '%s' does not implement the %s list; treating it as empty",
@@ -825,6 +1095,7 @@ async def _list_catalog[P: mcp_types.PaginatedResult, T](
         return []
     except ValidationError as exc:
         raise _invalid_page_error(server_name, kind, 1, exc) from exc
+    _record_session_catalog_ttl(session_obj, kind, page)
     collected: dict[str, T] = {}
     sent: set[str] = set()
     stale = 0  # follow-up pages in a row that added nothing new
@@ -832,7 +1103,7 @@ async def _list_catalog[P: mcp_types.PaginatedResult, T](
         before = len(collected)
         for item in items_of(page):
             collected[key_of(item)] = item
-        cursor = page.nextCursor
+        cursor = page.next_cursor
         if len(collected) > cap or (cursor and len(collected) == cap):
             log.warning(
                 "MCP server '%s' lists %d or more %s; keeping the first %d. "
@@ -867,11 +1138,11 @@ async def _list_catalog[P: mcp_types.PaginatedResult, T](
         sent.add(cursor)
         try:
             page = await list_page(params=mcp_types.PaginatedRequestParams(cursor=cursor))
-        except McpError as exc:
-            # The SDK fails a request in flight on a dying transport with an McpError too
+        except MCPError as exc:
+            # The SDK fails a request in flight on a dying transport with an MCPError too
             # (CONNECTION_CLOSED, or the synthesized "Session terminated"); that is no answer
             # from the server, so discovery fails as it would on any other request.
-            if _is_dead_transport(exc):
+            if _is_dead_transport(exc, capture=capture):
                 raise
             log.warning(
                 "MCP server '%s' failed a later page of %s (JSON-RPC error %s); "
@@ -884,7 +1155,23 @@ async def _list_catalog[P: mcp_types.PaginatedResult, T](
             break
         except ValidationError as exc:
             raise _invalid_page_error(server_name, kind, len(sent) + 1, exc) from exc
-    return list(collected.values())[:cap]
+    final_items = list(collected.values())[:cap]
+    if on_complete is not None:
+        on_complete({key_of(item): item for item in final_items})
+    return final_items
+
+
+def _prune_session_tool_caches(
+    session: ClientSession, collected: dict[str, mcp_types.Tool]
+) -> None:
+    """Prune stale tool entries from *session*'s internal caches after a full multi-page walk."""
+    if not isinstance(session, _RealClientSession):
+        return
+    for cache_attr in ("_x_mcp_header_maps", "_tool_output_schemas", "_tool_output_validators"):
+        cache_dict = getattr(session, cache_attr, None)
+        if isinstance(cache_dict, dict):
+            for stale_name in [k for k in cache_dict if k not in collected]:
+                cache_dict.pop(stale_name, None)
 
 
 async def _list_all_tools(session: ClientSession, server_name: str) -> list[mcp_types.Tool]:
@@ -896,6 +1183,7 @@ async def _list_all_tools(session: ClientSession, server_name: str) -> list[mcp_
         lambda page: page.tools,
         lambda tool: tool.name,
         _MAX_TOOLS_PER_SERVER,
+        on_complete=lambda collected: _prune_session_tool_caches(session, collected),
     )
 
 
@@ -938,8 +1226,8 @@ async def _list_all_resource_templates(
         server_name,
         "resource templates",
         session.list_resource_templates,
-        lambda page: page.resourceTemplates,
-        lambda template: template.uriTemplate,
+        lambda page: page.resource_templates,
+        lambda template: template.uri_template,
         _MAX_RESOURCE_TEMPLATES_PER_SERVER,
         missing_ok=True,
     )
@@ -1005,7 +1293,7 @@ async def _list_resources_and_templates(
     The reap is BOUNDED by its own grace deadline (*reap_grace*), NOT left inside the
     outer ``asyncio.timeout`` (which fires exactly once — after it has
     fired, awaiting the cancelled children there is unbounded). The
-    pinned SDK (mcp>=1.27,<2) honours cancellation promptly, so this
+    pinned SDK (mcp>=2.3,<3) honours cancellation promptly, so this
     is belt-and-braces against a future regression: a child that
     ignores ``cancel()`` must not wedge this runner while it holds the
     per-server connect lock — the #839 deadlock class. A child still
@@ -1051,7 +1339,7 @@ async def _discover_catalogs(
     capability advertises the pair, but either list method may still be absent: the list helpers
     read only -32601 as an empty catalog.
     """
-    caps = session.get_server_capabilities()
+    caps = session.server_capabilities
     tools = await run(_list_all_tools(session, server_name))
     resources: list[mcp_types.Resource] = []
     templates: list[mcp_types.ResourceTemplate] = []
@@ -1082,17 +1370,17 @@ def _resource_entries(
             "uri": str(r.uri),
             "name": r.name or "",
             "description": r.description or "",
-            "mimeType": r.mimeType or "",
+            "mimeType": r.mime_type or "",
             "server": server_name,
         }
         for r in resources
     ]
     entries.extend(
         {
-            "uri": str(t.uriTemplate),
+            "uri": str(t.uri_template),
             "name": t.name or "",
             "description": t.description or "",
-            "mimeType": t.mimeType or "",
+            "mimeType": t.mime_type or "",
             "server": server_name,
             "template": True,
         }
@@ -1143,7 +1431,7 @@ def _sanitize_error_text(msg: str, limit: int = _MAX_ERROR_TEXT_LEN) -> str:
     the connection test) so a future sanitizer hardening cannot land on one and silently miss
     another.
     """
-    return msg.translate(_ERROR_TEXT_CONTROLS).strip()[:limit]
+    return msg[: max(limit * 4, 1024)].translate(_ERROR_TEXT_CONTROLS).strip()[:limit]
 
 
 class ServerUnreachableError(ConnectionError):
@@ -1256,14 +1544,27 @@ def _http_failure(status: int, detail: str = "") -> ConnectFailure:
     return ConnectFailure("http", f"{message}: {detail}" if detail else message, status)
 
 
-def _recorded_failure(capture: _AuthCapture | None) -> ConnectFailure | None:
+def _recorded_failure(
+    capture: _AuthCapture | None, leaf: BaseException | None = None
+) -> ConnectFailure | None:
     """The failure *capture* recorded off the wire: the first message the server answered with an
     error status. A 404 on a request that carried a session id means the server dropped the
     session it had just opened."""
     if capture is None or capture.first_error is None:
         return None
     status, held_session = capture.first_error
-    return _http_failure(status, _SESSION_DROPPED if status == 404 and held_session else "")
+    leaf_text = (
+        leaf.error.message
+        if isinstance(leaf, MCPError)
+        else (str(leaf) if leaf is not None else "")
+    )
+    if status == 404 and held_session:
+        detail = _SESSION_DROPPED
+    elif 300 <= status < 400 and leaf_text.startswith("Redirect to "):
+        detail = leaf_text
+    else:
+        detail = ""
+    return _http_failure(status, detail)
 
 
 def _protocol_failure(code: object, message: object) -> ConnectFailure:
@@ -1295,13 +1596,13 @@ def _classify_leaf(leaf: BaseException, capture: _AuthCapture | None) -> Connect
         )
     if isinstance(leaf, _ErrorAnswerError):
         return _protocol_failure(leaf.code, leaf.message)
-    if isinstance(leaf, McpError) and leaf.error.code == mcp_types.CONNECTION_CLOSED:
+    if isinstance(leaf, MCPError) and leaf.error.code == mcp_types.CONNECTION_CLOSED:
         return None  # what the teardown leaves behind, not why it began
-    if isinstance(leaf, httpx.HTTPStatusError | httpx2.HTTPStatusError | McpError):
+    if isinstance(leaf, httpx.HTTPStatusError | httpx2.HTTPStatusError | MCPError):
         # The status the server answered with, read off the wire: the SDK reports it as a status
         # error, its own "Session terminated" stand-in for a 404 or a generic MCP error,
         # depending on its version.
-        recorded = _recorded_failure(capture)
+        recorded = _recorded_failure(capture, leaf)
         if recorded is not None:
             return recorded
     if isinstance(leaf, httpx.HTTPStatusError | httpx2.HTTPStatusError):
@@ -1311,7 +1612,7 @@ def _classify_leaf(leaf: BaseException, capture: _AuthCapture | None) -> Connect
         # names the whole request URL, so it is worded from the status alone.
         sdk_redirect = 300 <= status < 400 and str(leaf).startswith("Redirect to ")
         return _http_failure(status, str(leaf) if sdk_redirect else "")
-    if isinstance(leaf, McpError):
+    if isinstance(leaf, MCPError):
         if leaf.error.code == _SDK_SESSION_TERMINATED_CODE:
             return _http_failure(404)  # with no recorded status, the v1 SDK's stand-in for a 404
         return _protocol_failure(leaf.error.code, leaf.error.message)
@@ -1361,13 +1662,13 @@ def classify_connect_failure(
     for failure in failures:
         if failure.kind != "error":
             return failure
-    recorded = _recorded_failure(capture)
+    recorded = _recorded_failure(capture, leaves[0] if leaves else None)
     if recorded is not None:
         return recorded
     if failures:
         return failures[0]
     if any(
-        isinstance(leaf, McpError) and leaf.error.code == mcp_types.CONNECTION_CLOSED
+        isinstance(leaf, MCPError) and leaf.error.code == mcp_types.CONNECTION_CLOSED
         for leaf in leaves
     ):
         return ConnectFailure("error", _CONNECTION_CLOSED)
@@ -1393,24 +1694,341 @@ _PROBE_TEARDOWN_S = 5.0
 _PROBE_ERROR_MAX_LEN = 1024
 
 
+def _extract_supported_versions(data: Any) -> list[str] | None:
+    """Return ``data.supported`` from an ``UNSUPPORTED_PROTOCOL_VERSION`` error, if present."""
+    supported = (
+        data.get("supported") if isinstance(data, dict) else getattr(data, "supported", None)
+    )
+    if isinstance(supported, list) and all(isinstance(v, str) for v in supported):
+        return supported
+    return None
+
+
+_RealClientSession = ClientSession
+
+
+async def _negotiate_session(
+    session: ClientSession,
+    *,
+    capture: _AuthCapture | None = None,
+) -> None:
+    """Negotiate the MCP protocol version on *session*: probe ``server/discover`` (2026-07-28)
+    and fall back to the ``initialize`` handshake on legacy servers.
+
+    Mock sessions in unit tests (not instances of :class:`ClientSession`) call
+    ``await session.initialize()`` directly. On real HTTP transports, a probe answered with a
+    status the response hook records on *capture* (a 401 or 403, or a redirect the transport
+    will not follow) ends the negotiation, because ``initialize`` would meet the same answer.
+    Any other refusal of the probe falls back to ``initialize``, as the SDK's own negotiation
+    does.
+    """
+    if not isinstance(session, _RealClientSession):
+        await session.initialize()
+    else:
+        result: mcp_types.DiscoverResult | None = None
+        version = LATEST_MODERN_VERSION
+        for attempt in range(2):
+            try:
+                raw = await session.send_discover(version)
+                result = mcp_types.DiscoverResult.model_validate(raw, by_name=False)
+                break
+            except MCPError as exc:
+                if exc.error.code == mcp_types.UNSUPPORTED_PROTOCOL_VERSION:
+                    supported = _extract_supported_versions(exc.error.data)
+                    mutual = [v for v in MODERN_PROTOCOL_VERSIONS if v in (supported or ())]
+                    if mutual and attempt == 0:
+                        version = mutual[-1]
+                        continue
+                    if supported is not None and not any(
+                        v in HANDSHAKE_PROTOCOL_VERSIONS for v in supported
+                    ):
+                        raise
+                if exc.error.code in (
+                    mcp_types.CONNECTION_CLOSED,
+                    mcp_types.REQUEST_TIMEOUT,
+                ) or (
+                    capture is not None
+                    and (capture.status is not None or capture.first_error is not None)
+                ):
+                    raise
+                try:
+                    await session.initialize()
+                except MCPError as handshake_exc:
+                    if (
+                        handshake_exc.error.code != mcp_types.UNSUPPORTED_PROTOCOL_VERSION
+                        or attempt != 0
+                        or (
+                            capture is not None
+                            and (capture.status is not None or capture.first_error is not None)
+                        )
+                    ):
+                        raise
+                    supported = _extract_supported_versions(handshake_exc.error.data)
+                    mutual = [v for v in MODERN_PROTOCOL_VERSIONS if v in (supported or ())]
+                    if not mutual:
+                        raise
+                    version = mutual[-1]
+                    continue
+                break
+            except ValidationError:
+                if capture is not None and (
+                    capture.status is not None or capture.first_error is not None
+                ):
+                    raise
+                await session.initialize()
+                break
+
+        if result is not None:
+            if any(v in MODERN_PROTOCOL_VERSIONS for v in result.supported_versions):
+                session.adopt(result)
+            elif not result.supported_versions or any(
+                v in HANDSHAKE_PROTOCOL_VERSIONS for v in result.supported_versions
+            ):
+                await session.initialize()
+            else:
+                raise MCPError(
+                    code=mcp_types.UNSUPPORTED_PROTOCOL_VERSION,
+                    message=(
+                        f"Unsupported protocol version from server/discover: "
+                        f"client supports {list(MODERN_PROTOCOL_VERSIONS)}, "
+                        f"server supports {result.supported_versions}"
+                    ),
+                )
+    if capture is not None:
+        capture.negotiated = True
+
+
+def _configure_session_logging(
+    session: Any,
+    *,
+    log_level: mcp_types.LoggingLevel | None,
+    logging_callback: Any = None,
+) -> None:
+    """Install *log_level* on a real :class:`ClientSession` prior to or after negotiation.
+
+    Keeping ``ClientSession(read, write, message_handler=...)``'s positional/keyword call signature
+    unchanged preserves compatibility with unit-test session factories while still configuring
+    2026-07-28 per-request ``_meta["io.modelcontextprotocol/logLevel"]`` stamping (via ``adopt()``).
+    ``notifications/message`` routing is handled uniformly in ``message_handler`` so the SDK does
+    not invoke both ``_logging_callback`` and ``_message_handler`` for the same notification.
+    """
+    _ = logging_callback
+    if isinstance(session, _RealClientSession) and session._log_level != log_level:
+        session._log_level = log_level
+        if session.discover_result is not None:
+            session.adopt(session.discover_result)
+
+
+def _accept_modern_listen_notification(session: Any, msg: Any) -> bool:
+    """Return False when *msg* is a 2026-07-28 subscription notification on a session with active
+    ``listen()`` routes that is missing/mismatched on ``subscriptionId`` or rejected by ``honored``."""
+    if not isinstance(
+        msg,
+        mcp_types.ToolListChangedNotification
+        | mcp_types.PromptListChangedNotification
+        | mcp_types.ResourceListChangedNotification
+        | mcp_types.ResourceUpdatedNotification,
+    ):
+        return True
+    routes = getattr(session, "_listen_routes", None)
+    if not isinstance(routes, dict) or not routes:
+        return True
+    params = getattr(msg, "params", None)
+    meta = getattr(params, "meta", None) if params is not None else None
+    if not isinstance(meta, dict):
+        return False
+    sub_id = meta.get(SUBSCRIPTION_ID_META_KEY)
+    if not isinstance(sub_id, int | str) or isinstance(sub_id, bool):
+        return False
+    route = routes.get(sub_id)
+    if route is None or getattr(route, "end", None) == "lost":
+        return False
+    honored = getattr(route, "honored", None)
+    if honored is None:
+        return True
+    if isinstance(msg, mcp_types.ToolListChangedNotification):
+        return bool(honored.tools_list_changed)
+    if isinstance(msg, mcp_types.PromptListChangedNotification):
+        return bool(honored.prompts_list_changed)
+    if isinstance(msg, mcp_types.ResourceListChangedNotification):
+        return bool(honored.resources_list_changed)
+    honored_uris = getattr(route, "_honored_uris", None)
+    return isinstance(honored_uris, set | frozenset | list | tuple) and (
+        str(msg.params.uri) in honored_uris
+    )
+
+
+async def _enter_modern_subscription(
+    stack: AsyncExitStack,
+    session: ClientSession,
+    *,
+    resource_subscriptions: Sequence[str] = (),
+    capture: _AuthCapture | None = None,
+    timeout: float = 10.0,
+) -> Subscription | None:
+    """Open a ``subscriptions/listen`` stream on *stack* for a 2026-07-28 *session* that
+    advertises ``list_changed`` or resource ``subscribe`` capabilities, or return ``None``."""
+    if (
+        not isinstance(session, _RealClientSession)
+        or session.protocol_version not in MODERN_PROTOCOL_VERSIONS
+    ):
+        return None
+    caps = session.server_capabilities
+    if caps is None:
+        return None
+    tools_changed = bool(caps.tools and caps.tools.list_changed)
+    resources_changed = bool(caps.resources and caps.resources.list_changed)
+    prompts_changed = bool(caps.prompts and caps.prompts.list_changed)
+    resources_subscribe = bool(caps.resources and caps.resources.subscribe)
+    uris = (
+        [u for u in resource_subscriptions if isinstance(u, str) and u]
+        if resources_subscribe
+        else []
+    )
+    if not (tools_changed or resources_changed or prompts_changed or uris):
+        return None
+    child_stack = await stack.enter_async_context(AsyncExitStack())
+    try:
+        async with asyncio.timeout(timeout):
+            sub = await child_stack.enter_async_context(
+                listen(
+                    session,
+                    tools_list_changed=tools_changed,
+                    resources_list_changed=resources_changed,
+                    prompts_list_changed=prompts_changed,
+                    resource_subscriptions=uris,
+                )
+            )
+    except (MCPError, ListenNotSupportedError, SubscriptionLost, TimeoutError) as exc:
+        await child_stack.aclose()
+        if _is_dead_transport(exc, capture=capture) or (
+            capture is not None and capture.status is not None
+        ):
+            raise
+        return None
+    if getattr(getattr(sub, "_route", None), "end", None) is not None:
+        await child_stack.aclose()
+        return None
+    return sub
+
+
+async def _park_transport_owner(
+    close_requested: asyncio.Event,
+    sub: Subscription | None,
+    *,
+    sub_stack: AsyncExitStack | None = None,
+    relisten: Callable[[AsyncExitStack], Awaitable[Subscription | None]] | None = None,
+    relisten_requested: asyncio.Event | None = None,
+    on_relisten: Callable[[], None] | None = None,
+) -> None:
+    """Park a transport owner until *close_requested* is set.
+
+    When *relisten* is ``None``, drains *sub* once (propagating :class:`SubscriptionLost`)
+    and waits for *close_requested*. When *relisten* is provided, supervises the
+    ``subscriptions/listen`` stream in-task using a per-subscription child
+    :class:`AsyncExitStack`, re-opening on graceful server stream recycling or
+    *relisten_requested* without tearing down the underlying :class:`ClientSession`,
+    while propagating :class:`SubscriptionLost` so an unexpected transport drop triggers
+    normal session eviction and reconnect.
+    """
+    can_relisten = relisten is not None and relisten_requested is not None
+
+    async def _wait_signal(*, timeout: float | None = None) -> None:
+        if not can_relisten and timeout is None:
+            await close_requested.wait()
+            return
+        tasks = {asyncio.create_task(close_requested.wait())}
+        if can_relisten and relisten_requested is not None:
+            tasks.add(asyncio.create_task(relisten_requested.wait()))
+        try:
+            await asyncio.wait(tasks, timeout=timeout, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for t in tasks:
+                t.cancel()
+
+    current_sub = sub
+    first_iteration = True
+    consecutive_quick_closes = 0
+    need_relisten_refetch = False
+    while not close_requested.is_set():
+        iter_stack = sub_stack if first_iteration and sub_stack is not None else AsyncExitStack()
+        async with iter_stack:
+            if not first_iteration:
+                assert relisten is not None and relisten_requested is not None
+                relisten_requested.clear()
+                current_sub = await relisten(iter_stack)
+                if need_relisten_refetch and current_sub is not None and on_relisten is not None:
+                    on_relisten()
+                need_relisten_refetch = False
+            first_iteration = False
+
+            if current_sub is None:
+                await _wait_signal()
+                continue
+
+            active_sub = current_sub
+
+            async def _watch_signals(target_sub: Subscription = active_sub) -> None:
+                await _wait_signal()
+                route = getattr(target_sub, "_route", None)
+                if route is not None:
+                    route.settle("local")
+
+            started_at = time.monotonic()
+            received_event = False
+            watcher = asyncio.create_task(_watch_signals())
+            try:
+                async for _event in active_sub:
+                    received_event = True
+            finally:
+                watcher.cancel()
+
+        if close_requested.is_set():
+            return
+        if not can_relisten:
+            await close_requested.wait()
+            return
+        if relisten_requested is not None and relisten_requested.is_set():
+            consecutive_quick_closes = 0
+            need_relisten_refetch = False
+            continue
+        need_relisten_refetch = True
+        if received_event or time.monotonic() - started_at >= 1.0:
+            consecutive_quick_closes = 0
+            await _wait_signal(timeout=1.0)
+        else:
+            consecutive_quick_closes += 1
+            if consecutive_quick_closes >= 2:
+                current_sub = None
+                consecutive_quick_closes = 0
+                await _wait_signal()
+            else:
+                await _wait_signal(timeout=1.0)
+
+
 async def _probe_http_server(url: str, headers: dict[str, str], label: str) -> ConnectionProbe:
-    """Connect, initialize and list the catalogs once; see :func:`probe_http_server`."""
+    """Connect, negotiate and list the catalogs once; see :func:`probe_http_server`."""
     deadline = asyncio.get_running_loop().time() + MCPClientManager._CONNECT_TIMEOUT
     capture = _AuthCapture()
     try:
         await _tcp_preflight(label, url, MCPClientManager._TCP_PROBE_TIMEOUT)
         async with (
-            streamablehttp_client(
-                url=url, headers=headers, httpx_client_factory=_make_capturing_http_factory(capture)
-            ) as (read, write, _),
+            _make_capturing_http_factory(capture)(headers=headers) as http_client,
+            streamable_http_client(
+                url,
+                http_client=http_client,
+                max_sse_event_size=_MCP_MAX_SSE_EVENT_SIZE,
+            ) as (read, write),
             ClientSession(read, write) as session,
         ):
+            with contextlib.suppress(TypeError):
+                _session_http_captures[session] = capture
             # The deadline covers the requests, never the unwind after them: a cancel landing in
             # the SDK's exit could leave an anyio cancel scope half-exited. An unwind that runs
             # over (a server that trickles its answer to the request ending the session) is cut
             # off by probe_http_server, on this loop of the test's own, closed right after.
             async with asyncio.timeout_at(deadline):
-                await session.initialize()
+                await _negotiate_session(session, capture=capture)
                 tools, resources, templates, prompts = await _discover_catalogs(
                     session,
                     label,
@@ -1512,6 +2130,7 @@ class StaticServerState:
     # ``_teardown_static_session`` for the close protocol).
     owner_task: asyncio.Task[None] | None = None
     close_requested: asyncio.Event | None = None
+    relisten_requested: asyncio.Event | None = None
     streams: tuple[Any, Any] | None = None
     # Replaced for each connection, never reset by a dispatch: static calls may overlap.
     http_capture: _AuthCapture | None = None
@@ -1568,6 +2187,7 @@ class PoolEntryState:
     # for the close protocol).
     owner_task: asyncio.Task[None] | None = None
     close_requested: asyncio.Event | None = None
+    relisten_requested: asyncio.Event | None = None
     streams: tuple[Any, Any] | None = None
     # Catalog state — populated lazily once per-user discovery wires
     # in; left ``None`` here so 200-entry pools don't retain 600 empty
@@ -1883,6 +2503,7 @@ class MCPClientManager:
         # credential, so the priming / keep-alive-sweep / consent sites that
         # iterate ``_oauth_user_server_names`` deliberately exclude these.
         self._obo_server_names: set[str] = set()
+        self._pool_server_configs: dict[str, dict[str, Any]] = {}
         # (user, server) → monotonic time of this node's last DB-confirmed
         # pending-consent DELETE. The dispatch-success clear skips its SQL
         # DELETE while the entry is younger than the TTL (keeps the hot path
@@ -1958,6 +2579,23 @@ class MCPClientManager:
         self._submission_cond = threading.Condition()
         self._submitting = 0
         self._accepting_work = True
+
+        # 2026-07-28 protocol-level response caching (ttlMs / cacheScope),
+        # per-URI resource subscriptions (subscriptions/listen + resources/updated),
+        # and per-request opt-in server logging (_meta[io.modelcontextprotocol/logLevel]).
+        self._response_cache_store = InMemoryResponseCacheStore()
+        self._response_caches: dict[tuple[str, str | None], ClientResponseCache] = {}
+        self._resource_subscriptions: dict[str, tuple[str, ...]] = {}
+        self._resource_updated_listeners: list[tuple[str | None, Callable[[str, str], None]]] = []
+        self._resource_updated_listeners_lock = threading.Lock()
+        raw_log_level = mcp_cfg.get("log_level")
+        self._default_log_level: mcp_types.LoggingLevel | None = (
+            cast_log_level
+            if isinstance(raw_log_level, str)
+            and (cast_log_level := _normalize_log_level(raw_log_level)) is not None
+            else None
+        )
+        self._server_log_levels: dict[str, mcp_types.LoggingLevel | None] = {}
 
     def _ensure_static_state(self, name: str) -> StaticServerState:
         """Get or create the StaticServerState for ``name``.
@@ -2440,8 +3078,10 @@ class MCPClientManager:
         silently re-open that stale-stamp hole. Safe when the session is
         already gone: all parts are idempotent.
         """
+        _clear_catalog_ttls(state.session)
         state.session = None
         self._clear_static_push_state(name, markers=False)
+        self._purge_response_cache(name, user_id=None)
 
     async def _teardown_static_session(self, name: str) -> None:
         """Tear down a static server's session/transport (the ONE canonical order).
@@ -2483,6 +3123,7 @@ class MCPClientManager:
         close_requested = state.close_requested
         state.owner_task = None
         state.close_requested = None
+        state.relisten_requested = None
         # Signal BEFORE the first await: if this coroutine is itself cancelled
         # mid-teardown, the owner must already have its marching orders — a
         # parked owner that never learns of the close would hold the transport
@@ -2766,7 +3407,7 @@ class MCPClientManager:
         """
         if not isinstance(msg, mcp_types.ServerNotification):
             return
-        kind = _LIST_CHANGED_KINDS.get(type(msg.root))
+        kind = _LIST_CHANGED_KINDS.get(type(msg))
         if kind is None:
             return
         marker = (key, kind)
@@ -2926,6 +3567,90 @@ class MCPClientManager:
                 # refreshes again (see the docstring's ownership rules).
                 pending.discard(marker)
 
+    async def _handle_common_notification(
+        self,
+        msg: Any,
+        server_name: str,
+        *,
+        user_id: str | None = None,
+    ) -> bool:
+        """Handle notifications shared identically between static and pool sessions."""
+        if isinstance(msg, mcp_types.ServerNotification):
+            await self._evict_cache_for_notification(server_name, msg, user_id=user_id)
+        if isinstance(msg, mcp_types.ResourceUpdatedNotification):
+            self._handle_resource_updated(server_name, str(msg.params.uri), user_id=user_id)
+            return True
+        if isinstance(msg, mcp_types.LoggingMessageNotification):
+            await self._make_logging_callback(server_name, user_id=user_id)(msg.params)
+            return True
+        return False
+
+    async def _run_owner_session(
+        self,
+        stack: AsyncExitStack,
+        read: Any,
+        write: Any,
+        *,
+        server_name: str,
+        cfg: dict[str, Any] | None = None,
+        message_handler: Any,
+        capture: _AuthCapture | None,
+        ready: asyncio.Future[Any],
+        close_requested: asyncio.Event,
+        relisten_requested: asyncio.Event,
+        on_relisten: Callable[[], None] | None = None,
+    ) -> None:
+        """Shared session initialization, negotiation, subscription, and parking inside an owner task."""
+        session = await stack.enter_async_context(
+            ClientSession(
+                read,
+                write,
+                message_handler=message_handler,
+            )
+        )
+        if capture is not None:
+            with contextlib.suppress(TypeError):
+                _session_http_captures[session] = capture
+        _configure_session_logging(
+            session,
+            log_level=self._effective_log_level(server_name, cfg),
+        )
+        init_sub_stack = await stack.enter_async_context(AsyncExitStack())
+        async with asyncio.timeout(self._CONNECT_TIMEOUT):
+            await _negotiate_session(session, capture=capture)
+            relisten_requested.clear()
+            sub = await _enter_modern_subscription(
+                init_sub_stack,
+                session,
+                resource_subscriptions=self._configured_resource_subscriptions(server_name, cfg),
+                capture=capture,
+            )
+        # Re-apply effective log level in case set_log_level ran while negotiation was in flight.
+        _configure_session_logging(
+            session,
+            log_level=self._effective_log_level(server_name, cfg),
+        )
+        if not ready.done():
+            ready.set_result(session)
+
+        async def _relisten(sub_stack: AsyncExitStack) -> Subscription | None:
+            relisten_requested.clear()
+            return await _enter_modern_subscription(
+                sub_stack,
+                session,
+                resource_subscriptions=self._configured_resource_subscriptions(server_name, cfg),
+                capture=None,
+            )
+
+        await _park_transport_owner(
+            close_requested,
+            sub,
+            sub_stack=init_sub_stack,
+            relisten=_relisten,
+            relisten_requested=relisten_requested,
+            on_relisten=on_relisten,
+        )
+
     def _make_static_notification_handler(self, name: str) -> Any:
         """Build the per-server notification handler for a static session.
 
@@ -2972,6 +3697,13 @@ class MCPClientManager:
         async def _on_notification(
             msg: Any,  # RequestResponder | ServerNotification | Exception
         ) -> None:
+            state = self._static_servers.get(name)
+            if not _accept_modern_listen_notification(
+                state.session if state is not None else None, msg
+            ):
+                return
+            if await self._handle_common_notification(msg, name, user_id=None):
+                return
             self._admit_list_changed(
                 msg,
                 name,
@@ -2986,6 +3718,12 @@ class MCPClientManager:
             )
 
         return _on_notification
+
+    def _on_static_relisten(self, name: str) -> None:
+        """Reconcile cached resources and catalogs after a 2026-07-28 static server closes and
+        re-opens its ``subscriptions/listen`` stream."""
+        self._purge_response_cache(name, read_only=True)
+        self._spawn_full_refresh(name, f"catalog refresh after subscription relisten for '{name}'")
 
     async def _run_static_notification_refresh(
         self,
@@ -3111,18 +3849,23 @@ class MCPClientManager:
         server_pids: list[int] = []  # recorded by the SDK spawn hook
         state.http_capture = _AuthCapture()
         state.http_fired_event = asyncio.Event()
+        relisten_requested = asyncio.Event()
+        state.relisten_requested = relisten_requested
         try:
             async with AsyncExitStack() as stack:
                 transport = cfg.get("type", "stdio")
                 if transport in ("http", "streamable-http") or "url" in cfg:
                     async with asyncio.timeout(self._CONNECT_TIMEOUT):
-                        read, write, _ = await stack.enter_async_context(
-                            streamablehttp_client(
-                                url=cfg["url"],
-                                headers=cfg.get("headers"),
-                                httpx_client_factory=_make_capturing_http_factory(
-                                    state.http_capture, state.http_fired_event
-                                ),
+                        http_client = await stack.enter_async_context(
+                            _make_capturing_http_factory(
+                                state.http_capture, state.http_fired_event
+                            )(headers=cfg.get("headers"))
+                        )
+                        read, write = await stack.enter_async_context(
+                            streamable_http_client(
+                                cfg["url"],
+                                http_client=http_client,
+                                max_sse_event_size=_MCP_MAX_SSE_EVENT_SIZE,
                             )
                         )
                 else:
@@ -3145,18 +3888,19 @@ class MCPClientManager:
                 # Stash stream refs so _pre_close_streams can unblock the
                 # SDK's transport tasks promptly during teardown (SDK #2147).
                 state.streams = (read, write)
-                session = await stack.enter_async_context(
-                    ClientSession(
-                        read,
-                        write,
-                        message_handler=self._make_static_notification_handler(name),
-                    )
+                await self._run_owner_session(
+                    stack,
+                    read,
+                    write,
+                    server_name=name,
+                    cfg=cfg,
+                    message_handler=self._make_static_notification_handler(name),
+                    capture=state.http_capture,
+                    ready=ready,
+                    close_requested=close_requested,
+                    relisten_requested=relisten_requested,
+                    on_relisten=lambda: self._on_static_relisten(name),
                 )
-                async with asyncio.timeout(self._CONNECT_TIMEOUT):
-                    await session.initialize()
-                if not ready.done():
-                    ready.set_result(session)
-                await close_requested.wait()
         except asyncio.CancelledError:
             if not ready.done():
                 ready.set_exception(ConnectionError(f"MCP connect for '{name}' was cancelled"))
@@ -3217,6 +3961,7 @@ class MCPClientManager:
             return
         state.owner_task = None
         state.close_requested = None
+        state.relisten_requested = None
         if state.session is not None:
             self._drop_static_session_and_stamp(name, state)
             log.info("MCP server '%s' transport terminated; session evicted for reconnect", name)
@@ -3316,20 +4061,22 @@ class MCPClientManager:
         # as failed. The live owner/session must likewise be torn down before
         # the error escapes.
         try:
-            caps: mcp_types.ServerCapabilities | None = session.get_server_capabilities()
+            caps: mcp_types.ServerCapabilities | None = session.server_capabilities
 
             tools_cap = caps.tools if caps is not None else None
-            supports_list_changed = tools_cap is not None and bool(tools_cap.listChanged)
+            supports_list_changed = tools_cap is not None and bool(tools_cap.list_changed)
 
             resources_cap = caps.resources if caps is not None else None
             supports_resources = resources_cap is not None
             supports_resource_list_changed = resources_cap is not None and bool(
-                resources_cap.listChanged
+                resources_cap.list_changed
             )
 
             prompts_cap = caps.prompts if caps is not None else None
             supports_prompts = prompts_cap is not None
-            supports_prompt_list_changed = prompts_cap is not None and bool(prompts_cap.listChanged)
+            supports_prompt_list_changed = prompts_cap is not None and bool(
+                prompts_cap.list_changed
+            )
 
             # Discovery runs in THIS caller task while the transport is hosted by the owner, so a
             # transport collapse mid-discovery cancels the OWNER, not us: each listing races the
@@ -3442,6 +4189,13 @@ class MCPClientManager:
         async def _on_pool_notification(
             msg: Any,  # RequestResponder | ServerNotification | Exception
         ) -> None:
+            entry = self._user_pool_entries.get(key)
+            if not _accept_modern_listen_notification(
+                entry.session if entry is not None else None, msg
+            ):
+                return
+            if await self._handle_common_notification(msg, server_name, user_id=user_id):
+                return
             self._admit_list_changed(
                 msg,
                 key,
@@ -3455,6 +4209,33 @@ class MCPClientManager:
             )
 
         return _on_pool_notification
+
+    def _on_pool_relisten(self, key: tuple[str, str]) -> None:
+        """Reconcile cached resources and catalogs for *key* after a 2026-07-28 pool server
+        closes and re-opens its ``subscriptions/listen`` stream."""
+        user_id, server_name = key
+        self._purge_response_cache(
+            server_name, user_id=user_id, include_public=True, read_only=True
+        )
+        entry = self._user_pool_entries.get(key)
+        if entry is None or entry.session is None:
+            return
+        refreshers: dict[
+            str, Callable[[tuple[str, str]], Awaitable[tuple[list[str], list[str]]]]
+        ] = {
+            "tools": self._refresh_pool_server_tools,
+            "resources": self._refresh_pool_server_resources,
+            "prompts": self._refresh_pool_server_prompts,
+        }
+        for kind, refresher in refreshers.items():
+            marker = (key, kind)
+            if marker in self._pool_refresh_pending:
+                continue
+            self._pool_refresh_pending.add(marker)
+            self._spawn_background(
+                self._run_notification_refresh(key, kind, refresher),
+                f"pool {kind} relisten refresh for '{server_name}'",
+            )
 
     async def _run_notification_refresh(
         self,
@@ -3547,26 +4328,37 @@ class MCPClientManager:
         try:
             async with AsyncExitStack() as stack:
                 async with asyncio.timeout(self._CONNECT_TIMEOUT):
-                    read, write, _ = await stack.enter_async_context(
-                        streamablehttp_client(**client_kwargs)
+                    factory: McpHttpClientFactory = client_kwargs["httpx_client_factory"]
+                    http_client = await stack.enter_async_context(
+                        factory(headers=client_kwargs.get("headers"))
+                    )
+                    read, write = await stack.enter_async_context(
+                        streamable_http_client(
+                            client_kwargs["url"],
+                            http_client=http_client,
+                            max_sse_event_size=_MCP_MAX_SSE_EVENT_SIZE,
+                        )
                     )
                 # Stash stream refs so _pre_close_streams can unblock the SDK's
                 # transport tasks promptly during teardown (SDK #2147).
                 entry = self._user_pool_entries.get(key)
+                relisten_requested = asyncio.Event()
                 if entry is not None:
                     entry.streams = (read, write)
-                session = await stack.enter_async_context(
-                    ClientSession(
-                        read,
-                        write,
-                        message_handler=self._make_pool_notification_handler(key),
-                    )
+                    entry.relisten_requested = relisten_requested
+                await self._run_owner_session(
+                    stack,
+                    read,
+                    write,
+                    server_name=server_name,
+                    cfg=client_kwargs.get("cfg"),
+                    message_handler=self._make_pool_notification_handler(key),
+                    capture=entry.auth_capture if entry is not None else None,
+                    ready=ready,
+                    close_requested=close_requested,
+                    relisten_requested=relisten_requested,
+                    on_relisten=lambda: self._on_pool_relisten(key),
                 )
-                async with asyncio.timeout(self._CONNECT_TIMEOUT):
-                    await session.initialize()
-                if not ready.done():
-                    ready.set_result(session)
-                await close_requested.wait()
         except asyncio.CancelledError:
             if not ready.done():
                 ready.set_exception(
@@ -3655,6 +4447,7 @@ class MCPClientManager:
         close_requested = entry.close_requested
         entry.owner_task = None
         entry.close_requested = None
+        entry.relisten_requested = None
         # Signal BEFORE the first await: if this coroutine is itself cancelled
         # mid-teardown, the owner must already have its marching orders — a
         # parked owner that never learns of the close would hold the transport
@@ -3700,6 +4493,7 @@ class MCPClientManager:
             return
         entry.owner_task = None
         entry.close_requested = None
+        entry.relisten_requested = None
         had_session = entry.session is not None
         self._drop_session_and_stamp(key, entry)
         if had_session:
@@ -3807,8 +4601,7 @@ class MCPClientManager:
         # retiring client's response hooks cannot supply the next connection's first failure.
         capture = auth_capture if auth_capture is not None else entry.auth_capture
         fired_event = auth_fired_event if auth_fired_event is not None else entry.auth_fired_event
-        capture.status = None
-        capture.www_authenticate = None
+        capture.reset()
         fired_event.clear()
 
         url = cfg.get("url")
@@ -3833,6 +4626,7 @@ class MCPClientManager:
             "url": url,
             "headers": headers,
             "httpx_client_factory": _make_capturing_http_factory(capture, fired_event),
+            "cfg": cfg,
         }
 
         # Pre-flight TCP check: fail fast before spawning an owner and entering
@@ -3892,16 +4686,16 @@ class MCPClientManager:
         # capability-gated so a server that doesn't implement them stays
         # cheap (no extra round-trips). Capabilities are populated by the
         # initialize roundtrip and immutable thereafter (R13).
-        caps: mcp_types.ServerCapabilities | None = session.get_server_capabilities()
+        caps: mcp_types.ServerCapabilities | None = session.server_capabilities
         resources_cap = caps.resources if caps is not None else None
         prompts_cap = caps.prompts if caps is not None else None
         entry.supports_resources = resources_cap is not None
         entry.supports_resource_list_changed = resources_cap is not None and bool(
-            resources_cap.listChanged
+            resources_cap.list_changed
         )
         entry.supports_prompts = prompts_cap is not None
         entry.supports_prompt_list_changed = prompts_cap is not None and bool(
-            prompts_cap.listChanged
+            prompts_cap.list_changed
         )
 
         # Discover this user's tool catalog. Discovery runs in THIS caller task
@@ -4994,7 +5788,7 @@ class MCPClientManager:
         # leave the dead pool entry in place forever (no rebuild).
         if _is_dead_transport(exc):
             return "transport"
-        if isinstance(exc, McpError):
+        if isinstance(exc, MCPError):
             return "protocol"
         if isinstance(exc, TimeoutError):
             return "transport"
@@ -5423,6 +6217,10 @@ class MCPClientManager:
         if name in self._server_configs:
             self._last_refresh[name] = (time.time(), f"error:{type(exc).__name__}")
         self._arm_refresh_retry(name)
+        dead_state = self._static_servers.get(name)
+        dead_capture = dead_state.http_capture if dead_state is not None else None
+        if _is_dead_transport(exc, capture=dead_capture) and dead_state is not None:
+            self._drop_static_session_and_stamp(name, dead_state)
 
     def _record_refresh_success(self, name: str) -> None:
         """Record a static-path refresh SUCCESS — the outcome twin of
@@ -5799,12 +6597,8 @@ class MCPClientManager:
                     return results  # garbage collection is closing an abandoned pass
                 # BaseExceptionGroup: a transport task-group failure from the
                 # reconnect/refresh must stay isolated to this server, not
-                # abort the whole refresh pass. Redaction + retry-arm live
-                # in the shared helper.
-                # ``_record_refresh_failure`` stamps the (config-gated)
-                # ``error:<Class>`` outcome and the pill in one place — see
-                # the eviction note below for why the write must not be
-                # duplicated (ungated) here.
+                # abort the whole refresh pass. Redaction + retry-arm +
+                # dead-transport eviction live in the shared helper.
                 self._record_refresh_failure(name, exc, context="Refresh")
                 # None, NOT ``([], [])``: a failure produced no catalog, and
                 # ``([], [])`` is reserved for "ran, no changes" — rendering
@@ -5813,18 +6607,6 @@ class MCPClientManager:
                 # failed) via ``last_refresh_outcome``, which
                 # ``_record_refresh_failure`` set above.
                 results[name] = None
-                # A dead transport leaves a non-None but unusable session, so
-                # the reconnect branch at the top of this loop (gated on
-                # ``session is None``) would never fire and every later pass
-                # would re-probe the corpse forever — the exact failure that
-                # required a full process restart to clear. Evicting the
-                # session here hands recovery to the health loop (and makes
-                # the next manual pass reconnect), turning any refresh pass
-                # into a self-healing liveness probe.
-                if _is_dead_transport(exc):
-                    dead_state = self._static_servers.get(name)
-                    if dead_state is not None:
-                        self._drop_static_session_and_stamp(name, dead_state)
 
         # The pass's final sync, its repair step (see the docstring)
         try:
@@ -6158,6 +6940,395 @@ class MCPClientManager:
             except Exception:
                 log.warning("Prompt-change listener raised", exc_info=True)
 
+    def add_resource_updated_listener(
+        self, callback: Callable[[str, str], None], *, user_id: str | None = None
+    ) -> None:
+        """Register a callback ``callback(server_name, uri)`` invoked on ``notifications/resources/updated``.
+
+        ``user_id=None`` (default) registers a global listener that fires on
+        every ``resources/updated`` notification (static or pool). A string
+        ``user_id`` scopes the listener to global static-path updates AND pool
+        updates for that user only.
+        """
+        with self._resource_updated_listeners_lock:
+            self._resource_updated_listeners.append((user_id, callback))
+
+    def remove_resource_updated_listener(
+        self, callback: Callable[[str, str], None], *, user_id: str | None = None
+    ) -> None:
+        """Unregister a ``resources/updated`` callback."""
+        with self._resource_updated_listeners_lock, contextlib.suppress(ValueError):
+            self._resource_updated_listeners.remove((user_id, callback))
+
+    def _handle_resource_updated(
+        self, server_name: str, uri: str, *, user_id: str | None = None
+    ) -> None:
+        """Dispatch a ``notifications/resources/updated`` event to scoped listeners."""
+        log.debug(
+            "Received resources/updated for '%s' from '%s'",
+            _sanitize_error_text(uri, 128),
+            server_name,
+        )
+        with self._resource_updated_listeners_lock:
+            listeners = [
+                cb
+                for uid, cb in self._resource_updated_listeners
+                if user_id is None or uid in (None, user_id)
+            ]
+        for cb in listeners:
+            try:
+                cb(server_name, uri)
+            except Exception:
+                log.warning("Resource-updated listener raised", exc_info=True)
+
+    def _signal_relisten(self, server_name: str) -> None:
+        """Signal active transport owners for *server_name* to re-open ``subscriptions/listen``."""
+        state = self._static_servers.get(server_name)
+        if state is not None and state.relisten_requested is not None:
+            state.relisten_requested.set()
+        for (_uid, srv), entry in list(self._user_pool_entries.items()):
+            if srv == server_name and entry.relisten_requested is not None:
+                entry.relisten_requested.set()
+
+    def set_resource_subscriptions(self, server_name: str, uris: Sequence[str]) -> None:
+        """Configure per-URI ``subscriptions/listen`` resource subscriptions for *server_name*."""
+        cleaned = tuple(dict.fromkeys(u for u in uris if isinstance(u, str) and u))
+        if cleaned:
+            self._resource_subscriptions[server_name] = cleaned
+        else:
+            self._resource_subscriptions.pop(server_name, None)
+        loop = self._loop
+        if loop is None or not loop.is_running():
+            self._signal_relisten(server_name)
+            return
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        if running is loop:
+            self._signal_relisten(server_name)
+        else:
+            with contextlib.suppress(RuntimeError):
+                loop.call_soon_threadsafe(self._signal_relisten, server_name)
+
+    def _configured_resource_subscriptions(
+        self, server_name: str, cfg: dict[str, Any] | None = None
+    ) -> tuple[str, ...]:
+        """Return deduplicated resource subscription URIs for *server_name*."""
+        effective_cfg = cfg if cfg is not None else self._server_configs.get(server_name)
+        raw_cfg = (
+            effective_cfg.get("resource_subscriptions") if isinstance(effective_cfg, dict) else None
+        )
+        merged: list[str] = []
+        if isinstance(raw_cfg, list | tuple | set):
+            merged.extend(u for u in raw_cfg if isinstance(u, str) and u)
+        merged.extend(self._resource_subscriptions.get(server_name, ()))
+        return tuple(dict.fromkeys(merged))
+
+    def _apply_log_level_to_sessions(self, server_name: str | None) -> None:
+        """Rebuild 2026-07-28 per-request ``logLevel`` stamps on live sessions (mcp-loop safe)."""
+        target_names = list(self._static_servers.keys()) if server_name is None else [server_name]
+        for name in target_names:
+            state = self._static_servers.get(name)
+            if state is not None and state.session is not None:
+                _configure_session_logging(state.session, log_level=self._effective_log_level(name))
+        for (_uid, srv), entry in list(self._user_pool_entries.items()):
+            if server_name is not None and srv != server_name:
+                continue
+            if entry.session is not None:
+                _configure_session_logging(entry.session, log_level=self._effective_log_level(srv))
+
+    def set_log_level(
+        self,
+        level: mcp_types.LoggingLevel | None,
+        *,
+        server_name: str | None = None,
+    ) -> None:
+        """Set the 2026-07-28 per-request opt-in ``_meta["io.modelcontextprotocol/logLevel"]`` level.
+
+        When *server_name* is ``None``, sets the manager-wide default; otherwise sets the override
+        for *server_name*. Live 2026-07-28 sessions immediately rebuild their request stamp in place
+        without reconnecting.
+        """
+        normalized = _normalize_log_level(level) if level is not None else None
+        if level is not None and normalized is None:
+            raise ValueError(f"Invalid MCP log level: {level!r}")
+        if server_name is None:
+            self._default_log_level = normalized
+        else:
+            if normalized is None:
+                self._server_log_levels.pop(server_name, None)
+            else:
+                self._server_log_levels[server_name] = normalized
+        loop = self._loop
+        if loop is None or not loop.is_running():
+            self._apply_log_level_to_sessions(server_name)
+            return
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        if running is loop:
+            self._apply_log_level_to_sessions(server_name)
+        else:
+            done: concurrent.futures.Future[None] = concurrent.futures.Future()
+
+            def _apply_on_loop() -> None:
+                try:
+                    self._apply_log_level_to_sessions(server_name)
+                finally:
+                    if not done.done():
+                        done.set_result(None)
+
+            try:
+                loop.call_soon_threadsafe(_apply_on_loop)
+                done.result(timeout=1.0)
+            except (RuntimeError, concurrent.futures.TimeoutError):
+                pass
+
+    def _effective_log_level(
+        self, server_name: str, cfg: dict[str, Any] | None = None
+    ) -> mcp_types.LoggingLevel | None:
+        """Resolve the effective MCP ``logLevel`` for *server_name*."""
+        if server_name in self._server_log_levels:
+            return self._server_log_levels[server_name]
+        effective_cfg = (
+            cfg
+            if cfg is not None
+            else (
+                self._server_configs.get(server_name) or self._pool_server_configs.get(server_name)
+            )
+        )
+        if isinstance(effective_cfg, dict) and "log_level" in effective_cfg:
+            parsed = _normalize_log_level(effective_cfg.get("log_level"))
+            if parsed is not None:
+                return parsed
+        return self._default_log_level
+
+    def _make_logging_callback(self, server_name: str, *, user_id: str | None = None) -> Any:
+        """Build the ``notifications/message`` callback for *server_name*, sanitizing server text."""
+
+        async def _on_log_message(params: mcp_types.LoggingMessageNotificationParams) -> None:
+            msg_level = str(params.level).lower()
+            threshold = self._effective_log_level(server_name)
+            if threshold is None or _MCP_LOG_SEVERITY_ORDER.get(
+                msg_level, 1
+            ) < _MCP_LOG_SEVERITY_ORDER.get(threshold, 0):
+                return
+            raw_py_level = _MCP_LOG_LEVEL_MAP.get(msg_level, logging.INFO)
+            # Cap untrusted upstream server log messages at WARNING so a server cannot trigger
+            # host ERROR/CRITICAL alert pages unless the host explicitly routes WARNING+.
+            py_level = min(raw_py_level, logging.WARNING)
+            raw_data = params.data
+            if isinstance(raw_data, str):
+                text = raw_data
+            else:
+                try:
+                    text = json.dumps(raw_data)
+                except Exception:
+                    text = str(raw_data)
+            sanitized = _sanitize_error_text(text)
+            safe_server = _sanitize_error_text(server_name, 64)
+            logger_name = (
+                f" ({_sanitize_error_text(str(params.logger), 64)})" if params.logger else ""
+            )
+            user_tag = f" [user={_sanitize_error_text(user_id, 64)}]" if user_id is not None else ""
+            log.log(
+                py_level,
+                f"MCP server '{safe_server}'{logger_name}{user_tag} [{params.level}]: {sanitized}",
+            )
+
+        return _on_log_message
+
+    @staticmethod
+    def _cache_key_matches(
+        key: Any,
+        server_name: str,
+        *,
+        user_id: str | None = None,
+        all_users: bool = False,
+        include_public: bool = True,
+        read_only: bool = False,
+        uri: str | None = None,
+    ) -> bool:
+        method = getattr(key, "method", None)
+        params_key = getattr(key, "params_key", None)
+        partition_raw = getattr(key, "partition", None)
+        if not isinstance(method, str) or not isinstance(partition_raw, str):
+            return False
+        if read_only and method != "resources/read":
+            return False
+        if uri is not None and params_key != uri:
+            return False
+        try:
+            fields = json.loads(partition_raw)
+        except ValueError:
+            return False
+        if not isinstance(fields, list) or len(fields) < 3:
+            return False
+        arm_id = fields[2]
+        sub_partition = fields[3] if len(fields) > 3 else None
+        if all_users:
+            return arm_id in (f"static:{server_name}", f"pool:{server_name}")
+        if user_id is None:
+            return bool(arm_id == f"static:{server_name}")
+        if not include_public:
+            return bool(arm_id == f"pool:{server_name}" and sub_partition == f"user:{user_id}")
+        return bool(arm_id == f"pool:{server_name}" and sub_partition in (None, f"user:{user_id}"))
+
+    def _purge_response_cache(
+        self,
+        server_name: str,
+        *,
+        user_id: str | None = None,
+        all_users: bool = False,
+        include_public: bool = True,
+        read_only: bool = False,
+        uri: str | None = None,
+    ) -> None:
+        """Purge cached responses in ``_response_cache_store`` and ``_response_caches`` for *server_name*."""
+        store = getattr(self, "_response_cache_store", None)
+        entries = getattr(store, "_entries", None)
+        if isinstance(entries, dict):
+            for key in [
+                k
+                for k in list(entries)
+                if self._cache_key_matches(
+                    k,
+                    server_name,
+                    user_id=user_id,
+                    all_users=all_users,
+                    include_public=include_public,
+                    read_only=read_only,
+                    uri=uri,
+                )
+            ]:
+                entries.pop(key, None)
+
+        caches = getattr(self, "_response_caches", None)
+        if not isinstance(caches, dict):
+            return
+        affected_keys = (
+            [k for k in list(caches) if k[0] == server_name]
+            if (all_users or (user_id is not None and include_public))
+            else [(server_name, user_id)]
+        )
+        for ck in affected_keys:
+            c = caches.get(ck)
+            if c is None:
+                continue
+            if uri is not None:
+                gen_key = ("resources/read", uri)
+                if gen_key in c._generations:
+                    c._generations[gen_key] += 1
+            else:
+                for gk in list(c._generations):
+                    if not read_only or gk[0] == "resources/read":
+                        c._generations[gk] += 1
+
+        if not read_only and uri is None:
+            if all_users:
+                for ck in affected_keys:
+                    caches.pop(ck, None)
+            else:
+                caches.pop((server_name, user_id), None)
+
+    def _resource_cache_for(
+        self,
+        server_name: str,
+        *,
+        session: Any = None,
+        user_id: str | None = None,
+    ) -> ClientResponseCache | None:
+        """Return the :class:`ClientResponseCache` for ``(server_name, user_id)`` when *session* is
+        on a modern protocol version, else ``None``."""
+        ver = _session_protocol_version(session) if session is not None else None
+        if session is not None and ver not in MODERN_PROTOCOL_VERSIONS:
+            return None
+        ver_str: str = ver or LATEST_MODERN_VERSION
+        cache_key = (server_name, user_id)
+        cache = self._response_caches.get(cache_key)
+        if cache is None:
+            cache = ClientResponseCache(
+                store=self._response_cache_store,
+                partition=f"user:{user_id}" if user_id is not None else f"static:{server_name}",
+                arm_id=f"pool:{server_name}" if user_id is not None else f"static:{server_name}",
+                default_ttl_ms=0,
+                clock=time.monotonic,
+                share_public=user_id is not None,
+                negotiated_version=lambda: ver_str,
+            )
+            self._response_caches[cache_key] = cache
+        elif ver is not None:
+            cache._negotiated_version = lambda: ver_str
+        return cache
+
+    async def _evict_cache_for_notification(
+        self,
+        server_name: str,
+        msg: mcp_types.ServerNotification,
+        *,
+        user_id: str | None = None,
+    ) -> None:
+        """Evict cached responses invalidated by *msg* for *server_name* without touching other users' private caches."""
+        cache = self._response_caches.get((server_name, user_id))
+        if cache is not None:
+            await cache.evict_for_notification(msg)
+
+        if isinstance(msg, mcp_types.ResourceUpdatedNotification):
+            uri = str(msg.params.uri)
+            self._purge_response_cache(
+                server_name, user_id=user_id, include_public=True, read_only=True, uri=uri
+            )
+        elif isinstance(msg, mcp_types.ResourceListChangedNotification):
+            self._purge_response_cache(
+                server_name, user_id=user_id, include_public=True, read_only=True
+            )
+
+    _MAX_CACHED_RESOURCE_BYTES = 1024 * 1024
+
+    async def _read_resource_with_cache(
+        self,
+        session: Any,
+        server_name: str,
+        uri: str,
+        *,
+        user_id: str | None = None,
+    ) -> Any:
+        """Read *uri* from *session*, serving and populating the 2026-07-28 response cache when active."""
+        cache = self._resource_cache_for(server_name, session=session, user_id=user_id)
+        if cache is None:
+            return await session.read_resource(uri)
+        cached = await cache.read("resources/read", uri)
+        if isinstance(cached, mcp_types.ReadResourceResult):
+            return cached
+        gen = cache.capture("resources/read", uri)
+        result = await session.read_resource(uri)
+        if (
+            isinstance(result, mcp_types.ReadResourceResult)
+            and self._response_caches.get((server_name, user_id)) is cache
+        ):
+            result_meta = getattr(result, "meta", None)
+            total_bytes = len(json.dumps(result_meta, default=str)) if result_meta else 0
+            for item in result.contents:
+                total_bytes += len(getattr(item, "text", "") or getattr(item, "blob", "") or "")
+                item_meta = getattr(item, "meta", None)
+                if item_meta:
+                    total_bytes += len(json.dumps(item_meta, default=str))
+            if total_bytes <= self._MAX_CACHED_RESOURCE_BYTES:
+                await cache.write("resources/read", uri, result, gen, mode="use")
+            else:
+                self._purge_response_cache(
+                    server_name,
+                    user_id=user_id,
+                    include_public=(
+                        user_id is None or getattr(result, "cache_scope", None) == "public"
+                    ),
+                    read_only=True,
+                    uri=uri,
+                )
+        return result
+
     # -- governance storage sync ---------------------------------------------
 
     def set_storage(self, storage: Any) -> None:
@@ -6383,9 +7554,10 @@ class MCPClientManager:
             entry = self._user_pool_entries.get(key)
             if entry is None:
                 continue
-            entry.drop_session()
+            self._drop_session_and_stamp(key, entry)
             entry.owner_task = None
             entry.close_requested = None
+            entry.relisten_requested = None
             # Pre-close streams to unblock the SDK's transport tasks
             # (anyio zero-buffer send — SDK #2147) so owners unwind fast.
             await self._pre_close_streams(key)
@@ -6403,6 +7575,7 @@ class MCPClientManager:
             self._drop_static_session_and_stamp(srv_name, srv_state)
             srv_state.owner_task = None
             srv_state.close_requested = None
+            srv_state.relisten_requested = None
             # Pre-close streams to unblock the SDK's transport tasks
             # (anyio zero-buffer send — SDK #2147) so owners unwind fast.
             await self._pre_close_streams(srv_name)
@@ -6477,7 +7650,12 @@ class MCPClientManager:
         # Clear listener lists to release callback references
         self._listeners.clear()
         self._resource_listeners.clear()
+        self._resource_updated_listeners.clear()
         self._prompt_listeners.clear()
+        self._resource_subscriptions.clear()
+        self._server_log_levels.clear()
+        self._response_caches.clear()
+        self._response_cache_store = InMemoryResponseCacheStore()
         # Clear resilience state
         self._consecutive_failures.clear()
         self._circuit_open_until.clear()
@@ -6862,6 +8040,9 @@ class MCPClientManager:
                         self._static_reconnect_attempt.pop(name, None)
                         self._static_reconnect_next.pop(name, None)
                         self._static_next_ping.pop(name, None)
+                        self._purge_response_cache(name, all_users=True)
+                        self._resource_subscriptions.pop(name, None)
+                        self._server_log_levels.pop(name, None)
                         # Rebuild merged state (serialized with notification
                         # handlers on the loop thread).
                         self._rebuild_tools()
@@ -6899,6 +8080,9 @@ class MCPClientManager:
             self._drop_pool_discovery_errors(name)
             self._clear_static_push_state(name, markers=True)
             self._cb_clear(name)
+            self._purge_response_cache(name, all_users=True)
+            self._resource_subscriptions.pop(name, None)
+            self._server_log_levels.pop(name, None)
             self._rebuild_tools()
             self._rebuild_resources()
             self._rebuild_prompts()
@@ -7230,13 +8414,31 @@ class MCPClientManager:
         self._obo_server_names = new_obo_names
         new_pool_auth = {n: "oauth_user" for n in self._oauth_user_server_names}
         new_pool_auth.update(dict.fromkeys(self._obo_server_names, "oauth_obo"))
+        prev_pool_configs = dict(self._pool_server_configs)
+        new_pool_configs = {
+            row["name"]: _pool_cfg_from_row(row)
+            for row in rows
+            if row.get("auth_type") in ("oauth_user", "oauth_obo") and row.get("name")
+        }
+        self._pool_server_configs = new_pool_configs
         # Pool-backed rows never enter ``_server_configs`` and therefore do
         # not pass through remove_server_sync. Clear the old registration's
-        # discovery failure here when a pool server is removed or changes its
-        # auth model, so a later same-name registration cannot inherit it.
-        for name, auth_type in prev_pool_auth.items():
-            if new_pool_auth.get(name) != auth_type:
+        # discovery failure and response cache here when a pool server is
+        # removed or changes its auth model or configuration, so a later
+        # same-name registration cannot inherit it.
+        for name in set(prev_pool_auth) | set(prev_pool_configs):
+            if new_pool_auth.get(name) != prev_pool_auth.get(name) or new_pool_configs.get(
+                name
+            ) != prev_pool_configs.get(name):
                 self._drop_pool_discovery_errors(name)
+                loop = self._loop
+                if loop is not None and loop.is_running():
+                    with contextlib.suppress(RuntimeError):
+                        loop.call_soon_threadsafe(
+                            functools.partial(self._purge_response_cache, name, all_users=True)
+                        )
+                else:
+                    self._purge_response_cache(name, all_users=True)
         # Pool servers newly registered OR migrated between pool auth types
         # since active sessions last primed.
         newly_added_pool = {
@@ -7292,6 +8494,8 @@ class MCPClientManager:
             if desired[name] != self._server_configs.get(name):
                 attempted.add(name)
                 log.info("Config changed for MCP server '%s', reconnecting", name)
+                saved_subs = self._resource_subscriptions.get(name)
+                saved_log_level = self._server_log_levels.get(name)
                 self.remove_server_sync(name, timeout=timeout)
                 if name in self._server_configs:
                     # Removal timed out (nothing mutated) — defer the update
@@ -7304,6 +8508,10 @@ class MCPClientManager:
                         name,
                     )
                     continue
+                if saved_subs is not None:
+                    self._resource_subscriptions[name] = saved_subs
+                if saved_log_level is not None and "log_level" not in desired[name]:
+                    self._server_log_levels[name] = saved_log_level
                 result = self.add_server_sync(name, desired[name], timeout=timeout)
                 # As for an add: a failed reconnect stays registered under the new config.
                 if name in self._server_configs:
@@ -7831,9 +9039,25 @@ class MCPClientManager:
         """
         state = self._static_servers.get(name)
         if state is not None and state.session is not None:
+            expires_at = _catalog_expires_at(state.session)
+            ttl_expired = expires_at is not None and now >= expires_at
             if name in self._static_refresh_retry:
+                _clear_catalog_ttls(state.session)
                 self._spawn_full_refresh(name, f"catalog refresh retry for '{name}'")
-            return await self._static_ping_one(name, now)
+            elif ttl_expired:
+                _clear_catalog_ttls(state.session)
+                self._spawn_full_refresh(name, f"catalog TTL expiry refresh for '{name}'")
+            before_ping = time.monotonic()
+            next_due = await self._static_ping_one(name, now)
+            post_ping_now = now + max(0.0, time.monotonic() - before_ping)
+            remaining_expires = _catalog_expires_at(state.session)
+            if remaining_expires is not None:
+                if post_ping_now >= remaining_expires:
+                    _clear_catalog_ttls(state.session)
+                    self._spawn_full_refresh(name, f"catalog TTL expiry refresh for '{name}'")
+                else:
+                    return min(next_due, remaining_expires)
+            return next_due
         return await self._static_reconnect_one(name)
 
     def _static_reconnect_delay(self, attempt: int) -> float:
@@ -7926,7 +9150,8 @@ class MCPClientManager:
         self._static_next_ping[name] = next_ping
         self._spawn_full_refresh(name, f"catalog refresh after static health reconnect '{name}'")
         log.info("MCP static health: reconnected '%s'", name)
-        return next_ping
+        expires_at = _catalog_expires_at(session)
+        return min(next_ping, expires_at) if expires_at is not None else next_ping
 
     def _schedule_next_ping(self, name: str) -> float:
         """Set and return the next liveness-ping deadline (fresh monotonic clock)."""
@@ -7979,7 +9204,11 @@ class MCPClientManager:
             # invariant-18: ``asyncio.timeout`` (NOT ``wait_for``) so ``send_ping``
             # runs in THIS task and anyio cancel-scope exit stays same-task.
             async with asyncio.timeout(self._STATIC_HEALTH_PING_TIMEOUT_S) as ping_timeout:
-                await session.send_ping()
+                protocol_version = getattr(session, "protocol_version", None)
+                if protocol_version in MODERN_PROTOCOL_VERSIONS:
+                    await session.send_discover(protocol_version)
+                else:
+                    await session.send_ping()
         except (Exception, asyncio.CancelledError, BaseExceptionGroup) as exc:
             # ``asyncio.timeout`` converts its OWN expiry to ``TimeoutError``;
             # ``ping_timeout.expired()`` is the unambiguous signal. A wedged anyio
@@ -7990,12 +9219,13 @@ class MCPClientManager:
             # stops via its ``except asyncio.CancelledError: return``.
             if not ping_timeout.expired() and isinstance(exc, asyncio.CancelledError):
                 raise
+            capture = state.http_capture if state is not None else None
             if ping_timeout.expired():
                 dead = False
             elif isinstance(exc, BaseExceptionGroup):
-                dead = any(_is_dead_transport(e) for e in exc.exceptions)
+                dead = any(_is_dead_transport(e, capture=capture) for e in exc.exceptions)
             else:
-                dead = _is_dead_transport(exc)
+                dead = _is_dead_transport(exc, capture=capture)
             # Re-check in-flight under this synchronous handler: a dispatch may
             # have started during the ping window; never evict a busy server.
             # Session-identity: only act on the session we actually PINGED — a
@@ -8131,7 +9361,7 @@ class MCPClientManager:
         classification = self._classify_failure(exc)
         dead = _is_dead_transport(exc)
         if classification == "transport" or (
-            classification == "other" and not isinstance(exc, ValidationError)
+            classification == "other" and not _is_sdk_result_error(exc)
         ):
             self._cb_record_failure(server_name)
         if dead or classification in ("auth_401", "auth_403"):
@@ -8171,10 +9401,15 @@ class MCPClientManager:
             pending.add(owner)
         try:
             await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+            if not call.done() and fired is not None and fired.done():
+                # The response hook sets fired_event before StreamableHTTPTransport delivers
+                # its synthesized JSONRPCError to JSONRPCDispatcher; let call finish naturally
+                # so cancelling send_raw_request does not emit a courtesy notifications/cancelled.
+                await asyncio.wait({call}, timeout=0.05)
             if call.done() and not call.cancelled():
                 try:
                     return call.result()
-                except Exception:
+                except (Exception, BaseExceptionGroup):
                     if capture is not None and capture.status is not None:
                         raise _CapturedHTTPError(capture) from None
                     raise
@@ -8213,6 +9448,15 @@ class MCPClientManager:
             # A replacement connection can already be connecting or have failed. Neither its
             # owner nor its captured status describes the session this coroutine would call.
             raise _TransportClosedError("MCP session changed before dispatch")
+        if (
+            state.in_flight == 0
+            and state.http_capture is not None
+            and state.owner_task is not None
+            and not state.owner_task.done()
+        ):
+            state.http_capture.reset(negotiated=state.http_capture.negotiated)
+            if state.http_fired_event is not None:
+                state.http_fired_event.clear()
         state.in_flight += 1
         try:
             return await self._await_session_call(
@@ -8292,7 +9536,9 @@ class MCPClientManager:
 
         future = self._submit_root(
             lambda: self._static_session_op(
-                server_name, session.call_tool(original_name, arguments), session=session
+                server_name,
+                self._call_tool_with_header_retry(session, server_name, original_name, arguments),
+                session=session,
             )
         )
         # exception() waits without raising the operation's own TimeoutError.
@@ -8310,6 +9556,60 @@ class MCPClientManager:
 
         self._cb_record_success(server_name)
         return _decode_tool_result(result)
+
+    async def _call_tool_with_header_retry(
+        self,
+        session: ClientSession,
+        server_name: str,
+        original_name: str,
+        arguments: dict[str, Any] | None,
+        *,
+        pool_key: tuple[str, str] | None = None,
+    ) -> mcp_types.CallToolResult:
+        """Call *original_name* on *session*, retrying once on ``HEADER_MISMATCH`` (-32023).
+
+        On a 2026-07-28 connection, ``ClientSession.call_tool`` mirrors arguments
+        annotated with ``x-mcp-header`` into ``Mcp-Param-*`` HTTP headers using the
+        schema cached by ``session.list_tools()``. If a server rejects the call with
+        ``HEADER_MISMATCH`` because its tool input schema changed since the last
+        listing, re-listing the tools refreshes ``session._x_mcp_header_maps`` and
+        the server's tool catalog so the single retry carries the updated header set.
+        """
+        try:
+            return await session.call_tool(original_name, arguments)
+        except MCPError as mismatch:
+            if (
+                mismatch.error.code != mcp_types.HEADER_MISMATCH
+                or getattr(session, "protocol_version", None) not in MODERN_PROTOCOL_VERSIONS
+            ):
+                raise
+            state = self._static_servers.get(server_name) if pool_key is None else None
+            pre_tools = state.tools if state is not None else None
+            try:
+                tools = await _list_all_tools(session, server_name)
+            except (MCPError, ValidationError, InvalidCatalogError) as relist_err:
+                capture = _session_http_captures.get(session)
+                if _is_dead_transport(relist_err, capture=capture):
+                    raise
+                raise mismatch from relist_err
+            server_tools = [_mcp_to_openai(server_name, tool) for tool in tools]
+            if pool_key is not None:
+                entry = self._user_pool_entries.get(pool_key)
+                if entry is not None and entry.session is session:
+                    entry.tools = server_tools
+                    self._rebuild_user_tool_map(pool_key[0])
+                    self._notify_user_tool_listeners(pool_key[0])
+            else:
+                lock = self._static_connect_lock_for(server_name)
+                cur_state = self._static_servers.get(server_name)
+                if cur_state is not None and cur_state.session is session:
+                    if not lock.locked() and cur_state.tools is pre_tools:
+                        cur_state.tools = server_tools
+                        self._rebuild_tools()
+                        self._notify_listeners()
+                    else:
+                        self._arm_refresh_retry(server_name)
+            return await session.call_tool(original_name, arguments)
 
     # -- pool dispatch -------------------------------------------------------
 
@@ -8970,18 +10270,20 @@ class MCPClientManager:
         entry = await self._ensure_pool_entry(key)
 
         # See PoolEntryState.auth_capture for why the carrier is
-        # entry-owned; _dispatch_pool_with_entry resets it under
+        # entry-owned; _dispatch_pool_with_entry_call resets it under
         # open_lock before call_tool, we read it after.
         capture = entry.auth_capture
         try:
-            result = await self._dispatch_pool_with_entry(
+            sdk_result = await self._dispatch_pool_with_entry_call(
                 entry=entry,
                 key=key,
                 cfg=cfg,
                 access_token=access_token,
-                original_name=original_name,
-                arguments=arguments,
+                sdk_call=lambda s: self._call_tool_with_header_retry(
+                    s, server_name, original_name, arguments, pool_key=key
+                ),
             )
+            result = _decode_tool_result(sdk_result)
         except asyncio.CancelledError:
             # A cancelled lock waiter has not owned this carrier; it may
             # describe the active caller's auth failure. Never retry or evict.
@@ -9122,7 +10424,9 @@ class MCPClientManager:
                 key=key,
                 cfg=cfg,
                 access_token=access_token,
-                sdk_call=lambda s: s.read_resource(uri),
+                sdk_call=lambda s: self._read_resource_with_cache(
+                    s, server_name, uri, user_id=user_id
+                ),
             )
         except asyncio.CancelledError:
             # Cancellation precedes shared-carrier auth handling; see _dispatch_pool.
@@ -9323,7 +10627,9 @@ class MCPClientManager:
         (owner death after an eviction): ``drop_session`` is idempotent
         and the pop is a no-op.
         """
+        _clear_catalog_ttls(entry.session)
         entry.drop_session()
+        self._purge_response_cache(key[1], user_id=key[0], include_public=False)
         for kind in _LIST_CHANGED_KINDS.values():
             self._last_pool_notification_refresh.pop((key, kind), None)
 
@@ -9358,6 +10664,8 @@ class MCPClientManager:
         evict = self._user_pool_entries.get(key)
         if evict is not None:
             self._drop_session_and_stamp(key, evict)
+        else:
+            self._purge_response_cache(key[1], user_id=key[0], include_public=False)
 
     def _evict_session_drop_catalog(self, key: tuple[str, str]) -> None:
         """Drop the cached session AND the entry's catalog contribution.
@@ -9609,6 +10917,7 @@ class MCPClientManager:
         """
         entry = self._user_pool_entries.get(key)
         if entry is None:
+            self._purge_response_cache(key[1], user_id=key[0], include_public=False)
             return
         async with entry.open_lock:
             if (
@@ -9693,44 +11002,6 @@ class MCPClientManager:
             detail=forbidden_detail,
         )
 
-    async def _dispatch_pool_with_entry(
-        self,
-        *,
-        entry: PoolEntryState,
-        key: tuple[str, str],
-        cfg: dict[str, Any],
-        access_token: str,
-        original_name: str,
-        arguments: dict[str, Any],
-    ) -> str:
-        """Hold ``entry.open_lock`` across connect-or-reuse AND ``call_tool``.
-
-        Thin wrapper over :meth:`_dispatch_pool_with_entry_call` —
-        passes a closure that invokes ``session.call_tool`` and
-        decodes the SDK result. See the helper for the carrier-race
-        rationale (which Phase 7 verified for the tool path; Phase 7b
-        reuses the same shape for resources & prompts).
-
-        **Why this wrapper exists** (revisited under Phase 7b pre-push
-        review): the autouse fixture
-        ``tests/test_mcp_pool_auth_introspection.py::_install_capture_intercept``
-        monkeypatches this method to stash ``entry.auth_capture`` on
-        ``mgr._test_active_capture`` for downstream call_tool stubs.
-        Inlining the wrapper would require redirecting the monkeypatch
-        to ``_dispatch_pool_with_entry_call`` (different kwargs shape)
-        and re-validating every test that depends on the interception.
-        Keeping the wrapper preserves a stable interception point on
-        the codebase's hottest correctness path.
-        """
-        result = await self._dispatch_pool_with_entry_call(
-            entry=entry,
-            key=key,
-            cfg=cfg,
-            access_token=access_token,
-            sdk_call=lambda s: s.call_tool(original_name, arguments),
-        )
-        return _decode_tool_result(result)
-
     async def _dispatch_pool_with_entry_call(
         self,
         *,
@@ -9742,10 +11013,9 @@ class MCPClientManager:
     ) -> Any:
         """Hold ``entry.open_lock`` across connect-or-reuse AND ``sdk_call``.
 
-        Generalisation of the Phase 7 ``_dispatch_pool_with_entry``
-        machinery (RFC §3.2): ``sdk_call`` is a closure that takes the
-        SDK ``ClientSession`` and returns an awaitable. The dispatcher
-        passes ``lambda s: s.call_tool(name, args)`` for tools,
+        ``sdk_call`` is a closure that takes the SDK ``ClientSession``
+        and returns an awaitable. The dispatcher passes
+        ``lambda s: s.call_tool(name, args)`` for tools,
         ``lambda s: s.read_resource(uri)`` for resources, and
         ``lambda s: s.get_prompt(name, arguments=args)`` for prompts.
 
@@ -9770,8 +11040,7 @@ class MCPClientManager:
         async with entry.open_lock:
             entry.last_used = time.monotonic()
             self._user_pool_last_used[key] = entry.last_used
-            entry.auth_capture.status = None
-            entry.auth_capture.www_authenticate = None
+            entry.auth_capture.reset(negotiated=entry.auth_capture.negotiated)
             entry.auth_fired_event.clear()
             session = entry.session
             if (
@@ -9808,6 +11077,8 @@ class MCPClientManager:
                 session = fresh.session
                 if session is None:
                     raise RuntimeError(f"Pool connect for {key!r} produced no session")
+                entry.auth_capture.reset(negotiated=entry.auth_capture.negotiated)
+                entry.auth_fired_event.clear()
             entry.in_flight += 1
             try:
 
@@ -9915,7 +11186,9 @@ class MCPClientManager:
 
         future = self._submit_root(
             lambda: self._static_session_op(
-                server_name, session.read_resource(uri), session=session
+                server_name,
+                self._read_resource_with_cache(session, server_name, uri),
+                session=session,
             )
         )
         try:
@@ -10042,6 +11315,7 @@ class MCPClientManager:
         """
         loop = self._loop
         if loop is None:
+            self._purge_response_cache(server_name, user_id=user_id, include_public=False)
             return
         key = (user_id, server_name)
 
@@ -10063,6 +11337,7 @@ class MCPClientManager:
             # the revoked catalog with nothing left to clear it.
             self._submit_root(_spawn_tracked)
         except MCPShutdownError as exc:
+            self._purge_response_cache(server_name, user_id=user_id, include_public=False)
             log.info(
                 "mcp_pool.evict_user_session_failed server=%s user=%s error=%s",
                 server_name,
@@ -10080,20 +11355,26 @@ def _decode_tool_result(result: mcp_types.CallToolResult) -> str:
     """Render an MCP ``tools/call`` result into the string the agent sees.
 
     Walks ``result.content`` collecting text parts and labelling binary
-    parts; an ``isError`` result is prefixed with ``Error: `` so the
-    LLM can narrate the failure. Shared by the static and pool dispatch
-    paths.
+    parts; when ``result.content`` is empty and ``result.structured_content``
+    is present, serializes ``structured_content`` as JSON. An ``is_error``
+    result is prefixed with ``Error: `` so the LLM can narrate the failure.
+    Shared by the static and pool dispatch paths.
     """
     texts: list[str] = []
     for item in result.content:
         if isinstance(item, mcp_types.TextContent):
             texts.append(item.text)
         elif isinstance(item, mcp_types.ImageContent | mcp_types.AudioContent):
-            texts.append(f"[{item.mimeType} data, {len(item.data)} bytes]")
+            texts.append(f"[{item.mime_type} data, {len(item.data)} bytes]")
         else:
             texts.append(str(item))
-    output = "\n".join(texts) if texts else "(no output)"
-    if result.isError:
+    if texts:
+        output = "\n".join(texts)
+    elif getattr(result, "structured_content", None) is not None:
+        output = json.dumps(result.structured_content)
+    else:
+        output = "(no output)"
+    if result.is_error:
         output = f"Error: {output}"
     return output
 

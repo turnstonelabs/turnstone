@@ -284,7 +284,7 @@ def _fake_connect_session() -> MagicMock:
     fake_session = MagicMock()
     fake_session.initialize = AsyncMock(return_value=None)
     fake_caps = mcp_types.ServerCapabilities(tools=mcp_types.ToolsCapability())
-    fake_session.get_server_capabilities = MagicMock(return_value=fake_caps)
+    fake_session.server_capabilities = fake_caps
     fake_session.list_tools = AsyncMock(return_value=mcp_types.ListToolsResult(tools=[]))
     return fake_session
 
@@ -300,20 +300,18 @@ def _patched_pool_transport(
     stream factory's url/headers into *observed_kwargs* when given.
     """
 
-    def _stream_factory(
-        *, url: str, headers: dict[str, str], httpx_client_factory: Any
-    ) -> _AsyncCM:
+    def _stream_factory(url: str, *, http_client: Any = None, **_kwargs: Any) -> _AsyncCM:
         if observed_kwargs is not None:
             observed_kwargs["url"] = url
-            observed_kwargs["headers"] = dict(headers)
-            observed_kwargs["httpx_client_factory"] = httpx_client_factory
-        return _AsyncCM((AsyncMock(), AsyncMock(), lambda: None))
+            observed_kwargs["headers"] = http_client.headers if http_client is not None else {}
+            observed_kwargs["http_client"] = http_client
+        return _AsyncCM((AsyncMock(), AsyncMock()))
 
     async def _probe(*_args: Any, **_kwargs: Any) -> None:
         return None
 
     with (
-        patch("turnstone.core.mcp_client.streamablehttp_client", side_effect=_stream_factory),
+        patch("turnstone.core.mcp_client.streamable_http_client", side_effect=_stream_factory),
         patch.object(mgr, "_tcp_probe", side_effect=_probe),
         patch("turnstone.core.mcp_client.ClientSession", return_value=_AsyncCM(fake_session)),
     ):
@@ -335,19 +333,21 @@ class TestLazyConnect:
     ) -> None:
         mgr, loop, _ = running_loop_mgr
         session = _fake_connect_session()
-        session.get_server_capabilities.return_value = mcp_types.ServerCapabilities(
+        session.server_capabilities = mcp_types.ServerCapabilities(
             resources=(
-                mcp_types.ResourcesCapability(listChanged=list_changed)
+                mcp_types.ResourcesCapability(list_changed=list_changed)
                 if kind == "resources"
                 else None
             ),
             prompts=(
-                mcp_types.PromptsCapability(listChanged=list_changed) if kind == "prompts" else None
+                mcp_types.PromptsCapability(list_changed=list_changed)
+                if kind == "prompts"
+                else None
             ),
         )
         session.list_resources = AsyncMock(return_value=mcp_types.ListResourcesResult(resources=[]))
         session.list_resource_templates = AsyncMock(
-            return_value=mcp_types.ListResourceTemplatesResult(resourceTemplates=[])
+            return_value=mcp_types.ListResourceTemplatesResult(resource_templates=[])
         )
         session.list_prompts = AsyncMock(return_value=mcp_types.ListPromptsResult(prompts=[]))
 
@@ -968,9 +968,7 @@ class TestEviction:
             entry = await mgr._ensure_pool_entry(key)
             entry.session = MagicMock()
             await entry.open_lock.acquire()  # park the first runner
-            note = mcp_types.ServerNotification(
-                mcp_types.ToolListChangedNotification(method="notifications/tools/list_changed")
-            )
+            note = mcp_types.ToolListChangedNotification(method="notifications/tools/list_changed")
             before = len(mgr._background_tasks)
             await handler(note)
             # Age the stamp past the debounce window: the MARKER (not
@@ -1104,9 +1102,7 @@ class TestEviction:
             # discards the notification.
             entry = await mgr._ensure_pool_entry(key)
             entry.session = MagicMock()
-            note = mcp_types.ServerNotification(
-                mcp_types.ToolListChangedNotification(method="notifications/tools/list_changed")
-            )
+            note = mcp_types.ToolListChangedNotification(method="notifications/tools/list_changed")
             await handler(note)
             # The handler returned WITHOUT running the refresh inline —
             # it must complete even though the refresh hasn't run yet.
@@ -1557,7 +1553,7 @@ class TestDispatchStateMachine:
         async def _call_tool(name, args):
             return mcp_types.CallToolResult(
                 content=[mcp_types.TextContent(type="text", text="tool-result")],
-                isError=False,
+                is_error=False,
             )
 
         fake_session.call_tool = _call_tool
@@ -1594,11 +1590,10 @@ class TestClassifyFailure:
             assert mgr._classify_failure(exc) == "transport"
 
     def test_protocol_error_classified_as_protocol(self) -> None:
-        from mcp import McpError
-        from mcp.types import ErrorData
+        from mcp import MCPError
 
         mgr = MCPClientManager({})
-        err = McpError(ErrorData(code=-32600, message="bad request"))
+        err = MCPError(code=-32600, message="bad request")
         assert mgr._classify_failure(err) == "protocol"
 
     def test_other_classified_as_other(self) -> None:
@@ -1737,7 +1732,7 @@ class TestHttpsEnforcement:
         async def _call_tool(name, args):
             return mcp_types.CallToolResult(
                 content=[mcp_types.TextContent(type="text", text="ok")],
-                isError=False,
+                is_error=False,
             )
 
         fake_session.call_tool = _call_tool
@@ -1916,7 +1911,7 @@ class TestConcurrentDispatch:
                 await asyncio.sleep(0.1)
                 return mcp_types.CallToolResult(
                     content=[mcp_types.TextContent(type="text", text="ok")],
-                    isError=False,
+                    is_error=False,
                 )
             finally:
                 with in_flight_lock:
@@ -1979,7 +1974,7 @@ class TestUserIdThreadThrough:
         async def _call_tool(name, args):
             return mcp_types.CallToolResult(
                 content=[mcp_types.TextContent(type="text", text="static-output")],
-                isError=False,
+                is_error=False,
             )
 
         fake_session.call_tool = _call_tool
@@ -2017,7 +2012,7 @@ class TestUserIdThreadThrough:
         async def _call_tool(name, args):
             return mcp_types.CallToolResult(
                 content=[mcp_types.TextContent(type="text", text="static-output")],
-                isError=False,
+                is_error=False,
             )
 
         fake_session.call_tool = _call_tool

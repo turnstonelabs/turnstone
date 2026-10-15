@@ -221,8 +221,8 @@ class TestConnectPaths:
         mgr = MCPClientManager({})
         observed: dict[str, str] = {}
 
-        def stream_factory(**kwargs: Any) -> Any:
-            observed.update(kwargs["headers"])
+        def stream_factory(_url: str = "", **kwargs: Any) -> Any:
+            observed.update(kwargs["http_client"].headers)
             raise ConnectionError("transport stubbed out")
 
         async def reachable(key: str | tuple[str, str], url: str) -> None:
@@ -235,12 +235,12 @@ class TestConnectPaths:
             "headers": {"X-Api-Key": "secret://fake/mcp/token"},
         }
         with (
-            patch("turnstone.core.mcp_client.streamablehttp_client", side_effect=stream_factory),
+            patch("turnstone.core.mcp_client.streamable_http_client", side_effect=stream_factory),
             pytest.raises(Exception),  # noqa: B017 - only the headers the transport saw matter
         ):
             asyncio.run(mgr._connect_one_pool(("user-1", "srv"), cfg, "user-token"))
-        assert observed["X-Api-Key"] == "Bearer live-token"
-        assert observed["Authorization"] == "Bearer user-token"
+        assert observed["x-api-key"] == "Bearer live-token"
+        assert observed["authorization"] == "Bearer user-token"
         assert cfg["headers"] == {"X-Api-Key": "secret://fake/mcp/token"}
 
     def test_reconnect_asks_the_store_again(

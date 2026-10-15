@@ -24,7 +24,7 @@ from unittest.mock import MagicMock, patch
 import httpx
 import pytest
 import uvicorn
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from tests._oauth_runtime_helpers import make_oauth_context
@@ -122,7 +122,7 @@ def _find_free_port() -> int:
 
 
 def _build_server(port: int, behaviour: dict[str, Any]) -> uvicorn.Server:
-    mcp = FastMCP(name="phase7b-resource-target", streamable_http_path="/mcp")
+    mcp = MCPServer(name="phase7b-resource-target")
 
     @mcp.resource("res://hello")
     def hello() -> str:
@@ -141,7 +141,7 @@ def _build_server(port: int, behaviour: dict[str, Any]) -> uvicorn.Server:
     async def echo(payload: str = "default") -> str:
         return f"echoed:{payload}"
 
-    app = mcp.streamable_http_app()
+    app = mcp.streamable_http_app(streamable_http_path="/mcp")
     app.add_middleware(BehaviorMiddleware, behaviour=behaviour)
     config = uvicorn.Config(
         app,

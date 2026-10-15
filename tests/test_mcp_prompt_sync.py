@@ -361,10 +361,8 @@ class TestRefreshPassSync:
             if driver == "notification":
                 handler = mgr._make_static_notification_handler("srv0")
                 await handler(
-                    mcp_types.ServerNotification(
-                        mcp_types.PromptListChangedNotification(
-                            method="notifications/prompts/list_changed"
-                        )
+                    mcp_types.PromptListChangedNotification(
+                        method="notifications/prompts/list_changed"
                     )
                 )
             else:

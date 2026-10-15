@@ -22,7 +22,7 @@ import time
 from typing import Any
 from unittest.mock import MagicMock
 
-import httpx
+import httpx2
 import pytest
 
 from tests.conftest import _run_on_loop
@@ -70,8 +70,8 @@ def _build_mock_transport_factory(
     monkeypatch: pytest.MonkeyPatch,
     handler: Any,
 ) -> None:
-    """Wrap ``_make_capturing_http_factory`` so the resulting httpx
-    client uses an ``httpx.MockTransport(handler)``.
+    """Wrap ``_make_capturing_http_factory`` so the resulting httpx2
+    client uses an ``httpx2.MockTransport(handler)``.
 
     The production capturing factory is preserved (we still get the
     response-hook plumbing); only the underlying transport is swapped.
@@ -86,9 +86,9 @@ def _build_mock_transport_factory(
     ) -> Any:
         inner = real_factory(capture, fired_event=fired_event)
 
-        def _factory(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
+        def _factory(*args: Any, **kwargs: Any) -> httpx2.AsyncClient:
             client = inner(*args, **kwargs)
-            client._transport = httpx.MockTransport(handler)
+            client._transport = httpx2.MockTransport(handler)
             return client
 
         return _factory
@@ -123,7 +123,7 @@ def _make_jsonrpc_handler(
     counter: list[int] | None = None,
     record_bodies: list[str] | None = None,
 ) -> Any:
-    """Build an httpx async handler for the ``streamable-http`` shape.
+    """Build an httpx2 async handler for the ``streamable-http`` shape.
 
     Returns a coroutine the MockTransport invokes per request.
     """
@@ -187,22 +187,32 @@ def _make_jsonrpc_handler(
             return _json.loads(match.group(1))
         return 1
 
-    async def _handler(req: httpx.Request) -> httpx.Response:
+    async def _handler(req: httpx2.Request) -> httpx2.Response:
         if req.method == "GET":
-            return httpx.Response(405)
+            return httpx2.Response(405)
         if req.method == "DELETE":
-            return httpx.Response(200)
+            return httpx2.Response(200)
         body = req.content.decode() if req.content else ""
         if record_bodies is not None:
             record_bodies.append(body)
         if "notifications/initialized" in body:
-            return httpx.Response(202)
+            return httpx2.Response(202)
+        if '"server/discover"' in body:
+            return httpx2.Response(
+                200,
+                headers={"content-type": "application/json"},
+                json={
+                    "jsonrpc": "2.0",
+                    "id": _extract_id(body),
+                    "error": {"code": -32601, "message": "Method not found"},
+                },
+            )
         counter[0] += 1
         req_id = _extract_id(body)
         if "method" in body and '"initialize"' in body:
             response_payload = dict(init_response)
             response_payload["id"] = req_id
-            return httpx.Response(
+            return httpx2.Response(
                 200,
                 headers={"content-type": "application/json", "mcp-session-id": "sess-1"},
                 json=response_payload,
@@ -210,7 +220,7 @@ def _make_jsonrpc_handler(
         if '"resources/templates/list"' in body:
             payload = dict(list_resource_templates_response)
             payload["id"] = req_id
-            return httpx.Response(
+            return httpx2.Response(
                 200,
                 headers={"content-type": "application/json"},
                 json=payload,
@@ -222,7 +232,7 @@ def _make_jsonrpc_handler(
             else:
                 payload = dict(list_resources_response)
             payload["id"] = req_id
-            return httpx.Response(
+            return httpx2.Response(
                 200,
                 headers={"content-type": "application/json"},
                 json=payload,
@@ -234,7 +244,7 @@ def _make_jsonrpc_handler(
             else:
                 payload = dict(list_prompts_response)
             payload["id"] = req_id
-            return httpx.Response(
+            return httpx2.Response(
                 200,
                 headers={"content-type": "application/json"},
                 json=payload,
@@ -242,7 +252,7 @@ def _make_jsonrpc_handler(
         # ``tools/list`` — by request order: explicit override first, then
         # the staged sequence, then fall back to ``list_tools_response``.
         if list_tools_status != 200:
-            return httpx.Response(
+            return httpx2.Response(
                 list_tools_status,
                 headers={"www-authenticate": 'Bearer error="invalid_token"'},
                 json=list_tools_error_payload or {"error": "unauthorized"},
@@ -253,7 +263,7 @@ def _make_jsonrpc_handler(
         else:
             payload = dict(list_tools_response)
         payload["id"] = req_id
-        return httpx.Response(
+        return httpx2.Response(
             200,
             headers={"content-type": "application/json"},
             json=payload,

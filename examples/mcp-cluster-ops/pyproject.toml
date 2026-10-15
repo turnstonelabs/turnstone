@@ -10,7 +10,7 @@ requires-python = ">=3.13"
 license = "Apache-2.0"
 dependencies = [
     "turnstone",
-    "mcp>=1.6",
+    "mcp>=2.3,<3",
 ]
 
 [project.scripts]

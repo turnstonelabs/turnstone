@@ -54,10 +54,10 @@ SERVER_SRC = textwrap.dedent(
     """Streamable-http MCP server that grows a tool at runtime (#839 repro)."""
     import sys
 
-    from mcp.server.fastmcp import Context, FastMCP
+    from mcp.server.mcpserver import Context, MCPServer
 
     port = int(sys.argv[1])
-    mcp = FastMCP("push-victim", host="127.0.0.1", port=port)
+    mcp = MCPServer("push-victim")
 
 
     @mcp.tool()
@@ -75,12 +75,13 @@ SERVER_SRC = textwrap.dedent(
     async def register_extra(ctx: Context) -> str:
         """Register extra_tool, then push tools/list_changed on this session."""
         mcp.add_tool(extra_tool)
+        await ctx.notify_tools_changed()
         await ctx.session.send_tool_list_changed()
         return "registered"
 
 
     if __name__ == "__main__":
-        mcp.run(transport="streamable-http")
+        mcp.run(transport="streamable-http", host="127.0.0.1", port=port)
     '''
 ).lstrip()
 
@@ -101,7 +102,7 @@ class TestPushRefreshNoDeadlock:
     ) -> None:
         # The subprocess runs sys.executable, so importability HERE is a
         # faithful proxy for the server side. Environment gaps skip, not fail.
-        pytest.importorskip("mcp.server.fastmcp")
+        pytest.importorskip("mcp.server.mcpserver")
         script = tmp_path / "push_srv.py"
         script.write_text(SERVER_SRC)
         port = _free_port()

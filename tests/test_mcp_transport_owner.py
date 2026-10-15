@@ -28,7 +28,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import mcp.types as mcp_types
 import pytest
-from mcp import McpError
+from mcp import MCPError
 
 from turnstone.core.mcp_client import MCPClientManager
 
@@ -85,11 +85,11 @@ def _make_session_mock() -> AsyncMock:
     """A ClientSession-shaped mock good enough for connect + discovery."""
     session = AsyncMock()
     session.initialize = AsyncMock()
-    session.get_server_capabilities = MagicMock(return_value=None)
+    session.server_capabilities = None
     session.list_tools = AsyncMock(return_value=mcp_types.ListToolsResult(tools=[]))
     session.list_resources = AsyncMock(return_value=mcp_types.ListResourcesResult(resources=[]))
     session.list_resource_templates = AsyncMock(
-        return_value=mcp_types.ListResourceTemplatesResult(resourceTemplates=[])
+        return_value=mcp_types.ListResourceTemplatesResult(resource_templates=[])
     )
     return session
 
@@ -138,15 +138,17 @@ class TestTransportOwnerLifecycle:
         patches: dict[str, Any] = {}
         fake = _fake_transport_and_session(patches)
         session = fake["session"]
-        session.get_server_capabilities.return_value = mcp_types.ServerCapabilities(
-            tools=mcp_types.ToolsCapability(listChanged=list_changed) if kind == "tools" else None,
+        session.server_capabilities = mcp_types.ServerCapabilities(
+            tools=mcp_types.ToolsCapability(list_changed=list_changed) if kind == "tools" else None,
             resources=(
-                mcp_types.ResourcesCapability(listChanged=list_changed)
+                mcp_types.ResourcesCapability(list_changed=list_changed)
                 if kind == "resources"
                 else None
             ),
             prompts=(
-                mcp_types.PromptsCapability(listChanged=list_changed) if kind == "prompts" else None
+                mcp_types.PromptsCapability(list_changed=list_changed)
+                if kind == "prompts"
+                else None
             ),
         )
         session.list_prompts = AsyncMock(return_value=mcp_types.ListPromptsResult(prompts=[]))
@@ -277,11 +279,9 @@ class TestTransportOwnerLifecycle:
         patches: dict[str, Any] = {}
         fake = _fake_transport_and_session(patches)
         session = fake["session"]
-        session.get_server_capabilities = MagicMock(
-            return_value=mcp_types.ServerCapabilities(
-                tools=mcp_types.ToolsCapability(listChanged=False),
-                resources=mcp_types.ResourcesCapability(listChanged=False),
-            )
+        session.server_capabilities = mcp_types.ServerCapabilities(
+            tools=mcp_types.ToolsCapability(list_changed=False),
+            resources=mcp_types.ResourcesCapability(list_changed=False),
         )
         session.list_tools = AsyncMock(
             return_value=mcp_types.ListToolsResult(
@@ -289,7 +289,7 @@ class TestTransportOwnerLifecycle:
                     mcp_types.Tool(
                         name="echo",
                         description="Echo input",
-                        inputSchema={"type": "object", "properties": {}},
+                        input_schema={"type": "object", "properties": {}},
                     )
                 ]
             )
@@ -300,17 +300,15 @@ class TestTransportOwnerLifecycle:
                     mcp_types.Resource(
                         uri="res://one",
                         name="one",
-                        mimeType="text/plain",
+                        mime_type="text/plain",
                     )
                 ]
             )
         )
         session.list_resource_templates = AsyncMock(
-            side_effect=McpError(
-                mcp_types.ErrorData(
-                    code=mcp_types.METHOD_NOT_FOUND,
-                    message="templates disabled",
-                )
+            side_effect=MCPError(
+                code=mcp_types.METHOD_NOT_FOUND,
+                message="templates disabled",
             )
         )
 
@@ -340,11 +338,9 @@ class TestTransportOwnerLifecycle:
         patches: dict[str, Any] = {}
         fake = _fake_transport_and_session(patches)
         session = fake["session"]
-        session.get_server_capabilities = MagicMock(
-            return_value=mcp_types.ServerCapabilities(
-                tools=mcp_types.ToolsCapability(listChanged=False),
-                resources=mcp_types.ResourcesCapability(listChanged=False),
-            )
+        session.server_capabilities = mcp_types.ServerCapabilities(
+            tools=mcp_types.ToolsCapability(list_changed=False),
+            resources=mcp_types.ResourcesCapability(list_changed=False),
         )
         session.list_tools = AsyncMock(
             return_value=mcp_types.ListToolsResult(
@@ -352,17 +348,15 @@ class TestTransportOwnerLifecycle:
                     mcp_types.Tool(
                         name="ghost",
                         description="Must never publish",
-                        inputSchema={"type": "object", "properties": {}},
+                        input_schema={"type": "object", "properties": {}},
                     )
                 ]
             )
         )
         session.list_resources = AsyncMock(
-            side_effect=McpError(
-                mcp_types.ErrorData(
-                    code=mcp_types.INVALID_PARAMS,
-                    message="Method not found",
-                )
+            side_effect=MCPError(
+                code=mcp_types.INVALID_PARAMS,
+                message="Method not found",
             )
         )
 
@@ -405,20 +399,18 @@ class TestTransportOwnerLifecycle:
         patches: dict[str, Any] = {}
         fake = _fake_transport_and_session(patches)
         session = fake["session"]
-        session.get_server_capabilities = MagicMock(
-            return_value=mcp_types.ServerCapabilities(resources=mcp_types.ResourcesCapability())
+        session.server_capabilities = mcp_types.ServerCapabilities(
+            resources=mcp_types.ResourcesCapability()
         )
         session.list_tools = AsyncMock(
             return_value=mcp_types.ListToolsResult(
-                tools=[mcp_types.Tool(name="ghost", inputSchema={"type": "object"})]
+                tools=[mcp_types.Tool(name="ghost", input_schema={"type": "object"})]
             )
         )
         started: set[str] = set()
         finished: set[str] = set()
         both_started = asyncio.Event()
-        catalog_error = McpError(
-            mcp_types.ErrorData(code=mcp_types.INVALID_PARAMS, message="invalid resource catalog")
-        )
+        catalog_error = MCPError(code=mcp_types.INVALID_PARAMS, message="invalid resource catalog")
 
         async def _list(kind: str) -> Any:
             started.add(kind)
@@ -442,8 +434,8 @@ class TestTransportOwnerLifecycle:
         session.list_resources = _resources
         session.list_resource_templates = _templates
         expected = {
-            "resources": McpError,
-            "templates": McpError,
+            "resources": MCPError,
+            "templates": MCPError,
             "timeout": TimeoutError,
             "owner": ConnectionError,
             "caller": asyncio.CancelledError,
@@ -493,11 +485,9 @@ class TestTransportOwnerLifecycle:
         patches: dict[str, Any] = {}
         fake = _fake_transport_and_session(patches)
         session = fake["session"]
-        session.get_server_capabilities = MagicMock(
-            return_value=mcp_types.ServerCapabilities(
-                tools=mcp_types.ToolsCapability(listChanged=False),
-                resources=mcp_types.ResourcesCapability(listChanged=False),
-            )
+        session.server_capabilities = mcp_types.ServerCapabilities(
+            tools=mcp_types.ToolsCapability(list_changed=False),
+            resources=mcp_types.ResourcesCapability(list_changed=False),
         )
         session.list_tools = AsyncMock(
             return_value=mcp_types.ListToolsResult(
@@ -505,7 +495,7 @@ class TestTransportOwnerLifecycle:
                     mcp_types.Tool(
                         name="ghost",
                         description="Must never publish",
-                        inputSchema={"type": "object", "properties": {}},
+                        input_schema={"type": "object", "properties": {}},
                     )
                 ]
             )
@@ -739,7 +729,7 @@ class TestTransportOwnerLifecycle:
                     mcp_types.Tool(
                         name="ghost",
                         description="Must never publish",
-                        inputSchema={"type": "object", "properties": {}},
+                        input_schema={"type": "object", "properties": {}},
                     )
                 ]
             )

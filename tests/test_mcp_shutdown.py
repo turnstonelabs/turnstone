@@ -130,6 +130,14 @@ class _Upstream:
         if "id" not in body:
             return web.Response(status=202)
         method = body["method"]
+        if method == "server/discover":
+            return web.json_response(
+                {
+                    "jsonrpc": "2.0",
+                    "id": body["id"],
+                    "error": {"code": -32601, "message": "Method not found"},
+                }
+            )
         if method == "initialize" and self.phase == "initialize-stream":
             response = web.StreamResponse(
                 status=200,

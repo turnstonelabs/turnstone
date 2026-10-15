@@ -45,10 +45,10 @@ SERVER_SRC = textwrap.dedent(
     """Healthy streamable-http MCP server; the test SIGKILLs it to flap."""
     import sys
 
-    from mcp.server.fastmcp import FastMCP
+    from mcp.server.mcpserver import MCPServer
 
     port = int(sys.argv[1])
-    mcp = FastMCP("flaky-victim", host="127.0.0.1", port=port)
+    mcp = MCPServer("flaky-victim")
 
 
     @mcp.tool()
@@ -58,7 +58,7 @@ SERVER_SRC = textwrap.dedent(
 
 
     if __name__ == "__main__":
-        mcp.run(transport="streamable-http")
+        mcp.run(transport="streamable-http", host="127.0.0.1", port=port)
     '''
 ).lstrip()
 
@@ -121,7 +121,7 @@ class TestFlakyServerNoSpin:
     ) -> None:
         # The subprocess runs sys.executable, so importability HERE is a
         # faithful proxy for the server side. Environment gaps skip, not fail.
-        pytest.importorskip("mcp.server.fastmcp")
+        pytest.importorskip("mcp.server.mcpserver")
         script = tmp_path / "flaky_srv.py"
         script.write_text(SERVER_SRC)
         port = _free_port()

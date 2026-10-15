@@ -970,6 +970,37 @@ url = "https://mcp.example.com/mcp"
 }
 ```
 
+#### Optional 2026-07-28 settings
+
+Three optional keys tune features of the 2026-07-28 MCP revision. Servers on the
+earlier 2025-11-25 revision ignore them, except that `log_level` also filters any log
+messages such a server sends unasked.
+
+| Key | Where | Type | Default | What it does |
+|---|---|---|---|---|
+| `log_level` | `[mcp]` | string | unset | The lowest severity of server log messages (`notifications/message`) that turnstone writes to its own log, for every MCP server. On 2026-07-28 connections, every request also asks the server for messages at this level and above (`_meta["io.modelcontextprotocol/logLevel"]`). Messages are logged under the server's name, stripped of control characters, and capped at `WARNING`, so a server cannot raise an `ERROR` in turnstone's log. When unset, server log messages are dropped. |
+| `log_level` | `[mcp.servers.<name>]` or `mcpServers.<name>` | string | the `[mcp]` value | Overrides `[mcp].log_level` for one server. |
+| `resource_subscriptions` | `[mcp.servers.<name>]` or `mcpServers.<name>` | list of strings | `[]` | Resource URIs to watch on a 2026-07-28 server that declares `resources.subscribe`. When the server reports that one changed (`notifications/resources/updated`), turnstone drops its cached copy, so the next `read_resource` fetches it again. Other servers ignore the key. |
+
+Log levels, lowest to highest: `debug`, `info`, `notice`, `warning`, `error`,
+`critical`, `alert`, `emergency`. Case does not matter, and an unrecognized value is
+ignored.
+
+```toml
+[mcp]
+log_level = "warning"
+
+[mcp.servers.docs]
+type = "http"
+url = "https://mcp.example.com/mcp"
+log_level = "info"
+resource_subscriptions = ["docs://index"]
+```
+
+The per-server keys are read only from configuration files. Servers added in the
+admin console do not carry them, and configuration files are not read at all while
+the database holds an enabled MCP server. `[mcp].log_level` applies to every server.
+
 ### Introspection
 
 Use the `/mcp` slash command to list all connected MCP tools:

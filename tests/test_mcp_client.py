@@ -62,7 +62,7 @@ def _fake_mcp_tool(name: str = "search", description: str = "Search stuff") -> m
     return mcp_types.Tool(
         name=name,
         description=description,
-        inputSchema={
+        input_schema={
             "type": "object",
             "properties": {"query": {"type": "string"}},
             "required": ["query"],
@@ -93,7 +93,7 @@ def _fake_mcp_resource(
     mime_type: str = "text/plain",
 ) -> mcp_types.Resource:
     """Create an SDK resource."""
-    return mcp_types.Resource(uri=uri, name=name, description=description, mimeType=mime_type)
+    return mcp_types.Resource(uri=uri, name=name, description=description, mime_type=mime_type)
 
 
 def _fake_resource_dict(
@@ -217,14 +217,14 @@ class TestMcpToOpenai:
         assert result["function"]["name"] == "mcp__fs__list_files"
 
     def test_empty_input_schema(self):
-        tool = mcp_types.Tool(name="ping", description="Ping the server", inputSchema={})
+        tool = mcp_types.Tool(name="ping", description="Ping the server", input_schema={})
         result = _mcp_to_openai("test", tool)
         assert result["function"]["parameters"] == {"type": "object", "properties": {}}
 
     @pytest.mark.parametrize("description", [None, ""])
     def test_empty_description(self, description):
         tool = mcp_types.Tool(
-            name="noop", description=description, inputSchema={"type": "object", "properties": {}}
+            name="noop", description=description, input_schema={"type": "object", "properties": {}}
         )
         result = _mcp_to_openai("test", tool)
         assert result["function"]["description"] == ""
@@ -1052,7 +1052,7 @@ class TestRefreshServer:
             return_value=mcp_types.ListResourcesResult(resources=[])
         )
         mock_session.list_resource_templates = AsyncMock(
-            return_value=mcp_types.ListResourceTemplatesResult(resourceTemplates=[])
+            return_value=mcp_types.ListResourceTemplatesResult(resource_templates=[])
         )
         mock_session.list_prompts = AsyncMock(return_value=mcp_types.ListPromptsResult(prompts=[]))
 
@@ -1149,7 +1149,7 @@ class TestLastRefreshTracking:
             return_value=mcp_types.ListResourcesResult(resources=[])
         )
         mock_session.list_resource_templates = AsyncMock(
-            return_value=mcp_types.ListResourceTemplatesResult(resourceTemplates=[])
+            return_value=mcp_types.ListResourceTemplatesResult(resource_templates=[])
         )
         mock_session.list_prompts = AsyncMock(return_value=mcp_types.ListPromptsResult(prompts=[]))
         # Config present: outcome writes are config-gated (a removed server
@@ -2223,7 +2223,7 @@ class TestMCPResources:
                 return_value=mcp_types.ListResourcesResult(resources=[new_res])
             )
             mock_session.list_resource_templates = AsyncMock(
-                return_value=mcp_types.ListResourceTemplatesResult(resourceTemplates=[])
+                return_value=mcp_types.ListResourceTemplatesResult(resource_templates=[])
             )
 
             await mgr._refresh_server_resources("fs")
@@ -2946,7 +2946,7 @@ class TestCircuitBreaker:
         mgr._tool_map["mcp__test__ping"] = ("test", "ping")
         # Pre-set a failure
         mgr._consecutive_failures["test"] = 2
-        mock_result = mcp_types.CallToolResult(content=[], isError=False)
+        mock_result = mcp_types.CallToolResult(content=[], is_error=False)
         mock_future = MagicMock()
         mock_future.result.return_value = mock_result
         with patch("asyncio.run_coroutine_threadsafe", new=_dispatch_stub(mock_future)):
@@ -2989,9 +2989,8 @@ class TestCircuitBreaker:
         assert not is_open_b
 
     def test_mcp_error_does_not_trip_circuit(self):
-        """Protocol errors (McpError) should not count as transport failures."""
-        from mcp import McpError
-        from mcp.types import ErrorData
+        """Protocol errors (MCPError) should not count as transport failures."""
+        from mcp import MCPError
 
         mgr = MCPClientManager({"test": {"type": "stdio", "command": "echo"}})
         mock_session = MagicMock()
@@ -3000,10 +2999,10 @@ class TestCircuitBreaker:
         mgr._loop = MagicMock()
         mgr._tool_map["mcp__test__ping"] = ("test", "ping")
         mock_future = MagicMock()
-        mock_future.result.side_effect = McpError(ErrorData(code=-32601, message="tool not found"))
+        mock_future.result.side_effect = MCPError(code=-32601, message="tool not found")
         with (
             patch("asyncio.run_coroutine_threadsafe", new=_dispatch_stub(mock_future)),
-            pytest.raises(McpError),
+            pytest.raises(MCPError),
         ):
             mgr.call_tool_sync("mcp__test__ping", {}, timeout=5)
         # Circuit should NOT have recorded a failure
@@ -3036,11 +3035,10 @@ class TestCircuitBreaker:
     def test_session_terminated_mcperror_evicts_and_trips_circuit(self):
         """Regression: when the MCP SERVER restarts and loses its session map, our
         held mcp-session-id is stale; the server returns HTTP 404 and the SDK
-        surfaces McpError(code=32600, 'Session terminated'). That is NOT a healthy
+        surfaces MCPError(code=32600, 'Session terminated'). That is NOT a healthy
         protocol rejection — the session must be evicted so the next dispatch
         reconnects with a fresh initialize; reusing it 404s forever (restart-hang)."""
-        from mcp import McpError
-        from mcp.types import ErrorData
+        from mcp import MCPError
 
         mgr = MCPClientManager({"test": {"type": "stdio", "command": "echo"}})
         mock_session = MagicMock()
@@ -3050,12 +3048,10 @@ class TestCircuitBreaker:
         mgr._tool_map["mcp__test__ping"] = ("test", "ping")
         mock_future = MagicMock()
         # Exactly what the streamable-http SDK injects on a 404 stale session.
-        mock_future.result.side_effect = McpError(
-            ErrorData(code=32600, message="Session terminated")
-        )
+        mock_future.result.side_effect = MCPError(code=32600, message="Session terminated")
         with (
             patch("asyncio.run_coroutine_threadsafe", new=_dispatch_stub(mock_future)),
-            pytest.raises(McpError),
+            pytest.raises(MCPError),
         ):
             mgr.call_tool_sync("mcp__test__ping", {}, timeout=5)
         assert mgr._static_servers["test"].session is None
@@ -3084,11 +3080,11 @@ class TestCircuitBreaker:
 
     def test_connection_closed_mcperror_evicts_and_trips_circuit(self):
         """Regression: when the SDK's ``post_writer`` swallows the transport
-        error, a dead connection surfaces as ``McpError(CONNECTION_CLOSED)``.
+        error, a dead connection surfaces as ``MCPError(CONNECTION_CLOSED)``.
         Unlike a genuine protocol rejection, this MUST evict + trip the
         breaker so the next dispatch reconnects instead of looping."""
-        from mcp import McpError
-        from mcp.types import CONNECTION_CLOSED, ErrorData
+        from mcp import MCPError
+        from mcp.types import CONNECTION_CLOSED
 
         mgr = MCPClientManager({"test": {"type": "stdio", "command": "echo"}})
         mock_session = MagicMock()
@@ -3097,12 +3093,12 @@ class TestCircuitBreaker:
         mgr._loop = MagicMock()
         mgr._tool_map["mcp__test__ping"] = ("test", "ping")
         mock_future = MagicMock()
-        mock_future.result.side_effect = McpError(
-            ErrorData(code=CONNECTION_CLOSED, message="connection closed")
+        mock_future.result.side_effect = MCPError(
+            code=CONNECTION_CLOSED, message="connection closed"
         )
         with (
             patch("asyncio.run_coroutine_threadsafe", new=_dispatch_stub(mock_future)),
-            pytest.raises(McpError),
+            pytest.raises(MCPError),
         ):
             mgr.call_tool_sync("mcp__test__ping", {}, timeout=5)
         assert mgr._static_servers["test"].session is None
@@ -3144,11 +3140,11 @@ class TestCircuitBreaker:
     def test_read_resource_sync_dead_transport_evicts_and_trips_circuit(self):
         """Regression (follow-up): read_resource_sync kept the old
         BrokenPipe/ConnectionReset/EOF-only guard, so a dead streamable-http
-        transport surfacing as McpError(CONNECTION_CLOSED) reused the corpse
+        transport surfacing as MCPError(CONNECTION_CLOSED) reused the corpse
         session forever — the exact restart-hang call_tool_sync already fixes.
         It must now evict the session AND trip the breaker."""
-        from mcp import McpError
-        from mcp.types import CONNECTION_CLOSED, ErrorData
+        from mcp import MCPError
+        from mcp.types import CONNECTION_CLOSED
 
         mgr = MCPClientManager({"test": {"type": "stdio", "command": "echo"}})
         mock_session = MagicMock()
@@ -3156,12 +3152,12 @@ class TestCircuitBreaker:
         mgr._loop = MagicMock()
         mgr._resource_map = {"file:///x": ("test", "file:///x")}
         mock_future = MagicMock()
-        mock_future.result.side_effect = McpError(
-            ErrorData(code=CONNECTION_CLOSED, message="connection closed")
+        mock_future.result.side_effect = MCPError(
+            code=CONNECTION_CLOSED, message="connection closed"
         )
         with (
             patch("asyncio.run_coroutine_threadsafe", new=_dispatch_stub(mock_future)),
-            pytest.raises(McpError),
+            pytest.raises(MCPError),
         ):
             mgr.read_resource_sync("file:///x", timeout=5)
         assert mgr._static_servers["test"].session is None
@@ -3170,8 +3166,7 @@ class TestCircuitBreaker:
     def test_read_resource_sync_protocol_mcperror_does_not_evict(self):
         """A healthy protocol rejection (resource not found) must NOT evict the
         session or trip the breaker on the resource path."""
-        from mcp import McpError
-        from mcp.types import ErrorData
+        from mcp import MCPError
 
         mgr = MCPClientManager({"test": {"type": "stdio", "command": "echo"}})
         mock_session = MagicMock()
@@ -3179,12 +3174,10 @@ class TestCircuitBreaker:
         mgr._loop = MagicMock()
         mgr._resource_map = {"file:///x": ("test", "file:///x")}
         mock_future = MagicMock()
-        mock_future.result.side_effect = McpError(
-            ErrorData(code=-32602, message="resource not found")
-        )
+        mock_future.result.side_effect = MCPError(code=-32602, message="resource not found")
         with (
             patch("asyncio.run_coroutine_threadsafe", new=_dispatch_stub(mock_future)),
-            pytest.raises(McpError),
+            pytest.raises(MCPError),
         ):
             mgr.read_resource_sync("file:///x", timeout=5)
         assert mgr._static_servers["test"].session is mock_session
@@ -3213,8 +3206,7 @@ class TestCircuitBreaker:
 
     def test_get_prompt_sync_protocol_mcperror_does_not_evict(self):
         """A healthy protocol rejection must NOT evict on the prompt path."""
-        from mcp import McpError
-        from mcp.types import ErrorData
+        from mcp import MCPError
 
         mgr = MCPClientManager({"test": {"type": "stdio", "command": "echo"}})
         mock_session = MagicMock()
@@ -3222,12 +3214,10 @@ class TestCircuitBreaker:
         mgr._loop = MagicMock()
         mgr._prompt_map = {"mcp__test__p": ("test", "p")}
         mock_future = MagicMock()
-        mock_future.result.side_effect = McpError(
-            ErrorData(code=-32602, message="prompt not found")
-        )
+        mock_future.result.side_effect = MCPError(code=-32602, message="prompt not found")
         with (
             patch("asyncio.run_coroutine_threadsafe", new=_dispatch_stub(mock_future)),
-            pytest.raises(McpError),
+            pytest.raises(MCPError),
         ):
             mgr.get_prompt_sync("mcp__test__p", timeout=5)
         assert mgr._static_servers["test"].session is mock_session
@@ -3240,56 +3230,48 @@ class TestIsDeadTransport:
     rejection' across every session-use site."""
 
     def test_connection_closed_is_dead(self):
-        from mcp import McpError
-        from mcp.types import CONNECTION_CLOSED, ErrorData
+        from mcp import MCPError
+        from mcp.types import CONNECTION_CLOSED
 
-        assert _is_dead_transport(
-            McpError(ErrorData(code=CONNECTION_CLOSED, message="connection closed"))
-        )
+        assert _is_dead_transport(MCPError(code=CONNECTION_CLOSED, message="connection closed"))
 
     def test_sdk_session_terminated_is_dead(self):
         """The streamable-http SDK synthesizes EXACTLY code=32600 /
         'Session terminated' when a held mcp-session-id 404s after a server
         restart — keyed off the code so it survives a message reword."""
-        from mcp import McpError
-        from mcp.types import ErrorData
+        from mcp import MCPError
 
-        assert _is_dead_transport(McpError(ErrorData(code=32600, message="Session terminated")))
+        assert _is_dead_transport(MCPError(code=32600, message="Session terminated"))
 
     def test_app_session_not_found_is_not_dead(self):
         """#2 regression: a HEALTHY session-owning MCP server (game/shell)
         rejecting a stale id with 'session not found' is a protocol error, NOT
         transport death. The old bare-substring match wrongly evicted the live
         session and tripped the shared breaker for every user."""
-        from mcp import McpError
-        from mcp.types import ErrorData
+        from mcp import MCPError
 
-        assert not _is_dead_transport(
-            McpError(ErrorData(code=-32603, message="Backend session not found"))
-        )
+        assert not _is_dead_transport(MCPError(code=-32603, message="Backend session not found"))
 
     def test_app_session_terminated_message_is_not_dead(self):
         """#8 regression: the message is application-controlled and is NOT matched
         — only the SDK's synthesized code 32600 is. A healthy session-owning
         server that returns a protocol error whose message is EXACTLY 'Session
         terminated' (or a superstring) with a normal code stays breaker-safe."""
-        from mcp import McpError
-        from mcp.types import ErrorData
+        from mcp import MCPError
 
         # Exact SDK message but an app protocol code (not 32600) — must NOT be dead.
         assert not _is_dead_transport(
-            McpError(ErrorData(code=-32603, message="Session terminated"))
+            MCPError(code=mcp_types.INVALID_REQUEST, message="Session terminated")
         )
         # Superstring likewise.
         assert not _is_dead_transport(
-            McpError(ErrorData(code=-32603, message="Player session terminated by host"))
+            MCPError(code=-32603, message="Player session terminated by host")
         )
 
     def test_plain_protocol_mcperror_is_not_dead(self):
-        from mcp import McpError
-        from mcp.types import ErrorData
+        from mcp import MCPError
 
-        assert not _is_dead_transport(McpError(ErrorData(code=-32601, message="method not found")))
+        assert not _is_dead_transport(MCPError(code=-32601, message="method not found"))
 
     def test_httpx_read_timeout_is_dead(self):
         """#7: an idle read timeout on a long-lived streamable-http stream is
@@ -3431,9 +3413,7 @@ class TestStaticNotificationRefresh:
         async def _fire() -> bool:
             mgr._static_connect_lock_for("srv")
             _seed_static_state(mgr, "srv", session=MagicMock())
-            note = mcp_types.ServerNotification(
-                mcp_types.ToolListChangedNotification(method="notifications/tools/list_changed")
-            )
+            note = mcp_types.ToolListChangedNotification(method="notifications/tools/list_changed")
             await handler(note)
             # The handler returned WITHOUT running the refresh inline —
             # it must complete even though the refresh hasn't run yet.
@@ -3486,9 +3466,7 @@ class TestStaticNotificationRefresh:
             lock = mgr._static_connect_lock_for("srv")
             _seed_static_state(mgr, "srv", session=MagicMock())
             await lock.acquire()  # park the first runner
-            note = mcp_types.ServerNotification(
-                mcp_types.ToolListChangedNotification(method="notifications/tools/list_changed")
-            )
+            note = mcp_types.ToolListChangedNotification(method="notifications/tools/list_changed")
             before = len(mgr._background_tasks)
             await handler(note)
             # Age the stamp past the debounce window: the MARKER (not
@@ -3853,7 +3831,7 @@ class TestStaticNotificationRefresh:
                 for i in range(_MAX_RESOURCES_PER_SERVER + 50)
             ]
         )
-        tmpl_result = mcp_types.ListResourceTemplatesResult(resourceTemplates=[])
+        tmpl_result = mcp_types.ListResourceTemplatesResult(resource_templates=[])
         session = MagicMock()
         session.list_resources = AsyncMock(return_value=res_result)
         session.list_resource_templates = AsyncMock(return_value=tmpl_result)
@@ -3889,11 +3867,11 @@ class TestStaticNotificationRefresh:
         async def _fire_both() -> None:
             mgr._static_connect_lock_for("srv")
             _seed_static_state(mgr, "srv", session=MagicMock())
-            tools_note = mcp_types.ServerNotification(
-                mcp_types.ToolListChangedNotification(method="notifications/tools/list_changed")
+            tools_note = mcp_types.ToolListChangedNotification(
+                method="notifications/tools/list_changed"
             )
-            prompts_note = mcp_types.ServerNotification(
-                mcp_types.PromptListChangedNotification(method="notifications/prompts/list_changed")
+            prompts_note = mcp_types.PromptListChangedNotification(
+                method="notifications/prompts/list_changed"
             )
             await handler(tools_note)
             # Immediately inside the tools stamp's window.
@@ -3921,9 +3899,7 @@ class TestStaticNotificationRefresh:
         async def _fire() -> None:
             mgr._static_connect_lock_for("srv")
             _seed_static_state(mgr, "srv", session=MagicMock())
-            note = mcp_types.ServerNotification(
-                mcp_types.ToolListChangedNotification(method="notifications/tools/list_changed")
-            )
+            note = mcp_types.ToolListChangedNotification(method="notifications/tools/list_changed")
             with patch.object(mgr, "_spawn_background", side_effect=_boom):
                 await handler(note)  # must swallow the scheduling failure
 
@@ -3949,9 +3925,7 @@ class TestStaticNotificationRefresh:
         async def _fire() -> None:
             mgr._static_connect_lock_for("srv")
             _seed_static_state(mgr, "srv", session=MagicMock())
-            note = mcp_types.ServerNotification(
-                mcp_types.ToolListChangedNotification(method="notifications/tools/list_changed")
-            )
+            note = mcp_types.ToolListChangedNotification(method="notifications/tools/list_changed")
             # monotonic() < _NOTIFICATION_DEBOUNCE: a 0.0-default compare
             # would debounce this first push; the None sentinel admits it.
             with patch("turnstone.core.mcp_client.time.monotonic", return_value=2.0):
@@ -3980,9 +3954,7 @@ class TestStaticNotificationRefresh:
         async def _fire_then_redrive() -> int:
             mgr._static_connect_lock_for("srv")
             _seed_static_state(mgr, "srv", session=MagicMock())
-            note = mcp_types.ServerNotification(
-                mcp_types.ToolListChangedNotification(method="notifications/tools/list_changed")
-            )
+            note = mcp_types.ToolListChangedNotification(method="notifications/tools/list_changed")
             await handler(note)  # admitted, runner spawns
             return len(mgr._background_tasks)
 
@@ -3992,9 +3964,7 @@ class TestStaticNotificationRefresh:
         mgr._static_refresh_retry.discard("srv")
 
         async def _fire_again() -> int:
-            note = mcp_types.ServerNotification(
-                mcp_types.ToolListChangedNotification(method="notifications/tools/list_changed")
-            )
+            note = mcp_types.ToolListChangedNotification(method="notifications/tools/list_changed")
             before = len(mgr._background_tasks)
             await handler(note)
             return len(mgr._background_tasks) - before
@@ -4018,9 +3988,7 @@ class TestStaticNotificationRefresh:
             # Stamp fresh (inside window) AND a runner marker present.
             mgr._last_notification_refresh[("srv", "tools")] = time.monotonic()
             mgr._static_refresh_pending.add(("srv", "tools"))
-            note = mcp_types.ServerNotification(
-                mcp_types.ToolListChangedNotification(method="notifications/tools/list_changed")
-            )
+            note = mcp_types.ToolListChangedNotification(method="notifications/tools/list_changed")
             await handler(note)
 
         _run_on_loop(loop, _fire_with_marker_present())
@@ -4510,7 +4478,7 @@ class TestStaticNotificationRefresh:
 
     def test_resources_refresh_accepts_missing_template_method(self) -> None:
         """Push/manual refresh shares the per-method compatibility behavior."""
-        from mcp import McpError
+        from mcp import MCPError
 
         mgr = MCPClientManager({})
         session = MagicMock()
@@ -4520,17 +4488,15 @@ class TestStaticNotificationRefresh:
                     mcp_types.Resource(
                         uri="res://fresh",
                         name="fresh",
-                        mimeType="text/plain",
+                        mime_type="text/plain",
                     )
                 ]
             )
         )
         session.list_resource_templates = AsyncMock(
-            side_effect=McpError(
-                mcp_types.ErrorData(
-                    code=mcp_types.METHOD_NOT_FOUND,
-                    message="templates disabled",
-                )
+            side_effect=MCPError(
+                code=mcp_types.METHOD_NOT_FOUND,
+                message="templates disabled",
             )
         )
         state = _seed_static_state(
@@ -4549,17 +4515,15 @@ class TestStaticNotificationRefresh:
 
     def test_resources_refresh_rejects_message_only_method_match(self) -> None:
         """Only -32601 is normalized; a lookalike error leaves catalog intact."""
-        from mcp import McpError
+        from mcp import MCPError
 
         mgr = MCPClientManager({})
         session = MagicMock()
         session.list_resources = AsyncMock(return_value=mcp_types.ListResourcesResult(resources=[]))
         session.list_resource_templates = AsyncMock(
-            side_effect=McpError(
-                mcp_types.ErrorData(
-                    code=mcp_types.INVALID_PARAMS,
-                    message="Method not found",
-                )
+            side_effect=MCPError(
+                code=mcp_types.INVALID_PARAMS,
+                message="Method not found",
             )
         )
         old_resources = [{"uri": "res://old", "server": "srv"}]
@@ -4571,7 +4535,7 @@ class TestStaticNotificationRefresh:
             resources=old_resources,
         )
 
-        with pytest.raises(McpError) as raised:
+        with pytest.raises(MCPError) as raised:
             asyncio.run(mgr._refresh_server_resources("srv"))
 
         assert raised.value.error.code == mcp_types.INVALID_PARAMS
@@ -5155,17 +5119,14 @@ class TestStaticHealthLoop:
         assert due > now  # next ping rescheduled, not "reconnect asap"
 
     def test_ping_one_mcp_error_does_not_evict(self, running_loop_mgr) -> None:
-        """A protocol ``McpError`` from a healthy connection (server gates/omits
+        """A protocol ``MCPError`` from a healthy connection (server gates/omits
         ``ping``) must NOT evict or trip the breaker — only a dead transport does
         (mirrors ``_record_and_evict_on_dead_transport``)."""
-        from mcp import McpError
-        from mcp.types import ErrorData
+        from mcp import MCPError
 
         mgr, loop, _ = running_loop_mgr
         sess = MagicMock()
-        sess.send_ping = AsyncMock(
-            side_effect=McpError(ErrorData(code=-32601, message="method not found"))
-        )
+        sess.send_ping = AsyncMock(side_effect=MCPError(code=-32601, message="method not found"))
         _seed_static_state(mgr, "up", session=sess)
         now = time.monotonic()
         due = _run_on_loop(loop, mgr._static_ping_one("up", now))
@@ -6201,3 +6162,1408 @@ class TestTeardownStaticSession:
 
 async def _spawn_task(coro: Any) -> asyncio.Task[Any]:
     return asyncio.ensure_future(coro)
+
+
+class TestMcpV2ProtocolFeatures:
+    """Tests for MCP Python SDK v2 (2026-07-28) protocol features."""
+
+    def test_negotiate_session_adopts_modern_discover(self, running_loop_mgr) -> None:
+        """When server/discover returns 2026-07-28 in supportedVersions, the session adopts it
+        without falling back to initialize."""
+        from mcp import ClientSession
+
+        from turnstone.core.mcp_client import _negotiate_session
+
+        _, loop, _ = running_loop_mgr
+        session = MagicMock(spec=ClientSession)
+        discover_payload = {
+            "supportedVersions": ["2026-07-28", "2025-11-25"],
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": "modern-srv", "version": "2.3.0"},
+        }
+        session.send_discover = AsyncMock(return_value=discover_payload)
+        session.initialize = AsyncMock()
+
+        _run_on_loop(loop, _negotiate_session(session))
+
+        session.send_discover.assert_awaited_once_with("2026-07-28")
+        session.adopt.assert_called_once()
+        adopted = session.adopt.call_args[0][0]
+        assert adopted.supported_versions == ["2026-07-28", "2025-11-25"]
+        session.initialize.assert_not_awaited()
+
+    def test_negotiate_session_falls_back_to_initialize_on_method_not_found(
+        self, running_loop_mgr
+    ) -> None:
+        """A legacy server that rejects server/discover with -32601 triggers initialize."""
+        from mcp import ClientSession
+        from mcp.shared.exceptions import MCPError
+
+        from turnstone.core.mcp_client import _negotiate_session
+
+        _, loop, _ = running_loop_mgr
+        session = MagicMock(spec=ClientSession)
+        session.send_discover = AsyncMock(side_effect=MCPError(code=-32601, message="Not found"))
+        session.initialize = AsyncMock()
+
+        _run_on_loop(loop, _negotiate_session(session))
+
+        session.send_discover.assert_awaited_once_with("2026-07-28")
+        session.initialize.assert_awaited_once()
+
+    def test_negotiate_session_raises_on_disjoint_future_versions(self, running_loop_mgr) -> None:
+        """When the server only supports versions newer than 2025-11-25, do not fall back."""
+        from mcp import ClientSession
+        from mcp.shared.exceptions import MCPError
+        from mcp.types import UNSUPPORTED_PROTOCOL_VERSION
+
+        from turnstone.core.mcp_client import _negotiate_session
+
+        _, loop, _ = running_loop_mgr
+        session = MagicMock(spec=ClientSession)
+        session.send_discover = AsyncMock(
+            side_effect=MCPError(
+                code=UNSUPPORTED_PROTOCOL_VERSION,
+                message="Unsupported protocol version",
+                data={"supported": ["2099-01-01"]},
+            )
+        )
+        session.initialize = AsyncMock()
+
+        with pytest.raises(MCPError, match="Unsupported protocol version"):
+            _run_on_loop(loop, _negotiate_session(session))
+
+        session.initialize.assert_not_awaited()
+
+    def test_negotiate_session_does_not_fall_back_on_captured_http_error(
+        self, running_loop_mgr
+    ) -> None:
+        """When the transport carrier recorded an HTTP error (e.g. 401), do not send a second
+        initialize request."""
+        from mcp import ClientSession
+        from mcp.shared.exceptions import MCPError
+        from mcp.types import CONNECTION_CLOSED
+
+        from turnstone.core.mcp_client import _AuthCapture, _negotiate_session
+
+        _, loop, _ = running_loop_mgr
+        session = MagicMock(spec=ClientSession)
+        session.send_discover = AsyncMock(
+            side_effect=MCPError(code=CONNECTION_CLOSED, message="Connection closed")
+        )
+        session.initialize = AsyncMock()
+        capture = _AuthCapture(status=401)
+
+        with pytest.raises(MCPError, match="Connection closed"):
+            _run_on_loop(loop, _negotiate_session(session, capture=capture))
+
+        session.initialize.assert_not_awaited()
+
+    def test_has_established_session_recognizes_modern_and_legacy_headers(self) -> None:
+        """_has_established_session distinguishes initial handshakes from post-handshake calls."""
+        from turnstone.core.mcp_client import _has_established_session
+
+        assert _has_established_session({"mcp-session-id": "sess-1"}) is True
+        assert (
+            _has_established_session(
+                {"mcp-protocol-version": "2026-07-28", "mcp-method": "tools/list"}
+            )
+            is True
+        )
+        assert (
+            _has_established_session(
+                {"mcp-protocol-version": "2026-07-28", "mcp-method": "server/discover"}
+            )
+            is False
+        )
+        assert _has_established_session({"mcp-protocol-version": "2026-07-28"}) is False
+        assert _has_established_session({}) is False
+
+    def test_park_transport_owner_propagates_subscription_lost(self, running_loop_mgr) -> None:
+        """An unexpected drop of the subscriptions/listen stream raises SubscriptionLost so the
+        transport owner's death handler evicts the session."""
+        from mcp.client.subscriptions import SubscriptionLost
+
+        from turnstone.core.mcp_client import _park_transport_owner
+
+        _, loop, _ = running_loop_mgr
+
+        class _FakeSub:
+            def __aiter__(self) -> Any:
+                return self
+
+            async def __anext__(self) -> Any:
+                raise SubscriptionLost("SSE stream closed by peer")
+
+        close_requested = asyncio.Event()
+        with pytest.raises(SubscriptionLost, match="SSE stream closed by peer"):
+            _run_on_loop(loop, _park_transport_owner(close_requested, _FakeSub()))
+
+    def test_park_transport_owner_exits_cleanly_on_close_requested(self, running_loop_mgr) -> None:
+        """When close_requested is set, _park_transport_owner stops draining the subscription and
+        returns cleanly."""
+        from mcp.client.subscriptions import ListenRoute, Subscription
+        from mcp.types import SubscriptionFilter
+
+        from turnstone.core.mcp_client import _park_transport_owner
+
+        _, loop, _ = running_loop_mgr
+
+        async def _exercise() -> None:
+            close_requested = asyncio.Event()
+            sub = Subscription(ListenRoute(), "listen-1", SubscriptionFilter())
+            task = asyncio.create_task(_park_transport_owner(close_requested, sub))
+            await asyncio.sleep(0.01)
+            close_requested.set()
+            await asyncio.wait_for(task, timeout=1.0)
+
+        _run_on_loop(loop, _exercise())
+
+    def test_health_ping_uses_send_discover_for_modern_and_send_ping_for_legacy(
+        self, running_loop_mgr
+    ) -> None:
+        """_static_ping_one uses send_discover on 2026-07-28 sessions and send_ping on legacy."""
+        mgr, loop, _ = running_loop_mgr
+
+        modern_sess = MagicMock()
+        modern_sess.protocol_version = "2026-07-28"
+        modern_sess.send_discover = AsyncMock()
+        modern_sess.send_ping = AsyncMock()
+        _seed_static_state(mgr, "modern", session=modern_sess)
+
+        legacy_sess = MagicMock()
+        legacy_sess.protocol_version = "2025-11-25"
+        legacy_sess.send_discover = AsyncMock()
+        legacy_sess.send_ping = AsyncMock()
+        _seed_static_state(mgr, "legacy", session=legacy_sess)
+
+        now = time.monotonic() + 1000.0
+        _run_on_loop(loop, mgr._static_ping_one("modern", now))
+        _run_on_loop(loop, mgr._static_ping_one("legacy", now))
+
+        modern_sess.send_discover.assert_awaited_once_with("2026-07-28")
+        modern_sess.send_ping.assert_not_awaited()
+        legacy_sess.send_ping.assert_awaited_once()
+        legacy_sess.send_discover.assert_not_awaited()
+
+    def test_call_tool_with_header_retry_relists_and_retries_once(self, running_loop_mgr) -> None:
+        """On HEADER_MISMATCH (-32023) at 2026-07-28, _call_tool_with_header_retry refreshes
+        tools/list once and retries call_tool."""
+        from mcp.shared.exceptions import MCPError
+        from mcp.types import HEADER_MISMATCH, CallToolResult, TextContent
+
+        mgr, loop, _ = running_loop_mgr
+        session = MagicMock()
+        session.protocol_version = "2026-07-28"
+        ok_result = CallToolResult(content=[TextContent(type="text", text="retried-ok")])
+        session.call_tool = AsyncMock(
+            side_effect=[
+                MCPError(code=HEADER_MISMATCH, message="Stale x-mcp header projection"),
+                ok_result,
+            ]
+        )
+
+        with patch(
+            "turnstone.core.mcp_client._list_all_tools", new=AsyncMock(return_value=[])
+        ) as mock_list:
+            res = _run_on_loop(
+                loop,
+                mgr._call_tool_with_header_retry(session, "srv", "deploy", {"region": "us-east-1"}),
+            )
+
+        assert res is ok_result
+        mock_list.assert_awaited_once_with(session, "srv")
+        assert session.call_tool.await_count == 2
+
+    def test_decode_tool_result_renders_structured_content_when_content_empty(self) -> None:
+        """When CallToolResult.content has no text blocks, structured_content is serialized."""
+        from mcp.types import CallToolResult
+
+        from turnstone.core.mcp_client import _decode_tool_result
+
+        res = CallToolResult(content=[], structured_content={"answer": 42, "ok": True})
+        assert _decode_tool_result(res) == '{"answer": 42, "ok": true}'
+
+        err_res = CallToolResult(
+            content=[], structured_content={"detail": "bad input"}, is_error=True
+        )
+        assert _decode_tool_result(err_res) == 'Error: {"detail": "bad input"}'
+
+    def test_resource_read_response_caching_static_and_ttl_zero(self, running_loop_mgr) -> None:
+        """_read_resource_with_cache caches 2026-07-28 ReadResourceResult with ttl_ms > 0 and
+        bypasses caching when ttl_ms == 0 or on legacy protocol versions."""
+        from mcp.types import ReadResourceResult, TextResourceContents
+
+        mgr, loop, _ = running_loop_mgr
+        session = MagicMock()
+        session.protocol_version = "2026-07-28"
+        cached_res = ReadResourceResult(
+            contents=[TextResourceContents(uri="file:///doc.md", text="v1")],
+            ttl_ms=60_000,
+        )
+        uncached_res = ReadResourceResult(
+            contents=[TextResourceContents(uri="file:///live.md", text="live")],
+            ttl_ms=0,
+        )
+
+        session.read_resource = AsyncMock(return_value=cached_res)
+        r1 = _run_on_loop(loop, mgr._read_resource_with_cache(session, "srv", "file:///doc.md"))
+        r2 = _run_on_loop(loop, mgr._read_resource_with_cache(session, "srv", "file:///doc.md"))
+        assert r1 == cached_res
+        assert r2 == cached_res
+        session.read_resource.assert_awaited_once_with("file:///doc.md")
+
+        # ttl_ms=0 is never stored
+        session.read_resource = AsyncMock(return_value=uncached_res)
+        _run_on_loop(loop, mgr._read_resource_with_cache(session, "srv", "file:///live.md"))
+        _run_on_loop(loop, mgr._read_resource_with_cache(session, "srv", "file:///live.md"))
+        assert session.read_resource.await_count == 2
+
+        # Legacy 2025-11-25 session bypasses cache completely
+        legacy_session = MagicMock()
+        legacy_session.protocol_version = "2025-11-25"
+        legacy_session.read_resource = AsyncMock(return_value=cached_res)
+        _run_on_loop(loop, mgr._read_resource_with_cache(legacy_session, "srv2", "file:///doc.md"))
+        _run_on_loop(loop, mgr._read_resource_with_cache(legacy_session, "srv2", "file:///doc.md"))
+        assert legacy_session.read_resource.await_count == 2
+
+    def test_resource_read_response_caching_pool_private_vs_public(self, running_loop_mgr) -> None:
+        """Pool resource reads isolate 'private' cache entries per user_id while sharing
+        'public' cache entries across users."""
+        from mcp.types import ReadResourceResult, TextResourceContents
+
+        mgr, loop, _ = running_loop_mgr
+        session = MagicMock()
+        session.protocol_version = "2026-07-28"
+
+        private_res = ReadResourceResult(
+            contents=[TextResourceContents(uri="file:///me.json", text="secret")],
+            ttl_ms=60_000,
+            cache_scope="private",
+        )
+        session.read_resource = AsyncMock(return_value=private_res)
+        _run_on_loop(
+            loop,
+            mgr._read_resource_with_cache(session, "pool-srv", "file:///me.json", user_id="u1"),
+        )
+        # Same user hits private cache
+        _run_on_loop(
+            loop,
+            mgr._read_resource_with_cache(session, "pool-srv", "file:///me.json", user_id="u1"),
+        )
+        assert session.read_resource.await_count == 1
+        # Different user misses u1's private cache
+        _run_on_loop(
+            loop,
+            mgr._read_resource_with_cache(session, "pool-srv", "file:///me.json", user_id="u2"),
+        )
+        assert session.read_resource.await_count == 2
+
+        # Public scope is shared across users
+        public_res = ReadResourceResult(
+            contents=[TextResourceContents(uri="file:///pub.json", text="shared")],
+            ttl_ms=60_000,
+            cache_scope="public",
+        )
+        session.read_resource = AsyncMock(return_value=public_res)
+        _run_on_loop(
+            loop,
+            mgr._read_resource_with_cache(session, "pool-srv", "file:///pub.json", user_id="u1"),
+        )
+        _run_on_loop(
+            loop,
+            mgr._read_resource_with_cache(session, "pool-srv", "file:///pub.json", user_id="u2"),
+        )
+        assert session.read_resource.await_count == 1
+
+    def test_resource_cache_eviction_on_resource_updated_and_list_changed(
+        self, running_loop_mgr
+    ) -> None:
+        """ResourceUpdatedNotification evicts only the matching URI while
+        ResourceListChangedNotification evicts all cached resources for that server."""
+        from mcp.types import (
+            ReadResourceResult,
+            ResourceListChangedNotification,
+            ResourceUpdatedNotification,
+            ResourceUpdatedNotificationParams,
+            TextResourceContents,
+        )
+
+        mgr, loop, _ = running_loop_mgr
+        session = MagicMock()
+        session.protocol_version = "2026-07-28"
+        session.read_resource = AsyncMock(
+            side_effect=lambda uri: ReadResourceResult(
+                contents=[TextResourceContents(uri=uri, text=f"body:{uri}")],
+                ttl_ms=60_000,
+            )
+        )
+
+        _run_on_loop(loop, mgr._read_resource_with_cache(session, "srv", "file:///a.txt"))
+        _run_on_loop(loop, mgr._read_resource_with_cache(session, "srv", "file:///b.txt"))
+        assert session.read_resource.await_count == 2
+
+        # Evict only file:///a.txt via ResourceUpdatedNotification
+        upd = ResourceUpdatedNotification(
+            params=ResourceUpdatedNotificationParams(uri="file:///a.txt")
+        )
+        _run_on_loop(loop, mgr._evict_cache_for_notification("srv", upd))
+
+        # file:///b.txt still hits cache; file:///a.txt re-fetches
+        _run_on_loop(loop, mgr._read_resource_with_cache(session, "srv", "file:///b.txt"))
+        assert session.read_resource.await_count == 2
+        _run_on_loop(loop, mgr._read_resource_with_cache(session, "srv", "file:///a.txt"))
+        assert session.read_resource.await_count == 3
+
+        # ResourceListChangedNotification evicts all resources for the server
+        list_changed = ResourceListChangedNotification()
+        _run_on_loop(loop, mgr._evict_cache_for_notification("srv", list_changed))
+        _run_on_loop(loop, mgr._read_resource_with_cache(session, "srv", "file:///b.txt"))
+        assert session.read_resource.await_count == 4
+
+    def test_catalog_ttl_ms_records_expiry_and_triggers_health_refresh(
+        self, running_loop_mgr
+    ) -> None:
+        """_list_all_tools records first-page ttl_ms on 2026-07-28 sessions and _static_health_one
+        spawns a full catalog refresh once that TTL expires."""
+        from mcp.types import ListToolsResult
+
+        from turnstone.core.mcp_client import (
+            _catalog_expires_at,
+            _list_all_tools,
+        )
+
+        mgr, loop, _ = running_loop_mgr
+
+        class _Session:
+            protocol_version = "2026-07-28"
+
+            async def list_tools(self, params=None):
+                return ListToolsResult(tools=[], ttl_ms=5_000)
+
+            async def send_discover(self, version):
+                return None
+
+        session = _Session()
+        _run_on_loop(loop, _list_all_tools(session, "srv"))
+        expires = _catalog_expires_at(session)
+        assert expires is not None
+
+        _seed_static_state(mgr, "srv", session=session)
+        mgr._static_next_ping["srv"] = expires + 100.0
+        with patch.object(mgr, "_spawn_full_refresh") as mock_refresh:
+            # Before expiry: no refresh spawned, deadline clamped to expires
+            due = _run_on_loop(loop, mgr._static_health_one("srv", expires - 1.0))
+            mock_refresh.assert_not_called()
+            assert due == pytest.approx(expires)
+
+            # At/after expiry: refresh spawned and TTL cleared
+            _run_on_loop(loop, mgr._static_health_one("srv", expires + 0.1))
+            mock_refresh.assert_called_once_with("srv", "catalog TTL expiry refresh for 'srv'")
+            assert _catalog_expires_at(session) is None
+
+    def test_enter_modern_subscription_passes_resource_subscriptions(
+        self, running_loop_mgr
+    ) -> None:
+        """_enter_modern_subscription forwards resource_subscriptions to listen() when the server
+        advertises capabilities.resources.subscribe."""
+        from contextlib import AsyncExitStack
+
+        from mcp.client.session import ClientSession
+        from mcp.types import (
+            DiscoverResult,
+            Implementation,
+            ResourcesCapability,
+            ServerCapabilities,
+        )
+
+        from turnstone.core.mcp_client import _enter_modern_subscription
+
+        _, loop, _ = running_loop_mgr
+
+        r_stream, w_stream = MagicMock(), MagicMock()
+        session = ClientSession(r_stream, w_stream)
+        session.adopt(
+            DiscoverResult(
+                protocol_version="2026-07-28",
+                supported_versions=["2026-07-28"],
+                capabilities=ServerCapabilities(
+                    resources=ResourcesCapability(subscribe=True, list_changed=True)
+                ),
+                server_info=Implementation(name="srv", version="1.0"),
+            )
+        )
+
+        captured_kwargs: dict[str, Any] = {}
+
+        class _FakeListenCtx:
+            async def __aenter__(self):
+                return "sub-handle"
+
+            async def __aexit__(self, *args):
+                return False
+
+        def _fake_listen(_sess, **kwargs):
+            captured_kwargs.update(kwargs)
+            return _FakeListenCtx()
+
+        async def _run():
+            async with AsyncExitStack() as stack:
+                with patch("turnstone.core.mcp_client.listen", side_effect=_fake_listen):
+                    sub = await _enter_modern_subscription(
+                        stack,
+                        session,
+                        resource_subscriptions=("file:///cfg.yaml", "file:///state.json"),
+                    )
+                    assert sub == "sub-handle"
+
+        _run_on_loop(loop, _run())
+        assert captured_kwargs["resources_list_changed"] is True
+        assert captured_kwargs["resource_subscriptions"] == [
+            "file:///cfg.yaml",
+            "file:///state.json",
+        ]
+
+    def test_resource_updated_notification_fires_listeners_static_and_pool(
+        self, running_loop_mgr
+    ) -> None:
+        """ResourceUpdatedNotification dispatches to registered listeners for both static
+        (user_id=None) and pool (user_id='u1') sessions, respecting user_id scoping."""
+        from mcp.types import (
+            ResourceUpdatedNotification,
+            ResourceUpdatedNotificationParams,
+        )
+
+        mgr, loop, _ = running_loop_mgr
+        global_events: list[tuple[str, str]] = []
+        u1_events: list[tuple[str, str]] = []
+        u2_events: list[tuple[str, str]] = []
+
+        def _global_listener(server_name: str, uri: str) -> None:
+            global_events.append((server_name, uri))
+
+        def _u1_listener(server_name: str, uri: str) -> None:
+            u1_events.append((server_name, uri))
+
+        def _u2_listener(server_name: str, uri: str) -> None:
+            u2_events.append((server_name, uri))
+
+        mgr.add_resource_updated_listener(_global_listener)
+        mgr.add_resource_updated_listener(_u1_listener, user_id="u1")
+        mgr.add_resource_updated_listener(_u2_listener, user_id="u2")
+        notif = ResourceUpdatedNotification(
+            params=ResourceUpdatedNotificationParams(uri="file:///updated.txt")
+        )
+
+        static_handler = mgr._make_static_notification_handler("static-srv")
+        pool_handler = mgr._make_pool_notification_handler(("u1", "pool-srv"))
+        _run_on_loop(loop, static_handler(notif))
+        _run_on_loop(loop, pool_handler(notif))
+
+        assert global_events == [
+            ("static-srv", "file:///updated.txt"),
+            ("pool-srv", "file:///updated.txt"),
+        ]
+        assert u1_events == [
+            ("static-srv", "file:///updated.txt"),
+            ("pool-srv", "file:///updated.txt"),
+        ]
+        # u2 sees static update but NOT u1's pool update
+        assert u2_events == [
+            ("static-srv", "file:///updated.txt"),
+        ]
+
+        mgr.remove_resource_updated_listener(_global_listener)
+        _run_on_loop(loop, static_handler(notif))
+        assert len(global_events) == 2
+
+    def test_configure_session_logging_and_sanitized_logging_callback(
+        self, running_loop_mgr, caplog
+    ) -> None:
+        """_configure_session_logging sets _log_level so 2026-07-28 adopt() stamps
+        _meta['io.modelcontextprotocol/logLevel'], and _make_logging_callback sanitizes
+        control characters in LoggingMessageNotification payloads."""
+        import logging as py_logging
+
+        from mcp.client.session import ClientSession
+        from mcp.types import (
+            DiscoverResult,
+            Implementation,
+            LoggingMessageNotificationParams,
+            ServerCapabilities,
+        )
+
+        from turnstone.core.mcp_client import _configure_session_logging
+
+        mgr, loop, _ = running_loop_mgr
+        mgr.set_log_level("warning", server_name="srv")
+        assert mgr._effective_log_level("srv") == "warning"
+
+        r_stream, w_stream = MagicMock(), MagicMock()
+        session = ClientSession(r_stream, w_stream)
+        cb = mgr._make_logging_callback("srv", user_id="u1")
+        _configure_session_logging(
+            session,
+            log_level=mgr._effective_log_level("srv"),
+            logging_callback=cb,
+        )
+        session.adopt(
+            DiscoverResult(
+                protocol_version="2026-07-28",
+                supported_versions=["2026-07-28"],
+                capabilities=ServerCapabilities(),
+                server_info=Implementation(name="srv", version="1.0"),
+            )
+        )
+        data: dict[str, Any] = {"method": "tools/call", "params": {"name": "ping"}}
+        opts: dict[str, Any] = {}
+        session._stamp(data, opts)
+        assert data["params"]["_meta"]["io.modelcontextprotocol/logLevel"] == "warning"
+
+        with caplog.at_level(py_logging.WARNING):
+            _run_on_loop(
+                loop,
+                cb(
+                    LoggingMessageNotificationParams(
+                        level="warning",
+                        logger="db\x1b[31m-pool",
+                        data="query slow\x1b[0m\x00!",
+                    )
+                ),
+            )
+        assert any(
+            "MCP server 'srv' (db [31m-pool) [user=u1] [warning]: query slow [0m !" in rec.message
+            and "\x1b" not in rec.message
+            and "\x00" not in rec.message
+            for rec in caplog.records
+        )
+
+    def test_negotiate_session_falls_back_on_legacy_http_400_and_null_id_jsonrpc_error(
+        self, running_loop_mgr
+    ) -> None:
+        """A legacy 2025-11-25 HTTP server that rejects server/discover with HTTP 400 or a
+        JSON-RPC error with id=null does not poison _AuthCapture or raise _ErrorAnswerError
+        before falling back to initialize()."""
+        import httpx
+        from mcp import ClientSession
+        from mcp.shared.exceptions import MCPError
+        from mcp.types import INTERNAL_ERROR
+
+        from turnstone.core.mcp_client import (
+            _AuthCapture,
+            _ErrorAnswerError,
+            _make_capturing_http_factory,
+            _negotiate_session,
+        )
+
+        _, loop, _ = running_loop_mgr
+        capture = _AuthCapture()
+        fired = asyncio.Event()
+        factory = _make_capturing_http_factory(capture, fired)
+
+        async def _exercise() -> None:
+            async with factory() as client:
+                load_body = client.event_hooks["request"][1]
+                hook = client.event_hooks["response"][0]
+                reject_non_mcp = client.event_hooks["response"][1]
+                discover_req = httpx.Request(
+                    "POST",
+                    "https://mcp.example.com/mcp",
+                    content=b'{"jsonrpc":"2.0","id":7,"method":"server/discover","params":{}}',
+                )
+                await load_body(discover_req)
+                # Pre-negotiation HTTP 400 on server/discover must NOT latch first_error or status
+                resp_400 = httpx.Response(400, text="Bad Request", request=discover_req)
+                await hook(resp_400)
+                assert capture.first_error is None
+                assert capture.status is None
+                assert not fired.is_set()
+
+                # Pre-negotiation JSON-RPC error with id=null on server/discover is rewritten with request id
+                null_id_resp = httpx.Response(
+                    200,
+                    headers={"content-type": "application/json"},
+                    content=b'{"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"Not initialized"}}',
+                    request=discover_req,
+                )
+                await reject_non_mcp(null_id_resp)
+                rewritten = json.loads(null_id_resp.content)
+                assert rewritten["id"] == 7
+                assert rewritten["error"]["code"] == -32600
+
+                # Negotiate falls back cleanly and marks capture.negotiated = True
+                session = MagicMock(spec=ClientSession)
+                session.send_discover = AsyncMock(
+                    side_effect=MCPError(
+                        code=INTERNAL_ERROR, message="Failed to send request: HTTP 400"
+                    )
+                )
+                session.initialize = AsyncMock()
+                await _negotiate_session(session, capture=capture)
+                session.initialize.assert_awaited_once()
+                assert capture.negotiated is True
+
+                # On initialize (not server/discover), id=null JSON-RPC error DOES raise _ErrorAnswerError
+                capture.negotiated = False
+                init_req = httpx.Request(
+                    "POST",
+                    "https://mcp.example.com/mcp",
+                    content=b'{"jsonrpc":"2.0","id":8,"method":"initialize","params":{}}',
+                )
+                await load_body(init_req)
+                init_null_id = httpx.Response(
+                    200,
+                    headers={"content-type": "application/json"},
+                    content=b'{"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"Bad init"}}',
+                    request=init_req,
+                )
+                with pytest.raises(_ErrorAnswerError):
+                    await reject_non_mcp(init_null_id)
+
+        _run_on_loop(loop, _exercise())
+
+    def test_stateless_modern_404_method_not_found_does_not_latch_capture_status(
+        self, running_loop_mgr
+    ) -> None:
+        """On a stateless 2026-07-28 HTTP connection (no Mcp-Session-Id header), an HTTP 404
+        carrying JSON-RPC METHOD_NOT_FOUND (-32601) does not latch capture.status or fired_event,
+        whereas a bare HTTP 404 does."""
+        import httpx
+
+        from turnstone.core.mcp_client import _AuthCapture, _make_capturing_http_factory
+
+        _, loop, _ = running_loop_mgr
+        capture = _AuthCapture(negotiated=True)
+        fired = asyncio.Event()
+        factory = _make_capturing_http_factory(capture, fired)
+
+        async def _exercise() -> None:
+            async with factory() as client:
+                hook = client.event_hooks["response"][0]
+                req = httpx.Request("POST", "https://mcp.example.com/mcp")
+                # 2026-07-28 HTTP 404 with JSON-RPC METHOD_NOT_FOUND (-32601)
+                rpc_404 = httpx.Response(
+                    404,
+                    headers={"content-type": "application/json"},
+                    content=(
+                        b'{"jsonrpc":"2.0","id":2,'
+                        b'"error":{"code":-32601,"message":"Method not found"}}'
+                    ),
+                    request=req,
+                )
+                await hook(rpc_404)
+                assert capture.status is None
+                assert not fired.is_set()
+
+                # Bare HTTP 404 (broken route / proxy) DOES latch capture.status = 404
+                bare_404 = httpx.Response(
+                    404,
+                    headers={"content-type": "text/plain"},
+                    content=b"404 Not Found",
+                    request=req,
+                )
+                await hook(bare_404)
+                assert capture.status == 404
+                assert fired.is_set()
+
+                # _AuthCapture.reset() clears all fields including first_error and negotiated
+                capture.first_error = (500, False)
+                capture.www_authenticate = 'Bearer error="invalid_token"'
+                capture.reset()
+                assert capture.status is None
+                assert capture.www_authenticate is None
+                assert capture.first_error is None
+                assert capture.negotiated is False
+
+        _run_on_loop(loop, _exercise())
+
+    def test_cross_user_private_cache_isolation_and_store_purge(self, running_loop_mgr) -> None:
+        """ResourceUpdatedNotification and ResourceListChangedNotification on u1's pool session
+        evict u1's private cache and public cache entries, but never evict u2's private cache.
+        Session drop and remove_server_sync purge underlying _response_cache_store entries."""
+        from mcp.types import (
+            ReadResourceResult,
+            ResourceListChangedNotification,
+            ResourceUpdatedNotification,
+            ResourceUpdatedNotificationParams,
+            TextResourceContents,
+        )
+
+        from turnstone.core.mcp_client import PoolEntryState
+
+        mgr, loop, _ = running_loop_mgr
+        session = MagicMock()
+        session.protocol_version = "2026-07-28"
+        session.read_resource = AsyncMock(
+            side_effect=lambda uri: ReadResourceResult(
+                contents=[TextResourceContents(uri=uri, text=f"priv:{uri}")],
+                ttl_ms=60_000,
+                cache_scope="private",
+            )
+        )
+
+        # Populate private cache for both u1 and u2 on pool-srv
+        _run_on_loop(
+            loop,
+            mgr._read_resource_with_cache(session, "pool-srv", "file:///me.json", user_id="u1"),
+        )
+        _run_on_loop(
+            loop,
+            mgr._read_resource_with_cache(session, "pool-srv", "file:///me.json", user_id="u2"),
+        )
+        assert session.read_resource.await_count == 2
+
+        # u1 receives ResourceUpdatedNotification -> u1's private entry is evicted, u2's is untouched
+        upd = ResourceUpdatedNotification(
+            params=ResourceUpdatedNotificationParams(uri="file:///me.json")
+        )
+        _run_on_loop(loop, mgr._evict_cache_for_notification("pool-srv", upd, user_id="u1"))
+
+        # u2 still hits private cache!
+        _run_on_loop(
+            loop,
+            mgr._read_resource_with_cache(session, "pool-srv", "file:///me.json", user_id="u2"),
+        )
+        assert session.read_resource.await_count == 2
+        # u1 re-fetches
+        _run_on_loop(
+            loop,
+            mgr._read_resource_with_cache(session, "pool-srv", "file:///me.json", user_id="u1"),
+        )
+        assert session.read_resource.await_count == 3
+
+        # u1 receives ResourceListChangedNotification -> u2's private entry is STILL untouched
+        _run_on_loop(
+            loop,
+            mgr._evict_cache_for_notification(
+                "pool-srv", ResourceListChangedNotification(), user_id="u1"
+            ),
+        )
+        _run_on_loop(
+            loop,
+            mgr._read_resource_with_cache(session, "pool-srv", "file:///me.json", user_id="u2"),
+        )
+        assert session.read_resource.await_count == 3
+
+        # Dropping u2's pool session purges u2's cache store entries so a new session re-fetches
+        entry_u2 = PoolEntryState(key=("u2", "pool-srv"), open_lock=asyncio.Lock(), session=session)
+        mgr._drop_session_and_stamp(("u2", "pool-srv"), entry_u2)
+        _run_on_loop(
+            loop,
+            mgr._read_resource_with_cache(session, "pool-srv", "file:///me.json", user_id="u2"),
+        )
+        assert session.read_resource.await_count == 4
+
+        # remove_server_sync purges _response_cache_store entries, _resource_subscriptions, and _server_log_levels
+        mgr.set_resource_subscriptions("pool-srv", ["file:///me.json"])
+        mgr.set_log_level("warning", server_name="pool-srv")
+        mgr.remove_server_sync("pool-srv")
+        assert "pool-srv" not in mgr._resource_subscriptions
+        assert "pool-srv" not in mgr._server_log_levels
+        _run_on_loop(
+            loop,
+            mgr._read_resource_with_cache(session, "pool-srv", "file:///me.json", user_id="u2"),
+        )
+        assert session.read_resource.await_count == 5
+
+    def test_static_health_one_clears_expired_ttl_when_refresh_retry_armed(
+        self, running_loop_mgr
+    ) -> None:
+        """When _static_refresh_retry is armed and catalog ttlMs is also expired, _static_health_one
+        clears the expired TTL so remaining_expires is None and the health loop does not spin."""
+        from mcp.types import ListToolsResult
+
+        from turnstone.core.mcp_client import (
+            _MIN_CATALOG_TTL_MS,
+            _catalog_expires_at,
+            _list_all_tools,
+        )
+
+        mgr, loop, _ = running_loop_mgr
+
+        class _Session:
+            protocol_version = "2026-07-28"
+            ttl_val: int | None = 10  # clamped to _MIN_CATALOG_TTL_MS (5000ms)
+
+            async def list_tools(self, params=None):
+                if self.ttl_val is None:
+                    return ListToolsResult(tools=[])
+                return ListToolsResult(tools=[], ttl_ms=self.ttl_val)
+
+            async def send_discover(self, version):
+                return None
+
+        session = _Session()
+        before = time.monotonic()
+        _run_on_loop(loop, _list_all_tools(session, "srv"))
+        expires = _catalog_expires_at(session)
+        assert expires is not None
+        assert expires >= before + (_MIN_CATALOG_TTL_MS / 1000.0) - 0.1
+
+        # Arm _static_refresh_retry AND advance past expires
+        _seed_static_state(mgr, "srv", session=session)
+        mgr._static_refresh_retry.add("srv")
+        next_ping = expires + 60.0
+        mgr._static_next_ping["srv"] = next_ping
+        with patch.object(mgr, "_spawn_full_refresh") as mock_refresh:
+            due = _run_on_loop(loop, mgr._static_health_one("srv", expires + 1.0))
+            mock_refresh.assert_called_once_with("srv", "catalog refresh retry for 'srv'")
+            assert _catalog_expires_at(session) is None
+            assert due >= next_ping
+
+        # Re-listing with ttl_ms omitted clears the kind's TTL entry
+        session.ttl_val = 6_000
+        _run_on_loop(loop, _list_all_tools(session, "srv"))
+        assert _catalog_expires_at(session) is not None
+        session.ttl_val = None
+        _run_on_loop(loop, _list_all_tools(session, "srv"))
+        assert _catalog_expires_at(session) is None
+
+    def test_call_tool_with_header_retry_updates_catalog_and_prunes_multipage_header_maps(
+        self, running_loop_mgr
+    ) -> None:
+        """_call_tool_with_header_retry updates state.tools / mgr._tool_map on HEADER_MISMATCH,
+        and _list_all_tools prunes removed tools from session._x_mcp_header_maps across multi-page
+        tools/list responses."""
+        from mcp.client.session import ClientSession
+        from mcp.shared.exceptions import MCPError
+        from mcp.types import (
+            HEADER_MISMATCH,
+            CallToolResult,
+            DiscoverResult,
+            Implementation,
+            ListToolsResult,
+            ServerCapabilities,
+            TextContent,
+            Tool,
+        )
+
+        from turnstone.core.mcp_client import _list_all_tools
+
+        mgr, loop, _ = running_loop_mgr
+        r_stream, w_stream = MagicMock(), MagicMock()
+        session = ClientSession(r_stream, w_stream)
+        session.adopt(
+            DiscoverResult(
+                protocol_version="2026-07-28",
+                supported_versions=["2026-07-28"],
+                capabilities=ServerCapabilities(),
+                server_info=Implementation(name="srv", version="1.0"),
+            )
+        )
+        # Seed a stale header map entry for 'removed_tool' alongside 'page1_tool'
+        session._x_mcp_header_maps["removed_tool"] = {"old": "Mcp-Param-Old"}
+
+        pages = [
+            ListToolsResult(
+                tools=[
+                    Tool(
+                        name="page1_tool",
+                        description="p1",
+                        input_schema={
+                            "type": "object",
+                            "properties": {"tenant": {"type": "string", "x-mcp-header": "Tenant"}},
+                        },
+                    )
+                ],
+                next_cursor="c2",
+            ),
+            ListToolsResult(
+                tools=[
+                    Tool(
+                        name="page2_tool",
+                        description="p2",
+                        input_schema={"type": "object", "properties": {}},
+                    )
+                ],
+                next_cursor=None,
+            ),
+        ]
+        page_idx = 0
+
+        async def _fake_list_tools(params=None):
+            nonlocal page_idx
+            res = pages[page_idx]
+            page_idx += 1
+            session._absorb_tool_listing(res, complete=False)
+            return res
+
+        session.list_tools = _fake_list_tools  # type: ignore[method-assign]
+        tools = _run_on_loop(loop, _list_all_tools(session, "srv"))
+        assert [t.name for t in tools] == ["page1_tool", "page2_tool"]
+        assert "removed_tool" not in session._x_mcp_header_maps
+        assert "page1_tool" in session._x_mcp_header_maps
+
+        # Verify _call_tool_with_header_retry publishes refreshed tools to state.tools & _tool_map
+        _seed_static_state(mgr, "srv", session=session, tools=[])
+        page_idx = 0
+        ok_result = CallToolResult(content=[TextContent(type="text", text="done")])
+        session.call_tool = AsyncMock(  # type: ignore[method-assign]
+            side_effect=[
+                MCPError(code=HEADER_MISMATCH, message="Stale headers"),
+                ok_result,
+            ]
+        )
+        res = _run_on_loop(
+            loop,
+            mgr._call_tool_with_header_retry(session, "srv", "page1_tool", {"tenant": "acme"}),
+        )
+        assert res is ok_result
+        assert [t["function"]["name"] for t in mgr._static_servers["srv"].tools] == [
+            "mcp__srv__page1_tool",
+            "mcp__srv__page2_tool",
+        ]
+        assert "mcp__srv__page1_tool" in mgr._tool_map
+        assert "mcp__srv__page2_tool" in mgr._tool_map
+
+    def test_logging_callback_filters_by_configured_level_and_caps_python_severity(
+        self, running_loop_mgr, caplog
+    ) -> None:
+        """_make_logging_callback drops notifications when effective_log_level is None or when
+        message severity is below threshold, caps Python logging at WARNING, and set_log_level(None)
+        clears the 2026-07-28 logLevel stamp."""
+        import logging as py_logging
+
+        from mcp.client.session import ClientSession
+        from mcp.types import (
+            DiscoverResult,
+            Implementation,
+            LoggingMessageNotificationParams,
+            ServerCapabilities,
+        )
+
+        mgr, loop, _ = running_loop_mgr
+        r_stream, w_stream = MagicMock(), MagicMock()
+        session = ClientSession(r_stream, w_stream)
+        session.adopt(
+            DiscoverResult(
+                protocol_version="2026-07-28",
+                supported_versions=["2026-07-28"],
+                capabilities=ServerCapabilities(),
+                server_info=Implementation(name="srv", version="1.0"),
+            )
+        )
+        _seed_static_state(mgr, "srv", session=session)
+        cb = mgr._make_logging_callback("srv")
+
+        # 1. With no log level configured (None), even 'emergency' is ignored
+        with caplog.at_level(py_logging.DEBUG):
+            caplog.clear()
+            _run_on_loop(loop, cb(LoggingMessageNotificationParams(level="emergency", data="boom")))
+            assert not any("MCP server 'srv'" in r.message for r in caplog.records)
+
+        # 2. With level='warning', 'info' is filtered out while 'emergency' logs at WARNING (capped)
+        mgr.set_log_level("warning", server_name="srv")
+        with caplog.at_level(py_logging.DEBUG):
+            caplog.clear()
+            _run_on_loop(loop, cb(LoggingMessageNotificationParams(level="info", data="chatty")))
+            _run_on_loop(
+                loop, cb(LoggingMessageNotificationParams(level="emergency", data="urgent"))
+            )
+            srv_records = [r for r in caplog.records if "MCP server 'srv'" in r.message]
+            assert len(srv_records) == 1
+            assert srv_records[0].levelno == py_logging.WARNING
+            assert "[emergency]: urgent" in srv_records[0].message
+
+        # 3. Clearing log level via set_log_level(None, server_name='srv') removes the _meta stamp
+        data: dict[str, Any] = {"method": "tools/call", "params": {"name": "ping"}}
+        session._stamp(data, {})
+        assert data["params"]["_meta"]["io.modelcontextprotocol/logLevel"] == "warning"
+
+        mgr.set_log_level(None, server_name="srv")
+        data2: dict[str, Any] = {"method": "tools/call", "params": {"name": "ping"}}
+        session._stamp(data2, {})
+        assert "io.modelcontextprotocol/logLevel" not in data2["params"]["_meta"]
+
+    def test_enter_modern_subscription_closes_one_shot_and_park_unwinds_initial_stack(self) -> None:
+        """_enter_modern_subscription closes and returns None when subscriptions/listen resolves
+        immediately (sub._route.end is not None), and _park_transport_owner unwinds the initial
+        sub_stack before calling relisten."""
+        from contextlib import AsyncExitStack
+
+        from turnstone.core.mcp_client import _enter_modern_subscription, _park_transport_owner
+
+        class _OneShotRoute:
+            end: str | None = "graceful"
+
+        class _OneShotSub:
+            def __init__(self) -> None:
+                self._route = _OneShotRoute()
+
+        class _OneShotCM:
+            def __init__(self) -> None:
+                self.exited = False
+
+            async def __aenter__(self) -> _OneShotSub:
+                return _OneShotSub()
+
+            async def __aexit__(self, *exc: Any) -> bool:
+                self.exited = True
+                return False
+
+        from mcp.client.session import ClientSession
+        from mcp.types import (
+            DiscoverResult,
+            Implementation,
+            ServerCapabilities,
+            ToolsCapability,
+        )
+
+        one_shot_cm = _OneShotCM()
+        r_stream, w_stream = MagicMock(), MagicMock()
+        session = ClientSession(r_stream, w_stream)
+        session.adopt(
+            DiscoverResult(
+                protocol_version="2026-07-28",
+                supported_versions=["2026-07-28"],
+                capabilities=ServerCapabilities(tools=ToolsCapability(list_changed=True)),
+                server_info=Implementation(name="srv", version="1.0"),
+            )
+        )
+
+        async def _check_one_shot() -> None:
+            with patch("turnstone.core.mcp_client.listen", return_value=one_shot_cm):
+                async with AsyncExitStack() as outer:
+                    sub = await _enter_modern_subscription(outer, session)
+                    assert sub is None
+                    assert one_shot_cm.exited is True
+
+        asyncio.run(_check_one_shot())
+
+        # Verify _park_transport_owner unwinds initial sub_stack on relisten_requested before relisten()
+        events: list[str] = []
+
+        class _InitialRoute:
+            def __init__(self, done: asyncio.Event) -> None:
+                self._done = done
+                self.end: str | None = None
+
+            def settle(self, reason: str) -> None:
+                self.end = reason
+                self._done.set()
+
+        class _InitialSub:
+            def __init__(self) -> None:
+                self._done = asyncio.Event()
+                self._route = _InitialRoute(self._done)
+
+            def __aiter__(self) -> Any:
+                return self
+
+            async def __anext__(self) -> Any:
+                await self._done.wait()
+                raise StopAsyncIteration
+
+        async def _check_park_initial_stack() -> None:
+            close_req = asyncio.Event()
+            relisten_req = asyncio.Event()
+            init_stack = AsyncExitStack()
+            await init_stack.__aenter__()
+
+            async def _on_init_exit() -> None:
+                events.append("init_stack_closed")
+
+            init_stack.push_async_callback(_on_init_exit)
+            init_sub = _InitialSub()
+
+            async def _relisten(_sub_stack: AsyncExitStack) -> Any:
+                events.append("relisten_called")
+                close_req.set()
+                return None
+
+            task = asyncio.create_task(
+                _park_transport_owner(
+                    close_req,
+                    init_sub,
+                    sub_stack=init_stack,
+                    relisten=_relisten,
+                    relisten_requested=relisten_req,
+                )
+            )
+            await asyncio.sleep(0.01)
+            relisten_req.set()
+            await asyncio.wait_for(task, timeout=2.0)
+
+        asyncio.run(_check_park_initial_stack())
+        assert events == ["init_stack_closed", "relisten_called"]
+
+    def test_single_user_session_drop_preserves_shared_public_pool_cache(
+        self, running_loop_mgr
+    ) -> None:
+        """Dropping user u1's pool session evicts u1's private cache entries without evicting the
+        shared 'public' pool cache entry or u2's private cache entries."""
+        from mcp.types import ReadResourceResult, TextResourceContents
+
+        from turnstone.core.mcp_client import PoolEntryState
+
+        mgr, loop, _ = running_loop_mgr
+        pub_calls = 0
+        priv_calls = 0
+
+        async def _read_resource(uri: str) -> ReadResourceResult:
+            nonlocal pub_calls, priv_calls
+            if uri == "file:///public.txt":
+                pub_calls += 1
+                return ReadResourceResult(
+                    contents=[TextResourceContents(uri=uri, text=f"pub-{pub_calls}")],
+                    ttl_ms=60000,
+                    cache_scope="public",
+                )
+            priv_calls += 1
+            return ReadResourceResult(
+                contents=[TextResourceContents(uri=uri, text=f"priv-{priv_calls}")],
+                ttl_ms=60000,
+                cache_scope="private",
+            )
+
+        s_u1 = MagicMock(protocol_version="2026-07-28")
+        s_u1.read_resource = AsyncMock(side_effect=_read_resource)
+        s_u2 = MagicMock(protocol_version="2026-07-28")
+        s_u2.read_resource = AsyncMock(side_effect=_read_resource)
+
+        entry_u1 = PoolEntryState(
+            key=("u1", "srv"),
+            open_lock=asyncio.Lock(),
+            session=s_u1,
+        )
+        mgr._user_pool_entries[("u1", "srv")] = entry_u1
+
+        # u1 populates both public and u1-private cache entries; u2 populates u2-private
+        _run_on_loop(
+            loop, mgr._read_resource_with_cache(s_u1, "srv", "file:///public.txt", user_id="u1")
+        )
+        _run_on_loop(
+            loop, mgr._read_resource_with_cache(s_u1, "srv", "file:///private.txt", user_id="u1")
+        )
+        _run_on_loop(
+            loop, mgr._read_resource_with_cache(s_u2, "srv", "file:///private.txt", user_id="u2")
+        )
+        assert pub_calls == 1
+        assert priv_calls == 2
+
+        # Drop u1's session: u1's private entry is purged, but public and u2's private remain cached
+        mgr._drop_session_and_stamp(("u1", "srv"), entry_u1)
+
+        res_pub_u2 = _run_on_loop(
+            loop, mgr._read_resource_with_cache(s_u2, "srv", "file:///public.txt", user_id="u2")
+        )
+        res_priv_u2 = _run_on_loop(
+            loop, mgr._read_resource_with_cache(s_u2, "srv", "file:///private.txt", user_id="u2")
+        )
+        assert pub_calls == 1
+        assert res_pub_u2.contents[0].text == "pub-1"
+        assert priv_calls == 2
+        assert res_priv_u2.contents[0].text == "priv-2"
+
+        # When u1 reads private again after reconnect, it fetches fresh from upstream
+        _run_on_loop(
+            loop, mgr._read_resource_with_cache(s_u1, "srv", "file:///private.txt", user_id="u1")
+        )
+        assert priv_calls == 3
+
+    def test_accept_modern_listen_notification_validates_active_route(self) -> None:
+        """On 2026-07-28 sessions with an active _listen_routes entry, notifications must carry a
+        matching subscriptionId and satisfy the route's honored filter."""
+        from types import SimpleNamespace
+
+        from mcp.shared.subscriptions import SUBSCRIPTION_ID_META_KEY
+        from mcp.types import (
+            NotificationParams,
+            ResourceUpdatedNotification,
+            ResourceUpdatedNotificationParams,
+            SubscriptionFilter,
+            ToolListChangedNotification,
+        )
+
+        from turnstone.core.mcp_client import _accept_modern_listen_notification
+
+        route = SimpleNamespace(
+            end=None,
+            honored=SubscriptionFilter(
+                tools_list_changed=True,
+                resources_list_changed=False,
+                prompts_list_changed=False,
+            ),
+            _honored_uris={"file:///allowed.txt"},
+        )
+        session = SimpleNamespace(
+            protocol_version="2026-07-28",
+            _listen_routes={7: route},
+        )
+
+        # Missing subscriptionId or wrong subscriptionId -> rejected
+        assert not _accept_modern_listen_notification(session, ToolListChangedNotification())
+        assert not _accept_modern_listen_notification(
+            session,
+            ToolListChangedNotification(
+                params=NotificationParams(_meta={SUBSCRIPTION_ID_META_KEY: 99})
+            ),
+        )
+        # Valid subscriptionId and honored tools_list_changed=True -> accepted
+        assert _accept_modern_listen_notification(
+            session,
+            ToolListChangedNotification(
+                params=NotificationParams(_meta={SUBSCRIPTION_ID_META_KEY: 7})
+            ),
+        )
+        # Disallowed URI vs allowed URI
+        assert not _accept_modern_listen_notification(
+            session,
+            ResourceUpdatedNotification(
+                params=ResourceUpdatedNotificationParams(
+                    uri="file:///other.txt",
+                    _meta={SUBSCRIPTION_ID_META_KEY: 7},
+                )
+            ),
+        )
+        assert _accept_modern_listen_notification(
+            session,
+            ResourceUpdatedNotification(
+                params=ResourceUpdatedNotificationParams(
+                    uri="file:///allowed.txt",
+                    _meta={SUBSCRIPTION_ID_META_KEY: 7},
+                )
+            ),
+        )
+
+    def test_park_transport_owner_fires_on_relisten_only_on_server_stream_close(self) -> None:
+        """on_relisten fires when a server-closed subscription stream is re-opened, not when
+        relisten_requested triggers a local filter update."""
+        from contextlib import AsyncExitStack
+        from types import SimpleNamespace
+
+        from turnstone.core.mcp_client import _park_transport_owner
+
+        on_relisten_calls: list[str] = []
+
+        class _Sub:
+            def __init__(self, *, server_close_immediately: bool = False) -> None:
+                self._done = asyncio.Event()
+                if server_close_immediately:
+                    self._done.set()
+                self._route = SimpleNamespace(end=None, settle=lambda _r: self._done.set())
+
+            def __aiter__(self) -> Any:
+                return self
+
+            async def __anext__(self) -> Any:
+                await self._done.wait()
+                raise StopAsyncIteration
+
+        async def _run() -> None:
+            close_req = asyncio.Event()
+            relisten_req = asyncio.Event()
+            step = 0
+
+            async def _relisten(_stack: AsyncExitStack) -> Any:
+                nonlocal step
+                step += 1
+                if step == 1:
+                    # Opened after local relisten_requested; next it will close from server side.
+                    return _Sub(server_close_immediately=True)
+                return _Sub(server_close_immediately=False)
+
+            def _on_relisten() -> None:
+                on_relisten_calls.append(f"step-{step}")
+                close_req.set()
+
+            task = asyncio.create_task(
+                _park_transport_owner(
+                    close_req,
+                    _Sub(server_close_immediately=False),
+                    relisten=_relisten,
+                    relisten_requested=relisten_req,
+                    on_relisten=_on_relisten,
+                )
+            )
+            await asyncio.sleep(0.01)
+            # Trigger local relisten (step 1): must NOT call on_relisten.
+            relisten_req.set()
+            await asyncio.wait_for(task, timeout=3.0)
+
+        asyncio.run(_run())
+        assert on_relisten_calls == ["step-2"]
+
+    def test_oversized_private_resource_preserves_public_cache_and_unregistered_uri_skips_gen(
+        self, running_loop_mgr
+    ) -> None:
+        """An oversized private resource read evicts only the user's private cache entry, and
+        purging an unregistered URI does not grow ClientResponseCache._generations."""
+        from mcp.types import ReadResourceResult, TextResourceContents
+
+        mgr, loop, _ = running_loop_mgr
+        big_text = "x" * (mgr._MAX_CACHED_RESOURCE_BYTES + 10)
+        calls = 0
+
+        async def _read_resource(uri: str) -> ReadResourceResult:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return ReadResourceResult(
+                    contents=[TextResourceContents(uri=uri, text="shared-public")],
+                    ttl_ms=60000,
+                    cache_scope="public",
+                )
+            return ReadResourceResult(
+                contents=[TextResourceContents(uri=uri, text=big_text)],
+                ttl_ms=60000,
+                cache_scope="private",
+            )
+
+        s_u1 = MagicMock(protocol_version="2026-07-28")
+        s_u1.read_resource = AsyncMock(side_effect=_read_resource)
+        s_u2 = MagicMock(protocol_version="2026-07-28")
+        s_u2.read_resource = AsyncMock(side_effect=_read_resource)
+
+        # u1 populates public cache for file:///doc.txt
+        _run_on_loop(
+            loop, mgr._read_resource_with_cache(s_u1, "srv", "file:///doc.txt", user_id="u1")
+        )
+        assert calls == 1
+
+        # Purging an arbitrary unregistered URI must not add keys to _generations
+        cache_u1 = mgr._response_caches[("srv", "u1")]
+        mgr._purge_response_cache(
+            "srv", user_id="u1", include_public=True, read_only=True, uri="file:///never-read.txt"
+        )
+        assert ("resources/read", "file:///never-read.txt") not in cache_u1._generations
+
+        # Evict only u1's private entry and make u1's next read return an oversized private result
+        entries = mgr._response_cache_store._entries
+        for k in list(entries):
+            if "user:u1" in k.partition:
+                entries.pop(k, None)
+        # Clear public entry temporarily to let u1 receive oversized private response, then re-seed
+        saved_entries = dict(entries)
+        entries.clear()
+        _run_on_loop(
+            loop, mgr._read_resource_with_cache(s_u1, "srv", "file:///doc.txt", user_id="u1")
+        )
+        assert calls == 2
+        entries.update(saved_entries)
+        # Trigger oversized private purge via _read_resource_with_cache when public is present for another URI
+        _run_on_loop(
+            loop,
+            mgr._read_resource_with_cache(s_u1, "srv", "file:///private-big.txt", user_id="u1"),
+        )
+        # u2 still hits the shared public cache for file:///doc.txt
+        res_u2 = _run_on_loop(
+            loop, mgr._read_resource_with_cache(s_u2, "srv", "file:///doc.txt", user_id="u2")
+        )
+        assert res_u2.contents[0].text == "shared-public"
+
+    def test_record_and_evict_ignores_sdk_result_validation_errors(self) -> None:
+        """UnexpectedClaimedResult and output-schema RuntimeError do not trip the circuit breaker."""
+        from mcp.client.extension import UnexpectedClaimedResult
+
+        mgr = MCPClientManager({})
+        mgr._cb_record_failure = MagicMock()  # type: ignore[method-assign]
+        mgr._record_and_evict_on_dead_transport("srv", UnexpectedClaimedResult("extension"))
+        mgr._record_and_evict_on_dead_transport(
+            "srv", RuntimeError("Invalid structured content returned by tool calc: bad")
+        )
+        mgr._record_and_evict_on_dead_transport(
+            "srv",
+            RuntimeError("Tool calc has an output schema but did not return structured content"),
+        )
+        mgr._cb_record_failure.assert_not_called()

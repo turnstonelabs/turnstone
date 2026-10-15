@@ -23,10 +23,9 @@ from unittest.mock import patch
 import mcp.types as mcp_types
 import pytest
 import uvicorn
-from mcp import McpError
+from mcp import MCPError
 from mcp.server.lowlevel import Server
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
-from pydantic import AnyUrl
 from starlette.applications import Starlette
 from starlette.routing import Mount
 
@@ -78,7 +77,7 @@ class PagedCatalog:
         names = self.items[kind]
         fresh = f"fresh-{self.requests[kind]}"
         if self.mode == "rejects-cursor" and cursor is not None:
-            raise McpError(mcp_types.ErrorData(code=mcp_types.INVALID_PARAMS, message="bad cursor"))
+            raise MCPError(code=mcp_types.INVALID_PARAMS, message="bad cursor")
         if self.mode == "empty-pages":
             return (names[:PAGE_SIZE] if cursor is None else []), fresh
         if self.mode in ("ignores-cursor", "rejects-cursor"):
@@ -95,60 +94,57 @@ class PagedCatalog:
         return names[start:end], (str(end) if end < len(names) else None)
 
 
-def _build_server(catalog: PagedCatalog) -> Server[Any, Any]:
-    server: Server[Any, Any] = Server("paged")
-
-    def _serve(kind: str, request_type: type, build: Any) -> None:
-        async def _handle(request: Any) -> mcp_types.ServerResult:
-            cursor = request.params.cursor if request.params is not None else None
+def _build_server(catalog: PagedCatalog) -> Server[Any]:
+    def _make_handler(kind: str, build: Any) -> Any:
+        async def _handle(_ctx: Any, params: mcp_types.PaginatedRequestParams | None) -> Any:
+            cursor = params.cursor if params is not None else None
             if catalog.before_page is not None:
                 await catalog.before_page(kind, cursor)
             names, next_cursor = catalog.page(kind, cursor)
-            return mcp_types.ServerResult(build(names, next_cursor))
+            return build(names, next_cursor)
 
-        server.request_handlers[request_type] = _handle
+        return _handle
 
-    _serve(
-        "tools",
-        mcp_types.ListToolsRequest,
-        lambda names, cursor: mcp_types.ListToolsResult(
-            tools=[
-                mcp_types.Tool(
-                    name=n,
-                    description=f"request {catalog.requests['tools']}",
-                    inputSchema={"type": "object", "properties": {}},
-                )
-                for n in names
-            ],
-            nextCursor=cursor,
+    return Server(
+        "paged",
+        on_list_tools=_make_handler(
+            "tools",
+            lambda names, cursor: mcp_types.ListToolsResult(
+                tools=[
+                    mcp_types.Tool(
+                        name=n,
+                        description=f"request {catalog.requests['tools']}",
+                        input_schema={"type": "object", "properties": {}},
+                    )
+                    for n in names
+                ],
+                next_cursor=cursor,
+            ),
+        ),
+        on_list_prompts=_make_handler(
+            "prompts",
+            lambda names, cursor: mcp_types.ListPromptsResult(
+                prompts=[mcp_types.Prompt(name=n) for n in names], next_cursor=cursor
+            ),
+        ),
+        on_list_resources=_make_handler(
+            "resources",
+            lambda names, cursor: mcp_types.ListResourcesResult(
+                resources=[mcp_types.Resource(uri=f"res://{n}", name=n) for n in names],
+                next_cursor=cursor,
+            ),
+        ),
+        on_list_resource_templates=_make_handler(
+            "templates",
+            lambda names, cursor: mcp_types.ListResourceTemplatesResult(
+                resource_templates=[
+                    mcp_types.ResourceTemplate(uri_template=f"res://{n}/{{id}}", name=n)
+                    for n in names
+                ],
+                next_cursor=cursor,
+            ),
         ),
     )
-    _serve(
-        "prompts",
-        mcp_types.ListPromptsRequest,
-        lambda names, cursor: mcp_types.ListPromptsResult(
-            prompts=[mcp_types.Prompt(name=n) for n in names], nextCursor=cursor
-        ),
-    )
-    _serve(
-        "resources",
-        mcp_types.ListResourcesRequest,
-        lambda names, cursor: mcp_types.ListResourcesResult(
-            resources=[mcp_types.Resource(uri=AnyUrl(f"res://{n}"), name=n) for n in names],
-            nextCursor=cursor,
-        ),
-    )
-    _serve(
-        "templates",
-        mcp_types.ListResourceTemplatesRequest,
-        lambda names, cursor: mcp_types.ListResourceTemplatesResult(
-            resourceTemplates=[
-                mcp_types.ResourceTemplate(uriTemplate=f"res://{n}/{{id}}", name=n) for n in names
-            ],
-            nextCursor=cursor,
-        ),
-    )
-    return server
 
 
 @pytest.fixture
@@ -466,8 +462,8 @@ def test_unparseable_later_page_fails_the_walk() -> None:
     ) -> mcp_types.ListToolsResult:
         if params is None:
             return mcp_types.ListToolsResult(
-                tools=[mcp_types.Tool(name="first", inputSchema={"type": "object"})],
-                nextCursor="next",
+                tools=[mcp_types.Tool(name="first", input_schema={"type": "object"})],
+                next_cursor="next",
             )
         return mcp_types.ListToolsResult.model_validate({"tools": "not a list"})
 
@@ -494,24 +490,21 @@ DYING_SERVER_SRC = textwrap.dedent(
 
     flag = sys.argv[1]
     names = [f"tools_{i}" for i in range(5)]
-    server = Server("dying")
 
 
-    async def list_tools(request):
-        cursor = request.params.cursor if request.params is not None else None
+    async def list_tools(_ctx, params):
+        cursor = params.cursor if params is not None else None
         if cursor is not None and os.path.exists(flag):
             os._exit(0)
         start = int(cursor or 0)
         end = start + 2
-        return types.ServerResult(
-            types.ListToolsResult(
-                tools=[types.Tool(name=n, inputSchema={"type": "object"}) for n in names[start:end]],
-                nextCursor=str(end) if end < len(names) else None,
-            )
+        return types.ListToolsResult(
+            tools=[types.Tool(name=n, input_schema={"type": "object"}) for n in names[start:end]],
+            next_cursor=str(end) if end < len(names) else None,
         )
 
 
-    server.request_handlers[types.ListToolsRequest] = list_tools
+    server = Server("dying", on_list_tools=list_tools)
 
 
     async def main():

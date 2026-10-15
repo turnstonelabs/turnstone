@@ -16,13 +16,14 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import anyio
 import httpx
+import httpx2
 import mcp.types as mcp_types
 import pytest
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import NameOID
-from mcp import McpError
+from mcp import MCPError
 from mcp.server.lowlevel import Server
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from starlette.applications import Starlette
@@ -115,6 +116,11 @@ class _Gate(BaseHTTPMiddleware):
                 return JSONResponse({"error": "unauthorized"}, status_code=401)
             body = await request.json()
             method = body.get("method")
+            if method == "server/discover" and (
+                self.upstream.drop_sessions or self.upstream.trickle_end
+            ):
+                error = {"code": -32601, "message": "Method not found"}
+                return JSONResponse({"jsonrpc": "2.0", "id": body["id"], "error": error})
             held = request.headers.get("mcp-session-id")
             if self.upstream.drop_sessions and held and method == "tools/list":
                 error = {"code": -32600, "message": "Session not found"}
@@ -128,7 +134,12 @@ class _Gate(BaseHTTPMiddleware):
                         break
                     await asyncio.sleep(0.05)
             if path == "/badtool" and method == "tools/list":
-                result = {"tools": [GOOD, NO_SCHEMA]}
+                result = {
+                    "resultType": "tools/list",
+                    "cacheScope": "public",
+                    "ttlMs": 0,
+                    "tools": [GOOD, NO_SCHEMA],
+                }
                 return JSONResponse({"jsonrpc": "2.0", "id": body["id"], "result": result})
         return await call_next(request)
 
@@ -141,29 +152,37 @@ class _McpApp:
         await self.sessions.handle_request(scope, receive, send)
 
 
-def _build_server() -> Server[Any, Any]:
-    server: Server[Any, Any] = Server("upstream")
+def _build_server() -> Server[Any]:
+    async def tools(_ctx: Any, _params: Any) -> mcp_types.ListToolsResult:
+        return mcp_types.ListToolsResult(
+            tools=[
+                mcp_types.Tool(name="alpha", input_schema={"type": "object"}),
+                mcp_types.Tool(name="beta", input_schema={"type": "object"}),
+            ]
+        )
 
-    @server.list_tools()
-    async def tools() -> list[mcp_types.Tool]:
-        return [
-            mcp_types.Tool(name="alpha", inputSchema={"type": "object"}),
-            mcp_types.Tool(name="beta", inputSchema={"type": "object"}),
-        ]
+    async def resources(_ctx: Any, _params: Any) -> mcp_types.ListResourcesResult:
+        return mcp_types.ListResourcesResult(
+            resources=[mcp_types.Resource(name="doc", uri="test://doc")]
+        )
 
-    @server.list_resources()
-    async def resources() -> list[mcp_types.Resource]:
-        return [mcp_types.Resource(name="doc", uri="test://doc")]
+    async def templates(_ctx: Any, _params: Any) -> mcp_types.ListResourceTemplatesResult:
+        return mcp_types.ListResourceTemplatesResult(
+            resource_templates=[
+                mcp_types.ResourceTemplate(name="page", uri_template="test://page/{n}")
+            ]
+        )
 
-    @server.list_resource_templates()
-    async def templates() -> list[mcp_types.ResourceTemplate]:
-        return [mcp_types.ResourceTemplate(name="page", uriTemplate="test://page/{n}")]
+    async def prompts(_ctx: Any, _params: Any) -> mcp_types.ListPromptsResult:
+        return mcp_types.ListPromptsResult(prompts=[mcp_types.Prompt(name="greet")])
 
-    @server.list_prompts()
-    async def prompts() -> list[mcp_types.Prompt]:
-        return [mcp_types.Prompt(name="greet")]
-
-    return server
+    return Server(
+        "upstream",
+        on_list_tools=tools,
+        on_list_resources=resources,
+        on_list_resource_templates=templates,
+        on_list_prompts=prompts,
+    )
 
 
 @contextlib.contextmanager
@@ -357,19 +376,49 @@ def test_an_error_the_sdk_cannot_read_is_reported_at_once(upstream: tuple[str, U
 
 
 @pytest.mark.parametrize("status", [401, 503])
-def test_an_error_status_on_a_notification_is_reported(
+def test_an_error_status_after_initialize_is_reported(
     upstream: tuple[str, Upstream], status: int
 ) -> None:
-    """The SDK ignores only a notification's 404; any other status ends the transport, and the
-    status is what the operator sees, not the closed stream it leaves behind."""
+    """The SDK ignores an error status on a notification and turns an error status on a request
+    into a generic -32603; the HTTP status off the wire is what the operator sees."""
     base, state = upstream
-    state.fail_method = ("notifications/initialized", status)
+    state.fail_method = ("tools/list", status)
 
     failure = probe_http_server(f"{base}/mcp", name="srv").failure
 
     assert failure is not None
     assert (failure.kind, failure.status) == ("http", status)
     assert failure.message.startswith(f"HTTP {status} ")
+
+
+@pytest.mark.parametrize("status", [400, 404, 405, 422, 500])
+def test_a_server_refusing_discover_falls_back_to_initialize(
+    upstream: tuple[str, Upstream], status: int
+) -> None:
+    """A 2025-11-25 server answers the server/discover probe with whatever status it gives a
+    method it does not know. As in the SDK's own negotiation, the connect falls back to
+    initialize."""
+    base, state = upstream
+    state.fail_method = ("server/discover", status)
+
+    probe = probe_http_server(f"{base}/mcp", name="srv")
+
+    assert probe.failure is None
+    assert probe.tools == ["alpha", "beta"]
+
+
+@pytest.mark.parametrize("status", [401, 403])
+def test_an_auth_status_on_discover_is_reported_without_a_fallback(
+    upstream: tuple[str, Upstream], status: int
+) -> None:
+    """initialize would meet the same challenge, and the auth flow needs this one."""
+    base, state = upstream
+    state.fail_method = ("server/discover", status)
+
+    failure = probe_http_server(f"{base}/mcp", name="srv").failure
+
+    assert failure is not None
+    assert (failure.kind, failure.status) == ("http", status)
 
 
 DROPPED = ConnectFailure(
@@ -418,9 +467,9 @@ def test_an_untrusted_certificate_reports_tls(tmp_path: Path) -> None:
     with _serve(Upstream(), **_self_signed(tmp_path)) as port:
         probe = probe_http_server(f"https://127.0.0.1:{port}/mcp", name="srv")
 
-    assert probe.failure == ConnectFailure(
-        "tls", "TLS handshake failed: certificate verify failed: self-signed certificate"
-    )
+    assert probe.failure is not None
+    assert probe.failure.kind == "tls"
+    assert probe.failure.message.startswith("TLS handshake failed: certificate verify failed: ")
 
 
 def test_a_closed_port_is_unreachable() -> None:
@@ -487,8 +536,8 @@ def test_a_host_that_cannot_be_looked_up_is_named() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _mcp_error(code: int, message: str) -> McpError:
-    return McpError(mcp_types.ErrorData(code=code, message=message))
+def _mcp_error(code: int, message: str) -> MCPError:
+    return MCPError(code=code, message=message)
 
 
 def _status_error(status: int, reason: str, text: str = "") -> httpx.HTTPStatusError:
@@ -739,27 +788,27 @@ REQUEST = {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}
     ("answered", "first_error"),
     [
         ([(404, NOTIFICATION), (404, ANSWER)], None),
-        ([(404, NOTIFICATION), (500, REQUEST)], (500, True)),
-        ([(503, NOTIFICATION)], (503, True)),
-        ([(401, ANSWER)], (401, True)),
+        ([(503, NOTIFICATION), (401, ANSWER)], None),
+        ([(503, NOTIFICATION), (500, REQUEST)], (500, True)),
+        ([(401, REQUEST)], (401, True)),
         ([(404, REQUEST)], (404, True)),
     ],
-    ids=["ignored-404s", "first-failure", "notification", "answer", "request-404"],
+    ids=["ignored-404s", "ignored-non-requests", "first-failure", "request-401", "request-404"],
 )
 @pytest.mark.anyio
 async def test_the_carrier_records_what_ends_the_transport(
     answered: list[tuple[int, dict[str, Any]]], first_error: tuple[int, bool] | None
 ) -> None:
-    """As the SDK does: a 404 on a notification or on the client's own answer is ignored, and
-    any other error status ends the transport, whatever the message."""
+    """As the SDK does: an error status on a notification or on the client's own answer is
+    ignored, and an error status on a request fails it."""
     capture = _AuthCapture()
     client = _make_capturing_http_factory(capture)()
     try:
         record = client.event_hooks["response"][0]
         held = {"mcp-session-id": "s1"}
         for status, body in answered:
-            request = httpx.Request("POST", "http://mcp.example/mcp", json=body, headers=held)
-            await record(httpx.Response(status, request=request))
+            request = httpx2.Request("POST", "http://mcp.example/mcp", json=body, headers=held)
+            await record(httpx2.Response(status, request=request))
     finally:
         await client.aclose()
 
@@ -772,10 +821,10 @@ async def test_the_initialize_check_leaves_later_answers_alone() -> None:
     client = _make_capturing_http_factory(_AuthCapture())()
     reject = client.event_hooks["response"][1]
 
-    def answered(method: str, content_type: str, body: bytes = b"<html></html>") -> httpx.Response:
+    def answered(method: str, content_type: str, body: bytes = b"<html></html>") -> httpx2.Response:
         sent = {"jsonrpc": "2.0", "id": 1, "method": method}
-        request = httpx.Request("POST", "http://mcp.example/mcp", json=sent)
-        return httpx.Response(
+        request = httpx2.Request("POST", "http://mcp.example/mcp", json=sent)
+        return httpx2.Response(
             200, request=request, headers={"content-type": content_type}, content=body
         )
 
@@ -910,6 +959,26 @@ def test_a_saved_server_words_a_failed_listing_from_its_status(
 
     error = "HTTP 401 Unauthorized: the server requires authorization"
     assert result["error"] == status["error"] == error
+
+
+@pytest.mark.parametrize("refusal", [405, 500])
+def test_a_saved_server_refusing_discover_connects(
+    upstream: tuple[str, Upstream], refusal: int
+) -> None:
+    """The connect's own negotiation falls back to initialize, not only the connection test's."""
+    base, state = upstream
+    state.fail_method = ("server/discover", refusal)
+    mgr = _manager({}, health_check_s=0)
+    mgr.start()
+    try:
+        result = mgr.add_server_sync("srv", {"type": "streamable-http", "url": f"{base}/mcp"})
+        status = mgr.get_server_status("srv")
+    finally:
+        mgr.shutdown()
+
+    assert result["connected"] is True
+    assert result["error"] == ""
+    assert status["tools"] == 2
 
 
 def test_a_refused_header_value_never_reaches_status_or_our_logs(

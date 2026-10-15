@@ -237,7 +237,7 @@ class TestCarrierLifecycle:
             call_index[0] += 1
             return mcp_types.CallToolResult(
                 content=[mcp_types.TextContent(type="text", text="ok")],
-                isError=False,
+                is_error=False,
             )
 
         async def _seed() -> None:
@@ -627,7 +627,7 @@ class TestDispatcherAuthFlows:
                 raise RuntimeError("upstream 401 (SDK-swallow shape)")
             return mcp_types.CallToolResult(
                 content=[mcp_types.TextContent(type="text", text="ok")],
-                isError=False,
+                is_error=False,
             )
 
         self._seed_pool_entry_with_call_tool(mgr, loop, _call_tool)
@@ -941,7 +941,7 @@ class TestBreakerInvariant:
         async def _call_tool_success(name: str, args: dict[str, Any]) -> Any:
             return mcp_types.CallToolResult(
                 content=[mcp_types.TextContent(type="text", text="ok")],
-                isError=False,
+                is_error=False,
             )
 
         async def _call_tool_403(name: str, args: dict[str, Any]) -> Any:
@@ -1051,7 +1051,7 @@ class TestOpenLockHeldAcrossCallTool:
                 await asyncio.sleep(0.1)
                 return mcp_types.CallToolResult(
                     content=[mcp_types.TextContent(type="text", text="ok")],
-                    isError=False,
+                    is_error=False,
                 )
             finally:
                 with in_flight_lock:
@@ -1297,9 +1297,9 @@ def _install_capture_intercept(monkeypatch: pytest.MonkeyPatch) -> None:
     """
     from turnstone.core import mcp_client as mcp_client_mod
 
-    original = mcp_client_mod.MCPClientManager._dispatch_pool_with_entry
+    original = mcp_client_mod.MCPClientManager._dispatch_pool_with_entry_call
 
-    async def _wrapped(self: MCPClientManager, **kwargs: Any) -> str:
+    async def _wrapped(self: MCPClientManager, **kwargs: Any) -> Any:
         # Stash the entry's persistent carrier so the test's call_tool
         # stub can populate it.
         entry = kwargs.get("entry")
@@ -1313,7 +1313,7 @@ def _install_capture_intercept(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr(
         mcp_client_mod.MCPClientManager,
-        "_dispatch_pool_with_entry",
+        "_dispatch_pool_with_entry_call",
         _wrapped,
     )
 
@@ -1847,7 +1847,7 @@ class TestPoolPrimingAndTokenRotation:
         async def _ok_call_tool(name: str, args: dict[str, Any]) -> Any:
             return mcp_types.CallToolResult(
                 content=[mcp_types.TextContent(type="text", text="ok")],
-                isError=False,
+                is_error=False,
             )
 
         async def _seed() -> None:

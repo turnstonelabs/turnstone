@@ -37,10 +37,11 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import threading
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 from mcp.server.transport_security import TransportSecuritySettings
 from starlette.responses import HTMLResponse, JSONResponse, Response
 
@@ -229,7 +230,10 @@ GETTING STARTED
 _BLANK_NAME = 'The gatekeeper squints. "I didn\'t catch your name, traveller."'
 
 # Module-level game singleton, built lazily so tests can inject their own.
+# MCP v2 runs synchronous tool handlers on worker threads, so all access to
+# the shared Game and its SQLite store is serialized under _GAME_LOCK.
 _GAME: Game | None = None
+_GAME_LOCK = threading.RLock()
 
 
 def _build_game(watch_url: str | None = None) -> Game:
@@ -244,15 +248,17 @@ def _build_game(watch_url: str | None = None) -> Game:
 def _game() -> Game:
     """Return the module game, building it on first use."""
     global _GAME
-    if _GAME is None:
-        _GAME = _build_game()
-    return _GAME
+    with _GAME_LOCK:
+        if _GAME is None:
+            _GAME = _build_game()
+        return _GAME
 
 
 def _set_game(game: Game) -> None:
     """Install a prebuilt game (used by create_app / tests)."""
     global _GAME
-    _GAME = game
+    with _GAME_LOCK:
+        _GAME = game
 
 
 def _guard_name(player: str) -> str | None:
@@ -260,7 +266,7 @@ def _guard_name(player: str) -> str | None:
     return None if player.strip() else _BLANK_NAME
 
 
-mcp: FastMCP = FastMCP(
+mcp: MCPServer = MCPServer(
     "understone",
     instructions=_PREMISE,
 )
@@ -276,7 +282,8 @@ def door_help() -> str:
     cheat-sheet. Call door_help before your first session to learn how to run
     the game, then call door_join to begin.
     """
-    watch_line = _game().watch_line()
+    with _GAME_LOCK:
+        watch_line = _game().watch_line()
     if watch_line:
         return f"{_DM_MANUAL}\nTHE LOBBY TV\n  {watch_line}\n"
     return _DM_MANUAL
@@ -299,7 +306,8 @@ def door_join(player: str) -> str:
     if blank is not None:
         return blank
     try:
-        return _game().join(player)
+        with _GAME_LOCK:
+            return _game().join(player)
     except Exception:
         log.exception("door_join failed for %r", player)
         return _unexpected()
@@ -318,7 +326,8 @@ def door_status(player: str) -> str:
     if blank is not None:
         return blank
     try:
-        return _game().status(player)
+        with _GAME_LOCK:
+            return _game().status(player)
     except Exception:
         log.exception("door_status failed for %r", player)
         return _unexpected()
@@ -340,7 +349,8 @@ def door_look(player: str) -> str:
     if blank is not None:
         return blank
     try:
-        return _game().look(player)
+        with _GAME_LOCK:
+            return _game().look(player)
     except Exception:
         log.exception("door_look failed for %r", player)
         return _unexpected()
@@ -366,7 +376,8 @@ def door_move(player: str, steps: str = "", heading: str = "", distance: int = 1
     if blank is not None:
         return blank
     try:
-        return _game().move(player, steps, heading, distance)
+        with _GAME_LOCK:
+            return _game().move(player, steps, heading, distance)
     except Exception:
         log.exception("door_move failed for %r", player)
         return _unexpected()
@@ -423,7 +434,8 @@ def door_action(
     if blank is not None:
         return blank
     try:
-        return _game().action(player, action, target, item, text, amount)
+        with _GAME_LOCK:
+            return _game().action(player, action, target, item, text, amount)
     except Exception:
         log.exception("door_action failed for %r action=%r", player, action)
         return _unexpected()
@@ -443,7 +455,8 @@ def door_log(player: str) -> str:
     if blank is not None:
         return blank
     try:
-        return _game().log(player)
+        with _GAME_LOCK:
+            return _game().log(player)
     except Exception:
         log.exception("door_log failed for %r", player)
         return _unexpected()
@@ -463,7 +476,8 @@ def door_rank(player: str = "") -> str:
         player: The caller's name (optional; marks their row when present).
     """
     try:
-        return _game().rank(player)
+        with _GAME_LOCK:
+            return _game().rank(player)
     except Exception:
         log.exception("door_rank failed for %r", player)
         return _unexpected()
@@ -492,13 +506,14 @@ def door_bestow(player: str, reason: str, gold: int = 0, heal: int = 0) -> str:
     if blank is not None:
         return blank
     try:
-        return _game().bestow(player, reason, gold, heal)
+        with _GAME_LOCK:
+            return _game().bestow(player, reason, gold, heal)
     except Exception:
         log.exception("door_bestow failed for %r", player)
         return _unexpected()
 
 
-# FastMCP.custom_route has no return annotation upstream (mcp 1.27.2), so mypy
+# MCPServer.custom_route has no return annotation upstream, so mypy
 # reads the decorator as untyped; the ignore is scoped to that single gap.
 @mcp.custom_route("/watch", methods=["GET"])  # type: ignore[untyped-decorator]
 async def watch_page(_request: Request) -> Response:
@@ -509,17 +524,21 @@ async def watch_page(_request: Request) -> Response:
 @mcp.custom_route("/watch/world.json", methods=["GET"])  # type: ignore[untyped-decorator]
 async def watch_world(_request: Request) -> Response:
     """Serve the STATIC map payload (dimensions, coloured rows, locations)."""
-    return JSONResponse(watch.build_world_payload(_game().world))
+    with _GAME_LOCK:
+        payload = watch.build_world_payload(_game().world)
+    return JSONResponse(payload)
 
 
 @mcp.custom_route("/watch/state.json", methods=["GET"])  # type: ignore[untyped-decorator]
 async def watch_state(_request: Request) -> Response:
     """Serve the DYNAMIC snapshot (players, Herald, Hall) — read-only.
 
-    The builder reads the module Game with no ``await`` in between, so each
+    The builder reads the module Game under ``_GAME_LOCK``, so each
     response is a consistent point-in-time snapshot of the shared world.
     """
-    return JSONResponse(watch.build_state_payload(_game()))
+    with _GAME_LOCK:
+        payload = watch.build_state_payload(_game())
+    return JSONResponse(payload)
 
 
 def _unexpected() -> str:
@@ -550,8 +569,8 @@ def _serve() -> None:
     """Serve the Understone MCP world over the configured transport.
 
     Honours UNDERSTONE_TRANSPORT: "stdio" (default) or "streamable-http".
-    For http, host/port/path are read from the environment and applied to the
-    FastMCP settings before serving. This is the actual transport launch; it is
+    For http, host/port/path are read from the environment and passed to
+    ``mcp.run`` when serving. This is the actual transport launch; it is
     kept separate from argument parsing so the parse step has no side effects.
     """
     logging.basicConfig(level=logging.INFO)
@@ -560,22 +579,17 @@ def _serve() -> None:
     if transport == "streamable-http":
         host = os.environ.get("UNDERSTONE_HOST", "127.0.0.1")
         port = int(os.environ.get("UNDERSTONE_PORT", "8077"))
-        mcp.settings.host = host
-        mcp.settings.port = port
-        mcp.settings.streamable_http_path = os.environ.get("UNDERSTONE_PATH", "/mcp")
-        mcp.settings.stateless_http = False
-        # FastMCP freezes DNS-rebinding protection (a localhost-only Host
-        # allowlist) at CONSTRUCTION, and this module builds `mcp` at import
-        # with the default 127.0.0.1 host — so a 0.0.0.0/LAN bind would 421
-        # "Invalid Host" on /mcp for every remote node (the multi-node case).
+        streamable_http_path = os.environ.get("UNDERSTONE_PATH", "/mcp")
         # Binding off localhost means we intend to accept other hosts, so drop
-        # the allowlist here (matching the SDK's own default for a non-localhost
-        # bind). These routes are unauthenticated by design — serve only on a
-        # trusted network. UNDERSTONE_HOST controls the bind.
-        if host not in ("127.0.0.1", "localhost", "::1"):
-            mcp.settings.transport_security = TransportSecuritySettings(
-                enable_dns_rebinding_protection=False
-            )
+        # the localhost-only DNS-rebinding allowlist here (matching the SDK's
+        # own default for a non-localhost bind). These routes are
+        # unauthenticated by design — serve only on a trusted network.
+        # UNDERSTONE_HOST controls the bind.
+        transport_security = (
+            TransportSecuritySettings(enable_dns_rebinding_protection=False)
+            if host not in ("127.0.0.1", "localhost", "::1")
+            else None
+        )
         # The spectator page is only reachable over http, so its URL is composed
         # here from the bind address. A 0.0.0.0 bind should advertise a host a
         # browser can actually reach (see the README Watch section).
@@ -586,7 +600,14 @@ def _serve() -> None:
             _set_game(_build_game(watch_url))
         except WorldLoadError as exc:
             raise SystemExit(f"failed to load world: {exc}") from exc
-        mcp.run(transport="streamable-http")
+        mcp.run(
+            transport="streamable-http",
+            host=host,
+            port=port,
+            streamable_http_path=streamable_http_path,
+            stateless_http=False,
+            transport_security=transport_security,
+        )
         return
 
     try:

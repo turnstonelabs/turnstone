@@ -38,7 +38,7 @@ import httpx
 import pytest
 import uvicorn
 from aiohttp import web
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from tests._oauth_runtime_helpers import make_oauth_context
@@ -188,13 +188,13 @@ def _find_free_port() -> int:
 
 
 def _build_server(port: int, behaviour: dict[str, Any]) -> uvicorn.Server:
-    mcp = FastMCP(name="phase6-target", streamable_http_path="/mcp")
+    mcp = MCPServer(name="phase6-target")
 
     @mcp.tool()
     async def echo(payload: str = "default") -> str:
         return f"echoed:{payload}"
 
-    app = mcp.streamable_http_app()
+    app = mcp.streamable_http_app(streamable_http_path="/mcp")
     app.add_middleware(BehaviorMiddleware, behaviour=behaviour)
     config = uvicorn.Config(
         app,

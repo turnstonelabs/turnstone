@@ -9,7 +9,7 @@ description = "Understone — a BBS-style ANSI door game served over MCP."
 requires-python = ">=3.13"
 license = "Apache-2.0"
 dependencies = [
-    "mcp>=1.27,<2",
+    "mcp>=2.3,<3",
 ]
 
 [project.scripts]

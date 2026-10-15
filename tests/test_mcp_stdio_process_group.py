@@ -37,7 +37,7 @@ SERVER_SRC = textwrap.dedent(
     """stdio MCP server that starts a helper process."""
     import subprocess, sys, time
 
-    from mcp.server.fastmcp import FastMCP
+    from mcp.server.mcpserver import MCPServer
 
     pidfile, marker, helper = sys.argv[1], sys.argv[2], sys.argv[3]
     sleep = "import time; time.sleep(120)"
@@ -47,7 +47,7 @@ SERVER_SRC = textwrap.dedent(
     with open(pidfile, "a") as f:
         print(proc.pid, file=f)
 
-    mcp = FastMCP("helper-spawner")
+    mcp = MCPServer("helper-spawner")
 
 
     @mcp.tool()
@@ -95,7 +95,7 @@ class _Spawner:
     """A manager running one real stdio server; kills stray helpers on exit."""
 
     def __init__(self, tmp_path: Path, helper: str = "plain") -> None:
-        pytest.importorskip("mcp.server.fastmcp")
+        pytest.importorskip("mcp.server.mcpserver")
         script = tmp_path / "server.py"
         script.write_text(SERVER_SRC)
         self.pidfile, self.marker = tmp_path / "pids", tmp_path / "clean-exit"

@@ -43,7 +43,7 @@ import os
 from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any
 
-from mcp.server.fastmcp import Context, FastMCP
+from mcp.server.mcpserver import Context, MCPServer
 from turnstone.sdk import TurnResult, TurnstoneConsole, TurnstoneServer
 
 if TYPE_CHECKING:
@@ -260,13 +260,13 @@ async def _list_nodes_impl(console_kw: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 @asynccontextmanager
-async def _lifespan(server: FastMCP[dict[str, Any]]) -> AsyncIterator[dict[str, Any]]:
+async def _lifespan(server: MCPServer[dict[str, Any]]) -> AsyncIterator[dict[str, Any]]:
     """Lifespan context — stores console connection kwargs for tool handlers."""
     kw = _console_kwargs()
     yield {"console_kwargs": kw}
 
 
-mcp = FastMCP(
+mcp = MCPServer(
     "turnstone-cluster-ops",
     instructions=(
         "Tools for executing commands across a Turnstone AI cluster. "
@@ -279,7 +279,7 @@ mcp = FastMCP(
 
 
 @mcp.tool()
-async def list_nodes(ctx: Context[Any, Any, Any]) -> str:
+async def list_nodes(ctx: Context[dict[str, Any], Any]) -> str:
     """List all active nodes in the Turnstone cluster.
 
     Call this before dispatching work to discover available node IDs.
@@ -294,7 +294,7 @@ async def list_nodes(ctx: Context[Any, Any, Any]) -> str:
 async def run_on_node(
     node_id: str,
     command: str,
-    ctx: Context[Any, Any, Any],
+    ctx: Context[dict[str, Any], Any],
     timeout: int = _DEFAULT_TIMEOUT,
 ) -> str:
     """Execute a shell command on a specific node and return the raw output.
@@ -331,7 +331,7 @@ async def run_on_node(
 async def run_on_nodes(
     node_ids: list[str],
     command: str,
-    ctx: Context[Any, Any, Any],
+    ctx: Context[dict[str, Any], Any],
     timeout: int = _DEFAULT_TIMEOUT,
 ) -> str:
     """Execute a shell command on specific nodes in parallel.
@@ -369,7 +369,7 @@ async def run_on_nodes(
 @mcp.tool()
 async def run_on_all_nodes(
     command: str,
-    ctx: Context[Any, Any, Any],
+    ctx: Context[dict[str, Any], Any],
     timeout: int = _DEFAULT_TIMEOUT,
 ) -> str:
     """Execute a shell command on ALL active nodes in parallel.

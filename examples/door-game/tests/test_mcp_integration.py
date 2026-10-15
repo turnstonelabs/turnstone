@@ -21,7 +21,7 @@ import threading
 import time
 from typing import TYPE_CHECKING, Any
 
-import httpx
+import httpx2
 import pytest
 import uvicorn
 from mcp import ClientSession
@@ -86,12 +86,6 @@ def live_server(tmp_path: Path) -> Any:
         if understone_server._GAME is not None:
             understone_server._GAME.store.close()
             understone_server._GAME = None
-        # FastMCP caches a StreamableHTTPSessionManager on the module-level mcp
-        # singleton and refuses a second lifespan .run() on the same instance.
-        # Reset it so each fixture instance boots a fresh session manager (the
-        # production server only ever runs one). Without this, a second
-        # fixture-using test fails on "run() can only be called once".
-        understone_server.mcp._session_manager = None
 
 
 async def _call_text(session: ClientSession, name: str, arguments: dict[str, Any]) -> str:
@@ -104,7 +98,7 @@ async def _drive(url: str) -> dict[str, Any]:
     """Run the full client conversation and return observations."""
     observations: dict[str, Any] = {}
     async with (
-        streamable_http_client(url) as (read, write, _get_session_id),
+        streamable_http_client(url) as (read, write),
         ClientSession(read, write) as session,
     ):
         await session.initialize()
@@ -119,7 +113,7 @@ async def _drive(url: str) -> dict[str, Any]:
 
     # A SECOND, independent session joins a second adventurer in the same world.
     async with (
-        streamable_http_client(url) as (read, write, _get_session_id),
+        streamable_http_client(url) as (read, write),
         ClientSession(read, write) as session,
     ):
         await session.initialize()
@@ -131,7 +125,7 @@ async def _drive(url: str) -> dict[str, Any]:
 
     # Back as player one: the shared world now shows the other adventurer.
     async with (
-        streamable_http_client(url) as (read, write, _get_session_id),
+        streamable_http_client(url) as (read, write),
         ClientSession(read, write) as session,
     ):
         await session.initialize()
@@ -181,7 +175,7 @@ def _watch_base(mcp_url: str) -> str:
 async def _join_over_mcp(mcp_url: str, name: str) -> None:
     """Sign one adventurer in over the real MCP wire (so state.json sees them)."""
     async with (
-        streamable_http_client(mcp_url) as (read, write, _get_session_id),
+        streamable_http_client(mcp_url) as (read, write),
         ClientSession(read, write) as session,
     ):
         await session.initialize()
@@ -194,7 +188,7 @@ def test_watch_routes_serve_world_state(live_server: str) -> None:
     # The MCP join writes the player into the shared world the routes read.
     asyncio.run(_join_over_mcp(live_server, "Watcher"))
 
-    with httpx.Client(timeout=5.0) as client:
+    with httpx2.Client(timeout=5.0) as client:
         page = client.get(f"{base}/watch")
         world = client.get(f"{base}/watch/world.json")
         state = client.get(f"{base}/watch/state.json")
@@ -225,12 +219,12 @@ def test_watch_routes_coexist_with_mcp(live_server: str) -> None:
 
     async def _drive_both() -> tuple[str, int]:
         async with (
-            streamable_http_client(live_server) as (read, write, _get_session_id),
+            streamable_http_client(live_server) as (read, write),
             ClientSession(read, write) as session,
         ):
             await session.initialize()
             joined = await _call_text(session, "door_join", {"player": "Coexist"})
-        with httpx.Client(timeout=5.0) as client:
+        with httpx2.Client(timeout=5.0) as client:
             status = client.get(f"{base}/watch/state.json").status_code
         return joined, status
 
@@ -242,18 +236,20 @@ def test_watch_routes_coexist_with_mcp(live_server: str) -> None:
 def test_streamable_http_host_gate_off_localhost() -> None:
     """A non-localhost bind must accept remote `Host` headers on /mcp.
 
-    REGRESSION: FastMCP freezes DNS-rebinding protection (a localhost-only Host
-    allowlist) at CONSTRUCTION, and ``server`` builds its FastMCP at import with
-    the default 127.0.0.1 host. A 0.0.0.0/LAN bind therefore answered TCP and
-    `/watch` but 421'd `/mcp` for every remote node ("Invalid Host header").
-    ``_serve`` drops the allowlist when bound off localhost; this pins the
-    mechanism — a default instance rejects a foreign Host, a protection-disabled
-    one accepts it (a 421 in the second case is the bug returning).
+    REGRESSION: MCPServer enables DNS-rebinding protection (a localhost-only
+    Host allowlist) by default when ``transport_security`` is not supplied. A
+    0.0.0.0/LAN bind without disabling protection therefore answers TCP and
+    `/watch` but 421s `/mcp` for every remote node ("Invalid Host header").
+    ``_serve`` passes ``transport_security=TransportSecuritySettings(
+    enable_dns_rebinding_protection=False)`` when bound off localhost; this
+    pins the mechanism — a default app rejects a foreign Host, a
+    protection-disabled one accepts it (a 421 in the second case is the bug
+    returning).
 
-    Uses fresh FastMCP instances (not the module singleton) so there is no
-    shared-state or app-cache coupling with the live-server tests above.
+    Uses fresh MCPServer instances (not the module singleton) so there is no
+    shared-state coupling with the live-server tests above.
     """
-    from mcp.server.fastmcp import FastMCP
+    from mcp.server.mcpserver import MCPServer
     from mcp.server.transport_security import TransportSecuritySettings
     from starlette.testclient import TestClient
 
@@ -274,15 +270,16 @@ def test_streamable_http_host_gate_off_localhost() -> None:
     }
 
     # Default (localhost-baked allowlist) — a remote Host is refused.
-    locked = FastMCP("hostgate-locked")
+    locked = MCPServer("hostgate-locked")
     with TestClient(locked.streamable_http_app()) as client:
         assert client.post("/mcp", headers=foreign, json=init).status_code == 421
 
     # Protection disabled (what _serve does off localhost) — remote Host accepted.
-    opened = FastMCP("hostgate-open")
-    opened.settings.transport_security = TransportSecuritySettings(
-        enable_dns_rebinding_protection=False
-    )
-    with TestClient(opened.streamable_http_app()) as client:
+    opened = MCPServer("hostgate-open")
+    with TestClient(
+        opened.streamable_http_app(
+            transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False)
+        )
+    ) as client:
         resp = client.post("/mcp", headers=foreign, json=init)
     assert resp.status_code != 421, f"remote Host still rejected: {resp.status_code} {resp.text}"

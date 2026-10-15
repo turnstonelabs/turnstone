@@ -15,9 +15,10 @@ import httpx2
 import mcp.types as mcp_types
 import pytest
 import uvicorn
-from mcp import McpError
+from mcp import MCPError
 from mcp.server.lowlevel import Server
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
+from mcp_types.version import MODERN_PROTOCOL_VERSIONS
 from starlette.applications import Starlette
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import JSONResponse
@@ -53,6 +54,7 @@ class Upstream:
         self.status = 200
         self.protocol_error = False
         self.fail_discovery = False
+        self.epoch = 0
         self.sessions: list[str | None] = []
 
 
@@ -64,8 +66,12 @@ class FailOperations(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next: Callable[..., Any]) -> Response:
         if request.method == "POST":
             body = await request.json()
+            if body.get("method") in ("initialize", "server/discover"):
+                self.upstream.epoch += 1
             if body.get("method") in _METHODS.values() or self.upstream.fail_discovery:
-                self.upstream.sessions.append(request.headers.get("mcp-session-id"))
+                self.upstream.sessions.append(
+                    request.headers.get("mcp-session-id") or f"stateless-{self.upstream.epoch}"
+                )
                 if self.upstream.status != 200 or self.upstream.protocol_error:
                     return JSONResponse(
                         {
@@ -78,54 +84,68 @@ class FailOperations(BaseHTTPMiddleware):
         return await call_next(request)
 
 
-def _build_server() -> Server[Any, Any]:
-    server: Server[Any, Any] = Server("upstream")
+def _build_server() -> Server[Any]:
+    async def tools(_ctx: Any, _params: Any) -> mcp_types.ListToolsResult:
+        return mcp_types.ListToolsResult(
+            tools=[mcp_types.Tool(name="op", input_schema={"type": "object"})]
+        )
 
-    @server.list_tools()
-    async def tools() -> list[mcp_types.Tool]:
-        return [mcp_types.Tool(name="op", inputSchema={"type": "object"})]
-
-    @server.call_tool()
-    async def call_tool(name: str, arguments: dict[str, Any]) -> mcp_types.CallToolResult:
+    async def call_tool(
+        _ctx: Any, params: mcp_types.CallToolRequestParams
+    ) -> mcp_types.CallToolResult | mcp_types.InputRequiredResult:
+        arguments = params.arguments or {}
+        if arguments.get("ask"):
+            return mcp_types.InputRequiredResult(request_state="awaiting-input")
+        if size := arguments.get("size"):
+            return mcp_types.CallToolResult(
+                content=[mcp_types.TextContent(type="text", text="x" * int(size))],
+                is_error=False,
+            )
         failed = bool(arguments.get("fail"))
         return mcp_types.CallToolResult(
             content=[mcp_types.TextContent(type="text", text="boom" if failed else "ok")],
-            isError=failed,
+            is_error=failed,
         )
 
-    @server.list_resources()
-    async def resources() -> list[mcp_types.Resource]:
-        return [mcp_types.Resource(name="op", uri="test://resource")]
-
-    @server.list_resource_templates()
-    async def templates() -> list[mcp_types.ResourceTemplate]:
-        return []
-
-    @server.list_prompts()
-    async def prompts() -> list[mcp_types.Prompt]:
-        return [mcp_types.Prompt(name="op")]
-
-    async def read_resource(request: mcp_types.ReadResourceRequest) -> mcp_types.ServerResult:
-        return mcp_types.ServerResult(
-            mcp_types.ReadResourceResult(
-                contents=[mcp_types.TextResourceContents(uri=request.params.uri, text="ok")]
-            )
+    async def resources(_ctx: Any, _params: Any) -> mcp_types.ListResourcesResult:
+        return mcp_types.ListResourcesResult(
+            resources=[mcp_types.Resource(name="op", uri="test://resource")]
         )
 
-    async def get_prompt(request: mcp_types.GetPromptRequest) -> mcp_types.ServerResult:
-        return mcp_types.ServerResult(
-            mcp_types.GetPromptResult(
-                messages=[
-                    mcp_types.PromptMessage(
-                        role="user", content=mcp_types.TextContent(type="text", text="ok")
-                    )
-                ]
-            )
+    async def templates(_ctx: Any, _params: Any) -> mcp_types.ListResourceTemplatesResult:
+        return mcp_types.ListResourceTemplatesResult(resource_templates=[])
+
+    async def prompts(_ctx: Any, _params: Any) -> mcp_types.ListPromptsResult:
+        return mcp_types.ListPromptsResult(prompts=[mcp_types.Prompt(name="op")])
+
+    async def read_resource(
+        _ctx: Any, params: mcp_types.ReadResourceRequestParams
+    ) -> mcp_types.ReadResourceResult:
+        return mcp_types.ReadResourceResult(
+            contents=[mcp_types.TextResourceContents(uri=str(params.uri), text="ok")]
         )
 
-    server.request_handlers[mcp_types.ReadResourceRequest] = read_resource
-    server.request_handlers[mcp_types.GetPromptRequest] = get_prompt
-    return server
+    async def get_prompt(
+        _ctx: Any, _params: mcp_types.GetPromptRequestParams
+    ) -> mcp_types.GetPromptResult:
+        return mcp_types.GetPromptResult(
+            messages=[
+                mcp_types.PromptMessage(
+                    role="user", content=mcp_types.TextContent(type="text", text="ok")
+                )
+            ]
+        )
+
+    return Server(
+        "upstream",
+        on_list_tools=tools,
+        on_call_tool=call_tool,
+        on_list_resources=resources,
+        on_list_resource_templates=templates,
+        on_read_resource=read_resource,
+        on_list_prompts=prompts,
+        on_get_prompt=get_prompt,
+    )
 
 
 @pytest.fixture
@@ -235,8 +255,25 @@ def test_tool_error_preserves_error_prefix_and_session(dispatch_env):
     assert _session(mgr, pooled) is session
 
 
+def test_an_input_request_is_breaker_neutral(dispatch_env):
+    """A 2026-07-28 server can answer a call with a request for input, which the SDK refuses with
+    a RuntimeError. The server answered, so neither the breaker nor the session pays for it."""
+    mgr, _upstream, pooled = dispatch_env
+    session = _session(mgr, pooled)
+    assert session.protocol_version in MODERN_PROTOCOL_VERSIONS
+    kwargs = {"user_id": "user-1" if pooled else None, "timeout": 4}
+
+    for _ in range(MCPClientManager._CB_FAILURE_THRESHOLD):
+        with pytest.raises(RuntimeError, match="InputRequiredResult"):
+            mgr.call_tool_sync("mcp__srv__op", {"ask": True}, **kwargs)
+
+    assert mgr._consecutive_failures.get("srv", 0) == 0
+    assert _session(mgr, pooled) is session
+    assert _call(mgr, "tool", pooled) == "ok"
+
+
 @pytest.mark.parametrize("kind", ["tool", "resource", "prompt"])
-@pytest.mark.parametrize("status", [400, 404, 502])
+@pytest.mark.parametrize("status", [404, 502])
 def test_http_failure_is_prompt_counted_and_reconnects(dispatch_env, kind, status):
     mgr, upstream, pooled = dispatch_env
     upstream.status = status
@@ -250,8 +287,7 @@ def test_http_failure_is_prompt_counted_and_reconnects(dispatch_env, kind, statu
         "the SDK stranded the caller until its deadline"
     )
     assert elapsed < 2, f"HTTP {status} took {elapsed:.2f}s to reach the caller"
-    if status != 400:
-        assert f"HTTP {status}" in str(caught.value)
+    assert f"HTTP {status}" in str(caught.value)
     assert mgr._consecutive_failures.get("srv", 0) == 1
     assert _session(mgr, pooled) is None
     assert upstream.sessions[0] == upstream.sessions[1]
@@ -263,16 +299,19 @@ def test_http_failure_is_prompt_counted_and_reconnects(dispatch_env, kind, statu
 
 
 @pytest.mark.parametrize("kind", ["tool", "resource", "prompt"])
-def test_http_200_protocol_error_keeps_session_and_breaker(dispatch_env, kind):
+@pytest.mark.parametrize("status", [200, 400])
+def test_http_protocol_error_keeps_session_and_breaker(dispatch_env, kind, status):
     mgr, upstream, pooled = dispatch_env
     original = _session(mgr, pooled)
+    upstream.status = status
     upstream.protocol_error = True
 
-    with pytest.raises(McpError, match="Session not found"):
+    with pytest.raises(MCPError, match="Session not found"):
         _call(mgr, kind, pooled)
 
     assert mgr._consecutive_failures.get("srv", 0) == 0
     assert _session(mgr, pooled) is original
+    upstream.status = 200
     upstream.protocol_error = False
     assert "ok" in _call(mgr, kind, pooled)
     assert upstream.sessions[2] == upstream.sessions[0]
@@ -329,7 +368,7 @@ def test_pool_reconnect_classifies_its_own_http_failure(dispatch_env):
 )
 def test_http_status_precedes_sdk_protocol_codes(sdk_code, status, classification):
     mgr = MCPClientManager({})
-    error = McpError(mcp_types.ErrorData(code=sdk_code, message="request failed"))
+    error = MCPError(code=sdk_code, message="request failed")
     assert mgr._classify_failure(error, capture=_AuthCapture(status=status)) == classification
     assert mgr._classify_failure(error) == "protocol"
 
@@ -383,13 +422,13 @@ async def test_hook_keeps_first_failure_and_ignores_cleanup():
     fired = asyncio.Event()
     async with _make_capturing_http_factory(capture, fired)() as client:
         hook = client.event_hooks["response"][0]
-        cleanup = httpx.Request("DELETE", "https://mcp.example.com/")
-        await hook(httpx.Response(502, request=cleanup))
+        cleanup = httpx2.Request("DELETE", "https://mcp.example.com/")
+        await hook(httpx2.Response(502, request=cleanup))
         assert capture.status is None
         assert not fired.is_set()
-        request = httpx.Request("POST", "https://mcp.example.com/")
-        await hook(httpx.Response(401, request=request, headers={"www-authenticate": "Bearer"}))
-        await hook(httpx.Response(502, request=request))
+        request = httpx2.Request("POST", "https://mcp.example.com/")
+        await hook(httpx2.Response(401, request=request, headers={"www-authenticate": "Bearer"}))
+        await hook(httpx2.Response(502, request=request))
         assert capture.status == 401
         assert capture.www_authenticate == "Bearer"
         assert fired.is_set()
@@ -518,7 +557,7 @@ async def test_completed_call_wins_but_failed_call_uses_http_status(succeeded):
         capture.status = 502
         fired.set()
         if not succeeded:
-            raise McpError(mcp_types.ErrorData(code=-32603, message="Server error response"))
+            raise MCPError(code=-32603, message="Server error response")
         return "completed result"
 
     call = mgr._await_session_call(operation(), owner=None, capture=capture, fired_event=fired)
@@ -527,3 +566,48 @@ async def test_completed_call_wins_but_failed_call_uses_http_status(succeeded):
     else:
         with pytest.raises(_CapturedHTTPError, match="HTTP 502"):
             await call
+
+
+def test_large_sse_tool_result_exceeding_sdk_default_1mb_limit() -> None:
+    """SSE tool results >1 MiB (the SDK default max_sse_event_size) succeed up to 16 MiB (#679 S8)."""
+    sessions = StreamableHTTPSessionManager(app=_build_server(), json_response=False)
+
+    @contextlib.asynccontextmanager
+    async def lifespan(_app: Starlette) -> AsyncIterator[None]:
+        async with sessions.run():
+            yield
+
+    app = Starlette(routes=[Mount("/", app=sessions.handle_request)], lifespan=lifespan)
+    port = _free_port()
+    server = uvicorn.Server(
+        uvicorn.Config(
+            app,
+            host="127.0.0.1",
+            port=port,
+            log_level="critical",
+            access_log=False,
+            timeout_graceful_shutdown=0,
+        )
+    )
+    thread = threading.Thread(
+        target=serve_until_exit, args=(server,), daemon=True, name="mcp-sse-large-payload"
+    )
+    thread.start()
+    try:
+        assert _wait_tcp_ready(port, 5), "SSE upstream server did not start"
+        url = f"http://127.0.0.1:{port}/mcp"
+        with patch("turnstone.core.mcp_client.load_config", return_value={}):
+            mgr = MCPClientManager({"srv": {"type": "http", "url": url}})
+        mgr.start()
+        try:
+            size = 2 * 1024 * 1024 + 1024  # >2 MiB, well over the SDK's 1 MiB default
+            output = mgr.call_tool_sync("mcp__srv__op", {"size": size}, timeout=15)
+            assert len(output) == size
+            assert output == "x" * size
+            assert mgr._consecutive_failures.get("srv", 0) == 0
+        finally:
+            mgr.shutdown()
+    finally:
+        server.should_exit = True
+        server.force_exit = True
+        thread.join(timeout=5)
