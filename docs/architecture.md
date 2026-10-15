@@ -991,9 +991,11 @@ adds, removes, or reconnects servers as needed.
 **Lifecycle:**
 1. `create_mcp_client()` reads server configs from TOML/JSON and database
 2. `MCPClientManager.start()` launches the background event loop thread
-3. `_connect_all()` connects to each server (stdio subprocess or HTTP), runs
-   `initialize()` + `list_tools()`, converts schemas to OpenAI format, detects
-   `tools.listChanged` capability for push notification support
+3. `_connect_all()` connects to each server (stdio subprocess or HTTP) and negotiates the
+   protocol revision: a `server/discover` probe adopts 2026-07-28 when the server offers it,
+   and a server that refuses the probe gets the `initialize()` handshake, as in the SDK's own
+   negotiation. It then lists the tools, converts schemas to OpenAI format, and detects
+   `tools.listChanged` for push notifications
 4. `ChatSession.__init__` receives the manager, builds `self._tools` (built-in + MCP),
    and registers a listener callback for tool-change notifications
 5. `_prepare_tool()` routes MCP tools to `_prepare_mcp_tool()` / `_exec_mcp_tool()`
@@ -1002,7 +1004,10 @@ adds, removes, or reconnects servers as needed.
 
 **Tool refresh:** Two mechanisms keep tools up-to-date without restart:
 - **Push:** Servers declaring `tools.listChanged` send `ToolListChangedNotification`;
-  the registered `message_handler` triggers immediate single-server refresh.
+  the registered `message_handler` triggers immediate single-server refresh. On a 2026-07-28
+  connection the notifications arrive on a `subscriptions/listen` stream that the owner task
+  holds open and reopens when the server ends it; a reopen after the server ended it refreshes
+  the catalogs, since a notification may have been missed in between.
 - **Manual:** `/mcp refresh [server]` calls `refresh_sync()` for on-demand refresh
   (also attempts reconnection for disconnected servers).
 
@@ -1017,9 +1022,10 @@ at connection time (server names with `__` are rejected).
 **Resilience:** Each MCP server has an independent circuit breaker that opens
 after 3 consecutive transport failures (timeouts, broken pipes, connection
 resets). Cooldown uses capped exponential backoff (30 s base, 5 min max) with
-per-server jitter to avoid thundering herd. Protocol-level errors (`McpError`)
+per-server jitter to avoid thundering herd. Protocol-level errors (`MCPError`)
 from a healthy connection do not trip the breaker, and neither does a result
-that does not match the protocol's schema. One malformed entry fails its whole
+that does not match the protocol's schema or that the client refuses (a 2026-07-28
+request for input). One malformed entry fails its whole
 catalog list, so the connect publishes nothing and the server's status names
 the entry and the field. A static server also withdraws the tools, resources
 and prompts kept from its last good connect (syncing its prompt templates), and
@@ -1043,11 +1049,13 @@ digs the failure out of the SDK's task groups, puts a cause ahead of the teardow
 wording does not depend on how the SDK reports it, and a status that ended the transport under a
 later request or notification still shows), the TLS failure, the timeout or the invalid catalog
 entry. It tells a dropped session from a URL with no MCP endpoint, and never quotes a header
-httpx refused to send. Every connect's HTTP client fails an initialize answered with something
+httpx2 refused to send. Every connect's HTTP client fails an initialize answered with something
 other than an MCP message (a web page, a proxy's sign-in page, a REST API's JSON) at once,
 saying what came back (for a JSON-RPC error the SDK cannot read, the server's own error), where
 the SDK would wait out the connect timeout; both checks also see a request redirected within its
-origin. A server whose connect fails when a reload adds it stays registered with that error; the
+origin. A `server/discover` probe answered that way fails the same, except that an error the SDK
+cannot read is matched to the probe, so the connect falls back to `initialize`. A server whose
+connect fails when a reload adds it stays registered with that error; the
 health loop retries it as it does a server that failed at startup. With the health check turned
 off, every reload starts a retry of the DB's servers that are not connected, without waiting for
 it; removing or editing such a server cancels its retry first.
@@ -1060,6 +1068,22 @@ bound on that loop ends a test that a server holds past the connect timeout, suc
 trickling its answer to the request that ends the session. It records and publishes nothing. The
 console checks a test's name, URL and headers as it checks a saved server's, at every write
 (create, update, import, registry install).
+
+**2026-07-28 connections:** Besides the negotiation and the listen stream above, the liveness
+check sends `server/discover` in place of `ping`, which the revision drops. A shared server's
+catalogs refresh when a list result's cache hint (`ttlMs`, at least 5 s) runs out, and resource
+reads are cached for as long as their hint allows (see [Tools: Caching](tools.md#caching)). The
+cache's store (`_ResponseCacheStore`) records which cache wrote each entry, so a purge picks one
+server's or one user's entries without reading the SDK's cache keys, which the SDK keeps opaque
+to stores. A tool call rejected for mismatched headers relists the tools and retries once, and
+server log messages at or above `log_level` go to turnstone's log, capped at `WARNING`.
+
+**Private SDK names:** turnstone uses an SDK internal only where the public API cannot do the
+job, and so that a change fails loudly: `_within_origin`, the redirect rule the response hooks
+apply (an import, so a rename fails at startup); httpx2's `Response._content`, to rewrite an
+error answer the SDK could not match to its request (each use checks the rewrite took); and the
+stdio spawn hook (#1226). `test_private_names_still_behave_as_relied_on` and
+`test_spawn_hook_records_the_server_pid` fail on the dependency update that changes them.
 
 **Registry discovery:** The console admin panel provides a registry discovery
 surface backed by the official MCP Registry (registry.modelcontextprotocol.io).

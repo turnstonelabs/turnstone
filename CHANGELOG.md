@@ -120,6 +120,21 @@ frozen.
 
 ### Added
 
+- **MCP servers on the 2026-07-28 revision (#679).** A connection probes `server/discover` and
+  adopts 2026-07-28 when the server offers it; a server that refuses the probe gets the 2025-11-25
+  `initialize` handshake, so existing servers connect as before. On 2026-07-28 connections, change
+  notifications arrive on a `subscriptions/listen` stream, reopened when the server ends it with a
+  full catalog refresh after each reopen; the liveness check sends `server/discover` instead of
+  `ping`; a shared server's catalogs refresh when their cache hint runs out; resource reads are
+  cached for as long as their hint allows; and a tool call rejected for mismatched headers relists
+  the tools and retries once. On a per-user server, a read the server marks `public` is shared
+  among that server's users until it expires (#1388). A request for input, which turnstone does
+  not handle yet, fails the call without counting against the server's circuit breaker. Two
+  optional settings: `log_level` (in `[mcp]`, or per server) writes server log messages at or
+  above that severity to turnstone's log, capped at `WARNING`, and `resource_subscriptions` (per
+  server) names resources whose cached reads a change notice drops. A tool result with only
+  structured content now reaches the model as JSON instead of "(no output)". See
+  [Optional 2026-07-28 settings](docs/tools.md#optional-2026-07-28-settings).
 - **User avatars (#997).** Each person shows as the first letter of their name on one of six
   colours, or as a picture they upload, in the rail's user chip and the console's Users table.
   **Change avatar** in the user menu offers the six colours, a picture upload (PNG, JPEG or WebP;
@@ -245,6 +260,14 @@ frozen.
 
 ### Changed
 
+- **The MCP client runs on the MCP Python SDK 2.3 (#679)** *(BREAKING)* — turnstone requires
+  `mcp>=2.3,<3`, so an MCP server run from turnstone's own Python environment must work with it
+  (FastMCP is now `MCPServer`); the cluster-ops and Understone examples move with it. MCP HTTP
+  connections now go through httpx2: TLS is verified against the operating system's trust store
+  instead of certifi's bundle (`SSL_CERT_FILE` and `SSL_CERT_DIR` still override it), and one
+  streamed event may be up to 16 MiB, so a larger tool result fails (1.x had no limit). When a
+  global OpenTelemetry tracer provider is configured, the SDK opens a span for each MCP request and
+  passes the trace context to the server in `_meta`; turnstone configures none.
 - **A model that isn't loaded is never replaced by another (#1359)** *(BREAKING)* — when the default
   model, the task model, the coordinator model or the channel model names a definition that isn't
   loaded (deleted, disabled, misspelled, or left out of a reload because its secret reference

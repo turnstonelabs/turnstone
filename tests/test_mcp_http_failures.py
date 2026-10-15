@@ -56,6 +56,7 @@ class Upstream:
         self.fail_discovery = False
         self.epoch = 0
         self.sessions: list[str | None] = []
+        self.log_levels: list[str | None] = []  # the log level each tools/call asked for
 
 
 class FailOperations(BaseHTTPMiddleware):
@@ -68,6 +69,9 @@ class FailOperations(BaseHTTPMiddleware):
             body = await request.json()
             if body.get("method") in ("initialize", "server/discover"):
                 self.upstream.epoch += 1
+            if body.get("method") == "tools/call":
+                meta = (body.get("params") or {}).get("_meta") or {}
+                self.upstream.log_levels.append(meta.get("io.modelcontextprotocol/logLevel"))
             if body.get("method") in _METHODS.values() or self.upstream.fail_discovery:
                 self.upstream.sessions.append(
                     request.headers.get("mcp-session-id") or f"stateless-{self.upstream.epoch}"
@@ -253,6 +257,22 @@ def test_tool_error_preserves_error_prefix_and_session(dispatch_env):
     assert _session(mgr, pooled) is session
     assert _call(mgr, "tool", pooled) == "ok"
     assert _session(mgr, pooled) is session
+
+
+def test_a_configured_log_level_reaches_the_server(upstream_server):
+    """A 2026-07-28 session asks its server for log messages at the server's configured level on
+    each request, and asks for none when no level is set."""
+    url, upstream = upstream_server
+    for cfg in ({"type": "http", "url": url, "log_level": "warning"}, {"type": "http", "url": url}):
+        with patch("turnstone.core.mcp_client.load_config", return_value={}):
+            mgr = MCPClientManager({"srv": cfg})
+        mgr.start()
+        try:
+            assert mgr.call_tool_sync("mcp__srv__op", {}, timeout=4) == "ok"
+        finally:
+            mgr.shutdown()
+
+    assert upstream.log_levels == ["warning", None]
 
 
 def test_an_input_request_is_breaker_neutral(dispatch_env):

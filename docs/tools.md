@@ -879,9 +879,11 @@ MCP-compatible service.
    sections, or via a standard MCP JSON config file (`--mcp-config`).
 
 2. **Discovery**: At startup, `MCPClientManager` connects to each configured server
-   (via stdio subprocess or HTTP), performs the MCP `initialize` handshake, and calls
-   `tools/list` to discover available tools. During the handshake, the manager checks
-   each server's capabilities for `tools.listChanged` support (push notifications).
+   (via stdio subprocess or HTTP) and negotiates the protocol revision: a
+   `server/discover` probe adopts 2026-07-28 when the server offers it, and a server
+   that refuses the probe gets the 2025-11-25 `initialize` handshake. It then calls
+   `tools/list` to discover available tools, and checks the server's capabilities for
+   `tools.listChanged` support (push notifications).
 
 3. **Schema conversion**: Each MCP tool's `inputSchema` is converted to OpenAI
    function-calling format. The tool name is prefixed: `mcp__{server}__{tool}`.
@@ -997,9 +999,10 @@ log_level = "info"
 resource_subscriptions = ["docs://index"]
 ```
 
-The per-server keys are read only from configuration files. Servers added in the
-admin console do not carry them, and configuration files are not read at all while
-the database holds an enabled MCP server. `[mcp].log_level` applies to every server.
+The per-server keys are read only from configuration files. Servers added or imported
+in the admin console do not carry them, and configuration files are not read at all
+while the database holds an enabled MCP server. `[mcp].log_level` applies to every
+server.
 
 ### Introspection
 
@@ -1023,7 +1026,9 @@ MCP tool lists stay up-to-date without restart through two mechanisms:
    that triggers an immediate refresh for that server (debounced per server and
    notification kind, and run off the receive loop). A refresh that fails while
    the connection stays up is retried automatically on the next health-loop tick
-   until one completes.
+   until one completes. On 2026-07-28 connections the notifications arrive on a
+   `subscriptions/listen` stream, reopened whenever the server ends it, with a full
+   refresh after each reopen in case a notification was missed in between.
 
 2. **Manual** -- `/mcp refresh` re-fetches tools from all servers immediately.
    `/mcp refresh <server>` targets a single server. If a server has disconnected,
@@ -1063,8 +1068,8 @@ makes them available to the model via the `read_resource` built-in tool.
 
 ### Discovery
 
-During the MCP `initialize` handshake, `MCPClientManager` checks each server's
-capabilities for the `resources` capability. For servers that declare it:
+When a connection opens, `MCPClientManager` checks the server's capabilities for
+the `resources` capability. For servers that declare it:
 
 1. `list_resources` fetches static resources (fixed URIs).
 2. `list_resource_templates` fetches URI templates (parameterized patterns like
@@ -1103,6 +1108,20 @@ Use read_resource(uri='...') to access the resources listed above.
 - **Auto-approve**: No -- requires user confirmation (reads external data).
 - **Agent availability**: `task_agent`.
 
+### Caching
+
+On 2026-07-28 connections, turnstone keeps a resource read for as long as the server's cache
+hint (`ttlMs`, at most 24 hours) allows; a read larger than 1 MiB is not kept, and nothing is
+cached on 2025-11-25 connections. A change notice from the server drops the reads it covers:
+`notifications/resources/list_changed` drops all of them, and `notifications/resources/updated`
+the one URI it names (see `resource_subscriptions` under
+[Optional 2026-07-28 settings](#optional-2026-07-28-settings)).
+
+On a per-user server (`oauth_user` or `oauth_obo`), a read the server marks
+`cacheScope: "public"` is shared: other users of that server get it from memory until it
+expires, and the server does not check their access. A server that marks per-user data public
+by mistake would leak it across users ([#1388](https://github.com/turnstonelabs/turnstone/issues/1388)).
+
 ### Capability guards
 
 The `read_resource` tool schema is always loaded (it is a built-in JSON schema),
@@ -1133,8 +1152,8 @@ declare the `prompts` capability.
 
 ### Discovery
 
-Prompt discovery mirrors resource discovery: `list_prompts` is called during
-the `initialize` handshake. Each prompt is stored with its prefixed name
+Prompt discovery mirrors resource discovery: `list_prompts` is called when a
+connection opens. Each prompt is stored with its prefixed name
 (`mcp__{server}__{prompt}`), description, and argument schema.
 
 ### use_prompt tool

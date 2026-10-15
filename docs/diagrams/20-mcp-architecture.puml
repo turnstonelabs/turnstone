@@ -63,8 +63,14 @@ end note
 
 MCPMgr -> DB : load_mcp_config(storage=)\n(merge config file + DB)
 
-MCPMgr -> MCPSrv : initialize (stdio or HTTP)
-MCPSrv --> MCPMgr : capabilities\n(tools, resources, prompts)
+MCPMgr -> MCPSrv : server/discover (stdio or HTTP)
+alt 2026-07-28 server
+  MCPSrv --> MCPMgr : DiscoverResult\n(versions, capabilities)
+else earlier server refuses the probe
+  MCPSrv --> MCPMgr : error
+  MCPMgr -> MCPSrv : initialize (2025-11-25 handshake)
+  MCPSrv --> MCPMgr : capabilities\n(tools, resources, prompts)
+end
 
 MCPMgr -> MCPSrv : tools/list
 MCPSrv --> MCPMgr : Tool[]
@@ -79,6 +85,15 @@ end
 opt prompts capability
   MCPMgr -> MCPSrv : prompts/list
   MCPSrv --> MCPMgr : Prompt[]
+end
+
+opt 2026-07-28 server with a list_changed capability
+  MCPMgr -> MCPSrv : subscriptions/listen
+  note right
+    Held open by the connection's owner task;
+    reopened when the server ends it, with a
+    full catalog refresh after the reopen.
+  end note
 end
 
 note over MCPMgr
@@ -134,9 +149,18 @@ note right
   needs_approval = True
 end note
 Session -> MCPMgr : read_resource_sync(uri)
-MCPMgr -> MCPSrv : resources/read
-MCPSrv --> MCPMgr : ReadResourceResult
-MCPMgr --> Session : content (text/blob)
+alt 2026-07-28, and a fresh cached read
+  MCPMgr --> Session : cached content
+  note right
+    Kept for the server's ttlMs (at most 24 h).
+    Per-user servers share a read the server
+    marks public among their users (#1388).
+  end note
+else
+  MCPMgr -> MCPSrv : resources/read
+  MCPSrv --> MCPMgr : ReadResourceResult
+  MCPMgr --> Session : content (text/blob)
+end
 
 == Runtime: Prompt Invocation ==
 
@@ -160,7 +184,10 @@ note over MCPMgr
   Probe success --> CLOSED (trip_count decays by 1)
   Probe failure --> OPEN (cooldown doubles, max 5 min)
 
-  McpError (protocol) does NOT trip breaker.
+  MCPError (protocol) and a refused result
+  (an input request) do NOT trip breaker.
+  HTTP 5xx and a held session's 404, read off
+  the wire, count as transport failures.
   BrokenPipeError / EOFError evicts dead session.
   All sync methods cancel orphaned futures on timeout.
   Transport streams pre-closed before stack teardown
@@ -177,6 +204,7 @@ MCPMgr -> MCPMgr : _cb_record_success()\nor _cb_record_failure()
 == Three-Tier Refresh ==
 
 group Push Notifications (debounced 5s per server)
+  note over MCPSrv, MCPMgr : 2026-07-28: delivered on the subscriptions/listen stream
   MCPSrv -> MCPMgr : ToolListChangedNotification
   MCPMgr -> MCPMgr : debounce check\n(skip if < 5s since last)
   MCPMgr -> MCPMgr : _refresh_server_tools()

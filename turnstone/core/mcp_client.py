@@ -48,11 +48,7 @@ import httpx2
 import mcp.client.stdio as mcp_stdio
 import mcp.types as mcp_types
 from mcp import ClientSession, MCPError, StdioServerParameters
-from mcp.client.caching import (
-    MAX_TTL_MS,
-    ClientResponseCache,
-    InMemoryResponseCacheStore,
-)
+from mcp.client.caching import MAX_TTL_MS, CacheEntry, CacheKey, ClientResponseCache
 from mcp.client.extension import UnexpectedClaimedResult
 from mcp.client.stdio import stdio_client
 from mcp.client.streamable_http import streamable_http_client
@@ -62,13 +58,10 @@ from mcp.client.subscriptions import (
     SubscriptionLost,
     listen,
 )
-from mcp.shared._httpx_utils import (
-    MCP_DEFAULT_SSE_READ_TIMEOUT,
-    MCP_DEFAULT_TIMEOUT,
-    McpHttpClientFactory,
-    _within_origin,
-)
-from mcp.shared.subscriptions import SUBSCRIPTION_ID_META_KEY
+
+# Private SDK name: the response hooks run before httpx2 builds a redirect's next request, so they
+# apply the transport's origin rule themselves. A rename fails this import, at startup.
+from mcp.shared._httpx_utils import _within_origin
 from mcp_types.version import (
     HANDSHAKE_PROTOCOL_VERSIONS,
     LATEST_MODERN_VERSION,
@@ -372,7 +365,8 @@ def _classify_http_status(
 
 
 def _has_established_session(headers: httpx.Headers | httpx2.Headers) -> bool:
-    """True when *headers* belong to a post-handshake request (legacy ``mcp-session-id`` or modern envelope)."""
+    """True when *headers* belong to a request on an established session: a 2025-11-25
+    ``mcp-session-id``, or a 2026-07-28 request's protocol headers."""
     return bool(headers.get("mcp-session-id")) or (
         headers.get("mcp-protocol-version") in MODERN_PROTOCOL_VERSIONS
         and headers.get("mcp-method") not in (None, "server/discover")
@@ -619,6 +613,36 @@ _SESSION_END_TIMEOUT_S = 3.0
 # as a -32000 CONNECTION_CLOSED error. 16 MiB accommodates multi-MB tool results
 # while retaining a bounded frame ceiling against runaway streams.
 _MCP_MAX_SSE_EVENT_SIZE = 16 * 1024 * 1024
+# The SDK's own client defaults, kept on ours: 30 s to connect, write or wait for the pool, and
+# 300 s for a read, since a server may hold a response stream open.
+_MCP_HTTP_TIMEOUT_S = 30.0
+_MCP_SSE_READ_TIMEOUT_S = 300.0
+
+
+class _HttpClientFactory(Protocol):
+    """Builds the ``httpx2.AsyncClient`` one MCP connection sends its requests through."""
+
+    def __call__(
+        self,
+        headers: dict[str, str] | None = None,
+        timeout: httpx2.Timeout | None = None,
+        auth: httpx2.Auth | None = None,
+    ) -> httpx2.AsyncClient: ...
+
+
+def _replace_read_body(response: httpx.Response | httpx2.Response, content: bytes) -> None:
+    """Make *response*, already read, hand the SDK *content* instead of what the server sent.
+
+    httpx2 has no public way to do this: it keeps a read body in ``Response._content``. If that
+    changes, the SDK would quietly read the original body, so the replacement is checked and fails
+    loudly instead.
+    """
+    response._content = content
+    if response.content != content:
+        raise RuntimeError(
+            "httpx2 no longer keeps a read response body in Response._content, so turnstone "
+            "cannot correct an MCP server's error answer"
+        )
 
 
 def _jsonrpc_body(request: httpx.Request | httpx2.Request) -> dict[str, Any] | None:
@@ -651,7 +675,7 @@ def _is_followed_post_redirect(response: httpx2.Response) -> bool:
 
 def _make_capturing_http_factory(
     capture: _AuthCapture, fired_event: asyncio.Event | None = None
-) -> McpHttpClientFactory:
+) -> _HttpClientFactory:
     """Return a client factory that records the first relevant HTTP failure into ``capture``.
 
     Its clients also give the request that ends a session ``_SESSION_END_TIMEOUT_S``, and fail an
@@ -740,7 +764,7 @@ def _make_capturing_http_factory(
                         if req_body is not None:
                             rewritten = _inject_jsonrpc_error_id(raw_err, req_body.get("id"))
                             if rewritten is not None:
-                                response._content = rewritten.model_dump_json().encode()
+                                _replace_read_body(response, rewritten.model_dump_json().encode())
                                 parsed_err = rewritten
                     if isinstance(parsed_err, mcp_types.JSONRPCError) and (
                         status == 400 or parsed_err.error.code == mcp_types.METHOD_NOT_FOUND
@@ -805,7 +829,7 @@ def _make_capturing_http_factory(
         if body.get("method") == "server/discover":
             rewritten = _inject_jsonrpc_error_id(content, body.get("id"))
             if rewritten is not None:
-                response._content = rewritten.model_dump_json().encode()
+                _replace_read_body(response, rewritten.model_dump_json().encode())
                 return
         raise error from None
 
@@ -821,9 +845,7 @@ def _make_capturing_http_factory(
             },
         }
         if timeout is None:
-            kwargs["timeout"] = httpx2.Timeout(
-                MCP_DEFAULT_TIMEOUT, read=MCP_DEFAULT_SSE_READ_TIMEOUT
-            )
+            kwargs["timeout"] = httpx2.Timeout(_MCP_HTTP_TIMEOUT_S, read=_MCP_SSE_READ_TIMEOUT_S)
         else:
             kwargs["timeout"] = timeout
         if headers is not None:
@@ -1028,6 +1050,70 @@ def _clear_catalog_ttls(session: Any, *, now: float | None = None) -> None:
                         ttls.pop(k, None)
 
 
+# The cache that wrote a cached response: (server name, user id), with ``None`` for a shared server.
+type _CacheOwner = tuple[str, str | None]
+
+
+class _ResponseCacheStore:
+    """Backing store for every server's response caches.
+
+    An in-memory LRU, like the SDK's ``InMemoryResponseCacheStore``: ``get`` and ``put`` refresh an
+    entry, and past ``max_entries`` the least recently used goes. It also records which cache wrote
+    each entry, so a purge can pick one server's or one user's entries without reading the SDK's
+    key format, which the SDK keeps opaque to stores. Methods are synchronous, so a purge cannot
+    interleave with a write.
+    """
+
+    def __init__(self, *, max_entries: int = 1024) -> None:
+        self._max_entries = max_entries
+        self._entries: dict[CacheKey, tuple[CacheEntry, _CacheOwner]] = {}
+
+    def view(self, owner: _CacheOwner) -> _ResponseCacheView:
+        return _ResponseCacheView(self, owner)
+
+    def get(self, key: CacheKey) -> CacheEntry | None:
+        held = self._entries.pop(key, None)
+        if held is None:
+            return None
+        self._entries[key] = held
+        return held[0]
+
+    def put(self, key: CacheKey, entry: CacheEntry, owner: _CacheOwner) -> None:
+        self._entries.pop(key, None)
+        self._entries[key] = (entry, owner)
+        if len(self._entries) > self._max_entries:
+            del self._entries[next(iter(self._entries))]
+
+    def delete(self, key: CacheKey) -> None:
+        self._entries.pop(key, None)
+
+    def purge(self, matches: Callable[[CacheKey, CacheEntry, _CacheOwner], bool]) -> None:
+        for key in [k for k, (entry, owner) in self._entries.items() if matches(k, entry, owner)]:
+            del self._entries[key]
+
+
+class _ResponseCacheView:
+    """One cache's ``ResponseCacheStore``: the shared store, recording this cache as each entry's
+    writer. A public-scope entry is keyed the same for every user of a server, so any of them
+    reads it."""
+
+    def __init__(self, store: _ResponseCacheStore, owner: _CacheOwner) -> None:
+        self._store = store
+        self._owner = owner
+
+    async def get(self, key: CacheKey) -> CacheEntry | None:
+        return self._store.get(key)
+
+    async def set(self, key: CacheKey, entry: CacheEntry) -> None:
+        self._store.put(key, entry, self._owner)
+
+    async def delete(self, key: CacheKey) -> None:
+        self._store.delete(key)
+
+    async def clear(self) -> None:
+        self._store.purge(lambda _key, _entry, owner: owner == self._owner)
+
+
 async def _list_catalog[P: mcp_types.PaginatedResult, T](
     server_name: str,
     kind: str,
@@ -1037,7 +1123,6 @@ async def _list_catalog[P: mcp_types.PaginatedResult, T](
     cap: int,
     *,
     missing_ok: bool = False,
-    on_complete: Callable[[dict[str, T]], None] | None = None,
 ) -> list[T]:
     """Every item one catalog lists, across its pages, deduplicated and capped at *cap*.
 
@@ -1155,23 +1240,7 @@ async def _list_catalog[P: mcp_types.PaginatedResult, T](
             break
         except ValidationError as exc:
             raise _invalid_page_error(server_name, kind, len(sent) + 1, exc) from exc
-    final_items = list(collected.values())[:cap]
-    if on_complete is not None:
-        on_complete({key_of(item): item for item in final_items})
-    return final_items
-
-
-def _prune_session_tool_caches(
-    session: ClientSession, collected: dict[str, mcp_types.Tool]
-) -> None:
-    """Prune stale tool entries from *session*'s internal caches after a full multi-page walk."""
-    if not isinstance(session, _RealClientSession):
-        return
-    for cache_attr in ("_x_mcp_header_maps", "_tool_output_schemas", "_tool_output_validators"):
-        cache_dict = getattr(session, cache_attr, None)
-        if isinstance(cache_dict, dict):
-            for stale_name in [k for k in cache_dict if k not in collected]:
-                cache_dict.pop(stale_name, None)
+    return list(collected.values())[:cap]
 
 
 async def _list_all_tools(session: ClientSession, server_name: str) -> list[mcp_types.Tool]:
@@ -1183,7 +1252,6 @@ async def _list_all_tools(session: ClientSession, server_name: str) -> list[mcp_
         lambda page: page.tools,
         lambda tool: tool.name,
         _MAX_TOOLS_PER_SERVER,
-        on_complete=lambda collected: _prune_session_tool_caches(session, collected),
     )
 
 
@@ -1713,7 +1781,7 @@ async def _negotiate_session(
     capture: _AuthCapture | None = None,
 ) -> None:
     """Negotiate the MCP protocol version on *session*: probe ``server/discover`` (2026-07-28)
-    and fall back to the ``initialize`` handshake on legacy servers.
+    and fall back to the ``initialize`` handshake on servers that predate it.
 
     Mock sessions in unit tests (not instances of :class:`ClientSession`) call
     ``await session.initialize()`` directly. On real HTTP transports, a probe answered with a
@@ -1798,67 +1866,7 @@ async def _negotiate_session(
         capture.negotiated = True
 
 
-def _configure_session_logging(
-    session: Any,
-    *,
-    log_level: mcp_types.LoggingLevel | None,
-    logging_callback: Any = None,
-) -> None:
-    """Install *log_level* on a real :class:`ClientSession` prior to or after negotiation.
-
-    Keeping ``ClientSession(read, write, message_handler=...)``'s positional/keyword call signature
-    unchanged preserves compatibility with unit-test session factories while still configuring
-    2026-07-28 per-request ``_meta["io.modelcontextprotocol/logLevel"]`` stamping (via ``adopt()``).
-    ``notifications/message`` routing is handled uniformly in ``message_handler`` so the SDK does
-    not invoke both ``_logging_callback`` and ``_message_handler`` for the same notification.
-    """
-    _ = logging_callback
-    if isinstance(session, _RealClientSession) and session._log_level != log_level:
-        session._log_level = log_level
-        if session.discover_result is not None:
-            session.adopt(session.discover_result)
-
-
-def _accept_modern_listen_notification(session: Any, msg: Any) -> bool:
-    """Return False when *msg* is a 2026-07-28 subscription notification on a session with active
-    ``listen()`` routes that is missing/mismatched on ``subscriptionId`` or rejected by ``honored``."""
-    if not isinstance(
-        msg,
-        mcp_types.ToolListChangedNotification
-        | mcp_types.PromptListChangedNotification
-        | mcp_types.ResourceListChangedNotification
-        | mcp_types.ResourceUpdatedNotification,
-    ):
-        return True
-    routes = getattr(session, "_listen_routes", None)
-    if not isinstance(routes, dict) or not routes:
-        return True
-    params = getattr(msg, "params", None)
-    meta = getattr(params, "meta", None) if params is not None else None
-    if not isinstance(meta, dict):
-        return False
-    sub_id = meta.get(SUBSCRIPTION_ID_META_KEY)
-    if not isinstance(sub_id, int | str) or isinstance(sub_id, bool):
-        return False
-    route = routes.get(sub_id)
-    if route is None or getattr(route, "end", None) == "lost":
-        return False
-    honored = getattr(route, "honored", None)
-    if honored is None:
-        return True
-    if isinstance(msg, mcp_types.ToolListChangedNotification):
-        return bool(honored.tools_list_changed)
-    if isinstance(msg, mcp_types.PromptListChangedNotification):
-        return bool(honored.prompts_list_changed)
-    if isinstance(msg, mcp_types.ResourceListChangedNotification):
-        return bool(honored.resources_list_changed)
-    honored_uris = getattr(route, "_honored_uris", None)
-    return isinstance(honored_uris, set | frozenset | list | tuple) and (
-        str(msg.params.uri) in honored_uris
-    )
-
-
-async def _enter_modern_subscription(
+async def _enter_subscription(
     stack: AsyncExitStack,
     session: ClientSession,
     *,
@@ -1867,7 +1875,11 @@ async def _enter_modern_subscription(
     timeout: float = 10.0,
 ) -> Subscription | None:
     """Open a ``subscriptions/listen`` stream on *stack* for a 2026-07-28 *session* that
-    advertises ``list_changed`` or resource ``subscribe`` capabilities, or return ``None``."""
+    advertises ``list_changed`` or resource ``subscribe`` capabilities, or return ``None``.
+
+    ``None`` also when the server acknowledges none of the requested notifications: it will send
+    nothing, so there is nothing to listen to.
+    """
     if (
         not isinstance(session, _RealClientSession)
         or session.protocol_version not in MODERN_PROTOCOL_VERSIONS
@@ -1906,7 +1918,13 @@ async def _enter_modern_subscription(
         ):
             raise
         return None
-    if getattr(getattr(sub, "_route", None), "end", None) is not None:
+    honored = sub.honored
+    if not (
+        honored.tools_list_changed
+        or honored.prompts_list_changed
+        or honored.resources_list_changed
+        or honored.resource_subscriptions
+    ):
         await child_stack.aclose()
         return None
     return sub
@@ -1946,6 +1964,41 @@ async def _park_transport_owner(
             for t in tasks:
                 t.cancel()
 
+    async def _next_event(target: Subscription) -> bool:
+        """Wait for *target*'s next event: True for one, False once its stream has ended."""
+        try:
+            await anext(target)
+        except StopAsyncIteration:
+            return False
+        return True
+
+    async def _drain(target: Subscription) -> bool:
+        """Consume *target*'s events until its stream ends or a close or relisten is signalled,
+        and say whether any event arrived. :class:`SubscriptionLost` propagates.
+
+        A wait cancelled by the signal consumes nothing, and leaving ``listen()`` afterwards ends
+        the subscription.
+        """
+        received = False
+        signal = asyncio.create_task(_wait_signal())
+        try:
+            while True:
+                event = asyncio.create_task(_next_event(target))
+                # Retrieve what a late-cancelled wait raised, so it is not reported unseen.
+                event.add_done_callback(lambda t: t.cancelled() or t.exception())
+                try:
+                    await asyncio.wait({event, signal}, return_when=asyncio.FIRST_COMPLETED)
+                finally:
+                    if not event.done():
+                        event.cancel()
+                if not event.done() or event.cancelled():
+                    return received
+                if not event.result():
+                    return received
+                received = True
+        finally:
+            signal.cancel()
+
     current_sub = sub
     first_iteration = True
     consecutive_quick_closes = 0
@@ -1966,22 +2019,8 @@ async def _park_transport_owner(
                 await _wait_signal()
                 continue
 
-            active_sub = current_sub
-
-            async def _watch_signals(target_sub: Subscription = active_sub) -> None:
-                await _wait_signal()
-                route = getattr(target_sub, "_route", None)
-                if route is not None:
-                    route.settle("local")
-
             started_at = time.monotonic()
-            received_event = False
-            watcher = asyncio.create_task(_watch_signals())
-            try:
-                async for _event in active_sub:
-                    received_event = True
-            finally:
-                watcher.cancel()
+            received_event = await _drain(current_sub)
 
         if close_requested.is_set():
             return
@@ -2583,8 +2622,9 @@ class MCPClientManager:
         # 2026-07-28 protocol-level response caching (ttlMs / cacheScope),
         # per-URI resource subscriptions (subscriptions/listen + resources/updated),
         # and per-request opt-in server logging (_meta[io.modelcontextprotocol/logLevel]).
-        self._response_cache_store = InMemoryResponseCacheStore()
-        self._response_caches: dict[tuple[str, str | None], ClientResponseCache] = {}
+        self._response_cache_store = _ResponseCacheStore()
+        self._response_caches: dict[_CacheOwner, ClientResponseCache] = {}
+        self._response_cache_versions: dict[_CacheOwner, str] = {}
         self._resource_subscriptions: dict[str, tuple[str, ...]] = {}
         self._resource_updated_listeners: list[tuple[str | None, Callable[[str, str], None]]] = []
         self._resource_updated_listeners_lock = threading.Lock()
@@ -3600,42 +3640,38 @@ class MCPClientManager:
         relisten_requested: asyncio.Event,
         on_relisten: Callable[[], None] | None = None,
     ) -> None:
-        """Shared session initialization, negotiation, subscription, and parking inside an owner task."""
+        """Run one connection's session inside its owner task: negotiate, subscribe, then park.
+
+        The session asks a 2026-07-28 server for log messages at the level in effect when it
+        connects; :meth:`set_log_level` reaches a live session's requests at its next connect.
+        """
         session = await stack.enter_async_context(
             ClientSession(
                 read,
                 write,
                 message_handler=message_handler,
+                log_level=self._effective_log_level(server_name, cfg),
             )
         )
         if capture is not None:
             with contextlib.suppress(TypeError):
                 _session_http_captures[session] = capture
-        _configure_session_logging(
-            session,
-            log_level=self._effective_log_level(server_name, cfg),
-        )
         init_sub_stack = await stack.enter_async_context(AsyncExitStack())
         async with asyncio.timeout(self._CONNECT_TIMEOUT):
             await _negotiate_session(session, capture=capture)
             relisten_requested.clear()
-            sub = await _enter_modern_subscription(
+            sub = await _enter_subscription(
                 init_sub_stack,
                 session,
                 resource_subscriptions=self._configured_resource_subscriptions(server_name, cfg),
                 capture=capture,
             )
-        # Re-apply effective log level in case set_log_level ran while negotiation was in flight.
-        _configure_session_logging(
-            session,
-            log_level=self._effective_log_level(server_name, cfg),
-        )
         if not ready.done():
             ready.set_result(session)
 
         async def _relisten(sub_stack: AsyncExitStack) -> Subscription | None:
             relisten_requested.clear()
-            return await _enter_modern_subscription(
+            return await _enter_subscription(
                 sub_stack,
                 session,
                 resource_subscriptions=self._configured_resource_subscriptions(server_name, cfg),
@@ -3697,11 +3733,6 @@ class MCPClientManager:
         async def _on_notification(
             msg: Any,  # RequestResponder | ServerNotification | Exception
         ) -> None:
-            state = self._static_servers.get(name)
-            if not _accept_modern_listen_notification(
-                state.session if state is not None else None, msg
-            ):
-                return
             if await self._handle_common_notification(msg, name, user_id=None):
                 return
             self._admit_list_changed(
@@ -4189,11 +4220,6 @@ class MCPClientManager:
         async def _on_pool_notification(
             msg: Any,  # RequestResponder | ServerNotification | Exception
         ) -> None:
-            entry = self._user_pool_entries.get(key)
-            if not _accept_modern_listen_notification(
-                entry.session if entry is not None else None, msg
-            ):
-                return
             if await self._handle_common_notification(msg, server_name, user_id=user_id):
                 return
             self._admit_list_changed(
@@ -4328,7 +4354,7 @@ class MCPClientManager:
         try:
             async with AsyncExitStack() as stack:
                 async with asyncio.timeout(self._CONNECT_TIMEOUT):
-                    factory: McpHttpClientFactory = client_kwargs["httpx_client_factory"]
+                    factory: _HttpClientFactory = client_kwargs["httpx_client_factory"]
                     http_client = await stack.enter_async_context(
                         factory(headers=client_kwargs.get("headers"))
                     )
@@ -7025,66 +7051,29 @@ class MCPClientManager:
         merged.extend(self._resource_subscriptions.get(server_name, ()))
         return tuple(dict.fromkeys(merged))
 
-    def _apply_log_level_to_sessions(self, server_name: str | None) -> None:
-        """Rebuild 2026-07-28 per-request ``logLevel`` stamps on live sessions (mcp-loop safe)."""
-        target_names = list(self._static_servers.keys()) if server_name is None else [server_name]
-        for name in target_names:
-            state = self._static_servers.get(name)
-            if state is not None and state.session is not None:
-                _configure_session_logging(state.session, log_level=self._effective_log_level(name))
-        for (_uid, srv), entry in list(self._user_pool_entries.items()):
-            if server_name is not None and srv != server_name:
-                continue
-            if entry.session is not None:
-                _configure_session_logging(entry.session, log_level=self._effective_log_level(srv))
-
     def set_log_level(
         self,
         level: mcp_types.LoggingLevel | None,
         *,
         server_name: str | None = None,
     ) -> None:
-        """Set the 2026-07-28 per-request opt-in ``_meta["io.modelcontextprotocol/logLevel"]`` level.
+        """Set the lowest severity of server log messages turnstone keeps: the default for every
+        server when *server_name* is ``None``, else an override for *server_name*.
 
-        When *server_name* is ``None``, sets the manager-wide default; otherwise sets the override
-        for *server_name*. Live 2026-07-28 sessions immediately rebuild their request stamp in place
-        without reconnecting.
+        Incoming messages are filtered at the new level at once. A 2026-07-28 session asks its
+        server for messages at the level in effect when it connected (the request field
+        ``_meta["io.modelcontextprotocol/logLevel"]``), so that request changes at its next
+        connect.
         """
         normalized = _normalize_log_level(level) if level is not None else None
         if level is not None and normalized is None:
             raise ValueError(f"Invalid MCP log level: {level!r}")
         if server_name is None:
             self._default_log_level = normalized
+        elif normalized is None:
+            self._server_log_levels.pop(server_name, None)
         else:
-            if normalized is None:
-                self._server_log_levels.pop(server_name, None)
-            else:
-                self._server_log_levels[server_name] = normalized
-        loop = self._loop
-        if loop is None or not loop.is_running():
-            self._apply_log_level_to_sessions(server_name)
-            return
-        try:
-            running = asyncio.get_running_loop()
-        except RuntimeError:
-            running = None
-        if running is loop:
-            self._apply_log_level_to_sessions(server_name)
-        else:
-            done: concurrent.futures.Future[None] = concurrent.futures.Future()
-
-            def _apply_on_loop() -> None:
-                try:
-                    self._apply_log_level_to_sessions(server_name)
-                finally:
-                    if not done.done():
-                        done.set_result(None)
-
-            try:
-                loop.call_soon_threadsafe(_apply_on_loop)
-                done.result(timeout=1.0)
-            except (RuntimeError, concurrent.futures.TimeoutError):
-                pass
+            self._server_log_levels[server_name] = normalized
 
     def _effective_log_level(
         self, server_name: str, cfg: dict[str, Any] | None = None
@@ -7140,42 +7129,6 @@ class MCPClientManager:
 
         return _on_log_message
 
-    @staticmethod
-    def _cache_key_matches(
-        key: Any,
-        server_name: str,
-        *,
-        user_id: str | None = None,
-        all_users: bool = False,
-        include_public: bool = True,
-        read_only: bool = False,
-        uri: str | None = None,
-    ) -> bool:
-        method = getattr(key, "method", None)
-        params_key = getattr(key, "params_key", None)
-        partition_raw = getattr(key, "partition", None)
-        if not isinstance(method, str) or not isinstance(partition_raw, str):
-            return False
-        if read_only and method != "resources/read":
-            return False
-        if uri is not None and params_key != uri:
-            return False
-        try:
-            fields = json.loads(partition_raw)
-        except ValueError:
-            return False
-        if not isinstance(fields, list) or len(fields) < 3:
-            return False
-        arm_id = fields[2]
-        sub_partition = fields[3] if len(fields) > 3 else None
-        if all_users:
-            return arm_id in (f"static:{server_name}", f"pool:{server_name}")
-        if user_id is None:
-            return bool(arm_id == f"static:{server_name}")
-        if not include_public:
-            return bool(arm_id == f"pool:{server_name}" and sub_partition == f"user:{user_id}")
-        return bool(arm_id == f"pool:{server_name}" and sub_partition in (None, f"user:{user_id}"))
-
     def _purge_response_cache(
         self,
         server_name: str,
@@ -7186,52 +7139,37 @@ class MCPClientManager:
         read_only: bool = False,
         uri: str | None = None,
     ) -> None:
-        """Purge cached responses in ``_response_cache_store`` and ``_response_caches`` for *server_name*."""
-        store = getattr(self, "_response_cache_store", None)
-        entries = getattr(store, "_entries", None)
-        if isinstance(entries, dict):
-            for key in [
-                k
-                for k in list(entries)
-                if self._cache_key_matches(
-                    k,
-                    server_name,
-                    user_id=user_id,
-                    all_users=all_users,
-                    include_public=include_public,
-                    read_only=read_only,
-                    uri=uri,
-                )
-            ]:
-                entries.pop(key, None)
+        """Drop cached responses for *server_name*.
 
-        caches = getattr(self, "_response_caches", None)
-        if not isinstance(caches, dict):
-            return
+        Every user's with *all_users*; else the shared server's when *user_id* is ``None``; else
+        that user's own, plus the reads its server's users share when *include_public*. *read_only*
+        keeps to ``resources/read``, and *uri* to one resource. The caches involved are replaced,
+        so a read still in flight on one of them cannot write its answer back.
+        """
+
+        def _matches(key: CacheKey, entry: CacheEntry, owner: _CacheOwner) -> bool:
+            if owner[0] != server_name:
+                return False
+            if read_only and key.method != "resources/read":
+                return False
+            if uri is not None and key.params_key != uri:
+                return False
+            if all_users:
+                return True
+            if user_id is None:
+                return owner[1] is None
+            if owner[1] == user_id and entry.scope == "private":
+                return True
+            return include_public and entry.scope == "public" and owner[1] is not None
+
+        self._response_cache_store.purge(_matches)
         affected_keys = (
-            [k for k in list(caches) if k[0] == server_name]
+            [k for k in self._response_caches if k[0] == server_name]
             if (all_users or (user_id is not None and include_public))
             else [(server_name, user_id)]
         )
-        for ck in affected_keys:
-            c = caches.get(ck)
-            if c is None:
-                continue
-            if uri is not None:
-                gen_key = ("resources/read", uri)
-                if gen_key in c._generations:
-                    c._generations[gen_key] += 1
-            else:
-                for gk in list(c._generations):
-                    if not read_only or gk[0] == "resources/read":
-                        c._generations[gk] += 1
-
-        if not read_only and uri is None:
-            if all_users:
-                for ck in affected_keys:
-                    caches.pop(ck, None)
-            else:
-                caches.pop((server_name, user_id), None)
+        for cache_key in affected_keys:
+            self._response_caches.pop(cache_key, None)
 
     def _resource_cache_for(
         self,
@@ -7241,26 +7179,29 @@ class MCPClientManager:
         user_id: str | None = None,
     ) -> ClientResponseCache | None:
         """Return the :class:`ClientResponseCache` for ``(server_name, user_id)`` when *session* is
-        on a modern protocol version, else ``None``."""
+        on a protocol revision that has response caching (2026-07-28 and later), else ``None``."""
         ver = _session_protocol_version(session) if session is not None else None
         if session is not None and ver not in MODERN_PROTOCOL_VERSIONS:
             return None
-        ver_str: str = ver or LATEST_MODERN_VERSION
         cache_key = (server_name, user_id)
+        # The cache reads its session's protocol version through this table at every lookup.
+        if ver is not None:
+            self._response_cache_versions[cache_key] = ver
+        else:
+            self._response_cache_versions.setdefault(cache_key, LATEST_MODERN_VERSION)
         cache = self._response_caches.get(cache_key)
         if cache is None:
+            # Pool caches share the reads a server marks public among its users: see #1388.
             cache = ClientResponseCache(
-                store=self._response_cache_store,
+                store=self._response_cache_store.view(cache_key),
                 partition=f"user:{user_id}" if user_id is not None else f"static:{server_name}",
                 arm_id=f"pool:{server_name}" if user_id is not None else f"static:{server_name}",
                 default_ttl_ms=0,
                 clock=time.monotonic,
                 share_public=user_id is not None,
-                negotiated_version=lambda: ver_str,
+                negotiated_version=functools.partial(self._response_cache_versions.get, cache_key),
             )
             self._response_caches[cache_key] = cache
-        elif ver is not None:
-            cache._negotiated_version = lambda: ver_str
         return cache
 
     async def _evict_cache_for_notification(
@@ -7655,7 +7596,8 @@ class MCPClientManager:
         self._resource_subscriptions.clear()
         self._server_log_levels.clear()
         self._response_caches.clear()
-        self._response_cache_store = InMemoryResponseCacheStore()
+        self._response_cache_versions.clear()
+        self._response_cache_store = _ResponseCacheStore()
         # Clear resilience state
         self._consecutive_failures.clear()
         self._circuit_open_until.clear()
