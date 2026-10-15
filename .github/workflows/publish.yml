@@ -79,7 +79,7 @@ jobs:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         if: steps.tag.outputs.skip == 'false'
         with:
-          python-version: "3.14"
+          python-version: "3.15"
       - run: pip install build
         if: steps.tag.outputs.skip == 'false'
       - run: python -m build
