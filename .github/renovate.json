@@ -50,6 +50,14 @@
       "matchStrings": ["hls-(?<currentValue>[\\d.]+)/"],
       "depNameTemplate": "hls.js",
       "datasourceTemplate": "npm"
+    },
+    {
+      "customType": "regex",
+      "description": "Track the uv version CI installs",
+      "managerFilePatterns": ["/^\\.github/workflows/.+\\.ya?ml$/"],
+      "matchStrings": ["uv-version: \"(?<currentValue>[\\d.]+)\""],
+      "depNameTemplate": "uv",
+      "datasourceTemplate": "pypi"
     }
   ],
   "packageRules": [
@@ -137,6 +145,13 @@
       "description": "GitHub Actions — group all action updates",
       "groupName": "GitHub Actions",
       "matchManagers": ["github-actions"],
+      "automerge": false
+    },
+    {
+      "description": "uv — the version CI installs and the image's copy move together",
+      "groupName": "uv",
+      "matchPackageNames": ["uv", "ghcr.io/astral-sh/uv"],
+      "schedule": ["before 9am on Monday"],
       "automerge": false
     }
   ]
