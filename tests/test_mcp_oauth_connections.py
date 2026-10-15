@@ -878,10 +878,13 @@ class TestRevokeConnection:
 
 class TestEvictUserSession:
     def test_evict_user_session_no_loop_is_silent_noop(self) -> None:
-        from turnstone.core.mcp_client import MCPClientManager
+        from turnstone.core.mcp_client import MCPClientManager, _ResponseCacheStore
 
         mgr = MCPClientManager.__new__(MCPClientManager)
         mgr._loop = None  # type: ignore[attr-defined]
+        # With no loop the eviction only drops the user's cached responses.
+        mgr._response_cache_store = _ResponseCacheStore()  # type: ignore[attr-defined]
+        mgr._response_caches = {}  # type: ignore[attr-defined]
         # Must not raise.
         mgr.evict_user_session("user-1", "srv-oauth")
 

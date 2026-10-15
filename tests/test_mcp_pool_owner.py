@@ -124,7 +124,9 @@ def _fake_transport_and_session(patches: dict[str, Any]) -> dict[str, Any]:
         finally:
             events.append("session_exit")
 
-    def fake_client_session(_read: Any, _write: Any, message_handler: Any = None):
+    def fake_client_session(
+        _read: Any, _write: Any, message_handler: Any = None, log_level: Any = None
+    ):
         return fake_client_session_cm()
 
     patches["streamable_http_client"] = fake_streamable_http_client
@@ -324,7 +326,9 @@ class TestPoolTransportOwnerLifecycle:
                 finally:
                     events.append("session_exit")
 
-        def fake_session(_read: Any, _write: Any, message_handler: Any = None):
+        def fake_session(
+            _read: Any, _write: Any, message_handler: Any = None, log_level: Any = None
+        ):
             return fake_session_cm()
 
         key = ("user-1", "pool-srv")

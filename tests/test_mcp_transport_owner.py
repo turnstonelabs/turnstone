@@ -115,7 +115,9 @@ def _fake_transport_and_session(mgr_module_patches: dict[str, Any]) -> dict[str,
         finally:
             events.append("session_exit")
 
-    def fake_client_session(_read: Any, _write: Any, message_handler: Any = None):
+    def fake_client_session(
+        _read: Any, _write: Any, message_handler: Any = None, log_level: Any = None
+    ):
         return fake_client_session_cm()
 
     mgr_module_patches["stdio_client"] = fake_stdio_client
