@@ -44,7 +44,8 @@ pip install -e ".[test,dev]"
 The `dev` extra installs `ruff` and `mypy`. Before pushing, run:
 
 ```
-ruff check turnstone tests
+ruff check .
+ruff format --check .
 mypy turnstone
 pytest
 ```

@@ -238,9 +238,11 @@ class TestMCPRegistryClientSearch:
         mock_response.text = "Internal Server Error"
 
         async with MCPRegistryClient() as client:
-            with patch.object(client._client, "get", new=AsyncMock(return_value=mock_response)):
-                with pytest.raises(MCPRegistryError, match="500"):
-                    await client.search()
+            with (
+                patch.object(client._client, "get", new=AsyncMock(return_value=mock_response)),
+                pytest.raises(MCPRegistryError, match="500"),
+            ):
+                await client.search()
 
     @pytest.mark.anyio
     async def test_search_limit_clamped(self) -> None:

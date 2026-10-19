@@ -14,6 +14,9 @@
   "prHourlyLimit": 2,
   "schedule": ["before 9am on Monday"],
   "timezone": "America/New_York",
+  "pre-commit": {
+    "enabled": true
+  },
   "lockFileMaintenance": {
     "enabled": true,
     "schedule": ["before 9am on Monday"]
@@ -115,16 +118,17 @@
     {
       "description": "Dev/test tooling",
       "groupName": "Tooling",
-      "matchPackageNames": [
-        "ruff",
-        "mypy",
-        "pytest",
-        "pytest-cov",
-        "pre-commit"
-      ],
+      "matchPackageNames": ["mypy", "pytest", "pytest-cov"],
       "schedule": ["before 9am on the first day of the month"],
       "automerge": true,
       "matchUpdateTypes": ["patch"]
+    },
+    {
+      "description": "ruff — the dev extra pin and the pre-commit hook move together",
+      "groupName": "ruff",
+      "matchPackageNames": ["ruff", "astral-sh/ruff-pre-commit"],
+      "schedule": ["before 9am on the first day of the month"],
+      "automerge": false
     },
     {
       "description": "Docker base images",

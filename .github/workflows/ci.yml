@@ -19,8 +19,7 @@ jobs:
         with:
           python-version: "3.14"
       - run: pip install pre-commit
-      # mypy runs separately in typecheck job with full project deps
-      - run: SKIP=mypy pre-commit run --all-files
+      - run: pre-commit run --all-files
 
   typecheck:
     runs-on: ubuntu-latest

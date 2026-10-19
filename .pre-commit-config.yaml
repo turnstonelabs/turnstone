@@ -1,19 +1,11 @@
 repos:
+  # Keep rev equal to the dev extra's ruff pin in pyproject.toml; Renovate bumps both together.
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.15.6
+    rev: v0.17.1
     hooks:
-      - id: ruff
+      - id: ruff-check
         args: [--fix]
       - id: ruff-format
-
-  - repo: https://github.com/pre-commit/mirrors-mypy
-    rev: v1.19.1
-    hooks:
-      - id: mypy
-        additional_dependencies: []
-        args: [--config-file=pyproject.toml]
-        pass_filenames: false
-        entry: mypy turnstone/
 
   - repo: local
     hooks:
