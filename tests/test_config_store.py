@@ -294,6 +294,25 @@ class TestReload:
         assert store.get("tools.timeout") == expected
         assert ConfigStore(storage).get("tools.timeout") == expected
 
+    def test_the_first_load_raises_when_storage_cannot_be_read(self, storage, monkeypatch):
+        # A store that never loaded would answer every get() with the registry
+        # default: retention 90 days where the operator chose 0 (#1406).
+        monkeypatch.setattr(storage, "get_system_settings_bulk", _unreadable)
+        with pytest.raises(RuntimeError, match="database went away"):
+            ConfigStore(storage)
+
+    def test_a_failed_reload_keeps_the_settings_that_last_loaded(self, storage, store, monkeypatch):
+        store.set("session.retention_days", 0)
+        version = store.version
+        monkeypatch.setattr(storage, "get_system_settings_bulk", _unreadable)
+        assert store.reload() is False
+        assert store.get("session.retention_days") == 0
+        assert store.version == version
+
+
+def _unreadable(node_id: str = "") -> dict[str, str]:
+    raise RuntimeError("database went away")
+
 
 # ---------------------------------------------------------------------------
 # all_effective()

@@ -655,7 +655,11 @@ def _cmd_rerank_calibrate(args: argparse.Namespace) -> None:
     from turnstone.core.rerank_calibrate import calibrate_model, merge_calibration_into_caps
 
     storage = _get_storage(args)
-    config_store = ConfigStore(storage)
+    try:
+        config_store = ConfigStore(storage)
+    except Exception as e:
+        print(f"Could not load the stored settings: {e}", file=sys.stderr)
+        sys.exit(1)
 
     alias = str(args.model).strip()
     row = storage.get_model_definition_by_alias(alias)

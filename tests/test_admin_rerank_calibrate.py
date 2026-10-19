@@ -160,6 +160,30 @@ def test_model_without_base_url_errors(tmp_path, monkeypatch):
     assert ei.value.code == 1
 
 
+def test_settings_that_cannot_load_stop_it_before_calibrating(tmp_path, monkeypatch, capsys):
+    """The stored query instruction is a setting: calibrating on the default one
+    would record a threshold measured under an instruction nobody chose (#1406)."""
+    from turnstone.core.storage._sqlite import SQLiteBackend
+
+    db = str(tmp_path / "t.db")
+    _seed_reranker(db)
+    calls: list[str] = []
+    monkeypatch.setattr(
+        "turnstone.core.rerank_calibrate.calibrate_model",
+        lambda base_url, model, api_key, **kw: calls.append(model),
+    )
+
+    def unreadable(self, node_id=""):
+        raise RuntimeError("database went away")
+
+    monkeypatch.setattr(SQLiteBackend, "get_system_settings_bulk", unreadable)
+    with pytest.raises(SystemExit) as ei:
+        _cmd_rerank_calibrate(_args(db, apply=True))
+    assert ei.value.code == 1
+    assert "database went away" in capsys.readouterr().err
+    assert calls == []
+
+
 @pytest.mark.parametrize(
     ("stored", "sent"),
     [

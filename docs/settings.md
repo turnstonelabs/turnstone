@@ -19,6 +19,13 @@ At runtime, `ConfigStore` loads all settings from storage into an in-memory
 cache. Reads are lock-free dict lookups on an immutable snapshot. Writes acquire
 a lock, persist to storage, and swap the cache atomically.
 
+A node or console that can't read its settings at startup logs
+`settings.load_failed` and exits instead of running on the registry defaults,
+and a node exits the same way when it can't read its model definitions. A
+supervisor restart (the shipped systemd unit's `Restart=on-failure`, a Compose
+restart policy, Kubernetes) retries the read. A reload that fails later keeps
+the settings that last loaded.
+
 ---
 
 ## Precedence

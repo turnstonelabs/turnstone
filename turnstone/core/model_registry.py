@@ -1613,10 +1613,10 @@ def load_model_registry(
     re-raises instead of degrading to a config.toml-only registry.
     Callers that hot-reload an existing registry need this so a transient
     DB outage doesn't silently drop every DB-sourced alias when the
-    truncated result is applied via ``ModelRegistry.reload``.  Callers
-    that build a fresh registry from scratch (CLI, lifespan startup) want
-    the default behaviour — boot succeeds with a config-only fallback
-    rather than crashing on a flaky DB.
+    truncated result is applied via ``ModelRegistry.reload``.  The node's
+    boot passes it too, so a supervisor restart retries the read instead
+    of the node running degraded until a Sync (#1406).  The CLI, doctor
+    and the console's coordinator bootstrap keep the config-only fallback.
 
     ``allow_empty``: when True, returns an empty registry instead of raising
     when no models are defined anywhere.  Server entry points pass this so a

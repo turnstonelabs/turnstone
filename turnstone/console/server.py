@@ -6011,12 +6011,15 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None]:
     storage = getattr(app.state, "auth_storage", None)
     config_store = None
     if storage:
-        try:
-            from turnstone.core.config_store import ConfigStore
+        from turnstone.core.config_store import ConfigStore
 
+        # Settings that can't be read end startup rather than run the console
+        # on every default; a supervisor restart retries the read.
+        try:
             config_store = ConfigStore(storage)
-        except Exception:
-            log.warning("Failed to initialise ConfigStore", exc_info=True)
+        except Exception as exc:
+            log.error("settings.load_failed: %s", exc)
+            raise SystemExit(1) from exc
     app.state.config_store = config_store
 
     # Initialize rule registry for configurable judge rules
@@ -17461,6 +17464,9 @@ def _seed_config_from_env(config_store: Any, storage: Any) -> None:
     Only seeds known settings from the registry to avoid storing garbage.
     Uses config_store.set() for proper validation, serialization, and
     cache invalidation.
+
+    A value the setting refuses is logged and skipped; a storage error
+    propagates, so the console doesn't start on settings it couldn't seed.
     """
     from turnstone.core.settings_registry import SETTINGS
 
@@ -17477,7 +17483,7 @@ def _seed_config_from_env(config_store: Any, storage: Any) -> None:
         try:
             config_store.set(key, env_val, changed_by="env")
             log.info("config.seeded_from_env: %s from %s", key, env_name)
-        except Exception:
+        except ValueError:
             log.warning("config.seed_failed: %s from %s", key, env_name, exc_info=True)
 
 
@@ -18557,12 +18563,18 @@ def main() -> None:
             _advertise_host = _socket.gethostname()
         console_url = f"http://{_advertise_host}:{args.port}"
     if auth_storage:
-        try:
-            from turnstone.core.config_store import ConfigStore
+        from turnstone.core.config_store import ConfigStore
 
+        # Settings that can't be read or seeded end startup rather than run the
+        # console on every default; a supervisor restart retries.
+        try:
             _cs = ConfigStore(auth_storage)
             # Seed ConfigStore from env vars (TURNSTONE_{SECTION}_{KEY})
             _seed_config_from_env(_cs, auth_storage)
+        except Exception as exc:
+            log.error("settings.load_failed: %s", exc)
+            raise SystemExit(1) from exc
+        try:
             if _cs.get("tls.enabled"):
                 from turnstone.console.tls import TLSManager
 

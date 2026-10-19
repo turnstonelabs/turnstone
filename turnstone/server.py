@@ -6250,7 +6250,13 @@ def main() -> None:
     from turnstone.core.config_store import ConfigStore
     from turnstone.core.storage import get_storage as _get_cs_storage
 
-    config_store = ConfigStore(storage=_get_cs_storage(), node_id=_node_id)
+    # Settings that can't be read end the boot: every default would apply, the
+    # startup prune below among them, and a supervisor restart retries the read.
+    try:
+        config_store = ConfigStore(storage=_get_cs_storage(), node_id=_node_id)
+    except Exception as exc:
+        log.error("settings.load_failed: %s", exc)
+        raise SystemExit(1) from exc
 
     # Warn about config.toml keys that are now managed by ConfigStore
     from turnstone.core.config import warn_migrated_settings
@@ -6286,6 +6292,9 @@ def main() -> None:
         # shows in the console, and models added in the admin panel hot-reload
         # in (internal_model_reload). Requests fail cleanly until then.
         allow_empty=True,
+        # Definitions that can't be read end the boot, as settings do: a
+        # config.toml-only registry would leave the node degraded until a Sync.
+        strict=True,
         detect_context_windows=True,
     )
 

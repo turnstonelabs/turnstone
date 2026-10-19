@@ -986,6 +986,43 @@ base_url = "http://laptop:8000/v1"
         finally:
             reset_storage()
 
+    def test_reports_settings_that_cannot_load(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Settings that didn't load would leave doctor on a default model the
+        cluster may not use; it reports the failure instead (#1406)."""
+        from turnstone.core.storage import init_storage, reset_storage
+
+        db_path = str(tmp_path / "doctor.db")
+        reset_storage()
+        st = init_storage("sqlite", path=db_path, run_migrations=True)
+        try:
+            st.create_model_definition(
+                "def1",
+                "default",
+                "test-model",
+                provider="openai-compatible",
+                base_url="http://localhost:9/v1",
+                api_key="dummy",
+                context_window=8192,
+                enabled=True,
+            )
+
+            def unreadable(node_id: str = "") -> dict[str, str]:
+                raise RuntimeError("database went away")
+
+            monkeypatch.setattr(st, "get_system_settings_bulk", unreadable)
+            monkeypatch.setattr("turnstone.doctor._validate_connection", lambda llm: (True, ""))
+            profile = _make_profile(
+                tmp_path, db_config={"backend": "sqlite", "url": "", "path": db_path}
+            )
+            brain, verdict = resolve_doctor_brain(profile, st, "")
+            assert brain is None
+            assert verdict.ok is False
+            assert "database went away" in verdict.detail
+        finally:
+            reset_storage()
+
     def test_names_a_skipped_definition_when_nothing_loads(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:

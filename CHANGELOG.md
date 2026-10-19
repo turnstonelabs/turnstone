@@ -621,6 +621,21 @@ frozen.
 
 ### Fixed
 
+- **A node or console that can't read its settings at startup exits instead of running on the
+  defaults (#1406).** When the settings query failed after the database migrations had run (a
+  dropped connection, a failover, a timeout), the process ran on every setting's default until
+  something reloaded them. A node pruned workstreams on the default 90-day retention even with
+  retention off or longer, and closed idle workstreams on the default timeout; the default model
+  and the task, coordinator, channel, judge and audio models moved; `model.auth_fail_closed`,
+  `model.auth_audience_allowlist`, `ratelimit.enabled` and `server.require_project` reverted;
+  workstreams created meanwhile were saved without `session.instructions`; and the node and the
+  console skipped TLS. The console could also store `tls.enabled = false` over a stored `true`,
+  which kept TLS off after later restarts: if a console started during a database outage, check
+  `tls.enabled` in the Settings tab. Both now log `settings.load_failed` and exit, so a supervisor
+  restart retries the read, and a node that can't read its model definitions exits too instead of
+  running on config.toml's models until a Sync. A reload that fails later keeps the settings that
+  last loaded. `turnstone-admin rerank-calibrate` stops with the error instead of calibrating on
+  the default query instruction.
 - **Channel bots no longer start conversations on the wrong model before they have fetched the
   channel model (#1377).** Until a Discord or Slack bot had fetched `channels.default_model_alias`
   once, every conversation started meanwhile took the setting as unset and ran for good on the
