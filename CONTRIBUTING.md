@@ -55,6 +55,9 @@ pytest
 - Keep pull requests focused — one change per PR
 - Add tests for new functionality
 - Follow existing code style and patterns
+- Treat a failed read (database, config file, network) as an error, never as an empty or default
+  value: writes, deletes and prunes act only on reads that succeeded, and a startup sync stores
+  only what it observed
 - Update documentation if your change affects user-facing behavior
 
 ## Reporting Issues
