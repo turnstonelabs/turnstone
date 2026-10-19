@@ -44,19 +44,19 @@ class PolicyVerdict:
 
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterable, Mapping, MutableMapping
+    from collections.abc import Awaitable, Callable, Iterable, Mapping, MutableMapping
 
     from turnstone.core.storage import StorageBackend
 
 log = get_logger(__name__)
 
 _WS_CREATE_TIMEOUT = 30.0  # seconds
-_MODELS_CACHE_TTL = 30.0  # cache model list for autocomplete
-# Cache the channel default alias as long as the model list. A model that isn't
-# loaded fails the conversation instead of running another (#1359), so after
-# the channel model is repointed and the old one removed, a stale alias fails
-# new conversations until it expires.
-_CHANNEL_DEFAULT_TTL = _MODELS_CACHE_TTL
+# How long the model list is cached, for the /ask autocomplete and for the
+# channel model it carries. A model that isn't loaded fails the conversation
+# instead of running another (#1359), so after the channel model is repointed
+# and the old one removed, a stale alias fails new conversations until it
+# expires.
+_MODELS_CACHE_TTL = 30.0
 
 #: What a channel adapter replies when a conversation can't start because its
 #: model isn't loaded. Nothing substitutes another model (#1359); the chat user
@@ -74,6 +74,14 @@ def model_unavailable_reply(exc: BaseException) -> str | None:
     if isinstance(exc, TurnstoneAPIError) and exc.code == "model_not_loaded":
         return MODEL_UNAVAILABLE_REPLY
     return None
+
+
+#: What a channel adapter replies when a conversation can't start because the
+#: channel model couldn't be looked up. Nothing falls back to another model
+#: (#1377), and the lookup may well work on the next try.
+MODEL_LOOKUP_FAILED_REPLY = (
+    "I couldn't look up the model for this conversation, so it didn't start. Please try again."
+)
 
 
 _FORK_SOURCE_NOT_FOUND = "Workstream not found"
@@ -185,10 +193,7 @@ class ChannelRouter:
                 timeout=_WS_CREATE_TIMEOUT,
             )
 
-        # Cached channel default alias (TTL-based).
-        self._channel_default_alias: str = ""
-        self._channel_default_ts: float = 0.0
-        # Cached model list for autocomplete (TTL-based).
+        # Cached model list and the defaults it carries (TTL-based).
         self._models_cache: dict[str, Any] = {}
         self._models_cache_ts: float = 0.0
 
@@ -204,16 +209,15 @@ class ChannelRouter:
 
     # -- model listing -------------------------------------------------------
 
-    async def list_models(self, *, cached: bool = False) -> dict[str, Any]:
-        """Fetch available model aliases and defaults from the server/console.
+    async def list_models(self) -> dict[str, Any]:
+        """Return available model aliases and defaults from the server/console.
 
-        When *cached* is True, returns a TTL-cached result to avoid
-        per-keystroke HTTP traffic during autocomplete.
+        Cached for ``_MODELS_CACHE_TTL``, so autocomplete keystrokes and new
+        conversations don't each cost an HTTP request. A failed fetch raises.
         """
-        if cached:
-            now = time.monotonic()
-            if self._models_cache and (now - self._models_cache_ts) < _MODELS_CACHE_TTL:
-                return self._models_cache
+        now = time.monotonic()
+        if self._models_cache and (now - self._models_cache_ts) < _MODELS_CACHE_TTL:
+            return self._models_cache
 
         if self._console:
             resp: Any = await self._console.list_models()
@@ -223,30 +227,21 @@ class ChannelRouter:
         # SDK returns a Pydantic model; convert to dict for callers.
         data: dict[str, Any] = resp.model_dump() if hasattr(resp, "model_dump") else resp
 
-        # Update cache regardless of `cached` flag — a fresh fetch is
-        # always worth caching for subsequent callers.
         self._models_cache = data
         self._models_cache_ts = time.monotonic()
         return data
 
     async def get_channel_default_alias(self) -> str:
-        """Return the channel default model alias (cached with TTL)."""
-        now = time.monotonic()
-        if (now - self._channel_default_ts) < _CHANNEL_DEFAULT_TTL:
-            return self._channel_default_alias
-        # Mark refresh window before awaiting so concurrent callers
-        # reuse the cached value instead of triggering duplicate fetches.
-        prev_ts = self._channel_default_ts
-        self._channel_default_ts = now
-        try:
-            data = await self.list_models()
-            self._channel_default_alias = data.get("channel_default_alias", "")
-        except Exception:
-            # Roll the timestamp back so the next caller retries instead of
-            # serving a stale/empty alias for the full TTL window.
-            self._channel_default_ts = prev_ts
-            log.debug("channel_router.channel_default_fetch_failed", exc_info=True)
-        return self._channel_default_alias
+        """Return the ``channels.default_model_alias`` setting, ``""`` when it is unset.
+
+        Read from the cached model list. A failed fetch raises: nothing falls back
+        to an older cached list's alias, nor to ``""``, which would read as "no
+        channel model is set" and start the conversation on a model nobody chose
+        for the channel (#1377).
+        """
+        data = await self.list_models()
+        alias: str = data.get("channel_default_alias", "")
+        return alias
 
     # -- internal helpers ----------------------------------------------------
 
@@ -314,7 +309,7 @@ class ChannelRouter:
         channel_type: str,
         channel_id: str,
         name: str = "",
-        model: str = "",
+        model: str | Callable[[], Awaitable[str]] = "",
         initial_message: str = "",
         client_type: str = "",
         channel_user_id: str = "",
@@ -324,6 +319,10 @@ class ChannelRouter:
 
         Returns ``(ws_id, is_new)`` where *is_new* is ``True`` when a new
         workstream was created.
+
+        *model* is the alias to create with, or a lookup awaited only when
+        this creates one, so a message to a live conversation never waits on
+        (or fails with) a model it doesn't need.
 
         A per-channel lock prevents duplicate workstreams when concurrent
         messages arrive for the same channel before the first creation
@@ -383,6 +382,7 @@ class ChannelRouter:
                 )
 
             # 2. Create via SDK client with atomic resume.
+            create_model = await model() if callable(model) else model
             resume_ws = old_ws_id or ""
             _tools_csv = ",".join(self._auto_approve_tools) if self._auto_approve_tools else ""
             log.info(
@@ -396,7 +396,7 @@ class ChannelRouter:
                 if self._console:
                     result = await self._console.route_create_workstream(
                         name=name,
-                        model=model,
+                        model=create_model,
                         resume_ws=resume_from,
                         resume_ws_exact=bool(resume_from),
                         skill=self._skill,
@@ -409,7 +409,7 @@ class ChannelRouter:
                 assert self._server is not None
                 response = await self._server.create_workstream(
                     name=name,
-                    model=model,
+                    model=create_model,
                     resume_ws=resume_from,
                     resume_ws_exact=bool(resume_from),
                     skill=self._skill,

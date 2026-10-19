@@ -37,6 +37,7 @@ from slack_sdk.web.async_client import AsyncWebClient
 from turnstone.channels._config import MAX_NOTIFY_TRACKING
 from turnstone.channels._formatter import chunk_message
 from turnstone.channels._routing import (
+    MODEL_LOOKUP_FAILED_REPLY,
     ChannelRouter,
     get_cycle_entry,
     model_unavailable_reply,
@@ -450,6 +451,20 @@ class TurnstoneSlackBot:
         if not await self._require_linked(slack_channel, user_id):
             return
 
+        # The channel adapter model (the Roles tab's), else the server default.
+        # Read it before touching the current session, so a failed read leaves
+        # that session in place instead of archiving it for one that can't start.
+        try:
+            channel_model = await self.router.get_channel_default_alias()
+        except Exception:
+            log.warning("slack.channel_model_lookup_failed", exc_info=True)
+            await self._client.chat_postEphemeral(
+                channel=slack_channel,
+                user=user_id,
+                text=MODEL_LOOKUP_FAILED_REPLY,
+            )
+            return
+
         existing = self._channel_sessions.get((slack_channel, user_id))
         if existing is not None:
             old_ws_id, old_thread_ts = existing
@@ -491,9 +506,8 @@ class TurnstoneSlackBot:
                 channel_type="slack",
                 channel_id=route.to_channel_id(),
                 name=f"slack-{slack_channel[:8]}",
-                # The channel adapter model (the Roles tab's), else the server
-                # default; a model that isn't loaded fails the create.
-                model=await self.router.get_channel_default_alias(),
+                # A model that isn't loaded fails the create.
+                model=channel_model,
                 client_type="chat",
             )
         except Exception as exc:
@@ -892,7 +906,9 @@ class TurnstoneSlackBot:
                 channel_type="slack",
                 channel_id=route.to_channel_id(),
                 name=f"slack-dm-{user_id[:8]}",
-                model=await self.router.get_channel_default_alias(),
+                # Looked up only when this starts or forks a conversation: a DM
+                # to a live one doesn't need it.
+                model=self.router.get_channel_default_alias,
                 client_type="chat",
             )
             await self.subscribe_ws(ws_id, route.to_channel_id())

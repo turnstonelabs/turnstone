@@ -621,6 +621,16 @@ frozen.
 
 ### Fixed
 
+- **Channel bots no longer start conversations on the wrong model before they have fetched the
+  channel model (#1377).** Until a Discord or Slack bot had fetched `channels.default_model_alias`
+  once, every conversation started meanwhile took the setting as unset and ran for good on the
+  fallback model (Discord's `--model`, else the server default). That covered a slow or failing
+  first fetch and, for a bot started less than 30 seconds after its host booted, the rest of those
+  30 seconds, when it didn't fetch at all. A conversation start now waits for the setting, and one
+  that can't fetch it doesn't start: Discord and the Slack slash command reply that they couldn't
+  look up the model, and the slash command keeps the current session open; a Slack DM gets its
+  usual error, including one that has to restart its conversation. Messages to a live conversation
+  don't fetch it.
 - **A JPEG saved in an extreme number of passes no longer ties up a CPU.** A progressive JPEG
   decodes in passes (scans), each costing a pass over the whole picture, and a small file can
   hold thousands. Chat attachment uploads now refuse a JPEG with more than 100 scans, and

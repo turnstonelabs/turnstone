@@ -283,7 +283,7 @@ still requiring manual approval for others).
 | `--slack-slash-command` | `TURNSTONE_SLACK_SLASH_COMMAND` | `/turnstone` | Slash command name registered in the Slack app |
 | `--server-url` | `TURNSTONE_SERVER_URL` | `http://localhost:8080` | Server URL (single-node) |
 | `--console-url` | `TURNSTONE_CONSOLE_URL` | — | Console URL (multi-node routing proxy) |
-| `--model` | — | server default | Discord's model for new workstreams when the `channels.default_model_alias` setting is empty (Slack uses only the setting). A model that isn't loaded fails the conversation instead of using another |
+| `--model` | — | server default | Discord's model for new workstreams when the `channels.default_model_alias` setting is empty (Slack uses only the setting). A model that isn't loaded, or a setting the bot can't fetch, fails the conversation instead of using another |
 | `--auto-approve` | — | `false` | Auto-approve ALL tool calls (skips approval buttons entirely) |
 | `--http-host` | — | `127.0.0.1` | HTTP server bind address for notify endpoint |
 | `--http-port` | `TURNSTONE_CHANNEL_PORT` | `8091` | HTTP server port |

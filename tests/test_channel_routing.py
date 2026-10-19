@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+import asyncio
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from turnstone.api.console_schemas import ListAvailableModelsResponse as ConsoleModelsResponse
 from turnstone.api.console_schemas import RouteCreateResponse
+from turnstone.api.server_schemas import ListAvailableModelsResponse as ServerModelsResponse
+from turnstone.channels import _routing
 from turnstone.channels._routing import ChannelRouter
 from turnstone.sdk._types import TurnstoneAPIError
 
@@ -601,3 +606,134 @@ class TestGetNodeUrl:
         url = await console_router.get_node_url("ws-1")
         assert url == "http://node2:8080/v1"
         mock_lookup.assert_awaited_once_with("ws-1")
+
+
+class TestChannelDefaultAlias:
+    """The channel model (``channels.default_model_alias``) comes from the cached model list.
+
+    ``""`` means the setting is unset, so it must never stand in for a value the
+    bot hasn't fetched: callers would start the conversation on their fallback
+    model, which the workstream then keeps (#1377).
+    """
+
+    @pytest.mark.anyio
+    async def test_concurrent_cold_callers_all_get_the_setting(
+        self, router: ChannelRouter, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A burst of conversation starts right after the bot starts: every one
+        # gets the setting, not only the one whose fetch filled the cache.
+        async def list_models() -> ServerModelsResponse:
+            await asyncio.sleep(0.01)
+            return ServerModelsResponse(channel_default_alias="chan-model")
+
+        assert router._server is not None
+        monkeypatch.setattr(router._server, "list_models", list_models)
+        aliases = await asyncio.gather(*(router.get_channel_default_alias() for _ in range(10)))
+        assert aliases == ["chan-model"] * 10
+
+    @pytest.mark.anyio
+    async def test_unset_setting_is_a_cached_value(
+        self, router: ChannelRouter, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        assert router._server is not None
+        fetch = AsyncMock(return_value=ServerModelsResponse())
+        monkeypatch.setattr(router._server, "list_models", fetch)
+        assert await router.get_channel_default_alias() == ""
+        assert await router.get_channel_default_alias() == ""
+        fetch.assert_awaited_once()
+
+    @pytest.mark.anyio
+    async def test_failed_fetch_raises_and_the_next_call_fetches_again(
+        self, console_router: ChannelRouter, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A console that can't answer /v1/api/models fails the conversation
+        # start instead of reading as "no channel model is set".
+        assert console_router._console is not None
+        fetch = AsyncMock(
+            side_effect=[
+                TurnstoneAPIError(503, "Storage not available"),
+                ConsoleModelsResponse(channel_default_alias="chan-model"),
+            ]
+        )
+        monkeypatch.setattr(console_router._console, "list_models", fetch)
+        with pytest.raises(TurnstoneAPIError, match="Storage not available"):
+            await console_router.get_channel_default_alias()
+        assert await console_router.get_channel_default_alias() == "chan-model"
+
+    @pytest.mark.anyio
+    async def test_failed_refresh_raises_instead_of_serving_the_previous_alias(
+        self, router: ChannelRouter, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        assert router._server is not None
+        fetch = AsyncMock(
+            side_effect=[
+                ServerModelsResponse(channel_default_alias="chan-model"),
+                TurnstoneAPIError(503, "down"),
+            ]
+        )
+        monkeypatch.setattr(router._server, "list_models", fetch)
+        assert await router.get_channel_default_alias() == "chan-model"
+        router._models_cache_ts -= _routing._MODELS_CACHE_TTL + 1
+        with pytest.raises(TurnstoneAPIError, match="down"):
+            await router.get_channel_default_alias()
+
+    @pytest.mark.anyio
+    async def test_first_call_fetches_whatever_the_clock_reads(
+        self, router: ChannelRouter, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # time.monotonic() counts from boot on Linux, so a bot started just after
+        # its host boots reads a small clock; with nothing cached it must still
+        # fetch.
+        monkeypatch.setattr(_routing, "time", SimpleNamespace(monotonic=lambda: 5.0))
+        assert router._server is not None
+        fetch = AsyncMock(return_value=ServerModelsResponse(channel_default_alias="chan-model"))
+        monkeypatch.setattr(router._server, "list_models", fetch)
+        assert await router.get_channel_default_alias() == "chan-model"
+        fetch.assert_awaited_once()
+
+    @pytest.mark.anyio
+    async def test_live_route_never_looks_up_the_model(
+        self, router: ChannelRouter, mock_storage: MagicMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A message to a live conversation needs no model, so a models endpoint
+        # that is down can't stop it.
+        mock_storage.get_channel_route.return_value = {"ws_id": "ws-live"}
+        monkeypatch.setattr(router, "_is_ws_live", AsyncMock(return_value=True))
+        assert router._server is not None
+        fetch = AsyncMock(side_effect=TurnstoneAPIError(503, "down"))
+        monkeypatch.setattr(router._server, "list_models", fetch)
+
+        result = await router.get_or_create_workstream(
+            "slack", "D1", model=router.get_channel_default_alias
+        )
+
+        assert result == ("ws-live", False)
+        fetch.assert_not_awaited()
+
+    @pytest.mark.anyio
+    async def test_create_looks_up_the_model_and_fails_closed(
+        self, router: ChannelRouter, mock_storage: MagicMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        assert router._server is not None
+        fetch = AsyncMock(
+            side_effect=[
+                TurnstoneAPIError(503, "down"),
+                ServerModelsResponse(channel_default_alias="chan-model"),
+            ]
+        )
+        monkeypatch.setattr(router._server, "list_models", fetch)
+        create = AsyncMock(return_value=MagicMock(ws_id="ws-new"))
+        monkeypatch.setattr(router._server, "create_workstream", create)
+
+        with pytest.raises(TurnstoneAPIError, match="down"):
+            await router.get_or_create_workstream(
+                "slack", "D1", model=router.get_channel_default_alias
+            )
+        create.assert_not_awaited()
+        mock_storage.create_channel_route.assert_not_called()
+
+        result = await router.get_or_create_workstream(
+            "slack", "D1", model=router.get_channel_default_alias
+        )
+        assert result == ("ws-new", True)
+        assert create.await_args.kwargs["model"] == "chan-model"

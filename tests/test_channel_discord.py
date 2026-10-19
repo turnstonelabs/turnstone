@@ -446,6 +446,26 @@ class TestMessageCog:
         thread.send.assert_awaited_once_with(MODEL_UNAVAILABLE_REPLY)
         ts.router.send_message.assert_not_awaited()
 
+    def test_mention_that_cannot_look_up_the_model_starts_nothing(self):
+        """#1377: a failed channel-model lookup leaves no empty thread and
+        doesn't fall back to the gateway's --model."""
+        from turnstone.channels._routing import MODEL_LOOKUP_FAILED_REPLY
+        from turnstone.sdk._types import TurnstoneAPIError
+
+        cog, ts, bot = self._make_cog()
+        bot.user.mentioned_in = MagicMock(return_value=True)
+        ts.router.get_channel_default_alias = AsyncMock(side_effect=TurnstoneAPIError(503, "down"))
+        ts.router.get_or_create_workstream = AsyncMock()
+        msg = _make_message(content="<@99999> hi", channel=MagicMock(spec=discord.TextChannel))
+        msg.create_thread = AsyncMock()
+        msg.reply = AsyncMock()
+
+        _run(cog._on_message(msg))
+
+        msg.create_thread.assert_not_awaited()
+        ts.router.get_or_create_workstream.assert_not_awaited()
+        msg.reply.assert_awaited_once_with(MODEL_LOOKUP_FAILED_REPLY)
+
     def test_ignores_non_allowed_channels(self):
         cog, ts, _bot = self._make_cog()
         ts._is_allowed_channel = MagicMock(return_value=False)
@@ -540,6 +560,23 @@ class TestAskModelSelection:
 
         _, kwargs = ts.router.get_or_create_workstream.call_args
         assert kwargs["model"] == "cli-model"
+
+    def test_ask_that_cannot_look_up_the_model_starts_nothing(self):
+        """#1377: a failed channel-model lookup creates no thread and doesn't
+        fall back to the gateway's --model."""
+        from turnstone.channels._routing import MODEL_LOOKUP_FAILED_REPLY
+        from turnstone.sdk._types import TurnstoneAPIError
+
+        cog, ts, interaction = self._make_cog_and_interaction()
+        ts.router.get_channel_default_alias = AsyncMock(side_effect=TurnstoneAPIError(503, "down"))
+
+        _run(cog._cmd_ask(interaction, "hello"))
+
+        interaction.channel.create_thread.assert_not_awaited()
+        ts.router.get_or_create_workstream.assert_not_awaited()
+        interaction.followup.send.assert_awaited_once_with(
+            MODEL_LOOKUP_FAILED_REPLY, ephemeral=True
+        )
 
     def test_empty_model_when_no_defaults(self):
         cog, ts, interaction = self._make_cog_and_interaction()

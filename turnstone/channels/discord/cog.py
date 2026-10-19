@@ -12,7 +12,7 @@ from collections import OrderedDict, deque
 from typing import TYPE_CHECKING
 from weakref import WeakValueDictionary
 
-from turnstone.channels._routing import model_unavailable_reply
+from turnstone.channels._routing import MODEL_LOOKUP_FAILED_REPLY, model_unavailable_reply
 from turnstone.core.log import get_logger
 
 if TYPE_CHECKING:
@@ -171,6 +171,17 @@ class MessageCog:
             if not content:
                 content = "Hello"
 
+            # The channel model, else the gateway's --model. Read it before the
+            # thread exists, so a failed read leaves no empty thread behind.
+            try:
+                mention_model = await self.ts.router.get_channel_default_alias()
+            except Exception:
+                log.warning("discord.channel_model_lookup_failed", exc_info=True)
+                await message.reply(MODEL_LOOKUP_FAILED_REPLY)
+                return
+            if not mention_model:
+                mention_model = self.ts.config.model
+
             # Create a thread from the message.
             thread_name = content[:_THREAD_NAME_MAX] if len(content) > _THREAD_NAME_MAX else content
             thread = await message.create_thread(
@@ -181,9 +192,6 @@ class MessageCog:
             # first, then send the message.  With SSE the event stream is
             # reliable once connected, but we still subscribe first for
             # consistency.
-            mention_model = await self.ts.router.get_channel_default_alias()
-            if not mention_model:
-                mention_model = self.ts.config.model
             try:
                 ws_id, _is_new = await self.ts.router.get_or_create_workstream(
                     channel_type="discord",
@@ -489,14 +497,7 @@ class MessageCog:
 
         thread_name = message[:_THREAD_NAME_MAX] if len(message) > _THREAD_NAME_MAX else message
 
-        # Create a standalone thread in the current channel.
-        if isinstance(channel, discord.TextChannel):
-            thread = await channel.create_thread(
-                name=thread_name,
-                auto_archive_duration=self.ts.config.thread_auto_archive,  # type: ignore[arg-type]
-                type=discord.ChannelType.public_thread,
-            )
-        else:
+        if not isinstance(channel, discord.TextChannel):
             await interaction.followup.send(
                 "Cannot create a thread in this channel type.",
                 ephemeral=True,
@@ -504,11 +505,24 @@ class MessageCog:
             return
 
         # Resolve model: explicit > channel default > CLI --model > server default.
+        # Read before the thread exists, so a failed read leaves no empty thread.
         effective_model = model
         if not effective_model:
-            effective_model = await self.ts.router.get_channel_default_alias()
+            try:
+                effective_model = await self.ts.router.get_channel_default_alias()
+            except Exception:
+                log.warning("discord.channel_model_lookup_failed", exc_info=True)
+                await interaction.followup.send(MODEL_LOOKUP_FAILED_REPLY, ephemeral=True)
+                return
         if not effective_model:
             effective_model = self.ts.config.model
+
+        # Create a standalone thread in the current channel.
+        thread = await channel.create_thread(
+            name=thread_name,
+            auto_archive_duration=self.ts.config.thread_auto_archive,  # type: ignore[arg-type]
+            type=discord.ChannelType.public_thread,
+        )
 
         try:
             ws_id, _is_new = await self.ts.router.get_or_create_workstream(
@@ -548,7 +562,7 @@ class MessageCog:
         from discord import app_commands
 
         try:
-            data = await self.ts.router.list_models(cached=True)
+            data = await self.ts.router.list_models()
         except Exception:
             return []
         choices: list[app_commands.Choice[str]] = []

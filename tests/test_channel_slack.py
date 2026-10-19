@@ -1399,15 +1399,38 @@ class TestChannelModel:
 
         assert router.get_or_create_workstream.await_args.kwargs["model"] == "slack-model"
 
-    def test_dm_creates_on_the_channel_model(self) -> None:
+    def test_dm_passes_the_channel_model_lookup_uncalled(self) -> None:
+        # #1377: the router looks the model up only when the DM starts or forks
+        # a conversation, so a DM to a live one never waits on it or fails with it.
         bot, router, _ = _make_bot()
-        router.get_channel_default_alias = AsyncMock(return_value="slack-model")
         router.get_or_create_workstream = AsyncMock(return_value=("ws-dm", True))
 
         event = _make_slack_event(channel="D12345", channel_type="im", thread_ts="")
         _run(bot._on_message(event, AsyncMock()))  # type: ignore[attr-defined]
 
-        assert router.get_or_create_workstream.await_args.kwargs["model"] == "slack-model"
+        model = router.get_or_create_workstream.await_args.kwargs["model"]
+        assert model is router.get_channel_default_alias
+        router.get_channel_default_alias.assert_not_awaited()
+
+    def test_slash_command_that_cannot_look_up_the_model_keeps_the_session(self) -> None:
+        # #1377: the lookup runs before the current session is archived, so a
+        # failed one leaves that session in place and says so.
+        from turnstone.channels._routing import MODEL_LOOKUP_FAILED_REPLY
+        from turnstone.sdk._types import TurnstoneAPIError
+
+        bot, router, client = _make_bot()
+        router.get_channel_default_alias = AsyncMock(side_effect=TurnstoneAPIError(503, "down"))
+        key, session = ("C01SAPU5414", "U777"), ("ws-old", "1000.000001")
+        bot._channel_sessions[key] = session  # type: ignore[attr-defined]
+
+        body = {"channel_id": "C01SAPU5414", "user_id": "U777", "text": ""}
+        _run(bot._on_slash_command(AsyncMock(), body))  # type: ignore[attr-defined]
+
+        router.close_workstream.assert_not_awaited()
+        client.chat_postMessage.assert_not_awaited()
+        router.get_or_create_workstream.assert_not_awaited()
+        assert client.chat_postEphemeral.await_args.kwargs["text"] == MODEL_LOOKUP_FAILED_REPLY
+        assert bot._channel_sessions[key] == session  # type: ignore[attr-defined]
 
     def test_slash_command_says_the_model_is_not_available(self) -> None:
         from turnstone.channels._routing import MODEL_UNAVAILABLE_REPLY

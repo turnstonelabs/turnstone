@@ -15,6 +15,7 @@ import pytest
 from tests._helpers import wait_until
 from tests.test_server_authz import _auth
 from tests.test_server_authz import app_client as app_client
+from turnstone.api.server_schemas import ListAvailableModelsResponse
 from turnstone.channels._routing import ChannelRouter
 from turnstone.core.storage import get_storage
 from turnstone.sdk.server import AsyncTurnstoneServer
@@ -544,6 +545,7 @@ async def test_slack_close_conflict_refreshes_cache_so_next_restart_converges(
 
     router._server.close_workstream = close
     router._server.create_workstream = AsyncMock(return_value=MagicMock(ws_id="new-session"))
+    router._server.list_models = AsyncMock(return_value=ListAvailableModelsResponse())
     try:
         for _ in range(2):
             await bot._on_slash_command(
