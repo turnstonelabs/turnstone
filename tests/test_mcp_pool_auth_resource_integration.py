@@ -1,9 +1,8 @@
 """Phase 7b integration tests — real-transport resource read 401/403/etc.
 
-Mirror of :mod:`tests.test_mcp_pool_auth_integration` for the resource
-path (RFC §3.2). Drives through the real ``streamablehttp_client``,
-real httpx response-hook plumbing, and a real upstream subprocess
-(``FastMCP`` with a programmable ``BehaviorMiddleware``). Direct
+Mirror of :mod:`tests.test_mcp_pool_auth_integration` for the resource path (RFC §3.2). Drives
+through the real ``streamable_http_client``, real httpx2 response-hook plumbing, and a real upstream
+server on a background thread (``MCPServer`` with a programmable ``BehaviorMiddleware``). Direct
 ``httpx.HTTPStatusError`` injection is forbidden (invariant 14).
 """
 
@@ -628,7 +627,7 @@ def test_resource_read_e2e_discovery_then_dispatch_succeeds(
     the ``_seed_pool_resource_map`` shortcut and lets ``_connect_one_pool``
     populate ``_user_resource_map`` from the real ``resources/list``
     upstream response. Verifies that the entry's discovered resources
-    match what the FastMCP fixture advertises AND that
+    match what the MCPServer fixture advertises AND that
     ``_user_resource_map[user_id]`` is populated with the URI(s) after
     discovery — proving the discovery path actually fired.
 
@@ -636,7 +635,7 @@ def test_resource_read_e2e_discovery_then_dispatch_succeeds(
     prompts), so the resource resolver cannot derive (server, uri) by
     parsing alone. The test triggers the connect via a prefix-parsed
     ``call_tool_sync`` first (which runs the full
-    tools+resources+prompts discovery against the FastMCP fixture),
+    tools+resources+prompts discovery against the MCPServer fixture),
     then drives ``read_resource_sync`` against a URI that the
     upstream advertised — proving that real discovery wired the URI
     into the per-user catalog.
@@ -655,7 +654,7 @@ def test_resource_read_e2e_discovery_then_dispatch_succeeds(
     mgr.set_storage(storage)
     mgr.set_app_state(_make_app_state(storage, cipher=cipher))
     # NB: no `_seed_pool_resource_map` — the connect runs the real
-    # ``resources/list`` against the FastMCP fixture and populates the
+    # ``resources/list`` against the MCPServer fixture and populates the
     # per-user catalog. The tool call below triggers that connect because
     # ``_resolve_pool_target`` derives (server, original) from the
     # ``mcp__pool-srv__echo`` prefix and lazy-connects via

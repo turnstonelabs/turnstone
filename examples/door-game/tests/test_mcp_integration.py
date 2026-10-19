@@ -1,6 +1,6 @@
 """End-to-end MCP integration test — the only test that touches the network.
 
-Boots the real Understone FastMCP app (backed by a temp DB) in a uvicorn
+Boots the real Understone MCPServer app (backed by a temp DB) in a uvicorn
 thread, then drives it over the real streamable-HTTP wire with the real MCP
 client: initialize, list_tools (all nine door_* names), join, look. A second
 client session joins a second adventurer in the SAME process and world, and

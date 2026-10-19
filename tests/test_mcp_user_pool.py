@@ -31,6 +31,7 @@ from tests._oauth_runtime_helpers import make_oauth_context
 from tests.conftest import (
     _drain_background,
     _run_on_loop,
+    make_client_session_double,
     make_mcp_token_cipher,
     stop_loop_thread,
 )
@@ -281,8 +282,7 @@ def _fake_connect_session() -> MagicMock:
     per-test doubles would silently stop matching the connect path's
     discovery sequence as it evolves.
     """
-    fake_session = MagicMock()
-    fake_session.initialize = AsyncMock(return_value=None)
+    fake_session = make_client_session_double()
     fake_caps = mcp_types.ServerCapabilities(tools=mcp_types.ToolsCapability())
     fake_session.server_capabilities = fake_caps
     fake_session.list_tools = AsyncMock(return_value=mcp_types.ListToolsResult(tools=[]))
@@ -693,6 +693,8 @@ class TestEviction:
             mgr._rebuild_user_tool_map("u0")
 
             class _RacingSession:
+                protocol_version = "2025-11-25"
+
                 async def list_tools(self, *, params: Any = None) -> Any:
                     # The entry is fully dropped and re-created while
                     # list_tools is in flight.
@@ -1878,11 +1880,11 @@ class TestConcurrentDispatch:
         concurrent same-key calls multiplexed on a shared
         ``ClientSession``. Phase 6 reverts that for the auth-aware path
         because the per-dispatch ``_AuthCapture`` is keyed off the
-        ``httpx.AsyncClient`` event hook — releasing the lock would let
+        ``httpx2.AsyncClient`` event hook — releasing the lock would let
         a concurrent dispatch overwrite the carrier mid-flight,
         attributing one caller's 401 to another (a security bug).
 
-        Verified by reverting ``_dispatch_pool_with_entry`` to the
+        Verified by reverting ``_dispatch_pool_with_entry_call`` to the
         Phase 5 shape (release ``open_lock`` before ``call_tool`` —
         i.e. move the ``in_flight += 1`` / ``call_tool`` / decrement
         block out of the ``async with`` body) and confirming this test

@@ -9,7 +9,7 @@ façade.
 
 Three extra HTTP routes (``/watch`` and its two JSON feeds) serve the
 read-only spectator page from :mod:`understone.watch`. They are registered via
-FastMCP's ``custom_route`` and ride inside the streamable-http app; the
+MCPServer's ``custom_route`` and ride inside the streamable-http app; the
 ``starlette`` request/response types appear ONLY here, mirroring the MCP SDK's
 own ``custom_route`` examples. The routes are unauthenticated by design and
 strictly read-only — they never mutate or persist world state.

@@ -19,11 +19,12 @@ import threading
 import time
 from contextlib import asynccontextmanager
 from typing import Any
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import mcp.types as mcp_types
 import pytest
 
+from tests.conftest import make_client_session_double
 from turnstone.core.mcp_client import MCPClientManager, PoolEntryState, _AuthCapture
 
 # ---------------------------------------------------------------------------
@@ -84,10 +85,9 @@ def _http_cfg() -> dict[str, Any]:
     return {"type": "streamable-http", "url": "https://mcp.example.com/mcp", "headers": {}}
 
 
-def _make_pool_session_mock() -> AsyncMock:
-    """A ClientSession-shaped mock good enough for pool connect + discovery."""
-    session = AsyncMock()
-    session.initialize = AsyncMock()
+def _make_pool_session_mock() -> MagicMock:
+    """A ClientSession double good enough for pool connect + discovery."""
+    session = make_client_session_double()
     # None caps → resources/prompts discovery is skipped; only list_tools runs.
     session.server_capabilities = None
     session.list_tools = AsyncMock(return_value=mcp_types.ListToolsResult(tools=[]))

@@ -1,16 +1,15 @@
 """Phase 6 integration tests — real-transport drives 401/403 through the SDK.
 
-These are the structural exit criterion for Phase 6. They MUST drive
-through the real ``streamablehttp_client``, the real httpx response-hook
-path, and a REAL upstream MCP server (a ``FastMCP`` in-process subprocess
-with a starlette middleware that programmatically returns 401/403 with
-crafted ``WWW-Authenticate`` headers).
+These are the structural exit criterion for Phase 6. They MUST drive through the real
+``streamable_http_client``, the real httpx2 response-hook path, and a REAL upstream MCP server (an
+in-process ``MCPServer`` on a background thread, with a starlette middleware that programmatically
+returns 401/403 with crafted ``WWW-Authenticate`` headers).
 
-Direct ``httpx.HTTPStatusError`` injection is FORBIDDEN here — Phase 5
-bug-1 was masked precisely by that pattern (the production code path
-was structurally unreachable, but the unit-test injection bypassed the
-SDK's swallow). The integration tests gate that the production path
-actually receives the carrier signal end-to-end.
+Direct ``httpx.HTTPStatusError`` injection is FORBIDDEN here — Phase 5 bug-1 was masked
+precisely by that pattern (the production code path was structurally unreachable, but the
+unit-test injection bypassed the SDK, which never hands a request's HTTP status error to the
+caller). The integration tests gate that the production path actually receives the carrier
+signal end-to-end.
 
 The fixture upstream is built in-thread (uvicorn on its own asyncio
 loop in a background thread) — same pattern as
@@ -220,7 +219,7 @@ def _wait_ready(port: int, timeout: float = 5.0) -> None:
 
 @pytest.fixture
 def upstream():
-    """Boot a FastMCP fixture upstream in a background thread.
+    """Boot an MCPServer fixture upstream in a background thread.
 
     Yields ``(url, behaviour)`` where ``behaviour`` is a mutable dict
     the test mutates to steer the middleware (set ``mode`` to one of
@@ -487,11 +486,10 @@ def test_integration_401_refresh_and_retry_succeeds(
     401, ``force_refresh=True`` mints a new bearer (stubbed), retry
     succeeds. Hard invariant 3: breaker counter remains 0.
 
-    Drives through the REAL ``streamablehttp_client`` and a REAL
-    upstream subprocess (no ``httpx.HTTPStatusError`` injection). This
-    is the structural exit gate for Phase 6 — the equivalent unit
-    tests CANNOT prove the production wiring works because the SDK
-    swallows the underlying exception.
+    Drives through the REAL ``streamable_http_client`` and a REAL upstream server on a background
+    thread (no ``httpx.HTTPStatusError`` injection). This is the structural exit gate for Phase 6 —
+    the equivalent unit tests CANNOT prove the production wiring works because the SDK never hands
+    the caller the HTTP status.
     """
     url, behaviour = upstream
     behaviour["mode"] = "once_401"
@@ -857,7 +855,7 @@ def test_integration_static_path_unaffected(
     pool path's auth introspection is wired up.
     """
     url, _behaviour = upstream
-    # No mode → middleware passes through to FastMCP.
+    # No mode → middleware passes through to MCPServer.
 
     mgr, loop, _ = running_loop_mgr
 
@@ -929,7 +927,7 @@ def test_static_dispatch_unaffected_by_consent_url_kwarg(
     # Drive call_tool_sync without a user_id — the static path is taken.
     result = mgr.call_tool_sync("mcp__static-srv__echo", {"payload": "static-x"}, timeout=15)
 
-    # Static path returns the FastMCP fixture's echo string.
+    # Static path returns the MCPServer fixture's echo string.
     assert "echoed:static-x" in result
     # No JSON envelope leaked through; specifically no consent_url field.
     assert "consent_url" not in result, (
@@ -956,45 +954,23 @@ def test_integration_pool_reuse_401_refresh_and_retry_succeeds(
 ) -> None:
     """Reused pool sessions still capture 401 correctly.
 
-    Dispatch 1 hits a passthrough upstream (200) and populates
-    ``entry.session``. Dispatch 2 reuses that session — no fresh
-    connect, so a per-dispatch ``_AuthCapture`` would never reach
-    the httpx response hook (the hook closes over the carrier passed
-    at first connect, which lives on the entry). A correctly-wired
-    entry-owned carrier is the only shape that lets dispatch 2's 401
-    surface to the dispatcher.
+    Dispatch 1 hits a passthrough upstream (200) and populates ``entry.session``. Dispatch 2
+    reuses that session — no fresh connect, so a per-dispatch ``_AuthCapture`` would never reach
+    the httpx2 response hook (the hook closes over the carrier passed at first connect, which
+    lives on the entry). A correctly-wired entry-owned carrier is the only shape that lets
+    dispatch 2's 401 surface to the dispatcher.
 
-    Two independent production bugs gate this test passing; both must
-    hold for reused-session 401 recovery to work end-to-end:
+    Verified on mcp 2.3.0 by reverting ``PoolEntryState.auth_capture`` to a per-dispatch
+    ``_AuthCapture()`` for both the call and the classification: dispatch 2's 401 reaches the
+    dispatcher only as the SDK's generic ``MCPError(-32603, "Server returned an error response")``,
+    nothing refreshes or retries, and the test fails. The race against the carrier's fired event in
+    ``_await_session_call`` does not gate this test, because SDK 2.3.0 answers the 401 at once with
+    a JSON-RPC error (tests/test_mcp_user_catalog.py::test_pool_connect_list_tools_401_propagates
+    fails if it does not); tests/test_mcp_http_failures.py pins the race.
 
-    1. The carrier must live on the pool entry (not per-dispatch) so
-       the response hook bound at first connect writes to the same
-       object the dispatcher reads across reuse. Verified by reverting
-       ``PoolEntryState.auth_capture`` to a per-dispatch
-       ``_AuthCapture()`` allocation: the carrier-fired event never
-       reaches the dispatcher and the test times out.
-
-    2. The dispatcher must race ``call_tool`` against the carrier's
-       fired event. The SDK's ``_receive_loop`` runs in BaseSession's
-       TaskGroup nested inside ``streamablehttp_client``'s TaskGroup;
-       when an upstream 4xx fires, the outer TaskGroup cancels
-       ``_receive_loop`` mid-finally before it can deliver
-       ``CONNECTION_CLOSED`` to the response stream's waiting
-       receiver. anyio's ``send_nowait`` skips waiters with pending
-       cancellation — but our dispatch task (created via
-       ``run_coroutine_threadsafe`` for the reused-session case) has
-       NO pending cancellation, so the send delivers but the receiver
-       never wakes (the waiter's Event is set on stale state). Result:
-       a forever-hung ``response_stream_reader.receive()``. Verified
-       by reverting the ``asyncio.wait({call_task, fired_task})``
-       race in ``_dispatch_pool_with_entry`` to a bare ``await
-       session.call_tool(...)``: the test times out.
-
-    This test is the structural gate against the per-dispatch carrier
-    pattern: it looks right in code review and passes single-dispatch
-    integration tests, but breaks silently on session reuse — and the
-    SDK-level hang the carrier fix exposes silently strands the
-    dispatcher even when the carrier is correct.
+    This test is the structural gate against the per-dispatch carrier pattern: it looks right in
+    code review and passes single-dispatch integration tests, but breaks silently on session
+    reuse.
     """
     url, behaviour = upstream
     behaviour["mode"] = "never"  # passthrough — dispatch 1 succeeds

@@ -159,9 +159,9 @@ class TestClassifyFailureWithCapture:
         assert mgr._classify_failure(RuntimeError("any"), capture=capture) == "auth_403"
 
     def test_classify_failure_no_capture_falls_through_to_legacy(self) -> None:
-        """Defense-in-depth: ``_refresh_and_persist`` raises ``HTTPStatusError``
-        directly without going through the SDK swallow, so the legacy branch
-        must still classify."""
+        """Defense-in-depth: an ``HTTPStatusError`` raised outside the SDK still classifies by its
+        status. None is known to reach the classifier today (the OAuth refresh wraps its HTTP errors
+        in ``OAuthRefreshError``), so this pins the fallback itself."""
         mgr = MCPClientManager({})
         req = httpx.Request("POST", "https://mcp.example.com/sse")
         for status, label in ((401, "auth_401"), (403, "auth_403")):
@@ -187,13 +187,11 @@ class TestCarrierLifecycle:
         prior dispatch's 401 cannot leak into the next dispatch's
         classification.
 
-        The carrier is owned by the pool entry (the httpx response hook
-        closes over ``entry.auth_capture`` at first connect; a per-
-        dispatch carrier would never reach the hook on a reused
-        session). Object identity is
-        therefore expected to be the SAME across dispatches; what
-        matters is that the FIELDS are reset under ``open_lock``
-        before ``call_tool`` runs.
+        The carrier is owned by the pool entry (the httpx2 response hook closes over
+        ``entry.auth_capture`` at first connect; a per-dispatch carrier would never reach the hook
+        on a reused session). Object identity is therefore expected to be the SAME across
+        dispatches; what matters is that the FIELDS are reset under ``open_lock`` before
+        ``call_tool`` runs.
 
         Test shape:
         1. Dispatch 1's stub ``call_tool`` populates the carrier with a
@@ -204,10 +202,8 @@ class TestCarrierLifecycle:
            www_authenticate=None) — proves dispatch 1's payload did
            not leak.
 
-        Verified by reverting ``_dispatch_pool_with_entry`` to remove
-        the two reset assignments under ``open_lock`` and confirming
-        this test fails because dispatch 2 observes dispatch 1's
-        leaked 401.
+        Verified by reverting ``_dispatch_pool_with_entry_call`` to remove the carrier resets under
+        ``open_lock``: dispatch 2 then observes dispatch 1's leaked 401 and this test fails.
         """
         from unittest.mock import patch
 
@@ -268,7 +264,7 @@ class TestCarrierLifecycle:
         # is gone.
         assert observed_states[1] == (None, None), (
             f"dispatch 2 leaked dispatch 1's state: {observed_states[1]}; "
-            "_dispatch_pool_with_entry's reset of entry.auth_capture is broken"
+            "_dispatch_pool_with_entry_call's reset of entry.auth_capture is broken"
         )
 
     def test_capture_dataclass_isolated_when_constructed_separately(self) -> None:
@@ -620,11 +616,10 @@ class TestDispatcherAuthFlows:
             nonlocal call_count
             call_count += 1
             if call_count == 1:
-                # Simulate the SDK swallow path: carrier was populated
-                # by the hook, but the exception that surfaces is a
-                # generic CONNECTION_CLOSED-shaped error.
+                # Simulate a 401 as the SDK reports it: the hook recorded the status on the carrier,
+                # and the error that surfaces carries no status (on SDK 2.3.0, a JSON-RPC error).
                 _populate_active_capture(mgr, status=401, header='Bearer error="invalid_token"')
-                raise RuntimeError("upstream 401 (SDK-swallow shape)")
+                raise RuntimeError("upstream 401 (status-less SDK error)")
             return mcp_types.CallToolResult(
                 content=[mcp_types.TextContent(type="text", text="ok")],
                 is_error=False,
@@ -1025,7 +1020,7 @@ class TestOpenLockHeldAcrossCallTool:
         in ``test_mcp_user_pool.py`` but pins the assertion to the carrier
         isolation rationale specifically.
 
-        Verified by reverting ``_dispatch_pool_with_entry`` to release
+        Verified by reverting ``_dispatch_pool_with_entry_call`` to release
         ``open_lock`` before ``call_tool`` (move the
         ``in_flight += 1`` / ``call_tool`` / decrement out of the
         ``async with`` body) and confirming this test observes
@@ -1089,14 +1084,12 @@ class TestOpenLockHeldAcrossCallTool:
 class TestCrossTaskRetryIsolation:
     """The auth_401 retry MUST run on a fresh asyncio.Task.
 
-    Phase 6's cross-task hop (``_dispatch_pool_sync`` schedules the
-    retry via a SECOND ``asyncio.run_coroutine_threadsafe`` call so the
-    retry's ``streamablehttp_client`` TaskGroup gets a clean anyio
-    cancel-scope state, free of the prior connect's teardown
-    pollution). An in-task retry inherits the prior anyio scope across
-    ``task.uncancel()`` and surfaces ``CancelledError`` from inside the
-    retry's own ``streamablehttp_client`` scope (verified empirically
-    by the prior implementer; cross-task is the architectural fix).
+    Phase 6's cross-task hop (``_dispatch_pool_sync`` schedules the retry via a SECOND
+    ``asyncio.run_coroutine_threadsafe`` call so the retry's ``streamable_http_client`` TaskGroup
+    gets a clean anyio cancel-scope state, free of the prior connect's teardown pollution). An
+    in-task retry inherits the prior anyio scope across ``task.uncancel()`` and surfaces
+    ``CancelledError`` from inside the retry's own ``streamable_http_client`` scope (verified
+    empirically by the prior implementer on the 1.x SDK; cross-task is the architectural fix).
     """
 
     def test_dispatch_pool_sync_retries_on_fresh_task(
@@ -1254,7 +1247,7 @@ class TestRetryTimeoutBudget:
 
 
 # ---------------------------------------------------------------------------
-# Test helpers — bridge the test stand-in for the real httpx event hook.
+# Test helpers — bridge the test stand-in for the real httpx2 event hook.
 #
 # The dispatcher consults ``entry.auth_capture`` (carrier owned by the pool
 # entry, persisted across dispatches; the production response hook closes
@@ -1287,7 +1280,7 @@ def _populate_active_capture(mgr: MCPClientManager, *, status: int, header: str)
 
 @pytest.fixture(autouse=True)
 def _install_capture_intercept(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Wrap ``_dispatch_pool_with_entry`` so the test's fake ``call_tool``
+    """Wrap ``_dispatch_pool_with_entry_call`` so the test's fake ``call_tool``
     can populate the entry-owned ``_AuthCapture`` via ``mgr._test_active_capture``.
 
     The wrap is a no-op for tests that don't call ``_populate_active_capture``;

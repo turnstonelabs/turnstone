@@ -33,7 +33,7 @@ from starlette.responses import HTMLResponse, JSONResponse, Response, StreamingR
 from starlette.routing import Route
 from starlette.testclient import TestClient
 
-from tests.conftest import _free_port, _poll_until, serve_asgi
+from tests.conftest import _free_port, _poll_until, _seed_static_state, serve_asgi
 from turnstone.console.server import admin_test_mcp_server
 from turnstone.core.auth import AuthResult
 from turnstone.core.mcp_client import (
@@ -60,6 +60,10 @@ if TYPE_CHECKING:
 GOOD = {"name": "good", "inputSchema": {"type": "object"}}
 NO_SCHEMA = {"name": "broken"}
 TOKEN = "t0ken-for-the-test"
+IMITATED_REDIRECT = (
+    "Redirect to http://mcp.example/phish?token=s3cret not followed; use that URL as the endpoint "
+    "if it is the intended server"
+)
 
 
 class Upstream:
@@ -83,10 +87,11 @@ async def _trickle(release: threading.Event) -> AsyncIterator[bytes]:
 
 
 class _Gate(BaseHTTPMiddleware):
-    """Misbehaves by path: a same-origin redirect, an HTML page, a REST API's JSON, a JSON-RPC
-    error with a null id, a blank answer, an outage, a malformed catalog. And by state: a bearer
-    check, a dropped session, a method answered with an error status, a method that never answers,
-    a session end answered a byte at a time."""
+    """Misbehaves by path: a same-origin redirect, a redirect to another origin, a 307 with no
+    location whose body imitates the SDK's redirect text, an HTML page, a REST API's JSON, a
+    JSON-RPC error with a null id, a blank answer, an outage, a malformed catalog. And by state: a
+    bearer check, a dropped session, a method answered with an error status, a method that never
+    answers, a session end answered a byte at a time."""
 
     def __init__(self, app: Any, upstream: Upstream) -> None:
         super().__init__(app)
@@ -96,6 +101,12 @@ class _Gate(BaseHTTPMiddleware):
         path = request.url.path
         if path.startswith("/r/"):
             return Response(status_code=307, headers={"location": path[2:]})
+        if path == "/elsewhere":
+            return Response(status_code=307, headers={"location": "http://mcp.example/mcp"})
+        if path == "/no-location" and request.method == "POST":
+            body = await request.json()
+            error = {"code": -32600, "message": IMITATED_REDIRECT}
+            return JSONResponse({"jsonrpc": "2.0", "id": body.get("id"), "error": error}, 307)
         if path == "/docs":
             return HTMLResponse("<html><body>Read the docs</body></html>")
         if path == "/api":
@@ -463,6 +474,31 @@ def test_a_same_origin_redirect_keeps_the_answer_checks(
     assert time.monotonic() - started < MCPClientManager._CONNECT_TIMEOUT / 3
 
 
+def test_a_redirect_to_another_origin_names_where_it_leads(upstream: tuple[str, Upstream]) -> None:
+    """The transport does not follow it, and reports it as a JSON-RPC error naming the location;
+    the recorded status words it."""
+    base, _ = upstream
+
+    assert probe_http_server(f"{base}/elsewhere", name="srv").failure == ConnectFailure(
+        "http",
+        "HTTP 307 Temporary Redirect: Redirect to http://mcp.example/mcp not followed; use that "
+        "URL as the endpoint if it is the intended server",
+        307,
+    )
+
+
+def test_a_3xx_without_a_location_is_worded_from_its_status(
+    upstream: tuple[str, Upstream],
+) -> None:
+    """With no location the transport reads the body as the answer, so text that reads like its
+    redirect advice is the server's own, and is not quoted."""
+    base, _ = upstream
+
+    assert probe_http_server(f"{base}/no-location", name="srv").failure == ConnectFailure(
+        "http", "HTTP 307 Temporary Redirect", 307
+    )
+
+
 def test_an_untrusted_certificate_reports_tls(tmp_path: Path) -> None:
     with _serve(Upstream(), **_self_signed(tmp_path)) as port:
         probe = probe_http_server(f"https://127.0.0.1:{port}/mcp", name="srv")
@@ -571,8 +607,10 @@ def _status_error(status: int, reason: str, text: str = "") -> httpx.HTTPStatusE
         ),
         pytest.param(
             _mcp_error(32600, "Session terminated"),
-            ConnectFailure("http", "HTTP 404 Not Found: no MCP endpoint at this URL", 404),
-            id="sdk-synthesized-404",
+            ConnectFailure(
+                "protocol", "The server answered with MCP error 32600: Session terminated"
+            ),
+            id="forwarded-positive-32600",  # the 1.x SDK's lost-session stand-in, via a proxy
         ),
         pytest.param(
             _mcp_error(mcp_types.CONNECTION_CLOSED, "Connection closed"),
@@ -716,7 +754,7 @@ def test_only_an_unknown_exception_is_unrecognized() -> None:
             id="404-on-initialize",
         ),
         pytest.param(
-            _mcp_error(32600, "Session terminated"),
+            _mcp_error(mcp_types.INVALID_REQUEST, "Session terminated"),
             (404, True),
             DROPPED,
             id="404-on-a-held-session",
@@ -756,8 +794,8 @@ def test_only_an_unknown_exception_is_unrecognized() -> None:
 def test_classifier_words_http_failures_from_the_recorded_status(
     exc: BaseException, first_error: tuple[int, bool], expected: ConnectFailure
 ) -> None:
-    """The status off the wire, whatever exception the SDK version raises for it (a status
-    error, a synthesized 32600, or the generic -32603 an SDK may report instead)."""
+    """The status off the wire, whatever exception the SDK raises for it (a status error, or a
+    JSON-RPC error: the server's own, or the SDK's stand-in that drops the status)."""
     capture = _AuthCapture(first_error=first_error)
     assert classify_connect_failure(exc, capture) == expected
 
@@ -861,10 +899,13 @@ def test_an_error_text_reads_on_one_line_with_no_control_characters() -> None:
 
 
 def test_recorded_wording_is_one_line() -> None:
-    redirect = _status_error(
-        307, "Temporary Redirect", "Redirect to http://mcp.example/mcp\nnot followed"
+    mgr = MCPClientManager({})
+    capture = _AuthCapture(first_error=(307, False), first_error_redirect=True)
+    _seed_static_state(mgr, "srv", http_capture=capture)
+    redirect = _mcp_error(
+        mcp_types.INVALID_REQUEST, "Redirect to http://mcp.example/mcp\nnot followed"
     )
-    text = MCPClientManager({})._connect_failure_text("srv", redirect)
+    text = mgr._connect_failure_text("srv", redirect)
     assert text == ("HTTP 307 Temporary Redirect: Redirect to http://mcp.example/mcp not followed")
 
 

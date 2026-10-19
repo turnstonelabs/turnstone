@@ -150,8 +150,8 @@ _STDIO_GROUP_POLL_S = 0.05
 def _install_stdio_pid_recorder() -> None:
     if os.name != "posix":
         return  # the SDK's Windows Job Object already ends the whole tree
-    # Private SDK name, unchanged from 1.30 through 2.2. If it goes, helpers leak
-    # as before; test_mcp_stdio_process_group fails rather than this import.
+    # Private SDK name. If it goes, helpers leak as before; test_mcp_stdio_process_group fails
+    # rather than this import.
     spawn = getattr(mcp_stdio, "_create_platform_compatible_process", None)
     if spawn is None:
         log.warning("MCP SDK stdio spawn hook not found; server helpers may outlive servers")
@@ -212,22 +212,19 @@ async def _stop_stdio_server_group(pgid: int) -> None:
 # HTTP failure introspection (response-hook carrier)
 # ---------------------------------------------------------------------------
 #
-# The MCP SDK's ``streamable_http`` transport raises
-# :class:`httpx.HTTPStatusError` inside ``_handle_post_request`` and the
-# enclosing ``post_writer`` swallows it (``mcp/client/streamable_http.py``
-# logger.exception path). The dispatcher either sees ``McpError(CONNECTION_CLOSED)`` without
-# status or headers, or keeps waiting after the transport has died.
-# To recover upstream auth, lost-session and server failures we use the SDK's
-# extension point — ``streamablehttp_client(httpx_client_factory=...)``
-# — and pass a factory that builds the ``httpx.AsyncClient`` with a
-# response hook. The hook fires after headers arrive but BEFORE
-# ``raise_for_status()`` runs, so the carrier is populated before the
-# SDK swallow.
-#
-# Forward-compat: ``streamablehttp_client`` is ``@deprecated`` in SDK
-# 1.27 in favour of ``streamable_http_client(http_client=...)`` which
-# accepts a pre-built client. The same factory pattern translates
-# 1:1 against the new entry point when we migrate.
+# The MCP SDK's ``streamable_http`` transport answers a request that got an error status (400 and
+# up) with a JSON-RPC error: the server's own error body when it sent one, else a stand-in (-32601
+# "Not Found" for a 404 before a session, -32600 "Session terminated" for a 404 on a held one,
+# -32603 for any other status). A redirect it does not follow (a 301, 302, 303, 307 or 308 with a
+# location) fails the request with -32600 naming the location, its body unread; any other 3xx is not
+# an error to it, and its body is read as the answer. The status and headers never reach the caller.
+# A request that fails in transit reaches the caller as ``MCPError(CONNECTION_CLOSED)``, its cause
+# raised in the task that hosts the transport (a failed connect, a cut JSON answer) or logged at
+# debug level (a cut SSE stream); or the caller keeps waiting after the transport has died.
+# To recover upstream auth, lost-session and server failures, every HTTP connection gets an
+# ``httpx2.AsyncClient`` from :func:`_make_capturing_http_factory`, passed to
+# ``streamable_http_client(http_client=...)``. Its response hook runs when the headers arrive,
+# before the transport reads the body, so the carrier holds the status before the SDK drops it.
 
 
 # Defensive cap on the number of tools we accept from any single MCP server's ``tools/list``
@@ -328,19 +325,6 @@ _PENDING_CONSENT_CLEAR_TTL_SECONDS = 300.0
 _PENDING_CONSENT_CLEARED_MAX = 4096
 
 
-# ``mcp.client.streamable_http._send_session_terminated_error`` synthesizes this
-# (non-standard, POSITIVE) JSON-RPC code *client-side* when a held
-# ``mcp-session-id`` 404s after the MCP server restarted and dropped its session
-# map. It is NOT a documented MCP constant, and the SDK deliberately discards the
-# server's own 404 body ("Session not found", code ``-32600``) — so it is pinned
-# here, greppable for the next SDK bump. No spec-compliant server emits a POSITIVE
-# 32600, which is what makes the code a safe, deterministic dead-transport signal
-# to key off. The application-controlled message is NOT matched: a healthy
-# session-owning server can legitimately return a protocol error whose message is
-# "Session terminated".
-_SDK_SESSION_TERMINATED_CODE = 32600
-
-
 def _exception_summary(exc: BaseException) -> str:
     """``Type: message`` for a server's recorded error, or the bare type when the message is empty.
 
@@ -405,32 +389,27 @@ def _is_dead_transport(exc: BaseException, *, capture: _AuthCapture | None = Non
     session must be torn down and rebuilt (vs a protocol-level rejection
     from a still-healthy connection).
 
-    Captured HTTP failures and owner death are authoritative. Without those signals, retain
-    the v1 SDK fallbacks below. Its session uses anyio in-memory streams, with three death modes:
+    Captured HTTP failures and owner death are authoritative. A server that restarted and
+    dropped its session map answers our held session with a 404, which the response hook
+    records on *capture*, as it does a 5xx. No SDK error code or message marks a lost session:
+    the SDK's stand-in for that 404, -32600 "Session terminated", is also plain
+    ``INVALID_REQUEST``, and a healthy session-owning server can return a protocol error with that
+    message. Without those signals, the session's anyio in-memory streams have two death modes:
 
     1. **Local stream torn down** — the GET/SSE or POST stream died (idle close,
        peer reset, keep-alive expiry) and the ``ClientSession`` object survives
        with a closed write stream, so ``list_tools``/``call_tool`` raises
        :class:`anyio.ClosedResourceError` / :class:`anyio.BrokenResourceError`.
-    2. **Transport-swallowed** — the SDK's ``post_writer`` swallows the upstream
-       error and the caller sees ``McpError(CONNECTION_CLOSED)`` (-32000); or the
-       underlying httpx connection is gone / unrecoverable mid-exchange. Every
-       ``httpx.NetworkError`` ({Connect,Read,Write,Close}Error), the Connect/Read/
-       Write timeouts, and ``httpx.RemoteProtocolError`` qualify — notably a
-       read/idle timeout on a long-lived stream, which is NOT a builtin
-       ``TimeoutError`` and would otherwise be misread as a healthy "other"
-       failure. ``httpx.PoolTimeout`` is deliberately EXCLUDED: it means
-       connection-pool saturation, not a dead connection — evicting the session
-       wouldn't relieve the pressure and would trip the shared breaker for all
-       users on transient load.
-    3. **Server-side session lost** — the MCP server RESTARTED and dropped its
-       session map, so our held ``mcp-session-id`` is unknown. The server returns
-       HTTP 404 and the SDK synthesizes ``McpError(code=32600, "Session
-       terminated")`` (see ``streamable_http._send_session_terminated_error``),
-       discarding the server's own 404 body. Keyed off that synthesized code
-       ALONE (a positive 32600 no compliant server emits); the message is
-       application-controlled, so a healthy session-owning server that returns a
-       protocol error reading "Session terminated" stays breaker-safe.
+    2. **Transport-swallowed** — a request that failed in transit reaches the caller as
+       ``MCPError(CONNECTION_CLOSED)`` (-32000), its cause raised in the transport's host task or
+       logged at debug level; or the underlying HTTP connection is gone / unrecoverable
+       mid-exchange. Every ``NetworkError`` ({Connect,Read,Write,Close}Error), the
+       Connect/Read/Write timeouts, and ``RemoteProtocolError`` qualify, from either HTTP client —
+       notably a read/idle timeout on a long-lived stream, which is NOT a builtin ``TimeoutError``
+       and would otherwise be misread as a healthy "other" failure. ``PoolTimeout`` is
+       deliberately EXCLUDED: it means connection-pool saturation, not a dead connection —
+       evicting the session wouldn't relieve the pressure and would trip the shared breaker for
+       all users on transient load.
 
     The raw-socket variants (``BrokenPipeError`` / ``ConnectionResetError`` /
     ``EOFError``) are kept for the stdio transport and defense-in-depth.
@@ -450,32 +429,27 @@ def _is_dead_transport(exc: BaseException, *, capture: _AuthCapture | None = Non
         return True
     if _classify_http_exception(exc) == "transport":
         return True
-    if isinstance(exc, MCPError):
-        code = exc.error.code
-        if code == mcp_types.CONNECTION_CLOSED:
-            return True
-        # Server-restarted-session loss (v1 SDK fallback when no HTTP capture is present):
-        # match only the v1 SDK's deterministic positive 32600 code; on v2, held-session
-        # HTTP 404s are captured off the wire via capture.status == 404 above.
-        if code == _SDK_SESSION_TERMINATED_CODE:
-            return True
-    return False
+    return isinstance(exc, MCPError) and exc.error.code == mcp_types.CONNECTION_CLOSED
 
 
 @dataclass
 class _AuthCapture:
     """Observed auth, held-session 404, or 5xx failure, before the SDK loses its status.
 
-    ``first_error`` is the first JSON-RPC request the server answered with an error status (400
-    and up), with whether it carried a session id: what a failed connect is worded from
-    (:func:`classify_connect_failure`) whatever exception the SDK raises for it. It leaves out
-    anything but a request (a notification or the client's own answer), whose error status the SDK
-    ignores.
+    ``first_error`` is the first JSON-RPC request the server answered with an error status (400 and
+    up) or with a 3xx judged unfollowed (:func:`_is_followed_post_redirect`), with whether it
+    carried a session id: what a failed connect is worded from (:func:`classify_connect_failure`)
+    whatever exception the SDK raises for it. It leaves out anything but a request (a notification
+    or the client's own answer), whose error status the SDK ignores. ``first_error_redirect`` says
+    whether that answer was a redirect with a location. Only then does the SDK fail the request with
+    its own text, naming the location; it reads the body of any other 3xx as the answer, so that
+    text is the server's.
     """
 
     status: int | None = None
     www_authenticate: str | None = None
     first_error: tuple[int, bool] | None = None
+    first_error_redirect: bool = False
     negotiated: bool = False
 
     def reset(self, *, negotiated: bool = False) -> None:
@@ -483,6 +457,7 @@ class _AuthCapture:
         self.status = None
         self.www_authenticate = None
         self.first_error = None
+        self.first_error_redirect = False
         self.negotiated = negotiated
 
 
@@ -657,7 +632,13 @@ def _jsonrpc_body(request: httpx.Request | httpx2.Request) -> dict[str, Any] | N
 
 
 def _is_followed_post_redirect(response: httpx2.Response) -> bool:
-    """Return True if *response* is a 307/308 POST redirect that ``stream_within_origin`` follows."""
+    """Whether *response* is a 307/308 POST redirect that ``stream_within_origin`` follows: its
+    Location, joined to the request's URL, stays on the request's origin (or is its https upgrade)
+    and brings no userinfo of its own. httpx2 repairs some Locations before the transport reads them
+    (an empty one becomes the request's own URL; a scheme with no host takes the request's host),
+    and for those the judgment here can differ from the transport's, either way. The hop past the
+    budget (``client.max_redirects``) comes back unfollowed but is judged followed here, so it is
+    not recorded."""
     if response.status_code not in (307, 308):
         return False
     location = response.headers.get("location")
@@ -718,7 +699,7 @@ def _make_capturing_http_factory(
         # Use ``get_list(...)[0]`` rather than ``get(...)`` so a
         # malicious upstream that emits multiple ``WWW-Authenticate``
         # headers cannot inject auth-params into the parser via the
-        # comma-joined value httpx returns from ``get(...)``. Repeated
+        # comma-joined value httpx2 returns from ``get(...)``. Repeated
         # headers join with ``, `` which the RFC 7235 tokenizer would
         # otherwise consume as a continuation of the first challenge,
         # silently folding attacker scopes into the parsed dict. We
@@ -786,6 +767,8 @@ def _make_capturing_http_factory(
             and "id" in req_body
         ):
             capture.first_error = (status, held_session)
+            # What httpx2 checks, after the hooks, before building a redirect's next request.
+            capture.first_error_redirect = response.has_redirect_location
         if capture.status is not None:
             return
         if status in (401, 403) or (status == 404 and held_session) or 500 <= status < 600:
@@ -812,7 +795,7 @@ def _make_capturing_http_factory(
             raise _NotMcpResponseError(
                 content_type.split(";", 1)[0].strip()[:100] or "no content type"
             )
-        # The SDK reads the whole answer next, and gets it from httpx's copy.
+        # The SDK reads the whole answer next, and gets it from httpx2's copy.
         content = await response.aread()
         try:
             parsed = mcp_types.jsonrpc_message_adapter.validate_json(content, by_name=False)
@@ -901,12 +884,11 @@ class InvalidCatalogError(Exception):
     """A catalog page from an MCP server that fails the SDK's result validation.
 
     The SDK validates a list result as a whole, so one malformed entry rejects its entire page, and
-    there is no public way, on SDK 1.x or 2.x, to read the valid entries around it (#1224). The
-    server did answer, so this is a conformance failure rather than a transport one: it never
-    counts against the circuit breaker, and the static health loop retries it on
-    ``_INVALID_CATALOG_RETRY_S`` instead of the reconnect backoff. Built by
-    :func:`_invalid_page_error`, whose message names the entry and the field for the server's
-    status and leaves out the entry's values.
+    it has no public way to read the valid entries around it (#1224). The server did answer, so
+    this is a conformance failure rather than a transport one: it never counts against the circuit
+    breaker, and the static health loop retries it on ``_INVALID_CATALOG_RETRY_S`` instead of the
+    reconnect backoff. Built by :func:`_invalid_page_error`, whose message names the entry and the
+    field for the server's status and leaves out the entry's values.
     """
 
 
@@ -985,12 +967,9 @@ def _normalize_log_level(level: Any) -> mcp_types.LoggingLevel | None:
     return _VALID_MCP_LOG_LEVELS.get(level.strip().lower())
 
 
-def _session_protocol_version(session: Any) -> str | None:
+def _session_protocol_version(session: ClientSession | None) -> str | None:
     """Return *session*'s negotiated protocol version string, or ``None``."""
-    if session is None:
-        return None
-    ver = getattr(session, "protocol_version", None)
-    return ver if isinstance(ver, str) else None
+    return None if session is None else session.protocol_version
 
 
 _MIN_CATALOG_TTL_MS = 5_000
@@ -1004,50 +983,46 @@ def _pop_session_catalog_ttl(session: Any, kind: str) -> None:
     """Remove any recorded catalog TTL for *kind* on *session* before fetching."""
     if session is None:
         return
-    with contextlib.suppress(TypeError):
-        ttls = _session_catalog_ttls.get(session)
-        if ttls is not None:
-            ttls.pop(kind, None)
+    ttls = _session_catalog_ttls.get(session)
+    if ttls is not None:
+        ttls.pop(kind, None)
 
 
 def _record_session_catalog_ttl(session: Any, kind: str, page: Any) -> None:
-    """Record or clear the monotonic expiry of *kind*'s catalog on *session* from *page*'s ``ttlMs``."""
+    """Set or clear the monotonic expiry of *session*'s *kind* catalog from *page*'s ``ttlMs``."""
     if _session_protocol_version(session) not in MODERN_PROTOCOL_VERSIONS or not isinstance(
         page, mcp_types.CacheableResult
     ):
         return
-    with contextlib.suppress(TypeError):
-        if "ttl_ms" in page.model_fields_set and page.ttl_ms > 0:
-            ttl_s = max(_MIN_CATALOG_TTL_MS, min(page.ttl_ms, MAX_TTL_MS)) / 1000.0
-            _session_catalog_ttls.setdefault(session, {})[kind] = time.monotonic() + ttl_s
-        elif session in _session_catalog_ttls:
-            _session_catalog_ttls[session].pop(kind, None)
+    if "ttl_ms" in page.model_fields_set and page.ttl_ms > 0:
+        ttl_s = max(_MIN_CATALOG_TTL_MS, min(page.ttl_ms, MAX_TTL_MS)) / 1000.0
+        _session_catalog_ttls.setdefault(session, {})[kind] = time.monotonic() + ttl_s
+    elif session in _session_catalog_ttls:
+        _session_catalog_ttls[session].pop(kind, None)
 
 
 def _catalog_expires_at(session: Any) -> float | None:
     """Return the earliest catalog TTL expiry timestamp on *session*, or ``None``."""
     if session is None:
         return None
-    with contextlib.suppress(TypeError):
-        ttls = _session_catalog_ttls.get(session)
-        if ttls:
-            return min(ttls.values())
+    ttls = _session_catalog_ttls.get(session)
+    if ttls:
+        return min(ttls.values())
     return None
 
 
 def _clear_catalog_ttls(session: Any, *, now: float | None = None) -> None:
-    """Clear recorded catalog TTL expiry timestamps on *session* (or only those expired by *now*)."""
+    """Clear the catalog TTL expiries recorded on *session* (or only those expired by *now*)."""
     if session is None:
         return
-    with contextlib.suppress(TypeError):
-        ttls = _session_catalog_ttls.get(session)
-        if ttls is not None:
-            if now is None:
-                ttls.clear()
-            else:
-                for k, exp in list(ttls.items()):
-                    if exp <= now:
-                        ttls.pop(k, None)
+    ttls = _session_catalog_ttls.get(session)
+    if ttls is not None:
+        if now is None:
+            ttls.clear()
+        else:
+            for k, exp in list(ttls.items()):
+                if exp <= now:
+                    ttls.pop(k, None)
 
 
 # The cache that wrote a cached response: (server name, user id), with ``None`` for a shared server.
@@ -1160,8 +1135,7 @@ async def _list_catalog[P: mcp_types.PaginatedResult, T](
     session_obj = getattr(list_page, "__self__", None)
     capture: _AuthCapture | None = None
     if session_obj is not None:
-        with contextlib.suppress(TypeError):
-            capture = _session_http_captures.get(session_obj)
+        capture = _session_http_captures.get(session_obj)
     _pop_session_catalog_ttl(session_obj, kind)
     try:
         page = await list_page(params=None)
@@ -1615,20 +1589,20 @@ def _http_failure(status: int, detail: str = "") -> ConnectFailure:
 def _recorded_failure(
     capture: _AuthCapture | None, leaf: BaseException | None = None
 ) -> ConnectFailure | None:
-    """The failure *capture* recorded off the wire: the first message the server answered with an
-    error status. A 404 on a request that carried a session id means the server dropped the
-    session it had just opened."""
+    """The failure *capture* recorded off the wire: the first request the server answered with an
+    error status, or with a redirect judged unfollowed. A 404 on a request that carried a session id
+    means the server dropped the session it had just opened. After a redirect with a location,
+    *leaf*'s text is quoted when it starts "Redirect to ", as the SDK words a redirect it did not
+    follow. That text is the server's own when *leaf* failed a request other than the recorded one
+    (a later catalog page whose failure :func:`_list_catalog` tolerated leaves its record behind) or
+    when the transport did follow the redirect (see :func:`_is_followed_post_redirect`)."""
     if capture is None or capture.first_error is None:
         return None
     status, held_session = capture.first_error
-    leaf_text = (
-        leaf.error.message
-        if isinstance(leaf, MCPError)
-        else (str(leaf) if leaf is not None else "")
-    )
+    leaf_text = leaf.error.message if isinstance(leaf, MCPError) else ""
     if status == 404 and held_session:
         detail = _SESSION_DROPPED
-    elif 300 <= status < 400 and leaf_text.startswith("Redirect to "):
+    elif capture.first_error_redirect and leaf_text.startswith("Redirect to "):
         detail = leaf_text
     else:
         detail = ""
@@ -1667,22 +1641,16 @@ def _classify_leaf(leaf: BaseException, capture: _AuthCapture | None) -> Connect
     if isinstance(leaf, MCPError) and leaf.error.code == mcp_types.CONNECTION_CLOSED:
         return None  # what the teardown leaves behind, not why it began
     if isinstance(leaf, httpx.HTTPStatusError | httpx2.HTTPStatusError | MCPError):
-        # The status the server answered with, read off the wire: the SDK reports it as a status
-        # error, its own "Session terminated" stand-in for a 404 or a generic MCP error,
-        # depending on its version.
+        # The status the server answered with, read off the wire: the SDK reports a request's 4xx or
+        # 5xx answer, and a redirect with a location it did not follow, as a JSON-RPC error that
+        # drops the status; it reads any other 3xx body as the answer.
         recorded = _recorded_failure(capture, leaf)
         if recorded is not None:
             return recorded
     if isinstance(leaf, httpx.HTTPStatusError | httpx2.HTTPStatusError):
-        status = leaf.response.status_code
-        # The SDK raises a redirect it did not follow with its own text, naming the location to
-        # use instead with no userinfo or query. Any other status error is httpx's, whose text
-        # names the whole request URL, so it is worded from the status alone.
-        sdk_redirect = 300 <= status < 400 and str(leaf).startswith("Redirect to ")
-        return _http_failure(status, str(leaf) if sdk_redirect else "")
+        # Worded from the status alone: the error's text names the whole request URL.
+        return _http_failure(leaf.response.status_code)
     if isinstance(leaf, MCPError):
-        if leaf.error.code == _SDK_SESSION_TERMINATED_CODE:
-            return _http_failure(404)  # with no recorded status, the v1 SDK's stand-in for a 404
         return _protocol_failure(leaf.error.code, leaf.error.message)
     tls = _tls_error(leaf)
     if tls is not None:
@@ -1711,16 +1679,16 @@ def classify_connect_failure(
 ) -> ConnectFailure:
     """Why connecting to an MCP server failed, from what the connect raised.
 
-    The SDK's task groups can hold the cause beside the side effects of the teardown it set off,
-    in any order. The answer is, first to apply: the client's own shutdown; a failure recognized
-    here with a kind of its own; the status *capture* recorded off the wire; a failure recognized
-    here as a plain ``error``; a connection that closed under the requests; and last the first
-    exception's type and message, not ``recognized``. *capture* is the connection's HTTP failure
-    carrier, for connect failures only and when it is new to the connection: its status words an
-    HTTP failure whatever the SDK raises for it, and tells a 404 on a held session from one on
-    initialize. No message carries request headers: HTTP failures are worded here from the
-    status, a refused header is never quoted, and the SDK's redirect text names only the
-    redirect's location.
+    The SDK's task groups can hold the cause beside the side effects of the teardown it set off, in
+    any order. The answer is, first to apply: the client's own shutdown; a failure recognized here
+    with a kind of its own; the status *capture* recorded off the wire; a failure recognized here as
+    a plain ``error``; a connection that closed under the requests; and last the first exception's
+    type and message, not ``recognized``. *capture* is the connection's HTTP failure carrier, for
+    connect failures only and when it is new to the connection: its status words an HTTP failure
+    whatever the SDK raises for it, and tells a 404 on a held session from one on initialize. No
+    message carries request headers: HTTP failures are worded here from the status, a refused header
+    is never quoted, and redirect text is quoted only after a recorded redirect with a location
+    (:func:`_recorded_failure` says when that text can still be the server's).
     """
     leaves = _failure_leaves(exc)
     for leaf in leaves:
@@ -1772,9 +1740,6 @@ def _extract_supported_versions(data: Any) -> list[str] | None:
     return None
 
 
-_RealClientSession = ClientSession
-
-
 async def _negotiate_session(
     session: ClientSession,
     *,
@@ -1783,85 +1748,80 @@ async def _negotiate_session(
     """Negotiate the MCP protocol version on *session*: probe ``server/discover`` (2026-07-28)
     and fall back to the ``initialize`` handshake on servers that predate it.
 
-    Mock sessions in unit tests (not instances of :class:`ClientSession`) call
-    ``await session.initialize()`` directly. On real HTTP transports, a probe answered with a
-    status the response hook records on *capture* (a 401 or 403, or a redirect the transport
-    will not follow) ends the negotiation, because ``initialize`` would meet the same answer.
-    Any other refusal of the probe falls back to ``initialize``, as the SDK's own negotiation
-    does.
+    On HTTP transports, a probe answered with a status the response hook records on *capture* (a 401
+    or 403, or a redirect judged unfollowed) ends the negotiation, because ``initialize`` would meet
+    the same answer. Any other refusal of the probe falls back to ``initialize``, as the SDK's own
+    negotiation does.
     """
-    if not isinstance(session, _RealClientSession):
-        await session.initialize()
-    else:
-        result: mcp_types.DiscoverResult | None = None
-        version = LATEST_MODERN_VERSION
-        for attempt in range(2):
-            try:
-                raw = await session.send_discover(version)
-                result = mcp_types.DiscoverResult.model_validate(raw, by_name=False)
-                break
-            except MCPError as exc:
-                if exc.error.code == mcp_types.UNSUPPORTED_PROTOCOL_VERSION:
-                    supported = _extract_supported_versions(exc.error.data)
-                    mutual = [v for v in MODERN_PROTOCOL_VERSIONS if v in (supported or ())]
-                    if mutual and attempt == 0:
-                        version = mutual[-1]
-                        continue
-                    if supported is not None and not any(
-                        v in HANDSHAKE_PROTOCOL_VERSIONS for v in supported
-                    ):
-                        raise
-                if exc.error.code in (
-                    mcp_types.CONNECTION_CLOSED,
-                    mcp_types.REQUEST_TIMEOUT,
-                ) or (
-                    capture is not None
-                    and (capture.status is not None or capture.first_error is not None)
-                ):
-                    raise
-                try:
-                    await session.initialize()
-                except MCPError as handshake_exc:
-                    if (
-                        handshake_exc.error.code != mcp_types.UNSUPPORTED_PROTOCOL_VERSION
-                        or attempt != 0
-                        or (
-                            capture is not None
-                            and (capture.status is not None or capture.first_error is not None)
-                        )
-                    ):
-                        raise
-                    supported = _extract_supported_versions(handshake_exc.error.data)
-                    mutual = [v for v in MODERN_PROTOCOL_VERSIONS if v in (supported or ())]
-                    if not mutual:
-                        raise
+    result: mcp_types.DiscoverResult | None = None
+    version = LATEST_MODERN_VERSION
+    for attempt in range(2):
+        try:
+            raw = await session.send_discover(version)
+            result = mcp_types.DiscoverResult.model_validate(raw, by_name=False)
+            break
+        except MCPError as exc:
+            if exc.error.code == mcp_types.UNSUPPORTED_PROTOCOL_VERSION:
+                supported = _extract_supported_versions(exc.error.data)
+                mutual = [v for v in MODERN_PROTOCOL_VERSIONS if v in (supported or ())]
+                if mutual and attempt == 0:
                     version = mutual[-1]
                     continue
-                break
-            except ValidationError:
-                if capture is not None and (
-                    capture.status is not None or capture.first_error is not None
+                if supported is not None and not any(
+                    v in HANDSHAKE_PROTOCOL_VERSIONS for v in supported
                 ):
                     raise
-                await session.initialize()
-                break
-
-        if result is not None:
-            if any(v in MODERN_PROTOCOL_VERSIONS for v in result.supported_versions):
-                session.adopt(result)
-            elif not result.supported_versions or any(
-                v in HANDSHAKE_PROTOCOL_VERSIONS for v in result.supported_versions
+            if exc.error.code in (
+                mcp_types.CONNECTION_CLOSED,
+                mcp_types.REQUEST_TIMEOUT,
+            ) or (
+                capture is not None
+                and (capture.status is not None or capture.first_error is not None)
             ):
+                raise
+            try:
                 await session.initialize()
-            else:
-                raise MCPError(
-                    code=mcp_types.UNSUPPORTED_PROTOCOL_VERSION,
-                    message=(
-                        f"Unsupported protocol version from server/discover: "
-                        f"client supports {list(MODERN_PROTOCOL_VERSIONS)}, "
-                        f"server supports {result.supported_versions}"
-                    ),
-                )
+            except MCPError as handshake_exc:
+                if (
+                    handshake_exc.error.code != mcp_types.UNSUPPORTED_PROTOCOL_VERSION
+                    or attempt != 0
+                    or (
+                        capture is not None
+                        and (capture.status is not None or capture.first_error is not None)
+                    )
+                ):
+                    raise
+                supported = _extract_supported_versions(handshake_exc.error.data)
+                mutual = [v for v in MODERN_PROTOCOL_VERSIONS if v in (supported or ())]
+                if not mutual:
+                    raise
+                version = mutual[-1]
+                continue
+            break
+        except ValidationError:
+            if capture is not None and (
+                capture.status is not None or capture.first_error is not None
+            ):
+                raise
+            await session.initialize()
+            break
+
+    if result is not None:
+        if any(v in MODERN_PROTOCOL_VERSIONS for v in result.supported_versions):
+            session.adopt(result)
+        elif not result.supported_versions or any(
+            v in HANDSHAKE_PROTOCOL_VERSIONS for v in result.supported_versions
+        ):
+            await session.initialize()
+        else:
+            raise MCPError(
+                code=mcp_types.UNSUPPORTED_PROTOCOL_VERSION,
+                message=(
+                    f"Unsupported protocol version from server/discover: "
+                    f"client supports {list(MODERN_PROTOCOL_VERSIONS)}, "
+                    f"server supports {result.supported_versions}"
+                ),
+            )
     if capture is not None:
         capture.negotiated = True
 
@@ -1880,10 +1840,7 @@ async def _enter_subscription(
     ``None`` also when the server acknowledges none of the requested notifications: it will send
     nothing, so there is nothing to listen to.
     """
-    if (
-        not isinstance(session, _RealClientSession)
-        or session.protocol_version not in MODERN_PROTOCOL_VERSIONS
-    ):
+    if session.protocol_version not in MODERN_PROTOCOL_VERSIONS:
         return None
     caps = session.server_capabilities
     if caps is None:
@@ -2060,8 +2017,7 @@ async def _probe_http_server(url: str, headers: dict[str, str], label: str) -> C
             ) as (read, write),
             ClientSession(read, write) as session,
         ):
-            with contextlib.suppress(TypeError):
-                _session_http_captures[session] = capture
+            _session_http_captures[session] = capture
             # The deadline covers the requests, never the unwind after them: a cancel landing in
             # the SDK's exit could leave an anyio cancel scope half-exited. An unwind that runs
             # over (a server that trickles its answer to the request ending the session) is cut
@@ -2171,7 +2127,8 @@ class StaticServerState:
     close_requested: asyncio.Event | None = None
     relisten_requested: asyncio.Event | None = None
     streams: tuple[Any, Any] | None = None
-    # Replaced for each connection, never reset by a dispatch: static calls may overlap.
+    # Replaced for each connection. A dispatch that starts with no other call in flight resets
+    # it (see ``_static_session_op``); calls that overlap share it.
     http_capture: _AuthCapture | None = None
     http_fired_event: asyncio.Event | None = None
     tools: list[dict[str, Any]] = field(default_factory=list)
@@ -2203,13 +2160,11 @@ class PoolEntryState:
     ``call_tool`` can release ``open_lock`` while still pinning the
     entry's session against teardown.
 
-    ``auth_capture`` is bound once at first connect (passed to the
-    httpx response hook factory); the hook closes over this object for
-    the life of the underlying ``httpx.AsyncClient``. Each dispatch
-    resets the carrier's fields under ``open_lock`` before
-    ``call_tool`` and reads them after — a per-dispatch carrier would
-    fail silently on session reuse because the hook is bound at
-    connect time, not per dispatch.
+    ``auth_capture`` is bound once at first connect (passed to the response hook factory); the
+    hook closes over this object for the life of the underlying ``httpx2.AsyncClient``. Each
+    dispatch resets the carrier's fields under ``open_lock`` before ``call_tool`` and reads them
+    after — a per-dispatch carrier would fail silently on session reuse because the hook is bound
+    at connect time, not per dispatch.
     """
 
     key: tuple[str, str]  # (user_id, server_name)
@@ -2236,7 +2191,7 @@ class PoolEntryState:
     prompts: list[dict[str, Any]] | None = None
     last_used: float = 0.0
     in_flight: int = 0
-    # Access token this session's httpx client was connected with. The bearer is
+    # Access token this session's httpx2 client was connected with. The bearer is
     # frozen into the client's STATIC headers at connect (_connect_one_pool), so
     # when the stored token later refreshes we compare against this to detect a
     # stale session and reconnect (rebind the current token) proactively —
@@ -2510,13 +2465,12 @@ class MCPClientManager:
         self._user_token_refresh_keepalive_s = float(
             mcp_cfg.get("user_token_refresh_keepalive_seconds", 1800)
         )
-        # Static-server health loop: liveness-ping cadence (seconds). Each tick
-        # pings every connected static server (evicting a dead-but-idle one so it
-        # is reconnected) and retries any disconnected one on a capped, jittered,
-        # forever backoff. The SDK gives up reconnecting after 2 attempts with no
-        # backoff (verified: mcp 1.28.1) and never for other transports, so this
-        # is Turnstone's own reconnect — nothing upstream to lean on. <= 0
-        # disables the loop entirely.
+        # Static-server health loop: liveness-ping cadence (seconds). Each tick pings every
+        # connected static server (evicting a dead-but-idle one so it is reconnected) and retries
+        # any disconnected one on a capped, jittered, forever backoff. The SDK gives up
+        # reconnecting its GET stream after 2 attempts with no backoff (verified: mcp 2.3.0) and
+        # never reconnects other transports, so this is Turnstone's own reconnect — nothing
+        # upstream to lean on. <= 0 disables the loop entirely.
         self._static_health_check_s = float(mcp_cfg.get("static_health_check_seconds", 30))
         # Rate-limit clock for the orphaned-scope disarm backstop
         # (:meth:`_maybe_disarm_orphaned_scopes`). Monotonic; 0.0 = never ran.
@@ -3654,8 +3608,7 @@ class MCPClientManager:
             )
         )
         if capture is not None:
-            with contextlib.suppress(TypeError):
-                _session_http_captures[session] = capture
+            _session_http_captures[session] = capture
         init_sub_stack = await stack.enter_async_context(AsyncExitStack())
         async with asyncio.timeout(self._CONNECT_TIMEOUT):
             await _negotiate_session(session, capture=capture)
@@ -3731,7 +3684,7 @@ class MCPClientManager:
             self._arm_refresh_retry(name)
 
         async def _on_notification(
-            msg: Any,  # RequestResponder | ServerNotification | Exception
+            msg: Any,  # ServerNotification | Exception
         ) -> None:
             if await self._handle_common_notification(msg, name, user_id=None):
                 return
@@ -3844,7 +3797,7 @@ class MCPClientManager:
 
         THE anyio host-task invariant, and the fix for the flaky-server
         100%-CPU regression: anyio cancel scopes (inside the SDK's
-        ``streamablehttp_client`` / ``stdio_client`` / ``ClientSession`` task
+        ``streamable_http_client`` / ``stdio_client`` / ``ClientSession`` task
         groups) are bound to the task that enters them. A scope whose host
         task has finished can never be exited, and once such a scope is
         cancelled — by anyio's own ``task_done`` when a transport child dies
@@ -4218,7 +4171,7 @@ class MCPClientManager:
         }
 
         async def _on_pool_notification(
-            msg: Any,  # RequestResponder | ServerNotification | Exception
+            msg: Any,  # ServerNotification | Exception
         ) -> None:
             if await self._handle_common_notification(msg, server_name, user_id=user_id):
                 return
@@ -4533,17 +4486,15 @@ class MCPClientManager:
     async def _await_owner_discovery(self, owner: asyncio.Task[None], coro: Any) -> Any:
         """Await a discovery call in the caller task, aborting if the OWNER dies.
 
-        Shared by the static (``_connect_one_locked``) and pool
-        (``_connect_one_pool``) connect paths. Discovery (``list_tools`` /
-        ``list_resources`` / ``list_prompts``) runs in the connecting caller,
-        but the transport servicing it is hosted by ``owner``. When that
-        transport collapses — e.g. the SDK tears its task group down on an
-        upstream 401 — anyio cancels the OWNER (the scope host), NOT this
-        caller, so a bare ``await`` on the session's response stream would hang
-        until the surrounding bound fires. Racing the owner turns a transport
-        death into a prompt ``ConnectionError`` that the caller's ``except``
-        arm converts into a clean teardown. The owner is never cancelled here —
-        teardown owns its lifecycle; only the discovery future is reaped.
+        Shared by the static (``_connect_one_locked``) and pool (``_connect_one_pool``) connect
+        paths. Discovery (``list_tools`` / ``list_resources`` / ``list_prompts``) runs in the
+        connecting caller, but the transport servicing it is hosted by ``owner``. When that
+        transport collapses — e.g. a request fails in transit and the SDK's task group tears down —
+        anyio cancels the OWNER (the scope host), NOT this caller, so a bare ``await`` on the
+        session's response stream would hang until the surrounding bound fires. Racing the owner
+        turns a transport death into a prompt ``ConnectionError`` that the caller's ``except`` arm
+        converts into a clean teardown. The owner is never cancelled here — teardown owns its
+        lifecycle; only the discovery future is reaped.
         """
         call: asyncio.Future[Any] = asyncio.ensure_future(coro)
         try:
@@ -4724,26 +4675,23 @@ class MCPClientManager:
             prompts_cap.list_changed
         )
 
-        # Discover this user's tool catalog. Discovery runs in THIS caller task
-        # while the transport is hosted by the owner, so an upstream failure
-        # (e.g. a 401 the SDK surfaces by collapsing its task group) cancels the
-        # OWNER, not us — ``_await_owner_discovery`` races the owner so that death
-        # aborts discovery promptly instead of hanging on the response stream
-        # until the phase timeout. The carrier-race shape used by
-        # ``_dispatch_pool_with_entry`` defends a different scenario
-        # (reused-session 401 from inside a SECOND dispatch) that doesn't apply
-        # to first-connect discovery.
+        # Discover this user's tool catalog. Discovery runs in THIS caller task while the transport
+        # is hosted by the owner, so a failure that ends the transport (a request that fails in
+        # transit) cancels the OWNER, not us: ``_await_owner_discovery`` races the owner so that
+        # death aborts discovery promptly instead of hanging on the response stream until the phase
+        # timeout. An error status needs no race: the SDK answers it at once with a JSON-RPC error,
+        # and the dispatcher classifies the failure from the status the response hook recorded
+        # (``_classify_failure``). The carrier race in ``_await_session_call`` is for dispatches,
+        # where the recorded status must win over the SDK's status-less error.
         #
-        # ``asyncio.timeout``, NOT ``asyncio.wait_for`` (per
-        # ``feedback_asyncio_timeout_vs_wait_for.md``): ``wait_for`` wraps the
-        # inner coroutine in a fresh task, so any await that traverses anyio
-        # cleanup would run from a different task than entered the scope. That
-        # invariant STILL HOLDS here even though the transport cms now live in
-        # the owner task — the ``list_tools`` / ``list_resources`` /
-        # ``list_resource_templates`` / ``list_prompts`` calls all traverse the
-        # same ``mcp/shared/session.py`` ``send_request`` infrastructure (R6).
-        # Discovery-phase failures tear down through ``_teardown_pool_entry``,
-        # which closes the owner in-task.
+        # ``asyncio.timeout``, NOT ``asyncio.wait_for``: the awaits must stay in the task that
+        # entered the anyio scopes. ``asyncio.timeout`` guarantees that; ``wait_for`` moved the
+        # coroutine into a new task before Python 3.12, and still does for a timeout of 0 or less.
+        # That invariant STILL HOLDS here even though the transport cms now live in the owner task —
+        # the ``list_tools``, ``list_resources``, ``list_resource_templates`` and ``list_prompts``
+        # calls all go through ``ClientSession.send_request`` and the SDK's ``JSONRPCDispatcher``
+        # (R6). Discovery-phase failures tear down through ``_teardown_pool_entry``, which closes
+        # the owner in-task.
         try:
             async with asyncio.timeout(self._CONNECT_TIMEOUT):
                 tools = await self._await_owner_discovery(
@@ -4874,14 +4822,12 @@ class MCPClientManager:
         """Proactively connect a pool entry so its catalog populates into
         ``get_tools(user_id)`` WITHOUT waiting for a tool dispatch.
 
-        ``auth_type='oauth_user'`` tools are per-user and were previously
-        discovered ONLY lazily, on first dispatch (``_dispatch_pool_with_entry``
-        at the ``session is None`` branch). That creates a chicken-and-egg:
-        the model can't emit a call for a tool it can't see, but the tool
-        only appears after a call connects the pool — so the per-user
-        catalog stays empty and the server is stuck "connecting". This
-        connects at a known-good moment (OAuth consent completion), commits
-        the catalog and fires the per-user tool/resource/prompt listeners so
+        ``auth_type='oauth_user'`` tools are per-user and were previously discovered ONLY lazily, on
+        first dispatch (``_dispatch_pool_with_entry_call`` at the ``session is None`` branch). That
+        creates a chicken-and-egg: the model can't emit a call for a tool it can't see, but the tool
+        only appears after a call connects the pool — so the per-user catalog stays empty and the
+        server is stuck "connecting". This connects at a known-good moment (OAuth consent
+        completion), commits the catalog and fires the per-user tool/resource/prompt listeners so
         any live :class:`ChatSession` refreshes its tool list.
 
         Idempotent: a no-op if a dispatch (or an earlier prime) already
@@ -5095,7 +5041,8 @@ class MCPClientManager:
                             self._schedule_dead_grant_drop(
                                 lookup, key, observed_session=observed_session
                             )
-                            return  # not consented / no credential / refresh failed — lazy paths handle it
+                            # Not consented, no credential or refresh failed: lazy paths handle it.
+                            return
                         if server_row is None:
                             server_row = await asyncio.to_thread(
                                 self._storage.get_mcp_server_by_name, server_name
@@ -5605,7 +5552,7 @@ class MCPClientManager:
         keeps a cooled catalog-only entry so their model-visible tool
         list never silently shrinks (#836); a user without one gets the
         full drop. The LRU cap therefore bounds WARM entries — the
-        connection resources (transport, httpx client, owner task) are
+        connection resources (transport, httpx2 client, owner task) are
         what the cap exists to limit. Cooled entries hold none of
         those; they are bounded by live-session users × pool servers
         and reaped by the TTL pass within a tick of their user's last
@@ -5707,10 +5654,9 @@ class MCPClientManager:
         entry = self._user_pool_entries.get(key)
         if entry is None:
             return
-        # In-flight dispatchers may have released ``open_lock`` after the
-        # connect/reuse window (see ``_dispatch_pool_with_entry``); the
-        # ``in_flight`` counter is the source of truth for whether the
-        # session is currently being used.
+        # A dispatcher holds ``open_lock`` across its call (see ``_dispatch_pool_with_entry_call``)
+        # and counts itself in ``in_flight``, the source of truth for whether the session is
+        # currently being used.
         if entry.in_flight > 0:
             return
         lock = entry.open_lock
@@ -5788,16 +5734,15 @@ class MCPClientManager:
 
         Only ``transport`` failures trip the per-server breaker. Auth
         failures (401/403) invalidate only their connection and never affect the
-        breaker. Protocol errors (``McpError``) come from a healthy
+        breaker. Protocol errors (``MCPError``) come from a healthy
         connection that rejected the request.
 
-        HTTP classification prefers ``capture.status`` (response-hook
-        introspection — the SDK swallows :class:`httpx.HTTPStatusError`
-        in its ``post_writer`` so the carrier is the only signal that
-        reaches us in production). The ``HTTPStatusError`` fallback is
-        defense-in-depth for the non-SDK refresh path
-        (:func:`turnstone.core.mcp_oauth._refresh_and_persist`) where
-        ``httpx`` errors propagate directly.
+        HTTP classification prefers ``capture.status`` (response-hook introspection — the SDK
+        reports a 4xx or 5xx answer as a JSON-RPC error without its status, so the carrier is the
+        only signal that reaches us in production). The ``HTTPStatusError`` fallback classifies a
+        status error raised outside the SDK; none is known to reach it today, since the OAuth
+        refresh (:func:`turnstone.core.mcp_oauth._refresh_and_persist`) wraps its HTTP errors in
+        ``OAuthRefreshError``.
         """
         if isinstance(exc, _CapturedHTTPError):
             capture = exc.capture
@@ -5808,10 +5753,9 @@ class MCPClientManager:
         http_failure = _classify_http_exception(exc)
         if http_failure is not None:
             return http_failure
-        # A closed/broken transport must be classified BEFORE the McpError
-        # branch: the SDK surfaces a dead connection as McpError(CONNECTION_CLOSED),
-        # which would otherwise be mistaken for a healthy protocol rejection and
-        # leave the dead pool entry in place forever (no rebuild).
+        # A closed/broken transport must be classified BEFORE the MCPError branch: the SDK surfaces
+        # a dead connection as MCPError(CONNECTION_CLOSED), which would otherwise be mistaken for a
+        # healthy protocol rejection and leave the dead pool entry in place forever (no rebuild).
         if _is_dead_transport(exc):
             return "transport"
         if isinstance(exc, MCPError):
@@ -6969,7 +6913,7 @@ class MCPClientManager:
     def add_resource_updated_listener(
         self, callback: Callable[[str, str], None], *, user_id: str | None = None
     ) -> None:
-        """Register a callback ``callback(server_name, uri)`` invoked on ``notifications/resources/updated``.
+        """Register ``callback(server_name, uri)``, invoked on ``notifications/resources/updated``.
 
         ``user_id=None`` (default) registers a global listener that fires on
         every ``resources/updated`` notification (static or pool). A string
@@ -7095,7 +7039,7 @@ class MCPClientManager:
         return self._default_log_level
 
     def _make_logging_callback(self, server_name: str, *, user_id: str | None = None) -> Any:
-        """Build the ``notifications/message`` callback for *server_name*, sanitizing server text."""
+        """Build *server_name*'s ``notifications/message`` callback, which sanitizes server text."""
 
         async def _on_log_message(params: mcp_types.LoggingMessageNotificationParams) -> None:
             msg_level = str(params.level).lower()
@@ -7180,7 +7124,7 @@ class MCPClientManager:
     ) -> ClientResponseCache | None:
         """Return the :class:`ClientResponseCache` for ``(server_name, user_id)`` when *session* is
         on a protocol revision that has response caching (2026-07-28 and later), else ``None``."""
-        ver = _session_protocol_version(session) if session is not None else None
+        ver = _session_protocol_version(session)
         if session is not None and ver not in MODERN_PROTOCOL_VERSIONS:
             return None
         cache_key = (server_name, user_id)
@@ -7211,7 +7155,8 @@ class MCPClientManager:
         *,
         user_id: str | None = None,
     ) -> None:
-        """Evict cached responses invalidated by *msg* for *server_name* without touching other users' private caches."""
+        """Evict the cached responses *msg* invalidates for *server_name*, leaving other users'
+        private caches untouched."""
         cache = self._response_caches.get((server_name, user_id))
         if cache is not None:
             await cache.evict_for_notification(msg)
@@ -7236,7 +7181,7 @@ class MCPClientManager:
         *,
         user_id: str | None = None,
     ) -> Any:
-        """Read *uri* from *session*, serving and populating the 2026-07-28 response cache when active."""
+        """Read *uri* from *session*, through the 2026-07-28 response cache when it is active."""
         cache = self._resource_cache_for(server_name, session=session, user_id=user_id)
         if cache is None:
             return await session.read_resource(uri)
@@ -8861,13 +8806,12 @@ class MCPClientManager:
     async def _static_health_loop(self) -> None:
         """Long-running coroutine — keeps static MCP servers connected.
 
-        The autonomous reconnect Turnstone otherwise lacks. Every other reconnect
-        path is lazy (a tool dispatch, an operator refresh, a config edit), and
-        the SDK's own reconnect is a bounded 2-attempt burst on the
-        streamable-http GET stream ONLY (verified: mcp 1.28.1) — no backoff,
-        nothing for the other transports. So a static server that goes down and
-        comes back while nobody is dispatching to it stays dead until someone
-        acts. Each tick, on the mcp-loop:
+        The autonomous reconnect Turnstone otherwise lacks. Every other reconnect path is lazy (a
+        tool dispatch, an operator refresh, a config edit), and the SDK never re-establishes a
+        session: it only retries its GET stream and resumes a request's SSE stream, each a bounded
+        2-attempt burst with no backoff (verified: mcp 2.3.0), and does nothing for the other
+        transports. So a static server that goes down and comes back while nobody is dispatching
+        to it stays dead until someone acts. Each tick, on the mcp-loop:
 
           * a DISCONNECTED server (``session is None``) is reconnected on a
             capped, jittered, forever backoff (:meth:`_static_reconnect_delay`),
@@ -9110,7 +9054,7 @@ class MCPClientManager:
           * a genuinely DEAD transport (``_is_dead_transport``) is evicted
             (``session = None``) so the next tick reconnects it, and its breaker
             records a failure so dispatch fails fast meanwhile;
-          * a protocol ``McpError``, an ``httpx.PoolTimeout``, or a plain ping
+          * a protocol ``MCPError``, an ``httpx2.PoolTimeout``, or a plain ping
             TIMEOUT is "slow, not dead" — the ping is rescheduled WITHOUT evicting
             or tripping the breaker (a strict 5s ping vs a 120s dispatch would
             otherwise churn a heavy-but-working server every cycle);
@@ -9146,7 +9090,7 @@ class MCPClientManager:
             # invariant-18: ``asyncio.timeout`` (NOT ``wait_for``) so ``send_ping``
             # runs in THIS task and anyio cancel-scope exit stays same-task.
             async with asyncio.timeout(self._STATIC_HEALTH_PING_TIMEOUT_S) as ping_timeout:
-                protocol_version = getattr(session, "protocol_version", None)
+                protocol_version = session.protocol_version
                 if protocol_version in MODERN_PROTOCOL_VERSIONS:
                     await session.send_discover(protocol_version)
                 else:
@@ -9286,12 +9230,12 @@ class MCPClientManager:
         ``read_resource_sync`` / ``get_prompt_sync`` (call from their ``except``,
         then re-raise).
 
-        Protocol errors (``McpError`` from a healthy connection that rejected the request) do NOT
+        Protocol errors (``MCPError`` from a healthy connection that rejected the request) do NOT
         trip the breaker, and neither does a result that does not match the protocol's schema
         (``ValidationError``): the server answered, with something malformed, which says nothing
         about the transport (#1224). A dead transport — anyio Closed/BrokenResourceError, the
-        SDK-swallowed ``McpError(CONNECTION_CLOSED)``, a server-restarted session, or a gone httpx
-        connection — IS a transport failure even when it is an ``McpError``, so it trips the
+        SDK-swallowed ``MCPError(CONNECTION_CLOSED)``, a server-restarted session, or a gone HTTP
+        connection — IS a transport failure even when it is an ``MCPError``, so it trips the
         breaker AND evicts the session (leaving the owner/streams for ``_connect_one_locked``'s
         stale-guard close protocol to reap). Eviction is what lets the next dispatch's
         ``session is None`` check fire ``_cb_auto_reconnect`` instead of re-using the corpse.
@@ -9373,7 +9317,7 @@ class MCPClientManager:
 
         Increments the server's ``in_flight`` counter for the duration of the
         awaited op and decrements it in ``finally`` (mirrors the pool path's
-        ``entry.in_flight`` accounting at ``_dispatch_pool_with_entry``). The
+        ``entry.in_flight`` accounting at ``_dispatch_pool_with_entry_call``). The
         health-loop ping skips and never evicts a server with ``in_flight > 0``,
         so a long-running ``call_tool`` can't be torn down mid-flight by a
         liveness reconnect. MUST be scheduled onto the mcp-loop; the
@@ -9429,17 +9373,14 @@ class MCPClientManager:
         is ``oauth_user``, dispatch goes through the per-(user, server)
         pool. Otherwise the call uses the shared static connection.
 
-        Pool-path 401/403 handling: the SDK's ``post_writer`` swallows
-        ``httpx.HTTPStatusError``; we recover the upstream auth signal
-        via a response-hook carrier owned by the pool entry (bound to
-        the entry's persistent ``httpx.AsyncClient`` at first connect;
-        see ``PoolEntryState.auth_capture``). A 401 triggers one
-        refresh-and-retry with ``force_refresh=True``; persistent 401 emits
-        ``mcp_consent_required``. A 403 with
-        ``WWW-Authenticate: error="insufficient_scope"`` emits
-        ``mcp_insufficient_scope`` with the parsed scope set. Other
-        403s emit ``mcp_tool_call_forbidden``. Auth failures NEVER
-        trip the per-server breaker.
+        Pool-path 401/403 handling: the SDK reports a 401 or 403 as a JSON-RPC error without its
+        status; we recover the upstream auth signal via a response-hook carrier owned by the pool
+        entry (bound to the entry's persistent ``httpx2.AsyncClient`` at first connect; see
+        ``PoolEntryState.auth_capture``). A 401 triggers one refresh-and-retry with
+        ``force_refresh=True``; persistent 401 emits ``mcp_consent_required``. A 403 with
+        ``WWW-Authenticate: error="insufficient_scope"`` emits ``mcp_insufficient_scope`` with the
+        parsed scope set. Other 403s emit ``mcp_tool_call_forbidden``. Auth failures NEVER trip
+        the per-server breaker.
         """
         mapping = self._tool_map.get(func_name)
         server_name: str | None = None
@@ -9508,7 +9449,7 @@ class MCPClientManager:
         *,
         pool_key: tuple[str, str] | None = None,
     ) -> mcp_types.CallToolResult:
-        """Call *original_name* on *session*, retrying once on ``HEADER_MISMATCH`` (-32023).
+        """Call *original_name* on *session*, retrying once on ``HEADER_MISMATCH``.
 
         On a 2026-07-28 connection, ``ClientSession.call_tool`` mirrors arguments
         annotated with ``x-mcp-header`` into ``Mcp-Param-*`` HTTP headers using the
@@ -9522,7 +9463,7 @@ class MCPClientManager:
         except MCPError as mismatch:
             if (
                 mismatch.error.code != mcp_types.HEADER_MISMATCH
-                or getattr(session, "protocol_version", None) not in MODERN_PROTOCOL_VERSIONS
+                or session.protocol_version not in MODERN_PROTOCOL_VERSIONS
             ):
                 raise
             state = self._static_servers.get(server_name) if pool_key is None else None
@@ -9841,17 +9782,14 @@ class MCPClientManager:
         verbatim by ``_dispatch_pool`` to skip a duplicate DB hop.
 
         Retry-on-401: the 401 branch in :meth:`_dispatch_pool` raises
-        :class:`_PoolDispatchRetryRequested` after refreshing the
-        bearer. Catching the signal HERE — at the sync boundary — means
-        the retry is scheduled via a fresh
-        :func:`asyncio.run_coroutine_threadsafe` call, which runs the
-        retry coroutine in a brand-new :class:`asyncio.Task` with no
-        inherited anyio cancel-scope state from the prior connect's
-        ``streamablehttp_client`` TaskGroup. An in-task retry inherits
-        that scope state across :meth:`asyncio.Task.uncancel` and
-        ``loop.create_task`` and surfaces ``CancelledError`` from inside
-        the retry's own anyio scope. The retry-count ceiling is one;
-        callers see consent_required if both attempts 401.
+        :class:`_PoolDispatchRetryRequested` after refreshing the bearer. Catching the signal HERE —
+        at the sync boundary — means the retry is scheduled via a fresh
+        :func:`asyncio.run_coroutine_threadsafe` call, which runs the retry coroutine in a brand-new
+        :class:`asyncio.Task` with no inherited anyio cancel-scope state from the prior connect's
+        ``streamable_http_client`` TaskGroup. An in-task retry inherits that scope state across
+        :meth:`asyncio.Task.uncancel` and ``loop.create_task`` and surfaces ``CancelledError`` from
+        inside the retry's own anyio scope (observed on the 1.x SDK). The retry-count ceiling is
+        one; callers see consent_required if both attempts 401.
 
         The ``timeout`` is a wall-clock budget across both attempts —
         the retry's ``future.result`` window is reduced by however long
@@ -10235,21 +10173,16 @@ class MCPClientManager:
             if classification == "auth_401":
                 self._evict_session(key)
                 if retry_count == 0:
-                    # 401 on the initial attempt: signal the sync caller
-                    # to re-issue on a fresh :class:`asyncio.Task`. The
-                    # retry's :meth:`_dispatch_pool` invocation runs the
-                    # token lookup with ``force_refresh=True`` (the
-                    # ``retry_count > 0`` branch above), guaranteeing
-                    # the bearer attached to the retry's connect is
-                    # different from the one the AS just rejected. The
-                    # cross-task hop avoids the in-task anyio
-                    # cancel-scope inheritance that surfaces a
-                    # ``CancelledError`` from inside the retry's own
-                    # ``streamablehttp_client`` TaskGroup — see
-                    # :meth:`_dispatch_pool_sync` for the architectural
-                    # rationale.
+                    # 401 on the initial attempt: signal the sync caller to re-issue on a fresh
+                    # :class:`asyncio.Task`. The retry's :meth:`_dispatch_pool` invocation runs the
+                    # token lookup with ``force_refresh=True`` (the ``retry_count > 0`` branch
+                    # above), guaranteeing the bearer attached to the retry's connect is different
+                    # from the one the AS just rejected. The cross-task hop avoids the in-task anyio
+                    # cancel-scope inheritance that surfaces a ``CancelledError`` from inside the
+                    # retry's own ``streamable_http_client`` TaskGroup (observed on the 1.x SDK) —
+                    # see :meth:`_dispatch_pool_sync` for the architectural rationale.
                     #
-                    # exc_info=False: the underlying httpx exception
+                    # exc_info=False: the underlying httpx2 exception
                     # carries ``request.headers["authorization"]`` with
                     # the rejected bearer; standard tracebacks don't
                     # render locals but Sentry / faulthandler hooks
@@ -10599,7 +10532,7 @@ class MCPClientManager:
         could no longer emit the name they need to fire). A session-less
         entry stays fully dispatchable: tool-name resolution never reads
         the catalog (``_resolve_pool_target`` is name + server-row
-        based) and ``_dispatch_pool_with_entry`` connect-or-reuses,
+        based) and ``_dispatch_pool_with_entry_call`` connect-or-reuses,
         re-running discovery — post-reconnect drift self-corrects and
         the catalog-refresh notification fans out then.
         """
@@ -10962,7 +10895,7 @@ class MCPClientManager:
         ``lambda s: s.get_prompt(name, arguments=args)`` for prompts.
 
         Lock held across the SDK call because the entry's
-        ``_AuthCapture`` is keyed off the httpx event hook; releasing
+        ``_AuthCapture`` is keyed off the httpx2 event hook; releasing
         the lock would let a concurrent same-(user, server) dispatch
         overwrite the carrier mid-flight and attribute one caller's
         auth failure to another. Holding the lock serialises
@@ -10991,7 +10924,7 @@ class MCPClientManager:
                 and entry.bound_token != access_token
             ):
                 # The stored token refreshed since this session connected. The
-                # pooled httpx client's Authorization header is frozen at connect
+                # pooled httpx2 client's Authorization header is frozen at connect
                 # (_connect_one_pool), so a warm session would replay the now-
                 # stale bearer and eat a guaranteed upstream 401 before the
                 # auth_401 retry could heal it. Proactively reconnect to rebind

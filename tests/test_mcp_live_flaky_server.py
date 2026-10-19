@@ -1,7 +1,7 @@
 """Live flaky-server smoke test: SIGKILL-flap a real MCP server, no CPU spin.
 
 End-to-end regression for the flaky-server 100%-CPU incident: a real
-streamable-http MCP server (FastMCP, subprocess) is SIGKILLed and restarted
+streamable-http MCP server (MCPServer, subprocess) is SIGKILLed and restarted
 several times underneath a real ``MCPClientManager`` with the health loop
 running on compressed timings. The production failure signature was armed
 anyio ``CancelScope``s — each one re-delivers cancellation via ``call_soon``

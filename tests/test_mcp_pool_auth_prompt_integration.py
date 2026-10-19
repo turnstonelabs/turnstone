@@ -1,10 +1,9 @@
 """Phase 7b integration tests — real-transport prompt get 401/403/etc.
 
-Mirror of :mod:`tests.test_mcp_pool_auth_resource_integration` for the
-prompt path (RFC §3.3). Drives through the real ``streamablehttp_client``,
-real httpx response-hook plumbing, and a real upstream subprocess
-(``FastMCP`` with a programmable ``BehaviorMiddleware``). Direct
-``httpx.HTTPStatusError`` injection is forbidden (invariant 14).
+Mirror of :mod:`tests.test_mcp_pool_auth_resource_integration` for the prompt path (RFC §3.3).
+Drives through the real ``streamable_http_client``, real httpx2 response-hook plumbing, and a real
+upstream server on a background thread (``MCPServer`` with a programmable ``BehaviorMiddleware``).
+Direct ``httpx.HTTPStatusError`` injection is forbidden (invariant 14).
 """
 
 from __future__ import annotations
@@ -671,7 +670,7 @@ def test_prompt_get_e2e_discovery_then_dispatch_succeeds(
     the ``_seed_pool_prompt_map`` shortcut and lets ``_connect_one_pool``
     populate ``_user_prompt_map`` from the real ``prompts/list``
     upstream response. Verifies that the entry's discovered prompts
-    match what the FastMCP fixture advertises AND that
+    match what the MCPServer fixture advertises AND that
     ``_user_prompt_map[user_id]`` is populated with the prefixed name
     after dispatch — proving the discovery path actually fired.
 
@@ -693,7 +692,7 @@ def test_prompt_get_e2e_discovery_then_dispatch_succeeds(
     # via the `mcp__{server}__{prompt}` prefix and hands off to
     # ``_dispatch_pool_prompt_sync``, which lazy-connects via
     # ``_connect_one_pool``. The connect runs the real ``prompts/list``
-    # against the FastMCP fixture and populates the per-user catalog.
+    # against the MCPServer fixture and populates the per-user catalog.
 
     async def _fake_classified(**_kwargs: Any) -> TokenLookupResult:
         return TokenLookupResult(kind="token", token="access-aaa")

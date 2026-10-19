@@ -11,7 +11,12 @@ from unittest.mock import AsyncMock, Mock
 import anyio
 import pytest
 
-from tests.conftest import _run_on_loop, _seed_static_state, stop_loop_thread
+from tests.conftest import (
+    _run_on_loop,
+    _seed_static_state,
+    make_client_session_double,
+    stop_loop_thread,
+)
 from turnstone.core.mcp_client import MCPClientManager, PoolEntryState
 
 _KEY = ("user-1", "srv")
@@ -27,9 +32,7 @@ def kind(request):
 @pytest.fixture
 def dispatch_env(monkeypatch):
     mgr = MCPClientManager({})
-    session = SimpleNamespace(
-        call_tool=AsyncMock(), read_resource=AsyncMock(), get_prompt=AsyncMock()
-    )
+    session = make_client_session_double()
     _seed_static_state(mgr, "srv", session=session)
     mgr._tool_map["mcp__srv__op"] = ("srv", "op")
     mgr._resource_map["test://resource"] = ("srv", "test://resource")

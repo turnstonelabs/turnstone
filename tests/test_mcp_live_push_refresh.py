@@ -8,7 +8,7 @@ receive loop wedged permanently, and every call on the shared per-node
 session stalled behind it; the only "recovery" was the health loop's ping
 timeout tearing the transport down.
 
-A real streamable-http MCP server (FastMCP, subprocess) registers an extra
+A real streamable-http MCP server (MCPServer, subprocess) registers an extra
 tool at runtime inside a tool call and pushes ``notifications/tools/
 list_changed`` on the live session — so the notification and the call result
 are multiplexed on the real SDK receive loop, exactly the production shape.

@@ -30,6 +30,7 @@ import mcp.types as mcp_types
 import pytest
 from mcp import MCPError
 
+from tests.conftest import make_client_session_double
 from turnstone.core.mcp_client import MCPClientManager
 
 # ---------------------------------------------------------------------------
@@ -81,10 +82,9 @@ def _run(loop: asyncio.AbstractEventLoop, coro: Any, timeout: float = 5.0) -> An
     return asyncio.run_coroutine_threadsafe(coro, loop).result(timeout=timeout)
 
 
-def _make_session_mock() -> AsyncMock:
-    """A ClientSession-shaped mock good enough for connect + discovery."""
-    session = AsyncMock()
-    session.initialize = AsyncMock()
+def _make_session_mock() -> MagicMock:
+    """A ClientSession double good enough for connect + discovery."""
+    session = make_client_session_double()
     session.server_capabilities = None
     session.list_tools = AsyncMock(return_value=mcp_types.ListToolsResult(tools=[]))
     session.list_resources = AsyncMock(return_value=mcp_types.ListResourcesResult(resources=[]))

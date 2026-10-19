@@ -393,6 +393,25 @@ def _seed_static_state(mgr: MCPClientManager, name: str, **overrides: Any) -> St
     return state
 
 
+def make_client_session_double() -> MagicMock:
+    """A ``ClientSession`` double, specced against the SDK's class, for a server on the
+    2025-11-25 revision: it refuses the ``server/discover`` probe as such a server does, so
+    negotiation falls back to ``initialize`` and no ``subscriptions/listen`` stream opens.
+
+    Callers set the capabilities and catalogs their test needs; a name the SDK's class lacks fails,
+    whether read or written.
+    """
+    import mcp.types as mcp_types
+    from mcp import ClientSession, MCPError
+
+    session = MagicMock(spec_set=ClientSession)
+    session.send_discover.side_effect = MCPError(
+        code=mcp_types.METHOD_NOT_FOUND, message="Method not found"
+    )
+    session.protocol_version = "2025-11-25"
+    return session
+
+
 def _run_on_loop(loop: asyncio.AbstractEventLoop, coro: Any, timeout: float = 10) -> Any:
     """Submit *coro* to *loop*, wait for the result.
 
@@ -477,7 +496,7 @@ def _wait_session_live(
 
 
 def _popen_mcp_server(script_path: Any, port: int) -> subprocess.Popen[bytes]:
-    """Start a FastMCP live-server subprocess, streams to DEVNULL.
+    """Start an MCPServer live-server subprocess, streams to DEVNULL.
 
     The shared spawn primitive for the live MCP smoke tests
     (flaky-server flap loop, push-refresh) — the readiness wait and the

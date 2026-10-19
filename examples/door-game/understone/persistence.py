@@ -1,19 +1,18 @@
 """SQLite persistence — the only storage layer, ``sqlite3`` only.
 
-A single connection is held for the process lifetime. MCP tool handlers are
-synchronous and run on one event-loop thread, so writes serialise naturally
-and no connection pool or lock is needed [VERIFIED: handlers are sync def].
-WAL journaling is enabled so reads never block the single writer.
+A single connection is held for the process lifetime. MCP tool handlers are synchronous, and the MCP
+SDK runs them on worker threads, so the Store is not safe on its own: every access goes through
+``server.py``'s ``_GAME_LOCK``, one at a time. WAL journaling is enabled so reads never block the
+single writer.
 
 The store loads all players and recent events into memory at construction
 (a write-through cache). State-changing tools update the cache and the DB in
 one transaction; the game façade owns the per-action commit policy.
 
-The connection is opened with ``check_same_thread=False`` because the Store
-may be CONSTRUCTED on a different thread than the event-loop thread that later
-serves tools (both the test fixture and ``main`` do this). Post-construction
-access is single-threaded: sync tools run inline on the loop [verified against
-mcp 1.27 func_metadata], so writes still serialise without a lock.
+The connection is opened with ``check_same_thread=False`` because more than one thread uses it: the
+Store may be CONSTRUCTED on a different thread than the ones that later serve tools (both the test
+fixture and ``main`` do this), and the SDK runs each sync tool on one of its worker threads.
+``_GAME_LOCK`` keeps that access to one thread at a time.
 """
 
 from __future__ import annotations

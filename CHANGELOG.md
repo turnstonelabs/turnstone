@@ -267,7 +267,11 @@ frozen.
   instead of certifi's bundle (`SSL_CERT_FILE` and `SSL_CERT_DIR` still override it), and one
   streamed event may be up to 16 MiB, so a larger tool result fails (1.x had no limit). When a
   global OpenTelemetry tracer provider is configured, the SDK opens a span for each MCP request and
-  passes the trace context to the server in `_meta`; turnstone configures none.
+  passes the trace context to the server in `_meta`; turnstone configures none. A server's JSON-RPC
+  error with the positive code 32600, the 1.x SDK's stand-in for a lost session that a proxy built
+  on it can still forward, is now an ordinary protocol error: a call that gets one keeps its
+  session, is not counted by the circuit breaker and reconnects nothing, and a connection test or a
+  failed connect shows the server's own message.
 - **A model that isn't loaded is never replaced by another (#1359)** *(BREAKING)* — when the default
   model, the task model, the coordinator model or the channel model names a definition that isn't
   loaded (deleted, disabled, misspelled, or left out of a reload because its secret reference
