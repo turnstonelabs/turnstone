@@ -30,10 +30,10 @@ if TYPE_CHECKING:
 _REPO = Path(__file__).resolve().parents[1]
 _SECRET = "test-jwt-secret-minimum-32-chars!"
 
-# Runs an entry point with one SQLiteBackend read failing. The server is stubbed (the node
-# runs ``uvicorn.Server``, the console ``uvicorn.run``), so a host that starts anyway prints
-# SERVING and exits 0 instead of serving; port 0 keeps a missed stub off a real port. The
-# node's startup prune prints PRUNED.
+# Runs an entry point, optionally with one SQLiteBackend read failing. The server is stubbed
+# (the node runs ``uvicorn.Server``, the console ``uvicorn.run``), so a host that starts prints
+# SERVING and exits 0 instead of serving; port 0 keeps a missed stub off a real port. The node's
+# startup prune prints PRUNED.
 _SCRIPT = """
 import os
 import sys
@@ -56,7 +56,8 @@ def serve(*args, **kwargs):
 
 
 entry, read = sys.argv[1], sys.argv[2]
-setattr(SQLiteBackend, read, unreadable)
+if read:
+    setattr(SQLiteBackend, read, unreadable)
 uvicorn.run = serve
 uvicorn.Server.run = serve
 turnstone.core.memory.prune_workstreams = lambda **kwargs: print("PRUNED")
@@ -69,7 +70,9 @@ main()
 """
 
 
-def _run(tmp_path: Path, entry: str, unreadable: str) -> subprocess.CompletedProcess[str]:
+def _run(
+    tmp_path: Path, entry: str, unreadable: str = "", **extra_env: str
+) -> subprocess.CompletedProcess[str]:
     config_path = tmp_path / "config.toml"
     config_path.write_text("", encoding="utf-8")
     config_path.chmod(0o600)
@@ -80,6 +83,8 @@ def _run(tmp_path: Path, entry: str, unreadable: str) -> subprocess.CompletedPro
             "TURNSTONE_DB_BACKEND": "sqlite",
             "TURNSTONE_DB_PATH": str(tmp_path / "turnstone.db"),
             "TURNSTONE_JWT_SECRET": _SECRET,
+            "TURNSTONE_TLS_PEM_DIR": str(tmp_path / "tls"),
+            **extra_env,
         }
     )
     return subprocess.run(
@@ -95,6 +100,13 @@ def _run(tmp_path: Path, entry: str, unreadable: str) -> subprocess.CompletedPro
 
 def _unreadable(*args: object, **kwargs: object) -> dict[str, str]:
     raise RuntimeError("database went away")
+
+
+def _stored_tls(db_path: Path) -> list[tuple[str, str]]:
+    with contextlib.closing(sqlite3.connect(db_path)) as con:
+        return con.execute(
+            "SELECT value, changed_by FROM system_settings WHERE key = 'tls.enabled'"
+        ).fetchall()
 
 
 def test_node_exits_before_its_startup_prune_when_settings_cannot_load(tmp_path: Path) -> None:
@@ -132,11 +144,24 @@ def test_console_exits_without_storing_tls_off_when_settings_cannot_load(
     assert result.returncode == 1, output
     assert "settings.load_failed" in output
     assert "SERVING" not in result.stdout
-    with contextlib.closing(sqlite3.connect(db_path)) as con:
-        rows = con.execute(
-            "SELECT value, changed_by FROM system_settings WHERE key = 'tls.enabled'"
-        ).fetchall()
-    assert rows == [("true", "admin")]
+    assert _stored_tls(db_path) == [("true", "admin")]
+
+
+def test_a_console_started_without_tls_can_take_it_from_the_environment_later(
+    tmp_path: Path,
+) -> None:
+    # The startup sync used to store tls.enabled = false, and seeding skips a stored setting,
+    # so TURNSTONE_TLS_ENABLED never applied after a first start without it (#1413).
+    first = _run(tmp_path, "console")
+    assert first.returncode == 0, first.stdout + first.stderr
+    assert "SERVING" in first.stdout
+    assert _stored_tls(tmp_path / "turnstone.db") == []
+
+    second = _run(tmp_path, "console", TURNSTONE_TLS_ENABLED="true")
+    output = second.stdout + second.stderr
+    assert second.returncode == 0, output
+    assert "TLS enabled" in output
+    assert _stored_tls(tmp_path / "turnstone.db") == [("true", "env")]
 
 
 def test_console_startup_ends_when_its_settings_cannot_load(

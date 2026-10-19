@@ -636,6 +636,13 @@ frozen.
   running on config.toml's models until a Sync. A reload that fails later keeps the settings that
   last loaded. `turnstone-admin rerank-calibrate` stops with the error instead of calibrating on
   the default query instruction.
+- **`TURNSTONE_TLS_ENABLED` can turn TLS on for a console that has already started without it
+  (#1413).** Each console start without TLS stored `tls.enabled = false`, and a setting is seeded
+  from its environment variable only while nothing is stored for it, so adding the TLS compose
+  overlay to an existing deployment left TLS off. The console no longer writes `tls.enabled` at
+  startup; unset reads as off on the console and the nodes. A database an earlier start wrote
+  `false` into keeps it: reset `tls.enabled` in the Settings tab before relying on
+  `TURNSTONE_TLS_ENABLED`.
 - **Channel bots no longer start conversations on the wrong model before they have fetched the
   channel model (#1377).** Until a Discord or Slack bot had fetched `channels.default_model_alias`
   once, every conversation started meanwhile took the setting as unset and ran for good on the

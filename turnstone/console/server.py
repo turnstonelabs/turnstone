@@ -18597,26 +18597,14 @@ def main() -> None:
             log.warning("TLS initialization failed", exc_info=True)
             tls_mgr = None
 
-        # Sync TLS state to ConfigStore so server nodes see the correct value.
-        # Three cases:
-        # 1. TLS succeeded → write true
-        # 2. TLS not configured (DB false/unset) → write false (definitive)
-        # 3. TLS configured (DB true) but init failed → don't overwrite
-        #    (transient failure shouldn't permanently disable TLS)
-        try:
-            db_enabled = _cs.get("tls.enabled")
-            if tls_mgr is not None:
-                if not db_enabled:
-                    _cs.set("tls.enabled", True, changed_by="console-startup")
-            elif db_enabled:
-                log.warning(
-                    "tls.enabled is true in ConfigStore but TLS init failed — "
-                    "server nodes will attempt TLS and fall back to plain HTTP"
-                )
-            else:
-                _cs.set("tls.enabled", False, changed_by="console-startup")
-        except Exception:
-            log.debug("Failed to sync TLS state to ConfigStore", exc_info=True)
+        # Nothing is written back: nodes read tls.enabled as the operator stored
+        # it, and unset reads as off. Storing false here kept TURNSTONE_TLS_ENABLED
+        # from ever seeding a later start (#1413).
+        if tls_mgr is None and _cs.get("tls.enabled"):
+            log.warning(
+                "tls.enabled is true in ConfigStore but TLS init failed — "
+                "server nodes will attempt TLS and fall back to plain HTTP"
+            )
 
     app = create_app(
         collector=collector,
