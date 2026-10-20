@@ -17465,26 +17465,48 @@ def _seed_config_from_env(config_store: Any, storage: Any) -> None:
     Uses config_store.set() for proper validation, serialization, and
     cache invalidation.
 
-    A value the setting refuses is logged and skipped; a storage error
-    propagates, so the console doesn't start on settings it couldn't seed.
+    Every value is checked before anything is written: one its setting refuses
+    is logged and the console exits with nothing seeded, so a mistyped value
+    never leaves its setting at the default. A storage error propagates too. A
+    value shadowed by a row an earlier console start wrote (``console-startup``,
+    #1413) is reported, since the operator set the variable to change it.
     """
-    from turnstone.core.settings_registry import SETTINGS
+    from turnstone.core.settings_registry import SETTINGS, serialize_value, validate_value
 
+    seeds: list[tuple[str, str, str, str]] = []
+    refused = False
     for key in SETTINGS:
         env_name = "TURNSTONE_" + key.replace(".", "_").upper()
         env_val = os.environ.get(env_name)
         if env_val is None:
             continue
+        try:
+            seeds.append((key, env_name, env_val, serialize_value(validate_value(key, env_val))))
+        except ValueError as exc:
+            log.error("config.seed_refused: %s from %s: %s", key, env_name, exc)
+            refused = True
+    if refused:
+        raise SystemExit(1)
+    for key, env_name, env_val, serialized in seeds:
         # Only seed if not already stored (check raw storage to avoid
         # config_store cache, which may not reflect DB state yet)
         existing = storage.get_system_setting(key)
         if existing is not None:
+            if (
+                existing.get("changed_by") == "console-startup"
+                and existing.get("value") != serialized
+            ):
+                log.warning(
+                    "config.env_ignored: %s is stored as %s by an earlier console start, so %s "
+                    "is not applied; reset %s in the Settings tab to apply it",
+                    key,
+                    existing.get("value"),
+                    env_name,
+                    key,
+                )
             continue
-        try:
-            config_store.set(key, env_val, changed_by="env")
-            log.info("config.seeded_from_env: %s from %s", key, env_name)
-        except ValueError:
-            log.warning("config.seed_failed: %s from %s", key, env_name, exc_info=True)
+        config_store.set(key, env_val, changed_by="env")
+        log.info("config.seeded_from_env: %s from %s", key, env_name)
 
 
 # ---------------------------------------------------------------------------
@@ -18574,6 +18596,11 @@ def main() -> None:
         except Exception as exc:
             log.error("settings.load_failed: %s", exc)
             raise SystemExit(1) from exc
+
+        # TLS is required once it is enabled: a console that can't start it exits
+        # rather than serve plain HTTP to nodes that would fall back to it, and a
+        # supervisor restart retries. Nothing is written back: nodes read
+        # tls.enabled as stored, and unset reads as off (#1413).
         try:
             if _cs.get("tls.enabled"):
                 from turnstone.console.tls import TLSManager
@@ -18593,18 +18620,9 @@ def main() -> None:
                 # / docs/tls.md); rewriting the scheme to https here would
                 # advertise an ACME URL nodes can't reach.
                 log.info("TLS enabled")
-        except Exception:
-            log.warning("TLS initialization failed", exc_info=True)
-            tls_mgr = None
-
-        # Nothing is written back: nodes read tls.enabled as the operator stored
-        # it, and unset reads as off. Storing false here kept TURNSTONE_TLS_ENABLED
-        # from ever seeding a later start (#1413).
-        if tls_mgr is None and _cs.get("tls.enabled"):
-            log.warning(
-                "tls.enabled is true in ConfigStore but TLS init failed — "
-                "server nodes will attempt TLS and fall back to plain HTTP"
-            )
+        except Exception as exc:
+            log.error("tls.init_failed: %s", exc, exc_info=True)
+            raise SystemExit(1) from exc
 
     app = create_app(
         collector=collector,

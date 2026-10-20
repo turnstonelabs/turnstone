@@ -295,7 +295,9 @@ const client = new TurnstoneServer({
 ### Console Startup Flow
 
 1. Read `tls.enabled` from ConfigStore
-2. Initialize CA (load from DB or generate new root key)
+2. Initialize CA (load from DB or generate new root key). A console that can't
+   logs `tls.init_failed` and exits rather than serve without TLS, so a
+   supervisor restart retries; unlike a node, it has no plain-HTTP fallback
 3. Mount ACME responder at `/acme` (serves `/ca.pem` natively). When
    `TURNSTONE_ACME_EXTERNAL_URL` is set, use it for every advertised directory,
    order, authorization, and certificate URL; otherwise derive URLs from each

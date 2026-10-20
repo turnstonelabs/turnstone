@@ -260,6 +260,16 @@ frozen.
 
 ### Changed
 
+- **A console exits when it can't start the TLS it has enabled, or when a setting's
+  `TURNSTONE_*` variable holds a value the setting refuses (#1406)** *(BREAKING)* — a failed CA
+  load (a storage error, a corrupt row) used to leave the console serving plain HTTP until a
+  restart, and nodes that started meanwhile fell back to plain HTTP; a refused value such as
+  `TURNSTONE_TLS_ENABLED=on` was logged and skipped, leaving its setting at the default. The
+  console now logs `tls.init_failed`, or `config.seed_refused` once per refused variable, and
+  exits, seeding nothing on a start that refuses a value; a bool takes `true`, `1`, `yes`,
+  `false`, `0` or `no`. A console whose CA can't start for a lasting reason doesn't serve its
+  Settings tab either, so turning TLS off then means setting `tls.enabled` to `false` in the
+  `system_settings` table.
 - **The MCP client runs on the MCP Python SDK 2.3 (#679)** *(BREAKING)* — turnstone requires
   `mcp>=2.3,<3`, so an MCP server run from turnstone's own Python environment must work with it
   (FastMCP is now `MCPServer`); the cluster-ops and Understone examples move with it. MCP HTTP
@@ -632,17 +642,18 @@ frozen.
   console skipped TLS. The console could also store `tls.enabled = false` over a stored `true`,
   which kept TLS off after later restarts: if a console started during a database outage, check
   `tls.enabled` in the Settings tab. Both now log `settings.load_failed` and exit, so a supervisor
-  restart retries the read, and a node that can't read its model definitions exits too instead of
-  running on config.toml's models until a Sync. A reload that fails later keeps the settings that
-  last loaded. `turnstone-admin rerank-calibrate` stops with the error instead of calibrating on
-  the default query instruction.
+  restart retries the read, and a node that can't read its model definitions logs
+  `model_registry.load_failed` and exits too instead of running on config.toml's models until a
+  Sync. A reload that fails later keeps the settings that last loaded.
+  `turnstone-admin rerank-calibrate` stops with the error instead of calibrating on the default
+  query instruction.
 - **`TURNSTONE_TLS_ENABLED` can turn TLS on for a console that has already started without it
   (#1413).** Each console start without TLS stored `tls.enabled = false`, and a setting is seeded
   from its environment variable only while nothing is stored for it, so adding the TLS compose
-  overlay to an existing deployment left TLS off. The console no longer writes `tls.enabled` at
-  startup; unset reads as off on the console and the nodes. A database an earlier start wrote
-  `false` into keeps it: reset `tls.enabled` in the Settings tab before relying on
-  `TURNSTONE_TLS_ENABLED`.
+  overlay to an existing deployment left TLS off. The console's startup no longer writes back the
+  TLS state it found; unset reads as off on the console and the nodes. A database an earlier start
+  wrote `false` into keeps it, and the console now logs `config.env_ignored` when that row
+  shadows `TURNSTONE_TLS_ENABLED`: reset `tls.enabled` in the Settings tab to apply the variable.
 - **Channel bots no longer start conversations on the wrong model before they have fetched the
   channel model (#1377).** Until a Discord or Slack bot had fetched `channels.default_model_alias`
   once, every conversation started meanwhile took the setting as unset and ran for good on the

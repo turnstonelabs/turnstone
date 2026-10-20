@@ -1,9 +1,9 @@
-"""Startup coverage for a node or console whose stored settings can't be read (#1406).
+"""Startup coverage for a node or console that can't read or apply its stored settings (#1406).
 
 A host that started anyway would run on every setting's registry default: the node's startup
-prune on the default retention, the console's TLS sync storing ``false`` over the operator's
-``true``. The entry-point cases run the real ``main()`` in a subprocess against a fresh SQLite
-database, with one storage read made to fail and the server itself stubbed out.
+prune on the default retention, a console skipping the TLS it has enabled. The entry-point cases
+run the real ``main()`` in a subprocess against a fresh SQLite database, with one storage read
+made to fail and the server itself stubbed out; the env seeding cases call the seeding directly.
 """
 
 from __future__ import annotations
@@ -71,10 +71,10 @@ main()
 
 
 def _run(
-    tmp_path: Path, entry: str, unreadable: str = "", **extra_env: str
+    tmp_path: Path, entry: str, unreadable: str = "", config: str = "", **extra_env: str
 ) -> subprocess.CompletedProcess[str]:
     config_path = tmp_path / "config.toml"
-    config_path.write_text("", encoding="utf-8")
+    config_path.write_text(config, encoding="utf-8")
     config_path.chmod(0o600)
     env = {key: value for key, value in os.environ.items() if not key.startswith("TURNSTONE_")}
     env.update(
@@ -114,7 +114,8 @@ def test_node_exits_before_its_startup_prune_when_settings_cannot_load(tmp_path:
 
     output = result.stdout + result.stderr
     assert result.returncode == 1, output
-    assert "settings.load_failed" in output
+    # The documented event name, as the node's structured log renders it.
+    assert '"event": "settings.load_failed"' in output
     assert "database went away" in output
     assert "PRUNED" not in result.stdout
     assert "SERVING" not in result.stdout
@@ -126,7 +127,31 @@ def test_node_exits_when_its_model_definitions_cannot_load(tmp_path: Path) -> No
 
     output = result.stdout + result.stderr
     assert result.returncode == 1, output
+    assert '"event": "model_registry.load_failed"' in output
     assert "database went away" in output
+    assert "Traceback" not in output
+    assert "SERVING" not in result.stdout
+
+
+def test_node_exits_naming_a_model_definition_a_restart_wont_fix(tmp_path: Path) -> None:
+    result = _run(
+        tmp_path,
+        "node",
+        config=(
+            "[models.bad]\n"
+            'model = "m"\n'
+            'base_url = "http://model.example.com/v1"\n'
+            'api_key = "dummy"\n'
+            "context_window = 8192\n"
+            "max_concurrency = -1\n"
+        ),
+    )
+
+    output = result.stdout + result.stderr
+    assert result.returncode == 1, output
+    assert '"event": "model_registry.config_invalid"' in output
+    assert "max_concurrency" in output
+    assert "Traceback" not in output
     assert "SERVING" not in result.stdout
 
 
@@ -145,6 +170,24 @@ def test_console_exits_without_storing_tls_off_when_settings_cannot_load(
     assert "settings.load_failed" in output
     assert "SERVING" not in result.stdout
     assert _stored_tls(db_path) == [("true", "admin")]
+
+
+def test_console_with_tls_enabled_exits_when_tls_cannot_start(
+    tmp_path: Path, sqlite_migrated_template: Path
+) -> None:
+    # Serving without it would let nodes that start meanwhile fall back to plain HTTP.
+    db_path = tmp_path / "turnstone.db"
+    shutil.copyfile(sqlite_migrated_template, db_path)
+    with contextlib.closing(SQLiteBackend(str(db_path), create_tables=False)) as storage:
+        storage.upsert_system_setting(key="tls.enabled", value="true", changed_by="admin")
+
+    result = _run(tmp_path, "console", "load_tls_ca")
+
+    output = result.stdout + result.stderr
+    assert result.returncode == 1, output
+    assert "tls.init_failed" in output
+    assert "database went away" in output
+    assert "SERVING" not in result.stdout
 
 
 def test_a_console_started_without_tls_can_take_it_from_the_environment_later(
@@ -201,19 +244,29 @@ def _no_seed_env(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.mark.usefixtures("_no_seed_env")
-def test_env_seeding_skips_a_value_the_setting_refuses(
+def test_env_seeding_exits_on_a_value_its_setting_refuses_and_seeds_nothing(
     tmp_path: Path,
     sqlite_backend_factory: Callable[[str], SQLiteBackend],
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
+    # Skipping the value would leave TLS at its default, off, while the operator meant it on.
     from turnstone.console.server import _seed_config_from_env
 
     storage = sqlite_backend_factory(str(tmp_path / "console.db"))
     monkeypatch.setenv("TURNSTONE_TLS_ENABLED", "maybe")
+    monkeypatch.setenv("TURNSTONE_SESSION_RETENTION_DAYS", "30")
 
-    _seed_config_from_env(ConfigStore(storage), storage)
+    with (
+        caplog.at_level("ERROR", logger="turnstone.console.server"),
+        pytest.raises(SystemExit) as exc_info,
+    ):
+        _seed_config_from_env(ConfigStore(storage), storage)
 
+    assert exc_info.value.code == 1
+    assert "config.seed_refused: tls.enabled from TURNSTONE_TLS_ENABLED" in caplog.text
     assert storage.get_system_setting("tls.enabled") is None
+    assert storage.get_system_setting("session.retention_days") is None
 
 
 @pytest.mark.usefixtures("_no_seed_env")
@@ -231,3 +284,30 @@ def test_env_seeding_stops_on_a_storage_failure(
 
     with pytest.raises(RuntimeError, match="database went away"):
         _seed_config_from_env(store, storage)
+
+
+@pytest.mark.usefixtures("_no_seed_env")
+@pytest.mark.parametrize(("changed_by", "reported"), [("console-startup", True), ("admin", False)])
+def test_env_seeding_reports_a_variable_an_earlier_startup_row_shadows(
+    tmp_path: Path,
+    sqlite_backend_factory: Callable[[str], SQLiteBackend],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    changed_by: str,
+    reported: bool,
+) -> None:
+    # Only a console start wrote console-startup rows (#1413); an admin's value is the
+    # precedence working as designed.
+    from turnstone.console.server import _seed_config_from_env
+
+    storage = sqlite_backend_factory(str(tmp_path / "console.db"))
+    storage.upsert_system_setting(key="tls.enabled", value="false", changed_by=changed_by)
+    monkeypatch.setenv("TURNSTONE_TLS_ENABLED", "true")
+
+    with caplog.at_level("WARNING", logger="turnstone.console.server"):
+        _seed_config_from_env(ConfigStore(storage), storage)
+
+    row = storage.get_system_setting("tls.enabled")
+    assert row is not None
+    assert (row["value"], row["changed_by"]) == ("false", changed_by)
+    assert ("config.env_ignored: tls.enabled" in caplog.text) is reported
