@@ -1199,6 +1199,17 @@ frozen.
 
 ### Security
 
+- **A remote MCP server can no longer have the console send plain-http requests to its loopback
+  ports.** The OAuth address check's localhost development lane (plain http to a localhost name
+  that resolves only to loopback) also covered URLs an MCP server's metadata or challenge named,
+  so with the private-network setting off a server could still have the console send blind
+  requests to any port and path on its own loopback, and time them to learn which ports answer.
+  A URL a remote document names now gets that lane only when the server URL the operator typed
+  is itself a localhost URL; otherwise it is judged like any other address. A server reached
+  through a localhost URL keeps the lane for every URL its documents name, so one that isn't a
+  local development server (a remote server behind a local forwarder, say) can still name the
+  console's loopback ports. A remote MCP server whose authorization server runs on the console's
+  host needs that server's Authorization Server URL set to it.
 - **A media tool's thumbnail URL can no longer reach the host's own services or cloud metadata
   through an internationalized host name.** The channel thumbnail guard judged such a name as the
   system resolver encodes it (IDNA 2003), while the fetch connects to the name's IDNA 2008 form,

@@ -249,7 +249,9 @@ def test_refresh_discovery_and_post_stay_off_the_browser_loop(
         try:
             await web.TCPSite(runner, "127.0.0.1", 0).start()
             origin = f"http://127.0.0.1:{runner.addresses[0][1]}"
-            storage.update_mcp_server("srv-id", oauth_as_issuer_cached=origin)
+            # A loopback authorization server is reachable only for a server that is itself
+            # local, so the row names one on the same origin.
+            storage.update_mcp_server("srv-id", url=f"{origin}/sse", oauth_as_issuer_cached=origin)
             async with httpx2.AsyncClient() as browser_client:
                 observe_client(browser_client)
                 state = _make_app_state(storage, http_client=observe_client(json_http_client()))

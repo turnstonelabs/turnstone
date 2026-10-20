@@ -362,8 +362,9 @@ async def _discovery_probe(cfg: dict[str, str]) -> None:
     A realm issuer carries a path, which is the shape that failed before
     this branch. Discovery must resolve it, land on a document that
     advertises S256, and report the endpoints of that realm. The realm is
-    loopback, which the SSRF check admits as the development lane, so no
-    allowance is patched in.
+    loopback, which the SSRF check admits as the development lane for an
+    issuer the operator typed; this call stands in for one, so it asks for
+    that lane and nothing else is patched in.
     """
     import time
 
@@ -380,6 +381,7 @@ async def _discovery_probe(cfg: dict[str, str]) -> None:
                 http_client=recorder,  # type: ignore[arg-type]
                 trusted_hosts=frozenset(),
                 deadline=time.monotonic() + _DISCOVERY_TOTAL_BUDGET,
+                allow_localhost=True,
             )
         except Exception as exc:
             record(

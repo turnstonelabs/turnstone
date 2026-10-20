@@ -425,13 +425,17 @@ class _PRMCandidate:
     cannot starve another location's challenge. *allow_private* travels the
     same way: a location derived from the operator's own server URL may be
     private when the deployment has opted in, while one a remote document
-    named may never be, whatever the setting says.
+    named may never be, whatever the setting says. *allow_localhost*, the
+    localhost development lane, is decided the same way: a derived location
+    has it, and one a remote document named has it only when the operator's
+    server URL is itself a localhost URL.
     """
 
     url: str
     accepted: frozenset[str]
     hops: int
     allow_private: bool
+    allow_localhost: bool
 
 
 async def _fetch_prm_issuer(
@@ -474,6 +478,8 @@ async def _fetch_prm_issuer(
     remote document named — a challenge target, or the issuer this returns —
     is validated strictly however the setting is set, so a resource server
     can never steer the deployment at an address the operator did not type.
+    The localhost development lane follows the same line: such a URL gets it
+    only when the operator's server URL is a localhost URL too.
 
     The caller is responsible for passing the resulting issuer to
     :func:`_fetch_as_metadata` along with its ``trusted_hosts`` list —
@@ -490,7 +496,10 @@ async def _fetch_prm_issuer(
     origin = urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, "", "", ""))
 
     path_prm_url = _well_known_url(canonical, "oauth-protected-resource")
-    candidates = [_PRMCandidate(path_prm_url, frozenset({canonical}), 1, allow_private)]
+    # A remote document's URLs get the localhost lane only from a server the operator runs
+    # locally: the console's own loopback ports are otherwise out of its reach.
+    local_server = oauth_ssrf.url_is_localhost(server_url)
+    candidates = [_PRMCandidate(path_prm_url, frozenset({canonical}), 1, allow_private, True)]
     origin_prm_url = _well_known_url(origin, "oauth-protected-resource")
     if origin_prm_url != path_prm_url:
         # RFC 9728 §3.3 binds a document to the identifier its URL was
@@ -500,9 +509,11 @@ async def _fetch_prm_issuer(
         # path-specific location; it fails with the resource-mismatch
         # message and the operator's remedy is the Authorization Server URL
         # override, which skips PRM entirely.
-        candidates.append(_PRMCandidate(origin_prm_url, frozenset({origin}), 1, allow_private))
+        candidates.append(
+            _PRMCandidate(origin_prm_url, frozenset({origin}), 1, allow_private, True)
+        )
 
-    fetched: dict[tuple[str, bool], httpx2.Response] = {}
+    fetched: dict[tuple[str, bool, bool], httpx2.Response] = {}
     document_error: MCPOAuthDiscoveryError | None = None
     private_error: MCPOAuthDiscoveryError | None = None
     first_error: MCPOAuthDiscoveryError | None = None
@@ -520,7 +531,13 @@ async def _fetch_prm_issuer(
         # Keyed by the candidate's verdict as well as its URL: a response
         # fetched under the opt-in must not be reused for a candidate that
         # was denied it, or the verdict the record carries never applies.
-        cached = fetched.get((candidate.url, candidate.allow_private))
+        # The localhost lane counts only where it can change the verdict, on
+        # a localhost URL, so it doesn't split the key for any other URL.
+        verdict = (
+            candidate.allow_private,
+            candidate.allow_localhost and oauth_ssrf.url_is_localhost(candidate.url),
+        )
+        cached = fetched.get((candidate.url, *verdict))
         if cached is not None:
             resp = cached
         else:
@@ -534,6 +551,7 @@ async def _fetch_prm_issuer(
                     allow_http=True,
                     allow_private=candidate.allow_private,
                     private_requires_all=True,
+                    allow_localhost=candidate.allow_localhost,
                 )
             except oauth_ssrf.OAuthSSRFPrivateAddressError as exc:
                 private_error = private_error or _private_network_refusal(
@@ -555,7 +573,7 @@ async def _fetch_prm_issuer(
             except oauth_http._REQUEST_FAILURES as exc:
                 _record(_discovery_error(f"PRM fetch failed: {exc}", exc))
                 continue
-            fetched[(candidate.url, candidate.allow_private)] = resp
+            fetched[(candidate.url, *verdict)] = resp
 
         if resp.status_code == 401:
             challenge_url = _parse_prm_url_from_www_authenticate(
@@ -580,6 +598,7 @@ async def _fetch_prm_issuer(
                         candidate.accepted,
                         candidate.hops - 1,
                         candidate.allow_private and _same_origin(challenge_url, candidate.url),
+                        local_server,
                     ),
                 )
             else:
@@ -593,7 +612,9 @@ async def _fetch_prm_issuer(
             issuer_url = _prm_issuer_from_document(resp, candidate.accepted)
             # SSRF protection on the issuer URL itself — same-origin / trust-list
             # checks happen in ``_fetch_as_metadata``.
-            await oauth_ssrf.validate_url_no_ssrf_async(issuer_url, allow_http=True)
+            await oauth_ssrf.validate_url_no_ssrf_async(
+                issuer_url, allow_http=True, allow_localhost=local_server
+            )
         except MCPOAuthDiscoveryError as exc:
             document_error = document_error or exc
             continue
@@ -830,6 +851,7 @@ async def _fetch_as_metadata(
     trusted_hosts: frozenset[str],
     deadline: float,
     allow_private: bool = False,
+    allow_localhost: bool = False,
 ) -> oauth_http.ASMetadata:
     """Fetch and validate the authorization-server metadata document for *issuer*.
 
@@ -848,11 +870,17 @@ async def _fetch_as_metadata(
     override; an issuer a protected-resource document named is validated
     strictly however the deployment's setting is set. The document's own
     endpoints inherit the issuer's verdict, which is safe because they are
-    already bound same-origin to it.
+    already bound same-origin to it. *allow_localhost* grants the localhost
+    development lane the same way: to an operator-typed issuer, or to one
+    named for a server the operator runs on localhost.
     """
     try:
         issuer_parsed = await oauth_ssrf.validate_url_no_ssrf_async(
-            issuer, allow_http=True, allow_private=allow_private, private_requires_all=True
+            issuer,
+            allow_http=True,
+            allow_private=allow_private,
+            private_requires_all=True,
+            allow_localhost=allow_localhost,
         )
     except oauth_ssrf.OAuthSSRFPrivateAddressError as exc:
         raise _private_network_refusal(
@@ -968,6 +996,7 @@ async def _fetch_as_metadata(
                     allow_http=allow_http,
                     trusted_endpoint_hosts=trusted_hosts,
                     allow_private=allow_private and _same_origin(endpoint_url, issuer),
+                    allow_localhost=allow_localhost,
                 )
             except oauth_ssrf.OAuthSSRFError as exc:
                 # Escaped: the document's URL may hold the control characters that got it refused.
@@ -1010,7 +1039,9 @@ async def discover_authorization_server(
     by a fetched document is validated strictly whatever the setting says, so
     a remote server can never expand the deployment's reach into private
     space; the always-refused lanes (link-local, multicast, reserved, cloud
-    metadata) are refused under the opt-in too.
+    metadata) are refused under the opt-in too. The localhost development
+    lane reaches a fetched document's URLs only when the server URL is itself
+    a localhost URL, so a remote server can't name the console's own ports.
 
     Resolution order:
 
@@ -1060,7 +1091,11 @@ async def discover_authorization_server(
                 # we cached it (or the operator edited the row to point at a
                 # private host), drop the cache and fall through to PRM.
                 try:
-                    await oauth_ssrf.validate_url_no_ssrf_async(cached_issuer, allow_http=True)
+                    await oauth_ssrf.validate_url_no_ssrf_async(
+                        cached_issuer,
+                        allow_http=True,
+                        allow_localhost=oauth_ssrf.url_is_localhost(server_url),
+                    )
                 except oauth_ssrf.OAuthSSRFError as exc:
                     log.warning(
                         "mcp_server.oauth.cached_issuer_rejected",
@@ -1115,6 +1150,7 @@ async def discover_authorization_server(
                     trusted_hosts=trusted_hosts,
                     deadline=deadline,
                     allow_private=allow_private_network and bool(override_url),
+                    allow_localhost=bool(override_url) or oauth_ssrf.url_is_localhost(server_url),
                 )
                 if metadata_cache is not None:
                     metadata_cache[issuer] = (metadata, time.monotonic())

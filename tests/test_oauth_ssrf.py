@@ -19,6 +19,7 @@ from turnstone.core.oauth.ssrf import (
     OAuthSSRFPrivateAddressError,
     effective_port,
     is_localhost,
+    url_is_localhost,
     validate_discovered_endpoint,
     validate_url_no_ssrf,
 )
@@ -217,6 +218,34 @@ class TestValidateUrlNoSSRF:
         with patch("socket.getaddrinfo", return_value=self._PUBLIC_ADDR):
             parsed = validate_url_no_ssrf(f"https://STRA{sharp_s}E.Example.com/x", allow_http=False)
         assert parsed.hostname == "xn--strae-oqa.example.com"
+
+    def test_without_the_localhost_lane_http_to_localhost_is_refused(self) -> None:
+        with (
+            patch("socket.getaddrinfo", return_value=self._LOOPBACK_ADDR),
+            pytest.raises(OAuthSSRFError, match="must use HTTPS"),
+        ):
+            validate_url_no_ssrf("http://localhost:6379/x", allow_http=True, allow_localhost=False)
+
+    def test_without_the_localhost_lane_loopback_is_not_public(self) -> None:
+        with (
+            patch("socket.getaddrinfo", return_value=self._LOOPBACK_ADDR),
+            pytest.raises(OAuthSSRFPrivateAddressError),
+        ):
+            validate_url_no_ssrf("https://localhost:6379/x", allow_http=True, allow_localhost=False)
+
+    @pytest.mark.parametrize(
+        ("url", "local"),
+        [
+            ("http://127.0.0.1:8093/mcp", True),
+            ("http://kc.localhost:8080/realms/x", True),
+            ("http://kc" + chr(0x3002) + "localhost:8080/realms/x", True),
+            ("https://mcp.example.com/sse", False),
+            ("https://" + chr(0x2603) + ".example.com/", False),
+        ],
+        ids=["loopback-literal", "localhost-subdomain", "ideographic-dot", "public", "unparseable"],
+    )
+    def test_url_is_localhost_judges_the_dialed_host(self, url: str, local: bool) -> None:
+        assert url_is_localhost(url) is local
 
     def test_refuses_a_non_ascii_ipv6_zone_before_resolving(self) -> None:
         """httpx2 parses this host but can't send it as ASCII. The refusal must not depend on the

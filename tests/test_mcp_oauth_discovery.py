@@ -2448,3 +2448,95 @@ class TestTheGuardJudgesTheDialedHost:
         with pytest.raises(MCPOAuthDiscoveryError, match="on a private network"):
             asyncio.run(_run())
         assert sent == [_PATH_PRM, _ROOT_PRM]
+
+
+class TestLocalhostLane:
+    """A URL a remote document names gets the localhost development lane only when the server URL
+    the operator typed is itself a localhost URL, so a remote server can't reach the console's own
+    loopback ports. ``localhost`` resolves to loopback here: under the all-public stub the guard
+    would refuse it anyway, and the router fails any request that gets through."""
+
+    @staticmethod
+    def _discover(
+        server_url: str,
+        routes: dict[str, Any],
+        *,
+        cached_issuer: str | None = None,
+        addresses: dict[str, list[str]] | None = None,
+    ) -> tuple[ASMetadata, MagicMock]:
+        client = MagicMock(spec=httpx2.AsyncClient)
+        client.get = AsyncMock(side_effect=_router(routes))
+
+        async def _run() -> ASMetadata:
+            with _addr_map_patch(addresses or {"localhost": ["127.0.0.1"]}):
+                return await discover_authorization_server(
+                    server_name="srv-x",
+                    server_url=server_url,
+                    override_url=None,
+                    cached_issuer=cached_issuer,
+                    http_client=client,
+                    storage=_mk_storage_mock(),
+                    server_id="srv-id",
+                    trusted_hosts=frozenset(),
+                )
+
+        return asyncio.run(_run()), client
+
+    def test_a_remote_server_cannot_challenge_to_a_localhost_location(self) -> None:
+        meta, client = self._discover(
+            _SERVER,
+            {
+                _PATH_PRM: _challenge("http://localhost:6379/anything"),
+                _ROOT_PRM: _prm("https://mcp.example.com"),
+                _AS_META: _mk_response(200, _good_as_metadata_doc()),
+            },
+        )
+        assert meta.issuer == "https://as.example.com"
+        assert _urls(client) == [_PATH_PRM, _ROOT_PRM, _AS_META]
+
+    def test_a_remote_server_cannot_name_a_localhost_issuer(self) -> None:
+        with pytest.raises(MCPOAuthDiscoveryError, match="PRM issuer URL rejected"):
+            self._discover(
+                _SERVER,
+                {
+                    _PATH_PRM: _prm(_SERVER, issuer="http://localhost:9200"),
+                    _ROOT_PRM: _mk_response(404),
+                },
+            )
+
+    def test_a_cached_localhost_issuer_of_a_remote_server_is_dropped(self) -> None:
+        meta, client = self._discover(
+            _SERVER,
+            {_PATH_PRM: _prm(_SERVER), _AS_META: _mk_response(200, _good_as_metadata_doc())},
+            cached_issuer="http://localhost:9200",
+        )
+        assert meta.issuer == "https://as.example.com"
+        assert _urls(client) == [_PATH_PRM, _AS_META]
+
+    def test_a_local_server_may_name_a_localhost_issuer(self) -> None:
+        """The shape of a local development setup, and of the per-user harness."""
+        server = "http://127.0.0.1:8093/mcp"
+        issuer = "http://127.0.0.1:8092/realms/spike"
+        document = _good_as_metadata_doc()
+        document.update(
+            {
+                "issuer": issuer,
+                "authorization_endpoint": issuer + "/protocol/openid-connect/auth",
+                "token_endpoint": issuer + "/protocol/openid-connect/token",
+                "registration_endpoint": issuer + "/clients-registrations/openid-connect",
+                "jwks_uri": issuer + "/protocol/openid-connect/certs",
+            }
+        )
+        meta, client = self._discover(
+            server,
+            {
+                "http://127.0.0.1:8093/.well-known/oauth-protected-resource/mcp": _prm(
+                    server, issuer=issuer
+                ),
+                "http://127.0.0.1:8092/.well-known/oauth-authorization-server/realms/spike": (
+                    _mk_response(200, document)
+                ),
+            },
+            addresses={"127.0.0.1": ["127.0.0.1"]},
+        )
+        assert meta.token_endpoint == issuer + "/protocol/openid-connect/token"
