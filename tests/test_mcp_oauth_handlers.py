@@ -27,11 +27,15 @@ from tests.conftest import make_mcp_token_cipher
 from turnstone.core.auth import AuthResult
 from turnstone.core.mcp_crypto import MCPTokenStore
 from turnstone.core.mcp_oauth import (
+    MCPOAuthExchangeError,
     _validate_return_url,
+    exchange_code,
     handle_mcp_oauth_authorize,
     handle_mcp_oauth_callback,
+    register_dynamic_client,
 )
 from turnstone.core.oauth.context import TokenCoordination, oauth_context
+from turnstone.core.oauth.http import ASMetadata, OAuthError
 from turnstone.core.oauth.oidc import OIDCConfig
 
 if TYPE_CHECKING:
@@ -524,6 +528,38 @@ class TestCallback:
         )
         assert token_store.get_user_token("user-1", "srv-oauth") is None
 
+    def test_token_endpoint_the_client_cannot_send_fails_consent_cleanly(
+        self, storage: SQLiteBackend
+    ) -> None:
+        """A document naming a token endpoint that ends in a line feed is refused at discovery,
+        so the consent fails with OAuth's own error and nothing is posted (not a 500)."""
+        _seed_oauth_user_server(storage)
+        self._seed_pending(storage)
+        token_store = _make_token_store(storage)
+        document = _good_as_metadata_doc()
+        document["token_endpoint"] = "https://as.example.com/token" + chr(10)
+        methods: list[str] = []
+
+        def respond(request: httpx2.Request) -> httpx2.Response:
+            methods.append(request.method)
+            return httpx2.Response(200, json=document)
+
+        http_client = httpx2.AsyncClient(transport=httpx2.MockTransport(respond))
+        app = _build_app(storage=storage, http_client=http_client, token_store=token_store)
+        client = TestClient(app, raise_server_exceptions=False)
+
+        with _public_addr_patch():
+            resp = client.get(
+                "/v1/api/mcp/oauth/callback?code=auth-code&state=valid-state",
+                follow_redirects=False,
+            )
+
+        assert resp.status_code == 302
+        error = urllib.parse.parse_qs(urllib.parse.urlsplit(resp.headers["location"]).query)
+        assert "token_endpoint" in error["mcp_oauth_error"][0]
+        assert "POST" not in methods
+        assert token_store.get_user_token("user-1", "srv-oauth") is None
+
     def test_state_mismatch_redirects(
         self, storage: SQLiteBackend, http_client_mock: MagicMock
     ) -> None:
@@ -853,6 +889,32 @@ class TestDCR:
             "error": "Dynamic client registration failed: DCR request failed: connection refused"
         }
 
+    def test_registration_endpoint_the_client_cannot_send_answers_502(
+        self, storage: SQLiteBackend
+    ) -> None:
+        """A document naming a registration endpoint that ends in a line feed is refused at
+        discovery: a 502 naming the field, nothing posted (not a 500)."""
+        _seed_oauth_user_server(storage, client_id=None, registration_mode="dcr")
+        token_store = _make_token_store(storage)
+        document = _good_as_metadata_doc()
+        document["registration_endpoint"] = "https://as.example.com/register" + chr(10)
+        methods: list[str] = []
+
+        def respond(request: httpx2.Request) -> httpx2.Response:
+            methods.append(request.method)
+            return httpx2.Response(200, json=document)
+
+        http_client = httpx2.AsyncClient(transport=httpx2.MockTransport(respond))
+        app = _build_app(storage=storage, http_client=http_client, token_store=token_store)
+        client = TestClient(app, raise_server_exceptions=False)
+
+        with _public_addr_patch():
+            resp = client.get("/v1/api/mcp/oauth/start?server=srv-oauth", follow_redirects=False)
+
+        assert resp.status_code == 502
+        assert "registration_endpoint" in resp.json()["error"]
+        assert "POST" not in methods
+
     def test_concurrent_dcr_callers_register_once(
         self, storage: SQLiteBackend, http_client_mock: MagicMock
     ) -> None:
@@ -1156,6 +1218,71 @@ class TestCallbackErrorPopsPendingState:
         )
         assert replay.status_code == 302
         assert "session+expired" in replay.headers["location"]
+
+
+# ---------------------------------------------------------------------------
+# An endpoint the client cannot send past the guard
+# ---------------------------------------------------------------------------
+
+
+def _metadata_naming(**endpoints: str) -> ASMetadata:
+    fields: dict[str, Any] = {
+        "issuer": "https://as.example.com",
+        "authorization_endpoint": "https://as.example.com/authorize",
+        "token_endpoint": "https://as.example.com/token",
+        "registration_endpoint": "https://as.example.com/register",
+        "revocation_endpoint": None,
+        "jwks_uri": None,
+        "code_challenge_methods_supported": ("S256",),
+        "token_endpoint_auth_methods_supported": ("none",),
+    }
+    fields.update(endpoints)
+    return ASMetadata(**fields)
+
+
+def _client_that_must_not_send() -> httpx2.AsyncClient:
+    def respond(request: httpx2.Request) -> httpx2.Response:
+        raise AssertionError(f"a request was sent to {request.url}")
+
+    return httpx2.AsyncClient(transport=httpx2.MockTransport(respond))
+
+
+class TestUnsendableEndpointPastTheGuard:
+    """Discovery refuses an endpoint httpx2 cannot send; one that reaches the request anyway
+    (``httpx2.InvalidURL``, not an ``HTTPError``) still fails as OAuth's own error."""
+
+    def test_registration(self) -> None:
+        metadata = _metadata_naming(registration_endpoint="https://as.example.com/reg" + chr(10))
+
+        async def _run() -> None:
+            async with _client_that_must_not_send() as client:
+                await register_dynamic_client(
+                    as_metadata=metadata,
+                    redirect_uri="https://testserver/v1/api/mcp/oauth/callback",
+                    http_client=client,
+                )
+
+        with pytest.raises(OAuthError, match="DCR request failed"):
+            asyncio.run(_run())
+
+    def test_code_exchange(self) -> None:
+        metadata = _metadata_naming(token_endpoint="https://as.example.com/token" + chr(10))
+
+        async def _run() -> None:
+            async with _client_that_must_not_send() as client:
+                await exchange_code(
+                    as_metadata=metadata,
+                    code="auth-code",
+                    redirect_uri="https://testserver/v1/api/mcp/oauth/callback",
+                    code_verifier="verifier",
+                    client_id="client-abc",
+                    client_secret=None,
+                    mcp_server_canonical_url="https://mcp.example.com/sse",
+                    http_client=client,
+                )
+
+        with pytest.raises(MCPOAuthExchangeError, match="token exchange request failed"):
+            asyncio.run(_run())
 
 
 # ---------------------------------------------------------------------------

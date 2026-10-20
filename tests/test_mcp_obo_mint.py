@@ -827,6 +827,30 @@ class TestFailureHandling:
         assert oauth_context(state).token_store.get_oidc_credential(USER, ISSUER) is not None
         assert storage.get_oauth_token(USER, SERVER) is None
 
+    def test_token_endpoint_the_client_cannot_send_is_transient(
+        self, storage: SQLiteBackend
+    ) -> None:
+        """A token endpoint that reaches the mint unsendable (injected here past discovery's
+        guard) is a transient result, never a raise: ``httpx2.InvalidURL`` is not an
+        ``HTTPError``, so the grant has to map it too."""
+        _seed_obo_server(storage)
+        calls: list[str] = []
+
+        def respond(request: httpx2.Request) -> httpx2.Response:
+            calls.append(request.method)
+            return httpx2.Response(200, json={"access_token": "minted", "expires_in": 3600})
+
+        client = httpx2.AsyncClient(transport=httpx2.MockTransport(respond))
+        config = make_oidc_config(token_endpoint=TOKEN_ENDPOINT + chr(10))
+        state = _make_app_state(storage, http_client=client, oidc_config=config)
+        _seed_credential(state)
+
+        result = _mint(state)
+
+        assert result.kind == "refresh_failed_transient"
+        assert calls == []
+        assert oauth_context(state).token_store.get_oidc_credential(USER, ISSUER) is not None
+
     def test_missing_access_token_in_200_body_is_transient(self, storage: SQLiteBackend) -> None:
         """Case 9: a 200 body without ``access_token`` is a malformed-IdP
         blip — transient, credential kept, nothing cached."""

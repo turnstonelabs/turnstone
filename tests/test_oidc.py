@@ -1661,6 +1661,21 @@ class TestFetchJWKS:
 
         asyncio.run(_run())
 
+    def test_fetch_jwks_wraps_a_url_the_client_cannot_send(self):
+        """A jwks_uri that reaches the request unsendable (``httpx2.InvalidURL``, not an
+        ``HTTPError``) is a JWKS failure, which the boot prefetch survives."""
+        from turnstone.core.oauth.oidc import fetch_jwks
+
+        def respond(request: httpx2.Request) -> httpx2.Response:
+            raise AssertionError(f"a request was sent to {request.url}")
+
+        async def _run():
+            async with httpx2.AsyncClient(transport=httpx2.MockTransport(respond)) as client:
+                await fetch_jwks("https://idp.example.com/jwks" + chr(10), client=client)
+
+        with pytest.raises(OIDCError, match="JWKS fetch failed"):
+            asyncio.run(_run())
+
 
 class TestSanitizeLogText:
     def test_sanitize_log_text_escapes_control_chars(self):
@@ -2340,6 +2355,23 @@ class TestDiscoverOIDC:
     # Mock DNS result for a public IP — reused across discovery tests.
     _PUBLIC_ADDR = [(2, 1, 6, "", ("93.184.216.34", 0))]
 
+    def test_discover_oidc_latches_an_issuer_whose_discovery_url_cannot_be_sent(self):
+        """The issuer passes the guard, but the well-known path takes the URL past httpx2's length
+        limit: a configuration error, latched instead of escaping or being re-probed."""
+        config = _make_config(issuer="https://idp.example.com/" + "a" * 65_500)
+
+        def respond(request: httpx2.Request) -> httpx2.Response:
+            raise AssertionError(f"a request was sent to {request.url}")
+
+        async def _run():
+            async with httpx2.AsyncClient(transport=httpx2.MockTransport(respond)) as client:
+                with patch("socket.getaddrinfo", return_value=self._PUBLIC_ADDR):
+                    return await discover_oidc(config, client=client)
+
+        result = asyncio.run(_run())
+        assert result.enabled is False
+        assert result.discovery_retryable is False
+
     def test_discover_oidc_success(self):
         """Mock httpx2 response, verify endpoints populated."""
         config = _make_config(
@@ -2807,6 +2839,38 @@ class TestInitializeOIDCState:
         assert oauth_context(state).oidc_config.enabled is True
         assert oauth_context(state).oidc_config is cfg
         assert state.jwks_data is None
+
+    def test_initialize_latches_a_jwks_uri_the_client_cannot_send(self):
+        """A discovery document whose jwks_uri ends in a line feed is a config error: OIDC is
+        disabled and latched there, instead of the boot JWKS fetch raising out of startup."""
+        cfg = _make_config(redirect_base="https://app.example.com")
+        state = types.SimpleNamespace(jwks_data=None, oauth_context=OAuthContext(oidc_config=cfg))
+        document = {
+            "issuer": "https://idp.example.com",
+            "authorization_endpoint": "https://idp.example.com/authorize",
+            "token_endpoint": "https://idp.example.com/token",
+            "jwks_uri": "https://idp.example.com/jwks" + chr(10),
+        }
+
+        def respond(request: httpx2.Request) -> httpx2.Response:
+            return httpx2.Response(200, json=document)
+
+        real_client = httpx2.AsyncClient
+
+        def client_serving_the_document(**kwargs: Any) -> httpx2.AsyncClient:
+            return real_client(transport=httpx2.MockTransport(respond), **kwargs)
+
+        with (
+            patch("socket.getaddrinfo", return_value=[(2, 1, 6, "", ("93.184.216.34", 0))]),
+            patch("httpx2.AsyncClient", side_effect=client_serving_the_document),
+        ):
+            asyncio.run(initialize_oidc_state(state))
+
+        latched = oauth_context(state).oidc_config
+        assert latched.enabled is False
+        assert latched.discovery_retryable is False
+        assert state.jwks_data is None
+        assert state.oidc_http_client is None
 
     def test_initialize_survives_an_unreachable_jwks_endpoint(self):
         """An IdP whose JWKS endpoint is unreachable at boot leaves OIDC enabled for the lazy

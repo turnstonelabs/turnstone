@@ -656,6 +656,20 @@ frozen.
 
 ### Fixed
 
+- **An OAuth or OIDC endpoint URL the client can't send is refused when its document is read.** An
+  identity provider's discovery document, an MCP server's challenge or metadata, or an
+  authorization server's metadata could name an endpoint holding a control character (a stray
+  trailing newline, say), a lone surrogate, or a host that isn't valid IDNA 2008. The address
+  checks accepted it and the request then failed with an error OAuth didn't handle: a JWKS URL
+  like that stopped the node, console or CLI from starting; the MCP consent callback and client
+  registration answered 500; a challenge like that ended discovery before the server's
+  origin-level document was tried; an MCP token lookup raised instead of returning a retryable
+  failure; and a model token mint failed without recording a cause. Such a URL is now refused like
+  any other rejected endpoint, also in a field that is sent only on some paths or never (an
+  identity provider's `userinfo_endpoint`, an authorization server's `revocation_endpoint`): OIDC
+  sign-in turns off with the configuration error logged until the next start, consent fails with
+  the discovery error, and the challenge is skipped. A URL that reaches a request anyway fails like
+  an unreachable endpoint.
 - **A node or console that can't read its settings at startup exits instead of running on the
   defaults (#1406).** When the settings query failed after the database migrations had run (a
   dropped connection, a failover, a timeout), the process ran on every setting's default until

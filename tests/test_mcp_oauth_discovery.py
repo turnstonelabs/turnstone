@@ -18,7 +18,8 @@ from __future__ import annotations
 
 import asyncio
 import time
-from typing import Any
+import urllib.parse
+from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx2
@@ -32,6 +33,9 @@ from turnstone.core.mcp_oauth import (
     discover_authorization_server,
 )
 from turnstone.core.oauth.http import ASMetadata
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -2273,3 +2277,117 @@ class TestPrivateNetworkOptIn:
         with pytest.raises(MCPOAuthDiscoveryError, match="refused"):
             asyncio.run(_run())
         client.get.assert_not_called()
+
+
+def _discover_through(
+    respond: Callable[[httpx2.Request], httpx2.Response],
+) -> tuple[ASMetadata, list[str]]:
+    """Run discovery over a real client whose transport answers with *respond*; return the
+    metadata and the URLs that reached the transport."""
+    sent: list[str] = []
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        sent.append(str(request.url))
+        return respond(request)
+
+    async def _run() -> ASMetadata:
+        async with httpx2.AsyncClient(transport=httpx2.MockTransport(handler)) as client:
+            with _public_addr_patch():
+                return await discover_authorization_server(
+                    server_name="srv-x",
+                    server_url=_SERVER,
+                    override_url=None,
+                    cached_issuer=None,
+                    http_client=client,
+                    storage=_mk_storage_mock(),
+                    server_id="srv-id",
+                    trusted_hosts=frozenset(),
+                )
+
+    return asyncio.run(_run()), sent
+
+
+def _challenge_then_origin(challenge_url: str) -> Callable[[httpx2.Request], httpx2.Response]:
+    """The path PRM location challenges with *challenge_url*; the origin location answers."""
+    challenge = f'Bearer resource_metadata="{challenge_url}"'.encode()
+
+    def respond(request: httpx2.Request) -> httpx2.Response:
+        url = str(request.url)
+        if url == _PATH_PRM:
+            return httpx2.Response(401, headers=[(b"www-authenticate", challenge)])
+        if url == _ROOT_PRM:
+            return httpx2.Response(
+                200,
+                json={
+                    "resource": "https://mcp.example.com",
+                    "authorization_servers": ["https://as.example.com"],
+                },
+            )
+        if url == _AS_META:
+            return httpx2.Response(200, json=_good_as_metadata_doc())
+        raise AssertionError(f"unexpected request to {url}")
+
+    return respond
+
+
+async def _accept_any_url(url: str, **kwargs: Any) -> urllib.parse.ParseResult:
+    return urllib.parse.urlparse(url)
+
+
+class TestURLsTheClientCannotSend:
+    """httpx2 raises ``InvalidURL``, which is not an ``HTTPError``, for a URL it can't send. The
+    guard refuses such URLs; the requests still map one that gets past it."""
+
+    def test_challenge_url_with_a_tab_is_refused_before_any_request(self) -> None:
+        # The client's get fails any URL its router doesn't know, so the guard has to refuse the
+        # TAB URL: a request that failed for it would fail this test too.
+        tab_url = "https://mcp.example.com/prm" + chr(9) + "x"
+        meta, client = _discover(
+            _SERVER,
+            _router(
+                {
+                    _PATH_PRM: _challenge(tab_url),
+                    _ROOT_PRM: _prm("https://mcp.example.com"),
+                    _AS_META: _mk_response(200, _good_as_metadata_doc()),
+                }
+            ),
+        )
+        assert meta.issuer == "https://as.example.com"
+        assert _urls(client) == [_PATH_PRM, _ROOT_PRM, _AS_META]
+
+    def test_unused_endpoint_with_a_lone_surrogate_is_a_discovery_error(self) -> None:
+        document = _good_as_metadata_doc()
+        document["revocation_endpoint"] = "https://as.example.com/revoke" + chr(0xD800)
+        _discover_error(
+            _SERVER,
+            _router({_PATH_PRM: _prm(_SERVER), _AS_META: _mk_response(200, document)}),
+            "revocation_endpoint",
+        )
+
+    def test_prm_request_past_the_guard_falls_through_to_the_next_candidate(self) -> None:
+        unsendable = "https://" + chr(0x2603) + ".example.com/prm"
+        with patch(
+            "turnstone.core.oauth.ssrf.validate_url_no_ssrf_async", side_effect=_accept_any_url
+        ):
+            meta, sent = _discover_through(_challenge_then_origin(unsendable))
+        assert meta.issuer == "https://as.example.com"
+        assert sent == [_PATH_PRM, _ROOT_PRM, _AS_META]
+
+    def test_metadata_request_past_the_guard_is_a_discovery_error(self) -> None:
+        unsendable_issuer = "https://" + chr(0x2603) + ".example.com"
+
+        def respond(request: httpx2.Request) -> httpx2.Response:
+            if str(request.url) == _PATH_PRM:
+                return httpx2.Response(
+                    200, json={"resource": _SERVER, "authorization_servers": [unsendable_issuer]}
+                )
+            raise AssertionError(f"unexpected request to {request.url}")
+
+        with (
+            patch(
+                "turnstone.core.oauth.ssrf.validate_url_no_ssrf_async",
+                side_effect=_accept_any_url,
+            ),
+            pytest.raises(MCPOAuthDiscoveryError, match="AS metadata fetch failed"),
+        ):
+            _discover_through(respond)

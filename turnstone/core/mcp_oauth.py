@@ -33,8 +33,6 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Literal, NamedTuple, cast
 
-import httpx2
-
 from turnstone.core.audit import record_audit
 from turnstone.core.log import get_logger
 from turnstone.core.mcp_http_parsers import (
@@ -58,6 +56,7 @@ from turnstone.core.token_store import store as token_store_store
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
+    import httpx2
     from starlette.requests import Request
     from starlette.responses import Response
 
@@ -552,7 +551,7 @@ async def _fetch_prm_issuer(
                 continue
             try:
                 resp = await http_client.get(candidate.url, timeout=budget)
-            except httpx2.HTTPError as exc:
+            except oauth_http._REQUEST_FAILURES as exc:
                 _record(_discovery_error(f"PRM fetch failed: {exc}", exc))
                 continue
             fetched[(candidate.url, candidate.allow_private)] = resp
@@ -916,7 +915,7 @@ async def _fetch_as_metadata(
             break
         try:
             r = await http_client.get(metadata_url, timeout=budget)
-        except httpx2.HTTPError as exc:
+        except oauth_http._REQUEST_FAILURES as exc:
             first_error = first_error or _discovery_error(f"AS metadata fetch failed: {exc}", exc)
             continue
         if r.status_code != 200:
@@ -970,8 +969,9 @@ async def _fetch_as_metadata(
                     allow_private=allow_private and _same_origin(endpoint_url, issuer),
                 )
             except oauth_ssrf.OAuthSSRFError as exc:
+                # Escaped: the document's URL may hold the control characters that got it refused.
                 raise MCPOAuthDiscoveryError(
-                    f"AS {name} rejected (url={endpoint_url}): {exc}"
+                    f"AS {name} rejected (url={oauth_ssrf.sanitize_log_text(endpoint_url)}): {exc}"
                 ) from exc
 
         # Which discovery profile answered (rfc8414 vs oidc) is the load-bearing
@@ -1296,7 +1296,7 @@ async def register_dynamic_client(
             json=body,
             timeout=oauth_http._DEFAULT_HTTP_TIMEOUT,
         )
-    except httpx2.HTTPError as exc:
+    except oauth_http._REQUEST_FAILURES as exc:
         raise oauth_http.OAuthError(f"DCR request failed: {exc}") from exc
 
     if len(resp.content) > oauth_http._MAX_TOKEN_BODY_BYTES:
@@ -1366,7 +1366,7 @@ async def exchange_code(
             data=data,
             timeout=oauth_http._DEFAULT_HTTP_TIMEOUT,
         )
-    except httpx2.HTTPError as exc:
+    except oauth_http._REQUEST_FAILURES as exc:
         raise MCPOAuthExchangeError(f"token exchange request failed: {exc}") from exc
 
     if len(resp.content) > oauth_http._MAX_TOKEN_BODY_BYTES:

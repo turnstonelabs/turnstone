@@ -145,6 +145,55 @@ class TestValidateUrlNoSSRF:
         ):
             validate_url_no_ssrf("https://no.such.host.invalid", allow_http=False)
 
+    @pytest.mark.parametrize(
+        "char", [chr(9), chr(10), chr(13), chr(1), chr(0x7F)], ids=["tab", "lf", "cr", "soh", "del"]
+    )
+    def test_refuses_control_characters_before_resolving(self, char: str) -> None:
+        """urllib drops TAB, CR and LF and keeps the other control characters, so the checks
+        would judge a different URL from the one the client sends, and the client refuses it."""
+        with (
+            patch("socket.getaddrinfo") as resolve,
+            pytest.raises(OAuthSSRFError, match="control characters"),
+        ):
+            validate_url_no_ssrf(f"https://idp.example.com/to{char}ken", allow_http=False)
+        resolve.assert_not_called()
+
+    def test_refuses_a_host_the_client_cannot_encode(self) -> None:
+        """This host passes the resolver's IDNA 2003 encoding and fails the client's IDNA 2008."""
+        snowman = chr(0x2603)
+        with (
+            patch("socket.getaddrinfo", return_value=self._PUBLIC_ADDR),
+            pytest.raises(OAuthSSRFError, match="malformed"),
+        ):
+            validate_url_no_ssrf(f"https://{snowman}.example.com/token", allow_http=False)
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://idp.example.com/a" + chr(0xD800),
+            "https://idp.example.com/?q=" + chr(0xD800),
+            "https://u" + chr(0xD800) + "@idp.example.com/",
+        ],
+        ids=["path", "query", "userinfo"],
+    )
+    def test_refuses_a_lone_surrogate(self, url: str) -> None:
+        """A JSON document can carry a lone surrogate, which httpx2 can't encode into a URL."""
+        with (
+            patch("socket.getaddrinfo", return_value=self._PUBLIC_ADDR),
+            pytest.raises(OAuthSSRFError, match="malformed"),
+        ):
+            validate_url_no_ssrf(url, allow_http=False)
+
+    def test_refuses_an_out_of_range_port(self) -> None:
+        """httpx2 accepts this port and urllib refuses it; the refusal is the guard's own error."""
+        with pytest.raises(OAuthSSRFError, match="malformed"):
+            validate_url_no_ssrf("https://idp.example.com:99999/token", allow_http=False)
+
+    def test_a_space_the_client_encodes_is_still_accepted(self) -> None:
+        with patch("socket.getaddrinfo", return_value=self._PUBLIC_ADDR):
+            parsed = validate_url_no_ssrf("https://idp.example.com/a b", allow_http=False)
+        assert parsed.path == "/a b"
+
 
 class TestValidateDiscoveredEndpoint:
     _PUBLIC_ADDR = [(2, 1, 6, "", ("93.184.216.34", 0))]

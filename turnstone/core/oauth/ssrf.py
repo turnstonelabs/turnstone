@@ -24,6 +24,8 @@ from __future__ import annotations
 import asyncio
 import urllib.parse
 
+import httpx2
+
 from turnstone.core.ip_classify import (
     AddressLane,
     ResolutionError,
@@ -169,7 +171,23 @@ def validate_url_no_ssrf(
     evidence, and accepting it would put an OIDC token exchange —
     ``client_secret`` and authorization code included — on the wire in the
     clear.
+
+    A URL the client cannot send is refused before anything else, so a document naming one fails
+    here as a refused endpoint: one holding an ASCII control character, or one httpx2 cannot parse
+    or encode (a host that is not valid IDNA 2008, or a lone surrogate, for example). urllib drops
+    TAB, CR and LF and keeps the other control characters, so the checks below would otherwise
+    judge a different URL from the one sent.
     """
+    if any(ch.isascii() and not ch.isprintable() for ch in url):
+        raise OAuthSSRFError(
+            f"endpoint URL must not contain control characters: {sanitize_log_text(url)}"
+        )
+    try:
+        httpx2.URL(url)
+    except (httpx2.InvalidURL, UnicodeError) as exc:
+        raise OAuthSSRFError(
+            f"endpoint URL is malformed ({exc}): {sanitize_log_text(url)}"
+        ) from exc
     try:
         parsed = urllib.parse.urlparse(url)
         hostname = parsed.hostname
