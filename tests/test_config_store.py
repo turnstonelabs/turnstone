@@ -309,6 +309,18 @@ class TestReload:
         assert store.get("session.retention_days") == 0
         assert store.version == version
 
+    def test_a_stored_value_that_cannot_be_decoded_is_logged_by_key(self, storage, caplog):
+        # The key reads as its default. The line names the key but not the value, which the
+        # decode error quotes.
+        storage.upsert_system_setting(key="session.retention_days", value='"ninety days"')
+        with caplog.at_level("WARNING", logger="turnstone.core.config_store"):
+            store = ConfigStore(storage)
+        assert store.get("session.retention_days") == SETTINGS["session.retention_days"].default
+        records = [r for r in caplog.records if "config_store.setting_invalid" in r.getMessage()]
+        assert [r.levelname for r in records] == ["ERROR"]
+        assert "session.retention_days" in records[0].getMessage()
+        assert "ninety days" not in caplog.text
+
 
 def _unreadable(node_id: str = "") -> dict[str, str]:
     raise RuntimeError("database went away")

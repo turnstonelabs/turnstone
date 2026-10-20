@@ -296,8 +296,8 @@ const client = new TurnstoneServer({
 
 1. Read `tls.enabled` from ConfigStore
 2. Initialize CA (load from DB or generate new root key). A console that can't
-   logs `tls.init_failed` and exits rather than serve without TLS, so a
-   supervisor restart retries; unlike a node, it has no plain-HTTP fallback
+   logs `tls.init_failed` and exits rather than serve without the CA nodes
+   enroll through, so a supervisor restart retries
 3. Mount ACME responder at `/acme` (serves `/ca.pem` natively). When
    `TURNSTONE_ACME_EXTERNAL_URL` is set, use it for every advertised directory,
    order, authorization, and certificate URL; otherwise derive URLs from each
@@ -307,7 +307,10 @@ const client = new TurnstoneServer({
 4. Issue console certs (internal + optional frontend)
 5. Start CA-direct auto-renewal (no network, signs directly), scoped to the
    console's own cert, plus a periodic GC that reclaims cert rows for
-   long-departed nodes
+   long-departed nodes. A failure in step 4 or 5 is logged as
+   `tls.console_setup_failed` and the console keeps serving: nodes still
+   enroll, but the console can't reach nodes that require mTLS until it
+   restarts
 6. Register console URL in services table with heartbeat
 
 ---

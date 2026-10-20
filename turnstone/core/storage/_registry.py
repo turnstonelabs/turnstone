@@ -23,6 +23,19 @@ class StorageUnavailableError(Exception):
     """
 
 
+def storage_errors() -> tuple[type[Exception], ...]:
+    """The exceptions a failed storage call raises, for an ``except`` clause.
+
+    A database that can't be reached raises :class:`StorageUnavailableError`;
+    a statement it rejects or drops raises SQLAlchemy's ``DBAPIError``.
+    SQLAlchemy's own usage errors are code bugs and stay out. SQLAlchemy is
+    imported here, not at module load, like the backends.
+    """
+    import sqlalchemy as sa
+
+    return (StorageUnavailableError, sa.exc.DBAPIError)
+
+
 def init_storage(
     backend: str = "sqlite",
     *,

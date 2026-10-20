@@ -260,16 +260,18 @@ frozen.
 
 ### Changed
 
-- **A console exits when it can't start the TLS it has enabled, or when a setting's
-  `TURNSTONE_*` variable holds a value the setting refuses (#1406)** *(BREAKING)* — a failed CA
-  load (a storage error, a corrupt row) used to leave the console serving plain HTTP until a
-  restart, and nodes that started meanwhile fell back to plain HTTP; a refused value such as
-  `TURNSTONE_TLS_ENABLED=on` was logged and skipped, leaving its setting at the default. The
-  console now logs `tls.init_failed`, or `config.seed_refused` once per refused variable, and
-  exits, seeding nothing on a start that refuses a value; a bool takes `true`, `1`, `yes`,
-  `false`, `0` or `no`. A console whose CA can't start for a lasting reason doesn't serve its
-  Settings tab either, so turning TLS off then means setting `tls.enabled` to `false` in the
-  `system_settings` table.
+- **A console exits when it can't start the TLS certificate authority it has enabled, or when a
+  setting's `TURNSTONE_*` variable holds a value the setting refuses (#1406)** *(BREAKING)* — a
+  failed CA load (a storage error, a corrupt row) used to leave the console running without TLS
+  until a restart, and nodes that started meanwhile fell back to plain HTTP; a refused value such
+  as `TURNSTONE_TLS_ENABLED=on` was logged and skipped, leaving its setting at the default, and
+  one for a setting already stored was never read. The console now logs `tls.init_failed`, or
+  `config.seed_refused` once per refused variable, and exits, seeding nothing on a start that
+  refuses a value; a bool takes `true`, `1`, `yes`, `false`, `0` or `no`. An empty variable now
+  counts as unset, so it no longer stores an empty string. A console whose CA can't start for a
+  lasting reason doesn't serve its Settings tab either, so turning TLS off then means setting
+  `tls.enabled` to `false` in the `system_settings` table. A failure issuing the console's own
+  certificate is still logged, now as `tls.console_setup_failed`, and the console keeps serving.
 - **Database errors no longer quote the values a failed statement was sent** — an error message,
   and a traceback logged with it, names the statement and the database's reason only; the values
   stay on the exception's `params`.

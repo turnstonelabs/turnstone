@@ -6012,12 +6012,13 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None]:
     config_store = None
     if storage:
         from turnstone.core.config_store import ConfigStore
+        from turnstone.core.storage import storage_errors
 
         # Settings that can't be read end startup rather than run the console
         # on every default; a supervisor restart retries the read.
         try:
             config_store = ConfigStore(storage)
-        except Exception as exc:
+        except storage_errors() as exc:
             log.error("settings.load_failed: %s", exc)
             raise SystemExit(1) from exc
     app.state.config_store = config_store
@@ -6149,7 +6150,9 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None]:
         except Exception:
             log.warning("Failed to register console service", exc_info=True)
 
-    # TLS: init CA, issue console certs, start renewal
+    # TLS: init CA, issue console certs, start renewal. main() exits when the CA
+    # can't start; a failure here is logged and the console keeps serving, since
+    # nodes still enroll through that CA, and a restart retries.
     tls_mgr = getattr(app.state, "tls_manager", None)
     if tls_mgr is not None:
         try:
@@ -6212,7 +6215,12 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None]:
                 app.state.collector.upgrade_tls(tls_verify=client_ctx)
                 log.info("tls.proxy_clients.upgraded")
         except Exception:
-            log.warning("TLS initialization failed — continuing without TLS", exc_info=True)
+            log.warning(
+                "tls.console_setup_failed: the console's certificate, renewal or mTLS clients "
+                "didn't start; it keeps serving, but can't reach nodes that require mTLS until "
+                "it restarts",
+                exc_info=True,
+            )
 
     # Coordinator workstream plumbing.  Lazy — failure here is non-fatal;
     # the coordinator endpoints return 503 with a remediation message
@@ -17465,20 +17473,23 @@ def _seed_config_from_env(config_store: Any, storage: Any) -> None:
     Uses config_store.set() for proper validation, serialization, and
     cache invalidation.
 
-    Every value is checked before anything is written: one its setting refuses
-    is logged and the console exits with nothing seeded, so a mistyped value
-    never leaves its setting at the default. A storage error propagates too. A
-    value shadowed by a row an earlier console start wrote (``console-startup``,
-    #1413) is reported, since the operator set the variable to change it.
+    An empty value counts as unset, as a Compose ``${X:-}`` passthrough of an
+    unset variable gives. Every other value is checked before anything is
+    written: one its setting refuses is logged and the console exits with
+    nothing seeded, so a mistyped value never leaves its setting at the
+    default. A storage error while seeding is logged with its key and exits
+    too. A value shadowed by a ``console-startup`` row (#1413) is reported,
+    since the operator set the variable to change it.
     """
     from turnstone.core.settings_registry import SETTINGS, serialize_value, validate_value
+    from turnstone.core.storage import storage_errors
 
     seeds: list[tuple[str, str, str, str]] = []
     refused = False
     for key in SETTINGS:
         env_name = "TURNSTONE_" + key.replace(".", "_").upper()
         env_val = os.environ.get(env_name)
-        if env_val is None:
+        if env_val is None or not env_val.strip():
             continue
         try:
             seeds.append((key, env_name, env_val, serialize_value(validate_value(key, env_val))))
@@ -17490,23 +17501,26 @@ def _seed_config_from_env(config_store: Any, storage: Any) -> None:
     for key, env_name, env_val, serialized in seeds:
         # Only seed if not already stored (check raw storage to avoid
         # config_store cache, which may not reflect DB state yet)
-        existing = storage.get_system_setting(key)
-        if existing is not None:
-            if (
-                existing.get("changed_by") == "console-startup"
-                and existing.get("value") != serialized
-            ):
-                log.warning(
-                    "config.env_ignored: %s is stored as %s by an earlier console start, so %s "
-                    "is not applied; reset %s in the Settings tab to apply it",
-                    key,
-                    existing.get("value"),
-                    env_name,
-                    key,
-                )
-            continue
-        config_store.set(key, env_val, changed_by="env")
-        log.info("config.seeded_from_env: %s from %s", key, env_name)
+        try:
+            existing = storage.get_system_setting(key)
+            if existing is None:
+                config_store.set(key, env_val, changed_by="env")
+        except storage_errors() as exc:
+            log.error("config.seed_failed: %s from %s: %s", key, env_name, exc)
+            raise SystemExit(1) from exc
+        if existing is None:
+            log.info("config.seeded_from_env: %s from %s", key, env_name)
+        elif (
+            existing.get("changed_by") == "console-startup" and existing.get("value") != serialized
+        ):
+            log.warning(
+                "config.env_ignored: %s is stored as %s, so %s is not applied; reset %s in the "
+                "Settings tab to apply it",
+                key,
+                existing.get("value"),
+                env_name,
+                key,
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -18586,20 +18600,23 @@ def main() -> None:
         console_url = f"http://{_advertise_host}:{args.port}"
     if auth_storage:
         from turnstone.core.config_store import ConfigStore
+        from turnstone.core.storage import storage_errors
 
-        # Settings that can't be read or seeded end startup rather than run the
-        # console on every default; a supervisor restart retries.
+        # Settings that can't be read end startup rather than run the console on
+        # every default; a supervisor restart retries.
         try:
             _cs = ConfigStore(auth_storage)
-            # Seed ConfigStore from env vars (TURNSTONE_{SECTION}_{KEY})
-            _seed_config_from_env(_cs, auth_storage)
-        except Exception as exc:
+        except storage_errors() as exc:
             log.error("settings.load_failed: %s", exc)
             raise SystemExit(1) from exc
+        # Seed ConfigStore from env vars (TURNSTONE_{SECTION}_{KEY})
+        _seed_config_from_env(_cs, auth_storage)
 
-        # TLS is required once it is enabled: a console that can't start it exits
-        # rather than serve plain HTTP to nodes that would fall back to it, and a
-        # supervisor restart retries. Nothing is written back: nodes read
+        # Once TLS is enabled, a console that can't load or create its CA exits
+        # rather than serve without the ACME responder nodes enroll through (a node
+        # that can't enroll falls back to plain HTTP), and a supervisor restart
+        # retries. The lifespan issues the console's own certificate, and logs a
+        # failure there and serves on. Nothing is written back: nodes read
         # tls.enabled as stored, and unset reads as off (#1413).
         try:
             if _cs.get("tls.enabled"):
@@ -18643,7 +18660,9 @@ def main() -> None:
 
     import uvicorn
 
-    uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
+    # lifespan="on": a lifespan that can't start (its settings can't load) ends the
+    # process instead of leaving it serving without one.
+    uvicorn.run(app, host=args.host, port=args.port, log_level="warning", lifespan="on")
 
 
 if __name__ == "__main__":

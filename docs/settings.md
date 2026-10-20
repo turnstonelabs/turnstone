@@ -29,10 +29,12 @@ last loaded.
 
 The console seeds a setting from its `TURNSTONE_<SECTION>_<KEY>` environment
 variable (`TURNSTONE_TLS_ENABLED` for `tls.enabled`) while nothing is stored for
-it; a stored value, from the Settings tab or an earlier seed, wins. Every such
-variable is checked first: one its setting refuses (a bool takes `true`, `1`,
+it; a stored value, from the Settings tab or an earlier seed, wins. An empty
+variable counts as unset. Every other such variable is checked first, even one
+whose setting is stored: one its setting refuses (a bool takes `true`, `1`,
 `yes`, `false`, `0` or `no`) is logged as `config.seed_refused`, and the console
-exits without seeding any of them.
+exits without seeding any of them. A seed that can't be written is logged as
+`config.seed_failed` and ends startup too.
 
 ---
 

@@ -6249,12 +6249,14 @@ def main() -> None:
     # settings.  Created early so all subsequent init code can read from it.
     from turnstone.core.config_store import ConfigStore
     from turnstone.core.storage import get_storage as _get_cs_storage
+    from turnstone.core.storage import storage_errors
 
     # Settings that can't be read end the boot: every default would apply, the
     # startup prune below among them, and a supervisor restart retries the read.
+    # Any other error is a bug and keeps its traceback.
     try:
         config_store = ConfigStore(storage=_get_cs_storage(), node_id=_node_id)
-    except Exception as exc:
+    except storage_errors() as exc:
         log.error("settings.load_failed", error=str(exc))
         raise SystemExit(1) from exc
 
@@ -6306,7 +6308,7 @@ def main() -> None:
         # Row content a restart won't change: named, like a bad [secrets] table.
         log.error("model_registry.config_invalid", error=str(exc))
         raise SystemExit(1) from exc
-    except Exception as exc:
+    except storage_errors() as exc:
         log.error("model_registry.load_failed", error=str(exc))
         raise SystemExit(1) from exc
 

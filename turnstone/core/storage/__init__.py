@@ -27,6 +27,7 @@ from turnstone.core.storage._registry import (
     init_storage,
     is_storage_initialized,
     reset_storage,
+    storage_errors,
 )
 
 __all__ = [
@@ -51,4 +52,5 @@ __all__ = [
     "init_storage",
     "is_storage_initialized",
     "reset_storage",
+    "storage_errors",
 ]
