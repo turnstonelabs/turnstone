@@ -861,15 +861,13 @@ class TestEviction:
         assert mgr._last_pool_notification_refresh[(key, "tools")] == 456.0
 
     def test_notification_refresh_catches_exception_group(self, running_loop_mgr) -> None:
-        """A wedged anyio transport surfaces session-op failures as
-        ``BaseExceptionGroup`` — which ``except Exception`` misses. An
-        escaping group reaches ``_spawn_background``'s failure log,
-        whose ``exc_info`` serializes the chained httpx request
-        carrying ``Authorization: Bearer <token>``. The runner must
-        swallow the group (and keep the stamp) like any other refresh
-        failure. The member below is a BaseException so the group does
-        NOT collapse to ``ExceptionGroup`` (which ``Exception`` would
-        catch) — the anyio stray-cancel shape."""
+        """A wedged anyio transport surfaces session-op failures as ``BaseExceptionGroup`` — which
+        ``except Exception`` misses. An escaping group reaches ``_spawn_background``'s failure log,
+        whose ``exc_info`` serializes the chained httpx2 request carrying
+        ``Authorization: Bearer <token>``. The runner must swallow the group (and keep the stamp)
+        like any other refresh failure. The member below is a BaseException so the group does NOT
+        collapse to ``ExceptionGroup`` (which ``Exception`` would catch) — the anyio stray-cancel
+        shape."""
         mgr, loop, _ = running_loop_mgr
         key = ("u0", "pool-srv")
 
@@ -1609,30 +1607,30 @@ class TestClassifyFailure:
         Phase 6 split ``"auth"`` into ``"auth_401"`` / ``"auth_403"``
         so the dispatcher can refresh-and-retry only on 401.
         """
-        import httpx
+        import httpx2
 
         mgr = MCPClientManager({})
-        req = httpx.Request("POST", "https://mcp.example.com/sse")
-        resp = httpx.Response(401, request=req)
-        exc = httpx.HTTPStatusError("unauthorized", request=req, response=resp)
+        req = httpx2.Request("POST", "https://mcp.example.com/sse")
+        resp = httpx2.Response(401, request=req)
+        exc = httpx2.HTTPStatusError("unauthorized", request=req, response=resp)
         assert mgr._classify_failure(exc) == "auth_401"
 
     def test_http_403_classified_as_auth_403(self) -> None:
-        import httpx
+        import httpx2
 
         mgr = MCPClientManager({})
-        req = httpx.Request("POST", "https://mcp.example.com/sse")
-        resp = httpx.Response(403, request=req)
-        exc = httpx.HTTPStatusError("forbidden", request=req, response=resp)
+        req = httpx2.Request("POST", "https://mcp.example.com/sse")
+        resp = httpx2.Response(403, request=req)
+        exc = httpx2.HTTPStatusError("forbidden", request=req, response=resp)
         assert mgr._classify_failure(exc) == "auth_403"
 
     def test_http_500_classified_as_transport(self) -> None:
-        import httpx
+        import httpx2
 
         mgr = MCPClientManager({})
-        req = httpx.Request("POST", "https://mcp.example.com/sse")
-        resp = httpx.Response(500, request=req)
-        exc = httpx.HTTPStatusError("server", request=req, response=resp)
+        req = httpx2.Request("POST", "https://mcp.example.com/sse")
+        resp = httpx2.Response(500, request=req)
+        exc = httpx2.HTTPStatusError("server", request=req, response=resp)
         assert mgr._classify_failure(exc) == "transport"
 
 

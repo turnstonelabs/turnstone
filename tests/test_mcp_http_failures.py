@@ -10,7 +10,6 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
-import httpx
 import httpx2
 import mcp.types as mcp_types
 import pytest
@@ -36,7 +35,7 @@ from turnstone.core.mcp_client import (
     _AuthCapture,
     _CapturedHTTPError,
     _is_dead_transport,
-    _make_capturing_http_factory,
+    _make_capturing_http_client,
 )
 
 if TYPE_CHECKING:
@@ -444,7 +443,6 @@ def test_http_status_precedes_sdk_protocol_codes(sdk_code, status, classificatio
     assert mgr._classify_failure(error) == "protocol"
 
 
-@pytest.mark.parametrize("client", [httpx, httpx2], ids=["httpx", "httpx2"])
 @pytest.mark.parametrize(
     ("error_name", "dead"),
     [
@@ -460,14 +458,13 @@ def test_http_status_precedes_sdk_protocol_codes(sdk_code, status, classificatio
         ("LocalProtocolError", False),
     ],
 )
-def test_http_exception_families(client, error_name, dead):
-    error = getattr(client, error_name)("failure")
+def test_http_exception_families(error_name, dead):
+    error = getattr(httpx2, error_name)("failure")
     assert _is_dead_transport(error) is dead
     mgr = MCPClientManager({})
     assert mgr._classify_failure(error) == ("transport" if dead else "other")
 
 
-@pytest.mark.parametrize("client", [httpx, httpx2], ids=["httpx", "httpx2"])
 @pytest.mark.parametrize(
     ("status", "held", "classification"),
     [
@@ -478,12 +475,12 @@ def test_http_exception_families(client, error_name, dead):
         (502, False, "transport"),
     ],
 )
-def test_http_status_exception_fallback(client, status, held, classification):
-    request = client.Request(
+def test_http_status_exception_fallback(status, held, classification):
+    request = httpx2.Request(
         "POST", "https://mcp.example.com/", headers={"mcp-session-id": "held"} if held else {}
     )
-    response = client.Response(status, request=request)
-    error = client.HTTPStatusError("failure", request=request, response=response)
+    response = httpx2.Response(status, request=request)
+    error = httpx2.HTTPStatusError("failure", request=request, response=response)
     assert MCPClientManager({})._classify_failure(error) == classification
 
 
@@ -491,7 +488,7 @@ def test_http_status_exception_fallback(client, status, held, classification):
 async def test_hook_keeps_first_failure_and_ignores_cleanup():
     capture = _AuthCapture()
     fired = asyncio.Event()
-    async with _make_capturing_http_factory(capture, fired)() as client:
+    async with _make_capturing_http_client(capture, fired) as client:
         hook = client.event_hooks["response"][0]
         cleanup = httpx2.Request("DELETE", "https://mcp.example.com/")
         await hook(httpx2.Response(502, request=cleanup))
@@ -503,6 +500,16 @@ async def test_hook_keeps_first_failure_and_ignores_cleanup():
         assert capture.status == 401
         assert capture.www_authenticate == "Bearer"
         assert fired.is_set()
+
+
+@pytest.mark.anyio
+async def test_connection_client_sends_its_headers_and_keeps_the_sdk_timeouts():
+    """A connection's client sends the headers it is built with, and waits 30 s to connect, write
+    or get a pooled connection and 300 s for a read, since a server may hold a stream open."""
+    client = _make_capturing_http_client(_AuthCapture(), headers={"X-Api-Key": "key-1"})
+    async with client:
+        assert client.headers["x-api-key"] == "key-1"
+        assert client.timeout == httpx2.Timeout(30.0, read=300.0)
 
 
 @pytest.mark.anyio

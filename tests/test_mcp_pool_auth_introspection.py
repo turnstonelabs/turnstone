@@ -14,10 +14,9 @@ several tests note explicit "verified by reverting [production line] to
 authoring discipline so future readers can re-verify the assertions
 hold for the right reason.
 
-Direct ``httpx.HTTPStatusError`` injection appears ONLY in the
-classification tests for defense-in-depth coverage of the non-SDK
-refresh path. The dispatcher-asserting tests drive the carrier through
-the production path.
+Direct ``httpx2.HTTPStatusError`` injection appears ONLY in the classification tests, which pin the
+status fallback itself: no status error raised outside the SDK is known to reach the classifier. The
+dispatcher-asserting tests drive the carrier through the production path.
 """
 
 from __future__ import annotations
@@ -32,6 +31,7 @@ from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, MagicMock
 
 import httpx
+import httpx2
 import mcp.types as mcp_types
 import pytest
 
@@ -40,7 +40,7 @@ from tests.conftest import _run_on_loop, make_mcp_token_cipher, stop_loop_thread
 from turnstone.core.mcp_client import (
     MCPClientManager,
     _AuthCapture,
-    _make_capturing_http_factory,
+    _make_capturing_http_client,
 )
 from turnstone.core.mcp_crypto import MCPTokenStore
 from turnstone.core.oauth.context import TokenCoordination
@@ -159,14 +159,14 @@ class TestClassifyFailureWithCapture:
         assert mgr._classify_failure(RuntimeError("any"), capture=capture) == "auth_403"
 
     def test_classify_failure_no_capture_falls_through_to_legacy(self) -> None:
-        """Defense-in-depth: an ``HTTPStatusError`` raised outside the SDK still classifies by its
-        status. None is known to reach the classifier today (the OAuth refresh wraps its HTTP errors
-        in ``OAuthRefreshError``), so this pins the fallback itself."""
+        """Defense-in-depth: an httpx2 ``HTTPStatusError`` raised outside the SDK still classifies
+        by its status. None is known to reach the classifier today (the OAuth refresh wraps its HTTP
+        errors in ``OAuthRefreshError``), so this pins the fallback itself."""
         mgr = MCPClientManager({})
-        req = httpx.Request("POST", "https://mcp.example.com/sse")
+        req = httpx2.Request("POST", "https://mcp.example.com/sse")
         for status, label in ((401, "auth_401"), (403, "auth_403")):
-            resp = httpx.Response(status, request=req)
-            exc = httpx.HTTPStatusError("err", request=req, response=resp)
+            resp = httpx2.Response(status, request=req)
+            exc = httpx2.HTTPStatusError("err", request=req, response=resp)
             assert mgr._classify_failure(exc, capture=None) == label
 
     def test_classify_failure_capture_with_unrelated_status_falls_through(self) -> None:
@@ -283,17 +283,16 @@ class TestCarrierLifecycle:
     async def test_response_hook_captures_http_failures(self) -> None:
         """Auth and 5xx responses are captured; a 404 without a held session is ignored."""
         capture = _AuthCapture()
-        factory = _make_capturing_http_factory(capture)
-        client = factory()
+        client = _make_capturing_http_client(capture)
         try:
             hooks = client.event_hooks["response"]
             # The capture, then the initialize check, which raises and never records.
             assert [h.__name__ for h in hooks] == ["_hook", "_reject_non_mcp"]
             hook = hooks[0]
 
-            req = httpx.Request("POST", "https://mcp.example.com/")
+            req = httpx2.Request("POST", "https://mcp.example.com/")
             for ignored_status in (200, 201, 202, 400, 404, 429):
-                resp = httpx.Response(
+                resp = httpx2.Response(
                     ignored_status,
                     request=req,
                     headers={"www-authenticate": "Bearer should-be-ignored"},
@@ -304,7 +303,7 @@ class TestCarrierLifecycle:
             for tracked_status in (401, 403):
                 capture.status = None
                 capture.www_authenticate = None
-                resp = httpx.Response(
+                resp = httpx2.Response(
                     tracked_status,
                     request=req,
                     headers={"www-authenticate": f'Bearer error="x{tracked_status}"'},
@@ -313,12 +312,12 @@ class TestCarrierLifecycle:
                 assert capture.status == tracked_status
                 assert capture.www_authenticate == f'Bearer error="x{tracked_status}"'
 
-            req = httpx.Request(
+            req = httpx2.Request(
                 "POST", "https://mcp.example.com/", headers={"mcp-session-id": "held"}
             )
             for tracked_status in (404, 500, 502, 503, 599):
                 capture.status = None
-                await hook(httpx.Response(tracked_status, request=req))
+                await hook(httpx2.Response(tracked_status, request=req))
                 assert capture.status == tracked_status
                 assert capture.www_authenticate is None
         finally:

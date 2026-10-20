@@ -28,7 +28,7 @@ from turnstone.core.mcp_client import (
     MCPClientManager,
     PoolEntryState,
     _AuthCapture,
-    _make_capturing_http_factory,
+    _make_capturing_http_client,
 )
 
 # ---------------------------------------------------------------------------
@@ -68,32 +68,23 @@ def _build_mock_transport_factory(
     monkeypatch: pytest.MonkeyPatch,
     handler: Any,
 ) -> None:
-    """Wrap ``_make_capturing_http_factory`` so the resulting httpx2
-    client uses an ``httpx2.MockTransport(handler)``.
+    """Wrap ``_make_capturing_http_client`` so the client it builds uses an
+    ``httpx2.MockTransport(handler)``.
 
-    The production capturing factory is preserved (we still get the
-    response-hook plumbing); only the underlying transport is swapped.
-    Mirrors the spike v3 pattern that R6 used to verify discovery
+    The production capturing client is preserved (we still get the response-hook plumbing); only the
+    underlying transport is swapped. Mirrors the spike v3 pattern that R6 used to verify discovery
     behaviour against the real SDK.
     """
-    real_factory = _make_capturing_http_factory
+    real_builder = _make_capturing_http_client
 
-    def _wrapped_factory(
-        capture: _AuthCapture,
-        fired_event: asyncio.Event | None = None,
-    ) -> Any:
-        inner = real_factory(capture, fired_event=fired_event)
-
-        def _factory(*args: Any, **kwargs: Any) -> httpx2.AsyncClient:
-            client = inner(*args, **kwargs)
-            client._transport = httpx2.MockTransport(handler)
-            return client
-
-        return _factory
+    def _wrapped_builder(*args: Any, **kwargs: Any) -> httpx2.AsyncClient:
+        client = real_builder(*args, **kwargs)
+        client._transport = httpx2.MockTransport(handler)
+        return client
 
     monkeypatch.setattr(
-        "turnstone.core.mcp_client._make_capturing_http_factory",
-        _wrapped_factory,
+        "turnstone.core.mcp_client._make_capturing_http_client",
+        _wrapped_builder,
     )
 
 

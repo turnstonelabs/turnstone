@@ -460,7 +460,7 @@ class TestPoolTransportOwnerLifecycle:
         loop = asyncio.new_event_loop()
         stalled = asyncio.Event()
 
-        async def _owner_stalls(*_args: Any) -> None:
+        async def _owner_stalls(*_args: Any, **_kwargs: Any) -> None:
             stalled.set()
             await asyncio.Event().wait()
 
@@ -492,12 +492,12 @@ class TestPoolTransportOwnerLifecycle:
 
 
 # ---------------------------------------------------------------------------
-# Client-kwargs contract (bearer header + auth-capture factory)
+# HTTP client contract (bearer header + response hooks)
 # ---------------------------------------------------------------------------
 
 
-class TestPoolOwnerClientKwargs:
-    def test_client_factory_present_on_every_connection(self, running_loop_mgr) -> None:
+class TestPoolOwnerHttpClient:
+    def test_capturing_client_on_every_connection(self, running_loop_mgr) -> None:
         """Explicit and entry-owned carriers both install the hook and preserve the bearer."""
         mgr, loop, _ = running_loop_mgr
         key = ("user-1", "pool-srv")

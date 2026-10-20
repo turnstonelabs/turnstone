@@ -15,7 +15,6 @@ from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import anyio
-import httpx
 import httpx2
 import mcp.types as mcp_types
 import pytest
@@ -43,7 +42,7 @@ from turnstone.core.mcp_client import (
     ServerUnreachableError,
     _AuthCapture,
     _ErrorAnswerError,
-    _make_capturing_http_factory,
+    _make_capturing_http_client,
     _NotMcpResponseError,
     _sanitize_error_text,
     classify_connect_failure,
@@ -465,7 +464,7 @@ def test_a_session_dropped_after_initialize_is_not_a_wrong_url(
 def test_a_same_origin_redirect_keeps_the_answer_checks(
     upstream: tuple[str, Upstream], path: str, drop_sessions: bool, expected: ConnectFailure
 ) -> None:
-    """httpx sends a redirected request with its body unread; the hooks still read it."""
+    """httpx2 sends a redirected request with its body unread; the hooks still read it."""
     base, state = upstream
     state.drop_sessions = drop_sessions
     started = time.monotonic()
@@ -576,12 +575,12 @@ def _mcp_error(code: int, message: str) -> MCPError:
     return MCPError(code=code, message=message)
 
 
-def _status_error(status: int, reason: str, text: str = "") -> httpx.HTTPStatusError:
-    request = httpx.Request("POST", "http://mcp.example/mcp")
-    response = httpx.Response(
+def _status_error(status: int, reason: str, text: str = "") -> httpx2.HTTPStatusError:
+    request = httpx2.Request("POST", "http://mcp.example/mcp")
+    response = httpx2.Response(
         status, request=request, extensions={"reason_phrase": reason.encode()}
     )
-    return httpx.HTTPStatusError(text or f"{status} {reason}", request=request, response=response)
+    return httpx2.HTTPStatusError(text or f"{status} {reason}", request=request, response=response)
 
 
 @pytest.mark.parametrize(
@@ -622,7 +621,7 @@ def _status_error(status: int, reason: str, text: str = "") -> httpx.HTTPStatusE
                 "transport",
                 [
                     _mcp_error(mcp_types.CONNECTION_CLOSED, "Connection closed"),
-                    httpx.RemoteProtocolError("Server disconnected without sending a response."),
+                    httpx2.RemoteProtocolError("Server disconnected without sending a response."),
                 ],
             ),
             ConnectFailure(
@@ -637,7 +636,7 @@ def _status_error(status: int, reason: str, text: str = "") -> httpx.HTTPStatusE
                 "Redirect response '302 Found' for url 'http://u:pw@mcp.example/mcp?token=s3cret'",
             ),
             ConnectFailure("http", "HTTP 302 Found", 302),
-            id="redirect-with-no-location",  # httpx's text, naming the whole URL
+            id="redirect-with-no-location",  # httpx2's text, naming the whole URL
         ),
         pytest.param(
             TimeoutError(),
@@ -650,17 +649,17 @@ def _status_error(status: int, reason: str, text: str = "") -> httpx.HTTPStatusE
             id="worded-timeout",
         ),
         pytest.param(
-            httpx.ReadTimeout(""),
+            httpx2.ReadTimeout(""),
             ConnectFailure("timeout", "The server did not answer in time"),
             id="client-timeout",
         ),
         pytest.param(
-            httpx.ConnectError("All connection attempts failed"),
+            httpx2.ConnectError("All connection attempts failed"),
             ConnectFailure("unreachable", "Connection failed: All connection attempts failed"),
             id="connect-error",
         ),
         pytest.param(
-            httpx.RemoteProtocolError("Server disconnected without sending a response."),
+            httpx2.RemoteProtocolError("Server disconnected without sending a response."),
             ConnectFailure(
                 "error", "Connection failed: Server disconnected without sending a response."
             ),
@@ -688,7 +687,7 @@ def _status_error(status: int, reason: str, text: str = "") -> httpx.HTTPStatusE
                 "transport",
                 [
                     anyio.ClosedResourceError(),
-                    httpx.RemoteProtocolError("Server disconnected without sending a response."),
+                    httpx2.RemoteProtocolError("Server disconnected without sending a response."),
                 ],
             ),
             ConnectFailure(
@@ -705,7 +704,7 @@ def test_classifier(exc: BaseException, expected: ConnectFailure) -> None:
 @pytest.mark.parametrize(
     "exc",
     [
-        httpx.LocalProtocolError("Illegal header value b'sk-live-SECRET123 '"),
+        httpx2.LocalProtocolError("Illegal header value b'sk-live-SECRET123 '"),
         UnicodeEncodeError("ascii", "sk-live-SECRET" + chr(0xE9), 14, 15, "not in range"),
     ],
     ids=["whitespace", "outside-ascii"],
@@ -720,7 +719,7 @@ def test_a_refused_header_is_never_quoted(exc: BaseException) -> None:
 def test_only_a_refused_header_is_worded_as_one() -> None:
     """h11 refuses a framing header it cannot honour with text of its own, and an encoding error
     from elsewhere (a stdio argument) is no header at all."""
-    framing = httpx.LocalProtocolError("Only Transfer-Encoding: chunked is supported")
+    framing = httpx2.LocalProtocolError("Only Transfer-Encoding: chunked is supported")
     assert classify_connect_failure(framing) == ConnectFailure(
         "error", "Connection failed: Only Transfer-Encoding: chunked is supported"
     )
@@ -734,7 +733,7 @@ def test_only_an_unknown_exception_is_unrecognized() -> None:
     """The flag a caller reads to log a traceback; a deliberate plain error is recognized."""
     assert not classify_connect_failure(ConnectionError("refused")).recognized
     assert classify_connect_failure(MCPShutdownError()).recognized
-    assert classify_connect_failure(httpx.RemoteProtocolError("closed")).recognized
+    assert classify_connect_failure(httpx2.RemoteProtocolError("closed")).recognized
     assert classify_connect_failure(_mcp_error(mcp_types.CONNECTION_CLOSED, "closed")).recognized
 
 
@@ -840,7 +839,7 @@ async def test_the_carrier_records_what_ends_the_transport(
     """As the SDK does: an error status on a notification or on the client's own answer is
     ignored, and an error status on a request fails it."""
     capture = _AuthCapture()
-    client = _make_capturing_http_factory(capture)()
+    client = _make_capturing_http_client(capture)
     try:
         record = client.event_hooks["response"][0]
         held = {"mcp-session-id": "s1"}
@@ -856,7 +855,7 @@ async def test_the_carrier_records_what_ends_the_transport(
 @pytest.mark.anyio
 async def test_the_initialize_check_leaves_later_answers_alone() -> None:
     """Only initialize fails fast: a live session's later answers keep the SDK's handling."""
-    client = _make_capturing_http_factory(_AuthCapture())()
+    client = _make_capturing_http_client(_AuthCapture())
     reject = client.event_hooks["response"][1]
 
     def answered(method: str, content_type: str, body: bytes = b"<html></html>") -> httpx2.Response:
@@ -1025,7 +1024,7 @@ def test_a_saved_server_refusing_discover_connects(
 def test_a_refused_header_value_never_reaches_status_or_our_logs(
     upstream: tuple[str, Upstream], caplog: pytest.LogCaptureFixture
 ) -> None:
-    """httpx quotes a header it refuses to send, value and all. (The SDK's own error line still
+    """httpx2 quotes a header it refuses to send, value and all. (The SDK's own error line still
     carries it: the save and test checks keep such a header from being configured.)"""
     base, _ = upstream
     secret = "sk-live-SECRET123"

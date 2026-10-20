@@ -930,7 +930,12 @@ def test_shutdown_waits_for_an_owner_whose_connect_its_caller_gave_up_on(
     unwind = asyncio.Event()  # set by the test once the drain has met the owner
 
     async def owner(
-        self: MCPClientManager, key: Any, settings: Any, ready: Any, close_requested: Any
+        self: MCPClientManager,
+        key: Any,
+        settings: Any,
+        ready: Any,
+        close_requested: Any,
+        **_transport: Any,
     ) -> None:
         try:
             await asyncio.Event().wait()  # the server never answers the handshake

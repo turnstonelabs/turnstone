@@ -3,7 +3,7 @@
 Mirror of :mod:`tests.test_mcp_pool_auth_integration` for the resource path (RFC §3.2). Drives
 through the real ``streamable_http_client``, real httpx2 response-hook plumbing, and a real upstream
 server on a background thread (``MCPServer`` with a programmable ``BehaviorMiddleware``). Direct
-``httpx.HTTPStatusError`` injection is forbidden (invariant 14).
+``httpx2.HTTPStatusError`` injection is forbidden (invariant 14).
 """
 
 from __future__ import annotations

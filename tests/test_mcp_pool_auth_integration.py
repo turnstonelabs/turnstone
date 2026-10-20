@@ -5,11 +5,10 @@ These are the structural exit criterion for Phase 6. They MUST drive through the
 in-process ``MCPServer`` on a background thread, with a starlette middleware that programmatically
 returns 401/403 with crafted ``WWW-Authenticate`` headers).
 
-Direct ``httpx.HTTPStatusError`` injection is FORBIDDEN here — Phase 5 bug-1 was masked
-precisely by that pattern (the production code path was structurally unreachable, but the
-unit-test injection bypassed the SDK, which never hands a request's HTTP status error to the
-caller). The integration tests gate that the production path actually receives the carrier
-signal end-to-end.
+Direct ``httpx2.HTTPStatusError`` injection is FORBIDDEN here — Phase 5 bug-1 was masked precisely
+by that pattern (the production code path was structurally unreachable, but the unit-test injection
+bypassed the SDK, which never hands a request's HTTP status error to the caller). The integration
+tests gate that the production path actually receives the carrier signal end-to-end.
 
 The fixture upstream is built in-thread (uvicorn on its own asyncio
 loop in a background thread) — same pattern as
@@ -487,7 +486,7 @@ def test_integration_401_refresh_and_retry_succeeds(
     succeeds. Hard invariant 3: breaker counter remains 0.
 
     Drives through the REAL ``streamable_http_client`` and a REAL upstream server on a background
-    thread (no ``httpx.HTTPStatusError`` injection). This is the structural exit gate for Phase 6 —
+    thread (no ``httpx2.HTTPStatusError`` injection). This is the structural exit gate for Phase 6 —
     the equivalent unit tests CANNOT prove the production wiring works because the SDK never hands
     the caller the HTTP status.
     """
@@ -686,11 +685,10 @@ def test_integration_403_multi_www_authenticate_drops_injected_scopes(
     vector; both run together so a regression in one cannot silently
     re-open it):
 
-    1. ``_make_capturing_http_factory._hook`` reads
+    1. ``_make_capturing_http_client``'s ``_hook`` reads
        ``response.headers.get_list("www-authenticate")[0]`` rather than
-       ``response.headers.get(...)`` — the latter joins repeated
-       headers with ``", "`` which the RFC 7235 tokenizer would
-       otherwise consume as a continuation of the first challenge.
+       ``response.headers.get(...)`` — the latter joins repeated headers with ``", "`` which the
+       RFC 7235 tokenizer would otherwise consume as a continuation of the first challenge.
     2. ``parse_www_authenticate_bearer`` stops at the first ``Bearer``
        challenge boundary even if the input was already joined, so a
        hook regression to ``get(...)`` would NOT re-open the vector.
@@ -700,15 +698,13 @@ def test_integration_403_multi_www_authenticate_drops_injected_scopes(
     win and mask a single-layer regression. The undefended-absence
     case is what proves both layers actually do their job.
 
-    Negative-test (CRITICAL — Phase 5 lesson): verified by reverting
-    the hook to ``response.headers.get("www-authenticate")`` AND
-    removing the ``_looks_like_bearer_challenge_start`` guard in
-    ``parse_www_authenticate_bearer``. The test then fails because
-    ``scopes_required`` becomes ``["org:admin", "db:write"]`` — the
-    injected scopes from the second challenge silently fold into the
-    first challenge's params dict via httpx's comma-joined header
-    value (the absence of a first-occurrence scope means nothing
-    blocks the fold).
+    Negative-test (CRITICAL — Phase 5 lesson): verified by reverting the hook to
+    ``response.headers.get("www-authenticate")`` AND removing the
+    ``_looks_like_bearer_challenge_start`` guard in ``parse_www_authenticate_bearer``. The test then
+    fails because ``scopes_required`` becomes ``["org:admin", "db:write"]`` — the injected scopes
+    from the second challenge silently fold into the first challenge's params dict via httpx2's
+    comma-joined header value (the absence of a first-occurrence scope means nothing blocks the
+    fold).
     """
     url, behaviour = upstream
     behaviour["mode"] = "once_multi_www_auth_403"
@@ -845,9 +841,9 @@ def test_integration_breaker_unaffected_by_auth_failures(
 def test_integration_static_path_unaffected(
     upstream: Any, running_loop_mgr: Any, storage: SQLiteBackend
 ) -> None:
-    """Static-path connect against an unauthed upstream succeeds without
-    going through the capturing factory. This is the integration-level
-    mirror of ``test_reconnect_preserves_static_state_identity``.
+    """Static-path connect against an unauthed upstream succeeds, and a reconnect keeps its
+    ``StaticServerState`` and replaces its session. This is the integration-level mirror of
+    ``test_reconnect_preserves_static_state_identity``.
 
     Drives the static path against the same fixture upstream (with
     ``behaviour={}`` so middleware passes through) — confirms the
