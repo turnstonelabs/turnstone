@@ -1199,6 +1199,14 @@ frozen.
 
 ### Security
 
+- **A compressed OAuth response can no longer exhaust memory.** The OAuth client checked a
+  response body's size only after reading and decompressing all of it, so a few hundred bytes of
+  brotli from an MCP server, or from the authorization server its metadata names, could decode to
+  gigabytes first and take the console or node down for every user; connecting to such a server
+  or refreshing a token against it set it off. Bytes sent after the end of a gzip stream piled up
+  the same way while decoding to nothing. The client now stops reading a body past 256 KiB
+  decoded, past 512 KiB received, or once the request's read timeout has passed while reading it,
+  and each request keeps its own, smaller or equal, size limit.
 - **The OAuth address check judges the host the client connects to.** It resolved an
   internationalized host name the way the system resolver encodes it (IDNA 2003), while the HTTP
   client connects to the name's IDNA 2008 form, and for some names (one holding `ß`, say) those

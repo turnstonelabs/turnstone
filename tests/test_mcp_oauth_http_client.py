@@ -13,19 +13,30 @@ the merge is exercised on real clients through ``build_request``.
 from __future__ import annotations
 
 import asyncio
+import gzip
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
+import httpx2
 import pytest
 
 from turnstone.core.mcp_oauth import close_mcp_oauth_state, initialize_mcp_oauth_state
 from turnstone.core.oauth.context import OAuthContext
-from turnstone.core.oauth.http import _enter_mint_client, json_http_client, make_http_client
+from turnstone.core.oauth.http import (
+    _MAX_RESPONSE_BODY_BYTES,
+    OAuthRefreshError,
+    RefreshFailureClass,
+    _BoundedClient,
+    _enter_mint_client,
+    _hardened_token_post,
+    json_http_client,
+    make_http_client,
+)
 from turnstone.core.oauth.runtime import OAuthRuntime
 from turnstone.core.oauth.work import OAuthUnavailableError
 
 if TYPE_CHECKING:
-    import httpx2
+    from collections.abc import AsyncIterator
 
 
 def _accept(client: httpx2.AsyncClient, headers: dict[str, str] | None = None) -> str:
@@ -69,6 +80,151 @@ class TestSharedConstructor:
                 return client.trust_env, _accept(client)
 
         assert asyncio.run(_run()) == (True, "*/*")
+
+
+class _Streamed(httpx2.AsyncByteStream):
+    """A body delivered piece by piece, as a connection delivers it, counting the pieces pulled.
+
+    A MockTransport response built with ``content=`` is decoded when it is built, so a test of
+    how far the client reads has to stream its body."""
+
+    def __init__(self, pieces: list[bytes], *, delay: float = 0.0) -> None:
+        self._pieces = pieces
+        self._delay = delay
+        self.pulled = 0
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        for piece in self._pieces:
+            self.pulled += 1
+            if self._delay:
+                await asyncio.sleep(self._delay)
+            yield piece
+
+
+def _gzip_bomb() -> list[bytes]:
+    """16 MiB of zeros, gzip-compressed, in 1 KiB pieces: each piece decodes to about 1 MiB."""
+    compressed = gzip.compress(bytes(16 << 20))
+    return [compressed[start : start + 1024] for start in range(0, len(compressed), 1024)]
+
+
+class TestBoundedReads:
+    """The OAuth client stops reading a response body past its cap, so a small compressed body
+    can't decode to gigabytes before a request site's size check runs."""
+
+    def test_the_json_client_is_bounded(self) -> None:
+        async def _run() -> tuple[bool, int | None]:
+            async with json_http_client() as client:
+                return isinstance(client, _BoundedClient), getattr(client, "max_body", None)
+
+        assert asyncio.run(_run()) == (True, _MAX_RESPONSE_BODY_BYTES)
+
+    def test_a_compressed_body_is_decoded_only_past_the_cap(self) -> None:
+        stream = _Streamed(_gzip_bomb())
+
+        def respond(request: httpx2.Request) -> httpx2.Response:
+            return httpx2.Response(200, headers={"content-encoding": "gzip"}, stream=stream)
+
+        async def _run() -> httpx2.Response:
+            transport = httpx2.MockTransport(respond)
+            async with _BoundedClient(max_body=_MAX_RESPONSE_BODY_BYTES, transport=transport) as c:
+                return await c.get("https://as.example.com/.well-known/oauth-authorization-server")
+
+        resp = asyncio.run(_run())
+
+        assert resp.content == bytes(_MAX_RESPONSE_BODY_BYTES + 1)
+        # Each 1 KiB piece decodes to about 1 MiB, so the read stops within the first two.
+        assert stream.pulled <= 2
+        # Already decoded: the rebuilt response must not decode it again.
+        assert "content-encoding" not in resp.headers
+
+    def test_bytes_after_a_gzip_stream_stop_at_the_wire_limit(self) -> None:
+        """Bytes after the end of a gzip stream decode to nothing, so the decoded cap never sees
+        them; twice the cap on the wire stops the read."""
+        stream = _Streamed([gzip.compress(b"{}")] + [bytes(64 * 1024)] * 64)
+
+        def respond(request: httpx2.Request) -> httpx2.Response:
+            return httpx2.Response(200, headers={"content-encoding": "gzip"}, stream=stream)
+
+        async def _run() -> None:
+            transport = httpx2.MockTransport(respond)
+            async with _BoundedClient(max_body=_MAX_RESPONSE_BODY_BYTES, transport=transport) as c:
+                await c.post("https://as.example.com/register", json={})
+
+        with pytest.raises(httpx2.DecodingError, match="on the wire"):
+            asyncio.run(_run())
+        # 512 KiB on the wire is the gzip stream and eight 64 KiB pieces, plus the one past it.
+        assert stream.pulled <= 10
+
+    def test_a_body_that_trickles_in_is_cut_off_at_the_read_timeout(self) -> None:
+        """A byte every 50 ms never trips the per-read timeout; the body read as a whole has one."""
+        stream = _Streamed([b"x"] * 100, delay=0.05)
+
+        def respond(request: httpx2.Request) -> httpx2.Response:
+            return httpx2.Response(200, stream=stream)
+
+        async def _run() -> None:
+            transport = httpx2.MockTransport(respond)
+            async with _BoundedClient(max_body=_MAX_RESPONSE_BODY_BYTES, transport=transport) as c:
+                await c.post("https://as.example.com/token", data={}, timeout=0.3)
+
+        with pytest.raises(httpx2.ReadTimeout, match="not read within"):
+            asyncio.run(_run())
+        assert stream.pulled <= 20
+
+    def test_redirects_are_refused(self) -> None:
+        def respond(request: httpx2.Request) -> httpx2.Response:
+            raise AssertionError(f"a request was sent to {request.url}")
+
+        async def _run() -> None:
+            transport = httpx2.MockTransport(respond)
+            async with _BoundedClient(max_body=_MAX_RESPONSE_BODY_BYTES, transport=transport) as c:
+                await c.get("https://as.example.com/start", follow_redirects=True)
+
+        with pytest.raises(ValueError, match="redirects"):
+            asyncio.run(_run())
+
+    def test_status_and_raw_header_bytes_survive(self) -> None:
+        challenge = (
+            'Bearer resource_metadata="https://' + chr(0x2603) + '.example.com/x"'
+        ).encode()
+
+        def respond(request: httpx2.Request) -> httpx2.Response:
+            return httpx2.Response(401, headers=[(b"www-authenticate", challenge)])
+
+        async def _run() -> httpx2.Response:
+            transport = httpx2.MockTransport(respond)
+            async with _BoundedClient(max_body=_MAX_RESPONSE_BODY_BYTES, transport=transport) as c:
+                return await c.get("https://mcp.example.com/mcp")
+
+        resp = asyncio.run(_run())
+
+        assert resp.status_code == 401
+        assert resp.headers.raw == [(b"www-authenticate", challenge)]
+
+    def test_an_oversized_token_rejection_keeps_its_classification(self) -> None:
+        """The token POST still sees an over-cap body as oversized, with the status-based class the
+        OBO legs ask for, after reading only past the cap."""
+        stream = _Streamed(_gzip_bomb())
+
+        def respond(request: httpx2.Request) -> httpx2.Response:
+            return httpx2.Response(400, headers={"content-encoding": "gzip"}, stream=stream)
+
+        async def _run() -> None:
+            transport = httpx2.MockTransport(respond)
+            async with _BoundedClient(max_body=_MAX_RESPONSE_BODY_BYTES, transport=transport) as c:
+                await _hardened_token_post(
+                    token_endpoint="https://idp.example.com/token",
+                    data={"grant_type": "refresh_token"},
+                    http_client=c,
+                    request_label="mint",
+                    endpoint_label="token endpoint",
+                    classify_oversized_by_status=True,
+                )
+
+        with pytest.raises(OAuthRefreshError, match="exceeds size limit") as raised:
+            asyncio.run(_run())
+        assert raised.value.failure_class is RefreshFailureClass.AMBIGUOUS
+        assert stream.pulled <= 2
 
 
 class TestEveryClientGoesThroughTheFactory:

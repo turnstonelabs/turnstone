@@ -79,8 +79,9 @@ MCP_OAUTH_DISCOVERY_CACHE_TTL_SECONDS = 86400
 _PENDING_CLEANUP_INTERVAL_S = 60.0
 
 
-# Limits on PRM/AS body sizes — defensive against runaway responses.
-_MAX_DISCOVERY_BODY_BYTES = 256 * 1024
+# Limits on PRM/AS body sizes — defensive against runaway responses. The OAuth client keeps one
+# byte past this of a body, so the check in ``_json_object_body`` sees an oversized one as such.
+_MAX_DISCOVERY_BODY_BYTES = oauth_http._MAX_RESPONSE_BODY_BYTES
 
 
 # Whole-discovery probe budget. Each candidate location gets the standard
