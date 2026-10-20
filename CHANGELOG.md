@@ -1211,7 +1211,8 @@ frozen.
   system's trust store instead, so a native install must also update that store (Debian 13:
   `ca-certificates` 20250419+deb13u1, DSA-6572-1). A deployment that sets `SSL_CERT_FILE` or
   `SSL_CERT_DIR` verifies against that bundle instead, with `httpx` and HTTPX2 alike, and must
-  remove the root from it.
+  remove the root from it. Either way, restart Turnstone afterwards: a running process keeps the
+  roots it has already loaded.
 - **The Docker image no longer trusts the root of the compromised eMudhra CAs.** The image now
   refuses to build with a `ca-certificates` older than 20250419+deb13u1 (DSA-6572-1), Debian's
   update that removes the root from the system store. Its `pip`, which loads its own `certifi`
