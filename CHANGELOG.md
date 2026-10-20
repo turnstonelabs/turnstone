@@ -275,6 +275,11 @@ frozen.
 - **Database errors no longer quote the values a failed statement was sent** — an error message,
   and a traceback logged with it, names the statement and the database's reason only; the values
   stay on the exception's `params`.
+- **A SQLite database path holding `%` and two hex digits, or a `?`, opens the file it names**
+  *(BREAKING)* — the path was read as a URL, so `/data/a%20b/turnstone.db` opened
+  `/data/a b/turnstone.db`, and a `?` ended the path. Before upgrading, set the path the
+  deployment was using: when the escape is in the file name, the upgraded process opens a new,
+  empty database beside the old one.
 - **The MCP client runs on the MCP Python SDK 2.3 (#679)** *(BREAKING)* — turnstone requires
   `mcp>=2.3,<3`, so an MCP server run from turnstone's own Python environment must work with it
   (FastMCP is now `MCPServer`); the cluster-ops and Understone examples move with it. MCP HTTP
@@ -662,13 +667,11 @@ frozen.
 - **Database certificate paths and database passwords with punctuation no longer stop a node or
   console from starting.** The migration step failed before it connected when the PostgreSQL URL
   carried `sslrootcert`, `sslcert` or `sslkey` (under `[database]`, or as
-  `TURNSTONE_DB_SSLROOTCERT`, `TURNSTONE_DB_SSLCERT` and `TURNSTONE_DB_SSLKEY`) or a password with
-  punctuation other than `+`, `-`, `.`, `_` and `~`, and when a SQLite path held a `%`.
-  `python -m turnstone.core.storage._migrate` failed the same way; `sslmode` alone was not
-  affected.
-- **A SQLite database path holding `%` and two hex digits opens the file it names.** The path was
-  read as a URL, so `TURNSTONE_DB_PATH=/data/a%20b/turnstone.db` opened `/data/a b/turnstone.db`;
-  a deployment that relied on that should set the path it was using.
+  `TURNSTONE_DB_SSLROOTCERT`, `TURNSTONE_DB_SSLCERT` and `TURNSTONE_DB_SSLKEY`), another parameter
+  holding a path such as a Unix-socket `host=/run/postgresql`, or a password with punctuation
+  other than `+`, `-`, `.`, `_` and `~`, and when a SQLite path held a `%`, a letter outside ASCII
+  or punctuation such as `(`, `,`, `:` or `#`. `python -m turnstone.core.storage._migrate` failed
+  the same way; `sslmode` alone was not affected.
 - **The Docker image's migration step reads the database settings the services use.** `python -m
   turnstone.core.storage._migrate`, which the entrypoint runs before the services start, read
   only `TURNSTONE_DB_BACKEND`, `TURNSTONE_DB_URL` and `TURNSTONE_DB_PATH`. It now reads
