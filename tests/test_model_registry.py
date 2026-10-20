@@ -891,6 +891,37 @@ class TestLoadModelRegistryWithDB:
         assert cfg.max_tokens is None
         assert cfg.reasoning_effort is None
 
+    def test_db_sampling_params_that_are_not_numbers_load_as_unset(self, caplog: Any) -> None:
+        """A stored temperature or max_tokens that isn't a number is ignored, as in
+        config.toml, so a strict load (a node's boot and Sync) keeps the definition."""
+        storage = _MockStorage(
+            [
+                {
+                    "alias": "garbled",
+                    "model": "m",
+                    "provider": "openai",
+                    "base_url": "",
+                    "api_key": "",
+                    "context_window": 32768,
+                    "capabilities": "{}",
+                    "enabled": True,
+                    "temperature": "hot",
+                    "max_tokens": float("inf"),
+                }
+            ]
+        )
+        with (
+            patch("turnstone.core.model_registry.load_config", return_value={}),
+            caplog.at_level(logging.WARNING),
+        ):
+            reg = load_model_registry("http://x/v1", "x", "x", storage=storage, strict=True)
+        cfg = reg.get_config("garbled")
+        assert cfg.temperature is None
+        assert cfg.max_tokens is None
+        warned = [r.getMessage() for r in caplog.records]
+        assert any("model_registry.override_invalid" in m and "temperature" in m for m in warned)
+        assert any("model_registry.override_invalid" in m and "max_tokens" in m for m in warned)
+
     def test_db_reasoning_flags_loaded(self) -> None:
         """Per-model reasoning flags from DB are carried in ModelConfig."""
         storage = _MockStorage(

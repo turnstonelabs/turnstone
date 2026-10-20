@@ -673,6 +673,11 @@ frozen.
   turnstone.core.storage._migrate`, which the entrypoint runs before the services start, now
   passes `TURNSTONE_DB_SSLMODE`, `TURNSTONE_DB_SSLROOTCERT`, `TURNSTONE_DB_SSLCERT` and
   `TURNSTONE_DB_SSLKEY` to the database connection, as the node and console do.
+- **A stored model definition whose `temperature` or `max_tokens` isn't a number loads with that
+  field unset.** The loader logs `model_registry.override_invalid`, as it already ignored such
+  values in config.toml. Such a row used to stop the load at that row: a node's Sync answered
+  503, and doctor and the console's coordinator went without it and every definition sorting
+  after it. The console refuses such values, so only a direct write to the table stores one.
 - **Channel bots no longer start conversations on the wrong model before they have fetched the
   channel model (#1377).** Until a Discord or Slack bot had fetched `channels.default_model_alias`
   once, every conversation started meanwhile took the setting as unset and ran for good on the

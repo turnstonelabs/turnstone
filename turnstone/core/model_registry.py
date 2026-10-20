@@ -1357,6 +1357,24 @@ def _coerce_context_window(raw: Any, alias: str) -> int:
     return max(0, value)
 
 
+def _coerce_override[N: (int, float)](
+    raw: Any, convert: Callable[[Any], N], alias: str, field: str
+) -> N | None:
+    """Read a definition's ``temperature`` or ``max_tokens``; garbage becomes unset.
+
+    As for a bad config.toml override or ``context_window``, the definition still
+    loads: unset means the global default. The console refuses such a value when
+    it saves one, so only a direct write to the table stores it.
+    """
+    if raw is None:
+        return None
+    try:
+        return convert(raw)
+    except (TypeError, ValueError, OverflowError):
+        log.warning("model_registry.override_invalid", alias=alias, field=field, value=raw)
+        return None
+
+
 def _probe_context_window(cfg: ModelConfig) -> tuple[int | None, str]:
     """Ask *cfg*'s own endpoint for its window.
 
@@ -1720,8 +1738,10 @@ def load_model_registry(
                 # 0 = auto-detect, resolved per definition below
                 row_ctx = _coerce_context_window(row.get("context_window"), alias)
                 # Per-model sampling overrides (None = use global default)
-                row_temperature = row.get("temperature")
-                row_max_tokens = row.get("max_tokens")
+                row_temperature = _coerce_override(
+                    row.get("temperature"), float, alias, "temperature"
+                )
+                row_max_tokens = _coerce_override(row.get("max_tokens"), int, alias, "max_tokens")
                 row_reasoning_effort = row.get("reasoning_effort")
                 # Per-model reasoning flags. Defaults match the dataclass so a
                 # pre-052 row missing these columns degrades gracefully.
@@ -1755,8 +1775,8 @@ def load_model_registry(
                     provider=row_provider,
                     capabilities=caps,
                     source="db",
-                    temperature=float(row_temperature) if row_temperature is not None else None,
-                    max_tokens=int(row_max_tokens) if row_max_tokens is not None else None,
+                    temperature=row_temperature,
+                    max_tokens=row_max_tokens,
                     reasoning_effort=row_reasoning_effort
                     if row_reasoning_effort is not None
                     else None,
