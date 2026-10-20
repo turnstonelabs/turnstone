@@ -908,6 +908,7 @@ class TestLoadModelRegistryWithDB:
             [
                 {**base, "alias": "garbled", "temperature": "hot", "max_tokens": float("inf")},
                 {**base, "alias": "out-of-range", "temperature": float("nan"), "max_tokens": 0},
+                {**base, "alias": "too-hot", "temperature": 2.5, "max_tokens": 4096},
             ]
         )
         with (
@@ -925,6 +926,9 @@ class TestLoadModelRegistryWithDB:
                     "model_registry.override_invalid" in m and alias in m and field in m
                     for m in warned
                 ), (alias, field)
+        too_hot = reg.get_config("too-hot")
+        assert too_hot.temperature is None
+        assert too_hot.max_tokens == 4096
 
     def test_db_sampling_params_at_the_range_edges_load(self) -> None:
         """The console's own bounds stay valid: temperature 0 and 2, max_tokens 1."""
