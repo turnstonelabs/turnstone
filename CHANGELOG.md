@@ -659,6 +659,13 @@ frozen.
   TLS state it found; unset reads as off on the console and the nodes. A database an earlier start
   wrote `false` into keeps it, and the console now logs `config.env_ignored` when that row
   shadows `TURNSTONE_TLS_ENABLED`: reset `tls.enabled` in the Settings tab to apply the variable.
+- **Database certificate paths and database passwords with punctuation no longer stop a node or
+  console from starting.** The migration step failed before it connected when the PostgreSQL URL
+  carried `sslrootcert`, `sslcert` or `sslkey` (under `[database]`, or as
+  `TURNSTONE_DB_SSLROOTCERT`, `TURNSTONE_DB_SSLCERT` and `TURNSTONE_DB_SSLKEY`) or a password with
+  punctuation other than `+`, `-`, `.`, `_` and `~`, and when a SQLite path held a `%`.
+  `python -m turnstone.core.storage._migrate` failed the same way; `sslmode` alone was not
+  affected.
 - **Channel bots no longer start conversations on the wrong model before they have fetched the
   channel model (#1377).** Until a Discord or Slack bot had fetched `channels.default_model_alias`
   once, every conversation started meanwhile took the setting as unset and ran for good on the

@@ -36,6 +36,37 @@ class TestInitStorage:
         with pytest.raises(ValueError, match="requires a connection URL"):
             init_storage("postgresql")
 
+    def test_migrations_take_a_postgresql_url_that_holds_percent_escapes(self, monkeypatch):
+        # A certificate path is encoded into the URL (/ as %2F), and so is punctuation in a
+        # password; Alembic's config reads a bare % as interpolation.
+        from turnstone.core.storage import _migrate
+
+        handed: list[str] = []
+        monkeypatch.setattr(
+            _migrate,
+            "_run_with_pg_lock",
+            lambda engine, cfg: handed.append(
+                cfg.get_section(cfg.config_ini_section, {})["sqlalchemy.url"]
+            ),
+        )
+        storage = init_storage(
+            "postgresql",
+            url="postgresql+psycopg://user:p%40ss@db.example.com/db",
+            sslmode="verify-full",
+            sslrootcert="/etc/turnstone/db-ca.pem",
+            run_migrations=True,
+        )
+
+        assert [sa.engine.make_url(url) for url in handed] == [storage._engine.url]
+
+    def test_sqlite_migrations_run_under_a_directory_that_holds_a_percent_sign(self, tmp_path):
+        path = tmp_path / "50%" / "test.db"
+        path.parent.mkdir()
+        storage = init_storage("sqlite", path=str(path), run_migrations=True)
+
+        with storage._engine.connect() as conn:
+            assert conn.execute(sa.text("SELECT version_num FROM alembic_version")).scalar_one()
+
 
 class TestGetStorage:
     def test_auto_init(self, tmp_path, monkeypatch):

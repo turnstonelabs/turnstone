@@ -26,10 +26,14 @@ def run_migrations(storage: Any, backend: str) -> None:
 
     engine = storage._engine  # noqa: SLF001
 
-    # Build Alembic config programmatically (no alembic.ini needed)
+    # Build Alembic config programmatically (no alembic.ini needed). Its options go
+    # through ConfigParser interpolation, so a literal % is written %%: an encoded
+    # certificate path or password character, or a % in a path.
     cfg = Config()
-    cfg.set_main_option("script_location", _MIGRATIONS_DIR)
-    cfg.set_main_option("sqlalchemy.url", engine.url.render_as_string(hide_password=False))
+    cfg.set_main_option("script_location", _MIGRATIONS_DIR.replace("%", "%%"))
+    cfg.set_main_option(
+        "sqlalchemy.url", engine.url.render_as_string(hide_password=False).replace("%", "%%")
+    )
 
     # Check if this is an existing database without alembic_version
     if backend == "sqlite":
