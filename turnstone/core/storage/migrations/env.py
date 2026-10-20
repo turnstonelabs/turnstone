@@ -16,6 +16,8 @@ def run_migrations_online() -> None:
         config.get_section(config.config_ini_section, {}),
         prefix="sqlalchemy.",
         poolclass=pool.NullPool,
+        # Error text names the statement, not its values; they stay on exc.params.
+        hide_parameters=True,
     )
 
     with connectable.connect() as connection:

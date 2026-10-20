@@ -151,6 +151,49 @@ class TestStatementErrors:
         assert "bound-value-sentinel" not in str(exc_info.value)
         assert "bound-value-sentinel" in repr(exc_info.value.params)
 
+    def test_a_failed_migration_statement_names_no_bound_values(self, tmp_path):
+        # Migration 060 rewrites stored tool output; the engine Alembic builds hides it too.
+        from alembic import command
+        from alembic.config import Config
+
+        from turnstone.core.storage._migrate import _MIGRATIONS_DIR
+
+        db_path = tmp_path / "migrate.db"
+        cfg = Config()
+        cfg.set_main_option("script_location", _MIGRATIONS_DIR)
+        cfg.set_main_option("sqlalchemy.url", f"sqlite:///{db_path}")
+        command.upgrade(cfg, "059")
+        engine = sa.create_engine(f"sqlite:///{db_path}")
+        try:
+            with engine.begin() as conn:
+                conn.execute(
+                    sa.text(
+                        "INSERT INTO conversations (ws_id, timestamp, role, content, tool_call_id) "
+                        "VALUES ('ws1', '2026-06-01T00:00:00', 'tool', :content, 'call_a')"
+                    ),
+                    {
+                        "content": (
+                            "<tool_output>\nbound-value-sentinel\n</tool_output>\n\n"
+                            "<system-reminder>\nadvisory\n</system-reminder>"
+                        )
+                    },
+                )
+                conn.execute(
+                    sa.text(
+                        "CREATE TRIGGER refuse_rewrite BEFORE UPDATE ON conversations "
+                        "BEGIN SELECT RAISE(ABORT, 'refused'); END"
+                    )
+                )
+        finally:
+            engine.dispose()
+
+        with pytest.raises(sa.exc.DBAPIError) as exc_info:
+            command.upgrade(cfg, "060")
+
+        assert "refused" in str(exc_info.value)
+        assert "bound-value-sentinel" not in str(exc_info.value)
+        assert "bound-value-sentinel" in repr(exc_info.value.params)
+
     def test_the_postgresql_engine_hides_bound_values_too(self) -> None:
         # Building the backend doesn't connect while create_tables is off.
         backend = PostgreSQLBackend(
