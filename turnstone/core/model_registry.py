@@ -1358,21 +1358,33 @@ def _coerce_context_window(raw: Any, alias: str) -> int:
 
 
 def _coerce_override[N: (int, float)](
-    raw: Any, convert: Callable[[Any], N], alias: str, field: str
+    raw: Any,
+    convert: Callable[[Any], N],
+    alias: str,
+    field: str,
+    *,
+    low: N,
+    high: N | None = None,
 ) -> N | None:
     """Read a definition's ``temperature`` or ``max_tokens``; garbage becomes unset.
 
-    As for a bad config.toml override or ``context_window``, the definition still
-    loads: unset means the global default. The console refuses such a value when
-    it saves one, so only a direct write to the table stores it.
+    A value that isn't a number, or falls outside the range the console accepts, is
+    logged and left unset, as config.toml's overrides are: the definition still
+    loads, and unset means the global default. The console refuses such a value
+    when it saves one, so only a direct write to the table stores it.
     """
     if raw is None:
         return None
+    value: N | None
     try:
-        return convert(raw)
+        value = convert(raw)
     except (TypeError, ValueError, OverflowError):
+        value = None
+    # NaN fails every comparison, so the range check refuses it too.
+    if value is None or not low <= value or (high is not None and not value <= high):
         log.warning("model_registry.override_invalid", alias=alias, field=field, value=raw)
         return None
+    return value
 
 
 def _probe_context_window(cfg: ModelConfig) -> tuple[int | None, str]:
@@ -1739,9 +1751,11 @@ def load_model_registry(
                 row_ctx = _coerce_context_window(row.get("context_window"), alias)
                 # Per-model sampling overrides (None = use global default)
                 row_temperature = _coerce_override(
-                    row.get("temperature"), float, alias, "temperature"
+                    row.get("temperature"), float, alias, "temperature", low=0.0, high=2.0
                 )
-                row_max_tokens = _coerce_override(row.get("max_tokens"), int, alias, "max_tokens")
+                row_max_tokens = _coerce_override(
+                    row.get("max_tokens"), int, alias, "max_tokens", low=1
+                )
                 row_reasoning_effort = row.get("reasoning_effort")
                 # Per-model reasoning flags. Defaults match the dataclass so a
                 # pre-052 row missing these columns degrades gracefully.

@@ -892,22 +892,22 @@ class TestLoadModelRegistryWithDB:
         assert cfg.reasoning_effort is None
 
     def test_db_sampling_params_that_are_not_numbers_load_as_unset(self, caplog: Any) -> None:
-        """A stored temperature or max_tokens that isn't a number is ignored, as in
-        config.toml, so a strict load (a node's boot and Sync) keeps the definition."""
+        """A stored temperature or max_tokens that isn't a number, or is outside the range
+        the console accepts, is ignored as in config.toml, so a strict load (a node's boot
+        and Sync) keeps the definition."""
+        base = {
+            "model": "m",
+            "provider": "openai",
+            "base_url": "",
+            "api_key": "",
+            "context_window": 32768,
+            "capabilities": "{}",
+            "enabled": True,
+        }
         storage = _MockStorage(
             [
-                {
-                    "alias": "garbled",
-                    "model": "m",
-                    "provider": "openai",
-                    "base_url": "",
-                    "api_key": "",
-                    "context_window": 32768,
-                    "capabilities": "{}",
-                    "enabled": True,
-                    "temperature": "hot",
-                    "max_tokens": float("inf"),
-                }
+                {**base, "alias": "garbled", "temperature": "hot", "max_tokens": float("inf")},
+                {**base, "alias": "out-of-range", "temperature": float("nan"), "max_tokens": 0},
             ]
         )
         with (
@@ -915,12 +915,40 @@ class TestLoadModelRegistryWithDB:
             caplog.at_level(logging.WARNING),
         ):
             reg = load_model_registry("http://x/v1", "x", "x", storage=storage, strict=True)
-        cfg = reg.get_config("garbled")
-        assert cfg.temperature is None
-        assert cfg.max_tokens is None
         warned = [r.getMessage() for r in caplog.records]
-        assert any("model_registry.override_invalid" in m and "temperature" in m for m in warned)
-        assert any("model_registry.override_invalid" in m and "max_tokens" in m for m in warned)
+        for alias in ("garbled", "out-of-range"):
+            cfg = reg.get_config(alias)
+            assert cfg.temperature is None
+            assert cfg.max_tokens is None
+            for field in ("temperature", "max_tokens"):
+                assert any(
+                    "model_registry.override_invalid" in m and alias in m and field in m
+                    for m in warned
+                ), (alias, field)
+
+    def test_db_sampling_params_at_the_range_edges_load(self) -> None:
+        """The console's own bounds stay valid: temperature 0 and 2, max_tokens 1."""
+        storage = _MockStorage(
+            [
+                {
+                    "alias": "edges",
+                    "model": "m",
+                    "provider": "openai",
+                    "base_url": "",
+                    "api_key": "",
+                    "context_window": 32768,
+                    "capabilities": "{}",
+                    "enabled": True,
+                    "temperature": 2.0,
+                    "max_tokens": 1,
+                }
+            ]
+        )
+        with patch("turnstone.core.model_registry.load_config", return_value={}):
+            reg = load_model_registry("http://x/v1", "x", "x", storage=storage, strict=True)
+        cfg = reg.get_config("edges")
+        assert cfg.temperature == 2.0
+        assert cfg.max_tokens == 1
 
     def test_db_reasoning_flags_loaded(self) -> None:
         """Per-model reasoning flags from DB are carried in ModelConfig."""
