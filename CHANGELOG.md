@@ -1199,6 +1199,19 @@ frozen.
 
 ### Security
 
+- **Connections still made with `httpx` no longer trust the root of the compromised eMudhra
+  CAs.** The private keys of several eMudhra intermediate CAs can be recovered by anyone
+  (GHSA-6q48-6c7w-9gw2), so a client that trusts their root, emSign ECC Root CA - G3, accepts a
+  forged certificate for any host. Connections still made with `httpx` rather than HTTPX2, such
+  as web search, the reranker, skill sources, the MCP registry, notifications to channel gateways,
+  the console's connections to its nodes when it has no TLS certificate authority enabled, and the
+  SDK, CLI and channel clients, verify against the `certifi` bundle, which held that root.
+  Turnstone now requires `certifi>=2026.10.19`, which drops it. Connections on HTTPX2, such as
+  model providers, URL fetches, MCP servers, OAuth and OIDC sign-in, verify against the operating
+  system's trust store instead, so a native install must also update that store (Debian 13:
+  `ca-certificates` 20250419+deb13u1, DSA-6572-1). A deployment that sets `SSL_CERT_FILE` or
+  `SSL_CERT_DIR` verifies against that bundle instead, with `httpx` and HTTPX2 alike, and must
+  remove the root from it.
 - **A remote MCP server can no longer have the console send plain-http requests to its loopback
   ports.** The OAuth address check's localhost development lane (plain http to a localhost name
   that resolves only to loopback) also covered URLs an MCP server's metadata or challenge named,

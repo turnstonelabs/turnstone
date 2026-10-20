@@ -36,6 +36,11 @@ dependencies = [
     # boundary depends on the transport contract.
     "anthropic>=1,<2",
     "httpx>=0.28",
+    # Not imported: httpx (not HTTPX2) verifies TLS against this bundle, so the floor goes
+    # when httpx does. emSign ECC Root CA - G3 anchors eMudhra intermediate CAs whose keys
+    # were compromised (GHSA-6q48-6c7w-9gw2); 2026.10.18 dropped all four emSign roots, and
+    # 2026.10.19 drops only G3, keeping the three unaffected ones.
+    "certifi>=2026.10.19",
     # Direct because the provider boundary catches this exception family, the
     # Anthropic tests inject HTTPX2 clients, and the guarded URL fetch is built on
     # it; the OpenAI v3 / Anthropic v1 transitive dependency alone is not an import
