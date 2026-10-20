@@ -1199,6 +1199,13 @@ frozen.
 
 ### Security
 
+- **A media tool's thumbnail URL can no longer reach the host's own services or cloud metadata
+  through an internationalized host name.** The channel thumbnail guard judged such a name as the
+  system resolver encodes it (IDNA 2003), while the fetch connects to the name's IDNA 2008 form,
+  and for some names (one holding `ß`, say) those are two different hosts. A tool result could
+  name such a host to get a GET, with a path of its choosing, sent to loopback or a cloud metadata
+  address over plain http; the answer reached the channel only when it was a 200 image. The guard
+  now resolves the name the fetch connects to, and refuses a URL whose host can't be sent.
 - **A compressed OAuth response can no longer exhaust memory.** The OAuth client checked a
   response body's size only after reading and decompressing all of it, so a few hundred bytes of
   brotli from an MCP server, or from the authorization server its metadata names, could decode to

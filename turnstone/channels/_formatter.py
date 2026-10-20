@@ -242,9 +242,15 @@ async def _is_safe_image_url(url: str) -> bool:
     fetch.  Fully closing the gap requires pinning the validated IP on
     the connection (a custom httpx transport) — out of scope for this
     backfill pass.
+
+    The host resolved is the one the fetch dials: the IDNA 2008 ASCII name httpx2 parses from
+    the URL, which httpx encodes the same way. urllib keeps a Unicode name, which the resolver
+    would encode with IDNA 2003, and for some names the two are different hosts.
     """
     import asyncio
     from urllib.parse import urlparse
+
+    import httpx2
 
     from turnstone.core.ip_classify import (
         AddressLane,
@@ -261,7 +267,11 @@ async def _is_safe_image_url(url: str) -> bool:
         return False
     if parsed.username or parsed.password:
         return False
-    hostname = parsed.hostname
+    try:
+        hostname = httpx2.URL(url).raw_host.decode("ascii").lower()
+    except (httpx2.InvalidURL, UnicodeError):
+        # A host the fetch can't send: not IDNA 2008, or a non-ASCII IPv6 zone id.
+        return False
     if not hostname:
         return False
     if hostname in _BLOCKED_HOSTNAMES:

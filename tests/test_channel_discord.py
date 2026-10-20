@@ -1474,6 +1474,59 @@ class TestIsSafeImageUrl:
         self._patch_resolver(monkeypatch, ["fd00:ec2::23"])
         assert _run(_is_safe_image_url("http://ecs-meta.example.com/")) is False
 
+    def test_resolves_the_name_the_fetch_dials(self, monkeypatch):
+        """This host's IDNA 2003 form resolves to a public address and its IDNA 2008 form, which
+        the fetch dials, to loopback. The resolver stand-in encodes a str host with IDNA 2003, as
+        CPython's getaddrinfo does, so judging the Unicode name would check the wrong host."""
+        import socket
+
+        from turnstone.channels._formatter import _is_safe_image_url
+
+        addresses = {
+            "strasse.example.com": "203.0.113.5",
+            "xn--strae-oqa.example.com": "127.0.0.1",
+        }
+
+        def fake(host, port, family=0, *args, **kwargs):  # noqa: ARG001
+            name = (host.encode("idna") if isinstance(host, str) else host).decode("ascii")
+            return [(family, 0, 0, "", (addresses[name], 0))]
+
+        monkeypatch.setattr(socket, "getaddrinfo", fake)
+        url = "http://stra" + chr(0xDF) + "e.example.com/Items/abc/Images/Primary"
+        assert _run(_is_safe_image_url(url)) is False
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "http://" + chr(0x2603) + ".example.com/poster.png",
+            "http://[fe80::1%" + chr(0xFC) + "]/poster.png",
+        ],
+        ids=["not-idna-2008", "non-ascii-zone"],
+    )
+    def test_a_host_the_fetch_cannot_send_is_rejected(self, monkeypatch, url):
+        from turnstone.channels._formatter import _is_safe_image_url
+
+        self._patch_resolver(monkeypatch, ["203.0.113.5"])
+        assert _run(_is_safe_image_url(url)) is False
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "http://stra" + chr(0xDF) + "e.example.com/poster.png",
+            "http://example" + chr(0x3002) + "com/poster.png",
+            "http://" + chr(0x212A) + ".example.com/poster.png",
+            "http://[fe80::1%25eth0]/poster.png",
+        ],
+        ids=["sharp-s", "ideographic-full-stop", "kelvin-sign", "zone-id"],
+    )
+    def test_the_guard_and_the_fetch_read_the_same_host(self, url):
+        """The guard reads the host with httpx2 and the fetch dials through the bot's httpx
+        client, so the guard checks the host the fetch reaches only while the two agree."""
+        import httpx
+        import httpx2
+
+        assert httpx.URL(url).raw_host == httpx2.URL(url).raw_host
+
 
 class TestBuildMediaEmbed:
     """Tests for try_build_media_embed and embed builders."""
