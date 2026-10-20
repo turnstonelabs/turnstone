@@ -71,6 +71,20 @@ class TestInitStorage:
         with storage._engine.connect() as conn:
             assert conn.execute(sa.text("SELECT version_num FROM alembic_version")).scalar_one()
 
+    def test_migrations_run_from_a_directory_that_holds_a_percent_sign(self, tmp_path, monkeypatch):
+        # The migrations directory goes through Alembic's config too: an install path with a %.
+        import shutil
+
+        from turnstone.core.storage import _migrate
+
+        copied = tmp_path / "50%" / "migrations"
+        shutil.copytree(_migrate._MIGRATIONS_DIR, copied)
+        monkeypatch.setattr(_migrate, "_MIGRATIONS_DIR", str(copied))
+        storage = init_storage("sqlite", path=str(tmp_path / "test.db"), run_migrations=True)
+
+        with storage._engine.connect() as conn:
+            assert conn.execute(sa.text("SELECT version_num FROM alembic_version")).scalar_one()
+
 
 class TestMigrateEntrypoint:
     def test_it_applies_the_database_tls_settings(self, monkeypatch):
