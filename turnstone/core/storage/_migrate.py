@@ -142,9 +142,8 @@ def _bootstrap_existing_sqlite(engine: Any, cfg: Any) -> None:
             command.stamp(cfg, "001")
 
 
-if __name__ == "__main__":
-    # Allow running as: python -m turnstone.core.storage._migrate
-    # Used by Docker entrypoint to apply migrations before starting services.
+def _main() -> None:
+    """Apply migrations from the environment the services start with."""
     import os
 
     from turnstone.core.storage import get_storage, init_storage
@@ -156,6 +155,22 @@ if __name__ == "__main__":
     from turnstone.core.log import configure_logging
 
     configure_logging(level="INFO", service="migrate")
-    init_storage(backend, path=path, url=url, run_migrations=True)
+    init_storage(
+        backend,
+        path=path,
+        url=url,
+        # The database TLS settings the node and console apply.
+        sslmode=os.environ.get("TURNSTONE_DB_SSLMODE", ""),
+        sslrootcert=os.environ.get("TURNSTONE_DB_SSLROOTCERT", ""),
+        sslcert=os.environ.get("TURNSTONE_DB_SSLCERT", ""),
+        sslkey=os.environ.get("TURNSTONE_DB_SSLKEY", ""),
+        run_migrations=True,
+    )
     log.info("Migrations complete")
     get_storage().close()
+
+
+if __name__ == "__main__":
+    # Allow running as: python -m turnstone.core.storage._migrate
+    # Used by Docker entrypoint to apply migrations before starting services.
+    _main()

@@ -669,6 +669,10 @@ frozen.
 - **A SQLite database path holding `%` and two hex digits opens the file it names.** The path was
   read as a URL, so `TURNSTONE_DB_PATH=/data/a%20b/turnstone.db` opened `/data/a b/turnstone.db`;
   a deployment that relied on that should set the path it was using.
+- **The Docker image's migration step applies the database TLS settings.** `python -m
+  turnstone.core.storage._migrate`, which the entrypoint runs before the services start, now
+  passes `TURNSTONE_DB_SSLMODE`, `TURNSTONE_DB_SSLROOTCERT`, `TURNSTONE_DB_SSLCERT` and
+  `TURNSTONE_DB_SSLKEY` to the database connection, as the node and console do.
 - **Channel bots no longer start conversations on the wrong model before they have fetched the
   channel model (#1377).** Until a Discord or Slack bot had fetched `channels.default_model_alias`
   once, every conversation started meanwhile took the setting as unset and ran for good on the

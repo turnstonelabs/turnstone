@@ -72,6 +72,45 @@ class TestInitStorage:
             assert conn.execute(sa.text("SELECT version_num FROM alembic_version")).scalar_one()
 
 
+class TestMigrateEntrypoint:
+    def test_it_applies_the_database_tls_settings(self, monkeypatch):
+        # The Docker entrypoint runs it before the services start, from the same environment.
+        import types
+
+        import turnstone.core.log
+        import turnstone.core.storage
+        from turnstone.core.storage import _migrate
+
+        handed: dict[str, object] = {}
+        monkeypatch.setattr(turnstone.core.log, "configure_logging", lambda **kwargs: None)
+        monkeypatch.setattr(
+            turnstone.core.storage,
+            "init_storage",
+            lambda backend, **kwargs: handed.update(kwargs, backend=backend),
+        )
+        monkeypatch.setattr(
+            turnstone.core.storage, "get_storage", lambda: types.SimpleNamespace(close=lambda: None)
+        )
+        for name, value in {
+            "TURNSTONE_DB_BACKEND": "postgresql",
+            "TURNSTONE_DB_URL": "postgresql+psycopg://user@db.example.com/db",
+            "TURNSTONE_DB_SSLMODE": "verify-full",
+            "TURNSTONE_DB_SSLROOTCERT": "/etc/turnstone/db-ca.pem",
+            "TURNSTONE_DB_SSLCERT": "/etc/turnstone/db.crt",
+            "TURNSTONE_DB_SSLKEY": "/etc/turnstone/db.key",
+        }.items():
+            monkeypatch.setenv(name, value)
+
+        _migrate._main()
+
+        assert handed["backend"] == "postgresql"
+        assert handed["sslmode"] == "verify-full"
+        assert handed["sslrootcert"] == "/etc/turnstone/db-ca.pem"
+        assert handed["sslcert"] == "/etc/turnstone/db.crt"
+        assert handed["sslkey"] == "/etc/turnstone/db.key"
+        assert handed["run_migrations"] is True
+
+
 class TestGetStorage:
     def test_auto_init(self, tmp_path, monkeypatch):
         """get_storage() auto-initializes with SQLite if not yet initialized."""
