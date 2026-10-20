@@ -1170,6 +1170,12 @@ frozen.
 
 ### Security
 
+- **A user's bearer replaces the operator's Authorization header on per-user MCP servers.** On an
+  `oauth_user` or `oauth_obo` server whose headers held an Authorization header spelled otherwise
+  than `Authorization` (`authorization`, say), each user's connection sent that header beside the
+  user's bearer, and first. A server that reads the first one, as Starlette and the MCP SDK's
+  bearer middleware do, took every user for the operator's credential. The user's bearer now
+  replaces an operator Authorization header in any casing.
 - **The model reads only framework-written output-guard findings (#1291).** With the LLM stage on
   (`judge.output_guard_llm`), the advisory after a flagged tool result carried the judge's
   reasoning and its free-form flags: text the judge wrote after reading the attacker-controlled

@@ -4517,8 +4517,8 @@ class MCPClientManager:
         with three differences:
 
         * Streamable-HTTP transport only — pool servers are remote.
-        * ``Authorization: Bearer {access_token}`` injected into headers
-          alongside any operator-supplied static headers.
+        * ``Authorization: Bearer {access_token}`` added to the operator-supplied static headers,
+          replacing an operator Authorization header in any casing.
         * Tool / resource / prompt catalog discovery runs after
           ``initialize()`` (RFC §3.2 — discovery covers all three
           catalogs, capability-gated). The notification handler is
@@ -4566,10 +4566,16 @@ class MCPClientManager:
         # error boundary; this catch is for any callers that bypass it.
         _validate_oauth_user_url(url)
 
-        # Merge operator-supplied headers (secret:// references resolved) with
-        # the per-user bearer.
+        # Merge operator-supplied headers (secret:// references resolved) with the per-user
+        # bearer. The bearer replaces an operator Authorization header in any casing: sent beside
+        # it, the operator's would come first, and a server that reads the first one would take
+        # every user for the operator's credential.
         resolved_cfg = await self._with_resolved_headers(server_name, cfg)
-        headers: dict[str, str] = dict(resolved_cfg.get("headers") or {})
+        headers: dict[str, str] = {
+            name: value
+            for name, value in (resolved_cfg.get("headers") or {}).items()
+            if name.lower() != "authorization"
+        }
         headers["Authorization"] = f"Bearer {access_token}"
 
         # Pre-flight TCP check: fail fast before spawning an owner and entering

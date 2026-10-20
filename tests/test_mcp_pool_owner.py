@@ -545,3 +545,30 @@ class TestPoolOwnerHttpClient:
             ]
             assert fake_b["kwargs"]["http_client"].headers["Authorization"] == "Bearer tok-aaa"
             _run(loop, mgr._teardown_pool_entry(key))
+
+    @pytest.mark.parametrize("name", ["authorization", "AUTHORIZATION", "Authorization"])
+    def test_user_bearer_replaces_an_operator_authorization_header(
+        self, running_loop_mgr, name: str
+    ) -> None:
+        """An operator Authorization header, in any casing, gives way to the user's bearer: sent
+        beside it, the operator's would come first, and a server that reads the first one would
+        take every user for the operator's credential."""
+        mgr, loop, _ = running_loop_mgr
+        key = ("user-1", "pool-srv")
+        cfg = _http_cfg()
+        cfg["headers"] = {name: "Bearer operator-key", "X-Api-Key": "key-1"}
+        patches: dict[str, Any] = {}
+        fake = _fake_transport_and_session(patches)
+        with (
+            patch(
+                "turnstone.core.mcp_client.streamable_http_client",
+                patches["streamable_http_client"],
+            ),
+            patch("turnstone.core.mcp_client.ClientSession", patches["ClientSession"]),
+            patch.object(mgr, "_tcp_probe", new=AsyncMock()),
+        ):
+            _run(loop, _connect_under_lock(mgr, key, cfg))
+            headers = fake["kwargs"]["http_client"].headers
+            assert headers.get_list("authorization") == ["Bearer tok-aaa"]
+            assert headers["x-api-key"] == "key-1"
+            _run(loop, mgr._teardown_pool_entry(key))
