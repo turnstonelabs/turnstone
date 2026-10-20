@@ -59,11 +59,15 @@ class TestInitStorage:
 
         assert [sa.engine.make_url(url) for url in handed] == [storage._engine.url]
 
-    def test_sqlite_migrations_run_under_a_directory_that_holds_a_percent_sign(self, tmp_path):
-        path = tmp_path / "50%" / "test.db"
+    @pytest.mark.parametrize("directory", ["50%", "a%20b"])
+    def test_sqlite_migrations_run_under_a_directory_that_holds_a_percent_sign(
+        self, tmp_path, directory
+    ):
+        path = tmp_path / directory / "test.db"
         path.parent.mkdir()
         storage = init_storage("sqlite", path=str(path), run_migrations=True)
 
+        assert path.exists()
         with storage._engine.connect() as conn:
             assert conn.execute(sa.text("SELECT version_num FROM alembic_version")).scalar_one()
 

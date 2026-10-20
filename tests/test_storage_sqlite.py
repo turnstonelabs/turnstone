@@ -12,6 +12,21 @@ from tests._storage_fakes import expire_lease as _expire_lease
 from turnstone.core.storage._protocol import WorkstreamLeaseLostError
 from turnstone.core.storage._schema import workstreams
 
+# -- Database path -------------------------------------------------------------
+
+
+class TestDatabasePath:
+    def test_a_percent_escape_in_the_path_is_part_of_its_name(
+        self, tmp_path, sqlite_backend_factory
+    ):
+        # Parsed as a URL, a%20b would open the file under "a b" instead.
+        (tmp_path / "a%20b").mkdir()
+        sqlite_backend_factory(str(tmp_path / "a%20b" / "test.db"))
+
+        assert (tmp_path / "a%20b" / "test.db").exists()
+        assert not (tmp_path / "a b").exists()
+
+
 # -- Workstream registration ---------------------------------------------------
 
 

@@ -666,6 +666,9 @@ frozen.
   punctuation other than `+`, `-`, `.`, `_` and `~`, and when a SQLite path held a `%`.
   `python -m turnstone.core.storage._migrate` failed the same way; `sslmode` alone was not
   affected.
+- **A SQLite database path holding `%` and two hex digits opens the file it names.** The path was
+  read as a URL, so `TURNSTONE_DB_PATH=/data/a%20b/turnstone.db` opened `/data/a b/turnstone.db`;
+  a deployment that relied on that should set the path it was using.
 - **Channel bots no longer start conversations on the wrong model before they have fetched the
   channel model (#1377).** Until a Discord or Slack bot had fetched `channels.default_model_alias`
   once, every conversation started meanwhile took the setting as unset and ran for good on the
