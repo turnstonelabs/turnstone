@@ -2355,6 +2355,21 @@ class TestURLsTheClientCannotSend:
         assert meta.issuer == "https://as.example.com"
         assert _urls(client) == [_PATH_PRM, _ROOT_PRM, _AS_META]
 
+    def test_challenge_url_with_a_non_ascii_zone_is_refused_before_any_request(self) -> None:
+        zone_url = "https://[fe80::1%" + chr(0xFC) + "]/prm"
+        meta, client = _discover(
+            _SERVER,
+            _router(
+                {
+                    _PATH_PRM: _challenge(zone_url),
+                    _ROOT_PRM: _prm("https://mcp.example.com"),
+                    _AS_META: _mk_response(200, _good_as_metadata_doc()),
+                }
+            ),
+        )
+        assert meta.issuer == "https://as.example.com"
+        assert _urls(client) == [_PATH_PRM, _ROOT_PRM, _AS_META]
+
     def test_unused_endpoint_with_a_lone_surrogate_is_a_discovery_error(self) -> None:
         document = _good_as_metadata_doc()
         document["revocation_endpoint"] = "https://as.example.com/revoke" + chr(0xD800)
@@ -2391,3 +2406,45 @@ class TestURLsTheClientCannotSend:
             pytest.raises(MCPOAuthDiscoveryError, match="AS metadata fetch failed"),
         ):
             _discover_through(respond)
+
+
+class TestTheGuardJudgesTheDialedHost:
+    def test_document_named_issuer_never_reaches_the_address_the_client_would_dial(self) -> None:
+        """A PRM document names an issuer whose IDNA 2003 and IDNA 2008 encodings resolve to a
+        public and a private address. The guard judges the name the client dials, so discovery
+        refuses it and no request reaches that host."""
+        issuer = "https://stra" + chr(0xDF) + "e.example.com"
+        addresses = {"xn--strae-oqa.example.com": "10.0.0.12"}
+
+        def getaddrinfo(host: str | bytes, *args: Any, **kwargs: Any) -> list[Any]:
+            # As CPython does: a str host is encoded with the IDNA 2003 codec for the lookup.
+            name = (host.encode("idna") if isinstance(host, str) else host).decode("ascii")
+            return [(2, 1, 6, "", (addresses.get(name, "93.184.216.34"), 0))]
+
+        sent: list[str] = []
+
+        def respond(request: httpx2.Request) -> httpx2.Response:
+            sent.append(str(request.url))
+            if str(request.url) == _PATH_PRM:
+                return httpx2.Response(
+                    200, json={"resource": _SERVER, "authorization_servers": [issuer]}
+                )
+            return httpx2.Response(404)
+
+        async def _run() -> None:
+            async with httpx2.AsyncClient(transport=httpx2.MockTransport(respond)) as client:
+                with patch("socket.getaddrinfo", side_effect=getaddrinfo):
+                    await discover_authorization_server(
+                        server_name="srv-x",
+                        server_url=_SERVER,
+                        override_url=None,
+                        cached_issuer=None,
+                        http_client=client,
+                        storage=_mk_storage_mock(),
+                        server_id="srv-id",
+                        trusted_hosts=frozenset(),
+                    )
+
+        with pytest.raises(MCPOAuthDiscoveryError, match="on a private network"):
+            asyncio.run(_run())
+        assert sent == [_PATH_PRM, _ROOT_PRM]

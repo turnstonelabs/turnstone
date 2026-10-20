@@ -9,6 +9,7 @@ The OIDC test suite already exercises these via the OIDC adapter
 from __future__ import annotations
 
 import urllib.parse
+from typing import TYPE_CHECKING, Any
 from unittest.mock import patch
 
 import pytest
@@ -21,6 +22,20 @@ from turnstone.core.oauth.ssrf import (
     validate_discovered_endpoint,
     validate_url_no_ssrf,
 )
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+
+def _resolver_like_cpython(addresses: dict[str, str]) -> Callable[..., list[Any]]:
+    """A ``getaddrinfo`` stand-in that, as CPython's does, encodes a str host with the IDNA 2003
+    ``idna`` codec before the lookup; *addresses* is keyed by the name the lookup sends."""
+
+    def getaddrinfo(host: str | bytes, *args: Any, **kwargs: Any) -> list[Any]:
+        name = host.encode("idna") if isinstance(host, str) else host
+        return [(2, 1, 6, "", (addresses[name.decode("ascii")], 0))]
+
+    return getaddrinfo
 
 
 class TestIsLocalhost:
@@ -190,9 +205,41 @@ class TestValidateUrlNoSSRF:
             validate_url_no_ssrf("https://idp.example.com:99999/token", allow_http=False)
 
     def test_a_space_the_client_encodes_is_still_accepted(self) -> None:
+        """Accepted, and returned in the form the client sends."""
         with patch("socket.getaddrinfo", return_value=self._PUBLIC_ADDR):
             parsed = validate_url_no_ssrf("https://idp.example.com/a b", allow_http=False)
-        assert parsed.path == "/a b"
+        assert parsed.path == "/a%20b"
+
+    def test_returns_the_host_the_client_dials(self) -> None:
+        """Callers compare hosts (same-origin, the localhost lane) on this result, so it carries
+        the dialed name: lowercase IDNA 2008 ASCII."""
+        sharp_s = chr(0xDF)
+        with patch("socket.getaddrinfo", return_value=self._PUBLIC_ADDR):
+            parsed = validate_url_no_ssrf(f"https://STRA{sharp_s}E.Example.com/x", allow_http=False)
+        assert parsed.hostname == "xn--strae-oqa.example.com"
+
+    def test_refuses_a_non_ascii_ipv6_zone_before_resolving(self) -> None:
+        """httpx2 parses this host but can't send it as ASCII. The refusal must not depend on the
+        resolver failing for it, so even one that answers for any name doesn't change it."""
+        with (
+            patch("socket.getaddrinfo", return_value=self._PUBLIC_ADDR),
+            pytest.raises(OAuthSSRFError, match="malformed"),
+        ):
+            validate_url_no_ssrf("https://[fe80::1%" + chr(0xFC) + "]/x", allow_http=False)
+
+    def test_resolves_the_name_the_client_dials(self) -> None:
+        """A host whose IDNA 2003 and IDNA 2008 encodings differ names two hosts. The client
+        dials the 2008 form; resolving the Unicode name would check the 2003 one's addresses."""
+        sharp_s = chr(0xDF)
+        addresses = {
+            "strasse.example.com": "93.184.216.34",
+            "xn--strae-oqa.example.com": "10.0.0.12",
+        }
+        with (
+            patch("socket.getaddrinfo", side_effect=_resolver_like_cpython(addresses)),
+            pytest.raises(OAuthSSRFPrivateAddressError, match="non-public address"),
+        ):
+            validate_url_no_ssrf(f"https://stra{sharp_s}e.example.com/token", allow_http=False)
 
 
 class TestValidateDiscoveredEndpoint:
@@ -242,6 +289,38 @@ class TestValidateDiscoveredEndpoint:
                 issuer,
                 allow_http=False,
                 trusted_endpoint_hosts=frozenset({"shard.example.com"}),
+            )
+
+    def test_trusted_endpoint_host_matches_in_either_spelling(self) -> None:
+        """Hosts compare as the client dials them, so an operator may write a trusted host in
+        Unicode or as its ``xn--`` name, and a document may spell the endpoint either way."""
+        issuer = urllib.parse.urlparse("https://idp.example.com")
+        unicode_host = "b" + chr(0xFC) + "cher.example.com"
+        ascii_host = "xn--bcher-kva.example.com"
+        with patch("socket.getaddrinfo", return_value=self._PUBLIC_ADDR):
+            for endpoint_host, trusted_host in (
+                (unicode_host, unicode_host),
+                (ascii_host, unicode_host),
+                (unicode_host, ascii_host),
+            ):
+                validate_discovered_endpoint(
+                    f"https://{endpoint_host}/token",
+                    issuer,
+                    allow_http=False,
+                    trusted_endpoint_hosts=frozenset({trusted_host}),
+                )
+
+    def test_trusted_endpoint_host_holding_a_port_matches_nothing(self) -> None:
+        issuer = urllib.parse.urlparse("https://idp.example.com")
+        with (
+            patch("socket.getaddrinfo", return_value=self._PUBLIC_ADDR),
+            pytest.raises(OAuthSSRFError, match="not trusted"),
+        ):
+            validate_discovered_endpoint(
+                "https://shard.example.com/token",
+                issuer,
+                allow_http=False,
+                trusted_endpoint_hosts=frozenset({"shard.example.com:443"}),
             )
 
     def test_known_google_alias_passes(self) -> None:

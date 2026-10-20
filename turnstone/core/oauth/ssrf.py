@@ -128,6 +128,20 @@ def effective_port(parsed: urllib.parse.ParseResult) -> int | None:
     return {"http": 80, "https": 443}.get(parsed.scheme)
 
 
+def _dialed_host(host: str) -> str:
+    """Return a bare *host* as the client dials it, the form :func:`validate_url_no_ssrf` returns.
+
+    An operator may write a trusted host in Unicode or as its ``xn--`` name; both are the host the
+    client dials. An entry httpx2 can't read as a bare host (one holding a port, say) is compared
+    as written.
+    """
+    try:
+        url = httpx2.URL(scheme="https", host=host, path="/")
+        return urllib.parse.urlparse(str(url)).hostname or ""
+    except (httpx2.InvalidURL, ValueError):
+        return host.lower()
+
+
 def validate_url_no_ssrf(
     url: str,
     *,
@@ -177,26 +191,32 @@ def validate_url_no_ssrf(
     or encode (a host that is not valid IDNA 2008, or a lone surrogate, for example). urllib drops
     TAB, CR and LF and keeps the other control characters, so the checks below would otherwise
     judge a different URL from the one sent.
+
+    Every check, and the result returned, reads the URL as httpx2 normalizes it, which is the URL
+    the client sends. Its host is the IDNA 2008 ASCII name the client dials: urllib keeps a Unicode
+    name, which the resolver encodes with IDNA 2003, and the two can name different hosts
+    ("straße" is "strasse" to one and "xn--strae-oqa" to the other), so the addresses checked
+    would not be the ones the client reaches. Callers comparing hosts (same-origin, the localhost
+    lane) compare those dialed names too.
     """
     if any(ch.isascii() and not ch.isprintable() for ch in url):
         raise OAuthSSRFError(
             f"endpoint URL must not contain control characters: {sanitize_log_text(url)}"
         )
     try:
-        httpx2.URL(url)
-    except (httpx2.InvalidURL, UnicodeError) as exc:
+        parsed = urllib.parse.urlparse(str(httpx2.URL(url)))
+        hostname = parsed.hostname
+        _ = parsed.port  # parsed lazily; raises for an out-of-range value
+        # The client sends the host as ASCII. httpx2 keeps a non-ASCII IPv6 zone id in it, which
+        # fails here as it would when the request is built.
+        (hostname or "").encode("ascii")
+    except (httpx2.InvalidURL, ValueError) as exc:
+        # A lone surrogate raises UnicodeError, a ValueError too. Callers catch OAuthSSRFError
+        # only, and the URL can come from a hostile MCP server's document: anything else here would
+        # escape discovery instead of becoming a clean refusal.
         raise OAuthSSRFError(
             f"endpoint URL is malformed ({exc}): {sanitize_log_text(url)}"
         ) from exc
-    try:
-        parsed = urllib.parse.urlparse(url)
-        hostname = parsed.hostname
-        _ = parsed.port  # parsed lazily; raises for an out-of-range value
-    except ValueError as exc:
-        # Callers catch OAuthSSRFError only, and the URL can come from a
-        # hostile MCP server's discovery document — a bare ValueError here
-        # would escape discovery instead of becoming a clean refusal.
-        raise OAuthSSRFError(f"endpoint URL is malformed: {url}") from exc
 
     if not hostname:
         raise OAuthSSRFError(f"endpoint URL has no hostname: {url}")
@@ -307,7 +327,7 @@ def validate_discovered_endpoint(
     host_allowed = (
         endpoint_hostname == issuer_hostname
         or endpoint_hostname in known_trusted
-        or endpoint_hostname in trusted_endpoint_hosts
+        or any(_dialed_host(host) == endpoint_hostname for host in trusted_endpoint_hosts)
     )
     if not host_allowed:
         raise OAuthSSRFError(

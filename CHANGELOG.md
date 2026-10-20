@@ -1199,6 +1199,15 @@ frozen.
 
 ### Security
 
+- **The OAuth address check judges the host the client connects to.** It resolved an
+  internationalized host name the way the system resolver encodes it (IDNA 2003), while the HTTP
+  client connects to the name's IDNA 2008 form, and for some names (one holding `ß`, say) those
+  are two different hosts. An MCP server's metadata or challenge could name such a host, so the
+  check passed on one name's public address while the client connected to the other's internal
+  one: a TCP connection and TLS handshake to an internal host and port of the server's choosing,
+  which failed certificate verification before any request was sent. The check now resolves the
+  name the client connects to, and reads `[oidc] trusted_endpoint_hosts` the same way, so a host
+  there may be written in Unicode or as its `xn--` name.
 - **A user's bearer replaces the operator's Authorization header on per-user MCP servers.** On an
   `oauth_user` or `oauth_obo` server whose headers held an Authorization header spelled otherwise
   than `Authorization` (`authorization`, say), each user's connection sent that header beside the

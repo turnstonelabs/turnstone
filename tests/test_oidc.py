@@ -2372,6 +2372,37 @@ class TestDiscoverOIDC:
         assert result.enabled is False
         assert result.discovery_retryable is False
 
+    def test_discover_oidc_judges_the_localhost_lane_by_the_dialed_host(self):
+        """The client dials this issuer as keycloak.localhost (an ideographic full stop becomes a
+        dot). Discovery gives its endpoints the localhost lane on that same name, so the guard and
+        discovery agree."""
+        issuer = "http://keycloak" + chr(0x3002) + "localhost:8080"
+        document = {
+            "issuer": issuer,
+            "authorization_endpoint": "http://keycloak.localhost:8080/auth",
+            "token_endpoint": "http://keycloak.localhost:8080/token",
+            "jwks_uri": "http://keycloak.localhost:8080/jwks",
+        }
+        config = _make_config(
+            issuer=issuer,
+            authorization_endpoint="",
+            token_endpoint="",
+            userinfo_endpoint="",
+            jwks_uri="",
+        )
+
+        def respond(request: httpx2.Request) -> httpx2.Response:
+            return httpx2.Response(200, json=document)
+
+        async def _run():
+            async with httpx2.AsyncClient(transport=httpx2.MockTransport(respond)) as client:
+                with patch("socket.getaddrinfo", return_value=[(2, 1, 6, "", ("127.0.0.1", 0))]):
+                    return await discover_oidc(config, client=client)
+
+        result = asyncio.run(_run())
+        assert result.enabled is True
+        assert result.token_endpoint == "http://keycloak.localhost:8080/token"
+
     def test_discover_oidc_success(self):
         """Mock httpx2 response, verify endpoints populated."""
         config = _make_config(
