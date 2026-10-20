@@ -685,6 +685,9 @@ frozen.
   doctor and the console's coordinator went without it and every definition sorting after it. One
   out of range, `NaN` among them, was sent to the provider. The console refuses such values, so
   only a direct write to the table stores one.
+- **Saving a model definition with `max_tokens` set to `Infinity` answers 400.** The JSON body
+  parsed it as a float that `int()` can't convert, and the create and update endpoints answered
+  500.
 - **Channel bots no longer start conversations on the wrong model before they have fetched the
   channel model (#1377).** Until a Discord or Slack bot had fetched `channels.default_model_alias`
   once, every conversation started meanwhile took the setting as unset and ran for good on the

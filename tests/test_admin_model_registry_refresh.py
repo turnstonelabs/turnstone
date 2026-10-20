@@ -1049,6 +1049,28 @@ def _dynamic_create(client: TestClient, **overrides: Any) -> Any:
     return client.post("/v1/api/admin/model-definitions", json=body)
 
 
+def test_an_infinite_max_tokens_is_refused_on_create_and_update(storage: SQLiteBackend) -> None:
+    # A JSON body may carry Infinity, and int() of it raises OverflowError.
+    _seed_model_def(storage, definition_id="m1", alias="local", model="m")
+    client = _make_client(storage, _make_registry(alias="local", model="m"))
+    json_header = {"Content-Type": "application/json"}
+
+    created = client.post(
+        "/v1/api/admin/model-definitions",
+        content=b'{"alias": "inf", "model": "m", "max_tokens": Infinity}',
+        headers=json_header,
+    )
+    updated = client.put(
+        "/v1/api/admin/model-definitions/m1",
+        content=b'{"max_tokens": Infinity}',
+        headers=json_header,
+    )
+
+    for resp in (created, updated):
+        assert resp.status_code == 400, resp.text
+        assert resp.json()["error"] == "max_tokens must be an integer"
+
+
 def test_list_carries_no_auth_constraints(storage: SQLiteBackend) -> None:
     """The list answers to plain ``admin.models``, so it must not carry the
     approved-audience set — that lives on the admin.mcp-gated sub-route.

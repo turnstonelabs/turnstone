@@ -14587,7 +14587,7 @@ async def admin_create_model_definition(request: Request) -> JSONResponse:
     if body.get("max_tokens") is not None:
         try:
             max_tokens = int(body["max_tokens"])
-        except (ValueError, TypeError):
+        except (ValueError, TypeError, OverflowError):
             return JSONResponse({"error": "max_tokens must be an integer"}, status_code=400)
         if max_tokens < 1:
             return JSONResponse({"error": "max_tokens must be >= 1"}, status_code=400)
@@ -14928,7 +14928,7 @@ async def admin_update_model_definition(request: Request) -> JSONResponse:
         else:
             try:
                 mt_val = int(raw_mt)
-            except (ValueError, TypeError):
+            except (ValueError, TypeError, OverflowError):
                 return JSONResponse({"error": "max_tokens must be an integer"}, status_code=400)
             if mt_val < 1:
                 return JSONResponse({"error": "max_tokens must be >= 1"}, status_code=400)
