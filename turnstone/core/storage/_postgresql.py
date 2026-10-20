@@ -378,6 +378,8 @@ class PostgreSQLBackend(_KeyedAttachmentSaveWrappers):
             pool_size=pool_size,
             max_overflow=max_overflow,
             pool_pre_ping=True,
+            # Error text names the statement, not its values; they stay on exc.params.
+            hide_parameters=True,
         )
         self._db_unavailable = False
         self._db_unavailable_lock = threading.Lock()

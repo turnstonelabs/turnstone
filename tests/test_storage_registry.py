@@ -129,3 +129,34 @@ class TestConnUnavailableLogging:
         with pytest.raises(StorageUnavailableError), backend._conn():
             pass  # pragma: no cover
         assert backend._db_unavailable is True
+
+
+class TestStatementErrors:
+    """A failed statement's error text, which callers log, leaves out the values it bound."""
+
+    def test_a_failed_statement_names_no_bound_values(self, tmp_path, sqlite_backend_factory):
+        backend = sqlite_backend_factory(str(tmp_path / "test.db"))
+        with backend._engine.begin() as conn:
+            conn.execute(
+                sa.text(
+                    "CREATE TRIGGER refuse_settings BEFORE INSERT ON system_settings "
+                    "BEGIN SELECT RAISE(ABORT, 'refused'); END"
+                )
+            )
+
+        with pytest.raises(sa.exc.DBAPIError) as exc_info:
+            backend.upsert_system_setting(key="tools.searxng_url", value="bound-value-sentinel")
+
+        assert "refused" in str(exc_info.value)
+        assert "bound-value-sentinel" not in str(exc_info.value)
+        assert "bound-value-sentinel" in repr(exc_info.value.params)
+
+    def test_the_postgresql_engine_hides_bound_values_too(self) -> None:
+        # Building the backend doesn't connect while create_tables is off.
+        backend = PostgreSQLBackend(
+            "postgresql+psycopg://user:pass@db.example.com/db", create_tables=False
+        )
+        try:
+            assert backend._engine.hide_parameters is True
+        finally:
+            backend._engine.dispose()

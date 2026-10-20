@@ -270,6 +270,9 @@ frozen.
   `false`, `0` or `no`. A console whose CA can't start for a lasting reason doesn't serve its
   Settings tab either, so turning TLS off then means setting `tls.enabled` to `false` in the
   `system_settings` table.
+- **Database errors no longer quote the values a failed statement was sent** — an error message,
+  and a traceback logged with it, names the statement and the database's reason only; the values
+  stay on the exception's `params`.
 - **The MCP client runs on the MCP Python SDK 2.3 (#679)** *(BREAKING)* — turnstone requires
   `mcp>=2.3,<3`, so an MCP server run from turnstone's own Python environment must work with it
   (FastMCP is now `MCPServer`); the cluster-ops and Understone examples move with it. MCP HTTP

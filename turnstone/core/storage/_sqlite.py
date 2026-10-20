@@ -365,6 +365,8 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
             f"sqlite:///{path}",
             pool_pre_ping=True,
             connect_args={"check_same_thread": False, "timeout": 30},
+            # Error text names the statement, not its values; they stay on exc.params.
+            hide_parameters=True,
         )
 
         # Enable WAL mode for better concurrent read/write performance.
