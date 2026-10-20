@@ -447,6 +447,7 @@ interface, or anyone who can reach it can search through your instance.
 |----------|---------|-------------|
 | `WORKSPACE_MOUNT` | empty volume | Host directory bind-mounted at `/workspace` for the model to read/write |
 | `TURNSTONE_WORKSPACE` | `/workspace` (image env) | Directory named as the user's workspace in the model's tool descriptions; informational only — see [Working directory](#working-directory) |
+| `NODE_OPTIONS` | `--use-openssl-ca` (image env) | Makes Node.js, and the `npx` MCP servers it runs, verify TLS against the system trust store instead of Node's built-in root list; a value set here or in an MCP server's `env` must keep this flag |
 | `SKIP_PERMISSIONS` | — | Set to any value to auto-approve all tool calls (dev only) |
 | `MCP_CONFIG` | — | Path to an MCP server config file |
 | `TURNSTONE_IMAGE_TAG` | `latest` | ghcr.io image tag — production stack |

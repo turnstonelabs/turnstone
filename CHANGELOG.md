@@ -1212,6 +1212,17 @@ frozen.
   `ca-certificates` 20250419+deb13u1, DSA-6572-1). A deployment that sets `SSL_CERT_FILE` or
   `SSL_CERT_DIR` verifies against that bundle instead, with `httpx` and HTTPX2 alike, and must
   remove the root from it.
+- **The Docker image no longer trusts the root of the compromised eMudhra CAs.** The image now
+  refuses to build with a `ca-certificates` older than 20250419+deb13u1 (DSA-6572-1), Debian's
+  update that removes the root from the system store. Its `pip`, which loads its own `certifi`
+  bundle beside the system store, moves to 26.2.2 or later, and its `uv`, which `uvx` uses to
+  fetch packages, moves to 0.13.4; both drop the root from their bundled lists. A virtual
+  environment made with `python -m venv` still starts with the base image's pip 26.2.1, which
+  trusts the root, until its pip is upgraded. Node.js, which `npx` uses, now checks the system
+  store instead of its built-in list, which still has the root: the image sets
+  `NODE_OPTIONS=--use-openssl-ca`, so a `NODE_OPTIONS` set at run time, in the container's
+  environment or in an MCP server's `env`, must keep that flag. Node also follows `SSL_CERT_FILE`
+  and `SSL_CERT_DIR` now. Images published before this release still trust the root.
 - **A remote MCP server can no longer have the console send plain-http requests to its loopback
   ports.** The OAuth address check's localhost development lane (plain http to a localhost name
   that resolves only to loopback) also covered URLs an MCP server's metadata or challenge named,
