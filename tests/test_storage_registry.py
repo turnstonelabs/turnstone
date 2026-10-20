@@ -87,13 +87,24 @@ class TestInitStorage:
 
 
 class TestMigrateEntrypoint:
-    def test_it_applies_the_database_tls_settings(self, monkeypatch):
-        # The Docker entrypoint runs it before the services start, from the same environment.
+    """The Docker entrypoint runs it before the services start, in the same container."""
+
+    _ENV = {
+        "TURNSTONE_DB_BACKEND": "postgresql",
+        "TURNSTONE_DB_URL": "postgresql+psycopg://user@env.example.com/db",
+        "TURNSTONE_DB_SSLMODE": "verify-full",
+        "TURNSTONE_DB_SSLROOTCERT": "/etc/turnstone/env-ca.pem",
+        "TURNSTONE_DB_SSLCERT": "/etc/turnstone/env.crt",
+        "TURNSTONE_DB_SSLKEY": "/etc/turnstone/env.key",
+    }
+
+    @pytest.fixture
+    def handed(self, tmp_path, monkeypatch):
         import types
 
+        import turnstone.core.config as config_mod
         import turnstone.core.log
         import turnstone.core.storage
-        from turnstone.core.storage import _migrate
 
         handed: dict[str, object] = {}
         monkeypatch.setattr(turnstone.core.log, "configure_logging", lambda **kwargs: None)
@@ -105,24 +116,50 @@ class TestMigrateEntrypoint:
         monkeypatch.setattr(
             turnstone.core.storage, "get_storage", lambda: types.SimpleNamespace(close=lambda: None)
         )
-        for name, value in {
-            "TURNSTONE_DB_BACKEND": "postgresql",
-            "TURNSTONE_DB_URL": "postgresql+psycopg://user@db.example.com/db",
-            "TURNSTONE_DB_SSLMODE": "verify-full",
-            "TURNSTONE_DB_SSLROOTCERT": "/etc/turnstone/db-ca.pem",
-            "TURNSTONE_DB_SSLCERT": "/etc/turnstone/db.crt",
-            "TURNSTONE_DB_SSLKEY": "/etc/turnstone/db.key",
-        }.items():
+        # No config.toml unless a test writes one, so the developer's own can't leak in.
+        monkeypatch.setenv("TURNSTONE_CONFIG", str(tmp_path / "config.toml"))
+        monkeypatch.setattr(config_mod, "_cache", None)
+        monkeypatch.setattr(config_mod, "_config_path", None)
+        for name, value in self._ENV.items():
             monkeypatch.setenv(name, value)
+        return handed
+
+    def test_it_applies_the_database_settings_from_the_environment(self, handed):
+        from turnstone.core.storage import _migrate
 
         _migrate._main()
 
         assert handed["backend"] == "postgresql"
+        assert handed["url"] == "postgresql+psycopg://user@env.example.com/db"
         assert handed["sslmode"] == "verify-full"
-        assert handed["sslrootcert"] == "/etc/turnstone/db-ca.pem"
-        assert handed["sslcert"] == "/etc/turnstone/db.crt"
-        assert handed["sslkey"] == "/etc/turnstone/db.key"
+        assert handed["sslrootcert"] == "/etc/turnstone/env-ca.pem"
+        assert handed["sslcert"] == "/etc/turnstone/env.crt"
+        assert handed["sslkey"] == "/etc/turnstone/env.key"
         assert handed["run_migrations"] is True
+
+    def test_config_toml_database_settings_come_first_as_on_the_node(self, handed, tmp_path):
+        # docs/tls.md puts the database TLS settings in config.toml's [database].
+        from turnstone.core.storage import _migrate
+
+        (tmp_path / "config.toml").write_text(
+            "[database]\n"
+            'url = "postgresql+psycopg://user@config.example.com/db"\n'
+            'sslmode = "verify-ca"\n'
+            'sslrootcert = "/etc/turnstone/config-ca.pem"\n'
+            'sslcert = "/etc/turnstone/config.crt"\n'
+            'sslkey = "/etc/turnstone/config.key"\n',
+            encoding="utf-8",
+        )
+        (tmp_path / "config.toml").chmod(0o600)
+
+        _migrate._main()
+
+        assert handed["backend"] == "postgresql"  # not in config.toml, so from the environment
+        assert handed["url"] == "postgresql+psycopg://user@config.example.com/db"
+        assert handed["sslmode"] == "verify-ca"
+        assert handed["sslrootcert"] == "/etc/turnstone/config-ca.pem"
+        assert handed["sslcert"] == "/etc/turnstone/config.crt"
+        assert handed["sslkey"] == "/etc/turnstone/config.key"
 
 
 class TestGetStorage:
@@ -248,8 +285,9 @@ class TestStatementErrors:
 
         db_path = tmp_path / "migrate.db"
         cfg = Config()
-        cfg.set_main_option("script_location", _MIGRATIONS_DIR)
-        cfg.set_main_option("sqlalchemy.url", f"sqlite:///{db_path}")
+        # Escaped as run_migrations does, so a checkout path holding a % still works.
+        cfg.set_main_option("script_location", _MIGRATIONS_DIR.replace("%", "%%"))
+        cfg.set_main_option("sqlalchemy.url", f"sqlite:///{db_path}".replace("%", "%%"))
         command.upgrade(cfg, "059")
         engine = sa.create_engine(f"sqlite:///{db_path}")
         try:

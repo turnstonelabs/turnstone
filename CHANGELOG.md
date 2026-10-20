@@ -669,10 +669,12 @@ frozen.
 - **A SQLite database path holding `%` and two hex digits opens the file it names.** The path was
   read as a URL, so `TURNSTONE_DB_PATH=/data/a%20b/turnstone.db` opened `/data/a b/turnstone.db`;
   a deployment that relied on that should set the path it was using.
-- **The Docker image's migration step applies the database TLS settings.** `python -m
-  turnstone.core.storage._migrate`, which the entrypoint runs before the services start, now
-  passes `TURNSTONE_DB_SSLMODE`, `TURNSTONE_DB_SSLROOTCERT`, `TURNSTONE_DB_SSLCERT` and
-  `TURNSTONE_DB_SSLKEY` to the database connection, as the node and console do.
+- **The Docker image's migration step reads the database settings the services use.** `python -m
+  turnstone.core.storage._migrate`, which the entrypoint runs before the services start, read
+  only `TURNSTONE_DB_BACKEND`, `TURNSTONE_DB_URL` and `TURNSTONE_DB_PATH`. It now reads
+  config.toml's `[database]` first and then the `TURNSTONE_DB_*` variables, as the node does, the
+  TLS settings (`sslmode`, `sslrootcert`, `sslcert`, `sslkey`) included. A database configured
+  only in config.toml no longer leaves the step migrating a SQLite file in its working directory.
 - **A stored model definition whose `temperature` or `max_tokens` isn't a number loads with that
   field unset.** The loader logs `model_registry.override_invalid`, as it already ignored such
   values in config.toml. Such a row used to stop the load at that row: a node's Sync answered

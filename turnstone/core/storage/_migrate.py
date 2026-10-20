@@ -143,27 +143,29 @@ def _bootstrap_existing_sqlite(engine: Any, cfg: Any) -> None:
 
 
 def _main() -> None:
-    """Apply migrations from the environment the services start with."""
+    """Apply migrations with the database settings the services start with."""
     import os
 
+    from turnstone.core.config import load_config
+    from turnstone.core.log import configure_logging
     from turnstone.core.storage import get_storage, init_storage
 
-    backend = os.environ.get("TURNSTONE_DB_BACKEND", "sqlite")
-    url = os.environ.get("TURNSTONE_DB_URL", "")
-    path = os.environ.get("TURNSTONE_DB_PATH", "")
-
-    from turnstone.core.log import configure_logging
-
     configure_logging(level="INFO", service="migrate")
+    # config.toml [database] first, then the environment, as the node reads them.
+    database = load_config("database")
+
+    def setting(key: str, env_name: str, default: str = "") -> str:
+        value = database.get(key)
+        return str(value) if value else os.environ.get(env_name, default)
+
     init_storage(
-        backend,
-        path=path,
-        url=url,
-        # The database TLS settings the node and console apply.
-        sslmode=os.environ.get("TURNSTONE_DB_SSLMODE", ""),
-        sslrootcert=os.environ.get("TURNSTONE_DB_SSLROOTCERT", ""),
-        sslcert=os.environ.get("TURNSTONE_DB_SSLCERT", ""),
-        sslkey=os.environ.get("TURNSTONE_DB_SSLKEY", ""),
+        setting("backend", "TURNSTONE_DB_BACKEND", "sqlite"),
+        path=setting("path", "TURNSTONE_DB_PATH"),
+        url=setting("url", "TURNSTONE_DB_URL"),
+        sslmode=setting("sslmode", "TURNSTONE_DB_SSLMODE"),
+        sslrootcert=setting("sslrootcert", "TURNSTONE_DB_SSLROOTCERT"),
+        sslcert=setting("sslcert", "TURNSTONE_DB_SSLCERT"),
+        sslkey=setting("sslkey", "TURNSTONE_DB_SSLKEY"),
         run_migrations=True,
     )
     log.info("Migrations complete")
