@@ -45,7 +45,7 @@ import webbrowser
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any
 
-import httpx
+import httpx2
 from entra_diagnostics import failure_summary, report_source
 
 RESULTS: list[tuple[str, str, str]] = []  # (check, status, evidence)
@@ -169,7 +169,7 @@ def interactive_login(cfg: dict[str, str]) -> dict[str, Any]:
         raise SystemExit("state mismatch on redirect - aborting.")
     if not _CodeCatcher.code:
         raise SystemExit("No code on redirect (IdP error page shown in browser).")
-    resp = httpx.post(
+    resp = httpx2.post(
         f"https://login.microsoftonline.com/{cfg['ENTRA_TENANT_ID']}/oauth2/v2.0/token",
         data={
             "grant_type": "authorization_code",
@@ -189,7 +189,7 @@ def interactive_login(cfg: dict[str, str]) -> dict[str, Any]:
 
 def redeem(cfg: dict[str, str], refresh_token: str, scope: str) -> tuple[int, dict[str, Any]]:
     """Redeem a refresh token for an access token with the given scope."""
-    resp = httpx.post(
+    resp = httpx2.post(
         f"https://login.microsoftonline.com/{cfg['ENTRA_TENANT_ID']}/oauth2/v2.0/token",
         data={
             "grant_type": "refresh_token",
@@ -206,7 +206,7 @@ def redeem(cfg: dict[str, str], refresh_token: str, scope: str) -> tuple[int, di
 
 def obo_exchange(cfg: dict[str, str], assertion: str, scope: str) -> tuple[int, dict[str, Any]]:
     """V6: middle-tier OBO variant (jwt-bearer + requested_token_use)."""
-    resp = httpx.post(
+    resp = httpx2.post(
         f"https://login.microsoftonline.com/{cfg['ENTRA_TENANT_ID']}/oauth2/v2.0/token",
         data={
             "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",

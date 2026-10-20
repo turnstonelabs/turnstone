@@ -15,7 +15,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
-import httpx
+import httpx2
 import pytest
 
 HARNESS = Path(__file__).resolve().parents[1] / "scripts" / "obo-e2e"
@@ -302,14 +302,14 @@ def test_product_harness_uses_runtime_and_reports_upstream_failure(
     capsys: pytest.CaptureFixture[str],
     outcome: str,
 ) -> None:
-    def respond(request: httpx.Request) -> httpx.Response:
+    def respond(request: httpx2.Request) -> httpx2.Response:
         from urllib.parse import parse_qs
 
         scope = parse_qs(request.content.decode())["scope"][0]
         if outcome == "transport_error":
-            raise httpx.ReadTimeout("secret-response-payload", request=request)
+            raise httpx2.ReadTimeout("secret-response-payload", request=request)
         if outcome == "invalid_client":
-            return httpx.Response(
+            return httpx2.Response(
                 401,
                 json={
                     "error": "invalid_client",
@@ -318,9 +318,9 @@ def test_product_harness_uses_runtime_and_reports_upstream_failure(
                 },
             )
         if scope.startswith("api://aud-c/"):
-            return httpx.Response(400, json={"error": "invalid_grant", "error_codes": [65001]})
+            return httpx2.Response(400, json={"error": "invalid_grant", "error_codes": [65001]})
         audience = scope.removesuffix("/.default")
-        return httpx.Response(
+        return httpx2.Response(
             200,
             json={
                 "access_token": _jwt(audience),
@@ -333,7 +333,7 @@ def test_product_harness_uses_runtime_and_reports_upstream_failure(
     monkeypatch.setattr(
         modules.e2e,
         "json_http_client",
-        lambda _: httpx.AsyncClient(transport=httpx.MockTransport(respond)),
+        lambda _: httpx2.AsyncClient(transport=httpx2.MockTransport(respond)),
     )
     monkeypatch.setattr(modules.e2e, "tempfile", SimpleNamespace(mkdtemp=lambda **_: str(tmp_path)))
     monkeypatch.setattr(modules.e2e, "RESULTS", [])

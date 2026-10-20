@@ -70,7 +70,7 @@ from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import TYPE_CHECKING, Any
 
-import httpx
+import httpx2
 from cryptography.fernet import Fernet
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
@@ -183,17 +183,17 @@ class _PRMStub:
 
 
 class _Wire:
-    """Every request the product's OAuth client sends, via httpx's request hook."""
+    """Every request the product's OAuth client sends, via httpx2's request hook."""
 
     def __init__(
-        self, client: httpx.AsyncClient, *, loop: asyncio.AbstractEventLoop | None = None
+        self, client: httpx2.AsyncClient, *, loop: asyncio.AbstractEventLoop | None = None
     ) -> None:
         self.calls: list[tuple[str, str]] = []
         self.off_loop_calls: list[tuple[str, str]] = []
         self.loop = loop if loop is not None else asyncio.get_running_loop()
         client.event_hooks["request"].append(self._seen)
 
-    async def _seen(self, request: httpx.Request) -> None:
+    async def _seen(self, request: httpx2.Request) -> None:
         call = (request.method, str(request.url))
         self.calls.append(call)
         if asyncio.get_running_loop() is not self.loop:
@@ -224,7 +224,7 @@ class _Browser:
     with consent required — the consent form.
     """
 
-    def __init__(self, http: httpx.AsyncClient, user: str, password: str) -> None:
+    def __init__(self, http: httpx2.AsyncClient, user: str, password: str) -> None:
         self._http = http
         self._jar: dict[str, str] = {}
         self._user = user
@@ -232,7 +232,7 @@ class _Browser:
 
     async def _fetch(
         self, method: str, url: str, data: dict[str, str] | None = None
-    ) -> httpx.Response:
+    ) -> httpx2.Response:
         headers = {"Cookie": "; ".join(f"{k}={v}" for k, v in self._jar.items())}
         resp = await self._http.request(method, url, data=data, headers=headers)
         for raw in resp.headers.get_list("set-cookie"):
@@ -340,7 +340,7 @@ async def _run(cfg: dict[str, str]) -> None:
     callback_url = redirect_base + CALLBACK
     # The harness's own view of the realm, so the product's wire is judged
     # against endpoints it did not discover for itself.
-    realm = httpx.get(issuer + "/.well-known/openid-configuration", timeout=15.0).json()
+    realm = httpx2.get(issuer + "/.well-known/openid-configuration", timeout=15.0).json()
     token_endpoint = str(realm["token_endpoint"])
 
     stub = _PRMStub(
@@ -381,8 +381,8 @@ async def _run(cfg: dict[str, str]) -> None:
     app = _console_app(storage, store, redirect_base)
     await initialize_mcp_oauth_state(app.state)
     wire = _Wire(app.state.mcp_oauth_http_client)
-    console = httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url=redirect_base)
-    kc = httpx.AsyncClient(timeout=20.0)
+    console = httpx2.AsyncClient(transport=httpx2.ASGITransport(app=app), base_url=redirect_base)
+    kc = httpx2.AsyncClient(timeout=20.0)
     manager = MCPClientManager({})
     # Drive lookups explicitly so a timer cannot consume the grant under test.
     manager._user_token_sweep_s = 0

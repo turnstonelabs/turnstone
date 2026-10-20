@@ -292,6 +292,21 @@ frozen.
   on it can still forward, is now an ordinary protocol error: a call that gets one keeps its
   session, is not counted by the circuit breaker and reconnects nothing, and a connection test or a
   failed connect shows the server's own message.
+- **OIDC sign-in and OAuth run on httpx2 (#1011)** — the identity provider's discovery, keys and
+  code exchange at sign-in, and every OAuth request for MCP servers and models (discovery, client
+  registration, code exchange, refresh, revocation, and the on-behalf-of and client-credential
+  mints) now go through httpx2. Certificates are verified against the operating system's trust
+  store instead of certifi's bundle. A deployment that trusted its identity provider's or
+  authorization server's private CA through a modified `certifi` bundle must install that CA's
+  root certificate in the system store (an intermediate CA on its own no longer verifies), or point
+  `SSL_CERT_FILE` / `SSL_CERT_DIR` at a bundle holding the public roots as well as the private CA.
+  Those variables apply to every httpx2 client in the process, and strict X.509 checks and
+  `SSLKEYLOGFILE` apply only while one of them is set. The proxy variables still apply; `NO_PROXY`
+  now also matches IPv4 and IPv6 CIDR ranges and bracketed IPv6 addresses, and ignores an entry it
+  can't parse or that carries a path, so list such a host without its path. These requests send a
+  `python-httpx2` User-Agent and also accept zstd-compressed responses, and when something lowers
+  httpx2's log level (for example `ANTHROPIC_LOG=info`) they now log request lines, which show
+  only each URL's scheme, host and port.
 - **A model that isn't loaded is never replaced by another (#1359)** *(BREAKING)* — when the default
   model, the task model, the coordinator model or the channel model names a definition that isn't
   loaded (deleted, disabled, misspelled, or left out of a reload because its secret reference

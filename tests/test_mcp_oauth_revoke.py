@@ -6,7 +6,7 @@ The helper is best-effort RFC 7009 token revocation. It must:
 - never raise on non-2xx, network errors, or timeouts — caller doesn't
   want try/except in cleanup paths
 - never use ``exc_info=True`` — chained ``__context__`` may carry an
-  ``httpx.Request`` whose ``Authorization`` header holds a bearer; the
+  ``httpx2.Request`` whose ``Authorization`` header holds a bearer; the
   bearer-leak invariant requires structured fields with type names only
 """
 
@@ -16,7 +16,7 @@ import asyncio
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
-import httpx
+import httpx2
 
 from turnstone.core.mcp_oauth import (
     MCPOAuthDiscoveryError,
@@ -43,7 +43,7 @@ def _make_as_metadata(
 
 
 def _mk_response(status_code: int) -> MagicMock:
-    resp = MagicMock(spec=httpx.Response)
+    resp = MagicMock(spec=httpx2.Response)
     resp.status_code = status_code
     return resp
 
@@ -51,7 +51,7 @@ def _mk_response(status_code: int) -> MagicMock:
 class TestRevocationUnsupported:
     def test_revoke_token_skipped_when_revocation_endpoint_none(self) -> None:
         as_meta = _make_as_metadata(revocation_endpoint=None)
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.post = AsyncMock()
 
         with patch("turnstone.core.mcp_oauth.log") as mock_log:
@@ -73,7 +73,7 @@ class TestRevocationUnsupported:
 class TestRevocationSuccess:
     def test_revoke_token_succeeds_on_200(self) -> None:
         as_meta = _make_as_metadata()
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.post = AsyncMock(return_value=_mk_response(200))
 
         with patch("turnstone.core.mcp_oauth.log") as mock_log:
@@ -103,7 +103,7 @@ class TestRevocationSuccess:
 
     def test_revoke_token_omits_client_secret_when_none(self) -> None:
         as_meta = _make_as_metadata()
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.post = AsyncMock(return_value=_mk_response(200))
 
         asyncio.run(
@@ -126,7 +126,7 @@ class TestRevocationSuccess:
         # RFC 7009 says the AS MAY return any 2xx; treat the whole range
         # as success.
         as_meta = _make_as_metadata()
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.post = AsyncMock(return_value=_mk_response(204))
 
         with patch("turnstone.core.mcp_oauth.log") as mock_log:
@@ -147,7 +147,7 @@ class TestRevocationSuccess:
 class TestRevocationFailureLogged:
     def _run_and_capture(self, status: int) -> list[Any]:
         as_meta = _make_as_metadata()
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.post = AsyncMock(return_value=_mk_response(status))
 
         with patch("turnstone.core.mcp_oauth.log") as mock_log:
@@ -193,8 +193,8 @@ class TestRevocationFailureLogged:
 class TestRevocationExceptionPaths:
     def test_revoke_token_handles_network_error(self) -> None:
         as_meta = _make_as_metadata()
-        client = MagicMock(spec=httpx.AsyncClient)
-        client.post = AsyncMock(side_effect=httpx.ConnectError("boom"))
+        client = MagicMock(spec=httpx2.AsyncClient)
+        client.post = AsyncMock(side_effect=httpx2.ConnectError("boom"))
 
         with patch("turnstone.core.mcp_oauth.log") as mock_log:
             asyncio.run(
@@ -216,10 +216,10 @@ class TestRevocationExceptionPaths:
         )
         assert failed_call.kwargs.get("error") == "ConnectError"
 
-    def test_revoke_token_handles_httpx_timeout(self) -> None:
+    def test_revoke_token_handles_http_timeout(self) -> None:
         as_meta = _make_as_metadata()
-        client = MagicMock(spec=httpx.AsyncClient)
-        client.post = AsyncMock(side_effect=httpx.TimeoutException("slow"))
+        client = MagicMock(spec=httpx2.AsyncClient)
+        client.post = AsyncMock(side_effect=httpx2.TimeoutException("slow"))
 
         with patch("turnstone.core.mcp_oauth.log") as mock_log:
             asyncio.run(
@@ -243,7 +243,7 @@ class TestRevocationExceptionPaths:
 
     def test_revoke_token_handles_asyncio_timeout(self) -> None:
         as_meta = _make_as_metadata()
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
 
         async def _slow(*_args: Any, **_kwargs: Any) -> Any:
             await asyncio.sleep(10.0)
@@ -277,12 +277,12 @@ class TestRevocationExceptionPaths:
     def test_revoke_token_no_exc_info_in_logs(self) -> None:
         """Bearer-leak invariant: the revoke path must NEVER set
         ``exc_info=True``. Chained ``__context__`` may include an
-        ``httpx.Request`` whose ``Authorization`` header holds a
+        ``httpx2.Request`` whose ``Authorization`` header holds a
         bearer; the traceback formatter would render it.
         """
         as_meta = _make_as_metadata()
-        client = MagicMock(spec=httpx.AsyncClient)
-        client.post = AsyncMock(side_effect=httpx.ConnectError("boom"))
+        client = MagicMock(spec=httpx2.AsyncClient)
+        client.post = AsyncMock(side_effect=httpx2.ConnectError("boom"))
 
         with patch("turnstone.core.mcp_oauth.log") as mock_log:
             asyncio.run(
@@ -330,7 +330,7 @@ class TestAttemptUpstreamRevokeNeverRaises:
         storage = MagicMock()
         storage.get_mcp_oauth_client_secret_ct.return_value = None
         return {
-            "http_client": MagicMock(spec=httpx.AsyncClient),
+            "http_client": MagicMock(spec=httpx2.AsyncClient),
             "metadata_cache": None,
             "storage": storage,
             "token_store": token_store,
@@ -371,7 +371,7 @@ class TestAttemptUpstreamRevokeNeverRaises:
         for call in mock_log.info.call_args_list:
             assert "exc_info" not in call.kwargs, (
                 "outer-block log must not use exc_info=True — chained "
-                "__context__ may carry an httpx.Request bearer"
+                "__context__ may carry an httpx2.Request bearer"
             )
 
     def test_attempt_upstream_revoke_logs_discovery_failure(self) -> None:

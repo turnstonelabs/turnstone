@@ -32,7 +32,7 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 from unittest.mock import MagicMock, patch
 
-import httpx
+import httpx2
 import pytest
 import uvicorn
 from aiohttp import web
@@ -302,7 +302,7 @@ def _make_app_state(storage: SQLiteBackend, *, cipher: Any) -> SimpleNamespace:
         mcp_oauth_metadata_cache={},
         oauth_context=make_oauth_context(
             token_store=MCPTokenStore(storage, cipher, node_id="test"),
-            http_client=MagicMock(spec=httpx.AsyncClient),
+            http_client=MagicMock(spec=httpx2.AsyncClient),
         ),
     )
 
@@ -320,14 +320,14 @@ def test_browser_consent_then_dispatch_refreshes_on_oauth_runtime(
     manager._static_health_check_s = 0
 
     async def run() -> None:
-        requests: list[tuple[str, httpx.AsyncClient, asyncio.AbstractEventLoop]] = []
+        requests: list[tuple[str, httpx2.AsyncClient, asyncio.AbstractEventLoop]] = []
         grants: list[str] = []
 
-        def client() -> httpx.AsyncClient:
-            instance = httpx.AsyncClient()
+        def client() -> httpx2.AsyncClient:
+            instance = httpx2.AsyncClient()
             owner = asyncio.get_running_loop()
 
-            async def observe(request: httpx.Request) -> None:
+            async def observe(request: httpx2.Request) -> None:
                 # Deterministic even if a slow runner expires a keepalive socket.
                 assert asyncio.get_running_loop() is owner
                 requests.append((request.url.path, instance, owner))
@@ -386,8 +386,8 @@ def test_browser_consent_then_dispatch_refreshes_on_oauth_runtime(
                 manager.set_app_state(app.state)
                 await asyncio.to_thread(manager.start)
                 try:
-                    async with httpx.AsyncClient(
-                        transport=httpx.ASGITransport(app), base_url="https://testserver"
+                    async with httpx2.AsyncClient(
+                        transport=httpx2.ASGITransport(app), base_url="https://testserver"
                     ) as browser:
                         start = await browser.get(
                             "/v1/api/mcp/oauth/start", params={"server": "pool-srv"}

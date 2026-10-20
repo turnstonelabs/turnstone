@@ -21,7 +21,7 @@ import threading
 from typing import Any
 from unittest.mock import patch
 
-import httpx
+import httpx2
 import pytest
 
 from tests._oauth_runtime_helpers import make_oauth_context
@@ -147,7 +147,7 @@ def _wire_mgr(mgr: MCPClientManager, backend: Any) -> None:
         mcp_oauth_metadata_cache={},
         oauth_context=make_oauth_context(
             token_store=MCPTokenStore(backend, cipher, node_id="test"),
-            http_client=MagicMock(spec=httpx.AsyncClient),
+            http_client=MagicMock(spec=httpx2.AsyncClient),
         ),
     )
     mgr.set_storage(backend)

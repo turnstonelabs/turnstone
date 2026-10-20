@@ -20,7 +20,7 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 from unittest.mock import MagicMock, patch
 
-import httpx
+import httpx2
 import pytest
 import uvicorn
 from mcp.server.mcpserver import MCPServer
@@ -244,7 +244,7 @@ def _make_app_state(storage: SQLiteBackend, *, cipher: Any) -> SimpleNamespace:
         mcp_oauth_metadata_cache={},
         oauth_context=make_oauth_context(
             token_store=MCPTokenStore(storage, cipher, node_id="test"),
-            http_client=MagicMock(spec=httpx.AsyncClient),
+            http_client=MagicMock(spec=httpx2.AsyncClient),
         ),
     )
 

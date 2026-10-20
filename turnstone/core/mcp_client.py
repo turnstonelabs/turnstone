@@ -5721,8 +5721,8 @@ class MCPClientManager:
         only signal that reaches us in production). The ``HTTPStatusError`` fallback classifies an
         httpx2 status error raised outside the SDK; none is known to reach it today. The OAuth
         refresh (:func:`turnstone.core.mcp_oauth._refresh_and_persist`) wraps its HTTP errors in
-        ``OAuthRefreshError``, and must keep doing so: it still runs on httpx 1.x, whose errors no
-        classifier here recognizes.
+        ``OAuthRefreshError``, and must keep doing so: its client is httpx2 too, so an error it let
+        escape would read to the classifiers in this module as the MCP server's own failure.
         """
         if isinstance(exc, _CapturedHTTPError):
             capture = exc.capture

@@ -16,7 +16,7 @@ import asyncio
 from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
-import httpx
+import httpx2
 import pytest
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
@@ -81,7 +81,7 @@ async def _revoke_handler(request: Request) -> Response:
 def _build_app(
     *,
     storage: SQLiteBackend,
-    http_client: httpx.AsyncClient | MagicMock,
+    http_client: httpx2.AsyncClient | MagicMock,
     token_store: MCPTokenStore | None,
     user_id: str = "user-1",
     mcp_client: Any = None,
@@ -243,7 +243,7 @@ def _mk_response(
 ) -> MagicMock:
     import json as _json
 
-    resp = MagicMock(spec=httpx.Response)
+    resp = MagicMock(spec=httpx2.Response)
     resp.status_code = status_code
     resp.headers = headers or {}
     body_str = _json.dumps(json_body) if json_body is not None else ""
@@ -295,7 +295,7 @@ def storage(tmp_path: Any, sqlite_backend_factory) -> SQLiteBackend:
 
 @pytest.fixture
 def http_client_mock() -> MagicMock:
-    client = MagicMock(spec=httpx.AsyncClient)
+    client = MagicMock(spec=httpx2.AsyncClient)
     client.get = AsyncMock()
     client.post = AsyncMock()
     return client

@@ -339,7 +339,7 @@ obo_audience = "api://cli"
     script = """
 import asyncio
 import threading
-import httpx
+import httpx2
 from turnstone import cli
 from turnstone.core import mcp_crypto
 from turnstone.core.mcp_client import MCPClientManager
@@ -357,8 +357,8 @@ def make_client():
         assert asyncio.get_running_loop() is loop
         assert threading.current_thread().name == "oauth-loop"
         assert request.url.path == "/token"
-        return httpx.Response(200, json={"access_token": "cli-minted", "expires_in": 3600})
-    return httpx.AsyncClient(transport=httpx.MockTransport(post))
+        return httpx2.Response(200, json={"access_token": "cli-minted", "expires_in": 3600})
+    return httpx2.AsyncClient(transport=httpx2.MockTransport(post))
 
 original_start = MCPClientManager.start
 def start(manager):

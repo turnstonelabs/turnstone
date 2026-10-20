@@ -39,7 +39,7 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, MagicMock
 
-import httpx
+import httpx2
 import pytest
 
 from tests._oauth_runtime_helpers import make_oauth_context, run_adapter
@@ -87,7 +87,7 @@ def storage(tmp_path: Any, sqlite_backend_factory) -> SQLiteBackend:
 def _make_app_state(
     storage: SQLiteBackend,
     *,
-    http_client: httpx.AsyncClient,
+    http_client: httpx2.AsyncClient,
     oidc_config: OIDCConfig,
 ) -> SimpleNamespace:
     return SimpleNamespace(
@@ -166,7 +166,7 @@ def _seed_cache_row(
 
 
 def _mk_response(status_code: int = 200, json_body: Any = None) -> MagicMock:
-    resp = MagicMock(spec=httpx.Response)
+    resp = MagicMock(spec=httpx2.Response)
     resp.status_code = status_code
     resp.headers = {}
     body = "" if json_body is None else str(json_body)
@@ -199,7 +199,7 @@ class TestEntraLeg:
         caches as a refresh-less ``oauth_tokens`` row with ``as_issuer`` /
         ``audience`` populated and ``expires_at`` derived from ``expires_in``."""
         _seed_obo_server(storage)  # empty oauth_scopes → scope falls back to /.default
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.post = AsyncMock(
             return_value=_mk_response(200, {"access_token": "at-minted", "expires_in": 3600})
         )
@@ -246,7 +246,7 @@ class TestEntraLeg:
         scope list would drop the audience → wrong-audience bearer). Regression
         guard for the review's D finding."""
         _seed_obo_server(storage, oauth_scopes="custom.scope")
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.post = AsyncMock(
             return_value=_mk_response(200, {"access_token": "at-minted", "expires_in": 3600})
         )
@@ -273,7 +273,7 @@ class TestEntraLeg:
         believing it is the narrow configured one, and a scope narrowing that
         can't apply under entra would look like it did."""
         _seed_obo_server(storage, oauth_scopes="custom.scope")
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.post = AsyncMock()
         client.post.return_value = _mk_response(
             200, {"access_token": "at-broad-default", "expires_in": 3600}
@@ -301,7 +301,7 @@ class TestEntraLeg:
         """Case 5: Entra usually rotates the RT on redemption — the newest
         value MUST be persisted to the shared credential (write-back rule)."""
         _seed_obo_server(storage)
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.post = AsyncMock(
             return_value=_mk_response(
                 200,
@@ -337,7 +337,7 @@ class TestRfc8693Leg:
         ``subject_token`` is the FIRST call's access token; the RT rotated by
         call 1 is persisted to the credential."""
         _seed_obo_server(storage)  # empty oauth_scopes → exchange carries NO scope key
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.post = AsyncMock(
             side_effect=[
                 _mk_response(
@@ -396,7 +396,7 @@ class TestRfc8693Leg:
         ``scope`` (Keycloak optional audience scopes must be explicit) while
         the refresh leg still sends none."""
         _seed_obo_server(storage, oauth_scopes="custom.scope")
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.post = AsyncMock(
             side_effect=[
                 _mk_response(200, {"access_token": "subject-at", "expires_in": 300}),
@@ -436,7 +436,7 @@ class TestRfc8693Leg:
         exchange call and classifies transient — a malformed IdP response must
         not delete anything."""
         _seed_obo_server(storage)
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.post = AsyncMock(return_value=_mk_response(200, {"refresh_token": "rt-x"}))
         state = _make_app_state(
             storage,
@@ -460,7 +460,7 @@ class TestRfc8693Leg:
         for every obo server would redeem the consumed rt-1 and cascade-lock the
         user out. The exchange-response RT must NOT overwrite the credential."""
         _seed_obo_server(storage)
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.post = AsyncMock(
             side_effect=[
                 _mk_response(
@@ -507,7 +507,7 @@ class TestRfc8693Leg:
         from turnstone.core.oauth.tokens import _OBO_DEFAULT_TTL_SECONDS
 
         _seed_obo_server(storage)
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         # Entra-shaped single-POST mint, but the IdP omits expires_in.
         client.post = AsyncMock(return_value=_mk_response(200, {"access_token": "at-no-exp"}))
         state = _make_app_state(storage, http_client=client, oidc_config=make_oidc_config())
@@ -531,7 +531,7 @@ class TestRfc8693Leg:
         (audience-scoped) refresh_token; it must never be written to the shared
         issuer-wide credential."""
         _seed_obo_server(storage)
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.post = AsyncMock(
             side_effect=[
                 # Refresh leg does NOT rotate (no refresh_token).
@@ -574,7 +574,7 @@ class TestCacheAndCredentialLookup:
         """Case 4: a fresh ``oauth_tokens`` row is served straight from the
         cache — no IdP round-trip."""
         _seed_obo_server(storage)
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.post = AsyncMock()
         state = _make_app_state(storage, http_client=client, oidc_config=make_oidc_config())
         _seed_credential(state)
@@ -601,7 +601,7 @@ class TestCacheAndCredentialLookup:
         _seed_obo_server(storage)
 
         def _run_with_hint(hint: bool | None) -> tuple[Any, int]:
-            client = MagicMock(spec=httpx.AsyncClient)
+            client = MagicMock(spec=httpx2.AsyncClient)
             client.post = AsyncMock(
                 return_value=_mk_response(200, {"access_token": "minted-at", "expires_in": 3600})
             )
@@ -644,7 +644,7 @@ class TestCacheAndCredentialLookup:
         audience narrowing has to take effect immediately, not at token TTL. The
         stale row is ignored and a fresh mint (for the current audience) runs."""
         _seed_obo_server(storage)  # server oauth_audience = AUDIENCE (api://aud-a)
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.post = AsyncMock(
             return_value=_mk_response(200, {"access_token": "reminted-at", "expires_in": 3600})
         )
@@ -672,7 +672,7 @@ class TestCacheAndCredentialLookup:
         after the server's scopes are narrowed — even if the purge failed — so
         the privilege reduction takes effect on the next dispatch, not at TTL."""
         _seed_obo_server(storage, oauth_scopes="api.read")  # server's CURRENT scopes
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.post = AsyncMock(
             side_effect=[
                 _mk_response(200, {"access_token": "subject-at", "expires_in": 300}),
@@ -713,7 +713,7 @@ class TestCacheAndCredentialLookup:
         consent affordance is a re-login, not per-server consent); the IdP is
         never contacted."""
         _seed_obo_server(storage)
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.post = AsyncMock()
         state = _make_app_state(storage, http_client=client, oidc_config=make_oidc_config())
         # Deliberately NO upsert_oidc_credential.
@@ -739,7 +739,7 @@ class TestFailureHandling:
         survives, so one missing tenant grant can't lock the user out of
         every other OBO server."""
         _seed_obo_server(storage)
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.post = AsyncMock(
             return_value=_mk_response(
                 400,
@@ -779,7 +779,7 @@ class TestFailureHandling:
         cooldown makes an immediate second attempt return transient with NO
         additional IdP call."""
         _seed_obo_server(storage)
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.post = AsyncMock(
             return_value=_mk_response(503, {"error": "temporarily_unavailable"})
         )
@@ -803,11 +803,35 @@ class TestFailureHandling:
         assert client.post.call_count == 1
         assert oauth_context(state).token_store.get_oidc_credential(USER, ISSUER) is not None
 
+    def test_unreachable_token_endpoint_is_transient_through_a_real_client(
+        self, storage: SQLiteBackend
+    ) -> None:
+        """A transport failure on the mint leg is a transient result, never a raise, through a
+        real client: the grant's catch has to match the client's library, or the error escapes
+        the classified lookup into the MCP client."""
+        _seed_obo_server(storage)
+        calls: list[str] = []
+
+        def unreachable(request: httpx2.Request) -> httpx2.Response:
+            calls.append(request.method)
+            raise httpx2.ConnectError("connection refused", request=request)
+
+        client = httpx2.AsyncClient(transport=httpx2.MockTransport(unreachable))
+        state = _make_app_state(storage, http_client=client, oidc_config=make_oidc_config())
+        _seed_credential(state)
+
+        result = _mint(state)
+
+        assert result.kind == "refresh_failed_transient"
+        assert calls == ["POST"]
+        assert oauth_context(state).token_store.get_oidc_credential(USER, ISSUER) is not None
+        assert storage.get_oauth_token(USER, SERVER) is None
+
     def test_missing_access_token_in_200_body_is_transient(self, storage: SQLiteBackend) -> None:
         """Case 9: a 200 body without ``access_token`` is a malformed-IdP
         blip — transient, credential kept, nothing cached."""
         _seed_obo_server(storage)
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.post = AsyncMock(return_value=_mk_response(200, {"expires_in": 3600}))
         state = _make_app_state(storage, http_client=client, oidc_config=make_oidc_config())
         _seed_credential(state)
@@ -832,7 +856,7 @@ class TestFailureHandling:
         from turnstone.core.oauth.tokens import _refresh_backoff_state
 
         _seed_obo_server(storage)
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         # 400 with an error body over the 64KB cap.
         client.post = AsyncMock(
             return_value=_mk_response(400, {"error": "invalid_grant", "pad": "x" * (70 * 1024)})
@@ -857,7 +881,7 @@ class TestFailureHandling:
         import logging
 
         _seed_obo_server(storage)
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.post = AsyncMock(
             return_value=_mk_response(
                 400,
@@ -886,7 +910,7 @@ class TestFailureHandling:
         second dispatch surfaces the honest permanent classification during the
         cooldown window (not a misleading retryable transient)."""
         _seed_obo_server(storage)
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.post = AsyncMock(
             return_value=_mk_response(400, {"error": "invalid_grant", "error_description": "dead"})
         )
@@ -922,7 +946,7 @@ class TestFailureHandling:
         the cooldown) finds no row to delete and must NOT append a second audit
         row — the crux of the audit-spam finding."""
         _seed_obo_server(storage)
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.post = AsyncMock(
             return_value=_mk_response(400, {"error": "invalid_grant", "error_description": "dead"})
         )
@@ -959,7 +983,7 @@ class TestFailureHandling:
         from turnstone.core.oauth.tokens import _refresh_backoff_state
 
         _seed_obo_server(storage)
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.post = AsyncMock(
             return_value=_mk_response(200, {"access_token": "at-reminted", "expires_in": 3600})
         )
@@ -1004,7 +1028,7 @@ class TestFailureHandling:
         from unittest.mock import patch
 
         _seed_obo_server(storage)
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.post = AsyncMock()  # any IdP call would be a gate failure
         state = _make_app_state(storage, http_client=client, oidc_config=make_oidc_config())
         _seed_credential(state)
@@ -1054,7 +1078,7 @@ class TestFailureHandling:
         from unittest.mock import patch
 
         _seed_obo_server(storage)
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.post = AsyncMock(
             return_value=_mk_response(
                 200, {"access_token": "genuinely-reminted", "expires_in": 3600}
@@ -1104,7 +1128,7 @@ class TestFailureHandling:
         from unittest.mock import patch
 
         _seed_obo_server(storage)
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.post = AsyncMock(
             side_effect=[
                 _mk_response(
@@ -1150,7 +1174,7 @@ class TestFailureHandling:
         from unittest.mock import patch
 
         _seed_obo_server(storage)
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.post = AsyncMock(
             return_value=_mk_response(200, {"access_token": "minted-at", "expires_in": 3600})
         )
@@ -1182,7 +1206,7 @@ class TestFailureHandling:
         from turnstone.core.token_store.crypto import TokenDecryptError
 
         _seed_obo_server(storage)
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.post = AsyncMock()
         state = _make_app_state(storage, http_client=client, oidc_config=make_oidc_config())
         _seed_credential(state)
@@ -1212,7 +1236,7 @@ class TestMisconfiguration:
         operator-fixable misconfig — retryable classification, zero IdP
         calls, no exception (fixing config heals without re-consent)."""
         _seed_obo_server(storage)
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.post = AsyncMock()
         state = _make_app_state(
             storage,
@@ -1232,7 +1256,7 @@ class TestMisconfiguration:
         """Case 10b: a server row without ``oauth_audience`` cannot be minted
         for — same retryable misconfig outcome, zero IdP calls."""
         _seed_obo_server(storage, oauth_audience=None)
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.post = AsyncMock()
         state = _make_app_state(storage, http_client=client, oidc_config=make_oidc_config())
         _seed_credential(state)

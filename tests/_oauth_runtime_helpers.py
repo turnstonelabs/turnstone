@@ -6,7 +6,7 @@ from collections.abc import Coroutine
 from typing import Any
 from unittest.mock import Mock
 
-import httpx
+import httpx2
 
 from turnstone.core.oauth.context import OAuthContext
 from turnstone.core.oauth.runtime import OAuthRuntime
@@ -19,7 +19,7 @@ def run_adapter[T](operation: Coroutine[Any, Any, T]) -> T:
     return adapter_runner.get().run(operation)
 
 
-def make_oauth_context(*, http_client: httpx.AsyncClient, **fields: Any) -> OAuthContext:
+def make_oauth_context(*, http_client: httpx2.AsyncClient, **fields: Any) -> OAuthContext:
     """Run adapter operations on a real OAuth loop with a controlled transport.
 
     The suite's runtime fixture joins these threads at teardown, including

@@ -52,7 +52,7 @@ from turnstone.core.oauth.context import OAuthContext, oauth_context
 from turnstone.core.oauth.runtime import OAuthRuntime, shutdown_oauth_runtime
 
 if TYPE_CHECKING:
-    import httpx
+    import httpx2
 
 # Reuse the verified interactive-login machinery from the wire spike.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -88,10 +88,10 @@ def aud_matches(token: str, want_audience: str) -> tuple[bool, str]:
 
 
 class _CountingClient:
-    """Wraps httpx.AsyncClient, counting token-endpoint POSTs so cache hits
+    """Wraps httpx2.AsyncClient, counting token-endpoint POSTs so cache hits
     (which must issue zero) are observable."""
 
-    def __init__(self, inner: httpx.AsyncClient) -> None:
+    def __init__(self, inner: httpx2.AsyncClient) -> None:
         self._inner = inner
         self.posts = 0
 
@@ -102,7 +102,7 @@ class _CountingClient:
     async def aclose(self) -> None:
         await self._inner.aclose()
 
-    async def post(self, *args: Any, **kwargs: Any) -> httpx.Response:
+    async def post(self, *args: Any, **kwargs: Any) -> httpx2.Response:
         self.posts += 1
         try:
             response = await self._inner.post(*args, **kwargs)
@@ -128,7 +128,7 @@ def _make_app_state(
     context = OAuthContext(storage=storage, token_store=store, oidc_config=oidc_config)
     runtime = OAuthRuntime(
         context,
-        client_factory=lambda: cast("httpx.AsyncClient", _CountingClient(json_http_client(20.0))),
+        client_factory=lambda: cast("httpx2.AsyncClient", _CountingClient(json_http_client(20.0))),
     )
     context.runtime = runtime
     runtime.start()

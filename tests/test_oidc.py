@@ -12,7 +12,7 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
-import httpx
+import httpx2
 import jwt as pyjwt
 import pytest
 
@@ -52,7 +52,7 @@ def _mock_storage(**overrides):
 
 
 def _mock_async_client(mock_get):
-    """Build a patched httpx.AsyncClient context manager for async tests."""
+    """Build a patched httpx2.AsyncClient context manager for async tests."""
 
     class _AsyncCtx:
         async def __aenter__(self):
@@ -863,7 +863,7 @@ class TestValidateDiscoveredEndpoint:
             client = _mock_async_client(lambda url: _async_return(mock_response))
             with (
                 patch("socket.getaddrinfo", return_value=self._PUBLIC_ADDR),
-                patch("httpx.AsyncClient", return_value=client),
+                patch("httpx2.AsyncClient", return_value=client),
             ):
                 result = await discover_oidc(config)
             assert result.enabled is False
@@ -896,7 +896,7 @@ class TestValidateDiscoveredEndpoint:
             client = _mock_async_client(lambda url: _async_return(mock_response))
             with (
                 patch("socket.getaddrinfo", return_value=self._PUBLIC_ADDR),
-                patch("httpx.AsyncClient", return_value=client),
+                patch("httpx2.AsyncClient", return_value=client),
             ):
                 result = await discover_oidc(config)
             assert result.enabled is False
@@ -926,7 +926,7 @@ class TestValidateDiscoveredEndpoint:
             client = _mock_async_client(lambda url: _async_return(mock_response))
             with (
                 patch("socket.getaddrinfo", return_value=self._PUBLIC_ADDR),
-                patch("httpx.AsyncClient", return_value=client),
+                patch("httpx2.AsyncClient", return_value=client),
             ):
                 result = await discover_oidc(config)
             assert result.enabled is True
@@ -961,7 +961,7 @@ class TestValidateDiscoveredEndpoint:
             client = _mock_async_client(lambda url: _async_return(mock_response))
             with (
                 patch("socket.getaddrinfo", return_value=self._PUBLIC_ADDR),
-                patch("httpx.AsyncClient", return_value=client),
+                patch("httpx2.AsyncClient", return_value=client),
             ):
                 result = await discover_oidc(config)
             assert result.enabled is True
@@ -991,7 +991,7 @@ class TestValidateDiscoveredEndpoint:
             client = _mock_async_client(lambda url: _async_return(mock_response))
             with (
                 patch("socket.getaddrinfo", return_value=self._PUBLIC_ADDR),
-                patch("httpx.AsyncClient", return_value=client),
+                patch("httpx2.AsyncClient", return_value=client),
             ):
                 result = await discover_oidc(config)
             assert result.enabled is False
@@ -1039,7 +1039,7 @@ class TestValidateDiscoveredEndpoint:
             client = _mock_async_client(lambda url: _async_return(mock_response))
             with (
                 patch("socket.getaddrinfo", side_effect=_resolve),
-                patch("httpx.AsyncClient", return_value=client),
+                patch("httpx2.AsyncClient", return_value=client),
             ):
                 result = await discover_oidc(config)
             assert result.enabled is False
@@ -1069,7 +1069,7 @@ class TestValidateDiscoveredEndpoint:
             client = _mock_async_client(lambda url: _async_return(mock_response))
             with (
                 patch("socket.getaddrinfo", return_value=self._LOOPBACK_ADDR),
-                patch("httpx.AsyncClient", return_value=client),
+                patch("httpx2.AsyncClient", return_value=client),
             ):
                 result = await discover_oidc(config)
             assert result.enabled is True
@@ -1098,7 +1098,7 @@ class TestValidateDiscoveredEndpoint:
             client = _mock_async_client(lambda url: _async_return(mock_response))
             with (
                 patch("socket.getaddrinfo", return_value=self._PUBLIC_ADDR),
-                patch("httpx.AsyncClient", return_value=client),
+                patch("httpx2.AsyncClient", return_value=client),
             ):
                 result = await discover_oidc(config)
             assert result.enabled is True
@@ -1409,7 +1409,7 @@ class TestValidateIDToken:
 
 
 def _mock_async_post_client(mock_post):
-    """Build a patched httpx.AsyncClient context manager that supports POST."""
+    """Build a patched httpx2.AsyncClient context manager that supports POST."""
 
     class _AsyncCtx:
         async def __aenter__(self):
@@ -1439,7 +1439,7 @@ class TestExchangeCode:
         async def _run():
             client = _mock_async_post_client(_post)
             with (
-                patch("httpx.AsyncClient", return_value=client),
+                patch("httpx2.AsyncClient", return_value=client),
                 pytest.raises(OIDCError, match="non-dict body"),
             ):
                 await exchange_code(config, "code", "https://app.example.com/cb", "verifier")
@@ -1460,7 +1460,7 @@ class TestExchangeCode:
         async def _run():
             client = _mock_async_post_client(_post)
             with (
-                patch("httpx.AsyncClient", return_value=client),
+                patch("httpx2.AsyncClient", return_value=client),
                 pytest.raises(OIDCError) as exc_info,
             ):
                 await exchange_code(config, "code", "https://app.example.com/cb", "verifier")
@@ -1487,7 +1487,7 @@ class TestExchangeCode:
         async def _run():
             client = _mock_async_post_client(_post)
             with (
-                patch("httpx.AsyncClient", return_value=client),
+                patch("httpx2.AsyncClient", return_value=client),
                 pytest.raises(OIDCError, match="returned 400"),
             ):
                 await exchange_code(config, "code", "https://app.example.com/cb", "verifier")
@@ -1508,7 +1508,7 @@ class TestExchangeCode:
         async def _run():
             client = _mock_async_post_client(_post)
             with (
-                patch("httpx.AsyncClient", return_value=client),
+                patch("httpx2.AsyncClient", return_value=client),
                 pytest.raises(OIDCError, match="returned 500"),
             ):
                 await exchange_code(config, "code", "https://app.example.com/cb", "verifier")
@@ -1516,16 +1516,16 @@ class TestExchangeCode:
         asyncio.run(_run())
 
     def test_exchange_code_network_error_wraps_to_oidc_error(self):
-        """``httpx.RequestError`` from the transport surfaces as ``OIDCError``."""
+        """``httpx2.RequestError`` from the transport surfaces as ``OIDCError``."""
         config = _make_config()
 
         async def _post(_url, _data):
-            raise httpx.ConnectError("connection refused")
+            raise httpx2.ConnectError("connection refused")
 
         async def _run():
             client = _mock_async_post_client(_post)
             with (
-                patch("httpx.AsyncClient", return_value=client),
+                patch("httpx2.AsyncClient", return_value=client),
                 pytest.raises(OIDCError, match="Token exchange request failed"),
             ):
                 await exchange_code(config, "code", "https://app.example.com/cb", "verifier")
@@ -1539,7 +1539,7 @@ class TestExchangeCode:
 
 
 def _mock_async_get_client(mock_get):
-    """Build a patched httpx.AsyncClient context manager that supports GET-with-timeout."""
+    """Build a patched httpx2.AsyncClient context manager that supports GET-with-timeout."""
 
     class _AsyncCtx:
         async def __aenter__(self):
@@ -1564,7 +1564,7 @@ class TestFetchJWKS:
         from turnstone.core.oauth.oidc import fetch_jwks
 
         mock_response = MagicMock()
-        mock_response.raise_for_status.side_effect = httpx.HTTPStatusError(
+        mock_response.raise_for_status.side_effect = httpx2.HTTPStatusError(
             "404", request=MagicMock(), response=mock_response
         )
 
@@ -1574,7 +1574,7 @@ class TestFetchJWKS:
         async def _run():
             client = _mock_async_get_client(_get)
             with (
-                patch("httpx.AsyncClient", return_value=client),
+                patch("httpx2.AsyncClient", return_value=client),
                 pytest.raises(OIDCError, match="JWKS fetch failed"),
             ):
                 await fetch_jwks("https://idp.example.com/jwks")
@@ -1595,7 +1595,7 @@ class TestFetchJWKS:
         async def _run():
             client = _mock_async_get_client(_get)
             with (
-                patch("httpx.AsyncClient", return_value=client),
+                patch("httpx2.AsyncClient", return_value=client),
                 pytest.raises(OIDCError, match="not a JSON object"),
             ):
                 await fetch_jwks("https://idp.example.com/jwks")
@@ -1616,7 +1616,7 @@ class TestFetchJWKS:
         async def _run():
             client = _mock_async_get_client(_get)
             with (
-                patch("httpx.AsyncClient", return_value=client),
+                patch("httpx2.AsyncClient", return_value=client),
                 pytest.raises(OIDCError, match="missing 'keys' array"),
             ):
                 await fetch_jwks("https://idp.example.com/jwks")
@@ -1637,7 +1637,7 @@ class TestFetchJWKS:
         async def _run():
             client = _mock_async_get_client(_get)
             with (
-                patch("httpx.AsyncClient", return_value=client),
+                patch("httpx2.AsyncClient", return_value=client),
                 pytest.raises(OIDCError, match="missing 'keys' array"),
             ):
                 await fetch_jwks("https://idp.example.com/jwks")
@@ -1645,16 +1645,16 @@ class TestFetchJWKS:
         asyncio.run(_run())
 
     def test_fetch_jwks_network_error_raises(self):
-        """``httpx.RequestError`` from the transport -> OIDCError."""
+        """``httpx2.RequestError`` from the transport -> OIDCError."""
         from turnstone.core.oauth.oidc import fetch_jwks
 
         async def _get(_url):
-            raise httpx.ConnectError("connection refused")
+            raise httpx2.ConnectError("connection refused")
 
         async def _run():
             client = _mock_async_get_client(_get)
             with (
-                patch("httpx.AsyncClient", return_value=client),
+                patch("httpx2.AsyncClient", return_value=client),
                 pytest.raises(OIDCError, match="JWKS fetch failed"),
             ):
                 await fetch_jwks("https://idp.example.com/jwks")
@@ -2341,7 +2341,7 @@ class TestDiscoverOIDC:
     _PUBLIC_ADDR = [(2, 1, 6, "", ("93.184.216.34", 0))]
 
     def test_discover_oidc_success(self):
-        """Mock httpx response, verify endpoints populated."""
+        """Mock httpx2 response, verify endpoints populated."""
         config = _make_config(
             authorization_endpoint="",
             token_endpoint="",
@@ -2364,7 +2364,7 @@ class TestDiscoverOIDC:
             client = _mock_async_client(lambda url: _async_return(mock_response))
             with (
                 patch("socket.getaddrinfo", return_value=self._PUBLIC_ADDR),
-                patch("httpx.AsyncClient", return_value=client),
+                patch("httpx2.AsyncClient", return_value=client),
             ):
                 result = await discover_oidc(config)
 
@@ -2419,7 +2419,7 @@ class TestDiscoverOIDC:
             client = _mock_async_client(lambda url: _async_return(mock_response))
             with (
                 patch("socket.getaddrinfo", return_value=[(2, 1, 6, "", ("10.0.0.5", 0))]),
-                patch("httpx.AsyncClient", return_value=client),
+                patch("httpx2.AsyncClient", return_value=client),
             ):
                 result = await discover_oidc(config)
 
@@ -2429,7 +2429,7 @@ class TestDiscoverOIDC:
         asyncio.run(_run())
 
     def test_discover_oidc_failure(self):
-        """Mock httpx error -> enabled=False returned."""
+        """Mock httpx2 error -> enabled=False returned."""
         config = _make_config(
             authorization_endpoint="",
             token_endpoint="",
@@ -2438,13 +2438,13 @@ class TestDiscoverOIDC:
         )
 
         async def _failing_get(url):
-            raise httpx.ConnectError("connection refused")
+            raise httpx2.ConnectError("connection refused")
 
         async def _run():
             client = _mock_async_client(_failing_get)
             with (
                 patch("socket.getaddrinfo", return_value=self._PUBLIC_ADDR),
-                patch("httpx.AsyncClient", return_value=client),
+                patch("httpx2.AsyncClient", return_value=client),
             ):
                 result = await discover_oidc(config)
 
@@ -2485,7 +2485,7 @@ class TestDiscoverOIDC:
             client = _mock_async_client(lambda url: _async_return(mock_response))
             with (
                 patch("socket.getaddrinfo", return_value=self._PUBLIC_ADDR),
-                patch("httpx.AsyncClient", return_value=client),
+                patch("httpx2.AsyncClient", return_value=client),
             ):
                 result = await discover_oidc(config)
 
@@ -2511,7 +2511,7 @@ class TestDiscoverOIDC:
                 client = _mock_async_client(lambda url: _async_return(resp))
                 with (
                     patch("socket.getaddrinfo", return_value=self._PUBLIC_ADDR),
-                    patch("httpx.AsyncClient", return_value=client),
+                    patch("httpx2.AsyncClient", return_value=client),
                 ):
                     return await discover_oidc(config)
 
@@ -2540,13 +2540,13 @@ class TestRuntimeRediscovery:
         )
 
         async def _raise_connect(url):
-            raise httpx.ConnectError("boom")
+            raise httpx2.ConnectError("boom")
 
         async def _run():
             client = _mock_async_client(_raise_connect)
             with (
                 patch("socket.getaddrinfo", return_value=self._PUBLIC_ADDR),
-                patch("httpx.AsyncClient", return_value=client),
+                patch("httpx2.AsyncClient", return_value=client),
             ):
                 return await discover_oidc(config)
 
@@ -2608,7 +2608,7 @@ class TestRuntimeRediscovery:
             client = _mock_async_client(lambda url: _async_return(mock_response))
             with (
                 patch("socket.getaddrinfo", return_value=[(2, 1, 6, "", ("93.184.216.34", 0))]),
-                patch("httpx.AsyncClient", return_value=client),
+                patch("httpx2.AsyncClient", return_value=client),
             ):
                 await maybe_rediscover_oidc(state)
 
@@ -2651,7 +2651,7 @@ class TestRuntimeRediscovery:
             client = _mock_async_client(_get)
             with (
                 patch("socket.getaddrinfo", return_value=[(2, 1, 6, "", ("93.184.216.34", 0))]),
-                patch("httpx.AsyncClient", return_value=client),
+                patch("httpx2.AsyncClient", return_value=client),
             ):
                 await maybe_rediscover_oidc(state)
                 # Same window: cooldown already gates a second probe.
@@ -2808,6 +2808,37 @@ class TestInitializeOIDCState:
         assert oauth_context(state).oidc_config is cfg
         assert state.jwks_data is None
 
+    def test_initialize_survives_an_unreachable_jwks_endpoint(self):
+        """An IdP whose JWKS endpoint is unreachable at boot leaves OIDC enabled for the lazy
+        retry. The real ``fetch_jwks`` runs on the long-lived client here, so its catch has to
+        match the client's library: an error it let through would stop the server starting."""
+        from turnstone.core.oauth.oidc import close_oidc_state
+
+        cfg = _make_config(redirect_base="https://app.example.com")
+        state = types.SimpleNamespace(jwks_data=None, oauth_context=OAuthContext(oidc_config=cfg))
+
+        def unreachable(request: httpx2.Request) -> httpx2.Response:
+            raise httpx2.ConnectError("connection refused", request=request)
+
+        real_client = httpx2.AsyncClient
+
+        def client_with_unreachable_idp(**kwargs: Any) -> httpx2.AsyncClient:
+            return real_client(transport=httpx2.MockTransport(unreachable), **kwargs)
+
+        async def _ok(c, *, client=None):
+            return c
+
+        with (
+            patch("turnstone.core.oauth.oidc.discover_oidc", side_effect=_ok),
+            patch("httpx2.AsyncClient", side_effect=client_with_unreachable_idp),
+        ):
+            asyncio.run(initialize_oidc_state(state))
+
+        assert oauth_context(state).oidc_config.enabled is True
+        assert state.jwks_data is None
+        assert state.oidc_http_client is not None
+        asyncio.run(close_oidc_state(state))
+
     def test_initialize_success(self):
         """Both discovery and JWKS prefetch succeed."""
         cfg = _make_config(redirect_base="https://app.example.com")
@@ -2831,6 +2862,8 @@ class TestInitializeOIDCState:
         assert oauth_context(state).oidc_config.enabled is True
         assert state.jwks_data == jwks
         assert state.oidc_http_client is not None
+        # Sign-in keeps the proxy variables and SSL_CERT_* (see make_http_client).
+        assert state.oidc_http_client.trust_env is True
 
 
 async def _async_return(value):

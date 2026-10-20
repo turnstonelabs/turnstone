@@ -22,7 +22,7 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
-import httpx
+import httpx2
 import pytest
 import sqlalchemy as sa
 from aiohttp import web
@@ -104,7 +104,7 @@ class _ObservableLockCm:
 # ---------------------------------------------------------------------------
 
 
-def _make_app_state(storage: SQLiteBackend, *, http_client: httpx.AsyncClient) -> SimpleNamespace:
+def _make_app_state(storage: SQLiteBackend, *, http_client: httpx2.AsyncClient) -> SimpleNamespace:
     cipher = make_mcp_token_cipher()
     state = SimpleNamespace(
         auth_storage=storage,
@@ -171,7 +171,7 @@ def _good_as_metadata_doc() -> dict[str, Any]:
 
 
 def _mk_response(status_code: int = 200, json_body: Any = None) -> MagicMock:
-    resp = MagicMock(spec=httpx.Response)
+    resp = MagicMock(spec=httpx2.Response)
     resp.status_code = status_code
     resp.headers = {}
     body = "" if json_body is None else str(json_body)
@@ -207,16 +207,16 @@ def test_refresh_discovery_and_post_stay_off_the_browser_loop(
     _seed_server(storage)
 
     async def _run() -> None:
-        requests: list[tuple[str, httpx.AsyncClient, asyncio.AbstractEventLoop]] = []
+        requests: list[tuple[str, httpx2.AsyncClient, asyncio.AbstractEventLoop]] = []
 
-        def observe_client(client: httpx.AsyncClient) -> httpx.AsyncClient:
-            async def on_request(request: httpx.Request) -> None:
+        def observe_client(client: httpx2.AsyncClient) -> httpx2.AsyncClient:
+            async def on_request(request: httpx2.Request) -> None:
                 requests.append((request.url.path, client, asyncio.get_running_loop()))
 
             client.event_hooks["request"].append(on_request)
             return client
 
-        def transient_client(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
+        def transient_client(*args: Any, **kwargs: Any) -> httpx2.AsyncClient:
             return observe_client(json_http_client(*args, **kwargs))
 
         async def handle(request: web.Request) -> web.Response:
@@ -250,7 +250,7 @@ def test_refresh_discovery_and_post_stay_off_the_browser_loop(
             await web.TCPSite(runner, "127.0.0.1", 0).start()
             origin = f"http://127.0.0.1:{runner.addresses[0][1]}"
             storage.update_mcp_server("srv-id", oauth_as_issuer_cached=origin)
-            async with httpx.AsyncClient() as browser_client:
+            async with httpx2.AsyncClient() as browser_client:
                 observe_client(browser_client)
                 state = _make_app_state(storage, http_client=observe_client(json_http_client()))
                 state.mcp_oauth_http_client = browser_client
@@ -338,19 +338,19 @@ def test_sweep_refreshes_with_no_browser_client(
     mint_manager._user_token_refresh_keepalive_s = 3600 if keepalive else 0
     requests: list[str] = []
 
-    def handle(request: httpx.Request) -> httpx.Response:
+    def handle(request: httpx2.Request) -> httpx2.Response:
         requests.append(request.method)
         if request.method == "GET":
-            return httpx.Response(200, json=_good_as_metadata_doc())
+            return httpx2.Response(200, json=_good_as_metadata_doc())
         assert request.method == "POST"
         if failure:
             # A 400 reaches the error-code classifier even for the transient code.
-            return httpx.Response(400, json={"error": failure})
-        return httpx.Response(200, json={"access_token": "fresh-bbb", "expires_in": 3600})
+            return httpx2.Response(400, json={"error": failure})
+        return httpx2.Response(200, json={"access_token": "fresh-bbb", "expires_in": 3600})
 
     context = oauth_context(state)
     runtime = OAuthRuntime(
-        context, client_factory=lambda: httpx.AsyncClient(transport=httpx.MockTransport(handle))
+        context, client_factory=lambda: httpx2.AsyncClient(transport=httpx2.MockTransport(handle))
     )
     context.runtime = runtime
     runtime.start()
@@ -402,7 +402,7 @@ class TestRefreshFailureClassification:
     def test_transient_503_keeps_token(self, storage: SQLiteBackend) -> None:
         """A 503 from the token endpoint is transient: keep the token, retryable kind."""
         _seed_server(storage)
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.get = AsyncMock(return_value=_mk_response(200, _good_as_metadata_doc()))
         client.post = AsyncMock(
             return_value=_mk_response(503, {"error": "temporarily_unavailable"})
@@ -417,11 +417,11 @@ class TestRefreshFailureClassification:
         assert oauth_context(state).token_store.get_user_token("user-1", "srv-oauth") is not None
 
     def test_transient_network_error_keeps_token(self, storage: SQLiteBackend) -> None:
-        """A network error (httpx.HTTPError) is transient: keep the token, retryable kind."""
+        """A network error (httpx2.HTTPError) is transient: keep the token, retryable kind."""
         _seed_server(storage)
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.get = AsyncMock(return_value=_mk_response(200, _good_as_metadata_doc()))
-        client.post = AsyncMock(side_effect=httpx.ConnectError("connection refused"))
+        client.post = AsyncMock(side_effect=httpx2.ConnectError("connection refused"))
         state = _make_app_state(storage, http_client=client)
         _seed_token(state, expires_in_seconds=-1000)
 
@@ -442,7 +442,7 @@ class TestRefreshFailureClassification:
         pre-existing consent to an unexpected re-consent. oauth_user keeps
         TRANSIENT; the token survives."""
         _seed_server(storage)
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.get = AsyncMock(return_value=_mk_response(200, _good_as_metadata_doc()))
         # 401 with an error body over the 64KB cap.
         client.post = AsyncMock(
@@ -469,7 +469,7 @@ class TestRefreshFailureClassification:
         """Contrast: 400 invalid_grant IS permanent — deletion is correct and the
         eventual fix MUST preserve it."""
         _seed_server(storage)
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.get = AsyncMock(return_value=_mk_response(200, _good_as_metadata_doc()))
         client.post = AsyncMock(return_value=_mk_response(400, {"error": "invalid_grant"}))
         state = _make_app_state(storage, http_client=client)
@@ -486,7 +486,7 @@ class TestRefreshFailureClassification:
         Audience on the row), not a dead grant. Re-consenting would send the
         same value, so the token is kept and the failure stays ambiguous."""
         _seed_server(storage)
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.get = AsyncMock(return_value=_mk_response(200, _good_as_metadata_doc()))
         client.post = AsyncMock(return_value=_mk_response(400, {"error": "invalid_target"}))
         state = _make_app_state(storage, http_client=client)
@@ -508,7 +508,7 @@ class TestRefreshFailureClassification:
         from unittest.mock import patch
 
         _seed_server(storage)
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.get = AsyncMock(return_value=_mk_response(200, _good_as_metadata_doc()))
         client.post = AsyncMock(return_value=_mk_response(400, {"error": "invalid_grant"}))
         state = _make_app_state(storage, http_client=client)
@@ -531,7 +531,7 @@ class TestRefreshFailureClassification:
         status — broadening ``permanent`` to "any 400" would silently revoke
         consent on a config blip (the regression this guards)."""
         _seed_server(storage)
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.get = AsyncMock(return_value=_mk_response(200, _good_as_metadata_doc()))
         client.post = AsyncMock(return_value=_mk_response(400, {"error": "invalid_client"}))
         state = _make_app_state(storage, http_client=client)
@@ -547,7 +547,7 @@ class TestRefreshFailureClassification:
         the token — one oddity must not revoke. Escalation only bites after a
         sustained run (see ``test_ambiguous_streak_escalates_to_revoke``)."""
         _seed_server(storage)
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.get = AsyncMock(return_value=_mk_response(200, _good_as_metadata_doc()))
         client.post = AsyncMock(return_value=_mk_response(400, None))
         state = _make_app_state(storage, http_client=client)
@@ -562,7 +562,7 @@ class TestRefreshFailureClassification:
         """``invalid_grant`` is a dead grant at ANY client-error status, not just
         400/401 — a 403 invalid_grant must still revoke + re-consent."""
         _seed_server(storage)
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.get = AsyncMock(return_value=_mk_response(200, _good_as_metadata_doc()))
         client.post = AsyncMock(return_value=_mk_response(403, {"error": "invalid_grant"}))
         state = _make_app_state(storage, http_client=client)
@@ -577,7 +577,7 @@ class TestRefreshFailureClassification:
         """An OIDC interaction-required code (Entra surfaces these) means the user
         must re-consent / re-auth — treat as permanent, revoke."""
         _seed_server(storage)
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.get = AsyncMock(return_value=_mk_response(200, _good_as_metadata_doc()))
         client.post = AsyncMock(return_value=_mk_response(401, {"error": "interaction_required"}))
         state = _make_app_state(storage, http_client=client)
@@ -594,7 +594,7 @@ class TestRefreshFailureClassification:
         threshold-crossing attempt escalates to re-consent so the user isn't
         stranded on a retryable error forever."""
         _seed_server(storage)
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.get = AsyncMock(return_value=_mk_response(200, _good_as_metadata_doc()))
         client.post = AsyncMock(return_value=_mk_response(400, None))
         state = _make_app_state(storage, http_client=client)
@@ -622,7 +622,7 @@ class TestRefreshFailureClassification:
         so even a long AS outage — far past the ambiguous threshold — keeps the
         token. A blip must never revoke consent, however long it lasts."""
         _seed_server(storage)
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.get = AsyncMock(return_value=_mk_response(200, _good_as_metadata_doc()))
         client.post = AsyncMock(
             return_value=_mk_response(503, {"error": "temporarily_unavailable"})
@@ -646,7 +646,7 @@ class TestRefreshFailureClassification:
         window returns the retryable kind WITHOUT a second token-endpoint
         round-trip — so a down AS isn't hammered once per tool call."""
         _seed_server(storage)
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.get = AsyncMock(return_value=_mk_response(200, _good_as_metadata_doc()))
         client.post = AsyncMock(
             return_value=_mk_response(503, {"error": "temporarily_unavailable"})
@@ -669,7 +669,7 @@ class TestRefreshFailureClassification:
         the next lookup returns ``missing`` AND prunes both, so neither in-process
         dict grows unboundedly on the missing path."""
         _seed_server(storage)
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.get = AsyncMock(return_value=_mk_response(200, _good_as_metadata_doc()))
         client.post = AsyncMock(
             return_value=_mk_response(503, {"error": "temporarily_unavailable"})
@@ -718,7 +718,7 @@ class TestObserveOnlyLookup:
         """The exact contrast to ``test_permanent_invalid_grant_revokes``: same
         dead-grant signal, but observe-only leaves the row for the lazy path."""
         _seed_server(storage)
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.get = AsyncMock(return_value=_mk_response(200, _good_as_metadata_doc()))
         client.post = AsyncMock(return_value=_mk_response(400, {"error": "invalid_grant"}))
         state = _make_app_state(storage, http_client=client)
@@ -734,7 +734,7 @@ class TestObserveOnlyLookup:
         ambiguous_streak, so a later foreground dispatch is not pushed over the
         escalation edge by background activity (the finding this guards)."""
         _seed_server(storage)
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.get = AsyncMock(return_value=_mk_response(200, _good_as_metadata_doc()))
         client.post = AsyncMock(return_value=_mk_response(400, None))
         state = _make_app_state(storage, http_client=client)
@@ -753,7 +753,7 @@ class TestObserveOnlyLookup:
         """An expired token with no refresh token surfaces as a dead grant but is
         NOT deleted on the observe path."""
         _seed_server(storage)
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.get = AsyncMock(return_value=_mk_response(200, _good_as_metadata_doc()))
         state = _make_app_state(storage, http_client=client)
         _seed_token(state, expires_in_seconds=-1000, refresh=None)
@@ -767,7 +767,7 @@ class TestObserveOnlyLookup:
         """Observe mode is not read-only: a near-expiry token is still refreshed
         (only the destructive failure paths change)."""
         _seed_server(storage)
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.get = AsyncMock(return_value=_mk_response(200, _good_as_metadata_doc()))
         client.post = AsyncMock(
             return_value=_mk_response(
@@ -808,19 +808,19 @@ def test_shared_issuer_refresh_survives_resource_metadata_outage(
     metadata_url = f"{issuer}/.well-known/oauth-authorization-server"
     token_url = f"{issuer}/token"
 
-    def handle(request: httpx.Request) -> httpx.Response:
+    def handle(request: httpx2.Request) -> httpx2.Response:
         url = str(request.url)
         requests.append((request.method, url))
         if request.method == "GET" and request.url.host != "as.example.com":
             if not prm_available:
-                return httpx.Response(503)
-            return httpx.Response(
+                return httpx2.Response(503)
+            return httpx2.Response(
                 200, json={"resource": prm_urls[url], "authorization_servers": [issuer]}
             )
         if request.method == "GET" and url == metadata_url:
-            return httpx.Response(200, json=_good_as_metadata_doc())
+            return httpx2.Response(200, json=_good_as_metadata_doc())
         if request.method == "POST" and url == token_url:
-            return httpx.Response(
+            return httpx2.Response(
                 200,
                 json={
                     "access_token": "fresh-bbb",
@@ -845,7 +845,7 @@ def test_shared_issuer_refresh_survives_resource_metadata_outage(
                 )
             ],
         ):
-            async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
+            async with httpx2.AsyncClient(transport=httpx2.MockTransport(handle)) as client:
                 state = _make_app_state(storage, http_client=client)
                 for name, url in servers.items():
                     storage.create_mcp_server(
@@ -905,7 +905,7 @@ def test_shared_issuer_refresh_survives_resource_metadata_outage(
 class TestUnchangedToken:
     def test_returns_existing_token_when_not_expired(self, storage: SQLiteBackend) -> None:
         _seed_server(storage)
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.get = AsyncMock()
         client.post = AsyncMock()
         state = _make_app_state(storage, http_client=client)
@@ -924,7 +924,7 @@ class TestUnchangedToken:
 
     def test_no_token_returns_none(self, storage: SQLiteBackend) -> None:
         _seed_server(storage)
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         state = _make_app_state(storage, http_client=client)
 
         async def _run():
@@ -947,7 +947,7 @@ class TestUnchangedToken:
         from turnstone.core.token_store.crypto import TokenDecryptError
 
         _seed_server(storage)
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         state = _make_app_state(storage, http_client=client)
         _seed_token(state, expires_in_seconds=3600)
 
@@ -984,7 +984,7 @@ class TestUnchangedToken:
 class TestRefresh:
     def test_refreshes_when_expired(self, storage: SQLiteBackend) -> None:
         _seed_server(storage)
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.get = AsyncMock(return_value=_mk_response(200, _good_as_metadata_doc()))
         client.post = AsyncMock(
             return_value=_mk_response(
@@ -1019,7 +1019,7 @@ class TestRefresh:
 
     def test_refresh_failure_deletes_row_and_returns_none(self, storage: SQLiteBackend) -> None:
         _seed_server(storage)
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.get = AsyncMock(return_value=_mk_response(200, _good_as_metadata_doc()))
         # AS rejects the refresh — token should be revoked.
         client.post = AsyncMock(
@@ -1081,7 +1081,7 @@ class TestRefresh:
                 },
             )
 
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.get = AsyncMock(return_value=_mk_response(200, _good_as_metadata_doc()))
         client.post = AsyncMock(side_effect=_post)
         state = _make_app_state(storage, http_client=client)
@@ -1127,7 +1127,7 @@ class TestRefresh:
         translates "omitted" into "pass through existing".
         """
         _seed_server(storage)
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.get = AsyncMock(return_value=_mk_response(200, _good_as_metadata_doc()))
         client.post = AsyncMock(
             return_value=_mk_response(
@@ -1156,7 +1156,7 @@ class TestRefresh:
     def test_refresh_rotated_refresh_token_replaces_existing(self, storage: SQLiteBackend) -> None:
         """When AS issues a fresh refresh_token, the new value REPLACES the prior."""
         _seed_server(storage)
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.get = AsyncMock(return_value=_mk_response(200, _good_as_metadata_doc()))
         client.post = AsyncMock(
             return_value=_mk_response(
@@ -1185,7 +1185,7 @@ class TestRefresh:
 
     def test_expired_no_refresh_token_revokes(self, storage: SQLiteBackend) -> None:
         _seed_server(storage)
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         state = _make_app_state(storage, http_client=client)
         _seed_token(state, expires_in_seconds=-1000, refresh=None)
 
@@ -1220,7 +1220,7 @@ class TestRefresh:
             backend_row["server_id"],
             oauth_audience="https://different-audience.example.com/api",
         )
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.get = AsyncMock(return_value=_mk_response(200, _good_as_metadata_doc()))
         client.post = AsyncMock(
             return_value=_mk_response(
@@ -1268,7 +1268,7 @@ class TestExpiresInParsing:
 
     def test_expires_in_float_parsed_correctly(self, storage: SQLiteBackend) -> None:
         _seed_server(storage)
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.get = AsyncMock(return_value=_mk_response(200, _good_as_metadata_doc()))
         client.post = AsyncMock(
             return_value=_mk_response(
@@ -1299,7 +1299,7 @@ class TestExpiresInParsing:
 
     def test_expires_in_str_with_decimal_parsed_correctly(self, storage: SQLiteBackend) -> None:
         _seed_server(storage)
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.get = AsyncMock(return_value=_mk_response(200, _good_as_metadata_doc()))
         client.post = AsyncMock(
             return_value=_mk_response(
@@ -1328,7 +1328,7 @@ class TestExpiresInParsing:
 
     def test_expires_in_int_string_parsed_correctly(self, storage: SQLiteBackend) -> None:
         _seed_server(storage)
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.get = AsyncMock(return_value=_mk_response(200, _good_as_metadata_doc()))
         client.post = AsyncMock(
             return_value=_mk_response(
@@ -1378,7 +1378,7 @@ class TestAdvisoryLock:
     def test_advisory_lock_acquired_during_refresh(self, storage: SQLiteBackend) -> None:
         """The storage advisory lock must be acquired when refresh runs."""
         _seed_server(storage)
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.get = AsyncMock(return_value=_mk_response(200, _good_as_metadata_doc()))
         client.post = AsyncMock(
             return_value=_mk_response(
@@ -1632,7 +1632,7 @@ class TestClassifiedGetter:
         from turnstone.core.mcp_oauth import get_user_access_token_classified
 
         _seed_server(storage)
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         state = _make_app_state(storage, http_client=client)
         _seed_token(state, expires_in_seconds=3600)
 
@@ -1649,7 +1649,7 @@ class TestClassifiedGetter:
         from turnstone.core.mcp_oauth import get_user_access_token_classified
 
         _seed_server(storage)
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         state = _make_app_state(storage, http_client=client)
 
         async def _run():
@@ -1671,7 +1671,7 @@ class TestClassifiedGetter:
         from turnstone.core.token_store.crypto import TokenDecryptError
 
         _seed_server(storage)
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         state = _make_app_state(storage, http_client=client)
         _seed_token(state, expires_in_seconds=3600)
 
@@ -1696,7 +1696,7 @@ class TestClassifiedGetter:
         from turnstone.core.mcp_oauth import get_user_access_token_classified
 
         _seed_server(storage)
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.get = AsyncMock(return_value=_mk_response(200, _good_as_metadata_doc()))
         client.post = AsyncMock(return_value=_mk_response(400, {"error": "invalid_grant"}))
         state = _make_app_state(storage, http_client=client)
@@ -1717,7 +1717,7 @@ class TestClassifiedGetter:
         from turnstone.core.mcp_oauth import get_user_access_token_classified
 
         _seed_server(storage)
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         state = _make_app_state(storage, http_client=client)
         _seed_token(state, expires_in_seconds=-1000, refresh=None)
 
@@ -1732,7 +1732,7 @@ class TestClassifiedGetter:
     def test_classified_does_not_break_legacy_helper(self, storage: SQLiteBackend) -> None:
         """The legacy ``get_user_access_token`` keeps its ``str | None`` contract."""
         _seed_server(storage)
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         state = _make_app_state(storage, http_client=client)
         _seed_token(state, expires_in_seconds=3600)
 

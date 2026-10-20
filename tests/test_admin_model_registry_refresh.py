@@ -4069,7 +4069,7 @@ def test_hot_enable_model_auth_rebinds_sessions_and_preserves_runtime(
     """A static-only host can gain model auth without creating or replacing MCP."""
     import asyncio
 
-    import httpx
+    import httpx2
 
     from tests.conftest import make_mcp_token_cipher
     from turnstone import server
@@ -4112,14 +4112,14 @@ def test_hot_enable_model_auth_rebinds_sessions_and_preserves_runtime(
     state.workstreams = state.coord_mgr = sessions
     posts: list[asyncio.AbstractEventLoop] = []
 
-    def post(request: httpx.Request) -> httpx.Response:
+    def post(request: httpx2.Request) -> httpx2.Response:
         posts.append(asyncio.get_running_loop())
-        return httpx.Response(200, json={"access_token": "hot-token", "expires_in": 3600})
+        return httpx2.Response(200, json={"access_token": "hot-token", "expires_in": 3600})
 
     monkeypatch.setattr(
         oauth_http,
         "json_http_client",
-        lambda: httpx.AsyncClient(transport=httpx.MockTransport(post)),
+        lambda: httpx2.AsyncClient(transport=httpx2.MockTransport(post)),
     )
     monkeypatch.setattr("turnstone.core.storage._registry.get_storage", lambda: storage)
 

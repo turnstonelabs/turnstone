@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     import asyncio
 
-    import httpx
+    import httpx2
 
     from turnstone.core.oauth.oidc import OIDCConfig
     from turnstone.core.oauth.runtime import OAuthRuntime
@@ -46,7 +46,7 @@ class OAuthContext:
     coordination: TokenCoordination = field(default_factory=TokenCoordination)
     token_memo: dict[tuple[str, str], UserTokenPlain] = field(default_factory=dict)
     metadata_cache: dict[str, Any] = field(default_factory=dict)
-    http_client: httpx.AsyncClient | None = field(default=None, repr=False)
+    http_client: httpx2.AsyncClient | None = field(default=None, repr=False)
     runtime: OAuthRuntime | None = field(default=None, repr=False)
 
 

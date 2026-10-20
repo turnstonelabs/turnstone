@@ -9,13 +9,14 @@ calls to these helpers and re-raises ``OIDCError`` so its public API is
 unchanged. The MCP OAuth module catches :class:`OAuthSSRFError` directly.
 
 DNS-rebinding limitation: this module resolves the hostname during
-validation, but the subsequent ``httpx`` call resolves again. A hostname
+validation, but the subsequent ``httpx2`` call resolves again. A hostname
 the operator points at could in principle rebind between the two resolves
 to expose an internal address. Callers must ensure the AS / IdP hostname
 is operator-controlled — the SSRF guard prevents private-IP responses for
 hostnames the operator points at, but does not prevent rebinding by a
-hostile DNS authority. Pinning a single resolution into the ``httpx``
-transport is a future hardening step.
+hostile DNS authority. Pinning a single resolution into the client's
+transport, as the guarded fetch's ``PinnedTransport``
+(:mod:`turnstone.core._web_transport`) does, is a future hardening step.
 """
 
 from __future__ import annotations

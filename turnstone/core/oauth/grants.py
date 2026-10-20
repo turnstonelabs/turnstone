@@ -10,7 +10,7 @@ from turnstone.core.oauth import http as oauth_http
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
 
-    import httpx
+    import httpx2
 
 log = get_logger(__name__)
 
@@ -23,7 +23,7 @@ async def refresh_token(
     client_secret: str | None,
     resource: str,
     scopes: str,
-    http_client: httpx.AsyncClient,
+    http_client: httpx2.AsyncClient,
 ) -> dict[str, Any]:
     """Refresh an access token via the ``refresh_token`` grant.
 
@@ -79,7 +79,7 @@ async def _obo_token_post(
     *,
     token_endpoint: str,
     data: dict[str, str],
-    http_client: httpx.AsyncClient,
+    http_client: httpx2.AsyncClient,
     leg: str,
 ) -> dict[str, Any]:
     """POST one OBO grant-leg request; classify failures like a refresh.
@@ -136,7 +136,7 @@ async def _obo_mint_entra(
     credential_refresh_token: str,
     audience: str,
     scopes: str,
-    http_client: httpx.AsyncClient,
+    http_client: httpx2.AsyncClient,
     persist_rotation: Callable[[str], Awaitable[None]],
 ) -> dict[str, Any]:
     """Entra leg: redeem the client-bound RT directly for the audience.
@@ -191,7 +191,7 @@ async def _obo_mint_rfc8693(
     credential_refresh_token: str,
     audience: str,
     scopes: str,
-    http_client: httpx.AsyncClient,
+    http_client: httpx2.AsyncClient,
     persist_rotation: Callable[[str], Awaitable[None]],
 ) -> dict[str, Any]:
     """RFC 8693 leg: refresh grant for a subject token, then token exchange.
@@ -288,7 +288,7 @@ async def mint_client_credentials(
     client_id: str,
     client_secret: str,
     audience: str,
-    http_client: httpx.AsyncClient,
+    http_client: httpx2.AsyncClient,
 ) -> dict[str, Any]:
     """Redeem the application's client credentials for an Entra audience."""
     return await _obo_token_post(

@@ -28,7 +28,7 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, MagicMock
 
-import httpx
+import httpx2
 import pytest
 import sqlalchemy as sa
 from alembic import command
@@ -404,7 +404,7 @@ class TestGetClientKeyInjection:
 
 
 def _make_app_state(
-    storage: SQLiteBackend, *, http_client: httpx.AsyncClient, oidc_config: OIDCConfig
+    storage: SQLiteBackend, *, http_client: httpx2.AsyncClient, oidc_config: OIDCConfig
 ) -> SimpleNamespace:
     return SimpleNamespace(
         auth_storage=storage,
@@ -418,7 +418,7 @@ def _make_app_state(
 
 
 def _mk_response(status_code: int = 200, json_body: Any = None) -> MagicMock:
-    resp = MagicMock(spec=httpx.Response)
+    resp = MagicMock(spec=httpx2.Response)
     resp.status_code = status_code
     resp.headers = {}
     body = "" if json_body is None else str(json_body)
@@ -449,7 +449,7 @@ def _mint(state: SimpleNamespace, **kwargs: Any) -> Any:
 
 class TestMintOboAccessToken:
     def test_happy_path_redeems_default_scope_and_caches(self, storage: SQLiteBackend) -> None:
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.post = AsyncMock(
             return_value=_mk_response(200, {"access_token": "at-minted", "expires_in": 3600})
         )
@@ -485,7 +485,7 @@ class TestMintOboAccessToken:
     ) -> None:
         # One shared enc key, as a cluster shares MCP_ENC_KEY across workers.
         cipher = make_mcp_token_cipher()
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.post = AsyncMock(
             return_value=_mk_response(200, {"access_token": "at-minted", "expires_in": 3600})
         )
@@ -528,7 +528,7 @@ class TestMintOboAccessToken:
         assert client.post.call_count == 1
 
     def test_rotated_refresh_token_persisted_to_credential(self, storage: SQLiteBackend) -> None:
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.post = AsyncMock(
             return_value=_mk_response(
                 200, {"access_token": "at", "expires_in": 3600, "refresh_token": "rt-2"}
@@ -542,7 +542,7 @@ class TestMintOboAccessToken:
         assert cred is not None and cred["refresh_token"] == "rt-2"
 
     def test_force_refresh_bypasses_cache(self, storage: SQLiteBackend) -> None:
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.post = AsyncMock(
             side_effect=[
                 _mk_response(200, {"access_token": "at-1", "expires_in": 3600}),
@@ -557,7 +557,7 @@ class TestMintOboAccessToken:
         assert client.post.call_count == 2
 
     def test_missing_credential_returns_none_no_http(self, storage: SQLiteBackend) -> None:
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.post = AsyncMock()
         state = _make_app_state(storage, http_client=client, oidc_config=make_oidc_config())
         # No captured credential seeded.
@@ -571,7 +571,7 @@ class TestMintOboAccessToken:
 
         warned: set[tuple[str, str]] = set()
         monkeypatch.setattr(model_oauth, "_MODEL_OBO_MISSING_CRED_WARNED", warned)
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.post = AsyncMock()
         state = _make_app_state(storage, http_client=client, oidc_config=make_oidc_config())
         assert _mint(state) is None
@@ -607,7 +607,7 @@ class TestMintOboAccessToken:
         """The last-cause record is keyed per (prefix, alias, user)."""
         from turnstone.core.model_oauth import model_mint_refusal_cause, model_obo_cache_server
 
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.post = AsyncMock(
             return_value=_mk_response(200, {"access_token": "at-bob", "expires_in": 3600})
         )
@@ -642,7 +642,7 @@ class TestMintOboAccessToken:
         recording user's successful mint clears a cause."""
         from turnstone.core.model_oauth import model_mint_refusal_cause, model_obo_cache_server
 
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.post = AsyncMock(
             return_value=_mk_response(200, {"access_token": "at-bob", "expires_in": 3600})
         )
@@ -672,7 +672,7 @@ class TestMintOboAccessToken:
         )
 
     def test_oidc_disabled_returns_none_no_http(self, storage: SQLiteBackend) -> None:
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.post = AsyncMock()
         state = _make_app_state(
             storage, http_client=client, oidc_config=make_oidc_config(enabled=False)
@@ -687,7 +687,7 @@ class TestMintOboAccessToken:
         """Discovery-pending self-heals, so it is not ``oidc_not_enabled``."""
         import logging
 
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.post = AsyncMock()
         state = _make_app_state(
             storage,
@@ -708,7 +708,7 @@ class TestMintOboAccessToken:
         """The cause carries which half of the store/storage pair is absent."""
         import logging
 
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.post = AsyncMock()
         state = _make_app_state(storage, http_client=client, oidc_config=make_oidc_config())
         oauth_context(state).token_store = None
@@ -726,7 +726,7 @@ class TestMintOboAccessToken:
         assert client.post.call_count == 0
 
     def test_unusable_profile_returns_none_no_http(self, storage: SQLiteBackend) -> None:
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.post = AsyncMock()
         state = _make_app_state(
             storage, http_client=client, oidc_config=make_oidc_config(obo_grant_profile="")
@@ -736,7 +736,7 @@ class TestMintOboAccessToken:
         assert client.post.call_count == 0
 
     def test_permanent_rejection_returns_none(self, storage: SQLiteBackend) -> None:
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.post = AsyncMock(
             return_value=_mk_response(
                 400, {"error": "invalid_grant", "error_description": "AADSTS65001"}
@@ -752,6 +752,31 @@ class TestMintOboAccessToken:
         assert _mint(state) is None
         assert client.post.call_count == 1
 
+    def test_unreachable_token_endpoint_refuses_with_a_cause_through_a_real_client(
+        self, storage: SQLiteBackend
+    ) -> None:
+        """A transport failure on the mint is a refusal with a cause and a cooldown, through a
+        real client: the grant's catch has to match the client's library, or the error escapes
+        the mint."""
+        from turnstone.core.model_oauth import model_mint_refusal_cause, model_obo_cache_server
+
+        calls: list[str] = []
+
+        def unreachable(request: httpx2.Request) -> httpx2.Response:
+            calls.append(request.method)
+            raise httpx2.ConnectError("connection refused", request=request)
+
+        client = httpx2.AsyncClient(transport=httpx2.MockTransport(unreachable))
+        state = _make_app_state(storage, http_client=client, oidc_config=make_oidc_config())
+        _seed_credential(state)
+
+        assert _mint(state) is None
+        cause = model_mint_refusal_cause("model_obo", model_obo_cache_server(MODEL_ALIAS), USER)
+        assert cause == "mint_failed"
+        # The cooldown keeps the next turn off the IdP.
+        assert _mint(state) is None
+        assert calls == ["POST"]
+
     def test_rfc8693_scoped_exchange_mints_and_caches(self, storage: SQLiteBackend) -> None:
         """The #955 wire-through: the exchange leg requests the caller's
         scopes, the row keys on the OWNING ALIAS, and the requested scopes
@@ -759,7 +784,7 @@ class TestMintOboAccessToken:
         """
         from turnstone.core.model_oauth import model_obo_cache_server
 
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.post = AsyncMock(
             side_effect=[
                 _mk_response(200, {"access_token": "subject-at", "expires_in": 300}),
@@ -805,7 +830,7 @@ class TestMintOboAccessToken:
         """
         from turnstone.core.model_oauth import model_obo_cache_server
 
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.post = AsyncMock(
             side_effect=[
                 _mk_response(200, {"access_token": "subject-1", "expires_in": 300}),
@@ -840,7 +865,7 @@ class TestMintOboAccessToken:
         re-mint — the row's stored scopes and the freshness compare's
         current side both pass through the one normalizer.
         """
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.post = AsyncMock(
             side_effect=[
                 _mk_response(200, {"access_token": "subject-at", "expires_in": 300}),
@@ -864,7 +889,7 @@ class TestMintOboAccessToken:
         """
         from turnstone.core.model_oauth import model_mint_refusal_cause, model_obo_cause_key
 
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.post = AsyncMock()
         state = _make_app_state(storage, http_client=client, oidc_config=make_oidc_config())
         _seed_credential(state)
@@ -933,7 +958,7 @@ class TestMintOboAccessToken:
         pinning that leg is a dispatch bug at the call site, not an operator
         state, so it raises instead of returning the fallback-eligible None.
         """
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.post = AsyncMock()
         state = _make_app_state(storage, http_client=client, oidc_config=make_oidc_config())
         _seed_credential(state)
@@ -952,7 +977,7 @@ class TestMintOboAccessToken:
         from turnstone.core.model_oauth import MintDispatchContractError
         from turnstone.core.model_registry import MODEL_AUTH_TEXT_MAX_LEN
 
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.post = AsyncMock()
         state = _make_app_state(storage, http_client=client, oidc_config=make_oidc_config())
         _seed_credential(state)
@@ -970,7 +995,7 @@ class TestMintOboAccessToken:
         """
         from turnstone.core.model_oauth import model_mint_refusal_cause, model_obo_cause_key
 
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.post = AsyncMock(
             side_effect=[
                 # Broken sibling: refresh lands, exchange refused.
@@ -1011,7 +1036,7 @@ class TestMintOboAccessToken:
         """
         from turnstone.core.model_oauth import model_mint_refusal_cause, model_obo_cause_key
 
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.post = AsyncMock(
             side_effect=[
                 # rfc8693-leg mint: refresh lands, exchange refused.
@@ -1051,7 +1076,7 @@ class TestMintOboAccessToken:
         the shape axis a fail-closed deployment would keep failing user
         turns for the full window after the fix.
         """
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.post = AsyncMock(
             side_effect=[
                 _mk_response(400, {"error": "invalid_grant", "error_description": "bad aud"}),
@@ -1077,7 +1102,7 @@ class TestMintOboAccessToken:
         """Cooldown arms on the identity cache key, so a broken alias cannot
         suppress a sibling alias sharing its gateway audience.
         """
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.post = AsyncMock(
             side_effect=[
                 # Broken alias: refresh leg lands, exchange leg is refused.
@@ -1143,7 +1168,7 @@ def _mint_app(state: SimpleNamespace, **kwargs: Any) -> Any:
 
 class TestMintAppAccessToken:
     def test_happy_path_client_credentials_and_caches(self, storage: SQLiteBackend) -> None:
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.post = AsyncMock(
             return_value=_mk_response(200, {"access_token": "app-at", "expires_in": 3600})
         )
@@ -1170,7 +1195,7 @@ class TestMintAppAccessToken:
         assert raw is not None and raw["refresh_token_ct"] is None
 
     def test_works_with_zero_user_credentials(self, storage: SQLiteBackend) -> None:
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.post = AsyncMock(
             return_value=_mk_response(200, {"access_token": "app-at", "expires_in": 3600})
         )
@@ -1180,7 +1205,7 @@ class TestMintAppAccessToken:
         assert _mint_app(state) == "app-at"
 
     def test_oidc_disabled_returns_none_no_http(self, storage: SQLiteBackend) -> None:
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.post = AsyncMock()
         state = _make_app_state(
             storage, http_client=client, oidc_config=make_oidc_config(enabled=False)
@@ -1189,7 +1214,7 @@ class TestMintAppAccessToken:
         assert client.post.call_count == 0
 
     def test_rejected_grant_returns_none(self, storage: SQLiteBackend) -> None:
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.post = AsyncMock(
             return_value=_mk_response(
                 400, {"error": "invalid_client", "error_description": "AADSTS7000215"}
@@ -1201,7 +1226,7 @@ class TestMintAppAccessToken:
         assert client.post.call_count == 1
 
     def test_non_entra_profile_is_explicitly_refused(self, storage: SQLiteBackend) -> None:
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.post = AsyncMock()
         state = _make_app_state(
             storage,
@@ -1213,7 +1238,7 @@ class TestMintAppAccessToken:
         client.post.assert_not_called()
 
     def test_force_refresh_bypasses_cache(self, storage: SQLiteBackend) -> None:
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.post = AsyncMock(
             side_effect=[
                 _mk_response(200, {"access_token": "app-1", "expires_in": 3600}),
@@ -1237,7 +1262,7 @@ class TestMintAppAccessToken:
         """
         from turnstone.core.model_oauth import model_app_cache_server
 
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.post = AsyncMock(
             return_value=_mk_response(200, {"access_token": "app-at", "expires_in": 3600})
         )
@@ -1348,7 +1373,7 @@ class TestModelOboToken:
         record (or unknown)."""
         import logging
 
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.post = AsyncMock(
             side_effect=[
                 _mk_response(200, {"access_token": "subject-at", "expires_in": 300}),
@@ -1394,7 +1419,7 @@ class TestModelOboToken:
 
         # A refused mint records its cause (typo'd grant profile), under the
         # same entra leg the entra_obo dispatch below pins.
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.post = AsyncMock()
         state = _make_app_state(
             storage,
@@ -1427,7 +1452,7 @@ class TestModelOboToken:
 
         # Credential captured under one encryption key; the store then
         # runs under a different key (rotation) — the real decrypt path.
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.post = AsyncMock()
         state = _make_app_state(storage, http_client=client, oidc_config=make_oidc_config())
         _seed_credential(state)

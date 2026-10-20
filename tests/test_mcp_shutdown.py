@@ -17,7 +17,7 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 from unittest.mock import MagicMock
 
-import httpx
+import httpx2
 import pytest
 from aiohttp import web
 from starlette.applications import Starlette
@@ -209,9 +209,9 @@ async def _host(
     return app, tokens
 
 
-async def _disconnect(app: Starlette) -> httpx.Response:
-    async with httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=app), base_url="http://test"
+async def _disconnect(app: Starlette) -> httpx2.Response:
+    async with httpx2.AsyncClient(
+        transport=httpx2.ASGITransport(app=app), base_url="http://test"
     ) as client:
         return await client.delete("/connections/pool-srv")
 

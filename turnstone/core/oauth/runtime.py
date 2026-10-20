@@ -15,7 +15,7 @@ from turnstone.core.oauth.work import OAuthUnavailableError, OAuthWork, _active_
 if TYPE_CHECKING:
     from collections.abc import Callable, Coroutine
 
-    import httpx
+    import httpx2
 
 log = get_logger(__name__)
 
@@ -36,7 +36,7 @@ class OAuthRuntime:
         self,
         context: OAuthContext,
         *,
-        client_factory: Callable[[], httpx.AsyncClient] | None = None,
+        client_factory: Callable[[], httpx2.AsyncClient] | None = None,
     ) -> None:
         self.context = context
         self._client_factory = client_factory

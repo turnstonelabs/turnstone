@@ -7,7 +7,7 @@ import enum
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-import httpx
+import httpx2
 
 from turnstone.core.log import get_logger
 from turnstone.core.oauth import ssrf as oauth_ssrf
@@ -75,7 +75,21 @@ class OAuthRefreshError(OAuthError):
         self.failure_class = failure_class
 
 
-def json_http_client(timeout: float = _DEFAULT_HTTP_TIMEOUT) -> httpx.AsyncClient:
+def make_http_client(
+    timeout: float = _DEFAULT_HTTP_TIMEOUT, *, headers: dict[str, str] | None = None
+) -> httpx2.AsyncClient:
+    """Return an HTTP client for identity-provider and authorization-server requests.
+
+    Every OAuth and OIDC client is built here, so they share one posture.
+    It keeps httpx2's environment defaults rather than setting
+    ``trust_env=False``: the proxy variables and ``SSL_CERT_FILE`` /
+    ``SSL_CERT_DIR`` apply to every such request, since a deployment may
+    reach its identity provider only through an egress proxy.
+    """
+    return httpx2.AsyncClient(timeout=timeout, headers=headers)
+
+
+def json_http_client(timeout: float = _DEFAULT_HTTP_TIMEOUT) -> httpx2.AsyncClient:
     """Return the JSON-preferring HTTP client used by OAuth consumers.
 
     Every request here consumes a JSON body: discovery documents, dynamic
@@ -83,18 +97,18 @@ def json_http_client(timeout: float = _DEFAULT_HTTP_TIMEOUT) -> httpx.AsyncClien
     grant legs. Some token endpoints content-negotiate and answer a bare
     ``Accept: */*`` with a form-encoded body the parsers cannot read, so
     the JSON preference is the client default rather than a per-call
-    literal that the next call site would forget. httpx applies a
+    literal that the next call site would forget. httpx2 applies a
     per-request ``headers=`` over this default, so a caller can still
     override it.
     """
-    return httpx.AsyncClient(timeout=timeout, headers={"Accept": "application/json"})
+    return make_http_client(timeout, headers={"Accept": "application/json"})
 
 
 # Cap on individual standard-field length when echoing AS error text.
 _AS_ERROR_FIELD_MAX = 80
 
 
-def _as_error_code(resp: httpx.Response) -> str | None:
+def _as_error_code(resp: httpx2.Response) -> str | None:
     """Return the RFC 6749 ``error`` code from a token-endpoint JSON error body.
 
     Feeds :func:`_classify_refresh_failure`, which maps the code to a handling
@@ -113,7 +127,7 @@ def _as_error_code(resp: httpx.Response) -> str | None:
     return None
 
 
-def _format_as_error(resp: httpx.Response) -> str:
+def _format_as_error(resp: httpx2.Response) -> str:
     """Build a safe, redacted summary of an AS error response.
 
     Pulls only the RFC 6749 standard error fields (``error``,
@@ -181,7 +195,7 @@ _TRANSIENT_AS_ERRORS = frozenset(
 )
 
 
-def _classify_refresh_failure(resp: httpx.Response) -> RefreshFailureClass:
+def _classify_refresh_failure(resp: httpx2.Response) -> RefreshFailureClass:
     """Classify a non-200 refresh response into a handling class.
 
     Conservative by construction — the only path to a PERMANENT
@@ -208,7 +222,7 @@ async def _hardened_token_post(
     *,
     token_endpoint: str,
     data: dict[str, str],
-    http_client: httpx.AsyncClient,
+    http_client: httpx2.AsyncClient,
     request_label: str,
     endpoint_label: str,
     classify_oversized_by_status: bool = False,
@@ -246,7 +260,7 @@ async def _hardened_token_post(
             data=data,
             timeout=_DEFAULT_HTTP_TIMEOUT,
         )
-    except (httpx.HTTPError, RuntimeError) as exc:
+    except (httpx2.HTTPError, RuntimeError) as exc:
         if http_client.is_closed:
             raise OAuthUnavailableError("OAuth HTTP client closed during shutdown") from exc
         if isinstance(exc, RuntimeError):

@@ -33,7 +33,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Literal, NamedTuple, cast
 
-import httpx
+import httpx2
 
 from turnstone.core.audit import record_audit
 from turnstone.core.log import get_logger
@@ -360,7 +360,7 @@ def _parse_prm_url_from_www_authenticate(header: str) -> str | None:
     return params.get("resource_metadata") or None
 
 
-def _json_object_body(resp: httpx.Response, label: str) -> dict[str, Any]:
+def _json_object_body(resp: httpx2.Response, label: str) -> dict[str, Any]:
     """Return a bounded, parsed JSON-object body, or raise the discovery error."""
     if len(resp.content) > _MAX_DISCOVERY_BODY_BYTES:
         raise MCPOAuthDiscoveryError(f"{label} response body exceeds size limit")
@@ -373,7 +373,7 @@ def _json_object_body(resp: httpx.Response, label: str) -> dict[str, Any]:
     return doc
 
 
-def _prm_issuer_from_document(resp: httpx.Response, accepted_resources: frozenset[str]) -> str:
+def _prm_issuer_from_document(resp: httpx2.Response, accepted_resources: frozenset[str]) -> str:
     """Validate one protected-resource metadata response and return its issuer.
 
     Raises :class:`MCPOAuthDiscoveryError` for an oversized, non-JSON, or
@@ -437,7 +437,7 @@ class _PRMCandidate:
 async def _fetch_prm_issuer(
     server_url: str,
     *,
-    http_client: httpx.AsyncClient,
+    http_client: httpx2.AsyncClient,
     deadline: float,
     allow_private: bool = False,
     server_name: str = "",
@@ -502,7 +502,7 @@ async def _fetch_prm_issuer(
         # override, which skips PRM entirely.
         candidates.append(_PRMCandidate(origin_prm_url, frozenset({origin}), 1, allow_private))
 
-    fetched: dict[tuple[str, bool], httpx.Response] = {}
+    fetched: dict[tuple[str, bool], httpx2.Response] = {}
     document_error: MCPOAuthDiscoveryError | None = None
     private_error: MCPOAuthDiscoveryError | None = None
     first_error: MCPOAuthDiscoveryError | None = None
@@ -552,7 +552,7 @@ async def _fetch_prm_issuer(
                 continue
             try:
                 resp = await http_client.get(candidate.url, timeout=budget)
-            except httpx.HTTPError as exc:
+            except httpx2.HTTPError as exc:
                 _record(_discovery_error(f"PRM fetch failed: {exc}", exc))
                 continue
             fetched[(candidate.url, candidate.allow_private)] = resp
@@ -826,7 +826,7 @@ def _as_metadata_from_document(
 async def _fetch_as_metadata(
     issuer: str,
     *,
-    http_client: httpx.AsyncClient,
+    http_client: httpx2.AsyncClient,
     trusted_hosts: frozenset[str],
     deadline: float,
     allow_private: bool = False,
@@ -916,7 +916,7 @@ async def _fetch_as_metadata(
             break
         try:
             r = await http_client.get(metadata_url, timeout=budget)
-        except httpx.HTTPError as exc:
+        except httpx2.HTTPError as exc:
             first_error = first_error or _discovery_error(f"AS metadata fetch failed: {exc}", exc)
             continue
         if r.status_code != 200:
@@ -993,7 +993,7 @@ async def discover_authorization_server(
     server_url: str,
     override_url: str | None,
     cached_issuer: str | None,
-    http_client: httpx.AsyncClient,
+    http_client: httpx2.AsyncClient,
     storage: StorageBackend,
     server_id: str,
     trusted_hosts: frozenset[str],
@@ -1028,7 +1028,7 @@ async def discover_authorization_server(
     # so a hard-down host cannot spend it twice. The per-request deadline
     # gives each probe an actionable error; the outer timeout in
     # ``_resolve_issuer_and_metadata`` is what makes the budget a real
-    # wall-clock ceiling, since httpx timeouts bound inactivity per phase
+    # wall-clock ceiling, since httpx2 timeouts bound inactivity per phase
     # rather than the whole call, and DNS, SSRF and endpoint validation run
     # outside them entirely.
     deadline = time.monotonic() + _DISCOVERY_TOTAL_BUDGET
@@ -1264,7 +1264,7 @@ async def register_dynamic_client(
     *,
     as_metadata: oauth_http.ASMetadata,
     redirect_uri: str,
-    http_client: httpx.AsyncClient,
+    http_client: httpx2.AsyncClient,
     scopes: str = "",
 ) -> tuple[str, str | None]:
     """Register a public client using RFC 7591 client metadata.
@@ -1296,7 +1296,7 @@ async def register_dynamic_client(
             json=body,
             timeout=oauth_http._DEFAULT_HTTP_TIMEOUT,
         )
-    except httpx.HTTPError as exc:
+    except httpx2.HTTPError as exc:
         raise oauth_http.OAuthError(f"DCR request failed: {exc}") from exc
 
     if len(resp.content) > oauth_http._MAX_TOKEN_BODY_BYTES:
@@ -1338,7 +1338,7 @@ async def exchange_code(
     client_id: str,
     client_secret: str | None,
     mcp_server_canonical_url: str,
-    http_client: httpx.AsyncClient,
+    http_client: httpx2.AsyncClient,
 ) -> dict[str, Any]:
     """Exchange an authorization code for an access (and optional refresh) token.
 
@@ -1366,7 +1366,7 @@ async def exchange_code(
             data=data,
             timeout=oauth_http._DEFAULT_HTTP_TIMEOUT,
         )
-    except httpx.HTTPError as exc:
+    except httpx2.HTTPError as exc:
         raise MCPOAuthExchangeError(f"token exchange request failed: {exc}") from exc
 
     if len(resp.content) > oauth_http._MAX_TOKEN_BODY_BYTES:
@@ -1390,7 +1390,7 @@ async def exchange_code(
 async def revoke_token_at_as(
     *,
     as_metadata: oauth_http.ASMetadata,
-    http_client: httpx.AsyncClient,
+    http_client: httpx2.AsyncClient,
     refresh_token: str,
     client_id: str,
     client_secret: str | None,
@@ -1431,7 +1431,7 @@ async def revoke_token_at_as(
             )
     except Exception as exc:
         # NOTE: never use ``exc_info=True`` here — chained ``__context__``
-        # may carry an ``httpx.Request`` whose ``Authorization`` header
+        # may carry an ``httpx2.Request`` whose ``Authorization`` header
         # holds a bearer. Structured fields with ``type(exc).__name__``
         # only.
         log.info(
@@ -2613,7 +2613,7 @@ async def _register_dynamic_client_if_needed(
     request: Request,
     storage: StorageBackend,
     token_store: MCPTokenStore,
-    http_client: httpx.AsyncClient,
+    http_client: httpx2.AsyncClient,
     as_metadata: oauth_http.ASMetadata,
     server_row: dict[str, Any],
     server_id: str,
@@ -2850,7 +2850,7 @@ async def _handle_mcp_oauth_authorize_inner(request: Request) -> Response:
             status_code=400,
         )
 
-    http_client: httpx.AsyncClient | None = getattr(
+    http_client: httpx2.AsyncClient | None = getattr(
         request.app.state, "mcp_oauth_http_client", None
     )
     if http_client is None:
@@ -3092,7 +3092,7 @@ async def _handle_mcp_oauth_callback_inner(request: Request) -> Response:
     if server_row is None:
         return RedirectResponse("/?mcp_oauth_error=server+missing", status_code=302)
 
-    http_client: httpx.AsyncClient | None = getattr(
+    http_client: httpx2.AsyncClient | None = getattr(
         request.app.state, "mcp_oauth_http_client", None
     )
     if http_client is None:
@@ -3420,7 +3420,7 @@ _REVOKE_UPSTREAM_CANCEL_TIMEOUT = 1.0
 
 async def _attempt_upstream_revoke(
     *,
-    http_client: httpx.AsyncClient,
+    http_client: httpx2.AsyncClient,
     metadata_cache: dict[str, Any] | None,
     # Strict unless the caller passes the deployment's opt-in, so a direct
     # caller cannot widen the deployment's reach by omission.
@@ -3453,7 +3453,7 @@ async def _attempt_upstream_revoke(
     ``Task exception was never retrieved`` from asyncio's default handler.
     Catching at the outer boundary keeps the helper's contract honest.
     Bearer-leak invariant: ``exc_info=True`` is forbidden on this path —
-    the chained ``__context__`` may carry an ``httpx.Request`` whose
+    the chained ``__context__`` may carry an ``httpx2.Request`` whose
     ``Authorization`` header holds the per-user bearer.
     """
     try:

@@ -11,7 +11,7 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING, Literal
 from urllib.parse import parse_qs
 
-import httpx
+import httpx2
 import pytest
 
 from tests._oauth_runtime_helpers import make_oauth_context
@@ -56,7 +56,7 @@ def test_protocol_and_store_work_without_loading_consumers() -> None:
         assert cipher.decrypt(cipher.encrypt(b"credential")) == b"credential"
         assert not any(name.startswith("turnstone.core.oauth") for name in sys.modules)
 
-        import httpx
+        import httpx2
         from turnstone.core import oauth
         shared_modules = {
             info.name for info in pkgutil.walk_packages(oauth.__path__, oauth.__name__ + ".")
@@ -64,6 +64,7 @@ def test_protocol_and_store_work_without_loading_consumers() -> None:
         for name in sorted(shared_modules):
             importlib.import_module(name)
         assert shared_modules <= sys.modules.keys()
+        assert "httpx" not in sys.modules, "shared OAuth loaded httpx 1.x; its clients are httpx2"
         from turnstone.core.oauth import grants, http, oidc
         config = {
             "issuer": "https://idp.example.com", "client_id": "client",
@@ -85,12 +86,14 @@ def test_protocol_and_store_work_without_loading_consumers() -> None:
         def request(req):
             calls.append(req)
             if len(calls) == 1:
-                return httpx.Response(200, json={"access_token": "subject", "refresh_token": "new"})
+                return httpx2.Response(
+                    200, json={"access_token": "subject", "refresh_token": "new"}
+                )
             assert rotations == ["new"], "rotation must persist before exchange"
-            return httpx.Response(400, json={"error": "invalid_grant"})
+            return httpx2.Response(400, json={"error": "invalid_grant"})
 
         async def run():
-            async with httpx.AsyncClient(transport=httpx.MockTransport(request)) as client:
+            async with httpx2.AsyncClient(transport=httpx2.MockTransport(request)) as client:
                 try:
                     await grants._obo_mint_rfc8693(
                         oidc_config=cfg, credential_refresh_token="old", audience="resource",
@@ -135,14 +138,14 @@ def _assert_shared_credential_rotation(backend: StorageBackend) -> None:
                     waiting.set()
                 return await super().acquire()
 
-        async def request(req: httpx.Request) -> httpx.Response:
+        async def request(req: httpx2.Request) -> httpx2.Response:
             form = parse_qs(req.content.decode())
             redemptions.append(form["refresh_token"][0])
             count = len(redemptions)
             if count == 1:
                 entered.set()
                 assert await asyncio.to_thread(release.wait, 5)
-            return httpx.Response(
+            return httpx2.Response(
                 200,
                 json={
                     "access_token": f"at-{count}",
@@ -151,7 +154,7 @@ def _assert_shared_credential_rotation(backend: StorageBackend) -> None:
                 },
             )
 
-        async with httpx.AsyncClient(transport=httpx.MockTransport(request)) as client:
+        async with httpx2.AsyncClient(transport=httpx2.MockTransport(request)) as client:
             state = SimpleNamespace(
                 auth_storage=backend,
                 oauth_context=make_oauth_context(
@@ -267,13 +270,13 @@ def _assert_independent_postgresql_rotation(backend: StorageBackend) -> None:
 
     sa.event.listen(other._engine, "after_cursor_execute", observe_probe)
 
-    async def request(req: httpx.Request) -> httpx.Response:
+    async def request(req: httpx2.Request) -> httpx2.Response:
         redemptions.append(parse_qs(req.content.decode())["refresh_token"][0])
         count = len(redemptions)
         if count == 1:
             entered.set()
             assert await asyncio.to_thread(release.wait, 5)
-        return httpx.Response(
+        return httpx2.Response(
             200,
             json={
                 "access_token": f"at-{count}",
@@ -286,13 +289,13 @@ def _assert_independent_postgresql_rotation(backend: StorageBackend) -> None:
         storage=backend,
         token_store=first_store,
         oidc_config=make_oidc_config(),
-        http_client=httpx.AsyncClient(transport=httpx.MockTransport(request)),
+        http_client=httpx2.AsyncClient(transport=httpx2.MockTransport(request)),
     )
     second = make_oauth_context(
         storage=other,
         token_store=TokenStore(other, cipher),
         oidc_config=make_oidc_config(),
-        http_client=httpx.AsyncClient(transport=httpx.MockTransport(request)),
+        http_client=httpx2.AsyncClient(transport=httpx2.MockTransport(request)),
     )
     assert first.runtime is not second.runtime
     assert first.coordination is not second.coordination

@@ -19,7 +19,7 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Literal
 from unittest.mock import AsyncMock
 
-import httpx
+import httpx2
 import pytest
 
 from tests._oauth_runtime_helpers import run_adapter
@@ -92,9 +92,9 @@ def _state(backend: StorageBackend) -> SimpleNamespace:
 
 
 def _runtime(context: OAuthContext, handler: Any = None) -> OAuthRuntime:
-    def client() -> httpx.AsyncClient:
+    def client() -> httpx2.AsyncClient:
         return (
-            httpx.AsyncClient(transport=httpx.MockTransport(handler))
+            httpx2.AsyncClient(transport=httpx2.MockTransport(handler))
             if handler
             else oauth_http.json_http_client()
         )
@@ -122,9 +122,9 @@ def test_cancelled_custodial_write_excludes_same_key_until_settled(
     request_context = contextvars.ContextVar("runtime_write_context", default="missing")
     worker_context: list[str] = []
 
-    def post(request: httpx.Request) -> httpx.Response:
+    def post(request: httpx2.Request) -> httpx2.Response:
         posts.append(asyncio.get_running_loop())
-        return httpx.Response(
+        return httpx2.Response(
             200, json={"access_token": "new", "refresh_token": "rt-new", "expires_in": 3600}
         )
 
@@ -334,7 +334,7 @@ def test_failed_runtime_initialization_logs_cause_and_is_not_retried(
     state = _state(backend)
     attempts = 0
 
-    def fail_client() -> httpx.AsyncClient:
+    def fail_client() -> httpx2.AsyncClient:
         nonlocal attempts
         attempts += 1
         raise ValueError("client initialization failed")
@@ -365,9 +365,9 @@ def test_runtime_reuses_shared_oidc_holder_after_host_rediscovery(
     host = SimpleNamespace(oauth_context=context)
     calls: list[str] = []
 
-    def request(req: httpx.Request) -> httpx.Response:
+    def request(req: httpx2.Request) -> httpx2.Response:
         calls.append(str(req.url))
-        return httpx.Response(200, json={"access_token": "model-token", "expires_in": 300})
+        return httpx2.Response(200, json={"access_token": "model-token", "expires_in": 300})
 
     runtime = _runtime(context, request)
     healed = dataclasses.replace(
@@ -796,7 +796,7 @@ def test_shutdown_cancels_inflight_http_before_closing_client(
     entered = threading.Event()
     order: list[str] = []
 
-    async def request(req: httpx.Request) -> httpx.Response:
+    async def request(req: httpx2.Request) -> httpx2.Response:
         entered.set()
         try:
             await asyncio.Future()
@@ -918,10 +918,10 @@ def test_client_closed_during_request_has_no_failure_disposition(
     )
     entered, release = threading.Event(), threading.Event()
 
-    async def request(req: httpx.Request) -> httpx.Response:
+    async def request(req: httpx2.Request) -> httpx2.Response:
         entered.set()
         assert await asyncio.to_thread(release.wait, 3)
-        return httpx.Response(400, json={"error": "invalid_grant"})
+        return httpx2.Response(400, json={"error": "invalid_grant"})
 
     runtime = _runtime(context, request)
     if path == "discovery":
