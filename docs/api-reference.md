@@ -1428,7 +1428,10 @@ runs, so queued multimodal turns cannot lose files to racing sends.  If
 validation fails the fresh workstream is rolled back so no published row or
 phantom create/close event leaks.  Validation stops at the first file it
 refuses, and the error starts with that file's name (`party.gif: GIF images
-are not supported. Use PNG, JPEG or WebP.`).
+are not supported. Use PNG, JPEG or WebP.`).  An image is stored as
+`POST /v1/api/workstreams/{ws_id}/attachments` stores it, with any
+transparent areas filled in, and the response's `attachment_ids` name the
+stored copies.
 
 **Request body:**
 
@@ -1636,6 +1639,14 @@ turn on this workstream.
   all accept it, and so is a JPEG saved in more than 100 progressive passes
   (`400`, code `unsupported`), since each pass costs a decode of the whole
   picture.
+- An image with transparent areas is stored with them filled with white,
+  black or mid grey, whichever its content's edges stand out on most, since
+  vision providers each remove transparency their own way; `size_bytes`,
+  `attachment_id` and the attachment's content are those of the stored image.
+  It keeps its format, colour profile and palette or grey colour, and a
+  lossless WebP stays lossless. An image over 8.4 megapixels, an animated
+  image, a colour-keyed PNG that isn't 8-bit, and one that would grow past the
+  cap are stored as uploaded.
 - Text documents (any `text/*` MIME, allow-listed application MIMEs, or
   known text extensions) are capped at **512 KiB** and must be UTF-8.
 - Per-(workstream, user) pending cap is **10** attachments.

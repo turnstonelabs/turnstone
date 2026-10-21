@@ -34,6 +34,7 @@ from tests._coord_test_helpers import (
     _FakeConfigStore,
     _seed_children,
 )
+from tests._helpers import opaque_png
 from turnstone.console.coordinator_ui import ConsoleCoordinatorUI
 from turnstone.console.server import (
     COORDINATOR_MODEL_WORDING,
@@ -744,12 +745,7 @@ def test_create_non_string_model_fields_collapse_to_none(storage):
     assert captured == {"model_alias": None, "judge_model": None}
 
 
-_PNG_1X1 = (
-    b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
-    b"\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\rIDATx\x9cc\xfc\xcf"
-    b"\xc0\xc0\xc0\x00\x00\x00\x05\x00\x01\xa5\xf6E@\x00\x00\x00\x00IEND"
-    b"\xaeB`\x82"
-)
+_PNG_1X1 = opaque_png()
 
 
 def test_create_with_multipart_attachments_stages_to_buffer(storage):

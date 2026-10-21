@@ -204,6 +204,25 @@ class TestContentPartBuilder:
     def test_unknown_kind_returns_none(self) -> None:
         assert attachment_to_content_part({"kind": "weird", "content": b"x"}) is None
 
+    def test_a_stored_transparent_image_is_sent_as_stored(self) -> None:
+        # Images are flattened as they enter a conversation, never when stored ones are sent:
+        # an image stored before then goes out as it always did, so the conversation's history
+        # and cached prefix don't change.
+        from io import BytesIO
+
+        from PIL import Image
+
+        src = Image.new("RGBA", (40, 20), (255, 255, 255, 0))
+        src.paste((255, 255, 255, 255), (10, 5, 30, 15))
+        buf = BytesIO()
+        src.save(buf, format="PNG")
+        part = attachment_to_content_part(
+            {"kind": "image", "content": buf.getvalue(), "mime_type": "image/png"}
+        )
+        assert part is not None
+        url = part["image_url"]["url"]
+        assert base64.b64decode(url.split(",", 1)[1]) == buf.getvalue()
+
 
 class TestAudioFormatMap:
     def test_known_mimes_map_to_codec_tokens(self) -> None:

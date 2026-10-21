@@ -18,15 +18,12 @@ import httpx2
 import pytest
 from starlette.testclient import TestClient
 
+from tests._helpers import opaque_png
 from turnstone.core.audio import _TTS_BACKEND_TIMEOUT_S
 from turnstone.core.settings_registry import SETTINGS
 
 # Magic-byte-valid 1x1 PNG
-PNG_1x1 = (
-    b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
-    b"\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\rIDATx\x9cc\xfc\xcf"
-    b"\xc0\xc0\xc0\x00\x00\x00\x05\x00\x01\xa5\xf6E@\x00\x00\x00\x00IEND\xaeB`\x82"
-)
+PNG_1x1 = opaque_png()
 
 # Magic-byte-valid minimal WAV (RIFF....WAVE) for audio-kind uploads.
 WAV_12 = b"RIFF\x24\x00\x00\x00WAVEfmt " + b"\x00" * 16
@@ -154,6 +151,31 @@ class TestUploadHappyPath:
         assert body["size_bytes"] == len(PNG_1x1)
         assert body["filename"] == "tiny.png"
         assert body["attachment_id"]
+
+    def test_upload_stores_a_transparent_image_flattened(self, app_client):
+        # #1445: providers each remove transparency their own way, so an image is flattened
+        # once, on upload, and the stored copy is what every model is sent and the id names.
+        import hashlib
+        from io import BytesIO
+
+        from PIL import Image
+
+        client, _ = app_client
+        src = Image.new("RGBA", (40, 20), (255, 255, 255, 0))
+        src.paste((255, 255, 255, 255), (10, 5, 30, 15))
+        uploaded = BytesIO()
+        src.save(uploaded, format="PNG")
+        aid = _upload(client, "ws-A", "userA", "title.png", uploaded.getvalue(), "image/png")
+        resp = client.get(
+            f"/v1/api/workstreams/ws-A/attachments/{aid}/content",
+            headers=_auth("userA"),
+        )
+        assert resp.status_code == 200
+        assert aid == hashlib.sha256(resp.content).hexdigest()
+        stored = Image.open(BytesIO(resp.content))
+        assert stored.mode == "RGB"
+        assert stored.getpixel((0, 0)) == (0, 0, 0)
+        assert stored.getpixel((20, 10)) == (255, 255, 255)
 
     def test_upload_markdown_text(self, app_client):
         client, _ = app_client

@@ -18,6 +18,7 @@ own size/TTL ceilings bound a flood instead.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import re
 from dataclasses import dataclass
@@ -351,6 +352,52 @@ def classify_uploaded_files(
     return classified, None
 
 
+def stored_upload_content(kind: str, data: bytes) -> bytes:
+    """The bytes an upload of ``kind`` is staged and stored as.
+
+    An image has its transparency flattened (:func:`turnstone.core.images.flatten_image`), so the
+    stored attachment is the image every model is sent; other kinds are stored as uploaded.  Both
+    upload paths stage what this returns.  It decodes a transparent image, so an async handler
+    calls :func:`gated_upload_content` instead.
+    """
+    if kind != "image":
+        return data
+    from turnstone.core.images import flatten_image
+
+    return flatten_image(data, max_bytes=IMAGE_SIZE_CAP)
+
+
+async def gated_upload_content(kind: str, data: bytes, gate: asyncio.Lock) -> bytes:
+    """:func:`stored_upload_content` for an async handler, one image at a time per ``gate``.
+
+    An image whose header declares transparency to flatten waits for ``gate`` on the event loop
+    and only then takes a worker thread to flatten.  Waiting in worker threads instead, behind
+    flatten_image's own one-at-a-time slot, a burst of uploads would fill the shared default
+    executor that every other request's storage and permission calls run on.  Anything else is
+    stored as uploaded without waiting for a turn.
+    """
+    from turnstone.core.images import needs_flattening
+
+    if kind != "image" or not await asyncio.to_thread(needs_flattening, data):
+        return data
+    async with gate:
+        return await asyncio.to_thread(stored_upload_content, kind, data)
+
+
+def any_upload_needs_flattening(files: list[tuple[str, str, bytes]]) -> bool:
+    """Whether storing a create's ``(filename, claimed_mime, data)`` files may flatten one.
+
+    Judged from each image's header (:func:`turnstone.core.images.needs_flattening`), so a create
+    whose files are documents, or images with no transparency to flatten, doesn't wait for a turn.
+    """
+    from turnstone.core.images import needs_flattening
+
+    return any(
+        sniff_image_mime(data) in MODEL_IMAGE_MIMES and needs_flattening(data)
+        for _, _, data in files
+    )
+
+
 def validate_and_save_uploaded_files(
     files: list[tuple[str, str, bytes]],
     ws_id: str,
@@ -389,7 +436,7 @@ def validate_and_save_uploaded_files(
             filename=filename,
             mime_type=mime,
             kind=kind,
-            content=data,
+            content=stored_upload_content(kind, data),
         )
         saved_ids.append(staged.attachment_id)
     return saved_ids, None

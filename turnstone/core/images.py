@@ -1,11 +1,10 @@
-"""Image-pixel utilities shared across the thumbnail, wire, and perception paths.
+"""Image-pixel utilities shared across the upload, thumbnail, wire, and perception paths.
 
-Currently: EXIF-orientation normalisation, the JPEG scan check that every
-decoder of an uploaded image applies first, and the orientation reader they all
-use instead of Pillow's EXIF parser.  Kept separate from
-:mod:`turnstone.core.thumbnails` (which downscales for the UI) — this operates on
-full-resolution bytes at the read/wire boundary so every consumer of an
-attachment sees the same upright pixels.
+Currently: EXIF-orientation normalisation, the transparency flattening an image gets as it enters
+a conversation, the JPEG scan check that every decoder of an uploaded image applies first, and the
+orientation reader they all use instead of Pillow's EXIF parser.  Kept separate from
+:mod:`turnstone.core.thumbnails` (which downscales for the UI) — this operates on full-resolution
+bytes at the read/wire boundary so every consumer of an attachment sees the same upright pixels.
 """
 
 from __future__ import annotations
@@ -51,6 +50,79 @@ MAX_JPEG_SCANS = 100
 # How much normalize_image_orientation keeps of the turned images it re-encoded.
 _NORMALIZED_BYTES = 64 * 1024 * 1024
 _NORMALIZED_ENTRIES = 4096
+
+# Modes whose pixels carry an alpha channel.  Other modes are transparent only through a
+# ``transparency`` entry in ``info``, a PNG's tRNS chunk for example.
+_ALPHA_MODES = frozenset({"RGBA", "LA", "PA", "RGBa", "La"})
+
+# Modes flattened to grey rather than RGB, so a grey image keeps one channel.
+_GREY_MODES = frozenset({"L", "LA", "La"})
+
+# The greys a transparent image may be flattened onto, as 8-bit levels, in order of preference on
+# a tie: white, black, then mid grey for content that has both light and dark edges.
+_BACKGROUND_LEVELS = (255, 0, 128)
+
+# An edge pixel blends with a background it has less contrast against than this: contrast as the
+# accessibility guidelines measure it, on relative luminance, and their minimum for graphics and
+# large text.  Every luminance blends with at least one of the three levels, and many with two.
+_MIN_CONTRAST = 3.0
+
+# An edge pixel vanishes into a background it has less contrast against than this.  No luminance
+# comes this close to two of the levels, so each edge pixel vanishes into one of them at most.
+_VANISH_CONTRAST = 1.5
+
+# The opacity from which a pixel counts as content when finding where content meets transparency.
+_CONTENT_ALPHA = 128
+
+# How many edge pixels a background may blend with and still count as blending with none, while
+# the other edge pixels outnumber them four to one.  A speck must not rule a background out, while
+# a word in a contrasting colour, which has a hundred or more edge pixels even in small type, must,
+# however much other content surrounds it, and so must a small icon that is nothing but the speck.
+# A needless mid grey costs contrast, but a wrong white or black loses that word.
+_STRAY_EDGE_PIXELS = 16
+
+# The largest image flattened, in pixels; a 4K screen fits.  Flattening holds several full-size
+# copies at once, and a WebP's encoder needs far more, so a larger transparent image is stored as
+# uploaded.
+_FLATTEN_MAX_PIXELS = 4096 * 2048
+
+# The formats uploads and read_file accept.  Pillow is offered nothing else: some of its decoders
+# accept any bytes, so a file that sniffs as WebP could otherwise be read as another format.
+_FLATTEN_FORMATS = ("PNG", "JPEG", "WEBP")
+
+
+def _linear(level: int) -> float:
+    """The relative luminance of 8-bit sRGB ``level``, from 0 for black to 1 for white."""
+    value = level / 255
+    return value / 12.92 if value <= 0.04045 else ((value + 0.055) / 1.055) ** 2.4
+
+
+def _contrast(a: float, b: float) -> float:
+    """The contrast ratio of two relative luminances: 1 when equal, 21 for black and white."""
+    return (max(a, b) + 0.05) / (min(a, b) + 0.05)
+
+
+# An edge pixel's relative luminance comes from its linear R, G and B (the lookup table, applied to
+# each channel, scales linear light to 8 bits) weighted as Rec. 709 weighs them.  Luma, weighted
+# from the encoded values instead, counts a bright colour such as cyan as clear of white, on which
+# it barely shows.
+_LINEAR_LUT = [round(255 * _linear(level)) for level in range(256)]
+_LUMINANCE_WEIGHTS = (0.2126, 0.7152, 0.0722, 0.0)
+
+
+def _bins_within(level: int, ratio: float) -> slice:
+    """The bins of a luminance histogram with less than ``ratio`` contrast against ``level``.
+
+    One run of bins, since contrast only grows with distance either side of the level.
+    """
+    near = [b for b in range(256) if _contrast(b / 255, _linear(level)) < ratio]
+    return slice(near[0], near[-1] + 1)
+
+
+# For each background level, the bins of the edge pixels' luminance histogram that vanish into it,
+# and those that blend with it.
+_VANISHING_BINS = {level: _bins_within(level, _VANISH_CONTRAST) for level in _BACKGROUND_LEVELS}
+_BLENDING_BINS = {level: _bins_within(level, _MIN_CONTRAST) for level in _BACKGROUND_LEVELS}
 
 
 def too_many_jpeg_scans(data: bytes) -> bool:
@@ -124,6 +196,133 @@ def turn_upright(img: Image.Image, orientation: int) -> Image.Image:
         8: Image.Transpose.ROTATE_90,
     }.get(orientation)
     return img if method is None else img.transpose(method)
+
+
+def has_transparency(img: Image.Image) -> bool:
+    """Whether an opened image declares an alpha channel or a transparent colour.
+
+    Reads only what ``Image.open`` parsed ahead of the pixels.  Whether any pixel is actually
+    transparent takes a decode, which :func:`flatten_transparency` does.
+    """
+    return img.mode in _ALPHA_MODES or "transparency" in img.info
+
+
+def flatten_transparency(img: Image.Image) -> Image.Image | None:
+    """``img`` flattened onto white, black or mid grey, whichever its content's edges stand out on.
+
+    ``None`` when no pixel is transparent.  What has to stay visible is where content meets the
+    transparent area: the content pixels next to a transparent one.  The background is the grey
+    the fewest of those pixels blend with (:func:`_background_level`), so white or bright text
+    goes onto black, dark text onto white, and an image with both onto mid grey, where each keeps
+    some contrast instead of one vanishing.  Content enclosed by other content, such as text on an
+    opaque panel, doesn't take part, and neither do faint pixels like a soft shadow.
+
+    The result keeps the image's kind of colour, so a re-encoded copy stays about the size of the
+    original: a palette image keeps its pixels' palette indices (:func:`_flatten_palette`), a grey
+    image stays grey, and the rest become RGB.  Turning palette images into RGB made them half as
+    big again.
+
+    Vision models take RGB only, and providers remove an alpha channel each their own way: onto
+    white, onto black, or by dropping it and showing whatever colour the transparent pixels store.
+    Content drawn for one background then disappears on the others, so it is flattened here.
+    """
+    from PIL import Image
+
+    rgba = img if img.mode == "RGBA" else img.convert("RGBA")  # convert copies an RGBA image
+    edge_luminance = _edge_luminance(rgba)
+    if edge_luminance is None:
+        return None
+    level = _background_level(edge_luminance)
+    if img.mode == "P":
+        return _flatten_palette(img, level)
+    if img.mode in _GREY_MODES:
+        flat = Image.new("L", rgba.size, level)
+        flat.paste(rgba.convert("L"), mask=rgba)
+        return flat
+    flat = Image.new("RGB", rgba.size, (level, level, level))
+    flat.paste(rgba, mask=rgba)
+    return flat
+
+
+def _edge_luminance(rgba: Image.Image) -> list[int] | None:
+    """The relative luminance histogram of ``rgba``'s content pixels that border a transparent one.
+
+    Bin ``b`` counts the pixels of luminance ``b / 255``.  ``None`` when no pixel is transparent.
+    The masks and copies built here are freed when it returns, before the caller allocates the
+    flattened copy.
+    """
+    from PIL import ImageChops
+
+    alpha = rgba.getchannel("A")
+    if alpha.getextrema()[0] == 255:
+        return None
+    content = alpha.point(lambda a: 255 if a >= _CONTENT_ALPHA else 0)
+    if content.getbbox() is None:  # nothing that opaque: every visible pixel is content
+        content = alpha.point(lambda a: 255 if a else 0)
+    edge = ImageChops.subtract(content, _erode(content))
+    linear = rgba.convert("RGB").point(_LINEAR_LUT * 3)  # a matrix conversion takes RGB only
+    return linear.convert("L", matrix=_LUMINANCE_WEIGHTS).histogram(mask=edge)
+
+
+def _erode(mask: Image.Image) -> Image.Image:
+    """0/255 ``mask`` with every pixel beside a 0 set to 0, as ``MinFilter(3)`` would.
+
+    A 3x3 box average reaches 255 only where all nine pixels are 255.  Pillow's rank filter holds
+    the GIL while it runs, which stalls the event loop even when the flatten runs in a worker
+    thread; the box blur releases it.
+    """
+    from PIL import ImageFilter
+
+    return mask.filter(ImageFilter.BoxBlur(1)).point(lambda v: 255 if v == 255 else 0)
+
+
+def _flatten_palette(img: Image.Image, level: int) -> Image.Image:
+    """Palette image ``img`` with each palette entry composited over grey ``level``.
+
+    The pixels keep their indices; only the palette and its transparency change.
+    """
+    palette = img.getpalette() or []
+    opacity = [255] * (len(palette) // 3)
+    transparency = img.info.get("transparency")
+    if isinstance(transparency, int) and transparency < len(opacity):
+        opacity[transparency] = 0  # a single transparent index
+    elif isinstance(transparency, bytes):
+        opacity[: len(transparency)] = transparency[: len(opacity)]  # an opacity per index
+    flat = img.copy()
+    flat.info.pop("transparency", None)
+    flat.putpalette(
+        [
+            (alpha * value + (255 - alpha) * level + 127) // 255
+            for index, alpha in enumerate(opacity)
+            for value in palette[3 * index : 3 * index + 3]
+        ]
+    )
+    return flat
+
+
+def _background_level(edge_luminance: list[int]) -> int:
+    """The level in :data:`_BACKGROUND_LEVELS` the fewest edge pixels vanish into, then blend with.
+
+    ``edge_luminance`` is the edge pixels' luminance histogram.  Losing an edge outright is worse
+    than dimming many, so the levels the fewest vanish into (:data:`_VANISH_CONTRAST`) come first,
+    and of those, the one the fewest blend with (:data:`_MIN_CONTRAST`).  A pixel vanishes into one
+    level at most, so content in two colours keeps both at 1.5:1 or more however unequal their
+    shares, and content in one colour gets 3:1 or more, which every colour has against white or
+    against black.  Both hold on the histogram's 8-bit bins: a real colour can come out a hair
+    under, 2.98:1 at worst.  Up to :data:`_STRAY_EDGE_PIXELS` edge pixels count as none while the
+    rest outnumber them four to one.  When edges cover the whole range, as a cut-out photo's do,
+    no level is clear of them, and the one the fewest vanish into loses the least.
+    """
+    total = sum(edge_luminance)
+
+    def count(bins: slice) -> int:
+        near = sum(edge_luminance[bins])
+        return 0 if near <= min(_STRAY_EDGE_PIXELS, (total - near) // 4) else near
+
+    return min(  # the first of equals: white, black, grey
+        _BACKGROUND_LEVELS,
+        key=lambda level: (count(_VANISHING_BINS[level]), count(_BLENDING_BINS[level])),
+    )
 
 
 class _NormalizedCache:
@@ -218,3 +417,138 @@ def normalize_image_orientation(data: bytes) -> bytes:
     except Exception as exc:
         log.warning("orientation normalize failed: %s", exc)
         return data
+
+
+# Flattening an image at the cap holds a few hundred MiB, so a process flattens one image at a
+# time and the rest wait their turn.
+_flatten_slot = threading.BoundedSemaphore(1)
+
+
+def flatten_image(data: bytes, *, max_bytes: int) -> bytes:
+    """``data`` with its transparency flattened, for an image entering a conversation.
+
+    Uploads and ``read_file`` images pass through here once, as they arrive, and are stored as it
+    returns them, so the stored image is the one every model is sent.  Nothing already stored is
+    flattened: a conversation keeps sending what it sent, and its history and cached prefix stay
+    as they were.
+
+    An image whose header declares no transparency comes back UNCHANGED, the same object, without
+    a decode, and so does one whose alpha channel holds no transparent pixel, after one.  So do
+    the images this leaves as uploaded: one over :data:`_FLATTEN_MAX_PIXELS`, an animated one, a
+    colour-keyed one Pillow can't key exactly (:func:`_colour_key_is_exact`), and one that would
+    re-encode larger than ``max_bytes``, the cap the original was checked against, since a stored
+    image goes out with every later request.  A flattened image keeps its format, its colour
+    profile and, for a WebP, whether it is lossless; its EXIF orientation is baked in, and the
+    rest of its EXIF, its text chunks, its gamma and chromaticity and its resolution are dropped.
+    One image is flattened at a time.  Never raises: any failure (Pillow missing, decode error)
+    returns the original bytes.
+    """
+    try:
+        from PIL import Image  # noqa: F401 - only to learn Pillow is there
+    except ImportError:  # pragma: no cover - declared dependency; defensive
+        return data
+    try:
+        img = _flattenable(data)
+        if img is None:
+            return data
+        if img.size[0] * img.size[1] > _FLATTEN_MAX_PIXELS:
+            # Not a warning: a large screen's screenshots get here, most with no transparent pixel.
+            log.info("transparency flatten skipped: image exceeds the flatten pixel cap")
+            return data
+        orientation = exif_orientation(img)
+        save_kwargs: dict[str, object] = {}
+        if img.info.get("icc_profile"):
+            save_kwargs["icc_profile"] = img.info["icc_profile"]
+        if img.format == "WEBP":
+            save_kwargs.update({"lossless": True} if _webp_is_lossless(data) else {"quality": 90})
+        with _flatten_slot:
+            flat = flatten_transparency(turn_upright(img, orientation))
+            if flat is None:
+                return data
+            buf = BytesIO()
+            flat.save(buf, format=img.format or "PNG", **save_kwargs)
+        out = buf.getvalue()
+        if len(out) > max_bytes:
+            log.warning(
+                "transparency flatten skipped: flattened image is %d bytes, over %d",
+                len(out),
+                max_bytes,
+            )
+            return data
+        return out
+    except Exception as exc:
+        log.warning("transparency flatten failed: %s", exc)
+        return data
+
+
+def needs_flattening(data: bytes) -> bool:
+    """Whether :func:`flatten_image` may change ``data``, judged from its header without a decode.
+
+    False for an image ``flatten_image`` returns unchanged on its header's word: one that declares
+    no transparency, and the ones it leaves as uploaded before decoding.  True for one whose
+    alpha channel may yet prove fully opaque, since only a decode tells, and for one whose header
+    can't be read, which ``flatten_image`` then returns unchanged itself.  A caller skips the wait
+    for a turn to flatten when this is False.
+    """
+    try:
+        img = _flattenable(data)
+    except Exception:
+        return True
+    return img is not None and img.size[0] * img.size[1] <= _FLATTEN_MAX_PIXELS
+
+
+def _flattenable(data: bytes) -> Image.Image | None:
+    """``data`` opened, or ``None`` when its header shows :func:`flatten_image` would keep it.
+
+    Kept: an image that declares no transparency, an animated one, a colour-keyed one Pillow
+    can't key exactly, and a JPEG with more scans than an encoder writes.  Reads the header only.
+    """
+    from PIL import Image
+
+    img = Image.open(BytesIO(data), formats=_FLATTEN_FORMATS)
+    if not has_transparency(img) or getattr(img, "is_animated", False):
+        return None
+    if not _colour_key_is_exact(img, data):
+        return None
+    # Every decoder checks scans first.  A JPEG declares no transparency, so it never gets here.
+    if too_many_jpeg_scans(data):
+        log.warning("transparency flatten skipped: JPEG has more than %d scans", MAX_JPEG_SCANS)
+        return None
+    return img
+
+
+def _colour_key_is_exact(img: Image.Image, data: bytes) -> bool:
+    """Whether Pillow marks the transparent pixels of PNG ``data``, opened as ``img``, exactly.
+
+    True for an alpha channel or a palette.  A colour key (a tRNS chunk on a grey or RGB image) is
+    matched against Pillow's 8-bit samples, so only an 8-bit image's key is exact: a 16-bit
+    image's is compared with clipped or truncated samples, and a 1-, 2- or 4-bit image's keeps the
+    file's own scale.  Those are left as uploaded rather than flattened wrongly.
+    """
+    if img.mode in _ALPHA_MODES or img.mode == "P":
+        return True
+    # The bit depth of an IHDR chunk that comes first, as the standard puts it.  Pillow also opens
+    # a file with another chunk ahead of it, whose byte there is something else.
+    ihdr_first = data[12:16] == b"IHDR"
+    return img.mode in ("L", "RGB") and img.format == "PNG" and ihdr_first and data[24] == 8
+
+
+def _webp_is_lossless(data: bytes) -> bool:
+    """Whether WebP ``data`` holds lossless image data: its first VP8 or VP8L chunk is VP8L.
+
+    Walks the RIFF chunks after the 12-byte header, each payload padded to an even length, and
+    into an animation frame's own chunks: a one-frame animation isn't animated, so it is
+    flattened like a still.  Searching the bytes for the chunk name instead would also match
+    metadata that contains it.
+    """
+    pos = 12
+    while pos + 8 <= len(data):
+        fourcc = data[pos : pos + 4]
+        if fourcc in (b"VP8 ", b"VP8L"):
+            return fourcc == b"VP8L"
+        if fourcc == b"ANMF":
+            pos += 8 + 16  # past the frame's 16-byte header, to its first chunk
+            continue
+        size = int.from_bytes(data[pos + 4 : pos + 8], "little")
+        pos += 8 + size + (size & 1)
+    return False

@@ -3733,6 +3733,29 @@ class TestExecReadImage:
         assert url.startswith("data:image/jpeg;base64,")
         assert base64.b64decode(url.split(",", 1)[1]) == img.read_bytes()
 
+    def test_a_transparent_image_is_sent_flattened(self, tmp_db, tmp_path):
+        """As an upload is, on the way in: providers each remove transparency their own way,
+        losing white on a transparent background, and a task agent sends these parts as they
+        are."""
+        from io import BytesIO
+
+        from PIL import Image
+
+        img = tmp_path / "title.png"
+        picture = Image.new("RGBA", (40, 20), (255, 255, 255, 0))
+        picture.paste((255, 255, 255, 255), (10, 5, 30, 15))
+        picture.save(img, format="PNG")
+
+        output = self._read_with_vision(img)
+        assert isinstance(output, list)
+        assert f"({img.stat().st_size:,} bytes)" in output[0]["text"], "the file's own size"
+        url = output[1]["image_url"]["url"]
+        assert url.startswith("data:image/png;base64,")
+        sent = Image.open(BytesIO(base64.b64decode(url.split(",", 1)[1])))
+        assert sent.mode == "RGB"
+        assert sent.getpixel((0, 0)) == (0, 0, 0)
+        assert sent.getpixel((20, 10)) == (255, 255, 255)
+
     def test_non_image_content_returns_error(self, tmp_db, tmp_path):
         """A failed download saved under an image name is not sent as an image."""
         page = tmp_path / "chart.png"

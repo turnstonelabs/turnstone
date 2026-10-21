@@ -19,14 +19,10 @@ from typing import Any
 import pytest
 from starlette.testclient import TestClient
 
-from tests._helpers import wait_until
+from tests._helpers import opaque_png, transparent_png, wait_until
 
 # Magic-byte-valid 1x1 PNG (matches the fixture in test_server_attachments_endpoints.py)
-PNG_1x1 = (
-    b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
-    b"\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\rIDATx\x9cc\xfc\xcf"
-    b"\xc0\xc0\xc0\x00\x00\x00\x05\x00\x01\xa5\xf6E@\x00\x00\x00\x00IEND\xaeB`\x82"
-)
+PNG_1x1 = opaque_png()
 
 _TEST_JWT_SECRET = "test-jwt-secret-minimum-32-chars!"
 
@@ -84,6 +80,38 @@ class TestValidateAndSaveUploadedFiles:
         finally:
             buf.clear()
 
+    def test_stages_a_transparent_image_flattened(self, tmp_path):
+        # #1445: as the upload endpoint does, so a workstream created with an image stores
+        # the flattened copy every model is sent.
+        import hashlib
+        from io import BytesIO
+
+        from PIL import Image
+
+        from turnstone.core.attachment_buffer import get_attachment_buffer
+        from turnstone.core.attachments import (
+            validate_and_save_uploaded_files as _validate_and_save_uploaded_files,
+        )
+
+        src = Image.new("RGBA", (40, 20), (255, 255, 255, 0))
+        src.paste((255, 255, 255, 255), (10, 5, 30, 15))
+        uploaded = BytesIO()
+        src.save(uploaded, format="PNG")
+        buf = get_attachment_buffer()
+        buf.clear()
+        try:
+            files = [("title.png", "image/png", uploaded.getvalue())]
+            ids, err = _validate_and_save_uploaded_files(files, "ws-X", "userA")
+            assert err is None
+            staged = buf.get(ids[0], ws_id="ws-X", user_id="userA")
+            assert staged is not None
+            assert ids[0] == hashlib.sha256(staged.content).hexdigest()
+            stored = Image.open(BytesIO(staged.content))
+            assert stored.mode == "RGB"
+            assert stored.getpixel((0, 0)) == (0, 0, 0)
+        finally:
+            buf.clear()
+
     def test_rejects_oversized_image(self, tmp_path):
         from turnstone.core.attachments import IMAGE_SIZE_CAP
         from turnstone.core.attachments import (
@@ -127,6 +155,93 @@ class TestValidateAndSaveUploadedFiles:
 # (The per-user pending-upload cap was removed with the content-addressing
 # cutover; ``validate_and_save_uploaded_files`` no longer 409s — the buffer's
 # own size/TTL ceilings bound a flood.)
+
+
+class TestGatedUploadContent:
+    def test_uploads_waiting_their_turn_hold_no_worker_thread(self, monkeypatch):
+        # Queued in the shared default executor instead, a burst of image uploads held up every
+        # other request's storage and permission calls until it drained.
+        import asyncio
+        import concurrent.futures
+        import time
+
+        from turnstone.core import attachments
+
+        def slow_flatten(kind: str, data: bytes) -> bytes:
+            time.sleep(0.2)
+            return data
+
+        monkeypatch.setattr(attachments, "stored_upload_content", slow_flatten)
+
+        async def scenario() -> float:
+            pool = concurrent.futures.ThreadPoolExecutor(max_workers=2)
+            asyncio.get_running_loop().set_default_executor(pool)
+            try:
+                gate = asyncio.Lock()
+                image = transparent_png()
+                uploads = [
+                    asyncio.create_task(attachments.gated_upload_content("image", image, gate))
+                    for _ in range(5)
+                ]
+                await asyncio.sleep(0.05)  # one upload flattening, four waiting
+                started = time.monotonic()
+                await asyncio.to_thread(time.sleep, 0)
+                waited = time.monotonic() - started
+                await asyncio.gather(*uploads)
+                return waited
+            finally:
+                pool.shutdown(wait=True)
+
+        assert asyncio.run(scenario()) < 0.15
+
+    def test_other_kinds_pass_straight_through(self):
+        import asyncio
+
+        from turnstone.core.attachments import gated_upload_content
+
+        async def scenario() -> bytes:
+            gate = asyncio.Lock()
+            async with gate:  # held: an image would wait, a document doesn't
+                return await gated_upload_content("text", b"notes", gate)
+
+        assert asyncio.run(scenario()) == b"notes"
+
+    def test_an_image_with_nothing_to_flatten_does_not_wait(self):
+        # Its header declares no transparency, so it is stored as uploaded behind no one.
+        import asyncio
+
+        from turnstone.core.attachments import gated_upload_content
+
+        async def scenario() -> bytes:
+            gate = asyncio.Lock()
+            async with gate, asyncio.timeout(5):
+                return await gated_upload_content("image", opaque_png(), gate)
+
+        assert asyncio.run(scenario()) == opaque_png()
+
+    def test_a_transparent_image_waits_its_turn(self):
+        import asyncio
+
+        from turnstone.core.attachments import gated_upload_content
+
+        async def scenario() -> None:
+            gate = asyncio.Lock()
+            async with gate:
+                with pytest.raises(TimeoutError):
+                    async with asyncio.timeout(0.5):
+                        await gated_upload_content("image", transparent_png(), gate)
+
+        asyncio.run(scenario())
+
+    def test_a_create_waits_only_when_an_image_may_need_flattening(self):
+        from turnstone.core.attachments import any_upload_needs_flattening
+
+        files = [
+            ("notes.txt", "text/plain", b"notes"),
+            ("shot.png", "image/png", opaque_png()),
+        ]
+        assert not any_upload_needs_flattening(files)
+        assert any_upload_needs_flattening([*files, ("logo.png", "image/png", transparent_png())])
 
 
 class TestResolveStagedAttachments:
@@ -437,6 +552,36 @@ class TestCreateMultipart:
         )
         assert resp.status_code == 400
         assert resp.json()["error"].startswith("party.gif: GIF images are not supported")
+
+    def test_a_transparent_image_is_stored_flattened(self, app_client):
+        # #1445, through the handler's gated save: the transparent image's id names its
+        # flattened copy, and the opaque one is stored as uploaded beside it.
+        import hashlib
+        from io import BytesIO
+
+        from PIL import Image
+
+        from turnstone.core.attachment_buffer import get_attachment_buffer
+
+        client, _, _gq = app_client
+        resp = client.post(
+            "/v1/api/workstreams/new",
+            data={"meta": json.dumps({"name": "logo"})},
+            files=[
+                ("file", ("logo.png", transparent_png(), "image/png")),
+                ("file", ("shot.png", opaque_png(), "image/png")),
+            ],
+            headers=_auth("userA"),
+        )
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        flattened_id, opaque_id = data["attachment_ids"]
+        assert opaque_id == hashlib.sha256(opaque_png()).hexdigest()
+        staged = get_attachment_buffer().get(flattened_id, ws_id=data["ws_id"], user_id="userA")
+        assert staged is not None
+        assert flattened_id == hashlib.sha256(staged.content).hexdigest()
+        stored = Image.open(BytesIO(staged.content))
+        assert (stored.mode, stored.getpixel((0, 0))) == ("RGB", (0, 0, 0))
 
     def test_create_with_image_and_initial_message(self, app_client):
         import hashlib

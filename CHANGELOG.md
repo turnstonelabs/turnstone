@@ -1272,6 +1272,25 @@ frozen.
 - **A node's workstream list in the console puts running workstreams first.** It ranked running
   workstreams below idle ones, the opposite of the cluster API's `sort=state`, so on a long list
   they fell off the first page.
+- **Images with transparent areas are flattened when they are attached (#1445).** A PNG or WebP went
+  to the model with its alpha channel, which vision models can't take, so each provider removed it
+  its own way: filling transparent areas with white or with black, or dropping the channel and
+  showing whatever colour the transparent pixels stored. White text on a transparent background
+  vanished wherever transparency became white, and dark text wherever it became black. An uploaded
+  image, and an image `read_file` returns, now has its transparent areas filled with white, black or
+  mid grey, whichever the content's edges stand out on most (mid grey when they are both light and
+  dark), and is stored that way: its preview and download show the flattened image, and every model
+  is sent the same pixels. The stored copy keeps the image's format, colour profile and kind of
+  colour (palette, grey or full colour), and a lossless WebP stays lossless. Images over 8.4
+  megapixels, animated images, colour-keyed PNGs that aren't 8-bit, and any image whose flattened
+  copy would outgrow the 4 MiB image cap are stored as uploaded. A process flattens one image at a
+  time, so a burst of uploads queues instead of flattening all at once; an image whose header
+  declares no transparency skips the queue. The queue has no length limit, and a workstream create
+  waiting its turn holds its workstream slot. On a node, rate limiting (`ratelimit.enabled`: per
+  IP, off by default) bounds how fast one client can add to the queue; the console's coordinator
+  uploads, open only to coordinator admins, have no rate limit. Images already in a conversation
+  are left as they are, so it keeps sending what it sent and its history and cached prompt prefix
+  don't change; attach such an image again to have it flattened.
 
 ### Security
 

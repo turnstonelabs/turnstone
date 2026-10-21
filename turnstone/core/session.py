@@ -102,6 +102,7 @@ from turnstone.core.completion_recovery import (
 from turnstone.core.config import get_searxng_engines, get_searxng_url, get_workspace_dir
 from turnstone.core.deadline import DeadlineCancelledError, StreamAbortRef
 from turnstone.core.edit import find_occurrences, pick_nearest
+from turnstone.core.images import flatten_image
 from turnstone.core.ip_classify import AddressLane
 from turnstone.core.log import get_logger
 from turnstone.core.lowering import (
@@ -25781,9 +25782,12 @@ class ChatSession:
             return call_id, msg
 
         self._current_read_files.add(resolved)
+        # Flattened as it enters the conversation, like an upload: a session stores this image
+        # as sent, and a task agent sends these parts as they are.
+        image = flatten_image(raw, max_bytes=_IMAGE_SIZE_CAP)
         content_parts: list[dict[str, Any]] = [
             {"type": "text", "text": ControllerText(f"Image file: {path} ({len(raw):,} bytes)")},
-            {"type": "image_url", "image_url": {"url": _encode_image_data_uri(raw, mime)}},
+            {"type": "image_url", "image_url": {"url": _encode_image_data_uri(image, mime)}},
         ]
 
         self._report_tool_result(call_id, "read_file", f"image ({len(raw):,} bytes)")

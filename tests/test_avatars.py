@@ -10,7 +10,6 @@ import re
 import struct
 import threading
 import time
-import zlib
 from io import BytesIO
 from pathlib import Path
 from typing import Any
@@ -19,6 +18,7 @@ import pytest
 from PIL import Image, ImageDraw
 
 from tests._exif_helpers import exif_block, jpeg_with_exif, orientation_entry, png_with_exif
+from tests._helpers import keyed_png
 from turnstone.core import avatars
 from turnstone.core.avatars import (
     PALETTE_SIZE,
@@ -360,28 +360,6 @@ def _png(size: tuple[int, int], color: tuple[int, ...] = (200, 30, 30, 255)) -> 
     return buf.getvalue()
 
 
-def _keyed_png(bit_depth: int, colour_type: int, rows: list[bytes], trns: bytes) -> bytes:
-    """A PNG written byte by byte, for sample depths Pillow can't save with a key."""
-
-    def chunk(kind: bytes, body: bytes) -> bytes:
-        return (
-            struct.pack(">L", len(body)) + kind + body + struct.pack(">L", zlib.crc32(kind + body))
-        )
-
-    width = 8
-    header = struct.pack(">LLBBBBB", width, len(rows), bit_depth, colour_type, 0, 0, 0)
-    raw = b"".join(bytes([0]) + row for row in rows)
-    return (
-        bytes([0x89])
-        + b"PNG"
-        + bytes([13, 10, 26, 10])
-        + chunk(b"IHDR", header)
-        + chunk(b"tRNS", trns)
-        + chunk(b"IDAT", zlib.compress(raw))
-        + chunk(b"IEND", b"")
-    )
-
-
 def _open(png: bytes) -> Image.Image:
     img = Image.open(BytesIO(png))
     img.load()
@@ -492,7 +470,7 @@ class TestNormalizePicture:
         self, depth: int, colour_type: int, row: bytes, trns: bytes
     ) -> None:
         # The left half holds the key, the right half another value.
-        data = _keyed_png(depth, colour_type, [row] * 8, trns)
+        data = keyed_png(depth, colour_type, [row] * 8, trns)
         out = _open(normalize_picture(data)[0]).convert("RGBA")
         assert out.getpixel((20, PICTURE_SIZE // 2))[3] == 0, "the keyed half is transparent"
         assert out.getpixel((PICTURE_SIZE - 20, PICTURE_SIZE // 2))[3] == 255, "the rest is not"
