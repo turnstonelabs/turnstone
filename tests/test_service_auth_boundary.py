@@ -441,7 +441,7 @@ class TestProxySseNon200LogLevel:
         from turnstone.console.server import _proxy_sse
 
         def handler(_req: httpx2.Request) -> httpx2.Response:
-            return httpx2.Response(403, text='{"error":"service scope required\\n"}')
+            return httpx2.Response(403, text='{"error":"service scope required' + chr(10) + '"}')
 
         sse_client = httpx2.AsyncClient(transport=httpx2.MockTransport(handler))
         proxy_client = httpx2.AsyncClient(transport=httpx2.MockTransport(handler))
@@ -627,7 +627,7 @@ class TestDenySentinelSharedIdentity:
 
 
 # ---------------------------------------------------------------------------
-# _bounded_body_preview control-char scrub (sec-1)
+# bounded_body_preview control-char scrub (sec-1)
 # ---------------------------------------------------------------------------
 
 
@@ -637,9 +637,9 @@ class TestBoundedBodyPreviewScrub:
         logs or in the operator-facing 503 ``collector_scope_error``
         — otherwise an attacker-controllable upstream can forge
         additional log lines or embed fake remediation text."""
-        from turnstone.console.server import _bounded_body_preview
+        from turnstone.console.log_preview import bounded_body_preview
 
-        preview = _bounded_body_preview("line-a\nline-b\r\nNUL\x00TAB\t")
+        preview = bounded_body_preview("line-a\nline-b\r\nNUL\x00TAB\t")
         assert "\n" not in preview
         assert "\r" not in preview
         assert "\x00" not in preview
@@ -649,16 +649,22 @@ class TestBoundedBodyPreviewScrub:
         assert "line-a" in preview
         assert "line-b" in preview
 
-    def test_accepts_bytes_and_decodes(self):
-        from turnstone.console.server import _bounded_body_preview
+    def test_unicode_controls_and_separators_replaced_with_space(self):
+        from turnstone.console.log_preview import bounded_body_preview
 
-        preview = _bounded_body_preview(b"hello\nworld")
+        text = "a" + chr(0x85) + "b" + chr(0x9B) + "c" + chr(0x2028) + "d" + chr(0x202E) + "e"
+        assert bounded_body_preview(text) == "a b c d e"
+
+    def test_accepts_bytes_and_decodes(self):
+        from turnstone.console.log_preview import bounded_body_preview
+
+        preview = bounded_body_preview(b"hello\nworld")
         assert preview == "hello world"
 
     def test_caps_at_requested_length(self):
-        from turnstone.console.server import _bounded_body_preview
+        from turnstone.console.log_preview import bounded_body_preview
 
-        preview = _bounded_body_preview("x" * 1000, cap=50)
+        preview = bounded_body_preview("x" * 1000, cap=50)
         assert len(preview) == 50
 
 

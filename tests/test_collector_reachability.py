@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from typing import TYPE_CHECKING, Any
 from unittest.mock import MagicMock
 
@@ -160,6 +161,37 @@ def test_a_transport_error_marks_the_node_down_and_the_loop_reconnects(backoffs)
     node = c._nodes["node-1"]
     assert (node.reachable, node.reachable_reason) == (True, "")
     assert set(node.workstreams) == {"ws-1"}
+
+
+def test_a_node_4xx_body_is_logged_without_control_characters(backoffs, caplog):
+    # A compromised node could otherwise forge a log line, or send terminal escapes, through the
+    # preview of its error reply.
+    c = _node_collector()
+    body = ("denied" + chr(13) + chr(10) + "forged line" + chr(27) + "[2K").encode()
+
+    def denied(_request: httpx2.Request) -> httpx2.Response:
+        return httpx2.Response(403, content=body)
+
+    with caplog.at_level(logging.WARNING, logger="turnstone.console.collector"):
+        _run_node_stream(c, [denied])
+
+    [message] = [r.getMessage() for r in caplog.records if "SSE 403" in r.getMessage()]
+    assert message.endswith("denied  forged line [2K")
+
+
+def test_a_snapshot_naming_another_node_is_logged_escaped(backoffs, caplog):
+    c = _node_collector()
+    forged = "node-1" + chr(13) + chr(10) + "WARNING forged" + chr(27) + "[2K"
+
+    def other_node(_request: httpx2.Request) -> httpx2.Response:
+        return _event_stream({**_snapshot(), "node_id": forged})
+
+    with caplog.at_level(logging.WARNING, logger="turnstone.console.collector"):
+        _run_node_stream(c, [other_node])
+
+    [message] = [r.getMessage() for r in caplog.records if "mismatch" in r.getMessage()]
+    assert "forged" in message
+    assert all(ch.isprintable() for ch in message)
 
 
 def test_a_node_event_over_one_mebibyte_applies(backoffs):

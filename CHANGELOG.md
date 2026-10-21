@@ -703,6 +703,13 @@ frozen.
   console answered 500 instead of 502, or failed to start when a node answered its startup scope
   check that way, and OAuth, OIDC, the MCP registry search and skill sources raised past their own
   error handling.
+- **Console logs no longer carry control characters from a request path or a node's reply** — a
+  proxied request that failed logged its path with any percent-encoded control characters decoded,
+  at debug, or at warning when the node answered an event stream with an error; the cluster
+  collector logged a node's 4xx reply, and the node id in a snapshot that named another node, at
+  warning as sent. With text-format logs, a signed-in user or a compromised node could forge a log
+  line or send terminal escapes. Paths and node ids are logged escaped, and every reply preview
+  replaces the characters that aren't printable, C1 controls and Unicode line separators included.
 - **An OAuth or OIDC endpoint URL the client can't send is refused when its document is read.** An
   identity provider's discovery document, an MCP server's challenge or metadata, or an
   authorization server's metadata could name an endpoint holding a control character (a stray

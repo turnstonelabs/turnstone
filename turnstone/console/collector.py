@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, Any
 
 import httpx2
 
+from turnstone.console.log_preview import bounded_stream_preview
 from turnstone.core.sse_limits import MAX_SSE_EVENT_SIZE
 from turnstone.core.workstream import (
     WorkstreamKind,
@@ -348,30 +349,9 @@ class ClusterCollector:
                     # "console dashboard is empty" footgun when the
                     # collector token lacked ``service`` scope.
                     if 400 <= status < 500:
-                        # Bounded body read — iterate aiter_bytes() up
-                        # to the preview cap so a malicious / oversized
-                        # upstream can't force the collector to buffer
-                        # an arbitrary HTML error page just to log a
-                        # 200-char preview.  Stops pulling bytes as
-                        # soon as we have enough.
-                        body_preview = ""
-                        try:
-                            preview_cap = 256  # >200 chars after UTF-8 decode
-                            chunks: list[bytes] = []
-                            bytes_read = 0
-                            async for chunk in source.response.aiter_bytes():
-                                if not chunk:
-                                    continue
-                                remaining = preview_cap - bytes_read
-                                if remaining <= 0:
-                                    break
-                                chunks.append(chunk[:remaining])
-                                bytes_read += len(chunks[-1])
-                                if bytes_read >= preview_cap:
-                                    break
-                            body_preview = b"".join(chunks).decode("utf-8", "replace")[:200]
-                        except Exception:
-                            body_preview = "<unreadable>"
+                        # A bounded read with control characters replaced: an oversized
+                        # error page isn't buffered, and a node can't forge log lines.
+                        body_preview = await bounded_stream_preview(source.response)
                         log.warning(
                             "SSE %d from node %s at %s — %s",
                             status,
@@ -399,7 +379,7 @@ class ClusterCollector:
                             # Client-side identity check (defense in depth)
                             if data.get("node_id") != node_id:
                                 log.warning(
-                                    "Snapshot node_id mismatch: expected %s, got %s",
+                                    "Snapshot node_id mismatch: expected %s, got %.200r",
                                     node_id,
                                     data.get("node_id"),
                                 )

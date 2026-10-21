@@ -47,6 +47,7 @@ from turnstone.api.docs import make_docs_handler, make_openapi_handler
 from turnstone.console.collector import ClusterCollector
 from turnstone.console.coordinator_alias import resolve_coordinator_alias
 from turnstone.console.coordinator_client import _serialize_messages, load_task_envelope
+from turnstone.console.log_preview import bounded_body_preview, bounded_stream_preview
 from turnstone.console.metrics import ConsoleMetrics
 from turnstone.console.router import ConsoleRouter
 from turnstone.console.schedule_timing import (
@@ -299,59 +300,6 @@ _GENERATED_WS_ID_COLLISION_RETRY_CAP = 3
 _PROXY_CLIENT_TIMEOUT_S = 30
 
 _PROXY_JWT_EXPIRY_SECONDS = 300  # 5 min — ample for any request round-trip
-
-
-_CONTROL_CHAR_RE = re.compile(r"[\x00-\x1f\x7f]")
-
-
-async def _bounded_stream_preview(response: httpx2.Response, cap: int = 200) -> str:
-    """Streaming counterpart of :func:`_bounded_body_preview`.
-
-    Iterates ``response.aiter_bytes`` up to ``cap * 1.3`` bytes (enough
-    for ``cap`` chars post-UTF-8 decode) so a compromised / oversized
-    upstream can't force the proxy to buffer an arbitrary error page
-    just to populate a preview.  Shares the control-char scrub with
-    the non-streaming helper so the output shape is identical across
-    sites.
-    """
-    preview_chunks: list[bytes] = []
-    read = 0
-    byte_cap = int(cap * 1.3) + 1
-    try:
-        async for chunk in response.aiter_bytes():
-            if not chunk:
-                continue
-            remaining = byte_cap - read
-            if remaining <= 0:
-                break
-            preview_chunks.append(chunk[:remaining])
-            read += len(preview_chunks[-1])
-            if read >= byte_cap:
-                break
-    except Exception:
-        return "<unreadable>"
-    decoded = b"".join(preview_chunks).decode("utf-8", "replace")
-    return _CONTROL_CHAR_RE.sub(" ", decoded)[:cap]
-
-
-def _bounded_body_preview(text: str | bytes, cap: int = 200) -> str:
-    """Return a body preview for 4xx logs capped at ``cap`` chars.
-
-    Body is already in memory on a non-streaming httpx2 response; this
-    helper exists so every call-site produces the same shape.
-
-    Control characters (CR, LF, NUL, ...) are replaced with spaces
-    before the cap: the preview flows into both ``log.warning`` records
-    and the operator-facing 503 ``collector_scope_error`` body, and
-    upstream-controlled newlines in either surface would let a
-    compromised node forge additional log lines or masquerade as
-    embedded remediation text.
-    """
-    if not text:
-        return ""
-    if isinstance(text, bytes):
-        text = text.decode("utf-8", "replace")
-    return _CONTROL_CHAR_RE.sub(" ", text)[:cap]
 
 
 def _dispatch_failed(node_id: str) -> JSONResponse:
@@ -869,7 +817,7 @@ class _NodeDashboardCache:
                         node_id,
                         status,
                         server_url,
-                        _bounded_body_preview(resp.content),
+                        bounded_body_preview(resp.content),
                     )
                     return None
             self._cache[node_id] = (time.monotonic(), payload)
@@ -996,7 +944,7 @@ async def _fetch_live_block(
                 row_node_id,
                 status,
                 server_url,
-                _bounded_body_preview(resp.content),
+                bounded_body_preview(resp.content),
             )
             return None
         if not (200 <= status < 300):
@@ -1951,7 +1899,7 @@ async def create_workstream(request: Request) -> JSONResponse:
                 "Workstream dispatch to %s: unparseable %s success body: %s",
                 node_id,
                 resp.status_code,
-                _bounded_body_preview(resp.content),
+                bounded_body_preview(resp.content),
             )
             return _dispatch_failed(node_id)
         return JSONResponse(
@@ -2016,7 +1964,7 @@ async def create_workstream(request: Request) -> JSONResponse:
         "Workstream dispatch to %s failed: node status %s: %s",
         node_id,
         resp.status_code,
-        _bounded_body_preview(resp.content),
+        bounded_body_preview(resp.content),
     )
     return _dispatch_failed(node_id)
 
@@ -2458,7 +2406,7 @@ async def route_create(request: Request) -> Response:
             log.warning(
                 "route_create.invalid_success_body node=%s body=%s",
                 ref.node_id,
-                _bounded_body_preview(resp.content),
+                bounded_body_preview(resp.content),
             )
             return _record_route(request, "create", 502, t0, _dispatch_failed(ref.node_id))
         destination_ws_id = raw_data.get("ws_id")
@@ -3543,7 +3491,7 @@ async def _proxy_static_mount(request: Request, mount: str) -> Response:
             headers=_proxy_static_request_headers(request),
         )
     except REQUEST_FAILURES as exc:
-        log.debug("Proxy %s error for %s/%s: %s", mount, node_id, path, exc)
+        log.debug("Proxy %s error for %r: %s", mount, f"{node_id}/{path}", exc)
         return _static_proxy_error("Node unreachable", 502)
     return _proxy_static_response(resp, path)
 
@@ -3710,7 +3658,7 @@ async def _proxy_get(request: Request, server_url: str, path: str) -> Response:
     try:
         resp = await client.get(target, headers=_proxy_auth_headers(request))
     except REQUEST_FAILURES as exc:
-        log.debug("Proxy GET error for %s: %s", target, exc)
+        log.debug("Proxy GET error for %r: %s", target, exc)
         return JSONResponse({"error": "Node unreachable"}, status_code=502)
     return Response(
         content=resp.content,
@@ -3740,7 +3688,7 @@ async def _proxy_post(
             headers=headers,
         )
     except REQUEST_FAILURES as exc:
-        log.debug("Proxy %s error for %s/%s: %s", request.method, api_prefix, path, exc)
+        log.debug("Proxy %s error for %r: %s", request.method, f"{api_prefix}/{path}", exc)
         return JSONResponse({"error": "Node unreachable"}, status_code=502)
     return Response(
         content=resp.content,
@@ -3828,14 +3776,14 @@ async def _proxy_sse(
             ) as response:
                 if response.status_code != 200:
                     status = response.status_code
-                    body_preview = await _bounded_stream_preview(response)
+                    body_preview = await bounded_stream_preview(response)
                     # Non-200 from a service-auth-backed SSE path is
                     # operator-actionable: 4xx = scope/tenant drift,
                     # 5xx = upstream outage.  Raise the log floor to
                     # WARNING so it surfaces in ops logs; the browser
                     # also receives the error event for UX.
                     log.warning(
-                        "proxy.sse.non_200 status=%d url=%s body=%s",
+                        "proxy.sse.non_200 status=%d url=%r body=%s",
                         status,
                         target,
                         body_preview,
@@ -3847,7 +3795,7 @@ async def _proxy_sse(
                         return
                     yield chunk
         except REQUEST_FAILURES:
-            log.debug("SSE proxy stream ended for %s", target)
+            log.debug("SSE proxy stream ended for %r", target)
 
     return StreamingResponse(
         raw_stream(),
@@ -5382,7 +5330,7 @@ async def _verify_collector_service_scope(app: Starlette, client: httpx2.AsyncCl
         # accepted and the handler got as far as the node_id check.
         log.info("collector_scope_probe.ok node=%s url=%s", probe_node, probe_target)
         return
-    body_preview = _bounded_body_preview(resp.content)
+    body_preview = bounded_body_preview(resp.content)
     if 400 <= status < 500:
         # 403 = missing ``service`` scope on the collector token; 401 =
         # JWT rejected outright (secret mismatch / audience drift).
@@ -5390,7 +5338,7 @@ async def _verify_collector_service_scope(app: Starlette, client: httpx2.AsyncCl
         # fixes it.  Upstream body is attacker-controllable so we
         # delimit it explicitly in the 503 error text; the preview
         # already passed through the control-char scrub in
-        # _bounded_body_preview.
+        # bounded_body_preview.
         app.state.collector_scope_error = (
             f"collector token rejected by {probe_node} ({probe_target}): "
             f"HTTP {status} — upstream_body=<<<{body_preview}>>>. "

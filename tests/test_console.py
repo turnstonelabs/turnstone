@@ -2,13 +2,14 @@
 
 import asyncio
 import json
+import logging
 import queue
 from typing import Any
 from unittest.mock import ANY, MagicMock
 
 import pytest
 
-from tests._http_failure_cases import UNREACHABLE_REPLIES
+from tests._http_failure_cases import UNREACHABLE_REPLIES, refuse
 from turnstone.console.collector import ClusterCollector, NodeSnapshot
 from turnstone.console.server import _PROXY_AUTH_LOCAL_HANDLERS
 
@@ -1998,6 +1999,65 @@ class TestConsoleProxy:
         assert resp.status_code == 502
         assert resp.json() == {"error": "Node unreachable"}
         assert sent == []
+
+    @pytest.mark.parametrize(
+        "forged",
+        [
+            # ESC, BEL and CR, which httpx2 won't put in a URL, so the request fails unsent.
+            "%1B%07%0DINFO%20forged",
+            # NEL, CSI and a line separator, which httpx2 percent-encodes and sends.
+            "%C2%85INFO%20forged%C2%9B2K%E2%80%A8",
+        ],
+        ids=["ascii-controls", "unicode-controls"],
+    )
+    @pytest.mark.parametrize(
+        ("method", "path"),
+        [
+            ("GET", "/node/node-a/static/app.js{forged}"),
+            ("GET", "/node/node-a/v1/api/workstreams{forged}"),
+            ("POST", "/node/node-a/v1/api/workstreams/new{forged}"),
+            ("GET", "/node/node-a/v1/api/workstreams/a{forged}/events"),
+        ],
+        ids=["static", "api-get", "api-post", "sse"],
+    )
+    def test_a_failed_request_logs_its_path_escaped(self, client, caplog, method, path, forged):
+        import httpx2
+
+        proxy = httpx2.AsyncClient(transport=httpx2.MockTransport(refuse))
+        client.app.state.proxy_client = proxy
+        client.app.state.proxy_sse_client = proxy
+        try:
+            with caplog.at_level(logging.DEBUG, logger="turnstone.console.server"):
+                client.request(
+                    method, path.format(forged=forged), json={} if method == "POST" else None
+                )
+        finally:
+            asyncio.run(proxy.aclose())
+
+        logged = [r.getMessage() for r in caplog.records if "forged" in r.getMessage()]
+        assert logged
+        assert all(ch.isprintable() for message in logged for ch in message)
+
+    def test_an_event_stream_error_logs_its_url_escaped(self, client, caplog):
+        import httpx2
+
+        def not_found(request: httpx2.Request) -> httpx2.Response:
+            return httpx2.Response(404, json={"error": "Unknown workstream"})
+
+        proxy = httpx2.AsyncClient(transport=httpx2.MockTransport(not_found))
+        client.app.state.proxy_sse_client = proxy
+        path = "/node/node-a/v1/api/workstreams/a%C2%85INFO%20forged%C2%9B2K%E2%80%A8/events"
+        try:
+            with caplog.at_level(logging.WARNING, logger="turnstone.console.server"):
+                client.get(path)
+        finally:
+            asyncio.run(proxy.aclose())
+
+        [message] = [
+            r.getMessage() for r in caplog.records if "proxy.sse.non_200" in r.getMessage()
+        ]
+        assert "forged" in message
+        assert all(ch.isprintable() for ch in message)
 
     @UNREACHABLE_REPLIES
     def test_proxy_sse_from_unreachable_node_ends_the_stream(self, client, reply):
