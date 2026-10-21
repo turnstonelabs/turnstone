@@ -84,6 +84,7 @@ from turnstone.core.mcp_oauth import (
     is_user_scoped_auth,
 )
 from turnstone.core.oauth.context import oauth_context
+from turnstone.core.sse_limits import MAX_SSE_EVENT_SIZE
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Coroutine, Sequence
@@ -578,11 +579,6 @@ class MCPShutdownError(RuntimeError):
 # spent. It bounds each read, not the request: a server that trickles its answer is cut off only
 # by the connection test's own bound, and a saved server's owner is left to finish on its own.
 _SESSION_END_TIMEOUT_S = 3.0
-# S8 (#679): httpx2.EventSource caps a single SSE event at 1 MiB by default,
-# which truncates large tool outputs (screenshots, multi-MB text/resource reads)
-# as a -32000 CONNECTION_CLOSED error. 16 MiB accommodates multi-MB tool results
-# while retaining a bounded frame ceiling against runaway streams.
-_MCP_MAX_SSE_EVENT_SIZE = 16 * 1024 * 1024
 # The SDK's own client defaults, kept on ours: 30 s to connect, write or wait for the pool, and
 # 300 s for a read, since a server may hold a response stream open.
 _MCP_HTTP_TIMEOUT_S = 30.0
@@ -1986,7 +1982,7 @@ async def _probe_http_server(url: str, headers: dict[str, str], label: str) -> C
             streamable_http_client(
                 url,
                 http_client=http_client,
-                max_sse_event_size=_MCP_MAX_SSE_EVENT_SIZE,
+                max_sse_event_size=MAX_SSE_EVENT_SIZE,
             ) as (read, write),
             ClientSession(read, write) as session,
         ):
@@ -3822,7 +3818,7 @@ class MCPClientManager:
                             streamable_http_client(
                                 cfg["url"],
                                 http_client=http_client,
-                                max_sse_event_size=_MCP_MAX_SSE_EVENT_SIZE,
+                                max_sse_event_size=MAX_SSE_EVENT_SIZE,
                             )
                         )
                 else:
@@ -4288,7 +4284,7 @@ class MCPClientManager:
                         streamable_http_client(
                             url,
                             http_client=http_client,
-                            max_sse_event_size=_MCP_MAX_SSE_EVENT_SIZE,
+                            max_sse_event_size=MAX_SSE_EVENT_SIZE,
                         )
                     )
                 # Stash stream refs so _pre_close_streams can unblock the SDK's
