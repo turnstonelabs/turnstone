@@ -246,7 +246,7 @@ Body.
     def test_oversized_raw_chunked_returns_413(self, client: TestClient) -> None:
         # When the client sends Transfer-Encoding: chunked there is no
         # Content-Length header, so the pre-check is skipped and the
-        # application-layer cap is the only line of defence.  httpx switches
+        # application-layer cap is the only line of defence.  httpx2 switches
         # to chunked when the body is a generator.
         def _gen() -> Iterator[bytes]:
             yield b'{"raw":"' + b"a" * 33_000 + b'"}'

@@ -16,7 +16,7 @@ skinparam ArrowColor #555555
 ' Python SDK
 package "turnstone/sdk/ (Python)" {
     abstract class _BaseClient <<async>> {
-        - _client: httpx.AsyncClient
+        - _client: httpx2.AsyncClient
         - _owns_client: bool
         + _request(method, path, ...) → T
         + _stream_sse(path, ...) → AsyncIterator
@@ -153,8 +153,8 @@ package "sdk/typescript/ (TypeScript)" {
 class "turnstone-server :8080" as Server <<artifact>>
 class "turnstone-console :8081" as Console <<artifact>>
 
-AsyncTurnstoneServer --> Server : httpx REST + SSE
-AsyncTurnstoneConsole --> Console : httpx REST + SSE
+AsyncTurnstoneServer --> Server : httpx2 REST + SSE
+AsyncTurnstoneConsole --> Console : httpx2 REST + SSE
 TSServer --> Server : fetch REST + SSE
 TSConsole --> Console : fetch REST + SSE
 

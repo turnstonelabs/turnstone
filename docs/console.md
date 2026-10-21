@@ -376,7 +376,7 @@ The server UI uses root-relative URLs (`/v1/api/workstreams/{ws_id}/send`, `/sta
 
 ### SSE Proxy
 
-SSE streams (`/v1/api/workstreams/{ws_id}/events`, `/v1/api/events/global`) are proxied as raw byte passthrough — the console opens an `httpx.AsyncClient.stream()` to the upstream server (with `read=None` and `pool=None` timeouts since SSE connections are long-lived) and relays every byte via `StreamingResponse`. This preserves server-side ping comments, event framing, and keepalives verbatim without parsing or re-encoding.
+SSE streams (`/v1/api/workstreams/{ws_id}/events`, `/v1/api/events/global`) are proxied as raw byte passthrough — the console opens an `httpx2.AsyncClient.stream()` to the upstream server (with `read=None` and `pool=None` timeouts since SSE connections are long-lived) and relays every byte via `StreamingResponse`. This preserves server-side ping comments, event framing, and keepalives verbatim without parsing or re-encoding.
 
 ### Authentication
 

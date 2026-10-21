@@ -460,7 +460,7 @@ def _build_registry() -> dict[str, SettingDef]:
             help="Controls how many nodes the console queries in parallel during "
             "fan-out operations (watch listing, MCP status, reload notifications). "
             "Higher values speed up large-cluster admin operations at the cost of "
-            "more concurrent connections. The httpx proxy pool is sized to match "
+            "more concurrent connections. The console's proxy connection pool is sized to match "
             "this value (requires console restart to take effect).",
         ),
         SettingDef(

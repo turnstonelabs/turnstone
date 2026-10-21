@@ -26,7 +26,7 @@ import threading
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-import httpx
+import httpx2
 import pytest
 from openai import OpenAI
 
@@ -874,7 +874,7 @@ class TestServerRateLimiting:
     def teardown_class(cls):
         cls.client.close()
 
-    def _get(self, path) -> httpx.Response:
+    def _get(self, path) -> httpx2.Response:
         return self.client.get(path)
 
     def test_burst_requests_succeed(self):

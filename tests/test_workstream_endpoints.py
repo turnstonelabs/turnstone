@@ -13,7 +13,7 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 from unittest.mock import MagicMock, patch
 
-import httpx
+import httpx2
 import pytest
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
@@ -668,7 +668,7 @@ class TestDeleteWorkstream:
             "delete_workstream_if_fork_reserved",
             _blocked_exact_delete,
         )
-        responses: list[httpx.Response] = []
+        responses: list[httpx2.Response] = []
 
         request_thread = threading.Thread(
             target=lambda: responses.append(client.post(f"/v1/api/workstreams/{ws_id}/delete")),
@@ -748,7 +748,7 @@ class TestDeleteWorkstream:
             "delete_workstream_if_fork_reserved",
             _blocked_exact_delete,
         )
-        responses: list[httpx.Response] = []
+        responses: list[httpx2.Response] = []
         request_thread = threading.Thread(
             target=lambda: responses.append(client.post(f"/v1/api/workstreams/{ws_id}/delete")),
             daemon=True,
@@ -1360,7 +1360,7 @@ def _build_history_asgi_app(
     """Raw ASGI app for the lifted history factory.
 
     Returned un-wrapped (no ``TestClient``) so the coalescing tests can
-    drive CONCURRENT requests through ``httpx.ASGITransport`` on a
+    drive CONCURRENT requests through ``httpx2.ASGITransport`` on a
     private event loop — ``TestClient`` is synchronous and can only
     hold one request in flight at a time.
     """
@@ -2061,7 +2061,7 @@ class TestHistoryCoalescing:
     The matrix these tests assert: join-vs-miss × gates-per-request ×
     failed-vs-clean shared draw × key isolation (ws, limit, AND the
     #894 truncation generation) × no cross-flight caching × owner
-    cancellation.  Driven through ``httpx.ASGITransport``
+    cancellation.  Driven through ``httpx2.ASGITransport``
     on a private loop because ``TestClient`` cannot hold two requests in
     flight at once.
 
@@ -2116,7 +2116,7 @@ class TestHistoryCoalescing:
         caplog: Any,
         *,
         cancel_owner: bool = False,
-    ) -> tuple[Any, httpx.Response]:
+    ) -> tuple[Any, httpx2.Response]:
         """Drive two concurrent requests through one shared flight.
 
         Every wait is a positive observable edge.  Owner arrival:
@@ -2139,8 +2139,8 @@ class TestHistoryCoalescing:
         ``Response``, hence the loose first-slot type.
         """
         caplog.set_level(logging.DEBUG, logger="turnstone.core.session_routes")
-        transport = httpx.ASGITransport(app=app)
-        async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        transport = httpx2.ASGITransport(app=app)
+        async with httpx2.AsyncClient(transport=transport, base_url="http://t") as c:
             t1 = asyncio.create_task(c.get(url))
             await _until(lambda: gated.load_calls == 1)
             t2 = asyncio.create_task(c.get(url))
@@ -2200,10 +2200,10 @@ class TestHistoryCoalescing:
         # to 0 forever and re-enabled joining).
         mock_ws.session._history_generation = 0
 
-        async def drive() -> tuple[httpx.Response, httpx.Response]:
+        async def drive() -> tuple[httpx2.Response, httpx2.Response]:
             caplog.set_level(logging.DEBUG, logger="turnstone.core.session_routes")
-            transport = httpx.ASGITransport(app=app)
-            async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+            transport = httpx2.ASGITransport(app=app)
+            async with httpx2.AsyncClient(transport=transport, base_url="http://t") as c:
                 t1 = asyncio.create_task(c.get(url))
                 await _until(lambda: gated.load_calls == 1)
                 # The rewind commits mid-flight: the truncation chokepoint
@@ -2270,9 +2270,9 @@ class TestHistoryCoalescing:
         a reconstruction of its own."""
         gated, _tenant_calls, app, url = self._scaffold(_inject_storage, "ws-flight-deny")
 
-        async def run() -> tuple[httpx.Response, httpx.Response]:
-            transport = httpx.ASGITransport(app=app)
-            async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        async def run() -> tuple[httpx2.Response, httpx2.Response]:
+            transport = httpx2.ASGITransport(app=app)
+            async with httpx2.AsyncClient(transport=transport, base_url="http://t") as c:
                 t1 = asyncio.create_task(c.get(url))
                 await _until(lambda: gated.load_calls == 1)
                 r2 = await c.get(url, headers={"x-test-deny": "1"})
@@ -2291,9 +2291,9 @@ class TestHistoryCoalescing:
         different limits are different flights."""
         gated, _tenant_calls, app, url = self._scaffold(_inject_storage, "ws-flight-limit")
 
-        async def run() -> tuple[httpx.Response, httpx.Response]:
-            transport = httpx.ASGITransport(app=app)
-            async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        async def run() -> tuple[httpx2.Response, httpx2.Response]:
+            transport = httpx2.ASGITransport(app=app)
+            async with httpx2.AsyncClient(transport=transport, base_url="http://t") as c:
                 t1 = asyncio.create_task(c.get(url))
                 await _until(lambda: gated.load_calls == 1)
                 t2 = asyncio.create_task(c.get(url, params={"limit": 1}))
@@ -2316,9 +2316,9 @@ class TestHistoryCoalescing:
         gated, _tenant_calls, app, url = self._scaffold(_inject_storage, "ws-flight-seq")
         gated.gate.set()  # pass-through
 
-        async def run() -> tuple[httpx.Response, httpx.Response]:
-            transport = httpx.ASGITransport(app=app)
-            async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        async def run() -> tuple[httpx2.Response, httpx2.Response]:
+            transport = httpx2.ASGITransport(app=app)
+            async with httpx2.AsyncClient(transport=transport, base_url="http://t") as c:
                 r1 = await c.get(url)
                 r2 = await c.get(url)
                 return r1, r2

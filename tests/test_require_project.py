@@ -21,14 +21,11 @@ import asyncio
 import contextlib
 import json
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any
+from typing import Any
 from unittest.mock import MagicMock
 
 import httpx2
 import pytest
-
-if TYPE_CHECKING:
-    import httpx
 
 # ---------------------------------------------------------------------------
 # Predicate matrix
@@ -448,7 +445,7 @@ def _console_client(
         client.close()
 
 
-def _create(client: Any) -> httpx.Response:
+def _create(client: Any) -> httpx2.Response:
     return client.post("/v1/api/cluster/workstreams/new", json={"node_id": "node-a", "name": "x"})
 
 

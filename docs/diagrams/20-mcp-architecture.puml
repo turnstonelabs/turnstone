@@ -53,7 +53,7 @@ MCPMgr -> MCPMgr : reconcile_sync()
 MCPMgr -> MCPSrv : connect to new server
 
 note over RegClient, Registry
-  MCPRegistryClient is an async httpx client
+  MCPRegistryClient is an async httpx2 client
   targeting registry.modelcontextprotocol.io/v0.1.
   resolve_install_config() translates registry
   remotes/packages into mcp_servers rows.

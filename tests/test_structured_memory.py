@@ -400,7 +400,7 @@ class TestSanitizeErrorText:
     def test_strips_url_userinfo(self):
         from turnstone.core.memory import sanitize_error_text
 
-        # Misconfigured OPENAI_BASE_URL → httpx ConnectError carries
+        # Misconfigured OPENAI_BASE_URL → httpx2 ConnectError carries
         # the userinfo verbatim in str(exc).
         msg = "ConnectError: connection failed to https://user:hunter2@api.example.com/v1/chat"
         out = sanitize_error_text(msg)

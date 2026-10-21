@@ -92,7 +92,7 @@ package "turnstone/sdk/" <<Rectangle>> {
     component [server.py\nTurnstoneServer (sync+async)] as sdkserver <<sdk>>
     component [console.py\nTurnstoneConsole (sync+async)] as sdkconsole <<sdk>>
     component [events.py\nTyped SSE event stream] as sdkevents <<sdk>>
-    component [_base.py\nhttpx client base] as sdkbase <<sdk>>
+    component [_base.py\nhttpx2 client base] as sdkbase <<sdk>>
 }
 
 ' Tool schemas

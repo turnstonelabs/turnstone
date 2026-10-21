@@ -11,7 +11,7 @@ Three scenarios:
 
 3. Per-session Authorization header isolation. Verifies: different Bearer
    tokens per ClientSession reach the server with the expected
-   Authorization header — i.e. httpx connection pooling does not cross
+   Authorization header — i.e. httpx2 connection pooling does not cross
    headers between sessions.
 
 Run: uv run python tests/spike_sdk_concurrency.py
@@ -277,7 +277,7 @@ async def scenario_2_concurrent_calls_shared_session(url: str) -> dict:
 async def scenario_3_header_isolation(url: str, n: int = 5) -> dict:
     """Open N sessions with distinct Authorization headers, call echo on each.
 
-    Verifies the server sees each session's own header — i.e. httpx
+    Verifies the server sees each session's own header — i.e. httpx2
     connection pooling does not cross headers between concurrent
     ClientSession instances against the same URL.
     """

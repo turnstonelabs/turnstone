@@ -108,13 +108,13 @@ def parse_www_authenticate_bearer(header: str) -> dict[str, str]:
     Only ``Bearer`` challenges are recognised. The function ignores any
     leading whitespace before the scheme. When a second ``Bearer``
     challenge appears after a separator comma — as it would when
-    httpx joins repeated ``WWW-Authenticate`` headers via
+    httpx2 joins repeated ``WWW-Authenticate`` headers via
     ``response.headers.get(...)`` — the tokenizer stops at the
     challenge boundary rather than folding the second challenge's
     auth-params into the first challenge's dict. This is the
     parser-side defence-in-depth mirror of the
     ``response.headers.get_list(...)[0]`` guard in the dispatcher's
-    capturing httpx factory; either layer alone neutralises the
+    capturing httpx2 client builder; either layer alone neutralises the
     multi-header injection vector but both run together so a
     regression in one cannot silently re-open it.
     A ``realm`` value that contains the literal text ``scope=fake`` is

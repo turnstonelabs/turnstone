@@ -556,7 +556,7 @@ class TLSClient:
         client = TLSClient(storage, console_url="http://console:8080")
         await client.init()             # Fetch CA, request cert
         server_ctx = client.get_server_ssl_context()  # For uvicorn
-        client_ctx = client.get_client_ssl_context()  # For httpx
+        client_ctx = client.get_client_ssl_context()  # For httpx2
         await client.start_renewal()    # Background auto-renewal
     """
 
@@ -882,7 +882,7 @@ class TLSClient:
         )
 
     def get_client_ssl_context(self) -> ssl.SSLContext | None:
-        """Build mTLS client context for httpx connections."""
+        """Build mTLS client context for httpx2 connections."""
         if self._bundle is None or self._ca_pem is None:
             return None
         from lacme.mtls import client_ssl_context

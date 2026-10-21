@@ -1,11 +1,10 @@
 """Tests for :meth:`ChatSession._format_backend_error`.
 
-The helper turns bare backend-boundary exceptions (HTTPX/HTTPX2 ``ReadTimeout``,
-OpenAI SDK ``APITimeoutError`` / ``APIConnectionError`` /
-``NotFoundError`` / ``RateLimitError`` / ``AuthenticationError``) into
-operator-actionable messages that include the provider, base URL, and
-model. We bind the method to lightweight stubs carrying one coherent
-``ModelLane`` rather than constructing a full :class:`ChatSession`.
+The helper turns bare backend-boundary exceptions (httpx2 ``ReadTimeout``, OpenAI SDK
+``APITimeoutError`` / ``APIConnectionError`` / ``NotFoundError`` / ``RateLimitError`` /
+``AuthenticationError``) into operator-actionable messages that include the provider, base URL, and
+model. We bind the method to lightweight stubs carrying one coherent ``ModelLane`` rather than
+constructing a full :class:`ChatSession`.
 """
 
 from __future__ import annotations
@@ -37,7 +36,7 @@ def _stub(
 
     ``client_attr`` selects which attribute on the client carries the
     URL — both ``base_url`` (OpenAI / Anthropic SDK public surface) and
-    ``_base_url`` (httpx fallback) are exercised by the helper.
+    ``_base_url`` (httpx2 fallback) are exercised by the helper.
     """
     client_kwargs: dict[str, Any] = {client_attr: base_url}
     lane = ModelLane(
@@ -73,12 +72,12 @@ def test_accepted_overflow_formats_as_context_overflow_at_any_tool_posture(nativ
 
 # ---------------------------------------------------------------------------
 # Synthetic exception classes — class name is what the helper matches on,
-# so we don't need real httpx / openai imports here.
+# so we don't need real httpx2 / openai imports here.
 # ---------------------------------------------------------------------------
 
 
 # N818 (Error suffix on Exception names) is intentionally suppressed
-# for the four classes below — they exist to impersonate httpx /
+# for the four classes below — they exist to impersonate httpx2 /
 # Anthropic SDK exception class names verbatim, since the formatter
 # matches by class name.  Renaming them defeats the test.
 
@@ -341,9 +340,8 @@ def test_http_200_json_error_is_rendered_as_context_overflow():
 
 
 def _stream_death_exemplars() -> list[BaseException]:
-    """One realistic instance per name in ``BACKEND_STREAM_EXC_NAMES``:
-    the normalized shape the guarded iterators raise, plus the raw HTTPX-family
-    names for any future unguarded path."""
+    """One realistic instance per name in ``BACKEND_STREAM_EXC_NAMES``: the normalized shape the
+    guarded iterators raise, plus the raw httpx2 names for any future unguarded path."""
     from turnstone.core.providers import IncompleteStreamError
 
     return [
@@ -500,8 +498,8 @@ def test_client_base_url_raises_degrades_gracefully():
 
 
 def test_httpx_underscore_base_url_fallback():
-    # httpx client carries ``_base_url`` on some versions instead of
-    # ``base_url`` — the helper checks both.
+    # A client may carry ``_base_url`` instead of ``base_url`` — the
+    # helper checks both.
     stub = _stub(base_url="http://alt-host:9000", client_attr="_base_url")
     # SimpleNamespace exposes the attr; remove the public one so the
     # fallback path is exercised.

@@ -18,7 +18,7 @@ _SPLIT_RE = re.compile(r"[_\-./\s]+")
 # Max BM25 hits handed to the reranker in one request — the recall pool whose
 # top-k the reranker reorders before the caller's ``k`` slice. Deliberately a
 # private copy (not shared from rerank.py) so this module stays import-light and
-# httpx-free; web_search.py defines the same cap independently — keep them in sync.
+# imports no HTTP client; web_search.py defines the same cap independently — keep them in sync.
 _RERANK_POOL = 50
 
 

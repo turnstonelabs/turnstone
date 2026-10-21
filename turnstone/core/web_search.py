@@ -32,7 +32,7 @@ log = get_logger(__name__)
 
 # Max SearxNG results sent to the reranker in one request — the pool re-ordered
 # before the caller's ``max_results`` slice. bm25.py defines the same cap
-# independently (kept separate so bm25 stays httpx-free) — keep the two in sync.
+# independently (kept separate so bm25 imports no HTTP client) — keep the two in sync.
 _RERANK_POOL = 50
 _RESULT_SNIPPET_CHARS = 500
 

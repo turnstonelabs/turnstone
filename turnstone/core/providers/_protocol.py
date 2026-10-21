@@ -328,12 +328,10 @@ def transport_guarded(chunks: Iterator[StreamChunk]) -> Iterator[StreamChunk]:
     A mid-body wire death (connection drop, TLS record failure, read
     timeout) surfaces as a bare transport error or an OpenAI
     ``APIConnectionError`` / ``APITimeoutError`` chained from it.  The
-    OpenAI v3 and Anthropic v1 default clients use ``httpx2``; Turnstone's
-    own HTTP clients and OpenAI's legacy-client escape hatch use ``httpx``.
-    This wrapper is the one conversion rule for both families and SDK
-    shapes, reusable by consumers that keep streaming semantics (the
-    interactive loop); :func:`drain_stream` applies it for the single-shot
-    lanes.
+    OpenAI v3 and Anthropic v1 clients Turnstone builds use ``httpx2``.
+    This wrapper is the one conversion rule for both SDK shapes, reusable
+    by consumers that keep streaming semantics (the interactive loop);
+    :func:`drain_stream` applies it for the single-shot lanes.
 
     - A ``TransportError`` BEFORE any finish reason re-raises (chained)
       as the retryable :class:`IncompleteStreamError`.
@@ -344,8 +342,7 @@ def transport_guarded(chunks: Iterator[StreamChunk]) -> Iterator[StreamChunk]:
     - Everything else — chunks, exhaustion, non-transport exceptions —
       passes through untouched.
     """
-    # Keep the transport libraries and SDK off the dataclass-only import path.
-    import httpx  # noqa: PLC0415
+    # Keep the transport library and SDK off the dataclass-only import path.
     import httpx2  # noqa: PLC0415
     import openai  # noqa: PLC0415
 
@@ -357,12 +354,12 @@ def transport_guarded(chunks: Iterator[StreamChunk]) -> Iterator[StreamChunk]:
             sc = next(iterator)
         except StopIteration:
             return
-        except (httpx.TransportError, httpx2.TransportError, openai.APIConnectionError) as exc:
+        except (httpx2.TransportError, openai.APIConnectionError) as exc:
             transport_exc = exc
             if isinstance(exc, openai.APIConnectionError):
                 # APITimeoutError is a subclass. Only a proven transport cause
                 # gets post-finish tolerance; other SDK failures pass through.
-                if not isinstance(exc.__cause__, (httpx.TransportError, httpx2.TransportError)):
+                if not isinstance(exc.__cause__, httpx2.TransportError):
                     raise
                 transport_exc = exc.__cause__
             if finish_seen:
@@ -468,15 +465,12 @@ def drain_stream(
       "answer".  (This deliberately replaced the retired non-streaming
       lane's unconditional byte-match append.)
 
-    Raises whatever the underlying stream raises — retry/deadline/fallback
-    policy stays with the caller, exactly as with the old non-streaming
-    transport — EXCEPT HTTPX/HTTPX2 transport failures, normalized by
-    :func:`transport_guarded` (the one conversion rule, shared with the
-    interactive loop): a mid-body death before the finish reason is
-    re-raised (chained) as :class:`IncompleteStreamError`, restoring the
-    wire-blip retryability the non-streaming transport had, and a
-    post-finish blip ends the stream cleanly so the completed result is
-    kept.
+    Raises whatever the underlying stream raises — retry/deadline/fallback policy stays with the
+    caller, exactly as with the old non-streaming transport — EXCEPT httpx2 transport failures,
+    normalized by :func:`transport_guarded` (the one conversion rule, shared with the interactive
+    loop): a mid-body death before the finish reason is re-raised (chained) as
+    :class:`IncompleteStreamError`, restoring the wire-blip retryability the non-streaming transport
+    had, and a post-finish blip ends the stream cleanly so the completed result is kept.
     """
     content_segments: list[str] = []
     segment_parts: list[str] = []

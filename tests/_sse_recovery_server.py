@@ -47,7 +47,7 @@ import time
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
-import httpx
+import httpx2
 import uvicorn
 
 from tests._session_helpers import scripted_chat_client
@@ -370,7 +370,7 @@ class RecoveryServer:
             secret=_JWT_SECRET,
             audience=JWT_AUD_SERVER,
         )
-        self._http = httpx.Client(base_url=self.base_url, timeout=httpx.Timeout(30.0))
+        self._http = httpx2.Client(base_url=self.base_url, timeout=httpx2.Timeout(30.0))
 
     def _serve(self) -> None:
         loop = asyncio.new_event_loop()

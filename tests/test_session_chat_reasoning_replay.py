@@ -11,7 +11,7 @@ Paths 1+2, gated on three conditions and nothing else:
 
 These tests drive through ``model_turn.maybe_attach_vllm_chat_reasoning``
 to pin each gate independently, then one round-trip test through the real
-OpenAI Python SDK + httpx MockTransport confirms the ``reasoning`` field
+OpenAI Python SDK + httpx2 MockTransport confirms the ``reasoning`` field
 actually reaches the wire bytes (the SDK-boundary guarantee that the
 attach approach hinges on).
 
@@ -29,7 +29,7 @@ from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
 
-import httpx
+import httpx2
 import pytest
 
 from tests._session_helpers import ArmedHandle, as_stream, mock_completion_result, think_tag_stream
@@ -274,7 +274,7 @@ class TestMaybeAttachVllmChatReasoningGates:
 
 # ---------------------------------------------------------------------------
 # End-to-end: SDK passthrough is the load-bearing assumption.  Verify it
-# with a real OpenAI client wired against an httpx MockTransport that
+# with a real OpenAI client wired against an httpx2 MockTransport that
 # inspects the body (per feedback_mock_transport_body_inspection).
 # ---------------------------------------------------------------------------
 
@@ -290,10 +290,10 @@ class TestReasoningFieldReachesWireBytes:
 
         captured: list[dict[str, Any]] = []
 
-        def handler(request: httpx.Request) -> httpx.Response:
+        def handler(request: httpx2.Request) -> httpx2.Response:
             body = request.content.decode("utf-8") if request.content else ""
             captured.append({"url": str(request.url), "body": body})
-            return httpx.Response(
+            return httpx2.Response(
                 200,
                 headers={"content-type": "text/event-stream"},
                 content=b"data: [DONE]\n\n",
@@ -302,14 +302,14 @@ class TestReasoningFieldReachesWireBytes:
         client = OpenAI(
             api_key="sk-test",
             base_url="http://mock.local/v1",
-            http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+            http_client=httpx2.Client(transport=httpx2.MockTransport(handler)),
         )
         return client, captured
 
     def test_reasoning_field_present_in_wire_body_when_attached(self) -> None:
         # Send messages that have the Phase 5 ``reasoning`` field
         # attached.  Drive a real provider call through the real OpenAI
-        # SDK + mock httpx and verify the field is in the captured POST
+        # SDK + mock httpx2 and verify the field is in the captured POST
         # body — the SDK passthrough assumption that the entire
         # session-level approach hinges on.
         client, captured = self._capture_client()

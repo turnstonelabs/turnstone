@@ -6,7 +6,7 @@ import asyncio
 import threading
 from typing import TYPE_CHECKING, Any
 
-import httpx
+import httpx2
 import pytest
 from starlette.applications import Starlette
 from starlette.routing import Route
@@ -81,10 +81,10 @@ def node(
         assert all(not thread.is_alive() for thread in threads)
 
 
-def _reload_pair(app: Starlette, *, concurrent: bool = True) -> list[httpx.Response]:
-    async def run() -> list[httpx.Response]:
-        async with httpx.AsyncClient(
-            transport=httpx.ASGITransport(app=app, raise_app_exceptions=False),
+def _reload_pair(app: Starlette, *, concurrent: bool = True) -> list[httpx2.Response]:
+    async def run() -> list[httpx2.Response]:
+        async with httpx2.AsyncClient(
+            transport=httpx2.ASGITransport(app=app, raise_app_exceptions=False),
             base_url="http://node.example.com",
         ) as client:
             if concurrent:

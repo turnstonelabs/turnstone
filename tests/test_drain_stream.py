@@ -9,7 +9,6 @@ provider_blocks, trailing-citation fold).
 
 from __future__ import annotations
 
-import httpx
 import httpx2
 import openai
 import pytest
@@ -438,13 +437,8 @@ class TestTransportGuarded:
 
     @pytest.mark.parametrize(
         "exc_cls",
-        [
-            httpx.ReadError,
-            httpx.RemoteProtocolError,
-            httpx2.ReadError,
-            httpx2.RemoteProtocolError,
-        ],
-        ids=["httpx-read", "httpx-protocol", "httpx2-read", "httpx2-protocol"],
+        [httpx2.ReadError, httpx2.RemoteProtocolError],
+        ids=["read", "protocol"],
     )
     def test_pre_finish_transport_error_becomes_retryable_incomplete(self, exc_cls):
         exc_name = exc_cls.__name__
@@ -459,17 +453,12 @@ class TestTransportGuarded:
             next(it)
         assert isinstance(excinfo.value.__cause__, exc_cls)
 
-    @pytest.mark.parametrize(
-        "exc_cls",
-        [httpx.ReadError, httpx2.ReadError],
-        ids=["httpx", "httpx2"],
-    )
-    def test_message_byte_matches_drains_shape(self, exc_cls):
+    def test_message_byte_matches_drains_shape(self):
         # The wrapper and the drain are the SAME conversion rule; any test
         # or log filter pinned to drain's message must match the wrapper's.
         def chunks():
             yield StreamChunk(content_delta="partial")
-            raise exc_cls("[SSL] record layer failure (_ssl.c:2590)")
+            raise httpx2.ReadError("[SSL] record layer failure (_ssl.c:2590)")
 
         with pytest.raises(IncompleteStreamError) as guarded:
             list(transport_guarded(chunks()))
@@ -477,12 +466,7 @@ class TestTransportGuarded:
             drain_stream(chunks())
         assert str(guarded.value) == str(drained.value)
 
-    @pytest.mark.parametrize(
-        "exc_cls",
-        [httpx.ReadError, httpx2.ReadError],
-        ids=["httpx", "httpx2"],
-    )
-    def test_post_finish_blip_ends_stream_cleanly(self, caplog, exc_cls):
+    def test_post_finish_blip_ends_stream_cleanly(self, caplog):
         # The generation already completed — the blip only cost trailing
         # metadata, so the stream ends instead of raising.
         import logging
@@ -490,7 +474,7 @@ class TestTransportGuarded:
         def chunks():
             yield StreamChunk(content_delta="done")
             yield StreamChunk(finish_reason="stop")
-            raise exc_cls("late blip")
+            raise httpx2.ReadError("late blip")
 
         with caplog.at_level(logging.WARNING, logger="turnstone.core.providers._protocol"):
             out = list(transport_guarded(chunks()))
@@ -560,23 +544,18 @@ class TestErrorPropagation:
         assert result.finish_reason == "stop"
         assert result.usage is None
 
-    @pytest.mark.parametrize(
-        "exc_cls",
-        [httpx.RemoteProtocolError, httpx2.RemoteProtocolError],
-        ids=["httpx", "httpx2"],
-    )
-    def test_transport_error_becomes_retryable_incomplete(self, exc_cls):
+    def test_transport_error_becomes_retryable_incomplete(self):
         # Streaming moves the body read out of the SDK's wrapped request:
-        # a mid-body wire failure surfaces as a raw HTTPX-family TransportError
+        # a mid-body wire failure surfaces as a raw httpx2 TransportError
         # no retry predicate recognizes. The drain re-raises it (chained,
         # message preserved) as the retryable IncompleteStreamError.
         def chunks():
             yield StreamChunk(content_delta="partial")
-            raise exc_cls("peer closed connection")
+            raise httpx2.RemoteProtocolError("peer closed connection")
 
         with pytest.raises(IncompleteStreamError, match="RemoteProtocolError") as excinfo:
             drain_stream(chunks())
-        assert isinstance(excinfo.value.__cause__, exc_cls)
+        assert isinstance(excinfo.value.__cause__, httpx2.RemoteProtocolError)
 
     def test_mid_stream_exception_propagates_verbatim(self):
         # Retry/deadline/fallback policy is the caller's — the drain adds

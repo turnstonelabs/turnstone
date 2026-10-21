@@ -70,8 +70,6 @@ class TestConfigureLogging:
     def test_quiet_third_party(self):
         configure_logging(level="DEBUG", json_output=False)
         for name in (
-            "httpx",
-            "httpcore",
             "httpx2",
             "httpcore2",
             "openai",

@@ -406,7 +406,7 @@ async def test_client_ctx_cached_and_reloaded_in_place():
     assert ctx1 is ctx2  # cached, not rebuilt per call
 
     # Reloading a renewed bundle must not raise and keeps the same object so
-    # httpx clients holding it pick up the new cert without a rebuild.
+    # httpx2 clients holding it pick up the new cert without a rebuild.
     mgr._reload_client_ctx(mgr._ca.issue(["console"]))
     assert mgr.get_client_ssl_context() is ctx1
 

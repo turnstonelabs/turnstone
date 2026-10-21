@@ -127,7 +127,7 @@ class CompletionRecovery:
 # ``ChatSession._record_fatal_error`` routes a fatal exception through
 # ``ChatSession._format_backend_error``, which matches the exception's class
 # name against the sets below, and :func:`is_context_overflow` uses the same
-# sets as its class gate.  Matching by name keeps both free of httpx / openai /
+# sets as its class gate.  Matching by name keeps both free of httpx2 / openai /
 # anthropic imports — the SDKs each define their own subclasses, but the names
 # (``ReadTimeout``, ``APITimeoutError``, …) are stable across them and the
 # OpenAI and Anthropic SDKs use the same names.
@@ -160,7 +160,7 @@ BACKEND_TRANSIENT_EXC_NAMES: frozenset[str] = frozenset({"UpstreamTransientError
 BACKEND_REPORTED_EXC_NAMES: frozenset[str] = frozenset({"APIError", "UpstreamResponseError"})
 # Mid-response stream deaths: the normalized shape every guarded iterator
 # raises (``IncompleteStreamError`` from ``drain_stream`` /
-# ``transport_guarded``) plus the raw HTTPX/HTTPX2 names for any future
+# ``transport_guarded``) plus the raw httpx2 names for any future
 # unguarded path (defense in depth).  Unioning them into
 # ``BACKEND_KNOWN_EXC_NAMES`` is required — ``ChatSession._format_backend_error`` gates
 # on that set before the branch lookups — and makes these three names

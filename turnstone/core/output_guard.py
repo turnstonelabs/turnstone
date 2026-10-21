@@ -89,7 +89,7 @@ _RE_PRIVATE_KEY_BLOCK = re.compile(
 # Database connection strings AND http(s) URLs that carry RFC-3986
 # userinfo (``user:pass@host``).  Adding http(s) here means a
 # misconfigured ``OPENAI_BASE_URL=https://user:pass@host`` that lands
-# in an httpx ``ConnectError.__str__`` is redacted by every caller of
+# in an httpx2 ``ConnectError.__str__`` is redacted by every caller of
 # ``redact_credentials`` — error persistence, audit details,
 # coordinator inspect/wait surfaces.  The structural form ``[^:@\s]+:
 # [^@\s]+@`` is specific enough that ``https://example.com:8080/path``

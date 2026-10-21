@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import TYPE_CHECKING, Any
 
-import httpx
+import httpx2
 import pytest
 from openai import OpenAI
 
@@ -148,15 +148,15 @@ class _JudgeCountingProxyHandler(BaseHTTPRequestHandler):
             headers["Content-Length"] = str(len(body))
             counter.begin_forward(alias)
             try:
-                upstream = httpx.post(
+                upstream = httpx2.post(
                     f"{self._proxy.upstream_base_url}{self.path}",
                     content=body,
                     headers=headers,
-                    timeout=httpx.Timeout(60.0, connect=5.0),
+                    timeout=httpx2.Timeout(60.0, connect=5.0),
                 )
             finally:
                 counter.end_forward(alias)
-            # ``httpx.post`` has consumed the complete streaming body here.
+            # ``httpx2.post`` has consumed the complete streaming body here.
             # A genuine backend rejection must fail the probe; only a successful
             # response is replaced with deterministic judge output.
             upstream.raise_for_status()

@@ -29,8 +29,6 @@ _CONTEXT_VARS: list[tuple[ContextVar[str], str]] = [
 
 # Third-party loggers that are noisy at INFO level.
 _QUIET_LOGGERS = (
-    "httpx",
-    "httpcore",
     "httpx2",
     "httpcore2",
     "openai",
@@ -56,11 +54,9 @@ class _RedactCredentialsFilter(logging.Filter):
     scheme, host and port. They are read from the URL's attributes, so
     rendering them cannot fail. The formatted message then passes through the
     output guard's credential redactor. Only httpx2's own records pass through
-    this filter: the SDKs' debug loggers enabled by ``ANTHROPIC_LOG=debug`` are
-    outside it, and so is the ``httpx`` logger of Turnstone's other clients,
-    which no installed SDK lowers from WARNING. A record that cannot be
-    formatted passes unchanged, so logging never breaks the request that
-    emitted it.
+    this filter; the SDKs' debug loggers enabled by ``ANTHROPIC_LOG=debug`` are
+    outside it. A record that cannot be formatted passes unchanged, so logging
+    never breaks the request that emitted it.
     """
 
     def filter(self, record: logging.LogRecord) -> bool:

@@ -7,7 +7,7 @@ import asyncio
 import time
 from typing import Any
 
-import httpx
+import httpx2
 import pytest
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
@@ -172,8 +172,8 @@ def test_concurrent_opens_run_post_load_and_audit_once() -> None:
     )
 
     async def both() -> list[Any]:
-        transport = httpx.ASGITransport(app=app)
-        async with httpx.AsyncClient(transport=transport, base_url="http://t") as client:
+        transport = httpx2.ASGITransport(app=app)
+        async with httpx2.AsyncClient(transport=transport, base_url="http://t") as client:
             return await asyncio.gather(
                 client.post(f"/v1/api/workstreams/{ws.id}/open"),
                 client.post(f"/v1/api/workstreams/{ws.id}/open"),

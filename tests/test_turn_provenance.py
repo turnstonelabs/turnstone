@@ -8,7 +8,7 @@ import logging
 from typing import TYPE_CHECKING, Any
 from unittest.mock import MagicMock, patch
 
-import httpx
+import httpx2
 import pytest
 
 from tests._session_helpers import (
@@ -57,7 +57,7 @@ def _good_stream(text: str) -> list[StreamChunk]:
 
 def _dying_stream(text: str) -> Iterator[StreamChunk]:
     yield StreamChunk(content_delta=text)
-    raise httpx.ReadError("old binding died")
+    raise httpx2.ReadError("old binding died")
 
 
 def _provenance(turn: Turn) -> dict[str, str | int]:

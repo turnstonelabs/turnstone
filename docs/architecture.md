@@ -1087,7 +1087,7 @@ stdio spawn hook (#1226). `test_private_names_still_behave_as_relied_on` and
 
 **Registry discovery:** The console admin panel provides a registry discovery
 surface backed by the official MCP Registry (registry.modelcontextprotocol.io).
-`MCPRegistryClient` (`turnstone/core/mcp_registry.py`) is a standalone httpx
+`MCPRegistryClient` (`turnstone/core/mcp_registry.py`) is a standalone httpx2
 async client that queries the registry's v0.1 API for server discovery. Search
 results are annotated with installed status by cross-referencing the
 `mcp_servers` table. Installation creates a DB row with `registry_name`,
@@ -1237,8 +1237,7 @@ client runs on HTTPX2, so a mid-body connection death escapes
 `messages.stream()` as an `httpx2` transport error and `transport_guarded`
 normalizes it into the retryable `IncompleteStreamError` exactly as for the
 OpenAI v3 lanes; anything handed to the client (`http_client`, timeouts,
-transports) must be an `httpx2` object — the SDK rejects the legacy `httpx`
-family at construction. SDK v1 also removed the typed `temperature` /
+transports) must be an `httpx2` object. SDK v1 also removed the typed `temperature` /
 `top_p` / `top_k` parameters, so the capability-gated temperature rides the
 request's `extra_body` (None still omits the field; enabled thinking still
 forces 1.0), and an operator `server_compat.extra_body` pin of the same key
@@ -2561,7 +2560,7 @@ Monitoring (2 daemon threads)        Control + Proxy (async Starlette)
 | every 60 seconds |                 |   → POST to target server  |
 +------------------+                 +----------------------------+
 | SSE manager      |                 | GET /node/{node_id}/       |
-| asyncio loop     |                 |   → httpx.AsyncClient      |
+| asyncio loop     |                 |   → httpx2.AsyncClient     |
 | 1 task per node  |                 |     proxy to server_url    |
 | /events/global   |                 | GET /node/{id}/v1/api/workstreams/{ws_id}/events |
 | snapshot+deltas  |                 |   → SSE stream proxy                              |
@@ -2596,7 +2595,7 @@ The console has two write-path capabilities:
    these.
 
 2. **Reverse proxy** — serves each node's server UI through the console port at
-   `/node/{node_id}/`. Uses `httpx.AsyncClient` to proxy HTTP and SSE traffic.
+   `/node/{node_id}/`. Uses `httpx2.AsyncClient` to proxy HTTP and SSE traffic.
    A JS shim is injected into the server's `app.js` to override `fetch()` and
    `EventSource()`, routing root-relative URLs through the proxy prefix. This
    eliminates the need for direct network access to individual server nodes.

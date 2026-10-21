@@ -307,6 +307,29 @@ frozen.
   `python-httpx2` User-Agent and also accept zstd-compressed responses, and when something lowers
   httpx2's log level (for example `ANTHROPIC_LOG=info`) they now log request lines, which show
   only each URL's scheme, host and port.
+- **The rest of Turnstone's HTTP clients run on httpx2, and `httpx`, `httpx-sse` and `certifi` are
+  no longer dependencies (#1011)** — web search through SearXNG, the reranker, skill sources, the
+  MCP registry, notifications to channel gateways, the CLI's `/cluster` commands, the console's
+  connections to its nodes (the routing proxy, the event relay, the cluster collector and the
+  coordinator's client), the channel adapters and the Python SDK now go through httpx2, as OAuth
+  does (above): certificates are verified against the operating system's trust store instead of
+  certifi's bundle, `SSL_CERT_FILE` and `SSL_CERT_DIR` still override it, the proxy variables still
+  apply with httpx2's reading of `NO_PROXY`, and requests send a `python-httpx2` User-Agent and also
+  accept zstd. When something lowers httpx2's log level (for example `ANTHROPIC_LOG=info`), these
+  clients log request lines too, showing only each URL's scheme, host and port; a program that
+  quieted the `httpx` logger for the SDK quiets `httpx2` instead. The cluster collector, the channel
+  adapters and the SDK accept one server-sent event of up to 16 MiB, as the MCP client does; a
+  larger event ends the stream, which the collector and the adapters reconnect (`httpx-sse` had no
+  limit). A node whose snapshot is over the limit, which a large backlog of pending approvals with
+  big tool arguments could produce, shows as unreachable in the console until the backlog shrinks.
+  Code run from Turnstone's Python environment that imports `httpx`, `httpx_sse` or `certifi`, such
+  as an MCP server started with that environment's Python, must now install them itself.
+- **The Python SDK runs on httpx2 and takes only an httpx2 client** *(BREAKING)* — `httpx_client=`
+  must be an `httpx2.AsyncClient`; an `httpx` client, or anything else, raises `TypeError` when the
+  SDK client is built rather than failing later mid-request or mid-stream. The SDK's transport
+  errors are httpx2's too (`httpx2.ConnectError`, `httpx2.SSEError` for an event stream it can't
+  read, and the rest of `httpx2.HTTPError`), so code that catches `httpx.HTTPError` or
+  `httpx_sse.SSEError` around SDK calls must catch httpx2's classes instead.
 - **A model that isn't loaded is never replaced by another (#1359)** *(BREAKING)* — when the default
   model, the task model, the coordinator model or the channel model names a definition that isn't
   loaded (deleted, disabled, misspelled, or left out of a reload because its secret reference
@@ -656,6 +679,14 @@ frozen.
 
 ### Fixed
 
+- **The Python SDK presents its client certificate when `ca_cert` is also set (#1425)** — with
+  both, the client certificate was dropped without a warning, so a node that requires one, such as
+  a node with TLS on, refused the handshake.
+- **The MCP registry search and skill-source downloads fail cleanly on a request they can't
+  build** — a redirect to a `Location` that can't be parsed or whose host isn't valid IDNA, or a
+  search term or path holding a lone surrogate, raised past their error handling: the console's
+  registry search answered 500 instead of 502, and one bundled file like that failed a whole skill
+  install instead of being skipped.
 - **An OAuth or OIDC endpoint URL the client can't send is refused when its document is read.** An
   identity provider's discovery document, an MCP server's challenge or metadata, or an
   authorization server's metadata could name an endpoint holding a control character (a stray
@@ -1199,20 +1230,16 @@ frozen.
 
 ### Security
 
-- **Connections still made with `httpx` no longer trust the root of the compromised eMudhra
-  CAs.** The private keys of several eMudhra intermediate CAs can be recovered by anyone
+- **No connection relies on the `certifi` bundle, which trusted the root of the compromised
+  eMudhra CAs.** The private keys of several eMudhra intermediate CAs can be recovered by anyone
   (GHSA-6q48-6c7w-9gw2), so a client that trusts their root, emSign ECC Root CA - G3, accepts a
-  forged certificate for any host. Connections still made with `httpx` rather than HTTPX2, such
-  as web search, the reranker, skill sources, the MCP registry, notifications to channel gateways,
-  the console's connections to its nodes when it has no TLS certificate authority enabled, and the
-  SDK, CLI and channel clients, verify against the `certifi` bundle, which held that root.
-  Turnstone now requires `certifi>=2026.10.19`, which drops it. Connections on HTTPX2, such as
-  model providers, URL fetches, MCP servers, OAuth and OIDC sign-in, verify against the operating
-  system's trust store instead, so a native install must also update that store (Debian 13:
-  `ca-certificates` 20250419+deb13u1, DSA-6572-1). A deployment that sets `SSL_CERT_FILE` or
-  `SSL_CERT_DIR` verifies against that bundle instead, with `httpx` and HTTPX2 alike, and must
-  remove the root from it. Either way, restart Turnstone afterwards: a running process keeps the
-  roots it has already loaded.
+  forged certificate for any host. Connections that don't name a CA of their own now verify against
+  the operating system's trust store (#1011), so a native install must update that store (Debian
+  13: `ca-certificates` 20250419+deb13u1, DSA-6572-1). `SSL_CERT_FILE` or `SSL_CERT_DIR` replaces
+  the store for most of them, so a deployment that sets one must also remove the root from that
+  bundle; the Vault secret backend without `ca_cert`, certificate enrollment and the CA certificate
+  fetches ignore those variables and keep using the system store. Either way, restart Turnstone
+  afterwards: a running process keeps the roots it has already loaded.
 - **The Docker image no longer trusts the root of the compromised eMudhra CAs.** The image now
   refuses to build with a `ca-certificates` older than 20250419+deb13u1 (DSA-6572-1), Debian's
   update that removes the root from the system store. Its `pip`, which loads its own `certifi`

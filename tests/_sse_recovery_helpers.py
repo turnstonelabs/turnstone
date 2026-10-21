@@ -6,7 +6,7 @@ The load-bearing assembly for ``tests/test_sse_recovery_e2e.py``: a
 assertion helpers the scenarios share. The server boot machinery lives
 in ``_sse_recovery_server.py``.
 
-Why a raw-socket SSE reader (and not ``httpx.stream``): the slow-consumer
+Why a raw-socket SSE reader (and not ``httpx2.stream``): the slow-consumer
 overflow scenario needs the consumer to STALL — stop reading the socket
 so the server's SSE generator blocks on ``await send`` and stops draining
 the per-UI listener queue, which then poisons at its cap. A faithful
@@ -14,7 +14,7 @@ stall needs (a) precise control over when bytes are read and (b) a small
 ``SO_RCVBUF`` so the in-flight backlog before poison stays bounded to
 ~100 KB instead of the client kernel's multi-MB autotuned default (which
 would need tens of thousands of events to overflow). A raw socket gives
-both; httpx (used here only for the plain ``/history`` request/response)
+both; httpx2 (used here only for the plain ``/history`` request/response)
 gives neither. This is ALSO closer to the browser: EventSource has a
 bounded receive buffer, not an unbounded one.
 
@@ -51,7 +51,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
 
-import httpx
+import httpx2
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -107,8 +107,8 @@ class BrowserlikeSSEClient:
         self._ws_id = ws_id
         self._token = token
         self._auth = {"Authorization": f"Bearer {token}"}
-        self._http = httpx.Client(
-            base_url=f"http://{self._host}:{self._port}", timeout=httpx.Timeout(15.0)
+        self._http = httpx2.Client(
+            base_url=f"http://{self._host}:{self._port}", timeout=httpx2.Timeout(15.0)
         )
 
         # EventSource-equivalent cursor state.

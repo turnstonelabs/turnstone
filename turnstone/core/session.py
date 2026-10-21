@@ -9427,12 +9427,12 @@ class ChatSession:
 
         ``ui.on_error`` and the persist BOTH receive the sanitized
         text — a misconfigured ``OPENAI_BASE_URL`` of the form
-        ``https://user:pass@host`` produces an httpx ``ConnectError``
+        ``https://user:pass@host`` produces an httpx2 ``ConnectError``
         whose ``str()`` carries the credentials verbatim, and they'd
         otherwise land in (a) the dashboard via ``on_error`` and (b)
         the coord LLM's prompt via inspect/wait.
 
-        Known backend boundary exceptions (httpx read/connect timeouts,
+        Known backend boundary exceptions (httpx2 read/connect timeouts,
         OpenAI/Anthropic SDK ``APITimeoutError`` / ``APIConnectionError``
         / ``NotFoundError`` / ``AuthenticationError`` / ``RateLimitError``)
         get rewritten into operator-actionable text that includes the
@@ -9552,17 +9552,14 @@ class ChatSession:
     ) -> str | None:
         """Return an enriched message for known backend boundary errors.
 
-        Returns ``None`` for exceptions outside the recognised set so the
-        caller falls back to the bare ``f"{type(exc).__name__}: {exc}"``
-        shape.  A context-window overflow is matched first by message *text* (it
-        can arrive as several exception classes); everything else is matched by
+        Returns ``None`` for exceptions outside the recognised set so the caller falls back to the
+        bare ``f"{type(exc).__name__}: {exc}"`` shape. A context-window overflow is matched first by
+        message *text* (it can arrive as several exception classes); everything else is matched by
         class name (see the ``BACKEND_*_EXC_NAMES`` sets in
-        :mod:`turnstone.core.completion_recovery`) so the same
-        helper covers
-        HTTPX/HTTPX2 ``ReadTimeout`` / ``ConnectError``, OpenAI SDK
-        ``APITimeoutError`` / ``APIConnectionError`` /
-        ``NotFoundError`` / ``RateLimitError`` / ``AuthenticationError``,
-        and the Anthropic SDK equivalents (which share names).
+        :mod:`turnstone.core.completion_recovery`) so the same helper covers httpx2 ``ReadTimeout``
+        / ``ConnectError``, OpenAI SDK ``APITimeoutError`` / ``APIConnectionError`` /
+        ``NotFoundError`` / ``RateLimitError`` / ``AuthenticationError``, and the Anthropic SDK
+        equivalents (which share names).
 
         Bad input while reading the binding-derived model label silently
         degrades to a ``"?"`` placeholder rather than failing — this helper
@@ -25039,7 +25036,7 @@ class ChatSession:
             self.ui.on_error(output)
         except Exception as e:
             # exc_info=True would let chained ``__context__`` carry an
-            # ``httpx.Request`` whose ``Authorization`` header holds the
+            # ``httpx2.Request`` whose ``Authorization`` header holds the
             # per-user bearer (Phase 7b pool dispatch path). Use
             # structured fields with ``type(e).__name__`` only.
             log.warning("mcp.resource_read_failed", uri=uri, error=type(e).__name__)
@@ -25139,7 +25136,7 @@ class ChatSession:
             self.ui.on_error(output)
         except Exception as e:
             # See ``_exec_read_resource`` for the no-``exc_info`` rationale —
-            # bearer-leak via chained ``httpx.Request`` __context__.
+            # bearer-leak via chained ``httpx2.Request`` __context__.
             log.warning("mcp.prompt_invoke_failed", name=name, error=type(e).__name__)
             output = _format_mcp_dispatch_error("MCP prompt error", e)
             mcp_error = True
@@ -28917,7 +28914,7 @@ class ChatSession:
         if kind in ("web", "table", "text", "markdown"):
             # Store text-family content as UTF-8 so legacy charsets render
             # instead of erroring "not previewable": a fetch honors the
-            # response charset (httpx ``resp.text``); local / attachment bytes
+            # response charset (httpx2 ``resp.text``); local / attachment bytes
             # go through the transcode ladder.  Web additionally gains a
             # ``<base href>`` (url targets) and a title fallback.
             text = resp.text if target_kind == "url" else transcode_text(body, mime_hint)

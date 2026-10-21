@@ -386,7 +386,7 @@ class TestMultipartBodyBudget:
 
     async def _send(self, path: str, size: int) -> tuple[int, int]:
         """POST a ``size``-byte file in chunks; return the status and bytes pulled."""
-        import httpx
+        import httpx2
 
         boundary = "budget-boundary"
         parts = [
@@ -407,8 +407,8 @@ class TestMultipartBodyBudget:
                 pulled += len(part)
                 yield part
 
-        transport = httpx.ASGITransport(app=self._app())
-        async with httpx.AsyncClient(
+        transport = httpx2.ASGITransport(app=self._app())
+        async with httpx2.AsyncClient(
             transport=transport, base_url="http://app.example.com"
         ) as http:
             resp = await http.post(

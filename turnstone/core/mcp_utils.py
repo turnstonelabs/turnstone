@@ -45,7 +45,7 @@ def strip_server_status(full: dict[str, Any]) -> dict[str, Any]:
     Read-scope callers must use :func:`strip_server_status_for_read`
     instead — error strings can carry stdio binary paths
     (``FileNotFoundError: ... '/usr/local/bin/...'``) or internal MCP
-    URLs (``httpx.ConnectError: ... 'https://internal/...'``) and
+    URLs (``httpx2.ConnectError: ... 'https://internal/...'``) and
     those are equivalent to leaking ``command``/``url``.
     """
     return {k: full[k] for k in _SERVER_STATUS_PUBLIC_KEYS if k in full}

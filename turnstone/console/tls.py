@@ -144,7 +144,7 @@ class TLSManager:
         self._internal_bundle: CertBundle | None = None
         self._frontend_bundle: CertBundle | None = None
         # Cached mTLS client context, mutated in place on renewal so the
-        # proxy/collector httpx clients pick up the renewed client cert
+        # proxy/collector httpx2 clients pick up the renewed client cert
         # without being rebuilt.
         self._client_ctx: ssl.SSLContext | None = None
 
@@ -471,7 +471,7 @@ class TLSManager:
     def _reload_client_ctx(self, bundle: CertBundle) -> None:
         """Load a renewed bundle into the cached mTLS client context in place.
 
-        httpx clients built with this context present the new client cert on
+        httpx2 clients built with this context present the new client cert on
         their next connection; existing keep-alive connections finish on the
         old one.  No-op until the context has been built.
         """

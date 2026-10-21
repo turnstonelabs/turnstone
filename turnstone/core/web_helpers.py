@@ -587,9 +587,9 @@ _VERSIONED_VENDOR_PATH_RE = re.compile(rf"^{_VERSIONED_VENDOR_DIR}/")
 def is_safe_static_asset_path(path: str) -> bool:
     """Return whether *path* is a canonical mount-relative asset path.
 
-    Starlette decodes percent escapes before populating ``{path:path}``, and
-    HTTPX normalizes dot segments when it builds an outbound URL.  Reject the
-    ambiguous forms before a console proxy can leave its static mount.
+    Starlette decodes percent escapes before populating ``{path:path}``, and httpx2 normalizes dot
+    segments when it builds an outbound URL.  Reject the ambiguous forms before a console proxy can
+    leave its static mount.
     """
     return (
         bool(path)

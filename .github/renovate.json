@@ -70,8 +70,6 @@
         "starlette",
         "uvicorn",
         "sse-starlette",
-        "httpx",
-        "httpx-sse",
         "pydantic"
       ],
       "schedule": ["before 9am on Wednesday"],

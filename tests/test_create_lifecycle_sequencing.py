@@ -9,7 +9,7 @@ import threading
 import time
 from typing import Any
 
-import httpx
+import httpx2
 import pytest
 from starlette.applications import Starlette
 from starlette.routing import Route
@@ -170,9 +170,9 @@ async def test_cancellation_during_session_build_removes_exact_hidden_create(
             build_finished.set()
 
     monkeypatch.setattr(mgr._adapter, "build_session", _blocked_build)
-    transport = httpx.ASGITransport(app=sync_client.app)
+    transport = httpx2.ASGITransport(app=sync_client.app)
     try:
-        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        async with httpx2.AsyncClient(transport=transport, base_url="http://test") as client:
             request_task = asyncio.create_task(
                 client.post(
                     "/v1/api/workstreams/new",
@@ -254,9 +254,9 @@ async def test_second_cancellation_cannot_interrupt_create_rollback(
 
     monkeypatch.setattr(mgr._adapter, "build_session", _blocked_build)
     monkeypatch.setattr(mgr, "discard", _blocked_discard)
-    transport = httpx.ASGITransport(app=sync_client.app)
+    transport = httpx2.ASGITransport(app=sync_client.app)
     try:
-        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        async with httpx2.AsyncClient(transport=transport, base_url="http://test") as client:
             request_task = asyncio.create_task(
                 client.post(
                     "/v1/api/workstreams/new",
@@ -602,8 +602,8 @@ async def test_cancellation_after_commit_waits_post_install_and_keeps_one_create
         create_post_install=_post_install,
     )
     app = Starlette(routes=[Route("/new", make_create_handler(cfg), methods=["POST"])])
-    transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+    transport = httpx2.ASGITransport(app=app)
+    async with httpx2.AsyncClient(transport=transport, base_url="http://test") as client:
         request_task = asyncio.create_task(client.post("/new", json={"name": "cancelled"}))
         await asyncio.wait_for(post_install_entered.wait(), timeout=5)
         request_task.cancel()

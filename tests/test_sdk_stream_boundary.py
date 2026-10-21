@@ -1,38 +1,34 @@
 """Offline pins of SDK boundary behaviors used by stream error handling.
 
-Eight facts, each probed against the REAL SDKs over mock/loopback
+Seven facts, each probed against the REAL SDKs over mock/loopback
 transports (no network, no live backend):
 
 1. OpenAI's ``max_retries`` covers request time only — a mid-BODY death
    produces no re-request. The supported SDK (>=3.14.1) wraps ``httpx2``
    transport errors in ``APIConnectionError`` or its ``APITimeoutError``
    subclass, retaining the transport cause.
-2. OpenAI v3's runtime-only legacy-client path preserves the old ``httpx``
-   exception family as the SDK error's cause when an application explicitly
-   injects that client.
-3. Anthropic v1's ``messages.stream()`` helper propagates the ``httpx2``
-   shape unwrapped with no SDK re-request, and the client rejects an injected
-   legacy ``httpx.Client`` at construction — the tests inject HTTPX2 objects.
-4. Closing an OpenAI v3 or Anthropic v1 default client from another thread
+2. Anthropic v1's ``messages.stream()`` helper propagates the ``httpx2``
+   shape unwrapped with no SDK re-request.
+3. Closing an OpenAI v3 or Anthropic v1 default client from another thread
    while a read is blocked (the ``ModelRegistry.reload()`` shape) completes
    safely; a later wire release surfaces as a raw or SDK-wrapped
    ``httpx2.TransportError`` on the blocked ``next()``. The production
    ``transport_guarded`` seam must normalize it before the retry gate.
-5. OpenAI v3 raises real HTTP errors before returning a stream, while an HTTP
+4. OpenAI v3 raises real HTTP errors before returning a stream, while an HTTP
    200 ``application/json`` response becomes an empty iterator unless the
    adapter rejects it before arming the stream.
-6. Refusal text is visible without inventing an early terminal signal, and
+5. Refusal text is visible without inventing an early terminal signal, and
    neither structured-output judge interprets a filtered response as a verdict.
-7. Anthropic v1 removed ``temperature`` / ``top_p`` / ``top_k`` from the
+6. Anthropic v1 removed ``temperature`` / ``top_p`` / ``top_k`` from the
    Messages signatures (a typed kwarg is a ``TypeError``): the adapter's
    capability-gated temperature reaches the request body through
    ``extra_body`` with unchanged send/omit semantics, and an operator
    ``server_compat`` pin of the same key wins.
-8. Both SDKs merge caller ``extra_headers`` over their own credential header
+7. Both SDKs merge caller ``extra_headers`` over their own credential header
    case-insensitively, even over ``with_options(api_key=...)``, so every
    adapter refuses credential names in ``extra_headers`` before the call.
 
-If an SDK/httpx upgrade changes any of these, the provider boundary and
+If an SDK/httpx2 upgrade changes any of these, the provider boundary and
 ``transport_guarded`` conversion (including the retry gate consuming it) must
 be re-verified — these tests are the tripwire. Wire framing bytes (CRLF, the
 SSE double-LF) are built via ``chr`` rather than escape literals so the
@@ -49,7 +45,6 @@ from typing import Any
 from unittest.mock import patch
 
 import anthropic
-import httpx
 import httpx2
 import openai
 import pytest
@@ -359,18 +354,6 @@ def test_judges_reject_chat_refusals_before_parsing_or_reprompting(
     assert len(requests) == 1
 
 
-class _DyingStream(httpx.SyncByteStream):
-    """Response body: one valid SSE payload, then a mid-read wire death."""
-
-    def __init__(self, payload: bytes, error: httpx.TransportError | None = None) -> None:
-        self._payload = payload
-        self._error = error or httpx.ReadError("[SSL] record layer failure (_ssl.c:2590)")
-
-    def __iter__(self):
-        yield self._payload
-        raise self._error
-
-
 class _Httpx2DyingStream(httpx2.SyncByteStream):
     """HTTPX2 response body: one SSE payload, then a wire death."""
 
@@ -417,19 +400,6 @@ class _OversizedJsonStream(httpx2.SyncByteStream):
 
     def close(self) -> None:
         self.closed = True
-
-
-def _dying_transport(payload: str, requests: list) -> httpx.MockTransport:
-    def handler(request: httpx.Request) -> httpx.Response:
-        requests.append(request)
-        return httpx.Response(
-            200,
-            headers={"content-type": "text/event-stream"},
-            stream=_DyingStream(payload.encode()),
-            request=request,
-        )
-
-    return httpx.MockTransport(handler)
 
 
 def _httpx2_dying_transport(payload: str, requests: list) -> httpx2.MockTransport:
@@ -744,38 +714,14 @@ def test_openai_v3_responses_midbody_death_preserves_transport_cause_and_no_rere
     assert len(requests) == 1
 
 
-def test_openai_v3_legacy_httpx_midbody_death_keeps_legacy_error_family():
-    requests: list = []
-    legacy_http_client = httpx.Client(transport=_dying_transport(CHAT_CHUNK, requests))
-    client = openai.OpenAI(
-        api_key="probe",
-        base_url="http://probe.invalid/v1",
-        http_client=legacy_http_client,  # type: ignore[arg-type]
-        max_retries=2,
-    )
-    stream = client.chat.completions.create(
-        model="m", messages=[{"role": "user", "content": "hi"}], stream=True
-    )
-    texts = []
-    with pytest.raises(openai.APIConnectionError) as excinfo:
-        for chunk in stream:
-            if chunk.choices and chunk.choices[0].delta.content:
-                texts.append(chunk.choices[0].delta.content)
-    assert type(excinfo.value) is openai.APIConnectionError
-    assert type(excinfo.value.__cause__) is httpx.ReadError
-    assert texts == ["hello"]
-    assert len(requests) == 1
-
-
 @pytest.mark.parametrize("surface", ["chat", "responses"])
-@pytest.mark.parametrize("http_module", [httpx, httpx2], ids=["httpx", "httpx2"])
 @pytest.mark.parametrize(
     ("error_name", "sdk_error_cls"),
     [("ReadError", openai.APIConnectionError), ("ReadTimeout", openai.APITimeoutError)],
 )
 @pytest.mark.parametrize("finished", [False, True])
 def test_openai_stream_transport_error_preserves_finish_semantics(
-    surface, http_module, error_name, sdk_error_cls, finished, caplog
+    surface, error_name, sdk_error_cls, finished, caplog
 ):
     """Exercise SDK wrapping, adapter iteration, and the shared drain together."""
     from turnstone.core.providers import (
@@ -785,8 +731,7 @@ def test_openai_stream_transport_error_preserves_finish_semantics(
     )
 
     requests: list = []
-    error = getattr(http_module, error_name)("wire died")
-    body_cls = _DyingStream if http_module is httpx else _Httpx2DyingStream
+    error = getattr(httpx2, error_name)("wire died")
     payload = CHAT_CHUNK if surface == "chat" else RESPONSES_EVENT
     if finished:
         terminal = (
@@ -808,16 +753,16 @@ def test_openai_stream_transport_error_preserves_finish_semantics(
 
     def handler(request):
         requests.append(request)
-        return http_module.Response(
+        return httpx2.Response(
             200,
             headers={"content-type": "text/event-stream"},
-            stream=body_cls(payload.encode(), error),
+            stream=_Httpx2DyingStream(payload.encode(), error),
         )
 
     with openai.OpenAI(
         api_key="probe",
         base_url="http://probe.invalid/v1",
-        http_client=http_module.Client(transport=http_module.MockTransport(handler)),
+        http_client=httpx2.Client(transport=httpx2.MockTransport(handler)),
         max_retries=2,
     ) as client:
         provider = create_provider("openai-compatible", api_surface=surface)
@@ -875,18 +820,6 @@ def test_anthropic_midbody_death_is_unwrapped_httpx2_error_and_no_rerequest():
     assert isinstance(excinfo.value, httpx2.TransportError)
     assert texts == ["hello"]
     assert len(requests) == 1
-
-
-def test_anthropic_v1_rejects_legacy_httpx_client_at_construction():
-    """Why every Anthropic boundary test injects HTTPX2 objects: the SDK
-    refuses the old family up front, so a legacy client cannot slip a
-    different exception family past ``transport_guarded`` unnoticed."""
-    legacy = httpx.Client()
-    try:
-        with pytest.raises(TypeError, match="httpx2"):
-            anthropic.Anthropic(api_key="probe", http_client=legacy)  # type: ignore[arg-type]
-    finally:
-        legacy.close()
 
 
 @pytest.mark.parametrize("surface", ["chat", "responses"])
@@ -1133,7 +1066,7 @@ class TestEagerAppendContract:
 
 @pytest.mark.parametrize("kwarg", ["temperature", "top_p", "top_k"])
 def test_anthropic_v1_rejects_typed_sampling_kwargs(kwarg: str):
-    """The SDK half of fact 7: the sampling kwargs are gone from the Messages
+    """The SDK half of fact 6: the sampling kwargs are gone from the Messages
     signatures, so an adapter that regressed to a typed kwarg would fail
     every real-SDK test before issuing a request.  Binding fails before any
     transport is touched, so no mock is needed."""
@@ -1202,7 +1135,7 @@ def test_anthropic_v1_temperature_rides_extra_body_to_the_wire(
     wire_temperature: Any,
     wire_template: Any,
 ):
-    """The adapter half of fact 7: the same send/omit semantics as the typed
+    """The adapter half of fact 6: the same send/omit semantics as the typed
     kwarg had, now through ``extra_body``, with an operator ``server_compat``
     pin keeping precedence over the resolved knob.  Driven through the real
     SDK so the merge into the JSON body is what is pinned, not the kwargs
@@ -1236,7 +1169,7 @@ def test_anthropic_v1_temperature_rides_extra_body_to_the_wire(
 
 
 def test_anthropic_extra_headers_replace_the_credential_header():
-    """The SDK half of fact 8 (Anthropic): a caller ``X-Api-Key`` replaces the
+    """The SDK half of fact 7 (Anthropic): a caller ``X-Api-Key`` replaces the
     key the SDK emits, even the one minted via ``with_options`` — the reason
     the adapters refuse credential names before the call."""
     captured: dict[str, Any] = {}
@@ -1256,7 +1189,7 @@ def test_anthropic_extra_headers_replace_the_credential_header():
 
 
 def test_openai_extra_headers_replace_the_credential_header():
-    """The SDK half of fact 8 (OpenAI v3): a caller ``Authorization`` replaces
+    """The SDK half of fact 7 (OpenAI v3): a caller ``Authorization`` replaces
     the bearer the SDK emits for a ``with_options``-minted key."""
     seen: dict[str, Any] = {}
 
@@ -1296,7 +1229,7 @@ def test_openai_extra_headers_replace_the_credential_header():
 def test_adapters_refuse_credential_headers_before_the_sdk_call(
     provider_name: str, api_surface: str | None, header: str
 ):
-    """The Turnstone half of fact 8: request assembly raises before any SDK
+    """The Turnstone half of fact 7: request assembly raises before any SDK
     call, so ``with_options(api_key=...)`` stays the only credential path."""
     from turnstone.core.providers import create_provider
 

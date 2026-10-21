@@ -3517,7 +3517,7 @@ class TestCreateForkRollback:
         """Request cancellation cannot outrun the non-cancellable clone."""
         import asyncio
 
-        import httpx
+        import httpx2
 
         assert anyio_backend == "asyncio"
         sync_client, mgr = app_client
@@ -3570,8 +3570,8 @@ class TestCreateForkRollback:
                 clone_finished.set()
 
         monkeypatch.setattr(_FakeSession, "fork_from_storage", _blocked_fork)
-        transport = httpx.ASGITransport(app=sync_client.app)
-        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        transport = httpx2.ASGITransport(app=sync_client.app)
+        async with httpx2.AsyncClient(transport=transport, base_url="http://test") as client:
             request_task = asyncio.create_task(
                 client.post(
                     "/v1/api/workstreams/new",

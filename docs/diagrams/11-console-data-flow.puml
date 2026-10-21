@@ -146,7 +146,7 @@ activate Server #FFF9C4
 
 Server -> CC : get_node_detail("nodeA")\n→ server_url = "http://10.0.1.1:8080"
 
-Server -> NodeA : GET http://10.0.1.1:8080/\n(via httpx.AsyncClient)
+Server -> NodeA : GET http://10.0.1.1:8080/\n(via httpx2.AsyncClient)
 activate NodeA
 NodeA --> Server : index.html
 deactivate NodeA
@@ -178,7 +178,7 @@ end note
 Browser -> Server : GET /node/nodeA/v1/api/workstreams/ws789/events
 activate Server #FFF9C4
 
-Server -> NodeA : GET http://10.0.1.1:8080/v1/api/workstreams/ws789/events\n(SSE stream via httpx.AsyncClient timeout=None)
+Server -> NodeA : GET http://10.0.1.1:8080/v1/api/workstreams/ws789/events\n(SSE stream via httpx2.AsyncClient, no read timeout)
 activate NodeA
 
 loop SSE streaming

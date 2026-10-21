@@ -164,7 +164,7 @@ Router --> CR : resolve / register route
 Router --> Server : single-node/direct mode\ncreate + send + approve
 Router --> ConsoleRouter : multi-node mode\nroute create/live/send/approve/lookup
 ConsoleRouter --> Server : routed HTTP to owning node
-Bot --> Server : GET /v1/api/workstreams/{ws_id}/events\n(SSE via httpx-sse)
+Bot --> Server : GET /v1/api/workstreams/{ws_id}/events\n(SSE via httpx2)
 Server --> Bot : SSE event stream
 
 Bot --> Discord : reply / embed\nbutton callback
@@ -211,7 +211,7 @@ note right of Server
   **Outbound Flow**
   1. Server emits SSE events on
      GET /v1/api/workstreams/{ws_id}/events
-  2. Bot subscribes via httpx-sse
+  2. Bot subscribes via httpx2's SSE support
   3. Bot formats and sends to Discord thread
 end note
 

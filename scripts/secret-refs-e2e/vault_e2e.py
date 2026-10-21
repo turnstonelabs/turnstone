@@ -36,7 +36,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-import httpx
+import httpx2
 import jwt
 
 from turnstone.core.config import config_file_path, load_config
@@ -83,7 +83,7 @@ def store_cli(*args: str) -> str:
 
 def token_status(token: str) -> int:
     """The store's answer to a token lookup with *token*: 200 while the token is valid."""
-    response = httpx.get(
+    response = httpx2.get(
         f"{ENV['STORE_ADDR']}/v1/auth/token/lookup-self",
         headers={"X-Vault-Token": token},
         timeout=5,
@@ -94,7 +94,7 @@ def token_status(token: str) -> int:
 
 def raw_field(path: str, field: str) -> str:
     """A field as the store holds it, read with the root token, outside Turnstone."""
-    response = httpx.get(
+    response = httpx2.get(
         f"{ENV['STORE_ADDR']}/v1/secret/data/{path}",
         headers={"X-Vault-Token": ENV["STORE_ROOT_TOKEN"]},
         timeout=5,

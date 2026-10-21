@@ -20,7 +20,7 @@ retry pays real exponential backoff).
 import logging
 from unittest.mock import MagicMock, patch
 
-import httpx
+import httpx2
 import pytest
 
 from tests._session_helpers import (
@@ -126,7 +126,7 @@ class TestMidStreamRetry:
         session = _make_session(ui)
         first_text = "streaming from the dead attempt"
         streams = [
-            _dying_stream(first_text, exc=httpx.ReadError("[SSL] record layer failure")),
+            _dying_stream(first_text, exc=httpx2.ReadError("[SSL] record layer failure")),
             _good_stream("Hello world"),
         ]
         create = arm_session(session, *streams).create_streaming
@@ -178,7 +178,7 @@ class TestMidStreamRetry:
         ui = RecordingUI()
         session = _make_session(ui)
         streams = [
-            _dying_stream("a", exc=httpx.ReadError("[SSL] record layer failure")) for _ in range(3)
+            _dying_stream("a", exc=httpx2.ReadError("[SSL] record layer failure")) for _ in range(3)
         ]
         create = arm_session(session, *streams).create_streaming
         with (
@@ -219,7 +219,7 @@ class TestMidStreamRetry:
             real_backoff(delay, my_generation)
 
         create = arm_session(
-            session, _dying_stream("Hel", exc=httpx.ReadError("wire died"))
+            session, _dying_stream("Hel", exc=httpx2.ReadError("wire died"))
         ).create_streaming
         with (
             patch.object(session, "_backoff_or_cancelled", side_effect=cancel_then_backoff),
@@ -242,7 +242,7 @@ class TestMidStreamRetry:
         ui = RecordingUI()
         session = _make_session(ui)
         streams = [
-            _dying_stream("x", exc=httpx.ReadError("wire died")),
+            _dying_stream("x", exc=httpx2.ReadError("wire died")),
             _good_stream("ok"),
         ]
 
@@ -272,8 +272,8 @@ class TestMidStreamRetry:
         ui = RecordingUI()
         session = _make_session(ui)
         streams = [
-            _dying_stream("x", exc=httpx.ReadError("wire died")),
-            _dying_stream("y", exc=httpx.ReadError("wire died again")),
+            _dying_stream("x", exc=httpx2.ReadError("wire died")),
+            _dying_stream("y", exc=httpx2.ReadError("wire died again")),
             _good_stream("ok"),
         ]
         create = arm_session(session, *streams).create_streaming
@@ -296,7 +296,7 @@ class TestMidStreamRetry:
         ui = RecordingUI()
         session = _make_session(ui)
         streams = [
-            _dying_stream(exc=httpx.ReadError("pre-token wire death")),
+            _dying_stream(exc=httpx2.ReadError("pre-token wire death")),
             _good_stream("ok"),
         ]
         arm_session(session, *streams)
@@ -321,7 +321,7 @@ class TestMidStreamRetry:
             session.cancel()
             real_backoff(delay, my_generation)
 
-        arm_session(session, _dying_stream(exc=httpx.ReadError("died before first token")))
+        arm_session(session, _dying_stream(exc=httpx2.ReadError("died before first token")))
         with (
             patch.object(session, "_backoff_or_cancelled", side_effect=cancel_then_backoff),
         ):
@@ -343,11 +343,11 @@ class TestMidStreamRetry:
             # A Stop lands after the re-create, before the first chunk:
             # cancel() closes the fresh stream and the read dies.
             session.cancel()
-            raise httpx.ReadError("closed by cancel")
+            raise httpx2.ReadError("closed by cancel")
             yield  # pragma: no cover — generator marker
 
         streams = [
-            _dying_stream("Hel", exc=httpx.ReadError("wire died")),
+            _dying_stream("Hel", exc=httpx2.ReadError("wire died")),
             second_stream(),
         ]
         arm_session(session, *streams)
@@ -425,7 +425,7 @@ class TestMidStreamRetry:
         session = _make_session(ui)
         provider = arm_session(
             session,
-            _dying_stream("x", exc=httpx.ReadError("wire died")),
+            _dying_stream("x", exc=httpx2.ReadError("wire died")),
             # A mid-retry rebind landed on a smaller-window model: the
             # re-create overflows deterministically (a creation-phase
             # raise — unarmed).
@@ -467,7 +467,7 @@ class TestMidStreamRetry:
         ui = RecordingUI()
         session = _make_session(ui)
         streams = [
-            _dying_stream("x", exc=httpx.ReadError("wire died")),
+            _dying_stream("x", exc=httpx2.ReadError("wire died")),
             _good_stream("ok"),
         ]
 
@@ -522,7 +522,7 @@ class TestMidStreamRetry:
             session._generation += 1  # force-cancel claimed a successor
             raise GenerationCancelled()
 
-        arm_session(session, _dying_stream("Hel", exc=httpx.ReadError("wire died")))
+        arm_session(session, _dying_stream("Hel", exc=httpx2.ReadError("wire died")))
         with (
             patch.object(session, "_backoff_or_cancelled", side_effect=supersede_then_cancel),
         ):
@@ -547,7 +547,7 @@ class TestMidStreamRetry:
         streams = [
             _dying_stream(
                 "dead attempt text that must not surface",
-                exc=httpx.ReadError("wire died"),
+                exc=httpx2.ReadError("wire died"),
             ),
             _good_stream("final answer"),
         ]
@@ -578,7 +578,7 @@ class TestMidStreamRetry:
             real_backoff(delay, my_generation)
 
         dead_text = "a dead attempt long enough to flush past the carry window"
-        arm_session(session, _dying_stream(dead_text, exc=httpx.ReadError("wire died")))
+        arm_session(session, _dying_stream(dead_text, exc=httpx2.ReadError("wire died")))
         with (
             patch.object(session, "_backoff_or_cancelled", side_effect=cancel_then_backoff),
         ):
@@ -600,7 +600,7 @@ class TestMidStreamRetry:
         ui = _Pre937UI()
         session = _make_session(ui)
         streams = [
-            _dying_stream("x", exc=httpx.ReadError("wire died")),
+            _dying_stream("x", exc=httpx2.ReadError("wire died")),
             _good_stream("ok"),
         ]
         arm_session(session, *streams)
@@ -688,7 +688,7 @@ class TestMidStreamRetry:
         session = _make_session(ui)
         create = arm_session(
             session,
-            _dying_stream("He", exc=httpx.ReadError("[SSL] record layer failure")),
+            _dying_stream("He", exc=httpx2.ReadError("[SSL] record layer failure")),
             RuntimeError("Cannot send a request, as the client has been closed."),
         ).create_streaming
         with (
@@ -714,7 +714,7 @@ class TestMidStreamRetry:
         def blipping():
             yield StreamChunk(content_delta="Hello world")
             yield StreamChunk(finish_reason="stop")
-            raise httpx.ReadError("late blip")  # the usage chunk is lost
+            raise httpx2.ReadError("late blip")  # the usage chunk is lost
 
         arm_session(session, blipping())
         session.send("test")
@@ -745,7 +745,7 @@ class TestRecreateWindowClassification:
         session = _make_session(ui)
         arm_session(
             session,
-            _dying_stream("Half an answer", exc=httpx.ReadError("wire died")),
+            _dying_stream("Half an answer", exc=httpx2.ReadError("wire died")),
             _good_stream("never reached"),
         )
         # The Stop lands AFTER backoff+discard, BEFORE the next attempt
@@ -792,7 +792,7 @@ class TestRecreateWindowClassification:
         session = _make_session(ui)
         arm_session(
             session,
-            _dying_stream("text", exc=httpx.ReadError("wire died")),
+            _dying_stream("text", exc=httpx2.ReadError("wire died")),
             _good_stream("never reached"),
         )
         # The re-issue round's PREAMBLE (before any begin_attempt) raises:
@@ -826,7 +826,7 @@ class TestRecreateWindowClassification:
         session = _make_session(ui)
         arm_session(
             session,
-            _dying_stream("text", exc=httpx.ReadError("wire died")),
+            _dying_stream("text", exc=httpx2.ReadError("wire died")),
             BackendAuthUnavailableError("obo mint refused for alias 'gpt': no cached grant"),
         )
         with pytest.raises(BackendAuthUnavailableError):
@@ -846,7 +846,7 @@ class TestRecreateWindowClassification:
         session = _make_session(ui)
         provider = arm_session(session)  # install the provider shell only
         scripts = [
-            _dying_stream("First words from the dying wire", exc=httpx.ReadError("wire died")),
+            _dying_stream("First words from the dying wire", exc=httpx2.ReadError("wire died")),
             _good_stream("Recovered"),
         ]
 
@@ -1030,7 +1030,7 @@ class TestGenerationFencedCreationNotices:
         consumer = _StreamTurnConsumer(session, 7)
         with (
             patch(
-                "turnstone.core.session.model_turn", side_effect=httpx.ConnectError("down")
+                "turnstone.core.session.model_turn", side_effect=httpx2.ConnectError("down")
             ) as dispatch,
             patch.object(session, "_stop_retrying", side_effect=supersede_before_notice),
             pytest.raises(GenerationCancelled),
@@ -1060,7 +1060,7 @@ class TestDebugDumpLatch:
         session.messages.append(Turn.user("hi"))
         arm_session(
             session,
-            _dying_stream("x" * 20, exc=httpx.ReadError("wire died")),
+            _dying_stream("x" * 20, exc=httpx2.ReadError("wire died")),
             _good_stream("ok"),
         )
         with patch.object(session, "_debug_print_request") as dump:

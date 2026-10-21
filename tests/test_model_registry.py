@@ -203,8 +203,8 @@ class TestModelRegistry:
             reg.get_client("nonexistent")
 
     def test_client_construction_failure_is_value_error(self) -> None:
-        # Environment failures inside SDK construction (e.g. httpx raising
-        # FileNotFoundError for a CA bundle deleted by a venv rebuild) must
+        # Environment failures inside SDK construction (e.g. httpx2 raising
+        # FileNotFoundError for an SSL_CERT_FILE bundle since deleted) must
         # surface as ValueError so routes answer 503-with-message instead
         # of an opaque 500.
         reg = self._make_registry()

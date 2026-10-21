@@ -35,18 +35,10 @@ dependencies = [
     # newer typed parameters. Keep major upgrades deliberate: the stream retry
     # boundary depends on the transport contract.
     "anthropic>=1,<2",
-    "httpx>=0.28",
-    # Not imported: httpx (not HTTPX2) verifies TLS against this bundle, so the floor goes
-    # when httpx does. emSign ECC Root CA - G3 anchors eMudhra intermediate CAs whose keys
-    # were compromised (GHSA-6q48-6c7w-9gw2); 2026.10.18 dropped all four emSign roots, and
-    # 2026.10.19 drops only G3, keeping the three unaffected ones.
-    "certifi>=2026.10.19",
-    # Direct because the provider boundary catches this exception family, the
-    # Anthropic tests inject HTTPX2 clients, and the guarded URL fetch is built on
-    # it; the OpenAI v3 / Anthropic v1 transitive dependency alone is not an import
-    # contract. 2.12 decodes compressed bodies in bounded pieces, which keeps the
-    # guarded fetch's decoded-byte limit a memory bound as well. The extras let
-    # fetches accept brotli and zstd (backports.zstd before Python 3.14).
+    # Turnstone's HTTP clients and the provider SDKs are built on httpx2, and the provider boundary
+    # catches its exception family. 2.12 decodes compressed bodies in bounded pieces, which keeps
+    # the guarded fetch's decoded-byte limit a memory bound as well. The extras let fetches accept
+    # brotli and zstd (backports.zstd before Python 3.14).
     "httpx2[brotli,zstd]>=2.12,<3",
     # The guarded URL transport supplies a backend that dials screened addresses.
     # Released in lockstep with httpx2, which pins the matching version.
@@ -55,7 +47,6 @@ dependencies = [
     "starlette>=1.3.1",  # CVE-2026-54282 (path->authority host spoof) + CVE-2026-54283 (url-encoded form DoS); supersedes the PYSEC-2026-161 host-header path-injection floor
     "uvicorn>=0.34",
     "sse-starlette>=2.0",
-    "httpx-sse>=0.4",
     "pydantic>=2.0",
     "pydantic-settings>=2.14.2",  # GHSA-4xgf-cpjx-pc3j: <2.14.2 advisory; pinned as a security floor for pip-audit
 
@@ -146,9 +137,6 @@ filterwarnings = [
     "error:unclosed database in:ResourceWarning",
     "error:.*was deleted while still open:ResourceWarning",
     "error::pytest.PytestUnraisableExceptionWarning",
-    # starlette deprecates the httpx-backed TestClient; revisit at the next
-    # starlette floor bump.
-    "ignore:Using `httpx` with `starlette.testclient` is deprecated",
 ]
 
 [tool.ruff]
@@ -192,7 +180,7 @@ module = ["mcp", "mcp.*"]
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
-module = ["sse_starlette", "sse_starlette.*", "uvicorn", "uvicorn.*", "httpx_sse", "httpx_sse.*"]
+module = ["sse_starlette", "sse_starlette.*", "uvicorn", "uvicorn.*"]
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]

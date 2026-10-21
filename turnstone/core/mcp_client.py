@@ -2946,7 +2946,7 @@ class MCPClientManager:
 
         MUST run on the mcp-loop, and only touches scopes HOSTED on it: the
         ``gc.get_objects()`` walk is process-global, and in ``turnstone-server``
-        this process also runs FastAPI/httpx anyio scopes on the MAIN loop —
+        this process also runs FastAPI/httpx2 anyio scopes on the MAIN loop —
         cancelling another loop's ``call_soon`` handle or clearing a set that
         loop may be iterating is a cross-thread reach with no thread-safety
         contract. Foreign-loop orphans are that loop's problem to fix. The

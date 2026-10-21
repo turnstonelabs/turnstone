@@ -25,7 +25,7 @@ from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import TYPE_CHECKING, Any
 
-import httpx
+import httpx2
 import pytest
 from openai import OpenAI
 
@@ -229,11 +229,11 @@ class _CountingProxyHandler(BaseHTTPRequestHandler):
             headers["Accept-Encoding"] = "identity"
             counter.begin_forward(alias)
             try:
-                upstream = httpx.post(
+                upstream = httpx2.post(
                     f"{self._proxy.upstream_base_url}{self.path}",
                     content=body,
                     headers=headers,
-                    timeout=httpx.Timeout(60.0, connect=5.0),
+                    timeout=httpx2.Timeout(60.0, connect=5.0),
                 )
             finally:
                 counter.end_forward(alias)
