@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import Any
 
-import httpx
+import httpx2
 import pytest
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
@@ -36,10 +36,10 @@ def _scripted_post(*responses: tuple[int, dict[str, Any]]) -> Any:
 
     remaining = list(responses)
 
-    async def _post(*args: Any, **kwargs: Any) -> httpx.Response:
+    async def _post(*args: Any, **kwargs: Any) -> httpx2.Response:
         status, body = remaining.pop(0)
-        return httpx.Response(
-            status, json=body, request=httpx.Request("POST", args[0] if args else "http://t")
+        return httpx2.Response(
+            status, json=body, request=httpx2.Request("POST", args[0] if args else "http://t")
         )
 
     return MagicMock(side_effect=_post)

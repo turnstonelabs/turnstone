@@ -13,7 +13,7 @@ import json
 from typing import Any
 from unittest.mock import MagicMock
 
-import httpx
+import httpx2
 import pytest
 from starlette.testclient import TestClient
 
@@ -90,17 +90,17 @@ def _make_app(router: Any = None) -> Any:
 def _make_proxy(status_code: int = 200, body: dict[str, Any] | None = None) -> MagicMock:
     payload = body or {"ws_id": _CREATED_WS_ID, "name": "test"}
 
-    async def _post(*args: Any, **kwargs: Any) -> httpx.Response:
-        return httpx.Response(
+    async def _post(*args: Any, **kwargs: Any) -> httpx2.Response:
+        return httpx2.Response(
             status_code,
             json=payload,
-            request=httpx.Request("POST", args[0] if args else "http://test"),
+            request=httpx2.Request("POST", args[0] if args else "http://test"),
         )
 
-    async def _request(method: str, *args: Any, **kwargs: Any) -> httpx.Response:
+    async def _request(method: str, *args: Any, **kwargs: Any) -> httpx2.Response:
         return await _post(*args, **kwargs)
 
-    proxy = MagicMock(spec=httpx.AsyncClient)
+    proxy = MagicMock(spec=httpx2.AsyncClient)
     proxy.post = MagicMock(side_effect=_post)
     proxy.request = MagicMock(side_effect=_request)
     return proxy
@@ -179,7 +179,7 @@ class TestRouteCreateAudit:
         app = _make_app(router=router)
         storage, captured = _capture_storage()
         # No proxy needed — handler returns 400 before any upstream call.
-        proxy = MagicMock(spec=httpx.AsyncClient)
+        proxy = MagicMock(spec=httpx2.AsyncClient)
         _wire(app, proxy, storage)
         client = TestClient(app, raise_server_exceptions=False)
 
@@ -214,21 +214,21 @@ class TestRouteCreateAudit:
 
         post_count = 0
 
-        async def _post(*args: Any, **kwargs: Any) -> httpx.Response:
+        async def _post(*args: Any, **kwargs: Any) -> httpx2.Response:
             nonlocal post_count
             post_count += 1
             url = args[0] if args else "http://test"
             if post_count == 1:
-                return httpx.Response(
-                    503, json={"error": "overloaded"}, request=httpx.Request("POST", url)
+                return httpx2.Response(
+                    503, json={"error": "overloaded"}, request=httpx2.Request("POST", url)
                 )
-            return httpx.Response(
+            return httpx2.Response(
                 200,
                 json={"ws_id": _CREATED_WS_ID, "name": "n"},
-                request=httpx.Request("POST", url),
+                request=httpx2.Request("POST", url),
             )
 
-        proxy = MagicMock(spec=httpx.AsyncClient)
+        proxy = MagicMock(spec=httpx2.AsyncClient)
         proxy.post = MagicMock(side_effect=_post)
         _wire(app, proxy, storage)
         client = TestClient(app, raise_server_exceptions=False)

@@ -16,7 +16,7 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
 from unittest.mock import MagicMock
 
-import httpx
+import httpx2
 import pytest
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
@@ -2922,8 +2922,8 @@ def test_cluster_inspect_unloaded_coordinator_live_null(storage):
     assert body["persisted"]["kind"] == "coordinator"
 
 
-def _install_proxy_client(client: TestClient, transport: httpx.MockTransport) -> None:
-    """Attach an httpx.AsyncClient backed by a MockTransport to the app state.
+def _install_proxy_client(client: TestClient, transport: httpx2.MockTransport) -> None:
+    """Attach an httpx2.AsyncClient backed by a MockTransport to the app state.
 
     cluster_ws_detail's node-backed branch reads
     ``request.app.state.proxy_client`` + ``request.app.state.collector``
@@ -2931,7 +2931,7 @@ def _install_proxy_client(client: TestClient, transport: httpx.MockTransport) ->
     tests short-circuit by injecting a proxy client here and stubbing
     the collector's node lookup with a MagicMock.
     """
-    client.app.state.proxy_client = httpx.AsyncClient(transport=transport)
+    client.app.state.proxy_client = httpx2.AsyncClient(transport=transport)
 
 
 def _install_collector_with_node(client: TestClient, node_id: str, server_url: str) -> None:
@@ -2979,13 +2979,13 @@ def test_cluster_inspect_node_backed_success(storage):
         ]
     }
 
-    def _handler(req: httpx.Request) -> httpx.Response:
+    def _handler(req: httpx2.Request) -> httpx2.Response:
         assert req.url.path == "/v1/api/dashboard"
-        return httpx.Response(200, json=payload)
+        return httpx2.Response(200, json=payload)
 
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
     _install_collector_with_node(client, "node-a", "http://node-a")
-    _install_proxy_client(client, httpx.MockTransport(_handler))
+    _install_proxy_client(client, httpx2.MockTransport(_handler))
 
     resp = client.get(f"/v1/api/cluster/ws/{ws_id}/detail", headers=_CLUSTER_HEADERS)
     assert resp.status_code == 200
@@ -3044,7 +3044,9 @@ def test_cluster_inspect_node_backed_pending_approval_detail_passes_through(stor
     }
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
     _install_collector_with_node(client, "node-a", "http://node-a")
-    _install_proxy_client(client, httpx.MockTransport(lambda r: httpx.Response(200, json=payload)))
+    _install_proxy_client(
+        client, httpx2.MockTransport(lambda r: httpx2.Response(200, json=payload))
+    )
     resp = client.get(f"/v1/api/cluster/ws/{ws_id}/detail", headers=_CLUSTER_HEADERS)
     assert resp.status_code == 200
     live = resp.json()["live"]
@@ -3070,24 +3072,26 @@ def test_cluster_inspect_node_backed_pending_approval_synthesized(storage):
     }
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
     _install_collector_with_node(client, "node-a", "http://node-a")
-    _install_proxy_client(client, httpx.MockTransport(lambda r: httpx.Response(200, json=payload)))
+    _install_proxy_client(
+        client, httpx2.MockTransport(lambda r: httpx2.Response(200, json=payload))
+    )
     resp = client.get(f"/v1/api/cluster/ws/{ws_id}/detail", headers=_CLUSTER_HEADERS)
     assert resp.status_code == 200
     assert resp.json()["live"]["pending_approval"] is True
 
 
 def test_cluster_inspect_node_unreachable_live_null(storage):
-    """httpx connect/timeout error → live: null, status 200."""
+    """httpx2 connect/timeout error → live: null, status 200."""
     mgr = _build_mgr(storage)
     ws_id = "de" * 16
     _seed_node_workstream(storage, ws_id=ws_id, node_id="node-a")
 
-    def _handler(req: httpx.Request) -> httpx.Response:
-        raise httpx.ConnectError("node down")
+    def _handler(req: httpx2.Request) -> httpx2.Response:
+        raise httpx2.ConnectError("node down")
 
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
     _install_collector_with_node(client, "node-a", "http://node-a")
-    _install_proxy_client(client, httpx.MockTransport(_handler))
+    _install_proxy_client(client, httpx2.MockTransport(_handler))
     resp = client.get(f"/v1/api/cluster/ws/{ws_id}/detail", headers=_CLUSTER_HEADERS)
     assert resp.status_code == 200
     assert resp.json()["live"] is None
@@ -3100,7 +3104,7 @@ def test_cluster_inspect_node_5xx_live_null(storage):
     _seed_node_workstream(storage, ws_id=ws_id, node_id="node-a")
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
     _install_collector_with_node(client, "node-a", "http://node-a")
-    _install_proxy_client(client, httpx.MockTransport(lambda r: httpx.Response(503, text="down")))
+    _install_proxy_client(client, httpx2.MockTransport(lambda r: httpx2.Response(503, text="down")))
     resp = client.get(f"/v1/api/cluster/ws/{ws_id}/detail", headers=_CLUSTER_HEADERS)
     assert resp.status_code == 200
     assert resp.json()["live"] is None
@@ -3118,7 +3122,9 @@ def test_cluster_inspect_node_missing_entry_live_null(storage):
     }
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
     _install_collector_with_node(client, "node-a", "http://node-a")
-    _install_proxy_client(client, httpx.MockTransport(lambda r: httpx.Response(200, json=payload)))
+    _install_proxy_client(
+        client, httpx2.MockTransport(lambda r: httpx2.Response(200, json=payload))
+    )
     resp = client.get(f"/v1/api/cluster/ws/{ws_id}/detail", headers=_CLUSTER_HEADERS)
     assert resp.status_code == 200
     assert resp.json()["live"] is None

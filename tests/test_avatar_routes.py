@@ -382,7 +382,7 @@ async def test_uploads_arriving_together_are_capped(db, monkeypatch) -> None:
     # one decoding and four waiting, and the rest are refused at once.
     import asyncio
 
-    import httpx
+    import httpx2
 
     from turnstone.console.collector import ClusterCollector
     from turnstone.console.server import _load_static, create_app
@@ -403,8 +403,8 @@ async def test_uploads_arriving_together_are_capped(db, monkeypatch) -> None:
         collector=MagicMock(spec=ClusterCollector), jwt_secret=_SECRET, auth_storage=db
     )
     png = _png()
-    transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(
+    transport = httpx2.ASGITransport(app=app)
+    async with httpx2.AsyncClient(
         transport=transport, base_url="http://console.example.com"
     ) as http:
         uploads = [
@@ -438,7 +438,7 @@ async def test_a_second_upload_is_refused_while_the_first_still_arrives(console_
     # can't have several bodies arriving at once.
     import asyncio
 
-    import httpx
+    import httpx2
 
     boundary = "avatar-boundary"
     head = (
@@ -457,8 +457,8 @@ async def test_a_second_upload_is_refused_while_the_first_still_arrives(console_
 
     url = f"/v1/api/users/{ME}/avatar/picture"
     slow_headers = {**OPERATOR, "Content-Type": f"multipart/form-data; boundary={boundary}"}
-    transport = httpx.ASGITransport(app=console_app)
-    async with httpx.AsyncClient(
+    transport = httpx2.ASGITransport(app=console_app)
+    async with httpx2.AsyncClient(
         transport=transport, base_url="http://console.example.com"
     ) as http:
         first = asyncio.ensure_future(http.put(url, content=slow_body(), headers=slow_headers))

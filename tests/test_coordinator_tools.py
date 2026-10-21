@@ -740,7 +740,7 @@ def test_a_queued_message_ends_a_real_wait_and_reaches_the_model(
     import time
     import uuid
 
-    import httpx
+    import httpx2
 
     from tests._session_helpers import NullUI, make_result
     from turnstone.console.coordinator_client import CoordinatorClient
@@ -763,7 +763,7 @@ def test_a_queued_message_ends_a_real_wait_and_reaches_the_model(
         token_factory=lambda: "t",
         coord_ws_id="coord-1",
         user_id="user-1",
-        http_client=httpx.Client(transport=httpx.MockTransport(lambda r: httpx.Response(200))),
+        http_client=httpx2.Client(transport=httpx2.MockTransport(lambda r: httpx2.Response(200))),
         child_event_bus=bus,
     )
     client._WAIT_HEARTBEAT_INTERVAL = 30.0  # type: ignore[misc]
@@ -2344,7 +2344,7 @@ def _write_path_client(tmp_path, name="oracle.db", *, sqlite_backend_factory):
     agreement test below, so it has to be the real one — a MagicMock would
     accept whatever prepare passed it and agree with itself.
     """
-    import httpx
+    import httpx2
 
     from turnstone.console.coordinator_client import CoordinatorClient
     from turnstone.core.child_event_bus import ChildEventBus
@@ -2357,7 +2357,7 @@ def _write_path_client(tmp_path, name="oracle.db", *, sqlite_backend_factory):
         token_factory=lambda: "t",
         coord_ws_id="coord-1",
         user_id="user-1",
-        http_client=httpx.Client(transport=httpx.MockTransport(lambda r: httpx.Response(200))),
+        http_client=httpx2.Client(transport=httpx2.MockTransport(lambda r: httpx2.Response(200))),
         child_event_bus=ChildEventBus(),
     )
 

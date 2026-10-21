@@ -21,11 +21,14 @@ import asyncio
 import contextlib
 import json
 from types import SimpleNamespace
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from unittest.mock import MagicMock
 
-import httpx
+import httpx2
 import pytest
+
+if TYPE_CHECKING:
+    import httpx
 
 # ---------------------------------------------------------------------------
 # Predicate matrix
@@ -383,19 +386,21 @@ def _console_headers() -> dict[str, str]:
 
 def _node_resp(
     status_code: int, json_body: dict[str, Any] | None = None, content: bytes | None = None
-) -> httpx.Response:
-    req = httpx.Request("POST", "http://a:8080/v1/api/workstreams/new")
+) -> httpx2.Response:
+    req = httpx2.Request("POST", "http://a:8080/v1/api/workstreams/new")
     if content is not None:
-        return httpx.Response(status_code, content=content, request=req)
-    return httpx.Response(status_code, json=json_body if json_body is not None else {}, request=req)
+        return httpx2.Response(status_code, content=content, request=req)
+    return httpx2.Response(
+        status_code, json=json_body if json_body is not None else {}, request=req
+    )
 
 
 @contextlib.contextmanager
 def _console_client(
-    node_response: httpx.Response | None = None, raise_exc: BaseException | None = None
+    node_response: httpx2.Response | None = None, raise_exc: BaseException | None = None
 ) -> Any:
     """A console TestClient whose proxied node create returns *node_response* (an
-    ``httpx.Response``) or raises *raise_exc*. Lifespan is not entered (matches the
+    ``httpx2.Response``) or raises *raise_exc*. Lifespan is not entered (matches the
     existing cluster-create tests) so the manually-attached proxy_client survives."""
     from starlette.testclient import TestClient
 
@@ -426,13 +431,13 @@ def _console_client(
     _load_static()
     app = create_app(collector=collector, jwt_secret=_CONSOLE_JWT_SECRET)
 
-    async def _mock_post(*_args: Any, **_kwargs: Any) -> httpx.Response:
+    async def _mock_post(*_args: Any, **_kwargs: Any) -> httpx2.Response:
         if raise_exc is not None:
             raise raise_exc
         assert node_response is not None
         return node_response
 
-    mock_proxy = MagicMock(spec=httpx.AsyncClient)
+    mock_proxy = MagicMock(spec=httpx2.AsyncClient)
     mock_proxy.post = MagicMock(side_effect=_mock_post)
     app.state.proxy_client = mock_proxy
 
@@ -505,9 +510,23 @@ class TestConsoleRequireProjectSurfacing:
         assert resp.status_code == 502
 
     def test_network_error_masked(self) -> None:
-        with _console_client(raise_exc=httpx.ConnectError("boom")) as client:
+        with _console_client(raise_exc=httpx2.ConnectError("boom")) as client:
             resp = _create(client)
         assert resp.status_code == 502
+
+    def test_refused_connection_masked(self) -> None:
+        def refuse(request: httpx2.Request) -> httpx2.Response:
+            raise httpx2.ConnectError("Connection refused", request=request)
+
+        proxy = httpx2.AsyncClient(transport=httpx2.MockTransport(refuse))
+        try:
+            with _console_client() as client:
+                client.app.state.proxy_client = proxy
+                resp = _create(client)
+        finally:
+            asyncio.run(proxy.aclose())
+        assert resp.status_code == 502
+        assert resp.json() == {"error": "Dispatch to node node-a failed"}
 
     def test_success_200_regression(self) -> None:
         with _console_client(_node_resp(200, {"ws_id": "ws_new", "name": "x"})) as client:

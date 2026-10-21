@@ -18,7 +18,7 @@ import json
 from typing import TYPE_CHECKING, Any
 from unittest.mock import MagicMock
 
-import httpx
+import httpx2
 import pytest
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
@@ -267,21 +267,21 @@ def test_coordinator_client_spawn_close_delete(tmp_path, sqlite_backend_factory)
     storage.register_workstream(
         "child-99", kind="interactive", parent_ws_id="coord-42", user_id="user-1"
     )
-    captured: list[httpx.Request] = []
+    captured: list[httpx2.Request] = []
 
-    def _handler(req: httpx.Request) -> httpx.Response:
+    def _handler(req: httpx2.Request) -> httpx2.Response:
         captured.append(req)
         path = req.url.path
         if path == "/v1/api/route/workstreams/new":
-            return httpx.Response(
+            return httpx2.Response(
                 201,
                 json={"ws_id": "child-99", "name": "spawned", "node_id": "node-a"},
             )
         # close and delete both return a generic ok
-        return httpx.Response(200, json={"status": "ok"})
+        return httpx2.Response(200, json={"status": "ok"})
 
-    transport = httpx.MockTransport(_handler)
-    http = httpx.Client(transport=transport)
+    transport = httpx2.MockTransport(_handler)
+    http = httpx2.Client(transport=transport)
     coord_client = CoordinatorClient(
         console_base_url="http://console",
         storage=storage,
@@ -382,8 +382,8 @@ def seeded_storage(tmp_path, sqlite_backend_factory):
 
 def _read_client(storage: SQLiteBackend) -> CoordinatorClient:
     """Build a CoordinatorClient whose HTTP transport is a no-op stub."""
-    transport = httpx.MockTransport(lambda r: httpx.Response(200))
-    http = httpx.Client(transport=transport)
+    transport = httpx2.MockTransport(lambda r: httpx2.Response(200))
+    http = httpx2.Client(transport=transport)
     return CoordinatorClient(
         console_base_url="http://x",
         storage=storage,

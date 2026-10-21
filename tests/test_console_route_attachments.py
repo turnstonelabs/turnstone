@@ -10,7 +10,7 @@ from __future__ import annotations
 from typing import Any
 from unittest.mock import MagicMock
 
-import httpx
+import httpx2
 from starlette.testclient import TestClient
 
 from turnstone.console.collector import ClusterCollector
@@ -63,7 +63,7 @@ class TestRouteCreateMultipart:
     def test_multipart_requires_ws_id_query(self):
         router = _make_router()
         app = _make_app(router=router)
-        app.state.proxy_client = MagicMock(spec=httpx.AsyncClient)
+        app.state.proxy_client = MagicMock(spec=httpx2.AsyncClient)
         client = TestClient(app, raise_server_exceptions=False)
         try:
             resp = client.post(
@@ -83,17 +83,17 @@ class TestRouteCreateMultipart:
 
         captured: dict[str, Any] = {}
 
-        async def _mock_post(*args: Any, **kwargs: Any) -> httpx.Response:
+        async def _mock_post(*args: Any, **kwargs: Any) -> httpx2.Response:
             captured["url"] = args[0] if args else ""
             captured["headers"] = kwargs.get("headers") or {}
             captured["content"] = kwargs.get("content")
-            return httpx.Response(
+            return httpx2.Response(
                 200,
                 json={"ws_id": "00ff" + "0" * 28, "name": "demo"},
-                request=httpx.Request("POST", args[0] if args else "http://test"),
+                request=httpx2.Request("POST", args[0] if args else "http://test"),
             )
 
-        mock_proxy = MagicMock(spec=httpx.AsyncClient)
+        mock_proxy = MagicMock(spec=httpx2.AsyncClient)
         mock_proxy.post = MagicMock(side_effect=_mock_post)
         app.state.proxy_client = mock_proxy
         client = TestClient(app, raise_server_exceptions=False)
@@ -129,16 +129,16 @@ class TestRouteCreateMultipart:
 
         captured: dict[str, Any] = {}
 
-        async def _mock_post(*args: Any, **kwargs: Any) -> httpx.Response:
+        async def _mock_post(*args: Any, **kwargs: Any) -> httpx2.Response:
             captured["headers"] = kwargs.get("headers") or {}
             captured["content"] = kwargs.get("content")
-            return httpx.Response(
+            return httpx2.Response(
                 200,
                 json={"ws_id": "00ff" + "0" * 28, "name": "ok"},
-                request=httpx.Request("POST", args[0] if args else "http://test"),
+                request=httpx2.Request("POST", args[0] if args else "http://test"),
             )
 
-        mock_proxy = MagicMock(spec=httpx.AsyncClient)
+        mock_proxy = MagicMock(spec=httpx2.AsyncClient)
         mock_proxy.post = MagicMock(side_effect=_mock_post)
         app.state.proxy_client = mock_proxy
         client = TestClient(app, raise_server_exceptions=False)
@@ -178,14 +178,14 @@ class TestRouteCreateMultipart:
         router = _make_router()
         app = _make_app(router=router)
 
-        async def _mock_post(*args: Any, **kwargs: Any) -> httpx.Response:
-            return httpx.Response(
+        async def _mock_post(*args: Any, **kwargs: Any) -> httpx2.Response:
+            return httpx2.Response(
                 200,
                 json={"ws_id": "a" * 32, "name": "json"},
-                request=httpx.Request("POST", args[0] if args else "http://test"),
+                request=httpx2.Request("POST", args[0] if args else "http://test"),
             )
 
-        mock_proxy = MagicMock(spec=httpx.AsyncClient)
+        mock_proxy = MagicMock(spec=httpx2.AsyncClient)
         mock_proxy.post = MagicMock(side_effect=_mock_post)
         app.state.proxy_client = mock_proxy
         client = TestClient(app, raise_server_exceptions=False)
@@ -207,7 +207,7 @@ class TestRouteCreateMultipart:
     def test_multipart_rejects_query_meta_ws_id_mismatch(self):
         router = _make_router()
         app = _make_app(router=router)
-        app.state.proxy_client = MagicMock(spec=httpx.AsyncClient)
+        app.state.proxy_client = MagicMock(spec=httpx2.AsyncClient)
         client = TestClient(app, raise_server_exceptions=False)
         try:
             query_ws_id = "a" * 32
@@ -237,7 +237,7 @@ class TestRouteAttachmentProxy:
     def _wire(self, mock_request_fn) -> tuple[Any, MagicMock]:
         router = _make_router()
         app = _make_app(router=router)
-        mock_proxy = MagicMock(spec=httpx.AsyncClient)
+        mock_proxy = MagicMock(spec=httpx2.AsyncClient)
         mock_proxy.request = MagicMock(side_effect=mock_request_fn)
         mock_proxy.get = MagicMock(side_effect=mock_request_fn)
         mock_proxy.post = MagicMock(side_effect=mock_request_fn)
@@ -247,12 +247,12 @@ class TestRouteAttachmentProxy:
     def test_upload_proxies_multipart(self):
         captured: dict[str, Any] = {}
 
-        async def _mock(*args: Any, **kwargs: Any) -> httpx.Response:
+        async def _mock(*args: Any, **kwargs: Any) -> httpx2.Response:
             captured["method"] = args[0] if args else kwargs.get("method")
             captured["url"] = args[1] if len(args) > 1 else kwargs.get("url", "")
             captured["headers"] = kwargs.get("headers") or {}
             captured["content"] = kwargs.get("content")
-            return httpx.Response(
+            return httpx2.Response(
                 200,
                 json={
                     "attachment_id": "att-1",
@@ -261,7 +261,7 @@ class TestRouteAttachmentProxy:
                     "size_bytes": 5,
                     "kind": "text",
                 },
-                request=httpx.Request("POST", "http://a:8080/x"),
+                request=httpx2.Request("POST", "http://a:8080/x"),
             )
 
         app, _ = self._wire(_mock)
@@ -281,11 +281,11 @@ class TestRouteAttachmentProxy:
             client.close()
 
     def test_list_proxies_get(self):
-        async def _mock(*args: Any, **kwargs: Any) -> httpx.Response:
-            return httpx.Response(
+        async def _mock(*args: Any, **kwargs: Any) -> httpx2.Response:
+            return httpx2.Response(
                 200,
                 json={"attachments": []},
-                request=httpx.Request("GET", "http://a:8080/x"),
+                request=httpx2.Request("GET", "http://a:8080/x"),
             )
 
         app, mock_proxy = self._wire(_mock)
@@ -302,8 +302,8 @@ class TestRouteAttachmentProxy:
             client.close()
 
     def test_get_content_preserves_upstream_headers(self):
-        async def _mock(*args: Any, **kwargs: Any) -> httpx.Response:
-            return httpx.Response(
+        async def _mock(*args: Any, **kwargs: Any) -> httpx2.Response:
+            return httpx2.Response(
                 200,
                 content=b"hello world",
                 headers={
@@ -311,7 +311,7 @@ class TestRouteAttachmentProxy:
                     "Content-Disposition": 'inline; filename="notes.md"',
                     "X-Content-Type-Options": "nosniff",
                 },
-                request=httpx.Request("GET", "http://a:8080/x"),
+                request=httpx2.Request("GET", "http://a:8080/x"),
             )
 
         app, _ = self._wire(_mock)
@@ -331,13 +331,13 @@ class TestRouteAttachmentProxy:
     def test_delete_proxies_method(self):
         captured: dict[str, Any] = {}
 
-        async def _mock(*args: Any, **kwargs: Any) -> httpx.Response:
+        async def _mock(*args: Any, **kwargs: Any) -> httpx2.Response:
             captured["method"] = args[0] if args else ""
             captured["url"] = args[1] if len(args) > 1 else ""
-            return httpx.Response(
+            return httpx2.Response(
                 200,
                 json={"status": "deleted"},
-                request=httpx.Request("DELETE", "http://a:8080/x"),
+                request=httpx2.Request("DELETE", "http://a:8080/x"),
             )
 
         app, _ = self._wire(_mock)
@@ -366,7 +366,7 @@ class TestRoutingFailures:
         router.route.side_effect = NoAvailableNodeError("no live nodes")
         router.refresh_cache.return_value = None
         app = _make_app(router=router)
-        app.state.proxy_client = MagicMock(spec=httpx.AsyncClient)
+        app.state.proxy_client = MagicMock(spec=httpx2.AsyncClient)
         client = TestClient(app, raise_server_exceptions=False)
         try:
             resp = client.get(

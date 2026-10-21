@@ -1490,7 +1490,7 @@ class TestConsoleWorkstreamCreation:
     def client_and_mock(self, mock_collector):
         """Returns (TestClient, mock_proxy_post) where mock_proxy_post is the
         patched proxy_client.post that captures outgoing HTTP calls."""
-        import httpx
+        import httpx2
         from starlette.testclient import TestClient
 
         from turnstone.console.server import _load_static, create_app
@@ -1503,14 +1503,14 @@ class TestConsoleWorkstreamCreation:
 
         # Set up a mock proxy_client (lifespan doesn't run in TestClient)
         async def _mock_post(*args, **kwargs):
-            return httpx.Response(
+            return httpx2.Response(
                 200,
                 json={"ws_id": "ws_new_123", "name": "test"},
-                request=httpx.Request("POST", args[0] if args else "http://test"),
+                request=httpx2.Request("POST", args[0] if args else "http://test"),
             )
 
         mock_post = MagicMock(side_effect=_mock_post)
-        mock_proxy = MagicMock(spec=httpx.AsyncClient)
+        mock_proxy = MagicMock(spec=httpx2.AsyncClient)
         mock_proxy.post = mock_post
         app.state.proxy_client = mock_proxy
 
@@ -1538,13 +1538,13 @@ class TestConsoleWorkstreamCreation:
 
     @staticmethod
     def _node_answers(mock_post, status, body):
-        import httpx
+        import httpx2
 
         async def _post(*args, **kwargs):
-            return httpx.Response(
+            return httpx2.Response(
                 status,
                 json=body,
-                request=httpx.Request("POST", args[0] if args else "http://test"),
+                request=httpx2.Request("POST", args[0] if args else "http://test"),
             )
 
         mock_post.side_effect = _post
@@ -1811,14 +1811,14 @@ class TestConsoleProxy:
     def test_proxy_static_percent_encodes_each_valid_path_segment(self, monkeypatch):
         from types import SimpleNamespace
 
-        import httpx
+        import httpx2
 
         from turnstone.console import server as csrv
 
-        upstream = httpx.Response(
+        upstream = httpx2.Response(
             200,
             content=b"asset",
-            request=httpx.Request("GET", "http://n:1/static/nested/asset"),
+            request=httpx2.Request("GET", "http://n:1/static/nested/asset"),
         )
         calls = []
 
@@ -1826,7 +1826,7 @@ class TestConsoleProxy:
             calls.append((url, headers))
             return upstream
 
-        proxy_client = MagicMock(spec=httpx.AsyncClient)
+        proxy_client = MagicMock(spec=httpx2.AsyncClient)
         proxy_client.get = MagicMock(side_effect=_mock_get)
         request = SimpleNamespace(
             app=SimpleNamespace(state=SimpleNamespace(proxy_client=proxy_client)),
@@ -1854,17 +1854,17 @@ class TestConsoleProxy:
     ):
         from types import SimpleNamespace
 
-        import httpx
+        import httpx2
 
         from turnstone.console import server as csrv
 
-        upstream = httpx.Response(
+        upstream = httpx2.Response(
             304,
             headers={
                 "etag": '"current-build"',
                 "last-modified": "Wed, 12 Aug 2026 12:00:00 GMT",
             },
-            request=httpx.Request("GET", f"http://n:1/{mount}/{path}"),
+            request=httpx2.Request("GET", f"http://n:1/{mount}/{path}"),
         )
         calls = []
 
@@ -1872,7 +1872,7 @@ class TestConsoleProxy:
             calls.append((url, headers))
             return upstream
 
-        proxy_client = MagicMock(spec=httpx.AsyncClient)
+        proxy_client = MagicMock(spec=httpx2.AsyncClient)
         proxy_client.get = MagicMock(side_effect=_mock_get)
         request = SimpleNamespace(
             app=SimpleNamespace(state=SimpleNamespace(proxy_client=proxy_client)),
@@ -1897,14 +1897,14 @@ class TestConsoleProxy:
 
     @pytest.mark.parametrize("status_code", [404, 500])
     def test_proxy_vendor_static_error_is_never_immutable(self, status_code):
-        import httpx
+        import httpx2
 
         from turnstone.console.server import _proxy_static_response
 
-        upstream = httpx.Response(
+        upstream = httpx2.Response(
             status_code,
             content=b"transient failure",
-            request=httpx.Request("GET", "http://n:1/shared/katex-0.19.0/missing.css"),
+            request=httpx2.Request("GET", "http://n:1/shared/katex-0.19.0/missing.css"),
         )
 
         resp = _proxy_static_response(upstream, "katex-0.19.0/missing.css")
@@ -1924,15 +1924,15 @@ class TestConsoleProxy:
     def test_proxy_vendor_static_preserves_stricter_upstream_policy(
         self, upstream_policy, expected
     ):
-        import httpx
+        import httpx2
 
         from turnstone.console.server import _proxy_static_response
 
-        upstream = httpx.Response(
+        upstream = httpx2.Response(
             200,
             content=b"asset",
             headers={"cache-control": upstream_policy},
-            request=httpx.Request("GET", "http://n:1/shared/katex-0.19.0/katex.js"),
+            request=httpx2.Request("GET", "http://n:1/shared/katex-0.19.0/katex.js"),
         )
 
         resp = _proxy_static_response(upstream, "katex-0.19.0/katex.js")
@@ -1951,6 +1951,53 @@ class TestConsoleProxy:
             json={"message": "hello", "ws_id": "ws1"},
         )
         assert resp.status_code == 404
+
+    @pytest.mark.parametrize(
+        ("method", "path"),
+        [
+            ("GET", "/node/node-a/"),
+            ("GET", "/node/node-a/static/app.js"),
+            ("GET", "/node/node-a/v1/api/workstreams"),
+            ("POST", "/node/node-a/v1/api/workstreams/new"),
+        ],
+        ids=["index", "static", "api-get", "api-post"],
+    )
+    def test_proxy_unreachable_node_returns_502(self, client, method, path):
+        import httpx2
+
+        def refuse(request: httpx2.Request) -> httpx2.Response:
+            raise httpx2.ConnectError("Connection refused", request=request)
+
+        proxy = httpx2.AsyncClient(transport=httpx2.MockTransport(refuse))
+        client.app.state.proxy_client = proxy
+        try:
+            resp = client.request(method, path, json={} if method == "POST" else None)
+        finally:
+            asyncio.run(proxy.aclose())
+
+        assert resp.status_code == 502
+        assert resp.json() == {"error": "Node unreachable"}
+
+    def test_proxy_sse_from_unreachable_node_ends_the_stream(self, client):
+        import httpx2
+        from starlette.testclient import TestClient
+
+        def refuse(request: httpx2.Request) -> httpx2.Response:
+            raise httpx2.ConnectError("Connection refused", request=request)
+
+        sse_client = httpx2.AsyncClient(transport=httpx2.MockTransport(refuse))
+        client.app.state.proxy_sse_client = sse_client
+        # The relay's headers are already sent when it connects upstream, so an
+        # exception escaping it would still read as an empty 200 unless raised here.
+        strict = TestClient(client.app, headers=_TEST_AUTH_HEADERS)
+        try:
+            resp = strict.get(f"/node/node-a/v1/api/workstreams/{'a' * 32}/events")
+        finally:
+            strict.close()
+            asyncio.run(sse_client.aclose())
+
+        assert resp.status_code == 200
+        assert resp.content == b""
 
     def test_proxy_api_per_ws_events_routes_to_sse_handler(self, client, mock_collector):
         """``/node/{node_id}/v1/api/workstreams/{ws_id}/events`` is the
@@ -2499,7 +2546,7 @@ class TestProxyRewriting:
         from types import SimpleNamespace
         from unittest.mock import MagicMock
 
-        import httpx
+        import httpx2
 
         from turnstone.console import server as csrv
 
@@ -2511,17 +2558,17 @@ class TestProxyRewriting:
             "literal replace() would silently inject nothing at all."
         )
 
-        upstream = httpx.Response(
+        upstream = httpx2.Response(
             200,
             content=index.encode(),
             headers={"content-type": "text/html; charset=utf-8"},
-            request=httpx.Request("GET", "http://n:1/"),
+            request=httpx2.Request("GET", "http://n:1/"),
         )
 
         async def _mock_get(*a, **kw):
             return upstream
 
-        proxy_client = MagicMock(spec=httpx.AsyncClient)
+        proxy_client = MagicMock(spec=httpx2.AsyncClient)
         proxy_client.get = MagicMock(side_effect=_mock_get)
         request = SimpleNamespace(
             app=SimpleNamespace(state=SimpleNamespace(proxy_client=proxy_client)),
@@ -3284,11 +3331,11 @@ class TestProxyGetHeaderPassThrough:
         from types import SimpleNamespace
         from unittest.mock import MagicMock
 
-        import httpx
+        import httpx2
 
         from turnstone.console import server as csrv
 
-        upstream = httpx.Response(
+        upstream = httpx2.Response(
             200,
             content=b"<html>page</html>",
             headers={
@@ -3299,13 +3346,13 @@ class TestProxyGetHeaderPassThrough:
                 "cache-control": "private, no-store",
                 "server": "upstream-internal",  # hop metadata: must NOT pass
             },
-            request=httpx.Request("GET", "http://n:1/x"),
+            request=httpx2.Request("GET", "http://n:1/x"),
         )
 
         async def _mock_get(*a, **kw):
             return upstream
 
-        proxy_client = MagicMock(spec=httpx.AsyncClient)
+        proxy_client = MagicMock(spec=httpx2.AsyncClient)
         proxy_client.get = MagicMock(side_effect=_mock_get)
         request = SimpleNamespace(
             app=SimpleNamespace(state=SimpleNamespace(proxy_client=proxy_client)),

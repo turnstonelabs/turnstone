@@ -11,7 +11,7 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
-import httpx
+import httpx2
 import pytest
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
@@ -2492,7 +2492,7 @@ def _fake_request(*nodes: dict[str, Any], proxy_client: Any = None) -> MagicMock
 
 
 def _mock_resp(status_code: int = 200, json_data: Any = None) -> MagicMock:
-    """Build a mock httpx response (sync .json(), like the real thing)."""
+    """Build a mock httpx2 response (sync .json(), like the real thing)."""
     resp = MagicMock()
     resp.status_code = status_code
     resp.json.return_value = json_data or {}
@@ -2656,10 +2656,10 @@ class TestNotifyNodesMcpReload:
         counted as a reached node — raise_for_status() routes the status into
         the error path so a stale node trips the 'did not reach' WARNING, and
         the (unused) response body is never consulted."""
-        http_req = httpx.Request("POST", "http://n1:8000/x")
+        http_req = httpx2.Request("POST", "http://n1:8000/x")
         resp = MagicMock()
-        resp.raise_for_status.side_effect = httpx.HTTPStatusError(
-            "503", request=http_req, response=httpx.Response(503, request=http_req)
+        resp.raise_for_status.side_effect = httpx2.HTTPStatusError(
+            "503", request=http_req, response=httpx2.Response(503, request=http_req)
         )
         client = AsyncMock()
         client.post.return_value = resp
@@ -3858,7 +3858,7 @@ class TestInternalMcpStatusEndpoint:
             assert "command" not in entry
             assert "url" not in entry
             # ``error`` text is replaced by ``has_error`` boolean so a
-            # FileNotFoundError binary path or httpx URL cannot leak
+            # FileNotFoundError binary path or httpx2 URL cannot leak
             # through verbose exception messages at read scope.
             assert "error" not in entry
             assert "has_error" in entry

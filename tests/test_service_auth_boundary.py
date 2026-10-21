@@ -15,7 +15,7 @@ Covers:
 - ``cluster_snapshot`` + ``cluster_events_sse`` endpoints gate on
   ``collector_scope_error`` and return 503 with a remediation hint.
 - ``_NodeDashboardCache.get`` logs 4xx at WARNING with status + body
-  preview.
+  preview, and an unreachable node yields no payload.
 - Cross-module identity of the ``DENY_EMPTY_SUB`` sentinel.
 """
 
@@ -25,7 +25,7 @@ import logging
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-import httpx
+import httpx2
 import pytest
 
 from turnstone.core.auth import AuthResult
@@ -138,15 +138,15 @@ class TestVerifyCollectorServiceScope:
             ]
         )
 
-        def handler(request: httpx.Request) -> httpx.Response:
+        def handler(request: httpx2.Request) -> httpx2.Response:
             # Caller MUST probe with expected_node_id set to the
             # sentinel so the server returns 409 before opening a
             # stream.
             assert "expected_node_id=_scope-probe_" in str(request.url)
             assert request.headers["authorization"] == "Bearer probe-token"
-            return httpx.Response(409, text='{"error":"node_id mismatch"}')
+            return httpx2.Response(409, text='{"error":"node_id mismatch"}')
 
-        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        client = httpx2.AsyncClient(transport=httpx2.MockTransport(handler))
         await _verify_collector_service_scope(app, client)
         assert app.state.collector_scope_error == ""
 
@@ -161,10 +161,10 @@ class TestVerifyCollectorServiceScope:
 
         app = _scope_probe_app(services=[{"service_id": "node-1", "url": "http://127.0.0.1:8001"}])
 
-        def handler(_req: httpx.Request) -> httpx.Response:
-            return httpx.Response(403, text='{"error":"service scope required"}')
+        def handler(_req: httpx2.Request) -> httpx2.Response:
+            return httpx2.Response(403, text='{"error":"service scope required"}')
 
-        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        client = httpx2.AsyncClient(transport=httpx2.MockTransport(handler))
         with caplog.at_level(logging.ERROR, logger="turnstone.console.server"):
             await _verify_collector_service_scope(app, client)
 
@@ -185,10 +185,10 @@ class TestVerifyCollectorServiceScope:
 
         app = _scope_probe_app(services=[{"service_id": "node-1", "url": "http://127.0.0.1:8001"}])
 
-        def handler(_req: httpx.Request) -> httpx.Response:
-            return httpx.Response(401, text="unauthorized")
+        def handler(_req: httpx2.Request) -> httpx2.Response:
+            return httpx2.Response(401, text="unauthorized")
 
-        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        client = httpx2.AsyncClient(transport=httpx2.MockTransport(handler))
         await _verify_collector_service_scope(app, client)
         assert "HTTP 401" in app.state.collector_scope_error
 
@@ -200,24 +200,24 @@ class TestVerifyCollectorServiceScope:
         from turnstone.console.server import _verify_collector_service_scope
 
         app = _scope_probe_app(services=[])
-        client = httpx.AsyncClient(transport=httpx.MockTransport(lambda _r: httpx.Response(500)))
+        client = httpx2.AsyncClient(transport=httpx2.MockTransport(lambda _r: httpx2.Response(500)))
         with caplog.at_level(logging.INFO, logger="turnstone.console.server"):
             await _verify_collector_service_scope(app, client)
         assert app.state.collector_scope_error == ""
 
     @pytest.mark.anyio
     async def test_network_error_does_not_refuse(self):
-        """Transient httpx.ConnectError during probe is a "cluster is
+        """Transient httpx2.ConnectError during probe is a "cluster is
         coming up" state; it must NOT be confused with scope drift.
         Leave ``collector_scope_error`` empty and log a warning."""
         from turnstone.console.server import _verify_collector_service_scope
 
         app = _scope_probe_app(services=[{"service_id": "node-1", "url": "http://127.0.0.1:8001"}])
 
-        def handler(_req: httpx.Request) -> httpx.Response:
-            raise httpx.ConnectError("connection refused")
+        def handler(_req: httpx2.Request) -> httpx2.Response:
+            raise httpx2.ConnectError("connection refused")
 
-        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        client = httpx2.AsyncClient(transport=httpx2.MockTransport(handler))
         await _verify_collector_service_scope(app, client)
         assert app.state.collector_scope_error == ""
 
@@ -268,10 +268,10 @@ class TestDashboardCache4xxLogLevel:
 
         cache = _NodeDashboardCache()
 
-        def handler(_req: httpx.Request) -> httpx.Response:
-            return httpx.Response(403, text='{"error":"service scope required"}')
+        def handler(_req: httpx2.Request) -> httpx2.Response:
+            return httpx2.Response(403, text='{"error":"service scope required"}')
 
-        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        client = httpx2.AsyncClient(transport=httpx2.MockTransport(handler))
         with caplog.at_level(logging.WARNING, logger="turnstone.console.server"):
             payload = await cache.get("node-1", "http://node-1:8001", client, {})
 
@@ -293,10 +293,10 @@ class TestDashboardCache4xxLogLevel:
 
         cache = _NodeDashboardCache()
 
-        def handler(_req: httpx.Request) -> httpx.Response:
-            return httpx.Response(200, json={"workstreams": []})
+        def handler(_req: httpx2.Request) -> httpx2.Response:
+            return httpx2.Response(200, json={"workstreams": []})
 
-        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        client = httpx2.AsyncClient(transport=httpx2.MockTransport(handler))
         with caplog.at_level(logging.WARNING, logger="turnstone.console.server"):
             payload = await cache.get("node-1", "http://node-1:8001", client, {})
 
@@ -314,18 +314,43 @@ class TestDashboardCache4xxLogLevel:
         cache = _NodeDashboardCache()
         calls = {"n": 0}
 
-        def handler(_req: httpx.Request) -> httpx.Response:
+        def handler(_req: httpx2.Request) -> httpx2.Response:
             calls["n"] += 1
             if calls["n"] == 1:
-                return httpx.Response(403, text="forbidden")
-            return httpx.Response(200, json={"workstreams": [{"ws_id": "ws-1"}]})
+                return httpx2.Response(403, text="forbidden")
+            return httpx2.Response(200, json={"workstreams": [{"ws_id": "ws-1"}]})
 
-        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        client = httpx2.AsyncClient(transport=httpx2.MockTransport(handler))
         first = await cache.get("node-1", "http://node-1:8001", client, {})
         second = await cache.get("node-1", "http://node-1:8001", client, {})
         assert first is None
         assert second == {"workstreams": [{"ws_id": "ws-1"}]}
         assert calls["n"] == 2, "4xx must bypass the cache so the retry reaches upstream"
+
+
+# ---------------------------------------------------------------------------
+# Dashboard cache — an unreachable node
+# ---------------------------------------------------------------------------
+
+
+class TestDashboardCacheUnreachableNode:
+    @pytest.mark.anyio
+    async def test_transport_error_is_no_payload(self):
+        """A node the proxy client cannot reach yields no dashboard, not an exception."""
+        from turnstone.console.server import _NodeDashboardCache
+
+        cache = _NodeDashboardCache()
+        calls: list[str] = []
+
+        def handler(request: httpx2.Request) -> httpx2.Response:
+            calls.append(str(request.url))
+            raise httpx2.ConnectError("Connection refused", request=request)
+
+        async with httpx2.AsyncClient(transport=httpx2.MockTransport(handler)) as client:
+            payload = await cache.get("node-1", "http://node-1:8001", client, {})
+
+        assert payload is None
+        assert calls == ["http://node-1:8001/v1/api/dashboard"]
 
 
 # ---------------------------------------------------------------------------
@@ -342,8 +367,8 @@ class TestFetchLiveBlock4xxLogLevel:
         the silence the cache path previously had also applied here."""
         from turnstone.console.server import _fetch_live_block
 
-        def handler(_req: httpx.Request) -> httpx.Response:
-            return httpx.Response(401, text='{"error":"JWT audience mismatch"}')
+        def handler(_req: httpx2.Request) -> httpx2.Response:
+            return httpx2.Response(401, text='{"error":"JWT audience mismatch"}')
 
         # Build the request with explicit state so _proxy_auth_headers
         # takes the empty-headers fallback (no auth_result, no
@@ -352,7 +377,7 @@ class TestFetchLiveBlock4xxLogLevel:
         request = MagicMock()
         request.state = SimpleNamespace(auth_result=None)
         request.app.state = SimpleNamespace(
-            proxy_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+            proxy_client=httpx2.AsyncClient(transport=httpx2.MockTransport(handler)),
             proxy_token_mgr=None,
             jwt_secret="",
             dashboard_cache=None,  # force the direct-fetch branch
@@ -398,11 +423,11 @@ class TestProxySseNon200LogLevel:
 
         from turnstone.console.server import _proxy_sse
 
-        def handler(_req: httpx.Request) -> httpx.Response:
-            return httpx.Response(403, text='{"error":"service scope required\\n"}')
+        def handler(_req: httpx2.Request) -> httpx2.Response:
+            return httpx2.Response(403, text='{"error":"service scope required\\n"}')
 
-        sse_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-        proxy_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        sse_client = httpx2.AsyncClient(transport=httpx2.MockTransport(handler))
+        proxy_client = httpx2.AsyncClient(transport=httpx2.MockTransport(handler))
         scope = {
             "type": "http",
             "method": "GET",
@@ -462,15 +487,15 @@ class TestProxySseLastEventIdForwarding:
 
         captured_headers: dict[str, str] = {}
 
-        def handler(req: httpx.Request) -> httpx.Response:
-            # httpx headers are case-insensitive; capture lowercased.
+        def handler(req: httpx2.Request) -> httpx2.Response:
+            # httpx2 headers are case-insensitive; capture lowercased.
             captured_headers.update({k.lower(): v for k, v in req.headers.items()})
-            return httpx.Response(
+            return httpx2.Response(
                 200, text="data: {}\n\n", headers={"content-type": "text/event-stream"}
             )
 
-        sse_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-        proxy_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        sse_client = httpx2.AsyncClient(transport=httpx2.MockTransport(handler))
+        proxy_client = httpx2.AsyncClient(transport=httpx2.MockTransport(handler))
         scope = {
             "type": "http",
             "method": "GET",
@@ -508,14 +533,14 @@ class TestProxySseLastEventIdForwarding:
 
         captured_headers: dict[str, str] = {}
 
-        def handler(req: httpx.Request) -> httpx.Response:
+        def handler(req: httpx2.Request) -> httpx2.Response:
             captured_headers.update({k.lower(): v for k, v in req.headers.items()})
-            return httpx.Response(
+            return httpx2.Response(
                 200, text="data: {}\n\n", headers={"content-type": "text/event-stream"}
             )
 
-        sse_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-        proxy_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        sse_client = httpx2.AsyncClient(transport=httpx2.MockTransport(handler))
+        proxy_client = httpx2.AsyncClient(transport=httpx2.MockTransport(handler))
         scope = {
             "type": "http",
             "method": "GET",

@@ -16,7 +16,7 @@ channels:
 
 The client is **synchronous by design** — coordinator tool execs run
 on the ChatSession's worker thread, not on the event loop — so it uses
-``httpx.Client`` rather than the async client.  A per-session
+``httpx2.Client`` rather than the async client.  A per-session
 :class:`CoordinatorTokenManager` mints short-lived console-audience
 JWTs carrying the real user's identity + scopes.
 """
@@ -33,7 +33,7 @@ from collections import OrderedDict
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, ClassVar
 
-import httpx
+import httpx2
 
 from turnstone.core.auth import JWT_AUD_CONSOLE, create_jwt
 from turnstone.core.log import get_logger
@@ -526,7 +526,7 @@ class CoordinatorClient:
         coord_ws_id: str,
         user_id: str,
         timeout: float = 30.0,
-        http_client: httpx.Client | None = None,
+        http_client: httpx2.Client | None = None,
         child_event_bus: ChildEventBus,
     ) -> None:
         self._base_url = console_base_url.rstrip("/")
@@ -538,7 +538,7 @@ class CoordinatorClient:
         # ``http_client`` override exists for testing — prod always
         # constructs a fresh sync client so connection pools live and die
         # with the coordinator session.
-        self._http = http_client or httpx.Client(timeout=timeout)
+        self._http = http_client or httpx2.Client(timeout=timeout)
         self._owns_http = http_client is None
         # In-process wakeup bus for ``wait_for_workstream``.  The wait
         # loop blocks on a ``threading.Event`` keyed by ws_id and only
@@ -574,7 +574,7 @@ class CoordinatorClient:
         if self._owns_http:
             try:
                 self._http.close()
-            except httpx.HTTPError:
+            except httpx2.HTTPError:
                 log.debug("coord_client.close.failed", exc_info=True)
 
     # -- internal helpers ---------------------------------------------------
@@ -622,7 +622,7 @@ class CoordinatorClient:
         """
         try:
             resp = self._http.post(url, json=body, headers=self._headers())
-        except httpx.HTTPError as exc:
+        except httpx2.HTTPError as exc:
             log.warning("coord_client.http_error path=%s err=%s", log_path, exc)
             return {"error": f"upstream unreachable: {exc}", "status": 0}
         try:
@@ -2100,7 +2100,7 @@ class CoordinatorClient:
             # previous 2s was conservatively generous and stalled the
             # session thread visibly when a node was unhealthy.
             resp = self._http.get(url, headers=self._headers(), timeout=1.0)
-        except httpx.HTTPError:
+        except httpx2.HTTPError:
             log.debug("coord_client.cluster_inspect.http_error ws=%s", ws_id, exc_info=True)
             self._store_live_cache(ws_id, now, None)
             return None

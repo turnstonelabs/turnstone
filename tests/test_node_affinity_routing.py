@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 
 import httpx
+import httpx2
 import pytest
 
 from tests.test_console_routing_proxy import (
@@ -59,12 +60,12 @@ async def test_create_intent_crosses_console_and_node(
     client.app.state.node_id = manager._node_id = "host-1"
     storage = get_storage()
     console, router = _console(storage)
-    async with httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=client.app), base_url="http://host.example:8080"
+    async with httpx2.AsyncClient(
+        transport=httpx2.ASGITransport(app=client.app), base_url="http://host.example:8080"
     ) as node:
         console.state.proxy_client = node
-        async with httpx.AsyncClient(
-            transport=httpx.ASGITransport(app=console), base_url="http://console"
+        async with httpx2.AsyncClient(
+            transport=httpx2.ASGITransport(app=console), base_url="http://console"
         ) as proxy:
             path = f"/v1/api/{endpoint}/workstreams/new"
             if multipart and endpoint == "route":
@@ -123,13 +124,13 @@ async def test_required_node_identity_is_not_an_automatic_placement_mode(
         dispatched.append(request.url.host)
         client.app.state.node_id = manager._node_id = request.url.host.split(".")[0]
 
-    async with httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=client.app),
+    async with httpx2.AsyncClient(
+        transport=httpx2.ASGITransport(app=client.app),
         event_hooks={"request": [capture]},
     ) as node:
         console.state.proxy_client = node
-        async with httpx.AsyncClient(
-            transport=httpx.ASGITransport(app=console), base_url="http://console"
+        async with httpx2.AsyncClient(
+            transport=httpx2.ASGITransport(app=console), base_url="http://console"
         ) as proxy:
             response = await proxy.post(
                 "/v1/api/cluster/workstreams/new", json=body, headers=_TEST_AUTH_HEADERS
@@ -164,12 +165,12 @@ async def test_failed_create_skips_policy_reads_for_unsuitable_candidates(
 
     def fail(request):
         dispatched.append(request)
-        return httpx.Response(503, json={"error": "Node unavailable"})
+        return httpx2.Response(503, json={"error": "Node unavailable"})
 
-    async with httpx.AsyncClient(transport=httpx.MockTransport(fail)) as node:
+    async with httpx2.AsyncClient(transport=httpx2.MockTransport(fail)) as node:
         console.state.proxy_client = node
-        async with httpx.AsyncClient(
-            transport=httpx.ASGITransport(app=console), base_url="http://console"
+        async with httpx2.AsyncClient(
+            transport=httpx2.ASGITransport(app=console), base_url="http://console"
         ) as proxy:
             response = await proxy.post(
                 "/v1/api/route/workstreams/new", json={}, headers=_TEST_AUTH_HEADERS
@@ -197,12 +198,12 @@ async def test_explicit_continuation_is_new_identity_and_inheritance_is_enforced
     storage.save_message(source, "user", "saved history", lease=manager.lease_fence(source))
     manager.close(source)
     console, router = _console(storage)
-    async with httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=client.app), base_url="http://host.example:8080"
+    async with httpx2.AsyncClient(
+        transport=httpx2.ASGITransport(app=client.app), base_url="http://host.example:8080"
     ) as node:
         console.state.proxy_client = node
-        async with httpx.AsyncClient(
-            transport=httpx.ASGITransport(app=console), base_url="http://console"
+        async with httpx2.AsyncClient(
+            transport=httpx2.ASGITransport(app=console), base_url="http://console"
         ) as proxy:
             path = f"/v1/api/{endpoint}/workstreams/new"
             if multipart:
@@ -313,8 +314,8 @@ async def test_private_requirement_is_hidden_from_route_and_fork(app_client):
         audience=JWT_AUD_CONSOLE,
     )
     headers = {"Authorization": f"Bearer {token}"}
-    async with httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=console), base_url="http://console"
+    async with httpx2.AsyncClient(
+        transport=httpx2.ASGITransport(app=console), base_url="http://console"
     ) as proxy:
         for ws_id in (source, "b" * 32):
             response = await proxy.get("/v1/api/route", params={"ws_id": ws_id}, headers=headers)
@@ -392,8 +393,8 @@ async def test_invalid_or_missing_required_node_never_dispatches(
     app_client, endpoint, body, status
 ):
     console, _ = _console(get_storage())
-    async with httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=console), base_url="http://console"
+    async with httpx2.AsyncClient(
+        transport=httpx2.ASGITransport(app=console), base_url="http://console"
     ) as proxy:
         response = await proxy.post(
             f"/v1/api/{endpoint}/workstreams/new", json=body, headers=_TEST_AUTH_HEADERS

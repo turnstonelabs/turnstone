@@ -34,7 +34,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
-import httpx
+import httpx2
 from sse_starlette import EventSourceResponse
 from starlette.applications import Starlette
 from starlette.background import BackgroundTask
@@ -303,7 +303,7 @@ _PROXY_JWT_EXPIRY_SECONDS = 300  # 5 min — ample for any request round-trip
 _CONTROL_CHAR_RE = re.compile(r"[\x00-\x1f\x7f]")
 
 
-async def _bounded_stream_preview(response: httpx.Response, cap: int = 200) -> str:
+async def _bounded_stream_preview(response: httpx2.Response, cap: int = 200) -> str:
     """Streaming counterpart of :func:`_bounded_body_preview`.
 
     Iterates ``response.aiter_bytes`` up to ``cap * 1.3`` bytes (enough
@@ -336,7 +336,7 @@ async def _bounded_stream_preview(response: httpx.Response, cap: int = 200) -> s
 def _bounded_body_preview(text: str | bytes, cap: int = 200) -> str:
     """Return a body preview for 4xx logs capped at ``cap`` chars.
 
-    Body is already in memory on a non-streaming httpx response; this
+    Body is already in memory on a non-streaming httpx2 response; this
     helper exists so every call-site produces the same shape.
 
     Control characters (CR, LF, NUL, ...) are replaced with spaces
@@ -818,7 +818,7 @@ class _NodeDashboardCache:
         self,
         node_id: str,
         server_url: str,
-        client: httpx.AsyncClient,
+        client: httpx2.AsyncClient,
         headers: dict[str, str],
     ) -> dict[str, Any] | None:
         now = time.monotonic()
@@ -843,7 +843,7 @@ class _NodeDashboardCache:
                     headers=headers,
                     timeout=2.0,
                 )
-            except (httpx.HTTPError, TimeoutError):
+            except (httpx2.HTTPError, TimeoutError):
                 resp = None
             if resp is not None:
                 status = resp.status_code
@@ -966,7 +966,7 @@ async def _fetch_live_block(
     server_url = _get_server_url(request, row_node_id)
     if not server_url:
         return None
-    client: httpx.AsyncClient = request.app.state.proxy_client
+    client: httpx2.AsyncClient = request.app.state.proxy_client
     # Route through the per-node dashboard cache — N concurrent
     # cluster_ws_detail calls to children on the same node collapse
     # to one upstream GET per 2s TTL window instead of N full
@@ -983,7 +983,7 @@ async def _fetch_live_block(
                 headers=_proxy_auth_headers(request),
                 timeout=2.0,
             )
-        except (httpx.HTTPError, TimeoutError):
+        except (httpx2.HTTPError, TimeoutError):
             return None
         status = resp.status_code
         if 400 <= status < 500:
@@ -1002,7 +1002,7 @@ async def _fetch_live_block(
             return None
         try:
             raw = resp.json()
-        except (ValueError, httpx.HTTPError):
+        except (ValueError, httpx2.HTTPError):
             return None
         payload = raw if isinstance(raw, dict) else None
     if payload is None:
@@ -1891,7 +1891,7 @@ async def create_workstream(request: Request) -> JSONResponse:
         "project_id": project_id,
     }
 
-    client: httpx.AsyncClient = request.app.state.proxy_client
+    client: httpx2.AsyncClient = request.app.state.proxy_client
     headers = _proxy_auth_headers(request)
     node_url = f"{server_url.rstrip('/')}/v1/api/workstreams/new"
     try:
@@ -1910,7 +1910,7 @@ async def create_workstream(request: Request) -> JSONResponse:
             )
         else:
             resp = await client.post(node_url, json=ws_body, headers=headers)
-    except httpx.HTTPError as exc:
+    except httpx2.HTTPError as exc:
         log.warning("Workstream dispatch to %s failed: %s", node_id, exc)
         return _dispatch_failed(node_id)
 
@@ -1930,7 +1930,7 @@ async def create_workstream(request: Request) -> JSONResponse:
     # actionable attach-denied 403 and factory-misconfig 503 are also masked
     # to 502 — a deliberate leak boundary; do NOT surface 403/503 here without
     # re-checking the leak. Branch on the explicit success range (not
-    # raise_for_status) so a future httpx that lets a 3xx through still cannot
+    # raise_for_status) so a future httpx2 that lets a 3xx through still cannot
     # reach the 2xx json parse. Guard BOTH body reads (a 204 / non-JSON 2xx
     # would otherwise raise a JSONDecodeError → console 500 → operator retry →
     # orphan/duplicate ws).
@@ -2072,7 +2072,7 @@ async def route_create(request: Request) -> Response:
 
     raw_content_type = request.headers.get("content-type") or ""
     is_multipart = raw_content_type.lower().startswith("multipart/form-data")
-    client: httpx.AsyncClient = request.app.state.proxy_client
+    client: httpx2.AsyncClient = request.app.state.proxy_client
     headers = _proxy_auth_headers(request)
     pin = False
     body: dict[str, Any] = {}
@@ -2201,7 +2201,7 @@ async def route_create(request: Request) -> Response:
                 content=raw_body,
                 headers=upstream_headers,
             )
-        except httpx.HTTPError:
+        except httpx2.HTTPError:
             return _record_route(
                 request,
                 "create",
@@ -2339,7 +2339,7 @@ async def route_create(request: Request) -> Response:
                 resp = await client.post(
                     f"{ref.url}/v1/api/workstreams/new", json=body, headers=headers
                 )
-            except httpx.HTTPError:
+            except httpx2.HTTPError:
                 return _record_route(
                     request,
                     "create",
@@ -2593,7 +2593,7 @@ async def route_attachment_proxy(request: Request) -> Response:
     if request.url.query:
         upstream_path += f"?{request.url.query}"
 
-    client: httpx.AsyncClient = request.app.state.proxy_client
+    client: httpx2.AsyncClient = request.app.state.proxy_client
     headers = _proxy_auth_headers(request)
     upstream_headers: dict[str, str] = dict(headers)
     if request.method in ("POST", "PUT", "DELETE"):
@@ -2608,7 +2608,7 @@ async def route_attachment_proxy(request: Request) -> Response:
                 content=body,
                 headers=upstream_headers,
             )
-        except httpx.HTTPError:
+        except httpx2.HTTPError:
             return _record_route(
                 request,
                 method,
@@ -2622,7 +2622,7 @@ async def route_attachment_proxy(request: Request) -> Response:
     else:
         try:
             resp = await client.get(f"{ref.url}{upstream_path}", headers=upstream_headers)
-        except httpx.HTTPError:
+        except httpx2.HTTPError:
             return _record_route(
                 request,
                 method,
@@ -2658,7 +2658,7 @@ async def route_attachment_proxy(request: Request) -> Response:
     )
 
 
-def _lease_refusal_holder(resp: httpx.Response) -> str | None:
+def _lease_refusal_holder(resp: httpx2.Response) -> str | None:
     """The holder a node's owner-lease refusal names ("" when unknown); None otherwise."""
     if resp.status_code != WorkstreamLeaseHeldError.status_code:
         return None
@@ -2672,12 +2672,12 @@ def _lease_refusal_holder(resp: httpx.Response) -> str | None:
     return holder if isinstance(holder, str) else ""
 
 
-def _is_lease_refusal(resp: httpx.Response) -> bool:
+def _is_lease_refusal(resp: httpx2.Response) -> bool:
     """A node refused because another process owns the workstream's lease."""
     return _lease_refusal_holder(resp) is not None
 
 
-async def _prepare_reroute(router: ConsoleRouter, resp: httpx.Response, ref: NodeRef) -> bool:
+async def _prepare_reroute(router: ConsoleRouter, resp: httpx2.Response, ref: NodeRef) -> bool:
     """Ready a re-route after a 404 or a lease refusal; False when it cannot move.
 
     A 404 may come from stale membership or overrides, so refresh first. A
@@ -2707,9 +2707,9 @@ async def _resend_if_route_moved(
     verb: str,
     t0: float,
     ref: NodeRef,
-    resp: httpx.Response,
-    send: Callable[[NodeRef], Awaitable[httpx.Response]],
-) -> tuple[NodeRef, httpx.Response] | Response:
+    resp: httpx2.Response,
+    send: Callable[[NodeRef], Awaitable[httpx2.Response]],
+) -> tuple[NodeRef, httpx2.Response] | Response:
     """Re-route once after ``resp`` and resend when the route moved.
 
     The caller decides which responses warrant this. Returns the node and
@@ -2736,7 +2736,7 @@ async def _resend_if_route_moved(
         return ref, resp
     try:
         return new_ref, await send(new_ref)
-    except httpx.HTTPError:
+    except httpx2.HTTPError:
         return _record_route(
             request,
             verb,
@@ -2982,14 +2982,14 @@ async def route_proxy(request: Request) -> Response:
     path = request.url.path
     upstream_path = path.replace("/api/route/", "/api/", 1)
 
-    client: httpx.AsyncClient = request.app.state.proxy_client
+    client: httpx2.AsyncClient = request.app.state.proxy_client
     headers = _proxy_auth_headers(request)
     http_method = request.method
     try:
         resp = await client.request(
             http_method, f"{ref.url}{upstream_path}", json=body, headers=headers
         )
-    except httpx.HTTPError:
+    except httpx2.HTTPError:
         return _record_route(
             request,
             verb,
@@ -3122,12 +3122,12 @@ async def route_workstream_delete(request: Request) -> Response:
             JSONResponse({"error": "routing failed"}, status_code=503),
         )
 
-    client: httpx.AsyncClient = request.app.state.proxy_client
+    client: httpx2.AsyncClient = request.app.state.proxy_client
     headers = _proxy_auth_headers(request)
     upstream_url = f"{ref.url}/v1/api/workstreams/{ws_id}/delete"
     try:
         resp = await client.post(upstream_url, json=body, headers=headers)
-    except httpx.HTTPError:
+    except httpx2.HTTPError:
         return _record_route(
             request,
             "delete",
@@ -3371,7 +3371,7 @@ async def route_workstream_live(request: Request) -> Response:
             JSONResponse({"error": "routing failed"}, status_code=503),
         )
 
-    client: httpx.AsyncClient = request.app.state.proxy_client
+    client: httpx2.AsyncClient = request.app.state.proxy_client
     headers = _proxy_auth_headers(request)
 
     async def _active_rows(route_ref: NodeRef) -> tuple[list[Any] | None, Response | None]:
@@ -3380,7 +3380,7 @@ async def route_workstream_live(request: Request) -> Response:
                 f"{route_ref.url}/v1/api/workstreams",
                 headers=headers,
             )
-        except httpx.HTTPError:
+        except httpx2.HTTPError:
             return None, JSONResponse(
                 {"error": f"upstream node {route_ref.node_id} unreachable"},
                 status_code=502,
@@ -3395,7 +3395,7 @@ async def route_workstream_live(request: Request) -> Response:
 
         try:
             payload = resp.json()
-        except (ValueError, httpx.HTTPError):
+        except (ValueError, httpx2.HTTPError):
             payload = None
         rows = payload.get("workstreams") if isinstance(payload, dict) else None
         if not isinstance(rows, list):
@@ -3464,7 +3464,7 @@ async def proxy_index(request: Request) -> Response:
     if not server_url:
         return JSONResponse({"error": "Node not found"}, status_code=404)
 
-    client: httpx.AsyncClient = request.app.state.proxy_client
+    client: httpx2.AsyncClient = request.app.state.proxy_client
     safe_node = urllib.parse.quote(node_id, safe="")
     prefix = f"/node/{safe_node}"
     try:
@@ -3490,7 +3490,7 @@ async def proxy_index(request: Request) -> Response:
         html_resp = HTMLResponse(page)
         html_resp.headers["Cache-Control"] = "no-cache"
         return html_resp
-    except httpx.HTTPError as exc:
+    except httpx2.HTTPError as exc:
         log.debug("Proxy index error for %s: %s", node_id, exc)
         return JSONResponse({"error": "Node unreachable"}, status_code=502)
 
@@ -3505,7 +3505,7 @@ def _proxy_static_request_headers(request: Request) -> dict[str, str]:
     return headers
 
 
-def _proxy_static_response(resp: httpx.Response, path: str) -> Response:
+def _proxy_static_response(resp: httpx2.Response, path: str) -> Response:
     """Preserve upstream validators and apply the local static cache policy."""
     cache_control = "no-store"
     if resp.status_code in (200, 304):
@@ -3535,14 +3535,14 @@ async def _proxy_static_mount(request: Request, mount: str) -> Response:
         return _static_proxy_error("Node not found", 404)
 
     encoded_path = "/".join(urllib.parse.quote(segment, safe="") for segment in path.split("/"))
-    client: httpx.AsyncClient = request.app.state.proxy_client
+    client: httpx2.AsyncClient = request.app.state.proxy_client
     try:
         resp = await client.get(
             f"{server_url}/{mount}/{encoded_path}",
             headers=_proxy_static_request_headers(request),
         )
         return _proxy_static_response(resp, path)
-    except httpx.HTTPError as exc:
+    except httpx2.HTTPError as exc:
         log.debug("Proxy %s error for %s/%s: %s", mount, node_id, path, exc)
         return _static_proxy_error("Node unreachable", 502)
 
@@ -3696,13 +3696,13 @@ _PROXY_PASS_HEADERS = (
 )
 
 
-def _proxy_pass_headers(resp: httpx.Response) -> dict[str, str]:
+def _proxy_pass_headers(resp: httpx2.Response) -> dict[str, str]:
     return {h: resp.headers[h] for h in _PROXY_PASS_HEADERS if h in resp.headers}
 
 
 async def _proxy_get(request: Request, server_url: str, path: str) -> Response:
     """Forward a GET request to the target server."""
-    client: httpx.AsyncClient = request.app.state.proxy_client
+    client: httpx2.AsyncClient = request.app.state.proxy_client
     target = f"{server_url}/{path}"
     if request.url.query:
         target += f"?{request.url.query}"
@@ -3714,7 +3714,7 @@ async def _proxy_get(request: Request, server_url: str, path: str) -> Response:
             media_type=resp.headers.get("content-type", "application/json"),
             headers=_proxy_pass_headers(resp),
         )
-    except httpx.HTTPError as exc:
+    except httpx2.HTTPError as exc:
         log.debug("Proxy GET error for %s: %s", target, exc)
         return JSONResponse({"error": "Node unreachable"}, status_code=502)
 
@@ -3723,7 +3723,7 @@ async def _proxy_post(
     request: Request, server_url: str, path: str, *, api_prefix: str = "api"
 ) -> Response:
     """Forward a non-GET request (POST/PUT/DELETE) to the target server."""
-    client: httpx.AsyncClient = request.app.state.proxy_client
+    client: httpx2.AsyncClient = request.app.state.proxy_client
     body = await request.body()
     content_type = request.headers.get("content-type", "application/json")
     target = f"{server_url}/{api_prefix}/{path}"
@@ -3743,7 +3743,7 @@ async def _proxy_post(
             status_code=resp.status_code,
             media_type=resp.headers.get("content-type", "application/json"),
         )
-    except httpx.HTTPError as exc:
+    except httpx2.HTTPError as exc:
         log.debug("Proxy %s error for %s/%s: %s", request.method, api_prefix, path, exc)
         return JSONResponse({"error": "Node unreachable"}, status_code=502)
 
@@ -3775,7 +3775,7 @@ async def _proxy_sse(
     if request.url.query:
         target += f"?{request.url.query}"
 
-    sse_client: httpx.AsyncClient = request.app.state.proxy_sse_client
+    sse_client: httpx2.AsyncClient = request.app.state.proxy_sse_client
     sse_auth: dict[str, str]
     if use_service_auth:
         proxy_token_mgr = getattr(request.app.state, "proxy_token_mgr", None)
@@ -3823,7 +3823,7 @@ async def _proxy_sse(
                 "GET",
                 target,
                 headers=upstream_headers,
-                timeout=httpx.Timeout(connect=10, read=None, write=5, pool=None),
+                timeout=httpx2.Timeout(connect=10, read=None, write=5, pool=None),
             ) as response:
                 if response.status_code != 200:
                     status = response.status_code
@@ -3845,7 +3845,7 @@ async def _proxy_sse(
                     if await request.is_disconnected():
                         return
                     yield chunk
-        except httpx.HTTPError:
+        except httpx2.HTTPError:
             log.debug("SSE proxy stream ended for %s", target)
 
     return StreamingResponse(
@@ -5298,7 +5298,7 @@ async def _first_safe_candidate(services: list[dict[str, Any]] | None) -> tuple[
         log.warning("collector_scope_probe.candidate_refused node=%s", nid)
 
 
-async def _verify_collector_service_scope(app: Starlette, client: httpx.AsyncClient) -> None:
+async def _verify_collector_service_scope(app: Starlette, client: httpx2.AsyncClient) -> None:
     """Probe one upstream node to confirm the collector token's scopes.
 
     The console's :class:`ClusterCollector` authenticates to upstream
@@ -5367,7 +5367,7 @@ async def _verify_collector_service_scope(app: Starlette, client: httpx.AsyncCli
             headers=headers,
             timeout=_PROBE_TIMEOUT_SECONDS,
         )
-    except (httpx.HTTPError, TimeoutError) as exc:
+    except (httpx2.HTTPError, TimeoutError) as exc:
         log.warning(
             "collector_scope_probe.transient_error node=%s url=%s — %s",
             probe_node,
@@ -6042,17 +6042,17 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None]:
     _proxy_ssl = _tls_mgr.get_client_ssl_context() if _tls_mgr and _tls_mgr.ca_initialized else None
     _proxy_verify: Any = _proxy_ssl if _proxy_ssl else True
 
-    app.state.proxy_client = httpx.AsyncClient(
+    app.state.proxy_client = httpx2.AsyncClient(
         timeout=_PROXY_CLIENT_TIMEOUT_S,
-        limits=httpx.Limits(
+        limits=httpx2.Limits(
             max_connections=fan_out + 50,
             max_keepalive_connections=min(fan_out // 4, 100),
         ),
         verify=_proxy_verify,
     )
-    app.state.proxy_sse_client = httpx.AsyncClient(
-        timeout=httpx.Timeout(connect=5, read=30, write=5, pool=5),
-        limits=httpx.Limits(
+    app.state.proxy_sse_client = httpx2.AsyncClient(
+        timeout=httpx2.Timeout(connect=5, read=30, write=5, pool=5),
+        limits=httpx2.Limits(
             max_connections=1100, max_keepalive_connections=100, keepalive_expiry=30
         ),
         verify=_proxy_verify,
@@ -6194,24 +6194,24 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None]:
             if client_ctx:
                 await app.state.proxy_client.aclose()
                 await app.state.proxy_sse_client.aclose()
-                app.state.proxy_client = httpx.AsyncClient(
+                app.state.proxy_client = httpx2.AsyncClient(
                     timeout=_PROXY_CLIENT_TIMEOUT_S,
-                    limits=httpx.Limits(
+                    limits=httpx2.Limits(
                         max_connections=app.state.fan_out_limit + 50,
                         max_keepalive_connections=min(app.state.fan_out_limit // 4, 100),
                     ),
                     verify=client_ctx,
                 )
-                app.state.proxy_sse_client = httpx.AsyncClient(
-                    timeout=httpx.Timeout(connect=5, read=30, write=5, pool=5),
-                    limits=httpx.Limits(
+                app.state.proxy_sse_client = httpx2.AsyncClient(
+                    timeout=httpx2.Timeout(connect=5, read=30, write=5, pool=5),
+                    limits=httpx2.Limits(
                         max_connections=1100,
                         max_keepalive_connections=100,
                         keepalive_expiry=30,
                     ),
                     verify=client_ctx,
                 )
-                # Upgrade collector httpx client for mTLS node polling
+                # Upgrade collector httpx2 client for mTLS node polling
                 app.state.collector.upgrade_tls(tls_verify=client_ctx)
                 log.info("tls.proxy_clients.upgraded")
         except Exception:
@@ -7622,7 +7622,7 @@ async def admin_list_watches(request: Request) -> JSONResponse:
         return err
     collector: ClusterCollector = request.app.state.collector
     nodes = collector.get_all_nodes()
-    client: httpx.AsyncClient = request.app.state.proxy_client
+    client: httpx2.AsyncClient = request.app.state.proxy_client
     headers = _proxy_auth_headers(request)
     sem = asyncio.Semaphore(_get_fan_out_limit(request))
 
@@ -7663,7 +7663,7 @@ async def admin_list_watches(request: Request) -> JSONResponse:
 _VALID_WATCH_ID = re.compile(r"^[a-fA-F0-9]+$")
 
 # Max concurrent outbound requests when fanning out to cluster nodes.
-# Must stay below the httpx pool limit (set in _lifespan) to leave
+# Must stay below the httpx2 pool limit (set in _lifespan) to leave
 # headroom for non-fan-out proxy traffic (UI proxying, SSE streams).
 _NODE_FAN_OUT_LIMIT = 200  # fallback; prefer cluster.node_fan_out_limit from storage
 
@@ -7697,7 +7697,7 @@ async def admin_cancel_watch(request: Request) -> Response:
     if not server_url:
         return JSONResponse({"error": "Node not found"}, status_code=404)
 
-    client: httpx.AsyncClient = request.app.state.proxy_client
+    client: httpx2.AsyncClient = request.app.state.proxy_client
     headers = {"Content-Type": "application/json"}
     headers.update(_proxy_auth_headers(request))
     try:
@@ -7711,7 +7711,7 @@ async def admin_cancel_watch(request: Request) -> Response:
             status_code=resp.status_code,
             media_type=resp.headers.get("content-type", "application/json"),
         )
-    except httpx.HTTPError:
+    except httpx2.HTTPError:
         return JSONResponse({"error": "Node unreachable"}, status_code=502)
 
 
@@ -10308,7 +10308,7 @@ async def _publish_config_change(request: Request) -> None:
     collector = getattr(request.app.state, "collector", None)
     if not collector:
         return
-    client: httpx.AsyncClient = request.app.state.proxy_client
+    client: httpx2.AsyncClient = request.app.state.proxy_client
     headers = _proxy_auth_headers(request)
     sem = asyncio.Semaphore(_get_fan_out_limit(request))
 
@@ -10998,7 +10998,7 @@ def _mcp_headers_error(headers: dict[Any, Any]) -> str | None:
     """Why *headers* cannot go out on an MCP server's requests, or None when they can.
 
     Names must be HTTP tokens and values printable ASCII with no space or tab at either end:
-    httpx refuses to send anything else, so the server could never connect, and its error would
+    httpx2 refuses to send anything else, so the server could never connect, and its error would
     quote the value. Shared like :func:`_mcp_url_error`. The message names a valid header, never
     its value, and never an invalid name, which can be a pasted ``Name: value`` line.
     """
@@ -11618,7 +11618,7 @@ async def _collect_mcp_status(
     """
     collector: ClusterCollector = request.app.state.collector
     nodes = collector.get_all_nodes()
-    client: httpx.AsyncClient = request.app.state.proxy_client
+    client: httpx2.AsyncClient = request.app.state.proxy_client
     headers = _proxy_auth_headers(request)
     sem = asyncio.Semaphore(_get_fan_out_limit(request))
 
@@ -12489,7 +12489,7 @@ async def _notify_nodes_mcp_reload(request: Request) -> dict[str, Any]:
     """
     collector: ClusterCollector = request.app.state.collector
     nodes = collector.get_all_nodes()
-    client: httpx.AsyncClient = request.app.state.proxy_client
+    client: httpx2.AsyncClient = request.app.state.proxy_client
     headers = _proxy_auth_headers(request)
     sem = asyncio.Semaphore(_get_fan_out_limit(request))
 
@@ -12505,7 +12505,7 @@ async def _notify_nodes_mcp_reload(request: Request) -> dict[str, Any]:
                     headers=headers,
                     timeout=30,
                 )
-                # A non-2xx reply is a failed reload, not a reached node (httpx
+                # A non-2xx reply is a failed reload, not a reached node (httpx2
                 # does not raise on status); surface it as an error so _run warns.
                 resp.raise_for_status()
                 return node_id, resp.json()
@@ -12669,7 +12669,7 @@ async def _notify_nodes_mcp_action(request: Request, action: str, name: str) -> 
     """
     collector: ClusterCollector = request.app.state.collector
     nodes = collector.get_all_nodes()
-    client: httpx.AsyncClient = request.app.state.proxy_client
+    client: httpx2.AsyncClient = request.app.state.proxy_client
     headers = _proxy_auth_headers(request)
     sem = asyncio.Semaphore(_get_fan_out_limit(request))
     safe_name = urllib.parse.quote(name, safe="")
@@ -12686,7 +12686,7 @@ async def _notify_nodes_mcp_action(request: Request, action: str, name: str) -> 
                     headers=headers,
                     timeout=30,
                 )
-                # A non-2xx reply is a failed action, not a reached node (httpx
+                # A non-2xx reply is a failed action, not a reached node (httpx2
                 # does not raise on status); surface it as an error to the operator.
                 resp.raise_for_status()
                 return node_id, resp.json()
@@ -13800,7 +13800,7 @@ async def _collect_model_status(
     """Query all nodes for model status. Returns {node_id: {alias: info}}."""
     collector: ClusterCollector = request.app.state.collector
     nodes = collector.get_all_nodes()
-    client: httpx.AsyncClient = request.app.state.proxy_client
+    client: httpx2.AsyncClient = request.app.state.proxy_client
     headers = _proxy_auth_headers(request)
     sem = asyncio.Semaphore(_get_fan_out_limit(request))
 
@@ -14071,7 +14071,7 @@ async def _notify_nodes_model_reload(request: Request) -> dict[str, Any]:
     """Tell all nodes to re-read model definitions from DB and rebuild registry."""
     collector: ClusterCollector = request.app.state.collector
     nodes = collector.get_all_nodes()
-    client: httpx.AsyncClient = request.app.state.proxy_client
+    client: httpx2.AsyncClient = request.app.state.proxy_client
     headers = _proxy_auth_headers(request)
     sem = asyncio.Semaphore(_get_fan_out_limit(request))
 

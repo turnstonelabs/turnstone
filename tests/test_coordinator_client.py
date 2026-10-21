@@ -1,6 +1,6 @@
 """Tests for ``turnstone.console.coordinator_client.CoordinatorClient``.
 
-Uses an httpx MockTransport to intercept outbound requests so we verify
+Uses an httpx2 MockTransport to intercept outbound requests so we verify
 the URL map, headers, and body shape without standing up a real console.
 Read-op tests hit a real in-memory SQLite backend to confirm the
 storage-call path.
@@ -13,7 +13,7 @@ import threading
 import time
 from typing import TYPE_CHECKING, Any
 
-import httpx
+import httpx2
 import pytest
 
 from turnstone.console.coordinator_client import (
@@ -117,23 +117,23 @@ def test_token_manager_rejects_nonpositive_ttl():
 
 
 def _mock_client(
-    handler: Callable[[httpx.Request], httpx.Response], sqlite_backend_factory
-) -> tuple[CoordinatorClient, list[httpx.Request]]:
-    """Build a CoordinatorClient with an httpx MockTransport recorder.
+    handler: Callable[[httpx2.Request], httpx2.Response], sqlite_backend_factory
+) -> tuple[CoordinatorClient, list[httpx2.Request]]:
+    """Build a CoordinatorClient with an httpx2 MockTransport recorder.
 
     Pre-registers the canonical test ws_ids (``ws-x``, ``ws-y``) under
     ``coord-1`` so the client-side tenant guard on send / close / cancel
     / delete passes.  The mutating-op tests want to verify the route
     map + body shape, not the guard.
     """
-    captured: list[httpx.Request] = []
+    captured: list[httpx2.Request] = []
 
-    def _trapping(req: httpx.Request) -> httpx.Response:
+    def _trapping(req: httpx2.Request) -> httpx2.Response:
         captured.append(req)
         return handler(req)
 
-    transport = httpx.MockTransport(_trapping)
-    http = httpx.Client(transport=transport)
+    transport = httpx2.MockTransport(_trapping)
+    http = httpx2.Client(transport=transport)
     storage = sqlite_backend_factory(":memory:")
     storage.register_workstream("coord-1", kind="coordinator", user_id="user-1")
     storage.register_workstream(
@@ -154,9 +154,9 @@ def _mock_client(
     return client, captured
 
 
-def _ok_json(payload: dict) -> Callable[[httpx.Request], httpx.Response]:
-    def _h(req: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json=payload)
+def _ok_json(payload: dict) -> Callable[[httpx2.Request], httpx2.Response]:
+    def _h(req: httpx2.Request) -> httpx2.Response:
+        return httpx2.Response(200, json=payload)
 
     return _h
 
@@ -336,8 +336,8 @@ def test_close_all_children_omits_empty_reason(sqlite_backend_factory):
 
 
 def test_close_all_children_surfaces_http_error(sqlite_backend_factory):
-    def _boom(_req: httpx.Request) -> httpx.Response:
-        return httpx.Response(500, json={"error": "internal"})
+    def _boom(_req: httpx2.Request) -> httpx2.Response:
+        return httpx2.Response(500, json={"error": "internal"})
 
     client, _captured = _mock_client(_boom, sqlite_backend_factory=sqlite_backend_factory)
     result = client.close_all_children()
@@ -346,8 +346,8 @@ def test_close_all_children_surfaces_http_error(sqlite_backend_factory):
 
 
 def test_close_all_children_surfaces_transport_error(sqlite_backend_factory):
-    def _raise(_req: httpx.Request) -> httpx.Response:
-        raise httpx.ConnectError("connection refused")
+    def _raise(_req: httpx2.Request) -> httpx2.Response:
+        raise httpx2.ConnectError("connection refused")
 
     client, _captured = _mock_client(_raise, sqlite_backend_factory=sqlite_backend_factory)
     result = client.close_all_children()
@@ -381,8 +381,8 @@ def test_approve_and_cancel_hit_their_routes(sqlite_backend_factory):
 
 
 def test_http_error_returns_structured_failure(sqlite_backend_factory):
-    def _boom(req: httpx.Request) -> httpx.Response:
-        raise httpx.ConnectError("no route to host", request=req)
+    def _boom(req: httpx2.Request) -> httpx2.Response:
+        raise httpx2.ConnectError("no route to host", request=req)
 
     client, _captured = _mock_client(_boom, sqlite_backend_factory=sqlite_backend_factory)
     result = client.send("ws-x", "hi")
@@ -391,8 +391,8 @@ def test_http_error_returns_structured_failure(sqlite_backend_factory):
 
 
 def test_non_2xx_response_populates_error(sqlite_backend_factory):
-    def _h(req: httpx.Request) -> httpx.Response:
-        return httpx.Response(500, json={"detail": "upstream down"})
+    def _h(req: httpx2.Request) -> httpx2.Response:
+        return httpx2.Response(500, json={"detail": "upstream down"})
 
     client, _c = _mock_client(_h, sqlite_backend_factory=sqlite_backend_factory)
     result = client.send("ws-x", "hi")
@@ -477,11 +477,11 @@ def test_mutating_ops_reject_child_name_with_id_pointer(tmp_path, sqlite_backend
         user_id="user-1",
         name="minisforum-research",
     )
-    captured: list[httpx.Request] = []
+    captured: list[httpx2.Request] = []
 
-    def _trap(req: httpx.Request) -> httpx.Response:
+    def _trap(req: httpx2.Request) -> httpx2.Response:
         captured.append(req)
-        return httpx.Response(200, json={})
+        return httpx2.Response(200, json={})
 
     client = CoordinatorClient(
         console_base_url="http://console",
@@ -489,7 +489,7 @@ def test_mutating_ops_reject_child_name_with_id_pointer(tmp_path, sqlite_backend
         token_factory=lambda: "t",
         coord_ws_id="coord-1",
         user_id="user-1",
-        http_client=httpx.Client(transport=httpx.MockTransport(_trap)),
+        http_client=httpx2.Client(transport=httpx2.MockTransport(_trap)),
         child_event_bus=ChildEventBus(),
     )
     result = client.send("minisforum-research", "status?")
@@ -544,8 +544,8 @@ def populated_storage(tmp_path, sqlite_backend_factory):
 
 
 def _make_read_client(storage: SQLiteBackend) -> CoordinatorClient:
-    transport = httpx.MockTransport(lambda r: httpx.Response(200))
-    http = httpx.Client(transport=transport)
+    transport = httpx2.MockTransport(lambda r: httpx2.Response(200))
+    http = httpx2.Client(transport=transport)
     return CoordinatorClient(
         console_base_url="http://x",
         storage=storage,
@@ -773,12 +773,12 @@ def _make_client_with_cluster_response(
     """Build a CoordinatorClient whose mocked HTTP transport returns
     ``status`` + ``body`` for any ``/cluster/ws/.../detail`` GET."""
 
-    def _handler(request: httpx.Request) -> httpx.Response:
+    def _handler(request: httpx2.Request) -> httpx2.Response:
         if "/v1/api/cluster/ws/" in request.url.path and request.method == "GET":
-            return httpx.Response(status, json=body or {})
-        return httpx.Response(200, json={})
+            return httpx2.Response(status, json=body or {})
+        return httpx2.Response(200, json={})
 
-    http = httpx.Client(transport=httpx.MockTransport(_handler))
+    http = httpx2.Client(transport=httpx2.MockTransport(_handler))
     return CoordinatorClient(
         console_base_url="http://x",
         storage=storage,
@@ -834,6 +834,29 @@ def test_inspect_degrades_to_storage_only_on_cluster_endpoint_503(populated_stor
         populated_storage, status=503, body={"error": "node unreachable"}
     )
     result = client.inspect("child-a")
+    assert "live" not in result
+    assert result["ws_id"] == "child-a"
+
+
+def test_inspect_degrades_to_storage_only_when_the_console_is_unreachable(populated_storage):
+    """A transport error on the live-state fetch takes the same degrade path."""
+    attempts: list[str] = []
+
+    def _refuse(request: httpx2.Request) -> httpx2.Response:
+        attempts.append(request.url.path)
+        raise httpx2.ConnectError("Connection refused", request=request)
+
+    client = CoordinatorClient(
+        console_base_url="http://x",
+        storage=populated_storage,
+        token_factory=lambda: "t",
+        coord_ws_id="coord-1",
+        user_id="user-1",
+        http_client=httpx2.Client(transport=httpx2.MockTransport(_refuse)),
+        child_event_bus=ChildEventBus(),
+    )
+    result = client.inspect("child-a")
+    assert attempts == ["/v1/api/cluster/ws/child-a/detail"]
     assert "live" not in result
     assert result["ws_id"] == "child-a"
 
@@ -1763,8 +1786,8 @@ def _make_read_client_with_bus(storage, bus) -> CoordinatorClient:
     Caller owns the bus so the test can call ``bus.notify(ws_id)`` to
     simulate the dispatch-sink wake-up.
     """
-    transport = httpx.MockTransport(lambda r: httpx.Response(200))
-    http = httpx.Client(transport=transport)
+    transport = httpx2.MockTransport(lambda r: httpx2.Response(200))
+    http = httpx2.Client(transport=transport)
     return CoordinatorClient(
         console_base_url="http://x",
         storage=storage,

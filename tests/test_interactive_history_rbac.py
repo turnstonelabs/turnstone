@@ -9,7 +9,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import bcrypt
-import httpx
+import httpx2
 import pytest
 
 from tests.test_server_authz import _FakeSession, _FakeUI
@@ -82,9 +82,9 @@ async def history_apps(tmp_path, sqlite_migrated_template):
     config = ConfigStore(storage)
     node.state.config_store = console.state.config_store = config
     async with (
-        httpx.AsyncClient(transport=httpx.ASGITransport(node), base_url="http://node.test") as nc,
-        httpx.AsyncClient(
-            transport=httpx.ASGITransport(console), base_url="http://console.test"
+        httpx2.AsyncClient(transport=httpx2.ASGITransport(node), base_url="http://node.test") as nc,
+        httpx2.AsyncClient(
+            transport=httpx2.ASGITransport(console), base_url="http://console.test"
         ) as cc,
     ):
         console.state.proxy_client = nc
