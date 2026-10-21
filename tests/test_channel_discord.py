@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import sys
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -1581,6 +1582,71 @@ class TestFetchThumbnail:
         assert _fetch_through(monkeypatch, handler) is None
 
 
+class TestBotServerCredential:
+    """Each SSE connection adds the server token itself, so the bot's shared client carries no
+    credential, and thumbnails, fetched from hosts that tool results name, have a client of their
+    own."""
+
+    @staticmethod
+    def _make_bot(monkeypatch, handler):
+        from turnstone.channels.discord.bot import TurnstoneBot
+        from turnstone.channels.discord.config import DiscordConfig
+
+        client_cls = httpx2.AsyncClient
+        monkeypatch.setattr(
+            "turnstone.channels.discord.bot.httpx2.AsyncClient",
+            functools.partial(client_cls, transport=httpx2.MockTransport(handler)),
+        )
+        return TurnstoneBot(
+            DiscordConfig(bot_token="token-test"),
+            "http://localhost:8080",
+            MagicMock(),
+            api_token="static-token",
+        )
+
+    def test_a_static_token_reaches_the_sse_request(self, monkeypatch):
+        requests = []
+
+        def handler(request):
+            requests.append(request)
+            return httpx2.Response(404)
+
+        bot = self._make_bot(monkeypatch, handler)
+
+        async def listen():
+            try:
+                await asyncio.wait_for(bot._sse_listener("abcdef0123456789", MagicMock()), 2)
+            finally:
+                await bot.router.aclose()
+                await bot._http_client.aclose()
+                await bot._media_http.aclose()
+
+        assert "authorization" not in bot._http_client.headers
+        _run(listen())
+        assert [r.url.path for r in requests] == ["/v1/api/workstreams/abcdef0123456789/events"]
+        assert requests[0].headers["authorization"] == "Bearer static-token"
+
+    def test_a_thumbnail_fetch_carries_no_credential(self, monkeypatch):
+        from turnstone.channels._formatter import _fetch_thumbnail
+
+        requests = []
+
+        def handler(request):
+            requests.append(request)
+            return httpx2.Response(200, headers={"content-type": "image/png"}, content=b"png")
+
+        bot = self._make_bot(monkeypatch, handler)
+        TestIsSafeImageUrl._patch_resolver(monkeypatch, ["203.0.113.5"])
+
+        async def fetch():
+            async with bot._http_client, bot._media_http as http:
+                return await _fetch_thumbnail(http, _THUMBNAIL_URL)
+
+        assert bot._media_http is not bot._http_client
+        assert _run(fetch()) == (b"png", "poster.png")
+        assert "authorization" not in requests[0].headers
+
+
 class TestBuildMediaEmbed:
     """Tests for try_build_media_embed and embed builders."""
 
@@ -1903,9 +1969,21 @@ class TestToolResultEvent:
         bot._pending_approval_msgs = {}
         bot._notify_reply_channels = {}
         bot._http_client = MagicMock()
+        bot._media_http = MagicMock()
         bot._should_auto_approve = MagicMock(return_value=False)
         _bind_ws_event_handlers(bot, TurnstoneBot)
         return bot
+
+    def test_a_media_result_is_fetched_through_the_media_client(self):
+        from turnstone.sdk.events import ToolResultEvent
+
+        bot = self._make_bot()
+        build = AsyncMock(return_value=None)
+        with patch("turnstone.channels._formatter.try_build_media_embed", build):
+            _run(bot._on_ws_event("ws-1", AsyncMock(), ToolResultEvent(ws_id="ws-1", name="m")))
+
+        build.assert_awaited_once()
+        assert build.await_args.kwargs["http"] is bot._media_http
 
     def test_marks_info_done_and_sends_result(self):
         from turnstone.sdk.events import ToolResultEvent

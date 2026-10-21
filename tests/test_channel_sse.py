@@ -232,8 +232,14 @@ class TestEventDispatch:
 
 class TestTokenFactory:
     @pytest.mark.anyio
-    @pytest.mark.parametrize("rotating", [False, True])
-    async def test_real_sdk_preserves_auth_headers(self, rotating):
+    @pytest.mark.parametrize(
+        ("token_factory", "authorization"),
+        [(None, None), (lambda: "a-token", "Bearer a-token")],
+        ids=["no-token-factory", "token-factory"],
+    )
+    async def test_the_token_comes_from_the_factory_alone(self, token_factory, authorization):
+        """On a client with no default headers, as the bots build theirs, a connection carries the
+        factory's token or none, beside the event-stream headers."""
         from turnstone.channels._sse import run_sse_stream
 
         requests = []
@@ -243,25 +249,21 @@ class TestTokenFactory:
             return httpx2.Response(404)
 
         on_unavailable = AsyncMock()
-        async with httpx2.AsyncClient(
-            transport=httpx2.MockTransport(respond),
-            headers={"Authorization": "Bearer static-token"},
-        ) as client:
+        async with httpx2.AsyncClient(transport=httpx2.MockTransport(respond)) as client:
             await asyncio.wait_for(
                 run_sse_stream(
                     http_client=client,
                     log_prefix="test",
                     ws_id="ws-1",
                     node_url_fn=AsyncMock(return_value="http://node.example"),
-                    token_factory=(lambda: "rotating-token") if rotating else None,
+                    token_factory=token_factory,
                     on_event=AsyncMock(),
                     on_unavailable=on_unavailable,
                 ),
                 timeout=2,
             )
         assert len(requests) == 1
-        expected = "rotating-token" if rotating else "static-token"
-        assert requests[0].headers["Authorization"] == f"Bearer {expected}"
+        assert requests[0].headers.get("Authorization") == authorization
         assert requests[0].headers["Accept"] == "text/event-stream"
         assert requests[0].headers["Cache-Control"] == "no-store"
         on_unavailable.assert_awaited_once()

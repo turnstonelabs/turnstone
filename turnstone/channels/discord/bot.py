@@ -202,9 +202,9 @@ class TurnstoneBot:
         self.config = config
         self._server_url = server_url.rstrip("/")
         self._console_url = console_url.rstrip("/") if console_url else ""
-        self._api_token = api_token
-        # Server factory for direct SSE connections to server nodes
-        self._token_factory = server_token_factory
+        # Each SSE connection to a server node authenticates through this. A static token goes
+        # the same way, so the shared client below holds no credential.
+        self._token_factory = server_token_factory or ((lambda: api_token) if api_token else None)
         self.storage = storage
         # Router gets the appropriate factory based on mode:
         # console mode → console factory; direct mode → server factory
@@ -250,17 +250,15 @@ class TurnstoneBot:
         # notification reply DM.  The target_user_id is carried so the
         # response message can be re-tracked for multi-turn DM conversations.
         self._notify_reply_channels: dict[str, tuple[discord.abc.Messageable, str]] = {}
-        # Shared HTTP client for SSE connections.
-        # Read timeout detects half-open connections (server sends ping=5s
+        # Shared HTTP client for SSE connections, with no credential of its own (see
+        # _token_factory). Read timeout detects half-open connections (server sends ping=5s
         # keepalives, so 90s is very conservative).
-        # Token factory provides auto-rotating JWTs; static token is fallback.
-        headers: dict[str, str] = {}
-        if api_token and not server_token_factory:
-            headers["Authorization"] = f"Bearer {api_token}"
         self._http_client = httpx2.AsyncClient(
-            headers=headers,
             timeout=httpx2.Timeout(connect=10.0, read=90.0, write=10.0, pool=10.0),
         )
+        # Thumbnail fetches go to hosts that tool results name, so they get a client of their own:
+        # nothing the server connections hold or receive, such as a cookie, reaches those hosts.
+        self._media_http = httpx2.AsyncClient()
 
         intents = discord.Intents.default()
         intents.message_content = True
@@ -676,7 +674,7 @@ class TurnstoneBot:
                 media_result = await try_build_media_embed(
                     event.name,
                     event.output,
-                    http=self._http_client,
+                    http=self._media_http,
                 )
             except Exception:
                 log.debug("discord.media_embed_failed", ws_id=ws_id, tool=event.name)
@@ -987,4 +985,5 @@ class TurnstoneBot:
             await self.unsubscribe_ws(ws_id)
         await self.router.aclose()
         await self._http_client.aclose()
+        await self._media_http.aclose()
         await self._bot.close()
