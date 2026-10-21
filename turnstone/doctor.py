@@ -51,7 +51,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-import httpx
+import httpx2
 from packaging.version import InvalidVersion, Version
 
 from turnstone import __version__
@@ -278,7 +278,7 @@ def _assert_safe_http_url(url: str) -> None:
 def _http_get_json(url: str, timeout: float = 5.0) -> Any:
     """GET *url* and parse JSON. Raises on network/parse failure or unsafe URL."""
     _assert_safe_http_url(url)
-    url = str(httpx.URL(url))
+    url = str(httpx2.URL(url))
     req = urllib.request.Request(
         url,
         headers={"Accept": "application/json", "User-Agent": f"turnstone-doctor/{__version__}"},

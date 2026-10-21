@@ -22,7 +22,7 @@ from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import TYPE_CHECKING, Any
 
-import httpx
+import httpx2
 import pytest
 
 from turnstone.core.model_registry import ModelConfig, ModelRegistry
@@ -110,9 +110,9 @@ class _LiveProxyServer(ThreadingHTTPServer):
     def __init__(self, counter: _Counter) -> None:
         self.counter = counter
         headers = {"Authorization": f"Bearer {_LIVE_API_KEY}"} if _LIVE_API_KEY else {}
-        self.upstream = httpx.Client(
+        self.upstream = httpx2.Client(
             headers=headers,
-            timeout=httpx.Timeout(60.0, connect=5.0),
+            timeout=httpx2.Timeout(60.0, connect=5.0),
         )
         super().__init__(("127.0.0.1", 0), _LiveProxyHandler)
 

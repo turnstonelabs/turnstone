@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
-import httpx
+import httpx2
 import pytest
 
 from turnstone.core.web_search import (
@@ -43,12 +43,12 @@ SEARXNG_JSON = {
 }
 
 
-def _mock_httpx_get(handler):
-    """Patch target for ``web_search.httpx.get`` that routes the call through a
-    real ``httpx.MockTransport``. The request flows through genuine httpx URL/
+def _mock_httpx2_get(handler):
+    """Patch target for ``web_search.httpx2.get`` that routes the call through a
+    real ``httpx2.MockTransport``. The request flows through genuine httpx2 URL/
     param encoding and response parsing — a true boundary, not a bare MagicMock.
     """
-    client = httpx.Client(transport=httpx.MockTransport(handler))
+    client = httpx2.Client(transport=httpx2.MockTransport(handler))
 
     def _get(url, **kwargs):
         return client.get(url, **kwargs)
@@ -126,16 +126,16 @@ class TestFormatSearXNG:
 
 class TestSearXNGClient:
     def test_request_construction_boundary(self):
-        """Drive a real httpx request through MockTransport and assert the
+        """Drive a real httpx2 request through MockTransport and assert the
         URL + query params the client builds."""
         captured: dict = {}
 
-        def handler(request: httpx.Request) -> httpx.Response:
+        def handler(request: httpx2.Request) -> httpx2.Response:
             captured["url"] = str(request.url)
             captured["params"] = dict(request.url.params)
-            return httpx.Response(200, json=SEARXNG_JSON)
+            return httpx2.Response(200, json=SEARXNG_JSON)
 
-        with patch("turnstone.core.web_search.httpx.get", _mock_httpx_get(handler)):
+        with patch("turnstone.core.web_search.httpx2.get", _mock_httpx2_get(handler)):
             client = SearXNGClient(
                 "http://searxng:8080", engines="duckduckgo,wikipedia", timeout=10
             )
@@ -151,11 +151,11 @@ class TestSearXNGClient:
     def test_category_it_maps_to_categories(self):
         captured: dict = {}
 
-        def handler(request: httpx.Request) -> httpx.Response:
+        def handler(request: httpx2.Request) -> httpx2.Response:
             captured["params"] = dict(request.url.params)
-            return httpx.Response(200, json={"results": []})
+            return httpx2.Response(200, json={"results": []})
 
-        with patch("turnstone.core.web_search.httpx.get", _mock_httpx_get(handler)):
+        with patch("turnstone.core.web_search.httpx2.get", _mock_httpx2_get(handler)):
             SearXNGClient("http://searxng:8080").search("q", category="it")
 
         assert captured["params"]["categories"] == "it"
@@ -163,11 +163,11 @@ class TestSearXNGClient:
     def test_general_category_omits_categories(self):
         captured: dict = {}
 
-        def handler(request: httpx.Request) -> httpx.Response:
+        def handler(request: httpx2.Request) -> httpx2.Response:
             captured["params"] = dict(request.url.params)
-            return httpx.Response(200, json={"results": []})
+            return httpx2.Response(200, json={"results": []})
 
-        with patch("turnstone.core.web_search.httpx.get", _mock_httpx_get(handler)):
+        with patch("turnstone.core.web_search.httpx2.get", _mock_httpx2_get(handler)):
             SearXNGClient("http://searxng:8080").search("q", category="general")
 
         assert "categories" not in captured["params"]
@@ -175,11 +175,11 @@ class TestSearXNGClient:
     def test_no_engines_omits_param(self):
         captured: dict = {}
 
-        def handler(request: httpx.Request) -> httpx.Response:
+        def handler(request: httpx2.Request) -> httpx2.Response:
             captured["params"] = dict(request.url.params)
-            return httpx.Response(200, json={"results": []})
+            return httpx2.Response(200, json={"results": []})
 
-        with patch("turnstone.core.web_search.httpx.get", _mock_httpx_get(handler)):
+        with patch("turnstone.core.web_search.httpx2.get", _mock_httpx2_get(handler)):
             SearXNGClient("http://searxng:8080", engines="").search("q")
 
         assert "engines" not in captured["params"]
@@ -187,11 +187,11 @@ class TestSearXNGClient:
     def test_base_url_trailing_slash_normalized(self):
         captured: dict = {}
 
-        def handler(request: httpx.Request) -> httpx.Response:
+        def handler(request: httpx2.Request) -> httpx2.Response:
             captured["url"] = str(request.url)
-            return httpx.Response(200, json={"results": []})
+            return httpx2.Response(200, json={"results": []})
 
-        with patch("turnstone.core.web_search.httpx.get", _mock_httpx_get(handler)):
+        with patch("turnstone.core.web_search.httpx2.get", _mock_httpx2_get(handler)):
             SearXNGClient("http://searxng:8080/").search("q")
 
         assert captured["url"].startswith("http://searxng:8080/search")  # no // dupe
@@ -200,12 +200,12 @@ class TestSearXNGClient:
         """A 403 (the classic 'json not enabled' failure) propagates as an
         HTTPStatusError so the caller surfaces a real error."""
 
-        def handler(request: httpx.Request) -> httpx.Response:
-            return httpx.Response(403, text="forbidden")
+        def handler(request: httpx2.Request) -> httpx2.Response:
+            return httpx2.Response(403, text="forbidden")
 
-        with patch("turnstone.core.web_search.httpx.get", _mock_httpx_get(handler)):
+        with patch("turnstone.core.web_search.httpx2.get", _mock_httpx2_get(handler)):
             client = SearXNGClient("http://searxng:8080")
-            with pytest.raises(httpx.HTTPStatusError):
+            with pytest.raises(httpx2.HTTPStatusError):
                 client.search("q")
 
 
@@ -411,10 +411,10 @@ class TestWebSearchReranking:
         assert out.index("[T1]") < out.index("[T0]")  # T1 promoted
 
     def test_searxng_client_threads_reranker_kwarg(self):
-        def handler(request: httpx.Request) -> httpx.Response:
-            return httpx.Response(200, json=_results("A", "B"))
+        def handler(request: httpx2.Request) -> httpx2.Response:
+            return httpx2.Response(200, json=_results("A", "B"))
 
-        with patch("turnstone.core.web_search.httpx.get", _mock_httpx_get(handler)):
+        with patch("turnstone.core.web_search.httpx2.get", _mock_httpx2_get(handler)):
             out = SearXNGClient("http://searxng:8080").search("q", reranker=lambda q, d: [1, 0])
 
         assert out.index("[B]") < out.index("[A]")  # reranker applied via search()

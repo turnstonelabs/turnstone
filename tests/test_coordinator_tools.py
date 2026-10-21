@@ -2113,7 +2113,7 @@ def test_notify_exec_on_coord_session_sends_via_channel_gateway(
     }
     with (
         patch("turnstone.core.session.get_storage", return_value=storage),
-        patch("turnstone.core.session.httpx.post", return_value=mock_resp) as mock_post,
+        patch("turnstone.core.session.httpx2.post", return_value=mock_resp) as mock_post,
     ):
         call_id, msg = sess._exec_notify(item)
 

@@ -333,12 +333,12 @@ class TestHttpGetJsonSafety:
         import socket
         import urllib.parse
 
-        import httpx
+        import httpx2
 
         from tests.test_open_preview_tool import _resolver
 
         url = f"http://{host}/health"
-        dialed_host = httpx.URL(url).raw_host.decode("ascii")
+        dialed_host = httpx2.URL(url).raw_host.decode("ascii")
         resolver_host = host.encode("idna").decode("ascii")
         looked_up = _resolver(
             monkeypatch,

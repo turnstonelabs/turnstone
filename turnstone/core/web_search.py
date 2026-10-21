@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, Protocol
 
-import httpx
+import httpx2
 
 from turnstone.core.log import get_logger
 from turnstone.core.mcp_oauth import is_user_scoped_auth
@@ -86,7 +86,7 @@ class SearXNGClient:
             params["categories"] = category
         if self._engines:
             params["engines"] = self._engines
-        resp = httpx.get(
+        resp = httpx2.get(
             f"{self._base_url}/search",
             params=params,
             timeout=self._timeout,

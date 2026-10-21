@@ -40,7 +40,6 @@ from datetime import UTC, datetime, timedelta
 from html import escape as _html_escape
 from typing import TYPE_CHECKING, Any, ClassVar, Literal, NamedTuple, Protocol, cast
 
-import httpx
 import httpx2
 
 from turnstone.core import fence
@@ -27949,7 +27948,7 @@ class ChatSession:
                     log.warning("notify.gateway_failed", reason="invalid_url", **gateway_fields)
                     continue
                 try:
-                    resp = httpx.post(url, json=payload, timeout=10, headers=auth_headers)
+                    resp = httpx2.post(url, json=payload, timeout=10, headers=auth_headers)
                     if resp.status_code < 300:
                         # Check that at least one target was actually delivered
                         try:

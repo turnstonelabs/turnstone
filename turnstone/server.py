@@ -2556,7 +2556,7 @@ def _deliver_notification(
     auth_headers: dict[str, str],
 ) -> None:
     """POST to channel gateway /v1/api/notify with retry."""
-    import httpx
+    import httpx2
 
     from turnstone.core.session import _notify_delivery_statuses, _notify_log_url
 
@@ -2586,7 +2586,7 @@ def _deliver_notification(
                 log.warning("notify_completion.invalid_url", **gateway_fields)
                 continue
             try:
-                resp = httpx.post(url, json=payload, timeout=10, headers=auth_headers)
+                resp = httpx2.post(url, json=payload, timeout=10, headers=auth_headers)
                 if resp.status_code < 300:
                     # Verify at least one target was delivered (mirrors _exec_notify)
                     try:

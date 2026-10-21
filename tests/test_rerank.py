@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from types import SimpleNamespace
 
-import httpx
+import httpx2
 import pytest
 
 from turnstone.core.model_turn import resolve_capabilities
@@ -19,10 +19,10 @@ from turnstone.core.rerank import (
 from turnstone.core.session import ChatSession
 
 
-def _install_mock_httpx_client(monkeypatch, handler):
+def _install_mock_httpx2_client(monkeypatch, handler):
     """Install the lifecycle-owned client over a real MockTransport boundary."""
-    client = httpx.Client(transport=httpx.MockTransport(handler))
-    monkeypatch.setattr("turnstone.core.rerank.httpx.Client", lambda: client)
+    client = httpx2.Client(transport=httpx2.MockTransport(handler))
+    monkeypatch.setattr("turnstone.core.rerank.httpx2.Client", lambda: client)
     return client
 
 
@@ -96,17 +96,17 @@ class TestParseHits:
 
 class TestCohereJinaRerankClient:
     def test_request_body_boundary(self, monkeypatch):
-        """Drive a real httpx request through MockTransport and assert the URL,
+        """Drive a real httpx2 request through MockTransport and assert the URL,
         body, and auth header the client builds."""
         captured: dict = {}
 
-        def handler(request: httpx.Request) -> httpx.Response:
+        def handler(request: httpx2.Request) -> httpx2.Response:
             captured["url"] = str(request.url)
             captured["body"] = json.loads(request.content)
             captured["auth"] = request.headers.get("authorization")
-            return httpx.Response(200, json=RESULTS_WRAPPED)
+            return httpx2.Response(200, json=RESULTS_WRAPPED)
 
-        _install_mock_httpx_client(monkeypatch, handler)
+        _install_mock_httpx2_client(monkeypatch, handler)
         client = CohereJinaRerankClient(
             "http://vllm:8000/rerank", model="bge", api_key="secret", timeout=10
         )
@@ -126,12 +126,12 @@ class TestCohereJinaRerankClient:
     def test_model_and_top_n_omitted_when_unset(self, monkeypatch):
         captured: dict = {}
 
-        def handler(request: httpx.Request) -> httpx.Response:
+        def handler(request: httpx2.Request) -> httpx2.Response:
             captured["body"] = json.loads(request.content)
             captured["auth"] = request.headers.get("authorization")
-            return httpx.Response(200, json={"results": []})
+            return httpx2.Response(200, json={"results": []})
 
-        _install_mock_httpx_client(monkeypatch, handler)
+        _install_mock_httpx2_client(monkeypatch, handler)
         CohereJinaRerankClient("http://h/rerank").rerank("q", ["a"])
 
         assert captured["body"] == {"query": "q", "documents": ["a"]}
@@ -140,28 +140,28 @@ class TestCohereJinaRerankClient:
     def test_empty_documents_makes_no_request(self, monkeypatch):
         called = {"n": 0}
 
-        def handler(request: httpx.Request) -> httpx.Response:
+        def handler(request: httpx2.Request) -> httpx2.Response:
             called["n"] += 1
-            return httpx.Response(200, json={"results": []})
+            return httpx2.Response(200, json={"results": []})
 
-        _install_mock_httpx_client(monkeypatch, handler)
+        _install_mock_httpx2_client(monkeypatch, handler)
         assert CohereJinaRerankClient("http://h/rerank").rerank("q", []) == []
         assert called["n"] == 0  # short-circuits before any HTTP call
 
     def test_bare_list_response_parsed(self, monkeypatch):
-        def handler(request: httpx.Request) -> httpx.Response:
-            return httpx.Response(200, json=BARE_LIST)
+        def handler(request: httpx2.Request) -> httpx2.Response:
+            return httpx2.Response(200, json=BARE_LIST)
 
-        _install_mock_httpx_client(monkeypatch, handler)
+        _install_mock_httpx2_client(monkeypatch, handler)
         hits = CohereJinaRerankClient("http://tei/rerank").rerank("q", ["a", "b"])
         assert [h.index for h in hits] == [1, 0]
 
     def test_http_error_propagates(self, monkeypatch):
-        def handler(request: httpx.Request) -> httpx.Response:
-            return httpx.Response(401, text="unauthorized")
+        def handler(request: httpx2.Request) -> httpx2.Response:
+            return httpx2.Response(401, text="unauthorized")
 
-        _install_mock_httpx_client(monkeypatch, handler)
-        with pytest.raises(httpx.HTTPStatusError):
+        _install_mock_httpx2_client(monkeypatch, handler)
+        with pytest.raises(httpx2.HTTPStatusError):
             CohereJinaRerankClient("http://h/rerank").rerank("q", ["a"])
 
 
@@ -336,7 +336,7 @@ class TestSessionRerankWiring:
 class TestRerankInstruction:
     """`rerank_instruction` wraps the query for instruction-aware rerankers.
 
-    Drives through the real httpx boundary (MockTransport) and inspects the sent
+    Drives through the real httpx2 boundary (MockTransport) and inspects the sent
     body — for endpoints that don't apply the model's own chat template; vLLM
     should use --chat-template instead (combining both double-wraps).
     """
@@ -346,19 +346,19 @@ class TestRerankInstruction:
 
         def handler(request):
             sent["body"] = json.loads(request.content)
-            return httpx.Response(200, json={"results": [{"index": 0, "relevance_score": 0.9}]})
+            return httpx2.Response(200, json={"results": [{"index": 0, "relevance_score": 0.9}]})
 
         return sent, handler
 
     def test_no_instruction_sends_bare_query(self, monkeypatch):
         sent, handler = self._capture()
-        _install_mock_httpx_client(monkeypatch, handler)
+        _install_mock_httpx2_client(monkeypatch, handler)
         CohereJinaRerankClient("http://x/rerank").rerank("capital of France", ["d0"])
         assert sent["body"]["query"] == "capital of France"
 
     def test_instruction_wraps_query(self, monkeypatch):
         sent, handler = self._capture()
-        _install_mock_httpx_client(monkeypatch, handler)
+        _install_mock_httpx2_client(monkeypatch, handler)
         CohereJinaRerankClient("http://x/rerank", instruction="Find relevant passages").rerank(
             "capital of France", ["d0"]
         )

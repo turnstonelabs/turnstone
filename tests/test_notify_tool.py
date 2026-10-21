@@ -128,7 +128,7 @@ class TestNotifyDiagnostics:
         logger = MagicMock()
         monkeypatch.setattr(caller_module, "log", logger)
         post = MagicMock()
-        monkeypatch.setattr(session_module.httpx, "post", post)
+        monkeypatch.setattr(session_module.httpx2, "post", post)
 
         def deliver():
             if request.param == "tool":
@@ -400,7 +400,7 @@ class TestExecNotify:
 
         with (
             patch("turnstone.core.session.get_storage", return_value=storage),
-            patch("turnstone.core.session.httpx.post", return_value=mock_resp) as mock_post,
+            patch("turnstone.core.session.httpx2.post", return_value=mock_resp) as mock_post,
             patch.dict("os.environ", {}, clear=False),
         ):
             call_id, msg = session._exec_notify(item)
@@ -464,7 +464,7 @@ class TestExecNotify:
 
         with (
             patch("turnstone.core.session.get_storage", return_value=storage),
-            patch("turnstone.core.session.httpx.post", return_value=mock_resp),
+            patch("turnstone.core.session.httpx2.post", return_value=mock_resp),
             patch.dict("os.environ", {}, clear=False),
         ):
             for _i in range(5):
@@ -497,7 +497,7 @@ class TestExecNotify:
         with (
             patch("turnstone.core.session.get_storage", return_value=storage),
             patch(
-                "turnstone.core.session.httpx.post",
+                "turnstone.core.session.httpx2.post",
                 side_effect=ConnectionError("refused"),
             ),
             patch.dict("os.environ", {}, clear=False),
@@ -533,7 +533,7 @@ class TestExecNotify:
         with (
             patch("turnstone.core.session.get_storage", return_value=storage),
             patch(
-                "turnstone.core.session.httpx.post",
+                "turnstone.core.session.httpx2.post",
                 side_effect=ConnectionError("refused"),
             ),
             patch.dict("os.environ", {}, clear=False),
@@ -574,7 +574,7 @@ class TestExecNotify:
 
         with (
             patch("turnstone.core.session.get_storage", return_value=storage),
-            patch("turnstone.core.session.httpx.post", return_value=mock_resp) as mock_post,
+            patch("turnstone.core.session.httpx2.post", return_value=mock_resp) as mock_post,
             patch.dict("os.environ", {}, clear=False),
         ):
             session._exec_notify(item)
@@ -604,13 +604,13 @@ class TestExecNotify:
 
         with (
             patch("turnstone.core.session.get_storage", return_value=storage),
-            patch("turnstone.core.session.httpx.post") as mock_post,
+            patch("turnstone.core.session.httpx2.post") as mock_post,
             patch.dict("os.environ", {}, clear=False),
             patch.object(session, "_backoff_or_cancelled"),
         ):
             call_id, msg = session._exec_notify(item)
 
-        # httpx.post should never be called for ftp:// URL
+        # httpx2.post should never be called for ftp:// URL
         mock_post.assert_not_called()
         assert "delivery failed" in msg.lower()
 
@@ -659,7 +659,7 @@ class TestExecNotify:
 
         with (
             patch("turnstone.core.session.get_storage", return_value=mock_storage),
-            patch("turnstone.core.session.httpx.post", return_value=mock_resp),
+            patch("turnstone.core.session.httpx2.post", return_value=mock_resp),
             patch.dict("os.environ", {}, clear=False),
             patch.object(session, "_backoff_or_cancelled") as mock_backoff,
         ):
@@ -705,7 +705,7 @@ class TestExecNotify:
 
         with (
             patch("turnstone.core.session.get_storage", return_value=storage),
-            patch("turnstone.core.session.httpx.post", side_effect=_post),
+            patch("turnstone.core.session.httpx2.post", side_effect=_post),
             patch.dict("os.environ", {}, clear=False),
             patch.object(session, "_backoff_or_cancelled") as mock_backoff,
         ):
@@ -768,7 +768,7 @@ class TestExecNotify:
         with (
             patch("turnstone.core.session.get_storage", return_value=storage),
             patch(
-                "turnstone.core.session.httpx.post",
+                "turnstone.core.session.httpx2.post",
                 side_effect=ConnectionError("refused"),
             ),
             patch.dict("os.environ", {}, clear=False),
@@ -810,7 +810,7 @@ class TestExecNotify:
 
         with (
             patch("turnstone.core.session.get_storage", return_value=storage),
-            patch("turnstone.core.session.httpx.post", return_value=mock_resp),
+            patch("turnstone.core.session.httpx2.post", return_value=mock_resp),
             patch.dict("os.environ", {}, clear=False),
             patch.object(session, "_backoff_or_cancelled"),
         ):

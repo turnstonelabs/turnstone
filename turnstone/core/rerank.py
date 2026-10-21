@@ -29,7 +29,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol
 
-import httpx
+import httpx2
 
 from turnstone.core.deadline import DeadlineCancelledError
 from turnstone.core.log import get_logger
@@ -505,7 +505,7 @@ class CohereJinaRerankClient:
         self._api_key = api_key
         self._timeout = timeout
         self._instruction = instruction
-        self._client = httpx.Client()
+        self._client = httpx2.Client()
         self._close_lock = threading.Lock()
         self._closed = False
 

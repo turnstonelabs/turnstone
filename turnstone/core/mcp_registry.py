@@ -1,7 +1,7 @@
 """MCP Registry client — queries the official MCP Registry API for server discovery.
 
 Standalone HTTP client with no dependencies on Turnstone storage/auth layers.
-Uses httpx for async HTTP requests and returns typed dataclasses.
+Uses httpx2 for async HTTP requests and returns typed dataclasses.
 
 Registry API docs: https://registry.modelcontextprotocol.io/docs
 """
@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import urlparse
 
-import httpx
+import httpx2
 
 DEFAULT_REGISTRY_URL = "https://registry.modelcontextprotocol.io"
 _SEARCH_PATH = "/v0.1/servers"
@@ -256,7 +256,7 @@ class MCPRegistryClient:
         timeout: float = _REQUEST_TIMEOUT,
     ) -> None:
         self._base_url = base_url.rstrip("/")
-        self._client = httpx.AsyncClient(timeout=timeout, follow_redirects=True)
+        self._client = httpx2.AsyncClient(timeout=timeout, follow_redirects=True)
 
     async def search(
         self,
@@ -287,7 +287,7 @@ class MCPRegistryClient:
         url = f"{self._base_url}{_SEARCH_PATH}"
         try:
             resp = await self._client.get(url, params=params)
-        except httpx.HTTPError as exc:
+        except httpx2.HTTPError as exc:
             raise MCPRegistryError(f"HTTP request failed: {exc}") from exc
 
         if resp.status_code != 200:

@@ -842,7 +842,7 @@ def _handle_ws_command(
 
 def _handle_cluster_command(cmd_line: str, console_url: str | None) -> None:
     """Handle /cluster subcommands querying the turnstone-console API."""
-    import httpx
+    import httpx2
 
     if not console_url:
         print(red("No console URL configured. Use --console-url or set [console] url in config."))
@@ -867,7 +867,7 @@ def _handle_cluster_command(cmd_line: str, console_url: str | None) -> None:
 
     try:
         if sub == "status":
-            resp = httpx.get(f"{console_url}/v1/api/cluster/overview", timeout=5, headers=headers)
+            resp = httpx2.get(f"{console_url}/v1/api/cluster/overview", timeout=5, headers=headers)
             data = resp.json()
             states = data.get("states", {})
             agg = data.get("aggregate", {})
@@ -889,7 +889,7 @@ def _handle_cluster_command(cmd_line: str, console_url: str | None) -> None:
 
         elif sub == "nodes":
             limit = 20
-            resp = httpx.get(
+            resp = httpx2.get(
                 f"{console_url}/v1/api/cluster/nodes?sort=activity&limit={limit}",
                 timeout=5,
                 headers=headers,
@@ -939,7 +939,7 @@ def _handle_cluster_command(cmd_line: str, console_url: str | None) -> None:
                         params += f"&{key}={val}"
                 else:
                     params += f"&state={arg}"
-            resp = httpx.get(
+            resp = httpx2.get(
                 f"{console_url}/v1/api/cluster/workstreams?{params}",
                 timeout=5,
                 headers=headers,
@@ -976,7 +976,7 @@ def _handle_cluster_command(cmd_line: str, console_url: str | None) -> None:
                 print(red("Usage: /cluster node <node_id>"))
                 return
             node_id = parts[2]
-            resp = httpx.get(
+            resp = httpx2.get(
                 f"{console_url}/v1/api/cluster/node/{node_id}", timeout=5, headers=headers
             )
             data = resp.json()
@@ -1003,7 +1003,7 @@ def _handle_cluster_command(cmd_line: str, console_url: str | None) -> None:
             print(f"Unknown /cluster subcommand: {sub}")
             print("Usage: /cluster [status|nodes|workstreams [state|node=X]|node <id>]")
 
-    except httpx.ConnectError:
+    except httpx2.ConnectError:
         print(red(f"Cannot connect to console at {console_url}"))
     except Exception as e:
         print(red(f"Cluster command failed: {e}"))

@@ -292,7 +292,7 @@ class TestNotifyFinalSayRead:
 
 
 class TestDeliverNotification:
-    @patch("httpx.post")
+    @patch("httpx2.post")
     def test_successful_delivery(self, mock_post):
         mock_resp = MagicMock(status_code=200)
         mock_resp.json.return_value = {"results": [{"status": "sent"}]}
@@ -323,7 +323,7 @@ class TestDeliverNotification:
 
         assert storage.list_services.call_count == 3
 
-    @patch("httpx.post", side_effect=ConnectionError("refused"))
+    @patch("httpx2.post", side_effect=ConnectionError("refused"))
     def test_http_error_continues(self, mock_post):
         storage = MagicMock()
         storage.list_services.return_value = [{"url": "http://gw:8080"}]

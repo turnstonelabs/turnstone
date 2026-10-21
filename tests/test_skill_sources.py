@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from unittest.mock import AsyncMock, MagicMock, patch
 
-import httpx
+import httpx2
 import pytest
 
 from turnstone.core.skill_sources import (
@@ -88,7 +88,7 @@ class TestParseGitHubUrl:
 
 
 class TestSkillsShClient:
-    """SkillsShClient with mocked httpx."""
+    """SkillsShClient with mocked httpx2."""
 
     @pytest.mark.anyio
     async def test_search_basic(self) -> None:
@@ -109,7 +109,7 @@ class TestSkillsShClient:
             ]
         }
 
-        with patch("turnstone.core.skill_sources.httpx.AsyncClient") as mock_client_cls:
+        with patch("turnstone.core.skill_sources.httpx2.AsyncClient") as mock_client_cls:
             instance = AsyncMock()
             instance.get = AsyncMock(return_value=mock_response)
             instance.__aenter__ = AsyncMock(return_value=instance)
@@ -131,7 +131,7 @@ class TestSkillsShClient:
         mock_response.raise_for_status = MagicMock()
         mock_response.json.return_value = {"skills": []}
 
-        with patch("turnstone.core.skill_sources.httpx.AsyncClient") as mock_client_cls:
+        with patch("turnstone.core.skill_sources.httpx2.AsyncClient") as mock_client_cls:
             instance = AsyncMock()
             instance.get = AsyncMock(return_value=mock_response)
             instance.__aenter__ = AsyncMock(return_value=instance)
@@ -145,9 +145,9 @@ class TestSkillsShClient:
 
     @pytest.mark.anyio
     async def test_search_http_error(self) -> None:
-        with patch("turnstone.core.skill_sources.httpx.AsyncClient") as mock_client_cls:
+        with patch("turnstone.core.skill_sources.httpx2.AsyncClient") as mock_client_cls:
             instance = AsyncMock()
-            instance.get = AsyncMock(side_effect=httpx.ConnectTimeout("timeout"))
+            instance.get = AsyncMock(side_effect=httpx2.ConnectTimeout("timeout"))
             instance.__aenter__ = AsyncMock(return_value=instance)
             instance.__aexit__ = AsyncMock(return_value=False)
             mock_client_cls.return_value = instance
@@ -161,10 +161,10 @@ class TestSkillsShClient:
         mock_response = MagicMock()
         mock_response.status_code = 500
         mock_response.raise_for_status = MagicMock(
-            side_effect=httpx.HTTPStatusError("500", request=MagicMock(), response=mock_response)
+            side_effect=httpx2.HTTPStatusError("500", request=MagicMock(), response=mock_response)
         )
 
-        with patch("turnstone.core.skill_sources.httpx.AsyncClient") as mock_client_cls:
+        with patch("turnstone.core.skill_sources.httpx2.AsyncClient") as mock_client_cls:
             instance = AsyncMock()
             instance.get = AsyncMock(return_value=mock_response)
             instance.__aenter__ = AsyncMock(return_value=instance)
@@ -182,7 +182,7 @@ class TestSkillsShClient:
         mock_response.raise_for_status = MagicMock()
         mock_response.json.return_value = {"skills": []}
 
-        with patch("turnstone.core.skill_sources.httpx.AsyncClient") as mock_client_cls:
+        with patch("turnstone.core.skill_sources.httpx2.AsyncClient") as mock_client_cls:
             instance = AsyncMock()
             instance.get = AsyncMock(return_value=mock_response)
             instance.__aenter__ = AsyncMock(return_value=instance)
@@ -222,7 +222,7 @@ class TestSkillsShClient:
             ]
         }
 
-        with patch("turnstone.core.skill_sources.httpx.AsyncClient") as mock_client_cls:
+        with patch("turnstone.core.skill_sources.httpx2.AsyncClient") as mock_client_cls:
             instance = AsyncMock()
             instance.get = AsyncMock(return_value=mock_response)
             instance.__aenter__ = AsyncMock(return_value=instance)
@@ -256,7 +256,7 @@ body
             ]
         }
 
-        with patch("turnstone.core.skill_sources.httpx.AsyncClient") as mock_client_cls:
+        with patch("turnstone.core.skill_sources.httpx2.AsyncClient") as mock_client_cls:
             instance = AsyncMock()
             instance.get = AsyncMock(return_value=mock_response)
             instance.__aenter__ = AsyncMock(return_value=instance)
@@ -289,7 +289,7 @@ body
         mock_response.status_code = 404
         mock_response.text = "Not Found"
 
-        with patch("turnstone.core.skill_sources.httpx.AsyncClient") as mock_client_cls:
+        with patch("turnstone.core.skill_sources.httpx2.AsyncClient") as mock_client_cls:
             instance = AsyncMock()
             instance.get = AsyncMock(return_value=mock_response)
             instance.__aenter__ = AsyncMock(return_value=instance)
@@ -308,7 +308,7 @@ body
             "files": [{"path": "scripts/run.sh", "contents": "x"}],
         }
 
-        with patch("turnstone.core.skill_sources.httpx.AsyncClient") as mock_client_cls:
+        with patch("turnstone.core.skill_sources.httpx2.AsyncClient") as mock_client_cls:
             instance = AsyncMock()
             instance.get = AsyncMock(return_value=mock_response)
             instance.__aenter__ = AsyncMock(return_value=instance)
@@ -325,7 +325,7 @@ body
         mock_response.status_code = 200
         mock_response.json.return_value = {"files": []}
 
-        with patch("turnstone.core.skill_sources.httpx.AsyncClient") as mock_client_cls:
+        with patch("turnstone.core.skill_sources.httpx2.AsyncClient") as mock_client_cls:
             instance = AsyncMock()
             instance.get = AsyncMock(return_value=mock_response)
             instance.__aenter__ = AsyncMock(return_value=instance)
@@ -342,7 +342,7 @@ body
         mock_response.status_code = 200
         mock_response.json.return_value = {"files": "oops"}
 
-        with patch("turnstone.core.skill_sources.httpx.AsyncClient") as mock_client_cls:
+        with patch("turnstone.core.skill_sources.httpx2.AsyncClient") as mock_client_cls:
             instance = AsyncMock()
             instance.get = AsyncMock(return_value=mock_response)
             instance.__aenter__ = AsyncMock(return_value=instance)
@@ -363,7 +363,7 @@ body
             "files": [{"path": "SKILL.md", "contents": "x" * (_MAX_SKILL_MD_SIZE + 1)}],
         }
 
-        with patch("turnstone.core.skill_sources.httpx.AsyncClient") as mock_client_cls:
+        with patch("turnstone.core.skill_sources.httpx2.AsyncClient") as mock_client_cls:
             instance = AsyncMock()
             instance.get = AsyncMock(return_value=mock_response)
             instance.__aenter__ = AsyncMock(return_value=instance)
@@ -393,7 +393,7 @@ body
             "files": [{"path": "SKILL.md", "contents": payload}],
         }
 
-        with patch("turnstone.core.skill_sources.httpx.AsyncClient") as mock_client_cls:
+        with patch("turnstone.core.skill_sources.httpx2.AsyncClient") as mock_client_cls:
             instance = AsyncMock()
             instance.get = AsyncMock(return_value=mock_response)
             instance.__aenter__ = AsyncMock(return_value=instance)
@@ -422,7 +422,7 @@ description: caps test
         mock_response.status_code = 200
         mock_response.json.return_value = {"files": files}
 
-        with patch("turnstone.core.skill_sources.httpx.AsyncClient") as mock_client_cls:
+        with patch("turnstone.core.skill_sources.httpx2.AsyncClient") as mock_client_cls:
             instance = AsyncMock()
             instance.get = AsyncMock(return_value=mock_response)
             instance.__aenter__ = AsyncMock(return_value=instance)
@@ -453,7 +453,7 @@ description: ext test
             ]
         }
 
-        with patch("turnstone.core.skill_sources.httpx.AsyncClient") as mock_client_cls:
+        with patch("turnstone.core.skill_sources.httpx2.AsyncClient") as mock_client_cls:
             instance = AsyncMock()
             instance.get = AsyncMock(return_value=mock_response)
             instance.__aenter__ = AsyncMock(return_value=instance)
@@ -467,7 +467,7 @@ description: ext test
 
 
 class TestFetchSkillFromGithub:
-    """GitHub fetch with mocked httpx."""
+    """GitHub fetch with mocked httpx2."""
 
     @pytest.mark.anyio
     async def test_invalid_url(self) -> None:
@@ -476,7 +476,7 @@ class TestFetchSkillFromGithub:
 
     @pytest.mark.anyio
     async def test_skill_md_not_found(self) -> None:
-        with patch("turnstone.core.skill_sources.httpx.AsyncClient") as mock_client_cls:
+        with patch("turnstone.core.skill_sources.httpx2.AsyncClient") as mock_client_cls:
             instance = AsyncMock()
             not_found = MagicMock()
             not_found.status_code = 404
@@ -516,7 +516,7 @@ Instructions here.
                 resp.status_code = 404
             return resp
 
-        with patch("turnstone.core.skill_sources.httpx.AsyncClient") as mock_client_cls:
+        with patch("turnstone.core.skill_sources.httpx2.AsyncClient") as mock_client_cls:
             instance = AsyncMock()
             instance.get = AsyncMock(side_effect=mock_get)
             instance.__aenter__ = AsyncMock(return_value=instance)

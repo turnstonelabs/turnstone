@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import functools
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx2
 import pytest
 
 from turnstone.core.mcp_registry import (
@@ -242,6 +244,20 @@ class TestMCPRegistryClientSearch:
                 patch.object(client._client, "get", new=AsyncMock(return_value=mock_response)),
                 pytest.raises(MCPRegistryError, match="500"),
             ):
+                await client.search()
+
+    @pytest.mark.anyio
+    async def test_search_transport_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        def handler(request: httpx2.Request) -> httpx2.Response:
+            raise httpx2.ConnectError("Connection refused", request=request)
+
+        # Through the constructor, so the client it builds is the one whose errors are caught.
+        monkeypatch.setattr(
+            "turnstone.core.mcp_registry.httpx2.AsyncClient",
+            functools.partial(httpx2.AsyncClient, transport=httpx2.MockTransport(handler)),
+        )
+        async with MCPRegistryClient(base_url="https://registry.example") as client:
+            with pytest.raises(MCPRegistryError, match="HTTP request failed"):
                 await client.search()
 
     @pytest.mark.anyio
