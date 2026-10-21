@@ -2976,9 +2976,6 @@ class TestSSEProxy:
 
             headers = {}
 
-            async def is_disconnected(self):
-                return False
-
         async def _run():
             response = await _proxy_sse(
                 FakeRequest(), "http://fake:8080", "events", api_prefix="v1/api"
@@ -3033,9 +3030,6 @@ class TestSSEProxy:
 
             headers = {}
 
-            async def is_disconnected(self):
-                return False
-
         async def _run():
             response = await _proxy_sse(FakeRequest(), "http://fake:8080", "events")
             chunks: list[bytes] = []
@@ -3047,61 +3041,142 @@ class TestSSEProxy:
 
         asyncio.run(_run())
 
+    def test_proxy_sse_closes_an_idle_upstream_through_uvicorn(self):
+        """Through uvicorn and the console's middleware, the relay closes its upstream connection
+        once the browser's connection closes, while the upstream has nothing more to send. This
+        also pins that uvicorn still reports an ASGI spec under which the response listens for
+        the disconnect."""
+        import httpx2
+        import uvicorn
+        from starlette.applications import Starlette
+        from starlette.routing import Route
+
+        from turnstone.console.server import _build_console_middleware, _proxy_sse
+
+        async def _run():
+            upstream_eof = asyncio.Event()
+
+            async def upstream(reader, writer):
+                await reader.readuntil(b"\r\n\r\n")
+                body = b"data: chunk1\n\n"
+                writer.write(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n"
+                    b"transfer-encoding: chunked\r\n\r\n"
+                    + f"{len(body):x}\r\n".encode()
+                    + body
+                    + b"\r\n"
+                )
+                await writer.drain()
+                await reader.read()  # idle until the relay drops the connection
+                upstream_eof.set()
+                writer.close()
+
+            node = await asyncio.start_server(upstream, "127.0.0.1", 0)
+            node_url = f"http://127.0.0.1:{node.sockets[0].getsockname()[1]}"
+
+            async def relay(request):
+                return await _proxy_sse(request, node_url, "events")
+
+            # /health is a public path, so the auth middleware passes the request on without a
+            # token; it hands receive and send through the same way on an authenticated path.
+            app = Starlette(
+                routes=[Route("/health", relay)],
+                middleware=_build_console_middleware(["http://example.com"]),
+            )
+            app.state.proxy_sse_client = httpx2.AsyncClient(trust_env=False)
+            server = uvicorn.Server(
+                uvicorn.Config(
+                    app,
+                    host="127.0.0.1",
+                    port=0,
+                    lifespan="off",
+                    log_level="warning",
+                    timeout_graceful_shutdown=1,
+                )
+            )
+            serving = asyncio.create_task(server.serve())
+            try:
+                while not server.started:
+                    await asyncio.sleep(0.01)
+                port = server.servers[0].sockets[0].getsockname()[1]
+                reader, writer = await asyncio.open_connection("127.0.0.1", port)
+                writer.write(b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+                received = b""
+                while b"chunk1" not in received:
+                    received += await asyncio.wait_for(reader.read(4096), 5)
+                writer.close()
+                await asyncio.wait_for(upstream_eof.wait(), 2)
+            finally:
+                server.should_exit = True
+                await serving
+                await app.state.proxy_sse_client.aclose()
+                node.close()
+                await node.wait_closed()
+
+        asyncio.run(_run())
+
     def test_proxy_sse_disconnect_handling(self):
-        """Proxy should stop when browser disconnects."""
+        """The relay stops, and closes its upstream stream, once the browser disconnects, even
+        while the upstream has nothing more to send."""
 
         from turnstone.console.server import _proxy_sse
 
-        class FakeResponse:
-            status_code = 200
-
-            async def aiter_bytes(self):
-                yield b"data: chunk1\n\n"
-                yield b"data: chunk2\n\n"  # should not be reached
-                yield b"data: chunk3\n\n"
-
-            async def aclose(self):
-                pass
-
-            async def __aenter__(self):
-                return self
-
-            async def __aexit__(self, *args):
-                pass
-
-        class FakeClient:
-            def stream(self, method, url, **kwargs):
-                return FakeResponse()
-
-        call_count = 0
-
-        class FakeRequest:
-            class url:  # noqa: N801
-                query = ""
-
-            class app:  # noqa: N801
-                class state:  # noqa: N801
-                    proxy_sse_client = FakeClient()
-                    proxy_auth_token = ""
-
-            headers = {}
-
-            async def is_disconnected(self):
-                nonlocal call_count
-                call_count += 1
-                return call_count > 1  # disconnect after first chunk
-
         async def _run():
-            response = await _proxy_sse(FakeRequest(), "http://fake:8080", "events")
-            chunks: list[bytes] = []
-            async for chunk in response.body_iterator:
-                chunks.append(chunk if isinstance(chunk, bytes) else chunk.encode())
-            body = b"".join(chunks)
-            assert b"chunk1" in body
-            # Should have stopped before chunk3
-            assert b"chunk3" not in body
+            first_sent = asyncio.Event()
+            upstream_closed = asyncio.Event()
 
-        asyncio.run(_run())
+            class FakeResponse:
+                status_code = 200
+
+                async def aiter_bytes(self):
+                    yield b"data: chunk1\n\n"
+                    # An upstream with nothing more to send, so only the disconnect can end the
+                    # relay.
+                    await asyncio.Event().wait()
+
+                async def __aenter__(self):
+                    return self
+
+                async def __aexit__(self, *args):
+                    upstream_closed.set()
+
+            class FakeClient:
+                def stream(self, method, url, **kwargs):
+                    return FakeResponse()
+
+            class FakeRequest:
+                class url:  # noqa: N801
+                    query = ""
+
+                class app:  # noqa: N801
+                    class state:  # noqa: N801
+                        proxy_sse_client = FakeClient()
+                        proxy_auth_token = ""
+
+                headers = {}
+
+            response = await _proxy_sse(FakeRequest(), "http://fake:8080", "events")
+            bodies: list[bytes] = []
+
+            async def receive():
+                await first_sent.wait()
+                return {"type": "http.disconnect"}
+
+            async def send(message):
+                if message["type"] == "http.response.body" and message.get("body"):
+                    bodies.append(message["body"])
+                    first_sent.set()
+
+            # The ASGI spec version uvicorn reports, under which the response listens for the
+            # disconnect itself (the uvicorn test above checks the real server). Under 2.4 nothing
+            # reads the disconnect, so the relay waits on its idle upstream and this times out.
+            scope = {"type": "http", "asgi": {"spec_version": "2.3"}}
+            await asyncio.wait_for(response(scope, receive, send), timeout=5)
+            return bodies, upstream_closed.is_set()
+
+        bodies, upstream_closed = asyncio.run(_run())
+        assert bodies == [b"data: chunk1\n\n"]
+        assert upstream_closed
 
 
 # ---------------------------------------------------------------------------

@@ -3790,9 +3790,11 @@ async def _proxy_sse(
                     )
                     yield f"event: error\ndata: Upstream returned status {status}\n\n".encode()
                     return
+                # No per-chunk disconnect check: under ASGI spec < 2.4, which uvicorn reports for
+                # HTTP, the StreamingResponse cancels this generator when the browser goes away,
+                # which closes the upstream stream. Under 2.4 or later the response learns of the
+                # disconnect only when a send fails, at the next upstream byte.
                 async for chunk in response.aiter_bytes():
-                    if await request.is_disconnected():
-                        return
                     yield chunk
         except REQUEST_FAILURES:
             log.debug("SSE proxy stream ended for %r", target)
