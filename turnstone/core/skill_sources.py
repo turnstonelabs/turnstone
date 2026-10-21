@@ -26,6 +26,12 @@ _GITHUB_URL_RE = re.compile(
     r"(?:/(?:tree|blob)/(?P<branch>[^/]+)(?:/(?P<path>.+))?)?$"
 )
 
+# What a failed request raises. ``InvalidURL`` and ``UnicodeError`` are not ``HTTPError``s: httpx2
+# raises them while building a request it cannot send, such as one for a redirect's malformed
+# Location, a host IDNA cannot encode (``idna.IDNAError`` is a ``UnicodeError``) or a path
+# holding a lone surrogate.
+_REQUEST_FAILURES = (httpx2.HTTPError, httpx2.InvalidURL, UnicodeError)
+
 _MAX_RESOURCE_FILES = 10
 _MAX_RESOURCE_SIZE = 100 * 1024  # 100KB per file
 _MAX_SKILL_MD_SIZE = 256 * 1024  # 256KB generous cap for SKILL.md
@@ -125,7 +131,7 @@ class SkillsShClient:
                 resp.raise_for_status()
             except httpx2.HTTPStatusError as exc:
                 raise SkillSourceError(f"skills.sh returned {exc.response.status_code}") from exc
-            except httpx2.HTTPError as exc:
+            except _REQUEST_FAILURES as exc:
                 raise SkillSourceError(f"skills.sh request failed: {exc}") from exc
 
         data = resp.json()
@@ -167,7 +173,7 @@ class SkillsShClient:
         async with httpx2.AsyncClient(follow_redirects=True, timeout=10.0) as client:
             try:
                 resp = await client.get(url)
-            except httpx2.HTTPError as exc:
+            except _REQUEST_FAILURES as exc:
                 raise SkillSourceError(f"Failed to download skill {skill_id}: {exc}") from exc
 
         if resp.status_code == 404:
@@ -316,7 +322,7 @@ async def _fetch_resource_contents(
                 resp = await client.get(f"{raw_base}/{rf['full_path']}")
                 if resp.status_code == 200:
                     return rf["path"], resp.text
-            except httpx2.HTTPError:
+            except _REQUEST_FAILURES:
                 pass  # best-effort fetch, skip on failure
         return None
 
@@ -393,7 +399,7 @@ async def fetch_skill_from_github(url: str) -> SkillPackage:
                         skill_md_dir = parts[0] if len(parts) > 1 else ""
                         resolved_branch = try_branch
                         break
-                except httpx2.HTTPError:
+                except _REQUEST_FAILURES:
                     continue
             if skill_md_content:
                 break
@@ -418,7 +424,7 @@ async def fetch_skill_from_github(url: str) -> SkillPackage:
                 tree_data = tree_resp.json()
                 rf = _find_resource_files(tree_data.get("tree", []), skill_md_dir)
                 resources = await _fetch_resource_contents(client, raw_base, rf)
-        except httpx2.HTTPError:
+        except _REQUEST_FAILURES:
             log.debug("Failed to fetch resource tree for %s/%s", owner, repo)
 
     # Build a per-skill source URL pointing to the specific subdirectory
@@ -480,7 +486,7 @@ async def fetch_skills_from_github_repo(url: str) -> list[SkillPackage]:
                     tree_data = resp.json()
                     resolved_branch = try_branch
                     break
-            except httpx2.HTTPError:
+            except _REQUEST_FAILURES:
                 continue
 
         if not tree_data:
@@ -516,7 +522,7 @@ async def fetch_skills_from_github_repo(url: str) -> list[SkillPackage]:
                     r = await client.get(f"{raw_base}/{p}")
                     if r.status_code == 200 and len(r.content) <= _MAX_SKILL_MD_SIZE:
                         return p, r.text
-                except httpx2.HTTPError:
+                except _REQUEST_FAILURES:
                     pass  # best-effort fetch, skip on failure
             return None
 

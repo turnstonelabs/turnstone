@@ -71,6 +71,17 @@ def _server_entry(
     return entry
 
 
+def _route_registry(monkeypatch: pytest.MonkeyPatch, handler: Any) -> None:
+    """Have the registry client's constructor build its client on *handler*'s MockTransport.
+
+    Going through the constructor makes the client it builds the one whose errors are caught.
+    """
+    monkeypatch.setattr(
+        "turnstone.core.mcp_registry.httpx2.AsyncClient",
+        functools.partial(httpx2.AsyncClient, transport=httpx2.MockTransport(handler)),
+    )
+
+
 # ---------------------------------------------------------------------------
 # MCPRegistryClient.search
 # ---------------------------------------------------------------------------
@@ -251,14 +262,38 @@ class TestMCPRegistryClientSearch:
         def handler(request: httpx2.Request) -> httpx2.Response:
             raise httpx2.ConnectError("Connection refused", request=request)
 
-        # Through the constructor, so the client it builds is the one whose errors are caught.
-        monkeypatch.setattr(
-            "turnstone.core.mcp_registry.httpx2.AsyncClient",
-            functools.partial(httpx2.AsyncClient, transport=httpx2.MockTransport(handler)),
+        _route_registry(monkeypatch, handler)
+        async with MCPRegistryClient(base_url="https://registry.example") as client:
+            with pytest.raises(MCPRegistryError, match="HTTP request failed"):
+                await client.search()
+
+    @pytest.mark.anyio
+    @pytest.mark.parametrize(
+        "location",
+        [
+            # httpx2 raises InvalidURL for the first and idna's IDNAError (a UnicodeError) for
+            # the second; neither is an HTTPError.
+            pytest.param("http:foo", id="unparseable"),
+            pytest.param("http://a..xn--b/", id="not-idna"),
+        ],
+    )
+    async def test_search_malformed_redirect(
+        self, monkeypatch: pytest.MonkeyPatch, location: str
+    ) -> None:
+        _route_registry(
+            monkeypatch, lambda request: httpx2.Response(302, headers={"Location": location})
         )
         async with MCPRegistryClient(base_url="https://registry.example") as client:
             with pytest.raises(MCPRegistryError, match="HTTP request failed"):
                 await client.search()
+
+    @pytest.mark.anyio
+    async def test_search_term_with_a_lone_surrogate(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Encoding the query raises UnicodeEncodeError before anything is sent.
+        _route_registry(monkeypatch, lambda request: httpx2.Response(200, json={}))
+        async with MCPRegistryClient(base_url="https://registry.example") as client:
+            with pytest.raises(MCPRegistryError, match="HTTP request failed"):
+                await client.search(q="a" + chr(0xD800))
 
     @pytest.mark.anyio
     async def test_search_limit_clamped(self) -> None:

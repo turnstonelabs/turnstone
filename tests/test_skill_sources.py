@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx2
@@ -11,9 +12,11 @@ from turnstone.core.skill_sources import (
     SkillNotFoundError,
     SkillSourceError,
     SkillsShClient,
+    _fetch_resource_contents,
     _parse_github_url,
     _split_skills_sh_id,
     fetch_skill_from_github,
+    fetch_skills_from_github_repo,
 )
 
 
@@ -530,3 +533,97 @@ Instructions here.
         assert package.listing.source == "github"
         assert package.listing.id == "owner/repo/test-skill"
         assert package.resources == {}
+
+
+def _malformed_redirect(request: httpx2.Request) -> httpx2.Response:
+    return httpx2.Response(302, headers={"Location": "http:foo"})
+
+
+def _route_skill_sources(monkeypatch, handler) -> None:
+    """Have every client skill_sources builds send through *handler*'s MockTransport."""
+    monkeypatch.setattr(
+        "turnstone.core.skill_sources.httpx2.AsyncClient",
+        functools.partial(httpx2.AsyncClient, transport=httpx2.MockTransport(handler)),
+    )
+
+
+_PROBE_SKILL_MD = "---\nname: probe-skill\ndescription: A probe skill\n---\n\nSteps.\n"
+
+
+class TestRequestsHttpx2CannotBuild:
+    """A request httpx2 can't build fails like a transport error, not past the catch site."""
+
+    @pytest.mark.anyio
+    async def test_search_reports_a_malformed_redirect(self, monkeypatch) -> None:
+        _route_skill_sources(monkeypatch, _malformed_redirect)
+        with pytest.raises(SkillSourceError, match="skills.sh request failed"):
+            await SkillsShClient("https://skills.example").search("pdf")
+
+    @pytest.mark.anyio
+    async def test_download_reports_a_malformed_redirect(self, monkeypatch) -> None:
+        _route_skill_sources(monkeypatch, _malformed_redirect)
+        with pytest.raises(SkillSourceError, match="Failed to download skill"):
+            await SkillsShClient("https://skills.example").download_skill("owner/repo/probe")
+
+    @pytest.mark.anyio
+    async def test_github_fetch_skips_candidates_it_cannot_request(self, monkeypatch) -> None:
+        _route_skill_sources(monkeypatch, _malformed_redirect)
+        with pytest.raises(SkillNotFoundError, match="SKILL.md not found"):
+            await fetch_skill_from_github("https://github.com/owner/repo")
+
+    @pytest.mark.anyio
+    async def test_github_fetch_keeps_the_skill_when_its_tree_cannot_be_requested(
+        self, monkeypatch
+    ) -> None:
+        def handler(request: httpx2.Request) -> httpx2.Response:
+            if request.url.host == "raw.githubusercontent.com":
+                return httpx2.Response(200, text=_PROBE_SKILL_MD)
+            return _malformed_redirect(request)
+
+        _route_skill_sources(monkeypatch, handler)
+        package = await fetch_skill_from_github("https://github.com/owner/repo")
+
+        assert package.parsed.name == "probe-skill"
+        assert package.resources == {}
+
+    @pytest.mark.anyio
+    async def test_repo_scan_reports_a_tree_it_cannot_request(self, monkeypatch) -> None:
+        _route_skill_sources(monkeypatch, _malformed_redirect)
+        with pytest.raises(SkillSourceError, match="Could not fetch repo tree"):
+            await fetch_skills_from_github_repo("https://github.com/owner/repo")
+
+    @pytest.mark.anyio
+    async def test_repo_scan_skips_a_skill_md_it_cannot_request(self, monkeypatch) -> None:
+        tree = {"tree": [{"type": "blob", "path": "skills/probe/SKILL.md"}]}
+
+        def handler(request: httpx2.Request) -> httpx2.Response:
+            if request.url.host == "api.github.com":
+                return httpx2.Response(200, json=tree)
+            return _malformed_redirect(request)
+
+        _route_skill_sources(monkeypatch, handler)
+        assert await fetch_skills_from_github_repo("https://github.com/owner/repo") == []
+
+    @pytest.mark.anyio
+    async def test_resource_fetch_skips_what_it_cannot_request(self) -> None:
+        def handler(request: httpx2.Request) -> httpx2.Response:
+            if request.url.path.endswith("/redirected.md"):
+                return _malformed_redirect(request)
+            if request.url.path.endswith("/not-idna.md"):
+                # idna's IDNAError, a UnicodeError rather than an InvalidURL.
+                return httpx2.Response(302, headers={"Location": "http://a..xn--b/"})
+            return httpx2.Response(200, text="kept")
+
+        resources = [
+            {"path": "references/redirected.md", "full_path": "s/references/redirected.md"},
+            {"path": "references/not-idna.md", "full_path": "s/references/not-idna.md"},
+            {"path": "references/surrogate.md", "full_path": "s/references/" + chr(0xD800)},
+            {"path": "references/kept.md", "full_path": "s/references/kept.md"},
+        ]
+        # Built as fetch_skill_from_github builds its client, which follows redirects.
+        async with httpx2.AsyncClient(
+            transport=httpx2.MockTransport(handler), follow_redirects=True
+        ) as client:
+            got = await _fetch_resource_contents(client, "https://raw.example/o/r/main", resources)
+
+        assert got == {"references/kept.md": "kept"}
