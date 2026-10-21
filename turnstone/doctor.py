@@ -291,7 +291,17 @@ def _http_get_json(url: str, timeout: float = 5.0) -> Any:
         allow_private_origin=True,
     )
     resp.raise_for_status()
-    return resp.json()
+    return _json_body(resp)
+
+
+def _json_body(resp: httpx2.Response) -> Any:
+    """*resp*'s JSON body. A body nested too deeply to parse raises ``ValueError``, as any other
+    body that isn't JSON does, rather than a ``RecursionError`` no caller expects.
+    """
+    try:
+        return resp.json()
+    except RecursionError as exc:
+        raise ValueError("JSON nested too deeply to parse") from exc
 
 
 def _upstream_tags(timeout: float) -> Any:
@@ -308,7 +318,7 @@ def _upstream_tags(timeout: float) -> Any:
         follow_redirects=True,
     )
     resp.raise_for_status()
-    return resp.json()
+    return _json_body(resp)
 
 
 def _run_readonly(
@@ -1601,7 +1611,8 @@ def _tool_http_health(args: dict[str, Any]) -> str:
         return f"{url} → HTTP {exc.response.status_code} {exc.response.reason_phrase}"
     except (*REQUEST_FAILURES, OSError, ValueError, TimeoutError) as exc:
         return f"{url} → unreachable ({exc})"
-    return json.dumps(data, indent=2, default=str)[:6000]
+    # Compact: indented output grows with the square of the reply's nesting depth.
+    return json.dumps(data, default=str)[:6000]
 
 
 def _tool_check_llm_backend(args: dict[str, Any]) -> str:

@@ -710,6 +710,10 @@ frozen.
   warning as sent. With text-format logs, a signed-in user or a compromised node could forge a log
   line or send terminal escapes. Paths and node ids are logged escaped, and every reply preview
   replaces the characters that aren't printable, C1 controls and Unicode line separators included.
+- **`turnstone-doctor` survives a health reply nested too deeply.** A node, or a URL the doctor was
+  asked to probe, answering with JSON nested tens of thousands of levels deep stopped the version
+  scan before its report, and the `http_health` tool's indented output grew with the square of the
+  nesting depth. Such a reply now reads as unparseable, and the tool shows a reply as compact JSON.
 - **An OAuth or OIDC endpoint URL the client can't send is refused when its document is read.** An
   identity provider's discovery document, an MCP server's challenge or metadata, or an
   authorization server's metadata could name an endpoint holding a control character (a stray

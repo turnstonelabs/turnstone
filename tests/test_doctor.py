@@ -385,6 +385,18 @@ class TestHttpGetJsonSafety:
         assert _http_get_json("http://localhost:8080/health") == {"ok": True}
 
 
+class TestJsonBody:
+    def test_a_body_nested_too_deeply_is_a_value_error(self) -> None:
+        from turnstone.doctor import _json_body
+
+        class _DeeplyNested:
+            def json(self) -> object:
+                raise RecursionError("maximum recursion depth exceeded")
+
+        with pytest.raises(ValueError, match="nested too deeply"):
+            _json_body(_DeeplyNested())  # type: ignore[arg-type]
+
+
 class TestHttpHealthTool:
     def test_ok(self) -> None:
         from turnstone.doctor import _tool_http_health
@@ -403,6 +415,13 @@ class TestHttpHealthTool:
         with patch("turnstone.doctor._http_get_json", side_effect=httpx2.ConnectError("refused")):
             out = _tool_http_health({"url": "http://localhost:8080"})
         assert "unreachable" in out
+
+    def test_the_reply_is_shown_compact(self) -> None:
+        from turnstone.doctor import _tool_http_health
+
+        with patch("turnstone.doctor._http_get_json", return_value={"a": {"b": [1, 2]}}):
+            out = _tool_http_health({"url": "http://localhost:8080"})
+        assert out == '{"a": {"b": [1, 2]}}'
 
     def test_an_error_status_is_reported(self, monkeypatch) -> None:
         from tests.test_web_transport import _Network, _response
