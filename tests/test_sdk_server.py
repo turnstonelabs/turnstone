@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 
-import httpx
+import httpx2
 import pytest
 
 from turnstone.sdk._types import TurnstoneAPIError
@@ -12,22 +12,22 @@ from turnstone.sdk.server import AsyncTurnstoneServer
 
 
 def _mock_transport(
-    responses: dict[str, httpx.Response] | None = None,
-) -> httpx.MockTransport:
+    responses: dict[str, httpx2.Response] | None = None,
+) -> httpx2.MockTransport:
     """Create a mock transport that routes by method+path."""
     table = responses or {}
 
-    def handler(request: httpx.Request) -> httpx.Response:
+    def handler(request: httpx2.Request) -> httpx2.Response:
         key = f"{request.method} {request.url.path}"
         if key in table:
             return table[key]
-        return httpx.Response(404, json={"error": "not found"})
+        return httpx2.Response(404, json={"error": "not found"})
 
-    return httpx.MockTransport(handler)
+    return httpx2.MockTransport(handler)
 
 
-def _json_response(data: dict, status: int = 200) -> httpx.Response:
-    return httpx.Response(status, json=data)
+def _json_response(data: dict, status: int = 200) -> httpx2.Response:
+    return httpx2.Response(status, json=data)
 
 
 # ---------------------------------------------------------------------------
@@ -44,7 +44,7 @@ async def test_list_workstreams():
             )
         }
     )
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as hc:
+    async with httpx2.AsyncClient(transport=transport, base_url="http://test") as hc:
         client = AsyncTurnstoneServer(httpx_client=hc)
         resp = await client.list_workstreams()
         assert len(resp.workstreams) == 1
@@ -77,7 +77,7 @@ async def test_dashboard():
             )
         }
     )
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as hc:
+    async with httpx2.AsyncClient(transport=transport, base_url="http://test") as hc:
         client = AsyncTurnstoneServer(httpx_client=hc)
         resp = await client.dashboard()
         assert resp.aggregate.total_tokens == 100
@@ -89,7 +89,7 @@ async def test_create_workstream():
     transport = _mock_transport(
         {"POST /v1/api/workstreams/new": _json_response({"ws_id": "ws_new", "name": "Analysis"})}
     )
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as hc:
+    async with httpx2.AsyncClient(transport=transport, base_url="http://test") as hc:
         client = AsyncTurnstoneServer(httpx_client=hc)
         resp = await client.create_workstream(name="Analysis")
         assert resp.ws_id == "ws_new"
@@ -100,12 +100,12 @@ async def test_create_workstream():
 async def test_create_workstream_forwards_structured_notify_targets():
     captured: dict = {}
 
-    def handler(request: httpx.Request) -> httpx.Response:
+    def handler(request: httpx2.Request) -> httpx2.Response:
         captured.update(json.loads(request.content))
         return _json_response({"ws_id": "ws_new", "name": "Analysis"})
 
-    transport = httpx.MockTransport(handler)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as hc:
+    transport = httpx2.MockTransport(handler)
+    async with httpx2.AsyncClient(transport=transport, base_url="http://test") as hc:
         client = AsyncTurnstoneServer(httpx_client=hc)
         await client.create_workstream(
             name="Analysis",
@@ -120,7 +120,7 @@ async def test_close_workstream():
     transport = _mock_transport(
         {"POST /v1/api/workstreams/ws1/close": _json_response({"status": "ok"})}
     )
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as hc:
+    async with httpx2.AsyncClient(transport=transport, base_url="http://test") as hc:
         client = AsyncTurnstoneServer(httpx_client=hc)
         resp = await client.close_workstream("ws1")
         assert resp.status == "ok"
@@ -136,13 +136,13 @@ async def test_close_workstream_sends_valid_json_body():
     object."""
     captured: dict = {}
 
-    def handler(request: httpx.Request) -> httpx.Response:
+    def handler(request: httpx2.Request) -> httpx2.Response:
         captured["content"] = bytes(request.content)
         captured["body"] = json.loads(request.content) if request.content else None
-        return httpx.Response(200, json={"status": "ok"})
+        return httpx2.Response(200, json={"status": "ok"})
 
-    transport = httpx.MockTransport(handler)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as hc:
+    transport = httpx2.MockTransport(handler)
+    async with httpx2.AsyncClient(transport=transport, base_url="http://test") as hc:
         client = AsyncTurnstoneServer(httpx_client=hc)
         # Default call (no reason) — body must still be valid JSON.
         await client.close_workstream("ws1")
@@ -160,13 +160,13 @@ async def test_rewind_sends_turns_body():
     (feedback_mock_transport_body_inspection)."""
     captured: dict = {}
 
-    def handler(request: httpx.Request) -> httpx.Response:
+    def handler(request: httpx2.Request) -> httpx2.Response:
         captured["path"] = request.url.path
         captured["body"] = json.loads(request.content) if request.content else None
-        return httpx.Response(200, json={"status": "ok", "removed": 4})
+        return httpx2.Response(200, json={"status": "ok", "removed": 4})
 
-    transport = httpx.MockTransport(handler)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as hc:
+    transport = httpx2.MockTransport(handler)
+    async with httpx2.AsyncClient(transport=transport, base_url="http://test") as hc:
         client = AsyncTurnstoneServer(httpx_client=hc)
         resp = await client.rewind("ws1", turns=2)
         assert captured["path"] == "/v1/api/workstreams/ws1/rewind"
@@ -179,7 +179,7 @@ async def test_retry_posts_to_path_keyed_endpoint():
     transport = _mock_transport(
         {"POST /v1/api/workstreams/ws1/retry": _json_response({"status": "ok", "retried": True})}
     )
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as hc:
+    async with httpx2.AsyncClient(transport=transport, base_url="http://test") as hc:
         client = AsyncTurnstoneServer(httpx_client=hc)
         resp = await client.retry("ws1")
         assert resp.status == "ok"
@@ -195,7 +195,7 @@ async def test_send():
     transport = _mock_transport(
         {"POST /v1/api/workstreams/ws1/send": _json_response({"status": "ok"})}
     )
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as hc:
+    async with httpx2.AsyncClient(transport=transport, base_url="http://test") as hc:
         client = AsyncTurnstoneServer(httpx_client=hc)
         resp = await client.send("Hello", "ws1")
         assert resp.status == "ok"
@@ -205,12 +205,12 @@ async def test_send():
 async def test_send_threads_client_send_id_without_idempotency_semantics():
     captured: dict = {}
 
-    def handler(request: httpx.Request) -> httpx.Response:
+    def handler(request: httpx2.Request) -> httpx2.Response:
         captured.update(json.loads(request.content))
-        return httpx.Response(200, json={"status": "ok"})
+        return httpx2.Response(200, json={"status": "ok"})
 
-    async with httpx.AsyncClient(
-        transport=httpx.MockTransport(handler), base_url="http://test"
+    async with httpx2.AsyncClient(
+        transport=httpx2.MockTransport(handler), base_url="http://test"
     ) as hc:
         client = AsyncTurnstoneServer(httpx_client=hc)
         await client.send("Hello", "ws1", client_send_id="browser-send_1")
@@ -227,7 +227,7 @@ async def test_approve():
             )
         }
     )
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as hc:
+    async with httpx2.AsyncClient(transport=transport, base_url="http://test") as hc:
         client = AsyncTurnstoneServer(httpx_client=hc)
         resp = await client.approve(ws_id="ws1", approved=True, feedback="looks good")
         assert resp.status == "ok"
@@ -243,7 +243,7 @@ async def test_cancel_preserves_dropped_snapshot():
             )
         }
     )
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as hc:
+    async with httpx2.AsyncClient(transport=transport, base_url="http://test") as hc:
         client = AsyncTurnstoneServer(httpx_client=hc)
         resp = await client.cancel("ws1")
         assert resp.status == "cancelled"
@@ -253,7 +253,7 @@ async def test_cancel_preserves_dropped_snapshot():
 @pytest.mark.anyio
 async def test_command():
     transport = _mock_transport({"POST /v1/api/command": _json_response({"status": "ok"})})
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as hc:
+    async with httpx2.AsyncClient(transport=transport, base_url="http://test") as hc:
         client = AsyncTurnstoneServer(httpx_client=hc)
         resp = await client.command(ws_id="ws1", command="/clear")
         assert resp.status == "ok"
@@ -268,7 +268,7 @@ async def test_command():
 async def test_get_history_preserves_handoff_fields_and_limit():
     captured: dict[str, str] = {}
 
-    def handler(request: httpx.Request) -> httpx.Response:
+    def handler(request: httpx2.Request) -> httpx2.Response:
         captured["path"] = request.url.path
         captured["limit"] = request.url.params["limit"]
         return _json_response(
@@ -283,8 +283,8 @@ async def test_get_history_preserves_handoff_fields_and_limit():
             }
         )
 
-    transport = httpx.MockTransport(handler)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as hc:
+    transport = httpx2.MockTransport(handler)
+    async with httpx2.AsyncClient(transport=transport, base_url="http://test") as hc:
         client = AsyncTurnstoneServer(httpx_client=hc)
         resp = await client.get_history("ws1", limit=42)
 
@@ -325,7 +325,7 @@ async def test_list_saved_workstreams():
             )
         }
     )
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as hc:
+    async with httpx2.AsyncClient(transport=transport, base_url="http://test") as hc:
         client = AsyncTurnstoneServer(httpx_client=hc)
         resp = await client.list_saved_workstreams()
         assert len(resp.workstreams) == 1
@@ -344,14 +344,14 @@ async def test_list_saved_workstreams():
 
 @pytest.mark.anyio
 async def test_list_saved_workstreams_sends_page_search_and_sort():
-    seen: list[httpx.URL] = []
+    seen: list[httpx2.URL] = []
 
-    def handler(request: httpx.Request) -> httpx.Response:
+    def handler(request: httpx2.Request) -> httpx2.Response:
         seen.append(request.url)
-        return httpx.Response(200, json={"workstreams": [], "total": 0, "limit": 20, "offset": 40})
+        return httpx2.Response(200, json={"workstreams": [], "total": 0, "limit": 20, "offset": 40})
 
-    transport = httpx.MockTransport(handler)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as hc:
+    transport = httpx2.MockTransport(handler)
+    async with httpx2.AsyncClient(transport=transport, base_url="http://test") as hc:
         client = AsyncTurnstoneServer(httpx_client=hc)
         await client.list_saved_workstreams(
             limit=20, offset=40, search="notes", sort="name", order="asc"
@@ -374,7 +374,7 @@ async def test_list_saved_workstreams_reads_a_server_older_than_paging():
     transport = _mock_transport(
         {"GET /v1/api/workstreams/saved": _json_response({"workstreams": [row]})}
     )
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as hc:
+    async with httpx2.AsyncClient(transport=transport, base_url="http://test") as hc:
         resp = await AsyncTurnstoneServer(httpx_client=hc).list_saved_workstreams()
     assert [ws.ws_id for ws in resp.workstreams] == ["s1"]
     assert (resp.total, resp.limit, resp.offset) == (0, 0, 0)
@@ -391,7 +391,7 @@ async def test_login():
     transport = _mock_transport(
         {"POST /v1/api/auth/login": _json_response({"status": "ok", "role": "full"})}
     )
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as hc:
+    async with httpx2.AsyncClient(transport=transport, base_url="http://test") as hc:
         client = AsyncTurnstoneServer(httpx_client=hc)
         resp = await client.login("test_token")
         assert resp.role == "full"
@@ -400,7 +400,7 @@ async def test_login():
 @pytest.mark.anyio
 async def test_logout():
     transport = _mock_transport({"POST /v1/api/auth/logout": _json_response({"status": "ok"})})
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as hc:
+    async with httpx2.AsyncClient(transport=transport, base_url="http://test") as hc:
         client = AsyncTurnstoneServer(httpx_client=hc)
         resp = await client.logout()
         assert resp.status == "ok"
@@ -415,7 +415,7 @@ async def test_logout():
 async def test_save_memory_requires_and_sends_description():
     captured: dict = {}
 
-    def handler(request: httpx.Request) -> httpx.Response:
+    def handler(request: httpx2.Request) -> httpx2.Response:
         captured.update(json.loads(request.content))
         return _json_response(
             {
@@ -432,8 +432,8 @@ async def test_save_memory_requires_and_sends_description():
             status=201,
         )
 
-    transport = httpx.MockTransport(handler)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as hc:
+    transport = httpx2.MockTransport(handler)
+    async with httpx2.AsyncClient(transport=transport, base_url="http://test") as hc:
         client = AsyncTurnstoneServer(httpx_client=hc)
         memory = await client.save_memory(
             "deployment_process",
@@ -450,7 +450,7 @@ async def test_save_memory_requires_and_sends_description():
 async def test_save_memory_explicit_general_type_is_sent():
     captured: dict[str, object] = {}
 
-    def handler(request: httpx.Request) -> httpx.Response:
+    def handler(request: httpx2.Request) -> httpx2.Response:
         captured.update(json.loads(request.content))
         return _json_response(
             {
@@ -465,8 +465,8 @@ async def test_save_memory_explicit_general_type_is_sent():
             }
         )
 
-    transport = httpx.MockTransport(handler)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as hc:
+    transport = httpx2.MockTransport(handler)
+    async with httpx2.AsyncClient(transport=transport, base_url="http://test") as hc:
         client = AsyncTurnstoneServer(httpx_client=hc)
         memory = await client.save_memory(
             "deployment_process",
@@ -482,11 +482,11 @@ async def test_save_memory_explicit_general_type_is_sent():
 @pytest.mark.anyio
 @pytest.mark.parametrize("description", [None, "", "   "])
 async def test_save_memory_rejects_empty_description(description):
-    def unexpected_request(_request: httpx.Request) -> httpx.Response:
+    def unexpected_request(_request: httpx2.Request) -> httpx2.Response:
         raise AssertionError("invalid memory must not reach the server")
 
-    transport = httpx.MockTransport(unexpected_request)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as hc:
+    transport = httpx2.MockTransport(unexpected_request)
+    async with httpx2.AsyncClient(transport=transport, base_url="http://test") as hc:
         client = AsyncTurnstoneServer(httpx_client=hc)
         with pytest.raises(ValueError, match="description is required"):
             await client.save_memory(
@@ -498,11 +498,11 @@ async def test_save_memory_rejects_empty_description(description):
 
 @pytest.mark.anyio
 async def test_save_memory_rejects_overlong_description_without_request():
-    def unexpected_request(_request: httpx.Request) -> httpx.Response:
+    def unexpected_request(_request: httpx2.Request) -> httpx2.Response:
         raise AssertionError("invalid memory must not reach the server")
 
-    transport = httpx.MockTransport(unexpected_request)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as hc:
+    transport = httpx2.MockTransport(unexpected_request)
+    async with httpx2.AsyncClient(transport=transport, base_url="http://test") as hc:
         client = AsyncTurnstoneServer(httpx_client=hc)
         with pytest.raises(ValueError, match="512"):
             await client.save_memory(
@@ -514,9 +514,9 @@ async def test_save_memory_rejects_overlong_description_without_request():
 
 @pytest.mark.anyio
 async def test_get_memory_fetches_exact_body_with_scope():
-    captured: list[httpx.Request] = []
+    captured: list[httpx2.Request] = []
 
-    def handler(request: httpx.Request) -> httpx.Response:
+    def handler(request: httpx2.Request) -> httpx2.Response:
         captured.append(request)
         return _json_response(
             {
@@ -534,8 +534,8 @@ async def test_get_memory_fetches_exact_body_with_scope():
             }
         )
 
-    transport = httpx.MockTransport(handler)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as hc:
+    transport = httpx2.MockTransport(handler)
+    async with httpx2.AsyncClient(transport=transport, base_url="http://test") as hc:
         client = AsyncTurnstoneServer(httpx_client=hc)
         memory = await client.get_memory(
             "deployment_process",
@@ -553,9 +553,9 @@ async def test_get_memory_fetches_exact_body_with_scope():
 
 @pytest.mark.anyio
 async def test_memory_name_path_segments_are_percent_encoded():
-    captured: list[httpx.Request] = []
+    captured: list[httpx2.Request] = []
 
-    def handler(request: httpx.Request) -> httpx.Response:
+    def handler(request: httpx2.Request) -> httpx2.Response:
         captured.append(request)
         if request.method == "DELETE":
             return _json_response({"status": "ok"})
@@ -575,8 +575,8 @@ async def test_memory_name_path_segments_are_percent_encoded():
             }
         )
 
-    transport = httpx.MockTransport(handler)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as hc:
+    transport = httpx2.MockTransport(handler)
+    async with httpx2.AsyncClient(transport=transport, base_url="http://test") as hc:
         client = AsyncTurnstoneServer(httpx_client=hc)
         await client.get_memory("café/name?#")
         await client.delete_memory("café/name?#")
@@ -605,7 +605,7 @@ async def test_health():
             )
         }
     )
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as hc:
+    async with httpx2.AsyncClient(transport=transport, base_url="http://test") as hc:
         client = AsyncTurnstoneServer(httpx_client=hc)
         resp = await client.health()
         assert resp.status == "ok"
@@ -621,12 +621,12 @@ async def test_health():
 async def test_api_error_raised():
     transport = _mock_transport(
         {
-            "POST /v1/api/workstreams/bad_ws/send": httpx.Response(
+            "POST /v1/api/workstreams/bad_ws/send": httpx2.Response(
                 404, json={"error": "Unknown workstream"}
             )
         }
     )
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as hc:
+    async with httpx2.AsyncClient(transport=transport, base_url="http://test") as hc:
         client = AsyncTurnstoneServer(httpx_client=hc)
         with pytest.raises(TurnstoneAPIError) as exc_info:
             await client.send("hi", "bad_ws")
@@ -639,7 +639,7 @@ async def test_api_error_raised():
 async def test_api_error_carries_the_body_code():
     transport = _mock_transport(
         {
-            "POST /v1/api/workstreams/new": httpx.Response(
+            "POST /v1/api/workstreams/new": httpx2.Response(
                 503,
                 json={
                     "error": "The default model 'x' isn't loaded",
@@ -649,7 +649,7 @@ async def test_api_error_carries_the_body_code():
             )
         }
     )
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as hc:
+    async with httpx2.AsyncClient(transport=transport, base_url="http://test") as hc:
         client = AsyncTurnstoneServer(httpx_client=hc)
         with pytest.raises(TurnstoneAPIError) as exc_info:
             await client.create_workstream(name="w")
@@ -662,12 +662,12 @@ async def test_api_error_carries_the_body_code():
 async def test_api_error_ignores_a_non_string_code():
     transport = _mock_transport(
         {
-            "POST /v1/api/workstreams/new": httpx.Response(
+            "POST /v1/api/workstreams/new": httpx2.Response(
                 503, json={"error": "boom", "code": {"nested": True}}
             )
         }
     )
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as hc:
+    async with httpx2.AsyncClient(transport=transport, base_url="http://test") as hc:
         client = AsyncTurnstoneServer(httpx_client=hc)
         with pytest.raises(TurnstoneAPIError) as exc_info:
             await client.create_workstream(name="w")
@@ -679,12 +679,12 @@ async def test_auth_header_injected():
     """Verify the Authorization header is set when a token is provided."""
     captured_headers: dict[str, str] = {}
 
-    def handler(request: httpx.Request) -> httpx.Response:
+    def handler(request: httpx2.Request) -> httpx2.Response:
         captured_headers.update(dict(request.headers))
-        return httpx.Response(200, json={"workstreams": []})
+        return httpx2.Response(200, json={"workstreams": []})
 
-    transport = httpx.MockTransport(handler)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as hc:
+    transport = httpx2.MockTransport(handler)
+    async with httpx2.AsyncClient(transport=transport, base_url="http://test") as hc:
         # Manually set auth header since we're injecting the client
         hc.headers["Authorization"] = "Bearer tok_test"
         client = AsyncTurnstoneServer(httpx_client=hc)
@@ -697,12 +697,12 @@ async def test_request_body_correct():
     """Verify POST requests send the correct JSON body."""
     captured_body: dict = {}
 
-    def handler(request: httpx.Request) -> httpx.Response:
+    def handler(request: httpx2.Request) -> httpx2.Response:
         captured_body.update(json.loads(request.content))
-        return httpx.Response(200, json={"status": "ok"})
+        return httpx2.Response(200, json={"status": "ok"})
 
-    transport = httpx.MockTransport(handler)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as hc:
+    transport = httpx2.MockTransport(handler)
+    async with httpx2.AsyncClient(transport=transport, base_url="http://test") as hc:
         client = AsyncTurnstoneServer(httpx_client=hc)
         await client.send("Hello world", "ws_123")
         assert captured_body == {"message": "Hello world"}
@@ -718,12 +718,12 @@ async def test_create_workstream_extended_params():
     """New optional params appear in JSON body only when non-empty."""
     captured_body: dict = {}
 
-    def handler(request: httpx.Request) -> httpx.Response:
+    def handler(request: httpx2.Request) -> httpx2.Response:
         captured_body.update(json.loads(request.content))
-        return httpx.Response(200, json={"ws_id": "ws_ext", "name": "ext"})
+        return httpx2.Response(200, json={"ws_id": "ws_ext", "name": "ext"})
 
-    transport = httpx.MockTransport(handler)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as hc:
+    transport = httpx2.MockTransport(handler)
+    async with httpx2.AsyncClient(transport=transport, base_url="http://test") as hc:
         client = AsyncTurnstoneServer(httpx_client=hc)
         await client.create_workstream(
             name="ext",
@@ -750,12 +750,12 @@ async def test_create_workstream_omits_empty_params():
     """Empty-string params should NOT appear in the JSON body."""
     captured_body: dict = {}
 
-    def handler(request: httpx.Request) -> httpx.Response:
+    def handler(request: httpx2.Request) -> httpx2.Response:
         captured_body.update(json.loads(request.content))
-        return httpx.Response(200, json={"ws_id": "ws_min", "name": "min"})
+        return httpx2.Response(200, json={"ws_id": "ws_min", "name": "min"})
 
-    transport = httpx.MockTransport(handler)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as hc:
+    transport = httpx2.MockTransport(handler)
+    async with httpx2.AsyncClient(transport=transport, base_url="http://test") as hc:
         client = AsyncTurnstoneServer(httpx_client=hc)
         await client.create_workstream(name="min")
         assert captured_body == {"name": "min"}
@@ -766,3 +766,11 @@ async def test_create_workstream_omits_empty_params():
         assert "ws_id" not in captured_body
         assert "persona" not in captured_body
         assert "project_id" not in captured_body
+
+
+def test_an_injected_client_must_be_an_httpx2_async_client():
+    # Anything but an httpx2.AsyncClient, such as the httpx client the SDK took before 1.9.
+    with httpx2.Client() as sync_client:
+        for client in (sync_client, object()):
+            with pytest.raises(TypeError, match=r"must be an httpx2\.AsyncClient, not "):
+                AsyncTurnstoneServer(httpx_client=client)

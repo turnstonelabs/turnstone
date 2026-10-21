@@ -271,25 +271,25 @@ class TestServerSaveMemory:
         self,
         server_client: TestClient,
     ) -> None:
-        import httpx
+        import httpx2
 
         from turnstone.sdk.server import AsyncTurnstoneServer
 
-        def forward(request: httpx.Request) -> httpx.Response:
+        def forward(request: httpx2.Request) -> httpx2.Response:
             response = server_client.request(
                 request.method,
                 request.url.raw_path.decode(),
                 content=request.content,
                 headers={"content-type": request.headers.get("content-type", "")},
             )
-            return httpx.Response(
+            return httpx2.Response(
                 response.status_code,
                 content=response.content,
                 headers={"content-type": response.headers.get("content-type", "")},
             )
 
-        transport = httpx.MockTransport(forward)
-        async with httpx.AsyncClient(transport=transport, base_url="http://test") as http:
+        transport = httpx2.MockTransport(forward)
+        async with httpx2.AsyncClient(transport=transport, base_url="http://test") as http:
             sdk = AsyncTurnstoneServer(httpx_client=http)
             created = await sdk.save_memory(
                 "typed_note",

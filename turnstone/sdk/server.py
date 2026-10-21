@@ -58,7 +58,7 @@ from turnstone.sdk.events import (
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Callable, Iterator
 
-    import httpx
+    import httpx2
 
 
 class AsyncTurnstoneServer(_BaseClient):
@@ -69,7 +69,7 @@ class AsyncTurnstoneServer(_BaseClient):
         base_url: str = "http://localhost:8080",
         token: str = "",
         timeout: float = 30.0,
-        httpx_client: httpx.AsyncClient | None = None,
+        httpx_client: httpx2.AsyncClient | None = None,
         ca_cert: str | None = None,
         client_cert: str | None = None,
         client_key: str | None = None,

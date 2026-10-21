@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-import httpx
+import httpx2
 import pytest
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
@@ -123,8 +123,8 @@ async def sdk_client(storage: SQLiteBackend):
     """SDK client wired to a real Starlette app via ASGITransport."""
     app = _make_app()
     app.state.auth_storage = storage
-    transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as hc:
+    transport = httpx2.ASGITransport(app=app)
+    async with httpx2.AsyncClient(transport=transport, base_url="http://testserver") as hc:
         yield AsyncTurnstoneConsole(httpx_client=hc)
 
 

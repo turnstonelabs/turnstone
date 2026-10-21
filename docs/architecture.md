@@ -87,7 +87,7 @@ turnstone/
     server.py         AsyncTurnstoneServer + TurnstoneServer (HTTP client)
     console.py        AsyncTurnstoneConsole + TurnstoneConsole (HTTP client)
     events.py         SSE event dataclasses with type registry
-    _base.py          Shared httpx async client, auth, error handling
+    _base.py          Shared httpx2 async client, auth, error handling
     _sync.py          Background event loop for sync wrappers
     _types.py         TurnResult + TurnstoneAPIError
   console/
@@ -2691,7 +2691,7 @@ typed event dataclasses.
 - `TurnstoneServer` / `AsyncTurnstoneServer` — server API (workstreams, chat, streaming)
 - `TurnstoneConsole` / `AsyncTurnstoneConsole` — console API (cluster overview, nodes, workstreams)
 
-**Design**: async-first with thin sync wrappers. `_BaseClient` provides httpx
+**Design**: async-first with thin sync wrappers. `_BaseClient` provides httpx2
 setup, auth headers, `_request()` (REST) and `_stream_sse()` (SSE). Sync
 clients delegate through `_SyncRunner` which maintains a persistent background
 event loop on a daemon thread.

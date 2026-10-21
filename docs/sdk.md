@@ -449,7 +449,7 @@ const client = new TurnstoneServer({
 
 ```
 turnstone/sdk/               Python SDK (sub-package)
-  _base.py                   Shared httpx async client, auth, error handling
+  _base.py                   Shared httpx2 async client, auth, error handling
   _sync.py                   Background event loop for sync wrappers
   _types.py                  TurnResult + TurnstoneAPIError
   events.py                  Typed SSE event dataclasses with type registry

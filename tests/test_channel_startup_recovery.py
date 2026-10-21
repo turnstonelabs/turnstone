@@ -6,7 +6,7 @@ import asyncio
 from collections import Counter
 from unittest.mock import AsyncMock, MagicMock, patch
 
-import httpx
+import httpx2
 import pytest
 
 from turnstone.channels._routing import ChannelRouter
@@ -56,20 +56,20 @@ async def test_startup_only_subscribes_live_routes_and_retains_inactive_associat
         assert request.method == "GET" and request.url.path == "/v1/api/workstreams"
         list_calls += 1
         if state == "unavailable":
-            return httpx.Response(503, json={"error": "node unavailable"})
+            return httpx2.Response(503, json={"error": "node unavailable"})
         workstreams = []
         if state == "live":
             workstreams = [
                 {"ws_id": "ws-0", "name": "live", "state": "idle"},
                 {"ws_id": "ws-1", "name": "pending", "state": "creating"},
             ]
-        return httpx.Response(200, json={"workstreams": workstreams})
+        return httpx2.Response(200, json={"workstreams": workstreams})
 
     router = ChannelRouter("http://server.example", db)
     await router.aclose()
     bot.router = router
-    async with httpx.AsyncClient(
-        transport=httpx.MockTransport(handler), base_url="http://server.example"
+    async with httpx2.AsyncClient(
+        transport=httpx2.MockTransport(handler), base_url="http://server.example"
     ) as http:
         router._server = AsyncTurnstoneServer(httpx_client=http)
         try:

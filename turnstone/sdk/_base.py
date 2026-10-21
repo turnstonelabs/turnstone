@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import contextlib
 import json
+import os
+import ssl
 from typing import TYPE_CHECKING, Any, Self, TypeVar, overload
 
-import httpx
+import httpx2
 
+from turnstone.core.sse_limits import MAX_SSE_EVENT_SIZE
 from turnstone.sdk._types import TurnstoneAPIError
 
 if TYPE_CHECKING:
@@ -16,7 +19,26 @@ if TYPE_CHECKING:
 T = TypeVar("T")
 
 
-def _error_fields(resp: httpx.Response) -> tuple[str, str]:
+def _tls_context(
+    ca_cert: str | None, client_cert: str | None, client_key: str | None
+) -> ssl.SSLContext:
+    """One TLS context holding the CAs to trust and the client certificate to present.
+
+    httpx2 takes these only as a context: it deprecates a CA path and a ``cert`` pair, and refuses
+    the two together. Without *ca_cert* the context trusts what httpx2 trusts by default.
+    """
+    if ca_cert and os.path.isdir(ca_cert):
+        ctx = ssl.create_default_context(capath=ca_cert)
+    elif ca_cert:
+        ctx = ssl.create_default_context(cafile=ca_cert)
+    else:
+        ctx = httpx2.create_ssl_context()
+    if client_cert:
+        ctx.load_cert_chain(client_cert, client_key)
+    return ctx
+
+
+def _error_fields(resp: httpx2.Response) -> tuple[str, str]:
     """``(message, code)`` for a non-2xx response.
 
     The message is the JSON body's ``error`` (or ``detail``), else the first 200
@@ -42,7 +64,7 @@ class _BaseClient:
         base_url: str = "http://localhost:8080",
         token: str = "",
         timeout: float = 30.0,
-        httpx_client: httpx.AsyncClient | None = None,
+        httpx_client: httpx2.AsyncClient | None = None,
         ca_cert: str | None = None,
         client_cert: str | None = None,
         client_key: str | None = None,
@@ -50,9 +72,11 @@ class _BaseClient:
     ) -> None:
         """Initialise the client.
 
-        When *httpx_client* is provided it is used directly and all other
-        params are ignored — configure headers, base URL, and TLS on the
-        injected client instead.
+        When *httpx_client* (an ``httpx2.AsyncClient``) is provided it is
+        used directly: *base_url*, *token*, *timeout* and the TLS arguments
+        are ignored, so configure them on the injected client instead.
+        *token_factory* still applies, adding each request's
+        ``Authorization`` header.
 
         *token_factory* is called before each request to get the current
         auth token.  Use this with :class:`ServiceTokenManager` for
@@ -64,30 +88,41 @@ class _BaseClient:
         A static *token* string is set once at construction.  If both
         *token* and *token_factory* are provided, *token_factory* wins.
 
-        For mTLS, pass *ca_cert* (CA bundle path), *client_cert* and
-        *client_key* (client certificate + key paths).
+        For mTLS, pass *ca_cert* (a CA bundle file, or an OpenSSL CA directory whose entries are
+        named by subject hash, as ``openssl rehash`` leaves them), *client_cert* and *client_key*
+        (client certificate + key paths). They are loaded into one TLS context here, so a file that
+        can't be read fails construction. OpenSSL reads a directory only when a handshake first
+        needs one of its CAs, and the context keeps what it loaded, so a directory that was never
+        hashed fails every request and a later change to it may not reach this client.
         """
         self._token_factory = token_factory
         headers: dict[str, str] = {}
         if token and not token_factory:
             headers["Authorization"] = f"Bearer {token}"
         if httpx_client is not None:
+            # Refused here rather than at the first request: a client from another library (the
+            # httpx library, which Turnstone used before 1.9) would otherwise fail later,
+            # mid-request or mid-stream, with errors that don't name the cause.
+            if not isinstance(httpx_client, httpx2.AsyncClient):
+                kind = type(httpx_client)
+                raise TypeError(
+                    "httpx_client must be an httpx2.AsyncClient, not "
+                    f"{kind.__module__}.{kind.__qualname__}"
+                )
             self._client = httpx_client
             self._owns_client = False
         else:
-            tls_kwargs: dict[str, Any] = {}
-            if ca_cert:
-                tls_kwargs["verify"] = ca_cert
-            if client_cert or client_key:
-                if not (client_cert and client_key):
-                    raise ValueError("Both client_cert and client_key must be provided for mTLS")
-                tls_kwargs["cert"] = (client_cert, client_key)
-            self._client = httpx.AsyncClient(
+            if (client_cert or client_key) and not (client_cert and client_key):
+                raise ValueError("Both client_cert and client_key must be provided for mTLS")
+            verify: ssl.SSLContext | bool = True
+            if ca_cert or client_cert:
+                verify = _tls_context(ca_cert, client_cert, client_key)
+            self._client = httpx2.AsyncClient(
                 base_url=base_url,
                 timeout=timeout,
                 headers=headers,
                 follow_redirects=True,
-                **tls_kwargs,
+                verify=verify,
             )
             self._owns_client = True
 
@@ -103,7 +138,7 @@ class _BaseClient:
         params: dict[str, Any] | None = ...,
         files: list[tuple[str, tuple[str, bytes, str]]] | None = ...,
         data: dict[str, Any] | None = ...,
-        timeout: httpx.Timeout | None = ...,
+        timeout: httpx2.Timeout | None = ...,
         response_model: type[T],
     ) -> T: ...
 
@@ -117,7 +152,7 @@ class _BaseClient:
         params: dict[str, Any] | None = ...,
         files: list[tuple[str, tuple[str, bytes, str]]] | None = ...,
         data: dict[str, Any] | None = ...,
-        timeout: httpx.Timeout | None = ...,
+        timeout: httpx2.Timeout | None = ...,
         response_model: None = ...,
     ) -> dict[str, Any]: ...
 
@@ -130,7 +165,7 @@ class _BaseClient:
         params: dict[str, Any] | None = None,
         files: list[tuple[str, tuple[str, bytes, str]]] | None = None,
         data: dict[str, Any] | None = None,
-        timeout: httpx.Timeout | None = None,
+        timeout: httpx2.Timeout | None = None,
         response_model: type[Any] | None = None,
     ) -> Any:
         """Execute an HTTP request and return parsed response data.
@@ -142,12 +177,12 @@ class _BaseClient:
         None keeps the client's.  Raises :class:`TurnstoneAPIError` on
         non-2xx responses.
         """
-        limits = httpx.USE_CLIENT_DEFAULT if timeout is None else timeout
+        limits = httpx2.USE_CLIENT_DEFAULT if timeout is None else timeout
         headers: dict[str, str] | None = None
         if self._token_factory is not None:
             headers = {"Authorization": f"Bearer {self._token_factory()}"}
         if files is not None:
-            # httpx infers multipart from the files= kwarg and sets the
+            # httpx2 infers multipart from the files= kwarg and sets the
             # Content-Type + boundary itself; do not pass json= alongside.
             resp = await self._client.request(
                 method,
@@ -205,15 +240,15 @@ class _BaseClient:
         params: dict[str, Any] | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
         """Open an SSE stream and yield parsed JSON dicts."""
-        from httpx_sse import aconnect_sse
-
         sse_kwargs: dict[str, Any] = {}
         if params:
             sse_kwargs["params"] = params
         if self._token_factory is not None:
             sse_kwargs["headers"] = {"Authorization": f"Bearer {self._token_factory()}"}
-        async with aconnect_sse(self._client, "GET", path, **sse_kwargs) as source:
-            async for sse in source.aiter_sse():
+        async with self._client.sse(
+            path, max_event_size=MAX_SSE_EVENT_SIZE, **sse_kwargs
+        ) as source:
+            async for sse in source:
                 if sse.data:
                     with contextlib.suppress(json.JSONDecodeError):
                         yield json.loads(sse.data)

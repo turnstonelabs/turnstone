@@ -18,7 +18,7 @@ from datetime import UTC, datetime, timedelta
 from enum import Enum
 from typing import TYPE_CHECKING, Any
 
-import httpx
+import httpx2
 import structlog
 
 from turnstone.console.schedule_timing import TS_FMT, compute_next_run, no_next_run_reason
@@ -36,16 +36,19 @@ log = structlog.get_logger(__name__)
 # scheduler_lock row: one JSON object, task id to hold.
 _HOLDS_KEY = "scheduler_holds"
 
-# Raised before the request is sent, so nothing reached the node: a
-# connection that never opened, a pool or proxy that refused it, a URL httpx
-# will not send to.  A failure after sending may have made the workstream.
+# Raised before the request is sent, so nothing reached the node: a connection that never opened, a
+# pool or proxy that refused it, a URL httpx2 will not send to.  A failure after sending may have
+# made the workstream.  The SDK client follows redirects, so these also come from the hop after a
+# 3xx, and still mean nothing was made: Turnstone's create handler never redirects, so a 3xx comes
+# from something in front of the node, such as an http-to-https proxy, that didn't run the create.
+# Retrying is right there, and a test pins it.
 _NEVER_SENT = (
-    httpx.ConnectError,
-    httpx.ConnectTimeout,
-    httpx.PoolTimeout,
-    httpx.ProxyError,
-    httpx.UnsupportedProtocol,
-    httpx.InvalidURL,
+    httpx2.ConnectError,
+    httpx2.ConnectTimeout,
+    httpx2.PoolTimeout,
+    httpx2.ProxyError,
+    httpx2.UnsupportedProtocol,
+    httpx2.InvalidURL,
 )
 
 
@@ -516,7 +519,7 @@ class TaskScheduler:
         try:
             client = self._get_sdk_client(server_url)
         except Exception as exc:
-            # A URL httpx will not take, or a token that will not mint:
+            # A URL httpx2 will not take, or a token that will not mint:
             # nothing was sent.  Classified rather than raised, so a fan-out
             # keeps the nodes that already created their workstream.
             log.warning("scheduler.sdk_client_failed", node_id=node_id, exc_info=True)

@@ -6,7 +6,6 @@ import asyncio
 import json
 from unittest.mock import AsyncMock, MagicMock
 
-import httpx
 import httpx2
 import pytest
 
@@ -112,20 +111,13 @@ async def test_retained_channel_cannot_adopt_another_users_workstream(app_client
                 assert storage.get_workstream(source) is not None
                 install_alias()
 
-    async with (
-        httpx.AsyncClient(
-            transport=httpx.ASGITransport(app=client.app),
-            base_url="http://server.example",
-            headers=service,
-            event_hooks={"request": [before_request]},
-        ) as http,
-        httpx2.AsyncClient(
-            transport=httpx2.ASGITransport(app=client.app), headers=service
-        ) as stream_http,
-    ):
-        # The SDK client is httpx; the bot's own client, used for the SSE stream, is httpx2.
-        bot._http_client = stream_http
-        bot.router._server = AsyncTurnstoneServer(httpx_client=http)
+    async with httpx2.AsyncClient(
+        transport=httpx2.ASGITransport(app=client.app),
+        base_url="http://server.example",
+        headers=service,
+        event_hooks={"request": [before_request]},
+    ) as http:
+        bot._http_client, bot.router._server = http, AsyncTurnstoneServer(httpx_client=http)
         try:
             await asyncio.wait_for(bot._sse_listener(source, thread), 2)
             assert storage.get_channel_route("discord", "555")["ws_id"] == source

@@ -10,13 +10,15 @@ import asyncio
 import itertools
 import json
 import logging
+import socket
 from typing import TYPE_CHECKING
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import httpx2
 import pytest
 
 from turnstone.channels import _sse
+from turnstone.channels._routing import ChannelRouter
 from turnstone.core.sse_limits import MAX_SSE_EVENT_SIZE
 
 if TYPE_CHECKING:
@@ -321,3 +323,48 @@ class TestTransportErrors:
         assert any(logged in r.getMessage() for r in caplog.records)
         assert len(node.requests) == 2
         assert _fast_sleep == [_sse.SSE_RECONNECT_DELAY]
+
+    def test_a_console_lookup_that_cannot_connect_is_a_connect_failure(
+        self, _fast_sleep, caplog, monkeypatch
+    ):
+        """The router resolves the node through the console SDK on every attempt, so the
+        errors the SDK raises must be the ones this loop names."""
+        # A loopback port nothing listens on: the SDK's real transport refuses the lookup.
+        for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"):
+            monkeypatch.delenv(name, raising=False)
+            monkeypatch.delenv(name.lower(), raising=False)
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            port = probe.getsockname()[1]
+        lookups = itertools.count()
+
+        async def listen() -> None:
+            router = ChannelRouter(
+                "http://node.example", MagicMock(), console_url=f"http://127.0.0.1:{port}"
+            )
+
+            async def node_url(ws_id: str) -> str:
+                if next(lookups) >= 2:
+                    raise asyncio.CancelledError
+                return await router.get_node_url(ws_id)
+
+            try:
+                async with httpx2.AsyncClient(transport=httpx2.MockTransport(_Node())) as client:
+                    await _sse.run_sse_stream(
+                        http_client=client,
+                        log_prefix="test",
+                        ws_id="ws-1",
+                        node_url_fn=node_url,
+                        token_factory=None,
+                        on_event=AsyncMock(),
+                        on_unavailable=AsyncMock(),
+                    )
+            finally:
+                await router.aclose()
+
+        with caplog.at_level(logging.DEBUG, logger="turnstone.channels._sse"):
+            _run(listen())
+
+        messages = [r.getMessage() for r in caplog.records]
+        assert sum("test.sse_connect_failed" in m for m in messages) == 2
+        assert not any("test.sse_error" in m for m in messages)

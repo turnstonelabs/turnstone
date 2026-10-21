@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 
-import httpx
 import httpx2
 import pytest
 
@@ -361,8 +360,8 @@ async def test_channel_preserves_pin_when_required_node_is_absent(app_client, co
         app = client.app
         headers = _auth("test-routing")
     client.app.state.node_id = manager._node_id = "node-1"
-    async with httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=app), base_url="http://other:8080", headers=headers
+    async with httpx2.AsyncClient(
+        transport=httpx2.ASGITransport(app=app), base_url="http://other:8080", headers=headers
     ) as http:
         if console_mode:
             channels._server = None

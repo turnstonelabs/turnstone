@@ -7,7 +7,6 @@ import json
 from typing import Any
 from unittest.mock import MagicMock
 
-import httpx
 import httpx2
 import pytest
 from starlette.testclient import TestClient
@@ -291,8 +290,8 @@ class TestRouteCreate:
         router = _make_mock_router()
         app = _make_app(router=router)
         _wire_proxy(app, _make_proxy_post(json_data={"ws_id": _DEST_WS_ID, "name": "sdk"}))
-        transport = httpx.ASGITransport(app=app)
-        async with httpx.AsyncClient(
+        transport = httpx2.ASGITransport(app=app)
+        async with httpx2.AsyncClient(
             transport=transport,
             base_url="http://test",
             headers=_TEST_AUTH_HEADERS,
@@ -429,8 +428,8 @@ class TestRouteCreate:
         app = _make_app(router=_make_mock_router(), auth_storage=storage)
         post = _make_proxy_post(json_data={"ws_id": _FORK_DEST_WS_ID})
         _wire_proxy(app, post)
-        async with httpx.AsyncClient(
-            transport=httpx.ASGITransport(app=app),
+        async with httpx2.AsyncClient(
+            transport=httpx2.ASGITransport(app=app),
             base_url="http://test",
             headers=_TEST_AUTH_HEADERS,
         ) as http_client:
@@ -872,8 +871,8 @@ class TestClusterCreate:
 
         mock_post = _make_proxy_post(json_data={"ws_id": "contract-ws"})
         app = self._app_with_node(mock_post)
-        transport = httpx.ASGITransport(app=app)
-        async with httpx.AsyncClient(
+        transport = httpx2.ASGITransport(app=app)
+        async with httpx2.AsyncClient(
             transport=transport,
             base_url="http://test",
             headers=_TEST_AUTH_HEADERS,

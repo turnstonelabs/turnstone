@@ -1,6 +1,6 @@
 """Tests for the attachment surface of turnstone.sdk.server (async + sync).
 
-Uses ``httpx.MockTransport`` to record what the SDK sends so we can
+Uses ``httpx2.MockTransport`` to record what the SDK sends so we can
 assert on multipart bodies, the auto-generated ws_id, etc.
 """
 
@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 import re
 
-import httpx
+import httpx2
 import pytest
 
 from turnstone.sdk._types import AttachmentUpload
@@ -22,14 +22,14 @@ PNG_1x1 = (
 )
 
 
-def _capturing_transport(response: httpx.Response) -> tuple[httpx.MockTransport, list]:
-    captured: list[httpx.Request] = []
+def _capturing_transport(response: httpx2.Response) -> tuple[httpx2.MockTransport, list]:
+    captured: list[httpx2.Request] = []
 
-    def handler(request: httpx.Request) -> httpx.Response:
+    def handler(request: httpx2.Request) -> httpx2.Response:
         captured.append(request)
         return response
 
-    return httpx.MockTransport(handler), captured
+    return httpx2.MockTransport(handler), captured
 
 
 # ---------------------------------------------------------------------------
@@ -39,7 +39,7 @@ def _capturing_transport(response: httpx.Response) -> tuple[httpx.MockTransport,
 
 @pytest.mark.anyio
 async def test_upload_attachment_sends_multipart():
-    response = httpx.Response(
+    response = httpx2.Response(
         200,
         json={
             "attachment_id": "att-1",
@@ -50,7 +50,7 @@ async def test_upload_attachment_sends_multipart():
         },
     )
     transport, captured = _capturing_transport(response)
-    async with httpx.AsyncClient(transport=transport, base_url="http://t") as hc:
+    async with httpx2.AsyncClient(transport=transport, base_url="http://t") as hc:
         client = AsyncTurnstoneServer(httpx_client=hc)
         result = await client.upload_attachment("ws-X", "tiny.png", PNG_1x1, mime_type="image/png")
     assert result.attachment_id == "att-1"
@@ -68,7 +68,7 @@ async def test_upload_attachment_sends_multipart():
 
 @pytest.mark.anyio
 async def test_list_attachments_returns_pending():
-    response = httpx.Response(
+    response = httpx2.Response(
         200,
         json={
             "attachments": [
@@ -83,7 +83,7 @@ async def test_list_attachments_returns_pending():
         },
     )
     transport, captured = _capturing_transport(response)
-    async with httpx.AsyncClient(transport=transport, base_url="http://t") as hc:
+    async with httpx2.AsyncClient(transport=transport, base_url="http://t") as hc:
         client = AsyncTurnstoneServer(httpx_client=hc)
         result = await client.list_attachments("ws-X")
     assert len(result.attachments) == 1
@@ -93,13 +93,13 @@ async def test_list_attachments_returns_pending():
 
 @pytest.mark.anyio
 async def test_get_attachment_content_returns_bytes():
-    response = httpx.Response(
+    response = httpx2.Response(
         200,
         content=b"hello world",
         headers={"Content-Type": "text/plain; charset=utf-8"},
     )
     transport, captured = _capturing_transport(response)
-    async with httpx.AsyncClient(transport=transport, base_url="http://t") as hc:
+    async with httpx2.AsyncClient(transport=transport, base_url="http://t") as hc:
         client = AsyncTurnstoneServer(httpx_client=hc)
         data = await client.get_attachment_content("ws-X", "att-1")
     assert data == b"hello world"
@@ -108,9 +108,9 @@ async def test_get_attachment_content_returns_bytes():
 
 @pytest.mark.anyio
 async def test_delete_attachment():
-    response = httpx.Response(200, json={"status": "deleted"})
+    response = httpx2.Response(200, json={"status": "deleted"})
     transport, captured = _capturing_transport(response)
-    async with httpx.AsyncClient(transport=transport, base_url="http://t") as hc:
+    async with httpx2.AsyncClient(transport=transport, base_url="http://t") as hc:
         client = AsyncTurnstoneServer(httpx_client=hc)
         result = await client.delete_attachment("ws-X", "att-1")
     assert result.status == "deleted"
@@ -124,9 +124,9 @@ async def test_delete_attachment():
 
 @pytest.mark.anyio
 async def test_send_with_attachment_ids():
-    response = httpx.Response(200, json={"status": "ok"})
+    response = httpx2.Response(200, json={"status": "ok"})
     transport, captured = _capturing_transport(response)
-    async with httpx.AsyncClient(transport=transport, base_url="http://t") as hc:
+    async with httpx2.AsyncClient(transport=transport, base_url="http://t") as hc:
         client = AsyncTurnstoneServer(httpx_client=hc)
         await client.send("hi", "ws-X", attachment_ids=["a1", "a2"])
     body = json.loads(bytes(captured[0].content))
@@ -136,9 +136,9 @@ async def test_send_with_attachment_ids():
 
 @pytest.mark.anyio
 async def test_send_omits_attachment_ids_when_none():
-    response = httpx.Response(200, json={"status": "ok"})
+    response = httpx2.Response(200, json={"status": "ok"})
     transport, captured = _capturing_transport(response)
-    async with httpx.AsyncClient(transport=transport, base_url="http://t") as hc:
+    async with httpx2.AsyncClient(transport=transport, base_url="http://t") as hc:
         client = AsyncTurnstoneServer(httpx_client=hc)
         await client.send("hi", "ws-X")
     body = json.loads(bytes(captured[0].content))
@@ -152,7 +152,7 @@ async def test_send_omits_attachment_ids_when_none():
 
 @pytest.mark.anyio
 async def test_create_workstream_with_attachments_sends_multipart():
-    response = httpx.Response(
+    response = httpx2.Response(
         200,
         json={
             "ws_id": "00ff" + "0" * 28,
@@ -163,7 +163,7 @@ async def test_create_workstream_with_attachments_sends_multipart():
         },
     )
     transport, captured = _capturing_transport(response)
-    async with httpx.AsyncClient(transport=transport, base_url="http://t") as hc:
+    async with httpx2.AsyncClient(transport=transport, base_url="http://t") as hc:
         client = AsyncTurnstoneServer(httpx_client=hc)
         resp = await client.create_workstream(
             name="demo",
@@ -192,7 +192,7 @@ async def test_create_workstream_with_attachments_sends_multipart():
 
 @pytest.mark.anyio
 async def test_create_workstream_caller_supplied_ws_id_used():
-    response = httpx.Response(
+    response = httpx2.Response(
         200,
         json={
             "ws_id": "deadbeef" * 4,
@@ -203,7 +203,7 @@ async def test_create_workstream_caller_supplied_ws_id_used():
         },
     )
     transport, captured = _capturing_transport(response)
-    async with httpx.AsyncClient(transport=transport, base_url="http://t") as hc:
+    async with httpx2.AsyncClient(transport=transport, base_url="http://t") as hc:
         client = AsyncTurnstoneServer(httpx_client=hc)
         await client.create_workstream(
             name="demo",
@@ -220,9 +220,9 @@ async def test_create_workstream_caller_supplied_ws_id_used():
 @pytest.mark.anyio
 async def test_create_workstream_without_attachments_uses_json():
     """Back-compat: callers that don't pass attachments still get the JSON path."""
-    response = httpx.Response(200, json={"ws_id": "ws-json", "name": "j", "attachment_ids": []})
+    response = httpx2.Response(200, json={"ws_id": "ws-json", "name": "j", "attachment_ids": []})
     transport, captured = _capturing_transport(response)
-    async with httpx.AsyncClient(transport=transport, base_url="http://t") as hc:
+    async with httpx2.AsyncClient(transport=transport, base_url="http://t") as hc:
         client = AsyncTurnstoneServer(httpx_client=hc)
         await client.create_workstream(name="j")
     req = captured[0]

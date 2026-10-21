@@ -4,15 +4,15 @@ from __future__ import annotations
 
 import json
 
-import httpx
+import httpx2
 
 from turnstone.sdk._sync import _SyncRunner
 from turnstone.sdk.console import AsyncTurnstoneConsole, TurnstoneConsole
 from turnstone.sdk.server import AsyncTurnstoneServer, TurnstoneServer
 
 
-def _json_response(data: dict, status: int = 200) -> httpx.Response:
-    return httpx.Response(status, json=data)
+def _json_response(data: dict, status: int = 200) -> httpx2.Response:
+    return httpx2.Response(status, json=data)
 
 
 # ---------------------------------------------------------------------------
@@ -74,13 +74,13 @@ def test_sync_runner_iter_empty():
 def test_sync_server_list_workstreams():
     """Sync server client delegates to async and returns correct model."""
 
-    def handler(request: httpx.Request) -> httpx.Response:
+    def handler(request: httpx2.Request) -> httpx2.Response:
         return _json_response({"workstreams": [{"ws_id": "ws1", "name": "test", "state": "idle"}]})
 
     # We need to create the async client with a mock transport,
     # then wrap it in the sync client
-    transport = httpx.MockTransport(handler)
-    hc = httpx.AsyncClient(transport=transport, base_url="http://test")
+    transport = httpx2.MockTransport(handler)
+    hc = httpx2.AsyncClient(transport=transport, base_url="http://test")
     async_client = AsyncTurnstoneServer(httpx_client=hc)
 
     server = TurnstoneServer.__new__(TurnstoneServer)
@@ -100,7 +100,7 @@ def test_sync_server_save_memory_preserves_omission_and_explicit_type():
     bodies: list[dict[str, object]] = []
     current_type = "feedback"
 
-    def handler(request: httpx.Request) -> httpx.Response:
+    def handler(request: httpx2.Request) -> httpx2.Response:
         nonlocal current_type
         body = json.loads(request.content)
         bodies.append(body)
@@ -119,8 +119,8 @@ def test_sync_server_save_memory_preserves_omission_and_explicit_type():
             }
         )
 
-    transport = httpx.MockTransport(handler)
-    hc = httpx.AsyncClient(transport=transport, base_url="http://test")
+    transport = httpx2.MockTransport(handler)
+    hc = httpx2.AsyncClient(transport=transport, base_url="http://test")
     async_client = AsyncTurnstoneServer(httpx_client=hc)
     server = TurnstoneServer.__new__(TurnstoneServer)
     server._runner = _SyncRunner()
@@ -143,7 +143,7 @@ def test_sync_server_save_memory_preserves_omission_and_explicit_type():
 
 
 def test_sync_server_get_history():
-    def handler(request: httpx.Request) -> httpx.Response:
+    def handler(request: httpx2.Request) -> httpx2.Response:
         assert request.url.params["limit"] == "25"
         return _json_response(
             {
@@ -154,8 +154,8 @@ def test_sync_server_get_history():
             }
         )
 
-    transport = httpx.MockTransport(handler)
-    hc = httpx.AsyncClient(transport=transport, base_url="http://test")
+    transport = httpx2.MockTransport(handler)
+    hc = httpx2.AsyncClient(transport=transport, base_url="http://test")
     async_client = AsyncTurnstoneServer(httpx_client=hc)
     server = TurnstoneServer.__new__(TurnstoneServer)
     server._runner = _SyncRunner()
@@ -171,13 +171,13 @@ def test_sync_server_get_history():
 def test_sync_server_context_manager():
     """TurnstoneServer can be used as a context manager."""
 
-    def handler(request: httpx.Request) -> httpx.Response:
+    def handler(request: httpx2.Request) -> httpx2.Response:
         return _json_response(
             {"status": "ok", "version": "0.3.0", "uptime_seconds": 1.0, "model": "gpt-5"}
         )
 
-    transport = httpx.MockTransport(handler)
-    hc = httpx.AsyncClient(transport=transport, base_url="http://test")
+    transport = httpx2.MockTransport(handler)
+    hc = httpx2.AsyncClient(transport=transport, base_url="http://test")
     async_client = AsyncTurnstoneServer(httpx_client=hc)
 
     server = TurnstoneServer.__new__(TurnstoneServer)
@@ -197,7 +197,7 @@ def test_sync_server_context_manager():
 def test_sync_console_overview():
     """Sync console client delegates to async and returns correct model."""
 
-    def handler(request: httpx.Request) -> httpx.Response:
+    def handler(request: httpx2.Request) -> httpx2.Response:
         return _json_response(
             {
                 "nodes": 1,
@@ -209,8 +209,8 @@ def test_sync_console_overview():
             }
         )
 
-    transport = httpx.MockTransport(handler)
-    hc = httpx.AsyncClient(transport=transport, base_url="http://test")
+    transport = httpx2.MockTransport(handler)
+    hc = httpx2.AsyncClient(transport=transport, base_url="http://test")
     async_client = AsyncTurnstoneConsole(httpx_client=hc)
 
     console = TurnstoneConsole.__new__(TurnstoneConsole)

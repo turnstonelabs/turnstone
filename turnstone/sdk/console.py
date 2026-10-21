@@ -14,7 +14,7 @@ from __future__ import annotations
 import secrets
 from typing import TYPE_CHECKING, Any
 
-import httpx
+import httpx2
 
 from turnstone.api.console_schemas import (
     AdminMemoryInfo,
@@ -93,7 +93,7 @@ class AsyncTurnstoneConsole(_BaseClient):
         base_url: str = "http://localhost:8090",
         token: str = "",
         timeout: float = 30.0,
-        httpx_client: httpx.AsyncClient | None = None,
+        httpx_client: httpx2.AsyncClient | None = None,
         ca_cert: str | None = None,
         client_cert: str | None = None,
         client_key: str | None = None,
@@ -1160,7 +1160,7 @@ class AsyncTurnstoneConsole(_BaseClient):
             "POST",
             "/v1/api/admin/mcp-servers/test",
             json_body=body,
-            timeout=httpx.Timeout(
+            timeout=httpx2.Timeout(
                 connect=limits.connect, read=read, write=limits.write, pool=limits.pool
             ),
             response_model=McpConnectionTestResponse,

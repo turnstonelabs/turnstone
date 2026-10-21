@@ -9,7 +9,6 @@ from __future__ import annotations
 import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
-import httpx
 import httpx2
 import pytest
 
@@ -108,18 +107,12 @@ async def test_restart_retains_association_and_recovers_history(app_client, plat
 
     await bot.router.aclose()
     await bot._http_client.aclose()
-    async with (
-        httpx.AsyncClient(
-            transport=httpx.ASGITransport(app=client.app),
-            base_url="http://server.example",
-            headers=_auth("owner"),
-        ) as http,
-        httpx2.AsyncClient(
-            transport=httpx2.ASGITransport(app=client.app), headers=_auth("owner")
-        ) as stream_http,
-    ):
-        # The SDK client is httpx; the bot's own client, used for the SSE stream, is httpx2.
-        bot._http_client = stream_http
+    async with httpx2.AsyncClient(
+        transport=httpx2.ASGITransport(app=client.app),
+        base_url="http://server.example",
+        headers=_auth("owner"),
+    ) as http:
+        bot._http_client = http
         bot.router._server = AsyncTurnstoneServer(httpx_client=http)
         # Test startup and inbound subscription requests without opening an
         # infinite ASGI stream. The unavailable response below uses real SSE.
