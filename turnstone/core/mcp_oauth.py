@@ -34,6 +34,7 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Literal, NamedTuple, cast
 
 from turnstone.core.audit import record_audit
+from turnstone.core.http_failures import REQUEST_FAILURES
 from turnstone.core.log import get_logger
 from turnstone.core.mcp_http_parsers import (
     MAX_INSUFFICIENT_SCOPE_REPORTED,
@@ -570,7 +571,7 @@ async def _fetch_prm_issuer(
                 continue
             try:
                 resp = await http_client.get(candidate.url, timeout=budget)
-            except oauth_http._REQUEST_FAILURES as exc:
+            except REQUEST_FAILURES as exc:
                 _record(_discovery_error(f"PRM fetch failed: {exc}", exc))
                 continue
             fetched[(candidate.url, *verdict)] = resp
@@ -944,7 +945,7 @@ async def _fetch_as_metadata(
             break
         try:
             r = await http_client.get(metadata_url, timeout=budget)
-        except oauth_http._REQUEST_FAILURES as exc:
+        except REQUEST_FAILURES as exc:
             first_error = first_error or _discovery_error(f"AS metadata fetch failed: {exc}", exc)
             continue
         if r.status_code != 200:
@@ -1333,7 +1334,7 @@ async def register_dynamic_client(
             json=body,
             timeout=oauth_http._DEFAULT_HTTP_TIMEOUT,
         )
-    except oauth_http._REQUEST_FAILURES as exc:
+    except REQUEST_FAILURES as exc:
         raise oauth_http.OAuthError(f"DCR request failed: {exc}") from exc
 
     if len(resp.content) > oauth_http._MAX_TOKEN_BODY_BYTES:
@@ -1403,7 +1404,7 @@ async def exchange_code(
             data=data,
             timeout=oauth_http._DEFAULT_HTTP_TIMEOUT,
         )
-    except oauth_http._REQUEST_FAILURES as exc:
+    except REQUEST_FAILURES as exc:
         raise MCPOAuthExchangeError(f"token exchange request failed: {exc}") from exc
 
     if len(resp.content) > oauth_http._MAX_TOKEN_BODY_BYTES:

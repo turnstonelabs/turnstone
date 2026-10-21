@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any
 
 import httpx2
 
+from turnstone.core.http_failures import REQUEST_FAILURES
 from turnstone.core.log import get_logger
 from turnstone.core.oauth import ssrf as oauth_ssrf
 from turnstone.core.oauth.work import OAuthUnavailableError
@@ -22,13 +23,6 @@ if TYPE_CHECKING:
 log = get_logger(__name__)
 
 _DEFAULT_HTTP_TIMEOUT = 10.0
-
-# What a failed OAuth or OIDC request raises, for every request site to map into OAuth's own
-# errors. ``InvalidURL`` and ``UnicodeError`` are not ``HTTPError``s: httpx2 raises them while
-# building a request for a URL it cannot send (one it cannot parse, or one holding a lone
-# surrogate). The SSRF guard refuses such URLs at discovery; this keeps one that reaches a request
-# anyway from escaping.
-_REQUEST_FAILURES = (httpx2.HTTPError, httpx2.InvalidURL, UnicodeError)
 
 
 # Tighter cap for token-endpoint and DCR responses — these never carry
@@ -372,7 +366,7 @@ async def _hardened_token_post(
             data=data,
             timeout=_DEFAULT_HTTP_TIMEOUT,
         )
-    except (*_REQUEST_FAILURES, RuntimeError) as exc:
+    except (*REQUEST_FAILURES, RuntimeError) as exc:
         if http_client.is_closed:
             raise OAuthUnavailableError("OAuth HTTP client closed during shutdown") from exc
         if isinstance(exc, RuntimeError):

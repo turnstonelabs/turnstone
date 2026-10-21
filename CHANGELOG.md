@@ -682,6 +682,13 @@ frozen.
 - **The Python SDK presents its client certificate when `ca_cert` is also set (#1425)** — with
   both, the client certificate was dropped without a warning, so a node that requires one, such as
   a node with TLS on, refused the handshake.
+- **The console answers 502 for a request to a node it can't build** — a node's redirect to a
+  `Location` that can't be parsed or whose host isn't valid IDNA, or a request path holding a
+  percent-encoded control character, raised past the console's error handling: proxied and routed
+  requests answered a bare 500 without recording route metrics, the event relay broke off after
+  its 200, a coordinator's inspect lost its fallback to stored state and its other calls to the
+  console raised instead of reporting it unreachable, and a node answering the startup scope check
+  that way, or with a body in a charset Python can't decode, stopped the console from starting.
 - **The MCP registry search and skill-source downloads fail cleanly on a request they can't
   build** — a redirect to a `Location` that can't be parsed or whose host isn't valid IDNA, or a
   search term or path holding a lone surrogate, raised past their error handling: the console's

@@ -11,6 +11,7 @@ import httpx2
 import pytest
 from starlette.testclient import TestClient
 
+from tests._http_failure_cases import UNREACHABLE_REPLIES
 from turnstone.console.collector import ClusterCollector
 from turnstone.console.router import ConsoleRouter, NodeRef
 from turnstone.core.rendezvous import NoAvailableNodeError
@@ -994,6 +995,7 @@ class TestRouteProxy:
 class TestRouteUpstreamUnreachable:
     """A node the proxy client cannot reach is a 502 that names the node."""
 
+    @UNREACHABLE_REPLIES
     @pytest.mark.parametrize(
         ("path", "body", "upstream"),
         [
@@ -1006,15 +1008,15 @@ class TestRouteUpstreamUnreachable:
         ],
         ids=["create", "send"],
     )
-    def test_refused_connection_is_a_502(self, path, body, upstream):
+    def test_a_node_it_cannot_reach_is_a_502(self, path, body, upstream, reply):
         seen: list[str] = []
 
-        def refuse(request: httpx2.Request) -> httpx2.Response:
+        def handler(request: httpx2.Request) -> httpx2.Response:
             seen.append(str(request.url))
-            raise httpx2.ConnectError("Connection refused", request=request)
+            return reply(request)
 
         app = _make_app(router=_make_mock_router())
-        proxy = httpx2.AsyncClient(transport=httpx2.MockTransport(refuse))
+        proxy = httpx2.AsyncClient(transport=httpx2.MockTransport(handler))
         app.state.proxy_client = proxy
         client = TestClient(app, raise_server_exceptions=False)
         try:
@@ -1026,6 +1028,32 @@ class TestRouteUpstreamUnreachable:
         assert resp.status_code == 502
         assert resp.json() == {"error": "upstream node node-a unreachable"}
         assert seen == [f"http://a:8080{upstream}"]
+
+    def test_a_path_httpx2_cannot_send_is_a_502(self):
+        # The console decodes %01 into the workstream id it forwards, and httpx2 refuses a
+        # control character in a URL, so nothing is sent.
+        sent: list[httpx2.Request] = []
+
+        def handler(request: httpx2.Request) -> httpx2.Response:
+            sent.append(request)
+            return httpx2.Response(200, json={})
+
+        app = _make_app(router=_make_mock_router())
+        proxy = httpx2.AsyncClient(transport=httpx2.MockTransport(handler))
+        app.state.proxy_client = proxy
+        client = TestClient(app, raise_server_exceptions=False)
+        try:
+            resp = client.post(
+                "/v1/api/route/workstreams/abc%01/send",
+                json={"message": "hello"},
+                headers=_TEST_AUTH_HEADERS,
+            )
+        finally:
+            client.close()
+            asyncio.run(proxy.aclose())
+
+        assert resp.status_code == 502
+        assert sent == []
 
 
 class TestRouteProxyPermissionGates:

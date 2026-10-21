@@ -36,6 +36,7 @@ from typing import TYPE_CHECKING, Any, ClassVar
 import httpx2
 
 from turnstone.core.auth import JWT_AUD_CONSOLE, create_jwt
+from turnstone.core.http_failures import REQUEST_FAILURES
 from turnstone.core.log import get_logger
 from turnstone.core.memory import LAST_ERROR_CONFIG_KEY
 from turnstone.core.metacognition import (
@@ -572,10 +573,7 @@ class CoordinatorClient:
     def close(self) -> None:
         """Release the underlying HTTP connection pool."""
         if self._owns_http:
-            try:
-                self._http.close()
-            except httpx2.HTTPError:
-                log.debug("coord_client.close.failed", exc_info=True)
+            self._http.close()
 
     # -- internal helpers ---------------------------------------------------
 
@@ -622,7 +620,7 @@ class CoordinatorClient:
         """
         try:
             resp = self._http.post(url, json=body, headers=self._headers())
-        except httpx2.HTTPError as exc:
+        except REQUEST_FAILURES as exc:
             log.warning("coord_client.http_error path=%s err=%s", log_path, exc)
             return {"error": f"upstream unreachable: {exc}", "status": 0}
         try:
@@ -2100,7 +2098,7 @@ class CoordinatorClient:
             # previous 2s was conservatively generous and stalled the
             # session thread visibly when a node was unhealthy.
             resp = self._http.get(url, headers=self._headers(), timeout=1.0)
-        except httpx2.HTTPError:
+        except REQUEST_FAILURES:
             log.debug("coord_client.cluster_inspect.http_error ws=%s", ws_id, exc_info=True)
             self._store_live_cache(ws_id, now, None)
             return None

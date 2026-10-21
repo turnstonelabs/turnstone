@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Any
 import httpx2
 import pytest
 
+from tests._http_failure_cases import UNREACHABLE_REPLIES
 from turnstone.console.coordinator_client import (
     _ROUTE_PATHS,
     CoordinatorClient,
@@ -345,11 +346,9 @@ def test_close_all_children_surfaces_http_error(sqlite_backend_factory):
     assert "error" in result
 
 
-def test_close_all_children_surfaces_transport_error(sqlite_backend_factory):
-    def _raise(_req: httpx2.Request) -> httpx2.Response:
-        raise httpx2.ConnectError("connection refused")
-
-    client, _captured = _mock_client(_raise, sqlite_backend_factory=sqlite_backend_factory)
+@UNREACHABLE_REPLIES
+def test_close_all_children_surfaces_transport_error(sqlite_backend_factory, reply):
+    client, _captured = _mock_client(reply, sqlite_backend_factory=sqlite_backend_factory)
     result = client.close_all_children()
     assert result["status"] == 0
     assert "upstream unreachable" in result["error"]
@@ -838,13 +837,15 @@ def test_inspect_degrades_to_storage_only_on_cluster_endpoint_503(populated_stor
     assert result["ws_id"] == "child-a"
 
 
-def test_inspect_degrades_to_storage_only_when_the_console_is_unreachable(populated_storage):
-    """A transport error on the live-state fetch takes the same degrade path."""
+@UNREACHABLE_REPLIES
+def test_inspect_degrades_to_storage_only_when_the_console_is_unreachable(populated_storage, reply):
+    """A transport error on the live-state fetch, or a reply httpx2 can't follow, takes the
+    same degrade path."""
     attempts: list[str] = []
 
-    def _refuse(request: httpx2.Request) -> httpx2.Response:
+    def _handler(request: httpx2.Request) -> httpx2.Response:
         attempts.append(request.url.path)
-        raise httpx2.ConnectError("Connection refused", request=request)
+        return reply(request)
 
     client = CoordinatorClient(
         console_base_url="http://x",
@@ -852,7 +853,7 @@ def test_inspect_degrades_to_storage_only_when_the_console_is_unreachable(popula
         token_factory=lambda: "t",
         coord_ws_id="coord-1",
         user_id="user-1",
-        http_client=httpx2.Client(transport=httpx2.MockTransport(_refuse)),
+        http_client=httpx2.Client(transport=httpx2.MockTransport(_handler)),
         child_event_bus=ChildEventBus(),
     )
     result = client.inspect("child-a")

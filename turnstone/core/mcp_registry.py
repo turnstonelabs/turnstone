@@ -15,15 +15,12 @@ from urllib.parse import urlparse
 
 import httpx2
 
+from turnstone.core.http_failures import REQUEST_FAILURES
+
 DEFAULT_REGISTRY_URL = "https://registry.modelcontextprotocol.io"
 _SEARCH_PATH = "/v0.1/servers"
 _REQUEST_TIMEOUT = 15.0
 _MAX_LIMIT = 100
-# What a failed request raises. ``InvalidURL`` and ``UnicodeError`` are not ``HTTPError``s: httpx2
-# raises them while building a request it cannot send, such as one for a redirect's malformed
-# Location, a host IDNA cannot encode (``idna.IDNAError`` is a ``UnicodeError``) or a search term
-# holding a lone surrogate.
-_REQUEST_FAILURES = (httpx2.HTTPError, httpx2.InvalidURL, UnicodeError)
 
 
 class MCPRegistryError(Exception):
@@ -292,7 +289,7 @@ class MCPRegistryClient:
         url = f"{self._base_url}{_SEARCH_PATH}"
         try:
             resp = await self._client.get(url, params=params)
-        except _REQUEST_FAILURES as exc:
+        except REQUEST_FAILURES as exc:
             raise MCPRegistryError(f"HTTP request failed: {exc}") from exc
 
         if resp.status_code != 200:

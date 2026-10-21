@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Any
 
 import httpx2
 
+from turnstone.core.http_failures import REQUEST_FAILURES
 from turnstone.core.log import get_logger
 from turnstone.core.oauth import grants as oauth_grants
 from turnstone.core.oauth import http as oauth_http
@@ -585,7 +586,7 @@ async def fetch_jwks(
                 resp = await transient.get(jwks_uri)
                 resp.raise_for_status()
                 result = resp.json()
-    except (*oauth_http._REQUEST_FAILURES, ValueError) as exc:
+    except (*REQUEST_FAILURES, ValueError) as exc:
         # ValueError covers json.JSONDecodeError (subclass).
         raise OIDCError(f"JWKS fetch failed: {exc}") from exc
     if not isinstance(result, dict):

@@ -8,6 +8,7 @@ from unittest.mock import ANY, MagicMock
 
 import pytest
 
+from tests._http_failure_cases import UNREACHABLE_REPLIES
 from turnstone.console.collector import ClusterCollector, NodeSnapshot
 from turnstone.console.server import _PROXY_AUTH_LOCAL_HANDLERS
 
@@ -1962,13 +1963,11 @@ class TestConsoleProxy:
         ],
         ids=["index", "static", "api-get", "api-post"],
     )
-    def test_proxy_unreachable_node_returns_502(self, client, method, path):
+    @UNREACHABLE_REPLIES
+    def test_proxy_unreachable_node_returns_502(self, client, method, path, reply):
         import httpx2
 
-        def refuse(request: httpx2.Request) -> httpx2.Response:
-            raise httpx2.ConnectError("Connection refused", request=request)
-
-        proxy = httpx2.AsyncClient(transport=httpx2.MockTransport(refuse))
+        proxy = httpx2.AsyncClient(transport=httpx2.MockTransport(reply))
         client.app.state.proxy_client = proxy
         try:
             resp = client.request(method, path, json={} if method == "POST" else None)
@@ -1978,14 +1977,34 @@ class TestConsoleProxy:
         assert resp.status_code == 502
         assert resp.json() == {"error": "Node unreachable"}
 
-    def test_proxy_sse_from_unreachable_node_ends_the_stream(self, client):
+    def test_proxy_path_httpx2_cannot_send_returns_502(self, client):
+        import httpx2
+
+        # The console decodes %01 into the path it forwards, and httpx2 refuses a control
+        # character in a URL, so nothing is sent.
+        sent: list[httpx2.Request] = []
+
+        def handler(request: httpx2.Request) -> httpx2.Response:
+            sent.append(request)
+            return httpx2.Response(200, json={})
+
+        proxy = httpx2.AsyncClient(transport=httpx2.MockTransport(handler))
+        client.app.state.proxy_client = proxy
+        try:
+            resp = client.get("/node/node-a/v1/api/workstreams%01")
+        finally:
+            asyncio.run(proxy.aclose())
+
+        assert resp.status_code == 502
+        assert resp.json() == {"error": "Node unreachable"}
+        assert sent == []
+
+    @UNREACHABLE_REPLIES
+    def test_proxy_sse_from_unreachable_node_ends_the_stream(self, client, reply):
         import httpx2
         from starlette.testclient import TestClient
 
-        def refuse(request: httpx2.Request) -> httpx2.Response:
-            raise httpx2.ConnectError("Connection refused", request=request)
-
-        sse_client = httpx2.AsyncClient(transport=httpx2.MockTransport(refuse))
+        sse_client = httpx2.AsyncClient(transport=httpx2.MockTransport(reply))
         client.app.state.proxy_sse_client = sse_client
         # The relay's headers are already sent when it connects upstream, so an
         # exception escaping it would still read as an empty 200 unless raised here.

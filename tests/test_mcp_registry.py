@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import httpx2
 import pytest
 
+from tests._http_failure_cases import UNREACHABLE_REPLIES
 from turnstone.core.mcp_registry import (
     MCPRegistryClient,
     MCPRegistryError,
@@ -258,31 +259,9 @@ class TestMCPRegistryClientSearch:
                 await client.search()
 
     @pytest.mark.anyio
-    async def test_search_transport_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        def handler(request: httpx2.Request) -> httpx2.Response:
-            raise httpx2.ConnectError("Connection refused", request=request)
-
-        _route_registry(monkeypatch, handler)
-        async with MCPRegistryClient(base_url="https://registry.example") as client:
-            with pytest.raises(MCPRegistryError, match="HTTP request failed"):
-                await client.search()
-
-    @pytest.mark.anyio
-    @pytest.mark.parametrize(
-        "location",
-        [
-            # httpx2 raises InvalidURL for the first and idna's IDNAError (a UnicodeError) for
-            # the second; neither is an HTTPError.
-            pytest.param("http:foo", id="unparseable"),
-            pytest.param("http://a..xn--b/", id="not-idna"),
-        ],
-    )
-    async def test_search_malformed_redirect(
-        self, monkeypatch: pytest.MonkeyPatch, location: str
-    ) -> None:
-        _route_registry(
-            monkeypatch, lambda request: httpx2.Response(302, headers={"Location": location})
-        )
+    @UNREACHABLE_REPLIES
+    async def test_search_request_failure(self, monkeypatch: pytest.MonkeyPatch, reply) -> None:
+        _route_registry(monkeypatch, reply)
         async with MCPRegistryClient(base_url="https://registry.example") as client:
             with pytest.raises(MCPRegistryError, match="HTTP request failed"):
                 await client.search()

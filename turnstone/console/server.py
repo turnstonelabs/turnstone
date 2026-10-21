@@ -72,6 +72,7 @@ from turnstone.core.avatar_routes import (
     upload_own_avatar_picture,
 )
 from turnstone.core.deadline import DeadlineExceededError, run_with_deadline
+from turnstone.core.http_failures import REQUEST_FAILURES
 from turnstone.core.http_headers import HEADER_VALUE_RE, HeaderValueError
 from turnstone.core.mcp_oauth import is_user_scoped_auth
 from turnstone.core.memory import get_workstream_display_names
@@ -843,7 +844,7 @@ class _NodeDashboardCache:
                     headers=headers,
                     timeout=2.0,
                 )
-            except (httpx2.HTTPError, TimeoutError):
+            except (*REQUEST_FAILURES, TimeoutError):
                 resp = None
             if resp is not None:
                 status = resp.status_code
@@ -868,7 +869,7 @@ class _NodeDashboardCache:
                         node_id,
                         status,
                         server_url,
-                        _bounded_body_preview(resp.text),
+                        _bounded_body_preview(resp.content),
                     )
                     return None
             self._cache[node_id] = (time.monotonic(), payload)
@@ -983,7 +984,7 @@ async def _fetch_live_block(
                 headers=_proxy_auth_headers(request),
                 timeout=2.0,
             )
-        except (httpx2.HTTPError, TimeoutError):
+        except (*REQUEST_FAILURES, TimeoutError):
             return None
         status = resp.status_code
         if 400 <= status < 500:
@@ -995,14 +996,14 @@ async def _fetch_live_block(
                 row_node_id,
                 status,
                 server_url,
-                _bounded_body_preview(resp.text),
+                _bounded_body_preview(resp.content),
             )
             return None
         if not (200 <= status < 300):
             return None
         try:
             raw = resp.json()
-        except (ValueError, httpx2.HTTPError):
+        except (ValueError, *REQUEST_FAILURES):
             return None
         payload = raw if isinstance(raw, dict) else None
     if payload is None:
@@ -1910,7 +1911,7 @@ async def create_workstream(request: Request) -> JSONResponse:
             )
         else:
             resp = await client.post(node_url, json=ws_body, headers=headers)
-    except httpx2.HTTPError as exc:
+    except REQUEST_FAILURES as exc:
         log.warning("Workstream dispatch to %s failed: %s", node_id, exc)
         return _dispatch_failed(node_id)
 
@@ -2201,7 +2202,7 @@ async def route_create(request: Request) -> Response:
                 content=raw_body,
                 headers=upstream_headers,
             )
-        except httpx2.HTTPError:
+        except REQUEST_FAILURES:
             return _record_route(
                 request,
                 "create",
@@ -2339,7 +2340,7 @@ async def route_create(request: Request) -> Response:
                 resp = await client.post(
                     f"{ref.url}/v1/api/workstreams/new", json=body, headers=headers
                 )
-            except httpx2.HTTPError:
+            except REQUEST_FAILURES:
                 return _record_route(
                     request,
                     "create",
@@ -2608,7 +2609,7 @@ async def route_attachment_proxy(request: Request) -> Response:
                 content=body,
                 headers=upstream_headers,
             )
-        except httpx2.HTTPError:
+        except REQUEST_FAILURES:
             return _record_route(
                 request,
                 method,
@@ -2622,7 +2623,7 @@ async def route_attachment_proxy(request: Request) -> Response:
     else:
         try:
             resp = await client.get(f"{ref.url}{upstream_path}", headers=upstream_headers)
-        except httpx2.HTTPError:
+        except REQUEST_FAILURES:
             return _record_route(
                 request,
                 method,
@@ -2736,7 +2737,7 @@ async def _resend_if_route_moved(
         return ref, resp
     try:
         return new_ref, await send(new_ref)
-    except httpx2.HTTPError:
+    except REQUEST_FAILURES:
         return _record_route(
             request,
             verb,
@@ -2989,7 +2990,7 @@ async def route_proxy(request: Request) -> Response:
         resp = await client.request(
             http_method, f"{ref.url}{upstream_path}", json=body, headers=headers
         )
-    except httpx2.HTTPError:
+    except REQUEST_FAILURES:
         return _record_route(
             request,
             verb,
@@ -3127,7 +3128,7 @@ async def route_workstream_delete(request: Request) -> Response:
     upstream_url = f"{ref.url}/v1/api/workstreams/{ws_id}/delete"
     try:
         resp = await client.post(upstream_url, json=body, headers=headers)
-    except httpx2.HTTPError:
+    except REQUEST_FAILURES:
         return _record_route(
             request,
             "delete",
@@ -3380,7 +3381,7 @@ async def route_workstream_live(request: Request) -> Response:
                 f"{route_ref.url}/v1/api/workstreams",
                 headers=headers,
             )
-        except httpx2.HTTPError:
+        except REQUEST_FAILURES:
             return None, JSONResponse(
                 {"error": f"upstream node {route_ref.node_id} unreachable"},
                 status_code=502,
@@ -3395,7 +3396,7 @@ async def route_workstream_live(request: Request) -> Response:
 
         try:
             payload = resp.json()
-        except (ValueError, httpx2.HTTPError):
+        except (ValueError, *REQUEST_FAILURES):
             payload = None
         rows = payload.get("workstreams") if isinstance(payload, dict) else None
         if not isinstance(rows, list):
@@ -3469,30 +3470,30 @@ async def proxy_index(request: Request) -> Response:
     prefix = f"/node/{safe_node}"
     try:
         resp = await client.get(f"{server_url}/", headers=_proxy_auth_headers(request))
-        if resp.status_code < 200 or resp.status_code >= 300:
-            log.debug("Upstream %s returned status %s", node_id, resp.status_code)
-            return JSONResponse(
-                {"error": "Upstream server error", "status_code": resp.status_code},
-                status_code=resp.status_code,
-            )
-        page = resp.text
-        # Rewrite static asset paths
-        page = page.replace('href="/static/', f'href="{prefix}/static/')
-        page = page.replace('src="/static/', f'src="{prefix}/static/')
-        page = page.replace('href="/shared/', f'href="{prefix}/shared/')
-        page = page.replace('src="/shared/', f'src="{prefix}/shared/')
-        # Inject the proxy shim (prefix rewriting + back-to-console) after
-        # <body>.  prefix is built from a node_id already validated against
-        # _VALID_NODE_ID, so json.dumps is the only escaping the JS literal
-        # needs.
-        shim_js = _JS_PROXY_SHIM.replace('"PREFIX_PLACEHOLDER"', json.dumps(prefix))
-        page = page.replace("<body>", "<body><script>" + shim_js + "</script>", 1)
-        html_resp = HTMLResponse(page)
-        html_resp.headers["Cache-Control"] = "no-cache"
-        return html_resp
-    except httpx2.HTTPError as exc:
+    except REQUEST_FAILURES as exc:
         log.debug("Proxy index error for %s: %s", node_id, exc)
         return JSONResponse({"error": "Node unreachable"}, status_code=502)
+    if resp.status_code < 200 or resp.status_code >= 300:
+        log.debug("Upstream %s returned status %s", node_id, resp.status_code)
+        return JSONResponse(
+            {"error": "Upstream server error", "status_code": resp.status_code},
+            status_code=resp.status_code,
+        )
+    page = resp.text
+    # Rewrite static asset paths
+    page = page.replace('href="/static/', f'href="{prefix}/static/')
+    page = page.replace('src="/static/', f'src="{prefix}/static/')
+    page = page.replace('href="/shared/', f'href="{prefix}/shared/')
+    page = page.replace('src="/shared/', f'src="{prefix}/shared/')
+    # Inject the proxy shim (prefix rewriting + back-to-console) after
+    # <body>.  prefix is built from a node_id already validated against
+    # _VALID_NODE_ID, so json.dumps is the only escaping the JS literal
+    # needs.
+    shim_js = _JS_PROXY_SHIM.replace('"PREFIX_PLACEHOLDER"', json.dumps(prefix))
+    page = page.replace("<body>", "<body><script>" + shim_js + "</script>", 1)
+    html_resp = HTMLResponse(page)
+    html_resp.headers["Cache-Control"] = "no-cache"
+    return html_resp
 
 
 def _proxy_static_request_headers(request: Request) -> dict[str, str]:
@@ -3541,10 +3542,10 @@ async def _proxy_static_mount(request: Request, mount: str) -> Response:
             f"{server_url}/{mount}/{encoded_path}",
             headers=_proxy_static_request_headers(request),
         )
-        return _proxy_static_response(resp, path)
-    except httpx2.HTTPError as exc:
+    except REQUEST_FAILURES as exc:
         log.debug("Proxy %s error for %s/%s: %s", mount, node_id, path, exc)
         return _static_proxy_error("Node unreachable", 502)
+    return _proxy_static_response(resp, path)
 
 
 async def proxy_static(request: Request) -> Response:
@@ -3708,15 +3709,15 @@ async def _proxy_get(request: Request, server_url: str, path: str) -> Response:
         target += f"?{request.url.query}"
     try:
         resp = await client.get(target, headers=_proxy_auth_headers(request))
-        return Response(
-            content=resp.content,
-            status_code=resp.status_code,
-            media_type=resp.headers.get("content-type", "application/json"),
-            headers=_proxy_pass_headers(resp),
-        )
-    except httpx2.HTTPError as exc:
+    except REQUEST_FAILURES as exc:
         log.debug("Proxy GET error for %s: %s", target, exc)
         return JSONResponse({"error": "Node unreachable"}, status_code=502)
+    return Response(
+        content=resp.content,
+        status_code=resp.status_code,
+        media_type=resp.headers.get("content-type", "application/json"),
+        headers=_proxy_pass_headers(resp),
+    )
 
 
 async def _proxy_post(
@@ -3729,23 +3730,23 @@ async def _proxy_post(
     target = f"{server_url}/{api_prefix}/{path}"
     if request.url.query:
         target += f"?{request.url.query}"
+    headers = {"Content-Type": content_type}
+    headers.update(_proxy_auth_headers(request))
     try:
-        headers = {"Content-Type": content_type}
-        headers.update(_proxy_auth_headers(request))
         resp = await client.request(
             request.method,
             target,
             content=body,
             headers=headers,
         )
-        return Response(
-            content=resp.content,
-            status_code=resp.status_code,
-            media_type=resp.headers.get("content-type", "application/json"),
-        )
-    except httpx2.HTTPError as exc:
+    except REQUEST_FAILURES as exc:
         log.debug("Proxy %s error for %s/%s: %s", request.method, api_prefix, path, exc)
         return JSONResponse({"error": "Node unreachable"}, status_code=502)
+    return Response(
+        content=resp.content,
+        status_code=resp.status_code,
+        media_type=resp.headers.get("content-type", "application/json"),
+    )
 
 
 async def _proxy_sse(
@@ -3845,7 +3846,7 @@ async def _proxy_sse(
                     if await request.is_disconnected():
                         return
                     yield chunk
-        except httpx2.HTTPError:
+        except REQUEST_FAILURES:
             log.debug("SSE proxy stream ended for %s", target)
 
     return StreamingResponse(
@@ -5367,7 +5368,7 @@ async def _verify_collector_service_scope(app: Starlette, client: httpx2.AsyncCl
             headers=headers,
             timeout=_PROBE_TIMEOUT_SECONDS,
         )
-    except (httpx2.HTTPError, TimeoutError) as exc:
+    except (*REQUEST_FAILURES, TimeoutError) as exc:
         log.warning(
             "collector_scope_probe.transient_error node=%s url=%s — %s",
             probe_node,
@@ -5381,7 +5382,7 @@ async def _verify_collector_service_scope(app: Starlette, client: httpx2.AsyncCl
         # accepted and the handler got as far as the node_id check.
         log.info("collector_scope_probe.ok node=%s url=%s", probe_node, probe_target)
         return
-    body_preview = _bounded_body_preview(resp.text)
+    body_preview = _bounded_body_preview(resp.content)
     if 400 <= status < 500:
         # 403 = missing ``service`` scope on the collector token; 401 =
         # JWT rejected outright (secret mismatch / audience drift).
@@ -7706,13 +7707,13 @@ async def admin_cancel_watch(request: Request) -> Response:
             content=b"{}",
             headers=headers,
         )
-        return Response(
-            content=resp.content,
-            status_code=resp.status_code,
-            media_type=resp.headers.get("content-type", "application/json"),
-        )
-    except httpx2.HTTPError:
+    except REQUEST_FAILURES:
         return JSONResponse({"error": "Node unreachable"}, status_code=502)
+    return Response(
+        content=resp.content,
+        status_code=resp.status_code,
+        media_type=resp.headers.get("content-type", "application/json"),
+    )
 
 
 # ---------------------------------------------------------------------------

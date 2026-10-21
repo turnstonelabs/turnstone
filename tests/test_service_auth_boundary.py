@@ -28,6 +28,7 @@ from unittest.mock import MagicMock
 import httpx2
 import pytest
 
+from tests._http_failure_cases import UNREACHABLE_REPLIES
 from turnstone.core.auth import AuthResult
 
 # ---------------------------------------------------------------------------
@@ -206,20 +207,36 @@ class TestVerifyCollectorServiceScope:
         assert app.state.collector_scope_error == ""
 
     @pytest.mark.anyio
-    async def test_network_error_does_not_refuse(self):
+    @UNREACHABLE_REPLIES
+    async def test_network_error_does_not_refuse(self, reply):
         """Transient httpx2.ConnectError during probe is a "cluster is
         coming up" state; it must NOT be confused with scope drift.
-        Leave ``collector_scope_error`` empty and log a warning."""
+        Leave ``collector_scope_error`` empty and log a warning. A reply
+        httpx2 can't follow (InvalidURL) is the same, not a startup failure."""
+        from turnstone.console.server import _verify_collector_service_scope
+
+        app = _scope_probe_app(services=[{"service_id": "node-1", "url": "http://127.0.0.1:8001"}])
+
+        client = httpx2.AsyncClient(transport=httpx2.MockTransport(reply))
+        await _verify_collector_service_scope(app, client)
+        assert app.state.collector_scope_error == ""
+
+    @pytest.mark.anyio
+    async def test_a_reply_in_a_charset_python_cant_decode_still_refuses(self):
+        # Decoding with errors="replace" raises for the idna codec, so the preview reads the
+        # body's bytes; a 403 still refuses rather than stopping the console from starting.
         from turnstone.console.server import _verify_collector_service_scope
 
         app = _scope_probe_app(services=[{"service_id": "node-1", "url": "http://127.0.0.1:8001"}])
 
         def handler(_req: httpx2.Request) -> httpx2.Response:
-            raise httpx2.ConnectError("connection refused")
+            return httpx2.Response(
+                403, headers={"content-type": "text/plain; charset=idna"}, content=b"denied"
+            )
 
         client = httpx2.AsyncClient(transport=httpx2.MockTransport(handler))
         await _verify_collector_service_scope(app, client)
-        assert app.state.collector_scope_error == ""
+        assert "denied" in app.state.collector_scope_error
 
 
 # ---------------------------------------------------------------------------
