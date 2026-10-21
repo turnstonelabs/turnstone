@@ -13,12 +13,11 @@ Interaction model
 * **DMs**: every message is routed freely, no slash command needed.
 
 Events are consumed from the server's per-workstream SSE endpoint
-(``GET /v1/api/workstreams/{ws_id}/events``) using httpx-sse. Inbound
-messages are sent directly to server nodes via HTTP
-(``POST /v1/api/workstreams/{ws_id}/send``).
+(``GET /v1/api/workstreams/{ws_id}/events``) using httpx2's SSE support. Inbound messages are sent
+directly to server nodes via HTTP (``POST /v1/api/workstreams/{ws_id}/send``).
 
 Install dependencies:
-    pip install slack-bolt httpx httpx-sse
+    pip install 'turnstone[slack]'
 """
 
 from __future__ import annotations
@@ -30,7 +29,7 @@ from collections import OrderedDict, deque
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, cast
 
-import httpx
+import httpx2
 from slack_bolt.async_app import AsyncApp
 from slack_sdk.web.async_client import AsyncWebClient
 
@@ -327,9 +326,9 @@ class TurnstoneSlackBot:
         if api_token and not server_token_factory:
             headers["Authorization"] = f"Bearer {api_token}"
 
-        self._http_client = httpx.AsyncClient(
+        self._http_client = httpx2.AsyncClient(
             headers=headers,
-            timeout=httpx.Timeout(connect=10.0, read=90.0, write=10.0, pool=10.0),
+            timeout=httpx2.Timeout(connect=10.0, read=90.0, write=10.0, pool=10.0),
         )
 
         self._app = AsyncApp(token=config.bot_token)

@@ -5,9 +5,8 @@ lifecycle of SSE event subscriptions, streaming message edits, and interactive
 approval views.
 
 Events are consumed from the server's per-workstream SSE endpoint
-(``GET /v1/api/workstreams/{ws_id}/events``) using httpx-sse.  Inbound
-messages are sent directly to server nodes via HTTP
-(``POST /v1/api/workstreams/{ws_id}/send``).
+(``GET /v1/api/workstreams/{ws_id}/events``) using httpx2's SSE support.  Inbound messages are sent
+directly to server nodes via HTTP (``POST /v1/api/workstreams/{ws_id}/send``).
 """
 
 from __future__ import annotations
@@ -18,7 +17,7 @@ import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
-import httpx
+import httpx2
 
 from turnstone.channels._config import MAX_NOTIFY_TRACKING
 from turnstone.channels._formatter import chunk_message
@@ -258,9 +257,9 @@ class TurnstoneBot:
         headers: dict[str, str] = {}
         if api_token and not server_token_factory:
             headers["Authorization"] = f"Bearer {api_token}"
-        self._http_client = httpx.AsyncClient(
+        self._http_client = httpx2.AsyncClient(
             headers=headers,
-            timeout=httpx.Timeout(connect=10.0, read=90.0, write=10.0, pool=10.0),
+            timeout=httpx2.Timeout(connect=10.0, read=90.0, write=10.0, pool=10.0),
         )
 
         intents = discord.Intents.default()

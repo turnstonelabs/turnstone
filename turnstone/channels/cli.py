@@ -356,9 +356,8 @@ async def _run_gateway(
         with contextlib.suppress(asyncio.CancelledError):
             await heartbeat_task
 
-        # Stop adapters so SSE tasks, httpx clients, and Slack socket
-        # handlers close cleanly before we deregister from the service
-        # registry.
+        # Stop adapters so SSE tasks, HTTP clients, and Slack socket handlers close cleanly before
+        # we deregister from the service registry.
         await asyncio.gather(
             *(adapter.stop() for adapter in adapters.values()),
             return_exceptions=True,

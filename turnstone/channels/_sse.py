@@ -12,11 +12,11 @@ import asyncio
 import json
 from typing import TYPE_CHECKING
 
-import httpx
-import httpx_sse
+import httpx2
 
 from turnstone.channels._config import SSE_MAX_RECONNECT_DELAY, SSE_RECONNECT_DELAY
 from turnstone.core.log import get_logger
+from turnstone.core.sse_limits import MAX_SSE_EVENT_SIZE
 from turnstone.sdk.events import ServerEvent
 
 if TYPE_CHECKING:
@@ -27,7 +27,7 @@ log = get_logger(__name__)
 
 async def run_sse_stream(
     *,
-    http_client: httpx.AsyncClient,
+    http_client: httpx2.AsyncClient,
     log_prefix: str,
     ws_id: str,
     node_url_fn: Callable[[str], Awaitable[str]],
@@ -40,7 +40,7 @@ async def run_sse_stream(
     Parameters
     ----------
     http_client:
-        Shared ``httpx.AsyncClient`` for all SSE connections.
+        Shared ``httpx2.AsyncClient`` for all SSE connections.
     log_prefix:
         Platform tag used in log events (e.g. ``"discord"`` / ``"slack"``).
     ws_id:
@@ -72,12 +72,11 @@ async def run_sse_stream(
             if token_factory is not None:
                 sse_headers = {"Authorization": f"Bearer {token_factory()}"}
 
-            async with httpx_sse.aconnect_sse(
-                http_client,
-                "GET",
+            async with http_client.sse(
                 url,
                 headers=sse_headers,
                 params={"user_turn": 1},
+                max_event_size=MAX_SSE_EVENT_SIZE,
             ) as event_source:
                 status = event_source.response.status_code
                 if status == 404:
@@ -100,14 +99,14 @@ async def run_sse_stream(
                         ws_id=ws_id,
                         status=status,
                     )
-                    raise httpx.HTTPStatusError(
+                    raise httpx2.HTTPStatusError(
                         f"SSE upstream {status}",
                         request=event_source.response.request,
                         response=event_source.response,
                     )
 
                 delay = SSE_RECONNECT_DELAY  # reset on successful connect
-                async for sse in event_source.aiter_sse():
+                async for sse in event_source:
                     if sse.event != "message" and sse.event:
                         continue
                     try:
@@ -130,7 +129,7 @@ async def run_sse_stream(
                             exc_info=True,
                         )
 
-        except httpx.HTTPStatusError as exc:
+        except httpx2.HTTPStatusError as exc:
             # Already logged at WARNING inside the try block (the raise
             # was our own — status was captured there).  Caught here to
             # fall through to backoff + retry.
@@ -139,13 +138,13 @@ async def run_sse_stream(
                 ws_id=ws_id,
                 error=str(exc),
             )
-        except httpx.RemoteProtocolError:
+        except httpx2.RemoteProtocolError:
             log.debug(f"{log_prefix}.sse_remote_closed", ws_id=ws_id)
         except asyncio.CancelledError:
             return
-        except httpx.ReadTimeout:
+        except httpx2.ReadTimeout:
             log.info(f"{log_prefix}.sse_read_timeout", ws_id=ws_id)
-        except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+        except (httpx2.ConnectError, httpx2.ConnectTimeout) as exc:
             log.warning(
                 f"{log_prefix}.sse_connect_failed",
                 ws_id=ws_id,

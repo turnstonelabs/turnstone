@@ -1,75 +1,96 @@
-"""Tests for the shared SSE reconnect helper in turnstone.channels._sse."""
+"""Tests for the shared SSE reconnect helper in turnstone.channels._sse.
+
+Each test drives the loop through a real ``httpx2.AsyncClient`` whose
+``MockTransport`` answers every connection attempt with the next scripted reply.
+"""
 
 from __future__ import annotations
 
 import asyncio
-import contextlib
+import itertools
 import json
-from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+import logging
+from typing import TYPE_CHECKING
+from unittest.mock import AsyncMock
 
-import httpx
+import httpx2
 import pytest
+
+from turnstone.channels import _sse
+from turnstone.core.sse_limits import MAX_SSE_EVENT_SIZE
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 
 def _run(coro):  # type: ignore[no-untyped-def]
     return asyncio.run(coro)
 
 
-class _FakeSSEEvent:
-    """A fake ``httpx_sse.ServerSentEvent`` with the subset we read."""
-
-    def __init__(self, event: str, data: str) -> None:
-        self.event = event
-        self.data = data
+def _content_event(text: str = "hello") -> str:
+    """A payload ``ServerEvent.from_dict`` will accept (a ContentEvent)."""
+    return json.dumps({"type": "content", "ws_id": "ws-1", "text": text})
 
 
-class _FakeEventSource:
-    """Context manager returned by our fake ``aconnect_sse``.
+def _status(code: int) -> Callable[[httpx2.Request], httpx2.Response]:
+    """A reply with *code* and no body."""
+    return lambda request: httpx2.Response(code)
 
-    Captures the (status_code, events) the test wants to deliver.
-    ``aiter_sse`` yields the events then returns; the caller then hits
-    the outer ``while True`` loop again, which will pick up the next
-    queued response via the shared iterator state on _FakeConnect.
+
+def _stream(*payloads: str) -> Callable[[httpx2.Request], httpx2.Response]:
+    """A 200 event stream with one ``data`` event per payload, then the end of the stream."""
+    body = "".join(f"data: {payload}\n\n" for payload in payloads).encode()
+    return lambda request: httpx2.Response(
+        200, headers={"content-type": "text/event-stream"}, content=body
+    )
+
+
+def _raise(
+    exc_type: type[httpx2.TransportError],
+) -> Callable[[httpx2.Request], httpx2.Response]:
+    """A reply that fails the connection attempt with *exc_type*."""
+
+    def reply(request: httpx2.Request) -> httpx2.Response:
+        raise exc_type("boom", request=request)
+
+    return reply
+
+
+class _Node:
+    """A node that answers each connection attempt with the next scripted reply.
+
+    Once the script runs out it raises ``asyncio.CancelledError``, as cancelling
+    the listener's task would, so the loop returns and the test ends.
     """
 
-    def __init__(self, *, status_code: int, events: list[_FakeSSEEvent]) -> None:
-        self.response = SimpleNamespace(
-            status_code=status_code,
-            request=MagicMock(),
-        )
-        self._events = events
+    def __init__(self, *replies: Callable[[httpx2.Request], httpx2.Response]) -> None:
+        self._replies = list(replies)
+        self.requests: list[httpx2.Request] = []
 
-    async def __aenter__(self) -> _FakeEventSource:
-        return self
-
-    async def __aexit__(self, exc_type, exc, tb) -> None:  # noqa: ANN001
-        return None
-
-    async def aiter_sse(self):  # type: ignore[no-untyped-def]
-        for event in self._events:
-            yield event
-
-
-class _FakeConnect:
-    """Drop-in replacement for ``httpx_sse.aconnect_sse``.
-
-    On each call, pops the next ``_FakeEventSource`` from *queue*.  When
-    the queue is empty, raises ``asyncio.CancelledError`` so the loop
-    terminates cleanly in tests.
-    """
-
-    def __init__(self, queue: list[_FakeEventSource]) -> None:
-        self._queue = queue
-        self.call_count = 0
-        self.calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
-
-    def __call__(self, *args, **kwargs):  # noqa: ANN001, ANN204
-        self.call_count += 1
-        self.calls.append((args, kwargs))
-        if not self._queue:
+    def __call__(self, request: httpx2.Request) -> httpx2.Response:
+        self.requests.append(request)
+        if not self._replies:
             raise asyncio.CancelledError
-        return self._queue.pop(0)
+        return self._replies.pop(0)(request)
+
+
+async def _listen(
+    node: _Node,
+    *,
+    on_event: AsyncMock | None = None,
+    on_unavailable: AsyncMock | None = None,
+    token_factory: Callable[[], str] | None = None,
+) -> None:
+    async with httpx2.AsyncClient(transport=httpx2.MockTransport(node)) as client:
+        await _sse.run_sse_stream(
+            http_client=client,
+            log_prefix="test",
+            ws_id="ws-1",
+            node_url_fn=AsyncMock(return_value="http://node.example"),
+            token_factory=token_factory,
+            on_event=on_event or AsyncMock(),
+            on_unavailable=on_unavailable or AsyncMock(),
+        )
 
 
 @pytest.fixture
@@ -84,83 +105,38 @@ def _fast_sleep(monkeypatch):
     return sleeps
 
 
-def _valid_event_data(ws_id: str = "ws-1") -> str:
-    """A payload ``ServerEvent.from_dict`` will accept (a ContentEvent)."""
-    return json.dumps(
-        {
-            "type": "content",
-            "ws_id": ws_id,
-            "text": "hello",
-        }
-    )
-
-
 # ---------------------------------------------------------------------------
 # 404 → on_unavailable + exit
 # ---------------------------------------------------------------------------
 
 
 class TestUnavailableStream:
-    def test_404_calls_on_unavailable_and_returns(self, monkeypatch, _fast_sleep):
-        from turnstone.channels import _sse
-
-        queue = [_FakeEventSource(status_code=404, events=[])]
-        fake_connect = _FakeConnect(queue)
-        monkeypatch.setattr(_sse.httpx_sse, "aconnect_sse", fake_connect)
-
+    def test_404_calls_on_unavailable_and_returns(self, _fast_sleep):
+        node = _Node(_status(404))
         on_unavailable = AsyncMock()
         on_event = AsyncMock()
 
-        async def node_url_fn(ws_id: str) -> str:
-            return "http://node"
-
-        _run(
-            _sse.run_sse_stream(
-                http_client=MagicMock(),
-                log_prefix="test",
-                ws_id="ws-1",
-                node_url_fn=node_url_fn,
-                token_factory=None,
-                on_event=on_event,
-                on_unavailable=on_unavailable,
-            )
-        )
+        _run(_listen(node, on_event=on_event, on_unavailable=on_unavailable))
 
         on_unavailable.assert_awaited_once()
         on_event.assert_not_awaited()
         # No reconnect after 404.
-        assert fake_connect.call_count == 1
-        assert fake_connect.calls[0][1]["params"] == {"user_turn": 1}
+        assert len(node.requests) == 1
+        assert str(node.requests[0].url) == (
+            "http://node.example/v1/api/workstreams/ws-1/events?user_turn=1"
+        )
         assert _fast_sleep == []
 
-    def test_on_unavailable_exception_still_exits(self, monkeypatch, _fast_sleep):
+    def test_on_unavailable_exception_still_exits(self, _fast_sleep):
         """If on_unavailable raises, the loop must not reconnect."""
-        from turnstone.channels import _sse
-
-        queue = [_FakeEventSource(status_code=404, events=[])]
-        fake_connect = _FakeConnect(queue)
-        monkeypatch.setattr(_sse.httpx_sse, "aconnect_sse", fake_connect)
-
+        node = _Node(_status(404))
         on_unavailable = AsyncMock(side_effect=RuntimeError("storage down"))
 
-        async def node_url_fn(ws_id: str) -> str:
-            return "http://node"
-
-        _run(
-            _sse.run_sse_stream(
-                http_client=MagicMock(),
-                log_prefix="test",
-                ws_id="ws-1",
-                node_url_fn=node_url_fn,
-                token_factory=None,
-                on_event=AsyncMock(),
-                on_unavailable=on_unavailable,
-            )
-        )
+        _run(_listen(node, on_unavailable=on_unavailable))
 
         on_unavailable.assert_awaited_once()
         # Still a single connect — no livelock.
-        assert fake_connect.call_count == 1
+        assert len(node.requests) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -169,80 +145,28 @@ class TestUnavailableStream:
 
 
 class TestBackoff:
-    def test_500_triggers_backoff_and_retries(self, monkeypatch, _fast_sleep):
-        from turnstone.channels import _sse
+    def test_500_triggers_backoff_and_retries(self, _fast_sleep):
+        node = _Node(_status(503), _status(503), _status(503))
 
-        queue = [
-            _FakeEventSource(status_code=503, events=[]),
-            _FakeEventSource(status_code=503, events=[]),
-            _FakeEventSource(status_code=503, events=[]),
-        ]
-        fake_connect = _FakeConnect(queue)
-        monkeypatch.setattr(_sse.httpx_sse, "aconnect_sse", fake_connect)
+        _run(_listen(node))
 
-        async def node_url_fn(ws_id: str) -> str:
-            return "http://node"
+        assert len(node.requests) == 4
+        # Starts at SSE_RECONNECT_DELAY and doubles each time, capped at
+        # SSE_MAX_RECONNECT_DELAY.
+        assert _fast_sleep == [_sse.SSE_RECONNECT_DELAY * n for n in (1, 2, 4)]
 
-        with contextlib.suppress(asyncio.CancelledError):
-            _run(
-                _sse.run_sse_stream(
-                    http_client=MagicMock(),
-                    log_prefix="test",
-                    ws_id="ws-1",
-                    node_url_fn=node_url_fn,
-                    token_factory=None,
-                    on_event=AsyncMock(),
-                    on_unavailable=AsyncMock(),
-                )
-            )
-
-        assert fake_connect.call_count >= 3
-        # First three recorded sleeps are 2s, 4s, 8s (starts at
-        # SSE_RECONNECT_DELAY, doubles each time, capped at
-        # SSE_MAX_RECONNECT_DELAY).
-        assert _fast_sleep[0] == _sse.SSE_RECONNECT_DELAY
-        assert _fast_sleep[1] == _sse.SSE_RECONNECT_DELAY * 2
-        assert _fast_sleep[2] == _sse.SSE_RECONNECT_DELAY * 4
-
-    def test_backoff_resets_after_successful_dispatch(self, monkeypatch, _fast_sleep):
-        """After a 200 + successful event dispatch, the next error
-        restarts backoff at the initial delay."""
-        from turnstone.channels import _sse
-
-        good_event = _FakeSSEEvent(event="message", data=_valid_event_data())
-        queue = [
-            _FakeEventSource(status_code=503, events=[]),
-            _FakeEventSource(status_code=200, events=[good_event]),
-            _FakeEventSource(status_code=503, events=[]),
-        ]
-        fake_connect = _FakeConnect(queue)
-        monkeypatch.setattr(_sse.httpx_sse, "aconnect_sse", fake_connect)
-
+    def test_backoff_resets_on_a_successful_connect(self, _fast_sleep):
+        """A 200 connect resets the delay, so after that stream ends the loop waits the base
+        delay again, and the next error doubles from there."""
+        node = _Node(_status(503), _stream(_content_event()), _status(503))
         on_event = AsyncMock()
 
-        async def node_url_fn(ws_id: str) -> str:
-            return "http://node"
+        _run(_listen(node, on_event=on_event))
 
-        with contextlib.suppress(asyncio.CancelledError):
-            _run(
-                _sse.run_sse_stream(
-                    http_client=MagicMock(),
-                    log_prefix="test",
-                    ws_id="ws-1",
-                    node_url_fn=node_url_fn,
-                    token_factory=None,
-                    on_event=on_event,
-                    on_unavailable=AsyncMock(),
-                )
-            )
-
-        on_event.assert_awaited()
-        # Sleep sequence: 2 (after first 503), 2 (reset after 200/event),
-        # then CancelledError exits.  First two sleeps are both the base
-        # delay — the reset did its job.
-        assert len(_fast_sleep) >= 2
-        assert _fast_sleep[0] == _sse.SSE_RECONNECT_DELAY
-        assert _fast_sleep[1] == _sse.SSE_RECONNECT_DELAY
+        on_event.assert_awaited_once()
+        # The base delay after the first 503, the base delay again once the
+        # stream ends (the connect reset it), then double after the next 503.
+        assert _fast_sleep == [_sse.SSE_RECONNECT_DELAY * n for n in (1, 1, 2)]
 
 
 # ---------------------------------------------------------------------------
@@ -251,65 +175,52 @@ class TestBackoff:
 
 
 class TestEventDispatch:
-    def test_invalid_json_is_skipped(self, monkeypatch, _fast_sleep):
-        from turnstone.channels import _sse
-
-        bad = _FakeSSEEvent(event="message", data="{not json")
-        good = _FakeSSEEvent(event="message", data=_valid_event_data())
-        queue = [_FakeEventSource(status_code=200, events=[bad, good])]
-        fake_connect = _FakeConnect(queue)
-        monkeypatch.setattr(_sse.httpx_sse, "aconnect_sse", fake_connect)
-
+    def test_invalid_json_is_skipped(self, _fast_sleep):
+        node = _Node(_stream("{not json", _content_event()))
         on_event = AsyncMock()
 
-        async def node_url_fn(ws_id: str) -> str:
-            return "http://node"
-
-        with contextlib.suppress(asyncio.CancelledError):
-            _run(
-                _sse.run_sse_stream(
-                    http_client=MagicMock(),
-                    log_prefix="test",
-                    ws_id="ws-1",
-                    node_url_fn=node_url_fn,
-                    token_factory=None,
-                    on_event=on_event,
-                    on_unavailable=AsyncMock(),
-                )
-            )
+        _run(_listen(node, on_event=on_event))
 
         # Good event delivered, bad one silently dropped.
         assert on_event.await_count == 1
 
-    def test_on_event_exception_does_not_kill_stream(self, monkeypatch, _fast_sleep):
-        from turnstone.channels import _sse
-
-        e1 = _FakeSSEEvent(event="message", data=_valid_event_data())
-        e2 = _FakeSSEEvent(event="message", data=_valid_event_data())
-        queue = [_FakeEventSource(status_code=200, events=[e1, e2])]
-        fake_connect = _FakeConnect(queue)
-        monkeypatch.setattr(_sse.httpx_sse, "aconnect_sse", fake_connect)
-
+    def test_on_event_exception_does_not_kill_stream(self, _fast_sleep):
+        node = _Node(_stream(_content_event(), _content_event()))
         on_event = AsyncMock(side_effect=[RuntimeError("boom"), None])
 
-        async def node_url_fn(ws_id: str) -> str:
-            return "http://node"
-
-        with contextlib.suppress(asyncio.CancelledError):
-            _run(
-                _sse.run_sse_stream(
-                    http_client=MagicMock(),
-                    log_prefix="test",
-                    ws_id="ws-1",
-                    node_url_fn=node_url_fn,
-                    token_factory=None,
-                    on_event=on_event,
-                    on_unavailable=AsyncMock(),
-                )
-            )
+        _run(_listen(node, on_event=on_event))
 
         # Both events attempted — first raised but second still delivered.
         assert on_event.await_count == 2
+
+    def test_an_event_over_one_mebibyte_is_delivered(self, _fast_sleep):
+        """httpx2 refuses an event over 1 MiB unless told otherwise, so this
+        pins that the loop passes MAX_SSE_EVENT_SIZE."""
+        text = "x" * (2 * 1024 * 1024)
+        node = _Node(_stream(_content_event(text)))
+        on_event = AsyncMock()
+
+        _run(_listen(node, on_event=on_event))
+
+        on_event.assert_awaited_once()
+        assert on_event.await_args.args[0].text == text
+
+    def test_an_event_over_the_cap_ends_the_connection(self, _fast_sleep, caplog):
+        # A valid event, so only the cap can keep it from on_event.
+        node = _Node(_stream(_content_event("x" * MAX_SSE_EVENT_SIZE)))
+        on_event = AsyncMock()
+
+        with caplog.at_level(logging.DEBUG, logger="turnstone.channels._sse"):
+            _run(_listen(node, on_event=on_event))
+
+        on_event.assert_not_awaited()
+        errors = [r.getMessage() for r in caplog.records if "test.sse_error" in r.getMessage()]
+        # The rendered traceback carries httpx2's SSEError for the cap.
+        assert len(errors) == 1
+        assert f"exceeded the {MAX_SSE_EVENT_SIZE} byte limit" in errors[0]
+        # The loop backs off and reconnects.
+        assert len(node.requests) == 2
+        assert _fast_sleep == [_sse.SSE_RECONNECT_DELAY]
 
 
 # ---------------------------------------------------------------------------
@@ -327,11 +238,11 @@ class TestTokenFactory:
 
         def respond(request):
             requests.append(request)
-            return httpx.Response(404)
+            return httpx2.Response(404)
 
         on_unavailable = AsyncMock()
-        async with httpx.AsyncClient(
-            transport=httpx.MockTransport(respond),
+        async with httpx2.AsyncClient(
+            transport=httpx2.MockTransport(respond),
             headers={"Authorization": "Bearer static-token"},
         ) as client:
             await asyncio.wait_for(
@@ -350,85 +261,63 @@ class TestTokenFactory:
         expected = "rotating-token" if rotating else "static-token"
         assert requests[0].headers["Authorization"] == f"Bearer {expected}"
         assert requests[0].headers["Accept"] == "text/event-stream"
+        assert requests[0].headers["Cache-Control"] == "no-store"
         on_unavailable.assert_awaited_once()
 
-    def test_header_refreshed_per_connection(self, monkeypatch, _fast_sleep):
+    def test_header_refreshed_per_connection(self, _fast_sleep):
         """token_factory is called once per reconnect so rotating service
         JWTs stay fresh."""
-        from turnstone.channels import _sse
+        counter = itertools.count()
+        # Two reconnects, then the script runs out and the loop exits.
+        node = _Node(_status(503), _status(503))
 
-        # Two reconnects followed by CancelledError to exit.
-        queue = [
-            _FakeEventSource(status_code=503, events=[]),
-            _FakeEventSource(status_code=503, events=[]),
+        _run(_listen(node, token_factory=lambda: f"tok-{next(counter)}"))
+
+        assert [request.headers["Authorization"] for request in node.requests] == [
+            "Bearer tok-0",
+            "Bearer tok-1",
+            "Bearer tok-2",
         ]
-        fake_connect = _FakeConnect(queue)
-        monkeypatch.setattr(_sse.httpx_sse, "aconnect_sse", fake_connect)
-
-        tokens: list[str] = []
-
-        def factory() -> str:
-            tok = f"tok-{len(tokens)}"
-            tokens.append(tok)
-            return tok
-
-        async def node_url_fn(ws_id: str) -> str:
-            return "http://node"
-
-        with contextlib.suppress(asyncio.CancelledError):
-            _run(
-                _sse.run_sse_stream(
-                    http_client=MagicMock(),
-                    log_prefix="test",
-                    ws_id="ws-1",
-                    node_url_fn=node_url_fn,
-                    token_factory=factory,
-                    on_event=AsyncMock(),
-                    on_unavailable=AsyncMock(),
-                )
-            )
-
-        assert len(tokens) >= 2
-        assert tokens[0] != tokens[1]
 
 
 # ---------------------------------------------------------------------------
-# httpx errors
+# Transport and protocol errors
 # ---------------------------------------------------------------------------
+
+
+def _not_an_event_stream(request: httpx2.Request) -> httpx2.Response:
+    return httpx2.Response(200, headers={"content-type": "application/json"}, content=b"{}")
 
 
 class TestTransportErrors:
-    def test_connect_error_falls_through_to_backoff(self, monkeypatch, _fast_sleep):
-        """ConnectError is caught and treated as retryable."""
-        from turnstone.channels import _sse
+    @pytest.mark.parametrize(
+        ("reply", "logged"),
+        [
+            (_raise(httpx2.ConnectError), "test.sse_connect_failed"),
+            (_raise(httpx2.ConnectTimeout), "test.sse_connect_failed"),
+            (_raise(httpx2.ReadTimeout), "test.sse_read_timeout"),
+            (_raise(httpx2.RemoteProtocolError), "test.sse_remote_closed"),
+            (_status(503), "test.sse_http_status_error"),
+            # httpx2.SSEError, which no clause names.
+            (_not_an_event_stream, "test.sse_error"),
+        ],
+        ids=[
+            "connect-error",
+            "connect-timeout",
+            "read-timeout",
+            "remote-protocol-error",
+            "status-error",
+            "not-an-event-stream",
+        ],
+    )
+    def test_failure_backs_off_and_reconnects(self, _fast_sleep, caplog, reply, logged):
+        """Each failure reaches the clause meant for it, then the loop backs off
+        and reconnects."""
+        node = _Node(reply)
 
-        call_order = {"n": 0}
+        with caplog.at_level(logging.DEBUG, logger="turnstone.channels._sse"):
+            _run(_listen(node))
 
-        def fake_connect(*args, **kwargs):  # noqa: ANN001, ANN003
-            call_order["n"] += 1
-            if call_order["n"] == 1:
-                raise httpx.ConnectError("boom")
-            # Second attempt: signal the loop to exit.
-            raise asyncio.CancelledError
-
-        monkeypatch.setattr(_sse.httpx_sse, "aconnect_sse", fake_connect)
-
-        async def node_url_fn(ws_id: str) -> str:
-            return "http://node"
-
-        with contextlib.suppress(asyncio.CancelledError):
-            _run(
-                _sse.run_sse_stream(
-                    http_client=MagicMock(),
-                    log_prefix="test",
-                    ws_id="ws-1",
-                    node_url_fn=node_url_fn,
-                    token_factory=None,
-                    on_event=AsyncMock(),
-                    on_unavailable=AsyncMock(),
-                )
-            )
-
-        assert call_order["n"] == 2
-        # Backoff ran once after the ConnectError.
+        assert any(logged in r.getMessage() for r in caplog.records)
+        assert len(node.requests) == 2
         assert _fast_sleep == [_sse.SSE_RECONNECT_DELAY]

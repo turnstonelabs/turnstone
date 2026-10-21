@@ -86,14 +86,14 @@ def _make_bot() -> tuple[object, MagicMock, MagicMock]:
     client.conversations_history = AsyncMock(return_value={"ok": True, "messages": []})
     client.views_open = AsyncMock(return_value={"ok": True})
 
-    # Patch httpx.AsyncClient so each test doesn't open a real client that
-    # leaks an unclosed-warning at GC time.  The bot's _http_client is only
-    # used by the SDK router (which we replace with a MagicMock below), so
-    # an AsyncMock standin is enough for every test that uses this factory.
+    # Patch httpx2.AsyncClient so each test doesn't open a real client that leaks an
+    # unclosed-warning at GC time.  The bot's _http_client is only used by the SSE listener (which
+    # we replace with an AsyncMock below), so an AsyncMock standin is enough for every test that
+    # uses this factory.
     with (
         patch("turnstone.channels.slack.bot.AsyncApp", MagicMock()),
         patch("turnstone.channels.slack.bot.AsyncWebClient", return_value=client),
-        patch("turnstone.channels.slack.bot.httpx.AsyncClient", return_value=AsyncMock()),
+        patch("turnstone.channels.slack.bot.httpx2.AsyncClient", return_value=AsyncMock()),
     ):
         bot = TurnstoneSlackBot(
             config,
@@ -830,7 +830,7 @@ class TestWsEventDispatch:
             patch("turnstone.channels.slack.bot.AsyncApp", MagicMock()),
             patch("turnstone.channels.slack.bot.AsyncWebClient", return_value=client),
             patch(
-                "turnstone.channels.slack.bot.httpx.AsyncClient",
+                "turnstone.channels.slack.bot.httpx2.AsyncClient",
                 return_value=AsyncMock(),
             ),
         ):
@@ -913,7 +913,7 @@ class TestWsEventDispatch:
             patch("turnstone.channels.slack.bot.AsyncApp", MagicMock()),
             patch("turnstone.channels.slack.bot.AsyncWebClient", return_value=client),
             patch(
-                "turnstone.channels.slack.bot.httpx.AsyncClient",
+                "turnstone.channels.slack.bot.httpx2.AsyncClient",
                 return_value=AsyncMock(),
             ),
         ):
@@ -1057,7 +1057,7 @@ class TestNotificationTracking:
             patch("turnstone.channels.slack.bot.AsyncApp", MagicMock()),
             patch("turnstone.channels.slack.bot.AsyncWebClient"),
             patch(
-                "turnstone.channels.slack.bot.httpx.AsyncClient",
+                "turnstone.channels.slack.bot.httpx2.AsyncClient",
                 return_value=AsyncMock(),
             ),
         ):
@@ -1078,7 +1078,7 @@ class TestNotificationTracking:
             patch("turnstone.channels.slack.bot.AsyncApp", MagicMock()),
             patch("turnstone.channels.slack.bot.AsyncWebClient"),
             patch(
-                "turnstone.channels.slack.bot.httpx.AsyncClient",
+                "turnstone.channels.slack.bot.httpx2.AsyncClient",
                 return_value=AsyncMock(),
             ),
         ):

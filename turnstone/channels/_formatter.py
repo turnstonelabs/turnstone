@@ -11,7 +11,7 @@ import json
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    import httpx
+    import httpx2
 
 
 def chunk_message(text: str, max_length: int = 2000) -> list[str]:
@@ -236,16 +236,14 @@ async def _is_safe_image_url(url: str) -> bool:
     ``::ffff:192.168.0.6`` is the LAN address it routes to (allowed here)
     rather than the reserved wrapper it looks like.
 
-    NOTE: there is a residual TOCTOU gap because httpx resolves the
-    hostname again when it actually issues the GET.  A 0-TTL rebinding
-    resolver could still slip an internal IP in between validation and
-    fetch.  Fully closing the gap requires pinning the validated IP on
-    the connection (a custom httpx transport) — out of scope for this
-    backfill pass.
+    NOTE: there is a residual TOCTOU gap because httpx2 resolves the hostname again when it actually
+    issues the GET.  A 0-TTL rebinding resolver could still slip an internal IP in between
+    validation and fetch.  Fully closing the gap requires pinning the validated IP on the connection
+    (a custom httpx2 transport) — out of scope for this backfill pass.
 
-    The host resolved is the one the fetch dials: the IDNA 2008 ASCII name httpx2 parses from
-    the URL, which httpx encodes the same way. urllib keeps a Unicode name, which the resolver
-    would encode with IDNA 2003, and for some names the two are different hosts.
+    The host resolved is the one the fetch dials: the IDNA 2008 ASCII name httpx2 parses from the
+    URL. urllib keeps a Unicode name, which the resolver would encode with IDNA 2003, and for some
+    names the two are different hosts.
     """
     import asyncio
     from urllib.parse import urlparse
@@ -300,7 +298,7 @@ async def _is_safe_image_url(url: str) -> bool:
 
 
 async def _fetch_thumbnail(
-    http: httpx.AsyncClient,
+    http: httpx2.AsyncClient,
     url: str,
     *,
     timeout: float = 5.0,
@@ -344,7 +342,7 @@ async def try_build_media_embed(
     tool_name: str,
     output: str,
     *,
-    http: httpx.AsyncClient,
+    http: httpx2.AsyncClient,
 ) -> tuple[Any, Any | None] | None:
     """Attempt to build a rich Discord embed from media tool output.
 

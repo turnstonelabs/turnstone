@@ -6,6 +6,7 @@ import asyncio
 import sys
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx2
 import pytest
 
 # discord.utils.escape_markdown passes 'count' as positional to re.sub,
@@ -147,14 +148,14 @@ class TestDiscordConfig:
 def _make_real_bot():
     """Construct a TurnstoneBot around a real ``commands.Bot`` (no gateway).
 
-    Storage is mocked and the module's httpx client is patched out; the
+    Storage is mocked and the module's httpx2 client is patched out; the
     underlying discord client object is real so tests can assert against
     the actual connection-state defaults every message create inherits.
     """
     from turnstone.channels.discord.bot import TurnstoneBot
     from turnstone.channels.discord.config import DiscordConfig
 
-    with patch("turnstone.channels.discord.bot.httpx.AsyncClient", return_value=AsyncMock()):
+    with patch("turnstone.channels.discord.bot.httpx2.AsyncClient", return_value=AsyncMock()):
         return TurnstoneBot(
             DiscordConfig(bot_token="token-test"), "http://localhost:8080", MagicMock()
         )
@@ -1509,23 +1510,75 @@ class TestIsSafeImageUrl:
         self._patch_resolver(monkeypatch, ["203.0.113.5"])
         assert _run(_is_safe_image_url(url)) is False
 
-    @pytest.mark.parametrize(
-        "url",
-        [
-            "http://stra" + chr(0xDF) + "e.example.com/poster.png",
-            "http://example" + chr(0x3002) + "com/poster.png",
-            "http://" + chr(0x212A) + ".example.com/poster.png",
-            "http://[fe80::1%25eth0]/poster.png",
-        ],
-        ids=["sharp-s", "ideographic-full-stop", "kelvin-sign", "zone-id"],
-    )
-    def test_the_guard_and_the_fetch_read_the_same_host(self, url):
-        """The guard reads the host with httpx2 and the fetch dials through the bot's httpx
-        client, so the guard checks the host the fetch reaches only while the two agree."""
-        import httpx
-        import httpx2
 
-        assert httpx.URL(url).raw_host == httpx2.URL(url).raw_host
+_THUMBNAIL_URL = "http://media.example.com/Items/abc/Images/Primary"
+
+
+def _fetch_through(monkeypatch, handler, *, resolves_to="203.0.113.5", **kwargs):
+    """Run _fetch_thumbnail through a real httpx2 client whose transport is *handler*."""
+    from turnstone.channels._formatter import _fetch_thumbnail
+
+    TestIsSafeImageUrl._patch_resolver(monkeypatch, [resolves_to])
+
+    async def fetch():
+        async with httpx2.AsyncClient(transport=httpx2.MockTransport(handler)) as http:
+            return await _fetch_thumbnail(http, _THUMBNAIL_URL, **kwargs)
+
+    return _run(fetch())
+
+
+async def _two_chunks():
+    yield b"x" * 8
+    yield b"x" * 8
+
+
+class TestFetchThumbnail:
+    """_fetch_thumbnail through a real httpx2 client."""
+
+    def test_returns_the_image_and_its_filename(self, monkeypatch):
+        requests = []
+
+        def handler(request):
+            requests.append(request)
+            return httpx2.Response(200, headers={"content-type": "image/png"}, content=b"png")
+
+        assert _fetch_through(monkeypatch, handler) == (b"png", "poster.png")
+        assert [(r.method, str(r.url)) for r in requests] == [("GET", _THUMBNAIL_URL)]
+
+    @pytest.mark.parametrize(
+        ("status", "headers", "content"),
+        [
+            (404, {"content-type": "image/png"}, b""),
+            (200, {"content-type": "text/html"}, b"<html>"),
+            # A short body declaring a long one, so only the declared length can refuse it.
+            (200, {"content-type": "image/jpeg", "content-length": "100"}, b"xxxx"),
+            (200, {"content-type": "image/jpeg"}, _two_chunks),
+        ],
+        ids=["not-found", "not-an-image", "declared-too-large", "streamed-too-large"],
+    )
+    def test_returns_none_for_a_response_it_cannot_use(self, monkeypatch, status, headers, content):
+        def handler(request):
+            # A generator streams a chunked body that declares no length.
+            body = content() if callable(content) else content
+            return httpx2.Response(status, headers=headers, content=body)
+
+        assert _fetch_through(monkeypatch, handler, max_bytes=8) is None
+
+    def test_a_url_the_guard_refuses_is_never_requested(self, monkeypatch):
+        requests = []
+
+        def handler(request):
+            requests.append(request)
+            return httpx2.Response(200, headers={"content-type": "image/png"}, content=b"png")
+
+        assert _fetch_through(monkeypatch, handler, resolves_to="127.0.0.1") is None
+        assert requests == []
+
+    def test_a_transport_error_returns_none(self, monkeypatch):
+        def handler(request):
+            raise httpx2.ConnectError("refused", request=request)
+
+        assert _fetch_through(monkeypatch, handler) is None
 
 
 class TestBuildMediaEmbed:
@@ -1581,6 +1634,28 @@ class TestBuildMediaEmbed:
         http = MagicMock()
         result = _run(try_build_media_embed("tool", "plain text", http=http))
         assert result is None
+
+    def test_thumbnail_is_fetched_and_attached(self, monkeypatch):
+        import json
+
+        from turnstone.channels._formatter import try_build_media_embed
+
+        TestIsSafeImageUrl._patch_resolver(monkeypatch, ["203.0.113.5"])
+        output = json.dumps(
+            {"name": "Test Movie", "type": "Movie", "id": "abc", "thumbnail_url": _THUMBNAIL_URL}
+        )
+
+        def handler(request):
+            return httpx2.Response(200, headers={"content-type": "image/webp"}, content=b"webp")
+
+        async def build():
+            async with httpx2.AsyncClient(transport=httpx2.MockTransport(handler)) as http:
+                return await try_build_media_embed("mcp__media__get_item", output, http=http)
+
+        embed, file = _run(build())
+        assert file.filename == "poster.webp"
+        assert file.fp.read() == b"webp"
+        assert embed.thumbnail.url == "attachment://poster.webp"
 
     def test_season_episode_string_values(self):
         """Season/episode numbers as strings should not raise."""
