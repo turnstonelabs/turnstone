@@ -327,33 +327,31 @@ class TestDiagnosticToolsReadOnly:
         assert "invalid service" in out.lower()
 
 
+def _clear_proxy_variables(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The doctor's fetch refuses to send through a proxy, and these tests script its connections.
+    for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY"):
+        monkeypatch.delenv(name, raising=False)
+        monkeypatch.delenv(name.lower(), raising=False)
+
+
 class TestHttpGetJsonSafety:
     @pytest.mark.parametrize("host", ["straße.example", "ς.example"])
     def test_fetch_uses_the_screened_hostname(self, monkeypatch, host):
-        import socket
-        import urllib.parse
-
         import httpx2
 
-        from tests.test_open_preview_tool import _resolver
+        from tests.test_web_transport import _Network, _response
 
+        _clear_proxy_variables(monkeypatch)
         url = f"http://{host}/health"
         dialed_host = httpx2.URL(url).raw_host.decode("ascii")
-        resolver_host = host.encode("idna").decode("ascii")
-        looked_up = _resolver(
+        net = _Network(
             monkeypatch,
-            {resolver_host: ["93.184.216.34"], dialed_host: ["93.184.216.34"]},
+            {dialed_host: [["93.184.216.34"]]},
+            [[_response(body=b'{"ok": true}')]],
         )
-
-        def _urlopen(req, **kwargs):
-            socket.getaddrinfo(urllib.parse.urlsplit(req.full_url).hostname, 80)
-            response = MagicMock()
-            response.__enter__.return_value.read.return_value = b'{"ok": true}'
-            return response
-
-        monkeypatch.setattr("urllib.request.urlopen", _urlopen)
         assert _http_get_json(url) == {"ok": True}
-        assert looked_up == [dialed_host, dialed_host]
+        assert net.lookups == [dialed_host, dialed_host]
+        assert [attempt[1] for attempt in net.attempts] == ["93.184.216.34"]
 
     def test_rejects_file_scheme(self) -> None:
         with pytest.raises(ValueError, match="non-http"):
@@ -363,19 +361,27 @@ class TestHttpGetJsonSafety:
         with pytest.raises(ValueError, match="link-local|metadata"):
             _http_get_json("http://169.254.169.254/latest/meta-data/")
 
+    def test_a_redirect_is_screened_before_it_is_followed(self, monkeypatch) -> None:
+        from tests.test_web_transport import _Network, _response
+        from turnstone.core.web import UrlBlockedError
+
+        _clear_proxy_variables(monkeypatch)
+        net = _Network(
+            monkeypatch,
+            {"node.example": [["10.0.0.5"]]},
+            [[_response(302, [("Location", "http://169.254.169.254/latest/meta-data/")])]],
+        )
+        with pytest.raises(UrlBlockedError) as refused:
+            _http_get_json("http://node.example/health")
+        assert refused.value.hop == 1
+        assert [attempt[1] for attempt in net.attempts] == ["10.0.0.5"]
+
     def test_allows_loopback(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # loopback must stay allowed (probing localhost /health is the job)
-        class _FakeResp:
-            def __enter__(self) -> _FakeResp:
-                return self
+        from tests.test_web_transport import _Network, _response
 
-            def __exit__(self, *a: object) -> bool:
-                return False
-
-            def read(self) -> bytes:
-                return b'{"ok": true}'
-
-        monkeypatch.setattr("urllib.request.urlopen", lambda *a, **k: _FakeResp())
+        _clear_proxy_variables(monkeypatch)
+        _Network(monkeypatch, {"localhost": [["127.0.0.1"]]}, [[_response(body=b'{"ok": true}')]])
         assert _http_get_json("http://localhost:8080/health") == {"ok": True}
 
 
@@ -390,13 +396,22 @@ class TestHttpHealthTool:
         assert "ok" in out and "1.7.0a2" in out
 
     def test_unreachable(self) -> None:
-        import urllib.error
+        import httpx2
 
         from turnstone.doctor import _tool_http_health
 
-        with patch("turnstone.doctor._http_get_json", side_effect=urllib.error.URLError("refused")):
+        with patch("turnstone.doctor._http_get_json", side_effect=httpx2.ConnectError("refused")):
             out = _tool_http_health({"url": "http://localhost:8080"})
         assert "unreachable" in out
+
+    def test_an_error_status_is_reported(self, monkeypatch) -> None:
+        from tests.test_web_transport import _Network, _response
+        from turnstone.doctor import _tool_http_health
+
+        _clear_proxy_variables(monkeypatch)
+        _Network(monkeypatch, {"localhost": [["127.0.0.1"]]}, [[_response(503)]])
+        out = _tool_http_health({"url": "http://localhost:8080"})
+        assert "HTTP 503" in out
 
 
 class TestCheckLlmBackendTool:
@@ -1240,7 +1255,7 @@ class TestCheckVersions:
 
     def test_upstream_parse(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         tags = [{"name": "v1.6.8"}, {"name": "v1.7.0a2"}, {"name": "v1.6.9"}]
-        monkeypatch.setattr("turnstone.doctor._http_get_json", lambda url, timeout=6.0: tags)
+        monkeypatch.setattr("turnstone.doctor._upstream_tags", lambda timeout: tags)
         vr = check_versions(_make_profile(tmp_path), None, offline=False)
         assert vr.upstream_stable == "1.6.9"
         assert vr.upstream_experimental == "1.7.0a2"
@@ -1248,12 +1263,12 @@ class TestCheckVersions:
     def test_upstream_unreachable_degrades(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        import urllib.error
+        import httpx2
 
-        def boom(url: str, timeout: float = 6.0) -> object:
-            raise urllib.error.URLError("no net")
+        def boom(timeout: float) -> object:
+            raise httpx2.ConnectError("no net")
 
-        monkeypatch.setattr("turnstone.doctor._http_get_json", boom)
+        monkeypatch.setattr("turnstone.doctor._upstream_tags", boom)
         vr = check_versions(_make_profile(tmp_path), None, offline=False)
         assert vr.upstream_error  # non-empty, but no exception raised
 
@@ -1502,11 +1517,33 @@ class TestVersionBehind:
 class TestUpstreamFetchParsing:
     def test_classifies_stable_vs_prerelease(self, monkeypatch: pytest.MonkeyPatch) -> None:
         tags = [{"name": "v1.5.18"}, {"name": "v1.6.9"}, {"name": "v1.7.0a1"}, {"name": "v1.7.0a2"}]
-        monkeypatch.setattr("turnstone.doctor._http_get_json", lambda url, timeout=6.0: tags)
+        monkeypatch.setattr("turnstone.doctor._upstream_tags", lambda timeout: tags)
         stable, experimental, err = _fetch_upstream_versions()
         assert stable == "1.6.9"
         assert experimental == "1.7.0a2"
         assert err == ""
+
+    def test_an_error_status_reads_as_one_line(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import httpx2
+
+        def forbidden(timeout: float) -> object:
+            request = httpx2.Request("GET", "https://tags.example/tags")
+            response = httpx2.Response(403, request=request)
+            raise httpx2.HTTPStatusError("forbidden", request=request, response=response)
+
+        monkeypatch.setattr("turnstone.doctor._upstream_tags", forbidden)
+        assert _fetch_upstream_versions() == ("", "", "HTTP 403 Forbidden")
+
+    def test_a_socks_proxy_the_client_cannot_use_degrades(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Without the socksio package, building a client for a socks proxy raises ImportError;
+        # nothing is dialed.
+        monkeypatch.setenv("ALL_PROXY", "socks5h://127.0.0.1:1")
+        monkeypatch.setattr("turnstone.doctor.GITHUB_TAGS_URL", "http://127.0.0.1:1/tags")
+        stable, experimental, err = _fetch_upstream_versions(timeout=1)
+        assert (stable, experimental) == ("", "")
+        assert err
 
 
 # ---------------------------------------------------------------------------

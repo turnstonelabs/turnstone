@@ -321,14 +321,13 @@ def fetch_with_ssrf_guard(
     executing the private-network request even if the response is later
     discarded.  Here each hop's URL is screened BEFORE its request is issued.
 
-    EVERY hop is screened, in every mode, the first included: a screen run
-    before approval must not resolve a hostname (see
-    :func:`screen_url_offline`), so this is where a hostname target is first
-    looked up.  ``allow_private_origin`` widens which lanes are acceptable,
-    it does not turn screening off: the caller sets it only when the operator
-    opted in AND the approval prompt marked the original target as a
-    private-network request, so the approval gate saw and approved that
-    private URL.
+    EVERY hop is screened, in every mode, the first included: a screen run before approval must not
+    resolve a hostname (see :func:`screen_url_offline`), so this is where a hostname target is first
+    looked up.  ``allow_private_origin`` widens which lanes are acceptable, it does not turn
+    screening off: the URL tools set it only when the operator opted in AND the approval prompt
+    marked the original target as a private-network request, so the approval gate saw and approved
+    that private URL, and the doctor sets it for every health probe, since reaching the operator's
+    own nodes is its job.
 
     ``first_hop_screen`` may supply the caller's execution-time verdict on
     this exact URL, so a private-grant recheck and hop 0 use the same answer.
@@ -389,15 +388,14 @@ def fetch_with_ssrf_guard(
             if screen.lane is AddressLane.PRIVATE and not private_allowed:
                 raise UrlBlockedError(screen, hop)
             if not screen.all_private:
-                # The chain can no longer be shown to be inside the operator's
-                # network, so private hops stop being allowed from here on.
-                # There is deliberately no exemption for the origin host: an
-                # earlier attempt to keep one let a public hop steer the fetcher
-                # back into the approved host at a path of its choosing, and
-                # made the grant re-entrant across same-host redirects with
-                # fresh DNS each time. The caller refuses a mixed-record origin
-                # outright instead, so a chain that gets here wholly private
-                # stays that way or ends.
+                # The chain can no longer be shown to be inside the operator's network, so private
+                # hops stop being allowed from here on. There is deliberately no exemption for the
+                # origin host: an earlier attempt to keep one let a public hop steer the fetcher
+                # back into the approved host at a path of its choosing, and made the grant
+                # re-entrant across same-host redirects with fresh DNS each time. The URL tools
+                # refuse a mixed-record origin outright instead, so a chain that gets here wholly
+                # private stays that way or ends; the doctor accepts one, and this latch then
+                # refuses every private hop after it.
                 private_allowed = False
             if client is None:
                 transport = PinnedTransport()

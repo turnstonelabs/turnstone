@@ -44,9 +44,7 @@ import subprocess
 import sys
 import tempfile
 import tomllib
-import urllib.error
 import urllib.parse
-import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -56,6 +54,7 @@ from packaging.version import InvalidVersion, Version
 
 from turnstone import __version__
 from turnstone.core.env import _is_secret
+from turnstone.core.http_failures import REQUEST_FAILURES
 from turnstone.ui.colors import BOLD, CYAN, DIM, GREEN, RED, RESET, YELLOW
 from turnstone.ui.markdown import MarkdownRenderer
 from turnstone.ui.spinner import Spinner
@@ -276,15 +275,40 @@ def _assert_safe_http_url(url: str) -> None:
 
 
 def _http_get_json(url: str, timeout: float = 5.0) -> Any:
-    """GET *url* and parse JSON. Raises on network/parse failure or unsafe URL."""
+    """GET *url* and parse JSON. Raises on network/parse failure, an error status or unsafe URL.
+
+    *url* comes from the model or the cluster, so it goes through the fetch the URL tools use.
+    That fetch screens every redirect before following it, refuses a private hop once a hop has
+    resolved to a public address, and connects only to the addresses it screened.
+    """
+    from turnstone.core.web import fetch_with_ssrf_guard
+
     _assert_safe_http_url(url)
-    url = str(httpx2.URL(url))
-    req = urllib.request.Request(
+    resp = fetch_with_ssrf_guard(
         url,
-        headers={"Accept": "application/json", "User-Agent": f"turnstone-doctor/{__version__}"},
+        timeout=timeout,
+        user_agent=f"turnstone-doctor/{__version__}",
+        allow_private_origin=True,
     )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 - scheme restricted above
-        return json.loads(resp.read().decode("utf-8"))
+    resp.raise_for_status()
+    return resp.json()
+
+
+def _upstream_tags(timeout: float) -> Any:
+    """GET the upstream tag list.
+
+    Its URL is fixed, so a plain client fetches it, which takes the proxy variables as the other
+    clients do, ``ALL_PROXY`` included.
+    """
+    resp = httpx2.get(
+        GITHUB_TAGS_URL,
+        params={"per_page": 100},
+        headers={"Accept": "application/json", "User-Agent": f"turnstone-doctor/{__version__}"},
+        timeout=timeout,
+        follow_redirects=True,
+    )
+    resp.raise_for_status()
+    return resp.json()
 
 
 def _run_readonly(
@@ -736,7 +760,7 @@ def _probe_health(url: str) -> dict[str, Any] | None:
         target += "/health"
     try:
         data = _http_get_json(target, timeout=4)
-    except (urllib.error.URLError, OSError, ValueError, TimeoutError):
+    except (*REQUEST_FAILURES, OSError, ValueError, TimeoutError):
         return None
     return data if isinstance(data, dict) else None
 
@@ -750,8 +774,11 @@ def _fetch_health_version(url: str) -> str:
 def _fetch_upstream_versions(timeout: float = 6.0) -> tuple[str, str, str]:
     """Return (latest_stable, latest_experimental, error) from the upstream tags."""
     try:
-        data = _http_get_json(GITHUB_TAGS_URL + "?per_page=100", timeout=timeout)
-    except (urllib.error.URLError, OSError, ValueError, TimeoutError) as exc:
+        data = _upstream_tags(timeout)
+    except httpx2.HTTPStatusError as exc:
+        return "", "", f"HTTP {exc.response.status_code} {exc.response.reason_phrase}"
+    except (*REQUEST_FAILURES, OSError, ValueError, TimeoutError, ImportError) as exc:
+        # ImportError: a socks proxy in the environment needs the socksio package.
         return "", "", str(exc)
     if not isinstance(data, list):
         return "", "", "unexpected response from GitHub tags API"
@@ -1570,9 +1597,9 @@ def _tool_http_health(args: dict[str, Any]) -> str:
         url = url + "/health"
     try:
         data = _http_get_json(url, timeout=5)
-    except urllib.error.HTTPError as exc:
-        return f"{url} → HTTP {exc.code} {exc.reason}"
-    except (urllib.error.URLError, OSError, ValueError, TimeoutError) as exc:
+    except httpx2.HTTPStatusError as exc:
+        return f"{url} → HTTP {exc.response.status_code} {exc.response.reason_phrase}"
+    except (*REQUEST_FAILURES, OSError, ValueError, TimeoutError) as exc:
         return f"{url} → unreachable ({exc})"
     return json.dumps(data, indent=2, default=str)[:6000]
 
