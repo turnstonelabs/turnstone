@@ -1,5 +1,6 @@
 """The SDK's TLS arguments against a loopback node that requires a client certificate."""
 
+import contextlib
 import http.server
 import json
 import shutil
@@ -11,6 +12,7 @@ import threading
 import httpx2
 import pytest
 
+from turnstone.sdk import REQUEST_FAILURES
 from turnstone.sdk._base import _BaseClient
 
 _HOST = "node.example"
@@ -44,10 +46,9 @@ def pki(tmp_path):
     return _issue(_HOST), _issue("client.example")
 
 
-@pytest.fixture
-def node(monkeypatch, pki):
+@contextlib.contextmanager
+def _serving(monkeypatch, server_paths, version):
     """Serve HTTPS on loopback as the node, requiring a client certificate from the CA."""
-    server_paths, _ = pki
     real_getaddrinfo = socket.getaddrinfo
 
     def resolve(host, *args, **kwargs):
@@ -61,10 +62,7 @@ def node(monkeypatch, pki):
         monkeypatch.delenv(name.lower(), raising=False)
 
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    # Under TLS 1.3 the node refuses a client without a certificate after the handshake, and the
-    # alert can surface as a raw ssl.SSLError on the first read; 1.2 refuses during the handshake,
-    # so the refusal is always a ConnectError.
-    context.maximum_version = ssl.TLSVersion.TLSv1_2
+    context.minimum_version = context.maximum_version = version
     context.load_cert_chain(str(server_paths.cert), str(server_paths.key))
     context.load_verify_locations(cafile=str(server_paths.ca))
     context.verify_mode = ssl.CERT_REQUIRED
@@ -72,10 +70,29 @@ def node(monkeypatch, pki):
     server.socket = context.wrap_socket(server.socket, server_side=True)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
-    yield f"https://{_HOST}:{server.server_address[1]}"
-    server.shutdown()
-    server.server_close()
-    thread.join(timeout=5)
+    try:
+        yield f"https://{_HOST}:{server.server_address[1]}"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+@pytest.fixture
+def node(monkeypatch, pki):
+    # Under TLS 1.2 the node refuses a client without a certificate during the handshake, so the
+    # refusal is always a ConnectError.
+    with _serving(monkeypatch, pki[0], ssl.TLSVersion.TLSv1_2) as url:
+        yield url
+
+
+@pytest.fixture
+def node_on_tls13(monkeypatch, pki):
+    # Under TLS 1.3 the client finishes its handshake before the node checks the certificate, so
+    # the refusal reaches the first read instead: as the alert itself, a raw ssl.SSLError, or as a
+    # ReadError when the node's reset arrives first.
+    with _serving(monkeypatch, pki[0], ssl.TLSVersion.TLSv1_3) as url:
+        yield url
 
 
 @pytest.mark.anyio
@@ -97,6 +114,14 @@ async def test_the_node_refuses_a_client_without_a_certificate(node, pki):
     server_paths, _ = pki
     async with _BaseClient(base_url=node, ca_cert=str(server_paths.ca)) as client:
         with pytest.raises(httpx2.ConnectError):
+            await client._request("GET", "/health")
+
+
+@pytest.mark.anyio
+async def test_a_refusal_after_the_tls13_handshake_is_a_request_failure(node_on_tls13, pki):
+    server_paths, _ = pki
+    async with _BaseClient(base_url=node_on_tls13, ca_cert=str(server_paths.ca)) as client:
+        with pytest.raises(REQUEST_FAILURES):
             await client._request("GET", "/health")
 
 

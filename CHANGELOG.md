@@ -326,10 +326,13 @@ frozen.
   as an MCP server started with that environment's Python, must now install them itself.
 - **The Python SDK runs on httpx2 and takes only an httpx2 client** *(BREAKING)* — `httpx_client=`
   must be an `httpx2.AsyncClient`; an `httpx` client, or anything else, raises `TypeError` when the
-  SDK client is built rather than failing later mid-request or mid-stream. The SDK's transport
-  errors are httpx2's too (`httpx2.ConnectError`, `httpx2.SSEError` for an event stream it can't
-  read, and the rest of `httpx2.HTTPError`), so code that catches `httpx.HTTPError` or
-  `httpx_sse.SSEError` around SDK calls must catch httpx2's classes instead.
+  SDK client is built rather than failing later mid-request or mid-stream. A request that fails in
+  transport raises one of `turnstone.sdk.REQUEST_FAILURES`: httpx2's own errors
+  (`httpx2.ConnectError`, `httpx2.SSEError` for an event stream it can't read, and the rest of
+  `httpx2.HTTPError`), and those httpx2 raises outside that family, for a redirect it can't follow
+  (`httpx2.InvalidURL`, `UnicodeError`) or a TLS alert after the handshake (`ssl.SSLError`). Code
+  that catches `httpx.HTTPError` or `httpx_sse.SSEError` around SDK calls must catch
+  `REQUEST_FAILURES` instead.
 - **A model that isn't loaded is never replaced by another (#1359)** *(BREAKING)* — when the default
   model, the task model, the coordinator model or the channel model names a definition that isn't
   loaded (deleted, disabled, misspelled, or left out of a reload because its secret reference

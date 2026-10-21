@@ -13,5 +13,6 @@ import httpx2
 # ``ssl.SSLError`` isn't one either: httpx2 maps a TLS failure during the handshake to
 # ``ConnectError``, but an alert that comes after it, such as a TLS 1.3 server refusing the client's
 # certificate, can reach an async client's first read unmapped (a sync client maps it to
-# ``ReadError``).
+# ``ReadError``). ``turnstone.sdk`` re-exports the tuple as public API, so a change here changes
+# what the SDK's callers catch.
 REQUEST_FAILURES = (httpx2.HTTPError, httpx2.InvalidURL, UnicodeError, ssl.SSLError)

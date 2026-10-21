@@ -12,6 +12,7 @@ Quick start::
 
 from __future__ import annotations
 
+from turnstone.core.http_failures import REQUEST_FAILURES
 from turnstone.sdk._types import AttachmentUpload, TurnResult, TurnstoneAPIError
 from turnstone.sdk.console import AsyncTurnstoneConsole, TurnstoneConsole
 from turnstone.sdk.events import (
@@ -62,8 +63,10 @@ __all__ = [
     # Result types
     "AttachmentUpload",
     "TurnResult",
-    "TurnstoneAPIError",
     "ConversationPersistenceState",
+    # Errors
+    "TurnstoneAPIError",
+    "REQUEST_FAILURES",
     # Server events
     "ServerEvent",
     "ConnectedEvent",
