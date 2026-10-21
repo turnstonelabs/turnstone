@@ -337,7 +337,10 @@ Fetch a web page or PDF and extract specific information from it.
 | `question` | string | yes      | What to extract or answer from the page or PDF. |
 
 - **What it does**: Fetches the URL and uses the LLM to answer the question from
-  the fetched content. HTML is stripped to plain text. A response whose bytes
+  the fetched content. HTML is stripped to plain text. A PNG, JPEG, GIF or WebP
+  image, or other binary content that isn't a PDF (a NUL character among the
+  first 8,192 characters of its decoded text), is refused with an error giving
+  its size and, if known, its type; nothing is extracted. A response whose bytes
   begin with PDF magic uses the attachment PDF ladder: native document input
   when the active model supports it, ordered page images for a vision model,
   configured perception, then local text extraction. If none can read the PDF,

@@ -9,6 +9,7 @@ to receive events and handle approval prompts.
 from __future__ import annotations
 
 import base64
+import codecs
 import collections
 import concurrent.futures
 import contextlib
@@ -2526,6 +2527,29 @@ def _document_text_budget_chars(
         available_tokens = min(share_tokens, usable_tokens - reserved_input_tokens)
     scaled = max(int(max(available_tokens, 0) * budget.chars_per_token), 0)
     return min(scaled, hard_char_cap) if hard_char_cap is not None else scaled
+
+
+# A NUL among the first 8192 characters of a fetched body's decoded text marks
+# it as binary.  read_file applies the same test to a file's first 8192 bytes;
+# web_fetch applies it after decoding, so UTF-16 text, whose bytes hold NULs,
+# still reads as text when it starts with a byte order mark or declares its
+# byte order (utf-16le or utf-16be).
+_WEB_FETCH_BINARY_SNIFF_CHARS = 8192
+
+# A media type as RFC 6838 names it: ``type/subtype``, each part a letter or
+# digit followed by at most 126 letters, digits or ``!#$&-^_.+``.
+_MEDIA_TYPE_RE = re.compile(r"[a-z0-9][a-z0-9!#$&^_.+-]{0,126}/[a-z0-9][a-z0-9!#$&^_.+-]{0,126}")
+
+
+def _declared_media_type(content_type: str) -> str | None:
+    """Return the bare media type a ``Content-Type`` value declares, or ``None``.
+
+    Parameters are dropped and the type is lowercased.  A value that isn't a
+    well-formed ``type/subtype`` gives ``None``, so an error naming the type
+    can't carry other header text into the model's context.
+    """
+    declared = content_type.split(";", 1)[0].strip().lower()
+    return declared if _MEDIA_TYPE_RE.fullmatch(declared) else None
 
 
 _RERANK_TIMEOUT_CAP_S = 15.0  # reranking <=50 short docs is fast; cap so a hung
@@ -28529,6 +28553,7 @@ class ChatSession:
         # before requesting it: the URL the model named, which the prepare-time
         # check could not resolve if it names a host, and wherever it 302s.
         pdf_data: bytes | None = None
+        binary_kind: str | None = None
         text = ""
         try:
             resp = fetch_with_ssrf_guard(
@@ -28541,10 +28566,23 @@ class ChatSession:
             body = resp.content
             if sniff_pdf_mime(body):
                 pdf_data = body
+            elif image_mime := sniff_image_mime(body):
+                binary_kind = f"an image ({image_mime}, {len(body):,} bytes)"
             else:
-                ct = resp.headers.get("content-type", "")
+                ct = resp.headers.get("content-type", "").lower()
+                # A UTF-16 byte order mark outranks a declared charset, as it
+                # does in browsers; httpx2 ignores it.  The little-endian UTF-32
+                # mark begins with the little-endian UTF-16 one, so it stays
+                # with the declared charset.
+                utf16_mark = body.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE))
+                if utf16_mark and not body.startswith(codecs.BOM_UTF32_LE):
+                    resp.encoding = "utf-16"
                 text = resp.text
-                if "html" in ct:
+                if "\x00" in text[:_WEB_FETCH_BINARY_SNIFF_CHARS]:
+                    declared = _declared_media_type(ct)
+                    served_as = f"served as {declared}, " if declared else ""
+                    binary_kind = f"binary ({served_as}{len(body):,} bytes)"
+                elif "html" in ct:
                     text = strip_html(text)
 
         except httpx2.HTTPStatusError as e:
@@ -28565,6 +28603,12 @@ class ChatSession:
             return call_id, msg
 
         _check_fetch_cancelled()
+        if binary_kind is not None:
+            msg = (
+                f"Error: fetched content is {binary_kind}; web_fetch reads web pages, text and PDFs"
+            )
+            _report_fetch_result(msg, is_error=True)
+            return call_id, msg
         if pdf_data is not None and len(pdf_data) > PDF_SIZE_CAP:
             msg = f"Error: fetched PDF is too large ({len(pdf_data):,} bytes; cap {PDF_SIZE_CAP:,})"
             _report_fetch_result(msg, is_error=True)

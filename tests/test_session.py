@@ -2,6 +2,7 @@
 
 import ast
 import base64
+import codecs
 import contextlib
 import json
 import logging
@@ -16,6 +17,7 @@ from unittest.mock import MagicMock, call, patch
 
 import pytest
 
+from tests._helpers import opaque_png
 from tests._oidc_test_helpers import keyed_app_state
 from tests._session_helpers import (
     FakeAnthropicBlock,
@@ -15178,6 +15180,210 @@ class TestWebFetchPdf:
             )
 
         report.assert_not_called()
+
+
+def _guarded_fetch_response(body: bytes, content_type: str | None) -> Any:
+    """A response built as ``fetch_with_ssrf_guard`` builds it, so the text
+    route decodes *body* the way it does in production."""
+    import httpx2
+
+    headers = {} if content_type is None else {"content-type": content_type}
+    return httpx2.Response(
+        200,
+        headers=headers,
+        content=body,
+        request=httpx2.Request("GET", "https://example.com/file"),
+    )
+
+
+def _jpeg_bytes() -> bytes:
+    from io import BytesIO
+
+    from PIL import Image
+
+    buf = BytesIO()
+    Image.new("RGB", (8, 8), (0, 128, 255)).save(buf, format="JPEG")
+    return buf.getvalue()
+
+
+def _zip_bytes() -> bytes:
+    import io
+    import zipfile
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("notes.txt", "hello " * 100)
+    return buf.getvalue()
+
+
+class TestWebFetchBinary:
+    """#1452: a body that is neither text nor a PDF is refused before extraction.
+
+    The text route decoded it with replacement characters, and the extraction
+    model answered from that noise.
+    """
+
+    @staticmethod
+    def _fetch(body: bytes, content_type: str | None) -> tuple[str, MagicMock, MagicMock]:
+        from turnstone.core.providers._protocol import CompletionResult
+
+        session = _make_session()
+        with (
+            patch(
+                "turnstone.core.session.fetch_with_ssrf_guard",
+                return_value=_guarded_fetch_response(body, content_type),
+            ),
+            patch.object(
+                session,
+                "_utility_completion",
+                return_value=CompletionResult(content="Extracted answer."),
+            ) as utility,
+            patch.object(session, "_report_tool_result") as report,
+        ):
+            _, answer = session._exec_web_fetch(
+                {"call_id": "binary", "url": "https://example.com/file", "question": "What is it?"}
+            )
+        return answer, utility, report
+
+    @pytest.mark.parametrize(
+        ("make_body", "content_type", "mime"),
+        [
+            (opaque_png, "image/png", "image/png"),
+            # Typed by its bytes, whatever the server calls it.
+            (_jpeg_bytes, "application/octet-stream", "image/jpeg"),
+            (_jpeg_bytes, None, "image/jpeg"),
+        ],
+    )
+    def test_image_is_refused_with_its_type_and_size(
+        self, make_body: Any, content_type: str | None, mime: str
+    ) -> None:
+        body = make_body()
+
+        answer, utility, report = self._fetch(body, content_type)
+
+        expected = (
+            f"Error: fetched content is an image ({mime}, {len(body):,} bytes); "
+            "web_fetch reads web pages, text and PDFs"
+        )
+        assert answer == expected
+        utility.assert_not_called()
+        report.assert_called_once_with("binary", "web_fetch", expected, is_error=True)
+
+    @pytest.mark.parametrize(
+        ("content_type", "served_as"),
+        [
+            ("application/zip", "served as application/zip, "),
+            ("Application/ZIP; name=notes.zip", "served as application/zip, "),
+            # A server that calls binary content a page is named as it said.
+            ("text/html; charset=utf-8", "served as text/html, "),
+            # Header text that isn't a media type never reaches the model.
+            ("not a media type", ""),
+            ("application/" + "x" * 128, ""),
+            (None, ""),
+        ],
+    )
+    def test_other_binary_is_refused_with_its_declared_type(
+        self, content_type: str | None, served_as: str
+    ) -> None:
+        body = _zip_bytes()
+
+        answer, utility, _ = self._fetch(body, content_type)
+
+        assert answer == (
+            f"Error: fetched content is binary ({served_as}{len(body):,} bytes); "
+            "web_fetch reads web pages, text and PDFs"
+        )
+        utility.assert_not_called()
+
+    def test_nul_in_the_first_8192_characters_marks_binary(self) -> None:
+        answer, utility, _ = self._fetch(b"a" * 8191 + b"\x00", "text/plain")
+
+        assert answer.startswith("Error: fetched content is binary (served as text/plain, ")
+        utility.assert_not_called()
+
+    def test_nul_past_the_first_8192_characters_keeps_the_text_route(self) -> None:
+        # Only the start decides, as for read_file, so a stray NUL further
+        # into a page doesn't stop it being read.
+        answer, utility, _ = self._fetch(b"a" * 8192 + b"\x00tail", "text/plain")
+
+        assert answer == "Extracted answer."
+        utility.assert_called_once()
+
+    @pytest.mark.parametrize(
+        ("body", "charset"),
+        [
+            ("The answer is 42.".encode("utf-16-le"), "utf-16le"),
+            ("The answer is 42.".encode("utf-16-be"), "utf-16be"),
+            # Its mark begins with the UTF-16 one; the declared charset decides.
+            (codecs.BOM_UTF32_LE + "The answer is 42.".encode("utf-32-le"), "utf-32"),
+        ],
+        ids=["utf-16le", "utf-16be", "utf-32-with-mark"],
+    )
+    def test_text_in_a_declared_wide_charset_is_read(self, body: bytes, charset: str) -> None:
+        # Its bytes hold NULs; the text they decode to holds none.
+        answer, utility, _ = self._fetch(body, f"text/plain; charset={charset}")
+
+        assert answer == "Extracted answer."
+        assert "The answer is 42." in utility.call_args.args[0][1].content[0].text
+
+    @pytest.mark.parametrize(
+        ("bom", "encoding", "content_type"),
+        [
+            (codecs.BOM_UTF16_LE, "utf-16-le", "text/plain"),
+            # Served as a download, with no charset at all.
+            (codecs.BOM_UTF16_BE, "utf-16-be", "application/octet-stream"),
+            # The byte order mark outranks a declared charset, as in browsers.
+            (codecs.BOM_UTF16_LE, "utf-16-le", "text/csv; charset=utf-8"),
+        ],
+        ids=["le-text-plain", "be-octet-stream", "le-declared-utf-8"],
+    )
+    def test_utf16_text_with_a_byte_order_mark_is_read(
+        self, bom: bytes, encoding: str, content_type: str
+    ) -> None:
+        answer, utility, _ = self._fetch(bom + "The answer is 42.".encode(encoding), content_type)
+
+        assert answer == "Extracted answer."
+        assert "The answer is 42." in utility.call_args.args[0][1].content[0].text
+
+    @pytest.mark.parametrize("content_type", ["text/html; charset=utf-8", "TEXT/HTML"])
+    def test_html_is_stripped_to_text(self, content_type: str) -> None:
+        answer, utility, _ = self._fetch(
+            b"<html><body><p>The answer is <b>42</b>.</p></body></html>", content_type
+        )
+
+        assert answer == "Extracted answer."
+        sent = utility.call_args.args[0][1].content[0].text
+        assert "The answer is 42." in sent
+        assert "<p>" not in sent
+
+    def test_pdf_with_binary_streams_keeps_the_pdf_route(self) -> None:
+        from turnstone.core.providers._protocol import ModelCapabilities
+
+        session = _make_session()
+        replace_session_lane(
+            session,
+            capabilities=ModelCapabilities(supports_pdf=True),
+        )
+        captured: dict[str, Any] = {}
+        body = b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\nstream\x00\x01\x02endstream"
+
+        with (
+            patch(
+                "turnstone.core.session.fetch_with_ssrf_guard",
+                return_value=_guarded_fetch_response(body, "application/pdf"),
+            ),
+            patch.object(
+                session,
+                "_utility_completion",
+                side_effect=_capture_pdf_utility(captured),
+            ),
+        ):
+            _, answer = session._exec_web_fetch(
+                {"call_id": "pdf-binary", "url": "https://example.com/report.pdf"}
+            )
+
+        assert answer == "PDF answer."
+        assert base64.b64decode(captured["content"]["document"]["data"]) == body
 
 
 def test_web_fetch_final_report_is_atomic_against_successor_claim():

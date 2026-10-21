@@ -1291,6 +1291,21 @@ frozen.
   uploads, open only to coordinator admins, have no rate limit. Images already in a conversation
   are left as they are, so it keeps sending what it sent and its history and cached prompt prefix
   don't change; attach such an image again to have it flattened.
+- **`web_fetch` refuses images and other binary content instead of extracting from it (#1452).** A
+  fetched body that wasn't a PDF was decoded as text, and an image's bytes decoded to characters
+  that were largely replacement characters: a 23 KB JPEG became 22,395 characters, 10,883 of them
+  U+FFFD. The result wasn't empty, so the extraction model was asked about it and answered from the
+  noise or made an answer up. `web_fetch` now returns an error naming the content's type and size
+  (for example `an image (image/png, 3,081 bytes)`) and makes no extraction call. A PNG, JPEG, GIF
+  or WebP image is recognised by its bytes; other content is binary when the first 8,192 characters
+  of its decoded text hold a NUL character. The error names the media type the server declared
+  when it is well formed. UTF-16 text still reads as text when it declares its byte order
+  (`utf-16le` or `utf-16be`), and when it starts with a byte order mark, which now outranks the
+  declared charset, as in browsers. A page served with its `Content-Type` in capitals, such as
+  `text/HTML`, now has its markup stripped like any other. A PDF that begins with the PDF header
+  is handled as before; one with bytes before its header, which was never recognised as a PDF, is
+  now refused as binary when its first 8,192 characters hold a NUL, as compressed content nearly
+  always does, instead of being decoded as text.
 
 ### Security
 
