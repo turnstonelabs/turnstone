@@ -694,6 +694,12 @@ frozen.
   search term or path holding a lone surrogate, raised past their error handling: the console's
   registry search answered 500 instead of 502, and one bundled file like that failed a whole skill
   install instead of being skipped.
+- **A TLS alert after the handshake fails a request like any other** — a TLS 1.3 server that refuses
+  the client's certificate says so after the handshake, and an async client could get that alert at
+  its first read as a raw `ssl.SSLError`, which the code making the request didn't catch: the
+  console answered 500 instead of 502, or failed to start when a node answered its startup scope
+  check that way, and OAuth, OIDC, the MCP registry search and skill sources raised past their own
+  error handling.
 - **An OAuth or OIDC endpoint URL the client can't send is refused when its document is read.** An
   identity provider's discovery document, an MCP server's challenge or metadata, or an
   authorization server's metadata could name an endpoint holding a control character (a stray

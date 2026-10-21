@@ -16,6 +16,7 @@ import httpx2
 import jwt as pyjwt
 import pytest
 
+from tests._http_failure_cases import refuse_the_certificate
 from tests.conftest import make_oidc_test_config as _make_config
 from turnstone.core.oauth.context import OAuthContext, oauth_context
 from turnstone.core.oauth.oidc import (
@@ -1676,6 +1677,19 @@ class TestFetchJWKS:
         with pytest.raises(OIDCError, match="JWKS fetch failed"):
             asyncio.run(_run())
 
+    def test_fetch_jwks_wraps_a_tls_alert_on_read(self):
+        """An identity provider that refuses the client after the handshake is a JWKS failure too:
+        the alert reaches the read as a raw ``ssl.SSLError``, which isn't an ``HTTPError``."""
+        from turnstone.core.oauth.oidc import fetch_jwks
+
+        async def _run():
+            transport = httpx2.MockTransport(refuse_the_certificate)
+            async with httpx2.AsyncClient(transport=transport) as client:
+                await fetch_jwks("https://idp.example.com/jwks", client=client)
+
+        with pytest.raises(OIDCError, match="JWKS fetch failed"):
+            asyncio.run(_run())
+
 
 class TestSanitizeLogText:
     def test_sanitize_log_text_escapes_control_chars(self):
@@ -2612,6 +2626,23 @@ class TestRuntimeRediscovery:
                 patch("httpx2.AsyncClient", return_value=client),
             ):
                 return await discover_oidc(config)
+
+        result = asyncio.run(_run())
+        assert result.enabled is False
+        assert result.discovery_retryable is True
+
+    def test_a_tls_alert_on_read_marks_config_retryable(self):
+        """An identity provider that refuses the client after the handshake is unreachable too: the
+        raw ssl.SSLError is caught, not raised."""
+        config = _make_config(
+            authorization_endpoint="", token_endpoint="", userinfo_endpoint="", jwks_uri=""
+        )
+
+        async def _run():
+            transport = httpx2.MockTransport(refuse_the_certificate)
+            async with httpx2.AsyncClient(transport=transport) as client:
+                with patch("socket.getaddrinfo", return_value=self._PUBLIC_ADDR):
+                    return await discover_oidc(config, client=client)
 
         result = asyncio.run(_run())
         assert result.enabled is False

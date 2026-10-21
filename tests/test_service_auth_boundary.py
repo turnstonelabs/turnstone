@@ -209,10 +209,10 @@ class TestVerifyCollectorServiceScope:
     @pytest.mark.anyio
     @UNREACHABLE_REPLIES
     async def test_network_error_does_not_refuse(self, reply):
-        """Transient httpx2.ConnectError during probe is a "cluster is
-        coming up" state; it must NOT be confused with scope drift.
-        Leave ``collector_scope_error`` empty and log a warning. A reply
-        httpx2 can't follow (InvalidURL) is the same, not a startup failure."""
+        """Transient httpx2.ConnectError during probe is a "cluster is coming up" state; it must NOT
+        be confused with scope drift. Leave ``collector_scope_error`` empty and log a warning. A
+        reply httpx2 can't follow (InvalidURL), or a TLS alert on the first read, is the same, not a
+        startup failure."""
         from turnstone.console.server import _verify_collector_service_scope
 
         app = _scope_probe_app(services=[{"service_id": "node-1", "url": "http://127.0.0.1:8001"}])
