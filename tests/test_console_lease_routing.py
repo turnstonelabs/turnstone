@@ -232,6 +232,26 @@ def test_delete_proxy_does_not_retry_other_conflicts() -> None:
     router.force_refresh.assert_not_called()
 
 
+def test_delete_proxy_passes_on_a_conflict_too_deep_to_parse(monkeypatch: Any) -> None:
+    """A 409 body nested deeper than the JSON parser can follow raises
+    ``RecursionError`` (Python 3.13 at about 10,000 levels), so only the
+    patched decoder reaches it here.  It reads as no lease refusal, and the
+    node's 409 passes through without a re-route."""
+
+    def _too_deep(*_a: Any, **_kw: Any) -> Any:
+        raise RecursionError("maximum recursion depth exceeded while decoding a JSON array")
+
+    router = _make_mock_router()
+    app = _make_app(router=router)
+    _wire_proxy(app, _scripted_post((409, _HELD)))
+    monkeypatch.setattr(httpx2.Response, "json", _too_deep)
+    resp = _post(app, "/v1/api/route/workstreams/delete", {"ws_id": "moved"})
+
+    assert resp.status_code == 409
+    assert len(_upstream_urls(app, method="post")) == 1
+    router.route.assert_called_once()
+
+
 # -- coordinator delete on the console -------------------------------------------
 
 

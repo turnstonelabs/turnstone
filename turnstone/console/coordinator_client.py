@@ -124,6 +124,10 @@ _WAIT_MESSAGE_TAIL_LIMIT: int = 20
 # children that don't exist or that changed.
 _WAIT_READ_FAILED = "the workstreams being waited on could not be read."
 
+# What ``list_nodes`` reports when a node-metadata read fails, in place of
+# the storage error, which can quote SQL.
+_NODE_METADATA_READ_FAILED = "the node metadata could not be read."
+
 # Sentinel strings used when a terminal state has no usable assistant
 # content to return.  Pinned as constants so callers (and tests) can
 # rely on the exact text rather than a fuzzed message.  The
@@ -654,7 +658,9 @@ class CoordinatorClient:
             return {"error": f"upstream unreachable: {exc}", "status": 0}
         try:
             data = resp.json() if resp.content else {}
-        except ValueError:
+        except (ValueError, RecursionError):
+            data = None
+        if not isinstance(data, dict):
             data = {"raw": resp.text}
         if resp.status_code >= 400:
             data.setdefault("error", f"HTTP {resp.status_code}")
@@ -1673,20 +1679,33 @@ class CoordinatorClient:
             # model is asking for a handful of nodes.  Per-node lookups
             # are bounded at 500 by the limit clamp.
             encoded_filters = {str(k): json.dumps(v) for k, v in filters.items()}
-            matching = self._storage.filter_nodes_by_metadata(encoded_filters)
+            matching = _read_or_raise(
+                self._coord_ws_id,
+                "node_metadata",
+                _NODE_METADATA_READ_FAILED,
+                lambda: self._storage.filter_nodes_by_metadata(encoded_filters),
+            )
             if active_ids is not None:
                 matching = {nid for nid in matching if nid in active_ids}
             node_ids = sorted(matching)
             truncated = len(node_ids) > page_size
             node_ids = node_ids[:page_size]
-            meta_rows_by_node: dict[str, list[dict[str, Any]]] = {
-                nid: self._storage.get_node_metadata(nid) for nid in node_ids
-            }
+            meta_rows_by_node: dict[str, list[dict[str, Any]]] = _read_or_raise(
+                self._coord_ws_id,
+                "node_metadata",
+                _NODE_METADATA_READ_FAILED,
+                lambda: {nid: self._storage.get_node_metadata(nid) for nid in node_ids},
+            )
         else:
             # Unfiltered case: one wide query.  The caller is paging
             # through the whole cluster and needs metadata for every
             # node anyway — per-node lookups would be a true N+1.
-            all_meta = self._storage.get_all_node_metadata()
+            all_meta = _read_or_raise(
+                self._coord_ws_id,
+                "node_metadata",
+                _NODE_METADATA_READ_FAILED,
+                self._storage.get_all_node_metadata,
+            )
             meta_node_ids = set(all_meta.keys())
             if active_ids is not None:
                 meta_node_ids &= active_ids
@@ -1707,7 +1726,7 @@ class CoordinatorClient:
                 raw_value = r.get("value", "")
                 try:
                     decoded = json.loads(raw_value) if isinstance(raw_value, str) else raw_value
-                except (TypeError, ValueError):
+                except (TypeError, ValueError, RecursionError):
                     decoded = raw_value
                 meta[key_str] = {
                     "value": decoded,

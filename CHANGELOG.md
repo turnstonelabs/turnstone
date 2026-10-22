@@ -1321,8 +1321,9 @@ frozen.
   workstream and unlinked the channel; they now report the error and keep the link. The console's
   route proxy tries the node that holds the workstream on the coded 503, as it does on a 404. When
   that retry can't refresh the cluster's membership or resolve the workstream's route, the proxy
-  answers 503 instead of passing on a 404 it couldn't check, and a failed membership read no longer
-  ends in a plain-text 500. The node's API spec and reference list the 503.
+  answers 503 instead of passing on a 404 it couldn't check. A failed membership read there, or on
+  any routed request while the console knows no live node, answers 503 instead of a plain-text
+  500. The node's API spec and reference list the 503.
 - **Every coordinator route checks a coordinator the same way, an outage included.** The console's
   coordinator routes share one access check. When a coordinator isn't loaded and its row can't be
   read, the check answers the same 404 "coordinator not found" as for an id that names nothing, so
@@ -1343,7 +1344,8 @@ frozen.
   0. A `wait_for_workstream` result for an errored child whose last error can't be read has
   `message: null`, as for any message the wait couldn't read, instead of the child's last assistant
   turn. `list_nodes` answers an error to retry when it can't read which nodes are live, instead of
-  offering every node that ever registered.
+  offering every node that ever registered, and says to retry instead of quoting the storage error
+  when it can't read their metadata.
 - **Other reads that fail say so instead of looking empty.** The coordinator metrics route answers
   503 when one of its reads fails, where it reported zeros that read as a healthy, idle
   coordinator. The cluster detail route answers 503 when it can't read the message tail it was

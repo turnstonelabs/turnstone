@@ -285,6 +285,35 @@ def test_send_posts_to_send_route(sqlite_backend_factory):
     assert body == {"message": "hello"}
 
 
+def test_a_route_reply_too_deep_to_parse_comes_back_raw(sqlite_backend_factory, monkeypatch):
+    """A route reply nested deeper than the JSON parser can follow raises
+    ``RecursionError`` (Python 3.13 at about 10,000 levels), so only the
+    patched decoder reaches it here.  It comes back as raw text, like any
+    other reply that can't be parsed."""
+
+    def _too_deep(*_a: Any, **_kw: Any) -> Any:
+        raise RecursionError("maximum recursion depth exceeded while decoding a JSON array")
+
+    client, _captured = _mock_client(
+        _ok_json({"status": 200}), sqlite_backend_factory=sqlite_backend_factory
+    )
+    monkeypatch.setattr(httpx2.Response, "json", _too_deep)
+    result = client.send("ws-x", "hello")
+    assert "raw" in result
+    assert result["status"] == 200
+
+
+@pytest.mark.parametrize("body", [b"null", b"[]", b'"queued"'])
+def test_a_route_reply_that_is_not_an_object_comes_back_raw(sqlite_backend_factory, body):
+    """A reply that parses to something other than an object comes back as raw
+    text, so a send the node accepted doesn't read as a failed call."""
+    client, _captured = _mock_client(
+        lambda _req: httpx2.Response(200, content=body),
+        sqlite_backend_factory=sqlite_backend_factory,
+    )
+    assert client.send("ws-x", "hello") == {"raw": body.decode(), "status": 200}
+
+
 def test_close_workstream_posts_to_close_route(sqlite_backend_factory):
     client, captured = _mock_client(
         _ok_json({"status": 200}), sqlite_backend_factory=sqlite_backend_factory
@@ -1051,6 +1080,62 @@ def test_list_nodes_raises_when_the_live_node_list_cannot_be_read(
         assert str(excinfo.value.__cause__) == "storage down"
     full = client.list_nodes(include_inactive=True)
     assert {n["node_id"] for n in full["nodes"]} == {"node-live", "node-dead"}
+
+
+@pytest.mark.parametrize("filters", [None, {"arch": "x86_64"}])
+def test_list_nodes_shows_a_value_too_deep_to_parse_raw(
+    tmp_path, monkeypatch, sqlite_backend_factory, filters
+):
+    """A stored value nested deeper than the JSON parser can follow raises
+    ``RecursionError`` (Python 3.13 at about 10,000 levels), so only the
+    patched decoder reaches it here.  It is listed raw, like any other value
+    that can't be parsed, instead of failing the whole cluster's listing."""
+    import types
+
+    from turnstone.console import coordinator_client as cc_module
+
+    st = sqlite_backend_factory(str(tmp_path / "nodes.db"))
+    _set_meta(st, "node-live", [("arch", "x86_64", "auto"), ("notes", "deep", "user")])
+    _register_service(st, "node-live")
+    client = _make_read_client(st)
+
+    def _loads(s: Any, *a: Any, **kw: Any) -> Any:
+        if s == '"deep"':
+            raise RecursionError("maximum recursion depth exceeded while decoding a JSON array")
+        return json.loads(s, *a, **kw)
+
+    monkeypatch.setattr(cc_module, "json", types.SimpleNamespace(loads=_loads, dumps=json.dumps))
+    (node,) = client.list_nodes(filters=filters)["nodes"]
+    assert node["metadata"]["notes"]["value"] == '"deep"'
+    assert node["metadata"]["arch"]["value"] == "x86_64"
+
+
+@pytest.mark.parametrize(
+    ("read", "filters"),
+    [
+        ("filter_nodes_by_metadata", {"arch": "x86_64"}),
+        ("get_node_metadata", {"arch": "x86_64"}),
+        ("get_all_node_metadata", None),
+    ],
+)
+def test_list_nodes_says_to_retry_when_node_metadata_cannot_be_read(
+    tmp_path, monkeypatch, sqlite_backend_factory, read, filters
+):
+    """A failed metadata read tells the model to retry instead of quoting the
+    storage error, which can carry SQL; the error stays chained for the logs."""
+    st = sqlite_backend_factory(str(tmp_path / "nodes.db"))
+    _set_meta(st, "node-live", [("arch", "x86_64", "auto")])
+    _register_service(st, "node-live")
+    client = _make_read_client(st)
+
+    def _down(*_a: Any, **_kw: Any) -> Any:
+        raise RuntimeError("SELECT node_id FROM node_metadata failed")
+
+    monkeypatch.setattr(st, read, _down)
+    with pytest.raises(CoordinatorReadError, match="node metadata could not be read") as excinfo:
+        client.list_nodes(filters=filters)
+    assert "SELECT" not in str(excinfo.value)
+    assert str(excinfo.value.__cause__) == "SELECT node_id FROM node_metadata failed"
 
 
 def test_list_nodes_filter_uses_natural_value_not_quoted(storage_with_nodes, monkeypatch):

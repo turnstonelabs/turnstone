@@ -723,6 +723,35 @@ class TestRouteCreate409Retry:
         assert post.call_count == 1
         assert post.call_args.kwargs["json"]["ws_id"] == _DEST_WS_ID
 
+    def test_a_conflict_too_deep_to_parse_is_not_a_collision(self, monkeypatch):
+        """A 409 body nested deeper than the JSON parser can follow raises
+        ``RecursionError`` (Python 3.13 at about 10,000 levels), so only the
+        patched decoder reaches it here.  It reads as no collision, and the
+        node's 409 passes through without a retry."""
+
+        def _too_deep(*_a: Any, **_kw: Any) -> Any:
+            raise RecursionError("maximum recursion depth exceeded while decoding a JSON array")
+
+        router = _make_mock_router()
+        app = _make_app(router=router)
+        post = _make_proxy_post(
+            status_code=409,
+            json_data={"error": "Workstream already exists"},
+        )
+        _wire_proxy(app, post)
+        monkeypatch.setattr(httpx2.Response, "json", _too_deep)
+        client = TestClient(app, raise_server_exceptions=False)
+
+        resp = client.post(
+            "/v1/api/route/workstreams/new",
+            json={"name": "test"},
+            headers=_TEST_AUTH_HEADERS,
+        )
+        client.close()
+
+        assert resp.status_code == 409
+        assert post.call_count == 1
+
     def test_generated_ws_id_collision_retry_is_bounded(self, monkeypatch):
         generated_ids = [f"{value:x}" * 32 for value in range(1, 5)]
         generated = MagicMock(side_effect=generated_ids)
@@ -1287,6 +1316,31 @@ class TestRouteWorkstreamLive:
         assert resp.status_code == 502
         assert "invalid active list" in resp.json()["error"]
 
+    def test_an_active_list_too_deep_to_parse_fails_closed(self, monkeypatch):
+        """An active list nested deeper than the JSON parser can follow raises
+        ``RecursionError`` (Python 3.13 at about 10,000 levels), so only the
+        patched decoder reaches it here.  It fails closed like any other
+        invalid list: a recorded 502, not a plain-text 500."""
+
+        def _too_deep(*_a: Any, **_kw: Any) -> Any:
+            raise RecursionError("maximum recursion depth exceeded while decoding a JSON array")
+
+        app = _make_app(router=_make_mock_router())
+        _wire_proxy_get(app, json_data={"workstreams": [{"ws_id": "ws-live", "state": "idle"}]})
+        recorded = MagicMock(wraps=app.state.console_metrics.record_route)
+        app.state.console_metrics.record_route = recorded
+        monkeypatch.setattr(httpx2.Response, "json", _too_deep)
+        client = TestClient(app, raise_server_exceptions=False)
+        resp = client.get(
+            "/v1/api/route/workstreams/ws-live/live",
+            headers=_TEST_AUTH_HEADERS,
+        )
+        client.close()
+
+        assert resp.status_code == 502
+        assert "invalid active list" in resp.text
+        assert [c.args[:2] for c in recorded.call_args_list] == [("live", 502)]
+
 
 # ---------------------------------------------------------------------------
 # Tests — not ready / no router -> 503
@@ -1413,6 +1467,43 @@ class TestRouteNoNode:
             headers=_TEST_AUTH_HEADERS,
         )
         assert resp.status_code == 503
+
+
+@pytest.mark.parametrize(
+    ("method", "path", "body", "label"),
+    [
+        ("POST", "/v1/api/route/workstreams/new", {"name": "test"}, "create"),
+        ("POST", "/v1/api/route/workstreams/abc/send", {"message": "hi"}, "send"),
+        ("POST", "/v1/api/route/workstreams/delete", {"ws_id": "abc"}, "delete"),
+        ("GET", "/v1/api/route/workstreams/abc/attachments", None, "attach"),
+        ("GET", "/v1/api/route?ws_id=abc", None, "route"),
+        ("GET", "/v1/api/route/workstreams/abc/live", None, "live"),
+    ],
+)
+def test_an_unready_router_whose_refresh_fails_answers_a_recorded_503(
+    method: str, path: str, body: dict[str, Any] | None, label: str
+) -> None:
+    """An unready router loads its node list before routing.  When that read
+    fails, each routed endpoint answers a recorded 503 instead of a
+    plain-text 500."""
+    router = _make_mock_router(ready=False)
+    router.refresh_cache.side_effect = RuntimeError("storage down")
+    app = _make_app(router=router)
+    app.state.proxy_client = MagicMock(spec=httpx2.AsyncClient)
+    recorded = MagicMock(wraps=app.state.console_metrics.record_route)
+    app.state.console_metrics.record_route = recorded
+    client = TestClient(app, raise_server_exceptions=False)
+    try:
+        resp = client.request(method, path, json=body, headers=_TEST_AUTH_HEADERS)
+    finally:
+        client.close()
+
+    assert resp.status_code == 503
+    assert resp.json() == {"error": "routing failed"}
+    assert [c.args[:2] for c in recorded.call_args_list] == [(label, 503)]
+    # Answered before routing, not by carrying on with an empty node list.
+    router.route.assert_not_called()
+    router.rendezvous_node.assert_not_called()
 
 
 def test_route_proxy_refresh_retries_new_url_for_same_node_identity():

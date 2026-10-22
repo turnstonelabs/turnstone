@@ -2005,6 +2005,26 @@ def _record_route(
     return resp
 
 
+async def _refresh_unready_router(
+    request: Request, router: ConsoleRouter, method: str, t0: float
+) -> Response | None:
+    """Reload the node list of a router that knows no live node; a recorded 503 when that fails."""
+    if router.is_ready():
+        return None
+    try:
+        await asyncio.to_thread(router.refresh_cache)
+    except Exception:
+        log.warning("route.refresh_failed method=%s", method, exc_info=True)
+        return _record_route(
+            request,
+            method,
+            503,
+            t0,
+            JSONResponse({"error": "routing failed"}, status_code=503),
+        )
+    return None
+
+
 async def route_create(request: Request) -> Response:
     """POST /v1/api/route/workstreams/new — create via rendezvous routing.
 
@@ -2037,8 +2057,9 @@ async def route_create(request: Request) -> Response:
                 status_code=503,
             ),
         )
-    if not router.is_ready():
-        await asyncio.to_thread(router.refresh_cache)
+    refused = await _refresh_unready_router(request, router, "create", t0)
+    if refused is not None:
+        return refused
 
     raw_content_type = request.headers.get("content-type") or ""
     is_multipart = raw_content_type.lower().startswith("multipart/form-data")
@@ -2330,7 +2351,7 @@ async def route_create(request: Request) -> Response:
                 collision = resp.status_code == 409 and resp.json() == {
                     "error": "Workstream already exists"
                 }
-            except ValueError:
+            except (ValueError, RecursionError):
                 collision = False
             if (
                 collision
@@ -2528,8 +2549,9 @@ async def route_attachment_proxy(request: Request) -> Response:
                 status_code=503,
             ),
         )
-    if not router.is_ready():
-        await asyncio.to_thread(router.refresh_cache)
+    refused = await _refresh_unready_router(request, router, method, t0)
+    if refused is not None:
+        return refused
 
     ws_id = request.path_params.get("ws_id", "").strip()
     if not ws_id:
@@ -2634,7 +2656,7 @@ def _lease_refusal_holder(resp: httpx2.Response) -> str | None:
         return None
     try:
         body = resp.json()
-    except ValueError:
+    except (ValueError, RecursionError):
         return None
     if not isinstance(body, dict) or body.get("code") != WorkstreamLeaseHeldError.code:
         return None
@@ -2899,8 +2921,9 @@ async def route_proxy(request: Request) -> Response:
                 status_code=503,
             ),
         )
-    if not router.is_ready():
-        await asyncio.to_thread(router.refresh_cache)
+    refused = await _refresh_unready_router(request, router, verb, t0)
+    if refused is not None:
+        return refused
 
     try:
         body = await request.json()
@@ -3097,8 +3120,9 @@ async def route_workstream_delete(request: Request) -> Response:
                 status_code=503,
             ),
         )
-    if not router.is_ready():
-        await asyncio.to_thread(router.refresh_cache)
+    refused = await _refresh_unready_router(request, router, "delete", t0)
+    if refused is not None:
+        return refused
     try:
         ref = await _request_route(request, router, ws_id, known_row=known_row)
     except NodeAffinityError as exc:
@@ -3264,8 +3288,9 @@ async def route_lookup(request: Request) -> JSONResponse:
                 status_code=503,
             ),
         )  # type: ignore[return-value]
-    if not router.is_ready():
-        await asyncio.to_thread(router.refresh_cache)
+    refused = await _refresh_unready_router(request, router, "route", t0)
+    if refused is not None:
+        return refused  # type: ignore[return-value]
 
     ws_id = request.query_params.get("ws_id", "")
     if not ws_id:
@@ -3335,8 +3360,9 @@ async def route_workstream_live(request: Request) -> Response:
                 status_code=503,
             ),
         )
-    if not router.is_ready():
-        await asyncio.to_thread(router.refresh_cache)
+    refused = await _refresh_unready_router(request, router, "live", t0)
+    if refused is not None:
+        return refused
 
     ws_id = request.path_params.get("ws_id", "").strip()
     if not ws_id:
@@ -3391,7 +3417,7 @@ async def route_workstream_live(request: Request) -> Response:
 
         try:
             payload = resp.json()
-        except (ValueError, *REQUEST_FAILURES):
+        except (ValueError, RecursionError, *REQUEST_FAILURES):
             payload = None
         rows = payload.get("workstreams") if isinstance(payload, dict) else None
         if not isinstance(rows, list):
