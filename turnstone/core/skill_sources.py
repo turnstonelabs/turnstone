@@ -181,7 +181,7 @@ class SkillsShClient:
 
         try:
             payload = resp.json()
-        except ValueError as exc:
+        except (ValueError, RecursionError) as exc:
             raise SkillSourceError(
                 f"skills.sh returned non-JSON for {skill_id}: {resp.text[:200]}"
             ) from exc

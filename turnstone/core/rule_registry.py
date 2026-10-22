@@ -156,7 +156,7 @@ class RuleRegistry:
             if isinstance(arg_patterns_raw, str):
                 try:
                     arg_patterns_raw = json.loads(arg_patterns_raw)
-                except (json.JSONDecodeError, TypeError):
+                except (json.JSONDecodeError, TypeError, RecursionError):
                     arg_patterns_raw = []
             by_name[name] = HeuristicRuleDef(
                 name=name,

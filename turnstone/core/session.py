@@ -252,7 +252,7 @@ from turnstone.core.settings_registry import (
     DEFAULT_AUTO_COMPACT_PCT,
     TOOL_TRUNCATION_MAX_CHARS,
 )
-from turnstone.core.skill_field_validation import SKILL_RUNTIME_CONFIG_FIELDS
+from turnstone.core.skill_field_validation import SKILL_RUNTIME_CONFIG_FIELDS, read_allowed_tools
 from turnstone.core.skill_parser import MAX_SKILL_DESCRIPTION_LEN
 from turnstone.core.storage import (
     AttachmentWrite,
@@ -2861,7 +2861,7 @@ def _format_mcp_dispatch_error(prefix: str, exc: Exception) -> str:
     text = str(exc)
     try:
         decoded = json.loads(text)
-    except (json.JSONDecodeError, ValueError):
+    except (json.JSONDecodeError, ValueError, RecursionError):
         return f"{prefix}: {exc}"
     if isinstance(decoded, dict) and isinstance(decoded.get("error"), dict):
         code = decoded["error"].get("code")
@@ -4724,7 +4724,7 @@ class ChatSession:
         raw = skill_data.get("arguments") or "[]"
         try:
             parsed = json.loads(raw)
-        except (ValueError, TypeError):
+        except (ValueError, TypeError, RecursionError):
             return []
         if not isinstance(parsed, list):
             return []
@@ -19636,8 +19636,15 @@ class ChatSession:
 
         try:
             args = json.loads(raw_args)
-        except json.JSONDecodeError as exc:
-            args = salvage_tool_arguments(func_name, raw_args)
+        except (ValueError, RecursionError) as exc:
+            # Only text that didn't decode is salvaged: valid JSON too deep to use, or holding a
+            # number past the parser's digit limit, has a structure salvage would guess at,
+            # picking a field from anywhere inside it.
+            args = (
+                salvage_tool_arguments(func_name, raw_args)
+                if isinstance(exc, json.JSONDecodeError)
+                else None
+            )
             if args is None:
                 preview = raw_args[:4000] + ("..." if len(raw_args) > 4000 else "")
                 # Surface to user so they can see what the model produced
@@ -23010,7 +23017,7 @@ class ChatSession:
             parsed = json.loads(raw) if isinstance(raw, str) else list(raw)
             if isinstance(parsed, list):
                 return " ".join(str(t) for t in parsed)
-        except (ValueError, TypeError):
+        except (ValueError, TypeError, RecursionError):
             pass
         return raw if isinstance(raw, str) else ""
 
@@ -23023,17 +23030,15 @@ class ChatSession:
         tags_raw = r.get("tags") or "[]"
         try:
             tags = json.loads(tags_raw) if isinstance(tags_raw, str) else list(tags_raw)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, RecursionError):
             tags = []
-        allowed_raw = r.get("allowed_tools") or "[]"
-        try:
-            allowed_full = (
-                json.loads(allowed_raw) if isinstance(allowed_raw, str) else list(allowed_raw)
-            )
-        except (TypeError, ValueError):
-            allowed_full = []
-        if not isinstance(allowed_full, list):
-            allowed_full = []
+        allowed_raw = r.get("allowed_tools")
+        # Read as workstream create reads it: an unreadable value grants none.
+        allowed_full = (
+            list(allowed_raw)
+            if isinstance(allowed_raw, list)
+            else read_allowed_tools(allowed_raw) or []
+        )
         cap = self._SKILLS_TOOLS_PROJECTION_CAP
         allowed_tools: list[str] = [str(t) for t in allowed_full[:cap]]
         if len(allowed_full) > cap:
@@ -23719,12 +23724,8 @@ class ChatSession:
         # approve — a model-planted critical-tier skill should never be
         # re-enabled by an operator who saw only the name on the card.
         existing_risk = str(existing.get("risk_level") or "")
-        try:
-            existing_allowed = json.loads(existing.get("allowed_tools") or "[]")
-            if not isinstance(existing_allowed, list):
-                existing_allowed = []
-        except (TypeError, ValueError):
-            existing_allowed = []
+        # Read as workstream create reads it, so the card shows what re-enabling grants.
+        existing_allowed = read_allowed_tools(existing.get("allowed_tools"))
         # Re-enabling lets new workstreams send their final output to these targets, so the card
         # and the judge see them whole, as on create and update, read the way workstream create
         # reads them: the same check, with blank, ``{}`` and invalid values applying as none.
@@ -23739,7 +23740,9 @@ class ChatSession:
         ]
         if existing_risk:
             preview_lines.append(f"    risk_level: {existing_risk}")
-        if existing_allowed:
+        if existing_allowed is None:
+            preview_lines.append("    allowed_tools: unreadable, so it grants none")
+        elif existing_allowed:
             preview_lines.append(f"    allowed_tools: {len(existing_allowed)} entries")
         if existing_notify:
             preview_lines.append(f"    notify_on_complete: {existing_notify}")

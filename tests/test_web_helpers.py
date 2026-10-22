@@ -432,3 +432,57 @@ class TestMultipartBodyBudget:
     async def test_a_chunked_body_under_the_cap_is_read(self, path: str) -> None:
         status, _pulled = await self._send(path, self.CAP // 2)
         assert status == 200
+
+
+class TestBodiesNestedTooDeeply:
+    """A body nested too deeply to parse is a 400, as malformed JSON is."""
+
+    SEED = '{"name": "deep"}'
+
+    def _client(self) -> Any:
+        from starlette.applications import Starlette
+        from starlette.responses import JSONResponse
+        from starlette.routing import Route
+        from starlette.testclient import TestClient
+
+        from turnstone.core.web_helpers import read_json_or_400, read_multipart_create_or_400
+
+        async def json_body(request: Request) -> JSONResponse:
+            body = await read_json_or_400(request)
+            return body if isinstance(body, JSONResponse) else JSONResponse(body)
+
+        async def create(request: Request) -> JSONResponse:
+            parsed = await read_multipart_create_or_400(
+                request, max_per_file_bytes=1024, max_total_bytes=1024
+            )
+            return parsed if isinstance(parsed, JSONResponse) else JSONResponse(parsed[0])
+
+        return TestClient(
+            Starlette(
+                routes=[
+                    Route("/json", json_body, methods=["POST"]),
+                    Route("/create", create, methods=["POST"]),
+                ]
+            )
+        )
+
+    def test_a_json_body(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from tests._deep_json import too_deep_to_parse
+
+        too_deep_to_parse(monkeypatch, self.SEED)
+        with self._client() as client:
+            resp = client.post(
+                "/json", content=self.SEED, headers={"Content-Type": "application/json"}
+            )
+        assert (resp.status_code, resp.json()) == (400, {"error": "Invalid JSON body"})
+
+    def test_the_meta_field_of_a_multipart_create(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from tests._deep_json import too_deep_to_parse
+
+        too_deep_to_parse(monkeypatch, self.SEED)
+        with self._client() as client:
+            resp = client.post(
+                "/create", data={"meta": self.SEED}, files={"file": ("a.txt", b"x", "text/plain")}
+            )
+        assert resp.status_code == 400
+        assert resp.json() == {"error": "'meta' field must be valid JSON"}

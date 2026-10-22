@@ -231,7 +231,7 @@ def _filter_line_indexes_bounded(
         )
     try:
         indexes = json.loads(out)
-    except ValueError:
+    except (ValueError, RecursionError):
         log.warning("bg_shell.filter_helper_bad_output", shell_id=shell_id)
         raise FilterExecError(
             "the filter could not be applied (helper returned malformed data); "

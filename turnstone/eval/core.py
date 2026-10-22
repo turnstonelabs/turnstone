@@ -534,7 +534,7 @@ class HeadlessSession(ChatSession):
                 args: dict[str, Any]
                 try:
                     args = json.loads(tc["function"]["arguments"])
-                except json.JSONDecodeError:
+                except (json.JSONDecodeError, RecursionError):
                     raw = tc["function"]["arguments"]
                     # Map bare strings to the primary arg key
                     pk = PRIMARY_KEY_MAP.get(func_name)

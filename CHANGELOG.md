@@ -1381,6 +1381,28 @@ frozen.
   behind send, speech to text and the command route reads the workstream's row in a worker thread,
   so a slow database no longer stalls every request on the node. The console's create proxy and
   node detail route read storage in a worker thread too.
+- **JSON nested too deeply to parse is treated as malformed (#1456).** Python 3.13's JSON parser
+  raises `RecursionError` instead of a decode error for input nested about 10,000 levels deep, and
+  3.14 raises it when a thread's stack runs out. Most of the package's parse guards caught only the
+  decode error, so such input got past them: a request body answered a 500 where malformed JSON
+  answers 400, and a stored value, a reply from a node or provider, a command's output or a model's
+  tool arguments failed a read that handles an unparseable one. Every parse guard now treats input
+  too deep to parse as malformed, and a test keeps new guards covered. A stored setting nested too
+  deeply reads as invalid, as a malformed one does, instead of failing a node's startup. A skill's
+  `allowed_tools` that can't be parsed, or isn't a flat list of names, grants no tools: it was split
+  on commas, so a value too deep for one node's parser could grant tools nobody listed. Workstream
+  create, the re-enable approval card, the skill scanner and the skills tool now read it one way;
+  the card says when it can't be read, and a comma-separated value from before the JSON form scores
+  and lists like its JSON form.
+- **Request bodies of the wrong shape answer 400.** Admin token creation read a body it couldn't
+  parse as `{}` and minted a token with the default scopes; it now answers 400, as it does for a
+  body that isn't a JSON object and for fields of the wrong type. That includes a number or boolean
+  token name, which it used to store as text, and an `expires_days` that isn't a whole number of
+  days of at least 1: `false` minted a token that had already expired. Login, first-time setup,
+  admin user creation and the channel notify hook answer 400 instead of 500 for a body that isn't a
+  JSON object or holds a field of the wrong type, and the notify hook's malformed-body error reads
+  "Invalid JSON body". The console reference's token example sends `scopes` as the comma-separated
+  string the API takes.
 
 ### Security
 

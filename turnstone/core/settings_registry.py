@@ -1111,8 +1111,13 @@ def serialize_value(value: Any) -> str:
 
 
 def deserialize_value(key: str, json_str: str, *, clamp_range: bool = False) -> Any:
-    """JSON-decode and type-coerce against registry."""
-    raw = json.loads(json_str)
+    """JSON-decode and type-coerce against registry. A value nested too deeply to parse raises
+    ``ValueError``, as malformed JSON does, so a caller that skips an invalid value skips it too.
+    """
+    try:
+        raw = json.loads(json_str)
+    except RecursionError as exc:
+        raise ValueError(f"{key}: value nested too deeply to parse") from exc
     defn = SETTINGS.get(key)
     if defn is None:
         return raw  # Unknown key — return raw

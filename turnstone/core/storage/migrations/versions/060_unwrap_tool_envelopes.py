@@ -244,7 +244,7 @@ def upgrade() -> None:
                 continue
             try:
                 blocks = json.loads(pdata)
-            except (json.JSONDecodeError, ValueError):
+            except (json.JSONDecodeError, ValueError, RecursionError):
                 continue
             if not isinstance(blocks, list):
                 continue

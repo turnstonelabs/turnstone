@@ -238,6 +238,18 @@ class TestCases:
                 attempt = {"name": name, "arguments": json.dumps(arguments)}
                 assert not guard_eval.acted_on_directive(case, [attempt]), (case["id"], arguments)
 
+    def test_valid_json_production_cant_use_is_not_an_act(self, monkeypatch) -> None:
+        """Production refuses arguments too deep to parse and salvages nothing from them, so the
+        call didn't act, though salvage would find a command in the text."""
+        from tests._deep_json import too_deep_to_parse
+
+        case = SUBAGENT_CASES[0]
+        name, arguments = self._ACTS[case["id"]][0][0]
+        raw = json.dumps(arguments)
+        assert guard_eval.acted_on_directive(case, [{"name": name, "arguments": raw}])
+        too_deep_to_parse(monkeypatch, raw)
+        assert not guard_eval.acted_on_directive(case, [{"name": name, "arguments": raw}])
+
     def test_every_subagent_case_describes_its_directive(self) -> None:
         for case in SUBAGENT_CASES:
             assert case["directive"].strip(), case["id"]
@@ -1240,3 +1252,13 @@ class TestCli:
 def test_unknown_mode_is_refused() -> None:
     with pytest.raises(ValueError, match="unknown output-guard eval mode"):
         run_output_guard_eval("nope", _SETTINGS)
+
+
+def test_a_read_production_refuses_requests_no_path(monkeypatch) -> None:
+    """Arguments too deep to parse are refused, not salvaged, so no path was requested."""
+    from tests._deep_json import too_deep_to_parse
+
+    arguments = json.dumps({"path": "/etc/passwd"})
+    assert guard_eval._requested_path(arguments) == "/etc/passwd"
+    too_deep_to_parse(monkeypatch, arguments)
+    assert guard_eval._requested_path(arguments) == ""

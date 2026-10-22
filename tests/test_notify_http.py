@@ -104,6 +104,43 @@ class TestNotifyEndpoint:
         assert resp.status_code == 200
         mock_adapter.send.assert_called_once_with("123456", "**Alert**\nHello!")
 
+    @pytest.mark.parametrize(
+        ("body", "error"),
+        [
+            (b"[]", "Request body must be a JSON object"),
+            (b'{"target": "x", "message": "hi"}', "target must be an object"),
+            (b'{"target": ["x"], "message": "hi"}', "target must be an object"),
+            (
+                b'{"target": {"username": ["u"]}, "message": "hi"}',
+                "target's username, channel_type and channel_id must be strings",
+            ),
+            (
+                b'{"target": {"channel_type": ["x"], "channel_id": "c"}, "message": "hi"}',
+                "target's username, channel_type and channel_id must be strings",
+            ),
+            (
+                b'{"target": {"channel_type": "discord", "channel_id": 5}, "message": "hi"}',
+                "target's username, channel_type and channel_id must be strings",
+            ),
+        ],
+        ids=[
+            "body-list",
+            "target-string",
+            "target-list",
+            "username-list",
+            "channel-type-list",
+            "channel-id-number",
+        ],
+    )
+    def test_a_body_it_cannot_use_is_a_400(self, client, mock_adapter, body, error):
+        resp = client.post(
+            "/v1/api/notify",
+            content=body,
+            headers={**_auth_headers(), "Content-Type": "application/json"},
+        )
+        assert (resp.status_code, resp.json()) == (400, {"error": error})
+        mock_adapter.send.assert_not_called()
+
     def test_username_resolution(self, client, storage, mock_adapter):
         # Create a user and link a channel
         storage.create_user("u1", "testuser", "Test User", "hash")

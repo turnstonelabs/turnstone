@@ -1235,7 +1235,7 @@ class AnthropicProvider:
                     args_str = fn.get("arguments", "{}")
                     try:
                         args_obj = json.loads(args_str)
-                    except (json.JSONDecodeError, TypeError):
+                    except (json.JSONDecodeError, TypeError, RecursionError):
                         args_obj = {}
                     content_blocks.append(
                         {
@@ -1725,7 +1725,7 @@ class AnthropicProvider:
                     rb = raw_blocks[event.index]
                     try:
                         rb["input"] = json.loads(rb.pop("_input_json"))
-                    except (json.JSONDecodeError, TypeError):
+                    except (json.JSONDecodeError, TypeError, RecursionError):
                         rb.pop("_input_json", None)
 
                 # When a server tool block completes, emit search query info
@@ -1735,7 +1735,7 @@ class AnthropicProvider:
                     try:
                         parsed = json.loads(info["input_json"])
                         query = parsed.get("query", "")
-                    except (json.JSONDecodeError, TypeError):
+                    except (json.JSONDecodeError, TypeError, RecursionError):
                         pass  # best-effort query extraction for status
                     sc.info_delta = f"[Searching: {query}]" if query else "[Searching...]"
 

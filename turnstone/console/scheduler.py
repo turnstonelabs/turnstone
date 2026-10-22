@@ -180,7 +180,7 @@ class TaskScheduler:
         if existing is not None:
             try:
                 lock_data = json.loads(existing.get("value", "{}"))
-            except (json.JSONDecodeError, TypeError):
+            except (json.JSONDecodeError, TypeError, RecursionError):
                 lock_data = {}
             owner = lock_data.get("owner", "")
             acquired_str = lock_data.get("acquired", "")
@@ -205,7 +205,7 @@ class TaskScheduler:
             return False
         try:
             lock_data = json.loads(existing.get("value", "{}"))
-        except (json.JSONDecodeError, TypeError):
+        except (json.JSONDecodeError, TypeError, RecursionError):
             return False
         return bool(lock_data.get("owner") == self._lock_owner)
 
@@ -407,7 +407,7 @@ class TaskScheduler:
                 )
                 for task_id, h in data.items()
             }
-        except (AttributeError, KeyError, TypeError, ValueError):
+        except (AttributeError, KeyError, TypeError, ValueError, RecursionError):
             log.warning("scheduler.holds_unreadable", exc_info=True)
             return None
 

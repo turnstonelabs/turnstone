@@ -517,7 +517,7 @@ def _has_tool_calls(tool_calls_json: str | None) -> bool:
         return False
     try:
         parsed = json.loads(tool_calls_json)
-    except (json.JSONDecodeError, TypeError):
+    except (json.JSONDecodeError, TypeError, RecursionError):
         return False
     return isinstance(parsed, list) and len(parsed) > 0
 
@@ -544,7 +544,7 @@ def normalize_native_for_save(
         return provider_data
     try:
         blocks = json.loads(provider_data)
-    except (json.JSONDecodeError, TypeError):
+    except (json.JSONDecodeError, TypeError, RecursionError):
         return provider_data
     if not isinstance(blocks, list):
         return provider_data
@@ -568,7 +568,7 @@ def wrap_provider_data(provider_data: str | None, producer: str | None) -> str |
         return provider_data
     try:
         blocks = json.loads(provider_data)
-    except (json.JSONDecodeError, TypeError):
+    except (json.JSONDecodeError, TypeError, RecursionError):
         return provider_data
     if isinstance(blocks, dict) and "blocks" in blocks:
         return provider_data
@@ -1367,7 +1367,7 @@ def parse_attachment_refs(raw: str | None) -> list[str]:
         return []
     try:
         parsed = json.loads(raw)
-    except (json.JSONDecodeError, TypeError):
+    except (json.JSONDecodeError, TypeError, RecursionError):
         return []
     if not isinstance(parsed, list):
         return []
@@ -1694,7 +1694,7 @@ def persona_row_to_dict(row: Any) -> dict[str, Any]:
         # JSONDecodeError message doesn't say WHICH row is corrupt.
         try:
             return json.loads(raw_value)
-        except ValueError as exc:
+        except (ValueError, RecursionError) as exc:
             raise ValueError(f"corrupt {column} on persona {d.get('persona_id')!r}: {exc}") from exc
 
     raw = d.get("tool_allowlist")
@@ -1892,19 +1892,11 @@ def scan_skill_content(content: str, allowed_tools: str) -> tuple[str, str, str]
     blocked by a scanner bug.
     """
     try:
+        from turnstone.core.skill_field_validation import read_allowed_tools
         from turnstone.core.skill_scanner import SCANNER_VERSION, scan_skill
 
-        tools: list[str] | None = None
-        if allowed_tools and allowed_tools.strip() != "[]":
-            try:
-                parsed = json.loads(allowed_tools)
-                if isinstance(parsed, list):
-                    tools = [str(x) for x in parsed if isinstance(x, str)]
-                    if not tools:
-                        tools = None
-            except (json.JSONDecodeError, TypeError):
-                pass  # falls back to None (no tool filter)
-        result = scan_skill(content, tools)
+        # The tools workstream create would grant: none for a value it can't read.
+        result = scan_skill(content, read_allowed_tools(allowed_tools) or None)
         return result.tier, json.dumps(result.to_dict(), ensure_ascii=False), SCANNER_VERSION
     except Exception:
         log.debug("skill_scanner: scan failed", exc_info=True)
@@ -2051,7 +2043,7 @@ def _native_from_provider_data(
         return None
     try:
         parsed = json.loads(provider_data)
-    except (json.JSONDecodeError, TypeError):
+    except (json.JSONDecodeError, TypeError, RecursionError):
         return None
     if isinstance(parsed, dict) and "blocks" in parsed:
         producer = parsed.get("producer") or ""
@@ -2081,7 +2073,7 @@ def _source_meta_from_json(meta_json: str | None) -> dict[str, Any] | None:
         return None
     try:
         parsed = json.loads(meta_json)
-    except (json.JSONDecodeError, TypeError):
+    except (json.JSONDecodeError, TypeError, RecursionError):
         return None
     return parsed if isinstance(parsed, dict) and parsed else None
 
@@ -2092,7 +2084,7 @@ def _tool_calls_from_json(tool_calls_json: str | None) -> tuple[ToolCall, ...]:
         return ()
     try:
         parsed = json.loads(tool_calls_json)
-    except (json.JSONDecodeError, TypeError):
+    except (json.JSONDecodeError, TypeError, RecursionError):
         return ()
     if not isinstance(parsed, list):
         return ()
@@ -2466,7 +2458,7 @@ def watch_snapshot_meta(raw_meta: Any) -> dict[str, Any] | None:
     """Validate watch metadata from a Turn or stored JSON, ignoring malformed data."""
     try:
         meta = json.loads(raw_meta) if isinstance(raw_meta, str) else raw_meta
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, RecursionError):
         return None
     if (
         isinstance(meta, dict)
@@ -2692,7 +2684,7 @@ def _fork_attachment_refs(raw: Any) -> list[str]:
         raise ForkSourceUnavailableError("fork source attachment references are invalid")
     try:
         parsed = json.loads(raw)
-    except (json.JSONDecodeError, TypeError) as exc:
+    except (json.JSONDecodeError, TypeError, RecursionError) as exc:
         raise ForkSourceUnavailableError("fork source attachment references are invalid") from exc
     if not isinstance(parsed, list) or any(
         not isinstance(attachment_id, str) or not attachment_id for attachment_id in parsed
@@ -3180,7 +3172,7 @@ def clone_workstream_transaction(
         marker_meta_raw = insert_rows[0].get("meta")
         try:
             marker_meta = json.loads(marker_meta_raw) if marker_meta_raw else {}
-        except (json.JSONDecodeError, TypeError) as exc:
+        except (json.JSONDecodeError, TypeError, RecursionError) as exc:
             raise ForkSourceUnavailableError("fork source compaction marker is invalid") from exc
         if not isinstance(marker_meta, dict):
             raise ForkSourceUnavailableError("fork source compaction marker is invalid")

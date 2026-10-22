@@ -367,7 +367,7 @@ def _json_object_body(resp: httpx2.Response, label: str) -> dict[str, Any]:
         raise MCPOAuthDiscoveryError(f"{label} response body exceeds size limit")
     try:
         doc = resp.json()
-    except ValueError as exc:
+    except (ValueError, RecursionError) as exc:
         raise MCPOAuthDiscoveryError(f"{label} body is not valid JSON: {exc}") from exc
     if not isinstance(doc, dict):
         raise MCPOAuthDiscoveryError(f"{label} body is not a JSON object")
@@ -1347,7 +1347,7 @@ async def register_dynamic_client(
 
     try:
         doc = resp.json()
-    except ValueError as exc:
+    except (ValueError, RecursionError) as exc:
         raise oauth_http.OAuthError(f"DCR body is not valid JSON: {exc}") from exc
 
     if not isinstance(doc, dict):
@@ -1417,7 +1417,7 @@ async def exchange_code(
 
     try:
         doc = resp.json()
-    except ValueError as exc:
+    except (ValueError, RecursionError) as exc:
         raise MCPOAuthExchangeError(f"token body is not valid JSON: {exc}") from exc
 
     if not isinstance(doc, dict):
@@ -1545,7 +1545,7 @@ def _validate_token_audience(
     try:
         payload_bytes = base64.urlsafe_b64decode((payload_b64 + padding).encode("ascii"))
         payload = json.loads(payload_bytes.decode("utf-8"))
-    except (ValueError, UnicodeDecodeError):
+    except (ValueError, UnicodeDecodeError, RecursionError):
         log.info(
             "mcp_server.oauth.opaque_token_aud_unverified",
             audience=accepted,

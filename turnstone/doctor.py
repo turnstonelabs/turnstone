@@ -1088,7 +1088,7 @@ def check_caddy_config(profile: InstallProfile) -> CaddyConfigCheck | None:
         return check
     try:
         check.in_sync = json.loads(loaded.stdout) == json.loads(adapted.stdout)
-    except ValueError:
+    except (ValueError, RecursionError):
         check.detail = "Caddy returned config that is not JSON"
     return check
 
@@ -2270,7 +2270,7 @@ def _run_conversation(
                 name = tc["function"]["name"]
                 try:
                     args = json.loads(tc["function"]["arguments"])
-                except json.JSONDecodeError as exc:
+                except (json.JSONDecodeError, RecursionError) as exc:
                     result = f"Error: invalid JSON arguments: {exc}"
                     args = {}
                 else:

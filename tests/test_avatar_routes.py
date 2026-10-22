@@ -527,6 +527,17 @@ class TestAdmin:
         assert stored is not None and stored["color"] not in (None, 3)
         assert body["avatar"] == {"color": stored["color"], "initial": "J", "picture": None}
 
+    def test_create_user_refuses_fields_that_are_not_strings(self, client, db) -> None:
+        resp = client.post(
+            "/v1/api/admin/users",
+            json={"username": 7, "display_name": "Jo Chen", "password": "long-enough"},
+            headers=self.ADMIN,
+        )
+        assert (resp.status_code, resp.json()) == (
+            400,
+            {"error": "username, display_name and password must be strings"},
+        )
+
 
 class TestIdentityPayloads:
     def test_whoami_carries_name_and_avatar(self, client, db) -> None:

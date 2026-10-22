@@ -85,7 +85,7 @@ def skill_summary_rows(storage: Any) -> list[dict[str, Any]]:
         if r.get("hidden_from_menu"):
             continue
         tags: list[str] = []
-        with contextlib.suppress(ValueError, TypeError):
+        with contextlib.suppress(ValueError, TypeError, RecursionError):
             tags = json.loads(r.get("tags", "[]"))
         skills.append(
             {
@@ -122,7 +122,7 @@ async def read_json_or_400(request: Request) -> dict[str, Any] | JSONResponse:
             return _JSONResponse({"error": "Request body must be a JSON object"}, status_code=400)
         body: dict[str, Any] = raw
         return body
-    except (ValueError, json.JSONDecodeError):
+    except (ValueError, json.JSONDecodeError, RecursionError):
         return _JSONResponse({"error": "Invalid JSON body"}, status_code=400)
     except Exception:
         import structlog
@@ -261,7 +261,7 @@ async def read_multipart_create_or_400(
         return _JSONResponse({"error": f"Missing '{meta_field}' JSON field"}, status_code=400)
     try:
         meta: dict[str, Any] = json.loads(meta_raw)
-    except (ValueError, json.JSONDecodeError):
+    except (ValueError, json.JSONDecodeError, RecursionError):
         return _JSONResponse({"error": f"'{meta_field}' field must be valid JSON"}, status_code=400)
     if not isinstance(meta, dict):
         return _JSONResponse({"error": f"'{meta_field}' must be a JSON object"}, status_code=400)

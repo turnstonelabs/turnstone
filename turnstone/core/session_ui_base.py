@@ -3861,7 +3861,7 @@ class SessionUIBase:
         for row in reversed(rows or []):
             try:
                 detail = json.loads(row.get("detail") or "{}")
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, RecursionError):
                 continue
             tools = detail.get("tools") or []
             ts = self._parse_audit_timestamp(row.get("timestamp", ""))

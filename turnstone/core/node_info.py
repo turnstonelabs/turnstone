@@ -337,7 +337,7 @@ def _detect_aws_metadata() -> dict[str, str]:
         return {}
     try:
         doc = json.loads(body)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, RecursionError):
         return {}
     # IMDS contract says this endpoint returns a JSON object — but a
     # spoofed responder can return any JSON.  Guard so a list / scalar
@@ -421,7 +421,7 @@ def _detect_azure_metadata() -> dict[str, str]:
         return {}
     try:
         doc = json.loads(body)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, RecursionError):
         return {}
     # Same isinstance guard as the AWS path — a non-dict body would
     # AttributeError on doc.get("compute") below.

@@ -507,7 +507,7 @@ def _error_answer(content: bytes) -> _ErrorAnswerError | None:
     (an integer code and a string message)."""
     try:
         body = json.loads(content)
-    except ValueError:
+    except (ValueError, RecursionError):
         return None
     if not isinstance(body, dict) or body.get("jsonrpc") != "2.0":
         return None
@@ -606,7 +606,7 @@ def _jsonrpc_body(request: httpx2.Request) -> dict[str, Any] | None:
         return None
     try:
         body = json.loads(request.content)
-    except (ValueError, httpx2.RequestNotRead):
+    except (ValueError, httpx2.RequestNotRead, RecursionError):
         return None
     return body if isinstance(body, dict) else None
 
@@ -11331,7 +11331,7 @@ def _parse_pending_consent_envelope(
     """
     try:
         decoded = json.loads(result)
-    except (json.JSONDecodeError, ValueError):
+    except (json.JSONDecodeError, ValueError, RecursionError):
         return None
     if not isinstance(decoded, dict):
         return None
@@ -11373,7 +11373,7 @@ def _is_structured_error(result: str) -> bool:
         return False
     try:
         decoded = json.loads(result)
-    except (json.JSONDecodeError, ValueError):
+    except (json.JSONDecodeError, ValueError, RecursionError):
         return False
     if not isinstance(decoded, dict):
         return False
@@ -11591,7 +11591,7 @@ def _pool_cfg_from_row(row: dict[str, Any]) -> dict[str, Any]:
     elif isinstance(headers_raw, str) and headers_raw:
         try:
             decoded = json.loads(headers_raw)
-        except (json.JSONDecodeError, TypeError):
+        except (json.JSONDecodeError, TypeError, RecursionError):
             decoded = {}
         if isinstance(decoded, dict):
             for k, v in decoded.items():
@@ -11625,17 +11625,17 @@ def _db_servers_to_config(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any
             cfg["command"] = row.get("command", "")
             try:
                 cfg["args"] = json.loads(row.get("args", "[]"))
-            except (json.JSONDecodeError, TypeError):
+            except (json.JSONDecodeError, TypeError, RecursionError):
                 cfg["args"] = []
             try:
                 cfg["env"] = json.loads(row.get("env", "{}"))
-            except (json.JSONDecodeError, TypeError):
+            except (json.JSONDecodeError, TypeError, RecursionError):
                 cfg["env"] = {}
         else:
             cfg["url"] = row.get("url", "")
             try:
                 cfg["headers"] = json.loads(row.get("headers", "{}"))
-            except (json.JSONDecodeError, TypeError):
+            except (json.JSONDecodeError, TypeError, RecursionError):
                 cfg["headers"] = {}
         result[name] = cfg
     return result

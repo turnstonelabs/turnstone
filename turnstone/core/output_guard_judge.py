@@ -359,7 +359,7 @@ def _extract_json(text: str) -> dict[str, Any] | None:
         data = json.loads(text.strip())
         if isinstance(data, dict):
             return data
-    except (json.JSONDecodeError, ValueError):
+    except (json.JSONDecodeError, ValueError, RecursionError):
         pass  # expected when the LLM prefixed prose or wrapped in a fence; fall through
 
     # Strategy 2: markdown code block.  Two linear searches find the match of
@@ -374,7 +374,7 @@ def _extract_json(text: str) -> dict[str, Any] | None:
             data = json.loads(text[opener.end() - 1 : closer.start() + 1])
             if isinstance(data, dict):
                 return data
-        except (json.JSONDecodeError, ValueError):
+        except (json.JSONDecodeError, ValueError, RecursionError):
             pass  # fence captured malformed JSON; fall through to brace scan
 
     # Strategy 3: find first { and matching }
@@ -391,7 +391,7 @@ def _extract_json(text: str) -> dict[str, Any] | None:
                         data = json.loads(text[start : i + 1])
                         if isinstance(data, dict):
                             return data
-                    except (json.JSONDecodeError, ValueError):
+                    except (json.JSONDecodeError, ValueError, RecursionError):
                         pass  # balanced braces but invalid JSON inside; treat as unparseable
                     break
 

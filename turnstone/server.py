@@ -2617,7 +2617,7 @@ def _fire_notify_targets(ws: Any, content: str) -> None:
 
     try:
         targets = json.loads(ws.notify_targets)
-    except (json.JSONDecodeError, TypeError):
+    except (json.JSONDecodeError, TypeError, RecursionError):
         return
     if not targets or not isinstance(targets, list):
         return
@@ -3145,12 +3145,12 @@ async def _interactive_create_prepare_install(
             ws.ui.auto_approve = True
         allowed = skill_data.get("allowed_tools", "")
         if allowed and allowed != "[]":
-            import json as _json
+            from turnstone.core.skill_field_validation import read_allowed_tools
 
-            try:
-                tools_list = _json.loads(allowed)
-            except (ValueError, TypeError):
-                tools_list = [t.strip() for t in allowed.split(",") if t.strip()]
+            tools_list = read_allowed_tools(allowed)
+            if tools_list is None:
+                log.warning("skill.allowed_tools_unreadable", skill_id=skill_data["template_id"])
+                tools_list = []
             if tools_list:
                 ws.ui.auto_approve_tools = set(tools_list)
                 # Tag each as skill-sourced so the dashboard can show

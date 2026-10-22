@@ -96,8 +96,31 @@ def parse_skill_session_config(body: dict[str, Any]) -> tuple[dict[str, Any], st
                 at_str = json.dumps([t.strip() for t in at_str.split(",") if t.strip()])
             try:
                 json.loads(at_str or "[]")
-            except (ValueError, TypeError):
+            except (ValueError, TypeError, RecursionError):
                 at_str = "[]"
             fields["allowed_tools"] = at_str or "[]"
 
     return fields, None
+
+
+def read_allowed_tools(stored: Any) -> list[str] | None:
+    """The tool names a skill's stored ``allowed_tools`` grants, or None when it can't be read.
+
+    The column holds a JSON array of names; a row from before that holds a comma-separated list.
+    Only a value that doesn't start with ``[`` is split on commas when it fails to parse: split
+    that way, a JSON value this process can't parse (malformed, or nested too deeply for its
+    parser) could yield names nobody listed. That value, and one that parses to anything but a flat
+    list of strings, grants nothing.
+    """
+    text = str(stored or "").strip()
+    if not text:
+        return []
+    try:
+        parsed = json.loads(text)
+    except (ValueError, RecursionError):
+        if text.startswith("["):
+            return None
+        return [t.strip() for t in text.split(",") if t.strip()]
+    if not isinstance(parsed, list) or not all(isinstance(t, str) for t in parsed):
+        return None
+    return parsed

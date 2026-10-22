@@ -764,6 +764,32 @@ class TestSessionIntegration:
         session.ui.on_error.assert_called_once()
         assert "Malformed tool call" in session.ui.on_error.call_args[0][0]
 
+    def test_prepare_tool_arguments_with_a_number_past_the_digit_limit_read_as_malformed(
+        self, tmp_db
+    ):
+        # json.loads raises a plain ValueError for an integer past 4,300 digits; it used to escape.
+        session = self._make_session(mcp_client=None)
+        raw = '{"command": "ls", "timeout": 1' + "0" * 4300 + "}"
+        prepared = session._prepare_tool(
+            {"id": "call_big", "function": {"name": "bash", "arguments": raw}}
+        )
+        assert "JSON parse error" in prepared["error"]
+        session.ui.on_error.assert_called_once()
+
+    def test_prepare_tool_arguments_nested_too_deeply_read_as_malformed(self, tmp_db, monkeypatch):
+        from tests._deep_json import too_deep_to_parse
+
+        session = self._make_session(mcp_client=None)
+        # Salvage would recover this command from text that didn't decode; from valid JSON too
+        # deep to use, it would be guessing, so the parse error reaches the model instead.
+        seed = '{"command": "echo hi"}'
+        too_deep_to_parse(monkeypatch, seed)
+        tc = {"id": "call_deep", "function": {"name": "bash", "arguments": seed}}
+        prepared = session._prepare_tool(tc)
+        assert "JSON parse error" in prepared["error"]
+        assert "Please retry" in prepared["error"]
+        session.ui.on_error.assert_called_once()
+
     def test_ensure_tool_call_ids_dict(self, tmp_db):
         """ensure_tool_call_ids fills empty IDs on streaming-style dict."""
         from turnstone.core.model_turn import ensure_tool_call_ids

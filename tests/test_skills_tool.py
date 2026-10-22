@@ -1585,6 +1585,41 @@ class TestExecSkillsToggle:
             action = "enable" if enable else "disable"
             return session._prepare_skills("c", {"action": action, "name": "x"})
 
+    @pytest.mark.parametrize(
+        ("stored", "shown"),
+        [
+            ('["bash", "read_file"]', ["bash", "read_file"]),
+            ("bash, read_file", ["bash", "read_file"]),
+            ("[bash", []),
+        ],
+        ids=["json", "legacy-list", "unreadable"],
+    )
+    def test_find_shows_allowed_tools_as_create_grants_them(self, stored, shown) -> None:
+        session = _make_session()
+        row = session._skills_project_row({"name": "x", "allowed_tools": stored})
+        assert row.get("allowed_tools", []) == shown
+
+    def test_enable_card_says_when_allowed_tools_are_unreadable(self, monkeypatch) -> None:
+        """Workstream create grants nothing for a value it can't parse, and the card says so."""
+        from tests._deep_json import too_deep_to_parse
+
+        stored = '["bash"]'
+        too_deep_to_parse(monkeypatch, stored)
+        session = _make_session()
+        storage = MagicMock()
+        storage.get_prompt_template_by_name.return_value = {
+            "template_id": "t1",
+            "name": "x",
+            "enabled": False,
+            "allowed_tools": stored,
+        }
+        with (
+            patch("turnstone.core.auth.user_has_permission", return_value=True),
+            patch("turnstone.core.session.get_storage", return_value=storage),
+        ):
+            item = session._prepare_skills("c", {"action": "enable", "name": "x"})
+        assert "    allowed_tools: unreadable, so it grants none" in item["preview"].split("\n")
+
     def test_enable_card_shows_stored_notify_targets(self) -> None:
         """Re-enabling lets new workstreams report to these targets, so the card and
         the judge see them whole (#1292)."""

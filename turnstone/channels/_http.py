@@ -7,17 +7,17 @@ requests from the server.  Exposes ``POST /v1/api/notify`` and ``GET /health``.
 from __future__ import annotations
 
 import asyncio
-import json
 import re
 import socket
 import uuid
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 from starlette.applications import Starlette
 from starlette.responses import JSONResponse
 from starlette.routing import Mount, Route
 
 from turnstone.core.log import get_logger
+from turnstone.core.web_helpers import read_json_or_400
 
 if TYPE_CHECKING:
     from starlette.requests import Request
@@ -95,10 +95,9 @@ async def _handle_notify(request: Request) -> JSONResponse:
     adapters: dict[str, ChannelAdapter] = request.app.state.adapters
     storage: StorageBackend = request.app.state.storage
 
-    try:
-        body: dict[str, Any] = await request.json()
-    except (json.JSONDecodeError, ValueError):
-        return JSONResponse({"error": "invalid JSON"}, status_code=400)
+    body = await read_json_or_400(request)
+    if isinstance(body, JSONResponse):
+        return body
 
     target = body.get("target")
     message = body.get("message", "").strip() if isinstance(body.get("message"), str) else ""
@@ -109,6 +108,17 @@ async def _handle_notify(request: Request) -> JSONResponse:
 
     if not target or not message:
         return JSONResponse({"error": "target and message are required"}, status_code=400)
+    if not isinstance(target, dict):
+        return JSONResponse({"error": "target must be an object"}, status_code=400)
+    if any(
+        not isinstance(target[key], str)
+        for key in ("username", "channel_type", "channel_id")
+        if key in target
+    ):
+        return JSONResponse(
+            {"error": "target's username, channel_type and channel_id must be strings"},
+            status_code=400,
+        )
 
     content = f"**{title}**\n{message}" if title else message
 

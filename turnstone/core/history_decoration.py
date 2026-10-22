@@ -145,7 +145,7 @@ def _decode_json_list(raw: Any) -> list[str]:
         return []
     try:
         decoded = json.loads(raw) if isinstance(raw, str) else raw
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, RecursionError):
         return []
     return decoded if isinstance(decoded, list) else []
 

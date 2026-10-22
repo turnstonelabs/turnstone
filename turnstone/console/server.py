@@ -507,7 +507,7 @@ async def cluster_nodes(request: Request) -> JSONResponse:
                 try:
                     _mf_json.loads(mv)
                     encoded[mk] = mv
-                except (ValueError, TypeError):
+                except (ValueError, TypeError, RecursionError):
                     encoded[mk] = _mf_json.dumps(mv)
             try:
                 node_ids = storage.filter_nodes_by_metadata(encoded)
@@ -816,7 +816,7 @@ class _NodeDashboardCache:
                 if 200 <= status < 300:
                     try:
                         raw = resp.json()
-                    except (ValueError, json.JSONDecodeError):
+                    except (ValueError, json.JSONDecodeError, RecursionError):
                         raw = None
                     if isinstance(raw, dict):
                         payload = raw
@@ -968,7 +968,7 @@ async def _fetch_live_block(
             return None
         try:
             raw = resp.json()
-        except (ValueError, *REQUEST_FAILURES):
+        except (ValueError, *REQUEST_FAILURES, RecursionError):
             return None
         payload = raw if isinstance(raw, dict) else None
     if payload is None:
@@ -6543,9 +6543,15 @@ async def admin_create_user(request: Request) -> JSONResponse:
     if isinstance(body, JSONResponse):
         return body
 
-    username = body.get("username", "").strip()
-    display_name = body.get("display_name", "").strip()
+    username = body.get("username", "")
+    display_name = body.get("display_name", "")
     password = body.get("password", "")
+    if not all(isinstance(v, str) for v in (username, display_name, password)):
+        return JSONResponse(
+            {"error": "username, display_name and password must be strings"}, status_code=400
+        )
+    username = username.strip()
+    display_name = display_name.strip()
 
     from turnstone.core.auth import is_valid_username
 
@@ -6704,14 +6710,15 @@ async def admin_create_token(request: Request) -> JSONResponse:
     if storage.get_user(user_id) is None:
         return JSONResponse({"error": "User not found"}, status_code=404)
 
-    try:
-        body: dict[str, Any] = await request.json()
-    except (ValueError, json.JSONDecodeError):
-        body = {}
+    body = await read_json_or_400(request)
+    if isinstance(body, JSONResponse):
+        return body
 
     name = body.get("name", "")
     scopes = body.get("scopes", "read,write,approve")
     expires_days = body.get("expires_days")
+    if not isinstance(name, str) or not isinstance(scopes, str):
+        return JSONResponse({"error": "name and scopes must be strings"}, status_code=400)
 
     # Validate scopes — ``service`` is NOT user-assignable (it bypasses
     # private-project tenancy; only ServiceTokenManager / the JWT secret
@@ -6726,9 +6733,18 @@ async def admin_create_token(request: Request) -> JSONResponse:
     if expires_days is not None:
         from datetime import UTC, datetime, timedelta
 
-        expires = (datetime.now(UTC) + timedelta(days=int(expires_days))).strftime(
-            "%Y-%m-%dT%H:%M:%S"
+        # Not bool, which is an int: false made a token that had already expired.
+        bad_days = JSONResponse(
+            {"error": "expires_days must be a whole number of days, at least 1"}, status_code=400
         )
+        if isinstance(expires_days, bool) or not isinstance(expires_days, int) or expires_days < 1:
+            return bad_days
+        try:
+            expires = (datetime.now(UTC) + timedelta(days=expires_days)).strftime(
+                "%Y-%m-%dT%H:%M:%S"
+            )
+        except OverflowError:
+            return bad_days
 
     raw = generate_token()
     tid = uuid.uuid4().hex
@@ -7130,7 +7146,7 @@ def _normalize_task_dict(task: dict[str, Any]) -> dict[str, Any]:
     raw_nt = task.get("notify_targets", "[]")
     try:
         task["notify_targets"] = _json.loads(raw_nt) if isinstance(raw_nt, str) else raw_nt
-    except (_json.JSONDecodeError, TypeError):
+    except (_json.JSONDecodeError, TypeError, RecursionError):
         task["notify_targets"] = []
     return task
 
@@ -8396,7 +8412,7 @@ async def admin_update_org(request: Request) -> JSONResponse:
         settings_str = str(body["settings"]).strip()
         try:
             json.loads(settings_str)
-        except (json.JSONDecodeError, TypeError):
+        except (json.JSONDecodeError, TypeError, RecursionError):
             return JSONResponse({"error": "settings must be valid JSON"}, status_code=400)
         updates["settings"] = settings_str
 
@@ -8651,7 +8667,7 @@ def _canonicalize_skill_string_list(raw: Any) -> str:
     if candidate.startswith("["):
         try:
             parsed = _json.loads(candidate)
-        except (ValueError, TypeError):
+        except (ValueError, TypeError, RecursionError):
             return "[]"
         if not isinstance(parsed, list):
             return "[]"
@@ -8692,7 +8708,7 @@ def _skill_to_response(r: dict[str, Any], resource_count: int = 0) -> dict[str, 
     import json as _json
 
     tags: list[str] = []
-    with contextlib.suppress(ValueError, TypeError):
+    with contextlib.suppress(ValueError, TypeError, RecursionError):
         tags = _json.loads(r.get("tags", "[]"))
     return {
         "template_id": r.get("template_id", ""),
@@ -8822,7 +8838,7 @@ async def admin_create_skill(request: Request) -> JSONResponse:
     variables = str(body.get("variables", "[]")).strip()
     try:
         _json.loads(variables)
-    except (_json.JSONDecodeError, TypeError):
+    except (_json.JSONDecodeError, TypeError, RecursionError):
         return JSONResponse({"error": "variables must be a valid JSON array"}, status_code=400)
     org_id = str(body.get("org_id", "")).strip()[:64]
     author = str(body.get("author", "")).strip()[:256]
@@ -8837,7 +8853,7 @@ async def admin_create_skill(request: Request) -> JSONResponse:
         tags_str = str(raw_tags).strip()
         try:
             _json.loads(tags_str)
-        except (ValueError, TypeError):
+        except (ValueError, TypeError, RecursionError):
             tags_str = "[]"
 
     # SKILL.md spec ``paths:`` — glob patterns gating autoload.
@@ -8986,7 +9002,7 @@ async def admin_update_skill(request: Request) -> JSONResponse:
         var_str = str(body["variables"]).strip()
         try:
             _json.loads(var_str)
-        except (_json.JSONDecodeError, TypeError):
+        except (_json.JSONDecodeError, TypeError, RecursionError):
             return JSONResponse({"error": "variables must be a valid JSON array"}, status_code=400)
         updates["variables"] = var_str
     if "author" in body:
@@ -9005,7 +9021,7 @@ async def admin_update_skill(request: Request) -> JSONResponse:
             tag_str = str(raw_tags).strip()
             try:
                 _json.loads(tag_str)
-            except (ValueError, TypeError):
+            except (ValueError, TypeError, RecursionError):
                 tag_str = "[]"
             updates["tags"] = tag_str
     if "paths" in body and body["paths"] is not None:
@@ -11092,7 +11108,7 @@ def _json_object(raw: Any) -> dict[str, Any]:
         return raw
     try:
         value = json.loads(raw or "{}")
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, RecursionError):
         return {}
     return value if isinstance(value, dict) else {}
 
@@ -11497,7 +11513,7 @@ def _mask_mcp_secrets(server: dict[str, Any], reveal: bool = False) -> dict[str,
     if s.get("env") and s["env"] != "{}":
         try:
             env_dict = json.loads(s["env"]) if isinstance(s["env"], str) else s["env"]
-        except (json.JSONDecodeError, TypeError):
+        except (json.JSONDecodeError, TypeError, RecursionError):
             env_dict = {}
         # A stored value that is not an object (hand-edited rows) shows as empty.
         s["env"] = json.dumps({k: "***" for k in env_dict} if isinstance(env_dict, dict) else {})
@@ -11506,7 +11522,7 @@ def _mask_mcp_secrets(server: dict[str, Any], reveal: bool = False) -> dict[str,
 
         try:
             hdr_dict = json.loads(s["headers"]) if isinstance(s["headers"], str) else s["headers"]
-        except (json.JSONDecodeError, TypeError):
+        except (json.JSONDecodeError, TypeError, RecursionError):
             hdr_dict = {}
         # A secret:// reference is not itself a secret; it stays visible. A
         # stored value that is not an object (hand-edited rows) shows as empty.
@@ -13386,7 +13402,7 @@ def _canonical_capabilities(raw: Any) -> str | None:
     """
     try:
         parsed = json.loads(str(raw or "") or "{}")
-    except ValueError:
+    except (ValueError, RecursionError):
         return None
     return canonical_caps_value(parsed)
 
@@ -13836,7 +13852,7 @@ def _stored_workspace_id(row: dict[str, Any], provider: str) -> str:
         return ""
     try:
         caps = json.loads(row.get("capabilities") or "{}")
-    except (json.JSONDecodeError, TypeError):
+    except (json.JSONDecodeError, TypeError, RecursionError):
         return ""
     sc = caps.get("server_compat") if isinstance(caps, dict) else None
     raw = sc.get("anthropic_workspace_id") if isinstance(sc, dict) else None
@@ -14231,7 +14247,7 @@ def _row_serves_chat(row: dict[str, Any]) -> bool:
     raw = row.get("capabilities") or "{}"
     try:
         caps = json.loads(raw) if isinstance(raw, str) else raw
-    except (json.JSONDecodeError, TypeError):
+    except (json.JSONDecodeError, TypeError, RecursionError):
         caps = {}
     return serves_chat(caps if isinstance(caps, dict) else {}, str(row.get("model") or ""))
 
@@ -14965,7 +14981,7 @@ async def admin_update_model_definition(request: Request) -> JSONResponse:
         # impossible to re-save, so the switch is refused until it is cleared.
         try:
             stored_caps = json.loads(existing.get("capabilities") or "{}")
-        except (json.JSONDecodeError, TypeError):
+        except (json.JSONDecodeError, TypeError, RecursionError):
             stored_caps = {}
         err_msg = _validate_anthropic_workspace_id(stored_caps, str(updates["provider"]))
         if err_msg:
@@ -16569,7 +16585,7 @@ async def admin_create_heuristic_rule(request: Request) -> JSONResponse:
     if isinstance(arg_patterns, str):
         try:
             arg_patterns = _json.loads(arg_patterns)
-        except _json.JSONDecodeError:
+        except (_json.JSONDecodeError, RecursionError):
             return JSONResponse({"error": "arg_patterns must be a JSON array"}, status_code=400)
     if not isinstance(arg_patterns, list):
         return JSONResponse({"error": "arg_patterns must be a list"}, status_code=400)
@@ -16712,7 +16728,7 @@ async def admin_update_heuristic_rule(request: Request) -> JSONResponse:
         if isinstance(ap, str):
             try:
                 ap = _json.loads(ap)
-            except _json.JSONDecodeError:
+            except (_json.JSONDecodeError, RecursionError):
                 return JSONResponse({"error": "arg_patterns must be a JSON array"}, status_code=400)
         if not isinstance(ap, list):
             return JSONResponse({"error": "arg_patterns must be a list"}, status_code=400)
@@ -17264,7 +17280,7 @@ async def admin_get_all_node_metadata(request: Request) -> JSONResponse:
         for r in rows:
             try:
                 val = _anm_json.loads(r["value"])
-            except (ValueError, TypeError):
+            except (ValueError, TypeError, RecursionError):
                 val = r["value"]
             entries.append({"key": r["key"], "value": val, "source": r["source"]})
         result[nid] = entries
@@ -17293,7 +17309,7 @@ async def admin_get_node_metadata(request: Request) -> JSONResponse:
     for r in rows:
         try:
             val = _nm_json.loads(r["value"])
-        except (ValueError, TypeError):
+        except (ValueError, TypeError, RecursionError):
             val = r["value"]
         metadata.append({"key": r["key"], "value": val, "source": r["source"]})
     return JSONResponse({"node_id": node_id, "metadata": metadata})

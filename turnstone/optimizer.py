@@ -635,7 +635,7 @@ def _exec_analyst_tool(name: str, arguments: str) -> str:
     """Execute a tool call from the analyst agent."""
     try:
         args = json.loads(arguments)
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, RecursionError):
         return f"Invalid JSON arguments: {arguments[:200]}"
 
     if name == "bash":
@@ -905,7 +905,7 @@ def _propose_tool_overrides(
 
     try:
         new_overrides = json.loads(raw)
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, RecursionError):
         _log(f"  Tool optimizer returned invalid JSON: {raw[:200]}", dim=True)
         return current_overrides
 

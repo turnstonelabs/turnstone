@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import json
 import os
 import re
 import secrets
@@ -1727,16 +1726,20 @@ async def handle_auth_login(request: Request, audience: str, cookie_name: str) -
     """
     from starlette.responses import JSONResponse
 
-    try:
-        body: dict[str, Any] = await request.json()
-    except (ValueError, json.JSONDecodeError):
-        return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
+    from turnstone.core.web_helpers import read_json_or_400
+
+    body = await read_json_or_400(request)
+    if isinstance(body, JSONResponse):
+        return body
 
     jwt_secret = getattr(request.app.state, "jwt_secret", "")
     storage = getattr(request.app.state, "auth_storage", None)
     login_limiter: LoginRateLimiter | None = getattr(request.app.state, "login_limiter", None)
 
     username = body.get("username", "")
+    password = body.get("password", "")
+    if not isinstance(username, str) or not isinstance(password, str):
+        return JSONResponse({"error": "username and password must be strings"}, status_code=400)
     client_ip = request.client.host if request.client else "unknown"
 
     # Check login rate limits (per-IP and per-username)
@@ -1759,7 +1762,6 @@ async def handle_auth_login(request: Request, audience: str, cookie_name: str) -
 
     result: AuthResult | None = None
     user: dict[str, Any] | None = None
-    password = body.get("password", "")
 
     if username and password and storage is not None:
         # Enforce OIDC-only mode: reject password login when disabled
@@ -1884,14 +1886,21 @@ async def handle_auth_setup(request: Request, audience: str, cookie_name: str) -
     if storage is None:
         return JSONResponse({"error": "Storage not available"}, status_code=503)
 
-    try:
-        body: dict[str, Any] = await request.json()
-    except (ValueError, json.JSONDecodeError):
-        return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
+    from turnstone.core.web_helpers import read_json_or_400
 
-    username = body.get("username", "").strip()
-    display_name = body.get("display_name", "").strip()
+    body = await read_json_or_400(request)
+    if isinstance(body, JSONResponse):
+        return body
+
+    username = body.get("username", "")
+    display_name = body.get("display_name", "")
     password = body.get("password", "")
+    if not all(isinstance(v, str) for v in (username, display_name, password)):
+        return JSONResponse(
+            {"error": "username, display_name and password must be strings"}, status_code=400
+        )
+    username = username.strip()
+    display_name = display_name.strip()
 
     if not is_valid_username(username):
         return JSONResponse(

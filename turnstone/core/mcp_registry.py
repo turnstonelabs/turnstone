@@ -300,7 +300,7 @@ class MCPRegistryClient:
 
         try:
             data = resp.json()
-        except (ValueError, TypeError) as exc:
+        except (ValueError, TypeError, RecursionError) as exc:
             raise MCPRegistryError(f"Invalid JSON response: {exc}") from exc
 
         servers_raw = data.get("servers") or []

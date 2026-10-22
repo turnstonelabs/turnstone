@@ -250,7 +250,7 @@ class _BaseClient:
         ) as source:
             async for sse in source:
                 if sse.data:
-                    with contextlib.suppress(json.JSONDecodeError):
+                    with contextlib.suppress(json.JSONDecodeError, RecursionError):
                         yield json.loads(sse.data)
 
     # -- lifecycle -----------------------------------------------------------

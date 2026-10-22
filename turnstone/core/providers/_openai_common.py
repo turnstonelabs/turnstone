@@ -130,7 +130,7 @@ def _extract_upstream_error(
         return _INVALID_UPSTREAM_ERROR_BODY, "", "", None
     try:
         payload = json.loads(raw_body.decode("utf-8"))
-    except (UnicodeDecodeError, TypeError, ValueError):
+    except (UnicodeDecodeError, TypeError, ValueError, RecursionError):
         return _INVALID_UPSTREAM_ERROR_BODY, "", "", None
     if not isinstance(payload, dict):
         return _INVALID_UPSTREAM_ERROR_BODY, "", "", None

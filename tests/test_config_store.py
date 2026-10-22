@@ -321,6 +321,17 @@ class TestReload:
         assert "session.retention_days" in records[0].getMessage()
         assert "ninety days" not in caplog.text
 
+    def test_a_stored_value_nested_too_deeply_to_parse_reads_as_the_default(
+        self, storage, monkeypatch
+    ):
+        # The parser's RecursionError used to escape the first load, so the node couldn't start.
+        from tests._deep_json import too_deep_to_parse
+
+        storage.upsert_system_setting(key="session.retention_days", value="37")
+        too_deep_to_parse(monkeypatch, "37")
+        store = ConfigStore(storage)
+        assert store.get("session.retention_days") == SETTINGS["session.retention_days"].default
+
 
 def _unreadable(node_id: str = "") -> dict[str, str]:
     raise RuntimeError("database went away")

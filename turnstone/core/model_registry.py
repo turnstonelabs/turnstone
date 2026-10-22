@@ -1719,7 +1719,7 @@ def load_model_registry(
                         parsed = _json.loads(row["capabilities"])
                         if isinstance(parsed, dict):
                             caps = parsed
-                    except (_json.JSONDecodeError, TypeError):
+                    except (_json.JSONDecodeError, TypeError, RecursionError):
                         pass  # falls back to empty capabilities
                 defined.setdefault(alias, serves_chat(caps, str(row.get("model") or "")))
                 # Extract server_compat from capabilities (namespaced key)

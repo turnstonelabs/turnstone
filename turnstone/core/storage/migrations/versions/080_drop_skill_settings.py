@@ -84,7 +84,7 @@ def _notify_targets_valid(raw: str) -> bool:
     """
     try:
         parsed = json.loads(raw)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, RecursionError):
         return False
     if not isinstance(parsed, list) or len(parsed) > 10:
         return False

@@ -295,12 +295,12 @@ Delete a user and revoke all their tokens.
 
 #### `POST /v1/api/admin/users/{user_id}/tokens`
 
-Create an API token for the given user. Returns a `ts_`-prefixed token string that can be used for Bearer auth or passed to `client.login(token="ts_xxx")`.
+Create an API token for the given user. Returns a `ts_`-prefixed token string that can be used for Bearer auth or passed to `client.login(token="ts_xxx")`. `scopes` is a comma-separated string (default `"read,write,approve"`), and `expires_days` an optional whole number of days, at least 1.
 
 ```json
 {
   "name": "CI pipeline",
-  "scopes": ["read", "write"]
+  "scopes": "read,write"
 }
 ```
 

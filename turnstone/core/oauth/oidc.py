@@ -470,7 +470,7 @@ async def discover_oidc(
         # say): a configuration error, terminal like a rejected issuer.
         log.warning("OIDC issuer URL rejected: %s", exc)
         return dataclasses.replace(config, enabled=False, discovery_retryable=False)
-    except (*REQUEST_FAILURES, ValueError, KeyError) as exc:
+    except (*REQUEST_FAILURES, ValueError, KeyError, RecursionError) as exc:
         # ValueError covers json.JSONDecodeError (subclass). Retryable: the
         # IdP being unreachable at boot says nothing about the config.
         log.warning("OIDC discovery failed for %s: %s", config.issuer, exc, exc_info=True)
@@ -586,7 +586,7 @@ async def fetch_jwks(
                 resp = await transient.get(jwks_uri)
                 resp.raise_for_status()
                 result = resp.json()
-    except (*REQUEST_FAILURES, ValueError) as exc:
+    except (*REQUEST_FAILURES, ValueError, RecursionError) as exc:
         # ValueError covers json.JSONDecodeError (subclass).
         raise OIDCError(f"JWKS fetch failed: {exc}") from exc
     if not isinstance(result, dict):

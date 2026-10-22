@@ -190,7 +190,7 @@ def merge_calibration_into_caps(raw_caps: str | None, result: CalibrationResult)
             parsed = json.loads(raw_caps)
             if isinstance(parsed, dict):
                 caps = parsed
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, RecursionError):
             caps = {}
     caps.update(calibration_caps_fields(result))
     return json.dumps(caps)
@@ -258,11 +258,11 @@ def calibration_confinement_violations(
             parsed = json.loads(raw_caps)
             if isinstance(parsed, dict):
                 stored = parsed
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, RecursionError):
             stored = {}
     try:
         merged_parsed = json.loads(merged)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, RecursionError):
         return ["<merge output is not JSON>"]
     if not isinstance(merged_parsed, dict):
         return ["<merge output is not a JSON object>"]

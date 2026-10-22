@@ -55,7 +55,7 @@ _SPEECH_FLAGS: dict[str, tuple[str, ...]] = {
 def _serves_chat(capabilities: str | None, model: str | None) -> bool:
     try:
         caps = json.loads(capabilities or "{}")
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, RecursionError):
         caps = {}
     if not isinstance(caps, dict):
         caps = {}

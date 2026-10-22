@@ -224,7 +224,7 @@ def _as_error_code(resp: httpx2.Response) -> str | None:
     """
     try:
         doc = resp.json()
-    except ValueError:
+    except (ValueError, RecursionError):
         return None
     if isinstance(doc, dict):
         code = doc.get("error")
@@ -251,7 +251,7 @@ def _format_as_error(resp: httpx2.Response) -> str:
     parts: list[str] = []
     try:
         doc = resp.json()
-    except ValueError:
+    except (ValueError, RecursionError):
         doc = None
     if isinstance(doc, dict):
         for key in ("error", "error_description", "error_uri"):
@@ -395,7 +395,7 @@ async def _hardened_token_post(
 
     try:
         doc = resp.json()
-    except ValueError as exc:
+    except (ValueError, RecursionError) as exc:
         raise OAuthRefreshError(f"{request_label} body is not valid JSON: {exc}") from exc
     if not isinstance(doc, dict):
         raise OAuthRefreshError(f"{request_label} body is not a JSON object")

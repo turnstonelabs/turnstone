@@ -1611,6 +1611,43 @@ class TestConsoleLogin:
         resp = self.test_client.get("/v1/api/cluster/overview")
         assert resp.status_code == 401
 
+    @pytest.mark.parametrize(
+        ("path", "body", "error"),
+        [
+            ("/v1/api/auth/login", b"[]", "Request body must be a JSON object"),
+            ("/v1/api/auth/login", b'"x"', "Request body must be a JSON object"),
+            (
+                "/v1/api/auth/login",
+                b'{"username": 7, "password": "testpass"}',
+                "username and password must be strings",
+            ),
+            (
+                "/v1/api/auth/login",
+                b'{"username": "testuser", "password": ["testpass"]}',
+                "username and password must be strings",
+            ),
+            ("/v1/api/auth/setup", b"[]", "Request body must be a JSON object"),
+            (
+                "/v1/api/auth/setup",
+                b'{"username": 7, "display_name": "Ada", "password": "long-enough"}',
+                "username, display_name and password must be strings",
+            ),
+        ],
+        ids=[
+            "login-list",
+            "login-string",
+            "login-username-number",
+            "login-password-list",
+            "setup-list",
+            "setup-username-number",
+        ],
+    )
+    def test_a_body_it_cannot_use_is_a_400(self, path, body, error):
+        resp = self.test_client.post(
+            path, content=body, headers={"Content-Type": "application/json"}
+        )
+        assert (resp.status_code, resp.json()) == (400, {"error": error})
+
 
 # ---------------------------------------------------------------------------
 # Security hardening tests

@@ -54,7 +54,7 @@ def _read_credential_file(path: str, *, what: str) -> str:
 def _errors_of(response: httpx2.Response) -> str:
     try:
         body = response.json()
-    except ValueError:
+    except (ValueError, RecursionError):
         return ""
     if not isinstance(body, dict):
         return ""
@@ -154,7 +154,7 @@ class VaultBackend:
             )
         try:
             body = response.json()
-        except ValueError as exc:
+        except (ValueError, RecursionError) as exc:
             raise SecretBackendError(
                 "store unavailable", retryable=True, detail="non-JSON body"
             ) from exc
@@ -292,7 +292,7 @@ class VaultBackend:
             )
         try:
             body = response.json()
-        except ValueError as exc:
+        except (ValueError, RecursionError) as exc:
             raise SecretBackendError(
                 f"{cfg.auth} login failed", retryable=True, detail=f"{url}: non-JSON body"
             ) from exc

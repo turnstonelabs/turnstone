@@ -193,7 +193,7 @@ def evaluate_condition(
 
     # Build data context
     data: Any = None
-    with contextlib.suppress(json.JSONDecodeError, ValueError):
+    with contextlib.suppress(json.JSONDecodeError, ValueError, RecursionError):
         data = json.loads(output)
 
     context = {

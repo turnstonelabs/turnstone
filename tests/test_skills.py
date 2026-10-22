@@ -1929,6 +1929,26 @@ class TestSkillConfigAppliedToWorkstream:
         assert isinstance(ws.ui, WebUI)
         assert ws.ui.auto_approve_tools == {"bash", "read_file"}
 
+    def test_allowed_tools_too_deep_to_parse_grant_nothing(self, _ws_app, monkeypatch):
+        """A value this node can't parse is never split on commas, since the commas inside its
+        strings would grant tools nobody listed: here bash and write_file."""
+        from tests._deep_json import too_deep_to_parse
+        from turnstone.server import WebUI
+
+        client, mgr, storage = _ws_app
+        allowed = '["x,bash,write_file,y"]'
+        _create_template(
+            storage, "s1", "deep-skill", "Deep tools.", allowed_tools=allowed, enabled=True
+        )
+        too_deep_to_parse(monkeypatch, allowed)
+
+        resp = client.post("/v1/api/workstreams/new", json={"skill": "deep-skill"})
+        assert resp.status_code == 200
+        ws = mgr.get(resp.json()["ws_id"])
+        assert ws is not None
+        assert isinstance(ws.ui, WebUI)
+        assert not ws.ui.auto_approve_tools
+
     def test_all_session_config_fields_applied(self, _ws_app):
         """All session config fields from a skill are applied together."""
         from turnstone.server import WebUI
@@ -2077,3 +2097,45 @@ class TestSkillConfigAppliedToWorkstream:
         assert row is not None
         assert row[0] == ""
         assert row[1] == 0
+
+
+class TestReadAllowedTools:
+    """``read_allowed_tools``: what a stored ``allowed_tools`` grants, read one way by workstream
+    create and the re-enable card."""
+
+    @pytest.mark.parametrize(
+        ("stored", "granted"),
+        [
+            ('["bash", "read_file"]', ["bash", "read_file"]),
+            ("bash, read_file", ["bash", "read_file"]),  # a row from before the JSON form
+            ("[]", []),
+            ("", []),
+            (None, []),
+            ("[bash", None),
+            ('"bash"', None),
+            ('{"bash": true}', None),
+            ('[["bash"]]', None),
+            ("[1]", None),
+        ],
+    )
+    def test_reads_a_stored_value(self, stored: Any, granted: list[str] | None) -> None:
+        from turnstone.core.skill_field_validation import read_allowed_tools
+
+        assert read_allowed_tools(stored) == granted
+
+    def test_a_value_too_deep_to_parse_grants_nothing(self, monkeypatch) -> None:
+        from tests._deep_json import too_deep_to_parse
+        from turnstone.core.skill_field_validation import read_allowed_tools
+
+        stored = '["x,bash,write_file,y"]'
+        too_deep_to_parse(monkeypatch, stored)
+        assert read_allowed_tools(stored) is None
+
+    def test_the_scanner_scores_a_legacy_list_as_its_json_form(self) -> None:
+        from turnstone.core.storage._utils import scan_skill_content
+
+        content = "Run the build and read the log."
+        legacy = scan_skill_content(content, "bash, read_file")
+        current = scan_skill_content(content, '["bash", "read_file"]')
+        assert legacy[0] == current[0]
+        assert legacy[0] != scan_skill_content(content, "[]")[0]
