@@ -260,6 +260,13 @@ frozen.
 
 ### Changed
 
+- **The denial nudge no longer waits out `memory.nudge_cooldown` (#924).** The note asking the
+  model whether a rejected tool call reflects a lasting preference now follows each batch a person
+  rejects; the cooldown spaces only the correction and completion nudges and the coordinator's
+  open-task reminder. A rejection during a wake-driven turn gets no note, and it used to start the
+  cooldown anyway, so a rejection in the next `memory.nudge_cooldown` seconds got none either. In
+  the CLI, an approval prompt left unanswered (its input closed, or Ctrl+D) no longer counts as a
+  person's rejection, also when a tool policy refused another call in the same batch.
 - **A console exits when it can't start the TLS certificate authority it has enabled, or when a
   setting's `TURNSTONE_*` variable holds a value the setting refuses (#1406)** *(BREAKING)* — a
   failed CA load (a storage error, a corrupt row) used to leave the console running without TLS
@@ -636,7 +643,11 @@ frozen.
 
 ### Removed
 
-- Tool errors no longer trigger a reminder to search memory before retrying.
+- **The tool-error memory nudge is gone (#1454).** A failed tool call no longer gets "A tool just
+  returned an error. Before retrying, check your memories" after its result; the model gets the
+  error result alone. Persisted `tool_error` turns in existing transcripts still render.
+  `turnstone.core.memory.count_structured_memories`, `turnstone.core.metacognition.should_nudge`
+  and the `memory_count` keyword of `nudge_allowed` are removed.
 - **The `[model] fallback` failover chain is gone (#1359)** *(BREAKING)* — a turn whose model failed
   to answer after its retries was tried again on each alias in config.toml's `[model].fallback`
   list, healthy backends first, possibly on another provider; the turn now fails on its own model

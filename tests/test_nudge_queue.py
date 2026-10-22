@@ -103,7 +103,7 @@ class TestLenAndClear:
         preserve ``"any"``-channel external events (watch fires,
         background-shell exits) in order."""
         q = NudgeQueue()
-        q.enqueue("tool_error", "1", "tool")
+        q.enqueue("denial", "1", "tool")
         q.enqueue("watch_triggered", "2", "any")
         q.enqueue("correction", "3", "user")
         q.enqueue("background_shell_exit", "4", "any")
@@ -429,10 +429,9 @@ class TestPending:
 
 
 class TestMetadata:
-    """Producer-supplied ``metadata`` rides alongside ``(type, text)`` on
-    drain.  Today only ``watch_triggered`` populates it; the wire shape
-    accommodates future producers (e.g. structured tool_error context)
-    without another schema bump.
+    """Producer-supplied ``metadata`` rides alongside ``(type, text)`` on drain.  The watch fire,
+    the background-shell exit and the coordinator idle nudges populate it; the wire shape
+    accommodates future producers without another schema bump.
     """
 
     def test_drain_returns_metadata_when_set(self):

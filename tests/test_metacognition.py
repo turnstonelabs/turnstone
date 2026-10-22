@@ -27,7 +27,8 @@ from turnstone.core.metacognition import (
     format_idle_children_nudge,
     format_idle_tasks_nudge,
     format_nudge,
-    should_nudge,
+    nudge_allowed,
+    record_nudge,
     wait_call,
 )
 
@@ -221,36 +222,44 @@ class TestDetectCompletion:
         assert detect_completion("") is False
 
 
-class TestShouldNudge:
+class TestNudgeGate:
     def test_basic_fires(self):
         state: dict[str, float] = {}
-        assert should_nudge("correction", state, message_count=3) is True
+        assert nudge_allowed("correction", state, message_count=3) is True
+
+    def test_allowing_records_nothing(self):
+        """Only ``record_nudge`` starts the cooldown, so a refused delivery spends none."""
+        state: dict[str, float] = {}
+        assert nudge_allowed("correction", state, message_count=3) is True
+        assert state == {}
+        assert nudge_allowed("correction", state, message_count=3) is True
 
     def test_cooldown(self):
         state: dict[str, float] = {}
-        should_nudge("correction", state, message_count=3)
-        assert should_nudge("correction", state, message_count=3) is False
+        record_nudge("correction", state)
+        assert nudge_allowed("correction", state, message_count=3) is False
 
     def test_different_types_independent(self):
         state: dict[str, float] = {}
-        should_nudge("correction", state, message_count=3)
-        assert should_nudge("denial", state, message_count=3) is True
+        record_nudge("correction", state)
+        assert nudge_allowed("completion", state, message_count=3) is True
 
     def test_no_nudge_first_message(self):
         state: dict[str, float] = {}
-        assert should_nudge("correction", state, message_count=1) is False
+        assert nudge_allowed("correction", state, message_count=1) is False
 
     def test_no_type_fires_on_first_message(self):
-        """Every registered type is a live-conversation heuristic: none fires on the first message."""
+        """The gate treats every registered type as a live-conversation heuristic: none passes
+        on the first message."""
         from turnstone.core.metacognition import _NUDGE_MAP
 
         for nudge_type in _NUDGE_MAP:
             state: dict[str, float] = {}
-            assert should_nudge(nudge_type, state, message_count=1) is False
+            assert nudge_allowed(nudge_type, state, message_count=1) is False
 
     def test_invalid_type(self):
         state: dict[str, float] = {}
-        assert should_nudge("invalid", state, message_count=3) is False
+        assert nudge_allowed("invalid", state, message_count=3) is False
 
 
 class TestFormatNudge:
@@ -406,15 +415,15 @@ class TestFormatIdleChildrenNudge:
         # design — format_idle_children_nudge produces the real body.
         assert format_nudge("idle_children") == ""
 
-    def test_should_nudge_recognises_idle_children_type(self, monkeypatch):
-        # Type registration in ``_NUDGE_MAP`` makes ``should_nudge``
-        # recognise it for cooldown gating; without the entry it would
-        # silently return False on every call.
+    def test_nudge_allowed_recognises_idle_children_type(self, monkeypatch):
+        # Type registration in ``_NUDGE_MAP`` makes ``nudge_allowed`` recognise it for cooldown
+        # gating; without the entry it would silently return False on every call.
         state: dict[str, float] = {}
         # message_count > 1 to clear the first-message gate.
-        assert should_nudge("idle_children", state, message_count=4) is True
-        # Cooldown set on success → second immediate call returns False.
-        assert should_nudge("idle_children", state, message_count=5) is False
+        assert nudge_allowed("idle_children", state, message_count=4) is True
+        # A recorded fire starts the cooldown → an immediate second check refuses.
+        record_nudge("idle_children", state)
+        assert nudge_allowed("idle_children", state, message_count=5) is False
 
 
 class TestSanitizeName:
@@ -1099,9 +1108,9 @@ class TestFormatIdleTasksNudge:
         """Producer-supplied body, so the static map round-trips empty."""
         assert format_nudge("idle_tasks") == ""
 
-    def test_should_nudge_recognises_idle_tasks_type(self, monkeypatch):
+    def test_nudge_allowed_recognises_idle_tasks_type(self, monkeypatch):
         state: dict[str, float] = {}
-        assert should_nudge("idle_tasks", state, message_count=2)
+        assert nudge_allowed("idle_tasks", state, message_count=2)
 
 
 class TestFieldStrCoercion:

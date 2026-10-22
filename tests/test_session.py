@@ -7902,7 +7902,7 @@ class TestBatchEvaluateOutputs:
                     session._queued_messages.clear()
                 session._nudge_queue.clear()
                 session.queue_message("successor queued message", queue_msg_id="q-successor")
-                session._queue_tool_advisory("tool_error", "successor tool advisory")
+                session._queue_tool_advisory("denial", "successor tool advisory")
 
                 history_at_handoff = dicts_from_turns(session.messages)
                 saves_at_handoff = save_message.call_count
@@ -7922,7 +7922,7 @@ class TestBatchEvaluateOutputs:
         assert session._tool_error_flags["call-shared"] is True
         assert session._tool_status["call-shared"] is EffectStatus.COMMITTED
         assert list(session._queued_messages) == ["q-successor"]
-        assert _tool_pending(session) == [("tool_error", "successor tool advisory")]
+        assert _tool_pending(session) == [("denial", "successor tool advisory")]
 
     def test_output_warning_publication_is_atomic_against_successor_claim(self) -> None:
         """The guard UI commit and generation handoff have one total order.
@@ -10868,8 +10868,8 @@ class TestMetacognitiveBuffers:
 
     def test_queue_tool_advisory_stashes_tuple(self, tmp_db):
         session = _make_session()
-        session._queue_tool_advisory("tool_error", "check memories")
-        assert _tool_pending(session) == [("tool_error", "check memories")]
+        session._queue_tool_advisory("denial", "check memories")
+        assert _tool_pending(session) == [("denial", "check memories")]
 
     def test_emit_user_nudges_appends_system_turn_after_user(self, tmp_db):
         """User-channel nudges drain into a first-class ``system`` turn
@@ -10920,7 +10920,7 @@ class TestMetacognitiveBuffers:
         """System message must not include nudge text even with both buffers populated."""
         session = _make_session()
         session._queue_user_advisory("correction", "USER_NUDGE_MARK")
-        session._queue_tool_advisory("tool_error", "TOOL_NUDGE_MARK")
+        session._queue_tool_advisory("denial", "TOOL_NUDGE_MARK")
         session._init_system_messages()
         joined = "\n".join(m["content"] for m in session.system_messages if m["role"] == "system")
         assert "USER_NUDGE_MARK" not in joined
@@ -10928,7 +10928,7 @@ class TestMetacognitiveBuffers:
         # And the buffers are not drained by system rebuild — they wait
         # for their respective drain points (next user turn / tool batch).
         assert _user_pending(session) == [("correction", "USER_NUDGE_MARK")]
-        assert _tool_pending(session) == [("tool_error", "TOOL_NUDGE_MARK")]
+        assert _tool_pending(session) == [("denial", "TOOL_NUDGE_MARK")]
 
     def test_collect_advisories_drains_tool_buffer_on_last_result(self, tmp_db):
         """Tool-channel metacog nudges drain on the last result as
@@ -10936,17 +10936,17 @@ class TestMetacognitiveBuffers:
         appends each as a first-class ``{"role": "system"}`` turn after
         the tool batch."""
         session = _make_session()
-        session._queue_tool_advisory("tool_error", "ALERT")
+        session._queue_tool_advisory("denial", "ALERT")
         specs = session._collect_advisories(
             assessment=None, func_name="bash", received=None, result_index=1, result_count=1
         )
-        assert specs == [("tool_error", "ALERT", {})]
+        assert specs == [("denial", "ALERT", {})]
         # Buffer drained.
         assert _tool_pending(session) == []
 
     def test_collect_advisories_holds_tool_buffer_until_last_result(self, tmp_db):
         session = _make_session()
-        session._queue_tool_advisory("tool_error", "CHECK_MEMORY")
+        session._queue_tool_advisory("denial", "CHECK_MEMORY")
         specs = session._collect_advisories(
             assessment=None, func_name="bash", received=None, result_index=1, result_count=2
         )
@@ -11348,14 +11348,12 @@ class TestMetacognitiveBuffers:
         results. Waiting for the next user-message seam would let the model react to the denial
         without the nudge.
 
-        Drives the REAL ``_execute_tools`` two-phase gate with real
-        ``_nudges_enabled`` / ``should_nudge`` gating; only the prepare
-        step and the UI approval are stubbed."""
+        Drives the REAL ``_execute_tools`` two-phase gate with real ``_nudges_enabled`` gating;
+        only the prepare step and the UI approval are stubbed."""
         from turnstone.core.metacognition import format_nudge
 
         session = _make_session()
-        # ``should_nudge`` skips the very first message — give the session
-        # the natural pre-batch shape (user turn + assistant tool-call turn).
+        # The natural pre-batch shape: a user turn and the assistant tool-call turn.
         session.messages.append(turn_from_dict({"role": "user", "content": "do the thing"}))
         session.messages.append(turn_from_dict({"role": "assistant", "content": "calling"}))
 
@@ -11406,8 +11404,9 @@ class TestMetacognitiveBuffers:
                 "Approval timed out after 5s",
                 "timeout",
             ),
+            ("Denied by user", None, "no_input"),
         ],
-        ids=["deny-rule", "policies-unreadable", "nobody-answered"],
+        ids=["deny-rule", "policies-unreadable", "nobody-answered", "cli-input-closed"],
     )
     def test_a_refusal_no_person_made_queues_no_denial_nudge(
         self, tmp_db, denial_msg, reason, refused_by
@@ -11443,6 +11442,62 @@ class TestMetacognitiveBuffers:
 
         assert results == [("call_1", denial_msg)]
         assert session._nudge_queue.pending(channel="tool") == []
+
+    @staticmethod
+    def _deny_one_call(session, call_id: str) -> None:
+        """Run one approval-gated call through the REAL ``_execute_tools`` and deny it."""
+        item = {
+            "call_id": call_id,
+            "func_name": "notify",
+            "needs_approval": True,
+            "execute": lambda p: (p["call_id"], "EXECUTED — must not happen"),
+        }
+        with (
+            patch.object(session, "_safe_prepare_tool", return_value=item),
+            patch.object(session.ui, "approve_tools", return_value=(False, "not that file")),
+        ):
+            results, _feedback = session._execute_tools(
+                [
+                    {
+                        "id": call_id,
+                        "type": "function",
+                        "function": {"name": "notify", "arguments": "{}"},
+                    }
+                ]
+            )
+        assert results == [(call_id, "Denied by user: not that file")]
+
+    def test_a_second_rejection_right_after_the_first_gets_its_nudge(self, tmp_db):
+        """No cooldown: a second rejection right after the first still gets its nudge."""
+        from turnstone.core.metacognition import format_nudge
+
+        session = _make_session()
+        session.messages.append(turn_from_dict({"role": "user", "content": "do the thing"}))
+        session.messages.append(turn_from_dict({"role": "assistant", "content": "calling"}))
+
+        self._deny_one_call(session, "call_1")
+        assert session._nudge_queue.pending(channel="tool") == [("denial", format_nudge("denial"))]
+        session._nudge_queue.clear()  # delivered with the first batch's results
+
+        self._deny_one_call(session, "call_2")
+        assert session._nudge_queue.pending(channel="tool") == [("denial", format_nudge("denial"))]
+
+    def test_a_rejection_during_a_wake_turn_leaves_the_next_nudge_intact(self, tmp_db):
+        """#924: a wake turn queues no advisory, and its rejection must not suppress the nudge
+        for the next rejection a person makes."""
+        from turnstone.core.metacognition import format_nudge
+
+        session = _make_session()
+        session.messages.append(turn_from_dict({"role": "user", "content": "do the thing"}))
+        session.messages.append(turn_from_dict({"role": "assistant", "content": "calling"}))
+
+        session._wake_source_tag = "system_nudge"
+        self._deny_one_call(session, "call_1")
+        assert session._nudge_queue.pending(channel="tool") == []
+
+        session._wake_source_tag = ""
+        self._deny_one_call(session, "call_2")
+        assert session._nudge_queue.pending(channel="tool") == [("denial", format_nudge("denial"))]
 
     def test_queued_message_appends_system_turn_after_tool_batch(self, tmp_db):
         """A queued message arriving during a tool batch becomes a
@@ -11917,12 +11972,12 @@ class TestMetacognitiveBuffers:
         assert _user_pending(session) == []
 
     def test_cancel_handler_clears_tool_advisory_buffer(self, tmp_db):
-        """A tool_error advisory queued before a cancel must not
-        leak into the next generation's batch."""
+        """A denial advisory queued before a cancel must not leak into the next generation's
+        batch."""
         from turnstone.core.session import GenerationCancelled
 
         session = _make_session()
-        session._queue_tool_advisory("tool_error", "leftover")
+        session._queue_tool_advisory("denial", "leftover")
         with patch.object(session, "_stream_response", side_effect=GenerationCancelled()):
             session.send("user input")
 
@@ -11962,8 +12017,12 @@ class TestPostExecuteBoundary:
             assert all(turn.source != "tool_error" for turn in session.messages)
             assert all(call.args[1] != "tool_error" for call in system_turn.call_args_list)
 
-    @pytest.mark.parametrize("reason", ["stop", "close"])
-    def test_retired_generation_stops_before_result_processing(self, tmp_db, monkeypatch, reason):
+    @pytest.mark.parametrize("reason", ["stop", "close", "publication_latch"])
+    def test_stop_or_close_during_tool_execution_admits_no_result(
+        self, tmp_db, monkeypatch, reason
+    ):
+        """``publication_latch`` sets only the latch close installs first: the fence must refuse
+        on it alone, which ``_check_cancelled`` would not, since it never reads the latch."""
         session = _make_session()
         session._title_generated = True
         responses = [
@@ -11983,6 +12042,8 @@ class TestPostExecuteBoundary:
         def execute(_tool_calls, **_kwargs):
             if reason == "stop":
                 session._cancel_event.set()
+            elif reason == "close":
+                session.close_publication()
             else:
                 monkeypatch.setattr(session, "_publication_shutdown", True)
             return [("call-1", "finished")], None
@@ -12278,7 +12339,7 @@ class TestDeliverWakeNudge:
         session = _make_session()
         # Queue has only a tool-channel entry — wake's user-seam drain
         # won't match.  Bail before synthesizing an empty user turn.
-        session._queue_tool_advisory("tool_error", "stale")
+        session._queue_tool_advisory("denial", "stale")
         before_len = len(session.messages)
         with patch.object(session, "_stream_response") as turn:
             session.deliver_wake_nudge_from_queue()
@@ -12287,7 +12348,7 @@ class TestDeliverWakeNudge:
         assert turn.call_count == 0
         # Tool entry still queued (would orphan in production today; the
         # bail just protects against the empty-envelope failure mode).
-        assert _tool_pending(session) == [("tool_error", "stale")]
+        assert _tool_pending(session) == [("denial", "stale")]
         # Wake tag never set.
         assert session._wake_source_tag == ""
 
@@ -12408,7 +12469,7 @@ class TestDeliverWakeNudge:
         # The body contains "don't" — would match the strong-correction
         # `\bdon'?t\b` pattern if re-detected.
         session._nudge_queue.enqueue("idle_children", "don't do that next time", "any")
-        # Supply enough message context that should_nudge would otherwise fire a correction.
+        # Supply enough message context that nudge_allowed would otherwise pass a correction.
         session.messages.append(turn_from_dict({"role": "user", "content": "earlier"}))
         with (
             patch.object(session, "_stream_response", return_value=make_result("ok")),

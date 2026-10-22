@@ -173,7 +173,6 @@ from turnstone.core.metacognition import (
     sanitize_display,
     sanitize_name,
     sanitize_payload,
-    should_nudge,
     task_too_long_message,
     task_unrenderable_message,
 )
@@ -3596,8 +3595,8 @@ class ChatSession:
         #   - "wake" entries drain ONLY via ``deliver_wake_nudge_from_queue``
         #     (the coordinator idle nudges); invisible to every other seam
         #     and dropped — never demoted — on abandoned generations
-        # Cooldown timestamps live separately in ``_metacog_state`` for
-        # ``should_nudge`` gating.
+        # Cooldown timestamps live separately in ``_metacog_state``: read by
+        # ``nudge_allowed``, written by ``record_nudge`` once a nudge is queued.
         self._metacog_state: dict[str, float] = {}
         self._nudge_queue = NudgeQueue()
         # Wake-trigger plumbing: ``deliver_wake_nudge_from_queue`` sets
@@ -10630,14 +10629,14 @@ class ChatSession:
             raise GenerationCancelled()
 
     def _check_generation_admission(self, my_generation: int) -> None:
-        """Fence pre-turn setup against Stop, force-successor, and close.
+        """Fence generation-owned work against Stop, force-successor, and close.
 
-        This deliberately does not dispatch through ``_check_cancelled``.
-        That later cooperative probe is an established lightweight-session
-        test seam and also includes task-agent-local cancellation.  The setup
-        path needs the narrower, non-overridable session ownership invariant:
-        once a generation loses its event, number, or publication latch it may
-        not bind an actor, refresh configuration, or admit a user row.
+        This deliberately does not dispatch through ``_check_cancelled``. That later cooperative
+        probe is an established lightweight-session test seam and also includes task-agent-local
+        cancellation. Pre-turn setup and tool-result admission need the narrower, non-overridable
+        session ownership invariant: once a generation loses its event, number, or publication
+        latch it may not bind an actor, refresh configuration, admit a user row, or admit the
+        results of the tools it ran.
         """
 
         if (
@@ -13604,6 +13603,9 @@ class ChatSession:
                         f"{unexpected_ids}"
                     )
 
+                # A Stop, close or successor that landed while the tools ran: admit none of their
+                # results. ``_check_cancelled`` never reads the publication latch, and close
+                # installs that latch before it sets the cancel event; this fence refuses on either.
                 self._check_generation_admission(my_generation)
 
                 # Map tool_call_id → tool name for logging
@@ -18932,8 +18934,9 @@ class ChatSession:
           distinctly.  Cancel / exception / no-tool-call paths drain the
           queue as a real user row instead (Seams 2 and 3).
         - **Tool-channel advisories** (``denial`` / ``skill_hint``) and any-channel nudges
-          (``watch_triggered`` / ``idle_children``) — drained on the last result. ``meta`` carries
-          the producer's optional fields (e.g. ``watch_triggered``'s ``watch_name``).
+          (``watch_triggered`` / ``background_shell_exit``) — drained on the last result.
+          ``meta`` carries the producer's optional fields (e.g. ``watch_triggered``'s
+          ``watch_name``).
 
         Empty when no advisories apply (common case).  Guard findings
         attach per-result; queued messages and metacognitive nudges drain
@@ -19329,26 +19332,19 @@ class ChatSession:
                                     else "Denied by user"
                                 )
                     user_feedback = None  # feedback is in the denial_msg
-                    # The nudge says the user rejected a call: only when a person did,
-                    # not when tool policies refused it or nobody answered in time
-                    # (``_refused_by``).
+                    # The nudge says the user rejected a call: only when a person did, not when
+                    # tool policies refused it, nobody answered in time, or a CLI prompt had no
+                    # input left to answer with (``_refused_by``).
                     person_rejected = any(
                         item.get("denied") and not item.get("_refused_by") for item in items
                     )
-                    if (
-                        person_rejected
-                        and self._nudges_enabled("denial")
-                        and should_nudge(
-                            "denial",
-                            self._metacog_state,
-                            message_count=len(self.messages),
-                            cooldown_secs=self._mem_cfg.nudge_cooldown,
-                        )
-                    ):
-                        # Tool channel, not user: the denial is a response to THIS
-                        # batch, so the nudge rides ``_collect_advisories`` with
-                        # the denied tool results rather than reaching a later
-                        # user-message seam.
+                    if person_rejected and self._nudges_enabled("denial"):
+                        # Tool channel, not user: the denial is a response to THIS batch, so the
+                        # nudge rides ``_collect_advisories`` with the denied tool results rather
+                        # than reaching a later user-message seam. No cooldown (#924): each nudge
+                        # follows a rejection a person made, and ``_queue_tool_advisory`` does
+                        # nothing during a wake turn, so a stamp taken there would silence the next
+                        # real rejection's nudge.
                         self._queue_tool_advisory("denial", format_nudge("denial"))
 
             if not self._commit_for_generation(

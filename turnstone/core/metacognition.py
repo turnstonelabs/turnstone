@@ -1,9 +1,8 @@
 """Metacognitive prompting — situational nudges for proactive memory use.
 
-Static nudge text templates (``NUDGE_*``), detection heuristics
-(``detect_correction``, ``detect_completion``), and the cooldown-aware
-:func:`should_nudge` / :func:`format_nudge` /
-:func:`format_idle_children_nudge` / :func:`format_idle_tasks_nudge`
+Static nudge text templates (``NUDGE_*``), detection heuristics (``detect_correction``,
+``detect_completion``), the cooldown gate (:func:`nudge_allowed` / :func:`record_nudge`), and the
+:func:`format_nudge` / :func:`format_idle_children_nudge` / :func:`format_idle_tasks_nudge`
 helpers.
 
 The wake-trigger lifecycle (``IdleNudgeWatcher`` plus the
@@ -98,14 +97,11 @@ _NUDGE_MAP: dict[str, str] = {
     "denial": NUDGE_DENIAL,
     "completion": NUDGE_COMPLETION,
     "compaction_pending": NUDGE_COMPACTION,
-    # idle_children, idle_tasks and watch_triggered carry no static body
-    # — the per-fire text comes from a producer
-    # (``format_idle_children_nudge`` / ``format_idle_tasks_nudge`` for
-    # the former two, ``format_watch_message`` + ``sanitize_payload`` in
-    # the watch dispatch closure for the latter).  Empty string here
-    # keeps :func:`format_nudge` round-tripping honestly while still
-    # letting :func:`should_nudge` and ``_NUDGE_MAP``-as-registry
-    # consumers recognise the type.
+    # idle_children, idle_tasks and watch_triggered carry no static body — the per-fire text comes
+    # from a producer (``format_idle_children_nudge`` / ``format_idle_tasks_nudge`` for the former
+    # two, ``format_watch_message`` + ``sanitize_payload`` in the watch dispatch closure for the
+    # latter).  Empty string here keeps :func:`format_nudge` round-tripping honestly while still
+    # letting :func:`nudge_allowed` and ``_NUDGE_MAP``-as-registry consumers recognise the type.
     "idle_children": "",
     "idle_tasks": "",
     "watch_triggered": "",
@@ -113,13 +109,13 @@ _NUDGE_MAP: dict[str, str] = {
     # ``ChatSession._on_background_shell_exit`` and rides the shared
     # external-event rail, never :func:`format_nudge`.
     "background_shell_exit": "",
-    # participant_joined likewise carries no static body — the per-fire text
-    # ("<name> has joined this shared workstream…") is composed by its producer
-    # (``ChatSession._maybe_note_new_participant``) and emitted via
-    # ``_append_system_turn``, never through :func:`format_nudge`.  The entry
-    # exists only to keep this map mirroring ``tool_advisory.SYSTEM_TURN_SOURCES``
-    # (enforced by ``test_vocabulary_mirrors_nudge_map_both_directions``); nothing
-    # calls ``should_nudge("participant_joined", …)`` so it never auto-fires.
+    # participant_joined likewise carries no static body — the per-fire text ("<name> has joined
+    # this shared workstream…") is composed by its producer
+    # (``ChatSession._maybe_note_new_participant``) and emitted via ``_append_system_turn``, never
+    # through :func:`format_nudge`.  The entry exists only to keep this map mirroring
+    # ``tool_advisory.SYSTEM_TURN_SOURCES`` (enforced by
+    # ``test_vocabulary_mirrors_nudge_map_both_directions``); nothing gates a fire on
+    # ``nudge_allowed("participant_joined", …)``, so it never auto-fires.
     "participant_joined": "",
     # Live metadata-only pointer generated directly by the session planner.
     "memory_pointer": "",
@@ -1146,14 +1142,10 @@ def _cooldown_allows(
 ) -> bool:
     """Read-only cooldown peek — does NOT record a fire timestamp.
 
-    Use this as a cheap pre-gate before expensive work (storage queries,
-    message walks).  The authoritative follow-up re-checks cooldown
-    before the stamp is written — :func:`should_nudge` for
-    check-and-stamp callers, or :func:`nudge_allowed` +
-    :func:`record_nudge` where delivery has its own later gate (the
-    coordinator observer's split).  A producer that races between this
-    peek and the follow-up would just lose the fire to the other
-    producer — benign.
+    Use this as a cheap pre-gate before expensive work (storage queries, message walks).  The
+    authoritative follow-up, :func:`nudge_allowed`, re-checks cooldown before :func:`record_nudge`
+    writes the stamp at delivery.  A producer that races between this peek and the follow-up would
+    just lose the fire to the other producer — benign.
     """
     last = state.get(nudge_type)
     if last is None:
@@ -1168,13 +1160,12 @@ def nudge_allowed(
     message_count: int = 0,
     cooldown_secs: int = _COOLDOWN_SECS,
 ) -> bool:
-    """Every gate :func:`should_nudge` applies, WITHOUT recording a fire.
+    """Check whether a gated nudge type may fire now, WITHOUT recording a fire.
 
-    Split out so a producer with a further authoritative gate after this
-    one (the coordinator observer charges a per-type cap slot before it
-    enqueues) can ask "may this fire?" and record only once the fire
-    actually happened.  Recording earlier spends the cooldown on a nudge
-    that was never delivered.
+    The caller records with :func:`record_nudge` once the nudge is actually enqueued.  A later
+    gate can still refuse after this one says yes (the coordinator observer charges a per-type cap
+    slot before it enqueues), and recording at the check would spend the cooldown on a nudge that
+    was never delivered.
 
     Note the gates this applies that a bare ``_cooldown_allows`` peek does NOT: unknown type
     and ``message_count <= 1``. A caller that charges budget before consulting THIS function
@@ -1182,8 +1173,7 @@ def nudge_allowed(
     """
     if nudge_type not in _NUDGE_MAP:
         return False
-    # Every nudge is a live-conversation heuristic: none fires on the
-    # first message.
+    # Every type gated here is a live-conversation heuristic: none fires on the first message.
     if message_count <= 1:
         return False
     # Rate limit: one nudge per type per cooldown window
@@ -1198,33 +1188,6 @@ def record_nudge(nudge_type: str, state: dict[str, float]) -> None:
     when it is merely permitted — see :func:`nudge_allowed`.
     """
     state[nudge_type] = time.monotonic()
-
-
-def should_nudge(
-    nudge_type: str,
-    state: dict[str, float],
-    *,
-    message_count: int = 0,
-    cooldown_secs: int = _COOLDOWN_SECS,
-) -> bool:
-    """Check whether a nudge should fire, respecting cooldowns and context.
-
-    Records the fire timestamp on success — the check-and-stamp shape
-    every caller whose delivery immediately follows the check wants.
-    A caller with an authoritative gate BETWEEN the check and delivery
-    must use :func:`nudge_allowed` + :func:`record_nudge` instead, or a
-    refusal at that later gate burns the cooldown for a nudge nobody
-    received.
-    """
-    if not nudge_allowed(
-        nudge_type,
-        state,
-        message_count=message_count,
-        cooldown_secs=cooldown_secs,
-    ):
-        return False
-    record_nudge(nudge_type, state)
-    return True
 
 
 def format_nudge(nudge_type: str) -> str:

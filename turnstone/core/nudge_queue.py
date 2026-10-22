@@ -154,11 +154,11 @@ class NudgeQueue:
         producers can do non-trivial work (e.g. re-querying storage
         for active children) without blocking other producers.
 
-        ``metadata`` carries optional producer-specific fields that
-        drain returns alongside ``(nudge_type, text)``.  ``watch_triggered``
-        uses it for ``watch_name`` / ``command`` / ``poll_count`` /
-        ``max_polls`` / ``is_final`` so the frontend can render a
-        structured card; other producers leave it ``None``.
+        ``metadata`` carries optional producer-specific fields that drain returns alongside
+        ``(nudge_type, text)``.  ``watch_triggered`` uses it for ``watch_name`` / ``command`` /
+        ``poll_count`` / ``max_polls`` / ``is_final`` so the frontend can render a structured card;
+        the background-shell exit and the coordinator idle nudges carry their own fields, and other
+        producers leave it ``None``.
         """
         if channel not in _VALID_CHANNELS:
             raise ValueError(f"channel={channel!r}; expected one of {sorted(_VALID_CHANNELS)}")
@@ -328,13 +328,12 @@ class NudgeQueue:
     def clear_channels(self, channels: frozenset[str] | set[str]) -> int:
         """Drop entries whose channel is in ``channels``; return the count.
 
-        The abandoned-generation paths use this instead of :meth:`clear`:
-        ``"tool"``/``"user"`` advisories are generation-scoped commentary
-        (a stale ``tool_error`` nudge must not bleed into the next send), but
-        ``"any"``-channel entries are EXTERNAL events — a watch fire or a
-        background-shell exit that happened during the doomed generation
-        still happened, and dropping it would silently break the "you will
-        be notified" contract those producers promised the model.
+        The abandoned-generation paths use this instead of :meth:`clear`: ``"tool"``/``"user"``
+        advisories are generation-scoped commentary (a stale ``denial`` nudge must not bleed into
+        the next send), but ``"any"``-channel entries are EXTERNAL events — a watch fire or a
+        background-shell exit that happened during the doomed generation still happened, and
+        dropping it would silently break the "you will be notified" contract those producers
+        promised the model.
         """
         with self._lock:
             kept = deque(e for e in self._items if e.channel not in channels)

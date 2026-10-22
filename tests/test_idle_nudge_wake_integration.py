@@ -441,7 +441,7 @@ def test_coord_idle_with_active_children_emits_envelope_via_real_managers(coord_
         )
 
         # Pretend the coord has already had a real conversation so
-        # ``should_nudge``'s message_count > 1 gate passes.
+        # ``nudge_allowed``'s message_count > 1 gate passes.
         coord.session.messages.append(turn_from_dict({"role": "user", "content": "spawn 2"}))
         coord.session.messages.append(turn_from_dict({"role": "assistant", "content": "ok"}))
 

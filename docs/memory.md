@@ -155,10 +155,11 @@ select a larger-context model, or start a new workstream after memory cleanup.
 ### Nudges
 
 The metacognition layer can nudge the model to save memories at appropriate
-moments (e.g., after a correction or as a task wraps up). Nudges are
-rate-limited by `nudge_cooldown`. Setting `memory.nudges=false` suppresses both
-live memory pointers and memory-directed nudges; it does not remove the
-immutable initial index or the memory tool.
+moments: after a correction, as a task wraps up, or when a person rejects a tool
+call. `nudge_cooldown` spaces the correction and completion nudges (and the
+coordinator's open-task reminder); the rejection nudge has no cooldown. Setting
+`memory.nudges=false` suppresses both live memory pointers and memory-directed
+nudges; it does not remove the immutable initial index or the memory tool.
 
 ---
 
@@ -175,7 +176,7 @@ standalone CLI currently uses `MemoryConfig` defaults.
 | `memory.index_budget_chars` | `65536` | Complete-index soft character budget; never truncates |
 | `memory.model_index_over_budget_notice` | `false` | Add over-budget prose to successful model-tool saves |
 | `memory.max_content` | `32768` | Maximum memory body size in characters |
-| `memory.nudge_cooldown` | `300` | Minimum seconds between memory-directed nudges |
+| `memory.nudge_cooldown` | `300` | Minimum seconds between repeats of a correction or completion nudge, or of the coordinator's open-task reminder |
 | `memory.nudges` | `true` | Enable live pointers and memory-directed nudges; does not remove the index or tool |
 
 ---

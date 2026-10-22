@@ -148,6 +148,57 @@ class TestCLIPolicyEnforcement:
         prompt.assert_called_once()
         assert approved is False
 
+    @pytest.mark.parametrize(
+        ("answer", "refused_by"),
+        [(EOFError, "no_input"), (KeyboardInterrupt, None), ("n", None)],
+        ids=["no_input_left", "ctrl_c", "typed_no"],
+    )
+    def test_only_a_persons_answer_counts_as_their_rejection(self, answer, refused_by):
+        """End of input (stdin closed or exhausted, or Ctrl+D, the CLI's quit key) answers
+        nothing about the batch: it is refused, but marked so the session sends no "the user
+        rejected a call" nudge for it. A Ctrl-C at the prompt and a typed no are the person's own
+        rejection."""
+        ui = TerminalUI()
+        items = self._make_items("bash")
+
+        with (
+            patch("turnstone.core.policy.evaluate_loaded_tool_policies", return_value={}),
+            patch("turnstone.core.storage._registry.get_storage", return_value=MagicMock()),
+            patch("builtins.input", side_effect=[answer]),
+        ):
+            assert ui.approve_tools(items) == (False, None)
+
+        assert items[0]["denied"] is True
+        assert items[0].get("_refused_by") == refused_by
+
+    @pytest.mark.parametrize(
+        ("answer", "asked_call_refused_by"),
+        [(EOFError, "no_input"), ("n", None)],
+        ids=["no_input_left", "typed_no"],
+    )
+    def test_a_policy_refusal_beside_an_asked_call_is_marked_as_policy(
+        self, answer, asked_call_refused_by
+    ):
+        """A deny rule's refusal is nobody's rejection, also in a batch whose other call the
+        person is asked about, so only the person's own answer can bring the denial nudge."""
+        ui = TerminalUI()
+        items = self._make_items("bash", "write_file")
+
+        with (
+            patch(
+                "turnstone.core.policy.evaluate_loaded_tool_policies",
+                return_value={"bash": "deny"},
+            ),
+            patch("turnstone.core.storage._registry.get_storage", return_value=MagicMock()),
+            patch("builtins.input", side_effect=[answer]),
+        ):
+            assert ui.approve_tools(items) == (False, None)
+
+        assert items[0]["denied"] is True
+        assert items[0]["_refused_by"] == "policy"
+        assert items[1]["denied"] is True
+        assert items[1].get("_refused_by") == asked_call_refused_by
+
     @pytest.mark.parametrize("terminal", ["lone", "workstream_leaving_the_front"])
     def test_an_answer_to_a_stopped_prompt_is_not_used(self, capsys, terminal: str):
         """A Stop (a Ctrl-C, a close) can retire the batch while its prompt

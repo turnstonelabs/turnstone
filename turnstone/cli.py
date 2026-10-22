@@ -233,6 +233,7 @@ class TerminalUI(SessionUI):
                 policy_name = it.get("approval_label", "") or it.get("func_name", "")
                 if verdicts is None or verdicts.get(policy_name) == "deny":
                     it["denied"] = True
+                    it["_refused_by"] = "policy"
                     it["error"] = (
                         POLICIES_UNREADABLE_DENIAL
                         if verdicts is None
@@ -312,6 +313,7 @@ class TerminalUI(SessionUI):
                 return True, None
 
             # Prompt
+            no_input = False
             try:
                 if len(pending) == 1:
                     label = pending[0].get("approval_label", pending[0]["func_name"])
@@ -326,9 +328,13 @@ class TerminalUI(SessionUI):
                         f"\001{DIM}\002[y/n/a(lways), optional message]\001{RESET}\002 "
                     )
                 resp = input(prompt_text).strip()
-            except (EOFError, KeyboardInterrupt):
+            except (EOFError, KeyboardInterrupt) as exc:
                 self._write_terminal("\n")
                 resp = "n"
+                # End of input (stdin closed or exhausted, or Ctrl+D, which the banner offers as
+                # quit) answers nothing about the batch: it is refused as unanswered, not as the
+                # person's no. A Ctrl-C at the prompt stays the person's no.
+                no_input = isinstance(exc, EOFError)
 
             # A Stop (Ctrl-C, a close) can retire the batch while its prompt
             # waits, and the line typed next then lands here: use none of it.
@@ -365,6 +371,8 @@ class TerminalUI(SessionUI):
                 for item in pending:
                     item["denied"] = True
                     item["denial_msg"] = denial_msg
+                    if no_input:
+                        item["_refused_by"] = "no_input"
                 return False, None
 
     def on_tool_result(

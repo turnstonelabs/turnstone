@@ -267,7 +267,7 @@ class TestWakeWorkstreamIfPending:
         """Tool-channel entries belong to the next tool-result seam — a
         synthetic empty user turn can't drain them, so no wake."""
         _mgr, ws = fake_mgr_and_ws
-        ws.session._nudge_queue.enqueue("tool_error", "check memories", "tool")
+        ws.session._nudge_queue.enqueue("denial", "consider saving the feedback", "tool")
         with patch("turnstone.core.session_worker.send") as mock_send:
             assert wake_workstream_if_pending(ws) is False
             assert mock_send.call_count == 0

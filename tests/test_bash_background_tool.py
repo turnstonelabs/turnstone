@@ -362,11 +362,11 @@ def test_exit_notice_survives_generation_abandon_without_waking(session):
     assert _wait_until(
         lambda: any(t == "background_shell_exit" for t, _ in session._nudge_queue.pending())
     )
-    session._queue_tool_advisory("tool_error", "3 consecutive tool errors")
+    session._queue_tool_advisory("denial", "the user rejected a call")
     session._drain_pending_advisories()
     kinds = [t for t, _ in session._nudge_queue.pending()]
     assert "background_shell_exit" in kinds
-    assert "tool_error" not in kinds
+    assert "denial" not in kinds
     # Post-cancel quiescence: nothing is wake-eligible...
     assert not session._nudge_queue.has_pending(WAKE_PENDING)
     # ...yet the notice still delivers at the next legitimate seam.

@@ -629,20 +629,15 @@ class CoordinatorIdleObserver:
             valid_until=plan.valid_until,
             metadata=plan.metadata,
         )
-        # Record LAST — permission, then charge, then deliver, then
-        # record.  The stamp this writes IS the advice cooldown window
-        # (for a cap-only liveness type it gates nothing; the cap does),
-        # so the order is what keeps it honest: a refused fire must
-        # never burn budget.  ``should_nudge`` stamps at its own
-        # permission check, before ``_try_charge`` (the authoritative
-        # gate) has said yes — the loser of a cap race would then lose
-        # its next fire too, having delivered nothing.
-        # Reordering the CHARGE above the permission check would be
-        # worse: ``nudge_allowed`` refuses for reasons the cheap peek
-        # never sees (``message_count <= 1`` on a rehydrated session, an
-        # unregistered type), so the cap would be charged on every one
-        # of those refusals.  The stamp is also the per-type timestamp
-        # other tooling reads.
+        # Record LAST — permission, then charge, then deliver, then record.  The stamp this writes
+        # IS the advice cooldown window (for a cap-only liveness type it gates nothing; the cap
+        # does), so the order is what keeps it honest: a refused fire must never burn budget.
+        # Stamping at the permission check instead, before ``_try_charge`` (the authoritative
+        # gate) has said yes, would cost the loser of a cap race its next fire too, having
+        # delivered nothing.  Reordering the CHARGE above the permission check would be worse:
+        # ``nudge_allowed`` refuses for reasons the cheap peek never sees (``message_count <= 1``
+        # on a rehydrated session, an unregistered type), so the cap would be charged on every
+        # one of those refusals.  The stamp is also the per-type timestamp other tooling reads.
         record_nudge(plan.nudge_type, session._metacog_state)
         log.info(plan.log_msg, *plan.log_args)
         return True

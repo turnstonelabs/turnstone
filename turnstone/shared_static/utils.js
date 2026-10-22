@@ -94,9 +94,9 @@ const OPERATOR_SOURCE_LABELS = {
   correction: "metacognition",
   denial: "metacognition",
   completion: "metacognition",
-  // `start`, `resume` and `repeat` are no longer produced, but persisted
-  // rows still carry them and replay through /history, so they keep their
-  // label.
+  // `start`, `resume`, `repeat` and `tool_error` are no longer produced, but
+  // persisted rows still carry them and replay through /history, so they keep
+  // their label.
   start: "metacognition",
   resume: "metacognition",
   repeat: "metacognition",

@@ -906,11 +906,12 @@ def _build_registry() -> dict[str, SettingDef]:
             "memory",
             min_value=0,
             help="Minimum seconds between nudges of the same type. Applies to the "
-            "memory-save reminders (gentle prompts to record useful information such as "
-            "user preferences or project decisions) and to the coordinator's open-task "
-            "reminder. Does not apply to the coordinator's 'children still running' "
-            "liveness wake, which has no cooldown so an idle coordinator is never "
-            "silently stranded. Set to 0 to disable the spacing entirely.",
+            "memory-save reminders that follow a correction or finished work (gentle prompts "
+            "to record useful information such as user preferences or project decisions) and "
+            "to the coordinator's open-task reminder. Does not apply to the reminder after a "
+            "person rejects a tool call, or to the coordinator's 'children still running' "
+            "liveness wake, which has no cooldown so an idle coordinator is never silently "
+            "stranded. Set to 0 to disable the spacing entirely.",
         ),
         SettingDef(
             "memory.nudges",
