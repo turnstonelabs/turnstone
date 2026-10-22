@@ -24388,6 +24388,7 @@ class ChatSession:
             "last_emit_mono": 0.0,
         }
         progress_heartbeat_s = 5.0
+        origin_generation = _active_tool_origin_generation.get()
 
         def _progress(snap: dict[str, Any], elapsed: float) -> None:
             # Cooperative cancel seam.  ``wait_for_workstream`` holds no
@@ -24399,8 +24400,10 @@ class ChatSession:
             # ``except Exception`` — but ``GenerationCancelled`` is a
             # ``BaseException``, so raising here propagates cleanly out of
             # the wait into the send() cancel handler.  ~2s abort instead of
-            # up to 600s.
-            self._check_cancelled()
+            # up to 600s.  Scoped to the wait's generation: a force-cancel
+            # installs a fresh ``_cancel_event`` for the next turn, so the
+            # event alone reads an abandoned wait as still running.
+            self._check_cancelled(origin_generation)
             now = time.monotonic()
             changed = snap != progress_state["last_snap"]
             heartbeat_due = (now - progress_state["last_emit_mono"]) >= progress_heartbeat_s

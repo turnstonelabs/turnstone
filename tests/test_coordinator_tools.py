@@ -630,6 +630,36 @@ def test_wait_exec_progress_callback_observes_cancel(coord_session):
     assert sess._wait_wakers == set()
 
 
+def test_wait_exec_progress_callback_observes_a_force_cancel(coord_session):
+    """A force-cancel installs a fresh cancel event for the next turn, which
+    reads as clear.  The heartbeat checks the wait's own generation, so an
+    abandoned wait ends instead of polling until its timeout."""
+    from turnstone.core import session as session_mod
+    from turnstone.core.session import GenerationCancelled
+
+    sess, coord, _ui = coord_session
+    sess._generation = 7
+
+    def _wait(ws_ids, *, timeout, mode, since, progress_callback, interrupt, wake_event):
+        sess.force_abandon_generation(
+            target_is_current=lambda: True,
+            clear_target=lambda: True,
+            publish_abandoned=lambda: None,
+        )
+        assert not sess._cancel_event.is_set()
+        progress_callback({"a": {"state": "running"}}, 0.1)  # must raise
+        return {"results": {}, "complete": True, "elapsed": 0.1, "mode": mode}
+
+    coord.wait_for_workstream.side_effect = _wait
+    item = sess._prepare_tool(_tc("wait_for_workstream", {"ws_ids": ["a"]}))
+    token = session_mod._active_tool_origin_generation.set(7)
+    try:
+        with pytest.raises(GenerationCancelled):
+            sess._exec_wait_for_workstream(item)
+    finally:
+        session_mod._active_tool_origin_generation.reset(token)
+
+
 def test_wait_exec_default_timeout_when_omitted(coord_session):
     """timeout=None (omitted) becomes 60.0 in exec so the client receives
     a numeric value — explicit ``timeout=0`` is preserved (one-shot

@@ -1434,6 +1434,9 @@ frozen.
   unreadable scheduler locks prevent dispatch rather than allowing a takeover. Admin edits still
   save and notify nodes when another corrupt rule prevents a local reload, with a warning that
   allows administrators to repair rules one at a time.
+- **A force-cancelled `wait_for_workstream` stops.** A force-cancel gives the session a fresh
+  cancel event for its next turn, and the wait read the session's current one, so an abandoned wait
+  went on polling until its timeout, up to 600 seconds. It now checks the turn it belongs to.
 
 ### Security
 
