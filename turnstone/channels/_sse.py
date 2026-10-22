@@ -111,7 +111,7 @@ async def run_sse_stream(
                         continue
                     try:
                         data = json.loads(sse.data)
-                    except (json.JSONDecodeError, RecursionError):
+                    except (ValueError, RecursionError):
                         log.debug(
                             f"{log_prefix}.sse_invalid_json",
                             ws_id=ws_id,

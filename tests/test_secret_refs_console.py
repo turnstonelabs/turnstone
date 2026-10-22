@@ -90,6 +90,16 @@ class TestMasks:
         assert masked["headers"] == "{}"
         assert masked["env"] == "{}"
 
+    def test_mcp_mask_survives_an_overlong_integer(self) -> None:
+        from tests._deep_json import overlong_integer
+
+        stored = '{"TOKEN":"sk-live","counter":' + overlong_integer() + "}"
+        masked = _mask_mcp_secrets(
+            {"headers": stored, "env": stored, "oauth_client_secret_ct": None}
+        )
+        assert masked["headers"] == "{}"
+        assert masked["env"] == "{}"
+
 
 class TestWriteTimeChecks:
     def test_reference_problems(self, fake_store: FakeBackend) -> None:

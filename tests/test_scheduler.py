@@ -121,6 +121,30 @@ class TestSchedulerTick:
 
         storage.list_due_tasks.assert_not_called()
 
+    @pytest.mark.parametrize("corruption", ["syntax", "integer", "nesting"])
+    def test_tick_leaves_unreadable_lock_untouched(self, mocks, monkeypatch, corruption):
+        from datetime import UTC, datetime
+
+        from tests._deep_json import overlong_integer, too_deep_to_parse
+
+        collector, storage = mocks
+        lock = json.dumps(
+            {"owner": "other-instance", "acquired": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")}
+        )
+        if corruption == "syntax":
+            lock = "{broken"
+        elif corruption == "integer":
+            lock = lock[:-1] + ', "counter":' + overlong_integer() + "}"
+        else:
+            too_deep_to_parse(monkeypatch, lock)
+        _wire_lock_storage(storage, initial={"value": lock})
+
+        TaskScheduler(collector, storage)._tick()
+
+        storage.upsert_system_setting.assert_not_called()
+        storage.delete_system_setting.assert_not_called()
+        storage.list_due_tasks.assert_not_called()
+
     def test_tick_takes_expired_lock(self, mocks):
         """An expired lock from another instance should be taken over."""
         collector, storage = mocks

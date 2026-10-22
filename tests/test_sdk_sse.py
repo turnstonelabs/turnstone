@@ -67,6 +67,21 @@ async def test_stream_sse_skips_malformed_json():
 
 
 @pytest.mark.anyio
+async def test_stream_sse_skips_overlong_integer_and_continues():
+    from tests._deep_json import overlong_integer
+
+    raw = '{"count":' + overlong_integer() + "}"
+    transport = httpx2.MockTransport(
+        lambda request: _sse_response(raw, '{"type":"content","text":"ok"}')
+    )
+    async with httpx2.AsyncClient(transport=transport, base_url="https://node.example.com") as hc:
+        client = _BaseClient(httpx_client=hc)
+        events = [data async for data in client._stream_sse("/test")]
+
+    assert events == [{"type": "content", "text": "ok"}]
+
+
+@pytest.mark.anyio
 async def test_stream_sse_skips_empty_data():
     """SSE frames with empty data field are skipped."""
 

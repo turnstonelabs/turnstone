@@ -371,7 +371,7 @@ class ClusterCollector:
                             continue  # ping/comment frame
                         try:
                             data = json.loads(sse.data)
-                        except (json.JSONDecodeError, RecursionError):
+                        except (ValueError, RecursionError):
                             log.debug("Invalid SSE JSON from node %s", node_id)
                             continue
                         etype = data.get("type", "")
@@ -470,7 +470,7 @@ class ClusterCollector:
                 meta: dict[str, Any] = {}
                 raw_meta = svc.get("metadata", "")
                 if raw_meta:
-                    with contextlib.suppress(json.JSONDecodeError, TypeError, RecursionError):
+                    with contextlib.suppress(ValueError, TypeError, RecursionError):
                         meta = json.loads(raw_meta)
                 url = svc.get("url", "")
                 if nid not in self._nodes:

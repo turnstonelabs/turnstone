@@ -556,6 +556,21 @@ class TestAutoApproveToolsOnCreate:
         assert error in response.json()["error"]
         assert mgr.count == 0
 
+    def test_overlong_integer_in_notify_targets_refuses_before_create(self, app_client) -> None:
+        from tests._deep_json import overlong_integer
+
+        client, mgr = app_client
+        raw = '[{"channel_type":"test","channel_id":' + overlong_integer() + "}]"
+        response = client.post(
+            "/v1/api/workstreams/new",
+            json={"notify_targets": raw},
+            headers=_auth("user-1"),
+        )
+
+        assert response.status_code == 400
+        assert response.json()["error"] == "notify_targets must be valid JSON"
+        assert mgr.count == 0
+
     def test_schema_exposes_live_create_fields(self) -> None:
         from turnstone.api.server_schemas import CreateWorkstreamRequest
 

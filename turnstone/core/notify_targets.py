@@ -19,7 +19,7 @@ def validate_notify_targets(raw: Any, field: str = "notify_targets") -> tuple[st
     if isinstance(raw, str):
         try:
             parsed = json.loads(raw)
-        except (json.JSONDecodeError, TypeError, RecursionError):
+        except (ValueError, TypeError, RecursionError):
             return "[]", f"{field} must be valid JSON"
     elif isinstance(raw, list):
         parsed = raw

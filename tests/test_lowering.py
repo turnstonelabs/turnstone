@@ -213,6 +213,13 @@ def test_wire_valid_arguments_totals_on_deeply_nested_json() -> None:
     assert wire_valid_arguments(deep) is False
 
 
+def test_wire_valid_arguments_totals_on_overlong_integers() -> None:
+    from tests._deep_json import overlong_integer
+
+    raw = '{"timeout":' + overlong_integer() + "}"
+    assert wire_valid_arguments(raw) is False
+
+
 def test_tool_args_preview_stringifies_and_caps() -> None:
     assert tool_args_preview("x" * 500) == "x" * 120
     assert tool_args_preview(None) == "None"

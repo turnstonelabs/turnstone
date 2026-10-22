@@ -232,7 +232,7 @@ def snapshot_from_config(config: Mapping[str, str]) -> PersonaSnapshot | None:
     raw_tools = config["persona_tools"]
     try:
         tools_val = json.loads(raw_tools)
-    except (json.JSONDecodeError, TypeError, RecursionError) as exc:
+    except (ValueError, TypeError, RecursionError) as exc:
         raise ValueError(
             f"corrupt persona snapshot: persona_tools is not JSON: {raw_tools!r}"
         ) from exc

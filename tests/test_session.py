@@ -412,6 +412,49 @@ class TestSkillCommand:
 
 
 class TestChatSessionConstruction:
+    @pytest.mark.parametrize("patterns", ["[broken", "null", "[1]", '["["]', "overlong-integer"])
+    def test_invalid_rules_prevent_startup_without_custom_restrictions(self, tmp_db, patterns):
+        from tests._deep_json import overlong_integer
+        from turnstone.core.config_store import ConfigStore
+        from turnstone.core.judge import evaluate_heuristic
+
+        storage = get_storage()
+        storage.create_heuristic_rule(
+            rule_id="deny-read",
+            name="deny-read",
+            tool_pattern="read_file",
+            risk_level="critical",
+            confidence=1.0,
+            tier="critical",
+            recommendation="deny",
+        )
+        if patterns == "overlong-integer":
+            patterns = "[" + overlong_integer() + "]"
+        storage.create_heuristic_rule(
+            rule_id="broken-rule",
+            name="broken-rule",
+            tool_pattern="bash",
+            arg_patterns=patterns,
+            risk_level="low",
+            confidence=1.0,
+            recommendation="approve",
+        )
+        config_store = ConfigStore(storage)
+
+        with pytest.raises(ValueError, match="Invalid argument patterns.*broken-rule"):
+            _make_session(config_store=config_store)
+
+        storage.update_heuristic_rule("broken-rule", arg_patterns='["^echo safe$"]')
+        session = _make_session(config_store=config_store)
+        assert session._rule_registry is not None
+        verdict = evaluate_heuristic(
+            "read_file",
+            {"path": "report"},
+            "read_file",
+            rules=session._rule_registry.heuristic_rules,
+        )
+        assert verdict.recommendation == "deny"
+
     def test_system_messages_created(self, tmp_db):
         session = _make_session()
         assert len(session.system_messages) >= 1

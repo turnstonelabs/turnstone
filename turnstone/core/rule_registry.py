@@ -17,6 +17,7 @@ merged view, then atomically swaps the cached snapshots.
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 import threading
@@ -30,6 +31,11 @@ if TYPE_CHECKING:
     from turnstone.core.storage._protocol import StorageBackend
 
 log = logging.getLogger(__name__)
+
+
+class InvalidRuleConfigError(ValueError):
+    """Stored rule data cannot safely supply the configured restrictions."""
+
 
 # -- Public dataclasses ------------------------------------------------------
 
@@ -150,14 +156,22 @@ class RuleRegistry:
                 continue
             if not row.get("enabled"):
                 continue
-            import json
-
             arg_patterns_raw: Any = row.get("arg_patterns", "[]")
-            if isinstance(arg_patterns_raw, str):
-                try:
+            try:
+                if isinstance(arg_patterns_raw, str):
                     arg_patterns_raw = json.loads(arg_patterns_raw)
-                except (json.JSONDecodeError, TypeError, RecursionError):
-                    arg_patterns_raw = []
+                if not isinstance(arg_patterns_raw, list) or not all(
+                    isinstance(pattern, str) for pattern in arg_patterns_raw
+                ):
+                    raise ValueError("expected a list of strings")
+                for pattern in arg_patterns_raw:
+                    re.compile(pattern)
+            except (ValueError, TypeError, RecursionError, re.error, OverflowError) as exc:
+                # Empty patterns match every argument. Refuse invalid rules while retaining
+                # the cached snapshots on reload; initial session construction must also fail.
+                raise InvalidRuleConfigError(
+                    f"Invalid argument patterns for heuristic rule {name!r}"
+                ) from exc
             by_name[name] = HeuristicRuleDef(
                 name=name,
                 risk_level=row.get("risk_level", "medium"),

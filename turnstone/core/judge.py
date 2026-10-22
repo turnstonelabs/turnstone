@@ -1510,7 +1510,7 @@ class IntentJudge:
             if isinstance(func_args, str):
                 try:
                     func_args = json.loads(func_args)
-                except (json.JSONDecodeError, TypeError, RecursionError):
+                except (ValueError, TypeError, RecursionError):
                     func_args = {}
             approval_label = item.get("approval_label", func_name)
             call_id = item.get("call_id", item.get("tool_call_id", ""))
@@ -1820,7 +1820,7 @@ class IntentJudge:
         if isinstance(func_args, str):
             try:
                 func_args = json.loads(func_args)
-            except (json.JSONDecodeError, TypeError, RecursionError):
+            except (ValueError, TypeError, RecursionError):
                 func_args = {}
         call_id = item.get("call_id", item.get("tool_call_id", ""))
         # ``func_args_json`` is the verdict's record copy (persisted + streamed,
@@ -1985,7 +1985,7 @@ class IntentJudge:
                         tc_args = (
                             json.loads(tc_args_str) if isinstance(tc_args_str, str) else tc_args_str
                         )
-                    except (json.JSONDecodeError, TypeError, RecursionError):
+                    except (ValueError, TypeError, RecursionError):
                         tc_args = {}
 
                     tool_result = self._exec_read_only_tool(tc_name, tc_args)
@@ -2075,7 +2075,7 @@ class IntentJudge:
         if isinstance(func_args, str):
             try:
                 func_args = json.loads(func_args)
-            except (json.JSONDecodeError, TypeError, RecursionError):
+            except (ValueError, TypeError, RecursionError):
                 func_args = {}
         approval_label = item.get("approval_label", func_name)
 

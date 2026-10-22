@@ -1426,6 +1426,14 @@ frozen.
   deep are refused before replay capture, matching the streamed-input limit. Capabilities too deep
   to compare count as changed for authorization and prevent calibration writes. A recursive MCP
   output schema fails its tool call without opening the server's circuit breaker for other tools.
+- **Treat oversized JSON integers as malformed input (#1459).** Integers beyond the conversion
+  limit now receive the usual parse-error handling: invalid notification targets return 400,
+  malformed tool arguments fail replay validation, and SSE readers skip invalid events. Corrupt
+  heuristic-rule patterns reject a reload and preserve the cached rules; new sessions refuse to
+  start until those patterns are repaired. Pattern arrays must contain valid regex strings, and
+  unreadable scheduler locks prevent dispatch rather than allowing a takeover. Admin edits still
+  save and notify nodes when another corrupt rule prevents a local reload, with a warning that
+  allows administrators to repair rules one at a time.
 
 ### Security
 

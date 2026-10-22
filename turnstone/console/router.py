@@ -41,7 +41,7 @@ def _parse_weight(metadata_json: str) -> int:
     """
     try:
         meta = json.loads(metadata_json or "{}")
-    except (json.JSONDecodeError, TypeError, RecursionError):
+    except (ValueError, TypeError, RecursionError):
         return 1
     if not isinstance(meta, dict):
         return 1

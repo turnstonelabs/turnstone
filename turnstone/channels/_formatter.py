@@ -196,7 +196,7 @@ def try_parse_media(output: str) -> dict[str, Any] | None:
     """
     try:
         data = json.loads(output)
-    except (json.JSONDecodeError, TypeError, RecursionError):
+    except (ValueError, TypeError, RecursionError):
         return None
     if not isinstance(data, dict):
         return None

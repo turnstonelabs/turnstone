@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from turnstone.core.rule_registry import (
     RuleRegistry,
 )
@@ -79,6 +81,58 @@ class TestBuiltinsOnly:
 
 
 class TestHeuristicMerge:
+    @pytest.mark.parametrize(
+        "corruption",
+        [
+            "syntax",
+            "integer",
+            "nesting",
+            "null",
+            "false",
+            "0",
+            '""',
+            "{}",
+            "[1]",
+            "[null]",
+            "[{}]",
+            '["["]',
+            '["a{4294967296}"]',
+        ],
+    )
+    def test_invalid_patterns_preserve_the_cached_rules(self, corruption, monkeypatch) -> None:
+        from tests._deep_json import overlong_integer, too_deep_to_parse
+        from turnstone.core.judge import _match_rule
+
+        row = {
+            "name": "restricted-command",
+            "enabled": True,
+            "builtin": False,
+            "risk_level": "low",
+            "confidence": 1.0,
+            "recommendation": "approve",
+            "tool_pattern": "bash",
+            "arg_patterns": '["^echo safe$"]',
+        }
+        registry = RuleRegistry(storage=_MockStorage(heuristic_rows=[row]))
+        before = registry.heuristic_rules
+        version = registry.version
+        if corruption == "syntax":
+            row["arg_patterns"] = "[broken"
+        elif corruption == "integer":
+            row["arg_patterns"] = "[" + overlong_integer() + "]"
+        elif corruption == "nesting":
+            too_deep_to_parse(monkeypatch, row["arg_patterns"])
+        else:
+            row["arg_patterns"] = corruption
+
+        with pytest.raises(ValueError, match="Invalid argument patterns.*restricted-command"):
+            registry.reload()
+
+        assert registry.heuristic_rules is before
+        assert registry.version == version
+        rule = next(rule for rule in registry.heuristic_rules if rule.name == row["name"])
+        assert not _match_rule(rule, "bash", {"command": "touch report"}, "bash", "touch report")
+
     def test_custom_rule_added(self) -> None:
         storage = _MockStorage(
             heuristic_rows=[

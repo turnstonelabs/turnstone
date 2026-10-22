@@ -3463,10 +3463,13 @@ class ChatSession:
         # Initialize rule registry for configurable judge rules
         self._rule_registry = None
         if config_store is not None:
-            try:
-                from turnstone.core.rule_registry import RuleRegistry
+            from turnstone.core.rule_registry import InvalidRuleConfigError, RuleRegistry
 
+            try:
                 self._rule_registry = RuleRegistry(storage=config_store.storage)
+            except InvalidRuleConfigError:
+                # Falling back to built-ins would discard every configured restriction.
+                raise
             except Exception:
                 log.debug("rule_registry.init_failed", exc_info=True)
         self._memory_config = memory_config or MemoryConfig()

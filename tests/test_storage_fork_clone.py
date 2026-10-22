@@ -736,8 +736,12 @@ def test_clone_refuses_invalid_preview_reference(storage_backend, preview_id) ->
     assert attachment is not None and attachment["refcount"] == 1
 
 
-@pytest.mark.parametrize("raw_refs", ["invalid-json", "{}", '[""]', "[123]"])
+@pytest.mark.parametrize("raw_refs", ["invalid-json", "{}", '[""]', "[123]", "overlong-integer"])
 def test_clone_refuses_invalid_attachment_refs(storage_backend, raw_refs) -> None:
+    if raw_refs == "overlong-integer":
+        from tests._deep_json import overlong_integer
+
+        raw_refs = "[" + overlong_integer() + "]"
     backend = storage_backend
     _register(backend, "source", "alice")
     _register(backend, "destination", "alice", state="creating")

@@ -11592,7 +11592,7 @@ def _pool_cfg_from_row(row: dict[str, Any]) -> dict[str, Any]:
     elif isinstance(headers_raw, str) and headers_raw:
         try:
             decoded = json.loads(headers_raw)
-        except (json.JSONDecodeError, TypeError, RecursionError):
+        except (ValueError, TypeError, RecursionError):
             decoded = {}
         if isinstance(decoded, dict):
             for k, v in decoded.items():
@@ -11626,17 +11626,17 @@ def _db_servers_to_config(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any
             cfg["command"] = row.get("command", "")
             try:
                 cfg["args"] = json.loads(row.get("args", "[]"))
-            except (json.JSONDecodeError, TypeError, RecursionError):
+            except (ValueError, TypeError, RecursionError):
                 cfg["args"] = []
             try:
                 cfg["env"] = json.loads(row.get("env", "{}"))
-            except (json.JSONDecodeError, TypeError, RecursionError):
+            except (ValueError, TypeError, RecursionError):
                 cfg["env"] = {}
         else:
             cfg["url"] = row.get("url", "")
             try:
                 cfg["headers"] = json.loads(row.get("headers", "{}"))
-            except (json.JSONDecodeError, TypeError, RecursionError):
+            except (ValueError, TypeError, RecursionError):
                 cfg["headers"] = {}
         result[name] = cfg
     return result

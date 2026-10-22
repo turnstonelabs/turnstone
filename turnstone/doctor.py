@@ -2270,7 +2270,7 @@ def _run_conversation(
                 name = tc["function"]["name"]
                 try:
                     args = json.loads(tc["function"]["arguments"])
-                except (json.JSONDecodeError, RecursionError) as exc:
+                except (ValueError, RecursionError) as exc:
                     result = f"Error: invalid JSON arguments: {exc}"
                     args = {}
                 else:

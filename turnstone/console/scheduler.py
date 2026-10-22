@@ -165,8 +165,8 @@ class TaskScheduler:
         if existing is not None:
             try:
                 lock_data = json.loads(existing.get("value", "{}"))
-            except (json.JSONDecodeError, TypeError, RecursionError):
-                lock_data = {}
+            except (ValueError, TypeError, RecursionError):
+                return False  # Unreadable ownership does not authorize takeover.
             owner = lock_data.get("owner", "")
             acquired_str = lock_data.get("acquired", "")
             if owner != self._lock_owner and acquired_str:
@@ -190,7 +190,7 @@ class TaskScheduler:
             return False
         try:
             lock_data = json.loads(existing.get("value", "{}"))
-        except (json.JSONDecodeError, TypeError, RecursionError):
+        except (ValueError, TypeError, RecursionError):
             return False
         return bool(lock_data.get("owner") == self._lock_owner)
 

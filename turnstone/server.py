@@ -2617,7 +2617,7 @@ def _fire_notify_targets(ws: Any, content: str) -> None:
 
     try:
         targets = json.loads(ws.notify_targets)
-    except (json.JSONDecodeError, TypeError, RecursionError):
+    except (ValueError, TypeError, RecursionError):
         return
     if not targets or not isinstance(targets, list):
         return

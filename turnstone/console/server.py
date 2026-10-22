@@ -7137,7 +7137,7 @@ def _normalize_task_dict(task: dict[str, Any]) -> dict[str, Any]:
     raw_nt = task.get("notify_targets", "[]")
     try:
         task["notify_targets"] = _json.loads(raw_nt) if isinstance(raw_nt, str) else raw_nt
-    except (_json.JSONDecodeError, TypeError, RecursionError):
+    except (ValueError, TypeError, RecursionError):
         task["notify_targets"] = []
     return task
 
@@ -8403,7 +8403,7 @@ async def admin_update_org(request: Request) -> JSONResponse:
         settings_str = str(body["settings"]).strip()
         try:
             json.loads(settings_str)
-        except (json.JSONDecodeError, TypeError, RecursionError):
+        except (ValueError, TypeError, RecursionError):
             return JSONResponse({"error": "settings must be valid JSON"}, status_code=400)
         updates["settings"] = settings_str
 
@@ -8829,7 +8829,7 @@ async def admin_create_skill(request: Request) -> JSONResponse:
     variables = str(body.get("variables", "[]")).strip()
     try:
         _json.loads(variables)
-    except (_json.JSONDecodeError, TypeError, RecursionError):
+    except (ValueError, TypeError, RecursionError):
         return JSONResponse({"error": "variables must be a valid JSON array"}, status_code=400)
     org_id = str(body.get("org_id", "")).strip()[:64]
     author = str(body.get("author", "")).strip()[:256]
@@ -8993,7 +8993,7 @@ async def admin_update_skill(request: Request) -> JSONResponse:
         var_str = str(body["variables"]).strip()
         try:
             _json.loads(var_str)
-        except (_json.JSONDecodeError, TypeError, RecursionError):
+        except (ValueError, TypeError, RecursionError):
             return JSONResponse({"error": "variables must be a valid JSON array"}, status_code=400)
         updates["variables"] = var_str
     if "author" in body:
@@ -11504,7 +11504,7 @@ def _mask_mcp_secrets(server: dict[str, Any], reveal: bool = False) -> dict[str,
     if s.get("env") and s["env"] != "{}":
         try:
             env_dict = json.loads(s["env"]) if isinstance(s["env"], str) else s["env"]
-        except (json.JSONDecodeError, TypeError, RecursionError):
+        except (ValueError, TypeError, RecursionError):
             env_dict = {}
         # A stored value that is not an object (hand-edited rows) shows as empty.
         s["env"] = json.dumps({k: "***" for k in env_dict} if isinstance(env_dict, dict) else {})
@@ -11513,7 +11513,7 @@ def _mask_mcp_secrets(server: dict[str, Any], reveal: bool = False) -> dict[str,
 
         try:
             hdr_dict = json.loads(s["headers"]) if isinstance(s["headers"], str) else s["headers"]
-        except (json.JSONDecodeError, TypeError, RecursionError):
+        except (ValueError, TypeError, RecursionError):
             hdr_dict = {}
         # A secret:// reference is not itself a secret; it stays visible. A
         # stored value that is not an object (hand-edited rows) shows as empty.
@@ -13845,7 +13845,7 @@ def _stored_workspace_id(row: dict[str, Any], provider: str) -> str:
         return ""
     try:
         caps = json.loads(row.get("capabilities") or "{}")
-    except (json.JSONDecodeError, TypeError, RecursionError):
+    except (ValueError, TypeError, RecursionError):
         return ""
     sc = caps.get("server_compat") if isinstance(caps, dict) else None
     raw = sc.get("anthropic_workspace_id") if isinstance(sc, dict) else None
@@ -14240,7 +14240,7 @@ def _row_serves_chat(row: dict[str, Any]) -> bool:
     raw = row.get("capabilities") or "{}"
     try:
         caps = json.loads(raw) if isinstance(raw, str) else raw
-    except (json.JSONDecodeError, TypeError, RecursionError):
+    except (ValueError, TypeError, RecursionError):
         caps = {}
     return serves_chat(caps if isinstance(caps, dict) else {}, str(row.get("model") or ""))
 
@@ -14974,7 +14974,7 @@ async def admin_update_model_definition(request: Request) -> JSONResponse:
         # impossible to re-save, so the switch is refused until it is cleared.
         try:
             stored_caps = json.loads(existing.get("capabilities") or "{}")
-        except (json.JSONDecodeError, TypeError, RecursionError):
+        except (ValueError, TypeError, RecursionError):
             stored_caps = {}
         err_msg = _validate_anthropic_workspace_id(stored_caps, str(updates["provider"]))
         if err_msg:
@@ -16447,6 +16447,41 @@ async def admin_delete_judge_setting(request: Request) -> JSONResponse:
 # -- Heuristic rules -------------------------------------------------------
 
 
+def _reload_judge_rules(request: Request) -> str | None:
+    """Reload local rules, reporting invalid configuration without dropping the cache."""
+    from turnstone.core.rule_registry import InvalidRuleConfigError, RuleRegistry
+
+    registry = getattr(request.app.state, "rule_registry", None)
+    try:
+        if registry is not None:
+            registry.reload()
+        else:
+            config_store = getattr(request.app.state, "config_store", None)
+            if config_store is not None:
+                request.app.state.rule_registry = RuleRegistry(storage=config_store.storage)
+    except InvalidRuleConfigError as exc:
+        log.warning("Failed to reload rule configuration: %s", exc)
+        return str(exc)
+    return None
+
+
+async def _judge_write_response(
+    request: Request, payload: dict[str, Any], *, status_code: int = 200
+) -> JSONResponse:
+    """Acknowledge a persisted edit even when other corrupt rules prevent its reload."""
+    error = _reload_judge_rules(request)
+    await _publish_config_change(request)
+    if error:
+        payload = {
+            **payload,
+            "warning": (
+                f"Change saved, but rule configuration could not be loaded: {error}. "
+                "Repair the rule before starting new sessions."
+            ),
+        }
+    return JSONResponse(payload, status_code=status_code)
+
+
 async def admin_list_heuristic_rules(request: Request) -> JSONResponse:
     """GET /v1/api/admin/judge/heuristic-rules — list merged heuristic rules."""
     from turnstone.core.auth import require_permission
@@ -16578,12 +16613,14 @@ async def admin_create_heuristic_rule(request: Request) -> JSONResponse:
     if isinstance(arg_patterns, str):
         try:
             arg_patterns = _json.loads(arg_patterns)
-        except (_json.JSONDecodeError, RecursionError):
+        except (ValueError, RecursionError):
             return JSONResponse({"error": "arg_patterns must be a JSON array"}, status_code=400)
     if not isinstance(arg_patterns, list):
         return JSONResponse({"error": "arg_patterns must be a list"}, status_code=400)
     for i, pat in enumerate(arg_patterns):
-        err_msg = _validate_regex_pattern(str(pat))
+        if not isinstance(pat, str):
+            return JSONResponse({"error": f"arg_patterns[{i}] must be a string"}, status_code=400)
+        err_msg = _validate_regex_pattern(pat)
         if err_msg:
             return JSONResponse({"error": f"arg_patterns[{i}]: {err_msg}"}, status_code=400)
 
@@ -16616,13 +16653,9 @@ async def admin_create_heuristic_rule(request: Request) -> JSONResponse:
         storage, audit_uid, "heuristic_rule.create", "heuristic_rule", rule_id, {"name": name}, ip
     )
 
-    # Reload rule registry
-    rule_registry = getattr(request.app.state, "rule_registry", None)
-    if rule_registry:
-        rule_registry.reload()
-    await _publish_config_change(request)
-
-    return JSONResponse(storage.get_heuristic_rule(rule_id) or {}, status_code=201)
+    return await _judge_write_response(
+        request, storage.get_heuristic_rule(rule_id) or {}, status_code=201
+    )
 
 
 async def admin_get_heuristic_rule(request: Request) -> JSONResponse:
@@ -16721,12 +16754,16 @@ async def admin_update_heuristic_rule(request: Request) -> JSONResponse:
         if isinstance(ap, str):
             try:
                 ap = _json.loads(ap)
-            except (_json.JSONDecodeError, RecursionError):
+            except (ValueError, RecursionError):
                 return JSONResponse({"error": "arg_patterns must be a JSON array"}, status_code=400)
         if not isinstance(ap, list):
             return JSONResponse({"error": "arg_patterns must be a list"}, status_code=400)
         for i, pat in enumerate(ap):
-            err_msg = _validate_regex_pattern(str(pat))
+            if not isinstance(pat, str):
+                return JSONResponse(
+                    {"error": f"arg_patterns[{i}] must be a string"}, status_code=400
+                )
+            err_msg = _validate_regex_pattern(pat)
             if err_msg:
                 return JSONResponse({"error": f"arg_patterns[{i}]: {err_msg}"}, status_code=400)
         fields["arg_patterns"] = _json.dumps(ap)
@@ -16759,12 +16796,7 @@ async def admin_update_heuristic_rule(request: Request) -> JSONResponse:
         ip,
     )
 
-    rule_registry = getattr(request.app.state, "rule_registry", None)
-    if rule_registry:
-        rule_registry.reload()
-    await _publish_config_change(request)
-
-    return JSONResponse(storage.get_heuristic_rule(rule_id) or {})
+    return await _judge_write_response(request, storage.get_heuristic_rule(rule_id) or {})
 
 
 async def admin_delete_heuristic_rule(request: Request) -> JSONResponse:
@@ -16798,12 +16830,7 @@ async def admin_delete_heuristic_rule(request: Request) -> JSONResponse:
         ip,
     )
 
-    rule_registry = getattr(request.app.state, "rule_registry", None)
-    if rule_registry:
-        rule_registry.reload()
-    await _publish_config_change(request)
-
-    return JSONResponse({"status": "ok", "rule_id": rule_id})
+    return await _judge_write_response(request, {"status": "ok", "rule_id": rule_id})
 
 
 # -- Output guard patterns --------------------------------------------------
@@ -17000,13 +17027,9 @@ async def admin_create_output_guard_pattern(request: Request) -> JSONResponse:
         ip,
     )
 
-    # Reload rule registry
-    rule_registry = getattr(request.app.state, "rule_registry", None)
-    if rule_registry:
-        rule_registry.reload()
-    await _publish_config_change(request)
-
-    return JSONResponse(storage.get_output_guard_pattern(pattern_id) or {}, status_code=201)
+    return await _judge_write_response(
+        request, storage.get_output_guard_pattern(pattern_id) or {}, status_code=201
+    )
 
 
 async def admin_get_output_guard_pattern(request: Request) -> JSONResponse:
@@ -17157,12 +17180,7 @@ async def admin_update_output_guard_pattern(request: Request) -> JSONResponse:
         ip,
     )
 
-    rule_registry = getattr(request.app.state, "rule_registry", None)
-    if rule_registry:
-        rule_registry.reload()
-    await _publish_config_change(request)
-
-    return JSONResponse(storage.get_output_guard_pattern(pattern_id) or {})
+    return await _judge_write_response(request, storage.get_output_guard_pattern(pattern_id) or {})
 
 
 async def admin_delete_output_guard_pattern(request: Request) -> JSONResponse:
@@ -17196,12 +17214,7 @@ async def admin_delete_output_guard_pattern(request: Request) -> JSONResponse:
         ip,
     )
 
-    rule_registry = getattr(request.app.state, "rule_registry", None)
-    if rule_registry:
-        rule_registry.reload()
-    await _publish_config_change(request)
-
-    return JSONResponse({"status": "ok", "pattern_id": pattern_id})
+    return await _judge_write_response(request, {"status": "ok", "pattern_id": pattern_id})
 
 
 # -- Judge utility endpoints ------------------------------------------------
@@ -17215,9 +17228,9 @@ async def admin_judge_reload(request: Request) -> JSONResponse:
     if err:
         return err
 
-    rule_registry = getattr(request.app.state, "rule_registry", None)
-    if rule_registry:
-        rule_registry.reload()
+    error = _reload_judge_rules(request)
+    if error:
+        return JSONResponse({"error": error}, status_code=409)
 
     await _publish_config_change(request)
     return JSONResponse({"status": "ok"})

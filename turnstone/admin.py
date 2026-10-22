@@ -504,7 +504,7 @@ def _cmd_list_node_metadata(args: argparse.Namespace) -> None:
         try:
             parsed = json.loads(val)
             val_str = json.dumps(parsed) if isinstance(parsed, (dict, list)) else str(parsed)
-        except (json.JSONDecodeError, TypeError, RecursionError):
+        except (ValueError, TypeError, RecursionError):
             val_str = val
         if len(val_str) > 38:
             val_str = val_str[:35] + "..."
@@ -530,7 +530,7 @@ def _cmd_set_node_metadata(args: argparse.Namespace) -> None:
     # Try JSON parse, fall back to string
     try:
         value = json.loads(args.value)
-    except (json.JSONDecodeError, TypeError, RecursionError):
+    except (ValueError, TypeError, RecursionError):
         value = args.value
 
     storage.set_node_metadata(args.node_id, args.key, json.dumps(value), source="user")

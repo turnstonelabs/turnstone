@@ -1,9 +1,8 @@
-"""A JSON parse's decode-error handler also catches ``RecursionError``.
+"""JSON parse guards cover ``ValueError`` and ``RecursionError``.
 
-JSON nested too deeply for the parser raises ``RecursionError``, not ``ValueError``: Python 3.13 at
-about 10,000 levels, 3.14 when the thread's C stack runs out. A handler that catches ``ValueError``
-or ``JSONDecodeError`` around a parse lets such input past, so a request answers 500 where malformed
-JSON gets a 400, and a stored value too deep to parse fails a read that handles an unparseable one.
+An integer beyond the conversion limit raises plain ``ValueError``, not ``JSONDecodeError``.
+JSON nested too deeply raises ``RecursionError``: Python 3.13 at about 10,000 levels, 3.14 when the
+thread's C stack runs out. Both belong in a parse guard's malformed-input handling.
 """
 
 from __future__ import annotations
@@ -16,21 +15,23 @@ import pytest
 
 import turnstone
 
-# What a handler must name to catch a decode error, and to catch RecursionError.
-_DECODE_ERRORS = frozenset({"ValueError", "JSONDecodeError", "Exception", "BaseException"})
+# Syntax-error coverage alone does not cover every ValueError raised by the decoder.
+_DECODE_ERRORS = frozenset({"ValueError", "Exception", "BaseException"})
+_SYNTAX_ERRORS = _DECODE_ERRORS | {"JSONDecodeError"}
 _RECURSION_ERRORS = frozenset({"RecursionError", "RuntimeError", "Exception", "BaseException"})
 
 
 class _ParseGuards(ast.NodeVisitor):
-    """Finds a module's JSON parses whose decode-error handler misses ``RecursionError``.
+    """Finds JSON parse guards missing general ``ValueError`` or ``RecursionError`` coverage.
 
     A parse is ``json.loads`` or ``json.load``, under any name the module imports them as, or a
     ``.json()`` call with no arguments (an httpx2 response, a Starlette request). Its guard is the
     innermost ``try`` or ``contextlib.suppress`` block around it, in the same function, that
-    catches a decode error or ``RecursionError``. The guard's first handler that catches a decode
-    error must catch ``RecursionError`` too, unless one of its handlers names ``RecursionError``
-    itself. A parse with no guard in its function raises to its caller, which this can't see: a
-    helper whose callers guard it turns ``RecursionError`` into ``ValueError`` itself, as
+    catches a syntax error, ``ValueError`` or ``RecursionError``. The first syntax-error handler
+    must cover both general decode errors, unless explicit ``ValueError`` or ``RecursionError``
+    handlers distinguish them deliberately. A broad fallback after a syntax-only handler does
+    not count. A parse with no guard in its function raises to its caller, which this can't see:
+    a helper whose callers guard it turns ``RecursionError`` into ``ValueError`` itself, as
     ``deserialize_value`` does. Exception tuples are resolved within the module only.
     """
 
@@ -71,18 +72,23 @@ class _ParseGuards(ast.NodeVisitor):
 
     def _guarded(self) -> bool:
         for handlers in reversed(self._guards):
-            decode = recursion = None
-            named = False
+            syntax = decode = recursion = None
+            named_decode = named_recursion = False
             for i, expr in enumerate(handlers):
                 names = self._names(expr)
+                if syntax is None and (names is None or names & _SYNTAX_ERRORS):
+                    syntax = i
                 if decode is None and (names is None or names & _DECODE_ERRORS):
                     decode = i
+                    named_decode = names is not None and "ValueError" in names
                 if recursion is None and (names is None or names & _RECURSION_ERRORS):
                     recursion = i
-                named = named or (names is not None and "RecursionError" in names)
-            if decode is None and recursion is None:
+                    named_recursion = names is not None and "RecursionError" in names
+            if syntax is None and recursion is None:
                 continue  # neither reaches this guard's handlers; look further out
-            return decode is None or decode == recursion or named
+            return syntax is None or (
+                (syntax == decode or named_decode) and (syntax == recursion or named_recursion)
+            )
         return True
 
     def _is_parse(self, call: ast.Call) -> bool:
@@ -166,7 +172,7 @@ def _misses(source: str) -> tuple[int, list[int]]:
     return guards.parses, guards.misses
 
 
-def test_every_json_parse_guard_catches_recursion_error() -> None:
+def test_every_json_parse_guard_catches_value_and_recursion_errors() -> None:
     root = Path(turnstone.__file__).parent
     parses = 0
     misses: list[str] = []
@@ -176,8 +182,8 @@ def test_every_json_parse_guard_catches_recursion_error() -> None:
         misses += [f"{path.relative_to(root)}:{line}" for line in lines]
     assert parses > 0
     assert misses == [], (
-        "add RecursionError to the handler that catches the parse's decode error: JSON nested too "
-        "deeply to parse is malformed input"
+        "handle ValueError and RecursionError alongside JSON syntax errors: oversized integers "
+        "and excessive nesting are malformed input"
     )
 
 
@@ -211,6 +217,16 @@ def test_every_json_parse_guard_catches_recursion_error() -> None:
             return 500
         """,
         """
+        try:
+            data = resp.json()
+        except ValueError:
+            return 400
+        except Exception:
+            return 500
+        except RecursionError:
+            return 413
+        """,
+        """
         import json as _json
         try:
             data = _json.loads(raw)
@@ -232,7 +248,16 @@ def test_every_json_parse_guard_catches_recursion_error() -> None:
             pass
         """,
     ],
-    ids=["try", "request-json", "suppress", "split", "module-alias", "function-alias", "tuple"],
+    ids=[
+        "try",
+        "request-json",
+        "suppress",
+        "split",
+        "shadowed-handler",
+        "module-alias",
+        "function-alias",
+        "tuple",
+    ],
 )
 def test_a_guard_that_misses_recursion_error_is_found(source: str) -> None:
     parses, misses = _misses(source)
@@ -246,7 +271,62 @@ def test_a_guard_that_misses_recursion_error_is_found(source: str) -> None:
         """
         try:
             data = json.loads(raw)
-        except (json.JSONDecodeError, TypeError, RecursionError):
+        except (json.JSONDecodeError, RecursionError):
+            return 400
+        """,
+        """
+        try:
+            data = response.json()
+        except (json.JSONDecodeError, RecursionError):
+            return 400
+        except Exception:
+            return 500
+        """,
+        """
+        with contextlib.suppress(json.JSONDecodeError, RecursionError):
+            data = json.loads(raw)
+        """,
+        """
+        import json as _json
+        _ERRORS = (_json.JSONDecodeError, TypeError, RecursionError)
+        try:
+            data = _json.loads(raw)
+        except _ERRORS:
+            pass
+        """,
+    ],
+    ids=["syntax-only", "broad-fallback", "suppress", "tuple-alias"],
+)
+def test_a_guard_that_misses_plain_value_error_is_found(source: str) -> None:
+    parses, misses = _misses(source)
+    assert parses == 1
+    assert len(misses) == 1
+
+
+def test_a_shadowed_value_error_handler_does_not_count() -> None:
+    parses, misses = _misses(
+        """
+        try:
+            data = json.loads(raw)
+        except (json.JSONDecodeError, RecursionError):
+            return 400
+        except Exception:
+            return 500
+        except ValueError:
+            return 400
+        """
+    )
+    assert parses == 1
+    assert len(misses) == 1
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        """
+        try:
+            data = json.loads(raw)
+        except (ValueError, TypeError, RecursionError):
             data = {}
         """,
         """
@@ -273,6 +353,15 @@ def test_a_guard_that_misses_recursion_error_is_found(source: str) -> None:
             return 400
         except RecursionError:
             return 413
+        """,
+        # Syntax errors may be salvaged, while oversized values must be refused.
+        """
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            return salvage(raw)
+        except (ValueError, RecursionError):
+            return None
         """,
         # No guard in its function: the caller sees what it raises.
         """
@@ -304,12 +393,13 @@ def test_a_guard_that_misses_recursion_error_is_found(source: str) -> None:
         "suppress",
         "translated",
         "separate-handler",
+        "syntax-separate",
         "unguarded",
         "nested-def",
         "outer-guard",
     ],
 )
-def test_a_guard_that_catches_recursion_error_passes(source: str) -> None:
+def test_a_guard_that_catches_value_and_recursion_errors_passes(source: str) -> None:
     parses, misses = _misses(source)
     assert parses == 1
     assert misses == []

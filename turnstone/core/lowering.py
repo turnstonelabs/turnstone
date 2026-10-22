@@ -205,11 +205,10 @@ def wire_valid_arguments(arguments: Any) -> bool:
     if not isinstance(arguments, str):
         return False
     try:
-        # json.loads raises JSONDecodeError (already a ValueError, so listing both
-        # was redundant) on malformed JSON, and RecursionError on deeply-nested
-        # JSON — catch both so this predicate is total for any string input.
+        # ValueError covers both malformed JSON and integers beyond the conversion limit.
+        # RecursionError covers excessive nesting; neither may escape this total predicate.
         return isinstance(json.loads(arguments), dict)
-    except (json.JSONDecodeError, RecursionError):
+    except (ValueError, RecursionError):
         return False
 
 
