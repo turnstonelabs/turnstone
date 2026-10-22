@@ -13382,7 +13382,9 @@ _SCOPES_TOO_LONG_ERROR = f"obo_scopes exceeds {MODEL_AUTH_TEXT_MAX_LEN} characte
 
 
 def _canonical_capabilities(raw: Any) -> str | None:
-    """Canonical form of a ``capabilities`` blob, or ``None`` when unparseable.
+    """Canonical form of a ``capabilities`` blob.
+
+    Return ``None`` when parsing or canonicalization fails.
 
     Canonicalized through ``canonical_caps_value`` — the ONE normalization
     this column's two comparators share, so this guard and the calibrate
@@ -13393,9 +13395,9 @@ def _canonical_capabilities(raw: Any) -> str | None:
     """
     try:
         parsed = json.loads(str(raw or "") or "{}")
+        return canonical_caps_value(parsed)
     except (ValueError, RecursionError):
         return None
-    return canonical_caps_value(parsed)
 
 
 def _capabilities_value_changed(stored: Any, submitted: Any) -> bool:
@@ -13406,9 +13408,9 @@ def _capabilities_value_changed(stored: Any, submitted: Any) -> bool:
     test_reserialized_capabilities_do_not_defeat_pure_disable and
     test_capabilities_value_change_still_gates_dynamic_row.
 
-    An unparseable STORED blob compares as CHANGED (fail closed). The ONE
-    exception is the update twin's pure-disable derivation, which treats it
-    as not-blocking (see :func:`_derive_auth_gate`).
+    A stored blob that cannot be parsed or canonicalized compares as CHANGED (fail closed).
+    The ONE exception is the update twin's pure-disable derivation, which treats it as
+    not-blocking (see :func:`_derive_auth_gate`).
     """
     stored_canonical = _canonical_capabilities(stored)
     return stored_canonical is None or stored_canonical != _canonical_capabilities(submitted)

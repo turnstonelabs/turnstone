@@ -266,12 +266,15 @@ def calibration_confinement_violations(
         return ["<merge output is not JSON>"]
     if not isinstance(merged_parsed, dict):
         return ["<merge output is not a JSON object>"]
-    changed = {
-        key
-        for key in set(stored) | set(merged_parsed)
-        if (key in stored) != (key in merged_parsed)
-        or canonical_caps_value(stored.get(key)) != canonical_caps_value(merged_parsed.get(key))
-    }
+    try:
+        changed = {
+            key
+            for key in set(stored) | set(merged_parsed)
+            if (key in stored) != (key in merged_parsed)
+            or canonical_caps_value(stored.get(key)) != canonical_caps_value(merged_parsed.get(key))
+        }
+    except RecursionError:
+        return ["<capabilities nested too deeply>"]
     return sorted(changed - allowed)
 
 

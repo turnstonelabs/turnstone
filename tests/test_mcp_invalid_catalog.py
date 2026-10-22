@@ -365,6 +365,32 @@ def test_invalid_call_result_counts_against_no_breaker(
     assert result == "ok"
 
 
+def test_recursive_output_schema_counts_against_no_breaker(
+    upstream_server: tuple[str, Upstream],
+) -> None:
+    url, upstream = upstream_server
+    upstream.tools = [GOOD, {**GOOD, "name": "recursive", "outputSchema": {"$ref": "#"}}]
+    upstream.call_result = {
+        "content": [{"type": "text", "text": "ok"}],
+        "structuredContent": {},
+    }
+
+    with _started_manager(_static(url)) as mgr:
+        session = mgr._static_servers["srv"].session
+        for _ in range(mgr._CB_FAILURE_THRESHOLD + 1):
+            with pytest.raises(RecursionError):
+                mgr.call_tool_sync("mcp__srv__recursive", {}, timeout=10)
+        status = mgr.get_server_status("srv")
+        assert mgr._static_servers["srv"].session is session
+        result = mgr.call_tool_sync("mcp__srv__good", {}, timeout=10)
+        assert mgr._static_servers["srv"].session is session
+
+    assert status["connected"] is True
+    assert status["consecutive_failures"] == 0
+    assert status["circuit_open"] is False
+    assert result == "ok"
+
+
 def _invalid(result_type: type[BaseModel], payload: dict[str, Any]) -> ValidationError:
     with pytest.raises(ValidationError) as caught:
         result_type.model_validate(payload)

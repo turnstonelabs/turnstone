@@ -375,6 +375,23 @@ def test_calibrate_refuses_merge_that_writes_out_of_band_keys(
     assert storage.get_model_definition("r1")["capabilities"] == stored_before
 
 
+def test_calibrate_refuses_capabilities_too_deep_to_compare(
+    storage: SQLiteBackend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _seed_reranker(storage)
+    raw = '{"supports_rerank":true,"x":' + "[" * 1100 + "0" + "]" * 1100 + "}"
+    storage.update_model_definition("r1", capabilities=raw)
+    _stub_calibrate(monkeypatch, _result(separated=True, threshold=0.42))
+    client = _make_client(storage, _make_registry())
+
+    resp = client.post("/v1/api/admin/model-definitions/r1/calibrate")
+
+    assert resp.status_code == 500, resp.text
+    assert "capabilities nested too deeply" in resp.json()["error"]
+    assert "write refused" in resp.json()["error"]
+    assert storage.get_model_definition("r1")["capabilities"] == raw
+
+
 def test_calibrate_no_separation_persists_marker(
     storage: SQLiteBackend, monkeypatch: pytest.MonkeyPatch
 ) -> None:

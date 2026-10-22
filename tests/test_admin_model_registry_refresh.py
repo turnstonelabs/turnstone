@@ -3537,6 +3537,47 @@ def test_capabilities_canonical_compare_distinguishes_bool_from_int() -> None:
     assert _capabilities_value_changed("not json", '{"a": 1}')
 
 
+@pytest.mark.parametrize("side", ["stored", "submitted", "both"])
+def test_capabilities_too_deep_to_compare_count_as_changed(side: str) -> None:
+    from turnstone.console.server import _canonical_capabilities, _capabilities_value_changed
+
+    raw = '{"x":' + "[" * 1100 + "0" + "]" * 1100 + "}"
+    assert isinstance(json.loads(raw), dict)
+    assert _canonical_capabilities(raw) is None
+    stored = raw if side in ("stored", "both") else "{}"
+    submitted = raw if side in ("submitted", "both") else "{}"
+    assert _capabilities_value_changed(stored, submitted)
+
+
+@pytest.mark.parametrize("stored_deep", [False, True])
+@pytest.mark.parametrize("dynamic", [False, True])
+def test_deep_capabilities_update_preserves_auth_gate(
+    storage: SQLiteBackend, stored_deep: bool, dynamic: bool
+) -> None:
+    deep = '{"x":' + "[" * 1100 + "0" + "]" * 1100 + "}"
+    stored = deep if stored_deep else "{}"
+    submitted = "{}" if stored_deep else deep
+    _seed_model_def(
+        storage,
+        definition_id="m1",
+        alias="gw",
+        model="m",
+        auth_mode="entra_obo" if dynamic else "static",
+        obo_audience="api://approved" if dynamic else "",
+        capabilities=stored,
+    )
+    client = _make_client(storage, _make_registry(alias="gw", model="m"))
+
+    resp = client.put(
+        "/v1/api/admin/model-definitions/m1",
+        json={"capabilities": json.loads(submitted)},
+    )
+
+    assert resp.status_code == (403 if dynamic else 200), resp.text
+    expected = stored if dynamic else json.dumps(json.loads(submitted))
+    assert storage.get_model_definition("m1")["capabilities"] == expected
+
+
 def test_integral_float_capabilities_spelling_does_not_gate() -> None:
     """Integral floats normalize to ints before the canonical dump.
 

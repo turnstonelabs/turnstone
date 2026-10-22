@@ -36,6 +36,7 @@ payloads are byte-exact regardless of source-encoding handling.
 """
 
 import contextlib
+import copy
 import json
 import socket
 import threading
@@ -90,6 +91,82 @@ ANTHROPIC_EVENTS = (
     + 'data: {"type":"content_block_delta","index":0,'
     '"delta":{"type":"text_delta","text":"hello"}}' + LF + LF
 )
+
+
+@pytest.mark.parametrize("block_type", ["tool_use", "server_tool_use"])
+@pytest.mark.parametrize("emission", ["start", "delta"])
+@pytest.mark.parametrize("container", ["object", "list"])
+@pytest.mark.parametrize("depth", [200, 201, 600])
+def test_tool_input_depth_is_bounded_before_replay_capture(block_type, emission, container, depth):
+    from turnstone.core.providers import drain_stream
+    from turnstone.core.providers._anthropic import AnthropicProvider
+
+    opening, closing = ('{"x":', "}") if container == "object" else ("[", "]")
+    raw_input = '{"x":' + opening * (depth - 1) + "0" + closing * (depth - 1) + "}"
+    expected_input = json.loads(raw_input)
+    block = {"type": block_type, "id": "tool_1", "name": "test", "input": {}}
+    if emission == "start":
+        block["input"] = expected_input
+    events = [
+        {
+            "type": "message_start",
+            "message": {
+                "id": "msg_1",
+                "type": "message",
+                "role": "assistant",
+                "model": "test",
+                "content": [],
+                "stop_reason": None,
+                "stop_sequence": None,
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+            },
+        },
+        {"type": "content_block_start", "index": 0, "content_block": block},
+    ]
+    if emission == "delta":
+        events.append(
+            {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "input_json_delta", "partial_json": raw_input},
+            }
+        )
+    events.extend(
+        [
+            {"type": "content_block_stop", "index": 0},
+            {
+                "type": "message_delta",
+                "delta": {"stop_reason": "tool_use", "stop_sequence": None},
+                "usage": {"output_tokens": 1},
+            },
+            {"type": "message_stop"},
+        ]
+    )
+    payload = "".join(
+        "event: " + event["type"] + LF + "data: " + json.dumps(event) + LF + LF for event in events
+    )
+    response = httpx2.Response(
+        200,
+        headers={"content-type": "text/event-stream"},
+        stream=httpx2.ByteStream(payload.encode()),
+    )
+    with anthropic.Anthropic(
+        api_key="test-only",
+        max_retries=0,
+        http_client=httpx2.Client(transport=httpx2.MockTransport(lambda request: response)),
+    ) as client:
+        stream = AnthropicProvider(compat=True).create_streaming(
+            client=client, model="test", messages=[{"role": "user", "content": "test"}]
+        )
+        if depth > 200:
+            error = "nested more than 200" if emission == "start" else "recursion limit exceeded"
+            with pytest.raises(ValueError, match=error):
+                drain_stream(stream)
+        else:
+            result = drain_stream(stream)
+            replay = copy.deepcopy(result.provider_blocks)
+            assert replay[0]["input"] == expected_input
+        assert response.is_closed
 
 
 @pytest.mark.parametrize("parts", [["Cannot", " help."], ["", "Cannot", "", " help.", ""]])

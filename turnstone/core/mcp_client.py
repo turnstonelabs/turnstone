@@ -543,7 +543,8 @@ def _is_sdk_result_error(exc: BaseException) -> bool:
     which it raises as a plain ``RuntimeError``. Its text is the only discriminator, so
     ``test_an_input_request_is_breaker_neutral`` drives one through a real server.
     """
-    if isinstance(exc, ValidationError | UnexpectedClaimedResult):
+    # A cyclic output schema can exhaust the validator's recursion limit after a valid reply.
+    if isinstance(exc, ValidationError | UnexpectedClaimedResult | RecursionError):
         return True
     if type(exc) is RuntimeError:
         msg = str(exc)

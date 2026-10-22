@@ -1422,6 +1422,10 @@ frozen.
   levels or more opened a static MCP server's circuit breaker for every session on the node, and on
   a Python 3.13 node whose threads run on 2 MiB stacks an argument about 8,300 levels deep crashed
   the process. The model is told the arguments couldn't be parsed and to retry.
+- **Handle deep values and recursive output schemas (#1458).** Complete tool inputs over 200 levels
+  deep are refused before replay capture, matching the streamed-input limit. Capabilities too deep
+  to compare count as changed for authorization and prevent calibration writes. A recursive MCP
+  output schema fails its tool call without opening the server's circuit breaker for other tools.
 
 ### Security
 

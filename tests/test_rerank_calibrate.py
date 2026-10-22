@@ -194,3 +194,16 @@ class TestCalibrationCapsConfinement:
         merged = json.dumps({"server_compat": {"scale": 1}, **calibration_caps_fields(result)})
 
         assert calibration_confinement_violations(stored, merged, result) == []
+
+    @pytest.mark.parametrize("side", ["stored", "merged", "both"])
+    def test_confinement_refuses_values_too_deep_to_compare(self, side):
+        from turnstone.core.rerank_calibrate import calibration_confinement_violations
+
+        result = _build_result("m", "probability (0-1)", [0.9], [0.1])
+        deep = '{"x":' + "[" * 1100 + "0" + "]" * 1100 + "}"
+        stored = deep if side in ("stored", "both") else '{"x":0}'
+        merged = deep if side in ("merged", "both") else '{"x":0}'
+
+        assert calibration_confinement_violations(stored, merged, result) == [
+            "<capabilities nested too deeply>"
+        ]
