@@ -1271,6 +1271,23 @@ Be precise and evidence-based. Do not hedge — give a clear recommendation. \
 If you used read_file to check a target, cite what you found."""
 
 
+# Two linear searches find what the lazy pattern r"```(?:json)?\s*(\{.*?\})\s*```" captures: the
+# first opening fence whose body starts with "{", then the first "}" closing a fence after that
+# brace. The lazy pattern rescanned the rest of the reply from every unclosed opener, quadratic in
+# a reply that what the judge reads can steer.
+_RE_FENCE_OPENER = re.compile(r"```(?:json)?\s*\{")
+_RE_FENCE_CLOSER = re.compile(r"\}\s*```")
+
+
+def _fenced_object(text: str) -> str | None:
+    """The braces-and-body text of the first fenced JSON object in a judge's reply, or None."""
+    opener = _RE_FENCE_OPENER.search(text)
+    closer = _RE_FENCE_CLOSER.search(text, opener.end()) if opener else None
+    if opener is None or closer is None:
+        return None
+    return text[opener.end() - 1 : closer.start() + 1]
+
+
 # ---------------------------------------------------------------------------
 # IntentJudge — session-scoped LLM judge
 # ---------------------------------------------------------------------------
@@ -2322,10 +2339,10 @@ class IntentJudge:
             pass  # falls through to strategy 2
 
         # Strategy 2: Markdown code block
-        md_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
-        if md_match:
+        fenced = _fenced_object(text)
+        if fenced is not None:
             try:
-                data = json.loads(md_match.group(1))
+                data = json.loads(fenced)
                 if isinstance(data, dict):
                     return data
             except (json.JSONDecodeError, ValueError, RecursionError):

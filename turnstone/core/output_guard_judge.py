@@ -62,6 +62,7 @@ from turnstone.core.judge import (
     _CHARS_PER_TOKEN,
     UsageRecorder,
     _config_store_version,
+    _fenced_object,
     _judge_binding_from_session,
     _JudgeBindingState,
     _positive_window,
@@ -331,10 +332,6 @@ def _parse_line_ranges(raw: Any) -> tuple[tuple[int, int], ...]:
     return tuple(ranges)
 
 
-_RE_FENCE_OPENER = re.compile(r"```(?:json)?\s*\{")
-_RE_FENCE_CLOSER = re.compile(r"\}\s*```")
-
-
 def _extract_json(text: str) -> dict[str, Any] | None:
     """Extract a JSON object from text using three fallback strategies.
 
@@ -362,16 +359,11 @@ def _extract_json(text: str) -> dict[str, Any] | None:
     except (json.JSONDecodeError, ValueError, RecursionError):
         pass  # expected when the LLM prefixed prose or wrapped in a fence; fall through
 
-    # Strategy 2: markdown code block.  Two linear searches find the match of
-    # the lazy pattern r"```(?:json)?\s*(\{.*?\})\s*```": the first opening
-    # fence whose body starts with "{", then the first "}" closing a fence
-    # after that brace.  The lazy pattern rescanned the rest of the reply from
-    # every unclosed opener, quadratic in a reply the judge's reading can steer.
-    opener = _RE_FENCE_OPENER.search(text)
-    closer = _RE_FENCE_CLOSER.search(text, opener.end()) if opener else None
-    if opener and closer:
+    # Strategy 2: markdown code block, found in linear time.
+    fenced = _fenced_object(text)
+    if fenced is not None:
         try:
-            data = json.loads(text[opener.end() - 1 : closer.start() + 1])
+            data = json.loads(fenced)
             if isinstance(data, dict):
                 return data
         except (json.JSONDecodeError, ValueError, RecursionError):

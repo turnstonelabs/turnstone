@@ -282,6 +282,19 @@ class TestVerdictParsing:
         assert verdict.recommendation == "approve"
         assert verdict.tier == "llm"
 
+    def test_verdict_fenced_after_a_code_fence(self):
+        """A first fence that doesn't open on ``{`` is passed over, as the lazy
+        pattern the linear search replaced passed it over."""
+        content = 'See ```python\nx = 1\n``` then\n```json\n{"risk_level": "low"}\n```'
+        assert IntentJudge._extract_json(content) == {"risk_level": "low"}
+
+    def test_unclosed_fence_openers_parse_in_linear_time(self):
+        """64,000 characters of openers with no closing fence: the lazy pattern
+        took seconds here, rescanning from every opener."""
+        started = time.monotonic()
+        assert IntentJudge._extract_json("```{" * 16_000) is None
+        assert time.monotonic() - started < 1.0
+
     def test_brace_counting_fallback(self):
         """Provider returns verdict embedded in prose — strategy 3."""
         content = (
