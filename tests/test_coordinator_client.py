@@ -603,6 +603,23 @@ def test_list_children_returns_only_interactive_children(populated_storage):
     assert result["truncated"] is False
 
 
+def test_list_children_says_to_retry_when_the_children_cannot_be_read(
+    populated_storage, monkeypatch
+):
+    """A failed read tells the model to retry instead of quoting the storage
+    error, which can carry SQL; the error stays chained for the logs."""
+    client = _make_read_client(populated_storage)
+
+    def _down(*_a: Any, **_kw: Any) -> Any:
+        raise RuntimeError("SELECT ws_id FROM workstreams failed")
+
+    monkeypatch.setattr(populated_storage, "list_workstreams", _down)
+    with pytest.raises(CoordinatorReadError, match="list of your children could not be read") as e:
+        client.list_children("coord-1")
+    assert "SELECT" not in str(e.value)
+    assert str(e.value.__cause__) == "SELECT ws_id FROM workstreams failed"
+
+
 def test_list_children_excludes_cross_tenant_child(populated_storage):
     """SQL-level user_id filter drops forged parent_ws_id rows owned by another user."""
     client = _make_read_client(populated_storage)

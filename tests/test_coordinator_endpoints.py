@@ -32,6 +32,7 @@ from tests._coord_test_helpers import (
     _build_mgr_with_factory,
     _fake_registry,
     _FakeConfigStore,
+    _rehydrate_with_children_down,
     _seed_children,
 )
 from tests._helpers import opaque_png
@@ -2327,6 +2328,47 @@ def test_coord_cancel_cascades_to_children(storage):
     ]
     assert len(events) == 1
     assert set(json.loads(events[0]["detail"])["cancelled"]) == {"child-1", "child-2"}
+
+
+def test_coord_cancel_cascade_records_children_it_could_not_read(storage, monkeypatch):
+    """A coordinator rehydrated while its children query fails can't reach its
+    children: the owner's cancel still answers 200, and the cascade audit says
+    the children couldn't be read instead of recording an empty cascade."""
+    import json
+
+    from turnstone.console.server import _cascade_cancel_to_children
+    from turnstone.core.session_routes import SessionEndpointConfig, make_cancel_handler
+
+    mgr, ws, coord_id, _down = _rehydrate_with_children_down(
+        storage, monkeypatch, ["c" * 32, "d" * 32]
+    )
+    coord_client = MagicMock()
+    ws.session = MagicMock()
+    ws.session._coord_client = coord_client
+    cfg = SessionEndpointConfig(
+        permission_gate=_require_admin_coordinator,
+        manager_lookup=lambda r: (mgr, None),
+        tenant_check=None,
+        not_found_label="coordinator not found",
+        audit_action_prefix="coordinator",
+    )
+    handler = make_cancel_handler(cfg, post_cancel=_cascade_cancel_to_children)
+    app = Starlette(routes=[Route("/v1/api/workstreams/{ws_id}/cancel", handler, methods=["POST"])])
+    app.state.coord_adapter = mgr._adapter
+    app.state.auth_storage = storage
+    app.add_middleware(_AuthMiddleware)
+
+    resp = TestClient(app).post(f"/v1/api/workstreams/{coord_id}/cancel", headers=_COORD_HEADERS)
+    assert resp.status_code == 200
+    ws.session.cancel.assert_called_once()
+    coord_client.cancel.assert_not_called()
+    events = [
+        e for e in storage.list_audit_events() if e["action"] == "coordinator.cancel_cascaded"
+    ]
+    assert len(events) == 1
+    detail = json.loads(events[0]["detail"])
+    assert detail["error"] == "the coordinator's children could not be read"
+    assert detail["cancelled"] == []
 
 
 def test_coord_cancel_cascade_denied_for_service_token_without_grant(storage):

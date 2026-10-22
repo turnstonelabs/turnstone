@@ -1540,11 +1540,16 @@ class CoordinatorClient:
         # parent_ws_id gate at server.py enforces this), but the filter
         # is defense-in-depth for migration-era rows where that gate
         # didn't exist yet.
-        raw = self._storage.list_workstreams(
-            limit=limit,
-            parent_ws_id=parent_ws_id,
-            kind=WorkstreamKind.INTERACTIVE,
-            user_id=self._user_id or None,
+        raw = _read_or_raise(
+            self._coord_ws_id,
+            "children",
+            "the list of your children could not be read.",
+            lambda: self._storage.list_workstreams(
+                limit=limit,
+                parent_ws_id=parent_ws_id,
+                kind=WorkstreamKind.INTERACTIVE,
+                user_id=self._user_id or None,
+            ),
         )
         # ``deleted`` stays in the filter set so any legacy/synthetic row
         # that still carries that state (e.g. unmigrated data) is treated

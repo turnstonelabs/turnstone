@@ -46,6 +46,10 @@ if TYPE_CHECKING:
 log = get_logger(__name__)
 
 
+class ChildrenUnreadableError(RuntimeError):
+    """A coordinator's stored children couldn't be read, so its child set is unknown."""
+
+
 def _emit_coord_ui(ui: Any, ws: Workstream, hook: str, *args: Any) -> None:
     """Fire ONE coordinator UI hook in isolation.
 
@@ -122,6 +126,13 @@ class CoordinatorAdapter:
         # method names which still exist as thin shims for the
         # cluster-routing + cleanup callers.
         self._registry = ChildrenRegistry()
+        # Coordinators whose stored children couldn't be read when they
+        # were rehydrated: their child set is unknown until a retry reads
+        # it, and ``children_snapshot`` retries and raises meanwhile. The
+        # fan-out thread never retries: it delivers every coordinator's
+        # events, so a slow read there would hold them all up.
+        self._unseeded: set[str] = set()
+        self._unseeded_lock = threading.Lock()
         # In-process wakeup primitive for ``wait_for_workstream``. The
         # dispatch sink (:meth:`_dispatch_child_event`) calls
         # ``notify(child_ws_id)`` after each translated child event;
@@ -271,6 +282,8 @@ class CoordinatorAdapter:
         # pointers forever — :meth:`ChildrenRegistry.uninstall`
         # handles forward set + reverse entries + presence atomically.
         self._registry.uninstall(ws_id)
+        with self._unseeded_lock:
+            self._unseeded.discard(ws_id)
         try:
             self._collector.emit_console_ws_closed(ws_id)
         except Exception:
@@ -541,13 +554,15 @@ class CoordinatorAdapter:
     # ------------------------------------------------------------------
 
     def _rebuild_children_registry(self, coord_ws_id: str) -> None:
-        """Populate ``self._children[coord_ws_id]`` from storage.
+        """Seed the registry with the coordinator's stored children.
 
-        Called on ``emit_created`` (covers both ``create`` — empty result
-        set, cheap query — and ``open`` rehydrate where the subtree is
-        persisted). Closed / deleted children are intentionally kept in
-        the registry so the tree UI can render them grayed out; state is
-        authoritative in storage, not here.
+        Called on ``emit_rehydrated``, where the subtree is persisted (a
+        fresh create has no stored children, so ``emit_created`` skips
+        it), and by :meth:`children_snapshot` after a read that failed. A
+        failed read leaves the coordinator in ``_unseeded`` rather than
+        seeding an empty child set. Closed / deleted children are
+        intentionally kept in the registry so the tree UI can render them
+        grayed out; state is authoritative in storage, not here.
 
         UNIONs with any entries the fan-out thread already added during
         the storage query window. Overwriting would drop that child.
@@ -587,12 +602,16 @@ class CoordinatorAdapter:
                 user_id=coord_user_id,
             )
         except Exception:
-            log.debug(
+            # Not an empty child set: record the failure so the snapshot
+            # raises and a later call retries the read.
+            log.warning(
                 "coord_adapter.rebuild_children_failed ws=%s",
                 coord_ws_id[:8],
                 exc_info=True,
             )
-            rows = []
+            with self._unseeded_lock:
+                self._unseeded.add(coord_ws_id)
+            return
         if len(rows) > _rebuild_limit:
             log.warning(
                 "coord_adapter.rebuild_children_truncated ws=%s limit=%d",
@@ -611,6 +630,8 @@ class CoordinatorAdapter:
                 continue
             child_ids.append(child_id)
         self._registry.merge_children(coord_ws_id, child_ids)
+        with self._unseeded_lock:
+            self._unseeded.discard(coord_ws_id)
 
     def children_snapshot(self, coord_ws_id: str) -> list[str]:
         """Return a snapshot of the coordinator's direct child ws_ids.
@@ -621,7 +642,21 @@ class CoordinatorAdapter:
         either lands before (cancelled) or after (out of scope for
         this batch) — both safe. Returns an empty list for unknown
         coordinators.
+
+        When the coordinator's stored children couldn't be read on
+        rehydrate, this retries that read first, so async callers run it
+        in a worker thread, and raises :class:`ChildrenUnreadableError`
+        while they still can't be read.
         """
+        with self._unseeded_lock:
+            unseeded = coord_ws_id in self._unseeded
+        if unseeded:
+            self._rebuild_children_registry(coord_ws_id)
+            with self._unseeded_lock:
+                if coord_ws_id in self._unseeded:
+                    raise ChildrenUnreadableError(
+                        f"the children of coordinator {coord_ws_id[:8]} could not be read"
+                    )
         return self._registry.children_of(coord_ws_id)
 
     # ------------------------------------------------------------------

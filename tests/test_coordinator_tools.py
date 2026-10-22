@@ -323,6 +323,8 @@ def test_spawn_exec_treats_missing_ws_id_on_success_path_as_error(coord_session)
     item = sess._prepare_tool(_tc("spawn_workstream", {"initial_message": "hi"}))
     _call_id, output = sess._exec_spawn_workstream(item)
     assert "no ws_id" in output
+    # The child may exist, so the model checks before it retries.
+    assert "check with list_workstreams before retrying" in output
     assert ui.tool_results[-1][3] is True  # is_error
 
 
@@ -1748,6 +1750,18 @@ def test_spawn_batch_exec_surfaces_per_item_errors_in_denied(coord_session):
     assert "skill not found" in body["denied"][0]["reason"]
 
 
+def test_spawn_batch_exec_says_a_child_without_a_ws_id_may_exist(coord_session):
+    """A success-shaped reply with no ``ws_id`` leaves the child's existence
+    unknown, so its denied row says to check before retrying."""
+    sess, coord, _ui = coord_session
+    coord.spawn.return_value = {"name": "n", "node_id": "node-auto", "status": 200}
+    item = sess._prepare_tool(_tc("spawn_batch", {"children": _three_children()}))
+    _call_id, output = sess._exec_spawn_batch(item)
+    denied = json.loads(output)["denied"]
+    assert [d["idx"] for d in denied] == [0, 1, 2]
+    assert all("check with list_workstreams before retrying" in d["reason"] for d in denied)
+
+
 def test_spawn_batch_exec_stops_spawning_after_cancel(coord_session):
     """A cancel mid-batch stops creating the REST of the children.  The
     already-spawned child stays in ``results`` (it is a live remote
@@ -2051,6 +2065,23 @@ def test_close_all_children_exec_surfaces_client_exception(coord_session):
     item = sess._prepare_tool(_tc("close_all_children", {}))
     _call_id, output = sess._exec_close_all_children(item)
     assert "boom" in output
+    assert ui.tool_results[-1][3] is True
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [{"raw": "[]", "status": 200}, {"status": "ok", "closed": ["c-1"]}],
+    ids=["unparsed", "missing-lists"],
+)
+def test_close_all_children_exec_reports_an_unreadable_reply_as_an_error(coord_session, reply):
+    """A reply the client couldn't read as the route's object says nothing
+    about which children closed, so it is an error, not "closed 0"."""
+    sess, coord, ui = coord_session
+    coord.close_all_children.return_value = reply
+    item = sess._prepare_tool(_tc("close_all_children", {}))
+    _call_id, output = sess._exec_close_all_children(item)
+    assert output.startswith("Error: the close_all_children reply could not be read")
+    assert "check them with list_workstreams before retrying" in output
     assert ui.tool_results[-1][3] is True
 
 

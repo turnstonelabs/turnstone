@@ -130,6 +130,39 @@ def _build_mgr(storage: Any) -> SessionManager:
     return _build_mgr_with_factory(storage, _sf)
 
 
+def _rehydrate_with_children_down(
+    storage: Any, monkeypatch: Any, child_ws_ids: Iterable[str]
+) -> tuple[SessionManager, Any, str, dict[str, Any]]:
+    """Open a stored coordinator in a fresh manager while its children query fails.
+
+    The fresh manager stands in for a console restart, so its children
+    registry starts empty and the open seeds it from storage. The query for
+    the coordinator's children raises while ``down["on"]`` is true, and
+    ``down["calls"]`` counts how often it ran. Returns the manager, the opened
+    workstream, its id and ``down``.
+    """
+    coord_id = _build_mgr(storage).create(user_id="user-1", name="coord-a").id
+    for child_ws_id in child_ws_ids:
+        storage.register_workstream(
+            child_ws_id, kind="interactive", parent_ws_id=coord_id, user_id="user-1"
+        )
+    real = storage.list_workstreams
+    down: dict[str, Any] = {"on": True, "calls": 0}
+
+    def _flaky(*args: Any, **kwargs: Any) -> Any:
+        if kwargs.get("parent_ws_id") == coord_id:
+            down["calls"] += 1
+            if down["on"]:
+                raise RuntimeError("statement timeout")
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(storage, "list_workstreams", _flaky)
+    mgr = _build_mgr(storage)
+    ws = mgr.open(coord_id)
+    assert ws is not None
+    return mgr, ws, coord_id, down
+
+
 class MockStorage:
     """Minimal storage mock that implements ``list_services``.
 

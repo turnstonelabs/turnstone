@@ -1278,18 +1278,18 @@ async def cluster_node_detail(request: Request) -> JSONResponse:
     storage = getattr(request.app.state, "auth_storage", None)
     if storage is not None:
         try:
-            raw = storage.get_node_metadata(node_id)
-            entries = []
-            for r in raw:
-                try:
-                    val = _nd_json.loads(r["value"])
-                except (ValueError, TypeError):
-                    val = r["value"]
-                entries.append({"key": r["key"], "value": val, "source": r["source"]})
-            detail["metadata"] = entries
+            raw = await asyncio.to_thread(storage.get_node_metadata, node_id)
         except Exception:
             log.warning("cluster.node_metadata_load_failed node_id=%s", node_id, exc_info=True)
-            detail["metadata"] = []
+            return JSONResponse({"error": "node metadata could not be read"}, status_code=503)
+        entries = []
+        for r in raw:
+            try:
+                val = _nd_json.loads(r["value"])
+            except (ValueError, TypeError, RecursionError):
+                val = r["value"]
+            entries.append({"key": r["key"], "value": val, "source": r["source"]})
+        detail["metadata"] = entries
     else:
         detail["metadata"] = []
     return JSONResponse(detail)
@@ -2480,7 +2480,7 @@ async def route_create(request: Request) -> Response:
         storage = getattr(request.app.state, "auth_storage", None)
         if storage is not None:
             try:
-                row = storage.get_workstream(destination_ws_id)
+                row = await asyncio.to_thread(storage.get_workstream, destination_ws_id)
                 stored_node = row.get("node_id") if isinstance(row, dict) else None
                 if isinstance(stored_node, str) and stored_node:
                     bound_node_id = stored_node
@@ -4977,10 +4977,41 @@ async def _cascade_cancel_to_children(
     if _require_admin_coordinator(request, allow_service_bypass=False) is not None:
         log.debug("coordinator.cancel_cascade.skipped_unauthorized ws=%s", ws_id[:8])
         return None
+    from turnstone.console.coordinator_adapter import ChildrenUnreadableError
+
     coord_adapter = getattr(request.app.state, "coord_adapter", None)
     if coord_adapter is None:
         return None
-    child_ids = list(coord_adapter.children_snapshot(ws_id))
+    try:
+        child_ids = await asyncio.to_thread(coord_adapter.children_snapshot, ws_id)
+    except ChildrenUnreadableError:
+        # The coordinator's own cancel already happened. Its children can't
+        # be reached without their ids, so record that instead of skipping
+        # them quietly.
+        log.warning("coordinator.cancel_cascade.children_unreadable ws=%s", ws_id[:8])
+        audit_storage, _audit_err = require_storage_or_503(request)
+        if audit_storage is None:
+            return None
+        audit_user_id = _auth_user_id(request)
+        audit_host = request.client.host if request.client else ""
+
+        async def _record_unreadable() -> None:
+            await _emit_coord_audit(
+                audit_storage,
+                audit_user_id,
+                "coordinator.cancel_cascaded",
+                ws_id,
+                {
+                    "src": "coordinator",
+                    "error": "the coordinator's children could not be read",
+                    "cancelled": [],
+                    "failed": [],
+                    "skipped": [],
+                },
+                audit_host,
+            )
+
+        return BackgroundTask(_record_unreadable)
     if not child_ids:
         return None
     session = getattr(ws, "session", None)
@@ -5060,7 +5091,22 @@ async def coordinator_close_all_children(request: Request) -> JSONResponse:
             status_code=400,
         )
 
-    child_ids = list(coord_adapter.children_snapshot(ws_id)) if coord_adapter is not None else []
+    from turnstone.console.coordinator_adapter import ChildrenUnreadableError
+
+    child_ids: list[str] = []
+    if coord_adapter is not None:
+        try:
+            child_ids = await asyncio.to_thread(coord_adapter.children_snapshot, ws_id)
+        except ChildrenUnreadableError:
+            return JSONResponse(
+                {
+                    "error": (
+                        "the coordinator's children could not be read, so none was "
+                        "closed; retry after storage recovers"
+                    )
+                },
+                status_code=503,
+            )
 
     coord_client: Any = getattr(session, "_coord_client", None)
     closed, failed, skipped = await _fanout_on_children(

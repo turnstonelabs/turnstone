@@ -218,7 +218,7 @@ CONSOLE_ENDPOINTS: list[EndpointSpec] = [
         "GET",
         "Single node detail",
         response_model=NodeDetailResponse,
-        error_codes=[404],
+        error_codes=[404, 503],
         tags=["Cluster"],
     ),
     EndpointSpec(

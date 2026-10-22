@@ -1072,3 +1072,31 @@ class TestCoordinatorAdapterDispatchChildEvent:
             }
         )
         assert not event.is_set(), "bus notify fired for ws_id the dispatch dropped"
+
+
+def test_a_failed_children_seed_is_retried_by_the_snapshot_not_the_event_fan_out(
+    tmp_path: Any, monkeypatch: Any, sqlite_backend_factory: Any
+) -> None:
+    """A coordinator rehydrated while its children query fails can't route its
+    stored children's events.  The fan-out thread delivers every coordinator's
+    events, so it never reads storage to find them; the snapshot a close-all or
+    a cancel takes retries the read, and the children route once it succeeds."""
+    from tests._coord_test_helpers import _rehydrate_with_children_down
+    from turnstone.console.coordinator_adapter import ChildrenUnreadableError
+
+    storage = sqlite_backend_factory(str(tmp_path / "coord.db"))
+    child = "c" * 32
+    mgr, _ws, coord_id, down = _rehydrate_with_children_down(storage, monkeypatch, [child])
+    adapter = mgr._adapter
+    event = {"type": "cluster_state", "ws_id": child, "state": "idle"}
+    assert down["calls"] == 1  # the seed on open
+
+    adapter._dispatch_child_event(event)
+    assert down["calls"] == 1  # the fan-out read nothing
+    assert adapter._registry.parent_for(child) is None
+    with pytest.raises(ChildrenUnreadableError):
+        adapter.children_snapshot(coord_id)
+
+    down["on"] = False
+    assert adapter.children_snapshot(coord_id) == [child]
+    assert adapter._registry.parent_for(child) == coord_id

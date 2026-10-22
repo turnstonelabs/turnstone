@@ -1323,7 +1323,7 @@ frozen.
   that retry can't refresh the cluster's membership or resolve the workstream's route, the proxy
   answers 503 instead of passing on a 404 it couldn't check. A failed membership read there, or on
   any routed request while the console knows no live node, answers 503 instead of a plain-text
-  500. The node's API spec and reference list the 503.
+  500. The node's API spec and reference list the coded 503.
 - **Every coordinator route checks a coordinator the same way, an outage included.** The console's
   coordinator routes share one access check. When a coordinator isn't loaded and its row can't be
   read, the check answers the same 404 "coordinator not found" as for an id that names nothing, so
@@ -1345,7 +1345,14 @@ frozen.
   `message: null`, as for any message the wait couldn't read, instead of the child's last assistant
   turn. `list_nodes` answers an error to retry when it can't read which nodes are live, instead of
   offering every node that ever registered, and says to retry instead of quoting the storage error
-  when it can't read their metadata.
+  when it can't read their metadata. A stored node value nested too deeply to parse is listed raw
+  instead of failing the whole listing. `close_all_children` reports a reply it can't read as an
+  error instead of "closed 0". That error, and a spawn whose reply carries no ws_id, tell the model
+  to check `list_workstreams` before retrying, since the children may already have changed, and
+  `list_workstreams` says to retry instead of quoting the storage error when it can't read them. A
+  coordinator reopened while its children can't be read no longer takes them for none:
+  `close_all_children` answers an error to retry instead of "closed 0", and a cancel records that
+  it couldn't reach them instead of cascading to nobody.
 - **Other reads that fail say so instead of looking empty.** The coordinator metrics route answers
   503 when one of its reads fails, where it reported zeros that read as a healthy, idle
   coordinator. The cluster detail route answers 503 when it can't read the message tail it was
@@ -1354,12 +1361,14 @@ frozen.
   workstream's settings, where it showed stored reasoning that the model's settings may hide. The
   coordinator page's tasks and children panes say they couldn't be loaded, instead of "no tasks
   yet" or "no children spawned yet", until one of their loads succeeds; children that live updates
-  add in the meantime are marked as only part of the list.
+  add in the meantime are marked as only part of the list. The cluster node detail route answers
+  503 when it can't read the node's metadata, instead of showing none.
 - **Inspecting a child and checking access on a node cost less.** `inspect_workstream` reads the
   messages it returns, plus some slack, instead of the child's whole history and its attachments,
   and asks the console for no message tail it would discard. On a server node, the access check
   behind send, speech to text and the command route reads the workstream's row in a worker thread,
-  so a slow database no longer stalls every request on the node.
+  so a slow database no longer stalls every request on the node. The console's create proxy and
+  node detail route read storage in a worker thread too.
 
 ### Security
 

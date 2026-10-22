@@ -212,6 +212,39 @@ class TestRouteCreate:
         assert app.state.proxy_client.post.call_args.kwargs["json"]["resume_ws_exact"] is True
         client.close()
 
+    def test_route_create_reads_the_bound_node_off_the_event_loop(self):
+        """After the create, the console reads the new row for the node it is
+        bound to.  The read runs in a worker thread, so a slow or failing read
+        can't stall the console's event loop."""
+        on_loop: list[bool] = []
+
+        def _get_workstream(ws_id: str) -> dict[str, Any]:
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                on_loop.append(False)
+            else:
+                on_loop.append(True)
+            return {"ws_id": ws_id, "node_id": "node-z"}
+
+        router = _make_mock_router()
+        storage = MagicMock()
+        storage.get_workstream.side_effect = _get_workstream
+        app = _make_app(router=router, auth_storage=storage)
+        _wire_proxy(app, _make_proxy_post(json_data={"ws_id": _DEST_WS_ID, "name": "test"}))
+        client = TestClient(app, raise_server_exceptions=False)
+        resp = client.post(
+            "/v1/api/route/workstreams/new",
+            json={"name": "test"},
+            headers=_TEST_AUTH_HEADERS,
+        )
+        client.close()
+
+        assert resp.status_code == 200
+        assert resp.json()["node_id"] == "node-z"
+        assert on_loop
+        assert not any(on_loop)
+
     def test_route_create_target_node(self):
         """An explicit target is persisted without constraining the ID hash."""
         router = _make_mock_router()

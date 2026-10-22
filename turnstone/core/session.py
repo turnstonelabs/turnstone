@@ -22014,7 +22014,10 @@ class ChatSession:
         # ``_exec_spawn_batch`` (denied row on empty ws_id).
         child_ws_id = str(result.get("ws_id") or "")
         if not child_ws_id:
-            msg = "Error: spawn returned no ws_id"
+            msg = (
+                "Error: spawn's reply carried no ws_id, so whether the child was created "
+                "is unknown; check with list_workstreams before retrying"
+            )
             self._report_tool_result(call_id, "spawn_workstream", msg, is_error=True)
             return call_id, msg
         # Successful spawn — surface child_ws_id + node_id + name +
@@ -22221,7 +22224,15 @@ class ChatSession:
                 continue
             ws_id = str(result.get("ws_id") or "")
             if not ws_id:
-                denied.append({"idx": idx, "reason": "spawn returned no ws_id"})
+                denied.append(
+                    {
+                        "idx": idx,
+                        "reason": (
+                            "spawn's reply carried no ws_id, so whether the child was "
+                            "created is unknown; check with list_workstreams before retrying"
+                        ),
+                    }
+                )
                 continue
             results[str(idx)] = {
                 # ``child_ws_id`` (not ``ws_id``) — see the matching
@@ -22498,15 +22509,25 @@ class ChatSession:
                 {"call_id": call_id, "op": "close_all_children", "error": str(e)},
             )
             return call_id, msg
-        if result.get("error"):
-            msg = f"Error: {result['error']}"
+        error = result.get("error")
+        if not error and not all(
+            isinstance(result.get(key), list) for key in ("closed", "failed", "skipped")
+        ):
+            # A reply the client couldn't read as the route's object (it hands
+            # one back raw) says nothing about which children closed.
+            error = (
+                "the close_all_children reply could not be read, so which children closed "
+                "is unknown; check them with list_workstreams before retrying"
+            )
+        if error:
+            msg = f"Error: {error}"
             self._report_tool_result(call_id, "close_all_children", msg, is_error=True)
             self._emit_batch_event(
                 "batch_ended",
                 {
                     "call_id": call_id,
                     "op": "close_all_children",
-                    "error": str(result["error"]),
+                    "error": str(error),
                 },
             )
             return call_id, msg

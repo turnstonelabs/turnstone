@@ -20,6 +20,7 @@ from tests._coord_test_helpers import (
     _build_mgr,
     _fake_registry,
     _FakeConfigStore,
+    _rehydrate_with_children_down,
     _seed_children,
 )
 from turnstone.console.server import coordinator_close_all_children
@@ -149,6 +150,30 @@ def test_close_all_children_empty_children_still_audits(storage):
     assert [
         e for e in storage.list_audit_events() if e["action"] == "coordinator.closed_all_children"
     ]
+
+
+def test_close_all_children_answers_503_until_a_failed_children_read_succeeds(storage, monkeypatch):
+    """A coordinator rehydrated while its children query fails doesn't know its
+    children: close-all answers 503 and closes nothing, where it reported
+    "closed 0", and once the query works again it closes them all."""
+    children = ["c" * 32, "d" * 32]
+    mgr, ws, coord_id, down = _rehydrate_with_children_down(storage, monkeypatch, children)
+    coord_client = MagicMock()
+    coord_client.close_workstream.return_value = {"status": "ok"}
+    ws.session = MagicMock()
+    ws.session._coord_client = coord_client
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    url = f"/v1/api/workstreams/{coord_id}/close_all_children"
+
+    resp = client.post(url, json={}, headers=_COORD_HEADERS)
+    assert resp.status_code == 503
+    assert "children could not be read" in resp.json()["error"]
+    coord_client.close_workstream.assert_not_called()
+
+    down["on"] = False
+    resp = client.post(url, json={}, headers=_COORD_HEADERS)
+    assert resp.status_code == 200
+    assert sorted(resp.json()["closed"]) == children
 
 
 def test_close_all_children_without_coord_client_marks_all_failed(storage):

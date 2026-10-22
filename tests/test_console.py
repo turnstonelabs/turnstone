@@ -1313,6 +1313,68 @@ class TestConsoleHTTPEndpoints:
         assert status == 404
         assert "error" in data
 
+    def test_get_node_detail_attaches_decoded_metadata(self, client, mock_collector):
+        """The metadata read runs in a worker thread, off the event loop."""
+        on_loop: list[bool] = []
+
+        def _get_node_metadata(node_id: str) -> list[dict[str, str]]:
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                on_loop.append(False)
+            else:
+                on_loop.append(True)
+            return [
+                {"key": "arch", "value": '"x86_64"', "source": "auto"},
+                {"key": "notes", "value": "not json", "source": "user"},
+            ]
+
+        storage = MagicMock()
+        storage.get_node_metadata.side_effect = _get_node_metadata
+        client.app.state.auth_storage = storage
+        status, data = self._get(client, "/v1/api/cluster/node/node-a")
+        assert status == 200
+        assert data["metadata"] == [
+            {"key": "arch", "value": "x86_64", "source": "auto"},
+            {"key": "notes", "value": "not json", "source": "user"},
+        ]
+        assert on_loop == [False]
+
+    def test_get_node_detail_answers_503_when_its_metadata_cannot_be_read(
+        self, client, mock_collector
+    ):
+        """A failed metadata read is an error, not a node with no metadata."""
+        storage = MagicMock()
+        storage.get_node_metadata.side_effect = RuntimeError("storage down")
+        client.app.state.auth_storage = storage
+        status, data = self._get(client, "/v1/api/cluster/node/node-a")
+        assert status == 503
+        assert data == {"error": "node metadata could not be read"}
+
+    def test_get_node_detail_shows_a_value_too_deep_to_parse_raw(
+        self, client, mock_collector, monkeypatch
+    ):
+        """A stored value nested deeper than the JSON parser can follow raises
+        ``RecursionError`` (Python 3.13 at about 10,000 levels), so only the
+        patched decoder reaches it here.  It is shown raw, like any other value
+        that can't be parsed."""
+        real_loads = json.loads
+
+        def _loads(s: Any, *a: Any, **kw: Any) -> Any:
+            if s == '"deep"':
+                raise RecursionError("maximum recursion depth exceeded while decoding a JSON array")
+            return real_loads(s, *a, **kw)
+
+        storage = MagicMock()
+        storage.get_node_metadata.return_value = [
+            {"key": "notes", "value": '"deep"', "source": "user"},
+        ]
+        client.app.state.auth_storage = storage
+        monkeypatch.setattr(json, "loads", _loads)
+        status, data = self._get(client, "/v1/api/cluster/node/node-a")
+        assert status == 200
+        assert data["metadata"] == [{"key": "notes", "value": '"deep"', "source": "user"}]
+
     def test_get_snapshot(self, client, mock_collector):
         status, data = self._get(client, "/v1/api/cluster/snapshot")
         assert status == 200
