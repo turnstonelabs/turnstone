@@ -296,8 +296,8 @@ close_all_children(reason='benchmark complete')
 ```
 
 Prefer `spawn_batch` over 3 individual `spawn_workstream` calls —
-one approval instead of three, one audit trail, deterministic
-sibling ordering.  Pair with `wait_for_workstream(mode='all')` and
+one approval instead of three, one audit trail, results keyed by
+input index.  Pair with `wait_for_workstream(mode='all')` and
 `close_all_children(reason=...)` to wind the fan-out down in one
 approval each.
 

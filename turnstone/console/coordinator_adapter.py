@@ -636,12 +636,12 @@ class CoordinatorAdapter:
     def children_snapshot(self, coord_ws_id: str) -> list[str]:
         """Return a snapshot of the coordinator's direct child ws_ids.
 
-        Used by the cancel cascade and ``close_all_children`` to iterate
-        children without holding the registry lock during the per-child
-        HTTP dispatch. A mutation racing with the snapshot (child spawned mid-cascade)
-        either lands before (cancelled) or after (out of scope for
-        this batch) — both safe. Returns an empty list for unknown
-        coordinators.
+        Used by the cancel cascade and ``close_all_children`` to iterate children without holding
+        the registry lock during the per-child HTTP dispatch. The registry fills from children's
+        creation events, so the cascade leaves out a child whose create was in flight when the Stop
+        landed, or whose event hasn't arrived yet. ``spawn_batch`` cancels each child whose create
+        returns after its coordinator was stopped; any other child left out keeps running. Returns
+        an empty list for unknown coordinators.
 
         When the coordinator's stored children couldn't be read on
         rehydrate, this retries that read first, so async callers run it

@@ -10,6 +10,7 @@ Phase D's test_coordinator_end_to_end.
 from __future__ import annotations
 
 import json
+import threading
 from typing import Any
 from unittest.mock import ANY, MagicMock, patch
 
@@ -1752,62 +1753,114 @@ def test_spawn_batch_prepare_builds_approval_card(coord_session):
     assert "(idle)" in item["preview"]
 
 
-def test_spawn_batch_exec_serialises_spawns_and_returns_results(coord_session):
+def _spawned_child(**kwargs: Any) -> dict[str, Any]:
+    """A successful spawn reply whose ws_id names its spec, so a result row can be matched to the
+    child it came from whatever order the creates ran in."""
+    return {
+        "ws_id": f"child-{kwargs.get('name') or kwargs['initial_message']}",
+        "name": kwargs.get("name") or "auto",
+        "node_id": kwargs.get("target_node") or "node-auto",
+        "status": 200,
+    }
+
+
+def test_spawn_batch_exec_spawns_every_child_and_returns_results(coord_session):
     sess, coord, _ui = coord_session
     spawned: list[dict[str, Any]] = []
 
     def _spawn(**kwargs):
-        n = len(spawned)
-        ws = {
-            "ws_id": f"child-{n}",
-            "name": kwargs.get("name") or f"auto-{n}",
-            "node_id": kwargs.get("target_node") or "node-auto",
-            "status": 200,
-        }
         spawned.append(kwargs)
-        return ws
+        return _spawned_child(**kwargs)
 
     coord.spawn.side_effect = _spawn
     item = sess._prepare_tool(_tc("spawn_batch", {"children": _three_children()}))
     _call_id, output = sess._exec_spawn_batch(item)
 
-    # Three serial spawn() calls, in input order.
+    # One spawn() call per child, each carrying its own spec.
+    by_message = {s["initial_message"]: s for s in spawned}
     assert len(spawned) == 3
-    assert [s["initial_message"] for s in spawned] == ["benchmark A", "benchmark B", ""]
-    assert spawned[0]["skill"] == "researcher"
-    assert spawned[1]["target_node"] == "n-1"
-    assert spawned[2]["name"] == "idle-child"
+    assert set(by_message) == {"benchmark A", "benchmark B", ""}
+    assert by_message["benchmark A"]["skill"] == "researcher"
+    assert by_message["benchmark B"]["target_node"] == "n-1"
+    assert by_message[""]["name"] == "idle-child"
 
     body = json.loads(output)
     assert "truncated" not in body  # prepare hard-errors >10, no truncate state
     assert body["denied"] == []
-    # Keyed by input index (stringified).
+    # Keyed by input index (stringified), each row from its own child's reply.
     assert set(body["results"].keys()) == {"0", "1", "2"}
-    assert body["results"]["0"]["child_ws_id"] == "child-0"
+    assert body["results"]["0"]["child_ws_id"] == "child-benchmark A"
     assert body["results"]["1"]["node_id"] == "n-1"
-    assert body["results"]["2"]["child_ws_id"] == "child-2"
+    assert body["results"]["2"]["child_ws_id"] == "child-idle-child"
     # Confirm we don't leak the old ``ws_id`` key alongside the new
     # ``child_ws_id`` — see test_spawn_exec_does_not_surface_misleading_status_field
     # for the rationale on the rename.
     assert "ws_id" not in body["results"]["0"]
+    # Nobody stopped the batch, so it cancels nothing.
+    coord.cancel.assert_not_called()
+    coord.emit_audit.assert_not_called()
+
+
+def test_spawn_batch_exec_sends_every_child_at_once(coord_session):
+    """Every child's create is in flight together, however many the batch holds
+    (#1457): one after another, a stalled console or node made each child wait
+    out its timeout in turn.  The barrier lets a create through only once every
+    one has been sent, so creates sent one at a time, or on a pool narrower than
+    the batch, fail here as broken-barrier denials."""
+    sess, coord, _ui = coord_session
+    cap = sess._SPAWN_BATCH_MAX_CHILDREN
+    barrier = threading.Barrier(cap, timeout=10)
+
+    def _spawn(**kwargs):
+        barrier.wait()
+        return _spawned_child(**kwargs)
+
+    coord.spawn.side_effect = _spawn
+    children = [{"initial_message": f"brief {i}"} for i in range(cap)]
+    item = sess._prepare_tool(_tc("spawn_batch", {"children": children}))
+    _call_id, output = sess._exec_spawn_batch(item)
+    body = json.loads(output)
+    assert body["denied"] == []
+    assert set(body["results"].keys()) == {str(i) for i in range(cap)}
+
+
+def test_spawn_batch_exec_never_sends_a_row_prepare_denied(coord_session, monkeypatch):
+    """A row _prepare refused is never sent, and keeps its own reason while the
+    batch's valid rows are created.  The high-risk skill row carries every field
+    a create needs, so only the refusal keeps it from being sent."""
+    sess, coord, _ui = coord_session
+    monkeypatch.setattr(
+        sess,
+        "_high_risk_skill_denied",
+        lambda name: "skill 'danger' is high-risk" if name == "danger" else "",
+    )
+    coord.spawn.side_effect = _spawned_child
+    children = [
+        {"initial_message": "a"},
+        {"initial_message": "b", "skill": "danger"},
+        "not an object",
+        {"initial_message": "d"},
+    ]
+    item = sess._prepare_tool(_tc("spawn_batch", {"children": children}))
+    _call_id, output = sess._exec_spawn_batch(item)
+    body = json.loads(output)
+
+    assert sorted(c.kwargs["initial_message"] for c in coord.spawn.call_args_list) == ["a", "d"]
+    assert set(body["results"].keys()) == {"0", "3"}
+    assert body["denied"] == [
+        {"idx": 1, "reason": "skill 'danger' is high-risk"},
+        {"idx": 2, "reason": "child spec must be an object"},
+    ]
 
 
 def test_spawn_batch_exec_surfaces_per_item_errors_in_denied(coord_session):
     sess, coord, _ui = coord_session
 
-    counter = {"n": 0}
-
     def _spawn(**kwargs):
         msg = kwargs.get("initial_message", "")
         if msg == "benchmark B":
             return {"error": "skill not found: researcher", "status": 400}
-        counter["n"] += 1
-        return {
-            "ws_id": f"child-{counter['n']}",
-            "name": "n",
-            "node_id": "node-auto",
-            "status": 200,
-        }
+        return _spawned_child(**kwargs)
 
     coord.spawn.side_effect = _spawn
     item = sess._prepare_tool(_tc("spawn_batch", {"children": _three_children()}))
@@ -1831,33 +1884,255 @@ def test_spawn_batch_exec_says_a_child_without_a_ws_id_may_exist(coord_session):
     assert all("check with list_workstreams before retrying" in d["reason"] for d in denied)
 
 
-def test_spawn_batch_exec_stops_spawning_after_cancel(coord_session):
-    """A cancel mid-batch stops creating the REST of the children.  The
-    already-spawned child stays in ``results`` (it is a live remote
-    workstream); the remainder are marked not-spawned rather than created."""
+def test_spawn_batch_exec_cancel_holds_back_unsent_children(coord_session):
+    """A cancel that lands before a child's create is sent holds that child
+    back: nothing is created, each child is reported not spawned, and a row
+    _prepare refused keeps its own reason."""
     sess, coord, _ui = coord_session
+    children = [*_three_children(), "not an object"]
+    item = sess._prepare_tool(_tc("spawn_batch", {"children": children}))
+    sess._cancel_event.set()
+    _call_id, output = sess._exec_spawn_batch(item)
+    body = json.loads(output)
 
-    spawned: list[dict[str, Any]] = []
+    coord.spawn.assert_not_called()
+    coord.cancel.assert_not_called()
+    assert body["results"] == {}
+    assert body["denied"] == [
+        {"idx": 0, "reason": "not spawned: cancelled"},
+        {"idx": 1, "reason": "not spawned: cancelled"},
+        {"idx": 2, "reason": "not spawned: cancelled"},
+        {"idx": 3, "reason": "child spec must be an object"},
+    ]
+
+
+def test_spawn_batch_exec_remembers_a_stop_whose_event_was_cleared(coord_session):
+    """send() clears the cancel event once a Stop unwinds it.  The batch's
+    approval witness remembers the Stop, so a create not yet sent is still held
+    back."""
+    from turnstone.core.session import _ApprovalCancelWitness
+
+    sess, coord, _ui = coord_session
+    item = sess._prepare_tool(_tc("spawn_batch", {"children": _three_children()}))
+    item["_approval_cancel_witness"] = _ApprovalCancelWitness(sess, sess._cancel_event)
+    sess.cancel()
+    sess._cancel_event.clear()
+    _call_id, output = sess._exec_spawn_batch(item)
+    body = json.loads(output)
+
+    coord.spawn.assert_not_called()
+    assert all(d["reason"] == "not spawned: cancelled" for d in body["denied"])
+
+
+def test_spawn_batch_exec_cancels_children_created_after_a_stop(coord_session):
+    """A Stop that lands while the creates are in flight can't hold them back,
+    and the console's cancel cascade can't reach children that didn't exist
+    when it ran, so the batch cancels each child whose create returns after the
+    Stop and audits the cancels.  The batch's JSON still lists the children;
+    after a Stop the executor admits none of the turn's results, so the model
+    finds them with list_workstreams."""
+    sess, coord, _ui = coord_session
+    barrier = threading.Barrier(3, timeout=10)
 
     def _spawn(**kwargs):
-        n = len(spawned)
-        spawned.append(kwargs)
-        # Owner cancels right after the first child is created.
+        # Every create is in flight when the owner stops the coordinator.
+        barrier.wait()
         sess._cancel_event.set()
-        return {"ws_id": f"child-{n}", "name": "n", "node_id": "node", "status": 200}
+        return _spawned_child(**kwargs)
 
     coord.spawn.side_effect = _spawn
+    coord.cancel.return_value = {"status": 200}
     item = sess._prepare_tool(_tc("spawn_batch", {"children": _three_children()}))
     _call_id, output = sess._exec_spawn_batch(item)
     body = json.loads(output)
 
-    # Only the first child was actually spawned — the cancel halted the rest.
-    assert len(spawned) == 1
-    assert set(body["results"].keys()) == {"0"}
-    assert body["results"]["0"]["child_ws_id"] == "child-0"
-    # The remaining two are reported not-spawned (cancelled), not created.
-    cancelled = [d for d in body["denied"] if "cancelled" in d["reason"].lower()]
-    assert {d["idx"] for d in cancelled} == {1, 2}
+    created = sorted(row["child_ws_id"] for row in body["results"].values())
+    assert len(created) == 3
+    assert body["denied"] == []
+    assert sorted(c.args[0] for c in coord.cancel.call_args_list) == created
+    coord.emit_audit.assert_called_once_with(
+        "coordinator.cancel_cascaded",
+        {"src": "spawn_batch", "cancelled": created, "failed": []},
+    )
+
+
+def test_spawn_batch_exec_leaves_children_created_before_a_stop_to_the_cascade(
+    coord_session, monkeypatch
+):
+    """The batch cancels only the children whose create returns after the Stop.
+    A child created before it is the console's cancel cascade's to stop, so the
+    batch sends it no cancel of its own."""
+    from turnstone.core import session as session_mod
+
+    sess, coord, _ui = coord_session
+    futures: list[Any] = []
+    submit = session_mod._CtrlCSafeThreadPool.submit
+
+    def _submit(self, fn, /, *args, **kwargs):
+        future = submit(self, fn, *args, **kwargs)
+        futures.append(future)
+        return future
+
+    monkeypatch.setattr(session_mod._CtrlCSafeThreadPool, "submit", _submit)
+    late = threading.Barrier(2, timeout=10)
+
+    def _spawn(**kwargs):
+        if kwargs["initial_message"] == "benchmark A":
+            return _spawned_child(**kwargs)
+        # Both later creates are in flight; they return once A's create has
+        # been reported, and the Stop lands in between.
+        late.wait()
+        futures[0].result(timeout=10)
+        sess._cancel_event.set()
+        return _spawned_child(**kwargs)
+
+    coord.spawn.side_effect = _spawn
+    coord.cancel.return_value = {"status": 200}
+    item = sess._prepare_tool(_tc("spawn_batch", {"children": _three_children()}))
+    _call_id, output = sess._exec_spawn_batch(item)
+    body = json.loads(output)
+
+    assert set(body["results"].keys()) == {"0", "1", "2"}
+    assert sorted(c.args[0] for c in coord.cancel.call_args_list) == [
+        "child-benchmark B",
+        "child-idle-child",
+    ]
+
+
+def test_spawn_batch_exec_audits_a_child_cancel_that_fails(coord_session):
+    """The batch's cancel of a child created after a Stop is best effort: one
+    that raises or answers an error is audited as failed, and every child is
+    still reported."""
+    sess, coord, _ui = coord_session
+    barrier = threading.Barrier(3, timeout=10)
+
+    def _spawn(**kwargs):
+        barrier.wait()
+        sess._cancel_event.set()
+        return _spawned_child(**kwargs)
+
+    def _cancel(ws_id):
+        if ws_id == "child-benchmark A":
+            raise RuntimeError("console unreachable")
+        if ws_id == "child-benchmark B":
+            return {"error": "upstream unreachable: refused", "status": 0}
+        return {"status": 200}
+
+    coord.spawn.side_effect = _spawn
+    coord.cancel.side_effect = _cancel
+    item = sess._prepare_tool(_tc("spawn_batch", {"children": _three_children()}))
+    _call_id, output = sess._exec_spawn_batch(item)
+    body = json.loads(output)
+
+    assert set(body["results"].keys()) == {"0", "1", "2"}
+    coord.emit_audit.assert_called_once_with(
+        "coordinator.cancel_cascaded",
+        {
+            "src": "spawn_batch",
+            "cancelled": ["child-idle-child"],
+            "failed": ["child-benchmark A", "child-benchmark B"],
+        },
+    )
+
+
+def test_spawn_batch_exec_honours_a_force_cancel(coord_session):
+    """A force-cancel installs a fresh cancel event for the next turn, which
+    reads as clear.  The abandoned batch checks its own generation, so it sends
+    nothing rather than creating children nobody will see reported."""
+    from turnstone.core import session as session_mod
+
+    sess, coord, _ui = coord_session
+    item = sess._prepare_tool(_tc("spawn_batch", {"children": _three_children()}))
+    sess._generation = 7
+    abandoned, _error = sess.force_abandon_generation(
+        target_is_current=lambda: True,
+        clear_target=lambda: True,
+        publish_abandoned=lambda: None,
+    )
+    assert abandoned
+    assert not sess._cancel_event.is_set()
+    token = session_mod._active_tool_origin_generation.set(7)
+    try:
+        _call_id, output = sess._exec_spawn_batch(item)
+    finally:
+        session_mod._active_tool_origin_generation.reset(token)
+    body = json.loads(output)
+
+    coord.spawn.assert_not_called()
+    assert body["results"] == {}
+    assert all(d["reason"] == "not spawned: cancelled" for d in body["denied"])
+
+
+def test_spawn_batch_exec_cancels_children_created_after_a_force_cancel(coord_session):
+    """A force-cancel that lands while the creates are in flight installs a
+    fresh cancel event for the next turn.  The batch reads its own generation,
+    so it still cancels the children those creates return."""
+    from turnstone.core import session as session_mod
+
+    sess, coord, _ui = coord_session
+    sess._generation = 7
+    in_flight = threading.Barrier(3, timeout=10)
+    forced = threading.Event()
+
+    def _spawn(**kwargs):
+        if in_flight.wait() == 0:
+            sess.force_abandon_generation(
+                target_is_current=lambda: True,
+                clear_target=lambda: True,
+                publish_abandoned=lambda: None,
+            )
+            forced.set()
+        assert forced.wait(10)
+        return _spawned_child(**kwargs)
+
+    coord.spawn.side_effect = _spawn
+    coord.cancel.return_value = {"status": 200}
+    item = sess._prepare_tool(_tc("spawn_batch", {"children": _three_children()}))
+    token = session_mod._active_tool_origin_generation.set(7)
+    try:
+        _call_id, output = sess._exec_spawn_batch(item)
+    finally:
+        session_mod._active_tool_origin_generation.reset(token)
+    body = json.loads(output)
+
+    assert not sess._cancel_event.is_set()
+    created = sorted(row["child_ws_id"] for row in body["results"].values())
+    assert len(created) == 3
+    assert sorted(c.args[0] for c in coord.cancel.call_args_list) == created
+
+
+def test_spawn_batch_exec_reports_a_thread_that_fails_to_start(coord_session, monkeypatch):
+    """A thread that can't start (a process or thread limit) fails its submit
+    after the create was queued, so a running worker may still send it.  The
+    batch reports the children it created, that one as possibly sent and the
+    rest as not sent, rather than raising and losing the created children's ids."""
+    from turnstone.core import session as session_mod
+
+    sess, coord, _ui = coord_session
+    coord.spawn.side_effect = _spawned_child
+    submit = session_mod._CtrlCSafeThreadPool.submit
+    submits = {"n": 0}
+
+    def _submit(self, fn, /, *args, **kwargs):
+        future = submit(self, fn, *args, **kwargs)
+        submits["n"] += 1
+        if submits["n"] == 3:
+            raise RuntimeError("can't start new thread")
+        return future
+
+    monkeypatch.setattr(session_mod._CtrlCSafeThreadPool, "submit", _submit)
+    children = [{"initial_message": f"m{i}"} for i in range(4)]
+    item = sess._prepare_tool(_tc("spawn_batch", {"children": children}))
+    _call_id, output = sess._exec_spawn_batch(item)
+    body = json.loads(output)
+
+    # The third create was queued before its submit failed, so it still ran.
+    sent = sorted(c.kwargs["initial_message"] for c in coord.spawn.call_args_list)
+    assert sent == ["m0", "m1", "m2"]
+    assert set(body["results"].keys()) == {"0", "1"}
+    reasons = {d["idx"]: d["reason"] for d in body["denied"]}
+    assert "may still have been sent; check with list_workstreams" in reasons[2]
+    assert reasons[3] == "not spawned: the batch could not start a thread to send it"
 
 
 def test_spawn_batch_exec_continues_past_client_exception(coord_session):

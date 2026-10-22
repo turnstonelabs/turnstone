@@ -1244,3 +1244,43 @@ def test_does_not_deadlock_when_run_briefly_grabs_ws_lock() -> None:
     ws.worker_thread.join(timeout=2.0)
     assert session.send_calls == ["hello"]
     assert ws._worker_running is False
+
+
+def test_stop_before_the_first_turn_claims_keeps_it_from_running() -> None:
+    """A node's create dispatches a child's first message through
+    ``session_worker.send`` before it answers, and the worker slot captures the
+    session's cancel epoch.  A Stop that lands after the create answered but
+    before the worker claims its generation keeps the turn from running at all:
+    ``send()`` refuses at the claim, before the user row or any model call.
+    spawn_batch's cancel of a child created after its coordinator's Stop relies
+    on this."""
+    from turnstone.core.session import GenerationCancelled
+    from turnstone.core.trajectory import Role
+
+    session = make_session(user_id="alice")
+    ws = _make_ws(session)
+    may_claim = threading.Event()
+    outcome: list[str] = []
+
+    def _run_initial() -> None:
+        assert may_claim.wait(5)
+        try:
+            session.send("first brief")
+        except GenerationCancelled:
+            outcome.append("cancelled")
+        else:
+            outcome.append("ran")
+
+    assert session_worker.send(
+        ws,
+        enqueue=lambda: pytest.fail("a fresh workstream has no worker to reuse"),
+        run=_run_initial,
+        expected_session=session,
+    )
+    session.cancel()
+    may_claim.set()
+    assert ws.worker_thread is not None
+    ws.worker_thread.join(timeout=5.0)
+
+    assert outcome == ["cancelled"]
+    assert not any(turn.role is Role.USER for turn in session.messages)

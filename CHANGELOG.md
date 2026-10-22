@@ -260,6 +260,18 @@ frozen.
 
 ### Changed
 
+- **`spawn_batch` sends every child's create at once (#1457).** It sent them one after another,
+  and each create waits up to 30 seconds for the console, which waits up to 30 seconds for the
+  node, so a stalled console or node held the coordinator's call for up to five minutes. A stall
+  now costs about one timeout, and the children bound for healthy nodes are still created. A Stop
+  or force-cancel holds back only a child whose create hasn't been sent, which once the batch has
+  started is usually none of them. The console's cancel cascade reaches only the children it had
+  registered when the Stop landed, so the batch cancels each child whose create returns after the
+  stop, and audits those cancels as `coordinator.cancel_cascaded` with `src: spawn_batch`. The
+  children can be created in any order (`results` stays keyed by input index). With a node's rate
+  limiting on, a batch's creates arrive together and count against the one bucket that every
+  request the console forwards shares, so a `ratelimit.burst` below 10, or other console traffic,
+  can get some of them refused (#1464).
 - **The denial nudge no longer waits out `memory.nudge_cooldown` (#924).** The note asking the
   model whether a rejected tool call reflects a lasting preference now follows each batch a person
   rejects; the cooldown spaces only the correction and completion nudges and the coordinator's

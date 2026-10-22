@@ -22100,28 +22100,37 @@ class ChatSession:
             {"call_id": call_id, "op": "spawn_batch", "total": total},
         )
 
-        results: dict[str, dict[str, Any]] = {}
-        denied: list[dict[str, Any]] = []
-        for spec in children:
-            idx = spec["idx"]
-            # A cancel mid-batch stops creating the REST of the children —
-            # don't keep spawning workstreams the owner asked to stop.
-            # Cooperative: observed at this safe point between spawns, never
-            # mid-spawn.  Children already spawned this batch stay in
-            # ``results`` and are reported below (their ws_ids must survive —
-            # they are live remote workstreams, also durably parent-linked in
-            # storage); the rest are marked not-spawned.  Checked with the
-            # raw flag, not ``_check_cancelled``, so we fall through to the
-            # normal report path rather than raising and dropping the
-            # already-spawned ws_ids.
-            if self._cancel_event.is_set():
-                denied.append({"idx": idx, "reason": "not spawned: cancelled"})
-                continue
-            # Validation failures from _prepare surface here as denied
-            # rows — partial-success: don't abort the rest of the batch.
-            if "_error" in spec:
-                denied.append({"idx": idx, "reason": spec["_error"]})
-                continue
+        origin_generation = _active_tool_origin_generation.get()
+        witness = item.get("_approval_cancel_witness")
+        # Children whose create returned after the batch was stopped, each
+        # mapped to whether the cancel this batch sent it went through.
+        stop_cancels: dict[str, bool] = {}
+
+        def _batch_stopped() -> bool:
+            """Whether a Stop, force-cancel or close has reached this batch.
+
+            Read through the batch's own witness and generation, not the
+            session's current ``_cancel_event``: a force-cancel installs a
+            fresh event for the next turn, and send() clears the event once a
+            Stop unwinds it.
+            """
+            if witness is not None and witness.aborted:
+                return True
+            try:
+                self._check_cancelled(origin_generation)
+            except GenerationCancelled:
+                return True
+            return False
+
+        def _spawn_child(spec: dict[str, Any]) -> tuple[dict[str, Any] | None, str]:
+            """Create one child: ``(results row, "")``, or ``(None, denied reason)``."""
+            # A stopped batch holds back a create not yet sent.  Returned as a
+            # denied row rather than raised, so the batch still reports the
+            # creates that were sent; after a Stop, though, the executor admits
+            # none of the turn's results, and the model finds these children
+            # with list_workstreams.
+            if _batch_stopped():
+                return None, "not spawned: cancelled"
             try:
                 result = self._coord_client.spawn(
                     initial_message=spec["initial_message"],
@@ -22134,24 +22143,27 @@ class ChatSession:
                     persona=spec["persona"],
                 )
             except Exception as e:
-                denied.append({"idx": idx, "reason": f"spawn failed: {e}"})
-                continue
+                return None, f"spawn failed: {e}"
             if result.get("error"):
-                denied.append({"idx": idx, "reason": self._spawn_error(result)})
-                continue
+                return None, self._spawn_error(result)
             ws_id = str(result.get("ws_id") or "")
             if not ws_id:
-                denied.append(
-                    {
-                        "idx": idx,
-                        "reason": (
-                            "spawn's reply carried no ws_id, so whether the child was "
-                            "created is unknown; check with list_workstreams before retrying"
-                        ),
-                    }
+                return None, (
+                    "spawn's reply carried no ws_id, so whether the child was "
+                    "created is unknown; check with list_workstreams before retrying"
                 )
-                continue
-            results[str(idx)] = {
+            if _batch_stopped():
+                # The Stop's cascade cancels only the children the console had
+                # registered from their creation events when it landed, and
+                # this create's reply came after the Stop, so cancel the child
+                # here; a second cancel of one the cascade reached is harmless.
+                # Best effort: the audit below records a cancel that failed.
+                try:
+                    stop_cancels[ws_id] = not self._coord_client.cancel(ws_id).get("error")
+                except Exception:
+                    log.warning("spawn_batch.child_cancel_failed", ws_id=ws_id[:8], exc_info=True)
+                    stop_cancels[ws_id] = False
+            return {
                 # ``child_ws_id`` (not ``ws_id``) — see the matching
                 # comment in ``_exec_spawn_workstream``.
                 "child_ws_id": ws_id,
@@ -22162,7 +22174,73 @@ class ChatSession:
                 # proxy fills it with HTTP 200 on success, which the
                 # model can't usefully act on.  Errors land in
                 # ``denied[]`` instead.
-            }
+            }, ""
+
+        # Every child's create is sent at once (#1457).  Sent one after
+        # another, a stalled console or node made each child wait out its
+        # 30s timeout in turn, holding the call for minutes; at once, the
+        # batch waits about one timeout and the children bound for healthy
+        # nodes are still created.  Validation failures from _prepare are
+        # never sent and surface as denied rows — partial-success: they
+        # don't abort the rest of the batch.
+        sendable = [spec for spec in children if "_error" not in spec]
+        outcomes: dict[int, tuple[dict[str, Any] | None, str]] = {}
+        unsent: list[dict[str, Any]] = []
+        if sendable:
+            futures: dict[int, concurrent.futures.Future[tuple[dict[str, Any] | None, str]]] = {}
+            with _CtrlCSafeThreadPool(
+                max_workers=len(sendable), thread_name_prefix="coord-spawn-batch"
+            ) as pool:
+                for n, spec in enumerate(sendable):
+                    try:
+                        # One context copy per child, as a context runs on one
+                        # thread at a time: each create keeps the coordinator's
+                        # log fields.
+                        futures[spec["idx"]] = pool.submit(
+                            contextvars.copy_context().run, _spawn_child, spec
+                        )
+                    except RuntimeError:
+                        # No thread could start (a process or thread limit).
+                        log.warning("spawn_batch.submit_failed", idx=spec["idx"], exc_info=True)
+                        unsent = sendable[n:]
+                        break
+            outcomes = {idx: future.result() for idx, future in futures.items()}
+        for n, spec in enumerate(unsent):
+            # The submit that failed queued its create before starting a
+            # thread, so a worker already running may still have sent it; the
+            # rest were never sent.
+            if n == 0:
+                reason = (
+                    "the batch could not start a thread after queuing this create, so it "
+                    "may still have been sent; check with list_workstreams before retrying"
+                )
+            else:
+                reason = "not spawned: the batch could not start a thread to send it"
+            outcomes[spec["idx"]] = (None, reason)
+        if stop_cancels:
+            # Recorded as the console's cascade records its own cancels, which
+            # these complete.
+            self._coord_client.emit_audit(
+                "coordinator.cancel_cascaded",
+                {
+                    "src": "spawn_batch",
+                    "cancelled": sorted(ws for ws, ok in stop_cancels.items() if ok),
+                    "failed": sorted(ws for ws, ok in stop_cancels.items() if not ok),
+                },
+            )
+
+        results: dict[str, dict[str, Any]] = {}
+        denied: list[dict[str, Any]] = []
+        for spec in children:
+            idx = spec["idx"]
+            if "_error" in spec:
+                denied.append({"idx": idx, "reason": spec["_error"]})
+                continue
+            row, reason = outcomes[idx]
+            if row is None:
+                denied.append({"idx": idx, "reason": reason})
+            else:
+                results[str(idx)] = row
 
         # ``truncated`` intentionally omitted — the prepare step
         # hard-errors on >10 children rather than silent truncation,
