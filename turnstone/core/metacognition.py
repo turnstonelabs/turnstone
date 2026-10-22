@@ -52,12 +52,6 @@ NUDGE_COMPLETION = (
     "as memories (memory action='save') so future sessions can benefit."
 )
 
-NUDGE_TOOL_ERROR = (
-    "A tool just returned an error. Before retrying, check your memories — "
-    "the user may have given feedback about this tool or error pattern in a "
-    "previous session. Use memory(action='search') to find relevant guidance."
-)
-
 NUDGE_COMPACTION = (
     "The conversation is approaching the context limit and will be compacted "
     "shortly — older messages will be replaced by a summary. Reach a natural "
@@ -103,7 +97,6 @@ _NUDGE_MAP: dict[str, str] = {
     "correction": NUDGE_CORRECTION,
     "denial": NUDGE_DENIAL,
     "completion": NUDGE_COMPLETION,
-    "tool_error": NUDGE_TOOL_ERROR,
     "compaction_pending": NUDGE_COMPACTION,
     # idle_children, idle_tasks and watch_triggered carry no static body
     # — the per-fire text comes from a producer
@@ -132,13 +125,11 @@ _NUDGE_MAP: dict[str, str] = {
     "memory_pointer": "",
 }
 
-# Nudge types whose copy directs the model at the memory tool ("save that
-# as a feedback memory", "use memory(action='search')").  A memory-off
-# persona suppresses these — advertising a tool the persona hides produces
-# the same "I don't have access" apologies the memory-advisory gating
-# fixed — while behavioural nudges (compaction_pending, idle_children,
+# Nudge types whose copy directs the model to save memories. A memory-off persona suppresses
+# these — advertising a tool the persona hides produces the same "I don't have access" apologies
+# the memory-advisory gating fixed — while behavioural nudges (compaction_pending, idle_children,
 # watch_triggered) keep firing.
-MEMORY_NUDGE_TYPES: frozenset[str] = frozenset({"correction", "denial", "completion", "tool_error"})
+MEMORY_NUDGE_TYPES: frozenset[str] = frozenset({"correction", "denial", "completion"})
 
 # Nudge types whose copy names a specific tool the model is told to call,
 # mapped to that tool.  ``ChatSession._nudges_enabled`` suppresses a type
@@ -1175,7 +1166,6 @@ def nudge_allowed(
     state: dict[str, float],
     *,
     message_count: int = 0,
-    memory_count: int = 0,
     cooldown_secs: int = _COOLDOWN_SECS,
 ) -> bool:
     """Every gate :func:`should_nudge` applies, WITHOUT recording a fire.
@@ -1186,19 +1176,15 @@ def nudge_allowed(
     actually happened.  Recording earlier spends the cooldown on a nudge
     that was never delivered.
 
-    Note the gates this applies that a bare ``_cooldown_allows`` peek
-    does NOT: unknown type, ``message_count <= 1``, and the memory-count
-    requirement. A caller that charges budget before consulting THIS
-    function would charge on every one of those refusals.
+    Note the gates this applies that a bare ``_cooldown_allows`` peek does NOT: unknown type
+    and ``message_count <= 1``. A caller that charges budget before consulting THIS function
+    would charge on either of those refusals.
     """
     if nudge_type not in _NUDGE_MAP:
         return False
     # Every nudge is a live-conversation heuristic: none fires on the
     # first message.
     if message_count <= 1:
-        return False
-    # Tool error nudge only if there are memories to search
-    if nudge_type == "tool_error" and memory_count == 0:
         return False
     # Rate limit: one nudge per type per cooldown window
     last = state.get(nudge_type)
@@ -1219,7 +1205,6 @@ def should_nudge(
     state: dict[str, float],
     *,
     message_count: int = 0,
-    memory_count: int = 0,
     cooldown_secs: int = _COOLDOWN_SECS,
 ) -> bool:
     """Check whether a nudge should fire, respecting cooldowns and context.
@@ -1235,7 +1220,6 @@ def should_nudge(
         nudge_type,
         state,
         message_count=message_count,
-        memory_count=memory_count,
         cooldown_secs=cooldown_secs,
     ):
         return False

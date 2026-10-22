@@ -396,7 +396,6 @@ def test_assistant_persistence_recovery_completes_unstarted_tool_prefix(
         patch("turnstone.core.session.save_message", side_effect=_save_message) as save,
         patch.object(session, "_stream_response", side_effect=_stream),
         patch.object(session, "_execute_tools", execute),
-        patch.object(session, "_visible_memory_count", return_value=0),
         patch.object(session, "_print_status_line"),
     ):
         with pytest.raises(ConversationPersistenceError):
@@ -478,7 +477,6 @@ def test_assistant_commit_conflict_completes_live_tool_prefix_but_never_retries(
         patch("turnstone.core.session.save_message", side_effect=_save_message),
         patch.object(session, "_stream_response", stream),
         patch.object(session, "_execute_tools", execute),
-        patch.object(session, "_visible_memory_count", return_value=0),
         patch.object(session, "_print_status_line"),
     ):
         with pytest.raises(ConversationPersistenceError) as raised:

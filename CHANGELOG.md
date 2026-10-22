@@ -636,6 +636,7 @@ frozen.
 
 ### Removed
 
+- Tool errors no longer trigger a reminder to search memory before retrying.
 - **The `[model] fallback` failover chain is gone (#1359)** *(BREAKING)* — a turn whose model failed
   to answer after its retries was tried again on each alias in config.toml's `[model].fallback`
   list, healthy backends first, possibly on another provider; the turn now fails on its own model

@@ -62,7 +62,6 @@ def _deliver_watch_notice(session: ChatSession) -> None:
         patch.object(session, "_stream_response", return_value=make_result(content="Noticed.")),
         patch.object(session, "_update_token_table"),
         patch.object(session, "_print_status_line"),
-        patch.object(session, "_visible_memory_count", return_value=0),
     ):
         session.send("Check the watch.")
 
@@ -164,7 +163,6 @@ def test_immediate_wake_reads_guarded_snapshot_before_poll_commit(
             patch.object(session, "_evaluate_output", guard),
             patch.object(session, "_update_token_table"),
             patch.object(session, "_print_status_line"),
-            patch.object(session, "_visible_memory_count", return_value=0),
         ):
             runner._poll_watch(row)
 
@@ -264,7 +262,6 @@ def test_persisted_snapshot_keeps_output_and_condition_error_on_reload(
             patch.object(session, "_stream_response", return_value=make_result(content="Noticed.")),
             patch.object(session, "_update_token_table"),
             patch.object(session, "_print_status_line"),
-            patch.object(session, "_visible_memory_count", return_value=0),
         ):
             session.send("Check the watch.")
         # Model the runner's final write failing after the notice was delivered.

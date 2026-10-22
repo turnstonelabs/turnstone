@@ -130,7 +130,6 @@ from turnstone.core.media_materialization import (
 from turnstone.core.memory import (
     acquire_memory_index_snapshot,
     clear_last_error,
-    count_structured_memories,
     find_structured_memory_scopes,
     get_attachments,
     get_skill_by_name,
@@ -13605,23 +13604,7 @@ class ChatSession:
                         f"{unexpected_ids}"
                     )
 
-                # Tool-error nudge: queues an advisory for the next drain pass.
-                has_tool_error = any(self._tool_error_flags.get(tc_id) for tc_id, _ in results)
-                needs_tool_error_memory = self._nudges_enabled("tool_error") and has_tool_error
-                tool_error_memory_count = (
-                    self._visible_memory_count() if needs_tool_error_memory else 0
-                )
-                apply_post_execute_advisories = functools.partial(
-                    self._apply_post_execute_advisories,
-                    has_tool_error=has_tool_error,
-                    tool_error_memory_count=tool_error_memory_count,
-                )
-                if not self._publish_for_generation(
-                    my_generation,
-                    apply_post_execute_advisories,
-                    allow_cancelled=False,
-                ):
-                    raise GenerationCancelled()
+                self._check_generation_admission(my_generation)
 
                 # Map tool_call_id → tool name for logging
                 # Providers may pad a name with whitespace; dispatch strips it,
@@ -14341,12 +14324,11 @@ class ChatSession:
     def _drain_pending_advisories(self) -> None:
         """Drop the abandoned generation's advisory nudges — not external events.
 
-        Tool-channel nudges (``tool_error``, ``denial``)
-        queued earlier in this batch and user-channel nudges
-        (``correction``, …) queued during ``_check_metacognitive_nudge``
-        are commentary ABOUT the generation being abandoned (cancel,
-        KeyboardInterrupt, unexpected exception) — they drop so nothing
-        stale bleeds into the next send's tool loop or user turn.
+        Tool-channel advisories (``denial``, ``skill_hint``) queued earlier in this batch and
+        user-channel nudges (``correction``, …) queued during ``_check_metacognitive_nudge``
+        are commentary ABOUT the generation being abandoned (cancel, KeyboardInterrupt,
+        unexpected exception) — they drop so nothing stale bleeds into the next send's tool
+        loop or user turn.
 
         ``"any"``-channel entries survive but are DEMOTED to ``"quiet"``:
         those are external events (``watch_triggered``,
@@ -18949,11 +18931,9 @@ class ChatSession:
           ``priority`` so the UI can frame important interjections
           distinctly.  Cancel / exception / no-tool-call paths drain the
           queue as a real user row instead (Seams 2 and 3).
-        - **Metacognitive tool-channel nudges** (``tool_error`` /
-          ``denial``) and any-channel nudges
-          (``watch_triggered`` / ``idle_children``) — drained on the last
-          result.  ``meta`` carries the producer's optional fields
-          (e.g. ``watch_triggered``'s ``watch_name``).
+        - **Tool-channel advisories** (``denial`` / ``skill_hint``) and any-channel nudges
+          (``watch_triggered`` / ``idle_children``) — drained on the last result. ``meta`` carries
+          the producer's optional fields (e.g. ``watch_triggered``'s ``watch_name``).
 
         Empty when no advisories apply (common case).  Guard findings
         attach per-result; queued messages and metacognitive nudges drain
@@ -19030,9 +19010,7 @@ class ChatSession:
                 # retractions accumulate against ids nothing will restore.
                 self._close_pop_window(popped)
 
-            # Metacognitive tool-channel drain.  Queued by
-            # ``_queue_tool_advisory`` from the tool_error / denial
-            # paths just before this loop.
+            # Drain tool-channel advisories queued by the denial and skill-hint paths.
             for nt, text, meta in self._nudge_queue.drain(TOOL_DRAIN):
                 specs.append((nt, text, dict(meta) if meta else {}))
 
@@ -19282,9 +19260,6 @@ class ChatSession:
             jc_live = self._judge_cfg
             if judge_cancel and jc_live and jc_live.cancel_on_approval:
                 judge_cancel.set()
-        denial_memory_count = (
-            self._visible_memory_count() if not approved and self._nudges_enabled("denial") else 0
-        )
         # The post-gate state transition and denial advisory are one owner
         # publication.  Stop/close/force may win while the gate is parked; in
         # that case the witness wakes it, but the old worker must not repaint a
@@ -19367,7 +19342,6 @@ class ChatSession:
                             "denial",
                             self._metacog_state,
                             message_count=len(self.messages),
-                            memory_count=denial_memory_count,
                             cooldown_secs=self._mem_cfg.nudge_cooldown,
                         )
                     ):
@@ -21173,29 +21147,6 @@ class ChatSession:
             hint += " Project scope is read-only."
         return hint
 
-    def _visible_memory_count(self, access: _MemoryAccess | None = None) -> int:
-        """Count memories visible to this session.
-
-        Coord sessions are isolated to their own coord-scope namespace —
-        they don't see global / workstream / user rows.  The orchestration
-        role doesn't need user-context memory and pulling those rows in
-        would also surface memories from sibling interactive sessions
-        (same user, different workstream) into the coord's system
-        message, which the coord shouldn't be reasoning over.
-        """
-        resolved = access or self._memory_access()
-        total = 0
-        for scope, scope_id in self._visible_scopes(resolved):
-            try:
-                total += count_structured_memories(
-                    scope=scope,
-                    scope_id=scope_id,
-                    acting_principal_id=resolved.principal_id,
-                )
-            except Exception:
-                log.warning("Failed to count structured memories", exc_info=True)
-        return total
-
     def _visible_scopes(self, access: _MemoryAccess | None = None) -> list[tuple[str, str]]:
         """Return the (scope, scope_id) pairs visible to this session.
 
@@ -21413,12 +21364,9 @@ class ChatSession:
         entry queued here can never manufacture a synthetic user turn of
         its own — it waits for the user's real one.
 
-        No-ops while the session is inside a wake-driven turn
-        (``_wake_source_tag`` set) so model behaviour during the wake
-        send (e.g. denying a tool the wake suggested, hitting a
-        tool_error) doesn't queue a nudge that would land on
-        top of the wake's own turn or on the user's next real
-        turn referencing a context the user never saw.
+        No-ops while the session is inside a wake-driven turn (``_wake_source_tag`` set) so
+        advice generated during the wake cannot land on the wake's own turn or on the user's
+        next real turn referencing a context the user never saw.
         """
         if self._wake_source_tag:
             return
@@ -21493,12 +21441,10 @@ class ChatSession:
     def _queue_tool_advisory(self, nudge_type: str, text: str) -> None:
         """Queue a metacognitive nudge for the next tool-result batch.
 
-        Drains in ``_collect_advisories`` alongside guard findings, then is
-        emitted as a first-class ``{"role": "system"}`` turn AFTER the tool
-        batch (see the per-result loop in ``_run_loop``).  Used for nudges
-        that respond to a tool batch: ``tool_error`` and ``denial`` (the
-        operator rejected the batch — the nudge belongs next to the denied
-        results it explains).
+        Drains in ``_collect_advisories`` alongside guard findings, then is emitted as a
+        first-class ``{"role": "system"}`` turn AFTER the tool batch (see the per-result loop in
+        ``_run_loop``). Used for ``denial`` (the operator rejected the batch) and ``skill_hint``
+        advisories, which belong next to the results they explain.
 
         No-ops while the session is inside a wake-driven turn (see
         ``_queue_user_advisory`` for the rationale).
@@ -21777,46 +21723,6 @@ class ChatSession:
                         )
                         continue
                     self._nudge_queue.requeue(recovered, channel=QUIET_CHANNEL)
-
-    def _apply_post_execute_advisories(
-        self,
-        *,
-        has_tool_error: bool,
-        tool_error_memory_count: int | None = None,
-    ) -> None:
-        """Queue the tool-error nudge for a freshly-executed batch.
-
-        Updates ``self._nudge_queue`` (via ``_queue_tool_advisory``) and
-        ``self._metacog_state`` (cooldown timestamp via ``should_nudge``).
-        The operator-visible signal is the first-class operator-context
-        ``{"role": "system"}`` turn the per-result loop downstream emits
-        after the tool batch when the drained metacog nudges flush.
-
-        ``has_tool_error`` says whether any result in the batch carries a
-        ``_tool_error_flags`` mark, the authoritative is_error signal.  The
-        caller reads the flags; the per-result loop in ``_run_loop``
-        ``.pop``s them after this returns.
-        """
-        # Tool-error nudge — queued so it rides the same _collect_advisories
-        # drain pass as guard findings and is emitted as a system turn after
-        # the tool batch.  Cooldown gating in should_nudge keeps this to one
-        # nudge per batch even with many failing tools.
-        if (
-            self._nudges_enabled("tool_error")
-            and has_tool_error
-            and should_nudge(
-                "tool_error",
-                self._metacog_state,
-                message_count=len(self.messages),
-                memory_count=(
-                    tool_error_memory_count
-                    if tool_error_memory_count is not None
-                    else self._visible_memory_count()
-                ),
-                cooldown_secs=self._mem_cfg.nudge_cooldown,
-            )
-        ):
-            self._queue_tool_advisory("tool_error", format_nudge("tool_error"))
 
     # ------------------------------------------------------------------
     # Coordinator tools — reachable only when ``kind == "coordinator"``.

@@ -592,13 +592,6 @@ class CoordinatorIdleObserver:
         One implementation for both types so the charge discipline —
         cheap peek at plan time, authoritative :meth:`_try_charge` at
         the fire position — can never drift between paths.
-
-        ``memory_count=0`` is deliberate, not a stub: ``nudge_allowed``
-        reads ``memory_count`` only for the ``tool_error`` / ``resume``
-        / ``start`` types, so paying 1-2 ``count_structured_memories``
-        round-trips per IDLE event to compute the real number bought
-        nothing.  If a future nudge type routed through here needs it,
-        thread it explicitly.
         """
         # ``cooldown_secs`` rides in from the plan's gate head, per CLASS
         # (:data:`_NUDGE_TYPE_HAS_COOLDOWN`): ``memory.nudge_cooldown``
@@ -612,7 +605,6 @@ class CoordinatorIdleObserver:
             plan.nudge_type,
             session._metacog_state,
             message_count=len(session.messages),
-            memory_count=0,
             cooldown_secs=plan.cooldown_secs,
         ):
             return False

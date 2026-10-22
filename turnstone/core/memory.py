@@ -1526,23 +1526,3 @@ def memory_index_health(*, budget_chars: int, storage: Any | None = None) -> dic
         "invalid_description_count": invalid_total,
         "envelope_count": envelope_count,
     }
-
-
-def count_structured_memories(
-    mem_type: str = "",
-    scope: str = "",
-    scope_id: str = "",
-    *,
-    acting_principal_id: str = "",
-) -> int:
-    """Count structured memories with optional type/scope filter."""
-    try:
-        return get_storage().count_structured_memories(
-            mem_type=mem_type,
-            scope=scope,
-            scope_id=scope_id,
-            acting_principal_id=acting_principal_id,
-        )
-    except Exception:
-        log.warning("Failed to count structured memories", exc_info=True)
-        return 0

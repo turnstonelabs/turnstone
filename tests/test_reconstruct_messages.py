@@ -442,16 +442,18 @@ class TestSystemTurns:
         assert msgs[0]["role"] == "user"
 
     def test_trailing_system_after_complete_turn_kept(self):
-        """A system turn after a complete tool batch is preserved (no strip)."""
+        """A retired nudge after a complete tool batch keeps its text and source."""
         tc = json.dumps([{"id": "c1", "function": {"name": "bash", "arguments": "{}"}}])
         rows = [
             _row("user", "do it"),
             _row("assistant", "Running...", tool_calls=tc),
             _row("tool", "ok", tc_id="c1"),
-            _row("system", "you repeated a call", source="repeat"),
+            _row("system", "check your memories", source="tool_error"),
         ]
         msgs = reconstruct_messages(rows, "ws1")
         assert [m["role"] for m in msgs] == ["user", "assistant", "tool", "system"]
+        assert msgs[-1]["_source"] == "tool_error"
+        assert msgs[-1]["content"] == "check your memories"
 
     def test_trailing_system_after_text_turn_kept(self):
         rows = [

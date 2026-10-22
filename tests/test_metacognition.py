@@ -21,7 +21,6 @@ from turnstone.core.metacognition import (
     NUDGE_IDLE_TASKS_TAIL,
     NUDGE_IDLE_TASKS_WAIT_SLOT,
     NUDGE_REQUIRED_TOOL,
-    NUDGE_TOOL_ERROR,
     detect_completion,
     detect_correction,
     field_str,
@@ -225,34 +224,33 @@ class TestDetectCompletion:
 class TestShouldNudge:
     def test_basic_fires(self):
         state: dict[str, float] = {}
-        assert should_nudge("correction", state, message_count=3, memory_count=0) is True
+        assert should_nudge("correction", state, message_count=3) is True
 
     def test_cooldown(self):
         state: dict[str, float] = {}
-        should_nudge("correction", state, message_count=3, memory_count=0)
-        assert should_nudge("correction", state, message_count=3, memory_count=0) is False
+        should_nudge("correction", state, message_count=3)
+        assert should_nudge("correction", state, message_count=3) is False
 
     def test_different_types_independent(self):
         state: dict[str, float] = {}
-        should_nudge("correction", state, message_count=3, memory_count=0)
-        assert should_nudge("denial", state, message_count=3, memory_count=0) is True
+        should_nudge("correction", state, message_count=3)
+        assert should_nudge("denial", state, message_count=3) is True
 
     def test_no_nudge_first_message(self):
         state: dict[str, float] = {}
-        assert should_nudge("correction", state, message_count=1, memory_count=0) is False
+        assert should_nudge("correction", state, message_count=1) is False
 
     def test_no_type_fires_on_first_message(self):
-        """Every registered type is a live-conversation heuristic: none
-        fires on the first message, memories or not."""
+        """Every registered type is a live-conversation heuristic: none fires on the first message."""
         from turnstone.core.metacognition import _NUDGE_MAP
 
         for nudge_type in _NUDGE_MAP:
             state: dict[str, float] = {}
-            assert should_nudge(nudge_type, state, message_count=1, memory_count=3) is False
+            assert should_nudge(nudge_type, state, message_count=1) is False
 
     def test_invalid_type(self):
         state: dict[str, float] = {}
-        assert should_nudge("invalid", state, message_count=3, memory_count=0) is False
+        assert should_nudge("invalid", state, message_count=3) is False
 
 
 class TestFormatNudge:
@@ -265,30 +263,8 @@ class TestFormatNudge:
     def test_completion(self):
         assert format_nudge("completion") == NUDGE_COMPLETION
 
-    def test_tool_error(self):
-        assert format_nudge("tool_error") == NUDGE_TOOL_ERROR
-
     def test_invalid(self):
         assert format_nudge("invalid") == ""
-
-
-class TestToolErrorNudge:
-    def test_fires(self):
-        state: dict[str, float] = {}
-        assert should_nudge("tool_error", state, message_count=5, memory_count=3) is True
-
-    def test_cooldown(self):
-        state: dict[str, float] = {}
-        assert should_nudge("tool_error", state, message_count=5, memory_count=3) is True
-        assert should_nudge("tool_error", state, message_count=6, memory_count=3) is False
-
-    def test_not_on_first_message(self):
-        state: dict[str, float] = {}
-        assert should_nudge("tool_error", state, message_count=1, memory_count=3) is False
-
-    def test_not_with_zero_memories(self):
-        state: dict[str, float] = {}
-        assert should_nudge("tool_error", state, message_count=5, memory_count=0) is False
 
 
 class TestFormatIdleChildrenNudge:
@@ -436,9 +412,9 @@ class TestFormatIdleChildrenNudge:
         # silently return False on every call.
         state: dict[str, float] = {}
         # message_count > 1 to clear the first-message gate.
-        assert should_nudge("idle_children", state, message_count=4, memory_count=0) is True
+        assert should_nudge("idle_children", state, message_count=4) is True
         # Cooldown set on success → second immediate call returns False.
-        assert should_nudge("idle_children", state, message_count=5, memory_count=0) is False
+        assert should_nudge("idle_children", state, message_count=5) is False
 
 
 class TestSanitizeName:
@@ -1125,7 +1101,7 @@ class TestFormatIdleTasksNudge:
 
     def test_should_nudge_recognises_idle_tasks_type(self, monkeypatch):
         state: dict[str, float] = {}
-        assert should_nudge("idle_tasks", state, message_count=2, memory_count=0)
+        assert should_nudge("idle_tasks", state, message_count=2)
 
 
 class TestFieldStrCoercion:

@@ -3550,7 +3550,6 @@ class TestSendGenerationInitializationPublication:
 
         storage.list_message_senders.side_effect = fail_sender_read
         with (
-            patch.object(session, "_visible_memory_count", return_value=0),
             patch("turnstone.core.session.save_message", return_value=1),
         ):
             session._initialize_send_generation(

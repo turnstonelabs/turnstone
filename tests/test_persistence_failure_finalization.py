@@ -157,7 +157,6 @@ def test_soft_close_cannot_overtake_failed_assistant_tool_prefix() -> None:
         patch("turnstone.core.memory.persist_last_error"),
         patch.object(session, "_stream_response", return_value=make_result(tool_calls=[tool_call])),
         patch.object(session, "_execute_tools", MagicMock()) as execute_tools,
-        patch.object(session, "_visible_memory_count", return_value=0),
         patch.object(session, "_print_status_line"),
     ):
         send_thread = threading.Thread(target=_send, daemon=True)
@@ -228,7 +227,6 @@ def test_assistant_journal_rejection_cannot_persist_orphan_tool_suffix() -> None
             "_journal_conversation_row_locked",
             side_effect=_reject_assistant_journal,
         ),
-        patch.object(session, "_visible_memory_count", return_value=0),
         patch.object(session, "_print_status_line"),
         pytest.raises(RuntimeError, match="injected assistant journal rejection"),
     ):
@@ -280,7 +278,6 @@ def test_tool_journal_rejection_rolls_back_live_suffix_and_poison_claim() -> Non
             "_journal_conversation_row_locked",
             side_effect=_reject_tool_journal,
         ),
-        patch.object(session, "_visible_memory_count", return_value=0),
         patch.object(session, "_print_status_line"),
         pytest.raises(RuntimeError, match="injected tool journal rejection"),
     ):
@@ -331,7 +328,6 @@ def test_failed_structural_finalizer_keeps_dispatch_claim_poisoned() -> None:
             side_effect=RuntimeError("injected structural finalizer failure"),
         ),
         patch.object(session, "_consume_cancel", side_effect=_pause_before_consume),
-        patch.object(session, "_visible_memory_count", return_value=0),
         patch.object(session, "_print_status_line"),
     ):
         send_thread = threading.Thread(target=_send, daemon=True)
@@ -423,7 +419,6 @@ def test_pre_failure_worker_claim_cannot_dispatch_after_structural_poison(
             "_synthesize_cancelled_results",
             side_effect=RuntimeError("injected structural finalizer failure"),
         ),
-        patch.object(session, "_visible_memory_count", return_value=0),
         patch.object(session, "_print_status_line"),
     ):
         assert session_worker.send(
@@ -673,7 +668,6 @@ def test_post_synthesis_callback_failure_still_runs_tool_durability_ticket() -> 
             "_synthesize_cancelled_results",
             side_effect=_synthesize_then_raise,
         ),
-        patch.object(session, "_visible_memory_count", return_value=0),
         patch.object(session, "_print_status_line"),
         pytest.raises(RuntimeError, match="injected post-synthesis failure"),
     ):
@@ -1279,7 +1273,6 @@ def test_soft_close_cannot_skip_active_tool_cancellation_finalizer() -> None:
         patch("turnstone.core.memory.persist_last_error"),
         patch.object(session, "_stream_response", return_value=make_result(tool_calls=[tool_call])),
         patch.object(session, "_execute_tools", side_effect=_execute_tools),
-        patch.object(session, "_visible_memory_count", return_value=0),
         patch.object(session, "_print_status_line"),
     ):
         send_thread = threading.Thread(target=_send, daemon=True)
@@ -1352,7 +1345,6 @@ def test_force_successor_cannot_cross_an_incomplete_tool_prefix() -> None:
         patch("turnstone.core.memory.persist_last_error"),
         patch.object(session, "_stream_response", return_value=make_result(tool_calls=[tool_call])),
         patch.object(session, "_execute_tools", side_effect=_execute_tools),
-        patch.object(session, "_visible_memory_count", return_value=0),
         patch.object(session, "_print_status_line"),
     ):
         send_thread = threading.Thread(target=_send, daemon=True)
@@ -1589,7 +1581,6 @@ def test_force_handler_journals_unknown_before_slot_release(tool_row_id: int) ->
         patch("turnstone.core.memory.persist_last_error"),
         patch.object(session, "_stream_response", return_value=make_result(tool_calls=[tool_call])),
         patch.object(session, "_execute_tools", side_effect=_execute_tools),
-        patch.object(session, "_visible_memory_count", return_value=0),
         patch.object(session, "_print_status_line"),
     ):
         send_thread = threading.Thread(target=_send, daemon=True)
@@ -1905,7 +1896,6 @@ def test_user_journal_rejection_rolls_back_live_append() -> None:
             "_journal_conversation_row_locked",
             side_effect=_reject_user_journal,
         ),
-        patch.object(session, "_visible_memory_count", return_value=0),
         patch.object(session, "_print_status_line"),
         pytest.raises(RuntimeError, match="injected user journal rejection"),
     ):

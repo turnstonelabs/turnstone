@@ -427,9 +427,6 @@ def _send_with_steps(session, steps, *, results=None, **extra_patches):
         stack.enter_context(patch.object(session, "_update_token_table"))
         stack.enter_context(patch.object(session, "_print_status_line"))
         stack.enter_context(patch.object(session, "_emit_state"))
-        stack.enter_context(patch.object(session, "_visible_memory_count", return_value=0))
-        if results is not None:
-            stack.enter_context(patch.object(session, "_apply_post_execute_advisories"))
         stack.enter_context(patch("turnstone.core.session.save_message"))
         yield
 

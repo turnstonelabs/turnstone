@@ -826,7 +826,6 @@ def test_a_queued_message_ends_a_real_wait_and_reaches_the_model(
         stack.enter_context(patch.object(sess, "_update_token_table"))
         stack.enter_context(patch.object(sess, "_print_status_line"))
         stack.enter_context(patch.object(sess, "_emit_state"))
-        stack.enter_context(patch.object(sess, "_visible_memory_count", return_value=0))
         stack.enter_context(patch("turnstone.core.session.save_message"))
         sess._title_generated = True
         sender.start()

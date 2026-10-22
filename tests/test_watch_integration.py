@@ -123,7 +123,6 @@ def test_watch_fires_then_user_send_drains_envelope(tmp_db, monkeypatch):
         patch.object(session, "_stream_response", return_value=make_result(content="ok")),
         patch.object(session, "_update_token_table"),
         patch.object(session, "_print_status_line"),
-        patch.object(session, "_visible_memory_count", return_value=0),
     ):
         session._title_generated = True  # suppress orthogonal title side-thread
         session.send("ok")
@@ -177,7 +176,6 @@ def test_three_back_to_back_watch_fires_drain_into_one_turn(tmp_db, monkeypatch)
         patch.object(session, "_stream_response", return_value=make_result(content="got it")),
         patch.object(session, "_update_token_table"),
         patch.object(session, "_print_status_line"),
-        patch.object(session, "_visible_memory_count", return_value=0),
     ):
         session._title_generated = True
         session.send("user")

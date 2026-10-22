@@ -245,7 +245,6 @@ def test_idle_event_through_real_session_manager_drives_wake_send(real_mgr, tmp_
             patch.object(ws.session, "_stream_response", return_value=make_result(content="ok")),
             patch.object(ws.session, "_update_token_table"),
             patch.object(ws.session, "_print_status_line"),
-            patch.object(ws.session, "_visible_memory_count", return_value=0),
         ):
             # Suppress the auto-title side-thread; orthogonal to wake.
             ws.session._title_generated = True
@@ -346,7 +345,6 @@ def test_watch_fire_on_already_idle_session_drives_wake_send(real_mgr, tmp_db):
         patch.object(ws.session, "_stream_response", return_value=make_result(content="ok")),
         patch.object(ws.session, "_update_token_table"),
         patch.object(ws.session, "_print_status_line"),
-        patch.object(ws.session, "_visible_memory_count", return_value=0),
     ):
         ws.session._title_generated = True
         # Idle all along — no worker, and no state transition coming.
@@ -454,7 +452,6 @@ def test_coord_idle_with_active_children_emits_envelope_via_real_managers(coord_
             patch.object(coord.session, "_full_messages", return_value=[]),
             patch.object(coord.session, "_update_token_table"),
             patch.object(coord.session, "_print_status_line"),
-            patch.object(coord.session, "_visible_memory_count", return_value=0),
         ):
             coord.session._title_generated = True
             mgr.set_state(coord.id, WorkstreamState.IDLE)
@@ -543,7 +540,6 @@ def test_coord_idle_with_children_and_open_tasks_delivers_both(coord_mgr, tmp_db
             patch.object(coord.session, "_full_messages", return_value=[]),
             patch.object(coord.session, "_update_token_table"),
             patch.object(coord.session, "_print_status_line"),
-            patch.object(coord.session, "_visible_memory_count", return_value=0),
         ):
             coord.session._title_generated = True
             mgr.set_state(coord.id, WorkstreamState.IDLE)
@@ -645,7 +641,6 @@ def test_coord_idle_with_open_tasks_and_no_children_omits_children_content(coord
             patch.object(coord.session, "_full_messages", return_value=[]),
             patch.object(coord.session, "_update_token_table"),
             patch.object(coord.session, "_print_status_line"),
-            patch.object(coord.session, "_visible_memory_count", return_value=0),
         ):
             coord.session._title_generated = True
             mgr.set_state(coord.id, WorkstreamState.IDLE)
@@ -752,7 +747,6 @@ def test_stop_latch_survives_the_liveness_wake(coord_mgr, tmp_db):
             patch.object(coord.session, "_full_messages", return_value=[]),
             patch.object(coord.session, "_update_token_table"),
             patch.object(coord.session, "_print_status_line"),
-            patch.object(coord.session, "_visible_memory_count", return_value=0),
         ):
             coord.session._title_generated = True
 
@@ -851,7 +845,6 @@ def test_coord_idle_emitted_from_worker_thread_still_wakes(coord_mgr, tmp_db):
             patch.object(coord.session, "_full_messages", return_value=[]),
             patch.object(coord.session, "_update_token_table"),
             patch.object(coord.session, "_print_status_line"),
-            patch.object(coord.session, "_visible_memory_count", return_value=0),
         ):
             coord.session._title_generated = True
 
@@ -927,7 +920,6 @@ def _patch_llm_surface(session: Any) -> tuple[Any, ...]:
         patch.object(session, "_stream_response", return_value=make_result(content="ok")),
         patch.object(session, "_update_token_table"),
         patch.object(session, "_print_status_line"),
-        patch.object(session, "_visible_memory_count", return_value=0),
     )
 
 
@@ -944,7 +936,7 @@ def test_wake_channel_survives_real_seam_drains_and_delivers_via_wake(tmp_db):
     session._nudge_queue.enqueue("idle_children", "kids waiting", "wake")
 
     p = _patch_llm_surface(session)
-    with p[0], p[1], p[2], p[3]:
+    with p[0], p[1], p[2]:
         # Real user-seam drain: appends any drained entry as a system
         # turn — a wake-channel entry must neither drain nor render.
         session._emit_pending_user_nudges()
@@ -1032,7 +1024,7 @@ def test_quiet_ride_along_still_delivers_when_wake_proceeds(tmp_db):
     session._nudge_queue.enqueue("idle_children", "kids waiting", "wake")
 
     p = _patch_llm_surface(session)
-    with p[0], p[1], p[2], p[3]:
+    with p[0], p[1], p[2]:
         session.deliver_wake_nudge_from_queue()
 
     msgs = dicts_from_turns(session.messages)
@@ -1068,7 +1060,7 @@ def test_interjection_handoff_delivers_externals_and_drops_only_idle_nudges(tmp_
     session.queue_message("pivot: focus on the flaky login test")
 
     p = _patch_llm_surface(session)
-    with p[0], p[1], p[2], p[3]:
+    with p[0], p[1], p[2]:
         session.deliver_wake_nudge_from_queue()
 
     msgs = dicts_from_turns(session.messages)
@@ -1146,7 +1138,6 @@ def test_queued_interjection_owns_the_idle_seam(coord_mgr, tmp_db):
             patch.object(coord.session, "_full_messages", return_value=[]),
             patch.object(coord.session, "_update_token_table"),
             patch.object(coord.session, "_print_status_line"),
-            patch.object(coord.session, "_visible_memory_count", return_value=0),
         ):
             coord.session._title_generated = True
 

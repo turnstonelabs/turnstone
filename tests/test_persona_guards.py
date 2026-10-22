@@ -354,7 +354,6 @@ class TestMemoryOff:
         # Memory-directed nudges are suppressed; behavioural nudges stay.
         session._memory_config.nudges = True
         assert not session._nudges_enabled("correction")
-        assert not session._nudges_enabled("tool_error")
         assert session._nudges_enabled("compaction_pending")
 
     def test_allowlist_hiding_memory_tool_also_gates_nudges(
