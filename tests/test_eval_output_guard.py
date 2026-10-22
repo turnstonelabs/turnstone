@@ -1262,3 +1262,11 @@ def test_a_read_production_refuses_requests_no_path(monkeypatch) -> None:
     assert guard_eval._requested_path(arguments) == "/etc/passwd"
     too_deep_to_parse(monkeypatch, arguments)
     assert guard_eval._requested_path(arguments) == ""
+
+
+def test_a_read_past_the_depth_cap_requests_no_path() -> None:
+    from turnstone.core.tools import MAX_TOOL_ARGUMENT_DEPTH
+
+    depth = MAX_TOOL_ARGUMENT_DEPTH
+    arguments = '{"path": "/etc/passwd", "x": ' + "[" * depth + "]" * depth + "}"
+    assert guard_eval._requested_path(arguments) == ""

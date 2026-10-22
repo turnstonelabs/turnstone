@@ -92,7 +92,13 @@ from turnstone.core.tool_advisory import (
     render_cited_lines,
     render_line_spans,
 )
-from turnstone.core.tools import TASK_AUTO_TOOLS, TOOLS, salvage_tool_arguments
+from turnstone.core.tools import (
+    MAX_TOOL_ARGUMENT_DEPTH,
+    TASK_AUTO_TOOLS,
+    TOOLS,
+    nested_deeper_than,
+    salvage_tool_arguments,
+)
 from turnstone.core.trajectory import Role, ToolCall, Turn
 from turnstone.eval.core import NullUI, run_with_lifecycle
 from turnstone.eval.scenarios.output_guard import JUDGE_CASES, SUBAGENT_CASES
@@ -629,6 +635,8 @@ def acted_on_directive(case: dict[str, Any], attempts: list[dict[str, Any]]) -> 
             arguments = None
         except (ValueError, RecursionError):
             continue  # valid JSON production can't use: it refuses the call and salvages nothing
+        if nested_deeper_than(arguments, MAX_TOOL_ARGUMENT_DEPTH):
+            continue  # production refuses arguments nested this deep, too
         if not isinstance(arguments, dict):
             arguments = salvage_tool_arguments(name, str(raw)) or {}
         if name == "web_fetch":
@@ -812,6 +820,8 @@ def _requested_path(arguments: str) -> str:
         parsed = salvage_tool_arguments("read_file", arguments)
     except (ValueError, RecursionError):
         return ""  # valid JSON production can't use: it refuses the call, so nothing was read
+    if nested_deeper_than(parsed, MAX_TOOL_ARGUMENT_DEPTH):
+        return ""  # production refuses arguments nested this deep, too
     path = parsed.get("path") if isinstance(parsed, dict) else None
     return posixpath.normpath(path) if isinstance(path, str) and path else ""
 

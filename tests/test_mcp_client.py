@@ -790,6 +790,43 @@ class TestSessionIntegration:
         assert "Please retry" in prepared["error"]
         session.ui.on_error.assert_called_once()
 
+    def test_prepare_tool_arguments_nested_past_the_cap_read_as_malformed(self, tmp_db):
+        """Deeper arguments parse, but break code that walks them one level per call: an MCP
+        call's serializer, and on some hosts ``str()``."""
+        from turnstone.core.tools import MAX_TOOL_ARGUMENT_DEPTH
+
+        session = self._make_session(mcp_client=None)
+        depth = MAX_TOOL_ARGUMENT_DEPTH  # the object itself is one more level
+        raw = '{"command": ' + "[" * depth + "]" * depth + "}"
+        prepared = session._prepare_tool(
+            {"id": "call_deep", "function": {"name": "bash", "arguments": raw}}
+        )
+        assert f"nested more than {MAX_TOOL_ARGUMENT_DEPTH} levels deep" in prepared["error"]
+        session.ui.on_error.assert_called_once()
+
+    def test_prepare_tool_arguments_past_the_cap_are_not_salvaged(self, tmp_db):
+        # Salvage would pick the command and drop the rest; the model is told to retry instead.
+        from turnstone.core.tools import MAX_TOOL_ARGUMENT_DEPTH
+
+        session = self._make_session(mcp_client=None)
+        depth = MAX_TOOL_ARGUMENT_DEPTH
+        raw = '{"command": "echo top", "timeout": ' + "[" * depth + "]" * depth + "}"
+        prepared = session._prepare_tool(
+            {"id": "call_deep", "function": {"name": "bash", "arguments": raw}}
+        )
+        assert f"nested more than {MAX_TOOL_ARGUMENT_DEPTH} levels deep" in prepared["error"]
+
+    def test_prepare_tool_arguments_at_the_cap_parse(self, tmp_db):
+        from turnstone.core.tools import MAX_TOOL_ARGUMENT_DEPTH
+
+        session = self._make_session(mcp_client=None)
+        depth = MAX_TOOL_ARGUMENT_DEPTH - 1
+        raw = '{"command": "echo hi", "x": ' + "[" * depth + "]" * depth + "}"
+        prepared = session._prepare_tool(
+            {"id": "call_cap", "function": {"name": "bash", "arguments": raw}}
+        )
+        assert "nested more than" not in prepared.get("error", "")
+
     def test_ensure_tool_call_ids_dict(self, tmp_db):
         """ensure_tool_call_ids fills empty IDs on streaming-style dict."""
         from turnstone.core.model_turn import ensure_tool_call_ids

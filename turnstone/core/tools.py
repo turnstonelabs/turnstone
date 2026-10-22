@@ -157,6 +157,29 @@ _SALVAGE_KEYS = (
 )
 
 
+# How deeply a tool call's parsed arguments may nest objects and lists. JSON this deep still parses
+# (to about 10,000 levels on Python 3.13), but code that walks it one level per call does not: an
+# MCP call's serializer stops at 255 levels, and Python's recursion limit is about 1,000.
+MAX_TOOL_ARGUMENT_DEPTH = 100
+
+
+def nested_deeper_than(value: Any, limit: int) -> bool:
+    """Whether *value*, parsed JSON, nests objects and lists more than *limit* levels deep.
+
+    Walked without recursion, so a value too deep for recursive code is measured safely.
+    """
+    if not isinstance(value, (dict, list)):
+        return False
+    stack: list[tuple[dict[Any, Any] | list[Any], int]] = [(value, 1)]
+    while stack:
+        node, depth = stack.pop()
+        if depth > limit:
+            return True
+        children = node.values() if isinstance(node, dict) else node
+        stack.extend((child, depth + 1) for child in children if isinstance(child, (dict, list)))
+    return False
+
+
 def salvage_tool_arguments(func_name: str, raw_args: str) -> dict[str, Any] | None:
     """Arguments recovered from *raw_args* that are not valid JSON, else ``None``.
 

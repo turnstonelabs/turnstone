@@ -1417,6 +1417,11 @@ frozen.
   this way, and the launcher's create, which said only that the dispatch failed, now says when the
   workstream may exist. The task scheduler reads the same rule, so a firing whose create couldn't be
   encoded is held for retry instead of recorded as unresolved.
+- **A model's tool arguments nested more than 100 levels deep read as malformed.** Arguments that
+  deep still parse, but break code that walks them one level at a time: three MCP calls nested 255
+  levels or more opened a static MCP server's circuit breaker for every session on the node, and on
+  a Python 3.13 node whose threads run on 2 MiB stacks an argument about 8,300 levels deep crashed
+  the process. The model is told the arguments couldn't be parsed and to retry.
 
 ### Security
 

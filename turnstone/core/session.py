@@ -283,12 +283,14 @@ from turnstone.core.tools import (
     BUILTIN_TOOL_NAMES,
     COORDINATOR_TOOLS,
     INTERACTIVE_TOOLS,
+    MAX_TOOL_ARGUMENT_DEPTH,
     PRIMARY_KEY_MAP,
     TASK_AGENT_TOOLS,
     TASK_AUTO_TOOLS,
     TOOLS,
     apply_cwd_context,
     merge_mcp_tools,
+    nested_deeper_than,
     salvage_tool_arguments,
 )
 from turnstone.core.trajectory import (
@@ -19637,6 +19639,11 @@ class ChatSession:
 
         try:
             args = json.loads(raw_args)
+            # Deeper arguments parse, but break code that walks them one level per call.
+            if nested_deeper_than(args, MAX_TOOL_ARGUMENT_DEPTH):
+                raise RecursionError(
+                    f"arguments nested more than {MAX_TOOL_ARGUMENT_DEPTH} levels deep"
+                )
         except (ValueError, RecursionError) as exc:
             # Only text that didn't decode is salvaged: valid JSON too deep to use, or holding a
             # number past the parser's digit limit, has a structure salvage would guess at,

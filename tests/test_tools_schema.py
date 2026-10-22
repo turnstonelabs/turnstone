@@ -178,3 +178,28 @@ class TestToolsMetadata:
     def test_meta_has_all_tools(self):
         tool_names = {t["function"]["name"] for t in TOOLS}
         assert set(_META.keys()) == tool_names
+
+
+class TestNestedDeeperThan:
+    """``nested_deeper_than`` measures parsed JSON without recursing."""
+
+    @staticmethod
+    def _nest(depth: int) -> object:
+        value: object = "leaf"
+        for _ in range(depth):
+            value = [value]
+        return value
+
+    def test_counts_objects_and_lists_not_scalars(self) -> None:
+        from turnstone.core.tools import nested_deeper_than
+
+        assert nested_deeper_than("text", 0) is False
+        assert nested_deeper_than({"a": [1, {"b": 2}]}, 3) is False
+        assert nested_deeper_than({"a": [1, {"b": 2}]}, 2) is True
+
+    def test_a_value_too_deep_for_recursive_code(self) -> None:
+        from turnstone.core.tools import nested_deeper_than
+
+        assert nested_deeper_than(self._nest(100), 100) is False
+        assert nested_deeper_than(self._nest(101), 100) is True
+        assert nested_deeper_than(self._nest(50_000), 100) is True
