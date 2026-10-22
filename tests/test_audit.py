@@ -50,6 +50,37 @@ def test_record_audit_silent_on_failure():
     record_audit(BrokenStorage(), "u1", "test.action")
 
 
+def test_record_audit_keeps_an_event_whose_detail_is_too_deep_to_scrub(storage):
+    """The scrub recurses once per nesting level, so a detail nested past the recursion limit
+    fails it: the event is still recorded, with a placeholder for the detail, never raised and
+    never stored unscrubbed."""
+    deep: object = "password=hunter2"
+    for _ in range(5000):
+        deep = [deep]
+    record_audit(storage, "u1", "test.action", "user", "u9", {"value": deep})
+    [event] = storage.list_audit_events()
+    assert (event["action"], event["resource_id"]) == ("test.action", "u9")
+    assert json.loads(event["detail"]) == {"detail_omitted": "nested too deeply to record"}
+    assert "hunter2" not in json.dumps(event)
+
+
+def test_record_audit_keeps_an_event_whose_detail_is_too_deep_to_encode(storage, monkeypatch):
+    # Encoding fails only far deeper than the scrub (about 10,000 levels on 3.13, the thread's
+    # stack on 3.14), so the test makes it fail for this detail.
+    detail = {"value": ["unscrubbed"]}
+    real_dumps = json.dumps
+
+    def dumps(obj, *args, **kwargs):
+        if obj is detail:
+            raise RecursionError("maximum recursion depth exceeded while encoding a JSON object")
+        return real_dumps(obj, *args, **kwargs)
+
+    monkeypatch.setattr(json, "dumps", dumps)
+    record_audit(storage, "u1", "test.action", "user", "u9", detail, raw_detail=True)
+    [event] = storage.list_audit_events()
+    assert json.loads(event["detail"]) == {"detail_omitted": "nested too deeply to record"}
+
+
 def test_record_audit_generates_unique_ids(storage):
     record_audit(storage, "u1", "a.one")
     record_audit(storage, "u1", "a.two")
@@ -208,3 +239,12 @@ def test_record_audit_leaves_non_string_scalars_alone(storage):
     event = storage.list_audit_events()[0]
     detail = json.loads(event["detail"])
     assert detail == {"budget_ok": True, "spawned": 5, "parent": None}
+
+
+def test_record_audit_keeps_an_event_whose_detail_cannot_be_encoded(storage):
+    """A value JSON can't hold fails the encoding; the event stays on the trail all the same."""
+    import datetime
+
+    record_audit(storage, "u1", "test.action", "user", "u9", {"when": datetime.datetime.now()})
+    [event] = storage.list_audit_events()
+    assert json.loads(event["detail"]) == {"detail_omitted": "could not be encoded"}

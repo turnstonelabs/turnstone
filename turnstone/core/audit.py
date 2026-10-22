@@ -160,8 +160,6 @@ def record_audit(
     investigation — can pass ``raw_detail=True`` to opt out.  Every
     model→audit path MUST leave ``raw_detail`` at its default.
     """
-    if detail and not raw_detail and _has_any_string(detail):
-        detail = _redact_detail(detail)
     try:
         storage.record_audit_event(
             event_id=uuid.uuid4().hex,
@@ -169,8 +167,32 @@ def record_audit(
             action=action,
             resource_type=resource_type,
             resource_id=resource_id,
-            detail=json.dumps(detail) if detail else "{}",
+            detail=_stored_detail(detail, raw_detail=raw_detail, action=action),
             ip_address=ip_address,
         )
     except Exception:
         log.warning("Failed to record audit event: %s %s", action, resource_id, exc_info=True)
+
+
+def _stored_detail(detail: dict[str, Any] | None, *, raw_detail: bool, action: str) -> str:
+    """*detail* as the JSON an audit row stores, scrubbed unless *raw_detail*.
+
+    The scrub recurses once per nesting level, and so does encoding, so a detail nested past the
+    recursion limit fails both; encoding also fails on a value JSON can't hold, such as a datetime.
+    The event is then recorded with a placeholder that says which, instead of its detail: still on
+    the trail, and never stored unscrubbed.
+    """
+    if not detail:
+        return "{}"
+    try:
+        if not raw_detail and _has_any_string(detail):
+            detail = _redact_detail(detail)
+        return json.dumps(detail)
+    except (RecursionError, TypeError, ValueError) as exc:
+        reason = (
+            "nested too deeply to record"
+            if isinstance(exc, RecursionError)
+            else "could not be encoded"
+        )
+        log.error("Audit detail %s: %s", reason, action)
+        return json.dumps({"detail_omitted": reason})
