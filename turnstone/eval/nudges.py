@@ -69,6 +69,7 @@ from turnstone.console.coordinator_client import (
     CoordinatorClient,
     _enrich_wait_results,
     _last_assistant_text,
+    _roster_fields,
     load_task_envelope,
 )
 from turnstone.console.coordinator_idle_observer import (
@@ -410,12 +411,12 @@ class _StubCoordinatorClient(CoordinatorClient):
         (``complete=False``, ``message=None``, ``elapsed`` = the clamped
         requested timeout), and an id no fixture registered produces
         production's not-found shape — per-ws ``state="not_found"`` plus
-        the top-level ``error`` / ``not_found`` / ``children`` block,
-        built by the real (storage-backed) ``_ws_ref_error`` so the
-        did-you-mean and roster hints are the production ones.  The
-        earlier hardcoded terminal blob told the model a RUNNING child
-        had completed, so the pair arms measured a stub-invented
-        completion instead of the seeded state.
+        the top-level ``error`` / ``not_found`` block and, when it can be
+        read, the ``children`` roster, built by the real (storage-backed)
+        ``_ws_ref_error`` so the did-you-mean and roster hints are the
+        production ones.  The earlier hardcoded terminal blob told the
+        model a RUNNING child had completed, so the pair arms measured a
+        stub-invented completion instead of the seeded state.
 
         Messages ride production's ``_enrich_wait_results`` over the
         temp DB, where the run seeder wrote each child's fixture
@@ -498,14 +499,14 @@ class _StubCoordinatorClient(CoordinatorClient):
             "mode": mode,
         }
         if missing:
-            hints = [self._ws_ref_error(ws) for ws in missing]
+            hint_roster = self._roster_hint()
+            hints = [self._ws_ref_error(ws, roster=hint_roster) for ws in missing]
             out["not_found"] = [
                 {key: h[key] for key in ("ws_id", "error", "did_you_mean") if key in h}
                 for h in hints
             ]
             out["error"] = " | ".join(str(h.get("error") or "") for h in hints)
-            out["children"] = hints[0].get("children", [])
-            out["children_truncated"] = hints[0].get("children_truncated", False)
+            out.update(_roster_fields(hints[0]))
         return out
 
     def _fetch_cluster_live(self, ws_id: str) -> dict[str, Any] | None:
@@ -1177,19 +1178,14 @@ def _run_single_nudge(
 
     def _finish(session: Any, tool_log: list[dict[str, Any]]) -> dict[str, Any]:
         storage = state["storage"]
-        # The post-run read is the scoring GROUND TRUTH, and it is the
-        # module's only read whose failure would otherwise be attributed
-        # to the body under test: ``load_task_envelope``'s default fails
-        # OPEN (a swallowed storage raise comes back as an empty
-        # envelope, which scores as the model having deleted its tasks)
-        # for its UI read paths, where an empty pane beats a crashed
-        # request — the idle observer itself now opts out of the swallow
-        # and fails its event closed on a failed read.  A scorer needs
-        # the loud direction too, so read the raw row first (a storage
-        # fault raises here, loudly, and lands in the sweep's
-        # ``harness:`` bucket), refuse a row the seed wrote that storage
-        # no longer carries, and honour the corrupt flag instead of
-        # scoring corruption as emptiness.
+        # The post-run read is the scoring GROUND TRUTH, and an envelope
+        # that reads as empty scores as the model having deleted its
+        # tasks, so each way the read can come back empty without the
+        # model emptying it is refused instead of scored: a storage fault
+        # raises (``load_task_envelope`` raises on a failed read too) and
+        # lands in the sweep's ``harness:`` bucket, a row the seed wrote
+        # that storage no longer carries is refused, and the corrupt flag
+        # is honoured instead of scoring corruption as emptiness.
         raw_config = storage.load_workstream_config(coord_ws) or {}
         if case.get("tasks") and not raw_config.get("tasks"):
             raise RuntimeError(
@@ -1505,9 +1501,13 @@ class _ThrowawayEnvelopeStorage:
     through the REAL write path, and the write path's only storage
     traffic is the envelope read-modify-write — these two calls.  Every
     RULE stays in ``tasks_add``; this class holds a dict.  If the write
-    path ever grows a new storage call, the dry-run raises
-    ``AttributeError`` at sweep start — loud, pre-canary, pre-payment —
-    rather than silently vouching for rows the run path would reject.
+    path ever grows a new storage call, the dry-run raises at sweep
+    start — loud, pre-canary, pre-payment — rather than silently
+    vouching for rows the run path would reject.  A new call on the
+    envelope read arrives as the client's ``CoordinatorReadError``
+    chained from the ``AttributeError``, whose advice to retry is
+    written for a model, not for this check; anywhere else it is the
+    ``AttributeError`` itself.
     """
 
     def __init__(self) -> None:

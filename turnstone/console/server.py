@@ -142,6 +142,7 @@ from turnstone.core.storage import (
 )
 from turnstone.core.token_store.crypto import STARTUP_KEY_REQUIRED_HINT
 from turnstone.core.web_helpers import (
+    WORKSTREAM_UNREADABLE_CODE,
     RevalidatingStaticFiles,
     is_safe_static_asset_path,
     lease_refusal_response,
@@ -1009,10 +1010,12 @@ async def cluster_ws_detail(request: Request) -> JSONResponse:
     - ``persisted`` — the full ``get_workstream`` row (never ``None``).
     - ``live`` — live fields merged from the owning node, or ``null`` when
       the node is unreachable / the workstream isn't on its roster / the
-      coordinator isn't in memory.  The caller always sees ``persisted``
-      populated and a 200 response; node unreachability is signalled by
-      ``live=null`` rather than an error status.
-    - ``messages`` — tail-N conversation messages, default 20, capped at 200.
+      coordinator isn't in memory.  Node unreachability is signalled by
+      ``live=null`` rather than an error status: once the row and the
+      requested tail are read, the caller sees ``persisted`` populated and
+      a 200 response.
+    - ``messages`` — tail-N conversation messages, default 20, capped at
+      200; ``limit=0`` skips the read, and a read that fails answers 503.
 
     404 masks ownership failures (match :func:`make_detail_handler`).
     Correlation-id masks unexpected exceptions in the merge path.
@@ -1108,7 +1111,9 @@ async def cluster_ws_detail(request: Request) -> JSONResponse:
                 await asyncio.to_thread(storage.load_messages, ws_id, limit=limit, repair=False)
             )
         except Exception:
-            log.debug("cluster_ws_detail.load_messages_failed", exc_info=True)
+            # An empty tail would read as a workstream with no messages.
+            log.warning("cluster_ws_detail.load_messages_failed ws_id=%s", ws_id[:8], exc_info=True)
+            return JSONResponse({"error": "workstream messages could not be read"}, status_code=503)
 
     return JSONResponse(
         {
@@ -2642,10 +2647,22 @@ def _is_lease_refusal(resp: httpx2.Response) -> bool:
     return _lease_refusal_holder(resp) is not None
 
 
-async def _prepare_reroute(router: ConsoleRouter, resp: httpx2.Response, ref: NodeRef) -> bool:
-    """Ready a re-route after a 404 or a lease refusal; False when it cannot move.
+def _is_unreadable_refusal(resp: httpx2.Response) -> bool:
+    """A node's access check could not read the workstream's row (a coded 503)."""
+    if resp.status_code != 503:
+        return False
+    try:
+        body = resp.json()
+    except (ValueError, RecursionError):
+        return False
+    return isinstance(body, dict) and body.get("code") == WORKSTREAM_UNREADABLE_CODE
 
-    A 404 may come from stale membership or overrides, so refresh first. A
+
+async def _prepare_reroute(router: ConsoleRouter, resp: httpx2.Response, ref: NodeRef) -> bool:
+    """Ready a re-route after a 404, an unreadable-row 503 or a lease refusal.
+
+    Returns False when the route cannot move.  A 404 or an unreadable-row
+    503 may come from stale membership or overrides, so refresh first. A
     lease refusal names the holder: the refusing node itself means the route
     cannot move, so its 409 stands. An empty holder or a node the router
     already knows needs no refresh, because ``route()`` re-reads the holder
@@ -2680,12 +2697,12 @@ async def _resend_if_route_moved(
     The caller decides which responses warrant this. Returns the node and
     response to report (unchanged when the route cannot move or stays the
     same, so there is no loop and no scan), or a finished response when the
-    workstream's durable node requirement refuses the new route or the new
-    node is unreachable.
+    workstream's durable node requirement refuses the new route, the new
+    node is unreachable, or a 404 can't be checked again.
     """
-    if not await _prepare_reroute(router, resp, ref):
-        return ref, resp
     try:
+        if not await _prepare_reroute(router, resp, ref):
+            return ref, resp
         new_ref = await _request_route(request, router, ws_id)
     except NodeAffinityError as exc:
         return _record_route(
@@ -2695,8 +2712,20 @@ async def _resend_if_route_moved(
             t0,
             JSONResponse(exc.as_dict(), status_code=exc.status_code),
         )
-    except (NoAvailableNodeError, ValueError):
-        return ref, resp
+    except Exception:
+        # Membership or the route couldn't be read again. A 404 passed on
+        # here would read as closed to a channel, so it becomes the proxy's
+        # 503; any other answer passes through.
+        log.warning("route.reroute_unresolved ws=%s verb=%s", ws_id[:8], verb, exc_info=True)
+        if resp.status_code != 404:
+            return ref, resp
+        return _record_route(
+            request,
+            verb,
+            503,
+            t0,
+            JSONResponse({"error": "routing failed"}, status_code=503),
+        )
     if (new_ref.node_id, new_ref.url) == (ref.node_id, ref.url):
         return ref, resp
     try:
@@ -2970,9 +2999,11 @@ async def route_proxy(request: Request) -> Response:
     # have the workstream loaded. Refresh membership + overrides and
     # re-route; ``route()`` rereads the lease holder from the row, so a moved
     # workstream routes to its new owner. These verbs act on a loaded
-    # workstream, so a node that does not host it answers 404, never a lease
-    # refusal; such a 409 passes through unchanged.
-    if resp.status_code == 404:
+    # workstream, so a node that does not host it answers 404, or 503 with
+    # the unreadable-row code when its access check can't read the row
+    # (refused before the verb acts), never a lease refusal; such a 409
+    # passes through unchanged.
+    if resp.status_code == 404 or _is_unreadable_refusal(resp):
         moved = await _resend_if_route_moved(
             request,
             router,
@@ -3922,95 +3953,55 @@ def _require_admin_coordinator(
 async def _resolve_coordinator_or_404(
     request: Request,
     coord_mgr: Any,
-    storage: Any,
     ws_id: str,
-    user_id: str,
 ) -> tuple[Any, JSONResponse | None]:
-    """Resolve a coordinator workstream by id.
+    """Resolve a coordinator workstream by id for the coord-only verbs.
 
-    Returns ``(ws, None)`` on success — ``ws`` is the in-memory
+    Runs :func:`_coordinator_tenant_check`, the gate the shared verbs
+    (history, detail, ...) use, off the event loop, so every coordinator
+    route answers the same id the same way.  Returns ``(None, 404)`` when
+    the gate refuses, else ``(ws, None)``: ``ws`` is the in-memory
     ``Workstream`` when present, ``None`` when the coordinator is
     persisted but not loaded (callers may then fall through to
-    ``storage`` directly or trigger lazy rehydration).  Returns
-    ``(None, 404)`` on missing row / wrong kind / storage unavailable.
-
-    Centralises the manager-first, storage-fallback, 404-mask ladder
-    used by the coord-only verbs (``coordinator_children`` /
-    ``coordinator_tasks``).  The shared verbs (history, detail, ...)
-    route through :func:`_coordinator_tenant_check` instead (wired onto
-    ``coord_endpoint_config.tenant_check``).  Turnstone is a trusted-team
-    tool — ``user_id`` is metadata, not an ownership boundary, so this
-    helper does not gate on row ownership; ``admin.coordinator`` upstream
-    gates the surface.  It DOES enforce project tenancy, though: a
-    coordinator attached to a PRIVATE project stays confidential to its
-    members, so a non-member (even an ``admin.coordinator`` holder) is
-    404-masked, same as a missing row.
+    ``storage`` directly or trigger lazy rehydration).
     """
-    del user_id  # retained in signature for caller-site clarity; not consulted here
-    from turnstone.core.auth import WorkstreamProjectVisibility
-
-    miss = JSONResponse({"error": "coordinator not found"}, status_code=404)
-    visibility = WorkstreamProjectVisibility.for_request(request, storage=storage)
-    ws = coord_mgr.get(ws_id) if coord_mgr is not None else None
-    if ws is None:
-        if storage is None:
-            return None, miss
-        try:
-            # Cold-cache path (every console restart, eviction, console
-            # proxy hop) — offload the sync DB call so the coord
-            # children/tasks handlers don't block the event loop on the
-            # same DB the rest of the handler is unblocking.
-            row = await asyncio.to_thread(storage.get_workstream, ws_id)
-        except Exception:
-            log.debug("resolve_coordinator.storage_failed ws=%s", ws_id[:8], exc_info=True)
-            return None, miss
-        if (
-            row is None
-            or row.get("state") == "creating"
-            or row.get("kind") != WorkstreamKind.COORDINATOR
-        ):
-            return None, miss
-        # Project tenancy — the predicate may resolve a project row +
-        # membership, so judge it off the event loop.
-        if not await asyncio.to_thread(
-            visibility.ws_visible, row.get("project_id") or "", row.get("user_id") or ""
-        ):
-            return None, miss
-        return None, None
-    if not await asyncio.to_thread(
-        visibility.ws_visible, getattr(ws, "project_id", "") or "", ws.user_id or ""
-    ):
-        return None, miss
-    return ws, None
+    err404 = await asyncio.to_thread(_coordinator_tenant_check, request, ws_id, coord_mgr)
+    if err404 is not None:
+        return None, err404
+    return (coord_mgr.get(ws_id) if coord_mgr is not None else None), None
 
 
 def _coordinator_tenant_check(request: Request, ws_id: str, mgr: Any) -> JSONResponse | None:
-    """Project-tenancy gate for the lifted coordinator verbs.
+    """The coordinator gate: project tenancy for every coordinator route.
 
     Wired onto ``coord_endpoint_config.tenant_check`` (invoked SYNC in a
     thread) so history / export / detail / set_title / send / approve / …
-    all enforce it.  ``admin.coordinator`` gates the coordinator surface
-    cluster-wide, so row OWNERSHIP is not enforced (any operator may drive
-    any coordinator) — but a coordinator attached to a PRIVATE project stays
-    confidential to its members.
+    all enforce it, and :func:`_resolve_coordinator_or_404` runs it for the
+    coord-only verbs.  Turnstone is a trusted-team tool: ``admin.coordinator``
+    gates the coordinator surface cluster-wide, so row OWNERSHIP is not
+    enforced (any operator may drive any coordinator) — but a coordinator
+    attached to a PRIVATE project stays confidential to its members, so a
+    non-member (even an ``admin.coordinator`` holder) is 404-masked, same as
+    a missing row.
 
-    Sync mirror of :func:`_resolve_coordinator_or_404`'s manager-first,
-    storage-fallback, coordinator-kind ladder (the in-memory manager is the
-    existence/kind authority; a storage row covers saved/closed
-    coordinators) plus the project-visibility gate.  Everything that fails —
-    unknown id, wrong kind, or a private project the caller can't see —
-    404-masks identically, so the surface is neither an existence nor a
-    private-project oracle.  Reusing the manager-first + kind ladder also
+    The ladder is manager-first, storage-fallback, coordinator-kind (the
+    in-memory manager is the existence/kind authority; a storage row covers
+    saved/closed coordinators) plus the project-visibility gate.  Everything
+    that fails — unknown id, wrong kind, a private project the caller can't
+    see, or a read that fails — 404-masks identically, so the surface is
+    neither an existence nor a private-project oracle, during an outage too:
+    an unloaded coordinator's failed row read denies just as a loaded one's
+    failed project read does.  Reusing the manager-first + kind ladder also
     preserves the coord kind-isolation that :func:`make_set_title_handler`
     previously got from the ``tenant_check is None`` manager-lookup guard.
     """
     from turnstone.core.auth import WorkstreamProjectVisibility
 
     miss = JSONResponse({"error": "coordinator not found"}, status_code=404)
-    # Use the request's configured storage (like cluster_ws_detail /
-    # _resolve_coordinator_or_404) — NOT the global registry, which can
-    # resolve a different/auto-init'd backend and evaluate the tenancy
-    # decision against the wrong DB (fail-open on a missing project row).
+    # Use the request's configured storage (like cluster_ws_detail) — NOT
+    # the global registry, which can resolve a different/auto-init'd
+    # backend and evaluate the tenancy decision against the wrong DB
+    # (fail-open on a missing project row).
     storage = getattr(request.app.state, "auth_storage", None)
     if storage is None:
         return miss
@@ -4020,7 +4011,11 @@ def _coordinator_tenant_check(request: Request, ws_id: str, mgr: Any) -> JSONRes
         project_id = getattr(ws, "project_id", "") or ""
         owner = ws.user_id or ""
     else:
-        row = storage.get_workstream(ws_id)
+        try:
+            row = storage.get_workstream(ws_id)
+        except Exception:
+            log.warning("coordinator_tenant_check.storage_failed ws=%s", ws_id[:8], exc_info=True)
+            return miss
         if (
             row is None
             or row.get("state") == "creating"
@@ -4487,8 +4482,7 @@ async def coordinator_children(request: Request) -> JSONResponse:
     ws_id = request.path_params.get("ws_id", "")
     if not _VALID_WS_ID_RE.match(ws_id):
         return JSONResponse({"error": "invalid ws_id"}, status_code=400)
-    user_id = _auth_user_id(request)
-    _ws, err404 = await _resolve_coordinator_or_404(request, coord_mgr, storage, ws_id, user_id)
+    _ws, err404 = await _resolve_coordinator_or_404(request, coord_mgr, ws_id)
     if err404 is not None:
         return err404
 
@@ -4595,6 +4589,8 @@ async def coordinator_metrics(request: Request) -> JSONResponse:
 
     Ownership / authz: same gate as :func:`make_detail_handler` —
     404-mask rows the caller doesn't own (no existence-oracle leak).
+    A read that fails answers 503 rather than zeros, which would read
+    as a healthy, idle coordinator.
     """
     from turnstone.core.web_helpers import require_storage_or_503
 
@@ -4611,8 +4607,7 @@ async def coordinator_metrics(request: Request) -> JSONResponse:
     ws_id = request.path_params.get("ws_id", "")
     if not _VALID_WS_ID_RE.match(ws_id):
         return JSONResponse({"error": "invalid ws_id"}, status_code=400)
-    user_id = _auth_user_id(request)
-    _ws, err404 = await _resolve_coordinator_or_404(request, coord_mgr, storage, ws_id, user_id)
+    _ws, err404 = await _resolve_coordinator_or_404(request, coord_mgr, ws_id)
     if err404 is not None:
         return err404
 
@@ -4633,34 +4628,21 @@ async def coordinator_metrics(request: Request) -> JSONResponse:
             parent_ws_id=ws_id,
             user_id=None,
         )
-    except Exception:
-        log.debug("coordinator_metrics.state_counts_failed ws=%s", ws_id[:8], exc_info=True)
-        state_counts = {}
-    spawns_total = sum(state_counts.values())
-    try:
         spawns_last_hour = await asyncio.to_thread(
             storage.count_workstreams_since,
             hour_ago_iso,
             parent_ws_id=ws_id,
             user_id=None,
         )
-    except Exception:
-        log.debug(
-            "coordinator_metrics.spawns_last_hour_failed ws=%s",
-            ws_id[:8],
-            exc_info=True,
-        )
-        spawns_last_hour = 0
-
-    # Intent verdicts — scoped to the coordinator itself (child verdicts
-    # would require iterating every child's verdicts; deferred).  Small
-    # cap (last 200) keeps this a cheap query; enough to compute a
-    # meaningful rate for a busy coordinator.
-    try:
+        # Intent verdicts — scoped to the coordinator itself (child
+        # verdicts would require iterating every child's verdicts;
+        # deferred).  Small cap (last 200) keeps this a cheap query;
+        # enough to compute a meaningful rate for a busy coordinator.
         verdicts = await asyncio.to_thread(storage.list_intent_verdicts, ws_id=ws_id, limit=200)
     except Exception:
-        log.debug("coordinator_metrics.list_verdicts_failed ws=%s", ws_id[:8], exc_info=True)
-        verdicts = []
+        log.warning("coordinator_metrics.read_failed ws=%s", ws_id[:8], exc_info=True)
+        return JSONResponse({"error": "coordinator metrics could not be read"}, status_code=503)
+    spawns_total = sum(state_counts.values())
     total_verdicts = len(verdicts)
     fallback_count = 0
     for v in verdicts:
@@ -4797,7 +4779,7 @@ async def _resolve_coord_session(
     if not _VALID_WS_ID_RE.match(ws_id):
         return JSONResponse({"error": "invalid ws_id"}, status_code=400)
     user_id = _auth_user_id(request)
-    ws, err404 = await _resolve_coordinator_or_404(request, coord_mgr, storage, ws_id, user_id)
+    ws, err404 = await _resolve_coordinator_or_404(request, coord_mgr, ws_id)
     if err404 is not None:
         return err404
     if ws is None or ws.session is None:
@@ -5093,9 +5075,11 @@ async def coordinator_tasks(request: Request) -> JSONResponse:
     ``tasks(action="list")`` tool returns (less the list-tool's
     client-side 200-row slice; the UI handles its own pagination).
 
-    Corrupt envelopes return an empty list for UI resilience.  The
-    ``tasks`` tool remains the authoritative write path and surfaces
-    corruption errors to the model on mutation attempts.
+    Corrupt envelopes return an empty list for UI resilience.  A failed
+    storage read answers 503 instead, so the pane keeps the list it last
+    rendered rather than showing an empty one.  The ``tasks`` tool
+    remains the authoritative write path; it surfaces corruption errors
+    to the model on mutation attempts and a failed read on every action.
     """
     from turnstone.core.web_helpers import require_storage_or_503
 
@@ -5112,12 +5096,15 @@ async def coordinator_tasks(request: Request) -> JSONResponse:
     ws_id = request.path_params.get("ws_id", "")
     if not _VALID_WS_ID_RE.match(ws_id):
         return JSONResponse({"error": "invalid ws_id"}, status_code=400)
-    user_id = _auth_user_id(request)
-    _ws, err404 = await _resolve_coordinator_or_404(request, coord_mgr, storage, ws_id, user_id)
+    _ws, err404 = await _resolve_coordinator_or_404(request, coord_mgr, ws_id)
     if err404 is not None:
         return err404
 
-    envelope, _corrupt = await asyncio.to_thread(load_task_envelope, storage, ws_id)
+    try:
+        envelope, _corrupt = await asyncio.to_thread(load_task_envelope, storage, ws_id)
+    except Exception:
+        log.warning("coordinator.tasks_read_failed ws_id=%s", ws_id[:8], exc_info=True)
+        return JSONResponse({"error": "task list could not be read"}, status_code=503)
     envelope = _sanitize_task_envelope_for_display(envelope)
     return JSONResponse(envelope)
 

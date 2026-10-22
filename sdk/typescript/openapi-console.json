@@ -8140,7 +8140,7 @@
         "tags": [
           "Coordinator"
         ],
-        "description": "Returns the ``{version, tasks}`` envelope persisted via the ``tasks`` model tool.  Corrupt envelopes return an empty list (the tool itself surfaces corruption errors on mutation).",
+        "description": "Returns the ``{version, tasks}`` envelope persisted via the ``tasks`` model tool.  Corrupt envelopes return an empty list (the tool itself surfaces corruption errors on mutation); a storage read that fails answers 503.",
         "parameters": [
           {
             "name": "ws_id",

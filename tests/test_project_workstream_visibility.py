@@ -350,6 +350,20 @@ class TestResolveWorkstreamOwnerProjectGate:
         owner, err = resolve_workstream_owner(_request_for("bob"), "nope")
         assert err is not None and err.status_code == 404
 
+    def test_unreadable_ws_503s(self, tmp_db: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        from turnstone.core.memory import register_workstream
+        from turnstone.core.storage import get_storage
+        from turnstone.core.web_helpers import resolve_workstream_owner
+
+        register_workstream("ws-pub", user_id="alice")
+
+        def _broken(_ws_id: str) -> None:
+            raise RuntimeError("db down")
+
+        monkeypatch.setattr(get_storage(), "get_workstream", _broken)
+        owner, err = resolve_workstream_owner(_request_for("bob"), "ws-pub")
+        assert err is not None and err.status_code == 503
+
     def test_public_project_ws_resolves(self, tmp_db: str) -> None:
         from turnstone.core.memory import register_workstream
         from turnstone.core.storage import get_storage

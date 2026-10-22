@@ -275,10 +275,10 @@ Key properties:
   coord's children.  An id the caller doesn't own, a missing row, or
   a child hard-deleted mid-wait is reported as `state="not_found"`
   and aborts the wait on the tick that observes it (top-level
-  `error` / `not_found` / `children` fields, `complete=false`) — the
-  LLM should fix the id and re-issue, not conclude the child died.
-  Foreign and missing collapse into one shape, so the wait can't be
-  used as an existence oracle.
+  `error` / `not_found` fields, the `children` roster when it can be
+  read, `complete=false`) — the LLM should fix the id and re-issue,
+  not conclude the child died.  Foreign and missing collapse into one
+  shape, so the wait can't be used as an existence oracle.
 - **Messages come with a completed wait** — `message` carries each
   finished child's last assistant text only when the wait completes
   (or aborts on `not_found`).  A wait that times out or is

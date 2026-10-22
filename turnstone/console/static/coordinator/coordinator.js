@@ -4788,6 +4788,17 @@ function createCoordinatorPane(root, wsId, opts) {
   const CHILDREN_HARD_CAP = 2000;
 
   let tasksState = { version: 1, tasks: [] };
+  // Each sidebar pane's load state: "pending" until a load finishes,
+  // then "ok" once one has succeeded, or "failed" while none has.  A
+  // failed refresh after a success keeps the stale-but-real content,
+  // so "ok" is never undone.
+  let tasksLoad = "pending";
+  let childrenLoad = "pending";
+
+  // A pane none of whose loads succeeded says so instead of reading as empty.
+  function emptyPaneText(load, emptyText, what) {
+    return load === "failed" ? what + " couldn't be loaded" : emptyText;
+  }
 
   function stateGlyph(state) {
     // cls comes from the shared .ui-glyph-* vocabulary in ui-base.css
@@ -5600,9 +5611,22 @@ function createCoordinatorPane(root, wsId, opts) {
     if (rows.length === 0) {
       const empty = document.createElement("div");
       empty.className = "sidebar-empty";
-      empty.textContent = "no children spawned yet";
+      empty.textContent = emptyPaneText(
+        childrenLoad,
+        "no children spawned yet",
+        "children",
+      );
       childrenTreeEl.appendChild(empty);
     } else {
+      if (childrenLoad === "failed") {
+        // Live child events can add rows while no load has succeeded;
+        // those rows are only part of the list, so say so above them.
+        const partial = document.createElement("div");
+        partial.className = "sidebar-empty";
+        partial.textContent =
+          "children couldn't be loaded; showing live updates only";
+        childrenTreeEl.appendChild(partial);
+      }
       rows.forEach((r) => {
         const rowEl = renderChildRow(r);
         childrenTreeEl.appendChild(rowEl);
@@ -5777,7 +5801,7 @@ function createCoordinatorPane(root, wsId, opts) {
     if (tasks.length === 0) {
       const empty = document.createElement("div");
       empty.className = "sidebar-empty";
-      empty.textContent = "no tasks yet";
+      empty.textContent = emptyPaneText(tasksLoad, "no tasks yet", "tasks");
       tasksEl.appendChild(empty);
     } else {
       tasks.forEach((t) => tasksEl.appendChild(renderTaskRow(t)));
@@ -5810,8 +5834,10 @@ function createCoordinatorPane(root, wsId, opts) {
         childrenState.set(k, v);
         childrenLastSeen.set(k, now);
       });
+      childrenLoad = "ok";
     } catch (e) {
       console.warn("loadChildren failed", e);
+      if (childrenLoad !== "ok") childrenLoad = "failed";
     } finally {
       renderChildren();
       childrenState.forEach((_, ws) => scheduleLiveFetch(ws));
@@ -5824,8 +5850,10 @@ function createCoordinatorPane(root, wsId, opts) {
         "/v1/api/workstreams/" + encodeURIComponent(wsId) + "/tasks",
       );
       tasksState = body || { version: 1, tasks: [] };
+      tasksLoad = "ok";
     } catch (e) {
       console.warn("loadTasks failed", e);
+      if (tasksLoad !== "ok") tasksLoad = "failed";
     } finally {
       renderTasks();
     }

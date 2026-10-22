@@ -20,7 +20,9 @@ from tests._http_failure_cases import UNREACHABLE_REPLIES
 from turnstone.console.coordinator_client import (
     _ROUTE_PATHS,
     CoordinatorClient,
+    CoordinatorReadError,
     CoordinatorTokenManager,
+    load_task_envelope,
 )
 from turnstone.core.auth import JWT_AUD_CONSOLE, validate_jwt
 from turnstone.core.child_event_bus import ChildEventBus
@@ -1027,6 +1029,30 @@ def test_list_nodes_filters_stale_registrations_by_default(tmp_path, sqlite_back
     assert full_ids == {"node-live", "node-dead"}
 
 
+def test_list_nodes_raises_when_the_live_node_list_cannot_be_read(
+    tmp_path, monkeypatch, sqlite_backend_factory
+):
+    """A failed liveness read is an error to retry, not every node that ever
+    registered offered as a live target.  ``include_inactive`` asks for every
+    registration, so it needs no liveness read."""
+    st = sqlite_backend_factory(str(tmp_path / "nodes.db"))
+    _set_meta(st, "node-live", [("arch", "x86_64", "auto")])
+    _set_meta(st, "node-dead", [("arch", "x86_64", "auto")])
+    _register_service(st, "node-live")
+    client = _make_read_client(st)
+
+    def _down(*_a: Any, **_kw: Any) -> Any:
+        raise RuntimeError("storage down")
+
+    monkeypatch.setattr(st, "list_services", _down)
+    for filters in (None, {"arch": "x86_64"}):
+        with pytest.raises(CoordinatorReadError, match="live nodes could not be read") as excinfo:
+            client.list_nodes(filters=filters)
+        assert str(excinfo.value.__cause__) == "storage down"
+    full = client.list_nodes(include_inactive=True)
+    assert {n["node_id"] for n in full["nodes"]} == {"node-live", "node-dead"}
+
+
 def test_list_nodes_filter_uses_natural_value_not_quoted(storage_with_nodes, monkeypatch):
     """Model passes ``{"capability": "gpu"}`` — client re-encodes to
     ``'"gpu"'`` before filter_nodes_by_metadata so the stored text
@@ -1304,6 +1330,42 @@ def test_inspect_skips_workstream_config_read_for_live_workstreams(populated_sto
     assert calls == []
 
 
+def test_inspect_raises_when_the_history_cannot_be_read(populated_storage, monkeypatch):
+    """A failed history read is an error the model can retry, not an
+    empty history that reads as a child that produced nothing."""
+
+    def _broken(*_a, **_kw):
+        raise RuntimeError("storage down")
+
+    monkeypatch.setattr(populated_storage, "load_messages", _broken)
+    client = _make_read_client(populated_storage)
+    with pytest.raises(CoordinatorReadError) as excinfo:
+        client.inspect("child-a")
+    assert str(excinfo.value) == (
+        "the workstream's history could not be read. Retry after storage recovers."
+    )
+    assert str(excinfo.value.__cause__) == "storage down"
+
+
+@pytest.mark.parametrize("state", ["closed", "error"])
+def test_inspect_raises_when_a_terminal_childs_config_cannot_be_read(
+    populated_storage, monkeypatch, state
+):
+    """A terminal child's close reason and last error come from its
+    config row, so a failed read of it is an error rather than a child
+    that has neither."""
+    populated_storage.update_workstream_state("child-a", state)
+    _fail_config_reads(monkeypatch, populated_storage)
+    client = _make_read_client(populated_storage)
+    with pytest.raises(CoordinatorReadError) as excinfo:
+        client.inspect("child-a")
+    assert str(excinfo.value) == (
+        "the workstream's close reason and last error could not be read. "
+        "Retry after storage recovers."
+    )
+    assert str(excinfo.value.__cause__) == "storage down"
+
+
 def test_inspect_live_falls_back_to_persisted_tokens(populated_storage):
     """live block carries tokens=0 for an idle child whose node hasn't
     published a fresh tick — fall back to SUM(usage_events) so the
@@ -1348,6 +1410,115 @@ def test_inspect_live_keeps_nonzero_live_tokens(populated_storage):
     )
     result = client.inspect("child-a")
     assert result["live"]["tokens"] == 17
+
+
+def test_inspect_live_leaves_tokens_out_when_the_persisted_sum_cannot_be_read(
+    populated_storage, monkeypatch
+):
+    """A failed read of the persisted sum is not a zero: the live block
+    leaves the count out rather than report a child that spent nothing,
+    and is cached like the other failures, so a burst of inspects reads
+    the sum once."""
+    calls: list[str] = []
+
+    def _broken(ws_id: str):  # type: ignore[no-untyped-def]
+        calls.append(ws_id)
+        raise RuntimeError("storage down")
+
+    monkeypatch.setattr(populated_storage, "sum_workstream_tokens", _broken)
+    client = _make_client_with_cluster_response(
+        populated_storage,
+        status=200,
+        body={"persisted": {"ws_id": "child-a"}, "live": {"state": "idle", "tokens": 0}},
+    )
+    assert client.inspect("child-a")["live"] == {"state": "idle"}
+    assert client.inspect("child-a")["live"] == {"state": "idle"}
+    assert calls == ["child-a"]
+
+
+def test_inspect_raises_when_the_row_cannot_be_read(populated_storage, monkeypatch):
+    """The row read reports the same retryable error as inspect's other
+    reads, not the storage exception's own text."""
+
+    def _broken(*_a, **_kw):
+        raise RuntimeError("storage down")
+
+    monkeypatch.setattr(populated_storage, "get_workstream", _broken)
+    client = _make_read_client(populated_storage)
+    with pytest.raises(CoordinatorReadError) as excinfo:
+        client.inspect("child-a")
+    assert str(excinfo.value) == "the workstream could not be read. Retry after storage recovers."
+    assert str(excinfo.value.__cause__) == "storage down"
+
+
+def test_inspect_reads_the_tail_its_message_limit_needs(populated_storage, monkeypatch):
+    """inspect bounds its history read to the tail it returns, and reads
+    the whole history only when the bounded read comes back short."""
+    for i in range(30):
+        populated_storage.save_message("child-a", "user", f"message {i}")
+    limits: list[int | None] = []
+    real = populated_storage.load_messages
+
+    def _spy(ws_id: str, **kwargs: Any) -> Any:
+        limits.append(kwargs.get("limit"))
+        return real(ws_id, **kwargs)
+
+    monkeypatch.setattr(populated_storage, "load_messages", _spy)
+    client = _make_read_client(populated_storage)
+    tail = client.inspect("child-a", message_limit=5)["messages"]
+    assert [m["content"] for m in tail] == [f"message {i}" for i in range(25, 30)]
+    assert limits == [18]
+    limits.clear()
+    assert len(client.inspect("child-a", message_limit=50)["messages"]) == 30
+    assert limits == [108, None]
+
+
+def test_inspect_asks_the_detail_route_for_no_messages(populated_storage):
+    """inspect uses only the detail route's live block, so it asks the route
+    for no message tail."""
+    limits: list[str | None] = []
+
+    def _handler(request: httpx2.Request) -> httpx2.Response:
+        limits.append(request.url.params.get("limit"))
+        return httpx2.Response(200, json={"live": {"state": "idle", "tokens": 7}})
+
+    client = CoordinatorClient(
+        console_base_url="http://x",
+        storage=populated_storage,
+        token_factory=lambda: "t",
+        coord_ws_id="coord-1",
+        user_id="user-1",
+        http_client=httpx2.Client(transport=httpx2.MockTransport(_handler)),
+        child_event_bus=ChildEventBus(),
+    )
+    assert client.inspect("child-a")["live"] == {"state": "idle", "tokens": 7}
+    assert limits == ["0"]
+
+
+def test_inspect_reads_a_detail_reply_too_deep_to_parse_as_no_live_block(
+    populated_storage, monkeypatch
+):
+    """A detail reply nested deeper than the JSON parser can follow raises
+    ``RecursionError`` (Python 3.13 at about 10,000 levels, 3.14 when the C
+    stack runs out), so only the patched decoder reaches it here.  It leaves
+    the live block out, like any other reply that can't be parsed."""
+
+    def _too_deep(*_a: Any, **_kw: Any) -> Any:
+        raise RecursionError("maximum recursion depth exceeded while decoding a JSON array")
+
+    client = CoordinatorClient(
+        console_base_url="http://x",
+        storage=populated_storage,
+        token_factory=lambda: "t",
+        coord_ws_id="coord-1",
+        user_id="user-1",
+        http_client=httpx2.Client(
+            transport=httpx2.MockTransport(lambda r: httpx2.Response(200, json={"live": {}}))
+        ),
+        child_event_bus=ChildEventBus(),
+    )
+    monkeypatch.setattr(httpx2.Response, "json", _too_deep)
+    assert "live" not in client.inspect("child-a")
 
 
 # ---------------------------------------------------------------------------
@@ -1618,19 +1789,61 @@ def test_inspect_rejects_forged_cross_tenant_hex_row(hex_storage):
     assert "messages" not in result
 
 
-def test_ws_ref_validation_survives_roster_query_failure(hex_storage, monkeypatch):
-    """Storage failure during the roster read degrades hints to empty
-    but validation still errors honestly (never resolves blind)."""
+def test_ws_ref_validation_raises_when_the_roster_cannot_be_read(hex_storage, monkeypatch):
+    """A non-hex id is checked against the roster.  When that read fails the
+    call raises the read error: it never resolves blind, and it doesn't
+    reject an id it could not check or report the coordinator childless."""
     client = _make_read_client(hex_storage)
 
     def _boom(*args: object, **kwargs: object) -> None:
         raise RuntimeError("storage down")
 
     monkeypatch.setattr(hex_storage, "list_workstreams", _boom)
-    result = client.send("not-a-real-id", "hi")
-    assert result["status"] == 404
+    with pytest.raises(CoordinatorReadError) as excinfo:
+        client.send("not-a-real-id", "hi")
+    assert str(excinfo.value) == (
+        "the list of your children could not be read. Retry after storage recovers."
+    )
+
+
+@pytest.mark.parametrize("verb", ["inspect", "wait"])
+def test_unresolvable_id_carries_no_roster_it_could_not_read(hex_storage, monkeypatch, verb):
+    """An id that names no child is decided by a row read that succeeded.
+    When only the roster read fails, the error leaves the roster and its
+    suggestions out rather than report the coordinator has no children."""
+    client = _make_read_client(hex_storage)
+
+    def _boom(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("storage down")
+
+    monkeypatch.setattr(hex_storage, "list_workstreams", _boom)
+    if verb == "inspect":
+        result = client.inspect(MISSING_HEX)
+    else:
+        result = client.wait_for_workstream([MISSING_HEX], timeout=5, mode="all")
     assert "no workstream matching" in result["error"]
-    assert result["children"] == []
+    assert "children" not in result
+    assert "children_truncated" not in result
+    assert "did_you_mean" not in result
+
+
+def test_a_failed_ownership_read_raises_but_the_trusted_send_check_asks(hex_storage, monkeypatch):
+    """A mutating verb checks ownership with a row read.  When it fails the
+    verb raises the read error rather than answer that the child isn't
+    among the coordinator's children.  The trusted-send check only decides
+    whether to ask first, so it answers False and the send asks for
+    approval, the fail-closed answer."""
+    client = _make_read_client(hex_storage)
+    assert client._is_own_subtree(REAL_CHILD_HEX) is True
+
+    def _boom(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("storage down")
+
+    monkeypatch.setattr(hex_storage, "get_workstream", _boom)
+    with pytest.raises(CoordinatorReadError) as excinfo:
+        client.close_workstream(REAL_CHILD_HEX)
+    assert str(excinfo.value) == "the workstream could not be read. Retry after storage recovers."
+    assert client._is_own_subtree(REAL_CHILD_HEX) is False
 
 
 def test_uppercase_full_hex_ref_case_folds(hex_storage):
@@ -2206,6 +2419,37 @@ def test_wait_caller_event_wakes_a_wait_with_no_registered_ids(populated_storage
     assert elapsed < 1.0, f"the wake did not end the block: {elapsed}s"
 
 
+@pytest.mark.parametrize(
+    ("method", "first_failing_call"),
+    [("get_workstreams_batch", 2), ("sum_workstream_tokens_batch", 1)],
+)
+def test_wait_ends_with_the_read_error_when_a_tick_cannot_read(
+    populated_storage, monkeypatch, method, first_failing_call
+):
+    """A tick whose read fails ends the wait with the read error: rows it
+    could not read are not missing children, and token counts it could not
+    read are not a change since the caller's snapshot.  (The first rows read
+    is the ownership pre-read, which only arms the wake.)"""
+    real = getattr(populated_storage, method)
+    calls: list[Any] = []
+
+    def _fails(ws_ids: Any) -> Any:
+        calls.append(ws_ids)
+        if len(calls) >= first_failing_call:
+            raise RuntimeError("storage down")
+        return real(ws_ids)
+
+    monkeypatch.setattr(populated_storage, method, _fails)
+    client = _make_read_client(populated_storage)
+    since = {"child-b": {"state": "running", "tokens": 1234, "updated": ""}}
+    with pytest.raises(CoordinatorReadError) as excinfo:
+        client.wait_for_workstream(["child-b"], timeout=5, mode="all", since=since)
+    assert str(excinfo.value) == (
+        "the workstreams being waited on could not be read. Retry after storage recovers."
+    )
+    assert str(excinfo.value.__cause__) == "storage down"
+
+
 # ---------------------------------------------------------------------------
 # wait_for_workstream — last-message bundling
 # ---------------------------------------------------------------------------
@@ -2342,6 +2586,25 @@ def test_wait_for_workstream_error_falls_back_to_assistant_when_no_last_error(po
     result = client.wait_for_workstream(["child-a"], timeout=5, mode="any")
     snap = result["results"]["child-a"]
     assert snap["message"] == "partial output before crash"
+
+
+def test_wait_for_workstream_error_whose_last_error_cannot_be_read_has_no_message(
+    populated_storage, monkeypatch
+):
+    """A failed last-error read is ``message: null``, the wait's mark for
+    a message it couldn't read.  The assistant tail would report the
+    child's last turn as if no error text were stored."""
+    populated_storage.update_workstream_state("child-a", "error")
+    populated_storage.save_message("child-a", "assistant", "partial output before crash")
+    populated_storage.save_workstream_config("child-a", {"last_error": "RateLimitError: 429"})
+    _fail_config_reads(monkeypatch, populated_storage)
+    client = _make_read_client(populated_storage)
+    result = client.wait_for_workstream(["child-a"], timeout=5, mode="any")
+    assert result["complete"] is True  # an incomplete wait nulls every message anyway
+    snap = result["results"]["child-a"]
+    assert snap["state"] == "error"
+    assert snap["message"] is None
+    assert snap["truncated"] is False
 
 
 def test_wait_for_workstream_closed_returns_sentinel(populated_storage):
@@ -2689,6 +2952,91 @@ def test_tasks_mutations_refuse_corrupt_envelope(tmp_path, sqlite_backend_factor
     remove_result = client.tasks_remove("coord-1", task_id="x")
     assert "error" in remove_result
     assert "corrupt" in remove_result["error"]
+
+
+def _fail_config_reads(monkeypatch, storage: SQLiteBackend) -> None:
+    def _broken(*_a, **_kw):
+        raise RuntimeError("storage down")
+
+    monkeypatch.setattr(storage, "load_workstream_config", _broken)
+
+
+def test_load_task_envelope_raises_on_a_failed_read(tmp_path, monkeypatch, sqlite_backend_factory):
+    """A read that failed is never an empty envelope; a caller that wants
+    one catches the raise and chooses it (#1416)."""
+    st = sqlite_backend_factory(str(tmp_path / "tasks.db"))
+    st.register_workstream("coord-1", kind="coordinator", user_id="user-1")
+    _fail_config_reads(monkeypatch, st)
+    with pytest.raises(RuntimeError, match="storage down"):
+        load_task_envelope(st, "coord-1")
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        pytest.param(lambda c, ids: c.tasks_add("coord-1", title="new"), id="add"),
+        pytest.param(
+            lambda c, ids: c.tasks_update("coord-1", task_id=ids[0], status="done"),
+            id="update",
+        ),
+        pytest.param(lambda c, ids: c.tasks_remove("coord-1", task_id=ids[0]), id="remove"),
+        pytest.param(lambda c, ids: c.tasks_reorder("coord-1", task_ids=[]), id="reorder-empty"),
+        pytest.param(lambda c, ids: c.tasks_reorder("coord-1", task_ids=ids[::-1]), id="reorder"),
+        pytest.param(lambda c, ids: c.tasks_get("coord-1"), id="get"),
+    ],
+)
+def test_tasks_failed_read_raises_and_leaves_the_stored_list(
+    call, tmp_path, monkeypatch, sqlite_backend_factory
+):
+    """#1416: a task call whose storage read fails acts on nothing.  An
+    empty list stands in for none of them: an add or a reorder to ``[]``
+    would save over the stored list, update and remove would answer
+    "task not found", reorder would name an empty current set, and a
+    list would answer that there are no tasks.  The error is written for
+    the model, with the storage exception kept as its cause."""
+    st = sqlite_backend_factory(str(tmp_path / "tasks.db"))
+    st.register_workstream("coord-1", kind="coordinator", user_id="user-1")
+    client = _make_read_client(st)
+    ids = [client.tasks_add("coord-1", title=title)["id"] for title in ("first", "second")]
+    read_stored = st.load_workstream_config
+    stored = read_stored("coord-1")["tasks"]
+    _fail_config_reads(monkeypatch, st)
+
+    with pytest.raises(CoordinatorReadError) as excinfo:
+        call(client, ids)
+
+    assert str(excinfo.value) == (
+        "the stored task list could not be read; no task was changed. Retry after storage recovers."
+    )
+    assert str(excinfo.value.__cause__) == "storage down"
+    assert read_stored("coord-1")["tasks"] == stored
+
+
+def test_tasks_envelope_nested_too_deeply_is_corrupt(tmp_path, monkeypatch, sqlite_backend_factory):
+    """JSON nested deeper than the parser can follow raises
+    ``RecursionError``: Python 3.13 at about 10,000 levels, 3.14 when the
+    thread's C stack runs out.  The read succeeded, so it is a corrupt
+    envelope the mutators refuse to overwrite, not a storage failure to
+    retry.  The seed is a valid envelope, so only the patched decoder can
+    make it read as corrupt."""
+    import types
+
+    from turnstone.console import coordinator_client as cc_module
+
+    def _too_deep(*_a, **_kw):
+        raise RecursionError("maximum recursion depth exceeded while decoding a JSON array")
+
+    st = sqlite_backend_factory(str(tmp_path / "tasks.db"))
+    st.register_workstream("coord-1", kind="coordinator", user_id="user-1")
+    seed = json.dumps({"version": 1, "tasks": [{"id": "tsk_a", "title": "kept"}]})
+    st.save_workstream_config("coord-1", {"tasks": seed})
+    client = _make_read_client(st)
+    monkeypatch.setattr(cc_module, "json", types.SimpleNamespace(loads=_too_deep, dumps=json.dumps))
+
+    assert load_task_envelope(st, "coord-1") == ({"version": 1, "tasks": []}, True)
+    result = client.tasks_add("coord-1", title="new")
+    assert "corrupt" in result["error"]
+    assert st.load_workstream_config("coord-1")["tasks"] == seed
 
 
 def test_tasks_add_enforces_capacity_cap(tmp_path, monkeypatch, sqlite_backend_factory):

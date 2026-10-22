@@ -637,6 +637,37 @@ class TestSendMessageAttachments:
         assert atts[0].attachment_id == aid
         assert atts[0].kind == "text"
 
+    def test_send_reads_the_owner_row_off_the_event_loop(self, app_client, monkeypatch):
+        """The send's attachment-owner check reads the workstream's row from
+        storage; it runs in a worker thread, so a slow or failing read can't
+        stall every request on the node."""
+        import asyncio
+
+        from turnstone.core.storage._registry import get_storage
+
+        client, mgr = app_client
+        self._wire_ws(mgr, "ws-A", "userA")
+        storage = get_storage()
+        real = storage.get_workstream
+        on_loop: list[bool] = []
+
+        def _spy(ws_id: str) -> Any:
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                on_loop.append(False)
+            else:
+                on_loop.append(True)
+            return real(ws_id)
+
+        monkeypatch.setattr(storage, "get_workstream", _spy)
+        resp = client.post(
+            "/v1/api/workstreams/ws-A/send", json={"message": "hi"}, headers=_auth("userA")
+        )
+        assert resp.status_code == 200
+        assert on_loop
+        assert not any(on_loop)
+
     def test_send_validates_and_threads_client_send_id(self, app_client):
         client, mgr = app_client
         captured, _ = self._wire_ws(mgr, "ws-A", "userA")

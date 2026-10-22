@@ -1899,6 +1899,58 @@ def test_history_load_messages_exception_returns_non_authoritative_503(storage):
     assert resp.json() == {"error": "History temporarily unavailable"}
 
 
+def test_history_lookup_failing_after_the_tenant_check_is_503(storage):
+    """A row read that starts failing between the tenant check and the
+    handler's own lookup answers the 503 a failed history load does, not
+    404: an outage is not a missing workstream."""
+    from unittest.mock import patch
+
+    mgr = _build_history_mgr(storage)
+    storage.register_workstream("storage-only-coord", kind="coordinator", user_id="user-1")
+    assert mgr.get("storage-only-coord") is None
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+
+    real_get = storage.get_workstream
+    calls: list[str] = []
+
+    def _fail_after_the_tenant_check(ws_id: str):  # type: ignore[no-untyped-def]
+        calls.append(ws_id)
+        if len(calls) == 1:
+            return real_get(ws_id)
+        raise RuntimeError("db gone")
+
+    with patch.object(storage, "get_workstream", side_effect=_fail_after_the_tenant_check):
+        resp = client.get("/v1/api/workstreams/storage-only-coord/history", headers=_COORD_HEADERS)
+    assert len(calls) == 2  # the tenant check read, then the handler's lookup failed
+    assert resp.status_code == 503
+    assert resp.json() == {"error": "History temporarily unavailable"}
+
+
+def test_export_lookup_failing_after_the_tenant_check_is_503(storage):
+    """Export answers the same race as history: a row read that starts
+    failing between the tenant check and the handler's own lookup is a
+    503, not a 404, since an outage is not a missing workstream."""
+    from unittest.mock import patch
+
+    mgr = _build_history_mgr(storage)
+    storage.register_workstream("storage-only-coord", kind="coordinator", user_id="user-1")
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    real_get = storage.get_workstream
+    calls: list[str] = []
+
+    def _fail_after_the_tenant_check(ws_id: str):  # type: ignore[no-untyped-def]
+        calls.append(ws_id)
+        if len(calls) == 1:
+            return real_get(ws_id)
+        raise RuntimeError("db gone")
+
+    with patch.object(storage, "get_workstream", side_effect=_fail_after_the_tenant_check):
+        resp = client.get("/v1/api/workstreams/storage-only-coord/export", headers=_COORD_HEADERS)
+    assert len(calls) == 2  # the tenant check read, then the handler's lookup failed
+    assert resp.status_code == 503
+    assert resp.json() == {"error": "Export temporarily unavailable"}
+
+
 def test_history_clamps_limit_query_param(storage):
     """Pre-lift coord clamped ``?limit=`` to [1, 500]. The lifted factory
     preserves the same bounds. Out-of-range / unparseable values
@@ -2740,6 +2792,81 @@ def test_tasks_corrupt_envelope_returns_empty(storage):
     assert resp.json() == {"version": 1, "tasks": []}
 
 
+def test_tasks_failed_read_is_503(storage, monkeypatch):
+    """A failed storage read answers 503, never an empty list (#1416), so
+    the pane keeps the list it last rendered."""
+    mgr = _build_mgr(storage)
+    ws = mgr.create(user_id="user-1")
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+
+    def _broken(*_a, **_kw):
+        raise RuntimeError("storage down")
+
+    monkeypatch.setattr(storage, "load_workstream_config", _broken)
+    resp = client.get(f"/v1/api/workstreams/{ws.id}/tasks", headers=_COORD_HEADERS)
+    assert resp.status_code == 503
+    assert resp.json() == {"error": "task list could not be read"}
+
+
+def test_unloaded_coordinator_whose_row_cannot_be_read_is_denied(storage, monkeypatch):
+    """When the coordinator isn't loaded and its row read fails, its own
+    routes and the shared ones behind the tenant check (history here) deny
+    it as they deny an unknown id, rather than answer a 500."""
+    mgr = _build_mgr(storage)
+    ws_id = "c" * 32
+    storage.register_workstream(ws_id, kind="coordinator", user_id="user-1")
+    assert mgr.get(ws_id) is None
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    routes = ("tasks", "children", "history")
+    for route in routes:  # the unloaded row resolves while reads work
+        before = client.get(f"/v1/api/workstreams/{ws_id}/{route}", headers=_COORD_HEADERS)
+        assert before.status_code == 200, route
+
+    def _broken(*_a, **_kw):
+        raise RuntimeError("storage down")
+
+    monkeypatch.setattr(storage, "get_workstream", _broken)
+    for route in routes:
+        resp = client.get(f"/v1/api/workstreams/{ws_id}/{route}", headers=_COORD_HEADERS)
+        assert resp.status_code == 404, route
+        assert resp.json() == {"error": "coordinator not found"}
+
+
+@pytest.mark.parametrize(
+    "failing",
+    [
+        ("get_workstream",),
+        ("get_project", "is_project_member"),
+        ("get_workstream", "get_project", "is_project_member"),
+    ],
+    ids=["rows", "projects", "both"],
+)
+def test_an_outage_tells_a_non_member_nothing_about_coordinators(storage, monkeypatch, failing):
+    """Whichever reads fail, a caller outside a private project gets the same
+    404 for a loaded coordinator in that project, an unloaded one and an id
+    that names nothing, so an outage is no existence oracle."""
+    storage.create_project("proj-secret", "Secret", "alice")
+    mgr = _build_mgr(storage)
+    loaded = mgr.create(user_id="alice", project_id="proj-secret")
+    unloaded_id = "e" * 32
+    storage.register_workstream(
+        unloaded_id, kind="coordinator", user_id="alice", project_id="proj-secret"
+    )
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    stranger = {"X-Test-User": "stranger", "X-Test-Perms": "admin.coordinator"}
+
+    def _broken(*_a, **_kw):
+        raise RuntimeError("storage down")
+
+    for method in failing:
+        monkeypatch.setattr(storage, method, _broken)
+    for route in ("tasks", "history"):
+        for ws_id in (loaded.id, unloaded_id, "d" * 32):
+            resp = client.get(f"/v1/api/workstreams/{ws_id}/{route}", headers=stranger)
+            assert resp.status_code == 404, (route, ws_id)
+            assert resp.json() == {"error": "coordinator not found"}
+
+
 def test_tasks_any_admin_coordinator_caller_can_read(storage):
     # Trusted-team visibility: any ``admin.coordinator`` caller can
     # read the tasks envelope.
@@ -2774,6 +2901,26 @@ def test_cluster_inspect_unknown_ws_id_404(storage):
     client = _make_client(storage, coord_mgr=_build_mgr(storage), registry=_fake_registry())
     resp = client.get("/v1/api/cluster/ws/" + ("a" * 32) + "/detail", headers=_CLUSTER_HEADERS)
     assert resp.status_code == 404
+
+
+def test_cluster_inspect_failed_message_read_is_503(storage, monkeypatch):
+    """A failed read of the message tail is not an empty one: the route
+    answers 503 rather than a detail with ``messages: []``."""
+    mgr = _build_mgr(storage)
+    ws = mgr.create(user_id="owner")
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    url = f"/v1/api/cluster/ws/{ws.id}/detail"
+    assert client.get(url, headers=_CLUSTER_HEADERS).status_code == 200
+
+    def _broken(*_a, **_kw):
+        raise RuntimeError("storage down")
+
+    monkeypatch.setattr(storage, "load_messages", _broken)
+    resp = client.get(url, headers=_CLUSTER_HEADERS)
+    assert resp.status_code == 503
+    assert resp.json() == {"error": "workstream messages could not be read"}
+    # A caller that asks for no messages reads none, so it still gets its detail.
+    assert client.get(url + "?limit=0", headers=_CLUSTER_HEADERS).status_code == 200
 
 
 def test_cluster_inspect_invalid_ws_id_400(storage):

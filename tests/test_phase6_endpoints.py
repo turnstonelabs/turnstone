@@ -556,3 +556,25 @@ def test_metrics_spawns_last_hour_boundary(storage):
     body = resp.json()
     assert body["spawns_total"] == 2
     assert body["spawns_last_hour"] == 1
+
+
+@pytest.mark.parametrize(
+    "read", ["count_workstreams_by_state", "count_workstreams_since", "list_intent_verdicts"]
+)
+def test_metrics_failed_read_is_503(storage, monkeypatch, read):
+    """A read that fails answers 503, never zeros: a scraper would take
+    those for a healthy, idle coordinator."""
+    mgr = _build_mgr(storage)
+    ws = mgr.create(user_id="user-1")
+    client = _make_client(storage, coord_mgr=mgr)
+
+    def _broken(*_a, **_kw):
+        raise RuntimeError("storage down")
+
+    monkeypatch.setattr(storage, read, _broken)
+    resp = client.get(
+        f"/v1/api/workstreams/{ws.id}/metrics",
+        headers=_METRICS_HEADERS,
+    )
+    assert resp.status_code == 503
+    assert resp.json() == {"error": "coordinator metrics could not be read"}

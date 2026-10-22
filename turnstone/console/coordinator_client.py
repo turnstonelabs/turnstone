@@ -119,6 +119,11 @@ WAIT_MESSAGE_MAX_BYTES: int = 10 * 1024
 # without scanning the full history of a long-lived workstream.
 _WAIT_MESSAGE_TAIL_LIMIT: int = 20
 
+# What a wait reports when its children's rows or token counts can't be
+# read: the wait ends with this error instead of reading the failure as
+# children that don't exist or that changed.
+_WAIT_READ_FAILED = "the workstreams being waited on could not be read."
+
 # Sentinel strings used when a terminal state has no usable assistant
 # content to return.  Pinned as constants so callers (and tests) can
 # rely on the exact text rather than a fuzzed message.  The
@@ -323,6 +328,11 @@ def _levenshtein_capped(a: str, b: str, cap: int) -> int:
     return prev[la] if prev[la] <= cap else cap + 1
 
 
+def _roster_fields(payload: dict[str, Any]) -> dict[str, Any]:
+    """The roster an unresolvable-id payload carries, absent when it couldn't be read."""
+    return {key: payload[key] for key in ("children", "children_truncated") if key in payload}
+
+
 def _trim_ws_ref_hint(payload: dict[str, Any]) -> dict[str, Any]:
     """Per-ref entry for wait's ``invalid_ws_ids`` / ``not_found``
     channels — one shared shape: ``{ws_id, error, did_you_mean?}``.
@@ -344,14 +354,38 @@ def _utc_now_iso() -> str:
     return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
 
 
-def load_task_envelope(
-    storage: Any, ws_id: str, *, raise_on_read_failure: bool = False
-) -> tuple[dict[str, Any], bool]:
+class CoordinatorReadError(RuntimeError):
+    """A storage read behind a coordinator tool failed.
+
+    Raised by :class:`CoordinatorClient` in place of the storage
+    exception, which stays chained as ``__cause__``.  Its message is
+    written for the model: the tool reports it as the call's error.
+    """
+
+
+def _read_or_raise[ReadResultT](
+    ws_id: str, read: str, what: str, fn: Callable[[], ReadResultT]
+) -> ReadResultT:
+    """Run one storage read behind a coordinator tool.
+
+    A raise is logged and becomes a :class:`CoordinatorReadError` chained
+    from it, whose message is ``what`` followed by the advice to retry, so
+    an outage never reaches the model as a missing, empty or zero value.
+    """
+    try:
+        return fn()
+    except Exception as exc:
+        log.warning("coord_client.read_failed read=%s ws=%s", read, ws_id, exc_info=True)
+        raise CoordinatorReadError(f"{what} Retry after storage recovers.") from exc
+
+
+def load_task_envelope(storage: Any, ws_id: str) -> tuple[dict[str, Any], bool]:
     """Decode the persisted task envelope for ``ws_id``.
 
-    Shared between :class:`CoordinatorClient` (the model-tool write path)
-    and the coordinator UI's read endpoints so both agree on the schema
-    and corruption-tolerant semantics.  Returns ``(envelope, corrupt)``:
+    Shared by :class:`CoordinatorClient` (the model-tool write path), the
+    coordinator UI's read endpoint, the idle observer and the nudge eval
+    (its stimulus and its scorer), so all agree on the schema and
+    corruption-tolerant semantics.  Returns ``(envelope, corrupt)``:
 
     - ``corrupt=False, envelope={"version": 1, "tasks": []}`` — row absent
       or empty.
@@ -361,30 +395,25 @@ def load_task_envelope(
       list refuse to overwrite a corrupt blob (preserve for operator
       inspection); the UI read path treats it as an empty envelope.
 
-    A STORAGE READ failure is a separate axis from corruption, and the
-    caller chooses its policy.  By default the failure is absorbed into
-    ``(empty, corrupt=False)`` — right for the UI read endpoints, where
-    an empty pane beats a crashed request.  ``raise_on_read_failure=True``
-    lets the storage exception propagate instead: the idle observer
-    requires it, because its fire decision must fail closed on a read it
-    could not make, and an absorbed failure is indistinguishable from
-    "no tasks".  Only the read is governed by the flag — corruption
-    still reports through the flag in the tuple, never by raising.
+    A STORAGE READ failure is a separate axis from corruption, and it
+    raises: an absorbed failure is indistinguishable from "no tasks", so
+    a mutator would save its change over the stored list and the idle
+    observer's fire decision could not fail closed on a read it never
+    made.  A caller that can answer something better catches the
+    exception and chooses that answer itself, as the UI read endpoint
+    does with a 503.  Corruption is not a failed read: it still reports
+    through the flag in the tuple, never by raising.
     """
     empty: dict[str, Any] = {"version": 1, "tasks": []}
-    try:
-        raw = storage.load_workstream_config(ws_id) or {}
-    except Exception:
-        if raise_on_read_failure:
-            raise
-        log.debug("load_task_envelope.storage_failed ws=%s", ws_id, exc_info=True)
-        return empty, False
+    raw = storage.load_workstream_config(ws_id) or {}
     payload = raw.get("tasks")
     if not payload:
         return empty, False
     try:
         data = json.loads(payload)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, RecursionError):
+        # ``RecursionError``: JSON nested too deeply for the parser is as
+        # unparseable as malformed JSON, and the read itself succeeded.
         log.warning("tasks.corrupt_envelope ws=%s (unparseable JSON)", ws_id)
         return empty, True
     if not (isinstance(data, dict) and isinstance(data.get("tasks"), list)):
@@ -634,7 +663,7 @@ class CoordinatorClient:
 
     # -- tenant guard -------------------------------------------------------
 
-    def _is_own_subtree(self, ws_id: str) -> bool:
+    def _owns_subtree(self, ws_id: str) -> bool:
         """Return True if ``ws_id`` is the coordinator itself or one of its
         own children.  Defense-in-depth gate for every model-invoked
         mutating op (send / close / cancel / delete) so a coordinator
@@ -649,35 +678,42 @@ class CoordinatorClient:
         to a foreign-tenant workstream.
 
         404-shape on miss matches the shape inspect() uses to avoid
-        being an existence oracle.
+        being an existence oracle.  A row read that fails raises
+        :class:`CoordinatorReadError`: an outage is not a foreign or
+        missing workstream.
         """
         if not ws_id:
             return False
         if ws_id == self._coord_ws_id:
             return True
+        row = _read_or_raise(
+            ws_id,
+            "workstream",
+            "the workstream could not be read.",
+            lambda: self._storage.get_workstream(ws_id),
+        )
+        return self._row_in_own_subtree(ws_id, row)
+
+    def _is_own_subtree(self, ws_id: str) -> bool:
+        """:meth:`_owns_subtree` for the trusted-send auto-approval, which
+        only decides whether to ask first: a row that can't be read answers
+        False, so the send asks for approval, the fail-closed answer."""
         try:
-            row = self._storage.get_workstream(ws_id)
-        except Exception:
-            log.debug("coord_client.is_own_subtree.lookup_failed ws=%s", ws_id, exc_info=True)
+            return self._owns_subtree(ws_id)
+        except CoordinatorReadError:
             return False
-        if row is None or row.get("state") == "creating":
-            return False
-        if row.get("parent_ws_id") != self._coord_ws_id:
-            return False
-        return bool(row.get("user_id")) and row.get("user_id") == self._user_id
 
     def _row_in_own_subtree(self, ws_id: str, row: dict[str, Any] | None) -> bool:
-        """Row-level subtree predicate sharing one home for read paths.
+        """Row-level subtree predicate, the one home of the ownership rule.
 
-        Both :meth:`wait_for_workstream`'s pre-loop ownership filter and
-        its inner ``_snapshot_all`` already have the workstream row in
-        hand (from ``get_workstreams_batch``).  Funneling them through
-        the same 4-line check keeps the predicate in lockstep with
-        :meth:`_is_own_subtree` (used by mutating ops) — both require
-        ``parent_ws_id`` AND ``user_id`` parity so a corrupted or
-        forged ``parent_ws_id`` alone can't satisfy the gate on either
-        path.  Returns False on a missing / None row so callers can
-        safely pass ``rows.get(wid)``.
+        :meth:`_owns_subtree` (used by mutating ops) and both of
+        :meth:`wait_for_workstream`'s reads (its pre-loop ownership filter
+        and its inner ``_snapshot_all``, which have the rows in hand from
+        ``get_workstreams_batch``) apply it, so all require
+        ``parent_ws_id`` AND ``user_id`` parity: a corrupted or forged
+        ``parent_ws_id`` alone can't satisfy the gate on any path.
+        Returns False on a missing / None row so callers can safely pass
+        ``rows.get(wid)``.
         """
         if row is not None and row.get("state") == "creating":
             return False
@@ -697,22 +733,24 @@ class CoordinatorClient:
         Powers ws_id validation and the did-you-mean / roster blocks in
         unresolvable-id errors.  Unlike :meth:`list_children` this does
         NOT filter ``kind`` — a coordinator-kind child passes the
-        per-verb ownership guards (``_is_own_subtree`` checks parent +
+        per-verb ownership guards (``_owns_subtree`` checks parent +
         user only), so validation must see the same set or a legacy
         exact id could validate for one verb and 404 on another.  One
-        SQL page capped at ``_WS_REF_ROSTER_QUERY_LIMIT``; failures
-        collapse to an empty roster (hints degrade, validation still
-        errors honestly).
+        SQL page capped at ``_WS_REF_ROSTER_QUERY_LIMIT``.  A failed read
+        raises :class:`CoordinatorReadError`, since an empty roster would
+        tell the model it has no children; :meth:`_roster_hint` is the
+        form for hints on an answer that is already decided.
         """
-        try:
-            raw = self._storage.list_workstreams(
+        raw = _read_or_raise(
+            self._coord_ws_id,
+            "roster",
+            "the list of your children could not be read.",
+            lambda: self._storage.list_workstreams(
                 limit=_WS_REF_ROSTER_QUERY_LIMIT,
                 parent_ws_id=self._coord_ws_id,
                 user_id=self._user_id or None,
-            )
-        except Exception:
-            log.debug("coord_client.ws_ref.roster_failed", exc_info=True)
-            return []
+            ),
+        )
         roster: list[dict[str, Any]] = []
         for row in raw:
             try:
@@ -730,11 +768,23 @@ class CoordinatorClient:
             )
         return roster
 
+    def _roster_hint(self) -> list[dict[str, Any]] | None:
+        """:meth:`_children_roster` for hints, ``None`` when it can't be read.
+
+        The answer the hints decorate was decided by reads that succeeded,
+        so a roster that can't be read leaves the hints out instead of
+        failing that answer or reporting an empty roster.
+        """
+        try:
+            return self._children_roster()
+        except CoordinatorReadError:
+            return None
+
     def _ws_ref_error(
         self,
         ref: str,
         *,
-        roster: list[dict[str, Any]] | None = None,
+        roster: list[dict[str, Any]] | None,
     ) -> dict[str, Any]:
         """Uniform unresolvable-ws_id error payload.
 
@@ -744,17 +794,17 @@ class CoordinatorClient:
         (did-you-mean, roster) is computed from the coordinator's OWN
         children only.  Suggestions are advisory text — nothing here
         auto-resolves, so a near-miss id can never route a mutating verb
-        to a guessed target.
+        to a guessed target.  ``roster`` is ``None`` when it couldn't be
+        read (:meth:`_roster_hint`); the payload then carries no hints.
         """
-        if roster is None:
-            roster = self._children_roster()
         ref_l = (ref or "").strip().lower()
         # Clip the echoed ref in the STRING — a hostile / oversize ws_id
         # must not flood operator-facing text (see _WS_REF_ECHO_CLIP).
         shown = ref if len(ref) <= _WS_REF_ECHO_CLIP else ref[: _WS_REF_ECHO_CLIP - 3] + "..."
         parts = [f"no workstream matching {shown!r} among your children"]
+        known = roster or []
         did: list[dict[str, str]] = []
-        name_hits = [c for c in roster if c["name"] and c["name"].strip().lower() == ref_l]
+        name_hits = [c for c in known if c["name"] and c["name"].strip().lower() == ref_l]
         if name_hits:
             # The model pasted a display NAME.  Point it straight at the
             # id — names are mutable, non-unique labels, deliberately not
@@ -770,7 +820,7 @@ class CoordinatorClient:
             scored = sorted(
                 (
                     (_levenshtein_capped(ref_l, c["ws_id"], _WS_REF_SUGGEST_DISTANCE), c)
-                    for c in roster
+                    for c in known
                 ),
                 key=lambda pair: pair[0],
             )
@@ -798,11 +848,12 @@ class CoordinatorClient:
         }
         if did:
             payload["did_you_mean"] = did
-        payload["children"] = [
-            {"ws_id": c["ws_id"], "name": c["name"], "state": c["state"]}
-            for c in roster[:_WS_REF_ROSTER_CAP]
-        ]
-        payload["children_truncated"] = len(roster) > _WS_REF_ROSTER_CAP
+        if roster is not None:
+            payload["children"] = [
+                {"ws_id": c["ws_id"], "name": c["name"], "state": c["state"]}
+                for c in roster[:_WS_REF_ROSTER_CAP]
+            ]
+            payload["children_truncated"] = len(roster) > _WS_REF_ROSTER_CAP
         return payload
 
     def _resolve_ws_ref(
@@ -827,11 +878,15 @@ class CoordinatorClient:
         Anything else — truncated, garbled, non-hex, a display name —
         fails with the did-you-mean payload.  The pasted-a-name case is
         called out explicitly in the error; near-miss ids are NEVER
-        auto-resolved.
+        auto-resolved.  Shape 3 needs the roster, so when it can't be read
+        the call raises :class:`CoordinatorReadError` rather than reject an
+        id it could not check.
         """
         r = (ref or "").strip()
         if not r:
-            return "", self._ws_ref_error(r, roster=roster)
+            return "", self._ws_ref_error(
+                r, roster=roster if roster is not None else self._roster_hint()
+            )
         if r == self._coord_ws_id:
             return r, None
         rl = r.lower()
@@ -849,15 +904,15 @@ class CoordinatorClient:
 
         Shared preamble for the mutating verbs (send / close / cancel /
         delete): format-resolve via :meth:`_resolve_ws_ref`, then the
-        tenant gate via :meth:`_is_own_subtree`.  Returns
+        tenant gate via :meth:`_owns_subtree`.  Returns
         ``(ws_id, None)`` or ``("", error_payload)`` — one home so a
         future guard change (audit hook, logging) lands once.
         """
         resolved, ref_err = self._resolve_ws_ref(ws_id)
         if ref_err is not None:
             return "", ref_err
-        if not self._is_own_subtree(resolved):
-            return "", self._ws_ref_error(resolved)
+        if not self._owns_subtree(resolved):
+            return "", self._ws_ref_error(resolved, roster=self._roster_hint())
         return resolved, None
 
     # -- model-invoked mutating ops (HTTP) ---------------------------------
@@ -979,12 +1034,12 @@ class CoordinatorClient:
         return self._post("cancel", {}, ws_id=resolved)
 
     def rewind(self, ws_id: str, turns: int) -> dict[str, Any]:
-        if not self._is_own_subtree(ws_id):
+        if not self._owns_subtree(ws_id):
             return {"error": f"workstream not in coordinator subtree: {ws_id}", "status": 404}
         return self._post("rewind", {"turns": turns}, ws_id=ws_id)
 
     def retry(self, ws_id: str) -> dict[str, Any]:
-        if not self._is_own_subtree(ws_id):
+        if not self._owns_subtree(ws_id):
             return {"error": f"workstream not in coordinator subtree: {ws_id}", "status": 404}
         return self._post("retry", {}, ws_id=ws_id)
 
@@ -1070,11 +1125,12 @@ class CoordinatorClient:
         top-level ``error`` / ``invalid_ws_ids`` / ``children`` fields.
         Per-ref entries in ``invalid_ws_ids`` and ``not_found`` share
         one shape — ``{ws_id, error, did_you_mean}`` — and the children
-        roster rides once at top level on both channels.  A
-        well-formed id that is foreign, nonexistent, or hard-deleted
-        mid-wait surfaces as ``state="not_found"`` and aborts the wait
-        on the tick that observes it: ``complete=False`` plus top-level
-        ``error`` / ``not_found`` / ``children`` fields.  Without this,
+        roster rides once at top level on both channels (on the
+        ``not_found`` one only when it can be read).  A well-formed id
+        that is foreign, nonexistent, or hard-deleted mid-wait surfaces
+        as ``state="not_found"`` and aborts the wait on the tick that
+        observes it: ``complete=False`` plus top-level ``error`` /
+        ``not_found`` fields and that roster.  Without this,
         an unobservable member either burns the whole timeout
         (``mode='all'`` could never satisfy) or silently rides along to
         a "complete" result missing a lane — the original incident
@@ -1191,8 +1247,7 @@ class CoordinatorClient:
                     :_WS_REF_ERROR_TEXT_CAP
                 ],
                 "invalid_ws_ids": [_trim_ws_ref_hint(e) for e in invalid],
-                "children": invalid[0].get("children", []),
-                "children_truncated": invalid[0].get("children_truncated", False),
+                **_roster_fields(invalid[0]),
                 "results": {},
                 "complete": False,
                 "elapsed": 0.0,
@@ -1224,18 +1279,23 @@ class CoordinatorClient:
             round-trips from O(N) to O(1) at the documented cap.
             Cross-tenant + missing-row cases collapse into a single
             ``not_found`` shape so wait can't be used as an existence
-            oracle.
+            oracle.  A read that fails raises
+            :class:`CoordinatorReadError`, which ends the wait: rows it
+            could not read are not missing children, and token counts it
+            could not read are not a change.
             """
-            try:
-                rows = self._storage.get_workstreams_batch(cleaned)
-            except Exception:
-                log.debug("coord_client.wait.get_ws_batch_failed", exc_info=True)
-                rows = {wid: None for wid in cleaned}
-            try:
-                tokens_by_wid = self._storage.sum_workstream_tokens_batch(cleaned)
-            except Exception:
-                log.debug("coord_client.wait.sum_tokens_batch_failed", exc_info=True)
-                tokens_by_wid = {}
+            rows = _read_or_raise(
+                self._coord_ws_id,
+                "wait_rows",
+                _WAIT_READ_FAILED,
+                lambda: self._storage.get_workstreams_batch(cleaned),
+            )
+            tokens_by_wid = _read_or_raise(
+                self._coord_ws_id,
+                "wait_tokens",
+                _WAIT_READ_FAILED,
+                lambda: self._storage.sum_workstream_tokens_batch(cleaned),
+            )
             snaps: dict[str, dict[str, Any]] = {}
             for wid in cleaned:
                 row = rows.get(wid)
@@ -1298,6 +1358,8 @@ class CoordinatorClient:
         # ``_snapshot_all`` and exit via the not_found fail-fast in the
         # loop.  Predicate shared with ``_snapshot_all`` via
         # :meth:`_row_in_own_subtree`.
+        # A failed read here only skips the wake registration: the heartbeat
+        # still paces the loop, and the snapshot's own read raises.
         try:
             pre_rows = self._storage.get_workstreams_batch(cleaned)
         except Exception:
@@ -1423,16 +1485,13 @@ class CoordinatorClient:
             # not as a dead child.  Hints reference only this
             # coordinator's own children; foreign and nonexistent ids
             # produce identical payloads (no existence oracle).
-            hint_roster = self._children_roster()
+            hint_roster = self._roster_hint()
             hints = [self._ws_ref_error(wid, roster=hint_roster) for wid in not_found_ids]
             response["not_found"] = [_trim_ws_ref_hint(h) for h in hints]
             response["error"] = " | ".join(str(h.get("error") or "") for h in hints)[
                 :_WS_REF_ERROR_TEXT_CAP
             ]
-            response["children"] = hints[0].get("children", []) if hints else []
-            response["children_truncated"] = (
-                hints[0].get("children_truncated", False) if hints else False
-            )
+            response.update(_roster_fields(hints[0]))
         return response
 
     # -- model-invoked read ops (direct storage) ---------------------------
@@ -1597,14 +1656,15 @@ class CoordinatorClient:
         # include_inactive=True.
         active_ids: set[str] | None = None
         if not include_inactive:
-            try:
-                services = self._storage.list_services(
+            services = _read_or_raise(
+                self._coord_ws_id,
+                "live_nodes",
+                "the list of live nodes could not be read.",
+                lambda: self._storage.list_services(
                     "server", max_age_seconds=self._NODES_HEARTBEAT_WINDOW_S
-                )
-                active_ids = {s["service_id"] for s in services if s.get("service_id")}
-            except Exception:
-                log.debug("coord_client.list_services_failed", exc_info=True)
-                active_ids = None  # fail-open: return metadata as-is
+                ),
+            )
+            active_ids = {s["service_id"] for s in services if s.get("service_id")}
 
         if filters:
             # Filtered case: narrow to the matching ids first, then pull
@@ -1695,9 +1755,11 @@ class CoordinatorClient:
         """Return the task envelope ``{"version": 1, "tasks": [...]}``.
 
         Corrupt / legacy config rows return an empty envelope rather than
-        raising — a hand-edited DB shouldn't break the read path.  The
-        mutating methods use ``_load_task_envelope_strict`` to detect
-        corruption and refuse to overwrite silently.
+        raising — a hand-edited DB shouldn't break the read path, and the
+        mutating methods take the corrupt flag from ``_load_task_envelope``
+        and refuse to overwrite.  A failed storage read is different:
+        nothing was read, so it raises :class:`CoordinatorReadError` here,
+        as for the mutators, instead of answering that there are no tasks.
         """
         env, _ = self._load_task_envelope(ws_id)
         return env
@@ -1710,11 +1772,21 @@ class CoordinatorClient:
         cannot be used to peek at another coordinator's task list), then
         delegates to :func:`load_task_envelope` so the HTTP read endpoint
         and this method share the same decoder + corruption semantics.
+
+        A failed storage read raises :class:`CoordinatorReadError`, which
+        the ``tasks`` tool reports as the call's error.  Every caller reads
+        before it writes, so nothing has changed when it raises and the
+        call can be retried.
         """
         empty: dict[str, Any] = {"version": 1, "tasks": []}
         if ws_id != self._coord_ws_id:
             return empty, False
-        return load_task_envelope(self._storage, ws_id)
+        return _read_or_raise(
+            ws_id,
+            "task_list",
+            "the stored task list could not be read; no task was changed.",
+            lambda: load_task_envelope(self._storage, ws_id),
+        )
 
     def _save_tasks(
         self,
@@ -1984,38 +2056,51 @@ class CoordinatorClient:
         if ref_err is not None:
             return ref_err
         ws_id = resolved
-        full = self._storage.get_workstream(ws_id)
+        full = _read_or_raise(
+            ws_id,
+            "workstream",
+            "the workstream could not be read.",
+            lambda: self._storage.get_workstream(ws_id),
+        )
         # Misses return the same did-you-mean payload for nonexistent and
         # cross-tenant rows alike, so the existence-leak guarantee is
         # preserved while a garbled id stays recoverable in one
         # round-trip (the structured ``ws_id`` field echoes the value
         # the caller asked about).
         if full is None:
-            return self._ws_ref_error(ws_id)
+            return self._ws_ref_error(ws_id, roster=self._roster_hint())
         # Ownership parity with every other verb: parent AND user_id
         # (``_row_in_own_subtree``).  The parent-only check this
         # replaces let a forged / migration-era row (parent_ws_id=coord,
         # user_id=other-tenant) be read through inspect while the wait
         # and mutating paths rejected the same shape (#506).
         if not self._row_in_own_subtree(ws_id, full):
-            return self._ws_ref_error(ws_id)
-        # load_messages returns the full history in chronological order.
-        # We slice the tail in Python because the SQL tail-N is
-        # approximate across conversation boundaries.  Defensive
-        # try/except: storage errors should not break inspect.
-        messages: list[Any] = []
-        try:
-            # repair=False — inspect is a display read (admin viewing a
-            # child's history in the tree UI).  The LLM-context repair
-            # pass would strip trailing partial turns the operator is
-            # watching.
-            all_msgs = self._storage.load_messages(ws_id, repair=False)
-            if message_limit and message_limit > 0:
-                messages = all_msgs[-message_limit:]
-            else:
-                messages = all_msgs
-        except Exception:
-            log.debug("coord_client.load_messages.failed ws=%s", ws_id, exc_info=True)
+            return self._ws_ref_error(ws_id, roster=self._roster_hint())
+
+        # repair=False — inspect is a display read (admin viewing a
+        # child's history in the tree UI).  The LLM-context repair pass
+        # would strip trailing partial turns the operator is watching.  A
+        # failed read raises rather than inspecting as an empty history,
+        # which the model would read as a child that produced nothing.
+        def _history(limit: int | None) -> list[Any]:
+            return _read_or_raise(
+                ws_id,
+                "history",
+                "the workstream's history could not be read.",
+                lambda: self._storage.load_messages(ws_id, limit=limit, repair=False),
+            )
+
+        if message_limit and message_limit > 0:
+            # The row cap bounds the read to the tail; slicing again gives
+            # the exact count.  A tool-call group split at the cap's edge
+            # can leave fewer messages than rows, so a read that comes back
+            # short of the limit falls back to the whole history: either
+            # the history is short and the second read cheap, or rare.
+            messages: list[Any] = _history(2 * message_limit + 8)[-message_limit:]
+            if len(messages) < message_limit:
+                messages = _history(None)[-message_limit:]
+        else:
+            messages = _history(None)
         # Intent-judge verdicts are deliberately NOT surfaced here.
         # Their fields (``recommendation="review"``, ``user_decision="policy"``
         # for auto-approved-by-policy, etc.) read as workflow status to
@@ -2038,11 +2123,15 @@ class CoordinatorClient:
         # Only the terminal-state shapes can carry these — gating on
         # state avoids a per-inspect DB read on the hot live-child path.
         if full.get("state") in {"closed", "error", "deleted"}:
-            try:
-                cfg = self._storage.load_workstream_config(ws_id) or {}
-            except Exception:
-                log.debug("coord_client.load_workstream_config.failed ws=%s", ws_id, exc_info=True)
-                cfg = {}
+            cfg = (
+                _read_or_raise(
+                    ws_id,
+                    "close_reason",
+                    "the workstream's close reason and last error could not be read.",
+                    lambda: self._storage.load_workstream_config(ws_id),
+                )
+                or {}
+            )
             close_reason = cfg.get("close_reason")
             if close_reason:
                 result["close_reason"] = close_reason
@@ -2093,7 +2182,9 @@ class CoordinatorClient:
                 self._live_cache.move_to_end(ws_id)
                 return cached[1]
         try:
-            url = f"{self._base_url}/v1/api/cluster/ws/{ws_id}/detail"
+            # limit=0: only the live block is used, so the route skips
+            # loading and sending a message tail.
+            url = f"{self._base_url}/v1/api/cluster/ws/{ws_id}/detail?limit=0"
             # 1s timeout is ample for a same-host console call.  The
             # previous 2s was conservatively generous and stalled the
             # session thread visibly when a node was unhealthy.
@@ -2107,7 +2198,7 @@ class CoordinatorClient:
             return None
         try:
             payload = resp.json()
-        except ValueError:
+        except (ValueError, RecursionError):
             self._store_live_cache(ws_id, now, None)
             return None
         if not isinstance(payload, dict):
@@ -2126,10 +2217,14 @@ class CoordinatorClient:
             try:
                 persisted = self._storage.sum_workstream_tokens(ws_id)
             except Exception:
+                # A failed read is not a zero: leave the count out rather
+                # than report a child that spent nothing.  Cached like the
+                # other failures, so a burst of inspects asks once per TTL.
                 log.debug("coord_client.sum_tokens.failed ws=%s", ws_id, exc_info=True)
-                persisted = 0
-            if persisted:
-                result = {**result, "tokens": persisted}
+                result = {key: value for key, value in result.items() if key != "tokens"}
+            else:
+                if persisted:
+                    result = {**result, "tokens": persisted}
         self._store_live_cache(ws_id, now, result)
         return result
 
@@ -2543,8 +2638,9 @@ def _last_assistant_text(storage: Any, ws_id: str) -> str | None:
     return ""
 
 
-def _load_last_error(storage: Any, ws_id: str) -> str:
-    """Return the persisted ``last_error`` for ``ws_id`` or empty string.
+def _load_last_error(storage: Any, ws_id: str) -> str | None:
+    """Return the persisted ``last_error`` for ``ws_id``: ``""`` when none is
+    stored, ``None`` when the read failed.
 
     Worker threads write the (sanitized) exception text into
     ``workstream_config`` when a child enters the ``error`` terminal
@@ -2557,15 +2653,16 @@ def _load_last_error(storage: Any, ws_id: str) -> str:
     Reads via the per-storage handle the client was constructed with
     rather than ``turnstone.core.memory.load_last_error`` (which uses
     the process-global ``get_storage()``) so the wait path participates
-    in the test harness's per-call storage isolation.  Storage failures
-    collapse to empty so the caller can fall through to the existing
-    assistant-tail / sentinel path.
+    in the test harness's per-call storage isolation.  A failed read is
+    ``None``, not ``""``: an empty string sends the caller to the
+    assistant tail, which would report the child's last turn as if no
+    error text were stored.
     """
     try:
         cfg = storage.load_workstream_config(ws_id) or {}
     except Exception:
         log.debug("coord_client.wait.load_last_error_failed ws=%s", ws_id, exc_info=True)
-        return ""
+        return None
     raw = cfg.get(LAST_ERROR_CONFIG_KEY)
     return str(raw) if raw else ""
 
@@ -2606,10 +2703,10 @@ def _wait_message_for(
       deletes cascade rows out of storage, so the wait poll never
       observes a real ``deleted`` state in normal operation.
 
-    Storage failures during the message read collapse to ``(None, False)``
-    so a transient read error degrades gracefully (the wait itself
-    already completed; the model just gets ``message: null`` for the
-    affected ws and can fall back to inspect).
+    Storage failures during the message or last-error read collapse to
+    ``(None, False)`` so a transient read error degrades gracefully (the
+    wait itself already completed; the model just gets ``message: null``
+    for the affected ws and can fall back to inspect).
     """
     if state == "not_found":
         return _WAIT_SENTINEL_NOT_FOUND, False
@@ -2617,6 +2714,8 @@ def _wait_message_for(
         return _WAIT_SENTINEL_CLOSED, False
     if state == "error":
         last_error = _load_last_error(storage, ws_id)
+        if last_error is None:
+            return None, False
         if last_error:
             return _truncate_wait_message(last_error, max_bytes)
         # No persisted error — fall through to the assistant-tail walk

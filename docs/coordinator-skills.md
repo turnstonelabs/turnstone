@@ -201,10 +201,10 @@ recovery-oriented:
   carries the per-id payloads above, `elapsed=0`); a well-formed id
   that is foreign, nonexistent, or hard-deleted mid-wait surfaces as
   `state="not_found"` and aborts the wait on that tick with
-  top-level `error` / `not_found` / `children` fields.
-  `complete=true` therefore means every polled lane really finished
-  — an unobservable id can neither burn the timeout nor ride along
-  to a "complete" result.
+  top-level `error` / `not_found` fields and, when it can be read,
+  the `children` roster. `complete=true` therefore means every
+  polled lane really finished — an unobservable id can neither burn
+  the timeout nor ride along to a "complete" result.
 
 Pattern: capture each spawn result in the next tool call's input.
 The JSON tool-result carries `{"child_ws_id": "...", "name": "...",

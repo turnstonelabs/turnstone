@@ -1306,6 +1306,58 @@ frozen.
   is handled as before; one with bytes before its header, which was never recognised as a PDF, is
   now refused as binary when its first 8,192 characters hold a NUL, as compressed content nearly
   always does, instead of being decoded as text.
+- **A coordinator's task list survives a storage read that fails during a `tasks` call (#1416).**
+  A task add after a failed read saved its one task over the stored list, and a reorder with no
+  ids saved an empty list; an update or remove answered "task not found" and a list answered that
+  there were no tasks. Every `tasks` action now tells the model that the stored list couldn't be
+  read and nothing was changed, and to retry. The tasks pane's read answers 503 when it fails, so
+  the pane keeps the list it last showed instead of emptying. A list nested too deeply to parse
+  now reads as corrupt, like any other unparseable list: the pane shows it empty and changes to it
+  are refused.
+- **A server node no longer reports a workstream it can't read as missing.** A node route that
+  checks access to a workstream, such as its history, close or send, answers 503 with the code
+  `workstream_unreadable` instead of 404 "Workstream not found" when it has to read the
+  workstream's row and the read fails. Slack and Discord took that 404 for an already-closed
+  workstream and unlinked the channel; they now report the error and keep the link. The console's
+  route proxy tries the node that holds the workstream on the coded 503, as it does on a 404. When
+  that retry can't refresh the cluster's membership or resolve the workstream's route, the proxy
+  answers 503 instead of passing on a 404 it couldn't check, and a failed membership read no longer
+  ends in a plain-text 500. The node's API spec and reference list the 503.
+- **Every coordinator route checks a coordinator the same way, an outage included.** The console's
+  coordinator routes share one access check. When a coordinator isn't loaded and its row can't be
+  read, the check answers the same 404 "coordinator not found" as for an id that names nothing, so
+  a storage outage can't be used to tell which ids name coordinators in a private project. The
+  routes coordinators share with other workstreams, such as history, answered that read with a 500
+  before.
+- **Coordinator tools report a failed read instead of a missing or changed child.**
+  `wait_for_workstream` ends with an error to retry when it can't read its children's states or
+  token counts; it used to report them as not among the coordinator's children, or as changed since
+  the caller's snapshot. A send, close, cancel or delete whose ownership check can't read the child
+  answers an error to retry instead of "no workstream matching". When the list of the coordinator's
+  children can't be read, an id that has to be checked against it gets an error to retry, and an
+  error that only shows the list as a hint leaves it out instead of showing it empty.
+  `inspect_workstream` reports a failed read of a child's history, or of a finished child's close
+  reason and last error, as an error to retry instead of an empty history or a child with neither,
+  and a failed read of the child itself now says to retry instead of quoting the storage error. It
+  leaves a child's live token count out when the persisted count can't be read, instead of showing
+  0. A `wait_for_workstream` result for an errored child whose last error can't be read has
+  `message: null`, as for any message the wait couldn't read, instead of the child's last assistant
+  turn. `list_nodes` answers an error to retry when it can't read which nodes are live, instead of
+  offering every node that ever registered.
+- **Other reads that fail say so instead of looking empty.** The coordinator metrics route answers
+  503 when one of its reads fails, where it reported zeros that read as a healthy, idle
+  coordinator. The cluster detail route answers 503 when it can't read the message tail it was
+  asked for, instead of an empty tail. History and export answer 503 instead of 404 when their own
+  row read fails after the access check passed, and history answers 503 when it can't read a saved
+  workstream's settings, where it showed stored reasoning that the model's settings may hide. The
+  coordinator page's tasks and children panes say they couldn't be loaded, instead of "no tasks
+  yet" or "no children spawned yet", until one of their loads succeeds; children that live updates
+  add in the meantime are marked as only part of the list.
+- **Inspecting a child and checking access on a node cost less.** `inspect_workstream` reads the
+  messages it returns, plus some slack, instead of the child's whole history and its attachments,
+  and asks the console for no message tail it would discard. On a server node, the access check
+  behind send, speech to text and the command route reads the workstream's row in a worker thread,
+  so a slow database no longer stalls every request on the node.
 
 ### Security
 

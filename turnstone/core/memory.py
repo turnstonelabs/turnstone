@@ -784,38 +784,6 @@ def get_workstream_display_names(ws_ids: list[str]) -> dict[str, str | None]:
         return {}
 
 
-def get_workstream_metadata(ws_id: str) -> dict[str, Any] | None:
-    """Return workstream metadata dict or None if not found."""
-    try:
-        return get_storage().get_workstream_metadata(ws_id)
-    except Exception:
-        log.warning("Failed to get workstream metadata ws=%s", ws_id, exc_info=True)
-        return None
-
-
-def get_workstream_owner(ws_id: str) -> str | None:
-    """Return the workstream's owner ``user_id`` (or ``""`` when unowned)."""
-    try:
-        return get_storage().get_workstream_owner(ws_id)
-    except Exception:
-        log.warning("Failed to get workstream owner ws=%s", ws_id, exc_info=True)
-        return None
-
-
-def get_workstream_row(ws_id: str) -> dict[str, Any] | None:
-    """Return the full workstreams row dict, or None when missing/unreadable.
-
-    Same fail-soft shape as :func:`get_workstream_owner` — access gates
-    treat ``None`` as not-found, so a storage blip degrades to a 404
-    rather than a 500.
-    """
-    try:
-        return get_storage().get_workstream(ws_id)
-    except Exception:
-        log.warning("Failed to get workstream row ws=%s", ws_id, exc_info=True)
-        return None
-
-
 def update_workstream_title(ws_id: str, title: str, *, lease: LeaseFence | None = None) -> bool:
     """Set or update the auto-generated title for a workstream; ``True`` when it was written."""
     try:

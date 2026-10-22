@@ -448,16 +448,16 @@ class SessionEndpointConfig:
       returns ``(app.state.workstreams, None)``.
     - ``tenant_check``: per-``ws_id`` existence + access gate.
       Interactive wires :func:`_require_ws_access` (which 404s when
-      the workstream doesn't exist; row-level ownership is NOT
-      enforced — turnstone is a trusted-team tool, ``admin.workstreams``
-      scope is the cluster-wide gate). Coord sets this to ``None``
-      and relies on ``admin.coordinator`` from ``permission_gate``
-      plus an in-memory ``coord_mgr`` lookup at handler time.
-      Always invoked via ``await asyncio.to_thread(...)`` at handler
-      sites: the interactive resolver short-circuits on
-      ``mgr.get(ws_id)`` for warm cache but falls through to a
-      synchronous storage read (:func:`get_workstream_owner`) on a
-      manager-cache miss, so offloading keeps the event loop free
+      the workstream doesn't exist and answers 503 when its row can't
+      be read; row-level ownership is NOT enforced — turnstone is a
+      trusted-team tool, ``admin.workstreams`` scope is the
+      cluster-wide gate). Coord wires ``_coordinator_tenant_check``,
+      which enforces project tenancy behind the ``admin.coordinator``
+      ``permission_gate`` and 404-masks every refusal, a failed read
+      included. Always invoked via ``await asyncio.to_thread(...)`` at
+      handler sites: both resolvers short-circuit on ``mgr.get(ws_id)``
+      for warm cache but fall through to a synchronous storage read on
+      a manager-cache miss, so offloading keeps the event loop free
       during cold-cache lookups.
     - ``not_found_label``: the message body for the 404 returned when
       the manager has no such ws_id ("Workstream not found" for
@@ -477,7 +477,9 @@ class SessionEndpointConfig:
       defer the verb body changes).
     - ``attachment_owner_resolver``: resolves the ``user_id`` to scope
       attachments under for a given request + ws_id. Required when
-      ``supports_attachments`` is ``True``.
+      ``supports_attachments`` is ``True``. Invoked off the event loop
+      like ``tenant_check``: the interactive resolver reads the
+      workstream's row from storage.
     - ``spawn_metrics``: optional bookkeeping hook fired once per
       ``send`` that spawns a fresh worker (queue-reuse path skips it).
       Interactive wires its WebUI per-conversation counters; coord
@@ -4376,16 +4378,18 @@ def make_history_handler(cfg: SessionEndpointConfig) -> Handler:
         if not ws_id:
             return JSONResponse({"error": "ws_id is required"}, status_code=400)
 
-        # Cross-tenant gate.  Pre-PR-447 the response carried only
-        # message rows that an owning user wrote and that owning
-        # user's tools produced — sensitive but bounded to the same
-        # ``user_id`` as the workstream.  Even so, every other lifted
-        # session verb (send / approve / close / cancel / events /
-        # attachments) calls ``cfg.tenant_check`` and history was the
-        # outlier.  Coord wires ``tenant_check=None`` (the
-        # cluster-wide ``admin.coordinator`` permission_gate covers
-        # it); interactive wires ``_interactive_tenant_check`` and
-        # this call now restores parity with the rest of the surface.
+        # Cross-tenant gate.  Pre-PR-447 the response carried only message
+        # rows that an owning user wrote and that owning user's tools
+        # produced — sensitive but bounded to the same ``user_id`` as the
+        # workstream.  Even so, every other lifted session verb (send /
+        # approve / close / cancel / events / attachments) calls
+        # ``cfg.tenant_check`` and history was the outlier.  Coord wires
+        # ``_coordinator_tenant_check`` (project tenancy; the cluster-wide
+        # ``admin.coordinator`` permission_gate covers the rest) and
+        # interactive wires ``_interactive_tenant_check``.  Each answers a
+        # row it can't read itself (coord denies it as an unknown id,
+        # interactive answers 503), so the lookup below meets a failed read
+        # only when storage fails after the check passed.
         if cfg.tenant_check is not None:
             err_tenant = await asyncio.to_thread(cfg.tenant_check, request, ws_id, mgr)
             if err_tenant is not None:
@@ -4409,8 +4413,11 @@ def make_history_handler(cfg: SessionEndpointConfig) -> Handler:
             try:
                 row = await asyncio.to_thread(storage.get_workstream, ws_id)
             except Exception:
-                log.debug("ws.history.lookup_failed ws=%s", ws_id[:8], exc_info=True)
-                return JSONResponse({"error": cfg.not_found_label}, status_code=404)
+                # The 503 a failed history load answers, not a 404: an
+                # outage is not a missing workstream, and both panes keep
+                # their transcript on a non-2xx.
+                log.warning("ws.history.lookup_failed ws=%s", ws_id[:8], exc_info=True)
+                return JSONResponse({"error": "History temporarily unavailable"}, status_code=503)
             if row is None or row.get("kind") != cfg.list_kind:
                 return JSONResponse({"error": cfg.not_found_label}, status_code=404)
 
@@ -4732,15 +4739,11 @@ def make_history_handler(cfg: SessionEndpointConfig) -> Handler:
                 if not resolved_alias and storage is not None:
                     # Off-loop the sync storage call (mirrors get_workstream
                     # / load_messages / load_verdict_indexes / decorate /
-                    # extract_reasoning_for_history above).  Preserves the
-                    # try/except so a DB failure degrades to the
-                    # conservative-default branch instead of bubbling out.
-                    try:
-                        ws_cfg = (
-                            await asyncio.to_thread(storage.load_workstream_config, ws_id) or {}
-                        )
-                    except Exception:
-                        ws_cfg = {}
+                    # extract_reasoning_for_history above).  A failed read
+                    # fails the pass rather than falling back to the
+                    # default, which would surface reasoning the model's
+                    # settings may hide.
+                    ws_cfg = await asyncio.to_thread(storage.load_workstream_config, ws_id) or {}
                     resolved_alias = ws_cfg.get("model_alias") or ""
                 if resolved_registry is None:
                     # Interactive server stores the registry as
@@ -4921,10 +4924,11 @@ def make_export_handler(cfg: SessionEndpointConfig) -> Handler:
             return JSONResponse({"error": "ws_id is required"}, status_code=400)
 
         # Cross-tenant gate — same posture as history (interactive wires
-        # ``_interactive_tenant_check``; coord wires ``None`` and relies
-        # on the ``admin.coordinator`` permission_gate above). Always
-        # offloaded via ``to_thread`` since the interactive resolver
-        # falls through to a synchronous storage read on a cache miss.
+        # ``_interactive_tenant_check``; coord wires
+        # ``_coordinator_tenant_check`` behind the ``admin.coordinator``
+        # permission_gate above). Always offloaded via ``to_thread`` since
+        # both resolvers fall through to a synchronous storage read on a
+        # cache miss.
         if cfg.tenant_check is not None:
             err_tenant = await asyncio.to_thread(cfg.tenant_check, request, ws_id, mgr)
             if err_tenant is not None:
@@ -4946,8 +4950,10 @@ def make_export_handler(cfg: SessionEndpointConfig) -> Handler:
             try:
                 row = await asyncio.to_thread(storage.get_workstream, ws_id)
             except Exception:
-                log.debug("ws.export.lookup_failed ws=%s", ws_id[:8], exc_info=True)
-                return JSONResponse({"error": cfg.not_found_label}, status_code=404)
+                # An outage is not a missing workstream; history answers the
+                # same race with its own 503.
+                log.warning("ws.export.lookup_failed ws=%s", ws_id[:8], exc_info=True)
+                return JSONResponse({"error": "Export temporarily unavailable"}, status_code=503)
             if row is None or row.get("kind") != cfg.list_kind:
                 return JSONResponse({"error": cfg.not_found_label}, status_code=404)
 
@@ -5728,7 +5734,9 @@ def make_send_handler(cfg: SessionEndpointConfig) -> Handler:
                 # attachments are enabled. Fail loudly rather than
                 # silently filing under the wrong owner.
                 return JSONResponse({"error": "attachment_owner_resolver missing"}, status_code=500)
-            attach_user_id, owner_err = cfg.attachment_owner_resolver(request, ws_id, mgr)
+            attach_user_id, owner_err = await asyncio.to_thread(
+                cfg.attachment_owner_resolver, request, ws_id, mgr
+            )
             if owner_err is not None:
                 return owner_err
 
@@ -6078,7 +6086,7 @@ def make_attachment_handlers(cfg: SessionEndpointConfig) -> AttachmentHandlers:
         mgr = cast("SessionManager", mgr_opt)
         if cfg.attachment_owner_resolver is None:
             return "", JSONResponse({"error": "attachment_owner_resolver missing"}, status_code=500)
-        return cfg.attachment_owner_resolver(request, ws_id, mgr)
+        return await asyncio.to_thread(cfg.attachment_owner_resolver, request, ws_id, mgr)
 
     async def upload(request: Request) -> Response:
         from turnstone.core.attachment_buffer import get_attachment_buffer

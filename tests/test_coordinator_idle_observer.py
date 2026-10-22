@@ -2157,12 +2157,10 @@ class TestFailedReadSilencesTheEvent:
         assert self._charges(observer, ws) == {"idle_tasks": 1, "idle_children": 1}
 
     def test_a_failed_envelope_read_silences_both_and_charges_neither(self):
-        """The swallowed-failure mechanism, closed.  ``load_task_envelope``
-        absorbs a storage raise into an empty envelope by default, so the
-        advice path used to exit through the "no open tasks" gate —
-        looking compliant — while the observer never learned a read had
-        failed and the children path fired on, cap spent.  The observer
-        now reads strictly and the event fails closed.
+        """A failed envelope read silences both nudges and charges neither
+        cap.  The loader raises on a failed read, so the advice path can't
+        exit through the "no open tasks" gate, looking compliant, while
+        the children path fires on with its cap spent.
         """
         mgr, storage, ws, observer = self._arm()
         storage.config_raises = True
@@ -2379,10 +2377,9 @@ class TestAdviceDrainPredicate:
 
     def test_dropped_when_the_envelope_read_fails(self, coord_setup):
         """A failed storage read never delivers a nudge — the fire-gate
-        rule, holding at this predicate.  The predicate's read is STRICT
-        now, so the drop happens through the honest read-failure route
-        rather than the loader's swallow laundering the failure into
-        "no open tasks"."""
+        rule, holding at this predicate.  The loader raises on a failed
+        read, so the drop happens through the honest read-failure route
+        instead of reading as "no open tasks"."""
         mgr, storage, ws = coord_setup
         _set_tasks(storage, _task("tsk_a", "in_progress"))
         ws.session.messages = _assistant_turns("ok")

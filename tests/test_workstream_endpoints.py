@@ -2943,6 +2943,27 @@ class TestTenantCheckOnReadEndpoints:
             f"tenant_check must be invoked through asyncio.to_thread; got {offloaded}"
         )
 
+    def test_history_answers_503_when_the_owner_check_cannot_read_the_row(self, _inject_storage):
+        """An outage is not a missing workstream: through the production
+        tenant check, an unloaded workstream whose row read fails answers
+        503 rather than 404 "Workstream not found"."""
+        ws_id = "ws-cold-outage"
+        _inject_storage.register_workstream(ws_id, kind="interactive", user_id="test-user")
+        mock_mgr = MagicMock()
+        mock_mgr.get.return_value = None
+        client = _build_history_app(
+            mock_mgr, _inject_storage, tenant_check=_interactive_tenant_check
+        )
+        assert client.get(f"/v1/api/workstreams/{ws_id}/history").status_code == 200
+
+        with patch.object(_inject_storage, "get_workstream", side_effect=RuntimeError("db down")):
+            r = client.get(f"/v1/api/workstreams/{ws_id}/history")
+        assert r.status_code == 503
+        assert r.json() == {
+            "error": "workstream could not be read",
+            "code": "workstream_unreadable",
+        }
+
     def test_detail_cold_cache_falls_through_to_storage_via_thread(self, _inject_storage):
         """Detail counterpart to the cold-cache history test.
 
@@ -3147,6 +3168,36 @@ class TestHistoryReasoningRehydration:
             if m.get("role") == "assistant":
                 assert "reasoning" not in m
             assert "_provider_content" not in m
+
+    def test_history_handler_cold_workstream_config_read_failure_is_503(
+        self, _inject_storage, monkeypatch
+    ):
+        """A cold workstream whose stored settings can't be read answers 503:
+        the default would surface reasoning its model's settings hide."""
+        ws_id = "ws-reason-cold-unreadable"
+        _inject_storage.register_workstream(ws_id, kind="interactive", user_id="test-user")
+        _inject_storage.save_workstream_config(ws_id, {"model_alias": "claude-opus-4-7"})
+        provider_data = json.dumps(
+            [{"type": "thinking", "thinking": "should not surface", "signature": "s"}]
+        )
+        _inject_storage.save_message(ws_id, "assistant", "Answer.", provider_data=provider_data)
+
+        def _down(*_a: Any, **_kw: Any) -> Any:
+            raise RuntimeError("storage down")
+
+        monkeypatch.setattr(_inject_storage, "load_workstream_config", _down)
+        mock_mgr = MagicMock()
+        mock_mgr.get.return_value = None
+        app = _build_history_asgi_app(mock_mgr, _inject_storage)
+        app.state.registry = SimpleNamespace(
+            get_config=lambda alias: SimpleNamespace(
+                surface_persisted_reasoning=(alias != "claude-opus-4-7"),
+            )
+        )
+
+        r = TestClient(app).get(f"/v1/api/workstreams/{ws_id}/history")
+        assert r.status_code == 503
+        assert r.json() == {"error": "History temporarily unavailable"}
 
     def test_history_handler_cold_workstream_no_alias_defaults_true(self, _inject_storage):
         """A workstream that pre-dates the rehydrate-time alias persist

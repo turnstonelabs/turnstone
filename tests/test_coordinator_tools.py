@@ -1494,6 +1494,45 @@ def test_tasks_exec_reorder_surfaces_permutation_error(coord_session):
     assert "error" in parsed
 
 
+@pytest.mark.parametrize(
+    "args",
+    [
+        pytest.param({"action": "list"}, id="list"),
+        pytest.param({"action": "add", "title": "new"}, id="add"),
+        pytest.param({"action": "update", "task_id": "tsk_x", "status": "done"}, id="update"),
+        pytest.param({"action": "remove", "task_id": "tsk_x"}, id="remove"),
+        pytest.param({"action": "reorder", "task_ids": []}, id="reorder"),
+    ],
+)
+def test_tasks_exec_reports_a_failed_read_to_the_model(
+    coord_session, tmp_path, monkeypatch, sqlite_backend_factory, args
+):
+    """#1416 through the real client: a failed storage read reaches the
+    model as an error saying nothing changed, and the stored list stays."""
+    from tests.test_coordinator_client import _make_read_client
+
+    sess, _coord, ui = coord_session
+    st = sqlite_backend_factory(str(tmp_path / "tasks.db"))
+    st.register_workstream("coord-1", kind="coordinator", user_id="user-1")
+    sess._coord_client = _make_read_client(st)
+    sess._coord_client.tasks_add("coord-1", title="first")
+    read_stored = st.load_workstream_config
+    stored = read_stored("coord-1")["tasks"]
+
+    def _broken(*_a, **_kw):
+        raise RuntimeError("storage down")
+
+    monkeypatch.setattr(st, "load_workstream_config", _broken)
+    _, output = sess._exec_tasks(sess._prepare_tool(_tc("tasks", args)))
+
+    assert output == (
+        f"Error: tasks {args['action']} failed: the stored task list could not be read; "
+        "no task was changed. Retry after storage recovers."
+    )
+    assert ui.tool_results[-1][3] is True  # reported as an error
+    assert read_stored("coord-1")["tasks"] == stored
+
+
 def test_tasks_exec_remove_passes_client_dict_through(coord_session):
     """The client returns a dict; exec must pass it through without
     synthesising a generic 'not found' message that would mask corrupt-

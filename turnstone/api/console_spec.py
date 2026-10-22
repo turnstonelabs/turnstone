@@ -1757,7 +1757,8 @@ CONSOLE_ENDPOINTS: list[EndpointSpec] = [
         description=(
             "Returns the ``{version, tasks}`` envelope persisted via the "
             "``tasks`` model tool.  Corrupt envelopes return an empty "
-            "list (the tool itself surfaces corruption errors on mutation)."
+            "list (the tool itself surfaces corruption errors on mutation); "
+            "a storage read that fails answers 503."
         ),
         response_model=CoordinatorTasksResponse,
         error_codes=[400, 403, 404, 503],

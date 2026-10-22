@@ -884,16 +884,15 @@ class CoordinatorIdleObserver:
             return None
 
         # Gate: read the task envelope, with a failed read SURFACED.
-        # ``load_task_envelope``'s default swallows a storage raise into
-        # an empty envelope — right for its UI read paths, fatal here:
-        # this path would exit through the "no open tasks" gate having
-        # never learned a read failed, while the sibling path fired on.
-        # ``raise_on_read_failure=True`` routes the failure through
-        # :func:`_event_read` to the event-level veto instead.  A
-        # CORRUPT blob is different — that read SUCCEEDED and returned a
-        # broken value — so it stays a path-local decline: refuse to
-        # nudge about a list that cannot be parsed, and let the sibling
-        # class speak for its own domain.
+        # ``load_task_envelope`` raises on a failed storage read, and
+        # :func:`_event_read` routes that to the event-level veto.  An
+        # absorbed failure would be fatal here: this path would exit
+        # through the "no open tasks" gate having never learned a read
+        # failed, while the sibling path fired on.  A CORRUPT blob is
+        # different — that read SUCCEEDED and returned a broken value — so
+        # it stays a path-local decline: refuse to nudge about a list that
+        # cannot be parsed, and let the sibling class speak for its own
+        # domain.
         #
         # Cost note (accepted): this row read + JSON parse runs on EVERY
         # IDLE event that clears the cheap gates, whatever the children
@@ -907,7 +906,7 @@ class CoordinatorIdleObserver:
         envelope, corrupt = _event_read(
             ws_id,
             "task_envelope",
-            lambda: load_task_envelope(self._storage, ws_id, raise_on_read_failure=True),
+            lambda: load_task_envelope(self._storage, ws_id),
         )
         if corrupt:
             log.debug(
@@ -1109,19 +1108,16 @@ class CoordinatorIdleObserver:
             #
             # Corrupt envelope → drop, and a FAILED read → drop: a
             # failed storage read never delivers a nudge, at drain
-            # exactly as at the fire gate.  The read is STRICT
-            # (``raise_on_read_failure=True``) so the failure lands in
-            # this ``except`` with its honest log line instead of being
-            # laundered into "no open tasks" by the loader's swallow.
+            # exactly as at the fire gate.  The loader raises on a failed
+            # read, so the failure lands in this ``except`` with its
+            # honest log line instead of reading as "no open tasks".
             # ``_open_tasks`` sits INSIDE the try: it walks raw envelope
             # rows, so a ragged one is a data-shape condition, and
             # letting it escape would surface as ``predicate_raised`` —
             # which ``nudge_queue`` documents as a wiring bug, sending
             # operators after a phantom code defect.
             try:
-                env, is_corrupt = load_task_envelope(
-                    self._storage, bound_ws_id, raise_on_read_failure=True
-                )
+                env, is_corrupt = load_task_envelope(self._storage, bound_ws_id)
                 if is_corrupt:
                     return False
                 open_now = self._open_tasks(env)

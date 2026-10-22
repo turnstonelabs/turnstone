@@ -2791,12 +2791,10 @@ class TestRunResourceLifecycle:
         made["sessions"][0].close()
 
     def test_a_post_run_storage_fault_is_a_harness_failure(self, monkeypatch):
-        """The post-run envelope read is scoring GROUND TRUTH, and it
-        was the module's only read whose failure was attributed to the
-        body under test: ``load_task_envelope`` fails open, so a
-        transient storage fault came back as an empty envelope and
-        scored as the model having deleted its tasks.  The probe read
-        raises instead, landing in the sweep's ``harness:`` bucket."""
+        """The post-run envelope read is scoring GROUND TRUTH, so a
+        storage fault there is a harness failure in the sweep's
+        ``harness:`` bucket, never an empty envelope scored as the model
+        having deleted its tasks."""
         made = self._drive(monkeypatch, poison="read_raises", fast_retries=True)
 
         assert "result" not in made  # never scored as a model result

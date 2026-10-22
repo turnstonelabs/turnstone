@@ -334,7 +334,8 @@ remains open indefinitely; the server pushes events as they occur.
 | `ws_id`   | string | yes      | Workstream identifier      |
 
 **Error:** Returns `404` with `{"error": "Unknown workstream"}` if `ws_id` is
-not recognized.
+not recognized, and `503` with code `workstream_unreadable` if the workstream
+isn't loaded and its record can't be read.
 
 #### Connection lifecycle
 
@@ -920,9 +921,11 @@ bootstrap above. `cursor` is normally `null`; when non-null, pass it as
 `last_event_id` on the initial `/events` request. For a loaded workstream, pass
 the non-null `handoff_token` from the history just rendered on that same initial
 request. A missing, invisible, or wrong-kind workstream returns the endpoint's
-ordinary `404` shape.
+ordinary `404` shape, and one whose record can't be read returns `503` with
+code `workstream_unreadable`.
 
-If the durable prefix cannot be loaded, the endpoint returns:
+If the durable prefix or the workstream's saved settings can't be read, the
+endpoint returns:
 
 ```json
 {"error": "History temporarily unavailable"}
@@ -1189,6 +1192,7 @@ acknowledgement is lost.
 | 400    | `{"error": "client_send_id must match ..."}`    | Correlation token is invalid           |
 | 404    | `{"error": "Unknown workstream"}`               | `ws_id` not found (or closed mid-send) |
 | 409    | `{"status": "cross_user_interjection", ...}`    | Another participant's turn is in flight |
+| 503    | `{"error": "workstream could not be read"}`     | Its record can't be read               |
 
 ---
 
@@ -1240,7 +1244,8 @@ round.
 ```
 
 `cycle_id` is `null` if no pending round was resolved. An invalid workstream
-returns `404`; a stale `cycle_id` or `call_id` returns `409`.
+returns `404`, and one whose record can't be read returns `503` with code
+`workstream_unreadable`; a stale `cycle_id` or `call_id` returns `409`.
 
 ---
 
@@ -1331,12 +1336,13 @@ or `{"status": "running"}` as above.
 
 **Error responses:**
 
-| Status | Body                                | Condition                                        |
-|--------|-------------------------------------|--------------------------------------------------|
-| 400    | `{"error": "Empty command"}`        | Command is empty                                 |
-| 404    | `{"error": "Unknown workstream"}`   | `ws_id` not found                                |
-| 409    | `{"status": "busy", "error": ...}`  | A turn/command holds the worker                  |
-| 503    | `{"status": "error", "error": ...}` | The command worker could not be started (resource exhaustion) — the command did **not** run; retry shortly |
+| Status | Body                                        | Condition                                        |
+|--------|---------------------------------------------|--------------------------------------------------|
+| 400    | `{"error": "Empty command"}`                | Command is empty                                 |
+| 404    | `{"error": "Unknown workstream"}`           | `ws_id` not found                                |
+| 409    | `{"status": "busy", "error": ...}`          | A turn/command holds the worker                  |
+| 503    | `{"status": "error", "error": ...}`         | The command worker could not be started (resource exhaustion) — the command did **not** run; retry shortly |
+| 503    | `{"error": "workstream could not be read"}` | Its record can't be read                         |
 
 ---
 
@@ -1407,10 +1413,11 @@ currently return an empty object.
 
 **Error responses:**
 
-| Status | Body                               | Condition              |
-|--------|------------------------------------|------------------------|
-| 400    | `{"error": "No session"}`          | Session not initialized|
-| 404    | `{"error": "Unknown workstream"}`  | `ws_id` not found      |
+| Status | Body                                        | Condition                |
+|--------|---------------------------------------------|--------------------------|
+| 400    | `{"error": "No session"}`                   | Session not initialized  |
+| 404    | `{"error": "Unknown workstream"}`           | `ws_id` not found        |
+| 503    | `{"error": "workstream could not be read"}` | Its record can't be read |
 
 ---
 
@@ -1683,13 +1690,15 @@ workstream existence.
 | 404  | Workstream not found / not owned by caller              |
 | 409  | Pending-cap reached                                     |
 | 413  | Payload exceeds size cap                                |
+| 503  | Workstream record can't be read; retry                  |
 
 ---
 
 ### `GET /v1/api/workstreams/{ws_id}/attachments`
 
 List the caller's **pending** (unconsumed) attachments for this
-workstream.  Ownership failures are masked as `404`.
+workstream.  Ownership failures are masked as `404`; a workstream record
+that can't be read answers `503`.
 
 **Response:** `200`
 
@@ -1714,7 +1723,8 @@ workstream.  Ownership failures are masked as `404`.
 
 Returns the raw bytes of an attachment with its stored `Content-Type`.
 Useful for previewing an image or replaying a document.  Ownership
-failures are masked as `404`.
+failures are masked as `404`; a workstream record that can't be read
+answers `503`.
 
 **Response:** `200` — binary body, original `Content-Type`.
 
@@ -1724,7 +1734,7 @@ failures are masked as `404`.
 
 Remove a pending attachment.  Consumed attachments return `404` (they
 are part of a committed conversation turn).  Ownership failures are also
-masked as `404`.
+masked as `404`; a workstream record that can't be read answers `503`.
 
 **Response:** `200`
 
