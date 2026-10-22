@@ -12456,13 +12456,10 @@ class TestDeliverWakeNudge:
         assert session._wake_source_tag == ""
 
     def test_skips_metacog_check_on_synthetic_send(self, tmp_db):
-        """Wake-channel content with regex-matching trigger words must
-        NOT re-fire correction / completion nudges on top of the
-        envelope.  The ``_wake_source_tag`` guard at the top of
-        ``_check_metacognitive_nudge`` covers this; verify by enqueuing
-        text that *would* trigger ``detect_correction`` (contains
-        "don't") and asserting no fresh ``correction`` entry lands in
-        the queue post-wake.
+        """A wake whose queued nudge text holds a correction trigger word ("don't") must not leave a
+        fresh ``correction`` nudge behind: the wake sends an empty user turn, so nothing runs
+        detection on the queued text.  ``test_plan_skips_detection_inside_a_wake_turn`` pins the
+        planner's own wake guard.
         """
         session = _make_session()
         session._title_generated = True
@@ -12483,6 +12480,15 @@ class TestDeliverWakeNudge:
         # (The original entry was drained onto the wake turn, not
         # re-queued.)
         assert all(t != "correction" for t, _ in _user_pending(session))
+
+    def test_plan_skips_detection_inside_a_wake_turn(self, tmp_db):
+        """The planner's wake guard: inside a wake-driven turn even a strong correction plans
+        nothing."""
+        session = _make_session()
+        session.messages.append(turn_from_dict({"role": "user", "content": "earlier"}))
+        assert session._plan_metacognitive_nudge("No, don't do that.") is not None
+        session._wake_source_tag = "system_nudge"
+        assert session._plan_metacognitive_nudge("No, don't do that.") is None
 
     def test_flushed_user_msg_during_wake_does_not_inherit_source_tag(self, tmp_db):
         """A real user message queued via ``queue_message`` while a wake

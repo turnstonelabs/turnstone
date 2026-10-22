@@ -1390,7 +1390,7 @@ class TestProactivePreSend:
         with (
             # 9999 > hard (9000) → compaction is owed at send time.
             patch.object(session, "_estimated_prompt_tokens", return_value=9_999),
-            patch.object(session, "_check_metacognitive_nudge", return_value=None),
+            patch.object(session, "_plan_metacognitive_nudge", return_value=None),
             patch.object(session, "_do_auto_compact", side_effect=fake_compact),
             patch.object(session, "_stream_response", side_effect=fake_stream_response),
             patch.object(session, "_full_messages", return_value=[]),
@@ -1801,7 +1801,7 @@ class TestChunkerOverflowSplit:
 
         with (
             patch.object(session, "_estimated_prompt_tokens", return_value=10),  # under hard
-            patch.object(session, "_check_metacognitive_nudge", return_value=None),
+            patch.object(session, "_plan_metacognitive_nudge", return_value=None),
             patch.object(session, "_stream_response", side_effect=cancel_midstream),
             patch.object(session, "_full_messages", return_value=[]),
             patch.object(session, "_update_token_table"),

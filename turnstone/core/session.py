@@ -3599,13 +3599,11 @@ class ChatSession:
         # ``nudge_allowed``, written by ``record_nudge`` once a nudge is queued.
         self._metacog_state: dict[str, float] = {}
         self._nudge_queue = NudgeQueue()
-        # Wake-trigger plumbing: ``deliver_wake_nudge_from_queue`` sets
-        # this tag while sending a synthetic empty user turn so that
-        # ``_check_metacognitive_nudge`` and the ``_queue_*_advisory``
-        # producers short-circuit (the wake's nudge text contains
-        # trigger words like "don't" that would otherwise re-fire
-        # correction nudges on top of it) and so the synthesized user
-        # message gets stamped ``_source`` for audit / replay distinction.
+        # Wake-trigger plumbing: ``deliver_wake_nudge_from_queue`` sets this tag while sending a
+        # synthetic empty user turn so that ``_plan_metacognitive_nudge`` (belt-and-braces: the
+        # empty input matches no detector) and the ``_queue_*_advisory`` producers short-circuit,
+        # and so the synthesized user message gets stamped ``_source`` for audit / replay
+        # distinction.
         self._wake_source_tag: str = ""
         # True between an abandoned generation (cancel / interrupt /
         # fatal error) and the next real (non-wake) ``send`` — the
@@ -14327,10 +14325,10 @@ class ChatSession:
         """Drop the abandoned generation's advisory nudges — not external events.
 
         Tool-channel advisories (``denial``, ``skill_hint``) queued earlier in this batch and
-        user-channel nudges (``correction``, …) queued during ``_check_metacognitive_nudge``
-        are commentary ABOUT the generation being abandoned (cancel, KeyboardInterrupt,
-        unexpected exception) — they drop so nothing stale bleeds into the next send's tool
-        loop or user turn.
+        user-channel nudges (``correction``, …) that ``_plan_metacognitive_nudge`` planned for this
+        send are commentary ABOUT the generation being abandoned (cancel, KeyboardInterrupt,
+        unexpected exception) — they drop so nothing stale bleeds into the next send's tool loop or
+        user turn.
 
         ``"any"``-channel entries survive but are DEMOTED to ``"quiet"``:
         those are external events (``watch_triggered``,
@@ -21291,19 +21289,6 @@ class ChatSession:
             notices.append(f"{invalid} legacy entries need authored descriptions")
         return f"\nNotice: {'; '.join(notices)}." if notices else ""
 
-    def _check_metacognitive_nudge(self, user_message: str) -> tuple[str, str] | None:
-        """Check if a metacognitive nudge should fire for *user_message*.
-
-        Called *before* the user turn is appended to ``self.messages``, so
-        ``msg_count`` includes the about-to-be-appended message.
-
-        Returns ``(nudge_type, nudge_text)`` or ``None``.
-        """
-        planned = self._plan_metacognitive_nudge(user_message)
-        if planned:
-            record_nudge(planned[0], self._metacog_state)
-        return planned
-
     def _plan_metacognitive_nudge(
         self,
         user_message: str,
@@ -21464,9 +21449,8 @@ class ChatSession:
         ``_wake_source_tag`` is set for the duration of the synthetic
         send so:
 
-        * ``_check_metacognitive_nudge`` short-circuits (no
-          recursive correction / completion detection on the
-          envelope text)
+        * ``_plan_metacognitive_nudge`` short-circuits (belt-and-braces: the synthetic empty input
+          already matches no correction / completion detector)
         * ``_queue_user_advisory`` / ``_queue_tool_advisory`` short-
           circuit if model behaviour during the wake (e.g. a denied
           tool call) would otherwise queue a fresh nudge on top of

@@ -3305,7 +3305,7 @@ class TestSendGenerationInitializationPublication:
                     "save_message",
                     side_effect=blocked_save_message,
                 ) as save,
-                patch.object(session, "_check_metacognitive_nudge", return_value=None),
+                patch.object(session, "_plan_metacognitive_nudge", return_value=None),
                 patch.object(session, "_maybe_note_new_participant"),
                 patch.object(session, "_emit_pending_user_nudges"),
             ):
@@ -3368,9 +3368,9 @@ class TestSendGenerationInitializationPublication:
             patch("turnstone.core.session.threading.Thread") as title_thread,
             patch.object(
                 session,
-                "_check_metacognitive_nudge",
+                "_plan_metacognitive_nudge",
                 return_value=("reflection", "stale advisory"),
-            ) as check_metacog,
+            ) as plan_nudge,
             patch.object(session, "_init_system_messages") as init_system,
             pytest.raises(GenerationCancelled),
         ):
@@ -3395,7 +3395,7 @@ class TestSendGenerationInitializationPublication:
         assert origin_generation not in session._generation_principals
         save.assert_not_called()
         title_thread.assert_not_called()
-        check_metacog.assert_not_called()
+        plan_nudge.assert_not_called()
         init_system.assert_not_called()
 
     def test_stale_admission_cannot_commit_or_publish_private_memory_index(
