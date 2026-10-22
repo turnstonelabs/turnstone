@@ -228,7 +228,11 @@ shape `{"error":"Dispatch to node <node_id> failed"}` instead of reflecting
 arbitrary node text or retry-triggering 401/429 responses. Coded
 `server.require_project` (`400`) and wrong-execution-node (`409`) refusals retain
 their actionable wording. Consult the target node's logs for the underlying create
-correlation when a reachable node returns a masked 502.
+correlation when a reachable node returns a masked 502. When the create may have
+reached the node but no reply was read, a create that outlasts the console's
+30-second wait say, the `502` instead has `code: "upstream_no_reply"` and says
+the request may have been processed: the workstream may exist, so check before
+creating it again.
 
 ### `GET /v1/api/cluster/events`
 

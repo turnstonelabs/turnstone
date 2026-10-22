@@ -36,7 +36,11 @@ from typing import TYPE_CHECKING, Any, ClassVar
 import httpx2
 
 from turnstone.core.auth import JWT_AUD_CONSOLE, create_jwt
-from turnstone.core.http_failures import REQUEST_FAILURES
+from turnstone.core.http_failures import (
+    REQUEST_FAILURES,
+    UPSTREAM_NO_REPLY_CODE,
+    may_have_reached_server,
+)
 from turnstone.core.log import get_logger
 from turnstone.core.memory import LAST_ERROR_CONFIG_KEY
 from turnstone.core.metacognition import (
@@ -650,12 +654,27 @@ class CoordinatorClient:
         without duplicating the body of ``_post``.  ``log_path`` is a
         stable key for telemetry grouping — the URL itself embeds
         per-session ids that would fragment log aggregation.
+
+        A transport failure reads "unreachable" only when the request never
+        reached the console. Any other may have come after the request was
+        acted on, a create outlasting the client's timeout say, so its error
+        says the request may have been processed and carries
+        ``UPSTREAM_NO_REPLY_CODE``.
         """
         try:
             resp = self._http.post(url, json=body, headers=self._headers())
         except REQUEST_FAILURES as exc:
             log.warning("coord_client.http_error path=%s err=%s", log_path, exc)
-            return {"error": f"upstream unreachable: {exc}", "status": 0}
+            if not may_have_reached_server(exc):
+                return {"error": f"upstream unreachable: {exc}", "status": 0}
+            return {
+                "error": (
+                    f"no reply was read from upstream ({exc}), so the request may have been "
+                    "processed"
+                ),
+                "code": UPSTREAM_NO_REPLY_CODE,
+                "status": 0,
+            }
         try:
             data = resp.json() if resp.content else {}
         except (ValueError, RecursionError):

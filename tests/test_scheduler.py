@@ -812,6 +812,10 @@ class TestSchedulerTick:
             (httpx2.PoolTimeout("busy"), True),
             (httpx2.ProxyError("refused"), True),
             (httpx2.UnsupportedProtocol("no scheme"), True),
+            (httpx2.InvalidURL("bad location"), True),
+            # Encoding fails before the request is sent; decoding can fail after it was made.
+            (UnicodeEncodeError("ascii", "caf" + chr(0xE9), 3, 4, "out of range"), True),
+            (UnicodeDecodeError("utf-8", bytes([0xFF]), 0, 1, "invalid start byte"), False),
             (TurnstoneAPIError(429, "manager at capacity"), True),
             (TurnstoneAPIError(400, "unknown persona"), True),
             (TurnstoneAPIError(401, "token not yet valid"), True),

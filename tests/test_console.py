@@ -10,7 +10,12 @@ from unittest.mock import ANY, MagicMock
 
 import pytest
 
-from tests._http_failure_cases import UNREACHABLE_REPLIES, refuse
+from tests._http_failure_cases import (
+    MAYBE_PROCESSED_REPLIES,
+    UNREACHABLE_REPLIES,
+    UNSENT_REPLIES,
+    refuse,
+)
 from turnstone.console.collector import ClusterCollector, NodeSnapshot
 from turnstone.console.server import _PROXY_AUTH_LOCAL_HANDLERS
 
@@ -1650,6 +1655,33 @@ class TestConsoleWorkstreamCreation:
         assert resp.status_code == 503
         assert resp.json()["error"].startswith("The default model isn't loaded on node node-a")
 
+    @pytest.mark.parametrize(
+        ("failure", "body"),
+        [
+            ("refused", {"error": "Dispatch to node node-a failed"}),
+            (
+                "read-timeout",
+                {
+                    "error": (
+                        "no reply was read from node node-a, so the request may have been processed"
+                    ),
+                    "code": "upstream_no_reply",
+                },
+            ),
+        ],
+    )
+    def test_create_transport_failure(self, client_and_mock, failure, body):
+        # A create that outlasted the timeout may have made the workstream, so it isn't masked.
+        import httpx2
+
+        client, mock_post = client_and_mock
+        mock_post.side_effect = (
+            httpx2.ConnectError("refused") if failure == "refused" else httpx2.ReadTimeout("slow")
+        )
+        resp = client.post("/v1/api/cluster/workstreams/new", json={"node_id": "node-a"})
+        assert resp.status_code == 502
+        assert resp.json() == body
+
     def test_other_node_503s_stay_masked(self, client_and_mock):
         client, mock_post = client_and_mock
         self._node_answers(mock_post, 503, {"error": "factory text"})
@@ -2023,9 +2055,8 @@ class TestConsoleProxy:
             ("GET", "/node/node-a/"),
             ("GET", "/node/node-a/static/app.js"),
             ("GET", "/node/node-a/v1/api/workstreams"),
-            ("POST", "/node/node-a/v1/api/workstreams/new"),
         ],
-        ids=["index", "static", "api-get", "api-post"],
+        ids=["index", "static", "api-get"],
     )
     @UNREACHABLE_REPLIES
     def test_proxy_unreachable_node_returns_502(self, client, method, path, reply):
@@ -2034,12 +2065,51 @@ class TestConsoleProxy:
         proxy = httpx2.AsyncClient(transport=httpx2.MockTransport(reply))
         client.app.state.proxy_client = proxy
         try:
-            resp = client.request(method, path, json={} if method == "POST" else None)
+            resp = client.request(method, path)
         finally:
             asyncio.run(proxy.aclose())
 
         assert resp.status_code == 502
         assert resp.json() == {"error": "Node unreachable"}
+
+    def _proxy_post(self, client, reply):
+        import httpx2
+
+        proxy = httpx2.AsyncClient(transport=httpx2.MockTransport(reply))
+        client.app.state.proxy_client = proxy
+        try:
+            return client.post("/node/node-a/v1/api/workstreams/new", json={})
+        finally:
+            asyncio.run(proxy.aclose())
+
+    @UNSENT_REPLIES
+    def test_proxy_post_to_an_unreachable_node_returns_502(self, client, reply):
+        resp = self._proxy_post(client, reply)
+        assert resp.status_code == 502
+        assert resp.json() == {"error": "Node unreachable"}
+
+    @MAYBE_PROCESSED_REPLIES
+    def test_proxy_post_with_no_reply_may_have_been_processed(self, client, reply):
+        resp = self._proxy_post(client, reply)
+        assert resp.status_code == 502
+        assert resp.json() == {
+            "error": "no reply was read from the node, so the request may have been processed",
+            "code": "upstream_no_reply",
+        }
+
+    def test_a_watch_cancel_with_no_reply_may_have_been_processed(self, client):
+        import httpx2
+
+        from tests._http_failure_cases import time_out_reading
+
+        proxy = httpx2.AsyncClient(transport=httpx2.MockTransport(time_out_reading))
+        client.app.state.proxy_client = proxy
+        try:
+            resp = client.post("/v1/api/admin/watches/abc123/cancel", json={"node_id": "node-a"})
+        finally:
+            asyncio.run(proxy.aclose())
+        assert resp.status_code == 502
+        assert resp.json()["code"] == "upstream_no_reply"
 
     def test_proxy_path_httpx2_cannot_send_returns_502(self, client):
         import httpx2

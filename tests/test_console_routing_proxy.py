@@ -11,7 +11,7 @@ import httpx2
 import pytest
 from starlette.testclient import TestClient
 
-from tests._http_failure_cases import UNREACHABLE_REPLIES
+from tests._http_failure_cases import MAYBE_PROCESSED_REPLIES, UNSENT_REPLIES, time_out_reading
 from turnstone.console.collector import ClusterCollector
 from turnstone.console.router import ConsoleRouter, NodeRef
 from turnstone.core.rendezvous import NoAvailableNodeError
@@ -1054,27 +1054,52 @@ class TestRouteProxy:
         assert resp.status_code == 200
 
 
-class TestRouteUpstreamUnreachable:
-    """A node the proxy client cannot reach is a 502 that names the node."""
+_FORWARDED = pytest.mark.parametrize(
+    ("path", "kwargs", "upstream"),
+    [
+        (
+            "/v1/api/route/workstreams/new",
+            {"json": {"name": "child"}},
+            "/v1/api/workstreams/new",
+        ),
+        (
+            f"/v1/api/route/workstreams/new?ws_id={_DEST_WS_ID}",
+            {
+                "data": {"meta": json.dumps({"ws_id": _DEST_WS_ID})},
+                "files": {"file": ("a.txt", b"hello", "text/plain")},
+            },
+            "/v1/api/workstreams/new",
+        ),
+        (
+            "/v1/api/route/workstreams/abc123/send",
+            {"json": {"message": "hello"}},
+            "/v1/api/workstreams/abc123/send",
+        ),
+        (
+            "/v1/api/route/workstreams/delete",
+            {"json": {"ws_id": "abc123"}},
+            "/v1/api/workstreams/abc123/delete",
+        ),
+        (
+            "/v1/api/route/workstreams/abc123/attachments",
+            {"files": {"file": ("a.txt", b"hello", "text/plain")}},
+            "/v1/api/workstreams/abc123/attachments",
+        ),
+    ],
+    ids=["create", "create-multipart", "send", "delete", "attachment"],
+)
 
-    @UNREACHABLE_REPLIES
-    @pytest.mark.parametrize(
-        ("path", "body", "upstream"),
-        [
-            ("/v1/api/route/workstreams/new", {"name": "child"}, "/v1/api/workstreams/new"),
-            (
-                "/v1/api/route/workstreams/abc123/send",
-                {"message": "hello"},
-                "/v1/api/workstreams/abc123/send",
-            ),
-        ],
-        ids=["create", "send"],
-    )
-    def test_a_node_it_cannot_reach_is_a_502(self, path, body, upstream, reply):
+
+class TestRouteUpstreamUnreachable:
+    """A request the proxy couldn't forward is a 502 that names the node. It says unreachable when
+    the node never got the request; otherwise the node may have acted on it, so it says so."""
+
+    @staticmethod
+    def _post(path: str, kwargs: dict[str, Any], reply: Any) -> tuple[Any, list[str]]:
         seen: list[str] = []
 
         def handler(request: httpx2.Request) -> httpx2.Response:
-            seen.append(str(request.url))
+            seen.append(str(request.url).partition("?")[0])
             return reply(request)
 
         app = _make_app(router=_make_mock_router())
@@ -1082,13 +1107,32 @@ class TestRouteUpstreamUnreachable:
         app.state.proxy_client = proxy
         client = TestClient(app, raise_server_exceptions=False)
         try:
-            resp = client.post(path, json=body, headers=_TEST_AUTH_HEADERS)
+            resp = client.post(path, headers=_TEST_AUTH_HEADERS, **kwargs)
         finally:
             client.close()
             asyncio.run(proxy.aclose())
+        return resp, seen
 
+    @UNSENT_REPLIES
+    @_FORWARDED
+    def test_a_node_it_cannot_reach_is_a_502(self, path, kwargs, upstream, reply):
+        resp, seen = self._post(path, kwargs, reply)
         assert resp.status_code == 502
         assert resp.json() == {"error": "upstream node node-a unreachable"}
+        assert seen == [f"http://a:8080{upstream}"]
+
+    @MAYBE_PROCESSED_REPLIES
+    @_FORWARDED
+    def test_a_request_with_no_reply_may_have_been_processed(self, path, kwargs, upstream, reply):
+        resp, seen = self._post(path, kwargs, reply)
+        assert resp.status_code == 502
+        assert resp.json() == {
+            "error": (
+                "no reply was read from upstream node node-a, so the request may have been "
+                "processed"
+            ),
+            "code": "upstream_no_reply",
+        }
         assert seen == [f"http://a:8080{upstream}"]
 
     def test_a_path_httpx2_cannot_send_is_a_502(self):
@@ -1115,7 +1159,99 @@ class TestRouteUpstreamUnreachable:
             asyncio.run(proxy.aclose())
 
         assert resp.status_code == 502
+        assert resp.json() == {"error": "upstream node node-a unreachable"}
         assert sent == []
+
+    def test_a_body_httpx2_cannot_encode_is_unreachable(self):
+        # A lone surrogate parses from JSON but won't encode, so nothing reaches the node.
+        sent: list[httpx2.Request] = []
+
+        def handler(request: httpx2.Request) -> httpx2.Response:
+            sent.append(request)
+            return httpx2.Response(200, json={})
+
+        app = _make_app(router=_make_mock_router())
+        proxy = httpx2.AsyncClient(transport=httpx2.MockTransport(handler))
+        app.state.proxy_client = proxy
+        client = TestClient(app, raise_server_exceptions=False)
+        try:
+            resp = client.post(
+                "/v1/api/route/workstreams/abc123/send",
+                content=('{"message": "' + chr(92) + 'ud83d"}').encode(),
+                headers={**_TEST_AUTH_HEADERS, "Content-Type": "application/json"},
+            )
+        finally:
+            client.close()
+            asyncio.run(proxy.aclose())
+
+        assert resp.status_code == 502
+        assert resp.json() == {"error": "upstream node node-a unreachable"}
+        assert sent == []
+
+    def test_a_resend_to_a_node_url_httpx2_cannot_build_is_unreachable(self):
+        router = _make_mock_router()
+        router.route.side_effect = [
+            NodeRef("node-a", "http://a:8080"),
+            NodeRef("node-b", "http://b" + chr(1) + ":8080"),
+        ]
+        sent: list[str] = []
+
+        def handler(request: httpx2.Request) -> httpx2.Response:
+            sent.append(str(request.url))
+            return httpx2.Response(404, json={"error": "not found"})
+
+        app = _make_app(router=router)
+        proxy = httpx2.AsyncClient(transport=httpx2.MockTransport(handler))
+        app.state.proxy_client = proxy
+        client = TestClient(app, raise_server_exceptions=False)
+        try:
+            resp = client.post(
+                "/v1/api/route/workstreams/abc123/send",
+                json={"message": "hello"},
+                headers=_TEST_AUTH_HEADERS,
+            )
+        finally:
+            client.close()
+            asyncio.run(proxy.aclose())
+
+        assert resp.status_code == 502
+        assert resp.json() == {"error": "retry node node-b unreachable"}
+        assert sent == ["http://a:8080/v1/api/workstreams/abc123/send"]
+
+    def test_a_resend_with_no_reply_may_have_been_processed(self):
+        # node-a doesn't host the workstream; the route moves to node-b, which never replies.
+        router = _make_mock_router()
+        router.route.side_effect = [
+            NodeRef("node-a", "http://a:8080"),
+            NodeRef("node-b", "http://b:8080"),
+        ]
+
+        def handler(request: httpx2.Request) -> httpx2.Response:
+            if request.url.host == "a":
+                return httpx2.Response(404, json={"error": "not found"})
+            return time_out_reading(request)
+
+        app = _make_app(router=router)
+        proxy = httpx2.AsyncClient(transport=httpx2.MockTransport(handler))
+        app.state.proxy_client = proxy
+        client = TestClient(app, raise_server_exceptions=False)
+        try:
+            resp = client.post(
+                "/v1/api/route/workstreams/abc123/send",
+                json={"message": "hello"},
+                headers=_TEST_AUTH_HEADERS,
+            )
+        finally:
+            client.close()
+            asyncio.run(proxy.aclose())
+
+        assert resp.status_code == 502
+        assert resp.json() == {
+            "error": (
+                "no reply was read from retry node node-b, so the request may have been processed"
+            ),
+            "code": "upstream_no_reply",
+        }
 
 
 class TestRouteProxyPermissionGates:

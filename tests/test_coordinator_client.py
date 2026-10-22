@@ -16,7 +16,11 @@ from typing import TYPE_CHECKING, Any
 import httpx2
 import pytest
 
-from tests._http_failure_cases import UNREACHABLE_REPLIES
+from tests._http_failure_cases import (
+    MAYBE_PROCESSED_REPLIES,
+    UNREACHABLE_REPLIES,
+    UNSENT_REPLIES,
+)
 from turnstone.console.coordinator_client import (
     _ROUTE_PATHS,
     CoordinatorClient,
@@ -26,6 +30,7 @@ from turnstone.console.coordinator_client import (
 )
 from turnstone.core.auth import JWT_AUD_CONSOLE, validate_jwt
 from turnstone.core.child_event_bus import ChildEventBus
+from turnstone.core.http_failures import UPSTREAM_NO_REPLY_CODE
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -377,12 +382,34 @@ def test_close_all_children_surfaces_http_error(sqlite_backend_factory):
     assert "error" in result
 
 
-@UNREACHABLE_REPLIES
+@UNSENT_REPLIES
 def test_close_all_children_surfaces_transport_error(sqlite_backend_factory, reply):
     client, _captured = _mock_client(reply, sqlite_backend_factory=sqlite_backend_factory)
     result = client.close_all_children()
     assert result["status"] == 0
-    assert "upstream unreachable" in result["error"]
+    assert result["error"].startswith("upstream unreachable: ")
+    assert "code" not in result
+
+
+@MAYBE_PROCESSED_REPLIES
+def test_a_post_with_no_reply_may_have_been_processed(sqlite_backend_factory, reply):
+    # A create that outlasts the client's timeout may still have made the child.
+    client, captured = _mock_client(reply, sqlite_backend_factory=sqlite_backend_factory)
+    result = client.spawn(initial_message="hi", parent_ws_id="coord-1", user_id="user-1")
+    assert len(captured) == 1
+    assert result["status"] == 0
+    assert result["code"] == UPSTREAM_NO_REPLY_CODE
+    assert result["error"].startswith("no reply was read from upstream (")
+    assert result["error"].endswith("), so the request may have been processed")
+
+
+def test_a_post_to_a_url_it_cannot_build_is_unreachable(sqlite_backend_factory):
+    client, captured = _mock_client(
+        lambda request: httpx2.Response(200, json={}), sqlite_backend_factory=sqlite_backend_factory
+    )
+    result = client._post_url("http://console.example.com/x\x01", {}, log_path="/x")
+    assert captured == []
+    assert result["error"].startswith("upstream unreachable: ")
 
 
 def test_delete_workstream_posts_to_delete_route(sqlite_backend_factory):

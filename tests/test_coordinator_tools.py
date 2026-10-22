@@ -15,6 +15,7 @@ from unittest.mock import ANY, MagicMock, patch
 
 import pytest
 
+from turnstone.core.http_failures import UPSTREAM_NO_REPLY_CODE
 from turnstone.core.metacognition import TASK_NOTE_MAX, TASK_TITLE_MAX
 from turnstone.core.session import ChatSession
 from turnstone.prompts import ClientType
@@ -302,13 +303,52 @@ def test_spawn_batch_exec_does_not_surface_misleading_status_field(coord_session
 
 
 def test_spawn_exec_surfaces_client_error(coord_session):
+    # A 4xx refusal made nothing, so it carries no advice to check first.
     sess, coord, ui = coord_session
-    coord.spawn.return_value = {"error": "upstream unreachable", "status": 502}
+    coord.spawn.return_value = {"error": "unknown persona 'x'", "status": 400}
     item = sess._prepare_tool(_tc("spawn_workstream", {"initial_message": "hi"}))
     _call_id, output = sess._exec_spawn_workstream(item)
-    assert "upstream unreachable" in output
+    assert output == "Error: unknown persona 'x'"
     # UI got an error result
     assert ui.tool_results[-1][3] is True  # is_error
+
+
+@pytest.mark.parametrize("status", [500, 502, 504])
+def test_a_spawn_answered_with_a_5xx_says_to_check_before_retrying(coord_session, status):
+    # A gateway in front of the node can time out while the node finishes the create.
+    sess, coord, _ui = coord_session
+    coord.spawn.return_value = {"error": f"HTTP {status}", "status": status}
+    item = sess._prepare_tool(_tc("spawn_workstream", {"initial_message": "hi"}))
+    _call_id, output = sess._exec_spawn_workstream(item)
+    assert output == f"Error: HTTP {status}; check with list_workstreams before retrying"
+
+
+_NO_REPLY = {
+    "error": "no reply was read from upstream (timed out), so the request may have been processed",
+    "code": UPSTREAM_NO_REPLY_CODE,
+    "status": 0,
+}
+
+
+def test_a_spawn_with_no_reply_says_to_check_before_retrying(coord_session):
+    # The create may have made the child, so a retry could make a second one.
+    sess, coord, ui = coord_session
+    coord.spawn.return_value = dict(_NO_REPLY)
+    item = sess._prepare_tool(_tc("spawn_workstream", {"initial_message": "hi"}))
+    _call_id, output = sess._exec_spawn_workstream(item)
+    assert output == (f"Error: {_NO_REPLY['error']}; check with list_workstreams before retrying")
+    assert ui.tool_results[-1][3] is True  # is_error
+
+
+def test_a_batch_spawn_with_no_reply_says_to_check_before_retrying(coord_session):
+    sess, coord, _ui = coord_session
+    coord.spawn.return_value = dict(_NO_REPLY)
+    item = sess._prepare_tool(_tc("spawn_batch", {"children": [{"initial_message": "solo"}]}))
+    _call_id, output = sess._exec_spawn_batch(item)
+    body = json.loads(output)
+    assert body["denied"] == [
+        {"idx": 0, "reason": f"{_NO_REPLY['error']}; check with list_workstreams before retrying"}
+    ]
 
 
 def test_spawn_exec_treats_missing_ws_id_on_success_path_as_error(coord_session):

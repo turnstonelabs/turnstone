@@ -103,6 +103,7 @@ from turnstone.core.completion_recovery import (
 from turnstone.core.config import get_searxng_engines, get_searxng_url, get_workspace_dir
 from turnstone.core.deadline import DeadlineCancelledError, StreamAbortRef
 from turnstone.core.edit import find_occurrences, pick_nearest
+from turnstone.core.http_failures import UPSTREAM_NO_REPLY_CODE
 from turnstone.core.images import flatten_image
 from turnstone.core.ip_classify import AddressLane
 from turnstone.core.log import get_logger
@@ -21877,6 +21878,19 @@ class ChatSession:
             return persona, err or f"unknown persona {persona!r}"
         return str(row["name"]), ""
 
+    @staticmethod
+    def _spawn_error(result: dict[str, Any]) -> str:
+        """A failed spawn's error. When no reply was read, or a 5xx came back, the child may have
+        been created (a gateway in front of the node can time out while the node finishes), so the
+        error says to check before spawning it again."""
+        error = str(result["error"])
+        status = result.get("status")
+        if result.get("code") == UPSTREAM_NO_REPLY_CODE or (
+            isinstance(status, int) and status >= 500
+        ):
+            error += "; check with list_workstreams before retrying"
+        return error
+
     def _exec_spawn_workstream(self, item: dict[str, Any]) -> tuple[str, str]:
         call_id = item["call_id"]
         try:
@@ -21896,7 +21910,7 @@ class ChatSession:
             self._report_tool_result(call_id, "spawn_workstream", msg, is_error=True)
             return call_id, msg
         if result.get("error"):
-            msg = f"Error: {result['error']}"
+            msg = f"Error: {self._spawn_error(result)}"
             self._report_tool_result(call_id, "spawn_workstream", msg, is_error=True)
             return call_id, msg
         # Defensive: absence of ``error`` is the success signal, but
@@ -22113,7 +22127,7 @@ class ChatSession:
                 denied.append({"idx": idx, "reason": f"spawn failed: {e}"})
                 continue
             if result.get("error"):
-                denied.append({"idx": idx, "reason": str(result["error"])})
+                denied.append({"idx": idx, "reason": self._spawn_error(result)})
                 continue
             ws_id = str(result.get("ws_id") or "")
             if not ws_id:

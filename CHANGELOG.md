@@ -1403,6 +1403,20 @@ frozen.
   JSON object or holds a field of the wrong type, and the notify hook's malformed-body error reads
   "Invalid JSON body". The console reference's token example sends `scopes` as the comma-separated
   string the API takes.
+- **A request whose reply never came is no longer reported as unreachable.** A coordinator's
+  requests to the console, and the console's proxies to a node, called every transport failure
+  unreachable, a reply that timed out included. Both wait 30 seconds, so a create that took longer
+  could still make the child, and a model told the upstream was unreachable could spawn it again.
+  They now say unreachable only when the request never reached a handler that could act on it (a
+  connection that never opened, a request that couldn't be built or encoded, or a redirect from
+  something in front of the node); any other failure says no reply was read, so the request may have
+  been processed, and carries the code `upstream_no_reply`. `spawn_workstream` and `spawn_batch` add
+  that the coordinator should check with `list_workstreams` before retrying, after such a failure
+  and after any 5xx answer, since a gateway in front of the node can time out while the node
+  finishes. The console's create, verb, delete, attachment, node and watch-cancel proxies answer
+  this way, and the launcher's create, which said only that the dispatch failed, now says when the
+  workstream may exist. The task scheduler reads the same rule, so a firing whose create couldn't be
+  encoded is held for retry instead of recorded as unresolved.
 
 ### Security
 

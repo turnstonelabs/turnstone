@@ -3116,11 +3116,15 @@ console returns a bounded `502` instead of exposing or trusting the malformed
 payload.
 
 A required node missing from live membership returns `503` with
-`code: "required_node_unavailable"` and `required_node_id`. An unreachable
-registered node can return an upstream `502`. Neither condition permits a
-fallback to another node. Ordinary route resolution reads the durable
-requirement before cached placement, including after the node disappears.
-Private-project requirements follow the same visibility rules as history.
+`code: "required_node_unavailable"` and `required_node_id`. A registered node
+the console can't reach returns an upstream `502`. When the request may have
+reached the node but no reply was read, a create that outlasts the console's
+30-second wait say, the `502` has `code: "upstream_no_reply"` and says the
+request may have been processed: the workstream may exist, so check before
+creating it again. None of these conditions permits a fallback to another node.
+Ordinary route resolution reads the durable requirement before cached placement,
+including after the node disappears. Private-project requirements follow the
+same visibility rules as history.
 
 ### `GET /v1/api/route/workstreams/{ws_id}/live`
 

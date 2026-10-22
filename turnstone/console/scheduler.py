@@ -18,10 +18,10 @@ from datetime import UTC, datetime, timedelta
 from enum import Enum
 from typing import TYPE_CHECKING, Any
 
-import httpx2
 import structlog
 
 from turnstone.console.schedule_timing import TS_FMT, compute_next_run, no_next_run_reason
+from turnstone.core.http_failures import may_have_reached_server
 from turnstone.sdk._types import TurnstoneAPIError
 from turnstone.sdk.server import TurnstoneServer
 
@@ -35,21 +35,6 @@ log = structlog.get_logger(__name__)
 # The system_settings row of the firings held for retry, beside the
 # scheduler_lock row: one JSON object, task id to hold.
 _HOLDS_KEY = "scheduler_holds"
-
-# Raised before the request is sent, so nothing reached the node: a connection that never opened, a
-# pool or proxy that refused it, a URL httpx2 will not send to.  A failure after sending may have
-# made the workstream.  The SDK client follows redirects, so these also come from the hop after a
-# 3xx, and still mean nothing was made: Turnstone's create handler never redirects, so a 3xx comes
-# from something in front of the node, such as an http-to-https proxy, that didn't run the create.
-# Retrying is right there, and a test pins it.
-_NEVER_SENT = (
-    httpx2.ConnectError,
-    httpx2.ConnectTimeout,
-    httpx2.PoolTimeout,
-    httpx2.ProxyError,
-    httpx2.UnsupportedProtocol,
-    httpx2.InvalidURL,
-)
 
 
 class _Outcome(Enum):
@@ -549,9 +534,6 @@ class TaskScheduler:
                 client_type="scheduled",
             )
             ws_id = resp.ws_id
-        except _NEVER_SENT as exc:
-            log.warning("scheduler.sdk_dispatch_failed", node_id=node_id, exc_info=True)
-            return _Outcome.NOT_CREATED, f"{node_id} could not be reached ({type(exc).__name__})"
         except TurnstoneAPIError as exc:
             log.warning("scheduler.sdk_dispatch_failed", node_id=node_id, exc_info=True)
             if exc.status_code < 500:
@@ -559,6 +541,12 @@ class TaskScheduler:
             return _Outcome.UNKNOWN, f"{node_id} answered {exc}"
         except Exception as exc:
             log.warning("scheduler.sdk_dispatch_failed", node_id=node_id, exc_info=True)
+            # The SDK client follows redirects; the rule covers the hop after a 3xx too.
+            if not may_have_reached_server(exc):
+                return (
+                    _Outcome.NOT_CREATED,
+                    f"{node_id} could not be reached ({type(exc).__name__})",
+                )
             return _Outcome.UNKNOWN, f"{node_id} gave no answer ({type(exc).__name__})"
 
         self._write_run(

@@ -73,7 +73,11 @@ from turnstone.core.avatar_routes import (
     upload_own_avatar_picture,
 )
 from turnstone.core.deadline import DeadlineExceededError, run_with_deadline
-from turnstone.core.http_failures import REQUEST_FAILURES
+from turnstone.core.http_failures import (
+    REQUEST_FAILURES,
+    UPSTREAM_NO_REPLY_CODE,
+    may_have_reached_server,
+)
 from turnstone.core.http_headers import HEADER_VALUE_RE, HeaderValueError
 from turnstone.core.mcp_oauth import is_user_scoped_auth
 from turnstone.core.memory import get_workstream_display_names
@@ -1882,6 +1886,9 @@ async def create_workstream(request: Request) -> JSONResponse:
             resp = await client.post(node_url, json=ws_body, headers=headers)
     except REQUEST_FAILURES as exc:
         log.warning("Workstream dispatch to %s failed: %s", node_id, exc)
+        # A create that outlasted the timeout may have made the workstream, which the mask hides.
+        if may_have_reached_server(exc):
+            return _upstream_failure(exc, f"node {node_id}")
         return _dispatch_failed(node_id)
 
     # Preserve the coded project-required and wrong-executor refusals. Mask
@@ -2003,6 +2010,24 @@ def _record_route(
     if cm is not None:
         cm.record_route(method, status, time.monotonic() - t0)
     return resp
+
+
+def _upstream_failure(exc: Exception, node: str, *, unreachable: str = "") -> JSONResponse:
+    """The 502 for a request forwarded to *node*, a phrase like ``upstream node n1``, that failed in
+    transport. It says unreachable (*unreachable*, if given) only when the request never reached the
+    node: after that the node may have acted on it, a create that outlasted the proxy's timeout
+    say, so the reply says the request may have been processed and carries
+    ``UPSTREAM_NO_REPLY_CODE`` for the caller to check before retrying.
+    """
+    if not may_have_reached_server(exc):
+        return JSONResponse({"error": unreachable or f"{node} unreachable"}, status_code=502)
+    return JSONResponse(
+        {
+            "error": f"no reply was read from {node}, so the request may have been processed",
+            "code": UPSTREAM_NO_REPLY_CODE,
+        },
+        status_code=502,
+    )
 
 
 async def _refresh_unready_router(
@@ -2192,16 +2217,9 @@ async def route_create(request: Request) -> Response:
                 content=raw_body,
                 headers=upstream_headers,
             )
-        except REQUEST_FAILURES:
+        except REQUEST_FAILURES as exc:
             return _record_route(
-                request,
-                "create",
-                502,
-                t0,
-                JSONResponse(
-                    {"error": f"upstream node {ref.node_id} unreachable"},
-                    status_code=502,
-                ),
+                request, "create", 502, t0, _upstream_failure(exc, f"upstream node {ref.node_id}")
             )
     else:
         parsed_body = (
@@ -2330,16 +2348,13 @@ async def route_create(request: Request) -> Response:
                 resp = await client.post(
                     f"{ref.url}/v1/api/workstreams/new", json=body, headers=headers
                 )
-            except REQUEST_FAILURES:
+            except REQUEST_FAILURES as exc:
                 return _record_route(
                     request,
                     "create",
                     502,
                     t0,
-                    JSONResponse(
-                        {"error": f"upstream node {ref.node_id} unreachable"},
-                        status_code=502,
-                    ),
+                    _upstream_failure(exc, f"upstream node {ref.node_id}"),
                 )
 
             # The console chooses the destination id before routing, so the
@@ -2600,16 +2615,9 @@ async def route_attachment_proxy(request: Request) -> Response:
                 content=body,
                 headers=upstream_headers,
             )
-        except REQUEST_FAILURES:
+        except REQUEST_FAILURES as exc:
             return _record_route(
-                request,
-                method,
-                502,
-                t0,
-                JSONResponse(
-                    {"error": f"upstream node {ref.node_id} unreachable"},
-                    status_code=502,
-                ),
+                request, method, 502, t0, _upstream_failure(exc, f"upstream node {ref.node_id}")
             )
     else:
         try:
@@ -2752,16 +2760,9 @@ async def _resend_if_route_moved(
         return ref, resp
     try:
         return new_ref, await send(new_ref)
-    except REQUEST_FAILURES:
+    except REQUEST_FAILURES as exc:
         return _record_route(
-            request,
-            verb,
-            502,
-            t0,
-            JSONResponse(
-                {"error": f"retry node {new_ref.node_id} unreachable"},
-                status_code=502,
-            ),
+            request, verb, 502, t0, _upstream_failure(exc, f"retry node {new_ref.node_id}")
         )
 
 
@@ -3006,16 +3007,9 @@ async def route_proxy(request: Request) -> Response:
         resp = await client.request(
             http_method, f"{ref.url}{upstream_path}", json=body, headers=headers
         )
-    except REQUEST_FAILURES:
+    except REQUEST_FAILURES as exc:
         return _record_route(
-            request,
-            verb,
-            502,
-            t0,
-            JSONResponse(
-                {"error": f"upstream node {ref.node_id} unreachable"},
-                status_code=502,
-            ),
+            request, verb, 502, t0, _upstream_failure(exc, f"upstream node {ref.node_id}")
         )
 
     # Transparent retry on 404 (at most once): the selected node doesn't
@@ -3147,16 +3141,13 @@ async def route_workstream_delete(request: Request) -> Response:
     upstream_url = f"{ref.url}/v1/api/workstreams/{ws_id}/delete"
     try:
         resp = await client.post(upstream_url, json=body, headers=headers)
-    except REQUEST_FAILURES:
+    except REQUEST_FAILURES as exc:
         return _record_route(
             request,
             "delete",
             502,
             t0,
-            JSONResponse(
-                {"error": f"upstream node {ref.node_id} unreachable"},
-                status_code=502,
-            ),
+            _upstream_failure(exc, f"upstream node {ref.node_id}"),
         )
 
     # Only the node owning the workstream's lease may delete it (after its
@@ -3773,7 +3764,7 @@ async def _proxy_post(
         )
     except REQUEST_FAILURES as exc:
         log.debug("Proxy %s error for %r: %s", request.method, f"{api_prefix}/{path}", exc)
-        return JSONResponse({"error": "Node unreachable"}, status_code=502)
+        return _upstream_failure(exc, "the node", unreachable="Node unreachable")
     # A busy node's 429 names its wait in Retry-After, and the browser's
     # authFetch waits that long before retrying.  Only delta-seconds pass.
     retry_after = resp.headers.get("retry-after", "")
@@ -7793,8 +7784,8 @@ async def admin_cancel_watch(request: Request) -> Response:
             content=b"{}",
             headers=headers,
         )
-    except REQUEST_FAILURES:
-        return JSONResponse({"error": "Node unreachable"}, status_code=502)
+    except REQUEST_FAILURES as exc:
+        return _upstream_failure(exc, "the node", unreachable="Node unreachable")
     return Response(
         content=resp.content,
         status_code=resp.status_code,
