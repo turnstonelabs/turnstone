@@ -706,6 +706,9 @@ frozen.
 
 ### Fixed
 
+- **Close-all reaches coordinator children before their creation events arrive (#1471)** — it
+  combines registered children with a complete stored-child snapshot under the same owner. Failed
+  discovery returns 503 before closing anything, and delayed UI creation events remain deliverable.
 - **Stopping a coordinator reaches children whose creation events are delayed (#1465)** — the
   cancel cascade adds children stored under the coordinator to those already in its registry.
   Delayed events or reconnects no longer omit published children from the cancellation attempt.

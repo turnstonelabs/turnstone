@@ -1074,19 +1074,17 @@ class TestCoordinatorAdapterDispatchChildEvent:
         assert not event.is_set(), "bus notify fired for ws_id the dispatch dropped"
 
 
-def test_a_failed_children_seed_is_retried_by_the_snapshot_not_the_event_fan_out(
+def test_a_failed_children_seed_is_retried_on_rehydrate_not_the_event_fan_out(
     tmp_path: Any, monkeypatch: Any, sqlite_backend_factory: Any
 ) -> None:
-    """A coordinator rehydrated while its children query fails can't route its
-    stored children's events.  The fan-out thread delivers every coordinator's
-    events, so it never reads storage to find them; the snapshot a close-all takes
-    retries the read, and the children route once it succeeds."""
+    """A failed UI seed never makes event fan-out read storage. Rehydrating again retries the
+    seed and restores routing for stored children; Stop and close-all discover independently.
+    """
     from tests._coord_test_helpers import _rehydrate_with_children_down
-    from turnstone.console.coordinator_adapter import ChildrenUnreadableError
 
     storage = sqlite_backend_factory(str(tmp_path / "coord.db"))
     child = "c" * 32
-    mgr, _ws, coord_id, down = _rehydrate_with_children_down(storage, monkeypatch, [child])
+    mgr, ws, coord_id, down = _rehydrate_with_children_down(storage, monkeypatch, [child])
     adapter = mgr._adapter
     event = {"type": "cluster_state", "ws_id": child, "state": "idle"}
     assert down["calls"] == 1  # the seed on open
@@ -1094,9 +1092,11 @@ def test_a_failed_children_seed_is_retried_by_the_snapshot_not_the_event_fan_out
     adapter._dispatch_child_event(event)
     assert down["calls"] == 1  # the fan-out read nothing
     assert adapter._registry.parent_for(child) is None
-    with pytest.raises(ChildrenUnreadableError):
-        adapter.children_snapshot(coord_id)
-
     down["on"] = False
-    assert adapter.children_snapshot(coord_id) == [child]
+    adapter.emit_rehydrated(ws)
+    assert down["calls"] == 2
+    assert adapter.registered_children_snapshot(coord_id) == [child]
     assert adapter._registry.parent_for(child) == coord_id
+    listener = ws.ui._register_listener()
+    adapter._dispatch_child_event(event)
+    assert listener.get_nowait()["child_ws_id"] == child

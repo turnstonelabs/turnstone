@@ -141,7 +141,10 @@ def _rehydrate_with_children_down(
     ``down["calls"]`` counts how often it ran. Returns the manager, the opened
     workstream, its id and ``down``.
     """
-    coord_id = _build_mgr(storage).create(user_id="user-1", name="coord-a").id
+    original_mgr = _build_mgr(storage)
+    coord_id = original_mgr.create(user_id="user-1", name="coord-a").id
+    # Model shutdown before the replacement manager acquires the coordinator's lease.
+    original_mgr.release_leases()
     for child_ws_id in child_ws_ids:
         storage.register_workstream(
             child_ws_id, kind="interactive", parent_ws_id=coord_id, user_id="user-1"

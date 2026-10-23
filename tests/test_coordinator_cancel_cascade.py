@@ -114,7 +114,7 @@ def test_stop_reaches_stored_children_without_consuming_their_creation_events(ca
     states = ["idle", "running", "attention", "error", "closed"]
     children = [_child(cascade, n, state=state) for n, state in enumerate(states, start=1)]
     listener = cascade.coord.ui._register_listener()
-    assert cascade.adapter.children_snapshot(cascade.coord.id) == []
+    assert cascade.adapter.registered_children_snapshot(cascade.coord.id) == []
 
     response = cascade.client.post(cascade.url, json={"force": force})
 
@@ -126,7 +126,7 @@ def test_stop_reaches_stored_children_without_consuming_their_creation_events(ca
         "failed": [],
         "skipped": [],
     }
-    assert cascade.adapter.children_snapshot(cascade.coord.id) == []
+    assert cascade.adapter.registered_children_snapshot(cascade.coord.id) == []
     cascade.adapter._dispatch_child_event(
         {"type": "ws_created", "ws_id": children[0], "parent_ws_id": cascade.coord.id}
     )
@@ -240,11 +240,11 @@ def test_stop_keeps_known_children_and_delayed_events_after_a_failed_seed(
     assert detail["cancelled"] == expected
     assert ("error" in detail) is not storage_recovers
     # Stop must not retry a seed that would consume the delayed creation event.
+    assert cascade.adapter.registered_children_snapshot(cascade.coord.id) == [known]
     cascade.adapter._dispatch_child_event(
         {"type": "ws_created", "ws_id": delayed, "parent_ws_id": cascade.coord.id}
     )
     assert listener.get_nowait()["child_ws_id"] == delayed
-    assert cascade.coord.id in cascade.adapter._unseeded
     assert calls == 2  # the failed seed, then one authoritative cancellation read
 
 

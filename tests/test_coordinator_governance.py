@@ -605,15 +605,15 @@ def test_prepare_tool_allows_non_revoked_tool():
 
 
 # ---------------------------------------------------------------------------
-# children_snapshot (used by close_all_children)
+# Registered-child snapshots (used by Stop and close-all)
 # ---------------------------------------------------------------------------
 
 
-def test_children_snapshot_returns_copy_not_live_set(storage):
+def test_registered_children_snapshot_returns_copy_not_live_set(storage):
     mgr = _build_mgr(storage)
     coord = mgr.create(user_id="user-1", name="coord-a")
     _seed_children(mgr._adapter, coord.id, ["a", "b", "c"])
-    snap = mgr._adapter.children_snapshot(coord.id)
+    snap = mgr._adapter.registered_children_snapshot(coord.id)
     assert set(snap) == {"a", "b", "c"}
     _seed_children(mgr._adapter, coord.id, ["d"])
     assert set(snap) == {"a", "b", "c"}
