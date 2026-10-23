@@ -117,6 +117,19 @@ frozen.
 > `list_user_avatars`, `get_user_avatar_image`, `set_user_avatar_color`, `set_user_avatar_image` and
 > `clear_user_avatar_image`; the two setters return `False` for a user that doesn't exist, and
 > `clear_user_avatar_image` returns the SHA-256 of the picture it removed, or `None`.
+>
+> **Before upgrading:** the Anthropic SDK moves to 2.x, whose requests carry API version
+> `2026-10-21`, on both Anthropic lanes. That version refuses `temperature`, `top_p` and `top_k`
+> on every model, so the `anthropic` lane no longer sends a temperature: an alias on Claude Opus
+> 4.6, Sonnet 4.6, Haiku 4.5, Sonnet 4.5 or Opus 4.5 that sets one now samples at the API default
+> (1.0), and no other setting replaces it; later models already took only the default. Remove
+> any of the three from the `server_compat` of an `anthropic` definition, which the API now
+> refuses. A gateway in front of the `anthropic` lane must accept the new version (Amazon Bedrock
+> serves it only for Claude 4.7 and later). The `anthropic-compatible` lane still sends
+> temperature. Credentials keep their headers: an API key, stored or minted by a dynamic auth
+> mode, still goes out as `X-Api-Key` (Microsoft Foundry reads a key only there), and
+> `ANTHROPIC_AUTH_TOKEN` still goes out as a bearer; with both variables set, only
+> `ANTHROPIC_API_KEY` is sent now. The SDK is Apache-2.0 licensed from 2.0.
 
 ### Added
 
@@ -265,6 +278,10 @@ frozen.
 
 ### Changed
 
+- **The Anthropic SDK is 2.x, on API version 2026-10-21.** The `anthropic` lane sends no
+  `temperature` (thinking on Claude 4.6-era and older models used to force 1.0, which the new
+  version refuses), the five rows that took one now say they don't, and an API key keeps its 1.x
+  header, `X-Api-Key`, rather than the bearer 2.x would send. See the note under Before upgrading.
 - **`spawn_batch` sends every child's create at once (#1457).** It sent them one after another,
   and each create waits up to 30 seconds for the console, which waits up to 30 seconds for the
   node, so a stalled console or node held the coordinator's call for up to five minutes. A stall

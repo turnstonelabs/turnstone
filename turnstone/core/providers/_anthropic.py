@@ -38,6 +38,8 @@ from turnstone.core.trajectory import materialize_attachments
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Iterator
 
+    import httpx2
+
 log = logging.getLogger(__name__)
 
 
@@ -50,6 +52,23 @@ def _ensure_anthropic() -> Any:
     import anthropic  # noqa: PLC0415
 
     return anthropic
+
+
+def send_api_key_as_x_api_key(request: httpx2.Request) -> httpx2.Request:
+    """HTTP-client ``auth`` hook: move a bearer credential to ``X-Api-Key``.
+
+    SDK 2.x sends an API key as ``Authorization: Bearer``, where 1.x sent ``X-Api-Key``.  The
+    Claude API takes either, but Microsoft Foundry reads an API key only from ``X-Api-Key``, and a
+    gateway in front of either may read only that header.  ``create_client`` installs this hook
+    only on a client whose credential is an API key, so every request it sends, including those
+    of a ``with_options(api_key=...)`` copy carrying a minted token, keeps the 1.x header; a
+    client built with an auth token keeps its bearer.
+    """
+    scheme, _, credential = request.headers.get("Authorization", "").partition(" ")
+    if scheme == "Bearer" and credential:
+        del request.headers["Authorization"]
+        request.headers["X-Api-Key"] = credential
+    return request
 
 
 # -- message format helpers --------------------------------------------------
@@ -476,10 +495,10 @@ DEFAULT_THINKING_BUDGET = 4096
 # thinking with ``display: "summarized"`` (newer models return thinking
 # blocks with empty text without it), the ``low``..``high`` effort ladder (a
 # knob of ``xhigh`` or ``max`` rides ``high``; an unset knob still omits
-# ``output_config.effort``), and no temperature (newer models reject any
-# non-default value).  A budget model reached under another name, such as a
-# gateway's, lands here too and needs its own row's ``thinking_mode``,
-# ``supports_temperature`` and ``supports_effort`` in its definition's
+# ``output_config.effort``), and no temperature (API version 2026-10-21
+# refuses it on every model; the hosted lane never sends one).  A budget model
+# reached under another name, such as a gateway's, lands here too and needs
+# its own row's ``thinking_mode`` and ``supports_effort`` in its definition's
 # capabilities.  Limits stay conservative, and features some models lack stay
 # off: native mid-conversation system messages, the prefix-binding control
 # and tool search.  A model's real limits and features belong in its own row.
@@ -678,6 +697,7 @@ _ANTHROPIC_CAPABILITIES: dict[str, ModelCapabilities] = {
         supports_tool_search=True,
         supports_vision=True,
         supports_pdf=True,
+        supports_temperature=False,
         supports_reasoning_replay=True,
     ),
     # Sonnet 5.5: the sonnet-5 surface (below) plus mid-conversation system
@@ -751,6 +771,7 @@ _ANTHROPIC_CAPABILITIES: dict[str, ModelCapabilities] = {
         supports_tool_search=True,
         supports_vision=True,
         supports_pdf=True,
+        supports_temperature=False,
         supports_reasoning_replay=True,
     ),
     # Haiku 5.5: the first Haiku with adaptive thinking and effort.  The API
@@ -797,6 +818,7 @@ _ANTHROPIC_CAPABILITIES: dict[str, ModelCapabilities] = {
         supports_web_search=True,
         supports_vision=True,
         supports_pdf=True,
+        supports_temperature=False,
         supports_reasoning_replay=True,
     ),
     "claude-sonnet-4-5": ModelCapabilities(
@@ -807,6 +829,7 @@ _ANTHROPIC_CAPABILITIES: dict[str, ModelCapabilities] = {
         supports_web_search=True,
         supports_vision=True,
         supports_pdf=True,
+        supports_temperature=False,
         supports_reasoning_replay=True,
     ),
     "claude-opus-4-5": ModelCapabilities(
@@ -819,6 +842,7 @@ _ANTHROPIC_CAPABILITIES: dict[str, ModelCapabilities] = {
         supports_web_search=True,
         supports_vision=True,
         supports_pdf=True,
+        supports_temperature=False,
         supports_reasoning_replay=True,
     ),
 }
@@ -1004,12 +1028,8 @@ class AnthropicProvider:
             if caps.thinking_prefix_bound:
                 thinking_dict["block_binding"] = {"prefix_mismatch_behavior": "drop_block"}
             thinking_params = {"thinking": thinking_dict}
-            if caps.supports_temperature:
-                temperature = 1.0  # Required with thinking
         elif caps.thinking_mode == "manual":
             thinking_params = self._reasoning_params(reasoning_effort, extra_params, max_tokens)
-            if thinking_params:
-                temperature = 1.0
 
         kwargs: dict[str, Any] = {
             "model": model,
@@ -1042,22 +1062,23 @@ class AnthropicProvider:
                 kwargs["output_config"] = {"effort": effort}
 
         # ``extra_body`` is merged into the request JSON on top of the typed
-        # kwargs (SDK 1.x: an ``extra_body`` key replaces a typed one of the
-        # same name).  Two sources share it:
+        # kwargs (an ``extra_body`` key replaces a typed one of the same
+        # name).  Two sources share it:
         #
-        # * Temperature.  SDK 1.x removed the sampling kwargs from the
-        #   Messages signatures (a typed ``temperature=`` is a TypeError),
-        #   so the capability-gated value rides here with the same
-        #   semantics as before: None is never written — the request omits
-        #   the field so the server default applies (house rule: no code
-        #   pins) — and the thinking branches above still force 1.0 where
-        #   the API requires it.
+        # * Temperature, on the compat lane only.  The SDK has no sampling
+        #   kwargs (a typed ``temperature=`` is a TypeError), so the
+        #   capability-gated value rides here; None is never written — the
+        #   request omits the field so the server default applies (house
+        #   rule: no code pins).  The hosted lane sends API version
+        #   2026-10-21, which refuses temperature, top_p and top_k on every
+        #   model, even at their defaults, so it never sends one — whatever
+        #   a definition's capabilities claim.
         # * Operator server_compat overrides (e.g. chat_template_kwargs for
         #   anthropic-compatible local servers).  Applied last, so an
         #   operator pin of ``temperature`` beats the resolved knob — the
         #   precedence the OpenAI lanes already give a server_compat pin.
         extra_body: dict[str, Any] = {}
-        if caps.supports_temperature and temperature is not None:
+        if self._compat and caps.supports_temperature and temperature is not None:
             extra_body["temperature"] = temperature
         if extra_params:
             extra_body.update(
@@ -1438,8 +1459,7 @@ class AnthropicProvider:
         """Map reasoning_effort to Anthropic thinking parameters.
 
         Ensures ``budget_tokens < max_tokens`` so there's room for the
-        actual response.  Anthropic requires ``temperature=1`` when
-        thinking is enabled — callers must enforce this.
+        actual response.
         """
         if not reasoning_effort or reasoning_effort in ("none", ""):
             return {}

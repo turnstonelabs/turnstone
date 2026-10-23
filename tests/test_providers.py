@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 from types import SimpleNamespace
@@ -3119,6 +3120,44 @@ _LF = chr(10)
 _UNFIT = "bad" + chr(1)
 
 
+def _sent_credential_headers(monkeypatch: pytest.MonkeyPatch, lane: str) -> dict[str, str]:
+    """The credential headers one request from ``create_client(lane, ...)``'s client carries.
+
+    The transport is mounted on the HTTP client ``create_client`` builds, so the Anthropic lanes'
+    ``auth`` hook runs as in production; the SDK's ``auth_headers`` would show only its own view.
+    """
+    import anthropic
+    import httpx2
+    import openai
+
+    from turnstone.core.providers import create_client
+
+    sent: dict[str, str] = {}
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        sent.update(
+            (name, request.headers[name])
+            for name in ("authorization", "x-api-key")
+            if name in request.headers
+        )
+        body = {"object": "list", "data": [], "has_more": False, "first_id": None, "last_id": None}
+        return httpx2.Response(200, json=body, request=request)
+
+    for sdk in (anthropic, openai):
+
+        class TransportClient(sdk.DefaultHttpxClient):  # type: ignore[name-defined,misc]
+            def __init__(self, **kwargs: Any) -> None:
+                super().__init__(transport=httpx2.MockTransport(handler), **kwargs)
+
+        monkeypatch.setattr(sdk, "DefaultHttpxClient", TransportClient)
+    client = create_client(lane, base_url=_LANE_URL.get(lane, ""), api_key="")
+    try:
+        client.with_options(max_retries=0).models.list()
+    finally:
+        client.close()
+    return sent
+
+
 class TestProviderFactory:
     """Tests for create_provider and create_client factory functions."""
 
@@ -3210,24 +3249,34 @@ class TestProviderFactory:
                 )
                 for lane in _OPENAI_LANES
             ],
-            # Once one variable is passed, the SDK reads neither, so both go, cleaned.
+            # The Anthropic SDK holds one credential, ANTHROPIC_API_KEY before the token, which
+            # is then never read; the key rides X-Api-Key, cleaned.
             *[
                 (
                     lane,
-                    {"ANTHROPIC_API_KEY": "sk" + _LF, "ANTHROPIC_AUTH_TOKEN": "tok"},
-                    {"X-Api-Key": "sk", "Authorization": "Bearer tok"},
+                    {"ANTHROPIC_API_KEY": "sk" + _LF, "ANTHROPIC_AUTH_TOKEN": tok},
+                    {"X-Api-Key": "sk"},
                 )
                 for lane in _ANTHROPIC_LANES
+                for tok in ("tok", "tok" + _LF, _UNFIT)
             ],
             *[
                 (
                     lane,
-                    {"ANTHROPIC_API_KEY": "sk", "ANTHROPIC_AUTH_TOKEN": "tok" + _LF},
-                    {"X-Api-Key": "sk", "Authorization": "Bearer tok"},
+                    {"ANTHROPIC_API_KEY": "sk", "ANTHROPIC_AUTH_TOKEN": tok},
+                    {"X-Api-Key": "sk"},
                 )
                 for lane in _ANTHROPIC_LANES
+                for tok in ("tok" + _LF, _UNFIT)
             ],
+            # A token, the only credential set, keeps the SDK's bearer.
             ("anthropic", {"ANTHROPIC_AUTH_TOKEN": "tok" + _LF}, {"Authorization": "Bearer tok"}),
+            ("anthropic", {"ANTHROPIC_AUTH_TOKEN": "tok"}, {"Authorization": "Bearer tok"}),
+            # An API key the SDK reads itself rides X-Api-Key too.
+            *[
+                (lane, {"ANTHROPIC_API_KEY": "sk"}, {"X-Api-Key": "sk"})
+                for lane in _ANTHROPIC_LANES
+            ],
             # No ANTHROPIC_API_KEY: the placeholder goes, and the SDK never reads the token.
             ("anthropic-compatible", {"ANTHROPIC_AUTH_TOKEN": _UNFIT}, {"X-Api-Key": "dummy"}),
         ],
@@ -3240,14 +3289,14 @@ class TestProviderFactory:
         env: dict[str, str],
         headers: dict[str, str],
     ) -> None:
-        """Through the real SDK clients (building one sends nothing): a variable read from a file
-        keeps its line break, which the SDK would send as it is."""
-        from turnstone.core.providers import create_client
-
+        """Through the real SDK clients, on the wire: a variable read from a file keeps its line
+        break, which the SDK would send as it is."""
+        for name in _SDK_KEY_VARIABLES:
+            monkeypatch.delenv(name, raising=False)
         for name, value in env.items():
             monkeypatch.setenv(name, value)
-        client = create_client(lane, base_url=_LANE_URL.get(lane, ""), api_key="")
-        assert client.auth_headers == headers
+        sent = _sent_credential_headers(monkeypatch, lane)
+        assert sent == {name.lower(): value for name, value in headers.items()}
 
     @pytest.mark.parametrize(
         ("lane", "env", "variable"),
@@ -3259,14 +3308,8 @@ class TestProviderFactory:
                 (lane, {"ANTHROPIC_API_KEY": _UNFIT}, "ANTHROPIC_API_KEY")
                 for lane in _ANTHROPIC_LANES
             ],
-            *[
-                (
-                    lane,
-                    {"ANTHROPIC_API_KEY": "sk", "ANTHROPIC_AUTH_TOKEN": _UNFIT},
-                    "ANTHROPIC_AUTH_TOKEN",
-                )
-                for lane in _ANTHROPIC_LANES
-            ],
+            # The token is sent only with no ANTHROPIC_API_KEY, on the lane without a placeholder.
+            ("anthropic", {"ANTHROPIC_AUTH_TOKEN": _UNFIT}, "ANTHROPIC_AUTH_TOKEN"),
         ],
     )
     def test_create_client_refuses_an_sdk_variable_it_would_send(
@@ -5730,23 +5773,32 @@ class TestAnthropicPromptCaching:
         assert "temperature" not in kwargs
         assert "extra_body" not in kwargs
 
-    def test_opus_4_6_still_has_temperature(self) -> None:
-        """Opus 4.6 must still send temperature (regression guard) — through
-        ``extra_body``, since SDK v1 removed the typed sampling kwargs."""
-        caps = self.provider.get_capabilities("claude-opus-4-6")
+    @pytest.mark.parametrize("reasoning_effort", ["high", None])
+    @pytest.mark.parametrize("model", ["claude-opus-4-6", "claude-haiku-4-5"])
+    @pytest.mark.parametrize("claimed", [False, True])
+    def test_hosted_lane_sends_no_temperature(
+        self, model: str, reasoning_effort: str | None, claimed: bool
+    ) -> None:
+        """API version 2026-10-21 refuses temperature on every model, even the
+        1.0 thinking used to require: the hosted lane sends none, with thinking
+        on or off, even when a definition's capabilities claim support."""
+        caps = self.provider.get_capabilities(model)
+        assert caps.supports_temperature is False
+        if claimed:
+            caps = dataclasses.replace(caps, supports_temperature=True)
         kwargs = self.provider._build_thinking_and_kwargs(
             caps=caps,
-            reasoning_effort="high",
+            reasoning_effort=reasoning_effort,
             extra_params=None,
             max_tokens=8192,
             temperature=0.5,
             converted_msgs=[{"role": "user", "content": "hi"}],
             system_prompt="",
-            model="claude-opus-4-6",
+            model=model,
             tools=None,
         )
-        assert "temperature" not in kwargs  # a typed kwarg is a TypeError on SDK v1
-        assert kwargs["extra_body"] == {"temperature": 1.0}  # forced for adaptive thinking
+        assert "temperature" not in kwargs
+        assert "extra_body" not in kwargs
 
     def test_opus_4_7_thinking_display_summarized(self) -> None:
         """Opus 4.7 must opt in to thinking display with 'summarized'."""

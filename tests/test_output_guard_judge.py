@@ -1439,9 +1439,9 @@ class TestOutputBudget:
 
     def test_manual_thinking_guard_thinks_within_the_cap(self) -> None:
         """With an effort resolved, a guard on a model that takes a fixed thinking
-        budget now thinks (the 512 cap left no room), at temperature 1.0 whatever
-        the alias sets; without one it does not think and keeps the alias's
-        temperature."""
+        budget now thinks (the 512 cap left no room); without one it does not
+        think.  Either way the hosted lane sends no temperature, whatever the
+        alias sets: API version 2026-10-21 refuses it."""
         from turnstone.core.model_turn import resolve_lane
         from turnstone.core.providers import create_provider
 
@@ -1480,12 +1480,12 @@ class TestOutputBudget:
         assert thinking["max_tokens"] == 8000
         assert thinking["thinking"]["type"] == "enabled"
         assert 0 < thinking["thinking"]["budget_tokens"] < thinking["max_tokens"]
-        assert thinking["extra_body"]["temperature"] == 1.0
+        assert "extra_body" not in thinking
 
         plain = send(None)
         assert plain["max_tokens"] == 8000
         assert plain.get("thinking") is None
-        assert plain["extra_body"]["temperature"] == 0.1
+        assert "extra_body" not in plain
 
     def test_setting_change_retires_the_judge(self) -> None:
         """``model.max_tokens`` is not part of the lane, yet a change to it

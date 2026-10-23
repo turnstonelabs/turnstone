@@ -328,7 +328,7 @@ def transport_guarded(chunks: Iterator[StreamChunk]) -> Iterator[StreamChunk]:
     A mid-body wire death (connection drop, TLS record failure, read
     timeout) surfaces as a bare transport error or an OpenAI
     ``APIConnectionError`` / ``APITimeoutError`` chained from it.  The
-    OpenAI v3 and Anthropic v1 clients Turnstone builds use ``httpx2``.
+    OpenAI v3 and Anthropic v2 clients Turnstone builds use ``httpx2``.
     This wrapper is the one conversion rule for both SDK shapes, reusable
     by consumers that keep streaming semantics (the interactive loop);
     :func:`drain_stream` applies it for the single-shot lanes.

@@ -128,7 +128,7 @@ ANTHROPIC_SSE_STREAM = (
 def anthropic_body_capture_client(
     captured: dict[str, Any], *, sse: str = ANTHROPIC_SSE_STREAM
 ) -> Any:
-    """Real Anthropic v1 client over an HTTPX2 mock transport.
+    """Real Anthropic v2 client over an HTTPX2 mock transport.
 
     Every request is answered with *sse*; its decoded JSON body lands in
     ``captured["body"]`` and its headers (an ``httpx2.Headers``) in

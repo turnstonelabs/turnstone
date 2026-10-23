@@ -151,9 +151,9 @@ class TestCompatWireShape:
         ``thinking_budget_tokens`` is consumed by ``_reasoning_params`` and
         must never surface as wire ``extra_body`` — a leaked key would change
         every real-Anthropic request that threads a thinking override.  The
-        only ``extra_body`` entry is the temperature the enabled thinking
-        block forces (SDK v1 carries sampling there).  Negative-tested: fails
-        when the ``_INTERNAL_EXTRA_PARAMS`` exclusion is removed from
+        hosted lane sends no temperature, so the request has no
+        ``extra_body`` at all.  Negative-tested: fails when the
+        ``_INTERNAL_EXTRA_PARAMS`` exclusion is removed from
         ``_build_thinking_and_kwargs``.  The effort knob is explicit: unset
         effort means thinking OFF (the budget override modifies a thinking
         block, it never creates one).
@@ -170,7 +170,7 @@ class TestCompatWireShape:
             )
         )
         kwargs = client.messages.stream.call_args[1]
-        assert kwargs["extra_body"] == {"temperature": 1.0}
+        assert "extra_body" not in kwargs
         assert kwargs["thinking"] == {"type": "enabled", "budget_tokens": 2048}
 
 

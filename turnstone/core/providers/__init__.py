@@ -194,23 +194,22 @@ _ANTHROPIC_SDK_VARIABLES = {"ANTHROPIC_API_KEY": "api_key", "ANTHROPIC_AUTH_TOKE
 
 
 def _sdk_variable_credentials(variables: dict[str, str]) -> dict[str, str]:
-    """The SDK's credential *variables*, cleaned, as client arguments; ``{}`` when none needs it.
+    """The SDK's credential variable, cleaned, as a client argument; ``{}`` when it needs none.
 
-    The SDK reads these verbatim, and a value read from a file keeps a line break no header can
-    carry, so such a value follows the rule every key does
-    (:func:`~turnstone.core.http_headers.checked_header_value`) and goes to the SDK explicitly, the
-    other variables with it (an explicit credential stops the Anthropic SDK reading either one).
-    Values already fit, or unset, stay the SDK's to read. A value the rule refuses raises
-    :class:`~turnstone.core.http_headers.HeaderValueError` (a ``ValueError``) naming the variable.
+    The SDK uses only the first of its *variables* that is set (the Anthropic SDK holds one
+    credential, ``ANTHROPIC_API_KEY`` before ``ANTHROPIC_AUTH_TOKEN``) and reads it verbatim, and
+    a value read from a file keeps a line break no header can carry, so such a value follows the
+    rule every key does (:func:`~turnstone.core.http_headers.checked_header_value`) and goes to
+    the SDK explicitly. A value that already fits, or none set, stays the SDK's to read. A value
+    the rule refuses raises :class:`~turnstone.core.http_headers.HeaderValueError` (a
+    ``ValueError``) naming the variable.
     """
-    cleaned: dict[str, str] = {}
-    changed = False
     for variable, argument in variables.items():
         value = os.environ.get(variable, "")
         if value:
-            cleaned[argument] = checked_header_value(value, variable)
-            changed = changed or cleaned[argument] != value
-    return cleaned if changed else {}
+            cleaned = checked_header_value(value, variable)
+            return {argument: cleaned} if cleaned != value else {}
+    return {}
 
 
 def create_client(
@@ -266,7 +265,10 @@ def create_client(
             return OpenAI(base_url=base_url, api_key=openai_key, http_client=http_client)
         return OpenAI(api_key=openai_key, http_client=http_client)
     if provider_name in ("anthropic", "anthropic-compatible"):
-        from turnstone.core.providers._anthropic import _ensure_anthropic
+        from turnstone.core.providers._anthropic import (
+            _ensure_anthropic,
+            send_api_key_as_x_api_key,
+        )
 
         anthropic = _ensure_anthropic()
         local_without_key = provider_name in LOCAL_PROVIDERS and not os.environ.get(
@@ -300,7 +302,17 @@ def create_client(
             base_url = stripped or base_url
         if base_url and base_url != "https://api.anthropic.com":
             kwargs["base_url"] = base_url
-        kwargs["http_client"] = shutdown_on_close(anthropic.DefaultHttpxClient())
+        # An API key, passed here or read by the SDK from ANTHROPIC_API_KEY, keeps the header
+        # SDK 1.x sent it in (send_api_key_as_x_api_key); an auth token, a profile or workload
+        # identity keeps the SDK's bearer.
+        sends_api_key = "api_key" in kwargs or (
+            "auth_token" not in kwargs and bool(os.environ.get("ANTHROPIC_API_KEY"))
+        )
+        if sends_api_key:
+            http_client = anthropic.DefaultHttpxClient(auth=send_api_key_as_x_api_key)
+        else:
+            http_client = anthropic.DefaultHttpxClient()
+        kwargs["http_client"] = shutdown_on_close(http_client)
         return anthropic.Anthropic(**kwargs)
     raise ValueError(
         f"Unknown provider: {provider_name!r}. "

@@ -25,16 +25,18 @@ dependencies = [
     # 3.14 wraps stream transport failures in SDK errors; 3.14.1 leaves
     # application errors unwrapped. The stream boundary tests pin this contract.
     "openai>=3.14.1,<4",
-    # Version 1 moves the SDK onto HTTPX2 and removes the Messages sampling kwargs
-    # (temperature / top_p / top_k): the provider boundary injects HTTPX2 objects only
-    # and carries capability-gated temperature through ``extra_body``. Nothing above
-    # 1.0 is required — model IDs are opaque strings, the thinking block-binding
+    # Version 2 sends API version 2026-10-21, which refuses temperature / top_p / top_k
+    # on every model, and sends an API key as a bearer: the hosted lane sends no
+    # temperature (the compat lane carries its capability-gated value through
+    # ``extra_body``), and ``create_client`` moves an API key back to X-Api-Key. The SDK
+    # is on HTTPX2, so the provider boundary injects HTTPX2 objects only. Nothing above
+    # 2.0 is required — model IDs are opaque strings, the thinking block-binding
     # control rides the plain thinking dict, and refusal ``stop_details`` is read with
     # getattr — so the floor is the major. Raise it when adopting fast mode,
     # server-side fallbacks, advisor, or mid-conversation tool changes, which need
     # newer typed parameters. Keep major upgrades deliberate: the stream retry
     # boundary depends on the transport contract.
-    "anthropic>=1,<2",
+    "anthropic>=2,<3",
     # Turnstone's HTTP clients and the provider SDKs are built on httpx2, and the provider boundary
     # catches its exception family. 2.12 decodes compressed bodies in bounded pieces, which keeps
     # the guarded fetch's decoded-byte limit a memory bound as well. The extras let fetches accept
