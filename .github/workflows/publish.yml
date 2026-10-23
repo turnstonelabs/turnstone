@@ -76,15 +76,15 @@ jobs:
             fi
           fi
 
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
         if: steps.tag.outputs.skip == 'false'
         with:
-          python-version: "3.14"
+          python-version: "3.15"
       - run: pip install build
         if: steps.tag.outputs.skip == 'false'
       - run: python -m build
         if: steps.tag.outputs.skip == 'false'
-      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
+      - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # release/v1
         if: steps.tag.outputs.skip == 'false'
 
       - name: Create GitHub Release
