@@ -78,7 +78,7 @@ Issues = "https://github.com/turnstonelabs/turnstone/issues"
 test = ["pytest>=9.0", "pytest-cov>=6.0", "slack-bolt>=1.18", "aiohttp>=3.9", "fonttools[woff]>=4.66.1,<5"]
 # ruff stays equal to the ruff-pre-commit rev in .pre-commit-config.yaml, which CI's lint job runs,
 # so a local check reports what CI reports.
-dev = ["ruff==0.17.1", "mypy>=1.14"]
+dev = ["ruff==0.17.2", "mypy>=1.14"]
 discord = ["discord.py>=2.4"]
 slack = ["slack-bolt>=1.18", "aiohttp>=3.9"]
 all = ["turnstone[discord,slack]"]
