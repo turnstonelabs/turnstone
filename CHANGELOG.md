@@ -1524,6 +1524,9 @@ frozen.
 
 ### Security
 
+- **brotli 1.2.1 or later is required (CVE-2026-111497).** Earlier releases have an
+  out-of-bounds write that permits remote code execution, and the guarded fetch decodes brotli
+  bodies from untrusted servers through httpx2's brotli extra.
 - **No connection relies on the `certifi` bundle, which trusted the root of the compromised
   eMudhra CAs.** The private keys of several eMudhra intermediate CAs can be recovered by anyone
   (GHSA-6q48-6c7w-9gw2), so a client that trusts their root, emSign ECC Root CA - G3, accepts a

@@ -42,6 +42,10 @@ dependencies = [
     # the guarded fetch's decoded-byte limit a memory bound as well. The extras let fetches accept
     # brotli and zstd (backports.zstd before Python 3.14).
     "httpx2[brotli,zstd]>=2.12,<3",
+    # The brotli extra decodes bodies the guarded fetch reads from untrusted servers: 1.2.1
+    # fixes CVE-2026-111497 (out-of-bounds write permitting remote code execution). The marker
+    # matches httpx2's extra.
+    "brotli>=1.2.1; platform_python_implementation == 'CPython'",
     # The guarded URL transport supplies a backend that dials screened addresses.
     # Released in lockstep with httpx2, which pins the matching version.
     "httpcore2>=2.12,<3",
