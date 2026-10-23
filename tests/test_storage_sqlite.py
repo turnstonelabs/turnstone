@@ -759,6 +759,19 @@ class TestWorkstreams:
         assert len(rows) == 1
         assert rows[0][0] == "ws1"
 
+    def test_list_without_limit_keeps_parent_owner_and_publication_filters(self, backend):
+        for n in range(101):
+            backend.register_workstream(f"child-{n}", parent_ws_id="parent", user_id="owner")
+        backend.register_workstream("foreign", parent_ws_id="parent", user_id="another-owner")
+        backend.register_workstream("unrelated", parent_ws_id="another-parent", user_id="owner")
+        backend.register_workstream(
+            "creating", parent_ws_id="parent", user_id="owner", state="creating"
+        )
+
+        assert len(backend.list_workstreams(parent_ws_id="parent", user_id="owner")) == 100
+        rows = backend.list_workstreams(parent_ws_id="parent", user_id="owner", limit=None)
+        assert {row._mapping["ws_id"] for row in rows} == {f"child-{n}" for n in range(101)}
+
     def test_workstream_with_messages_in_history(self, backend):
         backend.register_workstream("ws1", node_id="node-a")
         backend.save_message("ws1", "user", "hello")

@@ -1442,13 +1442,16 @@ class StorageBackend(Protocol):
     def list_workstreams(
         self,
         node_id: str | None = None,
-        limit: int = 100,
+        limit: int | None = 100,
         *,
         parent_ws_id: str | None = None,
         kind: WorkstreamKind | str | None = None,
         user_id: str | None = None,
     ) -> list[Any]:
-        """List workstreams, optionally filtered.
+        """List published workstreams, optionally filtered.
+
+        ``limit=None`` returns all matching rows; the default caps the result at 100.
+        Workstreams still in ``creating`` are excluded regardless of the limit.
 
         Filters are additive.  When ``parent_ws_id`` / ``kind`` / ``user_id``
         are ``None`` (default) they are not applied — behavior is identical

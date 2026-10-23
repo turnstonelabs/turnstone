@@ -706,6 +706,10 @@ frozen.
 
 ### Fixed
 
+- **Stopping a coordinator reaches children whose creation events are delayed (#1465)** — the
+  cancel cascade adds children stored under the coordinator to those already in its registry.
+  Delayed events or reconnects no longer omit published children from the cancellation attempt.
+  If storage discovery fails, known children are still attempted and the audit records the failure.
 - **A node with rate limiting on gives each signed-in user their own bucket (#1464)** — it keyed
   its buckets on the request's address, and the console forwards every caller's request from its
   own, so every request the console forwarded to a node, from every user and coordinator, drew on

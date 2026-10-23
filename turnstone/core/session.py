@@ -21927,10 +21927,10 @@ class ChatSession:
     def _cancel_child_created_after_stop(self, ws_id: str) -> bool:
         """Cancel a child whose create returned after its tool call was stopped.
 
-        The Stop's cascade cancels only the children the console had registered from their
-        creation events when it landed, and this create's reply came after the Stop, so the
-        child is cancelled here; a second cancel of one the cascade reached is harmless.
-        Best effort: returns whether the cancel went through, for the caller's audit.
+        The Stop's cascade snapshots registered and stored children, but a create still in
+        flight can publish after that snapshot. Cancel its child here when the reply arrives;
+        a second cancel of one the cascade reached is harmless. Best effort: returns whether
+        the cancel went through, for the caller's audit.
         """
         try:
             return not self._coord_client.cancel(ws_id).get("error")

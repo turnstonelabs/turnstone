@@ -4946,8 +4946,8 @@ async def _cascade_cancel_to_children(
     cancelling a coordinator propagates down its spawned subtree — the
     cancellation appendix's "cancel flows down the subtree."  The
     coordinator's own session is already cancelled by ``make_cancel_handler``
-    before this runs; here we authorize + prepare the per-child fan-out and
-    hand it back as a ``BackgroundTask``.
+    before this runs; here we authorize and snapshot the registry plus the
+    stored children, then hand the per-child fan-out back as a ``BackgroundTask``.
 
     Returns a ``BackgroundTask`` (run AFTER the 200 is sent) or ``None``.
     Returning it rather than awaiting it inline is the "trigger, not drain"
@@ -4968,50 +4968,43 @@ async def _cascade_cancel_to_children(
     if _require_admin_coordinator(request, allow_service_bypass=False) is not None:
         log.debug("coordinator.cancel_cascade.skipped_unauthorized ws=%s", ws_id[:8])
         return None
-    from turnstone.console.coordinator_adapter import ChildrenUnreadableError
-
     coord_adapter = getattr(request.app.state, "coord_adapter", None)
     if coord_adapter is None:
         return None
-    try:
-        child_ids = await asyncio.to_thread(coord_adapter.children_snapshot, ws_id)
-    except ChildrenUnreadableError:
-        # The coordinator's own cancel already happened. Its children can't
-        # be reached without their ids, so record that instead of skipping
-        # them quietly.
-        log.warning("coordinator.cancel_cascade.children_unreadable ws=%s", ws_id[:8])
-        audit_storage, _audit_err = require_storage_or_503(request)
-        if audit_storage is None:
-            return None
-        audit_user_id = _auth_user_id(request)
-        audit_host = request.client.host if request.client else ""
+    child_ids = await asyncio.to_thread(coord_adapter.registered_children_snapshot, ws_id)
 
-        async def _record_unreadable() -> None:
-            await _emit_coord_audit(
-                audit_storage,
-                audit_user_id,
-                "coordinator.cancel_cascaded",
-                ws_id,
-                {
-                    "src": "coordinator",
-                    "error": "the coordinator's children could not be read",
-                    "cancelled": [],
-                    "failed": [],
-                    "skipped": [],
-                },
-                audit_host,
+    storage, _storage_err = require_storage_or_503(request)
+    coord_user_id = ws.user_id
+    children_unreadable = storage is None or not coord_user_id
+    if not children_unreadable:
+        try:
+            rows = await asyncio.to_thread(
+                storage.list_workstreams,
+                parent_ws_id=ws_id,
+                user_id=coord_user_id,
+                limit=None,
             )
-
-        return BackgroundTask(_record_unreadable)
-    if not child_ids:
+            # The query excludes creating reservations, but includes every published
+            # state. Keep this union local: seeding the registry would consume a
+            # delayed ws_created event before it could announce the child to the UI.
+            child_ids = sorted(set(child_ids).union(row._mapping["ws_id"] for row in rows))
+        except Exception:
+            # The known registry targets remain useful when this read fails. Each
+            # cancel still checks current ownership; never bypass that storage read.
+            children_unreadable = True
+            log.warning(
+                "coordinator.cancel_cascade.storage_read_failed ws=%s", ws_id[:8], exc_info=True
+            )
+    if children_unreadable:
+        log.warning("coordinator.cancel_cascade.children_unreadable ws=%s", ws_id[:8])
+    if not child_ids and not children_unreadable:
         return None
     session = getattr(ws, "session", None)
     coord_client: Any = getattr(session, "_coord_client", None) if session is not None else None
-    if coord_client is None:
+    if coord_client is None and not children_unreadable:
         return None
     # Capture the audit inputs now, while the request is fresh — the task
     # below runs after the response is sent.
-    storage, _storage_err = require_storage_or_503(request)
     user_id = _auth_user_id(request)
     client_host = request.client.host if request.client else ""
 
@@ -5025,12 +5018,20 @@ async def _cascade_cancel_to_children(
         # Restore the per-child forensic record the removed stop_cascade
         # wrote (the coordinator's own cancel is audited separately).
         if storage is not None:
+            detail: dict[str, Any] = {
+                "src": "coordinator",
+                "cancelled": ok,
+                "failed": failed,
+                "skipped": skipped,
+            }
+            if children_unreadable:
+                detail["error"] = "the coordinator's children could not be read"
             await _emit_coord_audit(
                 storage,
                 user_id,
                 "coordinator.cancel_cascaded",
                 ws_id,
-                {"src": "coordinator", "cancelled": ok, "failed": failed, "skipped": skipped},
+                detail,
                 client_host,
             )
         log.info(

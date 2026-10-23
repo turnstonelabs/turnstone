@@ -605,7 +605,7 @@ def test_prepare_tool_allows_non_revoked_tool():
 
 
 # ---------------------------------------------------------------------------
-# children_snapshot (used by the cancel cascade + close_all_children)
+# children_snapshot (used by close_all_children)
 # ---------------------------------------------------------------------------
 
 

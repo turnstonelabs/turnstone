@@ -633,15 +633,21 @@ class CoordinatorAdapter:
         with self._unseeded_lock:
             self._unseeded.discard(coord_ws_id)
 
+    def registered_children_snapshot(self, coord_ws_id: str) -> list[str]:
+        """Return known child IDs without reading storage or changing membership.
+
+        Cancellation combines this possibly incomplete set with its own storage read. Reading
+        here must neither hide known children after a failed seed nor consume delayed creation
+        events by rebuilding the registry.
+        """
+        return self._registry.children_of(coord_ws_id)
+
     def children_snapshot(self, coord_ws_id: str) -> list[str]:
         """Return a snapshot of the coordinator's direct child ws_ids.
 
-        Used by the cancel cascade and ``close_all_children`` to iterate children without holding
-        the registry lock during the per-child HTTP dispatch. The registry fills from children's
-        creation events, so the cascade leaves out a child whose create was in flight when the Stop
-        landed, or whose event hasn't arrived yet. ``spawn_batch`` cancels each child whose create
-        returns after its coordinator was stopped; any other child left out keeps running. Returns
-        an empty list for unknown coordinators.
+        Used by ``close_all_children`` to iterate children without holding the registry lock
+        during the per-child HTTP dispatch. The registry fills from children's creation events.
+        Returns an empty list for unknown coordinators.
 
         When the coordinator's stored children couldn't be read on
         rehydrate, this retries that read first, so async callers run it
@@ -657,7 +663,7 @@ class CoordinatorAdapter:
                     raise ChildrenUnreadableError(
                         f"the children of coordinator {coord_ws_id[:8]} could not be read"
                     )
-        return self._registry.children_of(coord_ws_id)
+        return self.registered_children_snapshot(coord_ws_id)
 
     # ------------------------------------------------------------------
     # Cluster-event fan-out thread

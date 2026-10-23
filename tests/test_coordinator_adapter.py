@@ -1079,8 +1079,8 @@ def test_a_failed_children_seed_is_retried_by_the_snapshot_not_the_event_fan_out
 ) -> None:
     """A coordinator rehydrated while its children query fails can't route its
     stored children's events.  The fan-out thread delivers every coordinator's
-    events, so it never reads storage to find them; the snapshot a close-all or
-    a cancel takes retries the read, and the children route once it succeeds."""
+    events, so it never reads storage to find them; the snapshot a close-all takes
+    retries the read, and the children route once it succeeds."""
     from tests._coord_test_helpers import _rehydrate_with_children_down
     from turnstone.console.coordinator_adapter import ChildrenUnreadableError
 
