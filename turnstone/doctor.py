@@ -2075,11 +2075,11 @@ def _setup_openai() -> tuple[str, Any, str]:
 
 
 def _setup_anthropic() -> tuple[str, Any, str]:
-    import anthropic
+    from turnstone.core.providers import create_client
 
     api_key = _prompt_api_key("ANTHROPIC_API_KEY", "Enter your Anthropic API key:")
     model = _prompt_model("anthropic")
-    return "anthropic", anthropic.Anthropic(api_key=api_key), model
+    return "anthropic", create_client("anthropic", base_url="", api_key=api_key), model
 
 
 def _detect_models(client: Any) -> list[str]:

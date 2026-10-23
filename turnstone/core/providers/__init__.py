@@ -304,12 +304,16 @@ def create_client(
             kwargs["base_url"] = base_url
         # An API key, passed here or read by the SDK from ANTHROPIC_API_KEY, keeps the header
         # SDK 1.x sent it in (send_api_key_as_x_api_key); an auth token, a profile or workload
-        # identity keeps the SDK's bearer.
+        # identity keeps the SDK's bearer.  A redirect would carry X-Api-Key to its target, even
+        # on another host (the HTTP client strips only Authorization there), so a client holding
+        # an API key follows none: a 3xx surfaces as an error.
         sends_api_key = "api_key" in kwargs or (
             "auth_token" not in kwargs and bool(os.environ.get("ANTHROPIC_API_KEY"))
         )
         if sends_api_key:
-            http_client = anthropic.DefaultHttpxClient(auth=send_api_key_as_x_api_key)
+            http_client = anthropic.DefaultHttpxClient(
+                auth=send_api_key_as_x_api_key, follow_redirects=False
+            )
         else:
             http_client = anthropic.DefaultHttpxClient()
         kwargs["http_client"] = shutdown_on_close(http_client)

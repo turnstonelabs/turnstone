@@ -111,13 +111,15 @@ def refuse_aborted_request(cancel_ref: Any) -> None:
         raise DeadlineCancelledError("cancel_ref aborted before dispatch")
 
 
-# Request headers that carry the backend credential.  Each SDK emits its own
-# from the client's key — ``x-api-key`` (Anthropic) or ``Authorization:
-# Bearer`` (OpenAI-style) — and a minted delegated credential rides
+# Request headers that carry the backend credential.  Each lane sends the
+# client's key in one — ``x-api-key`` on the Anthropic lanes (the SDK emits a
+# bearer that ``create_client``'s hook moves there), ``Authorization: Bearer``
+# on the OpenAI-style ones — and a minted delegated credential rides
 # ``client.with_options(api_key=...)``.  Both SDKs merge ``extra_headers``
-# over their own headers case-insensitively, so a caller header of the same
-# name would silently replace the credential (even over ``with_options``):
-# the adapters refuse these names at request assembly instead.
+# over their own headers case-insensitively, so a caller ``Authorization``
+# would silently replace the credential (even over ``with_options``) and a
+# caller ``x-api-key`` would add a second one: the adapters refuse these names
+# at request assembly instead.
 CREDENTIAL_HEADER_NAMES: frozenset[str] = frozenset({"x-api-key", "authorization"})
 
 

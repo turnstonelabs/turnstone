@@ -58,11 +58,17 @@ def send_api_key_as_x_api_key(request: httpx2.Request) -> httpx2.Request:
     """HTTP-client ``auth`` hook: move a bearer credential to ``X-Api-Key``.
 
     SDK 2.x sends an API key as ``Authorization: Bearer``, where 1.x sent ``X-Api-Key``.  The
-    Claude API takes either, but Microsoft Foundry reads an API key only from ``X-Api-Key``, and a
-    gateway in front of either may read only that header.  ``create_client`` installs this hook
+    Claude API takes either, but Microsoft Foundry doesn't read an API key from a bearer, and a
+    gateway in front of either may read only ``X-Api-Key``.  ``create_client`` installs this hook
     only on a client whose credential is an API key, so every request it sends, including those
     of a ``with_options(api_key=...)`` copy carrying a minted token, keeps the 1.x header; a
     client built with an auth token keeps its bearer.
+
+    The hook moves any bearer the request carries, not only the client's key: a copy made with
+    ``with_options(auth_token=...)``, or an ``Authorization`` header from
+    ``ANTHROPIC_CUSTOM_HEADERS``, would go out as ``X-Api-Key`` too, so a copy carries a minted
+    credential as ``api_key``.  It runs once per request, before redirects, which is why the
+    client it is installed on follows none.
     """
     scheme, _, credential = request.headers.get("Authorization", "").partition(" ")
     if scheme == "Bearer" and credential:

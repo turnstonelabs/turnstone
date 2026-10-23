@@ -32,6 +32,8 @@ transports (no network, no live backend):
 8. The clients ``create_client`` builds for the Anthropic lanes send an API
    key, a minted one included, as ``X-Api-Key`` and never as a bearer: the
    header Anthropic v1 used and the one Microsoft Foundry reads a key from.
+   Such a client follows no redirect, which would carry the key to another
+   host.
 
 If an SDK/httpx2 upgrade changes any of these, the provider boundary and
 ``transport_guarded`` conversion (including the retry gate consuming it) must
@@ -1386,3 +1388,38 @@ def test_anthropic_lanes_send_an_api_key_as_x_api_key(
     assert "authorization" not in headers
     assert headers.get("anthropic-version") == "2026-10-21"
     assert [sc.finish_reason for sc in chunks if sc.finish_reason] == ["stop"]
+
+
+@pytest.mark.parametrize("lane", ["anthropic", "anthropic-compatible"])
+def test_anthropic_api_key_client_follows_no_redirect(monkeypatch: pytest.MonkeyPatch, lane: str):
+    """The HTTP client strips only ``Authorization`` on a cross-host redirect, and
+    the hook runs once, before redirects, so a followed redirect would carry
+    ``X-Api-Key`` to whatever host it names.  A client holding an API key
+    follows none: the 3xx surfaces as an error and the other host sees nothing."""
+    from turnstone.core.providers import create_client
+
+    hops: list[tuple[str, str | None]] = []
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        hops.append((request.url.host, request.headers.get("x-api-key")))
+        return httpx2.Response(
+            307, headers={"location": "https://elsewhere.example/v1/messages"}, request=request
+        )
+
+    class CapturingHttpxClient(anthropic.DefaultHttpxClient):
+        def __init__(self, **kwargs: Any) -> None:
+            super().__init__(transport=httpx2.MockTransport(handler), **kwargs)
+
+    monkeypatch.setattr(anthropic, "DefaultHttpxClient", CapturingHttpxClient)
+    for name in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"):
+        monkeypatch.delenv(name, raising=False)
+    client = create_client(lane, base_url="http://probe.example", api_key="stored")
+    try:
+        with pytest.raises(anthropic.APIStatusError) as excinfo:
+            client.with_options(max_retries=0).messages.create(
+                model="m", max_tokens=8, messages=[{"role": "user", "content": "hi"}]
+            )
+    finally:
+        client.close()
+    assert excinfo.value.status_code == 307
+    assert hops == [("probe.example", "stored")]

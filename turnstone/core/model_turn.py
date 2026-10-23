@@ -1573,18 +1573,18 @@ def model_turn(
     *backend_auth_token* is a delegated-user or app-identity credential for a
     dynamically authenticated backend. When set, the call is issued on
     ``lane.client.with_options(api_key=...)`` — a copy that reuses the
-    client's connection pool but swaps the credential, so the SDK emits it as
-    its own auth header (``x-api-key`` for Anthropic, ``Authorization: Bearer``
-    for OpenAI-style).  This is deliberately NOT header injection via
-    ``extra_headers``: both SDKs merge caller headers over their own
-    case-insensitively, so an injected credential header would silently
-    replace the one the SDK emits — every adapter refuses credential names in
-    ``extra_headers`` at request assembly instead
-    (:func:`~turnstone.core.providers.refuse_credential_headers`).  ``None``
-    leaves the lane's static client credential in place. When the explicit
-    argument is absent, ``lane.backend_auth_resolver`` resolves it after
-    admission for each transport attempt, so a queued call cannot age a minted
-    credential before it reaches the wire.
+    client's connection pool and HTTP client but swaps the credential, so it
+    goes out in the lane's auth header (``x-api-key`` for Anthropic, through
+    ``create_client``'s hook, ``Authorization: Bearer`` for OpenAI-style).
+    This is deliberately NOT header injection via ``extra_headers``: both SDKs
+    merge caller headers over their own case-insensitively, so an injected
+    credential header would replace or duplicate the one the SDK emits — every
+    adapter refuses credential names in ``extra_headers`` at request assembly
+    instead (:func:`~turnstone.core.providers.refuse_credential_headers`).
+    ``None`` leaves the lane's static client credential in place. When the
+    explicit argument is absent, ``lane.backend_auth_resolver`` resolves it
+    after admission for each transport attempt, so a queued call cannot age a
+    minted credential before it reaches the wire.
 
     *acting_principal_id* is the caller's already-pinned effective principal,
     not a live session lookup. It is never used to mint a credential here; it

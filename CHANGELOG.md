@@ -127,9 +127,11 @@ frozen.
 > refuses. A gateway in front of the `anthropic` lane must accept the new version (Amazon Bedrock
 > serves it only for Claude 4.7 and later). The `anthropic-compatible` lane still sends
 > temperature. Credentials keep their headers: an API key, stored or minted by a dynamic auth
-> mode, still goes out as `X-Api-Key` (Microsoft Foundry reads a key only there), and
+> mode, still goes out as `X-Api-Key` (Microsoft Foundry doesn't take a key as a bearer), and
 > `ANTHROPIC_AUTH_TOKEN` still goes out as a bearer; with both variables set, only
-> `ANTHROPIC_API_KEY` is sent now. The SDK is Apache-2.0 licensed from 2.0.
+> `ANTHROPIC_API_KEY` is sent now. An Anthropic client holding an API key no longer follows
+> redirects, which carried `X-Api-Key` to any host they named: point a gateway that redirects at
+> its final address. The SDK is Apache-2.0 licensed from 2.0.
 
 ### Added
 
@@ -281,7 +283,8 @@ frozen.
 - **The Anthropic SDK is 2.x, on API version 2026-10-21.** The `anthropic` lane sends no
   `temperature` (thinking on Claude 4.6-era and older models used to force 1.0, which the new
   version refuses), the five rows that took one now say they don't, and an API key keeps its 1.x
-  header, `X-Api-Key`, rather than the bearer 2.x would send. See the note under Before upgrading.
+  header, `X-Api-Key`, rather than the bearer 2.x would send, on a client that follows no
+  redirects. See the note under Before upgrading.
 - **`spawn_batch` sends every child's create at once (#1457).** It sent them one after another,
   and each create waits up to 30 seconds for the console, which waits up to 30 seconds for the
   node, so a stalled console or node held the coordinator's call for up to five minutes. A stall

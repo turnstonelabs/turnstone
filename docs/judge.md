@@ -531,16 +531,16 @@ well as its verdict, so a thinking model that spends all of it also yields a
 labelled `llm_error` row, and the heuristic stage stands.
 
 The judge samples at the effort its alias resolves: the alias's own, else
-`model.reasoning_effort`. On a model that takes a fixed thinking budget, as
-some of Anthropic's do, a resolved effort turns thinking on for every judged
-result, and the request then carries temperature 1.0, which thinking requires,
-whatever the alias sets. The judge reads untrusted output, so that output can
-push each verdict toward the cap, and each judged result can take up to
-`judge.output_guard_llm_timeout`. The main loop judges up to four results of a
-batch at once; a task agent judges its results one at a time. To bound the
-cost and the wait, give the guard alias a smaller `max_tokens` and a low
-effort; `none` turns thinking off on a model that takes a fixed budget, but an
-adaptive model still thinks under `none`, at its own default effort.
+`model.reasoning_effort`. On a model that takes a fixed thinking budget, as some
+of Anthropic's do, a resolved effort turns thinking on for every judged result.
+The request carries no temperature, whatever the alias sets: the Anthropic API
+version Turnstone uses refuses one. The judge reads untrusted output, so that
+output can push each verdict toward the cap, and each judged result can take up
+to `judge.output_guard_llm_timeout`. The main loop judges up to four results of
+a batch at once; a task agent judges its results one at a time. To bound the
+cost and the wait, give the guard alias a smaller `max_tokens` and a low effort;
+`none` turns thinking off on a model that takes a fixed budget, but an adaptive
+model still thinks under `none`, at its own default effort.
 
 ### Merge semantics (heuristic + LLM judge)
 

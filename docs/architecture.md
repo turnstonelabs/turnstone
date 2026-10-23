@@ -1232,18 +1232,26 @@ reduction on cache hits, 1.25x write on first turn). Cache metrics (`cache_creat
 `cache_read_input_tokens`) are extracted from the stream's usage events. The `anthropic` SDK is a
 core dependency — the Anthropic provider is first-class alongside OpenAI.
 
-The Anthropic provider requires SDK v1 (`anthropic>=1,<2`). Its default
-client runs on HTTPX2, so a mid-body connection death escapes
-`messages.stream()` as an `httpx2` transport error and `transport_guarded`
-normalizes it into the retryable `IncompleteStreamError` exactly as for the
-OpenAI v3 lanes; anything handed to the client (`http_client`, timeouts,
-transports) must be an `httpx2` object. SDK v1 also removed the typed `temperature` /
-`top_p` / `top_k` parameters, so the capability-gated temperature rides the
-request's `extra_body` (None still omits the field; enabled thinking still
-forces 1.0), and an operator `server_compat.extra_body` pin of the same key
-wins over the session value. Credentials never ride `extra_headers` on any
-lane: both SDKs merge caller headers over their own credential header, so
-every adapter refuses `x-api-key` / `Authorization` entries at request
+The Anthropic provider requires SDK v2 (`anthropic>=2,<3`), which sends API
+version `2026-10-21`. Its default client runs on HTTPX2, so a mid-body
+connection death escapes `messages.stream()` as an `httpx2` transport error
+and `transport_guarded` normalizes it into the retryable
+`IncompleteStreamError` exactly as for the OpenAI v3 lanes; anything handed to
+the client (`http_client`, timeouts, transports) must be an `httpx2` object.
+API version `2026-10-21` refuses `temperature`, `top_p` and `top_k` on every
+model, even at their defaults, so the `anthropic` lane never sends a
+temperature, whatever a definition's capabilities claim. The
+`anthropic-compatible` lane sends its capability-gated temperature in the
+request's `extra_body` (None still omits the field), and an operator
+`server_compat.extra_body` pin of the same key wins over the session value.
+SDK v2 sends an API key as `Authorization: Bearer`; `create_client` installs
+an HTTP-client `auth` hook on every Anthropic client holding an API key that
+moves it back to `X-Api-Key`, the header SDK v1 used and the one Microsoft
+Foundry reads keys from, and that client follows no redirects, because the
+HTTP client strips only `Authorization` on a cross-host hop. A client built
+with an auth token keeps the bearer. Credentials never ride `extra_headers`
+on any lane: both SDKs merge caller headers over their own credential header,
+so every adapter refuses `x-api-key` / `Authorization` entries at request
 assembly, and a delegated credential rides `client.with_options(api_key=...)`.
 
 **GoogleProvider** (`_google.py`): extends `OpenAIChatCompletionsProvider` for
@@ -1566,10 +1574,9 @@ belongs on `anthropic-compatible`. The capability row comes from the
 model name the definition sends, so a gateway name that no row
 matches gets the default row, which thinks adaptively: a model that
 takes a thinking budget needs a name its own row matches, such as
-its Anthropic id, or `thinking_mode` set to `manual` and
-`supports_temperature` to `true` in the definition's capabilities,
-plus `supports_effort` set to `false` unless the model accepts
-`output_config` effort.
+its Anthropic id, or `thinking_mode` set to `manual` in the
+definition's capabilities, plus `supports_effort` set to `false`
+unless the model accepts `output_config` effort.
 
 Verified quirks of vLLM's Anthropic endpoint:
 
