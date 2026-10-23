@@ -7,6 +7,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+import yaml  # type: ignore[import-untyped]
 
 ROOT = Path(__file__).resolve().parents[1]
 RELEASE_SCRIPT = ROOT / "scripts" / "release.sh"
@@ -81,8 +82,8 @@ def _run_release(repo: Path, env: dict[str, str], version: str) -> subprocess.Co
     ("branch", "version", "app_version"),
     [
         ("main", "1.8.1", "1.8.1"),
-        # A pre-release keeps dev's chart on the newest stable release.
-        ("dev", "1.9.0a1", "1.8.0"),
+        # A pre-release keeps main's chart on the newest stable release.
+        ("main", "1.9.0a1", "1.8.0"),
         ("stable/1.8", "1.8.2", "1.8.2"),
     ],
 )
@@ -109,9 +110,9 @@ def test_release_script_accepts_version_for_branch(
     assert _git(repo, "status", "--porcelain").stdout == ""
 
 
-def test_release_script_points_dev_chart_at_newest_stable_tag(tmp_path: Path) -> None:
+def test_release_script_points_main_chart_at_newest_stable_tag(tmp_path: Path) -> None:
     tags = ("v1.7.12", "v1.8.9", "v1.8.10", "v1.9.0a1", "v1.9.0rc1")
-    repo, env = _release_repo(tmp_path, "dev", tags=tags)
+    repo, env = _release_repo(tmp_path, "main", tags=tags)
 
     result = _run_release(repo, env, "1.9.0a2")
 
@@ -131,9 +132,9 @@ def test_release_script_bumps_a_two_digit_chart_patch(tmp_path: Path) -> None:
 
 
 def test_release_script_never_moves_the_app_version_back(tmp_path: Path) -> None:
-    # A clone missing the newest stable tag must not downgrade dev's chart.
+    # A clone missing the newest stable tag must not downgrade main's chart.
     chart = CHART.replace('appVersion: "1.7.0"', 'appVersion: "1.8.5"')
-    repo, env = _release_repo(tmp_path, "dev", chart=chart, tags=("v1.8.4",))
+    repo, env = _release_repo(tmp_path, "main", chart=chart, tags=("v1.8.4",))
     before = _git(repo, "rev-parse", "HEAD").stdout.strip()
 
     result = _run_release(repo, env, "1.9.0a2")
@@ -146,7 +147,7 @@ def test_release_script_never_moves_the_app_version_back(tmp_path: Path) -> None
 
 def test_release_script_leaves_an_unchanged_chart_alone(tmp_path: Path) -> None:
     chart = CHART.replace('appVersion: "1.7.0"', 'appVersion: "1.8.0"')
-    repo, env = _release_repo(tmp_path, "dev", chart=chart, tags=("v1.8.0",))
+    repo, env = _release_repo(tmp_path, "main", chart=chart, tags=("v1.8.0",))
 
     result = _run_release(repo, env, "1.9.0a1")
 
@@ -184,7 +185,7 @@ def test_release_script_requires_a_package_version_line(tmp_path: Path) -> None:
 
 
 def test_release_script_pre_release_requires_a_stable_tag(tmp_path: Path) -> None:
-    repo, env = _release_repo(tmp_path, "dev", tags=("v1.9.0a1",))
+    repo, env = _release_repo(tmp_path, "main", tags=("v1.9.0a1",))
     before = _git(repo, "rev-parse", "HEAD").stdout.strip()
 
     result = _run_release(repo, env, "1.9.0a2")
@@ -230,11 +231,11 @@ def test_release_script_requires_a_chart_app_version(tmp_path: Path, chart: str 
 @pytest.mark.parametrize(
     ("branch", "version", "message"),
     [
-        ("main", "1.9.0rc1", "pre-releases must be cut from dev"),
-        ("dev", "1.9.0", "stable releases must be cut from main"),
-        ("stable/1.8", "1.8.2rc1", "pre-releases must be cut from dev"),
+        ("dev", "1.9.0rc1", "pre-releases must be cut from main"),
+        ("dev", "1.9.0", "releases must be cut from main or stable/X.Y"),
+        ("stable/1.8", "1.8.2rc1", "pre-releases must be cut from main"),
         ("stable/1.7", "1.8.1", "1.8.1 belongs on stable/1.8"),
-        ("feature/release", "1.8.1", "releases must be cut from main, dev, or stable/X.Y"),
+        ("feature/release", "1.8.1", "releases must be cut from main or stable/X.Y"),
     ],
 )
 def test_release_script_rejects_wrong_branch_without_mutation(
@@ -267,8 +268,61 @@ def test_release_script_rejects_detached_head(tmp_path: Path) -> None:
     assert _git(repo, "tag").stdout == ""
 
 
-def test_installer_defaults_new_clones_to_stable_main() -> None:
+def test_installer_defaults_new_clones_to_main() -> None:
     script = INSTALL_SCRIPT.read_text()
 
     assert 'SOURCE_BRANCH="${TURNSTONE_BRANCH:-main}"' in script
     assert 'git clone --depth 1 --branch "$SOURCE_BRANCH" "$REPO_URL" "$INSTALL_DIR"' in script
+
+
+@pytest.mark.parametrize("workflow", ["publish.yml", "docker-publish.yml"])
+@pytest.mark.parametrize(
+    ("tag", "other_tags", "latest"),
+    [
+        ("v1.9.0rc2", ("v1.8.7",), False),
+        ("v1.8.8", ("v1.8.7", "v1.9.0rc1"), True),
+        ("v1.9.0", ("v1.8.7",), True),
+        ("v1.8.9", ("v1.9.0",), False),
+        ("v1.9.10", ("v1.9.9", "v1.10.0rc1"), True),
+        ("v1.9.8", ("v1.9.9",), False),
+    ],
+)
+def test_publish_aliases_follow_final_tags_while_main_advances(
+    tmp_path: Path, workflow: str, tag: str, other_tags: tuple[str, ...], latest: bool
+) -> None:
+    repo, env = _release_repo(tmp_path, "main", tags=(*other_tags, tag))
+    (repo / "pyproject.toml").write_text("[project]" + chr(10) + 'version = "1.10.0a1"')
+    _git(repo, "commit", "-am", "start next development line")
+    _git(repo, "update-ref", "refs/remotes/origin/main", "HEAD")
+    _git(repo, "checkout", "--detach", tag)
+
+    definition = yaml.safe_load((ROOT / ".github" / "workflows" / workflow).read_text())
+    job = "publish" if workflow == "publish.yml" else "docker"
+    step_id = "release" if job == "publish" else "tags"
+    step = next(s for s in definition["jobs"][job]["steps"] if s.get("id") == step_id)
+    output = tmp_path / "outputs"
+    env.update(
+        REF=tag, GITHUB_OUTPUT=str(output), REGISTRY="registry.example.com", IMAGE_NAME="org/app"
+    )
+    result = subprocess.run(
+        ["bash", "-e", "-o", "pipefail", "-c", step["run"]],
+        cwd=repo,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    values = dict(line.split("=", 1) for line in output.read_text().splitlines())
+    prerelease = "rc" in tag
+    if job == "publish":
+        assert values == {"prerelease": str(prerelease).lower(), "make_latest": str(latest).lower()}
+    else:
+        prefix = "registry.example.com/org/app:"
+        expected = [prefix + tag[1:]]
+        if prerelease:
+            expected.append(prefix + "experimental")
+        else:
+            expected.append(prefix + tag[1:].rsplit(".", 1)[0])
+            if latest:
+                expected.extend([prefix + "stable", prefix + "latest"])
+        assert values["tags"].split(",") == expected

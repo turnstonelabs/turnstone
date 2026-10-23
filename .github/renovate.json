@@ -5,7 +5,7 @@
     "helpers:pinGitHubActionDigests",
     ":separateMajorReleases"
   ],
-  "baseBranchPatterns": ["dev"],
+  "baseBranchPatterns": ["main"],
   "gitIgnoredAuthors": [
     "41898282+github-actions[bot]@users.noreply.github.com"
   ],

@@ -23,13 +23,12 @@ transferring ownership.
 
 ## Choosing a Base Branch
 
-Most contributions should target `dev`, which integrates the next release.
-Target `main` only for a focused fix that should ship on the current stable
-line. If an issue explicitly affects a supported prior minor, target its
-`stable/X.Y` branch; maintainers will merge the fix forward through newer lines.
+Contributions target `main`, including features, refactors, and fixes for user
+escalations. Maintainers backport fixes to supported `stable/X.Y` branches when
+needed. There is no separate `dev` branch.
 
 See [the release process](docs/releasing.md) for the complete branch and
-synchronization policy.
+backport policy.
 
 ## Development Setup
 

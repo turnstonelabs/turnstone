@@ -39,22 +39,19 @@ Named after the [Ruddy Turnstone](https://en.wikipedia.org/wiki/Ruddy_turnstone)
 
 ### Repository branches
 
-Beginning with 1.8.0, stable releases and next-release development use distinct
-branches:
+All development integrates on `main`. Stable branches preserve maintained release
+lines:
 
 | Branch | Role | Pull requests |
 |--------|------|---------------|
-| `main` | Current stable release and install source | Fixes that should ship on the current stable line |
-| `dev` | Next release integration and GitHub default | Features, refactors, and development-only fixes |
-| `stable/X.Y` | Maintained prior release line | Fixes for that supported older minor |
+| `main` | Ongoing development, default branch, and source install path | Features, refactors, and fixes |
+| `stable/X.Y` | Maintained release line | Focused backports for that supported minor |
 
-GitHub defaults to `dev`, so new pull requests and ordinary source clones start
-on the development line. Stable-source install paths explicitly select `main`.
-There is no independently writable `stable/X.Y` mirror for the minor currently
-on `main`. Before `main` advances to the next stable minor, its current tip is
-preserved as that minor's maintenance branch. Maintainers then merge fixes
-forward (`stable/X.Y` → `main` → `dev`) so the branches retain shared ancestry
-without recurring cherry-picks.
+The former `main` is now `stable/1.8`, and the former `dev` is now `main`.
+There is no replacement `dev` branch. Features and user escalations use the
+same development flow, with selected fixes backported to supported stable lines.
+Source downloads and the installer continue to use `main`; choose `stable/1.8`
+explicitly to remain on 1.8. Versioned release archives remain tied to their tags.
 
 See [docs/releasing.md](docs/releasing.md) for the full release process.
 

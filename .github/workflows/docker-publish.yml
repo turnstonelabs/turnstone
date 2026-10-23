@@ -24,7 +24,7 @@ jobs:
     # Same gate as publish.yml: workflow_run fires for every CI completion
     # (including fork and same-repo PR runs) with this repo's token and
     # packages:write.  Only same-repo tag pushes may publish images; CI's
-    # push trigger matches main/dev/stable/* and v* tags, so a head_branch
+    # push trigger matches main/stable/* and v* tags, so a head_branch
     # starting with "v" is necessarily a tag run.
     if: >-
       github.event.workflow_run.conclusion == 'success' &&
@@ -37,7 +37,7 @@ jobs:
         with:
           ref: ${{ github.event.workflow_run.head_sha }}
           fetch-depth: 0
-          # Full history supplies origin/main for release-line classification.
+          # Full history supplies final tags for release-channel classification.
           # The docker build only reads the tree; keep the token out of it.
           persist-credentials: false
 
@@ -77,16 +77,15 @@ jobs:
             MINOR="${VERSION%.*}"
             TAGS="${FULL}:${VERSION},${FULL}:${MINOR}"
 
-            # Only the current stable line may move the global aliases. A
-            # maintained stable/X.Y branch still publishes exact and minor
-            # tags, but must not roll :stable/:latest back after main advances.
-            MAIN_VERSION=$(git show origin/main:pyproject.toml \
-              | sed -n 's/^version = "\([^"]*\)"/\1/p')
-            if [ -z "$MAIN_VERSION" ]; then
-              echo "Could not resolve the version on origin/main" >&2
+            # Main can already be developing the next minor. Only the newest
+            # final tag may move the global stable/latest aliases.
+            LATEST_STABLE=$(git tag -l 'v*' \
+              | grep -E '^v[0-9]+[.][0-9]+[.][0-9]+$' | sort -V | tail -n 1)
+            if [ -z "$LATEST_STABLE" ]; then
+              echo "Could not resolve the latest final release tag" >&2
               exit 1
             fi
-            if [ "${MAIN_VERSION%.*}" = "$MINOR" ]; then
+            if [ "$REF" = "$LATEST_STABLE" ]; then
               TAGS="${TAGS},${FULL}:stable,${FULL}:latest"
             fi
           fi

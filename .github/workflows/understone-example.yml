@@ -7,12 +7,12 @@ name: Understone example
 
 on:
   push:
-    branches: [main, dev, "stable/*"]
+    branches: [main, "stable/*"]
     paths:
       - "examples/door-game/**"
       - ".github/workflows/understone-example.yml"
   pull_request:
-    branches: [main, dev, "stable/*"]
+    branches: [main, "stable/*"]
     paths:
       - "examples/door-game/**"
       - ".github/workflows/understone-example.yml"

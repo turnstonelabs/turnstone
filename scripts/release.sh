@@ -4,9 +4,9 @@
 # and tag.
 #
 # Usage:
-#   scripts/release.sh 1.8.1 --push   # stable release from main
-#   scripts/release.sh 1.9.0a1 --push # pre-release from dev
-#   scripts/release.sh 1.8.2 --push   # prior-line patch from stable/1.8
+#   scripts/release.sh 1.9.0        # stable release from main; push the tag first
+#   scripts/release.sh 1.10.0a1 --push # pre-release from main
+#   scripts/release.sh 1.8.8        # maintenance release from stable/1.8
 #
 set -euo pipefail
 
@@ -22,9 +22,8 @@ fi
 
 TAG="v${VERSION}"
 
-# Enforce the release topology before changing any files. main is the current
-# stable line, dev is the next-release line, and stable/X.Y is a maintained
-# prior line whose branch name must match the version being released.
+# Enforce the release topology before changing any files. main carries ongoing
+# development; a stable/X.Y branch must match the final version being released.
 BRANCH=$(git symbolic-ref --quiet --short HEAD || true)
 if [ -z "$BRANCH" ]; then
     echo "error: releases must be cut from a branch, not detached HEAD" >&2
@@ -32,8 +31,8 @@ if [ -z "$BRANCH" ]; then
 fi
 
 if echo "$VERSION" | grep -qE '(a|b|rc)[0-9]+$'; then
-    if [ "$BRANCH" != "dev" ]; then
-        echo "error: pre-releases must be cut from dev (current branch: $BRANCH)" >&2
+    if [ "$BRANCH" != "main" ]; then
+        echo "error: pre-releases must be cut from main (current branch: $BRANCH)" >&2
         exit 1
     fi
 else
@@ -47,12 +46,8 @@ else
                 exit 1
             fi
             ;;
-        dev)
-            echo "error: stable releases must be cut from main or matching stable/X.Y" >&2
-            exit 1
-            ;;
         *)
-            echo "error: releases must be cut from main, dev, or stable/X.Y" >&2
+            echo "error: releases must be cut from main or stable/X.Y" >&2
             echo "  current branch: $BRANCH" >&2
             exit 1
             ;;
@@ -72,8 +67,8 @@ if git rev-parse "$TAG" >/dev/null 2>&1; then
 fi
 
 # The chart's appVersion is its default image tag. A stable release points the
-# chart on its own branch at itself. A pre-release points dev's chart at the
-# newest stable release instead, so installing the chart from dev, the default
+# chart on its own branch at itself. A pre-release points main's chart at the
+# newest stable release instead, so installing the chart from main, the default
 # branch, never selects a pre-release image.
 CHART="deploy/helm/turnstone/Chart.yaml"
 if ! grep -q '^appVersion: ' "$CHART" 2>/dev/null; then
@@ -92,7 +87,7 @@ else
     CHART_APP_VERSION="$VERSION"
 fi
 # Never move the default image backwards: a clone missing the newest stable tag
-# would otherwise quietly downgrade dev's chart.
+# would otherwise quietly downgrade main's chart.
 CURRENT_APP_VERSION=$(sed -n 's/^appVersion: "\{0,1\}\([^"]*\)"\{0,1\}$/\1/p' "$CHART")
 if ! printf '%s\n%s\n' "$CURRENT_APP_VERSION" "$CHART_APP_VERSION" | sort -V -C; then
     echo "error: the chart's appVersion would move back from $CURRENT_APP_VERSION to $CHART_APP_VERSION; fetch tags first" >&2
