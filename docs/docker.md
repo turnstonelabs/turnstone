@@ -269,10 +269,6 @@ or prepare `config.toml` using the fields and key-generation command in
 [`turnstone.example.toml`](../turnstone.example.toml), then follow the
 existing-file ownership instructions below. Preserve any existing key.
 
-This recipe uses GNU `mv` for its `-nT` options. On macOS, use `gmv` from
-[GNU coreutils](https://formulae.brew.sh/formula/coreutils) for the move step;
-the system `mv` does not support `-T`.
-
 To create a **new** config, replace the HTTPS origin in this command with the
 address users actually open. The helper writes privately as the image's
 `turnstone` account, including when Docker maps container UIDs on the host:
@@ -284,7 +280,7 @@ docker run --rm --network none --user root --entrypoint python \
   -v "$bootstrap_dir/output:/bootstrap:rw,z" "$turnstone_image" \
   -m turnstone.deploy.bootstrap_config /bootstrap/config.toml \
   https://turnstone.example.com --owner turnstone
-mv -nT -- "$bootstrap_dir/output/config.toml" ./config.toml
+(set -C; : >./config.toml) && mv -f -- "$bootstrap_dir/output/config.toml" ./config.toml
 rm -rf -- "$bootstrap_dir"
 ```
 
@@ -292,9 +288,10 @@ The outer directory stays private (`0700`); only its writable inner directory
 is exposed to the bootstrap container. Other host users cannot traverse the
 outer directory, and the generated key file is `0600` throughout.
 
-The final move uses GNU `mv`'s no-clobber mode and keeps an existing file. To
-reuse an existing configuration, place it at `./config.toml` instead; keep its
-encryption key.
+The final step claims `./config.toml` in the shell's no-clobber mode, which
+creates it only if nothing is there yet, and keeps an existing file. To reuse an
+existing configuration, place it at `./config.toml` instead; keep its encryption
+key.
 [`turnstone.example.toml`](../turnstone.example.toml) lists the bootstrap fields.
 The file must be readable by the image's `turnstone` user, with mode `0600`.
 For an existing file with different ownership on ordinary or rootless

@@ -310,14 +310,15 @@ def test_installer_private_staging_and_no_clobber(tmp_path, existing):
     result = run_installer_functions(
         tmp_path,
         r"""
+mode() { stat -c %a "$1" 2>/dev/null || stat -f %Lp "$1"; }
 docker_mock() {
     local stage=""
     while [ "$#" -gt 0 ]; do
         if [ "$1" = -v ]; then stage="${2%:/bootstrap:rw,z}"; break; fi
         shift
     done
-    [ "$(stat -c %a "$stage")" = 777 ] || return 1
-    [ "$(stat -c %a "$(dirname "$stage")")" = 700 ] || return 1
+    [ "$(mode "$stage")" = 777 ] || return 1
+    [ "$(mode "$(dirname "$stage")")" = 700 ] || return 1
     (umask 077; printf 'new config\n' >"$stage/config.toml")
 }
 create_shared_config https://turnstone.example.com

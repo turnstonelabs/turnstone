@@ -886,6 +886,10 @@ frozen.
   carried no name, so the chip fell back to "account" until the page reloaded. Login and refresh now
   return the display name and avatar as whoami does. The chip's old two-letter initials also broke
   on names starting with an emoji, punctuation or ß; the one-letter avatar replaces them.
+- **`run.sh` installs the shared config without GNU `mv`.** The installer relied on GNU `mv -nT` to
+  place `config.toml` without replacing an existing file, which fails on macOS and other BSD
+  userlands. It now claims the destination in the shell's no-clobber mode and renames into it, with
+  the same refusal of an existing file, and the `docs/docker.md` recipe no longer needs `gmv`.
 - **A host that can't run the PDF worker says so.** On macOS, which refuses a finite address-space
   limit, on any host whose sandbox blocks `setrlimit`, and on a host where the worker's temporary
   directory can't be created or the worker can't start, every PDF that needed local processing was
