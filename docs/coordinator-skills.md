@@ -33,9 +33,11 @@ at the edge.
 **`kind` is metadata, not an enforcement boundary.**  The model can
 `skills(action='find')` across every kind from any session, `get` any
 row by name, and `load` any visible skill regardless of session kind.
-Actual runtime capability is gated by `allowed_tools` + `auto_approve`
-on the skill and the operator's approval card on every `load` /
-`spawn_workstream(skill=...)` decision — `kind` doesn't add or remove
+A skill with `allowed_tools` or `auto_approve`, or whose text scans as
+`high` or `critical` risk, is principal-load-only: the model cannot
+`load` it or `spawn_workstream(skill=...)` with it, and the operator
+loads it with `/skill`.  Every other `load` / `spawn_workstream(skill=...)`
+goes through the operator's approval card — `kind` doesn't add or remove
 any of that.  It's a sorting / grouping / search-narrowing hint.
 
 The opt-in filter is on `skills(action='find', kind='coordinator')`

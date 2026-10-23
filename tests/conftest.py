@@ -786,3 +786,18 @@ def _clear_policy_cache():
     invalidate_policy_cache()
     yield
     invalidate_policy_cache()
+
+
+@pytest.fixture(autouse=True)
+def _clear_skill_risk_tiers():
+    """Drop the memoized skill risk tiers between tests.
+
+    The memo is process-wide and keyed on the skill's text, so a test that
+    patches the scanner would otherwise get the tier an earlier test scanned
+    for the same text.
+    """
+    from turnstone.core.storage._utils import skill_risk_tier
+
+    skill_risk_tier.cache_clear()
+    yield
+    skill_risk_tier.cache_clear()

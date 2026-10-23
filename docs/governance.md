@@ -128,6 +128,10 @@ alias and the `tools.agent_max_turns` setting.
   capability risk (from `allowed-tools` in SKILL.md). Results populate the `risk_level`
   (safe/low/medium/high/critical) and `scan_report` (JSON breakdown) columns.
   These fields are system-managed and cannot be overwritten via the admin API.
+  The model cannot activate a skill whose text scans `high` or `critical`, or that
+  grants tool approvals (`auto_approve` or `allowed_tools`); the operator loads it
+  with `/skill`. After a scanner change, stored reports are rescanned when a process
+  that runs migrations starts, before it serves.
 - **Discovery**: External skills can be discovered and installed from registries:
   - `GET /v1/api/admin/skills/discover?q=...` — search the skills.sh registry
     (or a custom registry via `skills.discovery_url` setting)

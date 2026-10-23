@@ -7,20 +7,23 @@ content risk, supply chain risk, vulnerability risk, and capability risk.
 Patterns calibrated against 25K public agent skill security audits across
 three independent auditors.
 
-Performance target: <50ms synchronous.  Dependencies: stdlib only (re).
+Every pattern runs in time linear in the text: a typical skill scans in a few
+milliseconds, and 32 KB of text dense with phrases the negation checks
+re-examine takes a few hundred.  Dependencies: stdlib only (re).
 """
 
 from __future__ import annotations
 
+import bisect
 import re
 from dataclasses import dataclass, field
 from typing import Any
 
 # Included in ScanResult.to_dict() so stored reports carry their version.
-# Bump when rules change.  Version-based re-scan (comparing stored version
-# against current SCANNER_VERSION on load) is not yet implemented — this is
-# infrastructure for future use by the rule update service.
-SCANNER_VERSION = "1"
+# Bump when rules change.  Only stored reports use it: the gate on what the
+# model may activate scans the row's current text itself, so a report left
+# from an older version never decides that.
+SCANNER_VERSION = "2"
 
 _TIERS = ("safe", "low", "medium", "high", "critical")
 _THRESHOLDS = ((2.8, "critical"), (2.0, "high"), (1.2, "medium"), (0.5, "low"))
@@ -33,28 +36,27 @@ def _tier_from_composite(score: float) -> str:
     return "safe"
 
 
-# -- Frontmatter helpers ---------------------------------------------------
+def _pair_on_line(first: str, second: str) -> re.Pattern[str]:
+    """Match a line where *second* comes after *first*, trying once per line.
 
-_RE_FM_FULL = re.compile(r"^---\s*\n(.*?)\n---\s*\n", re.DOTALL)
-_RE_FM_PARTIAL = re.compile(r"^---\s*\n(.*?)\n---", re.DOTALL)
-
-
-def _strip_frontmatter(text: str) -> str:
-    """Remove YAML frontmatter block, return body only."""
-    m = _RE_FM_FULL.match(text) or _RE_FM_PARTIAL.match(text)
-    return text[m.end() :] if m else text
+    A pattern written ``first.*second`` starts again at every occurrence of
+    *first* and rescans the rest of the line each time, which is quadratic in
+    a long line.  Here an atomic lazy prefix commits to the line's first
+    *first*, and the line matches when *second* comes anywhere after it.  Only
+    that occurrence is tried, so a later one whose whitespace wraps onto the
+    next line is not paired.  Group 1 is that first *first*, where the pair
+    starts.
+    """
+    return re.compile(rf"^(?>[^\n]*?({first}))[^\n]*(?:{second})", re.IGNORECASE | re.MULTILINE)
 
 
 # -- Calibrated regex patterns (from research scorer) ----------------------
 
-# Intentionally includes an empty alternative (trailing |) so that untagged
-# fenced code blocks (bare ```) count as shell blocks.  In SKILL.md files,
-# untagged code blocks are most commonly shell commands.  This is calibrated
-# against empirical distribution in public agent skill repositories.
-_RE_SHELL_BLOCK_OPEN = re.compile(
-    r"```(?:bash|sh|shell|zsh|fish|powershell|ps1|)\n",
-    re.IGNORECASE,
-)
+# A fence: three backticks and the info string, which ends the line.
+_RE_FENCE = re.compile(r"```([^`\n]*)$", re.MULTILINE)
+# Untagged blocks count as shell blocks: in SKILL.md files, untagged code
+# blocks are most commonly shell commands.
+_SHELL_FENCE_TAGS = frozenset({"bash", "sh", "shell", "zsh", "fish", "powershell", "ps1", ""})
 _RE_PIPE_TO_SHELL = re.compile(
     r"(?:curl|wget|fetch)\s[^\n|]{0,200}\|\s*(?:ba)?sh\b",
     re.IGNORECASE,
@@ -97,14 +99,18 @@ _RE_HARDCODED_CREDS = re.compile(
     r"|echo\s+[\"'][^\"']{4,}[\"']\s*\|\s*\S+\s+(?:auth|login|pass)",
     re.IGNORECASE,
 )
+# Each pattern that pairs two terms on one line is matched once per line by
+# _pair_on_line and counted beside the rest of its family.
 _RE_EXFIL = re.compile(
     r"\bngrok\b|\bcloudflared\b|\bpagekite\b"
-    r"|\btunnel\b.*(?:expose|forward|proxy|cloudflare|ngrok)"
-    r"|expose.*(?:localhost|port\s+\d)"
     r"|\bcookies?\s+(?:export|sync|dump|steal)\b"
-    r"|\bsession[_\-]?token\b.*\bplaintext\b"
     r"|(?:export|sync)\s+(?:browser\s+)?(?:cookie|session|credential|profile)\b",
     re.IGNORECASE,
+)
+_EXFIL_PAIRS = (
+    _pair_on_line(r"\btunnel\b", r"expose|forward|proxy|cloudflare|ngrok"),
+    _pair_on_line(r"expose", r"localhost|port\s+\d"),
+    _pair_on_line(r"\bsession[_\-]?token\b", r"\bplaintext\b"),
 )
 _RE_AUTH_ACCESS = re.compile(
     r"\b(?:oauth|jwt|bearer\s+token|api[_\s\-]?key|access[_\s\-]?token"
@@ -136,10 +142,17 @@ _RE_OBFUSCATION = re.compile(
     r"|unescape\(|fromCharCode\(|atob\(\s*[\"']",
     re.IGNORECASE,
 )
+# A curl with five or more characters after its flag dash, then a line that
+# makes something executable or runs it.  Tried once per line, at the line's
+# first such curl: each curl on a long line would otherwise rescan to its end.
 _RE_DOWNLOAD_EXEC = re.compile(
-    r"(?:curl|wget)\s+-[^\n]{5,}\n[^\n]{0,60}(?:chmod\s+\+x|sh\s|bash\s|exec\s)\b",
+    r"^(?>[^\n]*?(?:curl|wget)\s+-[^\n]{5})"
+    r"(?=[^\n]*+\n[^\n]{0,60}(?:chmod\s+\+x|sh\s|bash\s|exec\s)\b)",
     re.IGNORECASE | re.MULTILINE,
 )
+# URL patterns are matched once per URL token (_url_matches), so a run of
+# schemes is not rescanned from each one, and a long path stays matched.
+_RE_URL_TOKEN = re.compile(r"https?://[^\s\"'<>)]+", re.IGNORECASE)
 _RE_EXEC_URL_RAW = re.compile(
     r"https?://[^\s\"'<>)]{5,}\.(?:sh|bash|ps1|exe|msi|dmg|pkg|deb|rpm|run|bin)\b",
     re.IGNORECASE,
@@ -157,8 +170,12 @@ _TRUSTED_EXEC_DOMAINS = re.compile(
     r"|(?:docs|learn)\.microsoft\.com/"
     r"|docs\.github\.com/"
     r"|docs\.docker\.com/"
-    r"|get\.docker\.com|brew\.sh|npmjs\.com|pypi\.org"
-    r"|install\.python-poetry\.org|sh\.rustup\.rs|bootstrap\.pypa\.io)",
+    # The host must end here, though a trailing dot or a port may follow it:
+    # a prefix alone also matches a longer host (<host>.example.com) or
+    # userinfo in front of another host (<host>@... or <host>:443@...).
+    r"|(?:get\.docker\.com|brew\.sh|npmjs\.com|pypi\.org"
+    r"|install\.python-poetry\.org|sh\.rustup\.rs|bootstrap\.pypa\.io)"
+    r"(?=\.?(?::\d+)?(?:[/?#]|$)))",
     re.IGNORECASE,
 )
 _RE_E004 = re.compile(
@@ -181,10 +198,10 @@ _RE_E004_NEGATION = re.compile(
     re.IGNORECASE,
 )
 _RE_E005_RAW = re.compile(
-    r"https?://[^\s\"'<>)]{5,}\.(?:sh|bash|ps1|exe|msi|run|bin)\b"
-    r"|malicious\.com\b|evil\.com\b",
+    r"https?://[^\s\"'<>)]{5,}\.(?:sh|bash|ps1|exe|msi|run|bin)\b",
     re.IGNORECASE,
 )
+_RE_E005_DOMAIN = re.compile(r"malicious\.com\b|evil\.com\b", re.IGNORECASE)
 _RE_W007_POSITIVE = re.compile(
     r"echo\s+[\"'][^\"']{4,}[\"']\s*\|"
     r"|password\s*=\s*[\"'][^\"']{4,}[\"']"
@@ -218,21 +235,34 @@ _RE_NEGATION_CONTEXT = re.compile(
     re.IGNORECASE,
 )
 _RE_W011 = re.compile(
-    r"fetch.*untrusted\b"
-    r"|ingest.*external\s+(?:instruction|command|rule|control)\b"
-    r"|process.*third.party\s+(?:instruction|content.*agent|code)\b"
-    r"|web\s+content.*agent\b|agent.*web\s+content\b"
-    r"|(?:fetch|retrieve|download)\s[^\n]{0,80}(?:instruction|command|rule)\b"
+    r"(?:fetch|retrieve|download)\s[^\n]{0,80}(?:instruction|command|rule)\b"
     r"|apply\s+(?:all\s+)?rules?\s+from\s+(?:the\s+)?fetched\b"
-    r"|(?:act|execute)\s+on\s+(?:fetched|retrieved|external)\s+(?:content|instruction)"
-    r"|allow.*override\s+(?:system|context|instruction)",
+    r"|(?:act|execute)\s+on\s+(?:fetched|retrieved|external)\s+(?:content|instruction)",
     re.IGNORECASE,
 )
+_W011_PAIRS = (
+    _pair_on_line(r"fetch", r"untrusted\b"),
+    _pair_on_line(r"ingest", r"external\s+(?:instruction|command|rule|control)\b"),
+    # "process ... third party content ... agent" chains three terms: the
+    # second atomic prefix commits to the first "third party content" after
+    # "process", so this line, too, is tried once.
+    re.compile(
+        r"^(?>[^\n]*?(process))(?:[^\n]*third.party\s+(?:instruction|code)\b"
+        r"|(?>[^\n]*?third.party\s+content)[^\n]*agent\b)",
+        re.IGNORECASE | re.MULTILINE,
+    ),
+    _pair_on_line(r"web\s+content", r"agent\b"),
+    _pair_on_line(r"agent", r"web\s+content\b"),
+    _pair_on_line(r"allow", r"override\s+(?:system|context|instruction)"),
+)
 _RE_W011_NO_SANITIZE = re.compile(
-    r"(?:no\s+(?:explicit\s+)?(?:boundary|delimiter|sanitiz)"
-    r"|(?:sanitiz|escap).*absent|absent.*(?:sanitiz|escap)"
-    r"|without\s+(?:validation|sanitiz|escaping|boundary))",
+    r"no\s+(?:explicit\s+)?(?:boundary|delimiter|sanitiz)"
+    r"|without\s+(?:validation|sanitiz|escaping|boundary)",
     re.IGNORECASE,
+)
+_NO_SANITIZE_PAIRS = (
+    _pair_on_line(r"sanitiz|escap", r"absent"),
+    _pair_on_line(r"absent", r"sanitiz|escap"),
 )
 _RE_W011_FETCH_INSTRUCTION = re.compile(
     r"(?:fetch|retrieve|load|apply)\s[^\n]{0,80}(?:instruction|rule|command|guideline)",
@@ -241,9 +271,11 @@ _RE_W011_FETCH_INSTRUCTION = re.compile(
 _RE_W012 = re.compile(
     r"(?:fetch|download|load|execute)\s[^\n]{0,80}(?:url|endpoint|remote)"
     r"[^\n]{0,80}(?:instruction|rule|command|control)"
-    r"|remote\s+url\s+(?:that\s+)?(?:control|alter|change|influence)\s+agent"
-    r"|external\s+(?:url|source)\s+.*(?:alter|control)\s+(?:agent|behavior)",
+    r"|remote\s+url\s+(?:that\s+)?(?:control|alter|change|influence)\s+agent",
     re.IGNORECASE,
+)
+_W012_PAIRS = (
+    _pair_on_line(r"external\s+(?:url|source)\s+", r"(?:alter|control)\s+(?:agent|behavior)"),
 )
 _RE_RCE_RAW = re.compile(
     r"\bremote\s+(?:code\s+exec|exec(?:ution)?)\b"
@@ -255,8 +287,11 @@ _RE_RCE_NEGATION = re.compile(
     r".{0,40}(?:remote\s+code|arbitrary\s+code|rce\b)",
     re.IGNORECASE,
 )
+# A key-file name counts when a path character (. / ~) comes before it in the
+# same token.  The match starts at the token's first path character only: a
+# start at every path character would rescan the rest of the token each time.
 _RE_CRED_FILE = re.compile(
-    r"[\./~][^\s]*(?:\.pem|\.key|\.p12|\.pfx|id_rsa|id_ecdsa|\.kubeconfig)\b"
+    r"(?<!\S)[^\s./~]*[./~][^\s]*(?:\.pem|\.key|\.p12|\.pfx|id_rsa|id_ecdsa|\.kubeconfig)\b"
     r"|\~/\.(?:aws|gcp|azure|kube|ssh)/"
     r"|\.env(?:\.local|\.production|\.development)?\b",
     re.IGNORECASE,
@@ -271,6 +306,29 @@ _RE_PACKAGES = re.compile(
 # -- Negation-aware count helpers ------------------------------------------
 
 
+def _count_shell_blocks(text: str) -> int:
+    """Count fenced code blocks whose opening fence is shell-tagged or untagged.
+
+    A bare fence closes the block that is open, so a well-formed block's
+    closing fence does not count as the opening fence of an untagged block.
+    Any other fence opens a block and counts when its tag is a shell's or
+    empty, so no earlier fence, closed or not, can hide a shell-tagged one.  A
+    longer closing fence, or three backticks mid-line, can shift the pairing,
+    and the count can then be off by a block either way.
+    """
+    count = 0
+    inside = False
+    for m in _RE_FENCE.finditer(text):
+        info = m.group(1).strip()
+        if inside and not info:
+            inside = False
+            continue
+        inside = True
+        if (info.split(maxsplit=1)[0].lower() if info else "") in _SHELL_FENCE_TAGS:
+            count += 1
+    return count
+
+
 def _count_e004(text: str) -> int:
     """Count E004 (prompt injection) hits, filtering negation context."""
     count = 0
@@ -282,9 +340,32 @@ def _count_e004(text: str) -> int:
     return count
 
 
+def _count(text: str, *patterns: re.Pattern[str]) -> int:
+    """Total matches of every pattern in *patterns*."""
+    return sum(1 for p in patterns for _ in p.finditer(text))
+
+
+def _url_matches(text: str, pattern: re.Pattern[str]) -> list[re.Match[str]]:
+    """Match *pattern* at the start of each URL token: one try per token, so linear."""
+    return [
+        m
+        for tok in _RE_URL_TOKEN.finditer(text)
+        if (m := pattern.match(text, tok.start(), tok.end()))
+    ]
+
+
 def _count_e005(text: str) -> int:
     """Count E005 (suspicious executable URL) hits, excluding trusted domains."""
-    return sum(1 for m in _RE_E005_RAW.finditer(text) if not _TRUSTED_EXEC_DOMAINS.match(m.group()))
+    urls = _url_matches(text, _RE_E005_RAW)
+    count = sum(1 for m in urls if not _TRUSTED_EXEC_DOMAINS.match(m.group()))
+    # A named domain counts on its own only outside a matched URL, which
+    # already counted (or trusted) it.
+    starts = [m.start() for m in urls]
+    for d in _RE_E005_DOMAIN.finditer(text):
+        i = bisect.bisect_right(starts, d.start()) - 1
+        if i < 0 or d.start() >= urls[i].end():
+            count += 1
+    return count
 
 
 def _count_w007(text: str) -> int:
@@ -300,10 +381,13 @@ def _count_w007(text: str) -> int:
 
 def _count_w011(text: str) -> int:
     """Count W011 (third-party content exposure) with compound logic."""
-    count = len(_RE_W011.findall(text))
-    for m in _RE_W011_NO_SANITIZE.finditer(text):
-        start = max(0, m.start() - 400)
-        end = min(len(text), m.end() + 400)
+    count = _count(text, _RE_W011, *_W011_PAIRS)
+    # Each no-sanitizing phrase, from where it starts (a pair at its first term).
+    spans = [(m.start(), m.end()) for m in _RE_W011_NO_SANITIZE.finditer(text)]
+    spans += [(m.start(1), m.end()) for p in _NO_SANITIZE_PAIRS for m in p.finditer(text)]
+    for phrase_start, phrase_end in spans:
+        start = max(0, phrase_start - 400)
+        end = min(len(text), phrase_end + 400)
         if _RE_W011_FETCH_INSTRUCTION.search(text[start:end]):
             count += 1
     return count
@@ -322,7 +406,9 @@ def _count_rce(text: str) -> int:
 def _count_exec_urls(text: str) -> int:
     """Count executable URL hits, excluding trusted vendor domains."""
     return sum(
-        1 for m in _RE_EXEC_URL_RAW.finditer(text) if not _TRUSTED_EXEC_DOMAINS.match(m.group())
+        1
+        for m in _url_matches(text, _RE_EXEC_URL_RAW)
+        if not _TRUSTED_EXEC_DOMAINS.match(m.group())
     )
 
 
@@ -365,9 +451,9 @@ class _Features:
 
 
 def _extract_features(body: str) -> _Features:
-    """Extract all risk features from skill body text (frontmatter stripped)."""
+    """Extract all risk features from skill body text."""
     f = _Features()
-    f.shell_block_count = len(_RE_SHELL_BLOCK_OPEN.findall(body))
+    f.shell_block_count = _count_shell_blocks(body)
     f.pipe_to_shell = len(_RE_PIPE_TO_SHELL.findall(body))
     f.eval_exec = len(_RE_EVAL_EXEC.findall(body))
     f.subprocess_calls = len(_RE_SUBPROCESS.findall(body))
@@ -380,19 +466,19 @@ def _extract_features(body: str) -> _Features:
     f.cloud_cli = len(_RE_CLOUD_CLI.findall(body))
     f.browser_auto = len(_RE_BROWSER_AUTO.findall(body))
     f.hardcoded_creds = len(_RE_HARDCODED_CREDS.findall(body))
-    f.exfil_patterns = len(_RE_EXFIL.findall(body))
+    f.exfil_patterns = _count(body, _RE_EXFIL, *_EXFIL_PAIRS)
     f.rce_patterns = _count_rce(body)
     f.auth_access = len(_RE_AUTH_ACCESS.findall(body))
     f.cred_mentions = len(_RE_CREDS.findall(body))
     f.cred_env = len(_RE_CRED_ENV.findall(body))
     f.transitive_install = len(_RE_TRANSITIVE_INSTALL.findall(body))
     f.obfuscation = len(_RE_OBFUSCATION.findall(body))
-    f.download_exec = len(_RE_DOWNLOAD_EXEC.findall(body))
+    f.download_exec = _count(body, _RE_DOWNLOAD_EXEC)
     f.e004_prompt_injection = _count_e004(body)
     f.e005_suspicious_url = _count_e005(body)
     f.w007_insecure_creds = _count_w007(body)
     f.w011_third_party_content = _count_w011(body)
-    f.w012_unverifiable_dep = len(_RE_W012.findall(body))
+    f.w012_unverifiable_dep = _count(body, _RE_W012, *_W012_PAIRS)
     f.cred_file_access = len(_RE_CRED_FILE.findall(body))
     f.url_count = len(_RE_ALL_URLS.findall(body))
     f.package_refs = len(_RE_PACKAGES.findall(body))
@@ -718,15 +804,17 @@ def scan_skill(
     declared capability.
 
     Args:
-        content: Raw skill content text (may include YAML frontmatter).
+        content: The skill text as stored, which is the text the model reads.
+            Install stores the SKILL.md body without its frontmatter, so the
+            whole text is scanned: stripping a leading ``---`` block again
+            would hide whatever a body put between two horizontal rules.
         allowed_tools: Optional declared tool permissions (e.g. ["Bash(*)", "Read"]).
 
     Returns:
         Frozen ScanResult with tier, composite score, per-axis scores, flags,
         and a details dict for structured storage.
     """
-    body = _strip_frontmatter(content)
-    features = _extract_features(body)
+    features = _extract_features(content)
 
     content_score, content_flags = _score_content_risk(features)
     supply_score, supply_flags = _score_supply_chain_risk(features)

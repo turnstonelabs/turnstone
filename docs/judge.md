@@ -430,9 +430,29 @@ Results are stored in `risk_level` (tier: safe/low/medium/high/critical) and
 `scan_report` (JSON breakdown) on the `prompt_templates` table. These fields are
 system-managed and not editable via the admin API.
 
-The scanner is a pure function (~2ms) with no I/O. It runs synchronously in
-the storage layer. Scanner failures are silently caught to never block skill
-creation.
+The scanner is a pure function (a few milliseconds for a typical skill) with no
+I/O, and its time grows linearly with the text. It runs synchronously in the
+storage layer. Scanner failures are silently caught to never block skill
+creation. It reads the stored text whole: install has already removed the
+SKILL.md frontmatter, so nothing more is stripped. A placeholder with no value
+renders as nothing and joins the text around it, so it also reads the text as a
+load without arguments renders it, and with every placeholder removed, as a
+shell runs an unset `$variable`, and keeps the riskiest result.
+
+A skill is principal-load-only when its current text scans as `high` or
+`critical`, or when it grants tool approvals (`auto_approve`, or an
+`allowed_tools` list, which a workstream created with the skill is granted).
+The model cannot activate such a skill through `skills(load)`,
+`spawn_workstream` / `spawn_batch(skill=…)` or `task_agent(skill=…)`; the
+operator loads it with `/skill`. The gate scans the skill's current text rather
+than reading its stored `risk_level`, so a tier stored by an older scanner never
+decides. The operator's `/skill` warning, and the approval card and intent-judge
+view of `skills` `update`, `enable` and `disable`, read the same tier; the
+stored `risk_level` is what lists, filters and `skills(find)` show. Reports that
+are missing, or that an earlier scanner version wrote, are rescanned when a
+process that runs migrations starts, before it serves (about 10 ms a skill). A
+load or spawn checks its skill again just before it runs, and a tool batch that
+writes a skill and activates one is refused.
 
 See [docs/governance.md](governance.md) for the skill governance model.
 
@@ -674,11 +694,18 @@ and — for the LLM tier — confidence, reasoning, judge model, and latency.
 
 ### Session-level skill scan warning
 
-When a skill with `risk_level` of `high` or `critical` is loaded into a
+When a skill whose current text scans as `high` or `critical` is loaded into a
 session, a warning is emitted via `on_info`:
 
 ```
 ⚠ Skill 'my-skill' has risk level: high.
+Review scan report in admin panel before enabling in production.
+```
+
+If the text cannot be scanned, the warning says so instead:
+
+```
+⚠ Skill 'my-skill' could not be risk-checked.
 Review scan report in admin panel before enabling in production.
 ```
 

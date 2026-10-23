@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import functools
 import json
 import re
 from collections import Counter
@@ -13,6 +14,9 @@ import sqlalchemy as sa
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable
+
+    from turnstone.core.skill_scanner import ScanResult
+    from turnstone.core.storage._protocol import StorageBackend
 
 from turnstone.core.attachments import AUDIO_MIME_TO_FORMAT, unreadable_placeholder
 from turnstone.core.log import get_logger
@@ -1884,19 +1888,97 @@ VERDICT_MUTABLE = frozenset(
 # ---------------------------------------------------------------------------
 
 
+def scan_stored_skill(content: str, allowed_tools: str) -> ScanResult:
+    """Run the skill scanner on a skill as stored; *allowed_tools* is the column's raw value.
+
+    The text is also scanned as it reads when its placeholders have no value
+    (:func:`~turnstone.core.skill_placeholders.unfilled_readings`), and the
+    riskiest result is returned.  Raises whatever the scanner raises.  Uses
+    lazy imports to avoid circular dependencies.
+    """
+    from turnstone.core.skill_field_validation import read_allowed_tools
+    from turnstone.core.skill_placeholders import unfilled_readings
+    from turnstone.core.skill_scanner import scan_skill
+
+    # The tools workstream create would grant: none for a value it can't read.
+    tools = read_allowed_tools(allowed_tools) or None
+    result = scan_skill(content, tools)
+    for reading in unfilled_readings(content):
+        unfilled = scan_skill(reading, tools)
+        if unfilled.composite > result.composite:
+            result = unfilled
+    return result
+
+
+@functools.lru_cache(maxsize=32)
+def skill_risk_tier(content: str, allowed_tools: str) -> str:
+    """The risk tier :func:`scan_stored_skill` gives a skill's current text.
+
+    The activation gate, the operator's load warning, the approval cards and
+    the judge's view of a skill write all ask this, so they agree, whatever an
+    older scanner stored in the row.  Memoized on the text, which covers an
+    activation's repeated checks and a few skills in use; a scan that raises
+    is not cached.
+    """
+    return scan_stored_skill(content, allowed_tools).tier
+
+
+def rescan_stale_skills(storage: StorageBackend) -> int:
+    """Rescan each skill whose stored report is missing or another scanner version wrote.
+
+    Returns how many reports were rewritten.  Lists, filters, badges and
+    ``skills(find)`` rows show the stored tier, so after a scanner change every
+    row is brought up to date once; :func:`skill_risk_tier` scans the current
+    text wherever a tier decides or warns.  A row whose rescan fails keeps its
+    old report and is retried on the next run.  Each row is read again just
+    before its write and left alone if it changed meanwhile, so an edit is not
+    overwritten with the report of the text it replaced.
+    """
+    from turnstone.core.skill_scanner import SCANNER_VERSION
+
+    stale = [
+        row for row in storage.list_prompt_templates() if row.get("scan_version") != SCANNER_VERSION
+    ]
+    if stale:
+        log.info(
+            "Rescanning %d skills whose risk report is missing or from another scanner version",
+            len(stale),
+        )
+    rescanned = 0
+    for row in stale:
+        content = str(row.get("content") or "")
+        allowed_tools = str(row.get("allowed_tools") or "[]")
+        risk_level, scan_report, scan_version = scan_skill_content(content, allowed_tools)
+        if not scan_version:
+            continue
+        current = storage.get_prompt_template(row["template_id"])
+        if (
+            current is None
+            or current.get("scan_version") == SCANNER_VERSION
+            or str(current.get("content") or "") != content
+            or str(current.get("allowed_tools") or "[]") != allowed_tools
+        ):
+            continue
+        storage.update_prompt_template(
+            row["template_id"],
+            risk_level=risk_level,
+            scan_report=scan_report,
+            scan_version=scan_version,
+        )
+        rescanned += 1
+    return rescanned
+
+
 def scan_skill_content(content: str, allowed_tools: str) -> tuple[str, str, str]:
     """Run the skill scanner and return ``(risk_level, scan_report_json, scanner_version)``.
 
-    Uses a lazy import to avoid circular dependencies.  Silently returns
-    empty results on import or scan errors so skill creation is never
-    blocked by a scanner bug.
+    Silently returns empty results on import or scan errors so skill creation
+    is never blocked by a scanner bug.
     """
     try:
-        from turnstone.core.skill_field_validation import read_allowed_tools
-        from turnstone.core.skill_scanner import SCANNER_VERSION, scan_skill
+        from turnstone.core.skill_scanner import SCANNER_VERSION
 
-        # The tools workstream create would grant: none for a value it can't read.
-        result = scan_skill(content, read_allowed_tools(allowed_tools) or None)
+        result = scan_stored_skill(content, allowed_tools)
         return result.tier, json.dumps(result.to_dict(), ensure_ascii=False), SCANNER_VERSION
     except Exception:
         log.debug("skill_scanner: scan failed", exc_info=True)

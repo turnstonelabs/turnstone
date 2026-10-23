@@ -751,7 +751,11 @@ its own approval rule.
   `set_skill()`, which renders the text with `{{model}}`/`{{ws_id}}`/`{{node_id}}`
   variables, rebuilds the system messages and saves the config. Returns the
   skill's name, description and risk level. A disabled skill is refused, and so
-  is a high- or critical-risk one: only the operator can load that, with `/skill`.
+  is one whose text scans as high or critical risk, or that grants tool approvals
+  (`auto_approve` or `allowed_tools`): only the operator can load that, with
+  `/skill`. A batch that runs a write action (below) together with `load`, or
+  with a `spawn_workstream` / `spawn_batch` that names a skill, is refused: the
+  model splits them across turns.
 - `create`, `update`, `enable`, `disable` — Write the catalog. `enable` and
   `disable` flip the `enabled` flag; there is no delete action (hard delete stays
   in the admin UI).

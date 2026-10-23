@@ -1524,6 +1524,10 @@ frozen.
 - **A force-cancelled `wait_for_workstream` stops.** A force-cancel gives the session a fresh
   cancel event for its next turn, and the wait read the session's current one, so an abandoned wait
   went on polling until its timeout, up to 600 seconds. It now checks the turn it belongs to.
+- **The skill scanner counts a fenced code block once.** A block's closing fence also counted as
+  an untagged shell block, which raised the content risk of skills that show code, so skills with
+  code examples may now scan one tier lower. A fence in text with CRLF line ends, or an opening
+  fence on the last line, now counts too, so a skill with such shell blocks can scan a tier higher.
 
 ### Security
 
@@ -1726,6 +1730,53 @@ frozen.
   avatar uploads compared the Content-Length header with their limit before reading the body, but a
   chunked upload carries none and was read in full, spooled to disk, before the limit applied. The
   body is now counted as it arrives and refused once it passes the limit.
+- **The model can no longer activate a skill that grants tool approvals.** A workstream created
+  with a skill that has `auto_approve` approves every tool call, and one created with a skill's
+  `allowed_tools` list approves those tools, but only the skill's risk tier decided whether the
+  model could activate it, and the risk scanner never considers `auto_approve`: a coordinator
+  could hand such a skill to a child it spawned. A skill with either is now principal-load-only,
+  like a `high`- or `critical`-risk one: `skills(load)`, `spawn_workstream` /
+  `spawn_batch(skill=…)` and `task_agent(skill=…)` refuse it, and the operator loads it with
+  `/skill`. A list counts even when its entries match no tool turnstone grants (SKILL.md-style
+  names such as `Read` or `Bash(git:*)`); an operator can clear an installed skill's
+  `allowed_tools` to let the model load it.
+- **A skill changed after the model asked for it is checked again before it activates.** The
+  gate on what the model may activate checked a skill when its call was prepared, and the load or
+  spawn then read the skill again by name after approval, so a change in between, from the same
+  tool batch or during the approval wait, reached the model unchecked: a batch could give a skill
+  `auto_approve` and spawn a child with it. A tool batch that writes a skill (`skills` `create`,
+  `update`, `enable` or `disable`) and activates one (`skills` `load`, or `spawn_workstream` /
+  `spawn_batch` with a skill) is now refused, so the model splits them across turns, and a load or
+  spawn checks its skill again just before it runs.
+- **Text between two horizontal rules is no longer hidden from the skill scanner.** The scanner
+  removed a `---`-delimited frontmatter block from a skill's stored text, whose frontmatter install
+  had already removed, so a body that opened with a horizontal rule kept everything up to the next
+  `---` out of the scan while the model still read it. The scanner now reads the whole text.
+  Everything that decides or warns on a skill's risk now scans its current text instead of
+  reading its stored risk tier, so a skill scanned before this release is judged by the fixed
+  scanner: the gate on what the model may activate, the operator's `/skill` warning, the tier
+  `skills(load)` reports, and the approval card and intent-judge view of `skills` `update`,
+  `enable` and `disable`. Stored reports, which lists, filters and `skills(find)` show, are
+  rescanned when they are missing or an earlier scanner version wrote them, as a process that runs
+  migrations starts; the first start after this upgrade waits for it, about 10 ms a skill.
+- **A placeholder no longer hides a word from the skill scanner.** A placeholder that renders as
+  nothing (an argument on a load without arguments, an unset effort, a missing node id) joins the
+  text on either side of it, so a skill could store `cu$ARGUMENTS[9]rl` where the model reads
+  `curl`. The scanner now also reads a skill as a load without arguments renders it, and with
+  every placeholder removed, as a shell runs an unset `$variable`, and keeps the riskiest result.
+- **A lookalike host no longer passes for a trusted one in the skill scanner.** Seven of the
+  trusted hosts for script URLs matched as a bare prefix, so a script on a longer host that began
+  with one (`<trusted host>.example.com`), or behind userinfo naming one
+  (`<trusted host>@example.com`), counted as trusted. The trusted host must now end where the
+  URL's host does; a port or a trailing dot may still follow it.
+- **The skill scanner stays fast on long lines.** Several of its patterns rescanned the rest of a
+  line or token from every occurrence of their first term, so 32 KB of crafted skill text took up
+  to 13 seconds while holding the interpreter lock, stalling every other thread of the process.
+  A node scans the text the model proposes in `skills(create)` or `skills(update)` before
+  approval, and the console scans installs, updates and rescans on its event loop. Each pattern
+  that pairs two terms now tries once per line, and each URL pattern once per URL, so the same
+  text scans in under 50 ms; a skill with placeholders is read up to three times. Two paired
+  phrases on one line now count as two.
 
 ## [1.8.3]
 

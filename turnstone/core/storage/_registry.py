@@ -129,8 +129,26 @@ def init_storage(
         from turnstone.core.storage._migrate import run_migrations as _run_migrations
 
         _run_migrations(_storage, backend)
+        _rescan_stale_skills(_storage)
 
     return _storage
+
+
+def _rescan_stale_skills(storage: StorageBackend) -> None:
+    """Bring skill risk reports up to date; a failure is logged, never raised.
+
+    It runs before the process serves, so the first start after a scanner
+    change waits for it: about 10 ms a skill, in each process that migrates.
+    """
+    from turnstone.core.storage._utils import rescan_stale_skills
+
+    try:
+        count = rescan_stale_skills(storage)
+    except Exception:
+        log.warning("Rescanning skill risk reports failed", exc_info=True)
+        return
+    if count:
+        log.info("Rescanned %d skill risk reports", count)
 
 
 def get_storage() -> StorageBackend:

@@ -39,7 +39,7 @@ class TestInitStorage:
     def test_migrations_take_a_postgresql_url_that_holds_percent_escapes(self, monkeypatch):
         # A certificate path is encoded into the URL (/ as %2F), and so is punctuation in a
         # password; Alembic's config reads a bare % as interpolation.
-        from turnstone.core.storage import _migrate
+        from turnstone.core.storage import _migrate, _utils
 
         handed: list[str] = []
         monkeypatch.setattr(
@@ -49,6 +49,8 @@ class TestInitStorage:
                 cfg.get_section(cfg.config_ini_section, {})["sqlalchemy.url"]
             ),
         )
+        # The skill rescan that follows migrations would reach for the database; there is none.
+        monkeypatch.setattr(_utils, "rescan_stale_skills", lambda storage: 0)
         storage = init_storage(
             "postgresql",
             url="postgresql+psycopg://user:p%40ss@db.example.com/db",
@@ -84,6 +86,31 @@ class TestInitStorage:
 
         with storage._engine.connect() as conn:
             assert conn.execute(sa.text("SELECT version_num FROM alembic_version")).scalar_one()
+
+    def test_a_start_that_migrates_rescans_skill_reports_from_another_scanner(self, tmp_path):
+        from turnstone.core.skill_scanner import SCANNER_VERSION
+
+        path = str(tmp_path / "test.db")
+        storage = init_storage("sqlite", path=path, run_migrations=True)
+        storage.create_prompt_template(
+            template_id="t",
+            name="t",
+            category="general",
+            content="# Notes",
+            variables="[]",
+            org_id="",
+            created_by="test",
+        )
+
+        with storage._engine.begin() as conn:
+            conn.execute(sa.text("UPDATE prompt_templates SET scan_version = '1'"))
+
+        reset_storage()
+        storage = init_storage("sqlite", path=path, run_migrations=False)
+        assert storage.get_prompt_template("t")["scan_version"] == "1"
+        reset_storage()
+        storage = init_storage("sqlite", path=path, run_migrations=True)
+        assert storage.get_prompt_template("t")["scan_version"] == SCANNER_VERSION
 
 
 class TestMigrateEntrypoint:
