@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
+import ssl
 import threading
 import time
 from types import SimpleNamespace
@@ -263,6 +265,95 @@ def _session(mgr: MCPClientManager, pooled: bool) -> Any:
     return state.session
 
 
+@pytest.fixture
+def http_transport_failure(monkeypatch):
+    """Fail below the real SDK; successful requests still reach the loopback MCP server."""
+    fault = SimpleNamespace(error_type=None, methods=set(), attempts=0, failed_methods=[])
+    send = httpx2.AsyncHTTPTransport.handle_async_request
+
+    async def send_or_fail(transport, request):
+        if request.method == "POST" and fault.error_type is not None:
+            body = json.loads(request.content)
+            if body["method"] in fault.methods:
+                fault.attempts += 1
+                fault.failed_methods.append(body["method"])
+                raise fault.error_type("connection failed")
+        return await send(transport, request)
+
+    monkeypatch.setattr(httpx2.AsyncHTTPTransport, "handle_async_request", send_or_fail)
+    return fault
+
+
+@pytest.mark.parametrize("upstream_server", ["2026-07-28", "2025-11-25"], indirect=True)
+@pytest.mark.parametrize("dispatch_env", [True], indirect=True)
+@pytest.mark.parametrize("kind", ["tool", "resource", "prompt"])
+@pytest.mark.parametrize("error_type", [ssl.SSLError, httpx2.ReadError])
+def test_grouped_pool_connect_failures_open_breaker_and_recover(
+    dispatch_env, http_transport_failure, kind, error_type
+):
+    mgr, _upstream, pooled = dispatch_env
+    previous_session = _session(mgr, pooled)
+    _run_on_loop(mgr._loop, mgr._teardown_pool_entry(_KEY))
+    fault = http_transport_failure
+    expected_method = (
+        "initialize" if previous_session.protocol_version == "2025-11-25" else "server/discover"
+    )
+    fault.methods = {expected_method}
+    fault.error_type = error_type
+
+    for count in range(1, mgr._CB_FAILURE_THRESHOLD + 1):
+        with pytest.raises(ExceptionGroup) as caught:
+            _call(mgr, kind, pooled)
+        # The SDK itself groups the pre-boundary error; the test does not synthesize its wrapper.
+        assert caught.value.subgroup(error_type) is not None
+        assert mgr._classify_failure(caught.value) == "transport"
+        assert _is_dead_transport(caught.value) is True
+        assert mgr._consecutive_failures["srv"] == count
+        assert fault.attempts == count
+        assert _session(mgr, pooled) is None
+
+    with pytest.raises(RuntimeError, match="circuit open"):
+        _call(mgr, kind, pooled)
+    assert fault.attempts == mgr._CB_FAILURE_THRESHOLD
+    expected_failed_methods = [expected_method] * mgr._CB_FAILURE_THRESHOLD
+    assert fault.failed_methods == expected_failed_methods
+
+    fault.error_type = None
+    mgr._circuit_open_until["srv"] = time.monotonic() - 1
+    assert _call(mgr, kind, pooled) == "ok"
+    assert _session(mgr, pooled) is not previous_session
+    assert _session(mgr, pooled).protocol_version == previous_session.protocol_version
+    assert mgr._consecutive_failures.get("srv", 0) == 0
+    assert "srv" not in mgr._circuit_open_until
+
+
+@pytest.mark.parametrize("upstream_server", ["2026-07-28", "2025-11-25"], indirect=True)
+@pytest.mark.parametrize("kind", ["tool", "resource", "prompt"])
+@pytest.mark.parametrize("error_type", [ssl.SSLError, httpx2.ReadError])
+def test_established_transport_failure_is_counted_evicted_and_recovers(
+    dispatch_env, http_transport_failure, kind, error_type
+):
+    mgr, _upstream, pooled = dispatch_env
+    previous_session = _session(mgr, pooled)
+    fault = http_transport_failure
+    fault.methods = {_METHODS[kind]}
+    fault.error_type = error_type
+
+    with pytest.raises(Exception) as caught:
+        _call(mgr, kind, pooled)
+    assert not isinstance(caught.value, TimeoutError)
+    assert mgr._classify_failure(caught.value) == "transport"
+    assert _is_dead_transport(caught.value) is True
+    assert mgr._consecutive_failures["srv"] == 1
+    assert _session(mgr, pooled) is None
+    assert fault.attempts == 1
+
+    fault.error_type = None
+    assert _call(mgr, kind, pooled) == "ok"
+    assert _session(mgr, pooled) is not previous_session
+    assert mgr._consecutive_failures.get("srv", 0) == 0
+
+
 def test_tool_error_preserves_error_prefix_and_session(dispatch_env):
     """An isError result crosses the real transport and reaches the agent as an error."""
     mgr, _upstream, pooled = dispatch_env
@@ -443,28 +534,77 @@ def test_http_status_precedes_sdk_protocol_codes(sdk_code, status, classificatio
     assert mgr._classify_failure(error) == "protocol"
 
 
+def _grouped_failure(error):
+    return BaseExceptionGroup(
+        "transport owner", [asyncio.CancelledError(), ExceptionGroup("request", [error])]
+    )
+
+
+@pytest.mark.parametrize("grouped", [False, True], ids=["direct", "grouped"])
 @pytest.mark.parametrize(
-    ("error_name", "dead"),
+    ("error_type", "dead"),
     [
-        ("ConnectError", True),
-        ("ReadError", True),
-        ("WriteError", True),
-        ("CloseError", True),
-        ("ConnectTimeout", True),
-        ("ReadTimeout", True),
-        ("WriteTimeout", True),
-        ("RemoteProtocolError", True),
-        ("PoolTimeout", False),
-        ("LocalProtocolError", False),
+        (httpx2.ConnectError, True),
+        (httpx2.ReadError, True),
+        (httpx2.WriteError, True),
+        (httpx2.CloseError, True),
+        (httpx2.ConnectTimeout, True),
+        (httpx2.ReadTimeout, True),
+        (httpx2.WriteTimeout, True),
+        (httpx2.RemoteProtocolError, True),
+        (ssl.SSLError, True),
+        (httpx2.PoolTimeout, False),
+        (httpx2.LocalProtocolError, False),
     ],
 )
-def test_http_exception_families(error_name, dead):
-    error = getattr(httpx2, error_name)("failure")
+def test_http_exception_families(error_type, dead, grouped):
+    error = error_type("failure")
+    if grouped:
+        error = _grouped_failure(error)
     assert _is_dead_transport(error) is dead
     mgr = MCPClientManager({})
     assert mgr._classify_failure(error) == ("transport" if dead else "other")
 
 
+@pytest.mark.parametrize(
+    ("error", "classification", "dead"),
+    [
+        (MCPError(code=-32000, message="closed"), "transport", True),
+        (MCPError(code=-32600, message="rejected"), "protocol", False),
+        (TimeoutError("deadline"), "transport", False),
+        (ValueError("invalid"), "other", False),
+    ],
+)
+def test_grouped_non_http_failures(error, classification, dead):
+    grouped = _grouped_failure(error)
+    assert MCPClientManager({})._classify_failure(grouped) == classification
+    assert _is_dead_transport(grouped) is dead
+
+
+def test_cancellation_only_group_is_breaker_neutral():
+    error = BaseExceptionGroup("cancelled", [asyncio.CancelledError()])
+    assert MCPClientManager({})._classify_failure(error) == "other"
+    assert _is_dead_transport(error) is False
+
+
+@pytest.mark.parametrize("status", [401, 403])
+def test_captured_auth_precedes_grouped_transport_failure(status):
+    error = _grouped_failure(ssl.SSLError("failed"))
+    capture = _AuthCapture(status=status)
+    assert MCPClientManager({})._classify_failure(error, capture=capture) == f"auth_{status}"
+
+
+@pytest.mark.parametrize("status", [401, 403])
+@pytest.mark.parametrize("reverse", [False, True])
+def test_grouped_auth_precedes_connection_closed_during_teardown(status, reverse):
+    auth = _CapturedHTTPError(_AuthCapture(status=status))
+    closed = MCPError(code=-32000, message="closed")
+    errors = [closed, auth] if reverse else [auth, closed]
+    group = ExceptionGroup("transport owner", errors)
+    assert MCPClientManager({})._classify_failure(group) == f"auth_{status}"
+
+
+@pytest.mark.parametrize("grouped", [False, True], ids=["direct", "grouped"])
 @pytest.mark.parametrize(
     ("status", "held", "classification"),
     [
@@ -475,12 +615,14 @@ def test_http_exception_families(error_name, dead):
         (502, False, "transport"),
     ],
 )
-def test_http_status_exception_fallback(status, held, classification):
+def test_http_status_exception_fallback(status, held, classification, grouped):
     request = httpx2.Request(
         "POST", "https://mcp.example.com/", headers={"mcp-session-id": "held"} if held else {}
     )
     response = httpx2.Response(status, request=request)
     error = httpx2.HTTPStatusError("failure", request=request, response=response)
+    if grouped:
+        error = _grouped_failure(error)
     assert MCPClientManager({})._classify_failure(error) == classification
 
 

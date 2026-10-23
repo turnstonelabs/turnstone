@@ -706,6 +706,9 @@ frozen.
 
 ### Fixed
 
+- **Failed pooled MCP connections count toward the circuit breaker (#1447)** — TLS and network
+  errors wrapped in SDK exception groups now count once per failed operation. Repeated failures
+  open the circuit instead of attempting a new connection on every call.
 - **Close-all reaches coordinator children before their creation events arrive (#1471)** — it
   combines registered children with a complete stored-child snapshot under the same owner. Failed
   discovery returns 503 before closing anything, and delayed UI creation events remain deliverable.

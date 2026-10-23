@@ -360,7 +360,7 @@ def _has_established_session(headers: httpx2.Headers) -> bool:
 def _classify_http_exception(
     exc: BaseException,
 ) -> Literal["auth_401", "auth_403", "transport"] | None:
-    """Classify an httpx2 exception: a status error by its status (a 404 only on an established
+    """Classify a request exception: a status error by its status (a 404 only on an established
     session), and a broken connection as a transport failure."""
     if isinstance(exc, httpx2.HTTPStatusError):
         status = exc.response.status_code
@@ -373,7 +373,8 @@ def _classify_http_exception(
         | httpx2.ConnectTimeout
         | httpx2.ReadTimeout
         | httpx2.WriteTimeout
-        | httpx2.RemoteProtocolError,
+        | httpx2.RemoteProtocolError
+        | ssl.SSLError,
     ):
         # Pool saturation and local framing errors do not prove the connection is dead.
         return "transport"
@@ -405,13 +406,18 @@ def _is_dead_transport(exc: BaseException, *, capture: _AuthCapture | None = Non
        a builtin ``TimeoutError`` and would otherwise be misread as a healthy "other" failure.
        ``PoolTimeout`` is deliberately EXCLUDED: it means connection-pool saturation, not a dead
        connection — evicting the session wouldn't relieve the pressure and would trip the shared
-       breaker for all users on transient load.
+       breaker for all users on transient load. A TLS alert arriving after the handshake can
+       escape httpx2 as a raw ``ssl.SSLError`` and also proves the connection failed.
 
+    Transport owners can report these failures inside nested task groups, alongside the
+    cancellations that teardown caused. Inspect their non-cancellation leaves.
     The raw-socket variants (``BrokenPipeError`` / ``ConnectionResetError`` /
     ``EOFError``) are kept for the stdio transport and defense-in-depth.
     """
     if capture is not None and _classify_http_status(capture.status) == "transport":
         return True
+    if isinstance(exc, BaseExceptionGroup):
+        return any(_is_dead_transport(leaf) for leaf in _failure_leaves(exc))
     if isinstance(
         exc,
         anyio.ClosedResourceError
@@ -5727,6 +5733,20 @@ class MCPClientManager:
             captured = _classify_http_status(capture.status)
             if captured is not None:
                 return captured
+        if isinstance(exc, BaseExceptionGroup):
+            # Lazy connect forwards the owner's task-group failure. Auth remains authoritative
+            # over the closed streams teardown leaves behind; count a transport failure once,
+            # however many leaves the group holds. A cancellation-only group stays neutral.
+            kinds = {self._classify_failure(leaf) for leaf in _failure_leaves(exc)}
+            if "auth_401" in kinds:
+                return "auth_401"
+            if "auth_403" in kinds:
+                return "auth_403"
+            if "transport" in kinds:
+                return "transport"
+            if "protocol" in kinds:
+                return "protocol"
+            return "other"
         http_failure = _classify_http_exception(exc)
         if http_failure is not None:
             return http_failure
