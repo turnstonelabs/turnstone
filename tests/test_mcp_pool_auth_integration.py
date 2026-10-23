@@ -43,7 +43,7 @@ from tests._oauth_runtime_helpers import make_oauth_context
 from tests.conftest import make_mcp_token_cipher, serve_until_exit, stop_loop_thread
 from tests.test_mcp_oauth_handlers import _build_app
 from turnstone.core import mcp_oauth
-from turnstone.core.mcp_client import MCPClientManager
+from turnstone.core.mcp_client import MCPClientManager, _decode_tool_result
 from turnstone.core.mcp_crypto import MCPTokenStore
 from turnstone.core.mcp_oauth import TokenLookupResult
 from turnstone.core.oauth.context import TokenCoordination, oauth_context
@@ -424,7 +424,7 @@ def test_browser_consent_then_dispatch_refreshes_on_oauth_runtime(
                         user_id="user-1",
                         timeout=15,
                     )
-                    assert "echoed:consented" in result
+                    assert "echoed:consented" in _decode_tool_result(result)
                     assert grants == ["authorization_code", "refresh_token"]
                     assert [path for path, _, _ in requests] == ["/token"]
                     assert all(
@@ -511,8 +511,10 @@ def test_integration_401_refresh_and_retry_succeeds(
         "turnstone.core.mcp_client.get_user_access_token_classified",
         side_effect=_fake_classified,
     ):
-        result = mgr.call_tool_sync(
-            "mcp__pool-srv__echo", {"payload": "hi"}, user_id="user-1", timeout=15
+        result = _decode_tool_result(
+            mgr.call_tool_sync(
+                "mcp__pool-srv__echo", {"payload": "hi"}, user_id="user-1", timeout=15
+            )
         )
 
     assert "echoed:hi" in result
@@ -921,7 +923,9 @@ def test_static_dispatch_unaffected_by_consent_url_kwarg(
     fut.result(timeout=15)
 
     # Drive call_tool_sync without a user_id — the static path is taken.
-    result = mgr.call_tool_sync("mcp__static-srv__echo", {"payload": "static-x"}, timeout=15)
+    result = _decode_tool_result(
+        mgr.call_tool_sync("mcp__static-srv__echo", {"payload": "static-x"}, timeout=15)
+    )
 
     # Static path returns the MCPServer fixture's echo string.
     assert "echoed:static-x" in result
@@ -988,8 +992,10 @@ def test_integration_pool_reuse_401_refresh_and_retry_succeeds(
         side_effect=_fake_classified,
     ):
         # Dispatch 1: passthrough success. Establishes the pooled session.
-        result1 = mgr.call_tool_sync(
-            "mcp__pool-srv__echo", {"payload": "first"}, user_id="user-1", timeout=15
+        result1 = _decode_tool_result(
+            mgr.call_tool_sync(
+                "mcp__pool-srv__echo", {"payload": "first"}, user_id="user-1", timeout=15
+            )
         )
         assert "echoed:first" in result1
 
@@ -1009,8 +1015,10 @@ def test_integration_pool_reuse_401_refresh_and_retry_succeeds(
         # Dispatch 2: same (user, server). The hook from dispatch 1's
         # connect is still bound to entry.auth_capture. The 401 fires;
         # the dispatcher's auth_401 path triggers refresh-and-retry.
-        result2 = mgr.call_tool_sync(
-            "mcp__pool-srv__echo", {"payload": "second"}, user_id="user-1", timeout=15
+        result2 = _decode_tool_result(
+            mgr.call_tool_sync(
+                "mcp__pool-srv__echo", {"payload": "second"}, user_id="user-1", timeout=15
+            )
         )
 
     assert "echoed:second" in result2, (

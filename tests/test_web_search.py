@@ -5,6 +5,7 @@ from __future__ import annotations
 from unittest.mock import MagicMock, patch
 
 import httpx2
+import mcp.types as mcp_types
 import pytest
 
 from turnstone.core.web_search import (
@@ -217,7 +218,9 @@ class TestSearXNGClient:
 class TestMCPSearchClient:
     def test_delegates_to_mcp(self):
         mcp = MagicMock()
-        mcp.call_tool_sync.return_value = "MCP search results"
+        mcp.call_tool_sync.return_value = mcp_types.CallToolResult(
+            content=[mcp_types.TextContent(text="MCP search results")]
+        )
         client = MCPSearchClient(mcp, "mcp__ddg__search", timeout=30)
         result = client.search("test", max_results=3, category="news")
         mcp.call_tool_sync.assert_called_once_with(

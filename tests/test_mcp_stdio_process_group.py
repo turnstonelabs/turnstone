@@ -25,6 +25,7 @@ from mcp.client.stdio import stdio_client
 from tests.conftest import _poll_until, _wait_session_live
 from turnstone.core.mcp_client import (
     MCPClientManager,
+    _decode_tool_result,
     _stdio_server_pids,
     _stop_stdio_server_group,
 )
@@ -111,7 +112,9 @@ class _Spawner:
     def __enter__(self) -> _Spawner:
         self.mgr.start()
         assert _wait_session_live(self.mgr, "spawner", 20.0), "initial connect failed"
-        assert "42" in self.mgr.call_tool_sync("mcp__spawner__ping_me", {"x": 41}, timeout=10)
+        assert "42" in _decode_tool_result(
+            self.mgr.call_tool_sync("mcp__spawner__ping_me", {"x": 41}, timeout=10)
+        )
         return self
 
     def shutdown(self) -> None:

@@ -35,7 +35,12 @@ from tests.conftest import (
     make_mcp_token_cipher,
     stop_loop_thread,
 )
-from turnstone.core.mcp_client import _MAX_ERROR_TEXT_LEN, MCPClientManager, PoolEntryState
+from turnstone.core.mcp_client import (
+    _MAX_ERROR_TEXT_LEN,
+    MCPClientManager,
+    PoolEntryState,
+    _decode_tool_result,
+)
 from turnstone.core.mcp_crypto import MCPTokenStore
 from turnstone.core.oauth.context import OAuthContext, TokenCoordination, oauth_context
 
@@ -1564,11 +1569,13 @@ class TestDispatchStateMachine:
 
         _run_on_loop(loop, _seed_entry())
 
-        result = mgr.call_tool_sync(
-            "mcp__pool-srv__do_thing",
-            {"q": "hi"},
-            user_id="user-1",
-            timeout=5,
+        result = _decode_tool_result(
+            mgr.call_tool_sync(
+                "mcp__pool-srv__do_thing",
+                {"q": "hi"},
+                user_id="user-1",
+                timeout=5,
+            )
         )
         assert result == "tool-result"
 
@@ -1743,11 +1750,13 @@ class TestHttpsEnforcement:
 
         _run_on_loop(loop, _seed_entry())
 
-        result = mgr.call_tool_sync(
-            "mcp__pool-srv__do_thing",
-            {},
-            user_id="user-1",
-            timeout=5,
+        result = _decode_tool_result(
+            mgr.call_tool_sync(
+                "mcp__pool-srv__do_thing",
+                {},
+                user_id="user-1",
+                timeout=5,
+            )
         )
         # Loopback URL not rejected — dispatch reaches the (fake) session.
         assert result == "ok"
@@ -1932,11 +1941,13 @@ class TestConcurrentDispatch:
         def _dispatch() -> None:
             try:
                 results.append(
-                    mgr.call_tool_sync(
-                        "mcp__pool-srv__do_thing",
-                        {},
-                        user_id="user-1",
-                        timeout=5,
+                    _decode_tool_result(
+                        mgr.call_tool_sync(
+                            "mcp__pool-srv__do_thing",
+                            {},
+                            user_id="user-1",
+                            timeout=5,
+                        )
                     )
                 )
             except Exception as exc:  # pragma: no cover — diagnostic only
@@ -1983,7 +1994,9 @@ class TestUserIdThreadThrough:
         )
 
         # No user_id, no app_state — pool branch is skipped entirely.
-        result = mgr.call_tool_sync("mcp__static__t", {"q": "hi"}, user_id=None, timeout=5)
+        result = _decode_tool_result(
+            mgr.call_tool_sync("mcp__static__t", {"q": "hi"}, user_id=None, timeout=5)
+        )
         assert result == "static-output"
 
     def test_user_id_with_static_path_does_not_use_pool(
@@ -2020,11 +2033,13 @@ class TestUserIdThreadThrough:
             name="static-srv", session=fake_session
         )
 
-        result = mgr.call_tool_sync(
-            "mcp__static-srv__t",
-            {"q": "hi"},
-            user_id="user-1",
-            timeout=5,
+        result = _decode_tool_result(
+            mgr.call_tool_sync(
+                "mcp__static-srv__t",
+                {"q": "hi"},
+                user_id="user-1",
+                timeout=5,
+            )
         )
         assert result == "static-output"
         # No pool entries were created.

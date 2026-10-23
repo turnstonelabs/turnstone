@@ -32,6 +32,7 @@ from turnstone.core.mcp_client import (
     InvalidCatalogError,
     MCPClientManager,
     _AuthCapture,
+    _decode_tool_result,
     _invalid_page_error,
 )
 from turnstone.core.oauth.context import OAuthContext
@@ -334,7 +335,7 @@ def test_refresh_keeps_the_last_valid_catalog(upstream_server: tuple[str, Upstre
         status = mgr.get_server_status("srv")
         # Retried like any failed refresh: the next full pass is what clears the error.
         retry_armed = "srv" in mgr._static_refresh_retry
-        result = mgr.call_tool_sync("mcp__srv__good", {}, timeout=10)
+        result = _decode_tool_result(mgr.call_tool_sync("mcp__srv__good", {}, timeout=10))
 
     assert status["connected"] is True
     assert status["tools"] == 1
@@ -357,7 +358,7 @@ def test_invalid_call_result_counts_against_no_breaker(
                 mgr.call_tool_sync("mcp__srv__good", {}, timeout=10)
         status = mgr.get_server_status("srv")
         upstream.call_result = {"content": [{"type": "text", "text": "ok"}]}
-        result = mgr.call_tool_sync("mcp__srv__good", {}, timeout=10)
+        result = _decode_tool_result(mgr.call_tool_sync("mcp__srv__good", {}, timeout=10))
 
     assert status["connected"] is True
     assert status["consecutive_failures"] == 0
@@ -382,7 +383,7 @@ def test_recursive_output_schema_counts_against_no_breaker(
                 mgr.call_tool_sync("mcp__srv__recursive", {}, timeout=10)
         status = mgr.get_server_status("srv")
         assert mgr._static_servers["srv"].session is session
-        result = mgr.call_tool_sync("mcp__srv__good", {}, timeout=10)
+        result = _decode_tool_result(mgr.call_tool_sync("mcp__srv__good", {}, timeout=10))
         assert mgr._static_servers["srv"].session is session
 
     assert status["connected"] is True

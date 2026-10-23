@@ -133,6 +133,30 @@ def too_many_jpeg_scans(data: bytes) -> bool:
     return data.startswith(b"\xff\xd8\xff") and data.count(b"\xff\xda") > MAX_JPEG_SCANS
 
 
+def validate_image(data: bytes) -> None:
+    """Verify and decode an image before admitting its bytes to model history.
+
+    Share the format, pixel, JPEG-scan and one-image-at-a-time limits used by the image utilities.
+    Verification checks container integrity; loading also catches broken compressed pixel data.
+    Animated inputs are checked through their first frame, the frame used by vision consumers.
+    Unlike best-effort flattening, an unreadable input raises so the caller can omit it.
+    """
+    from PIL import Image
+
+    if too_many_jpeg_scans(data):
+        raise ValueError("image exceeds the JPEG scan limit")
+    with _flatten_slot:
+        try:
+            with Image.open(BytesIO(data), formats=_FLATTEN_FORMATS) as image:
+                if image.width * image.height > _MAX_IMAGE_PIXELS:
+                    raise ValueError("image exceeds the pixel limit")
+                image.verify()
+            with Image.open(BytesIO(data), formats=_FLATTEN_FORMATS) as image:
+                image.load()
+        except Exception as exc:
+            raise ValueError("image data could not be decoded within the image limits") from exc
+
+
 def exif_orientation(img: Image.Image) -> int:
     """The EXIF orientation an opened image declares: 1 is upright, 2-8 turn or flip.
 

@@ -872,7 +872,9 @@ class TestSessionIntegration:
         mock_mcp = MagicMock()
         mock_mcp.get_tools.return_value = [_fake_openai_tool()]
         mock_mcp.is_mcp_tool.return_value = True
-        mock_mcp.call_tool_sync.return_value = "result text"
+        mock_mcp.call_tool_sync.return_value = mcp_types.CallToolResult(
+            content=[mcp_types.TextContent(text="result text")]
+        )
         session = self._make_session(mcp_client=mock_mcp)
 
         item = {

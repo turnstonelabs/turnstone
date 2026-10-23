@@ -120,6 +120,11 @@ frozen.
 
 ### Added
 
+- **MCP image tool results (#1158).** Supported images reach vision models and appear in live and
+  reopened conversations. Image bytes use the existing database-backed, content-addressed attachment
+  store with reference counting; history and events carry references and metadata. Results combine
+  text before images; interleaved caption placement is outside this initial contract.
+
 - **MCP servers on the 2026-07-28 revision (#679).** A connection probes `server/discover` and
   adopts 2026-07-28 when the server offers it; a server that refuses the probe gets the 2025-11-25
   `initialize` handshake, so existing servers connect as before. On 2026-07-28 connections, change

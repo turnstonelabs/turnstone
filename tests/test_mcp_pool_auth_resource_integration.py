@@ -28,7 +28,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 
 from tests._oauth_runtime_helpers import make_oauth_context
 from tests.conftest import make_mcp_token_cipher, serve_until_exit, stop_loop_thread
-from turnstone.core.mcp_client import MCPClientManager
+from turnstone.core.mcp_client import MCPClientManager, _decode_tool_result
 from turnstone.core.mcp_crypto import MCPTokenStore
 from turnstone.core.mcp_oauth import TokenLookupResult
 from turnstone.core.oauth.context import TokenCoordination
@@ -670,8 +670,10 @@ def test_resource_read_e2e_discovery_then_dispatch_succeeds(
         # Step 1: trigger the connect via prefix-parsed tool dispatch.
         # Discovery (tools + resources + prompts) populates the per-user
         # catalogs.
-        tool_result = mgr.call_tool_sync(
-            "mcp__pool-srv__echo", {"payload": "ignite"}, user_id="user-1", timeout=15
+        tool_result = _decode_tool_result(
+            mgr.call_tool_sync(
+                "mcp__pool-srv__echo", {"payload": "ignite"}, user_id="user-1", timeout=15
+            )
         )
         assert "echoed:ignite" in tool_result
 

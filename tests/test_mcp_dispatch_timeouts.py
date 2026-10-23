@@ -17,7 +17,7 @@ from tests.conftest import (
     make_client_session_double,
     stop_loop_thread,
 )
-from turnstone.core.mcp_client import MCPClientManager, PoolEntryState
+from turnstone.core.mcp_client import MCPClientManager, PoolEntryState, _decode_tool_result
 
 _KEY = ("user-1", "srv")
 _ROW = {"name": "srv", "transport": "streamable-http", "url": "http://127.0.0.1:1/mcp"}
@@ -76,7 +76,7 @@ def _call(mgr: MCPClientManager, kind: str, pooled: bool, *, timeout: int = 5) -
             return mgr._dispatch_pool_resource_sync(uri="test://resource", **kwargs)
         return mgr._dispatch_pool_prompt_sync(original_name="op", arguments={}, **kwargs)
     if kind == "tool":
-        return mgr.call_tool_sync("mcp__srv__op", {}, timeout=timeout)
+        return _decode_tool_result(mgr.call_tool_sync("mcp__srv__op", {}, timeout=timeout))
     if kind == "resource":
         return mgr.read_resource_sync("test://resource", timeout=timeout)
     return mgr.get_prompt_sync("mcp__srv__op", timeout=timeout)

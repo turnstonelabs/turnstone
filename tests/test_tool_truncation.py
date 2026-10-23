@@ -21,7 +21,7 @@ from turnstone.core.session import (
     _active_task_agent_cancel_scope,
     _bash_output_truncation_marker,
 )
-from turnstone.core.trajectory import Role, turns_from_dicts
+from turnstone.core.trajectory import AttachmentRef, Role, TextBlock, turns_from_dicts
 from turnstone.core.truncation import BoundedTextBuffer, ProjectedText, truncate_text
 
 # ---------------------------------------------------------------------------
@@ -456,6 +456,95 @@ def _send_with_real_execution(session, steps, **extra_patches):
 
 def _tool_turn_texts(session):
     return [m.text for m in session.messages if m.role is Role.TOOL]
+
+
+@pytest.mark.parametrize("expand_guard", [False, True])
+def test_text_with_images_obeys_per_result_and_shared_admission_limits(session, expand_guard):
+    import base64
+
+    session._judge_config = JudgeConfig(output_guard=True, output_guard_llm=False)
+    session._chars_per_token = 4.0
+    session.tool_truncation = 1200
+    session._manual_tool_truncation = True
+    image = {
+        "type": "image_url",
+        "image_url": {"url": "data:image/png;base64," + base64.b64encode(PNG_1X1).decode()},
+    }
+    output = [
+        {"type": "text", "text": "BEGIN " + "a" * 5000 + "\n" + "b" * 5000 + " END"},
+        image,
+        image,
+    ]
+    calls = [
+        {"id": f"c{i}", "function": {"name": "mcp__lab__camera", "arguments": "{}"}}
+        for i in range(3)
+    ]
+    scanned = {}
+
+    def guard(call_id, text, *_args, **_kwargs):
+        scanned[call_id] = scanned.get(call_id, 0) + len(text)
+        return (text.replace("a", "[REDACTED]", 100) if expand_guard else text), None
+
+    with _send_with_tool_batch(
+        session,
+        calls,
+        [(call["id"], output) for call in calls],
+        _remaining_token_budget=MagicMock(return_value=800),
+        _compact_messages=MagicMock(return_value=False),
+        _evaluate_output=MagicMock(side_effect=guard),
+    ):
+        session.send("inspect")
+
+    tools = [turn for turn in session.messages if turn.role is Role.TOOL]
+    assert len(tools) == 3
+    for turn, cap in zip(tools, [1200, 1200, 800], strict=True):
+        text = "".join(block.text for block in turn.content if isinstance(block, TextBlock))
+        assert len(text) <= cap
+        assert text.count("chars truncated") == 1
+        assert [isinstance(block, AttachmentRef) for block in turn.content] == [
+            False,
+            True,
+            True,
+        ]
+    assert sum(scanned.values()) == 3200
+    assert len(output[0]["text"]) > 10000  # Admission must not mutate the executor's result.
+
+
+@pytest.mark.parametrize("image_between_text", [False, True])
+def test_mcp_text_is_guarded_as_one_body_before_admission(session, image_between_text):
+    import mcp.types as mcp_types
+
+    from tests.test_mcp_image_results import B64
+    from turnstone.core.mcp_client import _decode_tool_result
+
+    session._judge_config = JudgeConfig(
+        output_guard=True, output_guard_llm=False, redact_secrets=True
+    )
+    secret = "synthetic-private-material"
+    image = mcp_types.ImageContent(mime_type="image/png", data=B64)
+    parts = [
+        mcp_types.TextContent(text=text)
+        for text in (
+            "-----BEGIN PRIVATE KEY-----",
+            secret,
+            "-----END PRIVATE KEY-----",
+        )
+    ]
+    parts.insert(1 if image_between_text else len(parts), image)
+    output = _decode_tool_result(mcp_types.CallToolResult(content=parts))
+    calls = [{"id": "camera", "function": {"name": "mcp__lab__camera", "arguments": "{}"}}]
+    with _send_with_tool_batch(
+        session,
+        calls,
+        [("camera", output)],
+        _remaining_token_budget=MagicMock(return_value=4000),
+        _compact_messages=MagicMock(return_value=False),
+    ):
+        session.send("inspect")
+    (turn,) = [turn for turn in session.messages if turn.role is Role.TOOL]
+    assert secret not in turn.text
+    assert "[REDACTED:private_key]" in turn.text
+    assert isinstance(turn.content[-1], AttachmentRef)
 
 
 def _policy(*, owed: bool = False, over_soft: bool = False, over_hard: bool = False):

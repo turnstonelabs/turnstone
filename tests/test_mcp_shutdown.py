@@ -33,6 +33,7 @@ from turnstone.core.mcp_client import (
     MCPShutdownError,
     PoolEntryState,
     StaticServerState,
+    _decode_tool_result,
 )
 from turnstone.core.mcp_crypto import MCPTokenStore
 from turnstone.core.oauth.context import oauth_context
@@ -793,8 +794,12 @@ def test_shutdown_stops_waiting_sync_calls(
                 "add": lambda: manager.add_server_sync("srv", cfg),
                 "reconnect": lambda: manager.reconnect_sync("srv"),
                 "refresh": lambda: manager.refresh_sync("srv"),
-                "call_tool": lambda: manager.call_tool_sync("mcp__srv__example", {}),
-                "call_tool_reconnect": lambda: manager.call_tool_sync("mcp__srv__example", {}),
+                "call_tool": lambda: _decode_tool_result(
+                    manager.call_tool_sync("mcp__srv__example", {})
+                ),
+                "call_tool_reconnect": lambda: _decode_tool_result(
+                    manager.call_tool_sync("mcp__srv__example", {})
+                ),
             }
 
             async def evict_session() -> None:

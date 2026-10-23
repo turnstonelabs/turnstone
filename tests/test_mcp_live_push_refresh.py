@@ -43,7 +43,7 @@ from tests.conftest import (
     _wait_session_live,
     _wait_tcp_ready,
 )
-from turnstone.core.mcp_client import MCPClientManager
+from turnstone.core.mcp_client import MCPClientManager, _decode_tool_result
 
 if TYPE_CHECKING:
     import subprocess
@@ -139,7 +139,9 @@ class TestPushRefreshNoDeadlock:
             # flight, so its result and the notification share the receive
             # loop. Pre-fix, the inline-await handler parked that loop and
             # this call never returned.
-            out = mgr.call_tool_sync("mcp__push__register_extra", {}, timeout=10)
+            out = _decode_tool_result(
+                mgr.call_tool_sync("mcp__push__register_extra", {}, timeout=10)
+            )
             assert "registered" in out
 
             # The push-driven refresh completes on its own — no teardown.
@@ -152,7 +154,9 @@ class TestPushRefreshNoDeadlock:
 
             # The merged map rebuilt AND the receive loop still routes:
             # the brand-new tool dispatches end-to-end.
-            out = mgr.call_tool_sync("mcp__push__extra_tool", {"y": 21}, timeout=10)
+            out = _decode_tool_result(
+                mgr.call_tool_sync("mcp__push__extra_tool", {"y": 21}, timeout=10)
+            )
             assert "42" in out
         finally:
             if mgr is not None:

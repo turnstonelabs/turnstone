@@ -19,6 +19,7 @@ Refresh: two mechanisms keep tool/resource/prompt lists up-to-date:
 from __future__ import annotations
 
 import asyncio
+import base64
 import concurrent.futures
 import contextlib
 import contextvars
@@ -68,7 +69,15 @@ from mcp_types.version import (
 )
 from pydantic import ValidationError
 
+from turnstone.core.attachments import (
+    IMAGE_SIZE_CAP,
+    MODEL_IMAGE_MIMES,
+    classify_upload,
+    sniff_image_mime,
+    stored_upload_content,
+)
 from turnstone.core.config import load_config
+from turnstone.core.images import validate_image
 from turnstone.core.log import get_logger
 from turnstone.core.mcp_http_parsers import (
     MAX_INSUFFICIENT_SCOPE_REPORTED,
@@ -9354,7 +9363,7 @@ class MCPClientManager:
         user_id: str | None = None,
         timeout: int = 120,
         is_interactive_for_consent: bool = True,
-    ) -> str:
+    ) -> mcp_types.CallToolResult:
         """Execute an MCP tool call synchronously (blocks the calling thread).
 
         Dispatches an async ``tools/call`` to the background event loop and
@@ -9424,13 +9433,13 @@ class MCPClientManager:
             future.cancel()
             raise TimeoutError(f"MCP tool call timed out after {timeout}s") from None
         try:
-            result = future.result()
+            result: mcp_types.CallToolResult = future.result()
         except Exception as exc:
             self._record_and_evict_on_dead_transport(server_name, exc, session=session)
             raise
 
         self._cb_record_success(server_name)
-        return _decode_tool_result(result)
+        return result
 
     async def _call_tool_with_header_retry(
         self,
@@ -9763,15 +9772,13 @@ class MCPClientManager:
         server_row: dict[str, Any],
         timeout: int,
         is_interactive_for_consent: bool = True,
-    ) -> str:
+    ) -> mcp_types.CallToolResult:
         """Synchronous wrapper for pool dispatch.
 
-        Bridges sync caller → mcp-loop coroutine → result. Returns either
-        the tool output string or a structured-error JSON string when
-        token state forces the call to fail cleanly without raising
-        (consent required, key mismatch, etc.). ``server_row`` is the
-        row already resolved by ``_resolve_pool_target`` and is reused
-        verbatim by ``_dispatch_pool`` to skip a duplicate DB hop.
+        Bridges sync caller → mcp-loop coroutine → SDK result, preserving its explicit error
+        status. Callers decode images on their worker, outside the shared MCP event loop.
+        Structured authorization failures are raised below. ``server_row`` is already resolved
+        by ``_resolve_pool_target`` and reused by ``_dispatch_pool``.
 
         Retry-on-401: the 401 branch in :meth:`_dispatch_pool` raises
         :class:`_PoolDispatchRetryRequested` after refreshing the bearer. Catching the signal HERE —
@@ -9797,10 +9804,8 @@ class MCPClientManager:
         path keys on ``except Exception`` to render the dashboard's
         consent card — so we surface that JSON via ``RuntimeError`` here
         to drive the same path uniformly across tool / resource / prompt
-        dispatchers. The wrap is gated on
-        :func:`_is_structured_error` so a tool whose successful
-        output happens to start with ``{"error":...`` is unaffected;
-        only envelopes carrying an ``mcp_*`` code are converted.
+        dispatchers. Tool output stays inside the SDK result, so its text can never be mistaken
+        for one of these internal authorization envelopes.
         """
         start = time.monotonic()
         try:
@@ -9830,7 +9835,7 @@ class MCPClientManager:
                 arguments=arguments,
                 server_row=server_row,
             )
-        if _is_structured_error(result):
+        if isinstance(result, str):
             if not is_interactive_for_consent:
                 self._record_pending_consent_best_effort(
                     user_id=user_id, server_name=server_name, result=result
@@ -9851,7 +9856,7 @@ class MCPClientManager:
         original_name: str,
         arguments: dict[str, Any],
         server_row: dict[str, Any],
-    ) -> str:
+    ) -> mcp_types.CallToolResult | str:
         """Schedule one ``_dispatch_pool`` attempt and wait for the result.
 
         Split out of :meth:`_dispatch_pool_sync` so the two retry
@@ -10075,10 +10080,10 @@ class MCPClientManager:
         arguments: dict[str, Any],
         server_row: dict[str, Any],
         retry_count: int = 0,
-    ) -> str:
+    ) -> mcp_types.CallToolResult | str:
         """Pool-side coroutine: resolve token, connect-or-reuse, dispatch.
 
-        Returns either the textualized tool output or a structured-error
+        Returns either the SDK tool result or a structured-error
         JSON string when token state precludes dispatch. ``server_row``
         is supplied by ``_resolve_pool_target`` so this path doesn't
         re-issue the ``mcp_servers`` lookup; it's also pre-validated to
@@ -10146,7 +10151,7 @@ class MCPClientManager:
         # open_lock before call_tool, we read it after.
         capture = entry.auth_capture
         try:
-            sdk_result = await self._dispatch_pool_with_entry_call(
+            sdk_result: mcp_types.CallToolResult = await self._dispatch_pool_with_entry_call(
                 entry=entry,
                 key=key,
                 cfg=cfg,
@@ -10155,7 +10160,6 @@ class MCPClientManager:
                     s, server_name, original_name, arguments, pool_key=key
                 ),
             )
-            result = _decode_tool_result(sdk_result)
         except asyncio.CancelledError:
             # A cancelled lock waiter has not owned this carrier; it may
             # describe the active caller's auth failure. Never retry or evict.
@@ -10235,7 +10239,7 @@ class MCPClientManager:
             raise
 
         self._cb_record_success(server_name)
-        return result
+        return sdk_result
 
     async def _dispatch_pool_resource(
         self,
@@ -11218,26 +11222,69 @@ class MCPClientManager:
 # ---------------------------------------------------------------------------
 
 
-def _decode_tool_result(result: mcp_types.CallToolResult) -> str:
-    """Render an MCP ``tools/call`` result into the string the agent sees.
+def _decode_tool_result(result: mcp_types.CallToolResult) -> str | list[dict[str, Any]]:
+    """Normalize SDK content to one text body followed by supported images.
 
-    Walks ``result.content`` collecting text parts and labelling binary
-    parts; when ``result.content`` is empty and ``result.structured_content``
-    is present, serializes ``structured_content`` as JSON. An ``is_error``
-    result is prefixed with ``Error: `` so the LLM can narrate the failure.
-    Shared by the static and pool dispatch paths.
+    Images follow the upload policy and share one decoded-byte budget per result. The session
+    replaces inline images with content-addressed attachment references before admitting a turn.
+    Consumers call this on their synchronous worker, outside the MCP event loop.
+    Text-only results, structured-only results and error prefixes retain their existing shape.
+    Text/image interleaving is not supported: text order and image order survive independently.
+    Joining text here keeps the existing whole-result guard and storage contracts intact.
     """
-    texts: list[str] = []
+    parts: list[dict[str, Any]] = []
+    image_bytes = 0
     for item in result.content:
         if isinstance(item, mcp_types.TextContent):
-            texts.append(item.text)
-        elif isinstance(item, mcp_types.ImageContent | mcp_types.AudioContent):
-            texts.append(f"[{item.mime_type} data, {len(item.data)} bytes]")
+            parts.append({"type": "text", "text": item.text})
+        elif isinstance(item, mcp_types.ImageContent):
+            try:
+                if item.mime_type not in MODEL_IMAGE_MIMES:
+                    raise ValueError("unsupported image MIME type; use PNG, JPEG or WebP")
+                remaining = IMAGE_SIZE_CAP - image_bytes
+                if len(item.data) > 4 * ((remaining + 2) // 3):
+                    raise ValueError("image result exceeds byte limit")
+                raw = base64.b64decode(item.data, validate=True)
+                if len(raw) > remaining:
+                    raise ValueError("image result exceeds byte limit")
+                if sniff_image_mime(raw) != item.mime_type:
+                    raise ValueError("image bytes do not match MIME type")
+                _kind, _mime, rejection = classify_upload("tool-image", item.mime_type, raw)
+                if rejection is not None:
+                    raise ValueError(rejection.message)
+                validate_image(raw)
+                stored = stored_upload_content("image", raw)
+                size = max(len(raw), len(stored))
+                if size > remaining:
+                    raise ValueError("image result exceeds byte limit")
+            except ValueError as exc:
+                parts.append({"type": "text", "text": f"[MCP image omitted: {exc}]"})
+                continue
+            image_bytes += size
+            encoded = base64.b64encode(stored).decode("ascii")
+            parts.append(
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:{item.mime_type};base64,{encoded}"},
+                }
+            )
+        elif isinstance(item, mcp_types.AudioContent):
+            parts.append(
+                {"type": "text", "text": f"[{item.mime_type} data, {len(item.data)} bytes]"}
+            )
         else:
-            texts.append(str(item))
-    if texts:
-        output = "\n".join(texts)
-    elif getattr(result, "structured_content", None) is not None:
+            parts.append({"type": "text", "text": str(item)})
+    if image_bytes:
+        text = "\n".join(p["text"] for p in parts if p["type"] == "text")
+        if result.is_error:
+            text = "Error: MCP tool returned an error." + ("\n" + text if text else "")
+        images = [p for p in parts if p["type"] == "image_url"]
+        if not text:
+            text = f"[{len(images)} image{'s' if len(images) != 1 else ''} attached]"
+        return [{"type": "text", "text": text}, *images]
+    if parts:
+        output = "\n".join(p["text"] for p in parts)
+    elif result.structured_content is not None:
         output = json.dumps(result.structured_content)
     else:
         output = "(no output)"

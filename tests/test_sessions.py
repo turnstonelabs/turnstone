@@ -4,6 +4,7 @@ import json
 from typing import Any
 from unittest.mock import MagicMock, patch
 
+import mcp.types as mcp_types
 import pytest
 import sqlalchemy as sa
 
@@ -1421,7 +1422,9 @@ class TestMCPActingUserBinding:
     def _make(self, mock_openai_client, owner="alice"):
         mcp_client = MagicMock()
         mcp_client.get_tools.return_value = []
-        mcp_client.call_tool_sync.return_value = "ok"
+        mcp_client.call_tool_sync.return_value = mcp_types.CallToolResult(
+            content=[mcp_types.TextContent(text="ok")]
+        )
         session = ChatSession(
             client=mock_openai_client,
             model="local-model",

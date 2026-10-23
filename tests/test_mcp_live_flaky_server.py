@@ -34,7 +34,7 @@ from tests.conftest import (
     _wait_session_live,
     _wait_tcp_ready,
 )
-from turnstone.core.mcp_client import MCPClientManager
+from turnstone.core.mcp_client import MCPClientManager, _decode_tool_result
 
 if TYPE_CHECKING:
     import subprocess
@@ -171,7 +171,9 @@ class TestFlakyServerNoSpin:
                 assert _wait_session_live(mgr, "flaky", 10.0, previous_session=previous_session), (
                     f"no fresh session after flap cycle {_cycle}"
                 )
-                assert "42" in mgr.call_tool_sync("mcp__flaky__ping_me", {"x": 41}, timeout=10)
+                assert "42" in _decode_tool_result(
+                    mgr.call_tool_sync("mcp__flaky__ping_me", {"x": 41}, timeout=10)
+                )
 
             assert mgr._loop is not None
             armed, owners = -1, -1
@@ -203,7 +205,9 @@ class TestFlakyServerNoSpin:
             assert mgr._last_scope_disarm == 0.0
 
             # And the recovered session actually dispatches.
-            out = mgr.call_tool_sync("mcp__flaky__ping_me", {"x": 41}, timeout=10)
+            out = _decode_tool_result(
+                mgr.call_tool_sync("mcp__flaky__ping_me", {"x": 41}, timeout=10)
+            )
             assert "42" in out
         finally:
             if mgr is not None:

@@ -39,6 +39,7 @@ from tests.conftest import _run_on_loop, make_mcp_token_cipher, stop_loop_thread
 from turnstone.core.mcp_client import (
     MCPClientManager,
     _AuthCapture,
+    _decode_tool_result,
     _make_capturing_http_client,
 )
 from turnstone.core.mcp_crypto import MCPTokenStore
@@ -629,11 +630,13 @@ class TestDispatcherAuthFlows:
             "turnstone.core.mcp_client.get_user_access_token_classified",
             side_effect=_fake_classified,
         ):
-            result = mgr.call_tool_sync(
-                "mcp__pool-srv__do_thing",
-                {},
-                user_id="user-1",
-                timeout=5,
+            result = _decode_tool_result(
+                mgr.call_tool_sync(
+                    "mcp__pool-srv__do_thing",
+                    {},
+                    user_id="user-1",
+                    timeout=5,
+                )
             )
 
         assert result == "ok"
@@ -980,8 +983,8 @@ class TestBreakerInvariant:
             "turnstone.core.mcp_client.get_user_access_token_classified",
             side_effect=_fake_classified,
         ):
-            result_401_retry = mgr.call_tool_sync(
-                "mcp__pool-srv__do_thing", {}, user_id="user-1", timeout=5
+            result_401_retry = _decode_tool_result(
+                mgr.call_tool_sync("mcp__pool-srv__do_thing", {}, user_id="user-1", timeout=5)
             )
         assert result_401_retry == "ok"
         assert mgr._consecutive_failures.get("pool-srv", 0) == 0
@@ -1062,7 +1065,9 @@ class TestOpenLockHeldAcrossCallTool:
 
         def _dispatch() -> None:
             results.append(
-                mgr.call_tool_sync("mcp__pool-srv__do_thing", {}, user_id="user-1", timeout=5)
+                _decode_tool_result(
+                    mgr.call_tool_sync("mcp__pool-srv__do_thing", {}, user_id="user-1", timeout=5)
+                )
             )
 
         t1 = threading.Thread(target=_dispatch)
@@ -1116,7 +1121,7 @@ class TestCrossTaskRetryIsolation:
         # Capture each invocation's task identity.
         invocations: list[dict[str, Any]] = []
 
-        async def _fake_dispatch_pool(**kwargs: Any) -> str:
+        async def _fake_dispatch_pool(**kwargs: Any) -> mcp_types.CallToolResult:
             task = asyncio.current_task()
             invocations.append(
                 {
@@ -1127,11 +1132,13 @@ class TestCrossTaskRetryIsolation:
             )
             if kwargs.get("retry_count") == 0:
                 raise _PoolDispatchRetryRequested
-            return "RETRY_OK"
+            return mcp_types.CallToolResult(content=[mcp_types.TextContent(text="RETRY_OK")])
 
         mgr._dispatch_pool = _fake_dispatch_pool  # type: ignore[method-assign]
 
-        result = mgr.call_tool_sync("mcp__pool-srv__do_thing", {}, user_id="user-1", timeout=5)
+        result = _decode_tool_result(
+            mgr.call_tool_sync("mcp__pool-srv__do_thing", {}, user_id="user-1", timeout=5)
+        )
 
         assert result == "RETRY_OK"
         assert len(invocations) == 2, (
@@ -1182,13 +1189,13 @@ class TestRetryTimeoutBudget:
 
         observed_timeouts: list[int] = []
 
-        async def _slow_then_succeed(**kwargs: Any) -> str:
+        async def _slow_then_succeed(**kwargs: Any) -> mcp_types.CallToolResult:
             if kwargs.get("retry_count") == 0:
                 # Burn ~1s of wall-clock on the first attempt before
                 # signalling the retry.
                 await asyncio.sleep(1.0)
                 raise _PoolDispatchRetryRequested
-            return "RETRY_OK"
+            return mcp_types.CallToolResult(content=[mcp_types.TextContent(text="RETRY_OK")])
 
         mgr._dispatch_pool = _slow_then_succeed  # type: ignore[method-assign]
 
@@ -1200,7 +1207,9 @@ class TestRetryTimeoutBudget:
 
         mgr._run_pool_dispatch_attempt = _spy_run  # type: ignore[method-assign]
 
-        result = mgr.call_tool_sync("mcp__pool-srv__do_thing", {}, user_id="user-1", timeout=10)
+        result = _decode_tool_result(
+            mgr.call_tool_sync("mcp__pool-srv__do_thing", {}, user_id="user-1", timeout=10)
+        )
 
         assert result == "RETRY_OK"
         assert len(observed_timeouts) == 2, (
@@ -1494,14 +1503,11 @@ def test_get_prompt_sync_raises_on_structured_error_envelope(
     assert decoded["error"]["code"] == code
 
 
-def test_call_tool_sync_does_not_wrap_non_structured_string(
-    running_loop_mgr, storage: SQLiteBackend
+@pytest.mark.parametrize("code", ["tool_specific_failure", "mcp_tool_call_forbidden"])
+def test_call_tool_sync_preserves_successful_error_shaped_text(
+    running_loop_mgr, storage: SQLiteBackend, code: str
 ) -> None:
-    """A success-shape return whose payload merely happens to start with
-    ``{"error":...`` but lacks an ``mcp_*`` code MUST flow back to the
-    caller as a string, not a raised RuntimeError. This is the bug-1
-    fix's defensive gate: only structured-error envelopes are wrapped.
-    """
+    """The SDK result distinguishes tool data from internal authorization failures."""
     mgr, _loop, _ = running_loop_mgr
     cipher = make_mcp_token_cipher()
     _seed_oauth_server(storage, name="pool-srv")
@@ -1509,16 +1515,16 @@ def test_call_tool_sync_does_not_wrap_non_structured_string(
     mgr.set_storage(storage)
     mgr.set_app_state(_make_app_state(storage, cipher=cipher))
 
-    # Tool output that happens to look JSON-ish but isn't a Phase 7b
-    # ``_structured_error`` envelope. Must round-trip as a plain string.
-    payload = json.dumps({"error": {"code": "tool_specific_failure", "msg": "x"}})
+    payload = json.dumps({"error": {"code": code, "msg": "x"}})
 
-    async def _fake_dispatch_pool(**_kwargs: Any) -> str:
-        return payload
+    async def _fake_dispatch_pool(**_kwargs: Any) -> mcp_types.CallToolResult:
+        return mcp_types.CallToolResult(content=[mcp_types.TextContent(text=payload)])
 
     mgr._dispatch_pool = _fake_dispatch_pool  # type: ignore[method-assign]
 
-    result = mgr.call_tool_sync("mcp__pool-srv__do_thing", {}, user_id="user-1", timeout=5)
+    result = _decode_tool_result(
+        mgr.call_tool_sync("mcp__pool-srv__do_thing", {}, user_id="user-1", timeout=5)
+    )
     assert result == payload
 
 
@@ -1870,7 +1876,9 @@ class TestPoolPrimingAndTokenRotation:
 
         mgr._connect_one_pool = _fake_connect.__get__(mgr, type(mgr))  # type: ignore[method-assign]
 
-        result = mgr.call_tool_sync("mcp__pool-srv__do_thing", {}, user_id="user-1", timeout=5)
+        result = _decode_tool_result(
+            mgr.call_tool_sync("mcp__pool-srv__do_thing", {}, user_id="user-1", timeout=5)
+        )
 
         assert result == "ok"
         # Stale bound token (bearer-old) != resolved token (bearer-new) -> exactly

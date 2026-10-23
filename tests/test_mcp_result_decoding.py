@@ -39,7 +39,8 @@ def test_tool_mixed_content_retains_order_and_mime_types() -> None:
         ]
     )
     assert _decode_tool_result(result) == (
-        "before\n[image/png data, 8 bytes]\nbetween\n[audio/wav data, 4 bytes]"
+        "before\n[MCP image omitted: image bytes do not match MIME type]\nbetween\n"
+        "[audio/wav data, 4 bytes]"
     )
 
 

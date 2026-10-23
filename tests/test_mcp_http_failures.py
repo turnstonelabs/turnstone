@@ -36,6 +36,7 @@ from turnstone.core.mcp_client import (
     MCPClientManager,
     _AuthCapture,
     _CapturedHTTPError,
+    _decode_tool_result,
     _is_dead_transport,
     _make_capturing_http_client,
 )
@@ -245,7 +246,12 @@ def dispatch_env(request, upstream_server, monkeypatch):
             # dispatch must still see failures through the hook attached to that same client.
             _run_on_loop(mgr._loop, prime())
         # Establish a session and its catalog before injecting a failure.
-        assert mgr.call_tool_sync("mcp__srv__op", {}, user_id="user-1" if pooled else None) == "ok"
+        assert (
+            _decode_tool_result(
+                mgr.call_tool_sync("mcp__srv__op", {}, user_id="user-1" if pooled else None)
+            )
+            == "ok"
+        )
         yield mgr, upstream, pooled
     finally:
         mgr.shutdown()
@@ -254,7 +260,7 @@ def dispatch_env(request, upstream_server, monkeypatch):
 def _call(mgr: MCPClientManager, kind: str, pooled: bool) -> str:
     kwargs = {"user_id": "user-1" if pooled else None, "timeout": 4}
     if kind == "tool":
-        return mgr.call_tool_sync("mcp__srv__op", {}, **kwargs)
+        return _decode_tool_result(mgr.call_tool_sync("mcp__srv__op", {}, **kwargs))
     if kind == "resource":
         return mgr.read_resource_sync("test://resource", **kwargs)
     return mgr.get_prompt_sync("mcp__srv__op", {}, **kwargs)[0]["content"]
@@ -359,8 +365,10 @@ def test_tool_error_preserves_error_prefix_and_session(dispatch_env):
     mgr, _upstream, pooled = dispatch_env
     session = _session(mgr, pooled)
 
-    output = mgr.call_tool_sync(
-        "mcp__srv__op", {"fail": True}, user_id="user-1" if pooled else None, timeout=4
+    output = _decode_tool_result(
+        mgr.call_tool_sync(
+            "mcp__srv__op", {"fail": True}, user_id="user-1" if pooled else None, timeout=4
+        )
     )
 
     assert output == "Error: boom"
@@ -379,7 +387,7 @@ def test_a_configured_log_level_reaches_the_server(upstream_server):
             mgr = MCPClientManager({"srv": cfg})
         mgr.start()
         try:
-            assert mgr.call_tool_sync("mcp__srv__op", {}, timeout=4) == "ok"
+            assert _decode_tool_result(mgr.call_tool_sync("mcp__srv__op", {}, timeout=4)) == "ok"
         finally:
             mgr.shutdown()
 
@@ -826,7 +834,9 @@ def test_large_sse_tool_result_exceeding_sdk_default_1mb_limit() -> None:
         try:
             assert mgr._static_servers["srv"].session.protocol_version == "2025-11-25"
             size = 2 * 1024 * 1024 + 1024  # >2 MiB, well over the SDK's 1 MiB default
-            output = mgr.call_tool_sync("mcp__srv__op", {"size": size}, timeout=15)
+            output = _decode_tool_result(
+                mgr.call_tool_sync("mcp__srv__op", {"size": size}, timeout=15)
+            )
             assert len(output) == size
             assert output == "x" * size
             assert mgr._consecutive_failures.get("srv", 0) == 0

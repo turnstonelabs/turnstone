@@ -119,7 +119,7 @@ from turnstone.core.lowering import (
     tool_args_preview,
     wire_valid_arguments,
 )
-from turnstone.core.mcp_client import MCPShutdownError, try_prime_user_pools
+from turnstone.core.mcp_client import MCPShutdownError, _decode_tool_result, try_prime_user_pools
 from turnstone.core.media_materialization import (
     PDF_EXTRACTED_TEXT_PART_OVERHEAD_CHARS,
     PDF_RASTER_TRUNCATION_NOTICE,
@@ -1842,6 +1842,36 @@ _TOOL_RESULT_SHARE: float = 0.20
 # notice, and at an exhausted allowance they take the guaranteed floor instead
 # of the drop notice.
 _CONSUMED_RESULT_TOOLS: frozenset[str] = frozenset({"bash_output"})
+
+
+def _tool_result_text(output: Any) -> str | None:
+    """Read the text body of a scalar or one-text-block image result.
+
+    MCP normalizes to this shape at ingestion. Other multipart shapes keep their existing path.
+    Returning the original string also preserves controller text and bounded-capture metadata.
+    """
+    if isinstance(output, str):
+        return output
+    if (
+        isinstance(output, list)
+        and output
+        and isinstance(output[0], dict)
+        and output[0].get("type") == "text"
+        and isinstance(output[0].get("text"), str)
+        and all(isinstance(part, dict) and part.get("type") == "image_url" for part in output[1:])
+    ):
+        text: str = output[0]["text"]
+        return text
+    return None
+
+
+def _replace_tool_result_text(
+    output: str | list[dict[str, Any]], text: str
+) -> str | list[dict[str, Any]]:
+    """Replace the single text body read by ``_tool_result_text``; retain every image."""
+    if isinstance(output, str):
+        return text
+    return [{**output[0], "text": text}, *output[1:]]
 
 
 def _result_marker_factory(tool_name: str) -> TruncationMarker:
@@ -11359,6 +11389,7 @@ class ChatSession:
         preview: dict[str, Any] | None,
         effect_status: str | None,
         projection_safe: bool,
+        attachments: list[dict[str, Any]] | None = None,
     ) -> int | None:
         """Publish one accepted TOOL row or request exceptional repair.
 
@@ -11385,6 +11416,7 @@ class ChatSession:
                             is_error=is_error,
                             preview=preview,
                             effect_status=effect_status,
+                            **({"attachments": attachments} if attachments else {}),
                         )
                     )
                     if event_id is not None:
@@ -13739,14 +13771,15 @@ class ChatSession:
                     verbatim_pool = _ZERO_BUDGET_VERBATIM_POOL_CHARS
                     admitted: list[tuple[str, Any]] = []
                     for tc_id, output in results:
-                        if isinstance(output, str):
+                        text = _tool_result_text(output)
+                        if text is not None:
                             # ``_tool_error_flags`` is still populated here;
                             # the per-result loop below pops it to build the
                             # persisted turn.
                             truncation, verbatim_pool = self._admit_tool_result(
                                 names.get(tc_id, ""),
                                 tc_id,
-                                output,
+                                text,
                                 budget_tokens=truncation_budget,
                                 maximum_chars=cap,
                                 verbatim_pool=verbatim_pool,
@@ -13757,7 +13790,7 @@ class ChatSession:
                                 truncation_budget
                                 - math.ceil(len(truncation.text) / self._chars_per_token),
                             )
-                            output = truncation.text
+                            output = _replace_tool_result_text(output, truncation.text)
                         admitted.append((tc_id, output))
                     results = admitted
 
@@ -13851,16 +13884,17 @@ class ChatSession:
                 recut: list[tuple[int, str, Any, OutputAssessment | None]] = []
                 for _ri, tc_id, output, assessment in guarded_results:
                     rendered = _admissions.get(tc_id)
+                    text = _tool_result_text(output)
                     if (
                         rendered is not None
-                        and isinstance(output, str)
+                        and text is not None
                         and rendered.truncated
                         and rendered.limit_chars > 0
-                        and len(output) > rendered.limit_chars
-                        and output.count(rendered.marker) == 1
+                        and len(text) > rendered.limit_chars
+                        and text.count(rendered.marker) == 1
                     ):
-                        head, _marker, tail = output.partition(rendered.marker)
-                        output = (
+                        head, _marker, tail = text.partition(rendered.marker)
+                        text = (
                             TextProjectionSource(
                                 head, tail, len(head) + len(tail) + rendered.omitted_chars
                             )
@@ -13870,6 +13904,7 @@ class ChatSession:
                             )
                             .text
                         )
+                        output = _replace_tool_result_text(output, text)
                     recut.append((_ri, tc_id, output, assessment))
                 guarded_results = recut
                 _admissions.clear()
@@ -13913,6 +13948,16 @@ class ChatSession:
                             "tool_call_id": tc_id,
                             "content": tool_content,
                         }
+                        if tool_image_atts:
+                            tool_msg["_attachments_meta"] = [
+                                {
+                                    "attachment_id": att.attachment_id,
+                                    "kind": att.kind,
+                                    "filename": att.filename,
+                                    "mime_type": att.mime_type,
+                                }
+                                for att in tool_image_atts
+                            ]
                         tool_is_error = self._tool_error_flags.pop(tc_id, False)
                         if tool_is_error:
                             tool_msg["is_error"] = True
@@ -13941,18 +13986,14 @@ class ChatSession:
                                 1,
                                 int(text_chars / self._chars_per_token) + image_count * 1000,
                             )
-                            # One scalar is shared by pending /history,
-                            # accepted SSE, and the durable TEXT column. The
-                            # history projector joins multipart text blocks
-                            # with newlines, so use the same delimiter here.
-                            store_text = "\n".join(
-                                p.get("text", "")
-                                for p in output
-                                if isinstance(p, dict) and p.get("type") == "text"
-                            )
                         else:
                             tok_est = max(1, int(len(output) / self._chars_per_token))
-                            store_text = output
+                        # One scalar is shared by pending /history, accepted SSE, and storage.
+                        store_text = (
+                            "\n".join(p.get("text", "") for p in output if p.get("type") == "text")
+                            if isinstance(output, list)
+                            else output
+                        )
                         tool_atts = list(tool_image_atts)
                         if tool_preview is not None:
                             tool_atts.append(tool_preview[1])
@@ -14739,6 +14780,7 @@ class ChatSession:
                 preview=preview,
                 effect_status=effect_status,
                 projection_safe=projection_safe,
+                attachments=message.get("_attachments_meta"),
             )
             message["_event_id"] = event_id_ref[0]
             turn.meta.event_id = event_id_ref[0]
@@ -24972,7 +25014,7 @@ class ChatSession:
             "mcp_args": args,
         }
 
-    def _exec_mcp_tool(self, item: dict[str, Any]) -> tuple[str, str]:
+    def _exec_mcp_tool(self, item: dict[str, Any]) -> tuple[str, str | list[dict[str, Any]]]:
         """Execute an MCP tool call via the MCPClientManager."""
         self._check_cancelled()
         call_id: str = item["call_id"]
@@ -24983,13 +25025,15 @@ class ChatSession:
         mcp_error = False
         mcp_status: EffectStatus | None = None
         try:
-            output = self._mcp_client.call_tool_sync(
+            result = self._mcp_client.call_tool_sync(
                 func_name,
                 args,
                 user_id=str(item["_principal_id"] or "").strip() or None,
                 timeout=self.tool_timeout,
                 is_interactive_for_consent=self._is_interactive_for_consent,
             )
+            output = _decode_tool_result(result)
+            mcp_error = result.is_error
         except TimeoutError:
             # An MCP tool is an opaque action — the server may have run it to
             # completion before we stopped waiting, so the outcome is unobserved.
@@ -25015,10 +25059,18 @@ class ChatSession:
             mcp_error = True
             self.ui.on_error(output)
 
+        # Receipts are text-only; pixels must reach the ordinary multipart
+        # fold intact, never the string truncator or the SSE event ring.
+        receipt = output
+        if isinstance(output, list):
+            receipt = "\n".join(
+                p.get("text", "") if p.get("type") == "text" else "[image attached]" for p in output
+            )
+        assert isinstance(receipt, str)
         self._report_tool_result(
             call_id,
             func_name,
-            self._truncate_output(output),
+            self._truncate_output(receipt),
             is_error=mcp_error,
             status=mcp_status,
         )
@@ -27112,13 +27164,10 @@ class ChatSession:
                 # Agents operate autonomously; they can refine their queries
                 # if the clip loses important detail.
                 original_chars: int | None = None
-                if isinstance(output, str):
-                    original_chars = (
-                        output.source.original_chars
-                        if isinstance(output, ProjectedText)
-                        else len(output)
-                    )
-                    if isinstance(output, ProjectedText) or len(output) > _AGENT_GUARD_WINDOW_CHARS:
+                text = _tool_result_text(output)
+                if text is not None:
+                    original_chars = source_chars(text)
+                    if isinstance(text, ProjectedText) or len(text) > _AGENT_GUARD_WINDOW_CHARS:
                         # A capture arrives as a rendering with its source
                         # attached: render the window from that source here,
                         # in the head mode the clip below uses, so the agent
@@ -27127,12 +27176,16 @@ class ChatSession:
                         # marker from the start: should redaction shrink it
                         # below the clip, the result still reads as cut, with
                         # its true size.
-                        output = _clip_agent_text(
+                        output = _replace_tool_result_text(
                             output,
-                            _AGENT_GUARD_WINDOW_CHARS,
-                            original_chars=original_chars,
-                            tool_name=tool_name,
+                            _clip_agent_text(
+                                text,
+                                _AGENT_GUARD_WINDOW_CHARS,
+                                original_chars=original_chars,
+                                tool_name=tool_name,
+                            ),
                         )
+                del text
 
                 # Output guard on the window.  A tool's own text inside a list
                 # result is guarded part by part, as in the main loop.
@@ -27164,13 +27217,18 @@ class ChatSession:
                             principal_id=agent_principal,
                             cancel_ref=cancel_scope.cancel_ref,
                         )
-                if isinstance(output, str) and len(output) > _AGENT_TOOL_OUTPUT_CAP:
-                    output = _clip_agent_text(
+                text = _tool_result_text(output)
+                if text is not None and len(text) > _AGENT_TOOL_OUTPUT_CAP:
+                    output = _replace_tool_result_text(
                         output,
-                        _AGENT_TOOL_OUTPUT_CAP,
-                        original_chars=original_chars,
-                        tool_name=tool_name,
+                        _clip_agent_text(
+                            text,
+                            _AGENT_TOOL_OUTPUT_CAP,
+                            original_chars=original_chars,
+                            tool_name=tool_name,
+                        ),
                     )
+                del text
                 if assessment is not None:
                     # The guard read past the clip, so a finding on a cut
                     # result may concern text the agent never receives; the

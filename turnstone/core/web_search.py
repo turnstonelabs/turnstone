@@ -106,13 +106,35 @@ class MCPSearchClient:
     def search(self, query: str, max_results: int = 5, **kwargs: Any) -> str:
         import math
 
+        import mcp.types as mcp_types
+
+        from turnstone.core.mcp_client import _decode_tool_result
+
         args: dict[str, Any] = {"query": query}
         if max_results != 5:
             args["max_results"] = max_results
         category = kwargs.get("category")
         if category:
             args["category"] = category
-        return self._mcp.call_tool_sync(self._tool, args, timeout=max(1, math.ceil(self._timeout)))
+        result = self._mcp.call_tool_sync(
+            self._tool, args, timeout=max(1, math.ceil(self._timeout))
+        )
+        # This adapter consumes only text. Omit images before decoding their pixels.
+        result = result.model_copy(
+            update={
+                "content": [
+                    mcp_types.TextContent(
+                        text="[Image omitted from text-only web search; call the MCP tool directly to view it.]"
+                    )
+                    if isinstance(part, mcp_types.ImageContent)
+                    else part
+                    for part in result.content
+                ]
+            }
+        )
+        output = _decode_tool_result(result)
+        assert isinstance(output, str)
+        return output
 
 
 # ---------------------------------------------------------------------------

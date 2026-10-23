@@ -5411,7 +5411,8 @@ class TestAgentOutputGuard:
 
         assert [c for c in landed if c.startswith("x")][-1] == "x" * 1500
 
-    def test_agent_loop_guard_scans_a_bounded_window(self):
+    @pytest.mark.parametrize("multipart", [False, True])
+    def test_agent_loop_guard_scans_a_bounded_window(self, multipart):
         """The guard evaluates a bounded window of the result, never an
         unbounded string a tool server controls."""
         from turnstone.core.judge import JudgeConfig
@@ -5421,9 +5422,11 @@ class TestAgentOutputGuard:
         session = _make_session(judge_config=JudgeConfig(output_guard=True))
         client = replace_session_lane(session, provider=OpenAIChatCompletionsProvider()).client
         seen_lengths: list[int] = []
+        landed = []
 
         def recording_guard(_call_id, output, *_args, **_kwargs):
-            seen_lengths.append(len(output))
+            if _args[0] == "read_file":
+                seen_lengths.append(len(output))
             return output, None
 
         with patch.object(session, "_evaluate_output", side_effect=recording_guard):
@@ -5441,23 +5444,49 @@ class TestAgentOutputGuard:
                 {"content": "Done"},
             )
             huge = "x" * (_AGENT_TOOL_OUTPUT_CAP * 4)
+            image = {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}}
+            output = (
+                [
+                    {"type": "text", "text": huge + "\n" + huge},
+                    image,
+                    image,
+                ]
+                if multipart
+                else huge
+            )
 
             def fake_prepare(tc_dict, **kwargs):
                 return {
                     "call_id": tc_dict["id"],
                     "func_name": "read_file",
                     "needs_approval": False,
-                    "execute": lambda p: ("call_1", huge),
+                    "execute": lambda p: ("call_1", output),
                 }
 
-            with patch.object(session, "_prepare_tool", side_effect=fake_prepare):
+            original_tool = Turn.tool
+
+            def recording_tool(call_id, content, *args, **kwargs):
+                landed.append(content)
+                return original_tool(call_id, content, *args, **kwargs)
+
+            with (
+                patch.object(session, "_prepare_tool", side_effect=fake_prepare),
+                patch("turnstone.core.session.Turn.tool", side_effect=recording_tool),
+            ):
                 session._run_agent(
                     [Turn.user("test")],
                     tools=[{"type": "function", "function": {"name": "read_file"}}],
                     label="test",
                 )
 
-        assert seen_lengths and max(seen_lengths) <= _AGENT_GUARD_WINDOW_CHARS
+        from turnstone.core.session import _tool_result_text
+
+        assert seen_lengths and sum(seen_lengths) <= _AGENT_GUARD_WINDOW_CHARS
+        final = landed[-1]
+        assert len(_tool_result_text(final)) <= _AGENT_TOOL_OUTPUT_CAP
+        if multipart:
+            assert final[1] is image and final[2] is image
+            assert f"(truncated from {2 * len(huge) + 1} chars)" in _tool_result_text(final)
 
     def test_agent_loop_guard_window_reaches_past_the_clip(self):
         """A credential that straddles the clip boundary is seen whole by the
