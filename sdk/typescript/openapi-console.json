@@ -8386,7 +8386,7 @@
         "tags": [
           "Coordinator"
         ],
-        "description": "Reads the in-memory child registry and dispatches ``close_workstream`` via the routing proxy for every direct child under a bounded (16-concurrency) semaphore.  Soft-close only \u2014 it does not touch grandchildren (the model-facing tool asks for a bounded teardown of its own direct fan-out).  Returns ``{closed, failed, skipped}`` where ``skipped`` distinguishes already-gone (404) from dispatch-broken (``failed``).  The optional ``reason`` propagates to every closed child's audit + workstream_config.  Writes ``coordinator.closed_all_children`` at the coord level.",
+        "description": "Combines the in-memory child registry with all published children stored under the same coordinator and owner, without a listing cap. Creating reservations are excluded. Discovery leaves registry membership unchanged and returns 503 before any close is sent if the child set cannot be read. Dispatches ``close_workstream`` via the routing proxy for each child under a bounded (16-concurrency) semaphore. Soft-close only \u2014 it does not touch grandchildren. Returns ``{closed, failed, skipped}`` where ``skipped`` distinguishes already-gone (404) from dispatch-broken (``failed``). The optional ``reason`` propagates to every closed child's audit + workstream_config. Writes ``coordinator.closed_all_children`` at the coord level.",
         "parameters": [
           {
             "name": "ws_id",

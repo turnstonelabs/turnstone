@@ -362,10 +362,10 @@ auto-cascades to its direct children.
 
 Discovery combines registered children with all published children stored under the same
 coordinator and owner, including children whose creation events have not arrived. A failed
-discovery returns 503 before any child is closed. Discovery does not update UI membership: after
-a failed reopen seed, missing children regain event routing when their creation event arrives or
-the coordinator is reopened successfully. Children published after discovery are outside this
-close-all operation.
+discovery returns 503 before any child is closed. Discovery does not update UI membership or repair
+a failed reopen seed. Missing children whose creation events have already passed require a
+successful reopen to restore live event routing. Children published after discovery are outside
+this close-all operation.
 
 See [bulk-endpoints.md](bulk-endpoints.md) for why `close_all_children`
 uses the cascade-mutation shape and how it differs from the
