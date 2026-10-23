@@ -2300,7 +2300,12 @@ many addresses on public paths can't lock signed-in users out.
   IPv6 addresses are normalized. The direct client IP must be in the trusted
   set before XFF is considered.
 - On limit exceeded: HTTP 429 with `Retry-After` header and JSON body
-  `{"error": "Rate limit exceeded", "retry_after": N}`.
+  `{"error": "Rate limit exceeded", "retry_after": N}`. The limiter answers
+  before any handler runs, so a coordinator's `CoordinatorClient` sends a
+  refused create once more after that wait (when it's 5 seconds or less),
+  unless the coordinator is stopped first, which cuts the wait short. The
+  browser's `authFetch` retries a refused API call after that wait too, up to
+  twice.
 - The `turnstone_ratelimit_rejected_total` counter is incremented on each
   rejection.
 

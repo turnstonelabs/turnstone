@@ -269,8 +269,9 @@ frozen.
   registered when the Stop landed, so the batch cancels each child whose create returns after the
   stop, and audits those cancels as `coordinator.cancel_cascaded` with `src: spawn_batch`. The
   children can be created in any order (`results` stays keyed by input index). With a node's rate
-  limiting on, a batch's creates arrive together and count against their creator's bucket, so a
-  `ratelimit.burst` below 10, or the creator's other traffic, can get some of them refused (#1464).
+  limiting on, a batch's creates arrive together and count against their creator's bucket; a
+  create the limiter refuses is sent once more after the wait it names, and a second refusal is
+  reported as denied (#1464).
 - **The denial nudge no longer waits out `memory.nudge_cooldown` (#924).** The note asking the
   model whether a rejected tool call reflects a lasting preference now follows each batch a person
   rejects; the cooldown spaces only the correction and completion nudges and the coordinator's
@@ -725,6 +726,15 @@ frozen.
   each of its children on its creator's bucket, which the children's own creates may just have
   drained, and a cancel the limiter refused left that child running. A cancel is no longer
   limited: `/v1/api/workstreams/{ws_id}/cancel` and `/v1/api/watches/{watch_id}/cancel` are exempt.
+- **A coordinator sends a create the node's rate limiter refused once more (#1464)** — with rate
+  limiting on, `spawn_batch` sends every child's create at once, and a create past its creator's
+  burst was refused and reported as denied. A create the limiter refuses, from `spawn_batch` or
+  `spawn_workstream`, is now sent once more after the wait the refusal names, unless the
+  coordinator is stopped first, which cuts the wait short; the limiter answers before any handler
+  runs, so the refused create made nothing. A refusal that names no wait, or one longer than 5
+  seconds, comes back as before. Like `spawn_batch`, `spawn_workstream` now cancels a child whose
+  create returns after a Stop, which the console's cancel cascade can't reach, and audits the
+  cancel as `coordinator.cancel_cascaded` with `src: spawn_workstream`.
 - **The Python SDK presents its client certificate when `ca_cert` is also set (#1425)** — with
   both, the client certificate was dropped without a warning, so a node that requires one, such as
   a node with TLS on, refused the handshake.

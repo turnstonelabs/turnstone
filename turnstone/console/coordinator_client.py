@@ -547,6 +547,37 @@ _ROUTE_PATHS: dict[str, str] = {
     "close_all_children": "/v1/api/workstreams/{ws_id}/close_all_children",
 }
 
+# The longest wait a refused create is resent after.  A node's rate limiter names 1 or 2
+# seconds (``ratelimit.requests_per_second`` is at least 1); a longer wait isn't sat out.
+_RESEND_MAX_WAIT_S = 5
+# The wait is sat out in slices this many to the second, each one checking for a stop, so a
+# Stop or close cuts it short.  Counted rather than timed by the clock.
+_RESEND_WAIT_SLICES_PER_S = 10
+
+
+def _rate_limit_wait(resp: httpx2.Response) -> int | None:
+    """The seconds a 429 names in ``Retry-After``, when they're few enough to wait out.
+
+    Only delta-seconds count.  A node at capacity answers a create 429 with no
+    ``Retry-After``, so only its rate limiter's refusal comes back with a wait.
+    """
+    if resp.status_code != 429:
+        return None
+    value = resp.headers.get("retry-after", "")
+    if not (value.isascii() and value.isdigit() and len(value) <= 3):
+        return None
+    wait = int(value)
+    return wait if wait <= _RESEND_MAX_WAIT_S else None
+
+
+def _wait_unless_stopped(wait: int, stopped: Callable[[], bool]) -> bool:
+    """Sit out *wait* seconds unless *stopped* turns true first; True when the wait ran out."""
+    for _ in range(wait * _RESEND_WAIT_SLICES_PER_S):
+        if stopped():
+            return False
+        time.sleep(1 / _RESEND_WAIT_SLICES_PER_S)
+    return not stopped()
+
 
 class CoordinatorClient:
     """Sync helper driving a coordinator session's children.
@@ -623,6 +654,7 @@ class CoordinatorClient:
         body: dict[str, Any],
         *,
         ws_id: str | None = None,
+        resend_unless: Callable[[], bool] | None = None,
     ) -> dict[str, Any]:
         """POST to a routing-proxy path. ``ws_id`` is interpolated into
         the path template when it has a ``{ws_id}`` slot (post-#422
@@ -637,7 +669,9 @@ class CoordinatorClient:
             path = template.format(ws_id=ws_id)
         else:
             path = template
-        return self._post_url(f"{self._base_url}{path}", body, log_path=template)
+        return self._post_url(
+            f"{self._base_url}{path}", body, log_path=template, resend_unless=resend_unless
+        )
 
     def _post_url(
         self,
@@ -645,6 +679,7 @@ class CoordinatorClient:
         body: dict[str, Any],
         *,
         log_path: str,
+        resend_unless: Callable[[], bool] | None = None,
     ) -> dict[str, Any]:
         """POST a pre-built URL with the canonical error handling.
 
@@ -660,6 +695,12 @@ class CoordinatorClient:
         acted on, a create outlasting the client's timeout say, so its error
         says the request may have been processed and carries
         ``UPSTREAM_NO_REPLY_CODE``.
+
+        With ``resend_unless`` given, a 429 that names a short wait in
+        ``Retry-After`` is sent once more after that wait, unless
+        ``resend_unless()`` turns true during it; the refusal comes back otherwise.
+        Only a create passes it: a node's rate limiter answers before any
+        handler runs, so the create it refused made nothing.
         """
         try:
             resp = self._http.post(url, json=body, headers=self._headers())
@@ -675,6 +716,11 @@ class CoordinatorClient:
                 "code": UPSTREAM_NO_REPLY_CODE,
                 "status": 0,
             }
+        if resend_unless is not None:
+            wait = _rate_limit_wait(resp)
+            if wait is not None and _wait_unless_stopped(wait, resend_unless):
+                log.info("coord_client.resend_after_rate_limit path=%s wait=%ds", log_path, wait)
+                return self._post_url(url, body, log_path=log_path)
         try:
             data = resp.json() if resp.content else {}
         except (ValueError, RecursionError):
@@ -954,8 +1000,14 @@ class CoordinatorClient:
         target_node: str = "",
         project: str = "",
         persona: str = "",
+        resend_unless: Callable[[], bool] | None = None,
     ) -> dict[str, Any]:
-        """Create a child workstream via the routing proxy."""
+        """Create a child workstream via the routing proxy.
+
+        With ``resend_unless`` given, a create a node's rate limiter refused is
+        sent once more after the wait the refusal names, unless
+        ``resend_unless()`` says the caller has been stopped by then.
+        """
         body: dict[str, Any] = {
             "kind": WorkstreamKind.INTERACTIVE.value,
             "parent_ws_id": parent_ws_id,
@@ -977,7 +1029,7 @@ class CoordinatorClient:
             # handler at child-creation time.  Omitted = the interactive
             # kind default — never the parent's persona.
             body["persona"] = persona
-        return self._post("spawn", body)
+        return self._post("spawn", body, resend_unless=resend_unless)
 
     def send(self, ws_id: str, message: str) -> dict[str, Any]:
         resolved, ref_err = self._resolve_owned(ws_id)

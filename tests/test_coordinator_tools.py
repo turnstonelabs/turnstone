@@ -2158,6 +2158,244 @@ def test_spawn_batch_exec_continues_past_client_exception(coord_session):
     assert any(d["idx"] == 0 and "transient network error" in d["reason"] for d in body["denied"])
 
 
+# ---------------------------------------------------------------------------
+# A create the node's rate limiter refused is resent once, unless a Stop lands first (#1464)
+# ---------------------------------------------------------------------------
+
+
+def test_spawn_exec_hands_spawn_its_stop_check(coord_session):
+    sess, coord, _ui = coord_session
+    checks: list[bool] = []
+
+    def _spawn(**kwargs):
+        checks.append(kwargs["resend_unless"]())
+        sess._cancel_event.set()
+        checks.append(kwargs["resend_unless"]())
+        return _spawned_child(**kwargs)
+
+    coord.spawn.side_effect = _spawn
+    coord.cancel.return_value = {"status": 200}
+    item = sess._prepare_tool(_tc("spawn_workstream", {"initial_message": "hi"}))
+    sess._exec_spawn_workstream(item)
+    assert checks == [False, True]
+
+
+def test_spawn_exec_cancels_a_child_created_after_a_stop(coord_session):
+    """As spawn_batch does: the console's cancel cascade can't reach a child whose
+    create returned after the Stop, so spawn_workstream cancels it and audits that."""
+    sess, coord, _ui = coord_session
+
+    def _spawn(**kwargs):
+        sess._cancel_event.set()
+        return _spawned_child(**kwargs)
+
+    coord.spawn.side_effect = _spawn
+    coord.cancel.return_value = {"status": 200}
+    item = sess._prepare_tool(_tc("spawn_workstream", {"initial_message": "hi"}))
+    sess._exec_spawn_workstream(item)
+
+    coord.cancel.assert_called_once_with("child-hi")
+    coord.emit_audit.assert_called_once_with(
+        "coordinator.cancel_cascaded",
+        {"src": "spawn_workstream", "cancelled": ["child-hi"], "failed": []},
+    )
+
+
+def test_spawn_exec_audits_a_child_cancel_that_fails(coord_session):
+    sess, coord, _ui = coord_session
+
+    def _spawn(**kwargs):
+        sess._cancel_event.set()
+        return _spawned_child(**kwargs)
+
+    coord.spawn.side_effect = _spawn
+    coord.cancel.return_value = {"error": "upstream unreachable", "status": 0}
+    item = sess._prepare_tool(_tc("spawn_workstream", {"initial_message": "hi"}))
+    sess._exec_spawn_workstream(item)
+
+    coord.emit_audit.assert_called_once_with(
+        "coordinator.cancel_cascaded",
+        {"src": "spawn_workstream", "cancelled": [], "failed": ["child-hi"]},
+    )
+
+
+def test_spawn_exec_cancels_nothing_without_a_stop(coord_session):
+    sess, coord, _ui = coord_session
+    coord.spawn.side_effect = _spawned_child
+    item = sess._prepare_tool(_tc("spawn_workstream", {"initial_message": "hi"}))
+    sess._exec_spawn_workstream(item)
+
+    coord.cancel.assert_not_called()
+    coord.emit_audit.assert_not_called()
+
+
+def test_spawn_batch_exec_hands_spawn_its_stop_check(coord_session):
+    sess, coord, _ui = coord_session
+    checks: list[bool] = []
+
+    def _spawn(**kwargs):
+        checks.append(kwargs["resend_unless"]())
+        sess._cancel_event.set()
+        checks.append(kwargs["resend_unless"]())
+        return _spawned_child(**kwargs)
+
+    coord.spawn.side_effect = _spawn
+    coord.cancel.return_value = {"status": 200}
+    item = sess._prepare_tool(_tc("spawn_batch", {"children": [{"initial_message": "a"}]}))
+    sess._exec_spawn_batch(item)
+    assert checks == [False, True]
+
+
+class _RateLimitedConsole:
+    """The console's create route for a node whose rate limiter refuses each child's
+    first create, as the console relays it: a 429 naming a one-second wait."""
+
+    def __init__(self) -> None:
+        self.creates: list[str] = []
+        self._lock = threading.Lock()
+
+    def __call__(self, request: Any) -> Any:
+        import httpx2
+
+        message = json.loads(request.content)["initial_message"]
+        with self._lock:
+            self.creates.append(message)
+            attempt = self.creates.count(message)
+        if attempt == 1:
+            return httpx2.Response(
+                429,
+                json={"error": "Rate limit exceeded", "retry_after": 0.1},
+                headers={"Retry-After": "1"},
+            )
+        ws_id = f"{sum(map(ord, message)):032x}"
+        return httpx2.Response(200, json={"ws_id": ws_id, "name": message, "node_id": "n1"})
+
+
+def _rate_limited_client(sqlite_backend_factory, tmp_path, console: _RateLimitedConsole) -> Any:
+    import httpx2
+
+    from turnstone.console.coordinator_client import CoordinatorClient
+    from turnstone.core.child_event_bus import ChildEventBus
+
+    storage = sqlite_backend_factory(str(tmp_path / "spawn.db"))
+    storage.register_workstream("coord-1", kind="coordinator", user_id="user-1")
+    return CoordinatorClient(
+        console_base_url="http://x",
+        storage=storage,
+        token_factory=lambda: "t",
+        coord_ws_id="coord-1",
+        user_id="user-1",
+        http_client=httpx2.Client(transport=httpx2.MockTransport(console)),
+        child_event_bus=ChildEventBus(),
+    )
+
+
+def test_spawn_batch_creates_every_child_the_rate_limiter_refused_once(
+    coord_session, sqlite_backend_factory, tmp_path, monkeypatch
+):
+    from turnstone.console import coordinator_client
+
+    sess, _coord, _ui = coord_session
+    console = _RateLimitedConsole()
+    sess._coord_client = _rate_limited_client(sqlite_backend_factory, tmp_path, console)
+    waits: list[float] = []
+    monkeypatch.setattr(coordinator_client.time, "sleep", waits.append)
+
+    item = sess._prepare_tool(_tc("spawn_batch", {"children": _three_children()}))
+    _call_id, output = sess._exec_spawn_batch(item)
+    body = json.loads(output)
+
+    assert body["denied"] == []
+    assert sorted(body["results"]) == ["0", "1", "2"]
+    # Each child's one-second wait, sat out in tenths that each check for a stop.
+    assert waits == [0.1] * 30
+    assert sorted(console.creates) == sorted(["benchmark A", "benchmark B", ""] * 2)
+
+
+def _stop_during_the_wait(sess: ChatSession, item: dict[str, Any], stop: str) -> Any:
+    """A stand-in for the resend wait's sleep that stops the tool call the first time it
+    runs: by its cancel event, by a force-cancel (which installs a fresh, clear event for the
+    next turn) or by a Stop whose event send() has cleared (which the approval witness keeps)."""
+    from turnstone.core.session import _ApprovalCancelWitness
+
+    if stop == "force_cancel":
+        sess._generation = 7
+    if stop == "cleared_stop":
+        item["_approval_cancel_witness"] = _ApprovalCancelWitness(sess, sess._cancel_event)
+    stopped: list[bool] = []
+
+    def _sleep(_seconds: float) -> None:
+        if stopped:
+            return
+        stopped.append(True)
+        if stop == "cancel_event":
+            sess._cancel_event.set()
+        elif stop == "force_cancel":
+            abandoned, _error = sess.force_abandon_generation(
+                target_is_current=lambda: True,
+                clear_target=lambda: True,
+                publish_abandoned=lambda: None,
+            )
+            assert abandoned
+            assert not sess._cancel_event.is_set()
+        else:
+            sess.cancel()
+            sess._cancel_event.clear()
+
+    return _sleep
+
+
+@pytest.mark.parametrize("stop", ["cancel_event", "force_cancel", "cleared_stop"])
+@pytest.mark.parametrize("tool", ["spawn_workstream", "spawn_batch"])
+def test_a_stop_during_the_wait_holds_back_the_resend(
+    coord_session, sqlite_backend_factory, tmp_path, monkeypatch, tool, stop
+):
+    from turnstone.console import coordinator_client
+    from turnstone.core import session as session_mod
+
+    sess, _coord, _ui = coord_session
+    console = _RateLimitedConsole()
+    sess._coord_client = _rate_limited_client(sqlite_backend_factory, tmp_path, console)
+    args = (
+        {"initial_message": "a"}
+        if tool == "spawn_workstream"
+        else {"children": [{"initial_message": "a"}]}
+    )
+    item = sess._prepare_tool(_tc(tool, args))
+    monkeypatch.setattr(coordinator_client.time, "sleep", _stop_during_the_wait(sess, item, stop))
+
+    token = session_mod._active_tool_origin_generation.set(sess._generation)
+    try:
+        if tool == "spawn_workstream":
+            _call_id, output = sess._exec_spawn_workstream(item)
+            assert output == "Error: Rate limit exceeded"
+        else:
+            _call_id, output = sess._exec_spawn_batch(item)
+            body = json.loads(output)
+            assert body["results"] == {}
+            assert body["denied"] == [{"idx": 0, "reason": "Rate limit exceeded"}]
+    finally:
+        session_mod._active_tool_origin_generation.reset(token)
+    assert console.creates == ["a"]
+
+
+def test_spawn_exec_creates_a_child_the_rate_limiter_refused_once(
+    coord_session, sqlite_backend_factory, tmp_path, monkeypatch
+):
+    from turnstone.console import coordinator_client
+
+    sess, _coord, _ui = coord_session
+    console = _RateLimitedConsole()
+    sess._coord_client = _rate_limited_client(sqlite_backend_factory, tmp_path, console)
+    monkeypatch.setattr(coordinator_client.time, "sleep", lambda _s: None)
+
+    item = sess._prepare_tool(_tc("spawn_workstream", {"initial_message": "hi"}))
+    _call_id, output = sess._exec_spawn_workstream(item)
+
+    assert json.loads(output)["child_ws_id"] == f"{sum(map(ord, 'hi')):032x}"
+    assert console.creates == ["hi", "hi"]
+
+
 def test_spawn_batch_exec_emits_batch_started_and_ended(coord_session):
     sess, coord, _ui = coord_session
     events: list[dict[str, Any]] = []

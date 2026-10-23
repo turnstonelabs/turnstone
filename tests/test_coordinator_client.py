@@ -279,6 +279,131 @@ def test_spawn_omits_optional_empty_fields(sqlite_backend_factory):
     assert "target_node" not in body
 
 
+# ---------------------------------------------------------------------------
+# spawn resends a create the node's rate limiter refused (#1464)
+# ---------------------------------------------------------------------------
+
+
+def _rate_limited(retry_after: str | None = "1", status: int = 429) -> httpx2.Response:
+    """A node rate limiter's refusal as the console relays it, headers and all."""
+    headers = {"Retry-After": retry_after} if retry_after is not None else {}
+    body = {"error": "Rate limit exceeded", "retry_after": 0.1}
+    return httpx2.Response(status, json=body, headers=headers)
+
+
+def _created() -> httpx2.Response:
+    return httpx2.Response(200, json={"ws_id": "c" * 32, "name": "child", "node_id": "n1"})
+
+
+def _in_turn(
+    *replies: Callable[[], httpx2.Response],
+) -> Callable[[httpx2.Request], httpx2.Response]:
+    """Answer each request with the next reply."""
+    pending = list(replies)
+    return lambda _req: pending.pop(0)()
+
+
+@pytest.fixture
+def waits(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    """The waits the client sits out, recorded instead of slept."""
+    from turnstone.console import coordinator_client
+
+    slept: list[float] = []
+    monkeypatch.setattr(coordinator_client.time, "sleep", slept.append)
+    return slept
+
+
+def _spawn(client: CoordinatorClient, **kwargs: Any) -> dict[str, Any]:
+    return client.spawn(initial_message="hi", parent_ws_id="coord-1", user_id="user-1", **kwargs)
+
+
+def test_spawn_resends_a_create_the_rate_limiter_refused(sqlite_backend_factory, waits):
+    client, captured = _mock_client(_in_turn(_rate_limited, _created), sqlite_backend_factory)
+    result = _spawn(client, resend_unless=lambda: False)
+
+    assert result["ws_id"] == "c" * 32
+    # The one-second wait, sat out in tenths that each check for a stop.
+    assert waits == [0.1] * 10
+    assert len(captured) == 2
+    assert captured[1].url == captured[0].url
+    assert captured[1].content == captured[0].content
+    assert captured[1].headers["Authorization"] == "Bearer test-token"
+
+
+def test_spawn_resends_only_once(sqlite_backend_factory, waits):
+    client, captured = _mock_client(
+        _in_turn(_rate_limited, _rate_limited, _created), sqlite_backend_factory
+    )
+    result = _spawn(client, resend_unless=lambda: False)
+
+    assert result["status"] == 429
+    assert result["error"] == "Rate limit exceeded"
+    assert waits == [0.1] * 10
+    assert len(captured) == 2
+
+
+def test_spawn_does_not_resend_once_stopped_during_the_wait(sqlite_backend_factory, waits):
+    """A stop that lands during the wait cuts it short at the next tenth of a second."""
+    client, captured = _mock_client(_in_turn(_rate_limited, _created), sqlite_backend_factory)
+    result = _spawn(client, resend_unless=lambda: len(waits) >= 3)
+
+    assert result["status"] == 429
+    assert waits == [0.1] * 3
+    assert len(captured) == 1
+
+
+def test_spawn_does_not_wait_when_already_stopped(sqlite_backend_factory, waits):
+    client, captured = _mock_client(_in_turn(_rate_limited, _created), sqlite_backend_factory)
+    result = _spawn(client, resend_unless=lambda: True)
+
+    assert result["status"] == 429
+    assert waits == []
+    assert len(captured) == 1
+
+
+@pytest.mark.parametrize(
+    ("retry_after", "status"),
+    [
+        # A node at capacity refuses a create with no wait to sit out.
+        (None, 429),
+        ("Wed, 21 Oct 2026 07:28:00 GMT", 429),
+        ("6", 429),
+        ("1000", 429),
+        ("1", 503),
+    ],
+)
+def test_spawn_does_not_resend_without_a_short_named_wait(
+    sqlite_backend_factory, waits, retry_after, status
+):
+    client, captured = _mock_client(
+        _in_turn(lambda: _rate_limited(retry_after, status), _created), sqlite_backend_factory
+    )
+    result = _spawn(client, resend_unless=lambda: False)
+
+    assert result["status"] == status
+    assert waits == []
+    assert len(captured) == 1
+
+
+def test_spawn_without_resend_unless_returns_the_refusal(sqlite_backend_factory, waits):
+    client, captured = _mock_client(_in_turn(_rate_limited, _created), sqlite_backend_factory)
+    result = _spawn(client)
+
+    assert result["status"] == 429
+    assert waits == []
+    assert len(captured) == 1
+
+
+def test_send_does_not_resend_a_refusal(sqlite_backend_factory, waits):
+    """Only creates resend: a send's refusal comes straight back."""
+    client, captured = _mock_client(_in_turn(_rate_limited, _created), sqlite_backend_factory)
+    result = client.send("ws-x", "hello")
+
+    assert result["status"] == 429
+    assert waits == []
+    assert len(captured) == 1
+
+
 def test_send_posts_to_send_route(sqlite_backend_factory):
     client, captured = _mock_client(
         _ok_json({"status": 200}), sqlite_backend_factory=sqlite_backend_factory

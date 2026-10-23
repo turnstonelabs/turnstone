@@ -21901,8 +21901,46 @@ class ChatSession:
             error += "; check with list_workstreams before retrying"
         return error
 
+    def _tool_stop_check(self, item: dict[str, Any]) -> Callable[[], bool]:
+        """Return a check of whether a Stop, force-cancel or close has reached this tool call.
+
+        Call it on the tool's own thread, where the call's origin generation is set.  The
+        check reads the session's current ``_cancel_event`` (through ``_check_cancelled``)
+        and also the call's approval witness and origin generation, because the event alone
+        can forget a Stop: a force-cancel installs a fresh event for the next turn, and
+        send() clears the event once a Stop unwinds it.
+        """
+        origin_generation = _active_tool_origin_generation.get()
+        witness = item.get("_approval_cancel_witness")
+
+        def stopped() -> bool:
+            if witness is not None and witness.aborted:
+                return True
+            try:
+                self._check_cancelled(origin_generation)
+            except GenerationCancelled:
+                return True
+            return False
+
+        return stopped
+
+    def _cancel_child_created_after_stop(self, ws_id: str) -> bool:
+        """Cancel a child whose create returned after its tool call was stopped.
+
+        The Stop's cascade cancels only the children the console had registered from their
+        creation events when it landed, and this create's reply came after the Stop, so the
+        child is cancelled here; a second cancel of one the cascade reached is harmless.
+        Best effort: returns whether the cancel went through, for the caller's audit.
+        """
+        try:
+            return not self._coord_client.cancel(ws_id).get("error")
+        except Exception:
+            log.warning("coord.child_cancel_failed", ws_id=ws_id[:8], exc_info=True)
+            return False
+
     def _exec_spawn_workstream(self, item: dict[str, Any]) -> tuple[str, str]:
         call_id = item["call_id"]
+        stopped = self._tool_stop_check(item)
         try:
             result = self._coord_client.spawn(
                 initial_message=item["initial_message"],
@@ -21914,6 +21952,7 @@ class ChatSession:
                 target_node=item["target_node"],
                 project=item["project"],
                 persona=item["persona"],
+                resend_unless=stopped,
             )
         except Exception as e:
             msg = f"Error: spawn_workstream failed: {e}"
@@ -21937,6 +21976,17 @@ class ChatSession:
             )
             self._report_tool_result(call_id, "spawn_workstream", msg, is_error=True)
             return call_id, msg
+        if stopped():
+            # Audited as the console's cascade records its own cancels, as spawn_batch does.
+            cancelled = self._cancel_child_created_after_stop(child_ws_id)
+            self._coord_client.emit_audit(
+                "coordinator.cancel_cascaded",
+                {
+                    "src": "spawn_workstream",
+                    "cancelled": [child_ws_id] if cancelled else [],
+                    "failed": [] if cancelled else [child_ws_id],
+                },
+            )
         # Successful spawn — surface child_ws_id + node_id + name +
         # routing strategy so the coordinator can follow up with inspect
         # / send and explain why a given node was chosen.  ``status`` was
@@ -22100,35 +22150,19 @@ class ChatSession:
             {"call_id": call_id, "op": "spawn_batch", "total": total},
         )
 
-        origin_generation = _active_tool_origin_generation.get()
-        witness = item.get("_approval_cancel_witness")
+        _batch_stopped = self._tool_stop_check(item)
         # Children whose create returned after the batch was stopped, each
         # mapped to whether the cancel this batch sent it went through.
         stop_cancels: dict[str, bool] = {}
 
-        def _batch_stopped() -> bool:
-            """Whether a Stop, force-cancel or close has reached this batch.
-
-            Read through the batch's own witness and generation, not the
-            session's current ``_cancel_event``: a force-cancel installs a
-            fresh event for the next turn, and send() clears the event once a
-            Stop unwinds it.
-            """
-            if witness is not None and witness.aborted:
-                return True
-            try:
-                self._check_cancelled(origin_generation)
-            except GenerationCancelled:
-                return True
-            return False
-
         def _spawn_child(spec: dict[str, Any]) -> tuple[dict[str, Any] | None, str]:
             """Create one child: ``(results row, "")``, or ``(None, denied reason)``."""
-            # A stopped batch holds back a create not yet sent.  Returned as a
-            # denied row rather than raised, so the batch still reports the
-            # creates that were sent; after a Stop, though, the executor admits
-            # none of the turn's results, and the model finds these children
-            # with list_workstreams.
+            # A stopped batch holds back a create not yet sent, and doesn't
+            # resend one the node's rate limiter refused.  Returned as a denied
+            # row rather than raised, so the batch still reports the creates
+            # that were sent; after a Stop, though, the executor admits none of
+            # the turn's results, and the model finds these children with
+            # list_workstreams.
             if _batch_stopped():
                 return None, "not spawned: cancelled"
             try:
@@ -22141,6 +22175,7 @@ class ChatSession:
                     model=spec["model"],
                     target_node=spec["target_node"],
                     persona=spec["persona"],
+                    resend_unless=_batch_stopped,
                 )
             except Exception as e:
                 return None, f"spawn failed: {e}"
@@ -22153,16 +22188,8 @@ class ChatSession:
                     "created is unknown; check with list_workstreams before retrying"
                 )
             if _batch_stopped():
-                # The Stop's cascade cancels only the children the console had
-                # registered from their creation events when it landed, and
-                # this create's reply came after the Stop, so cancel the child
-                # here; a second cancel of one the cascade reached is harmless.
-                # Best effort: the audit below records a cancel that failed.
-                try:
-                    stop_cancels[ws_id] = not self._coord_client.cancel(ws_id).get("error")
-                except Exception:
-                    log.warning("spawn_batch.child_cancel_failed", ws_id=ws_id[:8], exc_info=True)
-                    stop_cancels[ws_id] = False
+                # The audit below records a cancel that failed.
+                stop_cancels[ws_id] = self._cancel_child_created_after_stop(ws_id)
             return {
                 # ``child_ws_id`` (not ``ws_id``) — see the matching
                 # comment in ``_exec_spawn_workstream``.

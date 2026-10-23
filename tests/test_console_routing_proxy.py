@@ -632,6 +632,38 @@ class TestRouteCreate503Retry:
         assert router.route.call_args.args == (_DEST_WS_ID,)
 
 
+class TestRouteCreateRateLimitRelay:
+    """A coordinator resends a create the node's rate limiter refused (#1464), and it sees
+    the wait only if route_create passes the node's 429 and its Retry-After through."""
+
+    def test_a_node_rate_limit_refusal_passes_through_with_its_wait(self):
+        app = _make_app(router=_make_mock_router())
+
+        async def _refused(*args: Any, **kwargs: Any) -> httpx2.Response:
+            return httpx2.Response(
+                429,
+                json={"error": "Rate limit exceeded", "retry_after": 0.1},
+                headers={"Retry-After": "1"},
+                request=httpx2.Request("POST", args[0] if args else "http://test"),
+            )
+
+        post = MagicMock(side_effect=_refused)
+        _wire_proxy(app, post)
+        client = TestClient(app, raise_server_exceptions=False)
+        resp = client.post(
+            "/v1/api/route/workstreams/new",
+            json={"name": "test-ws"},
+            headers=_TEST_AUTH_HEADERS,
+        )
+        client.close()
+
+        assert resp.status_code == 429
+        assert resp.headers["retry-after"] == "1"
+        assert resp.json() == {"error": "Rate limit exceeded", "retry_after": 0.1}
+        # The console doesn't retry it; the coordinator decides.
+        assert post.call_count == 1
+
+
 class TestRouteCreate409Retry:
     """Generated destination ids retry live collisions at the router."""
 
