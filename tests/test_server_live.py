@@ -817,7 +817,7 @@ class TestServerHealthMetrics:
 
 
 class TestServerRateLimiting:
-    """Verify per-IP rate limiting returns 429 with Retry-After header.
+    """Verify rate limiting returns 429 with Retry-After header.
 
     Creates a Starlette app with a tight rate limiter (rate=2, burst=3)
     and verifies that requests beyond the burst are rejected.

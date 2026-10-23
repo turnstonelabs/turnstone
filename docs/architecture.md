@@ -71,7 +71,7 @@ turnstone/
     storage/          Pluggable storage, atomic fork/create lifecycle, SQLite + PostgreSQL
     metrics.py        Prometheus-compatible metrics collector (MetricsCollector)
     healthcheck.py    BackendHealthMonitor — periodic probe + circuit breaker
-    ratelimit.py      Per-IP token-bucket rate limiter (RateLimiter, TokenBucket)
+    ratelimit.py      Per-user token-bucket rate limiter (RateLimiter, TokenBucket)
     edit.py           File edit utilities (find_occurrences, pick_nearest)
     safety.py         Command safety validation (blocked patterns, sanitization)
     web.py            Web utilities (HTML stripping, SSRF prevention)
@@ -2270,17 +2270,35 @@ degraded ──(any success)─────────────────�
 
 ### Rate Limiting
 
-`RateLimiter` (`turnstone/core/ratelimit.py`) enforces per-client-IP request
-limits using a token-bucket algorithm. Each IP gets a `TokenBucket` with
-`requests_per_second` (refill rate) and `burst` (bucket capacity) from
-`[ratelimit]` config.
+`RateLimiter` (`turnstone/core/ratelimit.py`) limits each signed-in user's
+requests to a node, and each client address's requests to public paths, using
+a token-bucket algorithm. Each key gets a `TokenBucket` with
+`requests_per_second` (refill rate) and `burst` (bucket capacity) from the
+`ratelimit.*` settings. The table holds at most `MAX_BUCKETS` keys; a new key
+past that evicts the least recently used bucket rather than being refused, so
+many addresses on public paths can't lock signed-in users out.
 
-- Applied via `RateLimitMiddleware` after authentication but before route dispatch.
-- `/health` and `/metrics` are exempt (monitoring must always be reachable).
-- **X-Forwarded-For support**: when `trusted_proxies` is configured (comma-separated
-  CIDRs), the middleware parses the `X-Forwarded-For` header using the
-  rightmost-untrusted approach. IPv4-mapped IPv6 addresses are normalized.
-  The direct client IP must be in the trusted set before XFF is considered.
+- Applied via `RateLimitMiddleware` after authentication but before route
+  dispatch, so `bucket_key` keys a signed-in request on its user id. A user
+  keeps one bucket per node whether the request comes direct or through the
+  console, which forwards each caller's own identity; a coordinator's requests
+  carry its creator's. The console's service identities (`console-proxy` for
+  the scheduler, `console-collector`) and the channel gateway's get a bucket
+  each the same way.
+- A request to a public path (login, the auth status, setup and OIDC paths)
+  carries no user, even from a signed-in caller, and is keyed on its client
+  address.
+- `/health` and `/metrics` are exempt (monitoring must always be reachable), as
+  are `/openapi.json`, `/docs`, the page (`/`) and its static files (`/static/`,
+  `/shared/`): one page load fetches more than 60 files, each revalidated on
+  every load, and a refused script or stylesheet isn't retried. So is a cancel
+  (`/v1/api/workstreams/{ws_id}/cancel`, `/v1/api/watches/{watch_id}/cancel`):
+  it stops work, and a Stop has to land however drained its caller's bucket is.
+- **X-Forwarded-For support** for address keys: when `trusted_proxies` is
+  configured (comma-separated CIDRs), the middleware parses the
+  `X-Forwarded-For` header using the rightmost-untrusted approach. IPv4-mapped
+  IPv6 addresses are normalized. The direct client IP must be in the trusted
+  set before XFF is considered.
 - On limit exceeded: HTTP 429 with `Retry-After` header and JSON body
   `{"error": "Rate limit exceeded", "retry_after": N}`.
 - The `turnstone_ratelimit_rejected_total` counter is incremented on each

@@ -1,14 +1,17 @@
 """Token-bucket rate limiter for the turnstone HTTP server.
 
-Per-IP rate limiting with configurable burst and refill rate.
-Thread-safe. Zero external dependencies.
+Rate limiting per signed-in user, or per client address on public paths such as
+sign-in, with configurable burst and refill rate.  Thread-safe.  Zero external
+dependencies.
 """
 
 from __future__ import annotations
 
 import ipaddress
+import re
 import threading
 import time
+from collections import OrderedDict
 
 from turnstone.core.log import get_logger
 
@@ -117,17 +120,52 @@ def resolve_client_ip(
     return str(addr)
 
 
-class RateLimiter:
-    """Per-IP rate limiter using token buckets."""
+def bucket_key(
+    user_id: str,
+    direct_ip: str | None,
+    forwarded_for: str,
+    trusted_proxies: frozenset[_NetworkType],
+) -> str | None:
+    """Name the bucket a request draws on, or ``None`` when there's nothing to key on.
 
-    EXEMPT_PATHS: frozenset[str] = frozenset({"/health", "/metrics", "/openapi.json", "/docs"})
+    A request that carries a user draws on that user's bucket wherever it comes from,
+    so the callers a proxy such as the console forwards each keep their own instead of
+    sharing the proxy's address.  A request to a public path, such as sign-in or the
+    auth status, carries no user even from a signed-in caller, and draws on its client
+    address's bucket, read through ``X-Forwarded-For`` only from trusted proxies.
+    """
+    if user_id:
+        return f"user:{user_id}"
+    if direct_ip is None:
+        return None
+    return "ip:" + resolve_client_ip(direct_ip, forwarded_for, trusted_proxies)
+
+
+# A cancel stops work, so it's never refused: a Stop has to land however drained its caller's
+# bucket is.  Only the cancel routes' full shape matches, since other routes end in a
+# parameter that can read "cancel".
+_CANCEL_PATH = re.compile(r"/v1/api/(?:workstreams|watches)/[^/]+/cancel")
+
+
+class RateLimiter:
+    """Rate limiter keeping one token bucket per key (see :func:`bucket_key`).
+
+    A new key past ``MAX_BUCKETS`` evicts the least recently used bucket rather than
+    being refused, so many addresses on public paths can't lock signed-in users out;
+    an evicted key starts over with a full bucket, as it would after :meth:`cleanup`.
+    """
+
+    # The page ("/") and its static files are exempt too: one page load fetches more than 60
+    # files, each revalidated on every load, and a refused script or stylesheet isn't retried.
+    EXEMPT_PATHS: frozenset[str] = frozenset({"/", "/health", "/metrics", "/openapi.json", "/docs"})
+    EXEMPT_PREFIXES: tuple[str, ...] = ("/static/", "/shared/")
     MAX_BUCKETS: int = 100_000
 
     def __init__(
         self,
         enabled: bool = False,
         rate: float = 10.0,
-        burst: int = 20,
+        burst: int = 50,
         trusted_proxies: str = "",
     ) -> None:
         if enabled and rate <= 0:
@@ -138,26 +176,34 @@ class RateLimiter:
         self.rate = rate
         self.burst = burst
         self.trusted_proxies: frozenset[_NetworkType] = parse_trusted_proxies(trusted_proxies)
-        self._buckets: dict[str, TokenBucket] = {}
+        self._buckets: OrderedDict[str, TokenBucket] = OrderedDict()
         self._lock = threading.Lock()
 
-    def check(self, client_ip: str, path: str) -> tuple[bool, float]:
-        """Check if request is allowed.
+    def exempt(self, path: str) -> bool:
+        """Whether a request to *path* is never limited."""
+        return (
+            path in self.EXEMPT_PATHS
+            or path.startswith(self.EXEMPT_PREFIXES)
+            or _CANCEL_PATH.fullmatch(path) is not None
+        )
+
+    def check(self, key: str, path: str) -> tuple[bool, float]:
+        """Check if a request drawing on *key*'s bucket is allowed.
 
         Returns (allowed, retry_after_seconds).
         """
-        if not self.enabled:
-            return True, 0.0
-        if path in self.EXEMPT_PATHS:
+        if not self.enabled or self.exempt(path):
             return True, 0.0
 
         with self._lock:
-            bucket = self._buckets.get(client_ip)
+            bucket = self._buckets.get(key)
             if bucket is None:
                 if len(self._buckets) >= self.MAX_BUCKETS:
-                    return False, 1.0
+                    self._buckets.popitem(last=False)
                 bucket = TokenBucket(self.rate, self.burst)
-                self._buckets[client_ip] = bucket
+                self._buckets[key] = bucket
+            else:
+                self._buckets.move_to_end(key)
             allowed = bucket.consume()
             retry_after = 0.0 if allowed else bucket.retry_after
 
@@ -167,7 +213,7 @@ class RateLimiter:
         """Remove stale buckets. Returns count removed."""
         now = time.monotonic()
         with self._lock:
-            stale = [ip for ip, b in self._buckets.items() if (now - b.last_refill) > max_age]
-            for ip in stale:
-                del self._buckets[ip]
+            stale = [key for key, b in self._buckets.items() if (now - b.last_refill) > max_age]
+            for key in stale:
+                del self._buckets[key]
         return len(stale)

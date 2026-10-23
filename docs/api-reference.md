@@ -2879,8 +2879,12 @@ Status code: `200` with an empty body.
 
 ### `429 Too Many Requests`
 
-Returned when the per-IP rate limiter rejects a request. `/health` and
-`/metrics` are exempt.
+Returned when the rate limiter rejects a request. Each signed-in user has their
+own limit, whether they call the node directly or through the console; a request
+to a public path, such as sign-in, is limited per client address. `/health`,
+`/metrics`, `/openapi.json`, `/docs`, the page (`/`), its static files
+(`/static/`, `/shared/`) and a cancel (`/v1/api/workstreams/{ws_id}/cancel`,
+`/v1/api/watches/{watch_id}/cancel`) are exempt.
 
 **Response headers:**
 
@@ -3036,7 +3040,7 @@ scrape_configs:
 | `turnstone_errors_total` | counter | — | Errors reported by workstreams |
 | `turnstone_context_window_used_ratio` | gauge | — | Last known fraction of context window in use (0.0–1.0) |
 | `turnstone_sse_connections_active` | gauge | — | Number of open SSE connections |
-| `turnstone_ratelimit_rejected_total` | counter | — | Requests rejected by the per-IP rate limiter |
+| `turnstone_ratelimit_rejected_total` | counter | — | Requests rejected by the rate limiter |
 | `turnstone_backend_up` | gauge | — | LLM backend reachability (1 = up, 0 = down) |
 | `turnstone_circuit_state` | gauge | — | Circuit breaker state (0 = closed, 1 = open, 2 = half_open) |
 | `turnstone_workstreams_evicted_total` | counter | — | Workstreams auto-evicted when at capacity |

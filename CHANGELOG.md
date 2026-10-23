@@ -269,9 +269,8 @@ frozen.
   registered when the Stop landed, so the batch cancels each child whose create returns after the
   stop, and audits those cancels as `coordinator.cancel_cascaded` with `src: spawn_batch`. The
   children can be created in any order (`results` stays keyed by input index). With a node's rate
-  limiting on, a batch's creates arrive together and count against the one bucket that every
-  request the console forwards shares, so a `ratelimit.burst` below 10, or other console traffic,
-  can get some of them refused (#1464).
+  limiting on, a batch's creates arrive together and count against their creator's bucket, so a
+  `ratelimit.burst` below 10, or the creator's other traffic, can get some of them refused (#1464).
 - **The denial nudge no longer waits out `memory.nudge_cooldown` (#924).** The note asking the
   model whether a rejected tool call reflects a lasting preference now follows each batch a person
   rejects; the cooldown spaces only the correction and completion nudges and the coordinator's
@@ -706,6 +705,26 @@ frozen.
 
 ### Fixed
 
+- **A node with rate limiting on gives each signed-in user their own bucket (#1464)** — it keyed
+  its buckets on the request's address, and the console forwards every caller's request from its
+  own, so every request the console forwarded to a node, from every user and coordinator, drew on
+  one bucket sized for a single client, and one busy user could starve the rest. A signed-in
+  request now draws on its user's bucket, whether it comes direct or through the console, and a
+  coordinator's on its creator's. A request to a public path, such as sign-in, is still limited
+  per client address, through `ratelimit.trusted_proxies`. A user's bucket now carries all of that
+  user's page loads, so the default `ratelimit.burst` rises from 20 to 50: reloading a page that
+  restores eight workstream panes makes about 30 API requests. A full table of buckets now evicts
+  the least recently used one instead of refusing every new caller.
+- **A node with rate limiting on no longer limits its page and static files (#1464)** — one load
+  of the node's page fetches more than 60 files (the page, its scripts and stylesheets, and the
+  modules they import), each revalidated on every load, so at the default burst of 20 half or more
+  of them were refused, a refused script or stylesheet isn't retried, and the page couldn't load,
+  whether opened directly or through the console. `/`, `/static/` and `/shared/` are now exempt,
+  like `/health` and `/metrics`.
+- **A Stop always lands on a node with rate limiting on (#1464)** — a coordinator's Stop cancels
+  each of its children on its creator's bucket, which the children's own creates may just have
+  drained, and a cancel the limiter refused left that child running. A cancel is no longer
+  limited: `/v1/api/workstreams/{ws_id}/cancel` and `/v1/api/watches/{watch_id}/cancel` are exempt.
 - **The Python SDK presents its client certificate when `ca_cert` is also set (#1425)** — with
   both, the client certificate was dropped without a warning, so a node that requires one, such as
   a node with TLS on, refused the handshake.
@@ -1311,10 +1330,10 @@ frozen.
   time, so a burst of uploads queues instead of flattening all at once; an image whose header
   declares no transparency skips the queue. The queue has no length limit, and a workstream create
   waiting its turn holds its workstream slot. On a node, rate limiting (`ratelimit.enabled`: per
-  IP, off by default) bounds how fast one client can add to the queue; the console's coordinator
-  uploads, open only to coordinator admins, have no rate limit. Images already in a conversation
-  are left as they are, so it keeps sending what it sent and its history and cached prompt prefix
-  don't change; attach such an image again to have it flattened.
+  signed-in user, off by default) bounds how fast one user can add to the queue; the console's
+  coordinator uploads, open only to coordinator admins, have no rate limit. Images already in a
+  conversation are left as they are, so it keeps sending what it sent and its history and cached
+  prompt prefix don't change; attach such an image again to have it flattened.
 - **`web_fetch` refuses images and other binary content instead of extracting from it (#1452).** A
   fetched body that wasn't a PDF was decoded as text, and an image's bytes decoded to characters
   that were largely replacement characters: a 23 KB JPEG became 22,395 characters, 10,883 of them

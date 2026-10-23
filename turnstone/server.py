@@ -84,7 +84,7 @@ from turnstone.core.model_turn import (
     resolve_temperature_setting,
 )
 from turnstone.core.notify_targets import validate_notify_targets
-from turnstone.core.ratelimit import resolve_client_ip
+from turnstone.core.ratelimit import bucket_key
 from turnstone.core.session import ChatSession, GenerationCancelled, SessionUI  # noqa: F401
 from turnstone.core.session_manager import (
     PERSISTENCE_RECONCILE_INTERVAL_SECONDS,
@@ -564,7 +564,11 @@ class WebUI(SessionUIBase):
 
 
 class RateLimitMiddleware:
-    """Per-IP token-bucket rate limiting."""
+    """Token-bucket rate limiting per signed-in user, or per client address on public paths.
+
+    Runs after :class:`AuthMiddleware`, so a request already carries its user,
+    including one the console forwards for its caller; a public path carries none.
+    """
 
     def __init__(self, app: ASGIApp) -> None:
         self.app = app
@@ -578,18 +582,24 @@ class RateLimitMiddleware:
             await self.app(scope, receive, send)
             return
         limiter = getattr(request.app.state, "rate_limiter", None)
-        if limiter is None:
+        if limiter is None or not limiter.enabled:
             await self.app(scope, receive, send)
             return
-        if not request.client:
-            # No peer address — cannot enforce per-IP limit; pass through
-            await self.app(scope, receive, send)
-            return
-        client_ip = request.client.host
-        xff = request.headers.get("X-Forwarded-For", "")
-        client_ip = resolve_client_ip(client_ip, xff, limiter.trusted_proxies)
         path = request.url.path
-        allowed, retry_after = limiter.check(client_ip, path)
+        if limiter.exempt(path):
+            await self.app(scope, receive, send)
+            return
+        key = bucket_key(
+            _auth_user_id(request),
+            request.client.host if request.client else None,
+            request.headers.get("X-Forwarded-For", ""),
+            limiter.trusted_proxies,
+        )
+        if key is None:
+            # Neither a user nor a peer address to key on; pass through.
+            await self.app(scope, receive, send)
+            return
+        allowed, retry_after = limiter.check(key, path)
         if not allowed:
             _metrics.record_ratelimit_reject()
             response = JSONResponse(
@@ -6464,7 +6474,7 @@ def main() -> None:
         _cfg = registry.get_config(_alias)
         health_registry.get_tracker(provider=_cfg.provider, base_url=_cfg.base_url)
 
-    # Per-IP rate limiter
+    # Rate limiter: per signed-in user, per client address on public paths
     from turnstone.core.ratelimit import RateLimiter
 
     rate_limiter = RateLimiter(

@@ -457,13 +457,14 @@ class "BackendHealthMonitor" as HealthMon {
 
 ' RateLimiter
 class "RateLimiter" as RateLimiter {
-    - _buckets: dict[str, TokenBucket]
+    - _buckets: OrderedDict[str, TokenBucket]
     - _rate: float
     - _burst: int
     --
-    + check(client_ip: str, path: str) → (bool, float)
+    + check(key: str, path: str) → (bool, float)
     --
-    Per-IP token bucket.
+    Token bucket per signed-in user,
+    or per client address on public paths.
     Returns (allowed, retry_after).
     --
     core/ratelimit.py
@@ -528,7 +529,7 @@ ModelTurnFn ..> BackendAuth : per-call resolver
 
 ChatSession --> HealthMon : checks circuit
 HealthMon --> "1" CircuitState : has
-RateLimiter --> "*" TokenBucket : per IP
+RateLimiter --> "*" TokenBucket : per user or address
 
 note bottom of ChatSession
   Central engine: multi-turn LLM loop
