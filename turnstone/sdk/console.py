@@ -1068,8 +1068,13 @@ class AsyncTurnstoneConsole(_BaseClient):
         env: dict[str, str] | None = None,
         auto_approve: bool = False,
         enabled: bool = True,
+        tls_skip_verify: bool = False,
     ) -> McpServerDetail:
-        """Create an MCP server definition."""
+        """Create an MCP server definition.
+
+        ``tls_skip_verify`` makes the console and every node accept any certificate a Streamable
+        HTTP server presents; the console refuses it for a stdio server.
+        """
         body: dict[str, Any] = {"name": name, "transport": transport}
         if command:
             body["command"] = command
@@ -1081,10 +1086,14 @@ class AsyncTurnstoneConsole(_BaseClient):
             body["headers"] = headers
         if env:
             body["env"] = env
-        if auto_approve:
-            body["auto_approve"] = True
-        if not enabled:
-            body["enabled"] = False
+        # A value other than the default goes as given, so the console judges what the caller
+        # passed: it refuses the string "false" instead of reading it as true, and None too.
+        if auto_approve is not False:
+            body["auto_approve"] = auto_approve
+        if enabled is not True:
+            body["enabled"] = enabled
+        if tls_skip_verify is not False:
+            body["tls_skip_verify"] = tls_skip_verify
         return await self._request(
             "POST",
             "/v1/api/admin/mcp-servers",
@@ -1141,18 +1150,22 @@ class AsyncTurnstoneConsole(_BaseClient):
         headers: dict[str, str] | None = None,
         auth_type: str = "static",
         name: str = "",
+        tls_skip_verify: bool = False,
     ) -> McpConnectionTestResponse:
         """Test a Streamable HTTP server's connection from the console, saving nothing.
 
         The console connects once with these values and lists the server's tools; when it
         cannot, ``ok`` is False and ``error`` and ``kind`` say why. Auth ``none`` or ``static``
-        only.
+        only. ``tls_skip_verify`` accepts any certificate, as a saved server with it does.
         """
         body: dict[str, Any] = {"url": url, "auth_type": auth_type}
         if headers:
             body["headers"] = headers
         if name:
             body["name"] = name
+        # As given, like create_mcp_server's booleans, so the console judges it.
+        if tls_skip_verify is not False:
+            body["tls_skip_verify"] = tls_skip_verify
         # Only the wait for the answer grows; the client's other limits stay as they are.
         limits = self._client.timeout
         read = None if limits.read is None else max(limits.read, _MCP_TEST_TIMEOUT_S)
@@ -1839,6 +1852,7 @@ class TurnstoneConsole:
         env: dict[str, str] | None = None,
         auto_approve: bool = False,
         enabled: bool = True,
+        tls_skip_verify: bool = False,
     ) -> McpServerDetail:
         return self._runner.run(
             self._async.create_mcp_server(
@@ -1851,6 +1865,7 @@ class TurnstoneConsole:
                 env=env,
                 auto_approve=auto_approve,
                 enabled=enabled,
+                tls_skip_verify=tls_skip_verify,
             )
         )
 
@@ -1876,9 +1891,16 @@ class TurnstoneConsole:
         headers: dict[str, str] | None = None,
         auth_type: str = "static",
         name: str = "",
+        tls_skip_verify: bool = False,
     ) -> McpConnectionTestResponse:
         return self._runner.run(
-            self._async.test_mcp_server(url, headers=headers, auth_type=auth_type, name=name)
+            self._async.test_mcp_server(
+                url,
+                headers=headers,
+                auth_type=auth_type,
+                name=name,
+                tls_skip_verify=tls_skip_verify,
+            )
         )
 
     # -- MCP registry --------------------------------------------------------

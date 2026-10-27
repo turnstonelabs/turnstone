@@ -2871,6 +2871,7 @@ class StorageBackend(Protocol):
         env: str = "{}",
         auto_approve: bool = False,
         enabled: bool = True,
+        tls_skip_verify: bool = False,
         created_by: str = "",
         registry_name: str | None = None,
         registry_version: str = "",
@@ -2883,8 +2884,9 @@ class StorageBackend(Protocol):
         oauth_registration_mode: str | None = None,
         oauth_authorization_server_url: str | None = None,
         oauth_as_issuer_cached: str | None = None,
-    ) -> None:
-        """Create an MCP server definition. No-op if server_id already exists."""
+    ) -> bool:
+        """Create an MCP server definition. Return whether inserted: a taken server_id, name or
+        registry_name inserts nothing."""
         ...
 
     def get_mcp_server(self, server_id: str) -> dict[str, Any] | None:
@@ -2900,7 +2902,10 @@ class StorageBackend(Protocol):
         ...
 
     def update_mcp_server(self, server_id: str, **fields: Any) -> bool:
-        """Update specified fields on an MCP server. Returns True if found."""
+        """Update specified fields on an MCP server. Returns True if found.
+
+        Raises :class:`StorageConflictError` when a new name or registry_name is taken.
+        """
         ...
 
     def get_mcp_server_by_registry_name(self, registry_name: str) -> dict[str, Any] | None:

@@ -2682,7 +2682,7 @@ the `admin.settings` permission.
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/v1/api/admin/mcp-servers` | List all MCP server definitions with live node status. Query: `?reveal=true` to show env/header secrets. |
-| POST | `/v1/api/admin/mcp-servers` | Create an MCP server definition. Body: `{name, transport, command?, args?, url?, headers?, env?, auto_approve?, enabled?}` |
+| POST | `/v1/api/admin/mcp-servers` | Create an MCP server definition. Body: `{name, transport, command?, args?, url?, headers?, env?, auto_approve?, enabled?, tls_skip_verify?}` |
 | GET | `/v1/api/admin/mcp-servers/{server_id}` | Get a single MCP server with per-node connection status. |
 | PUT | `/v1/api/admin/mcp-servers/{server_id}` | Update an MCP server definition. Partial updates supported. |
 | DELETE | `/v1/api/admin/mcp-servers/{server_id}` | Delete an MCP server definition. |
@@ -2700,12 +2700,42 @@ port out of range), or when a header name is not an HTTP token or a header value
 ASCII with no space at either end: no request could carry them. An update checks the URL only when
 it changes it or switches the transport to `streamable-http`, and only the header values it
 changes, so a row saved before these checks stays editable. Import reports such a server among its
-`errors` and imports the rest; a registry install answers `400`. When the URL's parse error would
-quote any of it before the host, where a password can sit, the error reads
-`url has an invalid host or port` instead.
+`errors` and imports the rest, as it does an entry that is not a JSON object; a registry install
+answers `400`. When the URL's parse error would quote any of it before the host, where a password
+can sit, the error reads `url has an invalid host or port` instead.
+
+`auto_approve` and `enabled` take `true`, `false`, `0` or `1`; create and update answer `400` for
+anything else, such as the string `"false"` or `null` (a null could mean clearing the flag as well
+as keeping it). Leave a field out to keep its stored value.
+
+`tls_skip_verify: true` makes the console and every node accept whatever certificate a Streamable
+HTTP server presents, checking neither its issuer nor its host name; the default `false` verifies
+it against the operating system's trust store. Create and update answer `400`, and import lists
+the server among its `errors`, when the value is not a JSON boolean (`null` included), or when it
+is `true` for a stdio server or for auth `oauth_user` or `oauth_obo`, whose per-user tokens need a
+verified certificate. Left out, it is `false` on create and import, and an update keeps the stored
+value, a new URL included. An update that moves a server to stdio or to per-user auth sets it back
+to `false`. See
+[Servers with self-signed certificates](tools.md#servers-with-self-signed-certificates) for when
+to use it.
+
+The `mcp_server.create`, `mcp_server.import` and `mcp_server.registry_install` audit events record
+where each Streamable HTTP server points, as `scheme://host:port`, never the URL's path or query: as
+`url`, or on an import as `origins` by server name. An update's `mcp_server.update` audit event
+lists the settings the write stores, changed or not: the console form re-sends every field with each
+save, so an event can list headers, flags and cleared OAuth settings (as `null`) that the edit left
+as they were. Headers, env and a stdio server's `args` appear only as `(updated)`. A changed URL
+appears only as `scheme://host:port`, never its path or query (`""` when the URL is cleared,
+`(updated)` when it is not an http or https URL with a host), and an unchanged URL is left out.
+An `oauth_audience` or `oauth_authorization_server_url` that holds an http or https URL also
+appears only as `scheme://host:port`. `tls_skip_verify` comes first, as `true`, on every edit of a
+server that skips verification, and as `false` on the edit that turns it off.
 
 Each server's `status` maps a node id (and `console`, for the console's own connection) to that
-connection's state. `has_error` is true while the last connect failed, and `error` says why.
+connection's state. `has_error` is true while the last connect failed, and `error` says why. A
+server from a node's configuration file has no row: it is listed with `source: "config"` and the
+transport its nodes report, and with placeholders for its other settings, such as an empty
+`command` and `url` and a `tls_skip_verify` of `false`.
 
 #### Test connection
 
@@ -2714,9 +2744,10 @@ connection's state. `has_error` is true while the last connect failed, and `erro
 Connects once to a Streamable HTTP server with auth `none` or `static`, the way a saved server's
 connect would, and lists its tools, resources and prompts. Nothing is saved and no catalog is
 published. The console runs the test from its own network position; nodes connect from theirs. Each
-test writes an `mcp_server.test` audit event with the scheme, host, port and outcome, never a header
-value or the rest of the URL; a header holding a `secret://` reference is recorded by name with the
-reference (`header_references`).
+test writes an `mcp_server.test` audit event with the scheme, host, port and outcome, and
+`tls_skip_verify: true` when the test skipped certificate verification, never a header value or the
+rest of the URL; a header holding a `secret://` reference is recorded by name with the reference
+(`header_references`).
 
 ```json
 {
@@ -2734,6 +2765,7 @@ reference (`header_references`).
 | `auth_type` | string | no (default `"static"`) | `"none"` or `"static"`. |
 | `transport` | string | no (default `"streamable-http"`) | Only `"streamable-http"` can be tested. |
 | `name` | string | no | Labels the server in error messages, and must be a valid server name; the URL's host stands in when empty. |
+| `tls_skip_verify` | boolean | no (default `false`) | `true` accepts any certificate, as a saved server with this setting does. |
 
 **Response:** `200` whether or not the server connected.
 
@@ -2761,11 +2793,11 @@ The request can take up to about a minute (the connect timeout, the session's te
 margin), so a client's timeout should be longer; a test still running then comes back with
 `kind` `timeout`.
 
-**Errors:** `400` (stdio transport, OAuth auth type, invalid name, URL or headers, or a `secret://`
-reference that is malformed, not the whole value, or refused by the store), `403` (no `admin.mcp`,
-or a `secret://` header without `admin.mcp` held explicitly, as from a service token), `429` (two
-tests are already running; the console runs at most two at once), `503` (the secret store cannot
-answer for a `secret://` header).
+**Errors:** `400` (stdio transport, OAuth auth type, invalid name, URL or headers, a
+`tls_skip_verify` that is not a JSON boolean, or a `secret://` reference that is malformed, not the
+whole value, or refused by the store), `403` (no `admin.mcp`, or a `secret://` header without
+`admin.mcp` held explicitly, as from a service token), `429` (two tests are already running; the
+console runs at most two at once), `503` (the secret store cannot answer for a `secret://` header).
 
 ---
 

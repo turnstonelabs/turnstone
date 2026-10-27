@@ -593,7 +593,17 @@ The tab has two views toggled via a pill control: **Servers** and
   a sign-in first and stdio servers run on each node, so neither can be
   tested. The console runs two tests at a time and turns away a third
   until one ends. Each test is audited (`mcp_server.test`, with the
-  scheme, host, port and outcome)
+  scheme, host, port and outcome, and whether certificate verification
+  was skipped)
+- **Skip certificate verification** -- the form offers it for a Streamable
+  HTTP server with no authorization or static headers. It is off by
+  default, and the form explains the risk: the console and every node
+  then accept any certificate the server presents, so anyone who can
+  intercept the connection can pose as the server. Meant for a device on
+  your own network whose self-signed certificate cannot be added to the
+  trust store; see [Servers with self-signed
+  certificates](tools.md#servers-with-self-signed-certificates). The list
+  marks every saved server that skips verification **NO CERT CHECK**
 - **Registry view** -- search the official MCP Registry to discover and
   install servers. Results show server name, description, version, source
   type badges (remote/npm/pypi), and Install/Installed/Update buttons.

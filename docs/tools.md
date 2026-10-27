@@ -1011,6 +1011,52 @@ in the admin console do not carry them, and configuration files are not read at 
 while the database holds an enabled MCP server. `[mcp].log_level` applies to every
 server.
 
+#### Servers with self-signed certificates
+
+turnstone verifies a Streamable HTTP server's certificate against the operating
+system's trust store. A server whose certificate comes from your own certificate
+authority works once that authority is in the store, or in the bundle named by
+`SSL_CERT_FILE` or `SSL_CERT_DIR`. That bundle replaces the store for the whole
+process, so it must also hold the public roots other connections need.
+
+When a certificate cannot be trusted that way, as with a device that generates its
+own self-signed certificate, verification can be turned off for that one server: set
+`tls_skip_verify = true` in its `[mcp.servers.<name>]` section or `mcpServers.<name>`
+entry, or turn on **Skip certificate verification** in the admin console's server
+form (`tls_skip_verify` in the API). Every connection to that server then accepts
+whatever certificate it presents, checking neither the issuer nor the host name. The
+traffic stays encrypted, but anyone who can intercept it can pose as the server: read
+or change the requests, including any credentials in its headers, and send the model
+tool results of their own. Use it only for servers on a network you control.
+
+```toml
+[mcp.servers.kvm-rack1]
+type = "http"
+url = "https://192.0.2.10/mcp"
+tls_skip_verify = true
+```
+
+- In a configuration file, only the boolean `true` turns verification off; any other
+  value, such as the string `"true"`, leaves it on. The admin API takes `true` or
+  `false` and refuses anything else, `null` included (import lists the server among
+  its errors).
+- Per-user OAuth servers (`oauth_user`, `oauth_obo`) always verify the certificate,
+  because every user's bearer token is sent to them. The console refuses the setting
+  for them, and for stdio servers, which make no TLS connection.
+- The setting stays with the server when its URL changes, like its headers. Turn it
+  off in the same edit when the new address should be verified.
+- Unlike the keys above, it is also kept when a configuration file is imported in the
+  admin console. **Test connection** uses the form's setting.
+- The admin console's server list marks every server saved in the console that skips
+  verification. It lists a server from a node's configuration file with placeholder
+  settings, so it does not mark one there. Changing the setting in the console
+  reconnects the server on every node.
+- Every audit event for creating, editing, importing or testing a server that skips
+  verification records `tls_skip_verify`, and an edit that turns it off records
+  `false`. Creating or importing any Streamable HTTP server also records where it
+  points, as `scheme://host:port`, so the audit log keeps the host after the server
+  is deleted.
+
 ### Introspection
 
 Use the `/mcp` slash command to list all connected MCP tools:

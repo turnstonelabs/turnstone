@@ -519,9 +519,11 @@ class TestMcpEndpoints:
         assert resp.status_code == 200, resp.text
         assert resp.json()["imported"] == ["imp"]
         events = [e for e in storage.list_audit_events(action="mcp_server.import")]
-        assert json.loads(events[0]["detail"])["header_references"] == {
-            "imp": {"Authorization": self.MCP_REF}
-        }
+        detail = json.loads(events[0]["detail"])
+        assert detail["header_references"] == {"imp": {"Authorization": self.MCP_REF}}
+        # Ahead of the origins: the Audit tab shows only a detail's first three keys.
+        assert list(detail)[:3] == ["imported", "skipped", "header_references"]
+        assert detail["origins"] == {"imp": "https://mcp.example.com:443"}
 
     def test_create_gates_validates_and_audits_header_references(
         self, storage: Any, fake_store: FakeBackend
@@ -544,9 +546,11 @@ class TestMcpEndpoints:
         resp = holder.post("/v1/api/admin/mcp-servers", json=body)
         assert resp.status_code < 300, resp.text
         events = storage.list_audit_events(action="mcp_server.create")
-        assert json.loads(events[0]["detail"])["header_references"] == {
-            "Authorization": self.MCP_REF
-        }
+        detail = json.loads(events[0]["detail"])
+        assert detail["header_references"] == {"Authorization": self.MCP_REF}
+        # Ahead of the origin: the Audit tab shows only a detail's first three keys.
+        assert list(detail)[:3] == ["name", "auth_type", "header_references"]
+        assert detail["url"] == "https://mcp.example.com:443"
 
     def test_import_refuses_a_reference_the_store_rejects(
         self, storage: Any, fake_store: FakeBackend
@@ -593,7 +597,7 @@ class TestMcpEndpoints:
         assert tested.status_code == 200, tested.text
         assert tested.json()["ok"] is True
         probe.assert_called_once_with(
-            url, {"Authorization": "Bearer live", "X-Plain": "v"}, name="srv"
+            url, {"Authorization": "Bearer live", "X-Plain": "v"}, name="srv", tls_skip_verify=False
         )
         (event,) = storage.list_audit_events(action="mcp_server.test")
         assert json.loads(event["detail"])["header_references"] == {"Authorization": self.MCP_REF}

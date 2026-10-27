@@ -130,6 +130,9 @@ from turnstone.core.storage._utils import (
     LIKE_ESCAPE as _LIKE_ESCAPE,
 )
 from turnstone.core.storage._utils import (
+    MCP_SERVER_BOOL_FIELDS as _MCP_SERVER_BOOL_FIELDS,
+)
+from turnstone.core.storage._utils import (
     MCP_SERVER_MUTABLE as _MCP_SERVER_MUTABLE,
 )
 from turnstone.core.storage._utils import (
@@ -5676,6 +5679,7 @@ class PostgreSQLBackend(_KeyedAttachmentSaveWrappers):
         env: str = "{}",
         auto_approve: bool = False,
         enabled: bool = True,
+        tls_skip_verify: bool = False,
         created_by: str = "",
         registry_name: str | None = None,
         registry_version: str = "",
@@ -5688,12 +5692,12 @@ class PostgreSQLBackend(_KeyedAttachmentSaveWrappers):
         oauth_registration_mode: str | None = None,
         oauth_authorization_server_url: str | None = None,
         oauth_as_issuer_cached: str | None = None,
-    ) -> None:
+    ) -> bool:
         from sqlalchemy.dialects import postgresql
 
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
         with self._conn() as conn:
-            conn.execute(
+            result = conn.execute(
                 postgresql.insert(mcp_servers)
                 .values(
                     server_id=server_id,
@@ -5706,6 +5710,7 @@ class PostgreSQLBackend(_KeyedAttachmentSaveWrappers):
                     env=env,
                     auto_approve=1 if auto_approve else 0,
                     enabled=1 if enabled else 0,
+                    tls_skip_verify=1 if tls_skip_verify else 0,
                     created_by=created_by,
                     registry_name=registry_name,
                     registry_version=registry_version,
@@ -5722,8 +5727,11 @@ class PostgreSQLBackend(_KeyedAttachmentSaveWrappers):
                     updated=now,
                 )
                 .on_conflict_do_nothing()
+                .returning(mcp_servers.c.server_id)
             )
+            inserted = result.scalar_one_or_none() is not None
             conn.commit()
+            return inserted
 
     def get_mcp_server(self, server_id: str) -> dict[str, Any] | None:
 
@@ -5733,7 +5741,7 @@ class PostgreSQLBackend(_KeyedAttachmentSaveWrappers):
             ).fetchone()
             if row is None:
                 return None
-            return _row_to_dict(row, "auto_approve", "enabled")
+            return _row_to_dict(row, *_MCP_SERVER_BOOL_FIELDS)
 
     def get_mcp_server_by_name(self, name: str) -> dict[str, Any] | None:
 
@@ -5741,7 +5749,7 @@ class PostgreSQLBackend(_KeyedAttachmentSaveWrappers):
             row = conn.execute(sa.select(mcp_servers).where(mcp_servers.c.name == name)).fetchone()
             if row is None:
                 return None
-            return _row_to_dict(row, "auto_approve", "enabled")
+            return _row_to_dict(row, *_MCP_SERVER_BOOL_FIELDS)
 
     def get_mcp_server_by_registry_name(self, registry_name: str) -> dict[str, Any] | None:
 
@@ -5751,7 +5759,7 @@ class PostgreSQLBackend(_KeyedAttachmentSaveWrappers):
             ).fetchone()
             if row is None:
                 return None
-            return _row_to_dict(row, "auto_approve", "enabled")
+            return _row_to_dict(row, *_MCP_SERVER_BOOL_FIELDS)
 
     def list_mcp_servers(self, enabled_only: bool = False) -> list[dict[str, Any]]:
 
@@ -5760,20 +5768,28 @@ class PostgreSQLBackend(_KeyedAttachmentSaveWrappers):
             if enabled_only:
                 q = q.where(mcp_servers.c.enabled == 1)
             rows = conn.execute(q).fetchall()
-            return [_row_to_dict(r, "auto_approve", "enabled") for r in rows]
+            return [_row_to_dict(r, *_MCP_SERVER_BOOL_FIELDS) for r in rows]
 
     def update_mcp_server(self, server_id: str, **fields: Any) -> bool:
 
         fields = {k: v for k, v in fields.items() if k in _MCP_SERVER_MUTABLE}
         fields["updated"] = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
-        if "auto_approve" in fields:
-            fields["auto_approve"] = 1 if fields["auto_approve"] else 0
-        if "enabled" in fields:
-            fields["enabled"] = 1 if fields["enabled"] else 0
+        for key in _MCP_SERVER_BOOL_FIELDS:
+            if key in fields:
+                fields[key] = 1 if fields[key] else 0
+        from turnstone.core.storage._protocol import StorageConflictError
+
         with self._conn() as conn:
-            result = conn.execute(
-                sa.update(mcp_servers).where(mcp_servers.c.server_id == server_id).values(**fields)
-            )
+            try:
+                result = conn.execute(
+                    sa.update(mcp_servers)
+                    .where(mcp_servers.c.server_id == server_id)
+                    .values(**fields)
+                )
+            except sa.exc.IntegrityError as exc:
+                conn.rollback()
+                msg = str(exc.orig) if exc.orig is not None else str(exc)
+                raise StorageConflictError(f"mcp_server conflict ({server_id}): {msg}") from exc
             conn.commit()
             return result.rowcount > 0
 

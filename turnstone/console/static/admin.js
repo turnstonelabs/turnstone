@@ -4640,6 +4640,11 @@ function _renderMcpServers(items) {
       : isRegistry
         ? ' <span class="scope-badge scope-registry">registry</span>'
         : ' <span class="scope-badge scope-manual">manual</span>';
+    // Amber like a medium scan risk: reachable, but unverified.
+    const tlsBadge =
+      s.tls_skip_verify === true
+        ? ' <span class="scope-badge scope-scan-medium" title="Certificate verification is off: any certificate this server presents is accepted">no cert check</span>'
+        : "";
     const detailAttr = isConfig
       ? 'data-mcp-detail-name="' + escapeHtml(s.name) + '"'
       : 'data-mcp-detail="' + escapeHtml(s.server_id) + '"';
@@ -4710,6 +4715,7 @@ function _renderMcpServers(items) {
       escapeHtml(s.name) +
       "</a>" +
       nameBadge +
+      tlsBadge +
       "</span>" +
       '<span class="admin-col admin-col-mtransport"><span class="mcp-transport-badge ' +
       transportCls +
@@ -4893,6 +4899,16 @@ function _selectedMcpAuthType() {
   return "static";
 }
 
+// Skipping certificate verification is for Streamable HTTP with no auth or
+// static headers: per-user OAuth always verifies, as its tokens need.
+function _mcpTlsSkipVerifyApplies() {
+  const authType = _selectedMcpAuthType();
+  return (
+    document.getElementById("mcp-transport").value === "streamable-http" &&
+    (authType === "none" || authType === "static")
+  );
+}
+
 function toggleMcpAuthFields() {
   const authType = _selectedMcpAuthType();
   const isOauthUser = authType === "oauth_user";
@@ -4927,6 +4943,11 @@ function toggleMcpAuthFields() {
     headersInput.hidden = !show;
     if (headersLabel) headersLabel.hidden = !show;
   }
+  const showTls = _mcpTlsSkipVerifyApplies();
+  const tlsRow = document.getElementById("mcp-tls-skip-verify-row");
+  if (tlsRow) tlsRow.hidden = !showTls;
+  const tlsHint = document.getElementById("mcp-tls-skip-verify-hint");
+  if (tlsHint) tlsHint.hidden = !showTls;
   // The connection test covers Streamable HTTP with no auth or static
   // headers; OAuth needs a sign-in first. A transport or auth change also
   // makes an earlier result stale.
@@ -4994,6 +5015,9 @@ function _mcpWire() {
   document
     .getElementById("mcp-headers")
     .addEventListener("input", _clearMcpTestResult);
+  document
+    .getElementById("mcp-tls-skip-verify")
+    .addEventListener("change", _clearMcpTestResult);
   _wireMcpAudienceAutofill();
 }
 
@@ -5018,6 +5042,7 @@ function _mcpResetForm() {
   document.getElementById("mcp-headers").value = "";
   document.getElementById("mcp-auto-approve").checked = false;
   document.getElementById("mcp-enabled").checked = true;
+  document.getElementById("mcp-tls-skip-verify").checked = false;
   // Reset auth radios + OAuth subfields to the 'static' default.
   document.getElementById("mcp-auth-static").checked = true;
   document.getElementById("mcp-auth-none").checked = false;
@@ -5084,6 +5109,8 @@ function showEditMcpModal(serverId) {
       document.getElementById("mcp-auto-approve").checked =
         s.auto_approve || false;
       document.getElementById("mcp-enabled").checked = s.enabled !== false;
+      document.getElementById("mcp-tls-skip-verify").checked =
+        s.tls_skip_verify === true;
       const authType = s.auth_type || "static";
       document.getElementById("mcp-auth-none").checked = authType === "none";
       document.getElementById("mcp-auth-static").checked =
@@ -5178,6 +5205,11 @@ function _parseMcpForm() {
       // 'none' / 'oauth_user' / 'oauth_obo' — clear static headers state.
       payload.headers = {};
     }
+    // Only the visible toggle turns it on: per-user OAuth hides it, and the
+    // console refuses it there.
+    payload.tls_skip_verify =
+      _mcpTlsSkipVerifyApplies() &&
+      document.getElementById("mcp-tls-skip-verify").checked;
   }
 
   if (authType === "oauth_user") {
@@ -5293,6 +5325,9 @@ function testMcpConnection() {
     url: document.getElementById("mcp-url").value.trim(),
     auth_type: authType,
     headers: authType === "static" ? _parseMcpHeaders() : {},
+    tls_skip_verify:
+      _mcpTlsSkipVerifyApplies() &&
+      document.getElementById("mcp-tls-skip-verify").checked,
   };
   _clearMcpTestResult();
   const seq = _mcpTestSeq;
@@ -5480,6 +5515,9 @@ function _openMcpDetail(s) {
       '<p style="font-size:12px;color:var(--fg-dim)">URL: <code>' +
       escapeHtml(s.url || "") +
       "</code></p>";
+    if (s.tls_skip_verify === true)
+      html +=
+        '<p style="font-size:12px;color:var(--fg-dim)">Certificate verification: <span style="color:var(--yellow)">off</span></p>';
   }
   html += "</div>";
   if (s.registry_name) {

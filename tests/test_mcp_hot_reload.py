@@ -381,6 +381,17 @@ class TestReconcileSync:
         # Not in "removed" (that's for servers absent from DB)
         assert "srv" not in result["removed"]
 
+    def test_turning_off_verification_reconnects(self) -> None:
+        url = "https://kvm.example.com/mcp"
+        mgr = MCPClientManager({"kvm": {"type": "streamable-http", "url": url, "headers": {}}})
+        mgr._db_managed.add("kvm")
+        row = _db_row("kvm", transport="streamable-http", url=url)
+        storage = _FakeStorage([{**row, "tls_skip_verify": True}])
+        mgr.reconcile_sync(storage)
+        # The old connection's config was evicted for a reconnect (which cannot complete
+        # without a running event loop, as in test_updates_changed_config).
+        assert "kvm" not in mgr._server_configs
+
     def test_no_change_is_noop(self) -> None:
         cfg = {"type": "stdio", "command": "echo", "args": [], "env": {}}
         mgr = MCPClientManager({"srv": dict(cfg)})

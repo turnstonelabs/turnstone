@@ -12599,6 +12599,11 @@
             "title": "Enabled",
             "type": "boolean"
           },
+          "tls_skip_verify": {
+            "default": false,
+            "title": "Tls Skip Verify",
+            "type": "boolean"
+          },
           "created_by": {
             "default": "",
             "title": "Created By",
@@ -12849,6 +12854,11 @@
             "title": "Enabled",
             "type": "boolean"
           },
+          "tls_skip_verify": {
+            "default": false,
+            "title": "Tls Skip Verify",
+            "type": "boolean"
+          },
           "auth_type": {
             "default": "static",
             "title": "Auth Type",
@@ -13030,28 +13040,19 @@
             "title": "Env"
           },
           "auto_approve": {
-            "anyOf": [
-              {
-                "type": "boolean"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "default": null,
-            "title": "Auto Approve"
+            "description": "Omit to leave the stored value unchanged; JSON null is refused (400).",
+            "title": "Auto Approve",
+            "type": "boolean"
           },
           "enabled": {
-            "anyOf": [
-              {
-                "type": "boolean"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "default": null,
-            "title": "Enabled"
+            "description": "Omit to leave the stored value unchanged; JSON null is refused (400).",
+            "title": "Enabled",
+            "type": "boolean"
+          },
+          "tls_skip_verify": {
+            "description": "Omit to leave the stored value unchanged; JSON null is refused (400).",
+            "title": "Tls Skip Verify",
+            "type": "boolean"
           },
           "auth_type": {
             "anyOf": [
@@ -13245,6 +13246,11 @@
             "default": "",
             "title": "Name",
             "type": "string"
+          },
+          "tls_skip_verify": {
+            "default": false,
+            "title": "Tls Skip Verify",
+            "type": "boolean"
           }
         },
         "required": [

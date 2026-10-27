@@ -1060,6 +1060,8 @@ export interface McpServerDetail {
   env: string;
   auto_approve: boolean;
   enabled: boolean;
+  /** Accepts any certificate the server presents (Streamable HTTP only). */
+  tls_skip_verify: boolean;
   created_by: string;
   registry_name: string | null;
   registry_version: string;
@@ -1083,6 +1085,8 @@ export interface CreateMcpServerRequest {
   env?: Record<string, string>;
   auto_approve?: boolean;
   enabled?: boolean;
+  /** Streamable HTTP with auth "none" or "static" only: accept any certificate. */
+  tls_skip_verify?: boolean;
 }
 
 export interface UpdateMcpServerRequest {
@@ -1095,6 +1099,8 @@ export interface UpdateMcpServerRequest {
   env?: Record<string, string>;
   auto_approve?: boolean;
   enabled?: boolean;
+  /** Streamable HTTP with auth "none" or "static" only: accept any certificate. */
+  tls_skip_verify?: boolean;
 }
 
 export interface ImportMcpConfigResponse {
@@ -1111,6 +1117,8 @@ export interface McpConnectionTestRequest {
   transport?: string;
   /** Labels the server in error messages; the URL's host stands in when empty. */
   name?: string;
+  /** Accept any certificate the server presents, as a saved server with it does. */
+  tls_skip_verify?: boolean;
 }
 
 export interface McpConnectionTestResponse {

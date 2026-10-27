@@ -1621,6 +1621,7 @@ MCP_SERVER_MUTABLE = frozenset(
         "env",
         "auto_approve",
         "enabled",
+        "tls_skip_verify",
         "registry_name",
         "registry_version",
         "registry_meta",
@@ -1633,6 +1634,9 @@ MCP_SERVER_MUTABLE = frozenset(
         "oauth_as_issuer_cached",
     }
 )
+# The ``mcp_servers`` integer columns that hold booleans: rows read them back as bool, and an
+# update stores them as 0 or 1.
+MCP_SERVER_BOOL_FIELDS = ("auto_approve", "enabled", "tls_skip_verify")
 MODEL_DEFINITION_MUTABLE = frozenset(
     {
         "alias",

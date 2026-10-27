@@ -10,6 +10,60 @@ All development now integrates on `main`. Supported release lines are maintained
 on `stable/X.Y` branches; `stable/1.8` preserves the former stable branch.
 The separate `dev` branch is retired. See [the release process](docs/releasing.md).
 
+## [2026-10-25]
+
+### Added
+
+- **Skip certificate verification for one MCP server.** A Streamable HTTP server
+  whose certificate cannot be added to the trust store, such as a device that
+  makes its own self-signed certificate, can be reached with
+  `tls_skip_verify = true` in its configuration entry or **Skip certificate
+  verification** in the admin console's server form. It is off by default and
+  refused for per-user OAuth and stdio servers. With it on, anyone who can
+  intercept the connection can pose as the server. The console's server list
+  marks every saved server that skips verification, and the audit log records
+  the setting whenever such a server is created, edited, imported or tested.
+  Migration 084 adds the setting, off for every existing server. See
+  [Servers with self-signed certificates](docs/tools.md#servers-with-self-signed-certificates).
+- **MCP server audit events record where each server points.** Creating,
+  importing or installing a Streamable HTTP server records its
+  `scheme://host:port`, so the audit log keeps the host after the server is
+  deleted, including one whose certificate went unchecked.
+
+### Fixed
+
+- **MCP server booleans are parsed strictly.** Creating or editing an MCP server
+  refuses an `auto_approve` or `enabled` that is not `true`, `false`, `0` or
+  `1`, and refuses `null` as schedules already do; the string `"false"` used to
+  count as true, and `null` as false. The Python SDK's `create_mcp_server` sends
+  such values as given, `None` included, so the console refuses them where the
+  SDK used to coerce them.
+- **The MCP server update audit no longer records a full URL or a stdio
+  server's arguments.** It records a changed URL as `scheme://host:port`, and an
+  OAuth audience or authorization server given as an http(s) URL the same way;
+  it leaves out the unchanged URL the server form re-sends with every save, and
+  records arguments only as `(updated)`, as it does headers and env. A URL's
+  path or query and an API key passed as an argument, either of which can be a
+  credential, used to land in the audit log.
+- **An MCP server name, or a registry server, that another save takes at the
+  same moment is refused.** Creating or installing the server answers `409`,
+  and an import lists it as skipped. The losing request used to report success
+  with an incomplete response and audit a server it never stored. A rename that
+  loses the race answers `409` where it answered 500.
+- **An edit of an MCP server another admin deletes at the same moment answers
+  `404`.** It used to answer 200, audit the edit and reload the nodes for a
+  server that no longer existed.
+- **An MCP import entry that is not an object** is listed among the import's
+  errors, whether or not its name is taken. One with a new name used to fail the
+  request with a 500 after saving the entries before it, which then got no audit
+  event and no node reload.
+- **An oversize MCP OAuth client secret is refused before anything is saved.**
+  A secret over 1024 characters used to be refused only after the server's row
+  was written, so the change got no audit event and no node reload.
+- **The console's Audit tab shows an object value as JSON** in an event's
+  summary, such as a created server's header references, where it showed
+  `[object Object]`.
+
 ## [1.9.0]
 
 Turnstone 1.9 focuses on predictable workstream ownership, explicit model

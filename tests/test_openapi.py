@@ -454,6 +454,18 @@ def test_model_update_key_and_url_schemas_offer_no_null() -> None:
         assert "default" not in props[name]
 
 
+def test_mcp_update_authority_schemas_offer_no_null() -> None:
+    """The MCP server update handler refuses a JSON null auto_approve, enabled or
+    tls_skip_verify (400), so the advertised schema must not offer one."""
+    from turnstone.api.console_spec import build_console_spec
+
+    props = build_console_spec()["components"]["schemas"]["UpdateMcpServerRequest"]["properties"]
+    for name in ("auto_approve", "enabled", "tls_skip_verify"):
+        assert props[name]["type"] == "boolean"
+        assert "anyOf" not in props[name]
+        assert "default" not in props[name]
+
+
 class TestCheckedInArtifactFreshness:
     """The checked-in `sdk/typescript/*.json` specs must match their source.
 

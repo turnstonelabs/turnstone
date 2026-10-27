@@ -2767,7 +2767,14 @@ function _renderGovAudit(events, total) {
       if (keys.length) {
         const parts = [];
         for (let k = 0; k < Math.min(keys.length, 3); k++) {
-          parts.push(keys[k] + "=" + String(d[keys[k]]).slice(0, 30));
+          const value = d[keys[k]];
+          // An object value, such as a create's header_references, would
+          // otherwise read [object Object]; a list stays comma-joined.
+          const text =
+            value !== null && typeof value === "object" && !Array.isArray(value)
+              ? JSON.stringify(value)
+              : String(value);
+          parts.push(keys[k] + "=" + text.slice(0, 30));
         }
         detail = parts.join(", ");
       }

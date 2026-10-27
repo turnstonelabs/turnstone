@@ -787,6 +787,8 @@ class McpServerInfo(BaseModel):
     env: str = "{}"
     auto_approve: bool = False
     enabled: bool = True
+    # True accepts any certificate the server presents (streamable-http only).
+    tls_skip_verify: bool = False
     created_by: str = ""
     registry_name: str | None = None
     registry_version: str = ""
@@ -832,6 +834,9 @@ class CreateMcpServerRequest(BaseModel):
     env: dict[str, str] = Field(default_factory=dict)
     auto_approve: bool = False
     enabled: bool = True
+    # Streamable HTTP with auth 'none' or 'static' only: accept any certificate the server
+    # presents, checking neither its issuer nor its host name.
+    tls_skip_verify: bool = False
     # OAuth-MCP: one of 'none' | 'static' | 'oauth_user'.
     # ``oauth_client_secret`` is plaintext input; never persisted,
     # redacted in audit log.
@@ -852,8 +857,20 @@ class UpdateMcpServerRequest(BaseModel):
     url: str | None = None
     headers: dict[str, str] | None = None
     env: dict[str, str] | None = None
-    auto_approve: bool | None = None
-    enabled: bool | None = None
+    # These three grant or withhold authority, and the handler refuses an explicit JSON null for
+    # them, so null stays out of the advertised union.
+    auto_approve: bool | SkipJsonSchema[None] = Field(
+        default_factory=lambda: None,
+        description="Omit to leave the stored value unchanged; JSON null is refused (400).",
+    )
+    enabled: bool | SkipJsonSchema[None] = Field(
+        default_factory=lambda: None,
+        description="Omit to leave the stored value unchanged; JSON null is refused (400).",
+    )
+    tls_skip_verify: bool | SkipJsonSchema[None] = Field(
+        default_factory=lambda: None,
+        description="Omit to leave the stored value unchanged; JSON null is refused (400).",
+    )
     auth_type: str | None = None
     oauth_client_id: str | None = None
     oauth_client_secret: str | None = None
@@ -890,6 +907,8 @@ class McpConnectionTestRequest(BaseModel):
     transport: str = "streamable-http"
     # Labels the server in error messages; the URL's host stands in when empty.
     name: str = ""
+    # Accept any certificate the server presents, as a saved server with this setting does.
+    tls_skip_verify: bool = False
 
 
 class McpConnectionTestResponse(BaseModel):

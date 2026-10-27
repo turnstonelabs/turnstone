@@ -116,6 +116,12 @@ def client_no_perm(storage):
 # ---------------------------------------------------------------------------
 
 
+def _detail(event: dict[str, Any]) -> dict[str, Any]:
+    """An audit event's detail, decoded."""
+    detail = event["detail"]
+    return json.loads(detail) if isinstance(detail, str) else detail
+
+
 def _mock_search_result(
     servers: list[RegistryServer] | None = None,
     next_cursor: str | None = None,
@@ -364,6 +370,81 @@ class TestRegistryInstall:
         data = resp.json()
         assert data["transport"] == "stdio"
         assert data["command"] == "npx"
+        (event,) = storage.list_audit_events(action="mcp_server.registry_install")
+        assert "url" not in _detail(event)
+
+    def test_install_audits_where_a_remote_points(
+        self, client: TestClient, storage: SQLiteBackend
+    ) -> None:
+        """Only its scheme, host and port: the URL's path or query can carry a credential."""
+        with (
+            patch("turnstone.core.mcp_registry.MCPRegistryClient") as mock_client,
+            patch(
+                "turnstone.console.server._notify_nodes_mcp_reload",
+                new_callable=AsyncMock,
+                return_value={},
+            ),
+        ):
+            instance = AsyncMock()
+            instance.search.return_value = _mock_search_result([_sample_remote_server()])
+            instance.__aenter__ = AsyncMock(return_value=instance)
+            instance.__aexit__ = AsyncMock(return_value=False)
+            mock_client.return_value = instance
+
+            resp = client.post(
+                "/v1/api/admin/mcp-registry/install",
+                json={
+                    "registry_name": "io.example/test-server",
+                    "source": "remote",
+                    "headers": {"Authorization": "Bearer sk-123"},
+                },
+            )
+
+        assert resp.status_code == 200, resp.text
+        (event,) = storage.list_audit_events(action="mcp_server.registry_install")
+        assert _detail(event)["url"] == "https://api.example.com:443"
+
+    def test_install_that_loses_a_name_race_answers_409(
+        self, client: TestClient, storage: SQLiteBackend
+    ) -> None:
+        """A name another request takes after the check stores nothing and audits nothing."""
+        import uuid
+
+        storage.create_mcp_server(
+            server_id=uuid.uuid4().hex,
+            name="io.example.test-server",
+            transport="stdio",
+            command="echo",
+        )
+        with (
+            patch("turnstone.core.mcp_registry.MCPRegistryClient") as mock_client,
+            # As if this request's name check ran before the other request's insert landed.
+            patch.object(storage, "get_mcp_server_by_name", return_value=None),
+        ):
+            instance = AsyncMock()
+            instance.search.return_value = _mock_search_result([_sample_remote_server()])
+            instance.__aenter__ = AsyncMock(return_value=instance)
+            instance.__aexit__ = AsyncMock(return_value=False)
+            mock_client.return_value = instance
+
+            resp = client.post(
+                "/v1/api/admin/mcp-registry/install",
+                json={
+                    "registry_name": "io.example/test-server",
+                    "source": "remote",
+                    "headers": {"Authorization": "Bearer sk-123"},
+                },
+            )
+
+        assert resp.status_code == 409
+        assert resp.json() == {
+            "error": (
+                "Another request installed 'io.example/test-server' or took the name "
+                "'io.example.test-server' first; try again, or provide a custom 'name'"
+            )
+        }
+        assert storage.list_audit_events(action="mcp_server.registry_install") == []
+        assert storage.get_mcp_server_by_registry_name("io.example/test-server") is None
 
     def test_install_duplicate_registry_name(
         self, client: TestClient, storage: SQLiteBackend

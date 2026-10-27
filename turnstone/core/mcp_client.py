@@ -650,18 +650,39 @@ def _is_followed_post_redirect(response: httpx2.Response) -> bool:
     return _within_origin(sent_url, target)
 
 
+def _tls_skip_verify(cfg: dict[str, Any]) -> bool:
+    """Whether a static server's *cfg* turns certificate verification off.
+
+    Only the boolean ``tls_skip_verify = true`` does, so a value such as the string ``"false"``
+    leaves verification on.
+    """
+    return cfg.get("tls_skip_verify") is True
+
+
+def tls_skip_verify_applies(transport: str | None, auth_type: str | None) -> bool:
+    """Whether a saved server's ``tls_skip_verify`` can turn certificate verification off.
+
+    Only on a streamable-http server without per-user auth: a per-user server is sent each user's
+    bearer token, which only a verified certificate keeps from whoever answers in its place. The
+    console judges what it reports and stores by this, and the nodes what they connect with.
+    """
+    return transport == "streamable-http" and not is_user_scoped_auth(auth_type)
+
+
 def _make_capturing_http_client(
     capture: _AuthCapture,
     fired_event: asyncio.Event | None = None,
     *,
     headers: dict[str, str] | None = None,
+    tls_skip_verify: bool = False,
 ) -> httpx2.AsyncClient:
     """Build the ``httpx2.AsyncClient`` one MCP connection sends its requests through: it sends
     *headers* and records the first relevant HTTP failure into ``capture``.
 
     It also gives the request that ends a session ``_SESSION_END_TIMEOUT_S``, and fails an
     initialize answered with something other than an MCP message (:class:`_NotMcpResponseError`).
-    Building it opens nothing; the task that enters it owns it.
+    With *tls_skip_verify* it accepts any certificate the server presents, checking neither the
+    issuer nor the host name. Building it opens nothing; the task that enters it owns it.
 
     The hooks are ``async`` because :class:`httpx2.AsyncClient` invokes
     event hooks via ``await hook(response)`` — a sync function would
@@ -817,6 +838,7 @@ def _make_capturing_http_client(
 
     return httpx2.AsyncClient(
         headers=headers,
+        verify=not tls_skip_verify,
         timeout=httpx2.Timeout(_MCP_HTTP_TIMEOUT_S, read=_MCP_SSE_READ_TIMEOUT_S),
         event_hooks={
             "request": [_bound_session_end, _load_body],
@@ -1987,14 +2009,18 @@ async def _park_transport_owner(
                 await _wait_signal(timeout=1.0)
 
 
-async def _probe_http_server(url: str, headers: dict[str, str], label: str) -> ConnectionProbe:
+async def _probe_http_server(
+    url: str, headers: dict[str, str], label: str, tls_skip_verify: bool
+) -> ConnectionProbe:
     """Connect, negotiate and list the catalogs once; see :func:`probe_http_server`."""
     deadline = asyncio.get_running_loop().time() + MCPClientManager._CONNECT_TIMEOUT
     capture = _AuthCapture()
     try:
         await _tcp_preflight(label, url, MCPClientManager._TCP_PROBE_TIMEOUT)
         async with (
-            _make_capturing_http_client(capture, headers=headers) as http_client,
+            _make_capturing_http_client(
+                capture, headers=headers, tls_skip_verify=tls_skip_verify
+            ) as http_client,
             streamable_http_client(
                 url,
                 http_client=http_client,
@@ -2028,7 +2054,11 @@ async def _probe_http_server(url: str, headers: dict[str, str], label: str) -> C
 
 
 def probe_http_server(
-    url: str, headers: dict[str, str] | None = None, *, name: str = ""
+    url: str,
+    headers: dict[str, str] | None = None,
+    *,
+    name: str = "",
+    tls_skip_verify: bool = False,
 ) -> ConnectionProbe:
     """Test a Streamable HTTP MCP server the way a connect would reach it, publishing nothing.
 
@@ -2036,6 +2066,7 @@ def probe_http_server(
     and lists the tools, plus the resources and prompts when the server advertises them, all within
     the connect timeout. Nothing is recorded or published, and nothing outlives the call. *name*
     labels the server in error messages; the URL's host stands in when it is empty.
+    *tls_skip_verify* accepts any certificate, as a saved server with that setting does.
 
     Blocks the calling thread for up to :func:`probe_http_server_max_s`. The test runs on an event
     loop of its own, so a fault inside the SDK stays in this thread instead of stalling the
@@ -2044,7 +2075,9 @@ def probe_http_server(
     label = name or urllib.parse.urlparse(url).hostname or url
     loop = asyncio.new_event_loop()
     try:
-        test = loop.create_task(_probe_http_server(url, dict(headers or {}), label))
+        test = loop.create_task(
+            _probe_http_server(url, dict(headers or {}), label, tls_skip_verify)
+        )
         # The SDK bounds each read of the request that ends the session, not the request: held
         # here to the bound as a whole, and the teardown below has the rest of it.
         loop.run_until_complete(
@@ -3828,6 +3861,7 @@ class MCPClientManager:
                                 state.http_capture,
                                 state.http_fired_event,
                                 headers=cfg.get("headers"),
+                                tls_skip_verify=_tls_skip_verify(cfg),
                             )
                         )
                         read, write = await stack.enter_async_context(
@@ -3964,7 +3998,8 @@ class MCPClientManager:
         state.http_capture = None
 
         transport = cfg.get("type", "stdio")
-        if transport in ("http", "streamable-http") or "url" in cfg:
+        is_http = transport in ("http", "streamable-http") or "url" in cfg
+        if is_http:
             # Pre-flight TCP check: fail fast before spawning an owner and
             # entering the SDK's anyio task group at all (an ECONNREFUSED
             # surfaces here as a clean ConnectionError instead of a
@@ -4105,13 +4140,17 @@ class MCPClientManager:
         if state.supports_prompt_list_changed:
             push_parts.append("prompts")
         push_status = f" (push: {','.join(push_parts)})" if push_parts else ""
+        # The node's own record that it accepts any certificate from this server: a server from a
+        # configuration file shows nowhere else.
+        tls_status = " (certificate not verified)" if is_http and _tls_skip_verify(cfg) else ""
         log.info(
-            "Connected MCP server '%s' — %d tool(s), %d resource(s), %d prompt(s)%s",
+            "Connected MCP server '%s' — %d tool(s), %d resource(s), %d prompt(s)%s%s",
             name,
             len(server_tools),
             resource_count,
             prompt_count,
             push_status,
+            tls_status,
         )
 
         # Sync discovered prompts into governance storage
@@ -4613,6 +4652,8 @@ class MCPClientManager:
                 ready,
                 close_requested,
                 url=url,
+                # Per-user connections always verify the certificate, which their bearer tokens
+                # need; the admin API refuses tls_skip_verify on these rows.
                 http_client=_make_capturing_http_client(capture, fired_event, headers=headers),
             ),
             name=f"mcp-pool-owner:{user_id}:{server_name}",
@@ -11705,6 +11746,10 @@ def _db_servers_to_config(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any
                 cfg["headers"] = json.loads(row.get("headers", "{}"))
             except (ValueError, TypeError, RecursionError):
                 cfg["headers"] = {}
+            if row.get("tls_skip_verify") and tls_skip_verify_applies(
+                row["transport"], row.get("auth_type")
+            ):
+                cfg["tls_skip_verify"] = True
         result[name] = cfg
     return result
 

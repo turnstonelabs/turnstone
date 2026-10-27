@@ -5,6 +5,8 @@ from __future__ import annotations
 import uuid
 from typing import TYPE_CHECKING
 
+import pytest
+
 if TYPE_CHECKING:
     from turnstone.core.storage._sqlite import SQLiteBackend
 
@@ -90,6 +92,22 @@ class TestMcpServerStorage:
         ok = db.update_mcp_server("nonexistent", name="x")
         assert ok is False
 
+    @pytest.mark.parametrize("column", ["name", "registry_name"])
+    def test_update_to_a_taken_value_raises_and_changes_nothing(
+        self, db: SQLiteBackend, column: str
+    ) -> None:
+        from turnstone.core.storage import StorageConflictError
+
+        db.create_mcp_server(server_id="a", name="taken", transport="stdio", registry_name="taken")
+        db.create_mcp_server(server_id="b", name="mine", transport="stdio", registry_name="mine")
+        with pytest.raises(StorageConflictError):
+            db.update_mcp_server("b", **{column: "taken"}, enabled=False)
+        s = db.get_mcp_server("b")
+        assert s is not None
+        assert (s["name"], s["registry_name"], s["enabled"]) == ("mine", "mine", True)
+        # The failed write leaves the backend usable.
+        assert db.update_mcp_server("b", enabled=False) is True
+
     def test_update_ignores_disallowed_fields(self, db: SQLiteBackend) -> None:
         sid = _make_id()
         db.create_mcp_server(server_id=sid, name="guard", transport="stdio", created_by="admin")
@@ -115,17 +133,23 @@ class TestMcpServerStorage:
         assert ok is False
 
     def test_create_duplicate_name(self, db: SQLiteBackend) -> None:
-        db.create_mcp_server(server_id=_make_id(), name="unique", transport="stdio")
-        # Second create with same name but different ID should be no-op (OR IGNORE)
+        assert db.create_mcp_server(server_id=_make_id(), name="unique", transport="stdio") is True
+        # Second create with same name but different ID should be no-op (OR IGNORE), and say so
         sid2 = _make_id()
-        db.create_mcp_server(server_id=sid2, name="unique", transport="stdio")
+        assert db.create_mcp_server(server_id=sid2, name="unique", transport="stdio") is False
         # OR IGNORE silently drops the conflicting insert
         assert db.get_mcp_server(sid2) is None
 
     def test_create_idempotent_same_id(self, db: SQLiteBackend) -> None:
         sid = _make_id()
-        db.create_mcp_server(server_id=sid, name="idem", transport="stdio", command="v1")
-        db.create_mcp_server(server_id=sid, name="idem", transport="stdio", command="v2")
+        assert (
+            db.create_mcp_server(server_id=sid, name="idem", transport="stdio", command="v1")
+            is True
+        )
+        assert (
+            db.create_mcp_server(server_id=sid, name="idem", transport="stdio", command="v2")
+            is False
+        )
         s = db.get_mcp_server(sid)
         assert s is not None
         assert s["command"] == "v1"  # original preserved, second ignored
@@ -144,6 +168,42 @@ class TestMcpServerStorage:
         assert s["transport"] == "streamable-http"
         assert s["url"] == "https://example.com/mcp"
         assert "Authorization" in s["headers"]
+
+    def test_tls_skip_verify_is_off_unless_set_and_reads_back_as_a_bool(
+        self, db: SQLiteBackend
+    ) -> None:
+        verified, skipped = _make_id(), _make_id()
+        db.create_mcp_server(
+            server_id=verified,
+            name="verified",
+            transport="streamable-http",
+            url="https://mcp.example.com/mcp",
+        )
+        db.create_mcp_server(
+            server_id=skipped,
+            name="skipped",
+            transport="streamable-http",
+            url="https://kvm.example.com/mcp",
+            registry_name="io.example/kvm",
+            tls_skip_verify=True,
+        )
+
+        by_id = db.get_mcp_server(verified)
+        by_name = db.get_mcp_server_by_name("skipped")
+        by_registry = db.get_mcp_server_by_registry_name("io.example/kvm")
+        listed = {s["name"]: s["tls_skip_verify"] for s in db.list_mcp_servers(enabled_only=True)}
+        assert by_id is not None
+        assert by_id["tls_skip_verify"] is False
+        assert by_name is not None
+        assert by_name["tls_skip_verify"] is True
+        assert by_registry is not None
+        assert by_registry["tls_skip_verify"] is True
+        assert listed == {"skipped": True, "verified": False}
+
+        assert db.update_mcp_server(skipped, tls_skip_verify=False) is True
+        after = db.get_mcp_server(skipped)
+        assert after is not None
+        assert after["tls_skip_verify"] is False
 
     # -- Registry columns -------------------------------------------------------
 
@@ -188,6 +248,18 @@ class TestMcpServerStorage:
 
     def test_get_by_registry_name_not_found(self, db: SQLiteBackend) -> None:
         assert db.get_mcp_server_by_registry_name("nonexistent") is None
+
+    def test_create_with_a_taken_registry_name_inserts_nothing(self, db: SQLiteBackend) -> None:
+        first, second = _make_id(), _make_id()
+        reg = "io.example/once"
+        created = db.create_mcp_server(
+            server_id=first, name="first", transport="stdio", registry_name=reg
+        )
+        lost = db.create_mcp_server(
+            server_id=second, name="second", transport="stdio", registry_name=reg
+        )
+        assert (created, lost) == (True, False)
+        assert db.get_mcp_server(second) is None
 
     def test_null_registry_name_no_conflict(self, db: SQLiteBackend) -> None:
         """Multiple servers with NULL registry_name should coexist."""

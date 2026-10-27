@@ -28,6 +28,7 @@ from turnstone.core.mcp_client import (
     _db_servers_to_config,
     _is_dead_transport,
     _mcp_to_openai,
+    _pool_cfg_from_row,
     _reap_cancelled,
     load_mcp_config,
 )
@@ -314,6 +315,40 @@ class TestDBServersToConfig:
         assert "static-srv" in result
         assert result["static-srv"]["url"] == "https://mcp.example.com"
         assert result["static-srv"]["headers"] == {"Authorization": "Bearer token"}
+
+    def test_tls_skip_verify_reaches_the_config_only_when_set(self) -> None:
+        def row(name: str, skip: bool) -> dict[str, Any]:
+            return {
+                "name": name,
+                "transport": "streamable-http",
+                "url": f"https://{name}.example.com/mcp",
+                "headers": "{}",
+                "auth_type": "none",
+                "tls_skip_verify": skip,
+            }
+
+        result = _db_servers_to_config([row("kvm", True), row("verified", False)])
+
+        assert result["kvm"]["tls_skip_verify"] is True
+        # Absent rather than False, so a verified server's config is what it was before.
+        assert "tls_skip_verify" not in result["verified"]
+
+    @pytest.mark.parametrize("auth_type", ["oauth_user", "oauth_obo"])
+    def test_a_per_user_row_never_carries_tls_skip_verify(self, auth_type: str) -> None:
+        # Per-user connections always verify the certificate, which every user's bearer token
+        # needs, even when two crossing edits left the column set on the row.
+        cfg = _pool_cfg_from_row(
+            {
+                "name": "pooled",
+                "transport": "streamable-http",
+                "url": "https://pooled.example.com/mcp",
+                "headers": "{}",
+                "auth_type": auth_type,
+                "tls_skip_verify": True,
+            }
+        )
+
+        assert "tls_skip_verify" not in cfg
 
     def test_db_servers_to_config_skips_oauth_user_rows(self) -> None:
         """Rows with auth_type=oauth_user must be invisible to the static

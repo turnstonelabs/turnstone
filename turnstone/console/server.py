@@ -8684,18 +8684,26 @@ def _canonicalize_skill_string_list(raw: Any) -> str:
     return _json.dumps([p.strip() for p in candidate.split(",") if p.strip()])
 
 
-def _parse_strict_bool(raw: Any, *, default: bool) -> tuple[bool, JSONResponse | None]:
+def _parse_strict_bool(
+    raw: Any, *, default: bool, field: str = ""
+) -> tuple[bool, JSONResponse | None]:
     """Strictly parse a boolean-shaped admin body field.
 
     Accepts:
     * Python ``bool`` (canonical JSON ``true``/``false``)
     * ``int`` ``0`` or ``1``
 
+    ``None`` (a key read with ``body.get`` that is absent, or a JSON
+    null) returns ``(default, None)``.  A caller for which a sent null
+    must not fall back to *default* refuses it first, as the schedule
+    endpoints do with :func:`_null_field`.
+
     Anything else returns a 400 ``JSONResponse`` — admin clients on
     this surface speak typed JSON, and silently coercing the string
     ``"false"`` (which Python truthiness reads as ``True``) would flip
     a field opposite to the obvious intent.  Caught by ``/review`` on
     PR #577: ``bool(body.get(..., False))`` accepted strings unsafely.
+    The error names *field* when one is given.
 
     Returns ``(value, None)`` on success or ``(default, response_400)``
     on failure — callers return the 400 early.
@@ -8707,7 +8715,7 @@ def _parse_strict_bool(raw: Any, *, default: bool) -> tuple[bool, JSONResponse |
     if raw is None:
         return default, None
     return default, JSONResponse(
-        {"error": "boolean field expects true/false (or 0/1)"},
+        {"error": f"{field or 'boolean field'} expects true/false (or 0/1)"},
         status_code=400,
     )
 
@@ -10886,7 +10894,7 @@ async def admin_registry_install(request: Request) -> JSONResponse:
     server_id = uuid.uuid4().hex
     audit_uid, ip = _audit_context(request)
 
-    storage.create_mcp_server(
+    created = storage.create_mcp_server(
         server_id=server_id,
         name=name,
         transport=config["transport"],
@@ -10902,12 +10910,27 @@ async def admin_registry_install(request: Request) -> JSONResponse:
         registry_version=config["registry_version"],
         registry_meta=json.dumps(config["registry_meta"]),
     )
+    if not created:
+        # Another request installed this registry server, or took the name, since the checks above.
+        # A retry's checks say which.
+        return JSONResponse(
+            {
+                "error": (
+                    f"Another request installed '{registry_name}' or took the name '{name}' "
+                    "first; try again, or provide a custom 'name'"
+                )
+            },
+            status_code=409,
+        )
 
     install_detail: dict[str, Any] = {
         "name": name,
         "registry_name": registry_name,
         "source": source,
     }
+    if config["transport"] == "streamable-http":
+        # Where the server points, never its path or query, which can carry a credential.
+        install_detail["url"] = _audit_url_origin(config.get("url", ""))
     if header_refs := _header_references(merged_headers):
         install_detail["header_references"] = header_refs
     record_audit(
@@ -11041,6 +11064,93 @@ def _parse_auth_type(body: dict[str, Any]) -> tuple[str | None, JSONResponse | N
             status_code=400,
         )
     return auth_type, None
+
+
+def _tls_skip_verify_for_write(
+    body: dict[str, Any], stored: bool, *, transport: str | None, auth_type: str | None
+) -> tuple[bool, str | None]:
+    """The ``tls_skip_verify`` a row has after a write of *body*, or why the write is refused.
+
+    Absent keeps *stored*. Otherwise only a JSON boolean is accepted: coercing a value such as
+    the string ``"false"`` would turn certificate verification off, and a null could mean keeping
+    the setting as well as clearing it, so it is refused as on the schedule endpoints. It can be
+    on only for a streamable-http server without per-user auth. Per-user rows send each user's
+    bearer token, and only a verified certificate keeps that token from whoever answers in the
+    server's place. A request that turns it on anywhere else is refused. A *stored* value that
+    stops applying (the row moves to stdio or to per-user auth) is cleared, so a later move back
+    does not restore it.
+    """
+    from turnstone.core.mcp_client import tls_skip_verify_applies
+
+    if "tls_skip_verify" in body and body["tls_skip_verify"] is None:
+        return stored, "tls_skip_verify must not be null"
+    requested = body.get("tls_skip_verify")
+    if requested is not None and not isinstance(requested, bool):
+        return stored, "tls_skip_verify must be true or false"
+    if requested and not tls_skip_verify_applies(transport, auth_type):
+        if transport != "streamable-http":
+            return stored, "tls_skip_verify applies only to streamable-http servers"
+        if is_user_scoped_auth(auth_type):
+            return stored, "tls_skip_verify cannot be set for auth_type 'oauth_user' or 'oauth_obo'"
+        return stored, "tls_skip_verify cannot be set for this server"
+    skip = stored if requested is None else requested
+    return skip and tls_skip_verify_applies(transport, auth_type), None
+
+
+def _effective_tls_skip_verify(row: dict[str, Any]) -> bool:
+    """Whether connections to the server in *row* skip certificate verification.
+
+    The column counts only on the rows nodes apply it to, as
+    :func:`turnstone.core.mcp_client.tls_skip_verify_applies` decides for both. Two edits that
+    cross, one moving the row to stdio or per-user auth while the other turns the setting on, can
+    leave it set on another row, where it changes no connection; reads report it as off, and the
+    row's next edit clears it.
+    """
+    from turnstone.core.mcp_client import tls_skip_verify_applies
+
+    return bool(row.get("tls_skip_verify")) and tls_skip_verify_applies(
+        row.get("transport"), row.get("auth_type")
+    )
+
+
+def _mcp_null_flag(body: dict[str, Any]) -> str | None:
+    """The first of ``auto_approve`` and ``enabled`` that *body* sends as null, or None.
+
+    Both grant or withhold authority, so a null is refused, as on the schedule endpoints
+    (:func:`_null_field`): read as false it cleared the flag, and read as "not sent" it would make
+    an attempt to clear auto-approval a silent no-op. ``tls_skip_verify`` follows the same rule in
+    :func:`_tls_skip_verify_for_write`.
+    """
+    return next(
+        (key for key in ("auto_approve", "enabled") if key in body and body[key] is None), None
+    )
+
+
+def _audit_url_target(url: str) -> dict[str, Any] | None:
+    """The scheme, host and port *url* points at, for an audit event, or None unless it is an
+    http(s) URL with a host. Never its path or query: either can carry a credential."""
+    try:
+        parsed = urllib.parse.urlparse(url)
+        port = parsed.port
+    except ValueError:
+        return None
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        return None
+    return {
+        "scheme": parsed.scheme,
+        "host": parsed.hostname,
+        "port": port if port is not None else (443 if parsed.scheme == "https" else 80),
+    }
+
+
+def _audit_url_origin(url: str) -> str | None:
+    """*url* as ``scheme://host:port`` for an audit event (an IPv6 host in brackets), or None
+    unless it is an http(s) URL with a host. One string, so the console's audit list shows it."""
+    target = _audit_url_target(url)
+    if target is None:
+        return None
+    host = f"[{target['host']}]" if ":" in target["host"] else target["host"]
+    return f"{target['scheme']}://{host}:{target['port']}"
 
 
 def _mcp_name_error(name: str) -> str | None:
@@ -11418,6 +11528,14 @@ _OAUTH_TOKEN_STORE_503_MSG = (
 )
 
 
+# Caps the plaintext, which defends against pathological input blowing up the Fernet ciphertext
+# column. Real OAuth client secrets from production AS implementations are well under 256 chars.
+_OAUTH_CLIENT_SECRET_MAX_CHARS = 1024
+_OAUTH_CLIENT_SECRET_TOO_LONG = (
+    f"oauth_client_secret must be {_OAUTH_CLIENT_SECRET_MAX_CHARS} characters or fewer"
+)
+
+
 def _require_token_store_for_oauth_secret(
     request: Request, body: dict[str, Any], *, auth_type: str
 ) -> JSONResponse | None:
@@ -11427,12 +11545,13 @@ def _require_token_store_for_oauth_secret(
     ``body`` and ``auth_type == 'oauth_user'`` but the cluster has no
     Fernet key configured.  Returns ``None`` otherwise (caller proceeds).
 
-    A second 400 is returned when the body field is present but not a
-    string or null — the caller should not need to re-validate it.
+    A 400 is returned when the body field is present but not a string or
+    null, or longer than ``_OAUTH_CLIENT_SECRET_MAX_CHARS`` — the caller
+    should not need to re-validate it.
 
     Used to fail-fast before ``storage.create_mcp_server`` /
-    ``storage.update_mcp_server`` so a 503 never leaves a partially
-    written row behind.
+    ``storage.update_mcp_server`` so a refusal never leaves a partially
+    written row behind, with no audit event or node reload for it.
     """
     if "oauth_client_secret" not in body or auth_type != "oauth_user":
         return None
@@ -11442,6 +11561,8 @@ def _require_token_store_for_oauth_secret(
             {"error": "oauth_client_secret must be a string or null"},
             status_code=400,
         )
+    if secret_input is not None and len(secret_input) > _OAUTH_CLIENT_SECRET_MAX_CHARS:
+        return JSONResponse({"error": _OAUTH_CLIENT_SECRET_TOO_LONG}, status_code=400)
     if oauth_context(request.app.state).token_store is None:
         return JSONResponse({"error": _OAUTH_TOKEN_STORE_503_MSG}, status_code=503)
     return None
@@ -11464,28 +11585,18 @@ def _apply_oauth_client_secret(
     is not ``oauth_user`` — ``(None, None)`` is returned in that case.
 
     On success returns ``(True, None)`` for a set or ``(False, None)``
-    for a clear.  Returns ``(None, error_response)`` only when the body
-    field has the wrong JSON type or the token store is unavailable
-    (callers must invoke ``_require_token_store_for_oauth_secret`` BEFORE
-    the storage write to avoid a partial-write hazard; this helper
-    re-checks defensively in case lifespan state changed mid-request).
+    for a clear.  Returns ``(None, error_response)`` only when
+    ``_require_token_store_for_oauth_secret`` refuses the body field
+    (callers must invoke it BEFORE the storage write to avoid a
+    partial-write hazard; this helper runs it again in case lifespan
+    state changed mid-request).
     """
     if "oauth_client_secret" not in body or auth_type != "oauth_user":
         return None, None
+    err = _require_token_store_for_oauth_secret(request, body, auth_type=auth_type)
+    if err is not None:
+        return None, err
     secret_input = body.get("oauth_client_secret")
-    if secret_input is not None and not isinstance(secret_input, str):
-        return None, JSONResponse(
-            {"error": "oauth_client_secret must be a string or null"},
-            status_code=400,
-        )
-    # Cap plaintext at 1024 chars — defends against pathological input
-    # blowing up the Fernet ciphertext column. Real OAuth client secrets
-    # from production AS implementations are well under 256 chars.
-    if isinstance(secret_input, str) and len(secret_input) > 1024:
-        return None, JSONResponse(
-            {"error": "oauth_client_secret must be 1024 characters or fewer"},
-            status_code=400,
-        )
     token_store = cast("MCPTokenStore | None", oauth_context(request.app.state).token_store)
     if token_store is None:
         return None, JSONResponse({"error": _OAUTH_TOKEN_STORE_503_MSG}, status_code=503)
@@ -11693,6 +11804,7 @@ def _mcp_server_to_detail(
     static / none rows don't carry an irrelevant ``0``.
     """
     d = dict(server)
+    d["tls_skip_verify"] = _effective_tls_skip_verify(server)
     d["status"] = node_statuses or {}
     if consented_users_count is not None:
         d["consented_users_count"] = consented_users_count
@@ -11860,6 +11972,7 @@ async def admin_list_mcp_servers(request: Request) -> JSONResponse:
                 "env": "{}",
                 "auto_approve": False,
                 "enabled": True,
+                "tls_skip_verify": False,
                 "created_by": "",
                 "auth_type": "static",
                 "created": "",
@@ -11922,6 +12035,21 @@ async def admin_create_mcp_server(request: Request) -> JSONResponse:
         return err_resp
     # Helper returns None when key is absent — fall back to the default.
     auth_type = auth_type_value if auth_type_value is not None else "static"
+    tls_skip_verify, tls_error = _tls_skip_verify_for_write(
+        body, False, transport=transport, auth_type=auth_type
+    )
+    if tls_error:
+        return JSONResponse({"error": tls_error}, status_code=400)
+    if null_flag := _mcp_null_flag(body):
+        return JSONResponse({"error": f"{null_flag} must not be null"}, status_code=400)
+    auto_approve, err_resp = _parse_strict_bool(
+        body.get("auto_approve"), default=False, field="auto_approve"
+    )
+    if err_resp is not None:
+        return err_resp
+    enabled, err_resp = _parse_strict_bool(body.get("enabled"), default=True, field="enabled")
+    if err_resp is not None:
+        return err_resp
 
     # Clean the OAuth text fields ONCE — reused by both the write-time validator
     # and the persisted ``oauth_cols`` below, so the validated and persisted
@@ -12000,7 +12128,7 @@ async def admin_create_mcp_server(request: Request) -> JSONResponse:
     }
     oauth_cols.update(_oauth_columns_to_clear(auth_type))
 
-    storage.create_mcp_server(
+    created = storage.create_mcp_server(
         server_id=server_id,
         name=name,
         transport=transport,
@@ -12009,12 +12137,15 @@ async def admin_create_mcp_server(request: Request) -> JSONResponse:
         url=server_url,
         headers=json.dumps(headers_dict) if isinstance(headers_dict, dict) else "{}",
         env=json.dumps(env_dict) if isinstance(env_dict, dict) else "{}",
-        auto_approve=bool(body.get("auto_approve", False)),
-        enabled=bool(body.get("enabled", True)),
+        auto_approve=auto_approve,
+        enabled=enabled,
+        tls_skip_verify=tls_skip_verify,
         created_by=audit_uid,
         auth_type=auth_type,
         **oauth_cols,
     )
+    if not created:  # another request took the name since the check above
+        return JSONResponse({"error": f"Server '{name}' already exists"}, status_code=409)
 
     # Encrypt + persist the operator-supplied client secret via the dedicated
     # writer.  Pre-checked above; the helper re-checks defensively.
@@ -12031,12 +12162,19 @@ async def admin_create_mcp_server(request: Request) -> JSONResponse:
         return err_resp
 
     audit_detail: dict[str, Any] = {"name": name, "auth_type": auth_type}
+    if tls_skip_verify:
+        # First, as on an update: the Audit tab shows only a detail's first three keys.
+        audit_detail = {"tls_skip_verify": True, **audit_detail}
     if header_refs := _header_references(headers_dict):
         audit_detail["header_references"] = header_refs
     if "oauth_client_secret" in body:
         audit_detail["oauth_client_secret"] = "(redacted)"
         if secret_set_state is not None:
             audit_detail["oauth_client_secret_set"] = secret_set_state
+    if transport == "streamable-http":
+        # Where the server points, never its path or query, which can carry a credential. Last,
+        # so a header reference or client-secret marker keeps its place among those three keys.
+        audit_detail["url"] = _audit_url_origin(server_url)
     record_audit(
         storage,
         audit_uid,
@@ -12090,6 +12228,7 @@ async def admin_update_mcp_server(request: Request) -> JSONResponse:
     """PUT /v1/api/admin/mcp-servers/{server_id} — update an MCP server."""
     from turnstone.core.audit import record_audit
     from turnstone.core.auth import require_permission
+    from turnstone.core.storage._protocol import StorageConflictError
     from turnstone.core.web_helpers import read_json_or_400, require_storage_or_503
 
     storage, err = require_storage_or_503(request)
@@ -12149,10 +12288,16 @@ async def admin_update_mcp_server(request: Request) -> JSONResponse:
     err = await _check_mcp_secret_fields(request, changed_headers, changed_env)
     if err is not None:
         return err
-    if "auto_approve" in body:
-        updates["auto_approve"] = bool(body["auto_approve"])
-    if "enabled" in body:
-        updates["enabled"] = bool(body["enabled"])
+    if null_flag := _mcp_null_flag(body):
+        return JSONResponse({"error": f"{null_flag} must not be null"}, status_code=400)
+    for _bool_key in ("auto_approve", "enabled"):
+        if _bool_key in body:
+            bool_value, err_resp = _parse_strict_bool(
+                body[_bool_key], default=bool(existing.get(_bool_key)), field=_bool_key
+            )
+            if err_resp is not None:
+                return err_resp
+            updates[_bool_key] = bool_value
     auth_type_value, err_resp = _parse_auth_type(body)
     if err_resp is not None:
         return err_resp
@@ -12241,6 +12386,20 @@ async def admin_update_mcp_server(request: Request) -> JSONResponse:
             ):
                 updates[_user_col] = updates.get(_user_col)
     updates.update(_oauth_columns_to_clear(target_auth))
+    # Judged on the row as it will be, like the OAuth columns above. A new URL keeps the stored
+    # value, as it keeps the headers. A value the request sends is stored, so of two saves that
+    # cross the later one wins, as for auto_approve and enabled. The comparison with the column
+    # itself clears a value left where it does not apply.
+    tls_skip_verify, tls_error = _tls_skip_verify_for_write(
+        body,
+        _effective_tls_skip_verify(existing),
+        transport=transport_after,
+        auth_type=target_auth,
+    )
+    if tls_error:
+        return JSONResponse({"error": tls_error}, status_code=400)
+    if "tls_skip_verify" in body or tls_skip_verify != bool(existing.get("tls_skip_verify")):
+        updates["tls_skip_verify"] = tls_skip_verify
     # A user-scoped row stores its URL in canonical RFC 8707 form, judged on
     # the post-update auth type and applied to the merged URL, so a flip into
     # oauth_user that omits ``url`` canonicalizes (or rejects) the stored value
@@ -12366,8 +12525,20 @@ async def admin_update_mcp_server(request: Request) -> JSONResponse:
     if err_resp is not None:
         return err_resp
 
-    if updates:
-        storage.update_mcp_server(server_id, **updates)
+    # Written even when *updates* is empty (it then stamps only ``updated``): the write is what
+    # says whether the row still exists, so a server deleted since the read above answers 404
+    # before any purge, secret write, audit event or reload.
+    try:
+        found = storage.update_mcp_server(server_id, **updates)
+    except StorageConflictError:
+        if not name_changing:
+            raise
+        # Another request took the name since the check above.
+        return JSONResponse(
+            {"error": f"Server '{updates['name']}' already exists"}, status_code=409
+        )
+    if not found:  # another request deleted the server since the read above
+        return JSONResponse({"error": "MCP server not found"}, status_code=404)
 
     audit_uid, ip = _audit_context(request)
 
@@ -12442,9 +12613,33 @@ async def admin_update_mcp_server(request: Request) -> JSONResponse:
         return err_resp
 
     audit_detail = dict(updates)
-    for _secret_key in ("env", "headers"):
+    # Values that can carry a credential: a stdio server's arguments (--api-key ...) as much as
+    # its environment or a server's headers.
+    for _secret_key in ("env", "headers", "args"):
         if _secret_key in audit_detail:
             audit_detail[_secret_key] = "(updated)"
+    # Where a new URL points, never its path or query, which can carry a credential. The form
+    # re-sends an unchanged URL with every save, which says nothing.
+    if "url" in audit_detail:
+        if audit_detail["url"] == (existing.get("url") or ""):
+            del audit_detail["url"]
+        elif audit_detail["url"]:
+            audit_detail["url"] = _audit_url_origin(audit_detail["url"]) or "(updated)"
+    # The same for the OAuth settings that hold a URL: an oauth_user audience is the server's own
+    # URL (the form fills it in from there), and the form re-sends the authorization server's URL
+    # with every save. Every http(s) value is cut to its origin, a URL-form obo app identifier or
+    # an issuer's tenant path included; another value, such as an api:// identifier, is kept.
+    for _url_key in ("oauth_audience", "oauth_authorization_server_url"):
+        _url_value = audit_detail.get(_url_key)
+        if isinstance(_url_value, str) and _url_value.lower().startswith(("http:", "https:")):
+            audit_detail[_url_key] = _audit_url_origin(_url_value) or "(updated)"
+    # Any edit of a server that skips certificate verification says so, whatever it changed: a
+    # new URL or new headers then go to a server whose certificate goes unchecked. So does the
+    # edit that clears the setting. First, since the Audit tab shows only a detail's first three
+    # keys and a full-form save stores many more; *updates* holds the same value when it holds
+    # one. The false a form re-sends for a server that verifies stays among the other settings.
+    if tls_skip_verify or tls_skip_verify != bool(existing.get("tls_skip_verify")):
+        audit_detail = {"tls_skip_verify": tls_skip_verify, **audit_detail}
     if header_refs := _header_references(body.get("headers")):
         audit_detail["header_references"] = header_refs
     if "oauth_client_secret" in body:
@@ -12859,12 +13054,13 @@ async def admin_test_mcp_server(request: Request) -> JSONResponse:
     Connects once from the console, with the form's unsaved values, the way a save's connect
     would, and reports the server's tool names and its resource and prompt counts, or why the
     connect failed. Nothing is stored and no catalog is published; the test itself is audited.
-    Streamable HTTP servers with auth ``none`` or ``static`` only. The name, URL and headers get
-    the checks a save gives them (:func:`_mcp_name_error`, :func:`_mcp_url_error`,
-    :func:`_mcp_headers_error`), which judge their form alone. A header holding a ``secret://``
-    reference also gets a save's reference checks (:func:`_check_mcp_secret_fields`), and the test
-    sends the value it names. There is no address screening: the admin.mcp gate is the control
-    here, as it is on the save that makes the console and every node connect to the URL.
+    Streamable HTTP servers with auth ``none`` or ``static`` only. The name, URL, headers and
+    ``tls_skip_verify`` get the checks a save gives them (:func:`_mcp_name_error`,
+    :func:`_mcp_url_error`, :func:`_mcp_headers_error`, :func:`_tls_skip_verify_for_write`), which
+    judge their form alone. A header holding a ``secret://`` reference also gets a save's
+    reference checks (:func:`_check_mcp_secret_fields`), and the test sends the value it names.
+    There is no address screening: the admin.mcp gate is the control here, as it is on the save
+    that makes the console and every node connect to the URL.
     """
     from turnstone.core.audit import record_audit
     from turnstone.core.auth import require_permission
@@ -12902,7 +13098,14 @@ async def admin_test_mcp_server(request: Request) -> JSONResponse:
     url = str(body.get("url", "")).strip()
     headers = body.get("headers") or {}
     name = str(body.get("name", "")).strip()[:64]
-    input_error = _mcp_test_input_error(url, headers) or (_mcp_name_error(name) if name else None)
+    tls_skip_verify, tls_error = _tls_skip_verify_for_write(
+        body, False, transport=transport, auth_type=auth_type
+    )
+    input_error = (
+        _mcp_test_input_error(url, headers)
+        or (_mcp_name_error(name) if name else None)
+        or tls_error
+    )
     if input_error:
         return JSONResponse({"error": input_error}, status_code=400)
     # The test answers in time for the SDKs' read timeout; resolving references counts against it.
@@ -12946,7 +13149,9 @@ async def admin_test_mcp_server(request: Request) -> JSONResponse:
     def _test() -> None:
         outcome: ConnectionProbe | BaseException
         try:
-            outcome = context.run(probe_http_server, url, headers, name=name)
+            outcome = context.run(
+                probe_http_server, url, headers, name=name, tls_skip_verify=tls_skip_verify
+            )
         except BaseException as exc:
             outcome = exc
         finally:
@@ -12967,14 +13172,14 @@ async def admin_test_mcp_server(request: Request) -> JSONResponse:
         probe = ConnectionProbe(failure=ConnectFailure("timeout", message))
     failure = probe.failure
     # The test sent a request on the admin's behalf: audit where and how it ended, never the
-    # headers or the full URL (its path or query can carry a credential).
-    parsed = urllib.parse.urlparse(url)
+    # headers or the full URL. The URL passed its check above, so it parses.
     audit_detail: dict[str, Any] = {
-        "scheme": parsed.scheme,
-        "host": parsed.hostname or "",
-        "port": parsed.port or (443 if parsed.scheme == "https" else 80),
+        **(_audit_url_target(url) or {}),
         "outcome": failure.kind if failure else "ok",
     }
+    if tls_skip_verify:
+        # First, as on an update: the Audit tab shows only a detail's first three keys.
+        audit_detail = {"tls_skip_verify": True, **audit_detail}
     if failure is not None and failure.status is not None:
         audit_detail["status"] = failure.status
     if header_references:
@@ -13196,6 +13401,8 @@ async def admin_import_mcp_config(request: Request) -> JSONResponse:
     imported: list[str] = []
     skipped: list[str] = []
     errors: list[str] = []
+    unverified: list[str] = []  # imported with certificate verification off
+    origins: dict[str, str | None] = {}  # each imported streamable-http server's scheme://host:port
     header_references: dict[str, dict[str, str]] = {}
     audit_uid, ip = _audit_context(request)
     current_count = len(storage.list_mcp_servers())
@@ -13214,6 +13421,9 @@ async def admin_import_mcp_config(request: Request) -> JSONResponse:
         srv_name = str(srv_name).strip()[:64]
         if not srv_name or _mcp_name_error(srv_name):
             errors.append(f"{srv_name}: invalid server name")
+            continue
+        if not isinstance(cfg, dict):
+            errors.append(f"{srv_name}: entry must be an object")
             continue
         if storage.get_mcp_server_by_name(srv_name):
             skipped.append(srv_name)
@@ -13240,6 +13450,12 @@ async def admin_import_mcp_config(request: Request) -> JSONResponse:
             errors.append(f"{srv_name}: env must be an object")
             continue
         url = str(cfg.get("url", "")).strip()
+        tls_skip_verify, tls_error = _tls_skip_verify_for_write(
+            cfg, False, transport=transport, auth_type="static"
+        )
+        if tls_error:
+            errors.append(f"{srv_name}: {tls_error}")
+            continue
         if transport == "streamable-http":
             input_error = _mcp_url_error(url) or _mcp_headers_error(raw_headers)
             if input_error:
@@ -13254,7 +13470,7 @@ async def admin_import_mcp_config(request: Request) -> JSONResponse:
 
         server_id = uuid.uuid4().hex
         try:
-            storage.create_mcp_server(
+            created = storage.create_mcp_server(
                 server_id=server_id,
                 name=srv_name,
                 transport=transport,
@@ -13265,17 +13481,32 @@ async def admin_import_mcp_config(request: Request) -> JSONResponse:
                 env=json.dumps(raw_env),
                 auto_approve=False,
                 enabled=True,
+                tls_skip_verify=tls_skip_verify,
                 created_by=audit_uid,
             )
-            imported.append(srv_name)
-            current_count += 1
         except Exception as exc:
             errors.append(f"{srv_name}: {exc}")
+            continue
+        if not created:  # another request took the name since the check above
+            skipped.append(srv_name)
+            continue
+        imported.append(srv_name)
+        if transport == "streamable-http":
+            origins[srv_name] = _audit_url_origin(url)
+        if tls_skip_verify:
+            unverified.append(srv_name)
+        current_count += 1
 
     if imported:
         import_detail: dict[str, Any] = {"imported": imported, "skipped": skipped}
+        if unverified:
+            import_detail["tls_skip_verify"] = unverified
         if imported_refs := {n: r for n, r in header_references.items() if n in imported}:
             import_detail["header_references"] = imported_refs
+        if origins:
+            # Where each server points, never a URL's path or query, which can carry a credential.
+            # Last, as on a create.
+            import_detail["origins"] = origins
         record_audit(
             storage,
             audit_uid,

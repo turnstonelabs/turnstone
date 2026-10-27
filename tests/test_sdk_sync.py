@@ -223,3 +223,73 @@ def test_sync_console_overview():
         assert resp.workstreams == 3
     finally:
         console.close()
+
+
+def test_sync_console_sends_mcp_booleans_as_given_and_leaves_out_defaults():
+    """A value other than the default goes as the caller passed it, so the console refuses the
+    string "false" instead of the SDK sending true, and None, sent as null, too; a default is left
+    out."""
+    url = "https://kvm.example.com/mcp"
+    bodies: list[dict] = []
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        bodies.append(json.loads(request.content))
+        if request.url.path.endswith("/test"):
+            return _json_response({"ok": True, "tools": [], "resources": 0, "prompts": 0})
+        return _json_response(
+            {
+                "server_id": "s1",
+                "name": "kvm",
+                "transport": "streamable-http",
+                "created": "2026-10-25T00:00:00",
+                "updated": "2026-10-25T00:00:00",
+            }
+        )
+
+    transport = httpx2.MockTransport(handler)
+    hc = httpx2.AsyncClient(transport=transport, base_url="http://test")
+    console = TurnstoneConsole.__new__(TurnstoneConsole)
+    console._runner = _SyncRunner()
+    console._async = AsyncTurnstoneConsole(httpx_client=hc)
+
+    try:
+        console.create_mcp_server("kvm", "streamable-http", url=url, tls_skip_verify=True)
+        console.create_mcp_server("plain", "streamable-http", url=url)
+        console.create_mcp_server(
+            "off", "streamable-http", url=url, auto_approve=True, enabled=False
+        )
+        console.create_mcp_server(
+            "typo",
+            "streamable-http",
+            url=url,
+            auto_approve="false",  # type: ignore[arg-type]
+            enabled="false",  # type: ignore[arg-type]
+            tls_skip_verify="false",  # type: ignore[arg-type]
+        )
+        console.create_mcp_server(
+            "unset",
+            "streamable-http",
+            url=url,
+            enabled=None,  # type: ignore[arg-type]
+        )
+        console.test_mcp_server(url, tls_skip_verify=True)
+        console.test_mcp_server(url, tls_skip_verify="0")  # type: ignore[arg-type]
+    finally:
+        console.close()
+
+    common = {"transport": "streamable-http", "url": url}
+    assert bodies == [
+        {"name": "kvm", **common, "tls_skip_verify": True},
+        {"name": "plain", **common},
+        {"name": "off", **common, "auto_approve": True, "enabled": False},
+        {
+            "name": "typo",
+            **common,
+            "auto_approve": "false",
+            "enabled": "false",
+            "tls_skip_verify": "false",
+        },
+        {"name": "unset", **common, "enabled": None},
+        {"url": url, "auth_type": "static", "tls_skip_verify": True},
+        {"url": url, "auth_type": "static", "tls_skip_verify": "0"},
+    ]

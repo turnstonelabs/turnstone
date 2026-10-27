@@ -22,6 +22,8 @@ from starlette.testclient import TestClient
 from turnstone.core.oauth.context import oauth_context
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from starlette.requests import Request
     from starlette.responses import Response
 
@@ -2136,6 +2138,52 @@ class TestImportMcpConfig:
         assert r.json()["imported"] == []
         assert storage.get_mcp_server_by_name("a" * 63 + "\n") is None
 
+    def test_import_lists_an_entry_that_is_not_an_object_and_imports_the_rest(
+        self, client, storage
+    ):
+        """Such an entry once raised after the entries before it were saved, leaving them with
+        no audit event and no node reload."""
+        config = {
+            "mcpServers": {
+                "kvm": {"url": "https://kvm.example.com/mcp", "tls_skip_verify": True},
+                "text": "x",
+                "nothing": None,
+                "listed": [],
+            },
+        }
+        with patch(
+            "turnstone.console.server._notify_nodes_mcp_reload",
+            new_callable=AsyncMock,
+            return_value={},
+        ) as notify:
+            r = client.post("/v1/api/admin/mcp-servers/import", json={"config": config})
+
+        assert r.status_code == 200, r.text
+        assert r.json()["imported"] == ["kvm"]
+        assert r.json()["errors"] == [
+            f"{name}: entry must be an object" for name in ("text", "nothing", "listed")
+        ]
+        (detail,) = _audit_details(storage, "mcp_server.import").values()
+        assert detail["imported"] == ["kvm"]
+        notify.assert_awaited_once_with(ANY)
+
+    def test_import_lists_an_entry_that_is_not_an_object_when_its_name_is_taken(
+        self, client, storage
+    ):
+        # An error, not a skip: the entry is checked before its name is.
+        client.post("/v1/api/admin/mcp-servers", json=_KVM)
+
+        r = client.post(
+            "/v1/api/admin/mcp-servers/import", json={"config": {"mcpServers": {"kvm": "x"}}}
+        )
+
+        assert r.status_code == 200, r.text
+        assert r.json() == {
+            "imported": [],
+            "skipped": [],
+            "errors": ["kvm: entry must be an object"],
+        }
+
     def test_import_not_a_dict(self, client):
         r = client.post(
             "/v1/api/admin/mcp-servers/import",
@@ -2209,6 +2257,867 @@ class TestImportMcpConfig:
         )
         assert r.status_code == 400
         assert "mcpServers" in r.json()["error"] or "No" in r.json()["error"]
+
+
+# ---------------------------------------------------------------------------
+# tls_skip_verify
+# ---------------------------------------------------------------------------
+
+_KVM = {"name": "kvm", "transport": "streamable-http", "url": "https://kvm.example.com/mcp"}
+_NOT_A_BOOL = "tls_skip_verify must be true or false"
+_NULL = "tls_skip_verify must not be null"
+_NOT_HTTP = "tls_skip_verify applies only to streamable-http servers"
+_PER_USER = "tls_skip_verify cannot be set for auth_type 'oauth_user' or 'oauth_obo'"
+
+
+def _detail(event: dict[str, Any]) -> dict[str, Any]:
+    """An audit event's detail, decoded."""
+    detail = event["detail"]
+    return json.loads(detail) if isinstance(detail, str) else detail
+
+
+def _audit_details(storage: SQLiteBackend, action: str) -> dict[str, dict[str, Any]]:
+    """Each *action* event's detail, by resource id.
+
+    One event per resource, or the test fails: with several, which one the dict keeps would be
+    chance (events order by a one-second timestamp, then a random id).
+    """
+    events = storage.list_audit_events(action=action)
+    ids = [e["resource_id"] for e in events]
+    assert len(set(ids)) == len(ids), f"more than one {action} event for a resource: {ids}"
+    return {e["resource_id"]: _detail(e) for e in events}
+
+
+def _audit_after(
+    storage: SQLiteBackend, action: str, write: Callable[[], Any]
+) -> tuple[Any, dict[str, Any]]:
+    """Run *write*; return its response and the detail of the one *action* event it records."""
+    before = {e["event_id"] for e in storage.list_audit_events(action=action)}
+    response = write()
+    (event,) = (e for e in storage.list_audit_events(action=action) if e["event_id"] not in before)
+    return response, _detail(event)
+
+
+class TestTlsSkipVerify:
+    def test_create_stores_it_and_audits_it(self, client, storage):
+        skipped = client.post("/v1/api/admin/mcp-servers", json={**_KVM, "tls_skip_verify": True})
+        verified = client.post("/v1/api/admin/mcp-servers", json={**_KVM, "name": "plain"})
+
+        assert skipped.status_code == 200, skipped.text
+        assert skipped.json()["tls_skip_verify"] is True
+        assert verified.json()["tls_skip_verify"] is False
+        details = _audit_details(storage, "mcp_server.create")
+        assert details[skipped.json()["server_id"]]["tls_skip_verify"] is True
+        assert "tls_skip_verify" not in details[verified.json()["server_id"]]
+
+    @pytest.mark.parametrize("value", ["true", "false", 1, 0, [], {}])
+    def test_only_a_json_boolean_is_accepted(self, client, storage, value):
+        r = client.post("/v1/api/admin/mcp-servers", json={**_KVM, "tls_skip_verify": value})
+
+        assert r.status_code == 400
+        assert r.json() == {"error": _NOT_A_BOOL}
+        assert storage.get_mcp_server_by_name("kvm") is None
+
+    def test_null_is_refused_wherever_it_is_read(self, client, storage):
+        # A null could mean clearing the setting as well as keeping it.
+        sid = client.post(
+            "/v1/api/admin/mcp-servers", json={**_KVM, "tls_skip_verify": True}
+        ).json()["server_id"]
+        nullish = {"url": "https://nullish.example.com/mcp", "tls_skip_verify": None}
+
+        created = client.post(
+            "/v1/api/admin/mcp-servers", json={**_KVM, "name": "nullish", "tls_skip_verify": None}
+        )
+        updated = client.put(f"/v1/api/admin/mcp-servers/{sid}", json={"tls_skip_verify": None})
+        imported = client.post(
+            "/v1/api/admin/mcp-servers/import", json={"config": {"mcpServers": {"n": nullish}}}
+        )
+        with patch("turnstone.core.mcp_client.probe_http_server") as probe:
+            tested = client.post(
+                "/v1/api/admin/mcp-servers/test",
+                json={"url": _KVM["url"], "auth_type": "none", "tls_skip_verify": None},
+            )
+
+        assert created.status_code == 400
+        assert created.json() == {"error": _NULL}
+        assert updated.status_code == 400
+        assert updated.json() == {"error": _NULL}
+        assert imported.json()["errors"] == [f"n: {_NULL}"]
+        assert tested.status_code == 400
+        assert tested.json() == {"error": _NULL}
+        probe.assert_not_called()
+        stored = storage.get_mcp_server(sid)
+        assert stored is not None
+        assert stored["tls_skip_verify"] is True
+        assert storage.get_mcp_server_by_name("nullish") is None
+        assert storage.get_mcp_server_by_name("n") is None
+
+    def test_create_refuses_it_for_a_stdio_server(self, client, storage):
+        r = client.post(
+            "/v1/api/admin/mcp-servers",
+            json={"name": "local", "transport": "stdio", "command": "npx", "tls_skip_verify": True},
+        )
+
+        assert r.status_code == 400
+        assert r.json() == {"error": _NOT_HTTP}
+        assert storage.get_mcp_server_by_name("local") is None
+
+    @pytest.mark.parametrize("auth_type", ["oauth_user", "oauth_obo"])
+    def test_create_refuses_it_for_per_user_oauth(self, client, storage, auth_type):
+        r = client.post(
+            "/v1/api/admin/mcp-servers",
+            json={**_KVM, "auth_type": auth_type, "tls_skip_verify": True},
+        )
+
+        assert r.status_code == 400
+        assert r.json() == {"error": _PER_USER}
+        assert storage.get_mcp_server_by_name("kvm") is None
+
+    def test_update_turns_it_on_and_off_and_keeps_it_when_absent(self, client, storage):
+        sid = client.post("/v1/api/admin/mcp-servers", json=_KVM).json()["server_id"]
+        path = f"/v1/api/admin/mcp-servers/{sid}"
+
+        def edit(body: dict[str, Any]) -> tuple[Any, Any]:
+            """The response, and what this edit's own audit event records for the setting."""
+            r, detail = _audit_after(
+                storage, "mcp_server.update", lambda: client.put(path, json=body)
+            )
+            return r, detail.get("tls_skip_verify")
+
+        on, on_recorded = edit({"tls_skip_verify": True})
+        kept, kept_recorded = edit({"enabled": False})
+        off, off_recorded = edit({"tls_skip_verify": False})
+
+        assert on.json()["tls_skip_verify"] is True
+        assert kept.json()["tls_skip_verify"] is True
+        assert off.json()["tls_skip_verify"] is False
+        # Every edit of a server that skips verification says so, and turning it off says false.
+        assert (on_recorded, kept_recorded, off_recorded) == (True, True, False)
+
+    def test_an_edit_of_a_server_that_verifies_does_not_lead_with_it(self, client, storage):
+        sid = client.post("/v1/api/admin/mcp-servers", json=_KVM).json()["server_id"]
+        path = f"/v1/api/admin/mcp-servers/{sid}"
+
+        _, api_detail = _audit_after(
+            storage, "mcp_server.update", lambda: client.put(path, json={"enabled": False})
+        )
+        _, form_detail = _audit_after(
+            storage,
+            "mcp_server.update",
+            lambda: client.put(path, json={**_KVM, "enabled": True, "tls_skip_verify": False}),
+        )
+
+        assert "tls_skip_verify" not in api_detail
+        # The form sends it with every save; it is stored, but takes no place in the summary.
+        assert next(iter(form_detail)) != "tls_skip_verify"
+        assert form_detail["tls_skip_verify"] is False
+
+    @pytest.mark.parametrize("sent", [False, True], ids=["sends-off", "sends-on"])
+    def test_the_later_of_two_crossing_saves_wins(self, client, storage, sent):
+        # As for auto_approve and enabled. This save read the row before the other one changed
+        # the setting, so what it sends equals what it read; it is stored all the same.
+        created = client.post("/v1/api/admin/mcp-servers", json={**_KVM, "tls_skip_verify": sent})
+        sid = created.json()["server_id"]
+        as_read = storage.get_mcp_server(sid)
+        storage.update_mcp_server(sid, tls_skip_verify=not sent)  # the other save
+        real_get = storage.get_mcp_server
+        reads = [as_read]
+
+        def get_mcp_server(server_id: str) -> dict[str, Any] | None:
+            return reads.pop() if reads else real_get(server_id)
+
+        with patch.object(storage, "get_mcp_server", side_effect=get_mcp_server):
+            r, detail = _audit_after(
+                storage,
+                "mcp_server.update",
+                lambda: client.put(
+                    f"/v1/api/admin/mcp-servers/{sid}", json={**_KVM, "tls_skip_verify": sent}
+                ),
+            )
+
+        assert r.status_code == 200, r.text
+        assert r.json()["tls_skip_verify"] is sent
+        stored = storage.get_mcp_server(sid)
+        assert stored is not None
+        assert stored["tls_skip_verify"] is sent
+        assert detail["tls_skip_verify"] is sent
+
+    def test_a_new_url_keeps_it_and_the_audit_says_so(self, client, storage):
+        # Like the headers, it stays with the server, and the edit's audit event says it does.
+        created = client.post("/v1/api/admin/mcp-servers", json={**_KVM, "tls_skip_verify": True})
+        sid = created.json()["server_id"]
+        other = "https://other.example.com/mcp"
+
+        r = client.put(f"/v1/api/admin/mcp-servers/{sid}", json={"url": other})
+
+        assert r.status_code == 200, r.text
+        assert r.json()["tls_skip_verify"] is True
+        detail = _audit_details(storage, "mcp_server.update")[sid]
+        assert detail["url"] == "https://other.example.com:443"
+        assert detail["tls_skip_verify"] is True
+
+    @pytest.mark.parametrize(
+        "row",
+        [
+            {"name": "local", "transport": "stdio", "command": "npx"},
+            {**_KVM, "auth_type": "oauth_user"},
+        ],
+        ids=["stdio", "per-user-auth"],
+    )
+    def test_a_value_left_where_it_cannot_apply_reads_as_off_and_the_next_edit_clears_it(
+        self, client, storage, row
+    ):
+        sid = client.post("/v1/api/admin/mcp-servers", json=row).json()["server_id"]
+        # What two crossing edits can leave: one moved the row while the other turned it on.
+        storage.update_mcp_server(sid, tls_skip_verify=True)
+        path = f"/v1/api/admin/mcp-servers/{sid}"
+
+        with _PATCH_MCP_STATUS:
+            read = client.get(path)
+        back = client.put(
+            path, json={"transport": "streamable-http", "url": _KVM["url"], "auth_type": "static"}
+        )
+
+        assert read.json()["tls_skip_verify"] is False
+        assert back.status_code == 200, back.text
+        assert back.json()["tls_skip_verify"] is False
+        stored = storage.get_mcp_server(sid)
+        assert stored is not None
+        assert stored["tls_skip_verify"] is False
+
+    def test_update_refuses_a_value_that_is_not_a_bool(self, client, storage):
+        sid = client.post("/v1/api/admin/mcp-servers", json=_KVM).json()["server_id"]
+
+        r = client.put(f"/v1/api/admin/mcp-servers/{sid}", json={"tls_skip_verify": "yes"})
+
+        assert r.status_code == 400
+        assert r.json() == {"error": _NOT_A_BOOL}
+        stored = storage.get_mcp_server(sid)
+        assert stored is not None
+        assert stored["tls_skip_verify"] is False
+
+    def test_update_refuses_it_for_a_per_user_server(self, client, storage):
+        created = client.post("/v1/api/admin/mcp-servers", json={**_KVM, "auth_type": "oauth_user"})
+        sid = created.json()["server_id"]
+
+        r = client.put(f"/v1/api/admin/mcp-servers/{sid}", json={"tls_skip_verify": True})
+        flip = client.put(
+            f"/v1/api/admin/mcp-servers/{sid}",
+            json={"auth_type": "static", "tls_skip_verify": True},
+        )
+
+        assert created.status_code == 200, created.text
+        assert r.status_code == 400
+        assert r.json() == {"error": _PER_USER}
+        # Leaving per-user auth in the same request makes it allowed.
+        assert flip.status_code == 200, flip.text
+        assert flip.json()["tls_skip_verify"] is True
+
+    @pytest.mark.parametrize(
+        "move",
+        [{"auth_type": "oauth_user"}, {"transport": "stdio", "command": "npx"}],
+        ids=["to-per-user-auth", "to-stdio"],
+    )
+    def test_a_move_where_it_cannot_apply_clears_it_for_good(self, client, storage, move):
+        created = client.post("/v1/api/admin/mcp-servers", json={**_KVM, "tls_skip_verify": True})
+        sid = created.json()["server_id"]
+        path = f"/v1/api/admin/mcp-servers/{sid}"
+
+        moved = client.put(path, json=move)
+        # The column itself, not only the effective value the API reports.
+        moved_row = storage.get_mcp_server(sid)
+        move_audit = _audit_details(storage, "mcp_server.update")[sid]
+        back = client.put(path, json={"transport": "streamable-http", "auth_type": "static"})
+
+        assert moved.status_code == 200, moved.text
+        assert moved.json()["tls_skip_verify"] is False
+        assert moved_row is not None
+        assert moved_row["tls_skip_verify"] is False
+        assert move_audit["tls_skip_verify"] is False
+        assert back.json()["tls_skip_verify"] is False
+
+    def test_a_move_is_judged_on_the_transport_it_moves_to(self, client, storage):
+        local = client.post(
+            "/v1/api/admin/mcp-servers",
+            json={"name": "local", "transport": "stdio", "command": "npx"},
+        ).json()["server_id"]
+        remote = client.post("/v1/api/admin/mcp-servers", json=_KVM).json()["server_id"]
+
+        onto_http = client.put(
+            f"/v1/api/admin/mcp-servers/{local}",
+            json={
+                "transport": "streamable-http",
+                "url": "https://local.example.com/mcp",
+                "tls_skip_verify": True,
+            },
+        )
+        onto_stdio = client.put(
+            f"/v1/api/admin/mcp-servers/{remote}",
+            json={"transport": "stdio", "command": "npx", "tls_skip_verify": True},
+        )
+
+        assert onto_http.status_code == 200, onto_http.text
+        assert onto_http.json()["tls_skip_verify"] is True
+        assert onto_stdio.status_code == 400
+        assert onto_stdio.json() == {"error": _NOT_HTTP}
+        stored = storage.get_mcp_server(remote)
+        assert stored is not None
+        assert stored["transport"] == "streamable-http"
+        assert stored["tls_skip_verify"] is False
+
+    def test_import_keeps_it_and_refuses_what_a_save_refuses(self, client, storage):
+        config = {
+            "mcpServers": {
+                "kvm": {
+                    "type": "http",
+                    "url": "https://kvm.example.com/mcp",
+                    "tls_skip_verify": True,
+                },
+                "typo": {"url": "https://typo.example.com/mcp", "tls_skip_verify": "true"},
+                "local": {"command": "npx", "tls_skip_verify": True},
+                "plain": {"url": "https://plain.example.com/mcp"},
+            },
+        }
+
+        r = client.post("/v1/api/admin/mcp-servers/import", json={"config": config})
+
+        assert r.status_code == 200
+        assert r.json()["imported"] == ["kvm", "plain"]
+        assert r.json()["errors"] == [f"typo: {_NOT_A_BOOL}", f"local: {_NOT_HTTP}"]
+        kvm = storage.get_mcp_server_by_name("kvm")
+        plain = storage.get_mcp_server_by_name("plain")
+        assert kvm is not None
+        assert kvm["tls_skip_verify"] is True
+        assert plain is not None
+        assert plain["tls_skip_verify"] is False
+        (detail,) = _audit_details(storage, "mcp_server.import").values()
+        assert detail["tls_skip_verify"] == ["kvm"]
+        # Among the three keys the Audit tab shows, ahead of the origins.
+        assert list(detail)[:3] == ["imported", "skipped", "tls_skip_verify"]
+
+    def test_the_refusal_follows_the_shared_rule(self, client, storage):
+        # Were the rule to narrow, a true it no longer allows would be refused, not dropped.
+        with patch("turnstone.core.mcp_client.tls_skip_verify_applies", return_value=False):
+            r = client.post("/v1/api/admin/mcp-servers", json={**_KVM, "tls_skip_verify": True})
+
+        assert r.status_code == 400
+        assert r.json() == {"error": "tls_skip_verify cannot be set for this server"}
+        assert storage.get_mcp_server_by_name("kvm") is None
+
+    def test_connection_test_passes_it_to_the_probe_and_audits_it(self, client, storage):
+        from turnstone.core.mcp_client import ConnectionProbe
+
+        with patch(
+            "turnstone.core.mcp_client.probe_http_server", return_value=ConnectionProbe()
+        ) as probe:
+            skipped = client.post(
+                "/v1/api/admin/mcp-servers/test",
+                json={"url": _KVM["url"], "auth_type": "none", "tls_skip_verify": True},
+            )
+            refused = client.post(
+                "/v1/api/admin/mcp-servers/test",
+                json={"url": _KVM["url"], "auth_type": "none", "tls_skip_verify": "true"},
+            )
+
+        assert skipped.status_code == 200
+        assert refused.status_code == 400
+        assert refused.json() == {"error": _NOT_A_BOOL}
+        probe.assert_called_once_with(_KVM["url"], {}, name="", tls_skip_verify=True)
+        (detail,) = _audit_details(storage, "mcp_server.test").values()
+        assert detail["tls_skip_verify"] is True
+
+    def test_a_configuration_file_server_is_listed_with_it_off(self, client):
+        # The console reads settings from rows only; a node's file has none to read.
+        statuses = {"node-a": {"kvm-file": {"connected": True}}}
+        with patch(
+            "turnstone.console.server._collect_mcp_status",
+            new_callable=AsyncMock,
+            return_value=statuses,
+        ):
+            r = client.get("/v1/api/admin/mcp-servers")
+
+        (listed,) = r.json()["servers"]
+        assert listed["source"] == "config"
+        assert listed["tls_skip_verify"] is False
+
+    def test_the_marker_leads_each_audit_detail(self, client, storage):
+        # The Audit tab shows only a detail's first three keys, and a full-form save stores many
+        # more (test_auth_markers_render_in_audit_detail_first_keys pins the same for models).
+        from turnstone.core.mcp_client import ConnectionProbe
+
+        headers = {"X-Kvm": "1"}
+        created, create_detail = _audit_after(
+            storage,
+            "mcp_server.create",
+            lambda: client.post(
+                "/v1/api/admin/mcp-servers",
+                json={**_KVM, "headers": headers, "tls_skip_verify": True},
+            ),
+        )
+        path = f"/v1/api/admin/mcp-servers/{created.json()['server_id']}"
+        form = {
+            **_KVM,
+            "headers": headers,
+            "auto_approve": False,
+            "enabled": True,
+            "auth_type": "static",
+            "tls_skip_verify": True,
+        }
+        _, save_detail = _audit_after(
+            storage, "mcp_server.update", lambda: client.put(path, json=form)
+        )
+        _, off_detail = _audit_after(
+            storage, "mcp_server.update", lambda: client.put(path, json={"tls_skip_verify": False})
+        )
+        with patch("turnstone.core.mcp_client.probe_http_server", return_value=ConnectionProbe()):
+            _, test_detail = _audit_after(
+                storage,
+                "mcp_server.test",
+                lambda: client.post(
+                    "/v1/api/admin/mcp-servers/test",
+                    json={"url": _KVM["url"], "auth_type": "none", "tls_skip_verify": True},
+                ),
+            )
+
+        for detail, value in [
+            (create_detail, True),
+            (save_detail, True),
+            (off_detail, False),
+            (test_detail, True),
+        ]:
+            assert next(iter(detail)) == "tls_skip_verify", detail
+            assert detail["tls_skip_verify"] is value
+
+    @pytest.mark.parametrize("transport", ["stdio", "streamable-http", "sse", "http"])
+    @pytest.mark.parametrize("auth_type", [None, "none", "static", "oauth_user", "oauth_obo"])
+    def test_the_console_judges_by_the_rule_the_nodes_connect_with(self, transport, auth_type):
+        # One rule for all, so it holds for a transport the console does not store today too.
+        from turnstone.console.server import _effective_tls_skip_verify, _tls_skip_verify_for_write
+        from turnstone.core.mcp_client import _db_servers_to_config
+
+        row = {
+            "name": "s",
+            "transport": transport,
+            "auth_type": auth_type,
+            "url": "https://s.example.com/mcp",
+            "tls_skip_verify": True,
+        }
+        on_nodes = _db_servers_to_config([row]).get("s", {}).get("tls_skip_verify", False)
+        _, refusal = _tls_skip_verify_for_write(
+            {"tls_skip_verify": True}, False, transport=transport, auth_type=auth_type
+        )
+
+        assert _effective_tls_skip_verify(row) is on_nodes
+        # A save asking for it is refused exactly where the nodes would not apply it.
+        assert (refusal is None) is on_nodes
+        assert on_nodes is (
+            transport == "streamable-http" and auth_type not in ("oauth_user", "oauth_obo")
+        )
+
+
+class TestStrictMcpBooleans:
+    """``auto_approve`` and ``enabled`` take a JSON boolean, 0 or 1. ``bool()`` reads the string
+    ``"false"`` as true, which let one turn approvals off, and null is refused as on the schedule
+    endpoints."""
+
+    _REFUSED = "{} expects true/false (or 0/1)"
+
+    @pytest.mark.parametrize("field", ["auto_approve", "enabled"])
+    def test_create_refuses_a_string(self, client, storage, field):
+        r = client.post("/v1/api/admin/mcp-servers", json={**_KVM, field: "false"})
+
+        assert r.status_code == 400
+        assert r.json() == {"error": self._REFUSED.format(field)}
+        assert storage.get_mcp_server_by_name("kvm") is None
+
+    @pytest.mark.parametrize("field", ["auto_approve", "enabled"])
+    def test_update_refuses_a_string_and_keeps_the_value(self, client, storage, field):
+        created = client.post("/v1/api/admin/mcp-servers", json=_KVM).json()
+
+        r = client.put(f"/v1/api/admin/mcp-servers/{created['server_id']}", json={field: "false"})
+
+        assert r.status_code == 400
+        assert r.json() == {"error": self._REFUSED.format(field)}
+        stored = storage.get_mcp_server(created["server_id"])
+        assert stored is not None
+        assert stored[field] is created[field]
+
+    def test_zero_and_one_count(self, client):
+        r = client.post("/v1/api/admin/mcp-servers", json={**_KVM, "auto_approve": 1, "enabled": 0})
+
+        assert r.json()["auto_approve"] is True
+        assert r.json()["enabled"] is False
+
+    @pytest.mark.parametrize("field", ["auto_approve", "enabled"])
+    def test_null_is_refused_on_create_and_update(self, client, storage, field):
+        # A null could mean clearing the flag as well as keeping it; it used to read as false.
+        refused = client.post("/v1/api/admin/mcp-servers", json={**_KVM, field: None})
+        created = client.post("/v1/api/admin/mcp-servers", json={**_KVM, "auto_approve": True})
+        sid = created.json()["server_id"]
+
+        updated = client.put(f"/v1/api/admin/mcp-servers/{sid}", json={field: None})
+
+        assert refused.status_code == 400
+        assert refused.json() == {"error": f"{field} must not be null"}
+        assert updated.status_code == 400
+        assert updated.json() == {"error": f"{field} must not be null"}
+        stored = storage.get_mcp_server(sid)
+        assert stored is not None
+        assert stored["auto_approve"] is True
+        assert stored["enabled"] is True
+
+
+class TestUpdateAuditCredentials:
+    """An update's audit event says where a changed URL points, never its path or query, and
+    records a stdio server's arguments only as updated: any of them can carry a credential."""
+
+    def test_a_changed_url_is_recorded_as_its_scheme_host_and_port(self, client, storage):
+        sid = client.post("/v1/api/admin/mcp-servers", json=_KVM).json()["server_id"]
+
+        client.put(
+            f"/v1/api/admin/mcp-servers/{sid}",
+            json={"url": "https://mcp.example.com:8443/v1/k3y/mcp?key=s3cret"},
+        )
+
+        detail = _audit_details(storage, "mcp_server.update")[sid]
+        # One string, so the console's audit list shows it.
+        assert detail["url"] == "https://mcp.example.com:8443"
+        assert "k3y" not in json.dumps(detail)
+        assert "s3cret" not in json.dumps(detail)
+
+    def test_an_unchanged_url_is_left_out(self, client, storage):
+        # The server form re-sends the URL with every save.
+        sid = client.post("/v1/api/admin/mcp-servers", json=_KVM).json()["server_id"]
+
+        client.put(f"/v1/api/admin/mcp-servers/{sid}", json={"url": _KVM["url"], "enabled": False})
+
+        detail = _audit_details(storage, "mcp_server.update")[sid]
+        assert "url" not in detail
+        assert detail["enabled"] is False
+
+    @pytest.mark.parametrize(
+        ("url", "recorded"),
+        [
+            ("", ""),
+            ("npx-server", "(updated)"),
+            ("localhost:9000", "(updated)"),
+            ("http://[::1", "(updated)"),
+            ("https://h.example.com:0/x", "https://h.example.com:0"),
+            ("https://[::1]:8443/x", "https://[::1]:8443"),
+        ],
+        ids=["cleared", "bare-word", "schemeless", "unparseable", "port-0", "ipv6"],
+    )
+    def test_a_stdio_rows_url_is_recorded_without_inventing_a_target(
+        self, client, storage, url, recorded
+    ):
+        # A stdio row's URL is stored without a check, so the audit must not assume it parses.
+        sid = client.post(
+            "/v1/api/admin/mcp-servers",
+            json={
+                "name": "local",
+                "transport": "stdio",
+                "command": "npx",
+                "url": "https://before.example.com/mcp",
+            },
+        ).json()["server_id"]
+
+        r = client.put(f"/v1/api/admin/mcp-servers/{sid}", json={"url": url})
+
+        assert r.status_code == 200, r.text
+        assert _audit_details(storage, "mcp_server.update")[sid]["url"] == recorded
+
+    def test_a_stdio_servers_arguments_are_recorded_as_updated(self, client, storage):
+        # An argument can carry a credential (--api-key ...), as headers and env can.
+        sid = client.post(
+            "/v1/api/admin/mcp-servers",
+            json={"name": "local", "transport": "stdio", "command": "npx"},
+        ).json()["server_id"]
+
+        r = client.put(f"/v1/api/admin/mcp-servers/{sid}", json={"args": ["--api-key", "s3cret"]})
+
+        assert r.status_code == 200, r.text
+        detail = _audit_details(storage, "mcp_server.update")[sid]
+        assert detail["args"] == "(updated)"
+        assert "s3cret" not in json.dumps(detail)
+        stored = storage.get_mcp_server(sid)
+        assert stored is not None
+        assert json.loads(stored["args"]) == ["--api-key", "s3cret"]
+
+    def test_oauth_urls_are_recorded_as_their_scheme_host_and_port(self, client, storage):
+        # The form fills an oauth_user audience in from the server URL, and re-sends the
+        # authorization server's URL with every save.
+        url = "https://mcp.example.com/v1/k3y/mcp?key=s3cret"
+        created = client.post("/v1/api/admin/mcp-servers", json={**_KVM, "url": url})
+        path = f"/v1/api/admin/mcp-servers/{created.json()['server_id']}"
+        form = {
+            **_KVM,
+            "url": url,
+            "auth_type": "oauth_user",
+            "oauth_registration_mode": "preregistered",
+            "oauth_client_id": "cli_abc",
+            "oauth_audience": url,
+            "oauth_authorization_server_url": "https://as.example.com/realm?tenant=as-s3cret",
+        }
+
+        _, flip = _audit_after(storage, "mcp_server.update", lambda: client.put(path, json=form))
+        _, resave = _audit_after(storage, "mcp_server.update", lambda: client.put(path, json=form))
+
+        assert flip["oauth_audience"] == "https://mcp.example.com:443"
+        for detail in (flip, resave):
+            assert detail["oauth_authorization_server_url"] == "https://as.example.com:443"
+            assert "k3y" not in json.dumps(detail)
+            assert "s3cret" not in json.dumps(detail)
+
+    def test_an_obo_app_identifier_is_recorded_as_sent(self, client, storage):
+        # Only an http(s) value is cut to its origin.
+        created = client.post(
+            "/v1/api/admin/mcp-servers",
+            json={**_KVM, "auth_type": "oauth_obo", "oauth_audience": "api://mcp-a"},
+        )
+        path = f"/v1/api/admin/mcp-servers/{created.json()['server_id']}"
+
+        _, detail = _audit_after(
+            storage,
+            "mcp_server.update",
+            lambda: client.put(path, json={"oauth_audience": "api://mcp-b"}),
+        )
+
+        assert detail["oauth_audience"] == "api://mcp-b"
+
+
+class TestAuditOrigins:
+    """Creating or importing a Streamable HTTP server records where it points, so the audit keeps
+    the host after the server is deleted; never the URL's path or query."""
+
+    def test_create_records_where_an_http_server_points(self, client, storage):
+        remote = client.post(
+            "/v1/api/admin/mcp-servers",
+            json={**_KVM, "url": "https://kvm.example.com:8443/v1/k3y/mcp?key=s3cret"},
+        ).json()["server_id"]
+        local = client.post(
+            "/v1/api/admin/mcp-servers",
+            json={"name": "local", "transport": "stdio", "command": "npx"},
+        ).json()["server_id"]
+
+        details = _audit_details(storage, "mcp_server.create")
+        assert details[remote]["url"] == "https://kvm.example.com:8443"
+        assert "k3y" not in json.dumps(details[remote])
+        assert "s3cret" not in json.dumps(details[remote])
+        assert "url" not in details[local]
+
+    def test_import_records_where_each_http_server_points(self, client, storage):
+        config = {
+            "mcpServers": {
+                "kvm": {"url": "https://kvm.example.com/v1/k3y/mcp"},
+                "local": {"command": "npx"},
+            }
+        }
+
+        r = client.post("/v1/api/admin/mcp-servers/import", json={"config": config})
+
+        assert r.json()["imported"] == ["kvm", "local"]
+        (detail,) = _audit_details(storage, "mcp_server.import").values()
+        assert detail["origins"] == {"kvm": "https://kvm.example.com:443"}
+        assert "k3y" not in json.dumps(detail)
+
+    def test_the_origin_follows_the_client_secret_marker(self, client, storage):
+        # The Audit tab shows only a detail's first three keys, where the marker matters more.
+        _, detail = _audit_after(
+            storage,
+            "mcp_server.create",
+            lambda: client.post(
+                "/v1/api/admin/mcp-servers",
+                json={
+                    "name": "oauthy",
+                    "transport": "streamable-http",
+                    "url": "https://mcp.example.com/mcp",
+                    "auth_type": "oauth_user",
+                    "oauth_client_id": "cli_abc",
+                    "oauth_client_secret": "s3cret",
+                },
+            ),
+        )
+
+        assert list(detail)[:3] == ["name", "auth_type", "oauth_client_secret"]
+        assert detail["url"] == "https://mcp.example.com:443"
+        assert "s3cret" not in json.dumps(detail)
+
+
+class TestNameTakenAfterTheCheck:
+    """A create, rename or import whose name another request takes between the name check and the
+    write stores nothing, so it neither reports success nor audits a change it did not save."""
+
+    def test_create_answers_409(self, client, storage):
+        first = client.post("/v1/api/admin/mcp-servers", json=_KVM).json()["server_id"]
+
+        # As if this request's name check ran before the other request's insert landed.
+        with patch.object(storage, "get_mcp_server_by_name", return_value=None):
+            r = client.post("/v1/api/admin/mcp-servers", json={**_KVM, "tls_skip_verify": True})
+
+        assert r.status_code == 409
+        assert r.json() == {"error": "Server 'kvm' already exists"}
+        assert list(_audit_details(storage, "mcp_server.create")) == [first]
+        stored = storage.get_mcp_server(first)
+        assert stored is not None
+        assert stored["tls_skip_verify"] is False
+
+    def test_a_rename_answers_409(self, client, storage):
+        client.post("/v1/api/admin/mcp-servers", json=_KVM)
+        other = client.post("/v1/api/admin/mcp-servers", json={**_KVM, "name": "other"})
+        sid = other.json()["server_id"]
+
+        with patch.object(storage, "get_mcp_server_by_name", return_value=None):
+            r = client.put(
+                f"/v1/api/admin/mcp-servers/{sid}", json={"name": "kvm", "enabled": False}
+            )
+
+        assert r.status_code == 409
+        assert r.json() == {"error": "Server 'kvm' already exists"}
+        stored = storage.get_mcp_server(sid)
+        assert stored is not None
+        assert (stored["name"], stored["enabled"]) == ("other", True)
+        assert storage.list_audit_events(action="mcp_server.update") == []
+
+    def test_import_lists_the_entry_as_skipped(self, client, storage):
+        client.post("/v1/api/admin/mcp-servers", json=_KVM)
+        config = {"mcpServers": {"kvm": {"url": _KVM["url"], "tls_skip_verify": True}}}
+
+        with patch.object(storage, "get_mcp_server_by_name", return_value=None):
+            r = client.post("/v1/api/admin/mcp-servers/import", json={"config": config})
+
+        assert r.status_code == 200
+        assert r.json() == {"imported": [], "skipped": ["kvm"], "errors": []}
+        assert storage.list_audit_events(action="mcp_server.import") == []
+
+    def test_an_oauth_create_answers_409_before_it_writes_the_secret(self, client, storage):
+        oauth = {**_KVM, "auth_type": "oauth_user", "oauth_client_id": "cli_abc"}
+        client.post("/v1/api/admin/mcp-servers", json=oauth)
+
+        with patch.object(storage, "get_mcp_server_by_name", return_value=None):
+            r = client.post(
+                "/v1/api/admin/mcp-servers", json={**oauth, "oauth_client_secret": "s3cret"}
+            )
+
+        assert r.status_code == 409
+        assert r.json() == {"error": "Server 'kvm' already exists"}
+        assert storage.list_audit_events(action="mcp_server.oauth.client_secret_set") == []
+
+
+class TestServerDeletedAfterTheRead:
+    """An update whose server another request deletes after the handler read it stores nothing,
+    so it neither reports success nor audits, reloads or writes a secret for a server that is
+    gone."""
+
+    @pytest.mark.parametrize(
+        ("server", "body"),
+        [
+            (_KVM, {"enabled": False}),
+            (
+                {**_KVM, "auth_type": "oauth_user", "oauth_client_id": "cli_abc"},
+                {"oauth_client_secret": "s3cret"},
+            ),
+        ],
+        ids=["edit", "secret-only"],
+    )
+    def test_update_answers_404(self, client, storage, server, body):
+        from turnstone.console.server import _check_mcp_secret_fields
+
+        sid = client.post("/v1/api/admin/mcp-servers", json=server).json()["server_id"]
+
+        async def delete_then_check(request, headers, env):
+            storage.delete_mcp_server(sid)  # another admin's delete lands at this await
+            return await _check_mcp_secret_fields(request, headers, env)
+
+        with (
+            patch("turnstone.console.server._check_mcp_secret_fields", new=delete_then_check),
+            patch(
+                "turnstone.console.server._notify_nodes_mcp_reload",
+                new_callable=AsyncMock,
+                return_value={},
+            ) as notify,
+        ):
+            r = client.put(f"/v1/api/admin/mcp-servers/{sid}", json=body)
+
+        assert r.status_code == 404
+        assert r.json() == {"error": "MCP server not found"}
+        assert storage.list_audit_events(action="mcp_server.update") == []
+        assert storage.list_audit_events(action="mcp_server.oauth.client_secret_set") == []
+        notify.assert_not_awaited()
+
+
+class TestOauthClientSecretLength:
+    """A secret over the limit is refused before the row is written, so a refusal never leaves a
+    change behind with no audit event and no node reload."""
+
+    _TOO_LONG = "oauth_client_secret must be 1024 characters or fewer"
+    _OAUTH = {
+        "name": "oauthy",
+        "transport": "streamable-http",
+        "url": "https://mcp.example.com/sse",
+        "auth_type": "oauth_user",
+        "oauth_client_id": "cli_abc",
+    }
+
+    def test_create_writes_nothing(self, client, storage):
+        r = client.post(
+            "/v1/api/admin/mcp-servers", json={**self._OAUTH, "oauth_client_secret": "A" * 1025}
+        )
+
+        assert r.status_code == 400
+        assert r.json() == {"error": self._TOO_LONG}
+        assert storage.list_mcp_servers() == []
+        assert storage.list_audit_events(action="mcp_server.create") == []
+
+    def test_update_writes_nothing(self, client, storage):
+        sid = client.post("/v1/api/admin/mcp-servers", json=_KVM).json()["server_id"]
+        before = storage.get_mcp_server(sid)
+
+        r = client.put(
+            f"/v1/api/admin/mcp-servers/{sid}",
+            json={
+                "auth_type": "oauth_user",
+                "url": "https://other.example.com/mcp",
+                "oauth_client_id": "cli_abc",
+                "oauth_client_secret": "A" * 1025,
+            },
+        )
+
+        assert r.status_code == 400
+        assert r.json() == {"error": self._TOO_LONG}
+        assert storage.get_mcp_server(sid) == before
+        assert storage.list_audit_events(action="mcp_server.update") == []
+
+    def test_a_secret_at_the_limit_is_accepted(self, client):
+        r = client.post(
+            "/v1/api/admin/mcp-servers", json={**self._OAUTH, "oauth_client_secret": "A" * 1024}
+        )
+
+        assert r.status_code == 200, r.text
+
+    def test_the_writer_refuses_it_on_its_own(self, client, storage):
+        # The handlers refuse it before the row is written; the writer checks it again.
+        from turnstone.console.server import _apply_oauth_client_secret
+
+        sid = client.post("/v1/api/admin/mcp-servers", json=self._OAUTH).json()["server_id"]
+        request = MagicMock()
+        request.app = client.app
+
+        state, err = _apply_oauth_client_secret(
+            request,
+            server_id=sid,
+            body={"oauth_client_secret": "A" * 1025},
+            auth_type="oauth_user",
+            audit_uid="admin",
+            storage=storage,
+            ip="",
+        )
+
+        assert state is None
+        assert err is not None
+        assert json.loads(err.body) == {"error": self._TOO_LONG}
+        stored = storage.get_mcp_server(sid)
+        assert stored is not None
+        assert stored["oauth_client_secret_ct"] is None
 
 
 # ---------------------------------------------------------------------------
@@ -2362,7 +3271,9 @@ class TestConnectionTestEndpoint:
             "kind": None,
             "status": None,
         }
-        probe.assert_called_once_with(self._URL, {"Authorization": "Bearer abc"}, name="docs")
+        probe.assert_called_once_with(
+            self._URL, {"Authorization": "Bearer abc"}, name="docs", tls_skip_verify=False
+        )
         assert storage.list_mcp_servers() == []
         (event,) = storage.list_audit_events(action="mcp_server.test")
         assert event["resource_id"] == "docs"

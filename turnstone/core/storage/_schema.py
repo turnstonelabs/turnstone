@@ -870,6 +870,10 @@ mcp_servers = sa.Table(
     sa.Column("auto_approve", sa.Integer, nullable=False, server_default="0"),
     sa.Column("enabled", sa.Integer, nullable=False, server_default="1"),
     sa.Column("created_by", sa.Text, nullable=False, server_default=""),
+    # 1 accepts whatever certificate a streamable-http server presents, with no CA or host name
+    # check. It counts only on a streamable-http row without per-user auth: the admin API refuses
+    # it elsewhere, and a 1 that two crossing edits leave on another row changes no connection.
+    sa.Column("tls_skip_verify", sa.Integer, nullable=False, server_default="0"),
     sa.Column("registry_name", sa.Text, nullable=True),
     sa.Column("registry_version", sa.Text, nullable=False, server_default=""),
     sa.Column("registry_meta", sa.Text, nullable=False, server_default="{}"),
