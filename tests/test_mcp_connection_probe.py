@@ -71,6 +71,7 @@ class Upstream:
         self.seen_auth: list[str | None] = []
         self.drop_sessions = False  # answer a catalog list on a held session with a 404
         self.fail_method: tuple[str, int] | None = None  # answer this method with this status
+        self.discover_error: dict[str, Any] | None = None  # refuse server/discover at 400 with it
         self.stall_method: str | None = None  # hold this method's answer until released
         self.stalled = threading.Event()
         self.release = threading.Event()
@@ -131,6 +132,9 @@ class _Gate(BaseHTTPMiddleware):
             ):
                 error = {"code": -32601, "message": "Method not found"}
                 return JSONResponse({"jsonrpc": "2.0", "id": body["id"], "error": error})
+            if method == "server/discover" and self.upstream.discover_error is not None:
+                error = self.upstream.discover_error
+                return JSONResponse({"jsonrpc": "2.0", "id": None, "error": error}, 400)
             held = request.headers.get("mcp-session-id")
             if self.upstream.drop_sessions and held and method == "tools/list":
                 error = {"code": -32600, "message": "Session not found"}
@@ -411,6 +415,20 @@ def test_a_server_refusing_discover_falls_back_to_initialize(
     initialize."""
     base, state = upstream
     state.fail_method = ("server/discover", status)
+
+    probe = probe_http_server(f"{base}/mcp", name="srv")
+
+    assert probe.failure is None
+    assert probe.tools == ["alpha", "beta"]
+
+
+def test_a_server_refusing_discover_with_32000_falls_back_to_initialize(
+    upstream: tuple[str, Upstream],
+) -> None:
+    """Some servers refuse a request sent before their session with HTTP 400 and -32000, which the
+    SDK also uses for ``CONNECTION_CLOSED``. The connect still falls back to initialize (#1489)."""
+    base, state = upstream
+    state.discover_error = {"code": -32000, "message": "Bad Request: Server not initialized"}
 
     probe = probe_http_server(f"{base}/mcp", name="srv")
 

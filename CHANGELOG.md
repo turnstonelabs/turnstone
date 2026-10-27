@@ -10,6 +10,17 @@ All development now integrates on `main`. Supported release lines are maintained
 on `stable/X.Y` branches; `stable/1.8` preserves the former stable branch.
 The separate `dev` branch is retired. See [the release process](docs/releasing.md).
 
+## [2026-10-27]
+
+### Fixed
+
+- **MCP servers that refuse the protocol probe with error -32000 connect again
+  (#1489).** Since 1.9.0, a Streamable HTTP server that answered the
+  `server/discover` probe with HTTP 400 and JSON-RPC error -32000, as many
+  servers that predate the 2026-07-28 revision do, failed to connect with "The
+  connection closed before the server answered". The connection now falls back
+  to the `initialize` handshake, as it does for other refusals.
+
 ## [2026-10-26]
 
 ### Added

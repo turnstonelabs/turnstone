@@ -1757,8 +1757,12 @@ async def _negotiate_session(
 
     On HTTP transports, a probe answered with a status the response hook records on *capture* (a 401
     or 403, or a redirect judged unfollowed) ends the negotiation, because ``initialize`` would meet
-    the same answer. Any other refusal of the probe falls back to ``initialize``, as the SDK's own
-    negotiation does.
+    the same answer. A probe that timed out ends it too: the SDK leaves that request in flight, and
+    on HTTP an error status answering it after the handshake would be recorded against the new
+    session (#1502). Any other refusal of the probe falls back to ``initialize``, as the SDK's own
+    negotiation does, including one with -32000, the code the SDK also uses for
+    ``CONNECTION_CLOSED``: some servers refuse a request sent before their session with it (#1489),
+    and on a connection that really closed ``initialize`` fails at once the same way.
     """
     result: mcp_types.DiscoverResult | None = None
     version = LATEST_MODERN_VERSION
@@ -1778,10 +1782,7 @@ async def _negotiate_session(
                     v in HANDSHAKE_PROTOCOL_VERSIONS for v in supported
                 ):
                     raise
-            if exc.error.code in (
-                mcp_types.CONNECTION_CLOSED,
-                mcp_types.REQUEST_TIMEOUT,
-            ) or (
+            if exc.error.code == mcp_types.REQUEST_TIMEOUT or (
                 capture is not None
                 and (capture.status is not None or capture.first_error is not None)
             ):
