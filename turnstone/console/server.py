@@ -120,6 +120,7 @@ from turnstone.core.session_routes import (
     make_attachment_handlers,
     make_cancel_handler,
     make_close_handler,
+    make_command_handler,
     make_create_handler,
     make_dequeue_handler,
     make_detail_handler,
@@ -302,7 +303,7 @@ _GENERATED_WS_ID_COLLISION_RETRY_CAP = 3
 # Client timeout for the REST proxy pool (BOTH constructions: startup and
 # the mTLS re-create).  Node endpoints that answer degraded-but-in-time
 # responses size their backstops strictly UNDER this bound — e.g. the
-# quick-command ``running`` answer (turnstone/server.py
+# quick-command ``running`` answer (turnstone/core/session_routes.py
 # _COMMAND_RESPONSE_BACKSTOP_S); a test pins the inequality.  The SSE
 # proxy client's granular Timeout is a separate contract.
 _PROXY_CLIENT_TIMEOUT_S = 30
@@ -4876,6 +4877,11 @@ def _set_audit_executor(executor: ThreadPoolExecutor | None) -> None:
     """Install or clear the process-wide audit executor (lifespan-owned)."""
     global _audit_executor_ref
     _audit_executor_ref = executor
+
+
+# The slash commands a coordinator's ``/command`` route runs. The coordinator
+# composer's coordSend names the same list in a regex; change both together.
+_COORDINATOR_COMMANDS = frozenset({"/model"})
 
 
 async def coordinator_trust(request: Request) -> JSONResponse:
@@ -18081,6 +18087,10 @@ def create_app(
             retry=make_retry_handler(  # lifted: shared body (#549)
                 coord_endpoint_config,
                 audit_emit=_audit_retry_coordinator,
+            ),
+            command=make_command_handler(  # lifted: shares the node /command body
+                coord_endpoint_config,
+                allowed_commands=_COORDINATOR_COMMANDS,
             ),
             events=make_events_handler(coord_endpoint_config),  # lifted: shared body
             history=make_history_handler(coord_endpoint_config),  # lifted: shared body

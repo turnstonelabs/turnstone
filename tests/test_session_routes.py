@@ -120,6 +120,19 @@ def test_rewind_retry_register_before_bare_detail() -> None:
     assert "POST" in by_path["/api/workstreams/{ws_id}/retry"]
 
 
+def test_command_registers_before_bare_detail() -> None:
+    """``/command`` mounts as a POST verb before the bare ``{ws_id}`` GET."""
+    routes: list[Any] = []
+    register_session_routes(
+        routes,
+        prefix="/api/workstreams",
+        handlers=SharedSessionVerbHandlers(detail=_stub, command=_stub),
+    )
+    paths = [r.path for r in routes if isinstance(r, Route)]
+    assert paths.index("/api/workstreams/{ws_id}/command") < paths.index("/api/workstreams/{ws_id}")
+    assert "POST" in dict(_route_paths(routes))["/api/workstreams/{ws_id}/command"]
+
+
 def test_attachment_routes_mount_when_quintet_provided() -> None:
     """All five attachment routes mount when ``handlers.attachments``
     is non-``None`` — the type system requires the five-handler
@@ -231,6 +244,7 @@ def test_console_create_app_only_mounts_unified_workstream_paths() -> None:
     # Spot-check one verb per category from the registrar.
     assert any(p.endswith("/api/workstreams/{ws_id}/send") for p in paths)
     assert any(p.endswith("/api/workstreams/{ws_id}/events") for p in paths)
+    assert any(p.endswith("/api/workstreams/{ws_id}/command") for p in paths)
     assert any(p.endswith("/api/workstreams/{ws_id}") for p in paths)
     # And one from the coord-only registrar.
     assert any(p.endswith("/api/workstreams/{ws_id}/trust") for p in paths)

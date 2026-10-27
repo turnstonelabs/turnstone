@@ -1232,6 +1232,7 @@ def required_scope(method: str, path: str) -> str:
             "cancel",
             "rewind",
             "retry",
+            "command",
             "close",
         }
     ):
@@ -1286,6 +1287,7 @@ def required_scope(method: str, path: str) -> str:
                 "cancel",
                 "rewind",
                 "retry",
+                "command",
                 "close",
             }:
                 return "write"

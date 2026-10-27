@@ -29,6 +29,7 @@ from turnstone.api.console_schemas import (
     CoordinatorChildrenResponse,
     CoordinatorCloseAllChildrenRequest,
     CoordinatorCloseAllChildrenResponse,
+    CoordinatorCommandRequest,
     CoordinatorCreateRequest,
     CoordinatorCreateResponse,
     CoordinatorOpenResponse,
@@ -1627,6 +1628,21 @@ CONSOLE_ENDPOINTS: list[EndpointSpec] = [
         tags=["Coordinator"],
     ),
     EndpointSpec(
+        "/v1/api/workstreams/{ws_id}/command",
+        "POST",
+        "Run a slash command on the coordinator session",
+        description=(
+            "Runs ``/model`` on the coordinator's worker slot, as ``POST /v1/api/command`` "
+            "does on a node; any other command returns 400. A busy session returns 409, "
+            "and a command still running after 25 seconds answers ``running``. Gated on "
+            "``admin.coordinator``."
+        ),
+        request_model=CoordinatorCommandRequest,
+        response_model=StatusResponse,
+        error_codes=[400, 403, 404, 409, 503],
+        tags=["Coordinator"],
+    ),
+    EndpointSpec(
         "/v1/api/workstreams/{ws_id}/close",
         "POST",
         "Soft-close the coordinator (unload from memory; storage preserved)",
@@ -1893,6 +1909,7 @@ _ALL_MODELS: list[type[BaseModel]] = [
     ConsoleCreateWsResponse,
     ConsoleHealthResponse,
     CoordinatorApproveRequest,
+    CoordinatorCommandRequest,
     ApproveRequest,
     ApproveResponse,
     CancelRequest,

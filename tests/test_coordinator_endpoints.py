@@ -38,6 +38,7 @@ from tests._coord_test_helpers import (
 from tests._helpers import opaque_png
 from turnstone.console.coordinator_ui import ConsoleCoordinatorUI
 from turnstone.console.server import (
+    _COORDINATOR_COMMANDS,
     COORDINATOR_MODEL_WORDING,
     _audit_cancel_coordinator,
     _audit_close_coordinator,
@@ -64,6 +65,7 @@ from turnstone.core.session_routes import (
     make_attachment_handlers,
     make_cancel_handler,
     make_close_handler,
+    make_command_handler,
     make_create_handler,
     make_dequeue_handler,
     make_detail_handler,
@@ -228,6 +230,14 @@ def _make_client(
             Route(
                 "/v1/api/workstreams/{ws_id}/refresh-title",
                 make_refresh_title_handler(_coord_endpoint_config),
+                methods=["POST"],
+            ),
+            Route(
+                "/v1/api/workstreams/{ws_id}/command",
+                make_command_handler(
+                    _coord_endpoint_config,
+                    allowed_commands=_COORDINATOR_COMMANDS,
+                ),
                 methods=["POST"],
             ),
             Route(
@@ -554,6 +564,118 @@ def test_coord_set_title_rejects_unowned_ws_404(storage):
     assert resp.status_code == 404
     # The interactive ws's display name is untouched — the alias write never fired.
     assert get_workstream_display_name("i" * 32) == "interactive-ws"
+
+
+# ---------------------------------------------------------------------------
+# Slash commands (POST /{ws_id}/command) — the node /command body behind the
+# coordinator's one command, /model.
+# ---------------------------------------------------------------------------
+
+
+def _post_command(client, ws_id, command, headers=_COORD_HEADERS):
+    return client.post(
+        f"/v1/api/workstreams/{ws_id}/command", json={"command": command}, headers=headers
+    )
+
+
+def _quiet_coord(storage):
+    """A coordinator whose stub session reports that the command did not end it."""
+    mgr = _build_mgr(storage)
+    ws = mgr.create(user_id="user-1")
+    session = cast("MagicMock", ws.session)
+    session.handle_command.return_value = False
+    return mgr, ws, session
+
+
+@pytest.mark.parametrize("command", ["/model fast", "/model", "/MODEL fast"])
+def test_command_runs_model_on_the_worker(storage, command):
+    mgr, ws, session = _quiet_coord(storage)
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = _post_command(client, ws.id, command)
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {"status": "ok"}
+    session.handle_command.assert_called_once_with(command, principal_id="user-1")
+    assert ws.worker_kind == "command"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "/name triage",
+        "/clear",
+        "/compact",
+        "/instructions be terse",
+        "/help",
+        "/rewind 1",
+        "/retry",
+        "/exit",
+        "/new",
+        "/models",
+    ],
+)
+def test_command_other_than_model_is_refused(storage, command):
+    mgr, ws, session = _quiet_coord(storage)
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = _post_command(client, ws.id, command)
+    assert resp.status_code == 400
+    word = command.split()[0]
+    assert resp.json()["error"] == f"{word} is not available here. Available: /model."
+    session.handle_command.assert_not_called()
+    session.compact_now.assert_not_called()
+
+
+@pytest.mark.parametrize("body", [{}, {"command": "   "}, {"command": 7}])
+def test_command_without_a_command_is_400(storage, body):
+    mgr, ws, session = _quiet_coord(storage)
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.post(f"/v1/api/workstreams/{ws.id}/command", json=body, headers=_COORD_HEADERS)
+    assert resp.status_code == 400
+    session.handle_command.assert_not_called()
+
+
+def test_command_requires_admin_coordinator(storage):
+    mgr, ws, session = _quiet_coord(storage)
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = _post_command(
+        client, ws.id, "/model fast", headers={"X-Test-User": "user-1", "X-Test-Perms": "read"}
+    )
+    assert resp.status_code == 403
+    session.handle_command.assert_not_called()
+
+
+def test_command_unknown_coordinator_404(storage):
+    mgr = _build_mgr(storage)
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = _post_command(client, "0" * 32, "/model fast")
+    assert resp.status_code == 404
+
+
+def test_command_private_project_hidden_from_non_member(storage):
+    # The coordinator must be live in the manager: a storage-only row 404s at
+    # mgr.get whether or not the tenant check runs.
+    storage.create_project("proj-secret", "Secret", "alice")
+    mgr = _build_mgr(storage)
+    ws = mgr.create(user_id="alice", project_id="proj-secret")
+    session = cast("MagicMock", ws.session)
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = _post_command(
+        client,
+        ws.id,
+        "/model fast",
+        headers={"X-Test-User": "stranger", "X-Test-Perms": "admin.coordinator"},
+    )
+    assert resp.status_code == 404
+    session.handle_command.assert_not_called()
+
+
+def test_command_on_a_busy_coordinator_is_409(storage):
+    mgr, ws, session = _quiet_coord(storage)
+    ws._worker_running = True
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = _post_command(client, ws.id, "/model fast")
+    assert resp.status_code == 409
+    assert resp.json()["status"] == "busy"
+    session.handle_command.assert_not_called()
 
 
 def test_active_list_row_shape_includes_unified_fields(storage):

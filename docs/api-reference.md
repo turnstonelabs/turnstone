@@ -1326,6 +1326,9 @@ the HTTP tenancy gates. Remote callers must use the dedicated create, open,
 fork (`resume_ws` on create), close, and delete endpoints. `/rewind` and
 `/retry` likewise use their path-keyed endpoints rather than `/command`.
 
+Coordinators use their own console route, described under
+`POST /v1/api/workstreams/{ws_id}/command` (Console) below.
+
 **Response:**
 
 ```json
@@ -1343,6 +1346,34 @@ or `{"status": "running"}` as above.
 | 409    | `{"status": "busy", "error": ...}`          | A turn/command holds the worker                  |
 | 503    | `{"status": "error", "error": ...}`         | The command worker could not be started (resource exhaustion) — the command did **not** run; retry shortly |
 | 503    | `{"error": "workstream could not be read"}` | Its record can't be read                         |
+
+---
+
+### `POST /v1/api/workstreams/{ws_id}/command` (Console)
+
+Runs a slash command in a coordinator session, with the same worker-slot rules
+as `POST /v1/api/command`. Coordinators run `/model` only. Requires
+`admin.coordinator`.
+
+**Request body:**
+
+```json
+{"command": "/model fast"}
+```
+
+**Response:** `{"status": "ok"}`, or `{"status": "running"}` for a command
+still running after 25 s.
+
+**Error responses:**
+
+| Status | Body                                                  | Condition                                  |
+|--------|-------------------------------------------------------|--------------------------------------------|
+| 400    | `{"error": "Empty command"}`                          | Command is empty                           |
+| 400    | `{"error": "/x is not available here. Available: /model."}` | Any command other than `/model`      |
+| 403    | `{"error": ...}`                                      | Caller lacks `admin.coordinator`           |
+| 404    | `{"error": ...}`                                      | No such coordinator, or not visible        |
+| 409    | `{"status": "busy", "error": ...}`                    | A turn/command holds the worker            |
+| 503    | `{"status": "error", "error": ...}`                   | The command worker could not be started    |
 
 ---
 

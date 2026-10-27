@@ -370,6 +370,11 @@ def resolve_temperature_setting(cfg: Any | None, config_store: Any | None) -> fl
     return temperature
 
 
+# The role rung coordinator sessions resolve reasoning effort through, both at
+# creation (the console session factory) and on a ``/model`` switch.
+COORDINATOR_EFFORT_KEY = "coordinator.reasoning_effort"
+
+
 def resolve_effort_setting(
     cfg: Any | None,
     config_store: Any | None,

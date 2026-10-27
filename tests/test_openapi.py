@@ -266,6 +266,7 @@ class TestConsoleSpec:
             "/v1/api/workstreams/{ws_id}/cancel",
             "/v1/api/workstreams/{ws_id}/rewind",
             "/v1/api/workstreams/{ws_id}/retry",
+            "/v1/api/workstreams/{ws_id}/command",
             "/v1/api/workstreams/{ws_id}/close",
             "/v1/api/workstreams/{ws_id}/events",
             "/v1/api/workstreams/{ws_id}/history",

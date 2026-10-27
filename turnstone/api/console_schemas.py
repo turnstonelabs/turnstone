@@ -1718,6 +1718,17 @@ class CoordinatorApproveRequest(BaseModel):
     )
 
 
+class CoordinatorCommandRequest(BaseModel):
+    """Body for POST /v1/api/workstreams/{ws_id}/command."""
+
+    command: str = Field(
+        description=(
+            "Slash command with its argument, for example ``/model fast``. "
+            "Coordinators run ``/model`` only."
+        )
+    )
+
+
 class CoordinatorChildInfo(BaseModel):
     """Per-row shape in the coordinator children listing."""
 

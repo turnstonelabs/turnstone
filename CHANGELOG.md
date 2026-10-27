@@ -10,6 +10,16 @@ All development now integrates on `main`. Supported release lines are maintained
 on `stable/X.Y` branches; `stable/1.8` preserves the former stable branch.
 The separate `dev` branch is retired. See [the release process](docs/releasing.md).
 
+## [2026-10-26]
+
+### Added
+
+- **`/model` in coordinator sessions.** Typing `/model` or `/model <alias>` in a
+  coordinator now shows or switches its model, as in an interactive workstream,
+  instead of sending the text to the model. Other text, including other slash
+  commands, still goes to the coordinator as a message. The console serves it at
+  `POST /v1/api/workstreams/{ws_id}/command`, gated on `admin.coordinator`.
+
 ## [2026-10-25]
 
 ### Added

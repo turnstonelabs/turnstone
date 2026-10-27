@@ -53,6 +53,7 @@ import {
   focusConvBatchHead,
   focusTemporarily,
   setToolOutputReviewState,
+  stripAnsi,
 } from "/shared/conversation.js";
 import {
   canAutoFoldTranscriptBatch,
@@ -2846,6 +2847,75 @@ function createCoordinatorPane(root, wsId, opts) {
       composer.setProject(coordProjectName || "");
   }
 
+  // /model goes to the coordinator's /command route, never to /send: a
+  // command is control-plane input, not a turn. coordSend sends nothing else
+  // here (see its slash branch). Response arms mirror the interactive pane's
+  // sendMessage: busy and error ride non-2xx codes, so the body is read
+  // before any ok check.
+  function runCoordCommand(text) {
+    if (busy) {
+      appendText("info", "Session is busy — commands can't run mid-turn.", {
+        label: "info",
+      });
+      return;
+    }
+    authFetch("/v1/api/workstreams/" + encodeURIComponent(wsId) + "/command", {
+      method: "POST",
+      credentials: "include",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ command: text }),
+    })
+      .then((r) =>
+        r.json().then(
+          (b) => ({ ok: r.ok, status: r.status, body: b || {} }),
+          () => ({ ok: r.ok, status: r.status, body: {} }),
+        ),
+      )
+      .then(({ ok, status, body }) => {
+        if (body.status === "busy") {
+          appendText(
+            "info",
+            body.error || "Session is busy — try again shortly.",
+            { label: "info" },
+          );
+        } else if (body.status === "running") {
+          appendText(
+            "info",
+            "Command is still running — results will appear here when it finishes.",
+            { label: "info" },
+          );
+        } else if (body.status === "error") {
+          appendText(
+            "error",
+            body.error || "Command failed to start — retry shortly.",
+            { label: "error" },
+          );
+        } else if (!ok) {
+          appendText(
+            "error",
+            body.error || "Command failed (HTTP " + status + ")",
+            { label: "error" },
+          );
+        }
+      })
+      .catch((err) => {
+        appendText(
+          "error",
+          "Command failed: " + (err && err.message ? err.message : err),
+          { label: "error" },
+        );
+      });
+    // Echo as a command chip, not a user bubble: commands don't join the
+    // trajectory, so a bubble would vanish on reload.
+    const echo = document.createElement("div");
+    echo.className = "msg command-echo";
+    echo.setAttribute("aria-label", "command");
+    echo.textContent = text;
+    messagesEl.appendChild(echo);
+    scrollFollow.jumpToLatest();
+    composer.clear();
+  }
+
   function coordSend() {
     const text = composer.value;
     const trimmed = (text || "").trim();
@@ -2855,6 +2925,14 @@ function createCoordinatorPane(root, wsId, opts) {
           label: "info",
         });
       }
+      return false;
+    }
+    // /model is the one slash command a coordinator runs (the server's
+    // _COORDINATOR_COMMANDS; change both together). Any other text, a
+    // leading "/" included (a path, another command word), goes to the
+    // coordinator as an ordinary message, as it always has.
+    if (/^\/model(\s|$)/i.test(trimmed)) {
+      runCoordCommand(trimmed);
       return false;
     }
     // The live-turn interjection queue is text-only. Keep the input and chips
@@ -4121,15 +4199,22 @@ function createCoordinatorPane(root, wsId, opts) {
         }
         break;
       case "error":
-        appendText("error", ev.message || "(unknown error)", {
+        appendText("error", stripAnsi(ev.message || "(unknown error)"), {
           label: "error",
         });
         break;
       case "info":
         // .msg.info (think-indigo) is the intended variant for info
         // events; prior routing to "tool" gave them accent-tinted tool
-        // styling which mis-categorised them as tool calls.
-        appendText("info", ev.message || "", { label: "info" });
+        // styling which mis-categorised them as tool calls.  Command output
+        // (/model) is coloured when the console runs in a terminal; strip
+        // the escapes as the interactive pane does, and keep its line breaks
+        // (.msg-body collapses whitespace).
+        appendMsg(
+          "info",
+          esc(stripAnsi(ev.message || "")).replace(/\n/g, "<br>"),
+          { label: "info" },
+        );
         break;
       case "user_turn":
         acceptUserTurn(ev);

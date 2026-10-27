@@ -2057,9 +2057,9 @@ model, and each turn records the message and then raises `ModelNotLoadedError`
 (a `ModelTurnLocalError`) before anything is dialed; `model_turn()` itself
 refuses a lane carrying that client before its admission slot or credential, so
 a call no check stopped never reaches the stand-in. The message names the model
-and a remedy for whoever reads it: `/model <alias>` on the web and in the CLI,
-which reads its models from config.toml once; an admin for a coordinator, a
-coordinator's child (whose errors the coordinator's model reads, so they never
+and a remedy for whoever reads it: `/model <alias>` on the web (coordinators
+too) and in the CLI, which reads its models from config.toml once; an admin for
+a coordinator's child (whose errors the coordinator's model reads, so they never
 name another model) and a scheduled run; and the channels' own advice in a chat
 conversation (`turnstone/core/model_remedies.py`), which says the message is
 kept, since chat has no `/retry`. `/model` prints the same message. The next

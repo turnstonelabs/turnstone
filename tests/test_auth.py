@@ -172,6 +172,9 @@ class TestRequiredScope:
     def test_post_retry_needs_write(self):
         assert required_scope("POST", "/api/workstreams/abc/retry") == "write"
 
+    def test_post_path_keyed_command_needs_write(self):
+        assert required_scope("POST", "/api/workstreams/abc/command") == "write"
+
     def test_get_events_per_ws_needs_read(self):
         assert required_scope("GET", "/api/workstreams/abc/events") == "read"
 
@@ -226,6 +229,9 @@ class TestRequiredScope:
 
     def test_proxy_v1_retry_needs_write(self):
         assert required_scope("POST", "/node/node-a/v1/api/workstreams/abc/retry") == "write"
+
+    def test_proxy_v1_command_needs_write(self):
+        assert required_scope("POST", "/node/node-a/v1/api/workstreams/abc/command") == "write"
 
     def test_proxy_v1_read_endpoint_needs_read(self):
         assert required_scope("GET", "/node/node-a/v1/api/workstreams") == "read"

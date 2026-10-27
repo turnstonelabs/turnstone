@@ -1250,6 +1250,53 @@ def test_deferred_send_settle_protocol_pins() -> None:
     assert '"Command failed: " + err.message' in interactive
 
 
+def test_coordinator_pane_runs_model_through_its_command_route() -> None:
+    """The coordinator composer sends ``/model`` to its own path-keyed
+    ``/command`` route before the attachment guard and the ``/send`` POST, and
+    surfaces the same degraded answers as the interactive pane. Any other text,
+    a leading "/" included, still goes to ``/send``."""
+    from turnstone.console.server import _COORDINATOR_COMMANDS
+
+    # coordSend's regex names the commands the server runs for coordinators.
+    # Growing the server list without the regex would send the new command to
+    # the model as chat: update both, then this assertion.
+    assert frozenset({"/model"}) == _COORDINATOR_COMMANDS
+
+    coordinator = (_ROOT / "turnstone/console/static/coordinator/coordinator.js").read_text(
+        encoding="utf-8"
+    )
+    send_fn = _extract_braced(coordinator, "function coordSend() {")
+    model_branch = _extract_braced(send_fn, "if (/^\\/model(\\s|$)/i.test(trimmed)) {")
+    assert "runCoordCommand(trimmed);" in model_branch
+    # Without the early return the command would also be posted as a turn.
+    assert "return false;" in model_branch
+    branch = send_fn.index("if (/^\\/model(\\s|$)/i.test(trimmed)) {")
+    assert branch < send_fn.index("Attachments can't be sent while the assistant is working")
+    assert branch < send_fn.index('+ "/send"')
+
+    run_fn = _extract_braced(coordinator, "function runCoordCommand(text) {")
+    assert '+ "/command"' in run_fn
+    assert run_fn.index("if (busy) {") < run_fn.index("authFetch(")
+    assert "composer.clear();" in run_fn
+    for arm in (
+        'body.status === "busy"',
+        'body.status === "running"',
+        'body.status === "error"',
+        "Command failed (HTTP ",
+        '"Command failed: "',
+    ):
+        assert arm in run_fn, arm
+    # /model output is coloured when the console runs in a terminal, and its
+    # readout spans several lines that .msg-body would collapse.
+    error_case = coordinator[coordinator.index('      case "error":\n        appendText(') :]
+    assert error_case.index('stripAnsi(ev.message || "(unknown error)")') < error_case.index(
+        "break;"
+    )
+    info_case = coordinator[coordinator.index('      case "info":\n') :]
+    info_case = info_case[: info_case.index("break;")]
+    assert 'esc(stripAnsi(ev.message || "")).replace(/\\n/g, "<br>")' in info_case
+
+
 def test_settle_send_response_missed_edge_behavior(tmp_path) -> None:
     """Execute the shared settle helper under node and pin the
     missed-edge matrix behaviorally (not just textually): a non-deferred

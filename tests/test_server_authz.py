@@ -1568,7 +1568,7 @@ def test_command_backstop_sits_under_console_proxy_timeout() -> None:
     either constant past the other and this fails before a proxied
     deployment silently loses the degraded answer again."""
     from turnstone.console.server import _PROXY_CLIENT_TIMEOUT_S
-    from turnstone.server import _COMMAND_RESPONSE_BACKSTOP_S
+    from turnstone.core.session_routes import _COMMAND_RESPONSE_BACKSTOP_S
 
     assert _COMMAND_RESPONSE_BACKSTOP_S < _PROXY_CLIENT_TIMEOUT_S
 

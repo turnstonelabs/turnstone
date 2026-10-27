@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING
 from turnstone.console.coordinator_alias import resolve_coordinator_alias
 from turnstone.core.log import get_logger
 from turnstone.core.model_turn import (
+    COORDINATOR_EFFORT_KEY,
     resolve_effort_setting,
     resolve_model_binding,
     resolve_temperature_setting,
@@ -206,7 +207,7 @@ def build_console_session_factory(
             else config_store.get("model.max_tokens")
         )
         eff_reasoning_effort = resolve_effort_setting(
-            r_cfg, config_store, role_key="coordinator.reasoning_effort"
+            r_cfg, config_store, role_key=COORDINATOR_EFFORT_KEY
         )
 
         coord_client = coord_client_factory(ws_id or "", uid)
