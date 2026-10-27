@@ -466,6 +466,22 @@ def test_mcp_update_authority_schemas_offer_no_null() -> None:
         assert "default" not in props[name]
 
 
+def test_skill_update_authority_schemas_offer_no_null() -> None:
+    """The skill update handler refuses a JSON null auto_approve, enabled or allowed_tools (400),
+    so the advertised schema must not offer one."""
+    from turnstone.api.console_spec import build_console_spec
+
+    props = build_console_spec()["components"]["schemas"]["UpdateSkillRequest"]["properties"]
+    for name, json_type in (
+        ("auto_approve", "boolean"),
+        ("enabled", "boolean"),
+        ("allowed_tools", "string"),
+    ):
+        assert props[name]["type"] == json_type
+        assert "anyOf" not in props[name]
+        assert "default" not in props[name]
+
+
 class TestCheckedInArtifactFreshness:
     """The checked-in `sdk/typescript/*.json` specs must match their source.
 

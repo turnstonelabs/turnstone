@@ -1222,6 +1222,45 @@ class TestExecSkillsCreate:
         assert "kind must be one of" in err
         assert "'bogus'" in err
 
+    def test_create_refuses_auto_approve_sent_as_a_string(self) -> None:
+        """``bool()`` read ``"false"`` as true, so a model asking for a skill without
+        auto-approval got one with it. The model gets an error it can retry from, and no
+        approval is asked for."""
+        session = _make_session()
+        with patch("turnstone.core.auth.user_has_permission", return_value=True):
+            item = session._prepare_skills(
+                "c",
+                {
+                    "action": "create",
+                    "name": "x",
+                    "content": "b",
+                    "description": "d",
+                    "allowed_tools": ["bash"],
+                    "auto_approve": "false",
+                },
+            )
+        assert item["needs_approval"] is False
+        assert item["error"] == "Error: create: auto_approve must be true or false"
+
+    def test_create_refuses_a_null_auto_approve(self) -> None:
+        session = _make_session()
+        with patch("turnstone.core.auth.user_has_permission", return_value=True):
+            item = session._prepare_skills(
+                "c",
+                {
+                    "action": "create",
+                    "name": "x",
+                    "content": "b",
+                    "description": "d",
+                    "auto_approve": None,
+                },
+            )
+        assert item["needs_approval"] is False
+        assert item["error"] == (
+            "Error: create: auto_approve must not be null: send a value, or leave it out to keep "
+            "the stored value (the default on create)"
+        )
+
     def test_create_audit_failure_does_not_block_write(self) -> None:
         """Audit failure must be logged loudly but not block the write —
         a successful write without an audit row is the exact forensic gap
@@ -1323,6 +1362,21 @@ class TestExecSkillsUpdate:
                 {"action": "update", "name": "existing", "auto_approve": True},
             )
         assert "WARNING: auto_approve" in item_b["preview"], item_b["preview"]
+
+    def test_update_refuses_auto_approve_sent_as_a_string(self) -> None:
+        session = _make_session()
+        storage = MagicMock()
+        storage.get_prompt_template_by_name.return_value = self._existing_row()
+        with (
+            patch("turnstone.core.auth.user_has_permission", return_value=True),
+            patch("turnstone.core.session.get_storage", return_value=storage),
+        ):
+            item = session._prepare_skills(
+                "c", {"action": "update", "name": "existing", "auto_approve": "false"}
+            )
+        assert item["needs_approval"] is False
+        assert item["error"] == "Error: update: auto_approve must be true or false"
+        storage.update_prompt_template.assert_not_called()
 
     def test_update_includes_projected_risk_on_preview(self) -> None:
         # The current tier is read from the skill's text, as the activation gate

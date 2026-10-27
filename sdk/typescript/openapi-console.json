@@ -15654,16 +15654,9 @@
             "title": "Version"
           },
           "auto_approve": {
-            "anyOf": [
-              {
-                "type": "boolean"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "default": null,
-            "title": "Auto Approve"
+            "description": "Omit to leave the stored value unchanged; JSON null is refused (400).",
+            "title": "Auto Approve",
+            "type": "boolean"
           },
           "notify_on_complete": {
             "anyOf": [
@@ -15678,16 +15671,9 @@
             "title": "Notify On Complete"
           },
           "enabled": {
-            "anyOf": [
-              {
-                "type": "boolean"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "default": null,
-            "title": "Enabled"
+            "description": "Omit to leave the stored value unchanged; JSON null is refused (400).",
+            "title": "Enabled",
+            "type": "boolean"
           },
           "priority": {
             "anyOf": [
@@ -15702,16 +15688,9 @@
             "title": "Priority"
           },
           "allowed_tools": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "default": null,
-            "title": "Allowed Tools"
+            "description": "Omit to leave the stored value unchanged; JSON null is refused (400).",
+            "title": "Allowed Tools",
+            "type": "string"
           },
           "license": {
             "anyOf": [

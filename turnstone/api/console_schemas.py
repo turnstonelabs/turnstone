@@ -474,11 +474,22 @@ class UpdateSkillRequest(BaseModel):
     variables: str | None = None
     author: str | None = None
     version: str | None = None
-    auto_approve: bool | None = None
+    # These three grant or withhold tool authority, and the handler refuses an explicit JSON null
+    # for them, so null stays out of the advertised union.
+    auto_approve: bool | SkipJsonSchema[None] = Field(
+        default_factory=lambda: None,
+        description="Omit to leave the stored value unchanged; JSON null is refused (400).",
+    )
     notify_on_complete: str | None = None
-    enabled: bool | None = None
+    enabled: bool | SkipJsonSchema[None] = Field(
+        default_factory=lambda: None,
+        description="Omit to leave the stored value unchanged; JSON null is refused (400).",
+    )
     priority: int | None = None
-    allowed_tools: str | None = None
+    allowed_tools: str | SkipJsonSchema[None] = Field(
+        default_factory=lambda: None,
+        description="Omit to leave the stored value unchanged; JSON null is refused (400).",
+    )
     license: str | None = None
     compatibility: str | None = None
     # SKILL.md spec ``paths:`` (#569 — filter consumer pending),

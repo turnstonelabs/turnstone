@@ -38,6 +38,13 @@ The separate `dev` branch is retired. See [the release process](docs/releasing.m
   count as true, and `null` as false. The Python SDK's `create_mcp_server` sends
   such values as given, `None` included, so the console refuses them where the
   SDK used to coerce them.
+- **Skill and schedule booleans are parsed strictly.** An `auto_approve` or
+  `enabled` that is not `true`, `false`, `0` or `1` is refused when a skill is
+  created or edited (from the admin API or the `skills` tool) and when a
+  schedule is; the string `"false"` used to count as true. A skill also
+  refuses either flag or `allowed_tools` sent as `null`, as schedules already
+  do: a null flag used to turn the flag off, and a null `allowed_tools` stored a
+  tool named `None`.
 - **The MCP server update audit no longer records a full URL or a stdio
   server's arguments.** It records a changed URL as `scheme://host:port`, and an
   OAuth audience or authorization server given as an http(s) URL the same way;

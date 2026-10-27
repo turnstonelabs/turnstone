@@ -50,13 +50,19 @@ def parse_skill_session_config(body: dict[str, Any]) -> tuple[dict[str, Any], st
 
     Field rules:
 
-    - ``auto_approve`` / ``enabled``: bool
+    - ``auto_approve`` / ``enabled``: a JSON boolean, or 0 or 1; anything else is an error, since
+      reading the string ``"false"`` as true would turn auto-approval on
     - ``notify_on_complete``: the targets a workstream's ``notify_targets`` accept, normalized to
       a JSON array string ("[]" if blank or the legacy ``{}`` sentinel from migrations 011/021);
       ``null`` counts as absent, so a model that sends null for an omitted argument keeps the
       stored targets
-    - ``allowed_tools``: JSON array string (accepts list, JSON string,
-      or comma-separated CSV string → canonicalized to JSON array)
+    - ``allowed_tools``: JSON array string (accepts list, JSON string, or comma-separated CSV
+      string → canonicalized to JSON array)
+
+    ``auto_approve``, ``enabled`` and ``allowed_tools`` refuse ``null``, as the schedule endpoints
+    do. Each grants or withholds tool authority, and a null can mean "clear it" as well as "leave
+    it", so reading it either way would get some caller's intent silently wrong.
+    ``notify_on_complete`` grants nothing, so a null there counts as absent.
 
     A skill carries no model alias, temperature, reasoning effort, max tokens or task-agent turn
     cap: the workstream's alias and the operator's ``tools.agent_max_turns`` setting supply those
@@ -65,11 +71,33 @@ def parse_skill_session_config(body: dict[str, Any]) -> tuple[dict[str, Any], st
     """
     fields: dict[str, Any] = {}
 
-    if "auto_approve" in body:
-        fields["auto_approve"] = bool(body.get("auto_approve", False))
+    # Every null at once, with the way out: a model that fills omitted arguments with null fixes
+    # them in one retry, and does not "fix" a null tool list by sending [], which clears it.
+    nulls = [
+        key
+        for key in ("auto_approve", "enabled", "allowed_tools")
+        if key in body and body[key] is None
+    ]
+    if len(nulls) == 1:
+        return {}, (
+            f"{nulls[0]} must not be null: send a value, or leave it out to keep the stored value "
+            "(the default on create)"
+        )
+    if nulls:
+        named = ", ".join(nulls[:-1]) + " and " + nulls[-1]
+        return {}, (
+            f"{named} must not be null: send values, or leave them out to keep the stored values "
+            "(the defaults on create)"
+        )
 
-    if "enabled" in body:
-        fields["enabled"] = bool(body.get("enabled", True))
+    for key in ("auto_approve", "enabled"):
+        if key not in body:
+            continue
+        value = body[key]
+        if isinstance(value, bool) or (isinstance(value, int) and value in (0, 1)):
+            fields[key] = bool(value)
+        else:
+            return {}, f"{key} must be true or false"
 
     if body.get("notify_on_complete") is not None:
         nc_raw = body["notify_on_complete"]
@@ -87,7 +115,7 @@ def parse_skill_session_config(body: dict[str, Any]) -> tuple[dict[str, Any], st
         fields["notify_on_complete"] = nc
 
     if "allowed_tools" in body:
-        at_raw = body.get("allowed_tools", "[]")
+        at_raw = body["allowed_tools"]
         if isinstance(at_raw, list):
             fields["allowed_tools"] = json.dumps(at_raw)
         else:

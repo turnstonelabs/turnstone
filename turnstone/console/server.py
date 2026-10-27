@@ -7378,13 +7378,19 @@ async def admin_create_schedule(request: Request) -> JSONResponse:
     target_mode = str(body.get("target_mode", "auto")).strip()[:256]
     model = str(body.get("model", "")).strip()[:128]
     initial_message = str(body.get("initial_message", "")).strip()[:SCHEDULE_MESSAGE_MAX_CHARS]
-    auto_approve = bool(body.get("auto_approve", False))
+    auto_approve, err_resp = _parse_strict_bool(
+        body.get("auto_approve"), default=False, field="auto_approve"
+    )
+    if err_resp is not None:
+        return err_resp
     raw_tools = body.get("auto_approve_tools", [])
     auto_approve_tools = raw_tools if isinstance(raw_tools, list) else []
     skill_name = str(body.get("skill", "")).strip()[:256]
     persona = str(body.get("persona", "")).strip()[:64]
     project_id = str(body.get("project_id", "")).strip()[:64]
-    enabled = bool(body.get("enabled", True))
+    enabled, err_resp = _parse_strict_bool(body.get("enabled"), default=True, field="enabled")
+    if err_resp is not None:
+        return err_resp
     # created_by is the authenticated admin — read via auth_result like every
     # other console endpoint (AuthMiddleware never sets request.state.user_id,
     # so the previous ``state.user_id`` read silently stored ""). It is now
@@ -7549,7 +7555,12 @@ async def admin_update_schedule(request: Request) -> JSONResponse:
             :SCHEDULE_MESSAGE_MAX_CHARS
         ]
     if "auto_approve" in body:
-        updates["auto_approve"] = bool(body["auto_approve"])
+        auto_approve, err_resp = _parse_strict_bool(
+            body["auto_approve"], default=False, field="auto_approve"
+        )
+        if err_resp is not None:
+            return err_resp
+        updates["auto_approve"] = auto_approve
     if "auto_approve_tools" in body:
         raw = body["auto_approve_tools"]
         updates["auto_approve_tools"] = raw if isinstance(raw, list) else []
@@ -7600,7 +7611,10 @@ async def admin_update_schedule(request: Request) -> JSONResponse:
                 updates["created_by"] = owner
         updates["project_id"] = project_val
     if "enabled" in body:
-        updates["enabled"] = bool(body["enabled"])
+        enabled, err_resp = _parse_strict_bool(body["enabled"], default=True, field="enabled")
+        if err_resp is not None:
+            return err_resp
+        updates["enabled"] = enabled
     if "notify_targets" in body:
         from turnstone.core.notify_targets import validate_notify_targets
 

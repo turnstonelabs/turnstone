@@ -121,6 +121,18 @@ def _sys_content(session: ChatSession) -> str:
     return "\n".join(m["content"] for m in session.system_messages)
 
 
+# What follows the field names when a skill body sends auto_approve, enabled or allowed_tools as
+# null: one field, then several.
+_NULL_HINT = (
+    " must not be null: send a value, or leave it out to keep the stored value (the default on "
+    "create)"
+)
+_NULLS_HINT = (
+    " must not be null: send values, or leave them out to keep the stored values (the defaults "
+    "on create)"
+)
+
+
 def _create_template(db, template_id, name, content, **kwargs):
     """Helper to create a prompt template in storage."""
     db.create_prompt_template(
@@ -874,6 +886,57 @@ class TestSkillAPI:
             },
         )
         assert resp.status_code == 400
+
+    @pytest.mark.parametrize("field", ["auto_approve", "enabled"])
+    def test_create_skill_boolean_string_rejected(self, api_client, api_storage, field):
+        """``bool()`` read the string ``"false"`` as true, so a skill asked for without
+        auto-approval got it. A value other than a boolean, 0 or 1 is refused."""
+        resp = api_client.post(
+            "/v1/api/admin/skills",
+            json={"name": "loose-bool", "content": "...", "description": "x", field: "false"},
+        )
+
+        assert resp.status_code == 400
+        assert resp.json() == {"error": f"{field} must be true or false"}
+        assert api_storage.get_prompt_template_by_name("loose-bool") is None
+
+    @pytest.mark.parametrize("field", ["auto_approve", "enabled"])
+    def test_update_skill_boolean_string_rejected(self, api_client, api_storage, field):
+        _create_template(api_storage, "s1", "strict-bool", "content")
+        before = api_storage.get_prompt_template("s1")
+
+        resp = api_client.put("/v1/api/admin/skills/s1", json={field: "false"})
+
+        assert resp.status_code == 400
+        assert resp.json() == {"error": f"{field} must be true or false"}
+        assert api_storage.get_prompt_template("s1") == before
+
+    @pytest.mark.parametrize("field", ["auto_approve", "enabled", "allowed_tools"])
+    def test_create_skill_null_refused(self, api_client, api_storage, field):
+        resp = api_client.post(
+            "/v1/api/admin/skills",
+            json={"name": "nulls", "content": "...", "description": "x", field: None},
+        )
+
+        assert resp.status_code == 400
+        assert resp.json() == {"error": field + _NULL_HINT}
+        assert api_storage.get_prompt_template_by_name("nulls") is None
+
+    @pytest.mark.parametrize("field", ["auto_approve", "enabled", "allowed_tools"])
+    def test_update_skill_null_refused_and_nothing_written(self, api_client, api_storage, field):
+        # A caller clearing auto-approval or the tool list with null hears that it did not.
+        _create_template(
+            api_storage, "s1", "kept", "content", auto_approve=True, allowed_tools='["bash"]'
+        )
+        before = api_storage.get_prompt_template("s1")
+
+        resp = api_client.put(
+            "/v1/api/admin/skills/s1", json={"description": "changed", field: None}
+        )
+
+        assert resp.status_code == 400
+        assert resp.json() == {"error": field + _NULL_HINT}
+        assert api_storage.get_prompt_template("s1") == before
 
     def test_update_skill_readonly_mixed_body_filters_spec(self, api_client, api_storage):
         """When JS sends all fields for a readonly skill, spec fields are silently dropped."""
@@ -2139,3 +2202,66 @@ class TestReadAllowedTools:
         current = scan_skill_content(content, '["bash", "read_file"]')
         assert legacy[0] == current[0]
         assert legacy[0] != scan_skill_content(content, "[]")[0]
+
+
+class TestSkillBooleanFields:
+    """``auto_approve`` and ``enabled`` on a skill body, which the admin endpoints and the
+    ``skills`` tool both read through ``parse_skill_session_config``."""
+
+    @pytest.mark.parametrize(
+        ("value", "stored"), [(True, True), (False, False), (1, True), (0, False)]
+    )
+    def test_a_boolean_or_zero_or_one_is_kept(self, value: Any, stored: bool) -> None:
+        from turnstone.core.skill_field_validation import parse_skill_session_config
+
+        assert parse_skill_session_config({"auto_approve": value, "enabled": value}) == (
+            {"auto_approve": stored, "enabled": stored},
+            None,
+        )
+
+    @pytest.mark.parametrize("value", ["false", "true", "", 2, 1.0, [], {}])
+    def test_anything_else_is_refused(self, value: Any) -> None:
+        from turnstone.core.skill_field_validation import parse_skill_session_config
+
+        assert parse_skill_session_config({"enabled": value}) == (
+            {},
+            "enabled must be true or false",
+        )
+
+    @pytest.mark.parametrize("field", ["auto_approve", "enabled", "allowed_tools"])
+    def test_null_is_refused(self, field: str) -> None:
+        # A null flag used to read as false and a null ``allowed_tools`` as a tool named "None";
+        # reading either as "not sent" would make an attempt to clear it a silent no-op.
+        from turnstone.core.skill_field_validation import parse_skill_session_config
+
+        assert parse_skill_session_config({field: None}) == ({}, field + _NULL_HINT)
+
+    @pytest.mark.parametrize(
+        ("body", "named"),
+        [
+            ({"auto_approve": None, "allowed_tools": None}, "auto_approve and allowed_tools"),
+            (
+                {"auto_approve": None, "enabled": None, "allowed_tools": None},
+                "auto_approve, enabled and allowed_tools",
+            ),
+        ],
+    )
+    def test_every_null_is_named_at_once(self, body: dict[str, Any], named: str) -> None:
+        # So a model that fills omitted arguments with null fixes them in one retry.
+        from turnstone.core.skill_field_validation import parse_skill_session_config
+
+        assert parse_skill_session_config(body) == ({}, named + _NULLS_HINT)
+
+    def test_a_null_notify_on_complete_still_counts_as_absent(self) -> None:
+        from turnstone.core.skill_field_validation import parse_skill_session_config
+
+        assert parse_skill_session_config({"notify_on_complete": None}) == ({}, None)
+
+    @pytest.mark.parametrize(("value", "stored"), [("", "[]"), ("[]", "[]"), ([], "[]")])
+    def test_an_empty_allowed_tools_still_clears_it(self, value: Any, stored: str) -> None:
+        from turnstone.core.skill_field_validation import parse_skill_session_config
+
+        assert parse_skill_session_config({"allowed_tools": value}) == (
+            {"allowed_tools": stored},
+            None,
+        )

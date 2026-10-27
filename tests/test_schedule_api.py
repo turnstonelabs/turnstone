@@ -566,6 +566,33 @@ class TestScheduleAPI:
         row = client.get("/v1/api/admin/schedules/" + created["task_id"]).json()
         assert row == created
 
+    @pytest.mark.parametrize("field", ["auto_approve", "enabled"])
+    def test_create_refuses_a_boolean_sent_as_a_string(self, client, field):
+        # bool() read the string "false" as true, which turned auto-approval on for every run.
+        resp = client.post("/v1/api/admin/schedules", json=_cron_payload(**{field: "false"}))
+        assert resp.status_code == 400
+        assert resp.json()["error"] == f"{field} expects true/false (or 0/1)"
+        assert client.get("/v1/api/admin/schedules").json()["schedules"] == []
+
+    @pytest.mark.parametrize("field", ["auto_approve", "enabled"])
+    def test_update_refuses_a_boolean_sent_as_a_string_and_changes_nothing(self, client, field):
+        created = client.post("/v1/api/admin/schedules", json=_cron_payload()).json()
+        resp = client.put(
+            "/v1/api/admin/schedules/" + created["task_id"],
+            json={field: "false", "description": "not applied either"},
+        )
+        assert resp.status_code == 400
+        assert resp.json()["error"] == f"{field} expects true/false (or 0/1)"
+        row = client.get("/v1/api/admin/schedules/" + created["task_id"]).json()
+        assert row == created
+
+    def test_zero_and_one_count_as_booleans(self, client):
+        created = client.post(
+            "/v1/api/admin/schedules", json=_cron_payload(auto_approve=1, enabled=0)
+        ).json()
+        assert created["auto_approve"] is True
+        assert created["enabled"] is False
+
     def test_update_blank_zone_is_refused(self, client):
         # A blank zone means UTC on create, where nothing is lost; on update
         # it would silently re-zone the schedule, so it is refused.
