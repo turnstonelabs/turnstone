@@ -37,7 +37,7 @@ class TestVersionHtml:
     def test_vendored_katex_skipped(self):
         from turnstone.core.web_helpers import version_html
 
-        html = '<link rel="stylesheet" href="/shared/katex-0.19.0/katex.min.css">'
+        html = '<link rel="stylesheet" href="/shared/katex-0.19.1/katex.min.css">'
         result = version_html(html)
         assert result == html  # unchanged
 
@@ -91,7 +91,7 @@ class TestVersionHtml:
 
         html = (
             '<link rel="stylesheet" href="/shared/base.css">\n'
-            '<link rel="stylesheet" href="/shared/katex-0.19.0/katex.min.css">\n'
+            '<link rel="stylesheet" href="/shared/katex-0.19.1/katex.min.css">\n'
             '<link rel="stylesheet" href="/static/style.css">\n'
             '<script src="/shared/utils.js"></script>\n'
             '<script src="/shared/hljs-11.12.0/highlight.min.js"></script>\n'
@@ -103,7 +103,7 @@ class TestVersionHtml:
         assert f'/shared/utils.js?v={__version__}"' in result
         assert f'/static/app.js?v={__version__}"' in result
         # Vendored libs unchanged
-        assert '/shared/katex-0.19.0/katex.min.css"' in result
+        assert '/shared/katex-0.19.1/katex.min.css"' in result
         assert '/shared/hljs-11.12.0/highlight.min.js"' in result
 
     def test_version_matches_package(self):
@@ -192,7 +192,7 @@ class TestRevalidatingStaticFiles:
 
         from turnstone.core.web_helpers import RevalidatingStaticFiles
 
-        vendor_dir = tmp_path / "katex-0.19.0"
+        vendor_dir = tmp_path / "katex-0.19.1"
         vendor_dir.mkdir()
         (vendor_dir / "katex.min.css").write_text(".katex {}", encoding="utf-8")
         app = Starlette(
@@ -200,7 +200,7 @@ class TestRevalidatingStaticFiles:
         )
 
         with TestClient(app) as client:
-            resp = client.get("/shared/katex-0.19.0/katex.min.css")
+            resp = client.get("/shared/katex-0.19.1/katex.min.css")
 
         assert resp.status_code == 200
         assert resp.headers["cache-control"] == "public, max-age=31536000, immutable"
@@ -230,10 +230,10 @@ class TestStaticAssetCacheControl:
         [
             ("interactive.js", "no-cache"),
             ("hls-2-player.js", "no-cache"),
-            ("katex-0.19.0/katex.min.css", "public, max-age=31536000, immutable"),
+            ("katex-0.19.1/katex.min.css", "public, max-age=31536000, immutable"),
             ("hljs-11.12.0/highlight.min.js", "public, max-age=31536000, immutable"),
-            ("katex-0.19.0/../private.json", "no-store"),
-            (r"katex-0.19.0\..\private.json", "no-store"),
+            ("katex-0.19.1/../private.json", "no-store"),
+            (r"katex-0.19.1\..\private.json", "no-store"),
             ("nested//asset.js", "no-store"),
         ],
     )

@@ -93,7 +93,7 @@ class TestRateLimiter:
 
         assert limiter.check("user:u1", "/") == (True, 0.0)
         assert limiter.check("user:u1", "/static/app.js") == (True, 0.0)
-        assert limiter.check("user:u1", "/shared/katex-0.19.0/katex.min.js") == (True, 0.0)
+        assert limiter.check("user:u1", "/shared/katex-0.19.1/katex.min.js") == (True, 0.0)
         # Only the mounts themselves: a path that merely starts the same way counts.
         assert limiter.check("user:u1", "/staticky")[0] is False
 
