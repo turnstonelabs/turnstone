@@ -28,6 +28,7 @@ import httpx2
 import pytest
 
 from tests._oauth_runtime_helpers import make_oauth_context
+from tests._session_helpers import log_has_field
 from turnstone.core.mcp_oauth import (
     MCPOAuthDiscoveryError,
     MCPOAuthIssuerChangedError,
@@ -1348,13 +1349,11 @@ class TestCachedIssuerSSRFRevalidation:
         assert str(exc).endswith("(pinned: https://as.example.com)")
         storage.update_mcp_server.assert_not_called()
         client.get.assert_not_called()
-        rejected = [
-            line
-            for line in caplog.text.splitlines()
-            if "mcp_server.oauth.cached_issuer_rejected" in line
+        [record] = [
+            r for r in caplog.records if "mcp_server.oauth.cached_issuer_rejected" in r.getMessage()
         ]
-        assert len(rejected) == 1
-        assert {"kept=True", "verdict=address"} <= set(rejected[0].split())
+        assert log_has_field(record, "kept", True)
+        assert log_has_field(record, "verdict", "address")
 
     @pytest.mark.parametrize(
         "pin",
@@ -1392,7 +1391,11 @@ class TestCachedIssuerSSRFRevalidation:
             call("srv-id", oauth_as_issuer_cached="https://as.example.com"),
         ]
         assert _urls(client) == [_PATH_PRM, _AS_META]
-        assert "kept=False" in caplog.text and "verdict=text" in caplog.text
+        [record] = [
+            r for r in caplog.records if "mcp_server.oauth.cached_issuer_rejected" in r.getMessage()
+        ]
+        assert log_has_field(record, "kept", False)
+        assert log_has_field(record, "verdict", "text")
 
     def test_a_dot_localhost_pin_answering_loopback_for_a_remote_server_is_kept(self) -> None:
         """Whether ``*.localhost`` answers loopback is DNS's verdict, which a forged answer must
