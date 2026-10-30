@@ -1823,8 +1823,8 @@ async def _abort_when_caller_leaves(request: Request, abort_ref: Any, done: asyn
     transport shuts down its socket, waking even a read already blocked on a
     silent backend. Before the backend sends headers there is no response handle
     to publish. The backend call's own timeout bounds that interval: 80 s of
-    silence for a play, and
-    the remainder of the 25 s HTTP request budget for a dictation. Neither retries.
+    silence for a play, and the remainder of the 25 s HTTP request budget for a
+    dictation. Neither retries.
 
     The caller is the browser on a direct connection, or the console.  The
     console closes its node request when the browser leaves a ``tts`` call

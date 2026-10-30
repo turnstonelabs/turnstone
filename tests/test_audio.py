@@ -1936,6 +1936,51 @@ def test_omni_stream_carries_deadline_to_another_worker_and_restores_context(mon
             stream.close()
 
 
+@pytest.mark.parametrize("ending", ["exhausted", "closed", "failed", "expired"])
+def test_a_finished_stream_stays_exhausted_after_its_deadline(monkeypatch, ending):
+    now = [100.0]
+    monkeypatch.setattr(audio, "time", SimpleNamespace(monotonic=lambda: now[0]))
+    monkeypatch.setattr(provider_http, "time", audio.time)
+    monkeypatch.setattr(audio, "_to_wav_16k_mono", lambda data, **kwargs: data)
+    gate = ModelAdmission("voice", 1)
+
+    def chunks():
+        yield _stream_chunk("hello")
+        if ending == "failed":
+            raise RuntimeError("backend reset")
+
+    client = MagicMock()
+    client.with_options.return_value.chat.completions.create.return_value = chunks()
+    deltas = audio.transcribe_stream(
+        registry=_FakeRegistry("voice", _Cfg("omni", {"supports_audio_input": True}), client, gate),
+        alias="voice",
+        data=b"audio",
+        deadline=125.0,
+    )
+    try:
+        assert next(deltas) == "hello"
+        if ending == "closed":
+            deltas.close()
+        elif ending == "failed":
+            with pytest.raises(RuntimeError, match="backend reset"):
+                next(deltas)
+        elif ending == "expired":
+            # The timer has not fired, so only the failed next() can give the slot back.
+            now[0] = 126.0
+            with pytest.raises(audio.AudioBackendError, match="deadline exceeded"):
+                next(deltas)
+        else:
+            with pytest.raises(StopIteration):
+                next(deltas)
+        assert gate.snapshot().in_flight == 0
+        now[0] = 126.0
+        # A deadline that passes after the stream finished is not its outcome.
+        with pytest.raises(StopIteration):
+            next(deltas)
+    finally:
+        deltas.close()
+
+
 @pytest.mark.parametrize("stream", [False, True])
 def test_expired_transcode_budget_does_not_take_a_slot(monkeypatch, stream):
     now = [100.0]
@@ -1952,9 +1997,11 @@ def test_expired_transcode_budget_does_not_take_a_slot(monkeypatch, stream):
         return SimpleNamespace(returncode=0, stdout=b"wav", stderr=b"")
 
     monkeypatch.setattr(audio.subprocess, "run", transcode)
-    with pytest.raises(audio.AudioBackendError, match="timed out"):
+    with pytest.raises(audio.AudioBackendError, match="timed out") as caught:
         _dictate_on_lane("omni-stream" if stream else "omni", client, gate, deadline=125.0)
 
+    # A local budget timeout is not reported as a backend failure on either route.
+    assert str(caught.value) == "Speech transcription request timed out"
     acquire.assert_not_called()
     client.with_options.assert_not_called()
     assert gate.snapshot().in_flight == 0

@@ -258,30 +258,39 @@ class _AdmittedStream:
 class _TranscriptDeltas:
     """The transcript deltas of one :class:`_AdmittedStream`, for the caller to iterate.
 
-    Ending or closing it closes the stream and gives the slot back, also before the first delta
-    is read, which a bare generator can't do: one closed before its first ``next()`` never runs its
-    ``finally``.  Close it from the thread that iterates it.  Any other thread aborts the caller's
-    ``cancel_ref`` instead, which closes the held stream without touching a generator that may be
-    running.
+    Ending, failing or closing it closes the stream and gives the slot back, also before the first
+    delta is read, which a bare generator can't do: one closed before its first ``next()`` never
+    runs its ``finally``.  Close it from the thread that iterates it.  Any other thread aborts the
+    caller's ``cancel_ref`` instead, which closes the held stream without touching a generator
+    that may be running.  Once it has ended, failed or been closed it stays exhausted, as a
+    generator does, rather than reporting a deadline that passes afterwards.
     """
 
     def __init__(self, held: _AdmittedStream, cancel_ref: Any) -> None:
         self._held = held
         self._deltas = _iter_stream_deltas(held, cancel_ref=cancel_ref)
+        self._finished = False
 
     def __iter__(self) -> _TranscriptDeltas:
         return self
 
     def __next__(self) -> str:
-        if self._held.deadline is None:
-            return next(self._deltas)
-        # Iteration runs on a different worker from the one that opened the
-        # stream. Limit this activation to next(), never across a yielded delta.
-        with self._held.deadline.activate():
-            self._held.deadline.remaining(AudioBackendError)
-            return next(self._deltas)
+        if self._finished:
+            raise StopIteration
+        try:
+            if self._held.deadline is None:
+                return next(self._deltas)
+            # Iteration runs on a different worker from the one that opened the
+            # stream. Limit this activation to next(), never across a yielded delta.
+            with self._held.deadline.activate():
+                self._held.deadline.remaining(AudioBackendError)
+                return next(self._deltas)
+        except BaseException:
+            self.close()
+            raise
 
     def close(self) -> None:
+        self._finished = True
         try:
             self._deltas.close()
         finally:
@@ -789,7 +798,7 @@ def transcribe_stream(
         except BaseException:
             held.close()
             raise
-    except (AudioBusyError, BackendAuthUnavailableError):
+    except (AudioBackendError, AudioBusyError, BackendAuthUnavailableError):
         raise
     except Exception as exc:
         refuse_aborted_request(cancel_ref)

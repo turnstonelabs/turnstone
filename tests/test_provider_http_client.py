@@ -493,6 +493,39 @@ def test_expired_dns_work_keeps_its_capacity_until_it_finishes(
     assert len(resolvers) == 3
 
 
+def test_numeric_hosts_connect_while_dns_capacity_is_exhausted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    slots = threading.BoundedSemaphore(1)
+    assert slots.acquire(blocking=False)  # Unfinished lookups hold every slot.
+    monkeypatch.setattr(provider_http, "_DNS_SLOTS", slots)
+    lookups: list[tuple[str, threading.Thread, int]] = []
+    original_getaddrinfo = socket.getaddrinfo
+
+    def recorded(host: str, port: int, *args: Any, **kwargs: Any) -> list[Any]:
+        lookups.append((host, threading.current_thread(), kwargs.get("flags", 0)))
+        return original_getaddrinfo(host, port, *args, **kwargs)
+
+    monkeypatch.setattr(socket, "getaddrinfo", recorded)
+    listener = socket.create_server(("127.0.0.1", 0))
+    try:
+        # Waiting for a slot would time out within this budget, failing the connect.
+        with http_request_deadline(time.monotonic() + 2.0):
+            stream = _ShutdownBackend(httpcore2.SyncBackend()).connect_tcp(
+                "127.0.0.1", listener.getsockname()[1], timeout=2.0, local_address="127.0.0.1"
+            )
+        stream.close()
+        # A name still needs a slot, so the exhausted capacity stays enforced.
+        with pytest.raises(httpcore2.ConnectTimeout, match="during DNS"):
+            provider_http._resolve_tcp("named.invalid", 80, time.monotonic() + 0.05)
+    finally:
+        listener.close()
+        slots.release()
+    caller = threading.current_thread()
+    assert [(host, thread) for host, thread, _ in lookups] == [("127.0.0.1", caller)] * 2
+    assert all(flags & socket.AI_NUMERICHOST for *_, flags in lookups)
+
+
 class _ConnectSocket:
     """A socket-shaped recorder for deterministic address-iteration tests."""
 

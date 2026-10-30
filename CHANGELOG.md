@@ -15,10 +15,10 @@ The separate `dev` branch is retired. See [the release process](docs/releasing.m
 ### Fixed
 
 - HTTP dictation makes one backend attempt with a 25-second budget shared by
-  preparation, credential minting, DNS, connection setup, upload and response I/O,
-  so a silent backend no longer holds speech capacity through long SDK retries.
-  In-turn transcription keeps its
-  existing timeout and retry behavior (#1509).
+  preparation, credential minting, DNS, connection setup, upload and response
+  I/O, so a silent backend no longer holds speech capacity through long SDK
+  retries. In-turn transcription keeps its existing timeout and retry behavior
+  (#1509).
 
 ## [2026-10-29]
 

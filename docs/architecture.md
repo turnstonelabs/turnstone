@@ -1330,16 +1330,17 @@ slot on four threads of its own per node, so those waits never hold the shared
 workers the heartbeat and access checks use; a streamed transcript is still read
 on them. Both HTTP dictation routes pass an absolute 25-second budget through
 transcoding, admission, and credential minting. The backend client makes one
-attempt; the provider transport recalculates the remaining time before each network operation and
-shuts down active I/O when the deadline expires. Upload and response reads share
-the same budget, including a streamed transcript's full lifetime. DNS and all
-connection attempts share the smaller of the connect timeout and that remaining
-budget. System DNS cannot be cancelled, so at most four unfinished lookups may
-remain on daemon threads; expired lookups cannot open a connection. In-turn
-transcription keeps the model client's timeout and retries. Two aliases never
-share a gate implicitly, even when their URLs are identical. For calls with
-context-first request admission, `model_turn()` admits the request before
-materializing attachment fallbacks; an oversized
+attempt; the provider transport recalculates the remaining time before each
+network operation and shuts down active I/O when the deadline expires. Upload
+and response reads share the same budget, including a streamed transcript's full
+lifetime. DNS and all connection attempts share the smaller of the connect
+timeout and that remaining budget. System DNS cannot be cancelled, so at most
+four unfinished lookups may remain on daemon threads; expired lookups cannot
+open a connection. A numeric address takes no lookup slot, so stuck lookups
+never delay it. In-turn transcription keeps the model client's timeout and
+retries. Two aliases never share a gate implicitly, even when their URLs are
+identical. For calls with context-first request admission, `model_turn()`
+admits the request before materializing attachment fallbacks; an oversized
 refusal therefore invokes neither attachment resolution nor nested
 perception/audio. Ordinary calls preserve their lowering cadence. Both paths
 finish attachment materialization before acquiring model capacity, then hold

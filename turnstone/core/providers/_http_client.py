@@ -15,6 +15,7 @@ from __future__ import annotations
 import contextlib
 import contextvars
 import functools
+import ipaddress
 import socket
 import threading
 import time
@@ -49,7 +50,20 @@ def _connect_remaining(deadline: float) -> float:
     return remaining
 
 
+def _is_ip_literal(host: str) -> bool:
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return True
+
+
 def _resolve_tcp(host: str, port: int, deadline: float) -> list[Any]:
+    if _is_ip_literal(host):
+        # AI_NUMERICHOST never queries a resolver, so a numeric address needs no
+        # slot and is not held up by lookups stuck on other hosts.
+        _connect_remaining(deadline)
+        return socket.getaddrinfo(host, port, type=socket.SOCK_STREAM, flags=socket.AI_NUMERICHOST)
     slots = _DNS_SLOTS
     if not slots.acquire(timeout=_connect_remaining(deadline)):
         raise httpcore2.ConnectTimeout("HTTP connection deadline exceeded during DNS")
