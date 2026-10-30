@@ -57,7 +57,7 @@ import {
 } from "./transcript_presentation.js";
 import { redactCredentials, tryPrettyJson } from "./redact_credentials.js";
 import { tryParseMcpError, buildMcpErrorEmbed } from "./mcp_error.js";
-import { authFetch } from "./auth.js";
+import { authFetch, hasScope, hasPermission } from "./auth.js";
 import { showToast } from "./toast.js";
 import { Composer } from "./composer.js";
 import {
@@ -210,6 +210,7 @@ const INTERACTIVE_DEFAULT_HOST = {
   // the preview pane beside this one; a bare pane keeps the transcript chip
   // as the only affordance.
   onPreview() {},
+  onFiles() {},
 };
 
 // The SSE overflow-recovery limiter (storm-guard threshold, cooldown-ladder
@@ -1213,6 +1214,7 @@ class Pane {
       // reach its own click (reveal), never the approve arm below — and
       // preventDefault here would swallow that click outright.
       if (e.target === this._sbApproval) return;
+      if (e.target === this._sbFiles) return;
       // Keyboard acts on the OLDEST live cycle (the one approvalBlockEl
       // tracks); sibling cards from parallel task agents resolve by
       // their own buttons or become oldest in turn.  When the feedback
@@ -1334,7 +1336,7 @@ class Pane {
 
     // Per-workstream status bar (above input)
     this.statusBarEl = document.createElement("div");
-    this.statusBarEl.className = "ws-status-bar";
+    this.statusBarEl.className = "ws-status-bar ws-sb-has-files";
     this.statusBarEl.setAttribute("role", "status");
     this.statusBarEl.setAttribute("aria-live", "polite");
     this.statusBarEl.setAttribute("aria-atomic", "true");
@@ -1364,10 +1366,24 @@ class Pane {
       this.revealPendingApproval(),
     );
 
+    this._sbFiles = document.createElement("button");
+    this._sbFiles.type = "button";
+    this._sbFiles.className = "ws-sb-files";
+    this._sbFiles.textContent = "Files";
+    const filesOpen = document.createElement("span");
+    filesOpen.textContent = "↗";
+    filesOpen.setAttribute("aria-hidden", "true");
+    this._sbFiles.appendChild(filesOpen);
+    this._sbFiles.hidden = !(hasScope("write") && hasPermission("files.read"));
+    this._sbFiles.title = "Open Files pane";
+    this._sbFiles.setAttribute("aria-label", "Browse workspace files");
+    this._sbFiles.addEventListener("click", () => this._host.onFiles());
+
     this.statusBarEl.appendChild(this._sbTokens);
     this.statusBarEl.appendChild(this._sbTools);
     this.statusBarEl.appendChild(this._sbApproval);
     this.statusBarEl.appendChild(this._sbTurns);
+    this.statusBarEl.appendChild(this._sbFiles);
     this.el.appendChild(this.statusBarEl);
 
     // Input area — DOM + behavior comes from shared/composer.js.  The
@@ -6072,6 +6088,11 @@ function createInteractivePane(root, wsId, opts) {
         typeof window.TS_SHELL.openPreview === "function"
       ) {
         window.TS_SHELL.openPreview(descriptor, { base: base, wsId: wsId });
+      }
+    },
+    onFiles() {
+      if (window.TS_SHELL && typeof window.TS_SHELL.openFiles === "function") {
+        window.TS_SHELL.openFiles({ base: base, wsId: wsId });
       }
     },
   };

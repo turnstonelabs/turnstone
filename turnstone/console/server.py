@@ -8021,6 +8021,8 @@ _VALID_PERMISSIONS = frozenset(
         "workstreams.create",
         "workstreams.close",
         "conversation.modify",
+        # Direct node filesystem browsing, distinct from tool execution.
+        "files.read",
         # Projects — shared resource containers.  Granted to builtin-admin via
         # migration 062; grantable to non-admin users via a custom role.
         # ``project.read``/``project.write`` compose with the per-project ACL

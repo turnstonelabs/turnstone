@@ -355,6 +355,10 @@ const _PERMISSION_SECTIONS = [
     ],
   },
   {
+    label: "Files",
+    permissions: ["files.read"],
+  },
+  {
     label: "Projects",
     permissions: [
       "project.create",

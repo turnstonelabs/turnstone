@@ -179,6 +179,22 @@
   word-break: break-word;
 }
 
+/* Source files retain indentation and scroll horizontally. The shared
+   highlight.js token theme in chat.css colors the safe code element. */
+.preview-source {
+  white-space: pre;
+  word-break: normal;
+  overflow-wrap: normal;
+  min-width: min-content;
+}
+.preview-source code {
+  display: block;
+  padding: 0;
+  background: none;
+  font: inherit;
+  color: inherit;
+}
+
 .preview-markdown {
   max-width: 86ch;
   margin: 0 auto;

@@ -245,12 +245,14 @@ def get_workspace_dir() -> str | None:
     """Load the operator-designated workspace directory (cached after first call).
 
     Precedence: config.toml [tools] workspace_dir -> $TURNSTONE_WORKSPACE.
-    Returns None when neither is set.  Purely informational: the value is
+    Returns None when neither is set.  For model tools, the value is
     rendered into the fs/shell tool descriptions (tools.apply_cwd_context)
     so the model knows where user files live when that differs from the
     process cwd — it does NOT chdir the process, and it does NOT confine
-    tool paths.  The Docker image sets the env var to its stock
-    ``/workspace`` bind-mount point.  Path confinement / per-workstream
+    tool paths. The Files pane also uses this as its workspace root,
+    alongside its separate /data and /tmp roots. The Docker image sets
+    the env var to its stock ``/workspace`` bind-mount point. Tool path
+    confinement and per-workstream
     working directories are a separate planned launch-time grant; keep
     this a plain node-level hint.
     """

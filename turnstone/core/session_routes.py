@@ -644,6 +644,15 @@ class AttachmentHandlers:
 
 
 @dataclass(frozen=True)
+class FilesystemHandlers:
+    """Read-only node-workspace routes, mounted only by interactive nodes."""
+
+    list: Handler
+    preview: Handler
+    content: Handler
+
+
+@dataclass(frozen=True)
 class SharedSessionVerbHandlers:
     """Bundle of HTTP handler callables for verbs both kinds expose.
 
@@ -682,6 +691,7 @@ class SharedSessionVerbHandlers:
 
     # Attachments — the four handlers come together or not at all.
     attachments: AttachmentHandlers | None = None
+    filesystem: FilesystemHandlers | None = None
 
 
 @dataclass(frozen=True)
@@ -809,6 +819,12 @@ def register_session_routes(
                 methods=["DELETE"],
             )
         )
+
+    if handlers.filesystem is not None:
+        fs = handlers.filesystem
+        routes.append(Route(f"{p}/{{ws_id}}/files", fs.list, methods=["GET"]))
+        routes.append(Route(f"{p}/{{ws_id}}/files/preview", fs.preview, methods=["GET"]))
+        routes.append(Route(f"{p}/{{ws_id}}/files/content", fs.content, methods=["GET"]))
 
     # --- Bare ``{ws_id}`` detail (GET) registers LAST so the verb-
     #     suffixed patterns above win for ``{ws_id}/...`` paths.
@@ -6573,9 +6589,7 @@ def make_attachment_handlers(cfg: SessionEndpointConfig) -> AttachmentHandlers:
         )
 
     async def get_content(request: Request) -> Response:
-        from starlette.responses import Response as _Response
-
-        from turnstone.core.web_helpers import latin1_safe_filename
+        from turnstone.core.file_responses import file_content_response
 
         resolved = await _resolve_served_blob(request)
         if not isinstance(resolved, tuple):
@@ -6585,53 +6599,26 @@ def make_attachment_handlers(cfg: SessionEndpointConfig) -> AttachmentHandlers:
         # rendering if a user uploaded an HTML-ish text file.  Images keep their
         # sniffed MIME (allowlist is strict: png/jpeg/gif/webp).
         response_mime = "text/plain; charset=utf-8" if kind == "text" else stored_mime
-        # Uploaded filenames routinely carry CJK / em dashes (non-latin-1) and
-        # can carry control bytes — either would 500 the serving route, so run
-        # the shared header sanitizer rather than emit them verbatim.
-        safe_name = latin1_safe_filename(filename)
-        headers = {
-            "X-Content-Type-Options": "nosniff",
-            "Content-Security-Policy": "default-src 'none'; sandbox",
-            "Content-Disposition": f'inline; filename="{safe_name}"',
-            "Cache-Control": "private, no-store",
-        }
-        return _Response(body, media_type=response_mime, headers=headers)
+        return file_content_response(body, response_mime, filename)
 
     async def get_preview(request: Request) -> Response:
-        from starlette.responses import Response as _Response
-
-        from turnstone.core.preview import PREVIEW_SERVE_MIMES, preview_response_headers
+        from turnstone.core.file_responses import file_preview_response
 
         resolved = await _resolve_served_blob(request)
         if not isinstance(resolved, tuple):
             return resolved
         body, _kind, stored_mime, filename = resolved
-        # Serve the STORED type so the browser renders it (html document, pdf
-        # viewer, image) — the opposite posture from ``get_content``'s
-        # force-text/plain, made safe by the per-mime CSP sandbox headers
-        # (``preview_response_headers``) plus the pane's iframe sandbox.
-        # Non-renderable types 415 rather than fall back to octet-stream: this
-        # route exists to render, ``/content`` exists to download.
-        bare_mime = stored_mime.split(";", 1)[0].strip().lower()
-        if bare_mime not in PREVIEW_SERVE_MIMES:
-            return JSONResponse({"error": "attachment is not previewable"}, status_code=415)
-        # ``?assets=1`` opts a previewed page back into loading its remote
-        # images / styles; default-off keeps the sandboxed document off the
-        # network (see ``preview_response_headers``).
-        allow_remote_assets = bool(request.query_params.get("assets"))
-        headers = preview_response_headers(
-            bare_mime, filename, allow_remote_assets=allow_remote_assets
+        # The stored type renders under the same MIME allowlist and sandbox
+        # policy as live files. Preserve this route's existing truthy query
+        # flags and error wording; authorization already ran above.
+        return file_preview_response(
+            body,
+            stored_mime,
+            filename,
+            allow_remote_assets=bool(request.query_params.get("assets")),
+            probe=bool(request.query_params.get("probe")),
+            unsupported_message="attachment is not previewable",
         )
-        # ``?probe=1`` preflight: the pane asks "will the real load paint?"
-        # before pointing an iframe / img at this URL.  Answer with the exact
-        # hardening headers the real response would carry but no body — the
-        # console reverse proxy forwards a HEAD as a full GET, so a HEAD
-        # preflight would drag the whole blob across the node→console hop just
-        # to discard it.  The ownership gate and the renderable-type check
-        # above have already run, so a 204 here means the GET will succeed.
-        if request.query_params.get("probe"):
-            return _Response(status_code=204, headers=headers)
-        return _Response(body, media_type=stored_mime, headers=headers)
 
     async def get_thumbnail(request: Request) -> Response:
         import asyncio

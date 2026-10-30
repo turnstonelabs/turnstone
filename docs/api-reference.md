@@ -1667,6 +1667,50 @@ history is discarded; retry the close after storage recovers.
 
 ---
 
+### Workspace files
+
+These node-local endpoints power the Files pane without invoking the model or storing
+attachment copies. They require `files.read` permission, `write` scope, project access to the workstream, and an
+active interactive session on the addressed node. Through the console, prefix them with
+`/node/{node_id}`. An inactive or rehomed session returns `409`; reopen the conversation
+before browsing again.
+
+All three endpoints accept `root=workspace|data|tmp` (default `workspace`) and a `path`
+relative to that root. `workspace` uses `[tools] workspace_dir`, then
+`TURNSTONE_WORKSPACE`, then the server working directory. `data` and `tmp` select `/data`
+and `/tmp`. An unknown root returns `400`; a missing root returns `503`. Symlinks and
+special files are not accessible. These are shared node directories, not project-private
+storage.
+
+#### `GET /v1/api/workstreams/{ws_id}/files`
+
+List a directory (`path` defaults to the root). The response contains the absolute display
+`root`, selected `root_id`, relative `path`, relative `parent` (`null` at the root),
+`entries`, and `truncated`. Each entry has `name`, `path`, `kind` (`directory` or `file`),
+and `modified` (Unix seconds). Files also include `size`, `preview_kind`, and
+`content_type`. `preview_kind: "binary"` means download only. Directories sort first.
+
+At most 1,000 directory entries are examined. The response explicitly sets `truncated`
+when that limit is reached. Inaccessible entries are omitted; a failed directory read
+returns an error rather than an empty listing.
+
+#### `GET /v1/api/workstreams/{ws_id}/files/preview`
+
+Serve a supported file under the existing preview content security policy. HTML is
+sandboxed; `assets=1` permits remote images/styles. `probe=1` validates the file and
+returns a bodyless `204`. Text is transcoded to UTF-8. Unsupported content returns `415`;
+files exceeding their preview limit return `413` (text/Markdown 512 KiB, tables 2 MiB,
+HTML/images 4 MiB, PDFs 32 MiB).
+
+#### `GET /v1/api/workstreams/{ws_id}/files/content`
+
+Download the original bytes as `application/octet-stream` with attachment disposition
+and the original filename. Downloads are limited to 64 MiB (`413` above the limit),
+independently of preview support or preview limits. File responses and successful
+listings use `Cache-Control: private, no-store`.
+
+---
+
 ### `POST /v1/api/workstreams/{ws_id}/attachments`
 
 Upload an image or text document and attach it to the caller's next user

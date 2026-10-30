@@ -830,6 +830,10 @@ ADMIN_PREFIX = "/api/admin/"
 # with exactly one path segment for each parameter.
 _ATTACHMENT_DELETE_RE = re.compile(r"^/api/workstreams/[^/]+/attachments/[^/]+$")
 
+# Workspace browsing exposes node-local bytes beyond conversation history.
+# Keep it at the same scope as asking the workstream to read a file.
+_FILESYSTEM_RE = re.compile(r"^/api/workstreams/[^/]+/files(?:/(?:preview|content))?$")
+
 # Matches the avatar writes: PUT /api/users/{user_id}/avatar (colour) and
 # PUT or DELETE /api/users/{user_id}/avatar/picture.
 _AVATAR_WRITE_RE = re.compile(r"^/api/users/[^/]+/avatar(?:/picture)?$")
@@ -1169,6 +1173,12 @@ def required_scope(method: str, path: str) -> str:
     """
     normalized = _strip_version_prefix(path)
     normalized = normalized.rstrip("/") if normalized != "/" else normalized
+
+    filesystem_path = (
+        _extract_proxied_path(normalized) if normalized.startswith("/node/") else normalized
+    )
+    if filesystem_path and _FILESYSTEM_RE.fullmatch(filesystem_path):
+        return "write"
 
     # The responder auto-approves challenges, so every non-bootstrap ACME route
     # is a cluster-CA signing surface.  ``service`` cannot be granted through

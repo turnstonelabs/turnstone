@@ -25,7 +25,7 @@
 
 import { PaneManager, ShellPane, openPopupMenu } from "./pane.js";
 import { mountRail, mountManage, glyph, setRowBadge } from "./rail.js";
-import { authFetch, hasScope } from "./auth.js";
+import { authFetch, hasScope, hasPermission, onAuthChange, whenPermissionsReady } from "./auth.js";
 import { openAvatarDialog, paintAvatar, readStoredAvatar } from "./avatar.js";
 import { readRefusal } from "./utils.js";
 // The interactive pane is a real ES module beside us in /shared (step 5a) — the
@@ -36,6 +36,7 @@ import { readRefusal } from "./utils.js";
 // would 404 and abort the whole shell module.
 import { createInteractivePane } from "./interactive.js";
 import { createPreviewPane } from "./preview.js";
+import { createFilesystemPane } from "./filesystem.js";
 import { mountTranscriptPresentationToggle } from "./transcript_presentation.js";
 
 function make(tag, className, text) {
@@ -1081,6 +1082,47 @@ async function mountShell() {
     }
   };
 
+  // Files are read from the interactive session's node. Like Preview, this
+  // singleton opens beside the conversation and closes when its cell is dismissed.
+  pm.registerType("filesystem", (id, extra) => {
+    const pane = createFilesystemPane(extra, {
+      persistMeta: (meta) => pm.setPaneMeta("filesystem", meta),
+      setTitle: (text) => pm.setTabTitle("filesystem", text),
+    });
+    pane.tabMenu = () => [
+      {
+        label: "Close pane",
+        accel: "close-pane",
+        key: paneAccelBadge("close-pane"),
+        action: () => pm.close(pane.id),
+      },
+    ];
+    return pane;
+  });
+  pm.setAuthGate("filesystem", {
+    canOpen: () => hasScope("write") && hasPermission("files.read"),
+    onDeny: () =>
+      window.showToast &&
+      window.showToast("File browsing permission and write access are required", "warn"),
+  });
+  const openFiles = (ctx) => {
+    if (!ctx || !ctx.wsId) return;
+    const pane = pm.openPaneBeside("filesystem");
+    if (pane) pane.showFiles(ctx);
+  };
+  const syncFilesAccess = () => {
+    for (const button of document.querySelectorAll(".ws-sb-files")) {
+      button.hidden = !(hasScope("write") && hasPermission("files.read"));
+    }
+  };
+  whenPermissionsReady(syncFilesAccess);
+  // One shell-level listener, not one leaked subscription per conversation.
+  // Drop rendered file content whenever identity or effective authority changes.
+  onAuthChange(() => {
+    syncFilesAccess();
+    if (pm.hasPane("filesystem")) pm.close("filesystem");
+  });
+
   // Tier-1 lifecycle → pane signal.  The console's ws_closed handler calls
   // this so an open pane on a CLOSED session closes outright — tab gone, a
   // split cell collapses onto its sibling.  This is the coordinator-closes-
@@ -1102,6 +1144,7 @@ async function mountShell() {
     setRowBadge,
     inEditable,
     openPreview,
+    openFiles,
   };
 
   // Login fan-out: app.js owns the single window.onLoginSuccess (the Tier-1

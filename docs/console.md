@@ -419,6 +419,38 @@ autoscroll, including during tool updates and when a response finishes. Scroll d
 pixels of the bottom, or select **Jump to latest**, to resume following. Sending or queuing a message
 also brings your new message into view. Each pane keeps its own follow state when you switch tabs.
 
+### Files pane
+
+Select **Files** in the status bar above an interactive conversation's composer to browse
+the workspace on that conversation's node. Files requires `files.read` permission and
+write access. The built-in admin and operator roles include this permission; role
+overrides can revoke it. The Files pane opens beside the conversation
+and works in both the standalone server UI and the cluster console. Opening Files from a
+different conversation switches to that conversation's node and workspace.
+
+Choose **Workspace**, **/data**, or **/tmp**, navigate folders, use the breadcrumbs to go back up, and select **Refresh** after tools
+create or change files. Select a file to preview HTML, images, PDFs, Markdown, tables, or
+text. **Copy** copies text source; **Download** saves the original file. Unsupported
+binary files can be downloaded without a preview. HTML follows the existing preview
+sandbox: scripts are disabled and remote images/styles require an explicit opt-in.
+Folder icons, type labels, and a breadcrumb address bar identify the current location
+and its contents. Recognized source files use the shared syntax highlighter; files over
+100,000 characters remain fully readable and copyable with highlighting skipped.
+
+**Workspace** is the node's configured `[tools] workspace_dir` (or `TURNSTONE_WORKSPACE`,
+normally `/workspace` in Docker), falling back to the server's working directory when
+neither is set. **/data** and **/tmp** browse those directories on the same node. These
+locations are shared by workstreams; they are not private per-conversation filesystems.
+Browsing stays inside the selected root and does not follow symlinks. An unavailable
+location is reported as an error. Listings examine at most 1,000 entries and downloads
+are limited to 64 MiB. Preview limits are 512 KiB for text/Markdown, 2 MiB for tables,
+4 MiB for HTML/images, and 32 MiB for PDFs; files above a preview limit remain downloadable
+within the download limit.
+
+V1 is read-only and opened by the user. It does not edit or delete files, automatically
+open generated files, add links to tool cards, or launch from coordinator conversations.
+Closing the Files pane leaves the conversation and files intact.
+
 ### Dashboard pane
 
 The home view is coordinator-first. It contains the persistent workstream

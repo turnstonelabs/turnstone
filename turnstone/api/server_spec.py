@@ -38,6 +38,7 @@ from turnstone.api.server_schemas import (
     HealthResponse,
     ListAttachmentsResponse,
     ListAvailableModelsResponse,
+    ListFilesystemResponse,
     ListMemoriesResponse,
     ListPersonaChoicesResponse,
     ListSavedWorkstreamsResponse,
@@ -450,6 +451,68 @@ SERVER_ENDPOINTS: list[EndpointSpec] = [
         error_codes=[400, 404, 500, 503],
         tags=["Workstreams"],
     ),
+    # --- Node workspace browsing ---
+    EndpointSpec(
+        "/v1/api/workstreams/{ws_id}/files",
+        "GET",
+        "Browse an interactive node's shared filesystem root",
+        description=(
+            "Read-only access to workspace, /data, or /tmp. Workspace uses configured "
+            "tools.workspace_dir / TURNSTONE_WORKSPACE, falling back to the node process "
+            "working directory when unset. Requires files.read permission, write "
+            "scope and an active local interactive workstream. Workstream "
+            "project-access checks apply; the directory is node-shared, not per-workstream. "
+            "Symlinks and special files are excluded. At most 1000 directory entries are "
+            "examined, with truncation reported explicitly."
+        ),
+        response_model=ListFilesystemResponse,
+        query_params=[
+            QueryParam("path", "Directory path relative to the selected root", default=""),
+            QueryParam(
+                "root", "Filesystem root", default="workspace", enum=["workspace", "data", "tmp"]
+            ),
+        ],
+        error_codes=[400, 403, 404, 409, 503],
+        tags=["Files"],
+    ),
+    EndpointSpec(
+        "/v1/api/workstreams/{ws_id}/files/preview",
+        "GET",
+        "Render a workspace file with the preview content security policy",
+        description=(
+            "Requires files.read permission, write scope, and an accessible active local "
+            "interactive workstream. Uses the existing per-kind preview size limits. "
+            "Symlinks are refused."
+        ),
+        query_params=[
+            QueryParam("path", "File path relative to the selected root"),
+            QueryParam(
+                "root", "Filesystem root", default="workspace", enum=["workspace", "data", "tmp"]
+            ),
+            QueryParam("probe", "Set to 1 for a bodyless 204 availability check"),
+            QueryParam("assets", "Set to 1 to permit remote HTML images and styles"),
+        ],
+        error_codes=[400, 403, 404, 409, 413, 415, 503],
+        tags=["Files"],
+    ),
+    EndpointSpec(
+        "/v1/api/workstreams/{ws_id}/files/content",
+        "GET",
+        "Download original workspace file bytes",
+        description=(
+            "Requires files.read permission, write scope, and an accessible active local "
+            "interactive workstream. Returns an attachment download, capped at 64 MiB. "
+            "Symlinks are refused."
+        ),
+        query_params=[
+            QueryParam("path", "File path relative to the selected root"),
+            QueryParam(
+                "root", "Filesystem root", default="workspace", enum=["workspace", "data", "tmp"]
+            ),
+        ],
+        error_codes=[400, 403, 404, 409, 413, 503],
+        tags=["Files"],
+    ),
     # --- Workstream attachments ---
     EndpointSpec(
         "/v1/api/workstreams/{ws_id}/attachments",
@@ -750,6 +813,7 @@ _ALL_MODELS: list[type[BaseModel]] = [
     ListSavedWorkstreamsResponse,
     UploadAttachmentResponse,
     ListAttachmentsResponse,
+    ListFilesystemResponse,
     SpeechToTextResponse,
     TextToSpeechRequest,
     HealthResponse,

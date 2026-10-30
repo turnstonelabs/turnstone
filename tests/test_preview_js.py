@@ -36,13 +36,42 @@ def _run_preview(scenario: str) -> None:
 const assert = (value, message) => { if (!value) throw new Error(message); };
 const requests = [];
 const timers = [];
+const copies = [];
+const copyTextToClipboard = async (text) => { copies.push(text); return true; };
+// renderer.js installs delegated image/link handlers on import. These tests
+// exercise the preview directly, so document-level events need no dispatch.
+document.addEventListener = () => {};
+// The real renderer needs the browser's compound selector and array-like
+// DOMTokenList. Keep these additions local to the preview/highlighter harness.
+const baseQuery = FakeElement.prototype.querySelectorAll;
+FakeElement.prototype.querySelectorAll = function (selector) {
+  if (selector === "pre code[class*='language-']") {
+    return baseQuery.call(this, "code").filter((node) =>
+      node.parentNode?.tagName === "PRE" && node.className.includes("language-"),
+    );
+  }
+  return baseQuery.call(this, selector);
+};
+const createElement = document.createElement;
+document.createElement = (tag) => {
+  const node = createElement(tag);
+  node.classList = new Proxy(node.classList, {
+    get(target, key) {
+      const classes = node.className.split(/\s+/).filter(Boolean);
+      if (key === "length") return classes.length;
+      if (/^\d+$/.test(String(key))) return classes[Number(key)];
+      return target[key];
+    },
+  });
+  return node;
+};
 const authFetch = (url) => new Promise((resolve, reject) => requests.push({url, resolve, reject}));
 const redactCredentials = (text) => text;
 globalThis.setTimeout = (fn) => timers.push(fn);
 const flush = () => new Promise(setImmediate);
 const descriptor = (id, kind = "text") => ({attachment_id: id, kind, title: id, source: id});
-const mount = (extra = null) => {
-  const pane = createPreviewPane(extra, {});
+const mount = (extra = null, api = {}) => {
+  const pane = createPreviewPane(extra, api);
   pane.el = document.createElement("section");
   pane.bodyEl = document.createElement("div");
   pane.el.append(pane.bodyEl);
@@ -55,6 +84,8 @@ const succeed = async (request, body = "saved bytes") => {
 };
 const href = (pane) => pane._downloadLink.getAttribute("href");
 """
+        + demodulize(_SHARED / "renderer.js")
+        + "\n"
         + demodulize(_PREVIEW_JS)
         + "\n"
         + scenario
@@ -129,6 +160,159 @@ pane.showPreview(descriptor("closing", "image"), ctx);
 pane.onClose();
 await succeed(requests.shift());
 assert(!href(pane), "a load completing after close must not enable its link");
+""")
+
+
+@node_skip
+def test_horizontal_source_scrolling_preserves_native_arrows_and_history_elsewhere() -> None:
+    _run_preview(r"""
+const pressKey = (pane, target, key) => {
+  const event = {target, key, defaultPrevented: false, preventDefault() { this.defaultPrevented = true; }};
+  for (const listener of pane.el._listeners.get("keydown")) listener.fn(event);
+  return event;
+};
+const pane = mount();
+const ctx = {base: "", wsId: "ws"};
+for (const name of ["first.js", "second.js"]) {
+  pane.showPreview(descriptor(name), ctx);
+  await succeed(requests.shift(), 'const message = "' + "long source ".repeat(100) + '";');
+}
+const content = pane._contentEl;
+assert(content.tabIndex === 0, "preview scroller is keyboard reachable in every browser");
+assert(content.getAttribute("aria-label") === "Preview content", "focusable scroller has an accessible name");
+content.clientWidth = 400;
+content.scrollWidth = 1200;
+content.scrollLeft = 0;
+content.focus();
+for (const key of ["ArrowLeft", "ArrowRight"]) {
+  assert(!pressKey(pane, content, key).defaultPrevented, "source arrows keep browser scrolling, including at an edge");
+}
+assert(pane._idx === 1 && requests.length === 0, "scrolling never switches files or starts a history load");
+const code = content.querySelector("code");
+assert(!pressKey(pane, code, "ArrowLeft").defaultPrevented, "source descendants retain scrolling too");
+
+// A nested code/table scroller can overflow while the outer host fits.
+content.scrollWidth = content.clientWidth;
+const pre = content.querySelector("pre");
+pre.clientWidth = 380;
+pre.scrollWidth = 1100;
+assert(!pressKey(pane, code, "ArrowLeft").defaultPrevented, "nested horizontal scrolling keeps native arrows");
+assert(pane._idx === 1 && requests.length === 0, "nested scrolling leaves history unchanged");
+
+// Non-scrolling content and toolbar controls retain the history shortcuts.
+pre.scrollWidth = pre.clientWidth;
+assert(pressKey(pane, content, "ArrowLeft").defaultPrevented, "non-scrolling content can navigate history");
+assert(pane._idx === 0, "left arrow opens the previous preview");
+await succeed(requests.shift());
+content.scrollWidth = 1200;
+assert(pressKey(pane, pane._fwdBtn, "ArrowRight").defaultPrevented, "toolbar arrows navigate even when source overflows");
+assert(pane._idx === 1, "right arrow opens the next preview");
+await succeed(requests.shift());
+
+const embedded = mount(null, {history: false});
+assert(!pressKey(embedded, embedded.el, "ArrowLeft").defaultPrevented, "embedded Files viewer has no history shortcuts");
+""")
+
+
+@node_skip
+def test_source_language_uses_supported_filename_and_basename_mappings() -> None:
+    _run_preview(r"""
+for (const [path, language] of [
+  ["src/app.tsx", "typescript"], ["src/hello #world.js", "javascript"],
+  ["/tmp/script.PY", "python"], [".env.production", "ini"],
+  ["project/Makefile", "makefile"], [".bashrc", "bash"],
+  ["pyproject.toml", "ini"], ["Cargo.rs", "rust"], ["main.go", "go"],
+  ["https://example.test/path/a%2Ecss?download=1#part", "css"],
+]) assert(sourceLanguage(path) === language, "recognized source filename: " + path);
+for (const path of [null, "", "notes.txt", "run.unknown", "x.constructor", "Dockerfile"]) {
+  assert(sourceLanguage(path) === null, "unknown format must not trigger auto-detection: " + path);
+}
+""")
+
+
+@node_skip
+def test_source_preview_reuses_real_highlighter_and_preserves_copy_and_download() -> None:
+    vendor = json.dumps(str(_SHARED / "hljs-11.12.0/highlight.min.js"))
+    _run_preview(
+        f"""
+const {{ createRequire }} = await import("node:module");
+globalThis.hljs = createRequire(import.meta.url)({vendor});
+"""
+        + r"""
+const pane = mount(null, {copy: true});
+const ctx = {base: "/node/A", wsId: "ws"};
+const source = 'const html = "<script>alert(1)</script>";\n';
+pane.showPreview({...descriptor("source"), file_path: "app.js", source: "wrong.py"}, ctx);
+await succeed(requests.shift(), source);
+const code = pane._contentEl.querySelector("code");
+assert(code.classList.contains("language-javascript"), "file path determines grammar before other metadata");
+assert(code.classList.contains("hljs"), "shared postRenderHljs invokes the vendored highlighter");
+assert(code.innerHTML.includes("hljs-keyword"), "real source keywords are highlighted");
+assert(code.innerHTML.includes("&lt;script&gt;"), "source HTML remains escaped");
+assert(!code.innerHTML.includes("<script>"), "source markup never becomes active HTML");
+assert(pane._copyText === source, "source copy keeps exact decoded text");
+pane._copyBtn.click();
+await flush();
+assert(copies[0] === source, "clipboard receives original source, not highlighted markup");
+assert(href(pane) === "/node/A/v1/api/workstreams/ws/attachments/source/content", "download route unchanged");
+pane.showPreview({...descriptor("second"), source: "attachment:second", title: "script.py"}, ctx);
+await succeed(requests.shift(), 'print("hello")\n');
+assert(pane._contentEl.querySelector("code").classList.contains("language-python"), "attachment preview falls back to title filename");
+"""
+    )
+
+
+@node_skip
+def test_source_preview_falls_back_when_vendor_language_or_highlighter_is_unavailable() -> None:
+    _run_preview(r"""
+const pane = mount(null, {copy: true});
+const ctx = {base: "", wsId: "ws"};
+const source = "const answer = 42;\n";
+pane.showPreview(descriptor("app.js"), ctx);
+await succeed(requests.shift(), source);
+assert(pane._contentEl.querySelector("code").textContent === source, "missing vendor retains source");
+assert(pane._contentEl.querySelector("code").classList.contains("nohighlight"), "missing vendor has plain style");
+let attempts = 0;
+globalThis.hljs = {getLanguage: () => null, configure: () => { attempts++; }};
+pane.showPreview(descriptor("app.ts"), ctx);
+await succeed(requests.shift(), source);
+assert(attempts === 0, "unsupported vendor grammar must not invoke the renderer");
+assert(pane._contentEl.querySelector("code").textContent === source, "missing grammar retains source");
+globalThis.hljs = {
+  getLanguage: () => ({}), configure: () => {},
+  highlightElement: (code) => { code.textContent = "partial mutation"; throw new Error("bad grammar"); },
+};
+pane.showPreview(descriptor("bad.js"), ctx);
+await succeed(requests.shift(), source);
+assert(pane._contentEl.querySelector("code").textContent === source, "vendor failures restore complete source");
+assert(pane._contentEl.querySelector("code").classList.contains("nohighlight"), "vendor failures restore plain style");
+assert(href(pane), "vendor errors cannot break downloading");
+pane._copyBtn.click();
+await flush();
+assert(copies[0] === source, "vendor failures cannot change copied source");
+pane.showPreview(descriptor("notes.txt"), ctx);
+await succeed(requests.shift(), source);
+assert(!pane._contentEl.querySelector("code"), "unknown text remains a plain text preview");
+assert(pane._contentEl.querySelector("pre").textContent === source, "plain text unchanged");
+""")
+
+
+@node_skip
+def test_large_source_skips_tokenization_without_truncating_content() -> None:
+    _run_preview(r"""
+let languageChecks = 0;
+globalThis.hljs = {getLanguage: () => { languageChecks++; return {}; }};
+const source = "const answer = 42;\n".repeat(6000);
+const pane = mount(null, {copy: true});
+pane.showPreview(descriptor("large.js"), {base: "", wsId: "ws"});
+await succeed(requests.shift(), source);
+assert(languageChecks === 0, "large source bypasses synchronous tokenization");
+assert(pane._contentEl.querySelector("code").textContent === source, "large source is fully visible");
+assert(pane._contentEl.querySelector(".preview-note").textContent.includes("Full source"), "plain rendering explains its scope");
+pane._copyBtn.click();
+await flush();
+assert(copies[0] === source, "large source copies in full");
+assert(href(pane), "large source remains downloadable");
 """)
 
 

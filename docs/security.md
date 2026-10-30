@@ -85,6 +85,7 @@ Scopes are hierarchical — higher scopes imply all lower ones.
 | Method | Path pattern | Required scope | Additional RBAC gate |
 |--------|-------------|----------------|----------------------|
 | GET | Any protected path | `read` | Endpoint-specific where documented |
+| GET, HEAD | `/api/workstreams/{ws_id}/files`, `/files/preview`, `/files/content` | `write` | `files.read`, active local interactive session and project tenancy; also enforced through the node proxy |
 | GET | `/api/workstreams/saved` | `read` | Creator/project visibility; console coordinator rows additionally require `admin.coordinator` |
 | GET | `/api/workstreams/{ws_id}` (detail) | `read`; also `write` to reopen a cold session | Project tenancy and kind-specific permission |
 | POST | `/api/command` | `write` | Project tenancy on the target workstream |
@@ -111,6 +112,17 @@ reopening a saved session and deleting history require write scope. The browser 
 `scopes` returned by login, refresh, and whoami separately from named RBAC permissions when showing
 these actions.
 
+The Files pane exposes node-shared files under the configured workspace (server working
+directory when unset), `/data`, and `/tmp`. It requires `files.read` permission in addition
+to write scope. The permission gates directory listings, previews, downloads, and the
+browser controls. It is included in the built-in admin and operator roles and can be
+revoked through role overrides or granted to custom roles. It controls direct file
+browsing; tool access to the filesystem remains governed by tool policies. Project
+tenancy gates the selected conversation, but does not make the shared disk private to that
+project. Requests are confined to one selected root, do not follow symlinks, reject special
+files, and do not reopen or reroute an inactive session. HTML uses the existing sandboxed
+preview policy; downloads carry attachment disposition and preserve original bytes.
+
 ### RBAC (Granular Permissions)
 
 > See also: [Governance documentation](governance.md)
@@ -130,7 +142,7 @@ Three built-in roles are seeded by migration 008:
 | Role | Permissions |
 |------|-------------|
 | admin | Admin-default baseline (all ordinary admin and lifecycle permissions; explicitly opt-in capabilities remain ungranted) |
-| operator | read, write, workstreams.create, workstreams.close, conversation.modify |
+| operator | read, write, workstreams.create, workstreams.close, conversation.modify, files.read |
 | viewer | read |
 
 Custom roles can be created with any subset of the valid permissions.

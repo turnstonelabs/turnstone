@@ -5758,6 +5758,7 @@ def create_app(
                 ui._ws_turn_tool_calls = 0
 
     from turnstone.core.attachments import classify_upload as _classify_upload
+    from turnstone.core.filesystem import make_filesystem_handlers
 
     interactive_attachment_helpers = AttachmentUploadHelpers(
         classify_upload=_classify_upload,
@@ -5890,6 +5891,7 @@ def create_app(
             history=history_handler,  # lifted: shared body (interactive feature gain)
             export=export_handler,  # lifted: shared body (#613, conversation-only)
             attachments=attachment_handlers,  # lifted: shared body (P1.5)
+            filesystem=make_filesystem_handlers(interactive_endpoint_config),
         ),
     )
     v1_routes.append(Route("/api/dashboard", dashboard))

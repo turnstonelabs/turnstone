@@ -943,6 +943,25 @@ class ListPersonaChoicesResponse(BaseModel):
     total: int = 0
 
 
+class FilesystemEntry(BaseModel):
+    name: str
+    path: str = Field(description="Path relative to the selected node filesystem root")
+    kind: Literal["directory", "file"]
+    modified: float = Field(description="Modification time as Unix seconds")
+    size: int | None = Field(default=None, description="File size in bytes")
+    preview_kind: str | None = Field(default=None, description="Preview kind, or binary")
+    content_type: str | None = None
+
+
+class ListFilesystemResponse(BaseModel):
+    root: str = Field(description="Absolute selected node-shared filesystem root")
+    root_id: Literal["workspace", "data", "tmp"]
+    path: str = Field(description="Current directory relative to root; empty for root")
+    parent: str | None
+    entries: list[FilesystemEntry]
+    truncated: bool = Field(description="Only the first 1000 directory entries were examined")
+
+
 class AvailableModelInfo(BaseModel):
     alias: str
     model: str

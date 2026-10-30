@@ -2078,6 +2078,37 @@
   white-space: nowrap;
   margin-left: auto;
 }
+/* Keep the Files action reachable in narrow split cells. */
+.ws-status-bar.ws-sb-has-files {
+  flex-wrap: wrap;
+  row-gap: 4px;
+}
+.ws-sb-files {
+  appearance: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  flex: none;
+  min-height: 24px;
+  padding: 2px 8px;
+  border: 1px solid color-mix(in srgb, var(--accent) 65%, var(--bg-surface));
+  border-radius: var(--r-sm);
+  background: color-mix(in srgb, var(--accent) 15%, var(--bg-surface));
+  color: var(--accent);
+  font: 600 11px/16px var(--font-ui);
+  white-space: nowrap;
+  cursor: pointer;
+}
+.ws-sb-files[hidden] { display: none; }
+.ws-sb-files:hover {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 22%, var(--bg-surface));
+}
+.ws-sb-files:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
 /* Pending-approval chip — a sticky, clickable count of the human gates open
    in THIS pane's transcript.  Parallel task agents make several live at
    once and the card can sit far off-screen; the click scrolls to the one

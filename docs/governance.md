@@ -22,7 +22,7 @@ migrations):
 | Role | Permissions |
 |------|-------------|
 | admin | Admin-default baseline: ordinary admin, lifecycle, tool-approval, coordinator, project, and persona capabilities. Explicit opt-in capabilities such as `model.skills.write` remain ungranted. |
-| operator | read, write, workstreams.create, workstreams.close, conversation.modify |
+| operator | read, write, workstreams.create, workstreams.close, conversation.modify, files.read |
 | viewer | read |
 
 Custom roles can be created with any subset of the valid permissions. Built-in
@@ -32,6 +32,12 @@ The `persona.create` / `persona.read` / `persona.write` family gates
 persona administration; migration `063` seeds all three onto
 `builtin-admin`, and any role can be granted them through the standard
 role and permission-override editors.
+
+The `files.read` permission gates the Files pane and its directory-listing, preview,
+and download endpoints. It is included in the built-in admin and operator roles;
+viewers do not receive it. File browsing also requires `write` scope and access to
+an active interactive workstream on the selected node. Role overrides can revoke
+direct browsing without changing the role's other conversation capabilities.
 
 **Auth flow:**
 1. User logs in (password or API token) → `_load_user_permissions()` aggregates

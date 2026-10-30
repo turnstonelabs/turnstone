@@ -241,6 +241,20 @@ class TestRoles:
         for p in ("persona.create", "persona.read", "persona.write"):
             assert p in perms
 
+    def test_create_and_update_role_with_file_permission(self, client):
+        response = client.post(
+            "/v1/api/admin/roles",
+            json=_role_payload(name="filereader", permissions="read,write,files.read"),
+        )
+        assert response.status_code == 200, response.json()
+        role_id = response.json()["role_id"]
+        assert "files.read" in response.json()["permissions"].split(",")
+        response = client.put(
+            f"/v1/api/admin/roles/{role_id}", json={"permissions": "read,files.read"}
+        )
+        assert response.status_code == 200, response.json()
+        assert response.json()["permissions"] == "read,files.read"
+
     def test_permission_sections_js_covers_valid_permissions(self):
         """F-5: ``_PERMISSION_SECTIONS`` in governance.js mirrors
         ``_VALID_PERMISSIONS`` in console/server.py.  A new perm added
@@ -325,6 +339,7 @@ class TestRoles:
             "workstreams.create",
             "workstreams.close",
             "conversation.modify",
+            "files.read",
             "coordinator.trust.send",
         }
         missing = sorted(seeded - _VALID_PERMISSIONS)
@@ -494,6 +509,17 @@ class TestRoleOverrides:
         body = resp.json()
         assert "persona.write" in body["effective"]
         assert body["grants"] == ["persona.write"]
+
+    def test_overrides_can_revoke_and_restore_file_permission(self, client, storage):
+        _seed_builtin_admin(storage, "read,write,admin.roles,files.read")
+        url = "/v1/api/admin/roles/builtin-admin/overrides"
+        response = client.put(url, json={"grant": [], "revoke": ["files.read"]})
+        assert response.status_code == 200, response.json()
+        assert response.json()["revokes"] == ["files.read"]
+        assert "files.read" not in response.json()["effective"]
+        response = client.put(url, json={"grant": [], "revoke": []})
+        assert response.status_code == 200, response.json()
+        assert "files.read" in response.json()["effective"]
 
     def test_overrides_replace_semantics(self, client, storage):
         _seed_builtin_admin(storage, "read,write,admin.roles")
