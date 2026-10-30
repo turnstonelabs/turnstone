@@ -2092,21 +2092,21 @@
   flex: none;
   min-height: 24px;
   padding: 2px 8px;
-  border: 1px solid color-mix(in srgb, var(--accent) 65%, var(--bg-surface));
+  border: 1px solid color-mix(in srgb, var(--blue) 65%, var(--bg-surface));
   border-radius: var(--r-sm);
-  background: color-mix(in srgb, var(--accent) 15%, var(--bg-surface));
-  color: var(--accent);
+  background: color-mix(in srgb, var(--blue) 15%, var(--bg-surface));
+  color: var(--blue);
   font: 600 11px/16px var(--font-ui);
   white-space: nowrap;
   cursor: pointer;
 }
 .ws-sb-files[hidden] { display: none; }
 .ws-sb-files:hover {
-  border-color: var(--accent);
-  background: color-mix(in srgb, var(--accent) 22%, var(--bg-surface));
+  border-color: var(--blue);
+  background: color-mix(in srgb, var(--blue) 22%, var(--bg-surface));
 }
 .ws-sb-files:focus-visible {
-  outline: 2px solid var(--accent);
+  outline: 2px solid var(--blue);
   outline-offset: 2px;
 }
 /* Pending-approval chip — a sticky, clickable count of the human gates open
