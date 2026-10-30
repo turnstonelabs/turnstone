@@ -830,6 +830,11 @@ ADMIN_PREFIX = "/api/admin/"
 # with exactly one path segment for each parameter.
 _ATTACHMENT_DELETE_RE = re.compile(r"^/api/workstreams/[^/]+/attachments/[^/]+$")
 
+# Matches POST /api/workstreams/{ws_id}/speech-to-text/stream. Streamed
+# dictation spends the same backend capacity and caller credential as the
+# write-scoped speech-to-text verb, but its last segment is ``stream``.
+_STT_STREAM_RE = re.compile(r"^/api/workstreams/[^/]+/speech-to-text/stream$")
+
 # Workspace browsing exposes node-local bytes beyond conversation history.
 # Keep it at the same scope as asking the workstream to read a file.
 _FILESYSTEM_RE = re.compile(r"^/api/workstreams/[^/]+/files(?:/(?:preview|content|resolve))?$")
@@ -1247,6 +1252,8 @@ def required_scope(method: str, path: str) -> str:
         }
     ):
         return "write"
+    if method == "POST" and _STT_STREAM_RE.match(normalized):
+        return "write"
     # Path-keyed approve verb: POST /api/workstreams/{ws_id}/approve.
     if (
         method == "POST"
@@ -1300,6 +1307,8 @@ def required_scope(method: str, path: str) -> str:
                 "command",
                 "close",
             }:
+                return "write"
+            if _STT_STREAM_RE.match(proxied):
                 return "write"
             if proxied.startswith("/api/workstreams/") and proxied.rsplit("/", 1)[-1] == "approve":
                 return "approve"

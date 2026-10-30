@@ -20,6 +20,15 @@ The separate `dev` branch is retired. See [the release process](docs/releasing.m
   retries. In-turn transcription keeps its existing timeout and retry behavior
   (#1509).
 
+### Security
+
+- **Streamed dictation needs write scope.** `POST
+  /api/workstreams/{ws_id}/speech-to-text/stream`, the route the browser's
+  microphone uses, accepted a read-only token, directly and through the console
+  proxy, while the JSON `speech-to-text` route required write. Both now require
+  write, so a read-only caller can no longer spend the speech-to-text model's
+  capacity or have a backend credential minted for it.
+
 ## [2026-10-29]
 
 > **Before upgrading:** the database advances from migration 084 to 085, which

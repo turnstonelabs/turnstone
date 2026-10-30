@@ -344,6 +344,30 @@ class TestRequiredScope:
         """GET on workstream sub-resource is not elevated."""
         assert required_scope("GET", "/api/workstreams/abc123/delete") == "read"
 
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "/v1/api/workstreams/abc123/speech-to-text",
+            "/v1/api/workstreams/abc123/speech-to-text/stream",
+            "/node/n1/v1/api/workstreams/abc123/speech-to-text",
+            "/node/n1/v1/api/workstreams/abc123/speech-to-text/stream",
+            "/node/n1/api/workstreams/abc123/speech-to-text/stream",
+        ],
+    )
+    def test_both_dictation_routes_need_write(self, path):
+        assert required_scope("POST", path) == "write"
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "/api/workstreams/abc123/stream",
+            "/api/workstreams/abc123/speech-to-text/stream/extra",
+            "/api/workstreams/abc/def/speech-to-text/stream",
+        ],
+    )
+    def test_dictation_stream_match_is_exact(self, path):
+        assert required_scope("POST", path) == "read"
+
 
 # ---------------------------------------------------------------------------
 # TestExtractBearer

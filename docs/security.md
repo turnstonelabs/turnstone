@@ -94,6 +94,7 @@ Scopes are hierarchical — higher scopes imply all lower ones.
 | POST | `/api/workstreams/{ws_id}/approve` | `approve` | `tools.approve` or `admin.coordinator` |
 | POST | `/api/workstreams/{ws_id}/{rewind,retry}` | `write` | `conversation.modify` |
 | POST | `/api/workstreams/{ws_id}/delete` | `write` | Project tenancy; coordinator rows also require `admin.coordinator` |
+| POST | `/api/workstreams/{ws_id}/speech-to-text`, `/speech-to-text/stream` | `write` | Project tenancy on the target workstream; also enforced through the node proxy |
 | POST | Other `/api/workstreams/{ws_id}/...` mutation endpoints | `write` | Project tenancy and endpoint-specific gates |
 | DELETE | `/api/workstreams/{ws_id}/send` (dequeue), `/api/workstreams/{ws_id}/attachments/{attachment_id}` | `write` | Project tenancy on the target workstream |
 | PUT | `/api/users/{user_id}/avatar`, `/api/users/{user_id}/avatar/picture` | `write` | The caller's own account only |

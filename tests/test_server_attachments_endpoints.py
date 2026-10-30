@@ -36,12 +36,12 @@ WAV_12 = b"RIFF\x24\x00\x00\x00WAVEfmt " + b"\x00" * 16
 _TEST_JWT_SECRET = "test-jwt-secret-minimum-32-chars!"
 
 
-def _make_jwt(user_id: str) -> str:
+def _make_jwt(user_id: str, scopes: frozenset[str] = frozenset({"read", "write"})) -> str:
     from turnstone.core.auth import JWT_AUD_SERVER, create_jwt
 
     return create_jwt(
         user_id=user_id,
-        scopes=frozenset({"read", "write"}),
+        scopes=scopes,
         source="test",
         secret=_TEST_JWT_SECRET,
         audience=JWT_AUD_SERVER,
@@ -109,8 +109,8 @@ def app_client(tmp_path):
         reset_storage()
 
 
-def _auth(user: str) -> dict[str, str]:
-    return {"Authorization": f"Bearer {_make_jwt(user)}"}
+def _auth(user: str, scopes: frozenset[str] = frozenset({"read", "write"})) -> dict[str, str]:
+    return {"Authorization": f"Bearer {_make_jwt(user, scopes)}"}
 
 
 def _harden_ws_mock(ws) -> None:
@@ -1284,6 +1284,18 @@ class TestSpeechToTextStream:
         assert resp.status_code == 200, resp.text
         assert resp.text == "hello from speech"
         assert mock_client.audio.transcriptions.with_streaming_response.create.called
+
+    @pytest.mark.parametrize("path", ["speech-to-text", "speech-to-text/stream"])
+    def test_both_dictation_routes_refuse_a_read_only_token(self, voice_app_client, path):
+        client, mock_client = voice_app_client
+        resp = client.post(
+            f"/v1/api/workstreams/ws-A/{path}",
+            files={"audio": ("speech.webm", b"RIFFfake", "audio/webm")},
+            headers=_auth("userA", frozenset({"read"})),
+        )
+        assert resp.status_code == 403
+        assert "'write' scope" in resp.text
+        mock_client.audio.transcriptions.with_streaming_response.create.assert_not_called()
 
 
 def _call_as_departing_caller(
