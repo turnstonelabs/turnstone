@@ -19,6 +19,11 @@ The separate `dev` branch is retired. See [the release process](docs/releasing.m
   I/O, so a silent backend no longer holds speech capacity through long SDK
   retries. In-turn transcription keeps its existing timeout and retry behavior
   (#1509).
+- **A `since` wait no longer reports `complete` before it is.** A
+  `wait_for_workstream` given `since` returned `complete: true` as soon as a
+  listed child changed, even when it had only started working. `complete` now
+  means the any/all condition held; the new `changed` field lists the children
+  whose change ended the wait.
 
 ### Security
 

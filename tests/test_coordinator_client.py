@@ -3445,6 +3445,134 @@ def test_wait_since_malformed_input_drops_silently(populated_storage):
     assert result["complete"] is True
 
 
+def test_wait_since_change_alone_is_not_complete(populated_storage):
+    """The incident: ``since`` is the snapshot from before the child started
+    (``idle``, meaning "wait until it finishes") and the child has moved on to
+    ``thinking``.  The change still ends the wait at once, but the mode
+    condition did not hold, so ``complete`` stays False, ``changed`` names the
+    child, and a child still at work carries no message."""
+    client = _make_read_client(populated_storage)
+    populated_storage.update_workstream_state("child-b", "idle")
+    before = client.wait_for_workstream(["child-b"], timeout=0, mode="any")["results"]
+    populated_storage.update_workstream_state("child-b", "thinking")
+    result = client.wait_for_workstream(["child-b"], timeout=5, mode="any", since=before)
+    assert result["complete"] is False
+    assert result["changed"] == ["child-b"]
+    assert result["results"]["child-b"]["state"] == "thinking"
+    assert result["results"]["child-b"]["message"] is None
+    assert result["elapsed"] < 1.0
+
+
+def test_wait_since_change_to_terminal_bundles_only_that_childs_message(
+    populated_storage, monkeypatch
+):
+    """Under ``mode='all'``, one child finishing while another still runs ends
+    a ``since`` wait without completing it.  The finished child is in
+    ``changed`` and delivers its answer now; every other child's ``message``
+    stays null with nothing read for it, as on a timeout, even one that had
+    already finished when the snapshot was taken."""
+    from turnstone.console import coordinator_client
+
+    reads: list[str] = []
+    real_message_for = coordinator_client._wait_message_for
+
+    def _counting_message_for(storage, wid, state):
+        reads.append(wid)
+        return real_message_for(storage, wid, state)
+
+    monkeypatch.setattr(coordinator_client, "_wait_message_for", _counting_message_for)
+    populated_storage.register_workstream(
+        "child-c", kind="interactive", parent_ws_id="coord-1", state="idle", user_id="user-1"
+    )
+    populated_storage.update_workstream_state("child-a", "running")
+    client = _make_read_client(populated_storage)
+    client._WAIT_HEARTBEAT_INTERVAL = 30.0  # type: ignore[misc]
+    ids = ["child-a", "child-b", "child-c"]
+    before = client.wait_for_workstream(ids, timeout=0, mode="all")["results"]
+    wake = threading.Event()
+
+    def _child_a_finishes() -> None:
+        populated_storage.save_message("child-a", "assistant", "child-a's findings")
+        populated_storage.update_workstream_state("child-a", "idle")
+        wake.set()
+
+    # The change lands once the wait is past its first tick, so only the
+    # wake's re-tick can see it before the 30 s heartbeat.
+    reason = _Reason(on_first_call=_child_a_finishes)
+    result = client.wait_for_workstream(
+        ids, timeout=20, mode="all", since=before, interrupt=reason, wake_event=wake
+    )
+    assert result["complete"] is False
+    assert result["changed"] == ["child-a"]
+    assert "interrupted" not in result
+    assert result["elapsed"] < 1.0
+    child_a, child_b, child_c = (result["results"][wid] for wid in ids)
+    assert (child_a["state"], child_a["message"]) == ("idle", "child-a's findings")
+    assert (child_b["state"], child_b["message"]) == ("running", None)
+    assert (child_c["state"], child_c["message"]) == ("idle", None)
+    assert reads == ["child-a"]
+
+
+def test_wait_since_change_that_meets_the_mode_completes(populated_storage):
+    """A change that also meets the mode condition completes the wait:
+    ``complete`` is True, ``changed`` still names the child, and its message
+    comes with it."""
+    populated_storage.save_message("child-b", "assistant", "child-b's findings")
+    client = _make_read_client(populated_storage)
+    before = client.wait_for_workstream(["child-b"], timeout=0, mode="any")["results"]
+    populated_storage.update_workstream_state("child-b", "idle")
+    result = client.wait_for_workstream(["child-b"], timeout=5, mode="any", since=before)
+    assert result["complete"] is True
+    assert result["changed"] == ["child-b"]
+    assert result["results"]["child-b"]["message"] == "child-b's findings"
+    assert result["elapsed"] < 1.0
+
+
+def test_wait_since_changed_follows_the_requested_order(populated_storage):
+    """``changed`` lists the changed children in the order the wait asked for
+    them, not in the ``since`` dict's order."""
+    client = _make_read_client(populated_storage)
+    since = {
+        "child-b": {"state": "idle", "tokens": 0, "updated": ""},
+        "child-a": {"state": "running", "tokens": 0, "updated": ""},
+    }
+    result = client.wait_for_workstream(["child-a", "child-b"], timeout=5, mode="all", since=since)
+    assert result["complete"] is False
+    assert result["changed"] == ["child-a", "child-b"]
+
+
+@pytest.mark.parametrize("since", [None, {}, ["not", "a", "dict"], {"child-a": "not-a-dict"}])
+def test_wait_without_a_usable_since_has_no_changed_key(populated_storage, since):
+    """``changed`` answers a ``since``: a wait without one, or with one that
+    parses to nothing, carries no ``changed`` key."""
+    client = _make_read_client(populated_storage)
+    result = client.wait_for_workstream(["child-a"], timeout=1.0, mode="any", since=since)
+    assert result["complete"] is True
+    assert "changed" not in result
+
+
+@pytest.mark.parametrize("ended_by", ["mode", "timeout", "interrupt"])
+def test_wait_since_reports_no_change_when_something_else_ends_it(populated_storage, ended_by):
+    """With a usable ``since``, ``changed`` is ``[]`` when the wait ended for
+    another reason: the mode condition alone, a timeout or an interrupt."""
+    client = _make_read_client(populated_storage)
+    ws_ids = ["child-a" if ended_by == "mode" else "child-b"]
+    before = client.wait_for_workstream(ws_ids, timeout=0, mode="all")["results"]
+    reason = _Reason()
+    if ended_by == "interrupt":
+        reason.reason = "user_message"
+    result = client.wait_for_workstream(
+        ws_ids,
+        timeout=0 if ended_by == "timeout" else 20,
+        mode="all",
+        since=before,
+        interrupt=reason,
+    )
+    assert result["complete"] is (ended_by == "mode")
+    assert result.get("interrupted") == ("user_message" if ended_by == "interrupt" else None)
+    assert result["changed"] == []
+
+
 def test_wait_progress_callback_invoked_per_tick(populated_storage):
     """The progress_callback is invoked once per poll tick with the
     current snapshot + elapsed seconds.  Snapshots carry state/tokens/

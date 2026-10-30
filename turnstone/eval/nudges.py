@@ -70,6 +70,7 @@ from turnstone.console.coordinator_client import (
     _enrich_wait_results,
     _last_assistant_text,
     _roster_fields,
+    _since_entry_changed,
     load_task_envelope,
 )
 from turnstone.console.coordinator_idle_observer import (
@@ -432,6 +433,12 @@ class _StubCoordinatorClient(CoordinatorClient):
         the forbidden rate then measures the fixture's hollowness — the
         round-8 voided cells.)  ``_scripted`` still takes precedence,
         for tests that need a specific payload.
+
+        ``since`` works as production's does: a seeded child that differs
+        from its hint (``state`` / ``tokens`` / ``updated``) ends the wait
+        at once, named in ``changed``, while ``complete`` still follows the
+        mode condition; ``changed`` is present whenever ``since`` holds an
+        entry, and empty when nothing differs.
         """
         scripted = self._scripted("wait_for_workstream")
         if scripted is not None:
@@ -484,21 +491,39 @@ class _StubCoordinatorClient(CoordinatorClient):
                 }
             snaps[ws] = snap
         missing = [ws for ws, snap in snaps.items() if snap["state"] == "not_found"]
+        since = kw.get("since")
+        since_map = (
+            {w: prev for w, prev in since.items() if isinstance(w, str) and isinstance(prev, dict)}
+            if isinstance(since, dict)
+            else {}
+        )
         complete = False
+        changed: list[str] = []
         if not missing:
             terminal = [s["state"] in WAIT_REAL_TERMINAL_STATES for s in snaps.values()]
             complete = all(terminal) if mode == "all" else any(terminal)
+            changed = [
+                ws
+                for ws, snap in snaps.items()
+                if ws in since_map and _since_entry_changed(snap, since_map[ws])
+            ]
         out: dict[str, Any] = {
             "results": _enrich_wait_results(
-                self._storage, snaps, complete=complete, not_found=bool(missing)
+                self._storage,
+                snaps,
+                complete=complete,
+                not_found=bool(missing),
+                changed=changed,
             ),
             "complete": complete,
-            # Approximate in production's favour: a resolved or aborted
-            # wait returns within a tick, an unresolved one burns the
-            # requested budget.
-            "elapsed": 0.0 if complete or missing else round(timeout_f, 3),
+            # Approximate in production's favour: a resolved, changed or
+            # aborted wait returns within a tick, an unresolved one burns
+            # the requested budget.
+            "elapsed": 0.0 if complete or changed or missing else round(timeout_f, 3),
             "mode": mode,
         }
+        if since_map:
+            out["changed"] = changed
         if missing:
             hint_roster = self._roster_hint()
             hints = [self._ws_ref_error(ws, roster=hint_roster) for ws in missing]

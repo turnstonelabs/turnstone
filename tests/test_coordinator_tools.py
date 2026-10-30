@@ -887,6 +887,45 @@ def test_wait_summary_and_wait_ended_name_how_the_wait_ended(
     assert ended.get("interrupted") == interrupted
 
 
+@pytest.mark.parametrize(
+    ("complete", "changed", "verb"),
+    [
+        (False, ["a"], "changed"),
+        (True, ["a"], "complete"),
+        (False, [], "timeout"),
+        (False, None, "timeout"),
+    ],
+)
+def test_wait_ended_by_a_since_change_is_not_called_a_timeout(
+    coord_session, complete, changed, verb
+):
+    """``since`` reaches the client and the client's ``changed`` reaches the
+    model.  A wait that a change ended before the mode condition held is not
+    summarized as a timeout, and ``wait_ended`` carries ``changed`` whenever
+    the result does; a wait without ``since`` (``changed`` of ``None`` here)
+    has neither."""
+    sess, coord, ui = coord_session
+    events: list[dict[str, Any]] = []
+    ui._enqueue = events.append  # type: ignore[attr-defined]
+    result = _wait_result(complete=complete)
+    args: dict[str, Any] = {"ws_ids": ["a"]}
+    if changed is not None:
+        result["changed"] = changed
+        args["since"] = {"a": {"state": "idle", "tokens": 0, "updated": ""}}
+    coord.wait_for_workstream.return_value = result
+    item = sess._prepare_tool(_tc("wait_for_workstream", args))
+    _call_id, output = sess._exec_wait_for_workstream(item)
+    assert coord.wait_for_workstream.call_args.kwargs["since"] == args.get("since")
+    assert json.loads(output).get("changed") == changed
+    resolved = 1 if complete else 0
+    assert ui.tool_results[-1][2] == f"{verb} after 1.25s ({resolved}/1 resolved)"
+    assert ui.tool_results[-1][3] is False
+    (ended,) = [e for e in events if e["type"] == "wait_ended"]
+    assert ended["complete"] is complete
+    assert ended.get("changed") == changed
+    assert "interrupted" not in ended
+
+
 def test_a_queued_message_ends_a_real_wait_and_reaches_the_model(
     monkeypatch, tmp_path, tmp_db, sqlite_backend_factory
 ):

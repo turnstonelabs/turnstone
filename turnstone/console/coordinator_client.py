@@ -431,7 +431,7 @@ def load_task_envelope(storage: Any, ws_id: str) -> tuple[dict[str, Any], bool]:
 
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Collection
 
     from turnstone.core.child_event_bus import ChildEventBus
     from turnstone.core.storage._protocol import LeaseFence, StorageBackend
@@ -1155,10 +1155,12 @@ class CoordinatorClient:
         rides along to a "complete" result (see the not_found fail-fast
         below).  Returns
         ``{"results": {ws_id: {state, tokens, updated, name, message,
-        truncated}}, "elapsed": float, "complete": bool, "mode": mode}``.
-        ``complete`` is True when the wait condition was met before the
-        deadline, False when the timeout fired or ``interrupt`` ended the
-        wait (results carry whatever last state was observed).
+        truncated}}, "elapsed": float, "complete": bool, "mode": mode}``,
+        plus ``changed`` when ``since`` is given (below).  ``complete``
+        is True when the mode condition held when the wait returned,
+        False when the timeout fired, ``interrupt`` ended the wait, or a
+        ``since`` change ended it first (results carry whatever last
+        state was observed).
 
         ``message`` carries the child's last assistant message text for
         ``idle`` / ``error`` states, or a short status sentinel for
@@ -1172,29 +1174,40 @@ class CoordinatorClient:
         follow-up ``inspect_workstream`` for the rest.  Bundled inline
         so the coordinator LLM doesn't need an extra round-trip per
         child to see what came back.  Only a completed wait (or a
-        not_found abort) bundles messages: a wait that times out or is
-        interrupted returns states only, ``None`` for every entry and no
-        storage read for them (#1339).  The model waits again after
-        either, and the wait that completes carries the finished
-        children's messages, so a re-issued wait never repeats a child's
-        text in the model's context.  A child that closed before the
-        completing wait carries only the ``closed`` sentinel there;
-        ``inspect_workstream`` still reads its transcript.
+        not_found abort) bundles every finished child's message; one
+        that a ``since`` change ends first bundles only the finished
+        ``changed`` children's (see ``since`` below).  A wait that times
+        out or is interrupted returns states only, ``None`` for every
+        entry and no storage read for them (#1339).  The model waits
+        again after either, and the wait that completes carries the
+        finished children's messages, so a re-issued wait never repeats
+        a child's text in the model's context.  A child that closed
+        before the completing wait carries only the ``closed`` sentinel
+        there; ``inspect_workstream`` still reads its transcript.
 
         ``since`` — optional prior snapshot (typically the ``results``
-        dict from an earlier ``wait_for_workstream`` call).  When
-        provided, the wait short-circuits as soon as ANY polled ws_id
-        that ALSO has a ``since`` entry differs from that prior
-        snapshot (``state`` / ``tokens`` / ``updated``), regardless of
-        ``mode``.  Lets a follow-up wait skip re-counting
-        already-completed children — the classic "spawn 3, wait for
-        the first, then wait for the next change" loop turns into two
-        calls instead of spinning the timeout on the still-terminal
-        first child.  ws_ids absent from ``since`` do NOT themselves
-        trigger the diff-based early exit — they fall back to the
-        normal ``mode`` condition.  This prevents a disjoint ``since``
-        dict from silently exiting on tick one (which the naive
-        missing-entry-counts-as-changed rule would cause).
+        dict from an earlier ``wait_for_workstream`` call).  It adds a
+        trigger, not a completion: the wait also returns as soon as ANY
+        polled ws_id that ALSO has a ``since`` entry differs from that
+        prior snapshot (``state`` / ``tokens`` / ``updated``).  The
+        response's ``changed`` lists those ws_ids in request order.  It
+        is present whenever ``since`` parsed to at least one entry, and
+        empty when the wait returned for another reason (the mode
+        condition alone, a timeout, an interrupt, a not_found abort).
+        ``complete`` stays False unless the mode condition held too, so
+        a child that merely moved on (``idle`` to ``thinking``) never
+        reads as done.  When a change alone ends the wait, only the
+        ``changed`` children that are real-terminal carry their
+        message, so a child that just finished delivers its answer
+        then; every other entry carries ``None``, as on a timeout.  A
+        later wait that completes bundles every finished child again.
+        An unchanged entry triggers nothing, so an unchanged child that
+        is already real-terminal still meets the mode condition
+        (``mode='any'`` returns at once for it).  ws_ids absent from
+        ``since`` do NOT themselves trigger the early return — they
+        count toward the ``mode`` condition only.  This prevents a
+        disjoint ``since`` dict from exiting on tick one (which the
+        naive missing-entry-counts-as-changed rule would cause).
 
         Unresolvable ids fail fast.  Refs are validated up front — a
         malformed ws_id (truncated / garbled / non-hex / a display
@@ -1228,19 +1241,20 @@ class CoordinatorClient:
 
         ``interrupt`` ends the wait early for a reason outside the
         children (#1339).  It is consulted once per tick, after the
-        completion checks and the deadline, right before the loop would
+        exit checks and the deadline, right before the loop would
         block; a non-empty return stops the wait with ``complete=False``,
         that tick's states (without messages, as on a timeout), and the
         returned string as the response's ``interrupted`` field.  The
         coordinator session passes ``"user_message"`` when the user has
         sent a message the next tool-result seam will deliver.  A tick
-        that also meets the wait condition reports ``complete=True`` and
-        no ``interrupted``.  ``wake_event`` is the Event the loop blocks
-        on, registered on the child-event bus in place of a fresh one, so
-        a caller that sets it cuts the block short.  The loop clears it at
-        the top of every tick and consults ``interrupt`` after the clear,
-        so a caller that makes ``interrupt`` return its reason before
-        setting the Event never loses the wake.
+        that also meets the mode condition, or sees a ``since`` change,
+        returns on that and carries no ``interrupted``.  ``wake_event``
+        is the Event the loop blocks on, registered on the child-event
+        bus in place of a fresh one, so a caller that sets it cuts the
+        block short.  The loop clears it at the top of every tick and
+        consults ``interrupt`` after the clear, so a caller that makes
+        ``interrupt`` return its reason before setting the Event never
+        loses the wake.
 
         Performance: each tick issues exactly two storage calls
         (``get_workstreams_batch`` + ``sum_workstream_tokens_batch``),
@@ -1406,11 +1420,12 @@ class CoordinatorClient:
             of the diffed fields.  Called only for ws_ids that appear in
             ``since_map`` — callers handling missing entries is the
             wrong default (it would make a disjoint since-dict exit
-            the wait on tick one with complete=True)."""
-            return any(snap.get(key) != prev.get(key) for key in ("state", "tokens", "updated"))
+            the wait on tick one)."""
+            return _since_entry_changed(snap, prev)
 
         last_results: dict[str, dict[str, Any]] = {}
         complete = False
+        changed: list[str] = []
         interrupted: str | None = None
         not_found_ids: list[str] = []
         # Subscribe to in-process state-change events for the watched
@@ -1480,40 +1495,36 @@ class CoordinatorClient:
                 ]
                 if not_found_ids:
                     break
-                # ``since`` — orthogonal to mode.  If the caller supplied a
-                # prior snapshot, any diff on a ws_id that IS in ``since_map``
-                # exits the wait so a follow-up call doesn't re-count
-                # already-terminal children.  ws_ids absent from ``since_map``
-                # are ignored for the diff-exit check — they fall through to
-                # the normal mode='any' / mode='all' conditions below.  This
-                # prevents a disjoint since-dict from exiting on tick one
-                # with complete=True (previous shape did, silently).
-                if since_map and any(
-                    _diff_since(snap, since_map[wid])
+                # Only the mode condition sets ``complete``.  Under
+                # ``mode='all'`` every ws_id actually finished observable
+                # work: ``not_found`` members can't ride along to a
+                # "complete" result — the fail-fast above exits first — so
+                # ``complete=True`` means every lane really resolved.
+                mode_met = any(real_terminal) if mode == "any" else all(real_terminal)
+                # ``since`` adds a trigger, not a completion: any diff on a
+                # ws_id that IS in ``since_map`` also ends the wait, named in
+                # ``changed`` (``results`` is keyed in request order), while
+                # ``complete`` stays with the mode condition — a child that
+                # only moved on (idle -> thinking) must not read as done.  An
+                # unchanged entry triggers nothing, so an unchanged child that
+                # is already real-terminal still meets the mode condition.
+                # ws_ids absent from ``since_map`` are ignored here — they
+                # count toward the mode condition only, so a disjoint
+                # since-dict can't end the wait on tick one.
+                changed = [
+                    wid
                     for wid, snap in results.items()
-                    if wid in since_map
-                ):
-                    complete = True
+                    if wid in since_map and _diff_since(snap, since_map[wid])
+                ]
+                if mode_met or changed:
+                    complete = mode_met
                     break
-                if mode == "any":
-                    if any(real_terminal):
-                        complete = True
-                        break
-                else:  # mode == "all"
-                    if all(real_terminal):
-                        # Every ws_id actually finished observable work.
-                        # ``not_found`` members can't ride along to a
-                        # "complete" result — the fail-fast above exits
-                        # first — so ``complete=True`` means every lane
-                        # really resolved.
-                        complete = True
-                        break
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     break
                 # The caller's reason to stop early, consulted only where
-                # the loop would otherwise block: a tick that met the
-                # wait condition broke above and reports complete.
+                # the loop would otherwise block: a tick that met the mode
+                # condition or saw a ``since`` change broke above.
                 reason = interrupt() if interrupt is not None else None
                 if reason:
                     interrupted = reason
@@ -1545,7 +1556,11 @@ class CoordinatorClient:
         # separate from the returned tool result and must not silently grow
         # new fields just because the wait completed.
         enriched_results = _enrich_wait_results(
-            self._storage, last_results, complete=complete, not_found=bool(not_found_ids)
+            self._storage,
+            last_results,
+            complete=complete,
+            not_found=bool(not_found_ids),
+            changed=changed,
         )
         response: dict[str, Any] = {
             "results": enriched_results,
@@ -1553,6 +1568,10 @@ class CoordinatorClient:
             "elapsed": round(time.monotonic() - start, 3),
             "mode": mode,
         }
+        if since_map:
+            # Every usable ``since`` gets an answer: the ids whose change
+            # ended the wait, or ``[]`` when something else ended it.
+            response["changed"] = changed
         if interrupted:
             response["interrupted"] = interrupted
         if not_found_ids:
@@ -2826,28 +2845,53 @@ def _wait_message_for(
     return None, False
 
 
+def _since_entry_changed(snap: dict[str, Any], prev: dict[str, Any]) -> bool:
+    """True when a wait snapshot differs from its ``since`` hint.
+
+    The fields ``wait_for_workstream``'s ``since`` compares; the eval
+    harness's synthesized wait shares the rule.
+    """
+    return any(snap.get(key) != prev.get(key) for key in ("state", "tokens", "updated"))
+
+
 def _enrich_wait_results(
     storage: Any,
     snaps: dict[str, dict[str, Any]],
     *,
     complete: bool,
     not_found: bool,
+    changed: Collection[str] = (),
 ) -> dict[str, dict[str, Any]]:
     """Return a fresh copy of each wait snapshot with ``message`` and ``truncated``.
 
     Only a wait that completed, or one that aborted on not_found ids, carries
-    messages.  A wait that timed out or was interrupted returns states only
-    (#1339): no child's message and no storage read.  The model waits again,
-    and the wait that completes bundles the finished children's messages, so
-    each child's text enters context once however many timeouts or user
-    messages come first.  The not_found abort keeps its messages: it is an
-    error the model fixes, not a wait it re-issues as it stands.
+    every finished child's message.  A wait that timed out or was interrupted
+    returns states only (#1339): no child's message and no storage read.  The
+    model waits again, and the wait that completes bundles the finished
+    children's messages, so each child's text enters context once however many
+    timeouts or user messages come first.  The not_found abort keeps its
+    messages: it is an error the model fixes, not a wait it re-issues as it
+    stands.
+
+    ``changed`` names the children whose ``since`` snapshot changed.  When that
+    change ends a wait before it completes, only the real-terminal ones among
+    them carry a message, so a child that just finished delivers its answer
+    with the change; every other child stays states-only, as on a timeout.  A
+    later wait that completes bundles every finished child, that one included.
 
     :meth:`CoordinatorClient.wait_for_workstream` and the eval harness's stub
     client both build their results here, so the synthesized wait follows the
     same rule as the real one.  ``snaps`` is never mutated.
     """
-    if not complete and not not_found:
+    if complete or not_found:
+        bundled: Collection[str] = snaps
+    else:
+        bundled = {
+            wid
+            for wid in changed
+            if str(snaps.get(wid, {}).get("state") or "") in WAIT_REAL_TERMINAL_STATES
+        }
+    if not bundled:
         return {wid: {**snap, "message": None, "truncated": False} for wid, snap in snaps.items()}
     # Bundle each terminal child's last assistant message inline so the
     # coordinator LLM doesn't have to follow up with one
@@ -2862,7 +2906,9 @@ def _enrich_wait_results(
     # (SQLite) / a connection pool (Postgres), so concurrent reads from the
     # worker pool are safe.
     io_wids = [
-        wid for wid, snap in snaps.items() if str(snap.get("state") or "") in ("idle", "error")
+        wid
+        for wid, snap in snaps.items()
+        if wid in bundled and str(snap.get("state") or "") in ("idle", "error")
     ]
     io_pairs: dict[str, tuple[str | None, bool]] = {}
     if io_wids:
@@ -2884,7 +2930,7 @@ def _enrich_wait_results(
         state = str(snap.get("state") or "")
         if wid in io_pairs:
             msg, trunc = io_pairs[wid]
-        elif state in WAIT_TERMINAL_STATES:
+        elif wid in bundled and state in WAIT_TERMINAL_STATES:
             msg, trunc = _wait_message_for(storage, wid, state)
         else:
             msg, trunc = None, False

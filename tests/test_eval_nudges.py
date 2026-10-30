@@ -2117,6 +2117,29 @@ class TestStubClient:
         assert unresolved["results"]["ws-idle"]["message"] is None
         assert unresolved["results"]["ws-idle"]["truncated"] is False
 
+    def test_wait_answers_since_as_production_does(self, eval_storage):
+        """``changed`` comes back whenever ``since`` holds an entry: empty when
+        the seeded world matches the hint, and naming a child that differs,
+        which ends the wait at once without completing it."""
+        client = _StubCoordinatorClient(
+            eval_storage,
+            coord_ws_id="coord-eval-1",
+            user_id="eval-user",
+            children=[{"ws_id": "ws-run", "name": "builder", "state": "running"}],
+        )
+        hint = client.wait_for_workstream(["ws-run"], timeout=30)["results"]
+        quiet = client.wait_for_workstream(["ws-run"], timeout=30, since=hint)
+        assert quiet["changed"] == []
+        assert quiet["complete"] is False
+        assert quiet["elapsed"] == 30.0
+
+        stale = {"ws-run": {**hint["ws-run"], "state": "idle"}}
+        moved = client.wait_for_workstream(["ws-run"], timeout=30, since=stale)
+        assert moved["changed"] == ["ws-run"]
+        assert moved["complete"] is False
+        assert moved["elapsed"] == 0.0
+        assert "changed" not in client.wait_for_workstream(["ws-run"], timeout=30)
+
     def test_wait_carries_the_seeded_childs_findings(self, eval_storage):
         """The pin the deepened world turns on: with the C6b child's
         transcript seeded through the real store, the synthesized wait's

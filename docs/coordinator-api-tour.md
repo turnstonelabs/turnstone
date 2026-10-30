@@ -145,7 +145,7 @@ with a `type` field.  The recurring shapes a UI has to handle:
 | `child_ws_state`    | A direct child transitioned state                                                          | `child_ws_id`, `state` |
 | `child_ws_closed`   | A direct child closed                                                                      | `child_ws_id` |
 | `child_ws_rename`   | A direct child's name changed                                                              | `child_ws_id`, `name` |
-| `wait_started` / `wait_progress` / `wait_ended` | `wait_for_workstream` tool lifecycle (see §6)                  | `call_id`, `ws_ids`, `elapsed`, `results`, `complete`, `interrupted` |
+| `wait_started` / `wait_progress` / `wait_ended` | `wait_for_workstream` tool lifecycle (see §6)                  | `call_id`, `ws_ids`, `elapsed`, `results`, `complete`, `interrupted`, `changed` |
 | `batch_started` / `batch_ended` | `spawn_batch` / `close_all_children` tool lifecycle                            | `call_id`, `op`, `total`/`succeeded`/`denied`/`closed`/`failed`/`skipped` |
 | `info` / `error`    | Operational messages                                                                       | `message` |
 | `history_resync`    | The rendered history token no longer names the accepted row prefix                         | `ws_id`, `reason` |
@@ -287,6 +287,15 @@ Key properties:
   output twice.  A child that closed before the completing wait
   shows only the `closed` sentinel there; `inspect_workstream` still
   reads what it produced.
+- **`since` adds a trigger, not a completion** — given an earlier
+  result's `results` as `since`, the wait also returns as soon as a
+  listed child differs from its snapshot, naming those children in
+  `changed` (`[]` when something else ended the wait; absent without
+  `since`).  `complete` stays false unless the mode condition held,
+  and a return the change alone caused carries `message` only for the
+  changed children that finished.  An unchanged child already in a
+  real terminal state still meets the mode condition.  `wait_ended`
+  carries the same `changed` field.
 - **A user message ends the wait** — when the user sends the
   coordinator a message while it waits, the wait returns at once with
   `complete=false`, `interrupted="user_message"` and states only, and

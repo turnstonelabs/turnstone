@@ -24638,7 +24638,18 @@ class ChatSession:
             if isinstance(snap, dict) and snap.get("state") in WAIT_REAL_TERMINAL_STATES
         )
         interrupted = result.get("interrupted")
-        verb = "complete" if complete else ("interrupted" if interrupted else "timeout")
+        # A ``since`` change can end the wait before the mode condition holds:
+        # ``complete`` is False, yet it isn't a timeout either.  ``changed``,
+        # present whenever a usable ``since`` came in, names the ids.
+        changed = result.get("changed")
+        if complete:
+            verb = "complete"
+        elif interrupted:
+            verb = "interrupted"
+        elif changed:
+            verb = "changed"
+        else:
+            verb = "timeout"
         # Denominator = polled set (not raw item['ws_ids']) so the ratio
         # stays coherent with what the client actually tracked after dedup.
         summary = f"{verb} after {elapsed}s ({resolved_count}/{len(results_dict)} resolved)"
@@ -24652,6 +24663,8 @@ class ChatSession:
         }
         if interrupted:
             ended["interrupted"] = interrupted
+        if changed is not None:
+            ended["changed"] = changed
         self._emit_wait_event("wait_ended", ended)
         return call_id, output
 
