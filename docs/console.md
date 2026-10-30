@@ -440,8 +440,10 @@ text. **Copy** copies text source; **Download** saves the original file. Unsuppo
 binary files can be downloaded without a preview. HTML follows the existing preview
 sandbox: scripts are disabled and remote images/styles require an explicit opt-in.
 Folder icons, type labels, and a breadcrumb address bar identify the current location
-and its contents. Recognized source files use the shared syntax highlighter; files over
-100,000 characters remain fully readable and copyable with highlighting skipped.
+and its contents. In the cluster console the address bar starts with the conversation's
+node ID, such as `node-5:`, because each node has its own locations. Recognized source
+files use the shared syntax highlighter; files over 100,000 characters remain fully
+readable and copyable with highlighting skipped.
 
 **Workspace** is the node's configured `[tools] workspace_dir` (or `TURNSTONE_WORKSPACE`,
 normally `/workspace` in Docker), falling back to the server's working directory when

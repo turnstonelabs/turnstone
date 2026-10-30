@@ -311,6 +311,72 @@ assert(requests[0].url.endsWith("&path="), "root breadcrumb navigates back to ro
 """)
 
 
+def test_address_bar_prefixes_paths_with_the_originating_node() -> None:
+    _run_files(r"""
+const shown = (pane) => pane._nodeName.children.map((part) => part.textContent);
+let pane = mount();
+assert(pane._node.hidden, "an unopened pane names no node");
+pane.showFiles({base: "/node/node-5", wsId: "one"});
+assert(!pane._node.hidden && shown(pane).join("") === "node-5", "a proxied path starts with its node");
+assert(pane._node.title === "Node node-5", "the prefix explains itself on hover");
+assert(pane._node.getAttribute("aria-hidden") === "true", "the visual prefix is not read twice");
+assert(pane._crumbs.getAttribute("aria-label") === "File location on node node-5", "the location landmark names the node");
+assert(pane._node.parentNode.contains(pane._crumbs) && !pane._crumbs.contains(pane._node), "node prefix does not scroll with the breadcrumbs");
+await listing(requests.shift(), "docs", [file("docs/a.txt")]);
+assert(pane._crumbs.title === "node-5:/workspace/project/docs", "full location is namespaced by node");
+assert(pane._directoryName.title === pane._crumbs.title, "directory heading shares the namespaced location");
+const restoredMeta = saved.at(-1);
+pane.onClose();
+pane = mount(restoredMeta);
+assert(shown(pane).join("") === "node-5", "a restored pane names its node from the saved transport");
+await listing(requests.shift(), "docs", []);
+const replica = "turnstone-server-7d9f8c6b5-x2x4p_ab12";
+pane.showFiles({base: "/node/" + encodeURIComponent(replica), wsId: "two"});
+assert(shown(pane)[1] === "x2x4p_ab12" && shown(pane).join("") === replica, "the distinguishing end of a long id never truncates");
+await listing(requests.shift(), "", []);
+pane.showFiles({base: "/node/node-12_ab12", wsId: "short"});
+assert(shown(pane)[0] === "" && shown(pane)[1] === "node-12_ab12", "a short id is never split into a one- or two-character head");
+await listing(requests.shift(), "", []);
+const rocket = String.fromCodePoint(0x1f680);
+pane.showFiles({base: "/node/" + encodeURIComponent("turnstone-" + rocket + "x2x4p_ab1"), wsId: "astral"});
+assert(shown(pane)[0] === "turnstone-" && shown(pane)[1] === rocket + "x2x4p_ab1", "the split never cuts a character in half");
+await listing(requests.shift(), "", []);
+pane.showFiles({base: "/node/" + encodeURIComponent("rack 3"), wsId: "spaced"});
+assert(shown(pane).join("") === "rack 3", "an encoded node id is shown decoded");
+await listing(requests.shift(), "", []);
+pane.showFiles({base: "/node/100%", wsId: "odd"});
+assert(shown(pane).join("") === "100%", "an undecodable node id is shown as sent");
+await listing(requests.shift(), "", []);
+pane.showFiles({base: "", wsId: "three"});
+assert(pane._node.hidden && !shown(pane).join(""), "a local session has no node prefix");
+assert(pane._crumbs.getAttribute("aria-label") === "File location", "a local location landmark names no node");
+await listing(requests.shift(), "", []);
+assert(pane._crumbs.title === "/workspace/project", "local paths are not namespaced");
+""")
+
+
+def test_breadcrumb_start_fades_only_while_earlier_crumbs_are_scrolled_out() -> None:
+    _run_files(r"""
+const pane = mount();
+const fades = () => pane._crumbs.classList.contains("is-clipped-start");
+const refresh = () => pane.bodyEl.querySelectorAll("button")
+  .find(button => button.getAttribute("aria-label") === "Refresh files").click();
+pane.showFiles({base: "/node/node-5", wsId: "one"});
+await listing(requests.shift(), "a/b", []);
+assert(!fades(), "a trail that fits has no fade");
+pane._crumbs.scrollWidth = 240;
+refresh();
+assert(fades(), "a trail scrolled to its current folder fades its clipped start");
+await listing(requests.shift(), "a/b", []);
+pane._crumbs.scrollLeft = 0;
+pane._crumbs.dispatch("scroll");
+assert(!fades(), "scrolling back to the root removes the fade");
+pane._crumbs.scrollLeft = 30;
+pane._crumbs.dispatch("scroll");
+assert(fades(), "scrolling away from the root restores the fade");
+""")
+
+
 def test_html_raw_copy_and_binary_download_use_embedded_viewer() -> None:
     _run_files(r"""
 const pane = mount();

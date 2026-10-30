@@ -35,6 +35,18 @@ function filesUrl(ctx, endpoint = "", path = "") {
   );
 }
 
+// Console requests reach a node through /node/{encoded node id}; a local
+// session's base is "" and names no node.
+function filesNode(base) {
+  const match = /^\/node\/([^/]+)/.exec(base || "");
+  if (!match) return "";
+  try {
+    return decodeURIComponent(match[1]);
+  } catch (_) {
+    return match[1];
+  }
+}
+
 function fileSize(size) {
   if (size == null) return "";
   if (size < 1024) return size + " B";
@@ -124,13 +136,34 @@ export function createFilesystemPane(extra, hostApi) {
     persist();
   };
 
+  // Fade the breadcrumbs' start edge while earlier crumbs are scrolled out, so
+  // a clipped root is not read as a relative path after the node prefix.
+  const markClipped = () => {
+    pane._crumbs.classList.toggle("is-clipped-start", pane._crumbs.scrollLeft > 0);
+  };
+
   const paintLocation = () => {
     const rootPath = pane._root || (pane._rootId === "workspace" ? "Workspace" : "/" + pane._rootId);
+    // Each node has its own roots, so a proxied path is prefixed with its node,
+    // like host:path. The prefix is visual; the location landmark's name
+    // carries the node for screen readers.
+    const node = filesNode(pane._ctx && pane._ctx.base);
+    pane._node.hidden = !node;
+    pane._node.title = node ? "Node " + node : "";
+    // Replicas share long id prefixes, so a narrow bar truncates the middle of
+    // a long id and keeps its distinguishing end visible. Split by code point.
+    const chars = Array.from(node);
+    const cut = chars.length > 12 ? chars.length - 10 : 0;
+    pane._nodeName.replaceChildren(
+      fileElement("span", "filesystem-node-head", chars.slice(0, cut).join("")),
+      fileElement("span", "filesystem-node-tail", chars.slice(cut).join("")),
+    );
+    pane._crumbs.setAttribute("aria-label", node ? "File location on node " + node : "File location");
     const rootCrumb = fileButton(rootPath, "Open selected root", () => navigate(""));
     rootCrumb.classList.add("filesystem-crumb", "filesystem-crumb-root");
     rootCrumb.title = rootPath;
     pane._crumbs.replaceChildren(rootCrumb);
-    pane._crumbs.title = rootPath.replace(/\/$/, "") + (pane._path ? "/" + pane._path : "");
+    pane._crumbs.title = (node ? node + ":" : "") + rootPath.replace(/\/$/, "") + (pane._path ? "/" + pane._path : "");
     let path = "";
     for (const part of pane._path.split("/").filter(Boolean)) {
       path += (path ? "/" : "") + part;
@@ -146,6 +179,7 @@ export function createFilesystemPane(extra, hostApi) {
     // Keep the current folder visible when the breadcrumb trail overflows.
     // Scroll only this address bar, without moving the page or keyboard focus.
     pane._crumbs.scrollLeft = pane._crumbs.scrollWidth;
+    markClipped();
     pane._directoryName.textContent = pane._path.split("/").pop() || (pane._rootId === "workspace" ? "Workspace" : "/" + pane._rootId);
     pane._directoryName.title = pane._crumbs.title;
     pane._up.disabled = !pane._path;
@@ -313,12 +347,20 @@ export function createFilesystemPane(extra, hostApi) {
     pane._up.disabled = true;
     pane._crumbs = fileElement("nav", "filesystem-breadcrumbs");
     pane._crumbs.setAttribute("aria-label", "File location");
+    pane._crumbs.addEventListener("scroll", markClipped, { passive: true });
     const refresh = fileButton("↻ Refresh", "Refresh files", () =>
       navigate(pane._path, pane._selected, pane._selectedTarget),
     );
     controls.append(rootChoice, refresh);
     const address = fileElement("div", "filesystem-address");
-    address.append(fileElement("span", "filesystem-path-label", "Path"), pane._crumbs);
+    // The node prefix stays outside the scrolling breadcrumbs so a deep path
+    // cannot push it out of view.
+    pane._node = fileElement("span", "filesystem-node");
+    pane._node.hidden = true;
+    pane._node.setAttribute("aria-hidden", "true");
+    pane._nodeName = fileElement("span", "filesystem-node-name");
+    pane._node.append(pane._nodeName, fileElement("span", "filesystem-separator", ":"));
+    address.append(fileElement("span", "filesystem-path-label", "Path"), pane._node, pane._crumbs);
     navigation.append(pane._up, address);
     toolbar.append(controls, navigation);
     const body = fileElement("div", "filesystem-body");
