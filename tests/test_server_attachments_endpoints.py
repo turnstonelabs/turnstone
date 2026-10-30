@@ -1146,7 +1146,7 @@ def voice_app_client(tmp_path):
         default="voice",
     )
     mock_client = MagicMock()
-    # Every clone (a minted credential, synthesis's bounded attempt) comes back
+    # Every clone (a minted credential, a voice call's bounded attempt) comes back
     # as this mock, so one surface scripts the backend for every route.
     # test_audio.py pins that synthesis really sends through its clone.
     mock_client.with_options.return_value = mock_client
@@ -1494,15 +1494,20 @@ class TestVoiceBackendAuth:
         response = _voice_request(client, route, user_id="userB")
 
         assert response.status_code == 200, response.text
-        mint_client.mint_model_obo_token_sync.assert_called_once_with(
+        mint_kwargs = dict(
             user_id="userB",
             alias="voice",
             audience="api://voice",
             scopes="",
             grant_leg="entra",
         )
+        if route != "tts":
+            deadline = mint_client.mint_model_obo_token_sync.call_args.kwargs["deadline"]
+            assert time.monotonic() < deadline <= time.monotonic() + 25.0
+            mint_kwargs["deadline"] = deadline
+        mint_client.mint_model_obo_token_sync.assert_called_once_with(**mint_kwargs)
         # The mint must reach the call as a clone, and nothing may replace it;
-        # synthesis then clones once more for its one bounded attempt.
+        # each voice call then clones once more for its one bounded attempt.
         expected = [call(api_key="minted-token")]
         if route == "tts":
             expected.append(
@@ -1511,6 +1516,13 @@ class TestVoiceBackendAuth:
                     timeout=httpx2.Timeout(_TTS_BACKEND_TIMEOUT_S, connect=5.0),
                 )
             )
+        else:
+            from turnstone.server import _STT_REQUEST_TIMEOUT_S
+
+            timeout = mock_client.with_options.call_args.kwargs["timeout"]
+            assert 0 < timeout.read <= _STT_REQUEST_TIMEOUT_S
+            assert timeout.connect == min(5.0, timeout.read)
+            expected.append(call(max_retries=0, timeout=timeout))
         assert mock_client.with_options.call_args_list == expected
 
     @pytest.mark.parametrize("route", ["stt", "stt-stream", "tts"])
@@ -1579,6 +1591,106 @@ def _voice_alias_full(client) -> Iterator[Any]:
 
 class TestVoiceAdmission:
     """Voice calls take the voice alias's ``max_concurrency`` slots."""
+
+    @pytest.mark.parametrize("route", ["stt", "stt-stream"])
+    @pytest.mark.parametrize("mode", ["entra_app", "entra_obo"])
+    def test_slow_credential_mint_expires_and_releases_dictation_capacity(
+        self, voice_app_client, monkeypatch, route, mode
+    ):
+        from dataclasses import replace
+
+        import turnstone.server as srv
+        from turnstone.core import model_oauth
+        from turnstone.core.model_oauth import OAuthModelTokenClient
+        from turnstone.core.oauth.context import OAuthContext
+        from turnstone.core.oauth.runtime import OAuthRuntime
+
+        client, mock_client = voice_app_client
+        registry = client.app.state.registry
+        registry._models["voice"] = replace(
+            registry._models["voice"],
+            # A timed-out mint must not dispatch using this otherwise valid fallback.
+            api_key="static-fallback",
+            auth_mode=mode,
+            obo_audience="api://voice",
+        )
+        gate = registry.get_admission("voice")
+        gate.set_limit(1)
+        context = OAuthContext()
+        runtime = OAuthRuntime(context)
+        context.runtime = runtime
+        runtime.start()
+        client.app.state.model_token_client = OAuthModelTokenClient(context)
+        cancelled = threading.Event()
+        started = threading.Event()
+
+        async def mint(**kwargs):
+            started.set()
+            assert gate.snapshot().in_flight == 1
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.set()
+
+        mint_name = "_mint_app_access_token" if mode == "entra_app" else "_mint_obo_access_token"
+        monkeypatch.setattr(model_oauth, mint_name, mint)
+        monkeypatch.setattr(srv, "_STT_REQUEST_TIMEOUT_S", 0.25)
+        try:
+            began = time.monotonic()
+            response = _voice_request(client, route, user_id="userA")
+            elapsed = time.monotonic() - began
+            assert response.status_code == 502, response.text
+            assert started.is_set()
+            assert cancelled.wait(1.0)
+            assert elapsed < 0.6
+            assert gate.snapshot().in_flight == 0
+            mock_client.audio.transcriptions.with_streaming_response.create.assert_not_called()
+
+            async def recovered(**kwargs):
+                return "recovered-token"
+
+            monkeypatch.setattr(model_oauth, mint_name, recovered)
+            assert _voice_request(client, route, user_id="userA").status_code == 200
+            assert gate.snapshot().in_flight == 0
+            assert mock_client.audio.transcriptions.with_streaming_response.create.call_count == 1
+        finally:
+            runtime.shutdown()
+
+    @pytest.mark.parametrize("route", ["stt", "stt-stream"])
+    @pytest.mark.parametrize("failure", ["before-headers", "budget-exhausted"])
+    def test_failed_dictation_releases_capacity_for_the_next_request(
+        self, voice_app_client, monkeypatch, route, failure
+    ):
+        import openai
+
+        import turnstone.server as srv
+
+        client, mock_client = voice_app_client
+        gate = client.app.state.registry.get_admission("voice")
+        gate.set_limit(1)
+        create = mock_client.audio.transcriptions.with_streaming_response.create
+        manager = create.return_value
+        budget = srv._STT_REQUEST_TIMEOUT_S
+        if failure == "before-headers":
+            manager.__enter__.side_effect = openai.APITimeoutError(
+                request=httpx2.Request("POST", "http://speech.example.com/v1/audio/transcriptions")
+            )
+        else:
+            monkeypatch.setattr(srv, "_STT_REQUEST_TIMEOUT_S", 0.0)
+
+        response = _voice_request(client, route, user_id="userA")
+
+        assert response.status_code == 502
+        assert response.json() == {"error": "Speech transcription backend failed"}
+        assert gate.snapshot().in_flight == 0
+        assert gate.snapshot().queued == 0
+        if failure == "budget-exhausted":
+            create.assert_not_called()
+
+        manager.__enter__.side_effect = None
+        monkeypatch.setattr(srv, "_STT_REQUEST_TIMEOUT_S", budget)
+        assert _voice_request(client, route, user_id="userA").status_code == 200
+        assert gate.snapshot().in_flight == 0
 
     @pytest.mark.parametrize("route", ["stt", "stt-stream"])
     def test_a_dictation_that_gets_no_slot_in_time_is_told_the_node_is_busy(
@@ -1672,6 +1784,7 @@ class TestVoiceAdmission:
             seen["thread"] = threading.current_thread().name
             seen["user_id"] = ctx_user_id.get()
             seen["wait"] = kwargs["admission_wait_s"]
+            seen["remaining"] = kwargs["deadline"] - time.monotonic()
             if call == "transcribe":
                 return audio_mod.TranscriptionResult(
                     transcript="hi", model_alias="voice", model="m"
@@ -1686,6 +1799,7 @@ class TestVoiceAdmission:
         assert seen["thread"].startswith("stt")
         assert seen["user_id"] == "userA"
         assert seen["wait"] <= srv._STT_ADMISSION_WAIT_S - 0.2
+        assert 0 < seen["remaining"] <= srv._STT_REQUEST_TIMEOUT_S - 0.2
 
     def test_a_dictation_that_gets_no_thread_in_time_is_told_the_node_is_busy(
         self, voice_app_client, monkeypatch
@@ -1747,13 +1861,12 @@ class TestVoiceAdmission:
         assert reported == []
 
     def test_dictation_wait_leaves_room_in_the_console_wait(self):
-        """A dictation waits for a slot for at most half of the console's wait
-        for a forwarded request, so the transcode and the transcription still fit
-        and a busy node answers 429 itself, before the console gives up on it."""
+        """The HTTP budget leaves room for a backend attempt after admission,
+        and for the node's error to reach the console before its read times out."""
         from turnstone.console.server import _PROXY_CLIENT_TIMEOUT_S
-        from turnstone.server import _STT_ADMISSION_WAIT_S
+        from turnstone.server import _STT_ADMISSION_WAIT_S, _STT_REQUEST_TIMEOUT_S
 
-        assert 0 < 2 * _STT_ADMISSION_WAIT_S <= _PROXY_CLIENT_TIMEOUT_S
+        assert 0 < _STT_ADMISSION_WAIT_S < _STT_REQUEST_TIMEOUT_S < _PROXY_CLIENT_TIMEOUT_S
 
 
 # ---------------------------------------------------------------------------

@@ -18,6 +18,7 @@ from __future__ import annotations
 import contextlib
 import subprocess
 import threading
+import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -32,6 +33,7 @@ from turnstone.core.model_turn import (
     resolve_model_binding,
 )
 from turnstone.core.providers import thinking_off_template_kwargs
+from turnstone.core.providers._http_client import HTTPDeadline, http_request_deadline
 from turnstone.core.providers._protocol import refuse_aborted_request
 from turnstone.core.server_compat import merge_server_compat
 
@@ -157,7 +159,33 @@ class AudioBusyError(RuntimeError):
     """The role's alias had no free slot in the time the caller allows (maps to 429)."""
 
 
-def _admit(lane: ModelLane, *, cancel_ref: Any, wait_s: float | None) -> AdmissionLease | None:
+def _remaining(deadline: float | None) -> float | None:
+    """Seconds left in an HTTP dictation's budget; in-turn calls have no deadline."""
+    if deadline is None:
+        return None
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise AudioBackendError("Speech transcription request timed out")
+    return remaining
+
+
+def _transcription_client(lane: ModelLane, *, cancel_ref: Any, deadline: float | None) -> Any:
+    _remaining(deadline)
+    client = lane_call_client(lane, cancel_ref=cancel_ref)
+    # Resolve credentials first: their cost also comes out of the HTTP budget.
+    # No retries, including Retry-After, for a caller with a short request budget.
+    remaining = _remaining(deadline)
+    if remaining is not None:
+        client = client.with_options(
+            max_retries=0,
+            timeout=httpx2.Timeout(remaining, connect=min(5.0, remaining)),
+        )
+    return client
+
+
+def _admit(
+    lane: ModelLane, *, cancel_ref: Any, wait_s: float | None, deadline: float | None = None
+) -> AdmissionLease | None:
     """Take one of the alias's ``max_concurrency`` slots for a backend call.
 
     It is the gate every generation on the alias takes in ``model_turn``, taken
@@ -167,6 +195,9 @@ def _admit(lane: ModelLane, *, cancel_ref: Any, wait_s: float | None) -> Admissi
     wait that ran out; an abort of *cancel_ref* ends the wait with
     ``DeadlineCancelledError``.
     """
+    remaining = _remaining(deadline)
+    if remaining is not None:
+        wait_s = remaining if wait_s is None else min(wait_s, remaining)
     if lane.admission is None:
         return None
     try:
@@ -176,9 +207,11 @@ def _admit(lane: ModelLane, *, cancel_ref: Any, wait_s: float | None) -> Admissi
 
 
 @contextlib.contextmanager
-def _admitted(lane: ModelLane, *, cancel_ref: Any, wait_s: float | None) -> Iterator[None]:
+def _admitted(
+    lane: ModelLane, *, cancel_ref: Any, wait_s: float | None, deadline: float | None = None
+) -> Iterator[None]:
     """Hold one of the alias's slots (see :func:`_admit`) for the block."""
-    lease = _admit(lane, cancel_ref=cancel_ref, wait_s=wait_s)
+    lease = _admit(lane, cancel_ref=cancel_ref, wait_s=wait_s, deadline=deadline)
     with lease if lease is not None else contextlib.nullcontext():
         yield
 
@@ -186,16 +219,22 @@ def _admitted(lane: ModelLane, *, cancel_ref: Any, wait_s: float | None) -> Iter
 class _AdmittedStream:
     """A backend chat stream that gives its admission slot back when it closes.
 
-    The slot is held for as long as the backend streams.  Two closers can race from different
-    threads: the :class:`_TranscriptDeltas` handed to the caller, when iteration ends or it is
-    closed, and the caller's abort ref.  The first closes the stream and releases the slot; the
-    other does nothing.
+    The slot is held for as long as the backend streams. Three closers can race from different
+    threads: the caller's :class:`_TranscriptDeltas`, its abort ref, and the deadline timer.
+    The first closes the stream and releases the slot; the others do nothing.
+    The close-once guard remains nonblocking because closing joins the timer,
+    whose expiry callback may itself be trying to close this stream.
     """
 
-    def __init__(self, stream: Any, lease: AdmissionLease | None) -> None:
+    def __init__(
+        self, stream: Any, lease: AdmissionLease | None, deadline: HTTPDeadline | None = None
+    ) -> None:
         self._stream = stream
         self._lease = lease
         self._close_once = threading.Lock()
+        self.deadline = deadline
+        if deadline is not None:
+            deadline.on_expire(self.close)
 
     def __iter__(self) -> Iterator[Any]:
         return iter(self._stream)
@@ -208,8 +247,12 @@ class _AdmittedStream:
             if callable(close):
                 close()
         finally:
-            if self._lease is not None:
-                self._lease.release()
+            try:
+                if self.deadline is not None:
+                    self.deadline.close()
+            finally:
+                if self._lease is not None:
+                    self._lease.release()
 
 
 class _TranscriptDeltas:
@@ -230,7 +273,13 @@ class _TranscriptDeltas:
         return self
 
     def __next__(self) -> str:
-        return next(self._deltas)
+        if self._held.deadline is None:
+            return next(self._deltas)
+        # Iteration runs on a different worker from the one that opened the
+        # stream. Limit this activation to next(), never across a yielded delta.
+        with self._held.deadline.activate():
+            self._held.deadline.remaining(AudioBackendError)
+            return next(self._deltas)
 
     def close(self) -> None:
         try:
@@ -366,7 +415,7 @@ def _serves_transcription_endpoint(cfg: Any, model: str) -> bool:
     return _infer_audio_capability(model, "stt")
 
 
-def _to_wav_16k_mono(data: bytes) -> bytes:
+def _to_wav_16k_mono(data: bytes, *, deadline: float | None = None) -> bytes:
     """Decode any ffmpeg-readable audio container to 16 kHz mono PCM WAV.
 
     Browsers record webm/opus (or ogg/mp4); the omni chat lane — vLLM in
@@ -379,6 +428,8 @@ def _to_wav_16k_mono(data: bytes) -> bytes:
     # ffmpeg reads only the piped bytes (-protocol_whitelist pipe) so a crafted
     # container can't open file:/http: references (SSRF / local file read); -vn
     # drops video streams and -t bounds the decode against a decompression bomb.
+    remaining = _remaining(deadline)
+    timeout = _FFMPEG_TIMEOUT_S if remaining is None else min(_FFMPEG_TIMEOUT_S, remaining)
     try:
         proc = subprocess.run(
             [
@@ -403,7 +454,7 @@ def _to_wav_16k_mono(data: bytes) -> bytes:
             ],
             input=data,
             capture_output=True,
-            timeout=_FFMPEG_TIMEOUT_S,
+            timeout=timeout,
         )
     except FileNotFoundError as exc:
         raise AudioBackendError("ffmpeg is not installed; cannot transcode audio") from exc
@@ -461,6 +512,7 @@ def _transcribe_via_chat(
     max_tokens: int = _OMNI_STT_MAX_TOKENS,
     cancel_ref: Any = None,
     admission_wait_s: float | None = None,
+    deadline: float | None = None,
 ) -> str:
     """Transcribe by handing the clip to an omni *chat* model as ``input_audio``.
 
@@ -473,21 +525,22 @@ def _transcribe_via_chat(
     """
     import base64
 
-    wav = _to_wav_16k_mono(data)
+    wav = _to_wav_16k_mono(data, deadline=deadline)
     audio_b64 = base64.b64encode(wav).decode("ascii")
     lane = binding.lane
-    with _admitted(lane, cancel_ref=cancel_ref, wait_s=admission_wait_s):
-        client = lane_call_client(lane, cancel_ref=cancel_ref)
-        manager = client.chat.completions.with_streaming_response.create(
-            model=lane.model,
-            messages=_omni_chat_messages(prompt, audio_b64),
-            max_tokens=max_tokens,
-            extra_body=extra_body or None,
-        )
-        refuse_aborted_request(cancel_ref)
-        with manager as response:
-            _capture_audio_handle(cancel_ref, response)
-            resp = response.parse()
+    with _admitted(lane, cancel_ref=cancel_ref, wait_s=admission_wait_s, deadline=deadline):
+        client = _transcription_client(lane, cancel_ref=cancel_ref, deadline=deadline)
+        with http_request_deadline(deadline):
+            manager = client.chat.completions.with_streaming_response.create(
+                model=lane.model,
+                messages=_omni_chat_messages(prompt, audio_b64),
+                max_tokens=max_tokens,
+                extra_body=extra_body or None,
+            )
+            refuse_aborted_request(cancel_ref)
+            with manager as response:
+                _capture_audio_handle(cancel_ref, response)
+                resp = response.parse()
     choices = getattr(resp, "choices", None) or []
     if not choices:
         return ""
@@ -502,6 +555,7 @@ def _transcribe_binding(
     prompt: str = "",
     cancel_ref: Any = None,
     admission_wait_s: float | None = None,
+    deadline: float | None = None,
 ) -> TranscriptionResult:
     """Transcribe through one already-resolved binding generation."""
     lane = binding.lane
@@ -529,13 +583,14 @@ def _transcribe_binding(
             }
             if prompt:
                 kwargs["prompt"] = prompt
-            with _admitted(lane, cancel_ref=cancel_ref, wait_s=admission_wait_s):
-                client = lane_call_client(lane, cancel_ref=cancel_ref)
-                manager = client.audio.transcriptions.with_streaming_response.create(**kwargs)
-                refuse_aborted_request(cancel_ref)
-                with manager as response:
-                    _capture_audio_handle(cancel_ref, response)
-                    resp = response.parse()
+            with _admitted(lane, cancel_ref=cancel_ref, wait_s=admission_wait_s, deadline=deadline):
+                client = _transcription_client(lane, cancel_ref=cancel_ref, deadline=deadline)
+                with http_request_deadline(deadline):
+                    manager = client.audio.transcriptions.with_streaming_response.create(**kwargs)
+                    refuse_aborted_request(cancel_ref)
+                    with manager as response:
+                        _capture_audio_handle(cancel_ref, response)
+                        resp = response.parse()
             transcript = (getattr(resp, "text", "") or "").strip()
         else:
             transcript = _transcribe_via_chat(
@@ -545,6 +600,7 @@ def _transcribe_binding(
                 extra_body=_omni_chat_extra_body(cfg),
                 cancel_ref=cancel_ref,
                 admission_wait_s=admission_wait_s,
+                deadline=deadline,
             )
     except (AudioBackendError, AudioBusyError, BackendAuthUnavailableError):
         raise
@@ -566,6 +622,7 @@ def transcribe(
     backend_auth_resolver: Callable[[str, ModelConfig | None], str | None] | None = None,
     cancel_ref: Any = None,
     admission_wait_s: float | None = None,
+    deadline: float | None = None,
 ) -> TranscriptionResult:
     """Transcribe ``data`` using the STT role alias's audio backend.
 
@@ -581,6 +638,12 @@ def transcribe(
     The backend call holds one of the alias's ``max_concurrency`` slots.
     ``admission_wait_s`` bounds the wait for it (``None`` waits until one frees),
     and :class:`AudioBusyError` reports a wait that ran out.
+
+    HTTP routes set a monotonic ``deadline``. Transcoding and admission use its
+    remaining budget, then the backend makes one attempt with that remaining
+    time as its I/O timeout. The provider transport also enforces that deadline
+    across successive network operations, including a progressing upload or
+    response. In-turn calls omit it and keep the model client's timeout and retries.
     """
     binding = _resolve_audio_binding(
         registry=registry,
@@ -595,6 +658,7 @@ def transcribe(
         prompt=prompt,
         cancel_ref=cancel_ref,
         admission_wait_s=admission_wait_s,
+        deadline=deadline,
     )
 
 
@@ -636,6 +700,7 @@ def transcribe_stream(
     backend_auth_resolver: Callable[[str, ModelConfig | None], str | None] | None = None,
     cancel_ref: Any = None,
     admission_wait_s: float | None = None,
+    deadline: float | None = None,
 ) -> Iterator[str]:
     """Stream transcript content deltas for the STT role alias.
 
@@ -650,6 +715,9 @@ def transcribe_stream(
     its slot until it closes: when the returned iterator ends or is closed, read
     or not, or when *cancel_ref* aborts, which also covers an iterator that is
     dropped without being closed.
+
+    ``deadline`` applies the HTTP budget described by :func:`transcribe`; it
+    also ends a progressing stream when its budget runs out.
     """
     binding = _resolve_audio_binding(
         registry=registry,
@@ -677,6 +745,7 @@ def transcribe_stream(
             prompt=prompt,
             cancel_ref=cancel_ref,
             admission_wait_s=admission_wait_s,
+            deadline=deadline,
         ).transcript
         return iter([text] if text else [])
     caps = getattr(cfg, "capabilities", None) or {}
@@ -685,28 +754,36 @@ def transcribe_stream(
 
     import base64
 
-    wav = _to_wav_16k_mono(data)
+    wav = _to_wav_16k_mono(data, deadline=deadline)
     audio_b64 = base64.b64encode(wav).decode("ascii")
     try:
-        lease = _admit(lane, cancel_ref=cancel_ref, wait_s=admission_wait_s)
+        lease = _admit(lane, cancel_ref=cancel_ref, wait_s=admission_wait_s, deadline=deadline)
+        budget = None
         try:
-            client = lane_call_client(lane, cancel_ref=cancel_ref)
+            client = _transcription_client(lane, cancel_ref=cancel_ref, deadline=deadline)
+            budget = HTTPDeadline(deadline) if deadline is not None else None
             request_kwargs = {
                 "model": model,
                 "messages": _omni_chat_messages(prompt or _OMNI_STT_PROMPT, audio_b64),
                 "max_tokens": _OMNI_STT_MAX_TOKENS,
                 "extra_body": _omni_chat_extra_body(cfg) or None,
                 "stream": True,
-                "timeout": _OMNI_STT_TIMEOUT_S,
             }
+            if deadline is None:
+                request_kwargs["timeout"] = _OMNI_STT_TIMEOUT_S
             refuse_aborted_request(cancel_ref)
-            stream = client.chat.completions.create(**request_kwargs)
+            with budget.activate() if budget is not None else contextlib.nullcontext():
+                stream = client.chat.completions.create(**request_kwargs)
         except BaseException:
-            if lease is not None:
-                lease.release()
+            try:
+                if budget is not None:
+                    budget.close()
+            finally:
+                if lease is not None:
+                    lease.release()
             raise
         # From here the stream owns the slot: closing it gives the slot back.
-        held = _AdmittedStream(stream, lease)
+        held = _AdmittedStream(stream, lease, budget)
         try:
             _capture_audio_handle(cancel_ref, held)
         except BaseException:

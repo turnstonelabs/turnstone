@@ -155,8 +155,17 @@ Voice requests wait less than generations do, because a browser is waiting on
 each one. Through the console a dictation waits at most 30 seconds for a node's
 answer, so dictation waits up to 15 seconds for a slot, counted from the
 request's arrival (its transcode, usually tens of milliseconds, comes on top;
-`_STT_ADMISSION_WAIT_S` in `turnstone/server.py`). A play needs most of its 90
-seconds for synthesis, so read-aloud does not wait at all (see
+`_STT_ADMISSION_WAIT_S` in `turnstone/server.py`). Both dictation routes make
+one backend attempt, with no SDK retries, including on `Retry-After`. Their
+transcode, admission, credential minting and backend network operations share a
+25-second budget from arrival (`_STT_REQUEST_TIMEOUT_S`). DNS and successive
+connection attempts also consume this budget. Upload, waiting for headers, and
+reading the response all consume that same remainder. The transport shuts down active I/O at the deadline,
+even if an upload or response is still delivering bytes. A backend timeout or
+exhausted preparation budget returns 502; a transient backend error fails the
+dictation instead of retrying, and a long clip may now fail where it previously
+succeeded late, even on a direct connection. A play needs most of its 90 seconds
+for synthesis, so read-aloud does not wait at all (see
 [Speech Synthesis Limits](#speech-synthesis-limits)). When no slot comes free in
 time the node answers 429 with `Retry-After`, which the browser waits out and
 retries twice. A node admits at most four dictations at once: each transcodes,
@@ -164,10 +173,10 @@ waits for its slot and opens its backend call on a thread of its own
 (`_STT_MAX_THREADS`), and more wait for a thread within the same 15 seconds. A
 streamed transcript is then read on the node's shared workers. Transcribing an
 audio attachment for a chat model that can't take audio waits as long as any
-generation. When one alias serves both chat and dictation, dictation waits
-behind chat replies; a second alias for the same server, with its own
-`max_concurrency`, keeps the two apart, at the cost of the server seeing both at
-once.
+generation and keeps the model client's timeout and retries. When one alias
+serves both chat and dictation, dictation waits behind chat replies; a second
+alias for the same server, with its own `max_concurrency`, keeps the two apart,
+at the cost of the server seeing both at once.
 
 ### Judge batch parallelism
 

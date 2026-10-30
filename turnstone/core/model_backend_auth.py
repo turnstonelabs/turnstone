@@ -7,6 +7,7 @@ two inputs for every model-backed role without importing session lifecycle.
 
 from __future__ import annotations
 
+import time
 from typing import TYPE_CHECKING, Any
 
 from turnstone.core.log import get_logger
@@ -60,6 +61,7 @@ def resolve_model_backend_auth_token(
     principal_id: str,
     config_store: Any | None,
     mint_client: ModelTokenClient | None,
+    deadline: float | None = None,
 ) -> str | None:
     """Resolve the dynamic credential for one pinned alias/config/principal.
 
@@ -68,6 +70,12 @@ def resolve_model_backend_auth_token(
     raise :class:`BackendAuthUnavailableError`; the SDK-construction placeholder
     is never allowed onto the wire.
     """
+
+    def check_deadline() -> None:
+        if deadline is not None and time.monotonic() >= deadline:
+            raise TimeoutError("Model credential deadline exceeded")
+
+    check_deadline()
     if not alias or config is None:
         return None
     mode = getattr(config, "auth_mode", "static")
@@ -106,7 +114,14 @@ def resolve_model_backend_auth_token(
             )
         return None
     if mode in APP_IDENTITY_MODEL_AUTH_MODES:
-        token = mint_client.mint_app_token_sync(alias=alias, audience=obo_audience)
+        check_deadline()
+        if deadline is None:
+            token = mint_client.mint_app_token_sync(alias=alias, audience=obo_audience)
+        else:
+            token = mint_client.mint_app_token_sync(
+                alias=alias, audience=obo_audience, deadline=deadline
+            )
+        check_deadline()
         if not token:
             log.warning(
                 "model_app.fallback_to_static",
@@ -135,13 +150,17 @@ def resolve_model_backend_auth_token(
             "Delegated backend authentication has no registered "
             f"grant-profile pairing for model alias {alias!r}"
         )
+    check_deadline()
+    deadline_kwargs = {"deadline": deadline} if deadline is not None else {}
     token = mint_client.mint_model_obo_token_sync(
         user_id=user_id,
         alias=alias,
         audience=obo_audience,
         scopes=mint_scopes,
         grant_leg=grant_leg,
+        **deadline_kwargs,
     )
+    check_deadline()
     if not token:
         log.warning(
             "model_obo.fallback_to_static",

@@ -1132,3 +1132,148 @@ def test_a_token_read_from_its_row_is_memoized_no_longer_than_the_window(backend
     capped = oauth_tokens._parse_iso_to_utc(entry["expires_at"] or "")
     assert capped is not None
     assert capped <= datetime.now(UTC) + timedelta(seconds=model_oauth._MEMO_MAX_AGE_S)
+
+
+@pytest.mark.parametrize("mode", ["entra_app", "entra_obo"])
+def test_expired_model_credential_deadline_never_mints(mode: str) -> None:
+    from unittest.mock import MagicMock
+
+    client = MagicMock()
+    config = ModelConfig(
+        alias="voice",
+        model="voice",
+        base_url="https://voice.example.com/v1",
+        api_key="fallback",
+        auth_mode=mode,
+        obo_audience="api://voice",
+    )
+    with pytest.raises(TimeoutError, match="credential deadline"):
+        resolve_model_backend_auth_token(
+            "voice",
+            config,
+            principal_id="user",
+            config_store=None,
+            mint_client=client,
+            deadline=0.0,
+        )
+    client.mint_app_token_sync.assert_not_called()
+    client.mint_model_obo_token_sync.assert_not_called()
+
+
+def test_model_deadline_bounds_cold_oauth_initialization_without_poisoning_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import time
+    from unittest.mock import MagicMock
+
+    created: list[httpx2.AsyncClient] = []
+    factory_started = threading.Event()
+    release = threading.Event()
+
+    def blocked_factory() -> httpx2.AsyncClient:
+        factory_started.set()
+        assert release.wait(2.0)
+        client = httpx2.AsyncClient()
+        created.append(client)
+        return client
+
+    monkeypatch.setattr(oauth_http, "json_http_client", blocked_factory)
+    context = OAuthContext(token_store=MagicMock())
+    started = time.monotonic()
+    try:
+        with pytest.raises(OAuthUnavailableError, match="initialization failed"):
+            ensure_oauth_runtime(context, deadline=started + 0.1)
+        assert factory_started.is_set()
+        assert time.monotonic() - started < 0.4
+        release.set()
+        # This request timed out, but another caller shares the same startup.
+        runtime = ensure_oauth_runtime(context, deadline=time.monotonic() + 1.0)
+        assert runtime is not None
+
+        async def next_call() -> str:
+            return "recovered"
+
+        assert runtime.call_sync(next_call, deadline=time.monotonic() + 1.0) == "recovered"
+        assert len(created) == 1
+    finally:
+        release.set()
+        if context.runtime is not None:
+            context.runtime.shutdown()
+    assert created and created[0].is_closed
+
+
+def test_model_deadline_bounds_runtime_creation_lock() -> None:
+    import time
+
+    from turnstone.core.oauth.runtime import _runtime_create_lock
+
+    context = OAuthContext()
+    with _runtime_create_lock:
+        started = time.monotonic()
+        with pytest.raises(OAuthUnavailableError, match="deadline expired"):
+            ensure_oauth_runtime(context, deadline=started + 0.05)
+        assert time.monotonic() - started < 0.3
+    assert context.runtime is None
+
+
+def test_model_deadline_bounds_runtime_submission_lock() -> None:
+    import time
+
+    context = OAuthContext()
+    runtime = _runtime(context)
+    calls = []
+
+    async def mint() -> str:
+        calls.append("mint")
+        return "token"
+
+    try:
+        with runtime._submissions:
+            started = time.monotonic()
+            with pytest.raises(OAuthUnavailableError, match="deadline expired"):
+                runtime.call_sync(mint, deadline=started + 0.05)
+            assert time.monotonic() - started < 0.3
+        assert calls == []
+    finally:
+        runtime.shutdown()
+
+
+@pytest.mark.parametrize("race", ["expired-before-wait", "completion-during-timeout"])
+def test_expired_startup_waiter_does_not_stop_an_initialized_runtime(
+    monkeypatch: pytest.MonkeyPatch, race: str
+) -> None:
+    import time
+
+    from turnstone.core.oauth import runtime as runtime_module
+
+    context = OAuthContext()
+    runtime = _runtime(context)
+    try:
+        with monkeypatch.context() as patch:
+            if race == "expired-before-wait":
+                remaining_timeout = runtime_module._remaining_timeout
+
+                def expire_before_wait(timeout, deadline):
+                    if timeout == OAuthRuntime.CALL_TIMEOUT:
+                        raise OAuthUnavailableError("OAuth caller deadline expired")
+                    return remaining_timeout(timeout, deadline)
+
+                patch.setattr(runtime_module, "_remaining_timeout", expire_before_wait)
+            else:
+
+                class FinishesAsWaitExpires(concurrent.futures.Future):
+                    def result(self, timeout=None):
+                        self.set_result(None)
+                        raise TimeoutError("wait expired as initialization finished")
+
+                patch.setattr(runtime, "_initialization", FinishesAsWaitExpires())
+            with pytest.raises((OAuthUnavailableError, TimeoutError)):
+                runtime.start(deadline=time.monotonic() + 1.0)
+
+        async def next_call() -> str:
+            return "still available"
+
+        assert runtime.call_sync(next_call) == "still available"
+        assert runtime._accepting and not runtime._stopping
+    finally:
+        runtime.shutdown()

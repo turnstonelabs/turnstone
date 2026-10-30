@@ -343,10 +343,10 @@ def _close_oauth_runtimes(
     runtimes: list[OAuthRuntime] = []
     start = OAuthRuntime.start
 
-    def tracked_start(runtime: OAuthRuntime) -> None:
+    def tracked_start(runtime: OAuthRuntime, *, deadline: float | None = None) -> None:
         if runtime not in runtimes:
             runtimes.append(runtime)
-        start(runtime)
+        start(runtime, deadline=deadline)
 
     monkeypatch.setattr(OAuthRuntime, "start", tracked_start)
     runner = asyncio.Runner()

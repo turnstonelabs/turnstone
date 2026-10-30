@@ -1050,10 +1050,11 @@ class ModelTokenClient(Protocol):
         scopes: str = "",
         grant_leg: str | None = None,
         timeout: float = 20.0,
+        deadline: float | None = None,
     ) -> str | None: ...
 
     def mint_app_token_sync(
-        self, *, alias: str, audience: str, timeout: float = 20.0
+        self, *, alias: str, audience: str, timeout: float = 20.0, deadline: float | None = None
     ) -> str | None: ...
 
     def invalidate_model_mint_memo_sync(
@@ -1082,11 +1083,13 @@ class OAuthModelTokenClient:
         scopes: str = "",
         grant_leg: str | None = None,
         timeout: float = 20.0,
+        deadline: float | None = None,
     ) -> str | None:
         if not user_id or not alias or not audience:
             return None
         try:
-            runtime = ensure_oauth_runtime(self.context)
+            deadline_kwargs = {"deadline": deadline} if deadline is not None else {}
+            runtime = ensure_oauth_runtime(self.context, **deadline_kwargs)
             if runtime is None:
                 return None
             return runtime.call_sync(
@@ -1099,6 +1102,7 @@ class OAuthModelTokenClient:
                     grant_leg=grant_leg,
                 ),
                 timeout=timeout,
+                **deadline_kwargs,
             )
         except MintDispatchContractError:
             log.error(
@@ -1115,12 +1119,13 @@ class OAuthModelTokenClient:
         return None
 
     def mint_app_token_sync(
-        self, *, alias: str, audience: str, timeout: float = 20.0
+        self, *, alias: str, audience: str, timeout: float = 20.0, deadline: float | None = None
     ) -> str | None:
         if not alias or not audience:
             return None
         try:
-            runtime = ensure_oauth_runtime(self.context)
+            deadline_kwargs = {"deadline": deadline} if deadline is not None else {}
+            runtime = ensure_oauth_runtime(self.context, **deadline_kwargs)
             if runtime is None:
                 return None
             return runtime.call_sync(
@@ -1128,6 +1133,7 @@ class OAuthModelTokenClient:
                     app_state=self.context, alias=alias, audience=audience
                 ),
                 timeout=timeout,
+                **deadline_kwargs,
             )
         except OAuthUnavailableError:
             log.warning("model app token mint unavailable alias=%s", alias)

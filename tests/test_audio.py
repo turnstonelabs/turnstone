@@ -1,15 +1,21 @@
 """Unit tests for the STT/TTS audio helper (model-role resolution + backends).
 
-``transcribe`` / ``synthesize`` are exercised through the registry boundary
-with a mocked OpenAI-SDK client (mocking ``client.audio.*``), so the real
-helper code runs end-to-end without a network call.
+Most tests exercise ``transcribe`` / ``synthesize`` through the registry
+boundary with a mocked OpenAI-SDK client. HTTP deadline regressions also run
+the real SDK and production transport against a local server.
 """
 
 from __future__ import annotations
 
+import contextlib
+import json
 import shutil
+import socket
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import httpx2
@@ -22,6 +28,8 @@ from turnstone.core import audio
 from turnstone.core.admission import ModelAdmission
 from turnstone.core.deadline import DeadlineCancelledError, StreamAbortRef
 from turnstone.core.model_backend_auth import BackendAuthUnavailableError
+from turnstone.core.providers import _http_client as provider_http
+from turnstone.core.providers._http_client import shutdown_on_close
 from turnstone.core.providers._openai_chat import OpenAIChatCompletionsProvider
 
 
@@ -250,7 +258,7 @@ class TestTranscribe:
             audio.transcribe(registry=reg, alias="voice", data=b"x", filename="a.wav")
 
     def test_omni_model_transcribes_via_chat(self, monkeypatch):
-        monkeypatch.setattr(audio, "_to_wav_16k_mono", lambda data: data)
+        monkeypatch.setattr(audio, "_to_wav_16k_mono", lambda data, **kwargs: data)
         client = MagicMock()
         msg = MagicMock(content="  the transcript  ")
         manager, _response = _response_manager(parsed=MagicMock(choices=[MagicMock(message=msg)]))
@@ -274,7 +282,7 @@ class TestTranscribe:
         assert "Only output the transcription" in text_part["text"]
 
     def test_omni_prompt_override_used(self, monkeypatch):
-        monkeypatch.setattr(audio, "_to_wav_16k_mono", lambda data: data)
+        monkeypatch.setattr(audio, "_to_wav_16k_mono", lambda data, **kwargs: data)
         client = MagicMock()
         manager, _response = _response_manager(
             parsed=MagicMock(choices=[MagicMock(message=MagicMock(content="x"))])
@@ -328,7 +336,7 @@ class TestTranscribe:
         call_client.close.assert_not_called()
 
     def test_omni_endpoint_uses_authenticated_clone_and_pinned_config(self, monkeypatch):
-        monkeypatch.setattr(audio, "_to_wav_16k_mono", lambda data: data)
+        monkeypatch.setattr(audio, "_to_wav_16k_mono", lambda data, **kwargs: data)
         base_client = MagicMock()
         call_client = MagicMock()
         base_client.with_options.return_value = call_client
@@ -401,7 +409,7 @@ class TestTranscribe:
         response.parse.assert_not_called()
 
     def test_abort_after_omni_manager_creation_prevents_dispatch(self, monkeypatch):
-        monkeypatch.setattr(audio, "_to_wav_16k_mono", lambda data: data)
+        monkeypatch.setattr(audio, "_to_wav_16k_mono", lambda data, **kwargs: data)
         client = MagicMock()
         ref = StreamAbortRef()
         manager, response = _response_manager(
@@ -848,7 +856,7 @@ class TestOmniChatCall:
     """The omni chat call carries the thinking-off extra_body and a token cap."""
 
     def test_sends_thinking_off_and_token_cap(self, monkeypatch):
-        monkeypatch.setattr(audio, "_to_wav_16k_mono", lambda data: data)
+        monkeypatch.setattr(audio, "_to_wav_16k_mono", lambda data, **kwargs: data)
         client = MagicMock()
         manager, _response = _response_manager(
             parsed=MagicMock(choices=[MagicMock(message=MagicMock(content="hi"))])
@@ -950,7 +958,7 @@ class TestTranscribeStream:
     """``transcribe_stream`` yields content deltas; resolve/transcode are eager."""
 
     def test_streams_chat_deltas_with_thinking_off(self, monkeypatch):
-        monkeypatch.setattr(audio, "_to_wav_16k_mono", lambda data: data)
+        monkeypatch.setattr(audio, "_to_wav_16k_mono", lambda data, **kwargs: data)
         client = MagicMock()
         client.chat.completions.create.return_value = iter(
             [_stream_chunk("and so"), _stream_chunk(None), _stream_chunk(" my fellow americans")]
@@ -993,7 +1001,7 @@ class TestTranscribeStream:
         client.chat.completions.create.assert_not_called()
 
     def test_omni_stream_uses_authenticated_clone_and_abort_closes_handle(self, monkeypatch):
-        monkeypatch.setattr(audio, "_to_wav_16k_mono", lambda data: data)
+        monkeypatch.setattr(audio, "_to_wav_16k_mono", lambda data, **kwargs: data)
         base_client = MagicMock()
         call_client = MagicMock()
         base_client.with_options.return_value = call_client
@@ -1023,7 +1031,7 @@ class TestTranscribeStream:
         call_client.close.assert_not_called()
 
     def test_abort_during_final_omni_request_shaping_prevents_dispatch(self, monkeypatch):
-        monkeypatch.setattr(audio, "_to_wav_16k_mono", lambda data: data)
+        monkeypatch.setattr(audio, "_to_wav_16k_mono", lambda data, **kwargs: data)
         client = MagicMock()
         ref = StreamAbortRef()
 
@@ -1097,7 +1105,7 @@ class TestAudioAdmission:
         gate = ModelAdmission("omni", 1)
         held: dict[str, int] = {}
 
-        def _transcode(data: bytes) -> bytes:
+        def _transcode(data: bytes, **kwargs) -> bytes:
             held["transcode"] = gate.snapshot().in_flight
             return data
 
@@ -1184,7 +1192,7 @@ class TestAudioAdmission:
         holder.release()
 
     def test_an_open_stream_holds_its_slot_until_it_has_been_read(self, monkeypatch):
-        monkeypatch.setattr(audio, "_to_wav_16k_mono", lambda data: data)
+        monkeypatch.setattr(audio, "_to_wav_16k_mono", lambda data, **kwargs: data)
         gate = ModelAdmission("omni", 1)
         stream = MagicMock()
         stream.__iter__.return_value = iter([_stream_chunk("hello")])
@@ -1208,7 +1216,7 @@ class TestAudioAdmission:
     def test_closing_a_stream_nobody_read_gives_its_slot_back(self, monkeypatch):
         # No cancel ref: closing the returned iterator alone must free the slot,
         # which a generator closed before its first next() would not.
-        monkeypatch.setattr(audio, "_to_wav_16k_mono", lambda data: data)
+        monkeypatch.setattr(audio, "_to_wav_16k_mono", lambda data, **kwargs: data)
         gate = ModelAdmission("omni", 1)
         stream = MagicMock()
         client = MagicMock()
@@ -1230,7 +1238,7 @@ class TestAudioAdmission:
     def test_aborting_a_stream_nobody_read_gives_its_slot_back(self, monkeypatch):
         # The endpoint aborts its ref on every exit, so an iterator it drops
         # unread and unclosed still frees the slot.
-        monkeypatch.setattr(audio, "_to_wav_16k_mono", lambda data: data)
+        monkeypatch.setattr(audio, "_to_wav_16k_mono", lambda data, **kwargs: data)
         gate = ModelAdmission("omni", 1)
         stream = MagicMock()
         client = MagicMock()
@@ -1254,7 +1262,7 @@ class TestAudioAdmission:
         stream.close.assert_called_once()
 
     def test_a_stream_that_fails_to_open_gives_its_slot_back(self, monkeypatch):
-        monkeypatch.setattr(audio, "_to_wav_16k_mono", lambda data: data)
+        monkeypatch.setattr(audio, "_to_wav_16k_mono", lambda data, **kwargs: data)
         gate = ModelAdmission("omni", 1)
         client = MagicMock()
         client.chat.completions.create.side_effect = RuntimeError("backend down")
@@ -1271,7 +1279,7 @@ class TestAudioAdmission:
         assert gate.snapshot().in_flight == 0
 
     def test_a_stream_aborted_as_it_opens_gives_its_slot_back(self, monkeypatch):
-        monkeypatch.setattr(audio, "_to_wav_16k_mono", lambda data: data)
+        monkeypatch.setattr(audio, "_to_wav_16k_mono", lambda data, **kwargs: data)
         gate = ModelAdmission("omni", 1)
         stream = MagicMock()
         client = MagicMock()
@@ -1297,7 +1305,7 @@ class TestAudioAdmission:
         stream.close.assert_called_once()
 
     def test_a_full_alias_refuses_a_stream_before_it_opens(self, monkeypatch):
-        monkeypatch.setattr(audio, "_to_wav_16k_mono", lambda data: data)
+        monkeypatch.setattr(audio, "_to_wav_16k_mono", lambda data, **kwargs: data)
         gate = ModelAdmission("omni", 1)
         client = MagicMock()
 
@@ -1352,3 +1360,601 @@ class TestAudioAdmission:
 
         clone.audio.speech.with_streaming_response.create.assert_not_called()
         assert gate.snapshot().queued == 0
+
+
+# ---------------------------------------------------------------------------
+# HTTP dictation budgets through the real SDK
+# ---------------------------------------------------------------------------
+
+
+def _dictate_on_lane(case, client, gate, **kwargs):
+    cfg = (
+        _Cfg("whisper-1")
+        if case.startswith("endpoint")
+        else _Cfg("omni", {"supports_audio_input": True})
+    )
+    arguments = dict(
+        registry=_FakeRegistry("voice", cfg, client, gate),
+        alias="voice",
+        data=b"audio",
+    )
+    arguments.update(kwargs)
+    if case.endswith("stream"):
+        return list(audio.transcribe_stream(**arguments))
+    return audio.transcribe(filename="speech.webm", **arguments)
+
+
+@contextlib.contextmanager
+def _stalled_transcription_backend(
+    case, *, trickle=False, send_stream_headers=False, stream_delta=None, stall_first=True
+):
+    """Stall the first request during upload, before headers, or before stream data."""
+    state = SimpleNamespace(
+        requests=0,
+        uploaded_bytes=0,
+        request_bytes=0,
+        upload_finished_at=None,
+        stop=threading.Event(),
+        start_body=threading.Event(),
+        workers=[],
+    )
+    lock = threading.Lock()
+
+    class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, *_args):
+            pass
+
+        def do_POST(self):
+            self.close_connection = True
+            with lock:
+                state.requests += 1
+                request_number = state.requests
+                state.workers.append(threading.current_thread())
+            self.connection.settimeout(3.0)
+            remaining = int(self.headers["Content-Length"])
+            if request_number == 1 and stall_first:
+                state.request_bytes = remaining
+                if not trickle and not send_stream_headers and state.stop.wait(0.6):
+                    return
+                try:
+                    while remaining and not state.stop.is_set():
+                        chunk = self.rfile.read(min(8192, remaining) if trickle else remaining)
+                        if not chunk:
+                            return
+                        state.uploaded_bytes += len(chunk)
+                        remaining -= len(chunk)
+                        if trickle and state.stop.wait(0.05):
+                            return
+                except OSError:
+                    # A request deadline may shut down a partially sent upload.
+                    return
+                if remaining:
+                    return
+                state.upload_finished_at = time.monotonic()
+                if send_stream_headers:
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/event-stream")
+                    self.send_header("Connection", "close")
+                    self.end_headers()
+                    self.wfile.flush()
+                    if stream_delta is not None and state.start_body.wait(3.0):
+                        payload = json.dumps(
+                            {
+                                "id": "transcript",
+                                "object": "chat.completion.chunk",
+                                "created": 0,
+                                "model": "omni",
+                                "choices": [{"index": 0, "delta": {"content": stream_delta}}],
+                            }
+                        ).encode()
+                        try:
+                            self.wfile.write(b"data: " + payload + b"\n\n")
+                            self.wfile.flush()
+                        except OSError:
+                            return
+                state.stop.wait(5.0)
+                return
+
+            self.rfile.read(remaining)
+            if case.startswith("endpoint"):
+                payload = json.dumps({"text": "recovered"}).encode()
+                content_type = "application/json"
+            else:
+                streaming = case.endswith("stream")
+                result = {
+                    "id": "transcript",
+                    "object": "chat.completion.chunk" if streaming else "chat.completion",
+                    "created": 0,
+                    "model": "omni",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta" if streaming else "message": {
+                                "role": "assistant",
+                                "content": "recovered",
+                            },
+                            "finish_reason": "stop",
+                        }
+                    ],
+                }
+                payload = json.dumps(result).encode()
+                if streaming:
+                    payload = b"data: " + payload + b"\n\ndata: [DONE]\n\n"
+                content_type = "text/event-stream" if streaming else "application/json"
+            self.send_response(200)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(payload)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(payload)
+
+    class Server(ThreadingHTTPServer):
+        daemon_threads = False
+
+    server = Server(("127.0.0.1", 0), Handler)
+    server_thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01})
+    server_thread.start()
+    state.base_url = f"http://127.0.0.1:{server.server_port}/v1"
+    try:
+        yield state
+    finally:
+        state.stop.set()
+        state.start_body.set()
+        server.shutdown()
+        server.server_close()  # Joins every non-daemon request worker.
+        server_thread.join(timeout=3.0)
+        assert not server_thread.is_alive()
+        assert all(not worker.is_alive() for worker in state.workers)
+
+
+@pytest.mark.parametrize("case", ["endpoint", "endpoint-stream", "omni", "omni-stream"])
+class TestTranscriptionHttpBudget:
+    def test_upload_and_silent_headers_share_one_deadline(self, monkeypatch, case):
+        monkeypatch.setattr(audio, "_to_wav_16k_mono", lambda data, **kwargs: data)
+        gate = ModelAdmission("voice", 1)
+        budget = 1.2
+        transport = httpx2.HTTPTransport(
+            socket_options=[(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)]
+        )
+        with (
+            _stalled_transcription_backend(case) as backend,
+            openai.OpenAI(
+                api_key="sk-test",
+                base_url=backend.base_url,
+                max_retries=2,
+                timeout=3.0,
+                http_client=shutdown_on_close(httpx2.Client(transport=transport)),
+            ) as client,
+        ):
+            started = time.monotonic()
+            with pytest.raises(audio.AudioBackendError) as caught:
+                _dictate_on_lane(
+                    case,
+                    client,
+                    gate,
+                    data=b"x" * (1024 * 1024),
+                    deadline=started + budget,
+                )
+            elapsed = time.monotonic() - started
+            causes = []
+            cause = caught.value
+            while cause is not None:
+                causes.append(cause)
+                cause = cause.__cause__
+            assert any(isinstance(cause, openai.APITimeoutError) for cause in causes)
+            assert any(isinstance(cause, httpx2.ReadTimeout) for cause in causes)
+            assert backend.requests == 1
+            assert backend.upload_finished_at is not None
+            assert 0.55 <= backend.upload_finished_at - started < budget
+            assert backend.uploaded_bytes == backend.request_bytes
+            assert gate.snapshot().in_flight == 0
+
+            # The expired request must not leave its deadline attached to this client.
+            recovered = _dictate_on_lane(case, client, gate)
+            assert (
+                "".join(recovered) if case.endswith("stream") else recovered.transcript
+            ) == "recovered"
+            assert backend.requests == 2
+            assert gate.snapshot().in_flight == 0
+            assert client.max_retries == 2
+            assert client.timeout == 3.0
+            assert elapsed <= budget + 0.3, f"upload plus silent read took {elapsed:.3f}s"
+
+    @pytest.mark.parametrize("failure", ["retry-after", "timeout"])
+    def test_failed_attempt_is_not_retried_and_releases_the_slot(self, monkeypatch, case, failure):
+        monkeypatch.setattr(audio, "time", SimpleNamespace(monotonic=lambda: 100.0))
+        monkeypatch.setattr(provider_http, "time", audio.time)
+        monkeypatch.setattr(audio, "_to_wav_16k_mono", lambda data, **kwargs: data)
+        gate = ModelAdmission("voice", 1)
+        seen = []
+
+        def backend(request):
+            seen.append(request.extensions["timeout"])
+            assert gate.snapshot().in_flight == 1
+            assert request.headers["authorization"] == "Bearer minted-token"
+            if failure == "timeout":
+                raise httpx2.ReadTimeout("backend silent before headers", request=request)
+            return httpx2.Response(
+                503, headers={"Retry-After": "120"}, json={"error": "overloaded"}
+            )
+
+        with openai.OpenAI(
+            api_key="original-token",
+            base_url="http://speech.example.com/v1",
+            max_retries=2,
+            timeout=600.0,
+            http_client=httpx2.Client(transport=httpx2.MockTransport(backend)),
+        ) as client:
+            with pytest.raises(audio.AudioBackendError):
+                _dictate_on_lane(
+                    case,
+                    client,
+                    gate,
+                    deadline=103.0,
+                    backend_auth_resolver=lambda *_: "minted-token",
+                )
+            assert client.api_key == "original-token"
+            assert client.max_retries == 2
+            assert client.timeout == 600.0
+
+        assert seen == [{"connect": 3.0, "read": 3.0, "write": 3.0, "pool": 3.0}]
+        assert gate.snapshot().in_flight == 0
+
+    def test_no_http_deadline_preserves_client_timeouts_and_retries(self, monkeypatch, case):
+        monkeypatch.setattr(audio, "_to_wav_16k_mono", lambda data, **kwargs: data)
+        gate = ModelAdmission("voice", 1)
+        seen = []
+
+        def backend(request):
+            seen.append(request.extensions["timeout"])
+            return httpx2.Response(
+                503, headers={"Retry-After": "0.001"}, json={"error": "overloaded"}
+            )
+
+        with (
+            openai.OpenAI(
+                api_key="sk-test",
+                base_url="http://speech.example.com/v1",
+                max_retries=1,
+                timeout=17.0,
+                http_client=httpx2.Client(transport=httpx2.MockTransport(backend)),
+            ) as client,
+            pytest.raises(audio.AudioBackendError),
+        ):
+            _dictate_on_lane(case, client, gate)
+
+        timeout = audio._OMNI_STT_TIMEOUT_S if case == "omni-stream" else 17.0
+        assert seen == [dict.fromkeys(("connect", "read", "write", "pool"), timeout)] * 2
+        assert gate.snapshot().in_flight == 0
+
+    def test_preparation_admission_and_auth_share_the_budget(self, monkeypatch, case):
+        now = [100.0]
+        monkeypatch.setattr(audio, "time", SimpleNamespace(monotonic=lambda: now[0]))
+        monkeypatch.setattr(provider_http, "time", audio.time)
+        gate = ModelAdmission("voice", 1)
+        original_acquire = gate.acquire
+        seen = {}
+
+        def transcode(*args, **kwargs):
+            seen["transcode"] = kwargs["timeout"]
+            assert gate.snapshot().in_flight == 0
+            now[0] += 2.0
+            return SimpleNamespace(returncode=0, stdout=b"wav", stderr=b"")
+
+        def acquire(**kwargs):
+            seen["admission"] = kwargs["timeout"]
+            now[0] += 3.0
+            return original_acquire(**kwargs)
+
+        def authenticate(*args):
+            assert gate.snapshot().in_flight == 1
+            now[0] += 4.0
+            return "minted-token"
+
+        def backend(request):
+            seen["backend"] = request.extensions["timeout"]
+            assert request.headers["authorization"] == "Bearer minted-token"
+            return httpx2.Response(400, json={"error": "test complete"})
+
+        monkeypatch.setattr(audio.subprocess, "run", transcode)
+        monkeypatch.setattr(gate, "acquire", acquire)
+        with (
+            openai.OpenAI(
+                api_key="original-token",
+                base_url="http://speech.example.com/v1",
+                http_client=httpx2.Client(transport=httpx2.MockTransport(backend)),
+            ) as client,
+            pytest.raises(audio.AudioBackendError),
+        ):
+            _dictate_on_lane(
+                case,
+                client,
+                gate,
+                deadline=125.0,
+                admission_wait_s=100.0,
+                backend_auth_resolver=authenticate,
+            )
+
+        if case.startswith("omni"):
+            assert seen["transcode"] == 25.0
+            assert seen["admission"] == 23.0
+            remaining = 16.0
+        else:
+            assert "transcode" not in seen
+            assert seen["admission"] == 25.0
+            remaining = 18.0
+        assert seen["backend"] == dict(connect=5.0, read=remaining, write=remaining, pool=remaining)
+        assert gate.snapshot().in_flight == 0
+
+    def test_expired_auth_budget_prevents_dispatch_and_releases_the_slot(self, monkeypatch, case):
+        now = [100.0]
+        monkeypatch.setattr(audio, "time", SimpleNamespace(monotonic=lambda: now[0]))
+        monkeypatch.setattr(provider_http, "time", audio.time)
+        monkeypatch.setattr(audio, "_to_wav_16k_mono", lambda data, **kwargs: data)
+        gate = ModelAdmission("voice", 1)
+        client = MagicMock()
+
+        def authenticate(*args):
+            assert gate.snapshot().in_flight == 1
+            now[0] = 126.0
+            return "minted-token"
+
+        with pytest.raises(audio.AudioBackendError, match="timed out"):
+            _dictate_on_lane(case, client, gate, deadline=125.0, backend_auth_resolver=authenticate)
+
+        client.with_options.assert_called_once_with(api_key="minted-token")
+        client.with_options.return_value.with_options.assert_not_called()
+        client.with_options.return_value.audio.transcriptions.with_streaming_response.create.assert_not_called()
+        client.with_options.return_value.chat.completions.with_streaming_response.create.assert_not_called()
+        client.with_options.return_value.chat.completions.create.assert_not_called()
+        assert gate.snapshot().in_flight == 0
+
+
+def test_slow_dns_releases_dictation_capacity_before_resolver_returns(monkeypatch):
+    gate = ModelAdmission("voice", 1)
+    resolver_started = threading.Event()
+    release_resolver = threading.Event()
+    resolver_threads = []
+    original_getaddrinfo = socket.getaddrinfo
+
+    def slow_getaddrinfo(host, port, *args, **kwargs):
+        if host in ("slow.invalid", b"slow.invalid"):
+            resolver_threads.append(threading.current_thread())
+            assert gate.snapshot().in_flight == 1
+            resolver_started.set()
+            release_resolver.wait(1.0)
+            host = "127.0.0.1"
+        return original_getaddrinfo(host, port, *args, **kwargs)
+
+    with (
+        _stalled_transcription_backend("endpoint", stall_first=False) as backend,
+        openai.OpenAI(
+            api_key="sk-test",
+            base_url=backend.base_url.replace("127.0.0.1", "slow.invalid"),
+            http_client=shutdown_on_close(httpx2.Client(trust_env=False)),
+        ) as client,
+    ):
+        monkeypatch.setattr(socket, "getaddrinfo", slow_getaddrinfo)
+        try:
+            started = time.monotonic()
+            with pytest.raises(audio.AudioBackendError) as caught:
+                _dictate_on_lane("endpoint", client, gate, deadline=started + 0.15)
+            elapsed = time.monotonic() - started
+            assert elapsed < 0.7, f"slow DNS held dictation capacity for {elapsed:.3f}s"
+            assert resolver_started.is_set()
+            assert not release_resolver.is_set()
+            assert resolver_threads[0].is_alive()
+            assert gate.snapshot().in_flight == 0
+            assert backend.requests == 0
+            causes = []
+            cause = caught.value
+            while cause is not None:
+                causes.append(cause)
+                cause = cause.__cause__
+            assert any(isinstance(cause, openai.APITimeoutError) for cause in causes)
+            assert any(isinstance(cause, httpx2.ConnectTimeout) for cause in causes)
+        finally:
+            release_resolver.set()
+            for thread in resolver_threads:
+                thread.join(timeout=3.0)
+                assert not thread.is_alive()
+
+        # Completing abandoned DNS must not connect or submit a late request.
+        assert backend.requests == 0
+        client.base_url = backend.base_url
+        assert _dictate_on_lane("endpoint", client, gate).transcript == "recovered"
+        assert backend.requests == 1
+        assert gate.snapshot().in_flight == 0
+
+
+def test_trickling_upload_cannot_renew_the_transcription_deadline():
+    gate = ModelAdmission("voice", 1)
+    budget = 1.0
+    transport = httpx2.HTTPTransport(socket_options=[(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)])
+    with (
+        _stalled_transcription_backend("endpoint", trickle=True) as backend,
+        openai.OpenAI(
+            api_key="sk-test",
+            base_url=backend.base_url,
+            max_retries=2,
+            timeout=3.0,
+            http_client=shutdown_on_close(httpx2.Client(transport=transport)),
+        ) as client,
+    ):
+        started = time.monotonic()
+        with pytest.raises(audio.AudioBackendError) as caught:
+            _dictate_on_lane(
+                "endpoint",
+                client,
+                gate,
+                data=b"x" * (1024 * 1024),
+                deadline=started + budget,
+            )
+        elapsed = time.monotonic() - started
+        causes = []
+        cause = caught.value
+        while cause is not None:
+            causes.append(cause)
+            cause = cause.__cause__
+        assert any(isinstance(cause, openai.APITimeoutError) for cause in causes)
+        assert any(isinstance(cause, httpx2.WriteTimeout) for cause in causes)
+        assert backend.requests == 1
+        assert 0 < backend.uploaded_bytes < backend.request_bytes
+        assert backend.upload_finished_at is None
+        assert gate.snapshot().in_flight == 0
+        assert _dictate_on_lane("endpoint", client, gate).transcript == "recovered"
+        assert backend.requests == 2
+        assert gate.snapshot().in_flight == 0
+        assert elapsed <= budget + 0.3, f"trickling upload took {elapsed:.3f}s"
+
+
+def test_unread_omni_stream_deadline_closes_response_and_releases_slot(monkeypatch):
+    monkeypatch.setattr(audio, "_to_wav_16k_mono", lambda data, **kwargs: data)
+    gate = ModelAdmission("voice", 1)
+    responses = []
+    budget = 0.8
+    with (
+        _stalled_transcription_backend("omni-stream", send_stream_headers=True) as backend,
+        openai.OpenAI(
+            api_key="sk-test",
+            base_url=backend.base_url,
+            http_client=shutdown_on_close(
+                httpx2.Client(event_hooks={"response": [responses.append]})
+            ),
+        ) as client,
+    ):
+        started = time.monotonic()
+        stream = audio.transcribe_stream(
+            registry=_FakeRegistry(
+                "voice", _Cfg("omni", {"supports_audio_input": True}), client, gate
+            ),
+            alias="voice",
+            data=b"audio",
+            deadline=started + budget,
+        )
+        try:
+            assert gate.snapshot().in_flight == 1
+            assert len(responses) == 1
+            assert not responses[0].is_closed
+            # No next() call: expiry must close and release an idle consumer's stream.
+            wait_until(lambda: gate.snapshot().in_flight == 0, timeout=budget + 0.3)
+            assert time.monotonic() - started <= budget + 0.3
+            assert responses[0].is_closed
+            assert backend.requests == 1
+            with pytest.raises(audio.AudioBackendError, match="deadline exceeded"):
+                next(stream)
+            assert _dictate_on_lane("omni-stream", client, gate) == ["recovered"]
+            assert gate.snapshot().in_flight == 0
+        finally:
+            stream.close()
+
+
+def test_omni_stream_carries_deadline_to_another_worker_and_restores_context(monkeypatch):
+    monkeypatch.setattr(audio, "_to_wav_16k_mono", lambda data, **kwargs: data)
+    gate = ModelAdmission("voice", 1)
+    budget = 0.8
+    network_reads = []
+    original_read = provider_http._ShutdownStream.read
+
+    def observe_read(self, *args, **kwargs):
+        # Observe the real socket boundary without replacing its blocking read.
+        network_reads.append((threading.get_ident(), provider_http._request_deadline.get()))
+        return original_read(self, *args, **kwargs)
+
+    monkeypatch.setattr(provider_http._ShutdownStream, "read", observe_read)
+    with (
+        _stalled_transcription_backend(
+            "omni-stream", send_stream_headers=True, stream_delta="first"
+        ) as backend,
+        openai.OpenAI(
+            api_key="sk-test",
+            base_url=backend.base_url,
+            http_client=shutdown_on_close(httpx2.Client()),
+        ) as client,
+        ThreadPoolExecutor(max_workers=1) as opening_worker,
+        ThreadPoolExecutor(max_workers=1) as consuming_worker,
+    ):
+        started = time.monotonic()
+        deadline = started + budget
+
+        def open_stream():
+            stream = audio.transcribe_stream(
+                registry=_FakeRegistry(
+                    "voice", _Cfg("omni", {"supports_audio_input": True}), client, gate
+                ),
+                alias="voice",
+                data=b"audio",
+                deadline=deadline,
+            )
+            assert provider_http._request_deadline.get() is None
+            return threading.get_ident(), stream
+
+        opening_thread, stream = opening_worker.submit(open_stream).result(timeout=3.0)
+
+        def consume_stream():
+            assert provider_http._request_deadline.get() is None
+            backend.start_body.set()
+            try:
+                assert next(stream) == "first"
+                assert time.monotonic() < deadline
+                assert gate.snapshot().in_flight == 1
+                assert provider_http._request_deadline.get() is None
+                # The backend remains silent after the first delta. The request's
+                # original deadline must govern this worker's next socket read.
+                with pytest.raises(openai.APIConnectionError) as caught:
+                    next(stream)
+                assert provider_http._request_deadline.get() is None
+                return threading.get_ident(), caught.value, time.monotonic() - started
+            finally:
+                stream.close()
+
+        try:
+            consuming_thread, failure, elapsed = consuming_worker.submit(consume_stream).result(
+                timeout=3.0
+            )
+            assert consuming_thread != opening_thread
+            consumer_budgets = [
+                value for thread, value in network_reads if thread == consuming_thread
+            ]
+            assert consumer_budgets
+            assert all(
+                value is not None and value.deadline == deadline for value in consumer_budgets
+            )
+            causes = []
+            while failure is not None:
+                causes.append(failure)
+                failure = failure.__cause__
+            assert any(isinstance(cause, httpx2.ReadTimeout) for cause in causes)
+            assert elapsed <= budget + 0.3, f"cross-worker stream read took {elapsed:.3f}s"
+            assert gate.snapshot().in_flight == 0
+            assert backend.requests == 1
+            assert _dictate_on_lane("omni-stream", client, gate) == ["recovered"]
+            assert gate.snapshot().in_flight == 0
+        finally:
+            stream.close()
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_expired_transcode_budget_does_not_take_a_slot(monkeypatch, stream):
+    now = [100.0]
+    monkeypatch.setattr(audio, "time", SimpleNamespace(monotonic=lambda: now[0]))
+    monkeypatch.setattr(provider_http, "time", audio.time)
+    gate = ModelAdmission("voice", 1)
+    acquire = MagicMock(wraps=gate.acquire)
+    monkeypatch.setattr(gate, "acquire", acquire)
+    client = MagicMock()
+
+    def transcode(*args, **kwargs):
+        assert kwargs["timeout"] == 25.0
+        now[0] = 126.0
+        return SimpleNamespace(returncode=0, stdout=b"wav", stderr=b"")
+
+    monkeypatch.setattr(audio.subprocess, "run", transcode)
+    with pytest.raises(audio.AudioBackendError, match="timed out"):
+        _dictate_on_lane("omni-stream" if stream else "omni", client, gate, deadline=125.0)
+
+    acquire.assert_not_called()
+    client.with_options.assert_not_called()
+    assert gate.snapshot().in_flight == 0

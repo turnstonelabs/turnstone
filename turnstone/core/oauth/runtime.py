@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import contextlib
 import threading
+import time
 from typing import TYPE_CHECKING, Any
 
 from turnstone.core.log import get_logger
@@ -18,11 +20,34 @@ from turnstone.core.oauth.work import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Coroutine
+    from collections.abc import Callable, Coroutine, Iterator
 
     import httpx2
 
 log = get_logger(__name__)
+
+
+def _remaining_timeout(timeout: float, deadline: float | None) -> float:
+    if deadline is None:
+        return timeout
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise OAuthUnavailableError("OAuth caller deadline expired")
+    return min(timeout, remaining)
+
+
+@contextlib.contextmanager
+def _deadline_lock(lock: Any, deadline: float | None) -> Iterator[None]:
+    if deadline is None:
+        lock.acquire()
+    elif not lock.acquire(timeout=_remaining_timeout(threading.TIMEOUT_MAX, deadline)):
+        raise OAuthUnavailableError("OAuth caller deadline expired")
+    try:
+        if deadline is not None:
+            _remaining_timeout(threading.TIMEOUT_MAX, deadline)
+        yield
+    finally:
+        lock.release()
 
 
 class OAuthRuntime:
@@ -49,33 +74,61 @@ class OAuthRuntime:
         self._thread: threading.Thread | None = None
         self._submissions = threading.Lock()
         self._accepting = False
+        self._stopping = False
+        self._initialization: concurrent.futures.Future[None] | None = None
         self._operations: set[asyncio.Task[Any]] = set()
         self._work: OAuthWork | None = None
 
-    def start(self) -> None:
-        """Start once; stopped instances are never replaced or restarted."""
-        with self._submissions:
-            if self._loop is not None:
+    def start(self, *, deadline: float | None = None) -> None:
+        """Start once; a timed-out waiter leaves shared initialization running."""
+        with _deadline_lock(self._submissions, deadline):
+            if self._stopping:
                 return
-            loop = asyncio.new_event_loop()
-            self._loop = loop
-            self._thread = threading.Thread(target=loop.run_forever, name="oauth-loop", daemon=True)
-            self._thread.start()
+            if self._loop is None:
+                loop = asyncio.new_event_loop()
+                self._loop = loop
+                self._thread = threading.Thread(
+                    target=loop.run_forever, name="oauth-loop", daemon=True
+                )
+                self._thread.start()
 
-            async def initialize() -> None:
-                self._work = OAuthWork(loop)
-                self.context.http_client = (self._client_factory or oauth_http.json_http_client)()
+                async def initialize() -> None:
+                    self._work = OAuthWork(loop)
+                    self.context.http_client = (
+                        self._client_factory or oauth_http.json_http_client
+                    )()
+                    with self._submissions:
+                        if not self._stopping:
+                            self._accepting = True
 
-            future = asyncio.run_coroutine_threadsafe(initialize(), loop)
-            try:
-                future.result(timeout=self.CALL_TIMEOUT)
-            except BaseException:
-                loop.call_soon_threadsafe(loop.stop)
-                self._thread.join(timeout=self.THREAD_JOIN_TIMEOUT)
-                if not self._thread.is_alive():
-                    loop.close()
+                self._initialization = asyncio.run_coroutine_threadsafe(initialize(), loop)
+            future = self._initialization
+        assert future is not None
+        timeout = _remaining_timeout(self.CALL_TIMEOUT, deadline)
+        try:
+            future.result(timeout=timeout)
+        except BaseException as exc:
+            if deadline is not None and (
+                not future.done() or future.cancelled() or future.exception() is not exc
+            ):
+                # Only an initialization failure belongs to this shared runtime.
+                # A caller timeout must not stop it, even if initialization won
+                # the race and completed while the waiter handled that timeout.
                 raise
-            self._accepting = True
+            with self._submissions:
+                self._stopping = True
+                self._accepting = False
+            loop = self._loop
+            thread = self._thread
+            assert loop is not None and thread is not None
+            loop.call_soon_threadsafe(loop.stop)
+            join_timeout = self.THREAD_JOIN_TIMEOUT
+            if deadline is not None:
+                join_timeout = min(join_timeout, max(0.0, deadline - time.monotonic()))
+            thread.join(timeout=join_timeout)
+            if not thread.is_alive():
+                loop.close()
+            raise
 
     async def _run[T](self, factory: Callable[[], Coroutine[Any, Any, T]]) -> T:
         task = asyncio.current_task()
@@ -110,9 +163,9 @@ class OAuthRuntime:
             _active_work.reset(token)
 
     def _submit[T](
-        self, factory: Callable[[], Coroutine[Any, Any, T]]
+        self, factory: Callable[[], Coroutine[Any, Any, T]], *, deadline: float | None = None
     ) -> concurrent.futures.Future[T]:
-        with self._submissions:
+        with _deadline_lock(self._submissions, deadline):
             loop = self._loop
             if not self._accepting or loop is None or not loop.is_running() or loop.is_closed():
                 raise OAuthRuntimeRefusedError("OAuth runtime is unavailable")
@@ -144,13 +197,19 @@ class OAuthRuntime:
             raise
 
     def call_sync[T](
-        self, factory: Callable[[], Coroutine[Any, Any, T]], *, timeout: float = CALL_TIMEOUT
+        self,
+        factory: Callable[[], Coroutine[Any, Any, T]],
+        *,
+        timeout: float = CALL_TIMEOUT,
+        deadline: float | None = None,
     ) -> T:
         if self._thread is threading.current_thread():
             raise OAuthUnavailableError("Cannot block the OAuth loop on itself")
-        future = self._submit(factory)
+        future = (
+            self._submit(factory) if deadline is None else self._submit(factory, deadline=deadline)
+        )
         try:
-            return future.result(timeout=timeout)
+            return future.result(timeout=_remaining_timeout(timeout, deadline))
         except concurrent.futures.TimeoutError:
             # An operation-raised TimeoutError is not a caller deadline.
             if future.done():
@@ -159,6 +218,9 @@ class OAuthRuntime:
             raise OAuthUnavailableError("OAuth caller deadline expired") from None
         except concurrent.futures.CancelledError:
             raise OAuthUnavailableError("OAuth runtime cancelled operation") from None
+        except OAuthUnavailableError:
+            future.cancel()
+            raise
 
     def _warn_outstanding(self, phase: str) -> None:
         work = self._work
@@ -213,6 +275,7 @@ class OAuthRuntime:
     def shutdown(self) -> None:
         """Quiesce submissions, drain within budgets, close HTTP, and join the loop."""
         with self._submissions:
+            self._stopping = True
             self._accepting = False
             loop = self._loop
         if loop is None or loop.is_closed():
@@ -247,19 +310,23 @@ class OAuthRuntime:
 _runtime_create_lock = threading.Lock()
 
 
-def ensure_oauth_runtime(host: Any) -> OAuthRuntime | None:
+def ensure_oauth_runtime(host: Any, *, deadline: float | None = None) -> OAuthRuntime | None:
     """Lazily start the host's one runtime when encrypted token storage is available."""
     context = oauth_context(host)
-    with _runtime_create_lock:
+    with _deadline_lock(_runtime_create_lock, deadline):
         if context.runtime is None and context.token_store is not None:
-            runtime = OAuthRuntime(context)
-            context.runtime = runtime
-            try:
+            context.runtime = OAuthRuntime(context)
+        runtime = context.runtime
+    if runtime is not None:
+        try:
+            if deadline is None:
                 runtime.start()
-            except Exception as exc:
-                log.error("OAuth runtime initialization failed", exc_info=True)
-                raise OAuthUnavailableError("OAuth runtime initialization failed") from exc
-        return context.runtime
+            else:
+                runtime.start(deadline=deadline)
+        except Exception as exc:
+            log.error("OAuth runtime initialization failed", exc_info=True)
+            raise OAuthUnavailableError("OAuth runtime initialization failed") from exc
+    return runtime
 
 
 def shutdown_oauth_runtime(host: Any) -> None:

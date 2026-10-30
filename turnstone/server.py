@@ -1696,9 +1696,14 @@ _STT_UPLOAD_CAP = 25 * 1024 * 1024  # 25 MiB — generous for short dictation cl
 # generation on a shared alias that is about to end.  The console's wait for a
 # forwarded request is _PROXY_CLIENT_TIMEOUT_S (30 s), and this leaves half of it
 # for the transcode and the transcription, so a busy node says so instead of the
-# console reporting no reply.  test_dictation_wait_leaves_room_in_the_console_wait
-# pins the two numbers.
+# console reporting no reply.
 _STT_ADMISSION_WAIT_S = 15.0
+
+# Budget from arrival for HTTP dictation preparation and one backend attempt.
+# The transcode, admission and credential lookup all reduce the backend's I/O
+# timeout. Active network I/O also shares this deadline, including uploads and
+# progressing streams. Leave room before the console's 30 s wait.
+_STT_REQUEST_TIMEOUT_S = 25.0
 
 # How many dictations a node admits at once.  Each transcodes, waits for its slot
 # and makes or opens its backend call on a thread of its own; a streamed
@@ -1761,7 +1766,9 @@ class _SpeechCapacity:
         self.executor.shutdown(wait=True, cancel_futures=True)
 
 
-def _audio_backend_auth_resolver(request: Request) -> Callable[[str, Any], str | None]:
+def _audio_backend_auth_resolver(
+    request: Request, *, deadline: float | None = None
+) -> Callable[[str, Any], str | None]:
     """Bind one audio HTTP request to its authenticated model principal."""
     from turnstone.core.model_backend_auth import resolve_model_backend_auth_token
 
@@ -1776,6 +1783,7 @@ def _audio_backend_auth_resolver(request: Request) -> Callable[[str, Any], str |
             principal_id=principal_id,
             config_store=config_store,
             mint_client=mint_client,
+            deadline=deadline,
         )
 
     return _resolve
@@ -1812,11 +1820,11 @@ async def _abort_when_caller_leaves(request: Request, abort_ref: Any, done: asyn
     cancelled once it is inside the SDK read.  Aborting ``abort_ref`` is what
     stops the work: a wait for the alias's admission slot gives up its place, and
     the backend response the call published on ``abort_ref`` is closed, so the
-    next read raises and the worker returns instead of reading an answer nobody
-    is waiting for.  A read already waiting on a silent backend notices only when
-    bytes arrive, and before the backend sends headers there is no handle yet.
-    The backend call's own timeout bounds both: 80 s of silence for a play, and the
-    model client's timeout and retries for a dictation, by default 600 s an attempt.
+    transport shuts down its socket, waking even a read already blocked on a
+    silent backend. Before the backend sends headers there is no response handle
+    to publish. The backend call's own timeout bounds that interval: 80 s of
+    silence for a play, and
+    the remainder of the 25 s HTTP request budget for a dictation. Neither retries.
 
     The caller is the browser on a direct connection, or the console.  The
     console closes its node request when the browser leaves a ``tts`` call
@@ -1853,13 +1861,19 @@ async def _run_dictation[T](
     a free dictation thread, and the call's ``admission_wait_s`` for its model's slot.  A
     dictation that gets no thread in time is refused as one that gets no slot is, so a node whose
     threads are all held by long transcriptions still answers 429 before the console stops
-    waiting.  The context copy carries the request's log fields, as asyncio.to_thread does.
+    waiting. The call also receives a deadline from arrival, so preparation and admission
+    reduce the backend timeout instead of restarting its budget. The context copy carries
+    the request's log fields, as asyncio.to_thread does.
     """
     from turnstone.core.audio import AudioBusyError
 
     def _with_remaining_wait() -> T:
         remaining = _STT_ADMISSION_WAIT_S - (time.monotonic() - arrived)
-        return call(**kwargs, admission_wait_s=max(0.0, remaining))
+        return call(
+            **kwargs,
+            admission_wait_s=max(0.0, remaining),
+            deadline=arrived + _STT_REQUEST_TIMEOUT_S,
+        )
 
     threads: ThreadPoolExecutor = request.app.state.stt
     context = contextvars.copy_context()
@@ -1935,7 +1949,9 @@ async def speech_to_text(request: Request) -> JSONResponse:
     if config_store is not None:
         stt_prompt = (config_store.get("audio.stt_prompt") or "").strip()
     abort_ref = StreamAbortRef()
-    backend_auth_resolver = _audio_backend_auth_resolver(request)
+    backend_auth_resolver = _audio_backend_auth_resolver(
+        request, deadline=arrived + _STT_REQUEST_TIMEOUT_S
+    )
     try:
         # Blocking SDK round-trip, off the event loop.
         async with _caller_watched(request, abort_ref):
@@ -2035,7 +2051,9 @@ async def speech_to_text_stream(request: Request) -> Response:
     if config_store is not None:
         stt_prompt = (config_store.get("audio.stt_prompt") or "").strip()
     abort_ref = StreamAbortRef()
-    backend_auth_resolver = _audio_backend_auth_resolver(request)
+    backend_auth_resolver = _audio_backend_auth_resolver(
+        request, deadline=arrived + _STT_REQUEST_TIMEOUT_S
+    )
 
     # Resolve + transcode + admission + open the stream eagerly (off the event
     # loop) so the common failures map to a clean status before any bytes are
