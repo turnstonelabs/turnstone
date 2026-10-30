@@ -165,12 +165,13 @@ same remainder. The transport shuts down active I/O at the deadline, even if an
 upload or response is still delivering bytes. A backend error or timeout, or a
 budget that runs out during the transcode or credential minting, returns 502
 without a retry, so a long clip may now fail where it previously succeeded late,
-even on a direct connection. A budget that runs out while the dictation waits
-for its slot returns 429, as a wait that finds no slot does. Once the streamed
-route has begun sending a transcript from a chat model that takes audio, its 200
-is already sent: a timeout or backend error then ends the transcript early, and
-one that ends before any text reads as no speech in the browser. A play needs
-most of its 90 seconds for synthesis, so read-aloud does not wait at all (see
+even on a direct connection. A wait for a slot that runs out returns 429
+instead, whichever limit ends it; the budget ends it first only after a
+transcode of more than about ten seconds. Once the streamed route has begun
+sending a transcript from a chat model that takes audio, its 200 is already
+sent: a timeout or backend error then ends the transcript early, and one that
+ends before any text reads as no speech in the browser. A play needs most of
+its 90 seconds for synthesis, so read-aloud does not wait at all (see
 [Speech Synthesis Limits](#speech-synthesis-limits)). When no slot comes free in
 time the node answers 429 with `Retry-After`, which the browser waits out and
 retries twice. A node admits at most four dictations at once: each transcodes,

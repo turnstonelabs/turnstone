@@ -258,12 +258,12 @@ class _AdmittedStream:
 class _TranscriptDeltas:
     """The transcript deltas of one :class:`_AdmittedStream`, for the caller to iterate.
 
-    Ending, failing or closing it closes the stream and gives the slot back, also before the first
-    delta is read, which a bare generator can't do: one closed before its first ``next()`` never
-    runs its ``finally``.  Close it from the thread that iterates it.  Any other thread aborts the
-    caller's ``cancel_ref`` instead, which closes the held stream without touching a generator
-    that may be running.  Once it has ended, failed or been closed it stays exhausted, as a
-    generator does, rather than reporting a deadline that passes afterwards.
+    Ending or closing it closes the stream and gives the slot back, also before the first delta
+    is read, which a bare generator can't do: one closed before its first ``next()`` never runs its
+    ``finally``.  Close it from the thread that iterates it.  Any other thread aborts the caller's
+    ``cancel_ref`` instead, which closes the held stream without touching a generator that may be
+    running.  Once it has ended, failed or been closed it stays exhausted, as a generator does,
+    rather than reporting a deadline that passes afterwards.
     """
 
     def __init__(self, held: _AdmittedStream, cancel_ref: Any) -> None:
@@ -286,7 +286,7 @@ class _TranscriptDeltas:
                 self._held.deadline.remaining(AudioBackendError)
                 return next(self._deltas)
         except BaseException:
-            self.close()
+            self._finished = True
             raise
 
     def close(self) -> None:
@@ -798,7 +798,7 @@ def transcribe_stream(
         except BaseException:
             held.close()
             raise
-    except (AudioBackendError, AudioBusyError, BackendAuthUnavailableError):
+    except (AudioBusyError, BackendAuthUnavailableError):
         raise
     except Exception as exc:
         refuse_aborted_request(cancel_ref)
