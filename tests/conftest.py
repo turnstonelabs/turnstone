@@ -333,6 +333,21 @@ def _default_sqlite_outside_the_repo(
 
 
 @pytest.fixture(autouse=True)
+def _no_ambient_proxies(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Clear the runner's proxy variables, so that no test depends on them.
+
+    A client built while they are set sends through the runner's proxy, past any transport the
+    test swapped in, and holds proxy mounts the test does not expect. Tests that exercise proxies
+    set their own. Live tests keep them: they reach real providers, which may need the proxy.
+    """
+    if request.node.get_closest_marker("live"):
+        return
+    for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY"):
+        monkeypatch.delenv(name, raising=False)
+        monkeypatch.delenv(name.lower(), raising=False)
+
+
+@pytest.fixture(autouse=True)
 def _close_oauth_runtimes(
     monkeypatch: pytest.MonkeyPatch, _no_leaked_threads: None
 ) -> Iterator[None]:
