@@ -6700,6 +6700,43 @@ class TestTaskExecutionJournalProjection:
         with pytest.raises(json.JSONDecodeError):
             json.loads(step["arguments"])
 
+    @pytest.mark.parametrize("name", ["write_file", "edit_file"])
+    @pytest.mark.parametrize("failure", ["syntax", "recursion", "overlong-integer"])
+    def test_invalid_file_arguments_do_not_interrupt_task_recall(self, monkeypatch, name, failure):
+        from tests._deep_json import overlong_integer, too_deep_to_parse
+        from turnstone.core.trajectory import ToolCall, Turn
+
+        invalid_path = "/workspace/reports/invalid.html"
+        if failure == "syntax":
+            arguments = '{"path":' + json.dumps(invalid_path) + ',"content":'
+        elif failure == "recursion":
+            arguments = json.dumps({"path": invalid_path, "content": [["nested"]]})
+            too_deep_to_parse(monkeypatch, arguments)
+        else:
+            arguments = (
+                '{"path":' + json.dumps(invalid_path) + ',"content":' + overlong_integer() + "}"
+            )
+        valid_path = "/workspace/reports/valid.html"
+        turns = [
+            Turn.assistant(tool_calls=(ToolCall(id="invalid", name=name, arguments=arguments),)),
+            Turn.tool("invalid", "Malformed tool arguments", is_error=True),
+            Turn.assistant(
+                tool_calls=(
+                    ToolCall(id="valid", name=name, arguments=json.dumps({"path": valid_path})),
+                )
+            ),
+            Turn.tool("valid", "File updated"),
+        ]
+
+        invalid, valid = _TaskExecutionJournal(turns).project_steps()
+        assert invalid["id"] == "invalid"
+        assert invalid["output"] == "Malformed tool arguments"
+        assert invalid["is_error"] is True
+        assert "file_path" not in invalid
+        assert valid["file_path"] == valid_path
+        assert valid["output"] == "File updated"
+        assert valid["is_error"] is False
+
     def test_step_count_capped_with_honest_marker(self):
         from turnstone.core.session import _AGENT_STEP_COUNT_CAP
         from turnstone.core.trajectory import ToolCall, Turn

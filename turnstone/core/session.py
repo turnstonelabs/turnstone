@@ -1561,7 +1561,7 @@ class _TaskExecutionJournal:
             if name in ("write_file", "edit_file"):
                 try:
                     args = json.loads(tool_call.arguments)
-                except (ValueError, TypeError):
+                except (ValueError, TypeError, RecursionError):
                     args = None
                 path = args.get("path") if isinstance(args, dict) else None
                 if isinstance(path, str) and 0 < len(path) <= 4096:

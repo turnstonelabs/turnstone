@@ -787,6 +787,10 @@ if (lateOutputs.length !== 1 || lateOutputs[0].output !== "orphan final")
         source,
         "  appendToolOutput(callId, name, output, isError, preview, opts = {}) {",
     )
+    file_result_chip = _as_function(
+        source,
+        "  _fileResultChip(row, isError, denied, effectStatus) {",
+    )
     announce_block = _as_function(source, "  announceToolBlock(items) {")
     announce_key = _as_function(source, "  _announceKey(items) {")
     _run_module(
@@ -932,6 +936,7 @@ function convBatchSummaryText() { return "tool batch"; }
 
 const handleEvent = %(handle)s;
 const appendToolOutput = %(append)s;
+const _fileResultChip = %(file_result_chip)s;
 const announceToolBlock = %(announce)s;
 const _announceKey = %(announce_key)s;
 const latestRows = new Map();
@@ -963,6 +968,7 @@ const pane = {
   isNearBottom() { return false; },
   scrollToBottom() {},
   appendToolOutput,
+  _fileResultChip,
   announceToolBlock,
   handleEvent,
 };
@@ -1042,6 +1048,7 @@ if (second.batch.children.some((node) => node.output === "old history corruption
             "projection": json.dumps(_TOOL_PROJECTION.as_uri()),
             "handle": handle_event,
             "append": append_output,
+            "file_result_chip": file_result_chip,
             "attachments": json.dumps(_ATTACHMENTS.as_uri()),
             "announce": announce_block,
             "announce_key": announce_key,
