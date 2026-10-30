@@ -2,6 +2,7 @@
 
 import os
 import queue
+import re
 import threading
 from unittest.mock import MagicMock, patch
 
@@ -357,16 +358,78 @@ class TestRequiredScope:
     def test_both_dictation_routes_need_write(self, path):
         assert required_scope("POST", path) == "write"
 
+    @pytest.mark.parametrize("prefix", ["", "/v1", "/node/n1", "/node/n1/v1"])
     @pytest.mark.parametrize(
-        "path",
+        ("verb", "scope"),
+        [("trust", "approve"), ("restrict", "write"), ("close_all_children", "write")],
+    )
+    def test_coordinator_verbs(self, prefix, verb, scope):
+        """Trust lets a coordinator's sends to its own subtree skip approval, so it
+        needs the scope that resolves an approval."""
+        assert required_scope("POST", f"{prefix}/api/workstreams/abc123/{verb}") == scope
+
+    @pytest.mark.parametrize("prefix", ["/v1", "/node/n1/v1"])
+    @pytest.mark.parametrize(
+        ("method", "tail"),
         [
-            "/api/workstreams/abc123/stream",
-            "/api/workstreams/abc123/speech-to-text/stream/extra",
-            "/api/workstreams/abc/def/speech-to-text/stream",
+            ("POST", "abc123/plan"),
+            ("POST", "abc123/speech-to-text/stream"),
+            ("PUT", "abc123/title"),
+            ("PATCH", "abc123"),
+            ("DELETE", "abc123/attachments/att-1"),
         ],
     )
-    def test_dictation_stream_match_is_exact(self, path):
-        assert required_scope("POST", path) == "read"
+    def test_ws_mutating_methods_need_write(self, prefix, method, tail):
+        """The method decides, so a verb no rule names cannot fall through to read."""
+        assert required_scope(method, f"{prefix}/api/workstreams/{tail}") == "write"
+
+    @pytest.mark.parametrize("method", ["GET", "HEAD"])
+    @pytest.mark.parametrize("tail", ["abc123", "abc123/history", "abc123/children"])
+    def test_ws_read_methods_need_read(self, method, tail):
+        assert required_scope(method, f"/v1/api/workstreams/{tail}") == "read"
+
+    def test_every_mounted_workstream_mutation_needs_write(self):
+        """Each route either app mounts under /api/workstreams/ for a method other than
+        GET or HEAD needs write or approve, directly and through the console's node proxy."""
+        from starlette.routing import Mount, Route
+
+        from turnstone.console.collector import ClusterCollector
+        from turnstone.console.server import create_app as create_console
+        from turnstone.server import create_app as create_node
+
+        def walk(routes, prefix=""):
+            for route in routes:
+                if isinstance(route, Mount):
+                    yield from walk(route.routes, prefix + route.path)
+                elif isinstance(route, Route):
+                    yield prefix + route.path, route.methods or set()
+
+        console = create_console(collector=MagicMock(spec=ClusterCollector), jwt_secret="x" * 64)
+        node = create_node(
+            workstreams=MagicMock(),
+            global_queue=queue.Queue(),
+            global_listeners=[],
+            global_listeners_lock=threading.Lock(),
+            skip_permissions=False,
+            jwt_secret="x" * 64,
+        )
+        checked = set()
+        for app in (console, node):
+            for template, methods in walk(app.routes):
+                if "/api/workstreams/" not in template:
+                    continue
+                path = re.sub(r"\{[^}]+\}", "x", template)
+                for method in methods - {"GET", "HEAD"}:
+                    for candidate in (path, f"/node/n1{path}"):
+                        scope = required_scope(method, candidate)
+                        assert scope in ("write", "approve"), f"{method} {candidate} -> {scope}"
+                    checked.add(f"{method} {template}")
+        assert {
+            "POST /v1/api/workstreams/{ws_id}/trust",
+            "POST /v1/api/workstreams/{ws_id}/restrict",
+            "POST /v1/api/workstreams/{ws_id}/close_all_children",
+            "POST /v1/api/workstreams/{ws_id}/speech-to-text/stream",
+        } <= checked
 
 
 # ---------------------------------------------------------------------------
@@ -1237,6 +1300,49 @@ class TestConsoleAuth:
             headers={"Authorization": "Bearer wrong"},
         )
         assert resp.status_code == 401
+
+    def _post_coordinator_verb(self, verb, scopes):
+        token = create_jwt(
+            "u1",
+            frozenset(scopes),
+            "test",
+            self._jwt_secret,
+            audience=JWT_AUD_CONSOLE,
+            permissions=frozenset({"admin.coordinator", "coordinator.trust.send"}),
+        )
+        return self.test_client.post(
+            f"/v1/api/workstreams/ws-1/{verb}",
+            json={},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+
+    @pytest.mark.parametrize(
+        ("verb", "scopes", "needed"),
+        [
+            ("trust", {"read"}, "approve"),
+            ("trust", {"read", "write"}, "approve"),
+            ("restrict", {"read"}, "write"),
+            ("close_all_children", {"read"}, "write"),
+        ],
+    )
+    def test_coordinator_verbs_refuse_a_narrower_token(self, verb, scopes, needed):
+        """The token holds every permission the handlers check; its scope refuses it."""
+        resp = self._post_coordinator_verb(verb, scopes)
+        assert resp.status_code == 403
+        assert resp.json()["error"] == f"Forbidden: token lacks '{needed}' scope"
+
+    @pytest.mark.parametrize(
+        ("verb", "scopes"),
+        [
+            ("trust", {"read", "write", "approve"}),
+            ("restrict", {"read", "write"}),
+            ("close_all_children", {"read", "write"}),
+        ],
+    )
+    def test_coordinator_verbs_admit_the_needed_scope(self, verb, scopes):
+        # This app runs no coordinator subsystem, so the handler answers 503.
+        resp = self._post_coordinator_verb(verb, scopes)
+        assert resp.status_code == 503
 
 
 # ---------------------------------------------------------------------------

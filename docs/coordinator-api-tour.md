@@ -311,7 +311,9 @@ rounds to a 10× token-efficiency win.
 These three endpoints let an operator steer a live coordinator session
 mid-flight.  All three emit an audit event tagged
 `coordinator.<action>` via the dedicated audit executor so a cascade
-burst can't starve audit writes.
+burst can't starve audit writes.  `/trust` needs a token with `approve`
+scope, since it waives approvals; `/restrict` and
+`/close_all_children` need `write`.
 
 ### `POST /trust` — auto-approve own-subtree sends
 

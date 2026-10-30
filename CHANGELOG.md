@@ -28,6 +28,19 @@ The separate `dev` branch is retired. See [the release process](docs/releasing.m
   proxy, while the JSON `speech-to-text` route required write. Both now require
   write, so a read-only caller can no longer spend the speech-to-text model's
   capacity or have a backend credential minted for it.
+- **Coordinator governance routes check token scope (#1517).** `POST
+  /api/workstreams/{ws_id}/trust`, `/restrict` and `/close_all_children`
+  accepted a read-only token held by a user with the coordinator permissions,
+  directly and through the console proxy. `trust` now requires `approve` scope,
+  since it lets a coordinator's sends to its own subtree skip approval;
+  `restrict` and `close_all_children` require `write`. Password and SSO
+  sessions are unaffected, since the permissions these routes check already give
+  them `approve`. An API token limited to `read,write`, or a session exchanged
+  from one, can no longer turn trust on or off.
+- **Workstream routes take their scope from the HTTP method.** Every request
+  under `/api/workstreams/` other than GET or HEAD now requires at least
+  `write`, so a route added there can no longer fall through to `read` the way
+  the streamed dictation route and the coordinator routes did.
 
 ## [2026-10-29]
 

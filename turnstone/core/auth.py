@@ -806,7 +806,6 @@ ACME_PUBLIC_PATHS: frozenset[str] = frozenset(
 WRITE_PATHS: frozenset[str] = frozenset(
     {
         "/api/command",
-        "/api/workstreams/new",
         "/api/cluster/workstreams/new",
         "/api/memories",
         "/api/tts",
@@ -826,14 +825,15 @@ APPROVE_PATHS: frozenset[str] = frozenset(
 )
 ADMIN_PREFIX = "/api/admin/"
 
-# Matches DELETE /api/workstreams/{ws_id}/attachments/{attachment_id}
-# with exactly one path segment for each parameter.
-_ATTACHMENT_DELETE_RE = re.compile(r"^/api/workstreams/[^/]+/attachments/[^/]+$")
+# Under /api/workstreams/, every method but these changes a workstream or
+# spends backend capacity, so required_scope classifies by method instead of
+# by verb and a new route cannot fall through to read.
+_WORKSTREAM_READ_METHODS = frozenset({"GET", "HEAD"})
 
-# Matches POST /api/workstreams/{ws_id}/speech-to-text/stream. Streamed
-# dictation spends the same backend capacity and caller credential as the
-# write-scoped speech-to-text verb, but its last segment is ``stream``.
-_STT_STREAM_RE = re.compile(r"^/api/workstreams/[^/]+/speech-to-text/stream$")
+# POST verbs under /api/workstreams/{ws_id}/ that settle approvals: ``approve``
+# resolves pending tool calls, and ``trust`` lets a coordinator's sends to its
+# own subtree skip approval.
+_WORKSTREAM_APPROVE_VERBS = frozenset({"approve", "trust"})
 
 # Workspace browsing exposes node-local bytes beyond conversation history.
 # Keep it at the same scope as asking the workstream to read a file.
@@ -1173,16 +1173,25 @@ def is_public_path(path: str) -> bool:
 def required_scope(method: str, path: str) -> str:
     """Return the minimum scope needed for *method* + *path*.
 
-    Returns ``"approve"`` for the approve endpoint and admin paths,
-    ``"write"`` for other state-modifying POST endpoints, ``"read"`` otherwise.
+    Returns ``"approve"`` for admin paths and the workstream verbs that settle
+    approvals, ``"write"`` for other state-modifying endpoints (every method
+    but GET and HEAD under ``/api/workstreams/``), ``"read"`` otherwise.
     """
     normalized = _strip_version_prefix(path)
     normalized = normalized.rstrip("/") if normalized != "/" else normalized
 
-    filesystem_path = (
-        _extract_proxied_path(normalized) if normalized.startswith("/node/") else normalized
-    )
-    if filesystem_path and _FILESYSTEM_RE.fullmatch(filesystem_path):
+    # Workstream paths need the same scope through the console's proxy routes
+    # (/node/{node_id}/api/... and /node/{node_id}/v1/api/...) as on the node.
+    api_path = _extract_proxied_path(normalized) if normalized.startswith("/node/") else normalized
+    if api_path and _FILESYSTEM_RE.fullmatch(api_path):
+        return "write"
+    if (
+        api_path
+        and api_path.startswith("/api/workstreams/")
+        and method not in _WORKSTREAM_READ_METHODS
+    ):
+        if method == "POST" and api_path.rsplit("/", 1)[-1] in _WORKSTREAM_APPROVE_VERBS:
+            return "approve"
         return "write"
 
     # The responder auto-approves challenges, so every non-bootstrap ACME route
@@ -1226,53 +1235,6 @@ def required_scope(method: str, path: str) -> str:
         and normalized.endswith("/cancel")
     ):
         return "write"
-    # Workstream sub-resource mutations: /api/workstreams/{ws_id}/{action}.
-    # The entries here denote write actions OR write-requiring collection
-    # endpoints (e.g. `attachments` is a collection with a POST that
-    # uploads a file — not a verb, but semantically a write). `events`
-    # falls through to the GET-default `read` and is intentionally not
-    # listed here.
-    if (
-        method == "POST"
-        and normalized.startswith("/api/workstreams/")
-        and normalized.rsplit("/", 1)[-1]
-        in {
-            "delete",
-            "open",
-            "refresh-title",
-            "title",
-            "attachments",
-            "speech-to-text",
-            "send",
-            "cancel",
-            "rewind",
-            "retry",
-            "command",
-            "close",
-        }
-    ):
-        return "write"
-    if method == "POST" and _STT_STREAM_RE.match(normalized):
-        return "write"
-    # Path-keyed approve verb: POST /api/workstreams/{ws_id}/approve.
-    if (
-        method == "POST"
-        and normalized.startswith("/api/workstreams/")
-        and normalized.rsplit("/", 1)[-1] == "approve"
-    ):
-        return "approve"
-    # Path-keyed dequeue: DELETE /api/workstreams/{ws_id}/send.
-    if (
-        method == "DELETE"
-        and normalized.startswith("/api/workstreams/")
-        and normalized.rsplit("/", 1)[-1] == "send"
-    ):
-        return "write"
-    # Attachment deletion: DELETE /api/workstreams/{ws_id}/attachments/{attachment_id}.
-    # Tight regex avoids false positives on unrelated deeper paths under
-    # /attachments/.
-    if method == "DELETE" and _ATTACHMENT_DELETE_RE.match(normalized):
-        return "write"
     # Memory delete: /api/memories/{name}
     if method == "DELETE" and normalized.startswith("/api/memories/"):
         return "write"
@@ -1292,39 +1254,6 @@ def required_scope(method: str, path: str) -> str:
                 return "approve"
             if proxied in WRITE_PATHS:
                 return "write"
-            # Parametric workstream sub-resource mutations
-            if proxied.startswith("/api/workstreams/") and proxied.rsplit("/", 1)[-1] in {
-                "delete",
-                "open",
-                "refresh-title",
-                "title",
-                "attachments",
-                "speech-to-text",
-                "send",
-                "cancel",
-                "rewind",
-                "retry",
-                "command",
-                "close",
-            }:
-                return "write"
-            if _STT_STREAM_RE.match(proxied):
-                return "write"
-            if proxied.startswith("/api/workstreams/") and proxied.rsplit("/", 1)[-1] == "approve":
-                return "approve"
-
-    # Proxied attachment deletion: /node/.../api/workstreams/{ws}/attachments/{id}
-    if method == "DELETE" and normalized.startswith("/node/"):
-        proxied = _extract_proxied_path(normalized)
-        if proxied and _ATTACHMENT_DELETE_RE.match(proxied):
-            return "write"
-        # Proxied path-keyed dequeue: DELETE /node/.../api/workstreams/{ws}/send.
-        if (
-            proxied
-            and proxied.startswith("/api/workstreams/")
-            and proxied.rsplit("/", 1)[-1] == "send"
-        ):
-            return "write"
 
     # Proxied avatar changes: /node/.../api/users/{user_id}/avatar[/picture].
     if method in ("PUT", "DELETE") and normalized.startswith("/node/"):
