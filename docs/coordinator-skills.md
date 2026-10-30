@@ -208,16 +208,20 @@ recovery-oriented:
   polled lane really finished — an unobservable id can neither burn
   the timeout nor ride along to a "complete" result.
 
-Pattern: capture each spawn result in the next tool call's input.
-The JSON tool-result carries `{"child_ws_id": "...", "name": "...",
-"node_id": "...", "routing_strategy": "..."}`; the model should
-extract the `child_ws_id` and pass it as `ws_id` (or in the `ws_ids`
-list) to `inspect_workstream` / `wait_for_workstream` /
-`send_to_workstream` / `close_workstream` verbatim.  The asymmetry
-— spawn returns `child_ws_id` but the other tools accept `ws_id` /
-`ws_ids` — is intentional: it defuses a coordinator-LLM recency
-bias where seeing `ws_id` in a spawn return primed re-spawn loops
-instead of progression to the wait phase.
+Pattern: capture each spawn result in the next tool call's input. The
+JSON tool-result carries `{"child_ws_id": "...", "name": "...",
+"node_id": "...", "routing_strategy": "..."}`, plus
+`initial_message_status` and a `note` when the child was created
+without its initial message (the note says whether to send it with
+`send_to_workstream` or, for a child closed while it was being
+created, to spawn again); the model should extract the `child_ws_id`
+and pass it as `ws_id` (or in the `ws_ids` list) to
+`inspect_workstream` / `wait_for_workstream` / `send_to_workstream` /
+`close_workstream` verbatim.  The asymmetry — spawn returns
+`child_ws_id` but the other tools accept `ws_id` / `ws_ids` — is
+intentional: it defuses a coordinator-LLM recency bias where seeing
+`ws_id` in a spawn return primed re-spawn loops instead of progression
+to the wait phase.
 
 A UI that wants human-readable identifiers should render the `name`
 field and keep the workstream id as the click-through key — note
@@ -243,7 +247,16 @@ Two distinct semantics, different cost profiles:
   interrupted returns states only; the wait that completes returns
   the children's messages, so a skill that needs the children
   finished re-issues the wait (after handling the user's message,
-  when one ended it).
+  when one ended it).  A child that hasn't started a message the
+  coordinator just dispatched (a spawn's initial message, or a
+  `send_to_workstream` to an idle child) reads `starting`, which isn't
+  terminal: keep waiting rather than resending.  One whose message
+  still hasn't started after 120 s reads `stalled`, and the first wait
+  to see it returns early; inspect it before resending.  If the
+  message is in its history, the child has it (a long context can take
+  minutes to compact), so give it more time, because a resend
+  delivers it twice.  After 600 s the child reads its stored state
+  again.  Both carry `dispatch_age_s`.
 - **`inspect_workstream(ws_id=...)`** — single read of the child's
   state + tail.  Costs a full assistant turn (judge, tokens, stream).
   Prefer this for "what does the final message say?" after the child

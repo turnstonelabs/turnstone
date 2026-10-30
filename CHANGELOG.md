@@ -19,6 +19,15 @@ The separate `dev` branch is retired. See [the release process](docs/releasing.m
   I/O, so a silent backend no longer holds speech capacity through long SDK
   retries. In-turn transcription keeps its existing timeout and retry behavior
   (#1509).
+- **A coordinator no longer reads a child it just messaged as finished.** A
+  child shows a dispatched message only once its turn starts, a few seconds
+  later, so a `wait_for_workstream` right after `spawn_workstream`,
+  `spawn_batch` or `send_to_workstream` returned at once with an empty result
+  or the child's previous answer, and a fast model resent the brief. Wait and
+  inspect now report such a child as `starting`, and as `stalled` after 120
+  seconds, with `dispatch_age_s`; the first wait that sees a stall returns
+  early and lists it in `stalled`. Spawn results say when the node didn't take
+  the first message (`initial_message_status`).
 - **A `since` wait no longer reports `complete` before it is.** A
   `wait_for_workstream` given `since` returned `complete: true` as soon as a
   listed child changed, even when it had only started working. `complete` now

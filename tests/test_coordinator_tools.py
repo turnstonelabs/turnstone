@@ -456,6 +456,37 @@ def test_spawn_exec_treats_missing_ws_id_on_success_path_as_error(coord_session)
     assert ui.tool_results[-1][3] is True  # is_error
 
 
+def test_spawn_exec_says_when_the_first_message_was_not_delivered(coord_session):
+    """The node creates the child but answers ``initial_message_status`` when
+    its first message wasn't delivered; the result passes it on with a note."""
+    sess, coord, _ui = coord_session
+    coord.spawn.return_value = {
+        "ws_id": "child-7",
+        "name": "c",
+        "node_id": "node-1",
+        "routing_strategy": "rendezvous",
+        "initial_message_status": "queue_full",
+        "status": 200,
+    }
+    item = sess._prepare_tool(_tc("spawn_workstream", {"initial_message": "hi"}))
+    _call_id, output = sess._exec_spawn_workstream(item)
+    body = json.loads(output)
+    assert body["child_ws_id"] == "child-7"
+    assert body["initial_message_status"] == "queue_full"
+    assert "without its first message" in body["note"]
+    assert "send_to_workstream" in body["note"]
+
+
+def test_spawn_exec_adds_no_delivery_note_when_the_message_was_delivered(coord_session):
+    sess, coord, _ui = coord_session
+    coord.spawn.return_value = {"ws_id": "child-7", "name": "c", "node_id": "node-1"}
+    item = sess._prepare_tool(_tc("spawn_workstream", {"initial_message": "hi"}))
+    _call_id, output = sess._exec_spawn_workstream(item)
+    body = json.loads(output)
+    assert "initial_message_status" not in body
+    assert "note" not in body
+
+
 # ---------------------------------------------------------------------------
 # inspect_workstream
 # ---------------------------------------------------------------------------
@@ -924,6 +955,57 @@ def test_wait_ended_by_a_since_change_is_not_called_a_timeout(
     assert ended["complete"] is complete
     assert ended.get("changed") == changed
     assert "interrupted" not in ended
+
+
+def test_wait_ended_by_a_stall_is_not_called_a_timeout(coord_session):
+    """A wait that returned because a dispatched message never started is
+    summarized as ``stalled``, and ``wait_ended`` carries the stalled ids."""
+    sess, coord, ui = coord_session
+    events: list[dict[str, Any]] = []
+    ui._enqueue = events.append  # type: ignore[attr-defined]
+    result = _wait_result(complete=False)
+    result["stalled"] = ["a"]
+    coord.wait_for_workstream.return_value = result
+    item = sess._prepare_tool(_tc("wait_for_workstream", {"ws_ids": ["a"]}))
+    _call_id, output = sess._exec_wait_for_workstream(item)
+    assert json.loads(output)["stalled"] == ["a"]
+    assert ui.tool_results[-1][2] == "stalled after 1.25s (0/1 resolved)"
+    (ended,) = [e for e in events if e["type"] == "wait_ended"]
+    assert ended["complete"] is False
+    assert ended["stalled"] == ["a"]
+
+
+def test_a_wait_runs_its_batch_in_model_order(coord_session):
+    """A wait beside a send in the parallel pool could read the child before
+    the send records its dispatch, and complete on the last turn's ``idle``.
+    A batch holding a wait runs in model order instead (test_session's
+    TestToolBatchPolicy covers how the executor serializes it)."""
+    sess, _coord, _ui = coord_session
+    item = sess._prepare_tool(_tc("wait_for_workstream", {"ws_ids": ["a"]}))
+    assert item["_batch_policy"]["serialize"] is True
+    assert item["_batch_policy"]["access"] == "read"
+
+
+def test_wait_progress_ignores_a_growing_dispatch_age(coord_session):
+    """A starting child's ``dispatch_age_s`` grows every tick.  Only a real
+    transition carries the results, so a quiet wait on a starting child
+    doesn't send every listener the full snapshot each tick."""
+    sess, coord, ui = coord_session
+    events: list[dict[str, Any]] = []
+    ui._enqueue = events.append  # type: ignore[attr-defined]
+
+    def _wait(ws_ids, *, timeout, mode, since, progress_callback, interrupt, wake_event):
+        for age in (0, 2, 4):
+            snap = {"a": {"state": "starting", "tokens": 0, "dispatch_age_s": age}}
+            progress_callback(snap, float(age))
+        progress_callback({"a": {"state": "thinking", "tokens": 0}}, 4.5)
+        return _wait_result(complete=False)
+
+    coord.wait_for_workstream.side_effect = _wait
+    item = sess._prepare_tool(_tc("wait_for_workstream", {"ws_ids": ["a"]}))
+    sess._exec_wait_for_workstream(item)
+    progress = [e for e in events if e["type"] == "wait_progress"]
+    assert [e["results"]["a"]["state"] for e in progress] == ["starting", "thinking"]
 
 
 def test_a_queued_message_ends_a_real_wait_and_reaches_the_model(
@@ -2014,6 +2096,28 @@ def test_spawn_batch_exec_says_a_child_without_a_ws_id_may_exist(coord_session):
     denied = json.loads(output)["denied"]
     assert [d["idx"] for d in denied] == [0, 1, 2]
     assert all("check with list_workstreams before retrying" in d["reason"] for d in denied)
+
+
+def test_spawn_batch_rows_say_when_a_first_message_was_not_delivered(coord_session):
+    sess, coord, _ui = coord_session
+
+    def _spawn(**kwargs):
+        reply = _spawned_child(**kwargs)
+        if kwargs["initial_message"] == "benchmark B":
+            reply["initial_message_status"] = "refused_closed"
+        return reply
+
+    coord.spawn.side_effect = _spawn
+    item = sess._prepare_tool(_tc("spawn_batch", {"children": _three_children()}))
+    _call_id, output = sess._exec_spawn_batch(item)
+    results = json.loads(output)["results"]
+    assert results["1"]["initial_message_status"] == "refused_closed"
+    # A child closed while it was being created can't take a send.
+    assert "spawn it again" in results["1"]["note"]
+    assert "send_to_workstream" not in results["1"]["note"]
+    for idx in ("0", "2"):
+        assert "initial_message_status" not in results[idx]
+        assert "note" not in results[idx]
 
 
 def test_spawn_batch_exec_cancel_holds_back_unsent_children(coord_session):

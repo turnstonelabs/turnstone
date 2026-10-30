@@ -30,6 +30,7 @@ import secrets
 import threading
 import time
 from collections import OrderedDict
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, ClassVar
 
@@ -431,7 +432,7 @@ def load_task_envelope(storage: Any, ws_id: str) -> tuple[dict[str, Any], bool]:
 
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Collection
+    from collections.abc import Callable, Collection, Iterable
 
     from turnstone.core.child_event_bus import ChildEventBus
     from turnstone.core.storage._protocol import LeaseFence, StorageBackend
@@ -579,6 +580,51 @@ def _wait_unless_stopped(wait: int, stopped: Callable[[], bool]) -> bool:
     return not stopped()
 
 
+# How long a message the coordinator dispatched may go unstarted before wait and inspect call
+# the child ``stalled`` instead of ``starting``.  The child's row shows the turn only once the
+# turn loop reports ``thinking``, after the send preamble, which normally takes seconds; the
+# model admission wait comes later, so it doesn't count against this.
+_DISPATCH_STALL_AFTER_S: float = 120.0
+
+# How long after the dispatch a record lapses, so the child reads as stored again.  Storage
+# never shows some records ending: a turn that reported no token usage and whose
+# ``thinking`` no wait read, or a message cancelled from elsewhere before it started.  Such a
+# child would otherwise stay ``stalled``, and a ``mode='all'`` wait on it could never finish.
+_DISPATCH_RECORD_TTL_S: float = 600.0
+
+# Cap on the dispatches one client remembers.  A record ends when storage shows its turn began
+# or ended, when the child is closed, cancelled or deleted through the client, or when it
+# lapses; the cap bounds the rest by evicting the oldest.
+_DISPATCH_RECORD_MAX: int = 512
+
+# The states wait and inspect show for a child whose dispatched message hasn't started.
+_DISPATCH_PENDING_STATES: frozenset[str] = frozenset({"starting", "stalled"})
+
+
+def _stored_state_tokens(
+    row: dict[str, Any], tokens_by_wid: dict[str, int], ws_id: str
+) -> tuple[str, int]:
+    """``ws_id``'s stored ``(state, tokens)``, normalized as a wait snapshot reads them."""
+    return str(row.get("state") or ""), int(tokens_by_wid.get(ws_id, 0) or 0)
+
+
+@dataclass(slots=True)
+class _Dispatch:
+    """A message the client dispatched to a child whose turn storage doesn't show yet.
+
+    ``baseline`` is the child's ``(state, tokens)`` from before the dispatch, always
+    ``idle``.  The turn's first state write changes it, and so does the token count a
+    finished turn records.  ``baseline_at`` is when the baseline held: the start of the
+    send's read of it, or the start of the spawn, before the child existed.
+    """
+
+    baseline: tuple[str, int]
+    baseline_at: float
+    dispatched_at: float
+    # Set once a wait has listed the child stalled; later waits don't end on it.
+    stall_reported: bool = False
+
+
 class CoordinatorClient:
     """Sync helper driving a coordinator session's children.
 
@@ -635,6 +681,12 @@ class CoordinatorClient:
         # tuple-size + dict-overhead) per coordinator.
         self._live_cache: OrderedDict[str, tuple[float, dict[str, Any] | None]] = OrderedDict()
         self._live_cache_lock = threading.Lock()
+        # Messages this client dispatched that the child's row doesn't show starting yet,
+        # keyed by child ws_id, oldest first (see ``_dispatch_state``).  Spawns, sends, waits
+        # and cancels run on different threads (spawn_batch's pool, the console's cancel
+        # cascade), hence the lock.
+        self._dispatches: OrderedDict[str, _Dispatch] = OrderedDict()
+        self._dispatch_lock = threading.Lock()
 
     # -- lifecycle ----------------------------------------------------------
 
@@ -1007,6 +1059,11 @@ class CoordinatorClient:
         With ``resend_unless`` given, a create a node's rate limiter refused is
         sent once more after the wait the refusal names, unless
         ``resend_unless()`` says the caller has been stopped by then.
+
+        A child created with a non-empty ``initial_message`` is recorded as
+        starting it (see :meth:`_dispatch_state`), unless the reply carries
+        ``initial_message_status``, which the node sets only when the message
+        was not delivered.
         """
         body: dict[str, Any] = {
             "kind": WorkstreamKind.INTERACTIVE.value,
@@ -1029,13 +1086,37 @@ class CoordinatorClient:
             # handler at child-creation time.  Omitted = the interactive
             # kind default — never the parent's persona.
             body["persona"] = persona
-        return self._post("spawn", body, resend_unless=resend_unless)
+        baseline_at = time.monotonic()
+        result = self._post("spawn", body, resend_unless=resend_unless)
+        child_ws_id = str(result.get("ws_id") or "")
+        if (
+            initial_message.strip()
+            and child_ws_id
+            and not result.get("error")
+            and not result.get("initial_message_status")
+        ):
+            # A new child's row starts idle with no tokens, so the spawn reads nothing.
+            self._record_dispatch(child_ws_id, ("idle", 0), baseline_at)
+        return result
 
     def send(self, ws_id: str, message: str) -> dict[str, Any]:
+        """Send a user message to a child via the routing proxy.
+
+        A reply with ``status: "ok"`` means a fresh turn took the message, so
+        a child that was ``idle`` just before the send is recorded as starting
+        it (see :meth:`_dispatch_state`); :meth:`_read_dispatch_baseline` says
+        why only an idle one.  ``queued`` means a live turn or a parked send
+        holds it, and records nothing.
+        """
         resolved, ref_err = self._resolve_owned(ws_id)
         if ref_err is not None:
             return ref_err
-        return self._post("send", {"message": message}, ws_id=resolved)
+        baseline_at = time.monotonic()
+        baseline = self._read_dispatch_baseline(resolved)
+        result = self._post("send", {"message": message}, ws_id=resolved)
+        if baseline is not None and result.get("status") == "ok":
+            self._record_dispatch(resolved, baseline, baseline_at)
+        return result
 
     def emit_audit(self, action: str, detail: dict[str, Any]) -> None:
         """Record an audit row attributed to this coordinator session.
@@ -1063,7 +1144,10 @@ class CoordinatorClient:
         body: dict[str, Any] = {}
         if reason:
             body["reason"] = reason
-        return self._post("close", body, ws_id=resolved)
+        result = self._post("close", body, ws_id=resolved)
+        if not result.get("error"):
+            self._forget_dispatch(resolved)
+        return result
 
     def close_all_children(self, reason: str = "") -> dict[str, Any]:
         """Soft-close every direct child of this coordinator (console-side fan-out).
@@ -1077,13 +1161,22 @@ class CoordinatorClient:
         body: dict[str, Any] = {}
         if reason:
             body["reason"] = reason
-        return self._post("close_all_children", body, ws_id=self._coord_ws_id)
+        result = self._post("close_all_children", body, ws_id=self._coord_ws_id)
+        closed = result.get("closed")
+        if not result.get("error") and isinstance(closed, list):
+            for child_ws_id in closed:
+                if isinstance(child_ws_id, str):
+                    self._forget_dispatch(child_ws_id)
+        return result
 
     def delete(self, ws_id: str) -> dict[str, Any]:
         resolved, ref_err = self._resolve_owned(ws_id)
         if ref_err is not None:
             return ref_err
-        return self._post("delete", {"ws_id": resolved})
+        result = self._post("delete", {"ws_id": resolved})
+        if not result.get("error"):
+            self._forget_dispatch(resolved)
+        return result
 
     # -- console-endpoint helpers (NOT model-invoked tools) -----------------
 
@@ -1108,7 +1201,11 @@ class CoordinatorClient:
         resolved, ref_err = self._resolve_owned(ws_id)
         if ref_err is not None:
             return ref_err
-        return self._post("cancel", {}, ws_id=resolved)
+        result = self._post("cancel", {}, ws_id=resolved)
+        if not result.get("error"):
+            # A cancelled message may never start, and the row can keep its baseline.
+            self._forget_dispatch(resolved)
+        return result
 
     def rewind(self, ws_id: str, turns: int) -> dict[str, Any]:
         if not self._owns_subtree(ws_id):
@@ -1119,6 +1216,159 @@ class CoordinatorClient:
         if not self._owns_subtree(ws_id):
             return {"error": f"workstream not in coordinator subtree: {ws_id}", "status": 404}
         return self._post("retry", {}, ws_id=ws_id)
+
+    # -- dispatched messages a child hasn't started -------------------------
+    #
+    # A child's row shows a dispatched message only once its turn reports
+    # ``thinking``, after the send preamble.  Until then a just-spawned child
+    # reads ``idle``, and a child sent a new message keeps its last turn's
+    # state, which a wait reads as finished.  The client remembers what it
+    # dispatched so wait and inspect can show such a child as ``starting`` (or
+    # ``stalled``).  Neither state is written to the child's row or its state
+    # events; only wait's and inspect's results carry them.
+    #
+    # The record is this client's, kept in memory, so it has limits:
+    # - It covers only what this client dispatched to an idle child.  A send
+    #   from elsewhere (the UI, another console), one the node parks behind a
+    #   slash-command window (``deferred``), one to a child in ``error``, and
+    #   any send before a console restart leave none, so a wait right after
+    #   one still reads the child's last state.
+    # - It ends when a read no older than its baseline finds the row's state
+    #   or token count moved.  A turn that reports no token usage, and whose
+    #   ``thinking`` no wait reads, or a message cancelled from elsewhere
+    #   before it started, keeps the child ``starting``, then ``stalled``,
+    #   until the record lapses (``_DISPATCH_RECORD_TTL_S``).  Tokens spent
+    #   before the turn shows end it early: after a pre-send compaction's
+    #   summary call (a resumed child already over its window), a wait can
+    #   read the last turn's ``idle`` in the moment before ``thinking`` is
+    #   stored.
+    # - A long pre-send compaction shows ``stalled`` while the child already
+    #   has the message.
+
+    def _record_dispatch(self, ws_id: str, baseline: tuple[str, int], baseline_at: float) -> None:
+        """Remember a message just dispatched to ``ws_id``, replacing any earlier record."""
+        with self._dispatch_lock:
+            self._dispatches.pop(ws_id, None)
+            self._dispatches[ws_id] = _Dispatch(baseline, baseline_at, time.monotonic())
+            while len(self._dispatches) > _DISPATCH_RECORD_MAX:
+                self._dispatches.popitem(last=False)
+
+    def _forget_dispatch(self, ws_id: str) -> None:
+        """Drop ``ws_id``'s record once the child is closed, cancelled or deleted."""
+        with self._dispatch_lock:
+            self._dispatches.pop(ws_id, None)
+
+    def _read_dispatch_baseline(self, ws_id: str) -> tuple[str, int] | None:
+        """``ws_id``'s stored ``(state, tokens)`` before a send, when it's ``idle``.
+
+        Only an idle child is tracked.  A child in ``error`` can fail its next
+        turn before the turn shows (its model is held, say) and end in
+        ``error`` with the same tokens, so a record would hide the new failure
+        behind ``starting``.  A busy row means the read raced a turn that was
+        still ending, and the next turn's ``thinking`` would match it.
+        ``None`` for those, and when the row is missing or a read fails; the
+        send then records nothing.  Callers pass an id that already passed the
+        ownership guard, which the batch reads leave to them.
+        """
+        try:
+            row = self._storage.get_workstreams_batch([ws_id]).get(ws_id)
+            if row is None or row.get("state") != "idle":
+                return None
+            tokens_by_wid = self._storage.sum_workstream_tokens_batch([ws_id])
+        except Exception:
+            log.debug("coord_client.send.baseline_read_failed ws=%s", ws_id, exc_info=True)
+            return None
+        return _stored_state_tokens(row, tokens_by_wid, ws_id)
+
+    def _dispatch_state(
+        self, ws_id: str, current: tuple[str, int], read_at: float
+    ) -> tuple[str, int, _Dispatch | None] | None:
+        """The state wait and inspect show for ``ws_id`` while its dispatched message waits.
+
+        ``current`` is the child's ``(state, tokens)`` from a storage read that
+        started at ``read_at`` (``time.monotonic()``).  ``None`` means show the
+        stored state: nothing is pending, the record lapsed, or a read no older
+        than the baseline found ``current`` off it because the turn began, ended
+        or failed, which ends the record for good.  A read older than the
+        baseline (an inspect running beside the send) is older news than the
+        baseline itself, so it never ends the record and reads as pending.
+        Otherwise returns ``(state, dispatch_age_s, unreported)``: ``starting``
+        until ``_DISPATCH_STALL_AFTER_S`` seconds have passed since the
+        dispatch, ``stalled`` after.  ``unreported`` is the record of a stall no
+        wait has listed yet, which the wait that lists it marks
+        (:meth:`_mark_stalls_reported`), and ``None`` otherwise.
+        """
+        with self._dispatch_lock:
+            record = self._dispatches.get(ws_id)
+            if record is None:
+                return None
+            age = time.monotonic() - record.dispatched_at
+            if age >= _DISPATCH_RECORD_TTL_S or (
+                current != record.baseline and read_at >= record.baseline_at
+            ):
+                del self._dispatches[ws_id]
+                return None
+            if age < _DISPATCH_STALL_AFTER_S:
+                return "starting", int(age), None
+            return "stalled", int(age), None if record.stall_reported else record
+
+    def _overlay_dispatches(
+        self, snaps: dict[str, dict[str, Any]], read_at: float
+    ) -> tuple[dict[str, str], dict[str, _Dispatch]]:
+        """Show the children of one wait tick whose dispatched message hasn't started.
+
+        Rewrites ``snaps``, read starting at ``read_at``, in place: such a
+        child's ``state`` reads ``starting`` or ``stalled`` (see
+        :meth:`_dispatch_state`) and its entry gains ``dispatch_age_s``.
+        Returns each such child's stored state, which the ``since`` diff
+        compares instead, and the stalls no wait has listed yet, with their
+        records; they end this wait.
+        """
+        stored: dict[str, str] = {}
+        first_stalls: dict[str, _Dispatch] = {}
+        for wid, snap in snaps.items():
+            shown = self._dispatch_state(wid, (snap["state"], snap["tokens"]), read_at)
+            if shown is None:
+                continue
+            stored[wid] = snap["state"]
+            snap["state"], snap["dispatch_age_s"], unreported = shown
+            if unreported is not None:
+                first_stalls[wid] = unreported
+        return stored, first_stalls
+
+    def _mark_stalls_reported(self, records: Iterable[_Dispatch]) -> None:
+        """Mark stalls a wait has listed, so later waits don't end on them.
+
+        Called once the wait's response is built, so a wait that raised before
+        returning leaves its stalls for the next one.
+        """
+        with self._dispatch_lock:
+            for record in records:
+                record.stall_reported = True
+
+    def _inspect_dispatch_state(
+        self, ws_id: str, row: dict[str, Any], read_at: float
+    ) -> tuple[str, int] | None:
+        """``(state, dispatch_age_s)`` for :meth:`inspect` from ``ws_id``'s row, or ``None``.
+
+        ``read_at`` is when inspect began reading ``row``.  Inspect reads no
+        token count of its own, so this reads one, and only while a message
+        dispatched to ``ws_id`` is pending.  Inspect calls it after reading the
+        history, so a turn that ended before that read shows by its tokens
+        rather than as ``starting`` beside its own reply.  A failed read shows
+        the stored state rather than failing the inspect.
+        """
+        with self._dispatch_lock:
+            if ws_id not in self._dispatches:
+                return None
+        try:
+            tokens_by_wid = self._storage.sum_workstream_tokens_batch([ws_id])
+        except Exception:
+            log.debug("coord_client.inspect.dispatch_tokens_failed ws=%s", ws_id, exc_info=True)
+            return None
+        current = _stored_state_tokens(row, tokens_by_wid, ws_id)
+        shown = self._dispatch_state(ws_id, current, read_at)
+        return None if shown is None else (shown[0], shown[1])
 
     # -- model-invoked block-wait -----------------------------------------
 
@@ -1207,7 +1457,9 @@ class CoordinatorClient:
         ``since`` do NOT themselves trigger the early return — they
         count toward the ``mode`` condition only.  This prevents a
         disjoint ``since`` dict from exiting on tick one (which the
-        naive missing-entry-counts-as-changed rule would cause).
+        naive missing-entry-counts-as-changed rule would cause).  A
+        child reported ``starting`` or ``stalled`` (below) differs only
+        once its stored state or token count does.
 
         Unresolvable ids fail fast.  Refs are validated up front — a
         malformed ws_id (truncated / garbled / non-hex / a display
@@ -1231,6 +1483,21 @@ class CoordinatorClient:
         ``not_found`` entries carry empty ``updated`` / ``name`` — with
         the display ``name`` filled in for own children as orientation
         (names are labels, NOT addresses).
+
+        A child whose stored state and token count haven't changed since this
+        client dispatched it a message (a spawn's initial message, or a send
+        that started a fresh turn on an idle child) reports
+        ``state="starting"``, which isn't terminal, so a wait issued right
+        after a dispatch doesn't read the child as finished.
+        After ``_DISPATCH_STALL_AFTER_S`` it reports ``stalled`` instead, and
+        both carry ``dispatch_age_s``, the whole seconds since the dispatch;
+        after ``_DISPATCH_RECORD_TTL_S`` it reads as stored again.
+        The first wait tick to see a child stalled ends that wait with
+        ``complete=False`` (unless the wait condition also held on that tick),
+        and the response lists the child in a top-level ``stalled``.  Later
+        waits still report the child ``stalled`` but neither end on it nor
+        list it, so ``stalled`` names the stalls that ended the wait, as
+        ``changed`` names the changes.  See :meth:`_dispatch_state`.
 
         ``progress_callback`` is invoked once per poll cycle with the
         current snapshot dict + elapsed seconds.  Swallows callback
@@ -1362,7 +1629,9 @@ class CoordinatorClient:
         start = time.monotonic()
         deadline = start + timeout_f
 
-        def _snapshot_all() -> dict[str, dict[str, Any]]:
+        def _snapshot_all() -> tuple[
+            dict[str, dict[str, Any]], dict[str, str], dict[str, _Dispatch]
+        ]:
             """One-tick snapshot for every cleaned ws_id.
 
             Issues two storage calls per tick (workstreams batch + token
@@ -1373,8 +1642,13 @@ class CoordinatorClient:
             oracle.  A read that fails raises
             :class:`CoordinatorReadError`, which ends the wait: rows it
             could not read are not missing children, and token counts it
-            could not read are not a change.
+            could not read are not a change.  A child whose dispatched
+            message hasn't started reads ``starting`` or ``stalled``, and
+            the stored states of those children and the stalls no wait has
+            listed come back beside the snapshot
+            (:meth:`_overlay_dispatches`).
             """
+            read_at = time.monotonic()
             rows = _read_or_raise(
                 self._coord_ws_id,
                 "wait_rows",
@@ -1400,13 +1674,15 @@ class CoordinatorClient:
                         "name": "",
                     }
                     continue
+                state, tokens = _stored_state_tokens(row, tokens_by_wid, wid)
                 snaps[wid] = {
-                    "state": str(row.get("state") or ""),
-                    "tokens": int(tokens_by_wid.get(wid, 0) or 0),
+                    "state": state,
+                    "tokens": tokens,
                     "updated": row.get("updated") or "",
                     "name": str(row.get("name") or ""),
                 }
-            return snaps
+            pending_stored, first_stalls = self._overlay_dispatches(snaps, read_at)
+            return snaps, pending_stored, first_stalls
 
         def _is_real_terminal(snap: dict[str, Any]) -> bool:
             # Real-terminal — these states drive ``complete=True``.
@@ -1415,17 +1691,35 @@ class CoordinatorClient:
             # via the fail-fast below instead.
             return snap.get("state", "") in self._WAIT_REAL_TERMINAL_STATES
 
-        def _diff_since(snap: dict[str, Any], prev: dict[str, Any]) -> bool:
+        def _diff_since(
+            snap: dict[str, Any], prev: dict[str, Any], stored_state: str | None
+        ) -> bool:
             """True when ``snap`` differs from the ``since`` hint on any
             of the diffed fields.  Called only for ws_ids that appear in
             ``since_map`` — callers handling missing entries is the
             wrong default (it would make a disjoint since-dict exit
-            the wait on tick one)."""
-            return _since_entry_changed(snap, prev)
+            the wait on tick one).
+
+            ``stored_state`` is the stored state of a child reported
+            ``starting`` or ``stalled``, else ``None``.  Those states are
+            this client's, not a change in storage, and the row's
+            ``updated`` moves when the dispatched message lands, before the
+            turn shows.  Such a child compares by its stored state, which a
+            hint reporting either state matches, and its token count."""
+            if stored_state is None:
+                return _since_entry_changed(snap, prev)
+            prev_state = prev.get("state")
+            if prev_state not in _DISPATCH_PENDING_STATES and prev_state != stored_state:
+                return True
+            return bool(snap.get("tokens") != prev.get("tokens"))
 
         last_results: dict[str, dict[str, Any]] = {}
         complete = False
         changed: list[str] = []
+        # The latest tick's stored states of children reported starting or
+        # stalled, and the stalls no wait had listed; those end the wait.
+        pending_stored: dict[str, str] = {}
+        first_stalls: dict[str, _Dispatch] = {}
         interrupted: str | None = None
         not_found_ids: list[str] = []
         # Subscribe to in-process state-change events for the watched
@@ -1473,7 +1767,7 @@ class CoordinatorClient:
                 # holds for the caller's ``interrupt``, consulted after
                 # this clear.
                 wake_event.clear()
-                results = _snapshot_all()
+                results, pending_stored, first_stalls = _snapshot_all()
                 last_results = results
                 if progress_callback is not None:
                     try:
@@ -1514,9 +1808,14 @@ class CoordinatorClient:
                 changed = [
                     wid
                     for wid, snap in results.items()
-                    if wid in since_map and _diff_since(snap, since_map[wid])
+                    if wid in since_map
+                    and _diff_since(snap, since_map[wid], pending_stored.get(wid))
                 ]
-                if mode_met or changed:
+                # A message a child hasn't started within
+                # ``_DISPATCH_STALL_AFTER_S`` also ends the first wait to see
+                # it, so the model can look at the child; ``complete`` still
+                # follows the mode condition alone.
+                if mode_met or changed or first_stalls:
                     complete = mode_met
                     break
                 remaining = deadline - time.monotonic()
@@ -1524,7 +1823,8 @@ class CoordinatorClient:
                     break
                 # The caller's reason to stop early, consulted only where
                 # the loop would otherwise block: a tick that met the mode
-                # condition or saw a ``since`` change broke above.
+                # condition, saw a ``since`` change or a first stall broke
+                # above.
                 reason = interrupt() if interrupt is not None else None
                 if reason:
                     interrupted = reason
@@ -1574,6 +1874,14 @@ class CoordinatorClient:
             response["changed"] = changed
         if interrupted:
             response["interrupted"] = interrupted
+        if first_stalls and not not_found_ids:
+            # Stalls first seen on the tick that ended the wait, which they
+            # ended unless something else did on that tick too.  A timeout or
+            # an interrupt never carries one: a first stall ends the wait
+            # before either is checked.  A not_found abort is an error the
+            # model fixes and waits again on, so it leaves them for that wait.
+            response["stalled"] = list(first_stalls)
+            self._mark_stalls_reported(first_stalls.values())
         if not_found_ids:
             # The wait aborted on unobservable members — surface a loud
             # top-level error with recovery hints (did-you-mean + child
@@ -2165,11 +2473,16 @@ class CoordinatorClient:
         response size on longer conversations.  The model only needs
         them for provider-fidelity replay tooling; regular inspect
         calls get the trimmed shape.
+
+        A child that hasn't started a message this client dispatched to it
+        reports ``state`` ``starting`` or ``stalled`` with ``dispatch_age_s``,
+        as :meth:`wait_for_workstream` does; its messages are returned as read.
         """
         resolved, ref_err = self._resolve_ws_ref(ws_id)
         if ref_err is not None:
             return ref_err
         ws_id = resolved
+        read_at = time.monotonic()
         full = _read_or_raise(
             ws_id,
             "workstream",
@@ -2231,12 +2544,16 @@ class CoordinatorClient:
                 messages, include_provider_content=include_provider_content
             ),
         }
+        # After the history read, so a turn that ended before it shows by its tokens.
+        pending_dispatch = self._inspect_dispatch_state(ws_id, full, read_at)
+        if pending_dispatch is not None:
+            result["state"], result["dispatch_age_s"] = pending_dispatch
         # Surface the operator-supplied close reason (persisted via
         # workstream_config by the server's close handler) and any
         # last-error text persisted by the worker-thread error path.
         # Only the terminal-state shapes can carry these — gating on
         # state avoids a per-inspect DB read on the hot live-child path.
-        if full.get("state") in {"closed", "error", "deleted"}:
+        if result.get("state") in {"closed", "error", "deleted"}:
             cfg = (
                 _read_or_raise(
                     ws_id,
@@ -2250,7 +2567,7 @@ class CoordinatorClient:
             if close_reason:
                 result["close_reason"] = close_reason
             last_error = cfg.get(LAST_ERROR_CONFIG_KEY)
-            if last_error and full.get("state") == "error":
+            if last_error and result.get("state") == "error":
                 # Only attach on error rows — closed/deleted may carry a
                 # historic last_error from a prior failed turn that was
                 # later resolved, and surfacing it would mislead the
@@ -2592,6 +2909,9 @@ def _inspect_skeleton(result: dict[str, Any]) -> dict[str, Any]:
         v = result.get(k)
         if v:
             skeleton[k] = v
+    # Present only for a ``starting`` / ``stalled`` child, and 0 is a real age.
+    if "dispatch_age_s" in result:
+        skeleton["dispatch_age_s"] = result["dispatch_age_s"]
     return skeleton
 
 

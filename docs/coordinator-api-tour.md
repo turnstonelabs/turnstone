@@ -279,6 +279,36 @@ Key properties:
   read, `complete=false`) — the LLM should fix the id and re-issue,
   not conclude the child died.  Foreign and missing collapse into one
   shape, so the wait can't be used as an existence oracle.
+- **Dispatched messages that haven't started** — a child just spawned
+  with an initial message, or an idle child sent a message that started
+  a fresh turn, stays `idle` in storage until the turn reports
+  `thinking`, a few seconds later.  Until the child's stored state or
+  token count changes, the wait reports it as `state="starting"`, which
+  isn't terminal; after 120 s it reports `stalled`, and after 600 s it
+  reads its stored state again.  Both carry `dispatch_age_s`, the whole
+  seconds since the coordinator dispatched the message.  A batch that
+  holds a `wait_for_workstream` runs its calls one at a time in order,
+  so a send listed before the wait is recorded when the wait starts, and
+  a read taken before the send read the child (an inspect beside it)
+  can't end the report.  The first wait that sees a child stalled
+  returns early with `complete=false` and lists it in a top-level
+  `stalled` field; later waits neither end early on it nor list it.  A
+  `since` entry compares such a child by its stored state and token
+  count, so entering `starting` or `stalled` isn't a change.
+  `inspect_workstream` reports the same states.  Neither is written to
+  storage or the child's state events; the `wait_progress` /
+  `wait_ended` events carry them only as part of the wait's results.
+  The console's coordinator client keeps the record in memory, so a
+  console restart drops it, and a send from elsewhere, a send the node
+  defers behind a slash command, or a send to a child in `error` shows
+  no `starting`.  The 600 s lapse bounds a report storage never shows
+  ending: a turn that reports no token usage and whose `thinking` no
+  wait reads, or a message cancelled from elsewhere before it started.
+  A pre-send compaction (a resumed child already over its context
+  window) runs after the message lands in the child's history but before
+  its turn shows, so a long one can read `stalled`, and the tokens its
+  summary spends can end `starting` a moment before the turn's
+  `thinking` is stored.
 - **Messages come with a completed wait** — `message` carries each
   finished child's last assistant text only when the wait completes
   (or aborts on `not_found`).  A wait that times out or is

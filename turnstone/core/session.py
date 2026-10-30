@@ -21819,6 +21819,28 @@ class ChatSession:
         return str(row["name"]), ""
 
     @staticmethod
+    def _spawn_delivery(result: dict[str, Any]) -> dict[str, Any]:
+        """The fields a spawn result adds for a child created without its first message.
+
+        The node sets ``initial_message_status`` (``queue_full`` or
+        ``refused_closed``) only when the initial message was not delivered,
+        and the console passes it through; otherwise this adds nothing.
+        """
+        status = result.get("initial_message_status")
+        if not status:
+            return {}
+        if status == "refused_closed":
+            note = (
+                "The child was closed while it was being created, so it never took its first "
+                "message; spawn it again if you still need it."
+            )
+        else:
+            note = (
+                "The child was created without its first message; send it with send_to_workstream."
+            )
+        return {"initial_message_status": status, "note": note}
+
+    @staticmethod
     def _spawn_error(result: dict[str, Any]) -> str:
         """A failed spawn's error. When no reply was read, or a 5xx came back, the child may have
         been created (a gateway in front of the node can time out while the node finishes), so the
@@ -21948,6 +21970,7 @@ class ChatSession:
                 "name": result.get("name"),
                 "node_id": result.get("node_id"),
                 "routing_strategy": result.get("routing_strategy"),
+                **self._spawn_delivery(result),
             },
             separators=(",", ":"),
         )
@@ -22148,6 +22171,7 @@ class ChatSession:
                 # proxy fills it with HTTP 200 on success, which the
                 # model can't usefully act on.  Errors land in
                 # ``denied[]`` instead.
+                **self._spawn_delivery(result),
             }, ""
 
         # Every child's create is sent at once (#1457).  Sent one after
@@ -24496,6 +24520,11 @@ class ChatSession:
             "timeout": args.get("timeout"),
             "mode": args.get("mode"),
             "since": since_hint,
+            # A wait beside a spawn or send in the parallel pool can read the
+            # child before the client records the dispatch, and take the last
+            # turn's ``idle`` for the reply.  Run the batch in model order, so
+            # a dispatch listed before the wait is recorded when it starts.
+            "_batch_policy": _batch_policy("wait_for_workstream", "read", "", serialize=True),
         }
 
     def _exec_wait_for_workstream(self, item: dict[str, Any]) -> tuple[str, str]:
@@ -24531,7 +24560,7 @@ class ChatSession:
         # elapsed; the full results dict is only useful on transitions, so
         # dropping redundant ticks is free.
         progress_state: dict[str, Any] = {
-            "last_snap": None,
+            "last_compared": None,
             "last_emit_mono": 0.0,
         }
         progress_heartbeat_s = 5.0
@@ -24552,7 +24581,15 @@ class ChatSession:
             # event alone reads an abandoned wait as still running.
             self._check_cancelled(origin_generation)
             now = time.monotonic()
-            changed = snap != progress_state["last_snap"]
+            # A starting or stalled child's ``dispatch_age_s`` grows every
+            # tick; the age alone isn't a transition.
+            compared = {
+                wid: {key: value for key, value in entry.items() if key != "dispatch_age_s"}
+                if isinstance(entry, dict)
+                else entry
+                for wid, entry in snap.items()
+            }
+            changed = compared != progress_state["last_compared"]
             heartbeat_due = (now - progress_state["last_emit_mono"]) >= progress_heartbeat_s
             if not changed and not heartbeat_due:
                 return
@@ -24566,7 +24603,7 @@ class ChatSession:
             if changed:
                 payload["results"] = snap
             self._emit_wait_event("wait_progress", payload)
-            progress_state["last_snap"] = snap
+            progress_state["last_compared"] = compared
             progress_state["last_emit_mono"] = now
 
         # A message the user sends while this wait blocks ends it at once
@@ -24642,12 +24679,18 @@ class ChatSession:
         # ``complete`` is False, yet it isn't a timeout either.  ``changed``,
         # present whenever a usable ``since`` came in, names the ids.
         changed = result.get("changed")
+        # ``stalled`` names children whose dispatched message hadn't started in
+        # time, each listed once, by the first wait to see it, which returned on
+        # it unless that wait completed or saw a change on the same tick.
+        stalled = result.get("stalled")
         if complete:
             verb = "complete"
         elif interrupted:
             verb = "interrupted"
         elif changed:
             verb = "changed"
+        elif stalled:
+            verb = "stalled"
         else:
             verb = "timeout"
         # Denominator = polled set (not raw item['ws_ids']) so the ratio
@@ -24665,6 +24708,8 @@ class ChatSession:
             ended["interrupted"] = interrupted
         if changed is not None:
             ended["changed"] = changed
+        if stalled:
+            ended["stalled"] = stalled
         self._emit_wait_event("wait_ended", ended)
         return call_id, output
 

@@ -11,10 +11,12 @@ from __future__ import annotations
 import json
 import threading
 import time
+import uuid
 from typing import TYPE_CHECKING, Any
 
 import httpx2
 import pytest
+import sqlalchemy as sa
 
 from tests._http_failure_cases import (
     MAYBE_PROCESSED_REPLIES,
@@ -31,6 +33,7 @@ from turnstone.console.coordinator_client import (
 from turnstone.core.auth import JWT_AUD_CONSOLE, validate_jwt
 from turnstone.core.child_event_bus import ChildEventBus
 from turnstone.core.http_failures import UPSTREAM_NO_REPLY_CODE
+from turnstone.core.storage._schema import workstreams
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -2971,6 +2974,612 @@ def test_wait_for_workstream_does_not_pollute_progress_callback(populated_storag
         for per_ws in tick.values():
             assert "message" not in per_ws
             assert "truncated" not in per_ws
+
+
+# ---------------------------------------------------------------------------
+# wait_for_workstream / inspect — a dispatched message the child hasn't started
+# ---------------------------------------------------------------------------
+#
+# A child's row shows a dispatched message only once its turn reports
+# ``thinking``, seconds after the spawn or send returned.  Until its stored
+# state or token count changes, wait and inspect report the child
+# ``starting``, or ``stalled`` once ``_DISPATCH_STALL_AFTER_S`` has passed.
+
+DISPATCHED_HEX = "5be1d7c2a9f04e6b8d3c1a7e9f2b4c60"
+
+
+class _Console:
+    """The console's routes as the client calls them, each answered by its last path segment."""
+
+    def __init__(self) -> None:
+        self.replies: dict[str, tuple[int, dict[str, Any]]] = {
+            "new": (200, {"ws_id": DISPATCHED_HEX, "name": "child", "node_id": "n1"}),
+            "send": (200, {"status": "ok", "attached_ids": [], "dropped_attachment_ids": []}),
+            "close": (200, {"status": "ok"}),
+            "cancel": (200, {"status": "ok"}),
+            "delete": (200, {"status": "ok"}),
+            "close_all_children": (200, {"closed": [DISPATCHED_HEX], "failed": [], "skipped": []}),
+        }
+
+    def __call__(self, req: httpx2.Request) -> httpx2.Response:
+        status, body = self.replies.get(req.url.path.rsplit("/", 1)[-1], (404, {}))
+        return httpx2.Response(status, json=body)
+
+
+@pytest.fixture
+def dispatch_storage(tmp_path, sqlite_backend_factory):
+    """A coordinator and one idle child, the row a node's create leaves behind."""
+    st = sqlite_backend_factory(str(tmp_path / "coord-dispatch.db"))
+    st.register_workstream("coord-1", kind="coordinator", user_id="user-1")
+    st.register_workstream(
+        DISPATCHED_HEX, kind="interactive", parent_ws_id="coord-1", user_id="user-1", name="child"
+    )
+    return st
+
+
+def _dispatch_client(storage: SQLiteBackend, console: _Console | None = None) -> CoordinatorClient:
+    return CoordinatorClient(
+        console_base_url="http://console.example.com",
+        storage=storage,
+        token_factory=lambda: "t",
+        coord_ws_id="coord-1",
+        user_id="user-1",
+        http_client=httpx2.Client(transport=httpx2.MockTransport(console or _Console())),
+        child_event_bus=ChildEventBus(),
+    )
+
+
+def _spawn_child(client: CoordinatorClient) -> None:
+    result = client.spawn(
+        initial_message="write the report", parent_ws_id="coord-1", user_id="user-1"
+    )
+    assert result["ws_id"] == DISPATCHED_HEX
+
+
+def _finish_turn(storage: SQLiteBackend, ws_id: str, answer: str, tokens: int = 120) -> None:
+    """Store a finished turn: its answer, the tokens it spent and the idle it ends on."""
+    storage.save_message(ws_id, "assistant", answer)
+    storage.record_usage_event(event_id=uuid.uuid4().hex, ws_id=ws_id, prompt_tokens=tokens)
+    storage.update_workstream_state(ws_id, "idle")
+
+
+def _backdate_dispatch(client: CoordinatorClient, ws_id: str, seconds: float) -> None:
+    """Move the recorded dispatch to ``ws_id`` ``seconds`` into the past."""
+    client._dispatches[ws_id].dispatched_at -= seconds
+
+
+def _wait_once(client: CoordinatorClient, ws_id: str = DISPATCHED_HEX) -> dict[str, Any]:
+    """One tick's results: a zero timeout snapshots once and returns."""
+    return client.wait_for_workstream([ws_id], timeout=0)
+
+
+def _backdate_updated(storage: SQLiteBackend, ws_id: str) -> None:
+    """Make ``ws_id``'s row look created and last changed long ago."""
+    with storage._engine.connect() as conn:
+        conn.execute(
+            sa.update(workstreams)
+            .where(workstreams.c.ws_id == ws_id)
+            .values(created="2020-01-01T00:00:00", updated="2020-01-01T00:00:00")
+        )
+        conn.commit()
+
+
+def test_wait_right_after_a_spawn_reports_the_child_starting(dispatch_storage):
+    """The incident: a wait issued right after a spawn read the new child's
+    ``idle`` row as finished, with no output, and the model resent the brief.
+    The child reads ``starting``, which isn't terminal, so the wait runs on."""
+    client = _dispatch_client(dispatch_storage)
+    _spawn_child(client)
+    result = client.wait_for_workstream([DISPATCHED_HEX], timeout=0.2, mode="any")
+    assert result["complete"] is False
+    assert result["elapsed"] >= 0.2
+    snap = result["results"][DISPATCHED_HEX]
+    assert snap["state"] == "starting"
+    assert 0 <= snap["dispatch_age_s"] < 120
+    assert snap["message"] is None
+    assert "stalled" not in result
+
+
+def test_a_spawned_child_reads_its_stored_state_once_its_turn_begins(dispatch_storage):
+    client = _dispatch_client(dispatch_storage)
+    _spawn_child(client)
+    assert _wait_once(client)["results"][DISPATCHED_HEX]["state"] == "starting"
+
+    dispatch_storage.update_workstream_state(DISPATCHED_HEX, "thinking")
+    thinking = _wait_once(client)["results"][DISPATCHED_HEX]
+    assert thinking["state"] == "thinking"
+    assert "dispatch_age_s" not in thinking
+
+    _finish_turn(dispatch_storage, DISPATCHED_HEX, "the report is done")
+    result = client.wait_for_workstream([DISPATCHED_HEX], timeout=5, mode="any")
+    assert result["complete"] is True
+    snap = result["results"][DISPATCHED_HEX]
+    assert snap["state"] == "idle"
+    assert snap["tokens"] == 120
+    assert snap["message"] == "the report is done"
+
+
+def test_a_turn_that_ended_between_waits_shows_by_its_tokens(dispatch_storage):
+    """No wait saw the turn's ``thinking``, but the tokens it spent show it ran."""
+    client = _dispatch_client(dispatch_storage)
+    _spawn_child(client)
+    _finish_turn(dispatch_storage, DISPATCHED_HEX, "done already")
+    result = client.wait_for_workstream([DISPATCHED_HEX], timeout=5, mode="any")
+    assert result["complete"] is True
+    assert result["results"][DISPATCHED_HEX]["state"] == "idle"
+    assert result["results"][DISPATCHED_HEX]["message"] == "done already"
+
+
+@pytest.mark.parametrize(
+    ("initial_message", "extra"),
+    [
+        # The node answers these only when the first message wasn't delivered.
+        ("write the report", {"initial_message_status": "queue_full"}),
+        ("write the report", {"initial_message_status": "refused_closed"}),
+        # A spawn with no initial message dispatches nothing.
+        ("   ", {}),
+    ],
+)
+def test_a_spawn_that_dispatched_no_message_records_nothing(
+    dispatch_storage, initial_message, extra
+):
+    console = _Console()
+    console.replies["new"] = (200, {"ws_id": DISPATCHED_HEX, "name": "child", **extra})
+    client = _dispatch_client(dispatch_storage, console)
+    client.spawn(initial_message=initial_message, parent_ws_id="coord-1", user_id="user-1")
+    result = client.wait_for_workstream([DISPATCHED_HEX], timeout=5, mode="any")
+    assert result["complete"] is True
+    assert result["results"][DISPATCHED_HEX]["state"] == "idle"
+    assert result["results"][DISPATCHED_HEX]["message"] == "(no recent assistant output)"
+
+
+def test_a_send_that_starts_a_fresh_turn_reports_the_child_starting(dispatch_storage):
+    """After a send the row keeps the last turn's ``idle`` until the new turn
+    begins, and a wait read the previous answer as the reply.  The child reads
+    ``starting`` until its row moves; the wait that completes has the new answer."""
+    _finish_turn(dispatch_storage, DISPATCHED_HEX, "first answer", tokens=50)
+    client = _dispatch_client(dispatch_storage)
+    assert client.send(DISPATCHED_HEX, "now the summary")["status"] == "ok"
+
+    pending = client.wait_for_workstream([DISPATCHED_HEX], timeout=0.2, mode="any")
+    assert pending["complete"] is False
+    assert pending["results"][DISPATCHED_HEX]["state"] == "starting"
+    assert pending["results"][DISPATCHED_HEX]["tokens"] == 50
+    assert pending["results"][DISPATCHED_HEX]["message"] is None
+
+    dispatch_storage.update_workstream_state(DISPATCHED_HEX, "thinking")
+    assert _wait_once(client)["results"][DISPATCHED_HEX]["state"] == "thinking"
+
+    _finish_turn(dispatch_storage, DISPATCHED_HEX, "the summary")
+    result = client.wait_for_workstream([DISPATCHED_HEX], timeout=5, mode="any")
+    assert result["complete"] is True
+    assert result["results"][DISPATCHED_HEX]["message"] == "the summary"
+
+
+@pytest.mark.parametrize("dispatch", ["spawn", "send"])
+def test_the_dispatched_message_landing_in_history_does_not_end_starting(
+    dispatch_storage, dispatch
+):
+    """The child saves the dispatched message, which moves its row's
+    ``updated``, before its turn reports ``thinking``.  Only the state and
+    token count show the turn began, so the child still reads ``starting``
+    and the wait doesn't complete on the last turn's ``idle``."""
+    if dispatch == "send":
+        _finish_turn(dispatch_storage, DISPATCHED_HEX, "first answer")
+    # Created and last changed long ago, so the save below moves ``updated``.
+    _backdate_updated(dispatch_storage, DISPATCHED_HEX)
+    client = _dispatch_client(dispatch_storage)
+    if dispatch == "spawn":
+        _spawn_child(client)
+    else:
+        assert client.send(DISPATCHED_HEX, "now the summary")["status"] == "ok"
+    dispatch_storage.save_message(DISPATCHED_HEX, "user", "the dispatched message")
+    result = client.wait_for_workstream([DISPATCHED_HEX], timeout=0, mode="any")
+    assert result["results"][DISPATCHED_HEX]["updated"] != "2020-01-01T00:00:00"
+    assert result["results"][DISPATCHED_HEX]["state"] == "starting"
+    assert result["complete"] is False
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        # A live turn took the message, or a send was parked behind a command.
+        {"status": "queued", "priority": "normal", "msg_id": "m-1"},
+        {"status": "queued", "deferred": True, "priority": "normal", "msg_id": "m-1"},
+        {"status": "queue_full", "attached_ids": [], "dropped_attachment_ids": []},
+    ],
+)
+def test_a_send_that_starts_no_fresh_turn_records_nothing(dispatch_storage, reply):
+    _finish_turn(dispatch_storage, DISPATCHED_HEX, "first answer")
+    console = _Console()
+    console.replies["send"] = (200, reply)
+    client = _dispatch_client(dispatch_storage, console)
+    client.send(DISPATCHED_HEX, "and another thing")
+    result = client.wait_for_workstream([DISPATCHED_HEX], timeout=5, mode="any")
+    assert result["complete"] is True
+    assert result["results"][DISPATCHED_HEX]["state"] == "idle"
+
+
+def test_a_send_whose_baseline_cannot_be_read_records_nothing(dispatch_storage, monkeypatch):
+    _finish_turn(dispatch_storage, DISPATCHED_HEX, "first answer")
+    client = _dispatch_client(dispatch_storage)
+
+    def _boom(*_a: object, **_kw: object) -> None:
+        raise RuntimeError("storage down")
+
+    with monkeypatch.context() as m:
+        # Only the pre-send baseline reads token counts on the send path.
+        m.setattr(dispatch_storage, "sum_workstream_tokens_batch", _boom)
+        assert client.send(DISPATCHED_HEX, "now the summary")["status"] == "ok"
+    result = client.wait_for_workstream([DISPATCHED_HEX], timeout=5, mode="any")
+    assert result["results"][DISPATCHED_HEX]["state"] == "idle"
+
+
+def test_a_message_unstarted_past_the_threshold_stalls_and_ends_the_first_wait(
+    dispatch_storage,
+):
+    client = _dispatch_client(dispatch_storage)
+    _spawn_child(client)
+    _backdate_dispatch(client, DISPATCHED_HEX, 200)
+    result = client.wait_for_workstream([DISPATCHED_HEX], timeout=30, mode="all")
+    assert result["complete"] is False
+    assert result["elapsed"] < 5
+    assert result["stalled"] == [DISPATCHED_HEX]
+    snap = result["results"][DISPATCHED_HEX]
+    assert snap["state"] == "stalled"
+    assert snap["dispatch_age_s"] >= 200
+    assert snap["message"] is None
+
+
+def test_a_reported_stall_does_not_end_the_next_wait(dispatch_storage):
+    """The model already heard about the stall, so it can't spin on it, and a
+    later wait that times out isn't listed as ended by it."""
+    client = _dispatch_client(dispatch_storage)
+    _spawn_child(client)
+    _backdate_dispatch(client, DISPATCHED_HEX, 200)
+    assert _wait_once(client)["stalled"] == [DISPATCHED_HEX]
+    result = client.wait_for_workstream([DISPATCHED_HEX], timeout=0.3, mode="all")
+    assert result["complete"] is False
+    assert result["elapsed"] >= 0.3
+    assert "stalled" not in result
+    assert result["results"][DISPATCHED_HEX]["state"] == "stalled"
+    assert result["results"][DISPATCHED_HEX]["dispatch_age_s"] >= 200
+
+
+def test_a_read_from_before_a_send_leaves_its_record(dispatch_storage, monkeypatch):
+    """Coordinator tools run in parallel, so a wait tick can read a child's row
+    just before a send records its dispatch.  That read can't show the new
+    turn, so it leaves the record alone, and the next read shows the child
+    ``starting`` rather than the last turn's ``idle``."""
+    _finish_turn(dispatch_storage, DISPATCHED_HEX, "first answer", tokens=50)
+    # The last turn is still ending when the wait reads the row.
+    dispatch_storage.update_workstream_state(DISPATCHED_HEX, "thinking")
+    client = _dispatch_client(dispatch_storage)
+    sum_tokens = dispatch_storage.sum_workstream_tokens_batch
+    sent: list[bool] = []
+
+    def _send_after_the_row_read(ws_ids: list[str]) -> dict[str, int]:
+        if not sent:
+            sent.append(True)
+            # Between the tick's row and token reads, the last turn ends and
+            # a parallel send records its dispatch.
+            dispatch_storage.update_workstream_state(DISPATCHED_HEX, "idle")
+            assert client.send(DISPATCHED_HEX, "now the summary")["status"] == "ok"
+        return sum_tokens(ws_ids)
+
+    monkeypatch.setattr(dispatch_storage, "sum_workstream_tokens_batch", _send_after_the_row_read)
+    result = client.wait_for_workstream([DISPATCHED_HEX], timeout=0.3, mode="any")
+    assert sent
+    assert result["complete"] is False
+    assert result["results"][DISPATCHED_HEX]["state"] == "starting"
+
+
+def test_only_a_read_older_than_the_baseline_reads_as_pending(dispatch_storage):
+    """A read taken while the send was in flight, after it read the baseline,
+    shows the dispatched turn when it moved the row (a model failing at once),
+    so it ends the record and shows the stored ``error``.  One taken before the
+    baseline is older news, and reads as pending."""
+    client = _dispatch_client(dispatch_storage)
+    client._record_dispatch(DISPATCHED_HEX, ("idle", 0), baseline_at=100.0)
+    record = client._dispatches[DISPATCHED_HEX]
+    assert client._dispatch_state(DISPATCHED_HEX, ("thinking", 0), read_at=99.0) is not None
+    assert client._dispatches[DISPATCHED_HEX] is record
+    assert client._dispatch_state(DISPATCHED_HEX, ("error", 0), read_at=100.0) is None
+    assert DISPATCHED_HEX not in client._dispatches
+
+
+def test_a_not_found_abort_leaves_a_stall_for_the_next_wait(dispatch_storage):
+    """The abort is an error the model fixes before it waits again, so the
+    stall it saw is neither listed nor used up there."""
+    client = _dispatch_client(dispatch_storage)
+    _spawn_child(client)
+    _backdate_dispatch(client, DISPATCHED_HEX, 200)
+    aborted = client.wait_for_workstream([DISPATCHED_HEX, "f" * 32], timeout=5)
+    assert aborted["not_found"]
+    assert "stalled" not in aborted
+    assert aborted["results"][DISPATCHED_HEX]["state"] == "stalled"
+    assert _wait_once(client)["stalled"] == [DISPATCHED_HEX]
+
+
+def test_a_record_lapses_so_a_child_cannot_stay_stalled(dispatch_storage):
+    """A record storage never shows ending (a message cancelled from elsewhere
+    before it started, say) lapses, and the child reads as stored again."""
+    from turnstone.console import coordinator_client
+
+    client = _dispatch_client(dispatch_storage)
+    _spawn_child(client)
+    _backdate_dispatch(client, DISPATCHED_HEX, coordinator_client._DISPATCH_RECORD_TTL_S - 1)
+    assert client.inspect(DISPATCHED_HEX)["state"] == "stalled"
+    _backdate_dispatch(client, DISPATCHED_HEX, 2)
+    assert client.inspect(DISPATCHED_HEX)["state"] == "idle"
+    result = client.wait_for_workstream([DISPATCHED_HEX], timeout=5, mode="all")
+    assert result["complete"] is True
+    assert result["results"][DISPATCHED_HEX]["state"] == "idle"
+    assert "stalled" not in result
+
+
+def test_a_wait_that_raised_leaves_its_stall_for_the_next(dispatch_storage):
+    """A stall counts as reported only once a wait returns it, so a wait the
+    coordinator's cancel ended (its progress callback raised) doesn't use it up."""
+
+    class _Cancelled(BaseException):
+        pass
+
+    def _cancel(_snap: object, _elapsed: float) -> None:
+        raise _Cancelled
+
+    client = _dispatch_client(dispatch_storage)
+    _spawn_child(client)
+    _backdate_dispatch(client, DISPATCHED_HEX, 200)
+    with pytest.raises(_Cancelled):
+        client.wait_for_workstream([DISPATCHED_HEX], timeout=5, progress_callback=_cancel)
+    assert _wait_once(client)["stalled"] == [DISPATCHED_HEX]
+
+
+def test_a_change_after_a_stall_reads_the_stored_state(dispatch_storage):
+    client = _dispatch_client(dispatch_storage)
+    _spawn_child(client)
+    _backdate_dispatch(client, DISPATCHED_HEX, 200)
+    assert _wait_once(client)["stalled"] == [DISPATCHED_HEX]
+
+    dispatch_storage.update_workstream_state(DISPATCHED_HEX, "thinking")
+    moved = _wait_once(client)
+    assert moved["results"][DISPATCHED_HEX]["state"] == "thinking"
+    assert "dispatch_age_s" not in moved["results"][DISPATCHED_HEX]
+    assert "stalled" not in moved
+
+    # The record ended when the row moved: a row back at the baseline (a turn
+    # stopped before it spent anything) reads as stored, not as stalled again.
+    dispatch_storage.update_workstream_state(DISPATCHED_HEX, "idle")
+    result = client.wait_for_workstream([DISPATCHED_HEX], timeout=5, mode="any")
+    assert result["complete"] is True
+    assert result["results"][DISPATCHED_HEX]["state"] == "idle"
+
+
+def test_a_stall_on_a_tick_that_meets_the_wait_condition_is_listed(dispatch_storage):
+    """``complete`` follows the wait condition, the stall is listed anyway, and
+    the stall counts as reported for the next wait."""
+    dispatch_storage.register_workstream(
+        REAL_CHILD_HEX, kind="interactive", parent_ws_id="coord-1", user_id="user-1"
+    )
+    client = _dispatch_client(dispatch_storage)
+    _spawn_child(client)
+    _backdate_dispatch(client, DISPATCHED_HEX, 200)
+    result = client.wait_for_workstream([DISPATCHED_HEX, REAL_CHILD_HEX], timeout=5, mode="any")
+    assert result["complete"] is True
+    assert result["stalled"] == [DISPATCHED_HEX]
+    assert result["results"][REAL_CHILD_HEX]["state"] == "idle"
+    assert client.wait_for_workstream([DISPATCHED_HEX], timeout=0.2)["elapsed"] >= 0.2
+
+
+def test_inspect_reports_a_child_that_has_not_started_its_message(dispatch_storage):
+    client = _dispatch_client(dispatch_storage)
+    _spawn_child(client)
+    # The child can store the message before its turn reports ``thinking``.
+    dispatch_storage.save_message(DISPATCHED_HEX, "user", "write the report")
+
+    starting = client.inspect(DISPATCHED_HEX)
+    assert starting["state"] == "starting"
+    assert 0 <= starting["dispatch_age_s"] < 120
+    assert [m["content"] for m in starting["messages"]] == ["write the report"]
+
+    _backdate_dispatch(client, DISPATCHED_HEX, 200)
+    stalled = client.inspect(DISPATCHED_HEX)
+    assert stalled["state"] == "stalled"
+    assert stalled["dispatch_age_s"] >= 200
+    # Inspect leaves the stall unreported, so the next wait still ends on it.
+    assert client.wait_for_workstream([DISPATCHED_HEX], timeout=5)["stalled"] == [DISPATCHED_HEX]
+
+    dispatch_storage.update_workstream_state(DISPATCHED_HEX, "thinking")
+    moved = client.inspect(DISPATCHED_HEX)
+    assert moved["state"] == "thinking"
+    assert "dispatch_age_s" not in moved
+
+
+def test_a_send_to_a_child_in_error_records_nothing(dispatch_storage):
+    """The next turn can fail before it shows (a held model) and end in
+    ``error`` with the same tokens, so a record would hide the new failure
+    behind ``starting`` and then ``stalled``.  The child reads as stored."""
+    dispatch_storage.update_workstream_state(DISPATCHED_HEX, "error")
+    dispatch_storage.save_workstream_config(DISPATCHED_HEX, {"last_error": "provider 500"})
+    client = _dispatch_client(dispatch_storage)
+    assert client.send(DISPATCHED_HEX, "try again")["status"] == "ok"
+    result = client.wait_for_workstream([DISPATCHED_HEX], timeout=5, mode="any")
+    assert result["complete"] is True
+    assert result["results"][DISPATCHED_HEX]["state"] == "error"
+    inspected = client.inspect(DISPATCHED_HEX)
+    assert inspected["state"] == "error"
+    assert inspected["last_error"] == "provider 500"
+
+
+def test_a_send_that_read_a_busy_row_records_nothing(dispatch_storage):
+    """The read raced a turn that was still ending: the new turn's
+    ``thinking`` would match that baseline, and a running child would read
+    ``starting``, then ``stalled``."""
+    _finish_turn(dispatch_storage, DISPATCHED_HEX, "first answer", tokens=50)
+    dispatch_storage.update_workstream_state(DISPATCHED_HEX, "thinking")
+    client = _dispatch_client(dispatch_storage)
+    assert client.send(DISPATCHED_HEX, "now the summary")["status"] == "ok"
+    assert DISPATCHED_HEX not in client._dispatches
+    snap = _wait_once(client)["results"][DISPATCHED_HEX]
+    assert snap["state"] == "thinking"
+    assert "dispatch_age_s" not in snap
+
+
+def test_a_since_wait_after_a_send_does_not_return_on_the_dispatch(dispatch_storage):
+    """The usual loop: wait, send, wait with ``since``.  ``starting`` isn't a
+    change in storage, nor is the message landing in the history; the wait
+    returns once the turn shows."""
+    _finish_turn(dispatch_storage, DISPATCHED_HEX, "first answer", tokens=50)
+    _backdate_updated(dispatch_storage, DISPATCHED_HEX)
+    client = _dispatch_client(dispatch_storage)
+    hint = _wait_once(client)["results"]
+    assert hint[DISPATCHED_HEX]["state"] == "idle"
+    assert client.send(DISPATCHED_HEX, "now the summary")["status"] == "ok"
+    dispatch_storage.save_message(DISPATCHED_HEX, "user", "now the summary")
+
+    pending = client.wait_for_workstream([DISPATCHED_HEX], timeout=0.3, since=hint)
+    assert pending["changed"] == []
+    assert pending["elapsed"] >= 0.3
+    assert pending["results"][DISPATCHED_HEX]["state"] == "starting"
+    assert pending["results"][DISPATCHED_HEX]["updated"] != hint[DISPATCHED_HEX]["updated"]
+
+    dispatch_storage.update_workstream_state(DISPATCHED_HEX, "thinking")
+    moved = client.wait_for_workstream([DISPATCHED_HEX], timeout=5, since=hint)
+    assert moved["changed"] == [DISPATCHED_HEX]
+    assert moved["complete"] is False
+    assert moved["results"][DISPATCHED_HEX]["state"] == "thinking"
+
+
+def test_a_since_hint_from_a_starting_child_changes_only_when_its_turn_shows(dispatch_storage):
+    """A hint taken while the child read ``starting`` matches it while it stays
+    unstarted, through the turn to ``stalled``, which ends the first wait as a
+    stall, not a change."""
+    client = _dispatch_client(dispatch_storage)
+    _spawn_child(client)
+    hint = _wait_once(client)["results"]
+    assert hint[DISPATCHED_HEX]["state"] == "starting"
+
+    _backdate_dispatch(client, DISPATCHED_HEX, 200)
+    stalled = client.wait_for_workstream([DISPATCHED_HEX], timeout=5, since=hint)
+    assert stalled["stalled"] == [DISPATCHED_HEX]
+    assert stalled["changed"] == []
+    quiet = client.wait_for_workstream([DISPATCHED_HEX], timeout=0.3, since=hint)
+    assert quiet["changed"] == []
+    assert quiet["elapsed"] >= 0.3
+
+    dispatch_storage.update_workstream_state(DISPATCHED_HEX, "thinking")
+    moved = client.wait_for_workstream([DISPATCHED_HEX], timeout=5, since=hint)
+    assert moved["changed"] == [DISPATCHED_HEX]
+
+
+def test_a_since_hint_from_before_an_earlier_turn_sees_its_tokens(dispatch_storage):
+    """A child reported ``starting`` still compares by its tokens: a turn that
+    ran between the hint and the dispatch is a change."""
+    client = _dispatch_client(dispatch_storage)
+    hint = _wait_once(client)["results"]
+    _finish_turn(dispatch_storage, DISPATCHED_HEX, "a turn the user started", tokens=80)
+    assert client.send(DISPATCHED_HEX, "now the summary")["status"] == "ok"
+    result = client.wait_for_workstream([DISPATCHED_HEX], timeout=5, since=hint)
+    assert result["changed"] == [DISPATCHED_HEX]
+    assert result["results"][DISPATCHED_HEX]["state"] == "starting"
+
+
+def test_inspect_shows_the_stored_state_when_its_token_read_fails(dispatch_storage, monkeypatch):
+    client = _dispatch_client(dispatch_storage)
+    _spawn_child(client)
+    dispatch_storage.save_message(DISPATCHED_HEX, "user", "write the report")
+
+    def _boom(*_a: object, **_kw: object) -> None:
+        raise RuntimeError("storage down")
+
+    with monkeypatch.context() as m:
+        m.setattr(dispatch_storage, "sum_workstream_tokens_batch", _boom)
+        degraded = client.inspect(DISPATCHED_HEX)
+    assert degraded["state"] == "idle"
+    assert "dispatch_age_s" not in degraded
+    assert [m["content"] for m in degraded["messages"]] == ["write the report"]
+    # The record survives the failed read.
+    assert client.inspect(DISPATCHED_HEX)["state"] == "starting"
+
+
+def test_inspect_of_a_turn_that_ended_during_the_read_shows_its_reply_as_stored(
+    dispatch_storage, monkeypatch
+):
+    """The row is read before the history, so a turn that ended in between
+    leaves the row at its baseline; the token count read after the history
+    shows the turn ran, rather than ``starting`` beside its own reply."""
+    client = _dispatch_client(dispatch_storage)
+    _spawn_child(client)
+    load_messages = dispatch_storage.load_messages
+    finished: list[bool] = []
+
+    def _load_after_the_turn(ws_id: str, **kwargs: Any) -> list[Any]:
+        if not finished:
+            finished.append(True)
+            _finish_turn(dispatch_storage, DISPATCHED_HEX, "the report is done")
+        return load_messages(ws_id, **kwargs)
+
+    monkeypatch.setattr(dispatch_storage, "load_messages", _load_after_the_turn)
+    result = client.inspect(DISPATCHED_HEX)
+    assert result["state"] == "idle"
+    assert "dispatch_age_s" not in result
+    assert [m["content"] for m in result["messages"]] == ["the report is done"]
+
+
+def test_inspect_skeleton_keeps_the_dispatch_age():
+    from turnstone.console.coordinator_client import _format_inspect_tiered
+
+    result = {**_make_inspect_result(state="starting", n_messages=50), "dispatch_age_s": 0}
+    parsed = json.loads(_format_inspect_tiered(result, budget=100))
+    assert parsed["_tier"] == "skeleton"
+    assert parsed["state"] == "starting"
+    assert parsed["dispatch_age_s"] == 0
+
+
+@pytest.mark.parametrize(
+    "end",
+    [
+        lambda client: client.close_workstream(DISPATCHED_HEX),
+        lambda client: client.cancel(DISPATCHED_HEX),
+        lambda client: client.delete(DISPATCHED_HEX),
+        lambda client: client.close_all_children(),
+    ],
+    ids=["close", "cancel", "delete", "close_all_children"],
+)
+def test_ending_a_childs_turn_forgets_its_dispatch(dispatch_storage, end):
+    """A cancelled message may never start and leave the row at its baseline,
+    so the record goes with the verb rather than reading ``stalled`` later."""
+    client = _dispatch_client(dispatch_storage)
+    _spawn_child(client)
+    assert not end(client).get("error")
+    assert _wait_once(client)["results"][DISPATCHED_HEX]["state"] == "idle"
+
+
+def test_a_cancel_that_failed_keeps_the_dispatch(dispatch_storage):
+    console = _Console()
+    console.replies["cancel"] = (502, {"error": "upstream node unreachable"})
+    client = _dispatch_client(dispatch_storage, console)
+    _spawn_child(client)
+    assert client.cancel(DISPATCHED_HEX)["error"]
+    assert _wait_once(client)["results"][DISPATCHED_HEX]["state"] == "starting"
+
+
+def test_the_dispatch_record_forgets_its_oldest_past_the_cap(dispatch_storage, monkeypatch):
+    from turnstone.console import coordinator_client
+
+    monkeypatch.setattr(coordinator_client, "_DISPATCH_RECORD_MAX", 2)
+    others = ["1" * 32, "2" * 32]
+    for ws_id in others:
+        dispatch_storage.register_workstream(
+            ws_id, kind="interactive", parent_ws_id="coord-1", user_id="user-1"
+        )
+    client = _dispatch_client(dispatch_storage)
+    for ws_id in [DISPATCHED_HEX, *others]:
+        assert client.send(ws_id, "go")["status"] == "ok"
+    assert _wait_once(client)["results"][DISPATCHED_HEX]["state"] == "idle"
+    states = client.wait_for_workstream(others, timeout=0)["results"]
+    assert [states[ws_id]["state"] for ws_id in others] == ["starting", "starting"]
 
 
 # ---------------------------------------------------------------------------
