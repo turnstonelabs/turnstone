@@ -1402,6 +1402,9 @@ def _stalled_transcription_backend(
 
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
+        # Read through an 8 KiB buffer on every Python version: 3.14's 128 KiB
+        # default buffer drains far more than one trickled chunk per read.
+        rbufsize = 8192
 
         def log_message(self, *_args):
             pass
