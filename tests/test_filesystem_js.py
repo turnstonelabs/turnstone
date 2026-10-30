@@ -322,6 +322,7 @@ assert(pane._node.title === "Node node-5", "the prefix explains itself on hover"
 assert(pane._node.getAttribute("aria-hidden") === "true", "the visual prefix is not read twice");
 assert(pane._crumbs.getAttribute("aria-label") === "File location on node node-5", "the location landmark names the node");
 assert(pane._node.parentNode.contains(pane._crumbs) && !pane._crumbs.contains(pane._node), "node prefix does not scroll with the breadcrumbs");
+assert(pane._crumbs.title === "Workspace", "the placeholder root label is not namespaced as a path");
 await listing(requests.shift(), "docs", [file("docs/a.txt")]);
 assert(pane._crumbs.title === "node-5:/workspace/project/docs", "full location is namespaced by node");
 assert(pane._directoryName.title === pane._crumbs.title, "directory heading shares the namespaced location");
@@ -339,7 +340,7 @@ assert(shown(pane)[0] === "" && shown(pane)[1] === "node-12_ab12", "a short id i
 await listing(requests.shift(), "", []);
 const rocket = String.fromCodePoint(0x1f680);
 pane.showFiles({base: "/node/" + encodeURIComponent("turnstone-" + rocket + "x2x4p_ab1"), wsId: "astral"});
-assert(shown(pane)[0] === "turnstone-" && shown(pane)[1] === rocket + "x2x4p_ab1", "the split never cuts a character in half");
+assert(shown(pane)[0] === "turnstone-" && shown(pane)[1] === rocket + "x2x4p_ab1", "the split never separates a surrogate pair");
 await listing(requests.shift(), "", []);
 pane.showFiles({base: "/node/" + encodeURIComponent("rack 3"), wsId: "spaced"});
 assert(shown(pane).join("") === "rack 3", "an encoded node id is shown decoded");

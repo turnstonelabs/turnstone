@@ -163,7 +163,9 @@ export function createFilesystemPane(extra, hostApi) {
     rootCrumb.classList.add("filesystem-crumb", "filesystem-crumb-root");
     rootCrumb.title = rootPath;
     pane._crumbs.replaceChildren(rootCrumb);
-    pane._crumbs.title = (node ? node + ":" : "") + rootPath.replace(/\/$/, "") + (pane._path ? "/" + pane._path : "");
+    // The "Workspace" placeholder shown before a listing is a label, not a path.
+    const namespace = node && rootPath.startsWith("/") ? node + ":" : "";
+    pane._crumbs.title = namespace + rootPath.replace(/\/$/, "") + (pane._path ? "/" + pane._path : "");
     let path = "";
     for (const part of pane._path.split("/").filter(Boolean)) {
       path += (path ? "/" : "") + part;
