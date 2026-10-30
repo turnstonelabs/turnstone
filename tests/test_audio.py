@@ -1493,6 +1493,14 @@ def _stalled_transcription_backend(
     class Server(ThreadingHTTPServer):
         daemon_threads = False
 
+        def server_bind(self):
+            if trickle:
+                # Keep a trickled upload blocked in the client's write. Where loopback
+                # buffers can hold the whole body, the write finishes and the deadline
+                # lands in the response read instead.
+                self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+            super().server_bind()
+
     server = Server(("127.0.0.1", 0), Handler)
     server_thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01})
     server_thread.start()
