@@ -428,6 +428,12 @@ overrides can revoke it. The Files pane opens beside the conversation
 and works in both the standalone server UI and the cluster console. Opening Files from a
 different conversation switches to that conversation's node and workspace.
 
+Successful `write_file` and `edit_file` cards include a blue file link. Select it to open
+the file's folder and preview in Files. These links also work in saved conversations and
+nested task-agent cards. They read the current file on the originating node; they are not
+snapshots of earlier contents. `open_preview` cards use the same link styling to reopen
+their stored previews.
+
 Choose **Workspace**, **/data**, or **/tmp**, navigate folders, use the breadcrumbs to go back up, and select **Refresh** after tools
 create or change files. Select a file to preview HTML, images, PDFs, Markdown, tables, or
 text. **Copy** copies text source; **Download** saves the original file. Unsupported
@@ -447,8 +453,8 @@ are limited to 64 MiB. Preview limits are 512 KiB for text/Markdown, 2 MiB for t
 4 MiB for HTML/images, and 32 MiB for PDFs; files above a preview limit remain downloadable
 within the download limit.
 
-V1 is read-only and opened by the user. It does not edit or delete files, automatically
-open generated files, add links to tool cards, or launch from coordinator conversations.
+The pane is read-only and opened by the user. It does not edit or delete files,
+automatically open generated files, or launch from coordinator conversations.
 Closing the Files pane leaves the conversation and files intact.
 
 ### Dashboard pane

@@ -74,6 +74,7 @@ export function createFilesystemPane(extra, hostApi) {
   pane._root = "";
   pane._rootId = "workspace";
   pane._selected = null;
+  pane._selectedTarget = null;
   pane._requestToken = 0;
   pane._closed = false;
 
@@ -84,12 +85,14 @@ export function createFilesystemPane(extra, hostApi) {
         rootId: pane._rootId,
         path: pane._path,
         selected: pane._selected,
+        selectedTarget: pane._selectedTarget,
       });
     }
   };
 
   const clearSelection = () => {
     pane._selected = null;
+    pane._selectedTarget = null;
     pane._preview.clearPreview();
     for (const row of pane._list.querySelectorAll(".filesystem-entry")) {
       row.classList.remove("is-selected");
@@ -97,9 +100,10 @@ export function createFilesystemPane(extra, hostApi) {
     }
   };
 
-  const selectFile = (entry) => {
+  const selectFile = (entry, targetPath = null) => {
     if (pane._closed) return;
     pane._selected = entry.path;
+    pane._selectedTarget = targetPath;
     for (const row of pane._list.querySelectorAll(".filesystem-entry")) {
       const selected = row.dataset.path === entry.path;
       row.classList.toggle("is-selected", selected);
@@ -148,16 +152,16 @@ export function createFilesystemPane(extra, hostApi) {
     if (api.setTitle) api.setTitle("Files");
   };
 
-  const listError = (message, path, selection) => {
+  const listError = (message, path, selection, targetPath) => {
     const error = fileElement("div", "filesystem-message filesystem-error", message);
     const retry = fileButton("Retry", "Reload this directory", () =>
-      navigate(path, selection),
+      navigate(path, selection, targetPath),
     );
     pane._list.replaceChildren(error, retry);
     pane._status.textContent = message;
   };
 
-  const navigate = async (path, selection = null) => {
+  const navigate = async (path, selection = null, targetPath = null) => {
     if (!pane._ctx || pane._closed) return;
     const token = ++pane._requestToken;
     const retainFocus = pane._list.contains(document.activeElement) ||
@@ -166,6 +170,8 @@ export function createFilesystemPane(extra, hostApi) {
     const ctx = { ...pane._ctx, rootId: pane._rootId };
     pane._path = path;
     clearSelection();
+    // Preserve pending intent for another refresh or restoration while loading.
+    pane._selectedTarget = targetPath;
     paintLocation();
     persist();
     pane._list.setAttribute("aria-busy", "true");
@@ -175,7 +181,7 @@ export function createFilesystemPane(extra, hostApi) {
     // inside the browser while loading; do not reclaim it if the user leaves.
     if (retainFocus) pane._list.focus({ preventScroll: true });
     try {
-      const response = await authFetch(filesUrl(ctx, "", path));
+      const response = await authFetch(filesUrl(ctx, targetPath ? "resolve" : "", targetPath || path));
       if (token !== pane._requestToken || pane._closed) return;
       if (!response.ok) {
         let message = response.status === 404
@@ -192,7 +198,7 @@ export function createFilesystemPane(extra, hostApi) {
           }
         } catch (_) { /* Proxy errors may not carry a JSON body. */ }
         if (token !== pane._requestToken || pane._closed) return;
-        listError(message, path, selection);
+        listError(message, path, selection, targetPath);
         return;
       }
       const data = await response.json();
@@ -202,6 +208,17 @@ export function createFilesystemPane(extra, hostApi) {
       }
       pane._path = data.path;
       pane._root = data.root || "";
+      if (targetPath) {
+        if (!["workspace", "data", "tmp"].includes(data.root_id) || typeof data.selected !== "string") {
+          throw new Error("Invalid file response");
+        }
+        pane._rootId = data.root_id;
+        pane._rootSelect.value = data.root_id;
+        selection = data.selected;
+        // Keep direct targets resolvable after refresh or pane restoration,
+        // even when the ordinary directory listing would omit this entry.
+        targetPath = pane._root.replace(/\/$/, "") + "/" + selection;
+      }
       paintLocation();
       pane._list.replaceChildren();
       for (const entry of data.entries) {
@@ -209,7 +226,7 @@ export function createFilesystemPane(extra, hostApi) {
         const appearance = fileAppearance(entry);
         const row = fileButton("", (directory ? "Open folder " : "Preview file ") + entry.name, () => {
           if (directory) navigate(entry.path);
-          else selectFile(entry);
+          else selectFile(entry, entry.path === selection ? targetPath : null);
         });
         row.className = "filesystem-entry";
         row.dataset.path = entry.path;
@@ -233,11 +250,11 @@ export function createFilesystemPane(extra, hostApi) {
       }
       pane._status.textContent = data.entries.length + " entries" + (data.truncated ? " (listing limited)" : "");
       const restored = data.entries.find((entry) => entry.kind === "file" && entry.path === selection);
-      if (restored) selectFile(restored);
+      if (restored) selectFile(restored, targetPath);
       persist();
     } catch (_) {
       if (token === pane._requestToken && !pane._closed) {
-        listError("Could not load files. Check the connection and try again.", path, selection);
+        listError("Could not load files. Check the connection and try again.", path, selection, targetPath);
       }
     } finally {
       if (token === pane._requestToken && !pane._closed) {
@@ -251,18 +268,19 @@ export function createFilesystemPane(extra, hostApi) {
 
   // Re-opening from the same conversation retains the directory and refreshes
   // disk state. Another conversation always starts at its own workspace root.
-  pane.showFiles = (ctx) => {
+  pane.showFiles = (ctx, targetPath = null) => {
     if (!ctx || !ctx.wsId || pane._closed) return;
     const same = pane._ctx && pane._ctx.wsId === ctx.wsId && pane._ctx.base === (ctx.base || "");
     const path = same ? pane._path : "";
     const selection = same ? pane._selected : null;
+    const selectedTarget = same ? pane._selectedTarget : null;
     pane._ctx = { base: ctx.base || "", wsId: ctx.wsId };
     if (!same) {
       pane._root = "";
       pane._rootId = "workspace";
       pane._rootSelect.value = "workspace";
     }
-    navigate(path, selection);
+    navigate(path, selection, targetPath || selectedTarget);
     pane._rootSelect.focus({ preventScroll: true });
   };
 
@@ -296,7 +314,7 @@ export function createFilesystemPane(extra, hostApi) {
     pane._crumbs = fileElement("nav", "filesystem-breadcrumbs");
     pane._crumbs.setAttribute("aria-label", "File location");
     const refresh = fileButton("↻ Refresh", "Refresh files", () =>
-      navigate(pane._path, pane._selected),
+      navigate(pane._path, pane._selected, pane._selectedTarget),
     );
     controls.append(rootChoice, refresh);
     const address = fileElement("div", "filesystem-address");
@@ -339,7 +357,7 @@ export function createFilesystemPane(extra, hostApi) {
       pane._ctx = { base: extra.ctx.base || "", wsId: extra.ctx.wsId };
       pane._rootId = ["workspace", "data", "tmp"].includes(extra.rootId) ? extra.rootId : "workspace";
       pane._rootSelect.value = pane._rootId;
-      navigate(extra.path || "", extra.selected || null);
+      navigate(extra.path || "", extra.selected || null, extra.selectedTarget || null);
     } else {
       pane._list.append(fileElement("div", "filesystem-message", "Open Files from a conversation to browse its workspace."));
     }

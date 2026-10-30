@@ -447,6 +447,7 @@ class PendingApprovalItem(BaseModel):
     approval_label: str = ""
     needs_approval: bool = False
     error: str | None = None
+    file_path: str | None = None
     heuristic_verdict: dict[str, Any] | None = None
     judge_verdict: dict[str, Any] | None = None
 
@@ -960,6 +961,15 @@ class ListFilesystemResponse(BaseModel):
     parent: str | None
     entries: list[FilesystemEntry]
     truncated: bool = Field(description="Only the first 1000 directory entries were examined")
+
+
+class ResolveFilesystemResponse(ListFilesystemResponse):
+    selected: str = Field(
+        description=(
+            "Selected file path relative to root; included in entries even when the "
+            "directory listing is truncated"
+        )
+    )
 
 
 class AvailableModelInfo(BaseModel):

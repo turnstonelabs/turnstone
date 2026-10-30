@@ -1456,6 +1456,97 @@
         }
       }
     },
+    "/v1/api/workstreams/{ws_id}/files/resolve": {
+      "get": {
+        "summary": "Resolve a tool file path to its browsable parent directory",
+        "operationId": "v1_api_workstreams_{ws_id}_files_resolve_get",
+        "tags": [
+          "Files"
+        ],
+        "description": "Requires files.read permission, write scope, and an accessible active local interactive workstream. Accepts absolute paths, home-relative paths, and paths relative to the node working directory, selecting the most specific matching workspace, /data, or /tmp root. Returns the parent directory listing with the selected file included even when the listing is truncated. Paths outside these roots, symlinks below a root, and special files are refused. Reads the current filesystem, not a snapshot.",
+        "parameters": [
+          {
+            "name": "ws_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "path",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Tool file path, absolute, home-relative, or relative to the node working directory"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResolveFilesystemResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Error 400",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Error 403",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Error 409",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Error 503",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/api/workstreams/{ws_id}/files/preview": {
       "get": {
         "summary": "Render a workspace file with the preview content security policy",
@@ -4576,6 +4667,18 @@
             "default": null,
             "title": "Error"
           },
+          "file_path": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "File Path"
+          },
           "heuristic_verdict": {
             "anyOf": [
               {
@@ -5273,6 +5376,68 @@
           "modified"
         ],
         "title": "FilesystemEntry",
+        "type": "object"
+      },
+      "ResolveFilesystemResponse": {
+        "properties": {
+          "root": {
+            "description": "Absolute selected node-shared filesystem root",
+            "title": "Root",
+            "type": "string"
+          },
+          "root_id": {
+            "enum": [
+              "workspace",
+              "data",
+              "tmp"
+            ],
+            "title": "Root Id",
+            "type": "string"
+          },
+          "path": {
+            "description": "Current directory relative to root; empty for root",
+            "title": "Path",
+            "type": "string"
+          },
+          "parent": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Parent"
+          },
+          "entries": {
+            "items": {
+              "$ref": "#/components/schemas/FilesystemEntry"
+            },
+            "title": "Entries",
+            "type": "array"
+          },
+          "truncated": {
+            "description": "Only the first 1000 directory entries were examined",
+            "title": "Truncated",
+            "type": "boolean"
+          },
+          "selected": {
+            "description": "Selected file path relative to root; included in entries even when the directory listing is truncated",
+            "title": "Selected",
+            "type": "string"
+          }
+        },
+        "required": [
+          "root",
+          "root_id",
+          "path",
+          "parent",
+          "entries",
+          "truncated",
+          "selected"
+        ],
+        "title": "ResolveFilesystemResponse",
         "type": "object"
       },
       "SpeechToTextResponse": {

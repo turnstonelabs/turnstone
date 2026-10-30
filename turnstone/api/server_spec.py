@@ -47,6 +47,7 @@ from turnstone.api.server_schemas import (
     MemoryInfo,
     MemorySummary,
     PersonaChoice,
+    ResolveFilesystemResponse,
     RewindRequest,
     SaveMemoryRequest,
     SearchMemoriesRequest,
@@ -476,6 +477,30 @@ SERVER_ENDPOINTS: list[EndpointSpec] = [
         tags=["Files"],
     ),
     EndpointSpec(
+        "/v1/api/workstreams/{ws_id}/files/resolve",
+        "GET",
+        "Resolve a tool file path to its browsable parent directory",
+        description=(
+            "Requires files.read permission, write scope, and an accessible active local "
+            "interactive workstream. Accepts absolute paths, home-relative paths, and paths "
+            "relative to the node working directory, selecting the most specific matching "
+            "workspace, /data, or /tmp root. "
+            "Returns the parent directory listing with the selected file included even when "
+            "the listing is truncated. Paths outside these roots, symlinks below a root, "
+            "and special files are refused. Reads the current filesystem, not a snapshot."
+        ),
+        response_model=ResolveFilesystemResponse,
+        query_params=[
+            QueryParam(
+                "path",
+                "Tool file path, absolute, home-relative, or relative to the node working directory",
+                required=True,
+            ),
+        ],
+        error_codes=[400, 403, 404, 409, 503],
+        tags=["Files"],
+    ),
+    EndpointSpec(
         "/v1/api/workstreams/{ws_id}/files/preview",
         "GET",
         "Render a workspace file with the preview content security policy",
@@ -814,6 +839,7 @@ _ALL_MODELS: list[type[BaseModel]] = [
     UploadAttachmentResponse,
     ListAttachmentsResponse,
     ListFilesystemResponse,
+    ResolveFilesystemResponse,
     SpeechToTextResponse,
     TextToSpeechRequest,
     HealthResponse,

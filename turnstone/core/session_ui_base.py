@@ -3511,6 +3511,7 @@ class SessionUIBase:
                         # verdict rides under ``heuristic_verdict``.
                         "heuristic_verdict": item.get("heuristic_verdict"),
                         "judge_verdict": verdicts.get(cid),
+                        "file_path": item.get("file_path"),
                     }
                 )
             # Primary call_id = first non-empty in list order (matches the
@@ -3587,6 +3588,10 @@ class SessionUIBase:
             }
             if "_heuristic_verdict" in it:
                 entry["heuristic_verdict"] = it["_heuristic_verdict"]
+            if it.get("func_name") in ("write_file", "edit_file"):
+                path = it.get("path")
+                if isinstance(path, str) and 0 < len(path) <= 4096:
+                    entry["file_path"] = path
             if it.get("_llm_verdict"):
                 # The completed LLM verdict that drove a Smart Approval.
                 # Sent so the auto-approved tool row renders the llm-tier

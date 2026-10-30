@@ -103,6 +103,158 @@ assert(!href(pane), "directory changes clear preview");
 """)
 
 
+def test_card_target_resolves_on_origin_and_selects_file_without_manual_navigation() -> None:
+    _run_files(r"""
+const pane = mount();
+pane.showFiles({base: "/node/B", wsId: "session/A"}, "/data/reports/a #.html");
+assert(requests[0].url === "/node/B/v1/api/workstreams/session%2FA/files/resolve?root=workspace&path=%2Fdata%2Freports%2Fa%20%23.html", "resolve must preserve node and encode full path");
+await succeed(requests.shift(), JSON.stringify({
+  root: "/data", root_id: "data", path: "reports", selected: "reports/a #.html",
+  entries: [file("reports/a #.html", "web")], truncated: true,
+}));
+assert(pane._rootId === "data" && pane._rootSelect.value === "data", "resolved root must become active");
+assert(pane._path === "reports", "resolved parent must be visible");
+assert(row(pane, "reports/a #.html").getAttribute("aria-current") === "true", "target must be selected");
+assert(requests[0].url.includes("/files/preview?root=data&path=reports%2Fa%20%23.html"), "preview uses resolved root");
+await succeed(requests.shift(), "<h1>Report</h1>");
+assert(href(pane).includes("/files/content?root=data&path="), "download uses resolved root");
+assert(saved.at(-1).selected === "reports/a #.html", "resolved selection is persisted");
+""")
+
+
+def test_capped_card_selection_survives_refresh_reopen_and_pane_restore() -> None:
+    _run_files(r"""
+let pane = mount();
+const ctx = {base: "/node/B", wsId: "session/A"};
+const target = "/data/reports/late #.txt";
+const answerBrowse = async request => {
+  const resolving = request.url.includes("/files/resolve?");
+  await succeed(request, JSON.stringify({
+    root: "/data", root_id: "data", path: "reports", selected: "reports/late #.txt",
+    entries: resolving ? [file("reports/late #.txt")] : [], truncated: true,
+  }));
+};
+const answerPreview = async text => {
+  assert(requests[0]?.url.includes("/files/preview?root=data&path=reports%2Flate%20%23.txt"), "capped-out target must be previewed");
+  await succeed(requests.shift(), text);
+  assert(row(pane, "reports/late #.txt")?.getAttribute("aria-current") === "true", "capped-out target stays selected");
+  assert(pane._preview._contentEl.querySelector("pre").textContent === text, "preview reloads current file bytes");
+};
+pane.showFiles(ctx, "reports/late #.txt");
+await answerBrowse(requests.shift());
+await answerPreview("initial");
+assert(saved.at(-1).selectedTarget === target, "resolved target persists its canonical absolute path");
+pane.bodyEl.querySelectorAll("button").find(button => button.getAttribute("aria-label") === "Refresh files").click();
+assert(requests[0].url.endsWith("/files/resolve?root=data&path=%2Fdata%2Freports%2Flate%20%23.txt"), "refresh must resolve the selected target");
+await answerBrowse(requests.shift());
+await answerPreview("refreshed");
+pane.showFiles(ctx);
+await answerBrowse(requests.shift());
+await answerPreview("reopened");
+const restoredMeta = saved.at(-1);
+pane.onClose();
+pane = mount(restoredMeta);
+assert(requests[0].url.startsWith("/node/B/v1/api/workstreams/session%2FA/files/resolve?"), "restore retains origin and resolves the target");
+await answerBrowse(requests.shift());
+await answerPreview("restored");
+pane._up.click();
+assert(!requests[0].url.includes("/resolve?") && requests[0].url.endsWith("&path="), "folder navigation must clear the direct target");
+await listing(requests.shift(), "", []);
+assert(!saved.at(-1).selectedTarget && !href(pane), "folder navigation clears persisted target and preview");
+""")
+
+
+def test_linked_target_survives_repeated_refresh_and_restore_while_loading() -> None:
+    _run_files(r"""
+let pane = mount();
+const ctx = {base: "/node/A", wsId: "one"};
+const target = "/tmp/reports/linked.txt";
+const resolved = {
+  root: "/tmp", root_id: "tmp", path: "reports", selected: "reports/linked.txt",
+  entries: [file("reports/linked.txt")], truncated: true,
+};
+const refresh = () => pane.bodyEl.querySelectorAll("button")
+  .find(button => button.getAttribute("aria-label") === "Refresh files").click();
+const nextResolve = () => {
+  const request = requests.shift();
+  assert(request.url.includes("/files/resolve?") && request.url.endsWith("path=%2Ftmp%2Freports%2Flinked.txt"), "loading must preserve the linked target for another refresh or restore");
+  return request;
+};
+const finish = async request => {
+  await succeed(request, JSON.stringify(resolved));
+  assert(requests[0]?.url.includes("/files/preview?root=tmp&path=reports%2Flinked.txt"), "resolved target must preview");
+  await succeed(requests.shift(), "linked");
+  assert(pane._selected === "reports/linked.txt", "capped-out file must remain selected");
+};
+pane.showFiles(ctx, target);
+await finish(nextResolve());
+refresh();
+const firstRefresh = nextResolve();
+refresh();
+await finish(nextResolve());
+await succeed(firstRefresh, JSON.stringify(resolved));
+assert(!requests.length, "superseded refresh must not start another preview");
+refresh();
+const oldPaneRequest = nextResolve();
+const loadingMeta = saved.at(-1);
+assert(loadingMeta.selectedTarget === target, "persist the pending target before the request completes");
+pane.onClose();
+pane = mount(loadingMeta);
+const restoredRequest = nextResolve();
+assert(restoredRequest.url.startsWith("/node/A/v1/api/workstreams/one/"), "restoration preserves the originating node");
+await succeed(oldPaneRequest, JSON.stringify(resolved));
+assert(!requests.length, "closed pane response cannot start a preview");
+await finish(restoredRequest);
+""")
+
+
+def test_selecting_another_file_clears_card_target_and_stale_resolution_is_ignored() -> None:
+    _run_files(r"""
+const pane = mount();
+const ctx = {base: "/node/A", wsId: "one"};
+const resolved = {
+  root: "/tmp", root_id: "tmp", path: "reports", selected: "reports/linked.txt",
+  entries: [file("reports/linked.txt"), file("reports/other.txt")], truncated: true,
+};
+pane.showFiles(ctx, "/tmp/reports/linked.txt");
+await succeed(requests.shift(), JSON.stringify(resolved));
+await succeed(requests.shift(), "linked");
+row(pane, "reports/other.txt").click();
+await succeed(requests.shift(), "other");
+assert(!saved.at(-1).selectedTarget, "selecting another file clears the previous direct target");
+pane.showFiles(ctx);
+assert(!requests[0].url.includes("/resolve?"), "reopen must not switch back to the old linked file");
+await listing(requests.shift(), "reports", resolved.entries, true);
+await succeed(requests.shift(), "other updated");
+pane.showFiles(ctx, "/tmp/reports/linked.txt");
+const stale = requests.shift();
+pane._up.click();
+await listing(requests.shift(), "", []);
+await succeed(stale, JSON.stringify(resolved));
+assert(pane._path === "" && pane._selected === null && !saved.at(-1).selectedTarget, "stale resolution cannot restore a target after folder navigation");
+assert(!requests.length && !href(pane), "stale resolution must not trigger a preview");
+""")
+
+
+def test_card_resolution_retry_and_stale_response_cannot_replace_newer_target() -> None:
+    _run_files(r"""
+const pane = mount();
+const ctx = {base: "/node/A", wsId: "one"};
+pane.showFiles(ctx, "/workspace/missing.txt");
+await succeed(requests.shift(), JSON.stringify({error: "File or directory not found"}), 404);
+assert(pane._status.textContent === "File or directory not found", "missing file gets actionable error");
+pane._list.querySelector("button").click();
+assert(requests[0].url.includes("/files/resolve?") && requests[0].url.endsWith("missing.txt"), "retry must resolve the original target");
+const old = requests.shift();
+pane.showFiles(ctx, "/tmp/latest.txt");
+await succeed(requests.shift(), JSON.stringify({root: "/tmp", root_id: "tmp", path: "", selected: "latest.txt", entries: [file("latest.txt")]}));
+await succeed(requests.shift(), "latest");
+await succeed(old, JSON.stringify({root: "/workspace", root_id: "workspace", path: "", selected: "missing.txt", entries: [file("missing.txt")]}));
+assert(pane._rootId === "tmp" && pane._selected === "latest.txt", "older response cannot steal target");
+assert(!row(pane, "missing.txt"), "older response cannot repaint the list");
+""")
+
+
 def test_context_changes_discard_stale_listing_and_preview() -> None:
     _run_files(r"""
 const pane = mount();

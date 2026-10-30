@@ -1,11 +1,68 @@
 """The Files launcher must preserve node locality and keyboard approval intent."""
 
+import json
 from pathlib import Path
 
 from tests._js_harness_helpers import FAKE_DOM, extract_braced, node_skip, run_node_source
 
 _ROOT = Path(__file__).resolve().parent.parent
 _SHARED = _ROOT / "turnstone/shared_static"
+
+
+@node_skip
+def test_content_links_keep_keyboard_activation_during_pending_approval() -> None:
+    source = (_SHARED / "interactive.js").read_text()
+    signature = 'this.el.addEventListener("keydown", (e) => {'
+    keys = extract_braced(source, signature)[len(signature) : -1]
+    proc = run_node_source(
+        FAKE_DOM
+        + "const {buildFileChip, buildPreviewChip} = await import("
+        + json.dumps((_SHARED / "conversation.js").as_uri())
+        + ");\n"
+        + "const handleKey = function(e) {"
+        + keys
+        + """};
+const opened = [];
+const path = '/workspace/report.html';
+const descriptor = {source: path, title: 'Report', kind: 'html'};
+const file = buildFileChip(path, value => opened.push(value));
+const preview = buildPreviewChip(descriptor, value => opened.push(value));
+let approvals = 0;
+const pane = {
+  pendingApproval: true,
+  approvalBlockEl: document.createElement('div'),
+  _oldestCycleId: () => 'pending',
+  getFeedback: () => '',
+  resolveApproval: () => { approvals++; },
+};
+for (const [chip, expected] of [[file, path], [preview, descriptor]]) {
+  for (const target of [chip, chip.querySelector('span')]) {
+    for (const key of ['Enter', ' ', 'y', 'n', 'a', 'Escape']) {
+      let prevented = false;
+      chip.focus();
+      handleKey.call(pane, {target, key, preventDefault() { prevented = true; }});
+      if (prevented || approvals) throw new Error('Content links must not resolve pending approval');
+      if (key === 'Enter' || key === ' ') {
+        const before = opened.length;
+        // Browser button activation follows only an uncancelled key event.
+        chip.click();
+        if (opened.length !== before + 1 || opened.at(-1) !== expected)
+          throw new Error('Native activation must open the intended content once');
+      }
+    }
+  }
+}
+// Keep the advertised approval shortcut available elsewhere in the pane.
+let prevented = false;
+const target = document.createElement('div');
+target.focus();
+handleKey.call(pane, {target, key: 'Enter', preventDefault() { prevented = true; }});
+if (!prevented || approvals !== 1) throw new Error('Pane approval shortcut must still work');
+"""
+    )
+    assert proc.returncode == 0, (
+        f"Content link keyboard routing failed:\n{proc.stderr}\n{proc.stdout}"
+    )
 
 
 @node_skip
@@ -50,11 +107,11 @@ if (pane._sbFiles.querySelector("span").getAttribute("aria-hidden") !== "true")
 def test_files_launcher_is_shared_and_passes_originating_transport() -> None:
     source = (_SHARED / "interactive.js").read_text()
     factory = source.split("function createInteractivePane(", 1)[1]
-    assert "window.TS_SHELL.openFiles({ base: base, wsId: wsId });" in factory
+    assert "window.TS_SHELL.openFiles({ base: base, wsId: wsId }, path);" in factory
     shell = (_SHARED / "shell.js").read_text()
     assert 'pm.registerType("filesystem", (id, extra)' in shell
     assert 'pm.openPaneBeside("filesystem")' in shell
-    assert "pane.showFiles(ctx)" in shell
+    assert "pane.showFiles(ctx, path)" in shell
     for path in ("turnstone/ui/static/index.html", "turnstone/console/static/index.html"):
         assert 'href="/shared/filesystem.css"' in (_ROOT / path).read_text()
 

@@ -6682,6 +6682,24 @@ class TestTaskExecutionJournalProjection:
         steps = _TaskExecutionJournal(turns).project_steps()
         assert [s["output"] for s in steps] == ["out-A", "out-B"]
 
+    def test_file_path_survives_clipped_task_arguments(self):
+        from turnstone.core.session import _AGENT_STEP_OUTPUT_CAP
+        from turnstone.core.trajectory import ToolCall, Turn
+
+        path = "/workspace/reports/quarterly.html"
+        arguments = json.dumps({"content": "x" * (_AGENT_STEP_OUTPUT_CAP + 100), "path": path})
+        turns = [
+            Turn.assistant(
+                tool_calls=(ToolCall(id="write", name="write_file", arguments=arguments),)
+            ),
+            Turn.tool("write", "Wrote report"),
+        ]
+        [step] = _TaskExecutionJournal(turns).project_steps()
+        assert step["file_path"] == path
+        assert len(step["arguments"]) <= _AGENT_STEP_OUTPUT_CAP
+        with pytest.raises(json.JSONDecodeError):
+            json.loads(step["arguments"])
+
     def test_step_count_capped_with_honest_marker(self):
         from turnstone.core.session import _AGENT_STEP_COUNT_CAP
         from turnstone.core.trajectory import ToolCall, Turn

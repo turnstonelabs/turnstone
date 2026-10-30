@@ -1675,7 +1675,7 @@ active interactive session on the addressed node. Through the console, prefix th
 `/node/{node_id}`. An inactive or rehomed session returns `409`; reopen the conversation
 before browsing again.
 
-All three endpoints accept `root=workspace|data|tmp` (default `workspace`) and a `path`
+Listing, preview, and content endpoints accept `root=workspace|data|tmp` (default `workspace`) and a `path`
 relative to that root. `workspace` uses `[tools] workspace_dir`, then
 `TURNSTONE_WORKSPACE`, then the server working directory. `data` and `tmp` select `/data`
 and `/tmp`. An unknown root returns `400`; a missing root returns `503`. Symlinks and
@@ -1693,6 +1693,15 @@ and `modified` (Unix seconds). Files also include `size`, `preview_kind`, and
 At most 1,000 directory entries are examined. The response explicitly sets `truncated`
 when that limit is reached. Inaccessible entries are omitted; a failed directory read
 returns an error rather than an empty listing.
+
+#### `GET /v1/api/workstreams/{ws_id}/files/resolve`
+
+Resolve a tool's `path` to a browsable file and return its parent directory listing, with
+`selected` identifying the file's root-relative path. The file is included even when the
+directory listing is truncated. Paths may be absolute, home-relative, or relative to the
+node's working directory, matching file-tool semantics. The most specific matching root
+is selected. The endpoint requires the same permission and workstream access as listing;
+paths outside the browsable roots and symlinks below a root return `403`.
 
 #### `GET /v1/api/workstreams/{ws_id}/files/preview`
 

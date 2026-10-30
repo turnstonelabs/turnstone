@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import errno
 import os
+from contextlib import suppress
 from types import SimpleNamespace
 
 import pytest
@@ -89,6 +91,113 @@ def test_directory_truncation_is_explicit(workspace, monkeypatch):
     assert result["truncated"] is True
 
 
+def test_resolve_tool_path_selects_file_even_beyond_listing_cap(workspace, monkeypatch):
+    folder = workspace / "reports"
+    folder.mkdir()
+    (folder / "report #1.html").write_text("<h1>Report</h1>")
+    monkeypatch.chdir(workspace)
+    monkeypatch.setattr(fs, "DIRECTORY_ENTRY_CAP", 0)
+    result = fs.resolve_file("reports/report #1.html")
+    assert result["root_id"] == "workspace"
+    assert result["path"] == "reports"
+    assert result["selected"] == "reports/report #1.html"
+    assert result["truncated"] is True
+    assert result["entries"][0]["preview_kind"] == "web"
+
+
+def test_resolve_uses_tool_cwd_not_configured_workspace(workspace, tmp_path, monkeypatch):
+    (workspace / "note.txt").write_text("wrong target")
+    other = tmp_path / "data"
+    other.mkdir()
+    (other / "note.txt").write_text("correct target")
+    monkeypatch.setitem(fs._FIXED_ROOTS, "data", str(other))
+    monkeypatch.chdir(other)
+    result = fs.resolve_file("note.txt")
+    assert result["root_id"] == "data"
+    assert result["root"] == str(other.resolve())
+    assert result["selected"] == "note.txt"
+
+
+@pytest.mark.parametrize("root_id", ["data", "tmp"])
+def test_resolve_absolute_paths_and_root_aliases(workspace, tmp_path, monkeypatch, root_id):
+    root = tmp_path / "actual"
+    root.mkdir()
+    (root / "file.txt").write_text("contents")
+    alias = tmp_path / "alias"
+    alias.symlink_to(root, target_is_directory=True)
+    monkeypatch.setitem(fs._FIXED_ROOTS, root_id, str(alias))
+    for path in (root / "file.txt", alias / "file.txt"):
+        result = fs.resolve_file(str(path))
+        assert result["root_id"] == root_id
+        assert result["selected"] == "file.txt"
+
+
+def test_resolve_prefers_nested_workspace_and_expands_home(workspace, tmp_path, monkeypatch):
+    monkeypatch.setitem(fs._FIXED_ROOTS, "tmp", str(tmp_path))
+    monkeypatch.setenv("HOME", str(workspace))
+    (workspace / "file.txt").write_text("hello")
+    assert fs.resolve_file("~/file.txt")["root_id"] == "workspace"
+    assert fs.resolve_file(str(workspace / "file.txt"))["root_id"] == "workspace"
+
+
+def test_configured_root_preserves_symlink_parent_resolution(workspace, tmp_path, monkeypatch):
+    actual = tmp_path / "actual"
+    (actual / "child").mkdir(parents=True)
+    (actual / "file.txt").write_text("contents")
+    link = workspace / "link"
+    link.symlink_to(actual / "child", target_is_directory=True)
+    monkeypatch.setattr(fs, "get_workspace_dir", lambda: str(link / ".."))
+    result = fs.list_directory("")
+    assert result["root"] == str(actual.resolve())
+    assert result["entries"][1]["name"] == "file.txt"
+
+
+def test_resolve_rejects_outside_symlinks_missing_and_special_files(
+    workspace, tmp_path, monkeypatch
+):
+    monkeypatch.setitem(fs._FIXED_ROOTS, "data", str(workspace))
+    monkeypatch.setitem(fs._FIXED_ROOTS, "tmp", str(workspace))
+    outside = tmp_path / "outside.txt"
+    outside.write_text("outside")
+    (workspace / "inside.txt").write_text("inside")
+    (workspace / "link.txt").symlink_to(workspace / "inside.txt")
+    (workspace / "outside-link.txt").symlink_to(outside)
+    os.mkfifo(workspace / "pipe")
+    for path, status in (
+        (outside, 403),
+        (workspace / "link.txt", 403),
+        (workspace / "outside-link.txt", 403),
+        (workspace / "missing.txt", 404),
+        (workspace / "pipe", 400),
+        (workspace, 400),
+    ):
+        with pytest.raises(fs.FilesystemError) as exc:
+            fs.resolve_file(str(path))
+        assert exc.value.status == status
+
+
+def test_resolve_parent_segments_cannot_hide_symlink_target(workspace, tmp_path):
+    folder = workspace / "folder"
+    folder.mkdir()
+    (workspace / "file.txt").write_text("inside")
+    (workspace / "link").symlink_to(tmp_path, target_is_directory=True)
+    assert fs.resolve_file(str(folder / ".." / "file.txt"))["selected"] == "file.txt"
+    with pytest.raises(fs.FilesystemError) as exc:
+        fs.resolve_file(str(workspace / "link" / ".." / "file.txt"))
+    assert exc.value.status == 403
+
+
+@pytest.mark.parametrize("name", ["report #1.html", "report?copy.html"])
+def test_literal_filename_punctuation_preserves_preview_kind(workspace, name):
+    original = b"<h1>Report</h1>"
+    (workspace / name).write_bytes(original)
+    assert fs.list_directory("")["entries"][0]["preview_kind"] == "web"
+    data, mime, filename = fs.read_file(name, preview=True)
+    assert data == original
+    assert mime.startswith("text/html")
+    assert filename == name
+
+
 @pytest.mark.parametrize("path", ["../outside", "/etc/passwd", "folder/../../outside", "a\0b"])
 def test_rejects_escape_paths(workspace, path):
     with pytest.raises(fs.FilesystemError) as exc:
@@ -125,6 +234,54 @@ def test_file_replacement_by_symlink_before_open_is_refused(workspace, tmp_path,
     monkeypatch.setattr(os, "open", replaced)
     with pytest.raises(fs.FilesystemError):
         fs.read_file("note.txt", preview=False)
+
+
+@pytest.mark.parametrize("failure", ["none", "open", "body", "close"])
+def test_path_walk_closes_all_descriptors_when_operations_fail(workspace, monkeypatch, failure):
+    folder = workspace / "folder"
+    folder.mkdir()
+    (folder / "note.txt").write_text("contents")
+    real_open, real_close = os.open, os.close
+    opened, closed = [], []
+
+    def tracked_open(path, flags, *args, **kwargs):
+        if failure == "open" and path == "note.txt":
+            raise OSError(errno.EACCES, "Cannot open file")
+        fd = real_open(path, flags, *args, **kwargs)
+        opened.append(fd)
+        return fd
+
+    def tracked_close(fd):
+        closed.append(fd)
+        real_close(fd)
+        if failure == "close" and len(closed) == 1:
+            raise OSError(errno.EIO, "Close reported an error")
+
+    monkeypatch.setattr(os, "open", tracked_open)
+    monkeypatch.setattr(os, "close", tracked_close)
+    try:
+
+        def walk():
+            with fs._open_path(workspace, "folder/note.txt", directory=False) as fd:
+                assert os.read(fd, 8) == b"contents"
+                if failure == "body":
+                    raise RuntimeError("Consumer failed")
+
+        if failure == "none":
+            walk()
+        else:
+            expected = {"open": fs.FilesystemError, "body": RuntimeError, "close": OSError}
+            with pytest.raises(expected[failure]):
+                walk()
+        assert closed == list(reversed(opened))
+        for fd in opened:
+            with pytest.raises(OSError) as exc:
+                os.fstat(fd)
+            assert exc.value.errno == errno.EBADF
+    finally:
+        for fd in opened:
+            with suppress(OSError):
+                real_close(fd)
 
 
 def test_missing_configured_workspace_does_not_fall_back(workspace, monkeypatch):
@@ -220,7 +377,7 @@ def test_changed_binary_content_is_not_previewed(workspace):
     assert fs.read_file("code.js", preview=False)[0] == b"\0secret"
 
 
-@pytest.mark.parametrize("suffix", ["", "/preview", "/content"])
+@pytest.mark.parametrize("suffix", ["", "/preview", "/content", "/resolve"])
 @pytest.mark.parametrize("prefix", ["/v1/api", "/api", "/node/n1/v1/api", "/node/n1/api"])
 def test_filesystem_requires_write_scope(prefix, suffix):
     assert required_scope("GET", f"{prefix}/workstreams/ws-A/files{suffix}") == "write"
@@ -262,11 +419,17 @@ async def test_file_permission_and_write_scope_reach_every_route(files_client, p
             (("read", "write"), ("files.read",), 200),
             (("read", "write", "service"), (), 200),
         ):
-            for suffix in ("", "/preview", "/content"):
+            for suffix in ("", "/preview", "/content", "/resolve"):
                 response = await target.request(
                     method,
                     f"{prefix}/workstreams/ws-A/files{suffix}",
-                    params={"path": "note.txt" if suffix else ""},
+                    params={
+                        "path": str(workspace / "note.txt")
+                        if suffix == "/resolve"
+                        else "note.txt"
+                        if suffix
+                        else ""
+                    },
                     headers=_auth(
                         "userA", scopes=scopes, permissions=permissions, audience=audience
                     ),
@@ -294,10 +457,16 @@ def test_api_token_observes_file_permission_grants_and_revocations(files_client)
     headers = {"Authorization": f"Bearer {token}"}
     for granted, expected in ((False, 403), (True, 200), (False, 403)):
         storage.set_role_overrides("file-reader", {"files.read"} if granted else set(), set())
-        for suffix in ("", "/preview", "/content"):
+        for suffix in ("", "/preview", "/content", "/resolve"):
             response = client.get(
                 "/v1/api/workstreams/ws-A/files" + suffix,
-                params={"path": "note.txt" if suffix else ""},
+                params={
+                    "path": str(workspace / "note.txt")
+                    if suffix == "/resolve"
+                    else "note.txt"
+                    if suffix
+                    else ""
+                },
                 headers=headers,
             )
             assert response.status_code == expected, response.text
@@ -316,7 +485,7 @@ def test_http_listing_preview_probe_download_and_auth(files_client):
         secret=_TEST_JWT_SECRET,
         audience=JWT_AUD_SERVER,
     )
-    for suffix in ("", "/preview", "/content"):
+    for suffix in ("", "/preview", "/content", "/resolve"):
         assert (
             client.get(url + suffix, headers={"Authorization": f"Bearer {readonly}"}).status_code
             == 403
@@ -352,7 +521,7 @@ def test_stale_workstream_never_serves_wrong_node_files(files_client, state):
     mgr.loaded.side_effect = lambda ws_id: None if state == "nonlocal" else ws
     # ws-A still exists in shared storage. A stale pane must not use that row
     # as proof that its original node still hosts the workstream.
-    for suffix in ("", "/preview", "/content"):
+    for suffix in ("", "/preview", "/content", "/resolve"):
         result = client.get(f"/v1/api/workstreams/ws-A/files{suffix}", headers=_auth("userA"))
         assert result.status_code == 409
         assert "not active on this node" in result.json()["error"]

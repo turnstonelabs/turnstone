@@ -1286,43 +1286,61 @@ export function buildConvResult(output, opts) {
   return block;
 }
 
-// Preview chip (.conv-preview-chip) — the transcript affordance for a tool
-// result that carries a preview-pane descriptor.  Live results auto-open the
-// pane; this chip is how the operator RE-opens one (after closing the pane,
-// or from a replayed transcript, where nothing auto-opens).  `descriptor` is
-// the structured preview object off the tool_result event / history entry;
-// `onOpen(descriptor)` is the pane-supplied opener (routed through the host
-// seam so this builder stays shell-agnostic).  textContent only.
-export function buildPreviewChip(descriptor, onOpen) {
-  const d = descriptor || {};
+// Shared open-content control for file results and stored previews. Callers
+// supply the destination; labels stay inert text, including paths and URLs.
+function buildContentChip(label, action, title, kind, onOpen) {
   const chip = document.createElement("button");
   chip.type = "button";
-  chip.className = "conv-preview-chip";
-  // The label can be a raw URL (no <title> found) — a target with embedded
-  // basic-auth must not print credentials into the transcript.
-  const label = redactCredentials(d.title || d.source || "preview");
-  chip.setAttribute("aria-label", "Open preview: " + label);
-  chip.title = d.source
-    ? "Open preview — " + redactCredentials(d.source)
-    : "Open preview";
+  chip.className = "conv-content-chip";
+  chip.setAttribute("aria-label", action + ": " + label);
+  chip.title = title;
   const glyph = document.createElement("span");
-  glyph.className = "conv-preview-glyph";
+  glyph.className = "conv-content-glyph";
   glyph.setAttribute("aria-hidden", "true");
   glyph.textContent = "▤";
   chip.appendChild(glyph);
   const text = document.createElement("span");
-  text.className = "conv-preview-title";
+  text.className = "conv-content-title";
   text.textContent = label;
   chip.appendChild(text);
-  if (d.kind) {
-    const kind = document.createElement("span");
-    kind.className = "conv-preview-kind";
-    kind.textContent = d.kind;
-    chip.appendChild(kind);
+  if (kind) {
+    const badge = document.createElement("span");
+    badge.className = "conv-content-kind";
+    badge.textContent = kind;
+    chip.appendChild(badge);
   }
+  const arrow = document.createElement("span");
+  arrow.className = "conv-content-glyph";
+  arrow.setAttribute("aria-hidden", "true");
+  arrow.textContent = "↗";
+  chip.appendChild(arrow);
   if (typeof onOpen === "function") {
-    chip.addEventListener("click", () => onOpen(d));
+    chip.addEventListener("click", onOpen);
   }
+  return chip;
+}
+
+export function buildPreviewChip(descriptor, onOpen) {
+  const d = descriptor || {};
+  const label = redactCredentials(d.title || d.source || "preview");
+  const title = d.source
+    ? "Open preview — " + redactCredentials(d.source)
+    : "Open preview";
+  const chip = buildContentChip(label, "Open preview", title, d.kind, () => {
+    if (typeof onOpen === "function") onOpen(d);
+  });
+  chip.classList.add("conv-preview-chip");
+  return chip;
+}
+
+export function buildFileChip(path, onOpen) {
+  const fullPath = redactCredentials(path);
+  const label = fullPath.split("/").pop() || fullPath;
+  const chip = buildContentChip(
+    label, "Open file", "Open file — " + fullPath, "File", () => onOpen(path),
+  );
+  chip.setAttribute("aria-label", "Open file: " + fullPath);
+  chip.classList.add("conv-file-chip");
   return chip;
 }
 

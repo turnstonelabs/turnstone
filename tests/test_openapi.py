@@ -63,6 +63,25 @@ class TestServerSpec:
         assert "stt_default_alias" in models_props
         assert "tts_default_alias" in models_props
 
+    def test_file_resolver_contract_includes_selected_file(self):
+        from turnstone.api.server_spec import build_server_spec
+
+        spec = build_server_spec()
+        resolve = spec["paths"]["/v1/api/workstreams/{ws_id}/files/resolve"]["get"]
+        query = {p["name"]: p for p in resolve["parameters"] if p["in"] == "query"}
+        assert set(query) == {"path"}
+        assert query["path"]["required"] is True
+        assert resolve["responses"]["200"]["content"]["application/json"]["schema"] == {
+            "$ref": "#/components/schemas/ResolveFilesystemResponse"
+        }
+        assert {"400", "403", "404", "409", "503"} <= resolve["responses"].keys()
+        schemas = spec["components"]["schemas"]
+        resolved = schemas["ResolveFilesystemResponse"]
+        assert "selected" in resolved["required"]
+        assert resolved["properties"]["selected"]["type"] == "string"
+        listing = schemas["ListFilesystemResponse"]["properties"]
+        assert {name: resolved["properties"][name] for name in listing} == listing
+
     def test_workstream_history_has_limit_query_param(self):
         """Mirror of the coord-side history limit param test — server now
         exposes the same endpoint via the lifted factory."""

@@ -1105,13 +1105,13 @@ async function mountShell() {
       window.showToast &&
       window.showToast("File browsing permission and write access are required", "warn"),
   });
-  const openFiles = (ctx) => {
+  const openFiles = (ctx, path = null) => {
     if (!ctx || !ctx.wsId) return;
     const pane = pm.openPaneBeside("filesystem");
-    if (pane) pane.showFiles(ctx);
+    if (pane) pane.showFiles(ctx, path);
   };
   const syncFilesAccess = () => {
-    for (const button of document.querySelectorAll(".ws-sb-files")) {
+    for (const button of document.querySelectorAll(".ws-sb-files, .conv-file-chip")) {
       button.hidden = !(hasScope("write") && hasPermission("files.read"));
     }
   };

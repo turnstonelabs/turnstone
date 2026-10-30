@@ -832,7 +832,7 @@ _ATTACHMENT_DELETE_RE = re.compile(r"^/api/workstreams/[^/]+/attachments/[^/]+$"
 
 # Workspace browsing exposes node-local bytes beyond conversation history.
 # Keep it at the same scope as asking the workstream to read a file.
-_FILESYSTEM_RE = re.compile(r"^/api/workstreams/[^/]+/files(?:/(?:preview|content))?$")
+_FILESYSTEM_RE = re.compile(r"^/api/workstreams/[^/]+/files(?:/(?:preview|content|resolve))?$")
 
 # Matches the avatar writes: PUT /api/users/{user_id}/avatar (colour) and
 # PUT or DELETE /api/users/{user_id}/avatar/picture.

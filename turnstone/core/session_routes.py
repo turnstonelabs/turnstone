@@ -650,6 +650,7 @@ class FilesystemHandlers:
     list: Handler
     preview: Handler
     content: Handler
+    resolve: Handler
 
 
 @dataclass(frozen=True)
@@ -825,6 +826,7 @@ def register_session_routes(
         routes.append(Route(f"{p}/{{ws_id}}/files", fs.list, methods=["GET"]))
         routes.append(Route(f"{p}/{{ws_id}}/files/preview", fs.preview, methods=["GET"]))
         routes.append(Route(f"{p}/{{ws_id}}/files/content", fs.content, methods=["GET"]))
+        routes.append(Route(f"{p}/{{ws_id}}/files/resolve", fs.resolve, methods=["GET"]))
 
     # --- Bare ``{ws_id}`` detail (GET) registers LAST so the verb-
     #     suffixed patterns above win for ``{ws_id}/...`` paths.

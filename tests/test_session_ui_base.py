@@ -1217,6 +1217,31 @@ def test_serialize_approval_items_forwards_denial_msg_as_error() -> None:
     assert out[0]["error"] == "Blocked by tool policy (pattern match for 'bash')"
 
 
+def test_file_targets_survive_live_and_pending_card_projection() -> None:
+    ui = _make_ui()
+    path = "reports/" + "long-" * 40 + "report.html"
+    items = ui._serialize_approval_items(
+        [
+            {
+                "call_id": "write",
+                "func_name": "write_file",
+                "path": path,
+                "content": "private body",
+            },
+            {"call_id": "edit", "func_name": "edit_file", "path": "/tmp/code.js"},
+            {"call_id": "read", "func_name": "read_file", "path": path},
+        ]
+    )
+    assert items[0]["file_path"] == path
+    assert "content" not in items[0]
+    assert items[1]["file_path"] == "/tmp/code.js"
+    assert "file_path" not in items[2]
+    _register_card_cycle(ui, {"cycle_id": "files", "items": items})
+    pending = ui.serialize_pending_approval_details()[0]["items"]
+    assert pending[0]["file_path"] == path
+    assert pending[1]["file_path"] == "/tmp/code.js"
+
+
 def test_record_auto_approves_appends_only_tagged_items() -> None:
     """Items without ``auto_approved=True`` are skipped — the ring
     buffer is meant to surface bypassed-the-gate calls, not a

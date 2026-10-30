@@ -12,9 +12,10 @@ import asyncio
 import errno
 import os
 import stat
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+from urllib.parse import quote
 
 from starlette.responses import JSONResponse, Response
 
@@ -47,14 +48,18 @@ class FilesystemError(Exception):
         self.status = status
 
 
-def _root(root_id: str) -> Path:
+def _root_path(root_id: str) -> Path:
     if root_id not in ("workspace", *_FIXED_ROOTS):
         raise FilesystemError("Unknown filesystem root", 400)
+    configured = (
+        get_workspace_dir() or os.getcwd() if root_id == "workspace" else _FIXED_ROOTS[root_id]
+    )
+    return Path(configured).expanduser().absolute()
+
+
+def _root(root_id: str) -> Path:
     try:
-        configured = (
-            get_workspace_dir() or os.getcwd() if root_id == "workspace" else _FIXED_ROOTS[root_id]
-        )
-        root = Path(configured).expanduser().resolve(strict=True)
+        root = _root_path(root_id).resolve(strict=True)
         if not root.is_dir():
             raise OSError("not a directory")
         return root
@@ -87,26 +92,23 @@ def _open_path(root: Path, path: str, *, directory: bool) -> Iterator[int]:
     open makes directory replacement unable to redirect a later open outside
     the workspace.
     """
-    fds: list[int] = []
-    try:
-        fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-        fds.append(fd)
-        parts = path.split("/") if path else []
-        for index, part in enumerate(parts):
-            flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
-            if index < len(parts) - 1 or directory:
-                flags |= os.O_DIRECTORY
-            fd = os.open(part, flags, dir_fd=fd)
-            fds.append(fd)
-        mode = os.fstat(fd).st_mode
-        if not (stat.S_ISDIR(mode) if directory else stat.S_ISREG(mode)):
-            raise FilesystemError("Only regular files and directories are accessible", 400)
-        yield fd
-    except OSError as exc:
-        raise _os_error(exc) from exc
-    finally:
-        for fd in reversed(fds):
-            os.close(fd)
+    with ExitStack() as stack:
+        try:
+            fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            stack.callback(os.close, fd)
+            parts = path.split("/") if path else []
+            for index, part in enumerate(parts):
+                flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+                if index < len(parts) - 1 or directory:
+                    flags |= os.O_DIRECTORY
+                fd = os.open(part, flags, dir_fd=fd)
+                stack.callback(os.close, fd)
+            mode = os.fstat(fd).st_mode
+            if not (stat.S_ISDIR(mode) if directory else stat.S_ISREG(mode)):
+                raise FilesystemError("Only regular files and directories are accessible", 400)
+            yield fd
+        except OSError as exc:
+            raise _os_error(exc) from exc
 
 
 def _preview_type(name: str, sample: bytes) -> tuple[str, str]:
@@ -117,7 +119,8 @@ def _preview_type(name: str, sample: bytes) -> tuple[str, str]:
     except UnicodeDecodeError as exc:
         if exc.reason == "unexpected end of data":
             sample = sample[: exc.start]
-    return resolve_preview_kind("", name, sample) or ("binary", "application/octet-stream")
+    # The shared classifier also accepts URLs; quote literal '?' and '#' in filenames.
+    return resolve_preview_kind("", quote(name), sample) or ("binary", "application/octet-stream")
 
 
 def list_directory(raw_path: str, *, root_id: str = "workspace") -> dict[str, Any]:
@@ -192,7 +195,7 @@ def read_file(
             raise FilesystemError("File exceeds the size limit", 413)
         data = b"".join(chunks)
     if preview:
-        resolved = resolve_preview_kind("", path, data)
+        resolved = resolve_preview_kind("", quote(path), data)
         if resolved is None:
             raise FilesystemError("File is not previewable; download it to open locally", 415)
         kind, mime = resolved
@@ -201,6 +204,56 @@ def read_file(
         if len(data) > PREVIEW_SIZE_CAPS[kind]:
             raise FilesystemError("File exceeds the preview size limit", 413)
     return data, mime, path.rsplit("/", 1)[-1]
+
+
+def resolve_file(raw_path: str) -> dict[str, Any]:
+    """Locate a tool path in the current node's browsable roots."""
+    if not raw_path or len(raw_path) > 4096 or "\0" in raw_path:
+        raise FilesystemError("Expected a file path", 400)
+    expanded = os.path.expanduser(raw_path)
+    absolute = Path(os.path.abspath(expanded))
+    candidates: list[tuple[int, str, Path, str]] = []
+    for root_id in ("workspace", *_FIXED_ROOTS):
+        try:
+            root = _root(root_id)
+            aliases = {_root_path(root_id), root}
+        except (FilesystemError, OSError):
+            continue
+        for alias in aliases:
+            if absolute.is_relative_to(alias):
+                relative = absolute.relative_to(alias).as_posix()
+                candidates.append((len(alias.parts), root_id, root, relative))
+    if not candidates:
+        raise FilesystemError("This file is outside the browsable roots", 403)
+    _, root_id, root, relative = max(candidates, key=lambda item: item[0])
+    path = _path(relative)
+    # Root aliases are allowed; user-selected symlinks below them are not.
+    # Compare before opening so normalization of a link followed by '..'
+    # cannot silently select a different file from the tool's target.
+    if Path(os.path.realpath(expanded)) != root / path:
+        raise FilesystemError("File is not accessible through a symbolic link", 403)
+    with _open_path(root, path, directory=False) as fd:
+        info = os.fstat(fd)
+        kind, mime = _preview_type(path, os.read(fd, _SNIFF_SIZE))
+    result = list_directory(path.rpartition("/")[0], root_id=root_id)
+    # A direct link must still select its file when the directory is capped.
+    if not any(entry["path"] == path for entry in result["entries"]):
+        result["entries"].append(
+            {
+                "name": path.rsplit("/", 1)[-1],
+                "path": path,
+                "kind": "file",
+                "size": info.st_size,
+                "modified": info.st_mtime,
+                "preview_kind": kind,
+                "content_type": mime,
+            }
+        )
+        result["entries"].sort(
+            key=lambda item: (item["kind"] != "directory", item["name"].casefold(), item["name"])
+        )
+    result["selected"] = path
+    return result
 
 
 def make_filesystem_handlers(cfg: SessionEndpointConfig) -> FilesystemHandlers:
@@ -274,4 +327,14 @@ def make_filesystem_handlers(cfg: SessionEndpointConfig) -> FilesystemHandlers:
     async def content(request: Request) -> Response:
         return await serve(request, preview=False)
 
-    return FilesystemHandlers(list=listing, preview=preview, content=content)
+    async def resolve(request: Request) -> Response:
+        err = await gate(request)
+        if err is not None:
+            return err
+        try:
+            result = await asyncio.to_thread(resolve_file, request.query_params.get("path", ""))
+            return JSONResponse(result, headers={"Cache-Control": "private, no-store"})
+        except FilesystemError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=exc.status)
+
+    return FilesystemHandlers(list=listing, preview=preview, content=content, resolve=resolve)

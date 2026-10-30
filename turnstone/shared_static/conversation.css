@@ -298,6 +298,56 @@
   padding-block: 6px;
 }
 
+/* File and preview links share one transcript action. */
+.conv-content-chip {
+  --content-link-ink: color-mix(in srgb, var(--blue) 10%, var(--ink-3));
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 30px;
+  max-width: calc(100% - 20px);
+  margin: 6px 10px;
+  padding: 4px 8px;
+  font: inherit;
+  font-size: 12px;
+  line-height: 1.4;
+  color: var(--content-link-ink);
+  background: color-mix(in srgb, var(--content-link-ink) 15%, var(--panel));
+  border: 1px solid color-mix(in srgb, var(--content-link-ink) 45%, var(--panel));
+  border-radius: var(--r-sm);
+  cursor: pointer;
+}
+.conv-content-chip[hidden] {
+  display: none;
+}
+.conv-content-chip:hover {
+  background: color-mix(in srgb, var(--content-link-ink) 22%, var(--panel));
+  border-color: var(--content-link-ink);
+}
+.conv-content-chip:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--content-link-ink) 80%, var(--panel));
+  outline-offset: -1px;
+}
+.conv-content-glyph {
+  flex: none;
+}
+.conv-content-title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.conv-content-kind {
+  flex: none;
+  padding: 0 4px;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  border: 1px solid color-mix(in srgb, var(--content-link-ink) 45%, var(--panel));
+  border-radius: 3px;
+}
+
 /* Row container.  Parallel batches frame rows with a left rail so they
    read as siblings of one decision; solo batches suppress it to keep
    visual weight low. */
@@ -672,7 +722,7 @@
 /* Tool result block — paired under its row, mono pre-block.  Capped at
    240px with internal scroll so a long output doesn't push the chat
    off-screen. */
-.conv-row-result {
+.conv-row-result:where(:not(.conv-content-chip)) {
   margin-top: 6px;
   padding: 6px 10px;
   font-family: var(--font-mono);
@@ -687,7 +737,7 @@
   max-height: 240px;
   overflow: auto;
 }
-.conv-row.error .conv-row-result {
+.conv-row.error .conv-row-result:where(:not(.conv-content-chip)) {
   border-left-color: var(--err);
   color: color-mix(in srgb, var(--err) 75%, var(--ink-2));
 }

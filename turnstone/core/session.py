@@ -1558,6 +1558,14 @@ class _TaskExecutionJournal:
                 "output": "",
                 "is_error": False,
             }
+            if name in ("write_file", "edit_file"):
+                try:
+                    args = json.loads(tool_call.arguments)
+                except (ValueError, TypeError):
+                    args = None
+                path = args.get("path") if isinstance(args, dict) else None
+                if isinstance(path, str) and 0 < len(path) <= 4096:
+                    recall_step["file_path"] = path
             pending = _PendingAgentCall(
                 call_id=tool_call.id,
                 name=name,
