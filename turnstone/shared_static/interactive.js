@@ -5510,7 +5510,7 @@ function _loadHls(callback) {
   if (_hlsState === "loading") return;
   _hlsState = "loading";
   const script = document.createElement("script");
-  script.src = "/shared/hls-1.7.3/hls.min.js";
+  script.src = "/shared/hls-1.7.4/hls.min.js";
   script.onload = function () {
     _hlsState = "ready";
     const q = _hlsQueue;

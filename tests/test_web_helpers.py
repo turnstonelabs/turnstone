@@ -58,7 +58,7 @@ class TestVersionHtml:
     def test_vendored_hls_skipped(self):
         from turnstone.core.web_helpers import version_html
 
-        html = '<script src="/shared/hls-1.7.3/hls.min.js"></script>'
+        html = '<script src="/shared/hls-1.7.4/hls.min.js"></script>'
         result = version_html(html)
         assert result == html  # unchanged
 
