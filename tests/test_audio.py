@@ -1525,7 +1525,9 @@ class TestTranscriptionHttpBudget:
     def test_upload_and_silent_headers_share_one_deadline(self, monkeypatch, case):
         monkeypatch.setattr(audio, "_to_wav_16k_mono", lambda data, **kwargs: data)
         gate = ModelAdmission("voice", 1)
-        budget = 1.2
+        # Leave time for request preparation and the delayed upload so expiry
+        # reaches the silent header read, even on a slower test runner.
+        budget = 2.0
         transport = httpx2.HTTPTransport(
             socket_options=[(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)]
         )
