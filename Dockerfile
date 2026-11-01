@@ -41,8 +41,8 @@ RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-reco
 RUN uv pip install --python /usr/local/bin/python3 --system "pip>=26.2.2"
 
 # Node.js LTS (for npx-based MCP servers like @modelcontextprotocol/server-github)
-COPY --from=node:24-slim /usr/local/bin/node /usr/local/bin/node
-COPY --from=node:24-slim /usr/local/lib/node_modules /usr/local/lib/node_modules
+COPY --from=node:26-slim /usr/local/bin/node /usr/local/bin/node
+COPY --from=node:26-slim /usr/local/lib/node_modules /usr/local/lib/node_modules
 RUN ln -s ../lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
     && ln -s ../lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx
 
