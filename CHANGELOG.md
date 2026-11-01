@@ -10,6 +10,17 @@ All development now integrates on `main`. Supported release lines are maintained
 on `stable/X.Y` branches; `stable/1.8` preserves the former stable branch.
 The separate `dev` branch is retired. See [the release process](docs/releasing.md).
 
+## [2026-11-01]
+
+### Fixed
+
+- A session create reports a full node only when every session slot is busy. Any
+  other runtime failure during a create also answered 429 with the raw error text,
+  so the browser retried it as a rate limit; it now answers 500 with a correlation
+  id. A scheduled task that hits one records the firing as unresolved instead of
+  retrying it. The coordinator API no longer documents a 429 for create, detail or
+  open, and its create now lists the 409 and 413 it can answer.
+
 ## [2026-10-31]
 
 ### Fixed

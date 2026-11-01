@@ -714,9 +714,9 @@ class SessionManager:
         failure both the in-memory slot and its unpublished durable
         reservation are released so capacity and IDs are not leaked.
 
-        Raises ``RuntimeError`` when the manager is at capacity with
+        Raises ``SessionCapacityError`` when the manager is at capacity with
         no idle workstream to evict — callers (HTTP handlers) translate
-        this to 429.
+        this to 429. An uncapped manager never raises it.
 
         ``defer_emit_created``: when ``True``, the workstream is reserved and
         the ``emit_created`` call is skipped. The caller takes ownership of
@@ -1324,11 +1324,10 @@ class SessionManager:
                 row = self._storage.ensure_workstream_incarnation_snapshot(ws_id)
                 if row is None or row.get("kind") != self.kind:
                     return None, False
-                # ``deleted`` is a tombstone — never resurrect.
-                # ``closed`` IS resurrectable; the Saved Workstreams
-                # landing makes restore an explicit user action, and
-                # ``_reserve_and_install`` still enforces
-                # max_active (evicting an idle peer or raising).
+                # ``deleted`` is a tombstone — never resurrect. ``closed`` IS resurrectable; the
+                # Saved Workstreams landing makes restore an explicit user action, and
+                # ``_reserve_and_install`` still enforces a capped manager's max_active (evicting
+                # an idle peer or raising).
                 if row.get("state") in {"creating", "deleted"}:
                     return None, False
 
@@ -1418,8 +1417,8 @@ class SessionManager:
                     # working.  Inside the unwind bracket: a parse raise must
                     # release the placeholder slot exactly like a
                     # build_session failure, or the ws_id stays tracked
-                    # forever (pinning a max_active slot and turning every
-                    # later open() into the already-tracked RuntimeError).
+                    # forever (pinning a slot and turning every later
+                    # open() into the already-tracked RuntimeError).
                     persona_snapshot = snapshot_from_config(saved_cfg or {})
                     extra_build_kwargs: dict[str, Any] = {"workstream_lease": lease}
                     if persona_snapshot is not None:

@@ -6551,8 +6551,18 @@
               }
             }
           },
-          "429": {
-            "description": "Error 429",
+          "409": {
+            "description": "Error 409",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Error 413",
             "content": {
               "application/json": {
                 "schema": {
@@ -6633,7 +6643,7 @@
         "tags": [
           "Coordinator"
         ],
-        "description": "Returns the persisted coordinator's display fields.  If the session isn't currently in memory, write scope is additionally required before the manager rehydrates it before responding; ``500`` on rehydrate failure carries a correlation id matching the server log line; ``409`` ``workstream_lease_held`` when another console holds it; ``429`` when every coordinator slot is busy (retry later).",
+        "description": "Returns the persisted coordinator's display fields.  If the session isn't currently in memory, write scope is additionally required before the manager rehydrates it before responding; ``500`` on rehydrate failure carries a correlation id matching the server log line; ``409`` ``workstream_lease_held`` when another console holds it.",
         "parameters": [
           {
             "name": "ws_id",
@@ -6687,16 +6697,6 @@
           },
           "409": {
             "description": "Error 409",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          },
-          "429": {
-            "description": "Error 429",
             "content": {
               "application/json": {
                 "schema": {
@@ -6844,7 +6844,7 @@
         "tags": [
           "Coordinator"
         ],
-        "description": "Parity with ``POST /v1/api/workstreams/{ws_id}/open`` \u2014 gives SDK callers and operators a way to warm a coordinator without browsing to it.  Idempotent: ``already_loaded=true`` when the session was already in memory.  ``409`` ``workstream_lease_held`` when another console holds the coordinator; ``429`` when every coordinator slot is busy (retry later).",
+        "description": "Parity with ``POST /v1/api/workstreams/{ws_id}/open`` \u2014 gives SDK callers and operators a way to warm a coordinator without browsing to it.  Idempotent: ``already_loaded=true`` when the session was already in memory.  ``409`` ``workstream_lease_held`` when another console holds the coordinator.",
         "parameters": [
           {
             "name": "ws_id",
@@ -6898,16 +6898,6 @@
           },
           "409": {
             "description": "Error 409",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          },
-          "429": {
-            "description": "Error 429",
             "content": {
               "application/json": {
                 "schema": {

@@ -639,6 +639,46 @@ def test_real_bootstrap_stands_up_subsystem_end_to_end(
         ConsoleCoordinatorUI._console_metrics = saved_metrics
 
 
+def test_real_bootstrap_stops_on_a_failed_idle_timeout_read(
+    storage: SQLiteBackend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Nothing else bounds loaded coordinators, so a failed read can't turn idle cleanup off."""
+    from turnstone.console.collector import ClusterCollector
+    from turnstone.console.metrics import ConsoleMetrics
+    from turnstone.core.config_store import ConfigStore
+
+    _seed_model_def(storage, definition_id="m1", alias="local", model="m")
+    config_store = ConfigStore(storage)
+    read_setting = config_store.get
+
+    def _get(key: str, *args: Any) -> Any:
+        if key == "server.workstream_idle_timeout":
+            raise OSError("settings read failed")
+        return read_setting(key, *args)
+
+    monkeypatch.setattr(config_store, "get", _get)
+    app = SimpleNamespace(
+        state=SimpleNamespace(
+            coord_mgr=None,
+            coord_adapter=None,
+            coord_registry=None,
+            coord_registry_error="",
+            coord_state_writer=None,
+            coord_idle_observer=None,
+            config_store=config_store,
+            collector=ClusterCollector(storage=storage),
+            console_metrics=ConsoleMetrics(),
+            jwt_secret="x" * 32,
+            console_url="http://127.0.0.1:8001",
+        )
+    )
+
+    _maybe_bootstrap_coord_subsystem(app, storage)
+
+    assert app.state.coord_mgr is None
+    assert "OSError" in app.state.coord_registry_error
+
+
 def test_real_bootstrap_rolls_back_partial_state_on_side_effect_failure(
     storage: SQLiteBackend, monkeypatch: pytest.MonkeyPatch
 ) -> None:

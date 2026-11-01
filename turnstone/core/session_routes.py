@@ -3519,12 +3519,10 @@ def make_create_handler(
       other shared verb returns 200), at the cost of leaving REST-
       strictly-correct semantics on the table — a one-time release
       note rather than ongoing client churn.
-    - **Both kinds converge on the manager-at-capacity 429
-      semantic.** Pre-lift interactive translated mgr.create's
-      ``RuntimeError`` to 400 ("invalid create request"); coord
-      already translated to 429. RuntimeError on ``SessionManager.create``
-      is documented as "manager at capacity" — 429 (rate-limit /
-      try-later) is the correct shape for both.
+    - **A full manager answers 429.** ``SessionCapacityError`` is the only
+      capacity refusal, and 429 (rate-limit / try-later) is its shape; an
+      uncapped manager never raises it. Any other ``RuntimeError`` takes the
+      correlation_id'd 500 below.
     - **Both kinds converge on the factory-misconfig 503
       semantic.** Pre-lift interactive let ``ValueError`` (raised by
       the session factory on a misconfigured model alias) propagate
@@ -3713,7 +3711,7 @@ def make_create_handler(
         # propagate to a stack-traced 500; the lifted body keeps the
         # 500 status but redacts the message (operator gets the
         # correlation id; logs carry the full ``exc_info``). The
-        # ``RuntimeError`` (capacity) and ``ValueError`` (factory
+        # ``SessionCapacityError`` and ``ValueError`` (factory
         # misconfig) branches stay specific to ``mgr.create``: the
         # skill-lookup path doesn't raise either of those.
         if cfg.create_build_kwargs is None:
@@ -3991,15 +3989,12 @@ def make_create_handler(
         except NodeAffinityError as exc:
             return JSONResponse(exc.as_dict(), status_code=exc.status_code)
         except (WorkstreamLeaseHeldError, WorkstreamLeaseLostError) as exc:
-            # A RuntimeError subclass: map it before the capacity arm below.
             return lease_refusal_response(exc)
         except WorkstreamHistoryUnavailableError as exc:
-            # Also a RuntimeError: the new session's settings read failed. Transient.
+            # The new session's settings read failed. Transient.
             return JSONResponse({"error": str(exc)}, status_code=503)
-        except RuntimeError as exc:
-            # ``SessionManager.create`` documents RuntimeError as
-            # "manager at capacity" — translate to 429 (rate-limit /
-            # try-later) on both kinds.
+        except SessionCapacityError as exc:
+            # Every slot busy and none evictable: try later, as an open is told.
             return JSONResponse({"error": str(exc)}, status_code=429)
         except UnknownModelAliasError as exc:
             # The model this create builds on isn't loaded here: a fork's

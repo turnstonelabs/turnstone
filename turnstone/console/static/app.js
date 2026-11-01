@@ -2399,7 +2399,7 @@ function _canActOnSavedSession(session) {
 // Saved Coordinators table — same shared createSavedTable as the server UI
 // (/shared/cards.js), with a CHILDREN column instead of MSGS and the
 // body-keyed (router-proxied) delete.  Activation POSTs /open before
-// navigating so capacity limits surface as a toast, not a broken page.
+// navigating so a refusal surfaces as a toast, not a broken page.
 let _coordTable = null;
 
 // Built at boot, not parse: the saved-table substrate (/shared/cards.js) is a
@@ -2493,7 +2493,7 @@ function _initSavedCoordTable() {
         }
         return;
       }
-      // POST /open BEFORE navigating so capacity issues surface as a toast
+      // POST /open BEFORE navigating so a refusal surfaces as a toast
       // instead of a broken-looking detail page.
       if (rowEl) rowEl.classList.add("is-busy");
       authFetch(
@@ -2512,11 +2512,7 @@ function _initSavedCoordTable() {
             return;
           }
           if (rowEl) rowEl.classList.remove("is-busy");
-          if (r.status === 429) {
-            showToast(
-              "All coordinator slots are active — close one first to restore this session",
-            );
-          } else if (r.status === 404) {
+          if (r.status === 404) {
             showToast("Coordinator no longer available");
             loadSavedCoordinators();
           } else if (r.status === 503) {

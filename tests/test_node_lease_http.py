@@ -15,7 +15,7 @@ from starlette.routing import Route
 
 from tests.test_server_authz import _auth
 from tests.test_server_authz import app_client as app_client
-from turnstone.core.session_manager import SessionFactoryLeaseError
+from turnstone.core.session_manager import SessionCapacityError, SessionFactoryLeaseError
 from turnstone.core.storage import WorkstreamLeaseHeldError, WorkstreamLeaseLostError, get_storage
 from turnstone.core.workstream import WorkstreamHistoryUnavailableError
 
@@ -228,7 +228,7 @@ def test_a_lease_refusal_answers_409_and_names_the_holder_only_when_known() -> N
             409,
             "workstream_lease_held",
         ),
-        (lambda: RuntimeError("All 1 slots are active"), 429, None),
+        (lambda: SessionCapacityError(1), 429, None),
         (lambda: SessionFactoryLeaseError(), 503, None),
         (lambda: WorkstreamHistoryUnavailableError("ws"), 503, None),
     ],
@@ -237,8 +237,7 @@ def test_a_lease_refusal_answers_409_and_names_the_holder_only_when_known() -> N
 def test_create_answers_each_failure_with_its_own_status(
     raised: Any, status: int, code: str | None
 ) -> None:
-    """Lease refusals and unreadable settings are RuntimeErrors too: their arms stay above the
-    capacity arm."""
+    """Each create failure maps to its own status; only a full manager answers 429."""
     from unittest.mock import MagicMock
 
     from starlette.testclient import TestClient
@@ -262,6 +261,35 @@ def test_create_answers_each_failure_with_its_own_status(
     assert r.status_code == status
     if code is not None:
         assert r.json()["code"] == code
+
+
+def test_create_doesnt_report_another_runtime_error_as_capacity() -> None:
+    """authFetch retries every 429, and the raw text must not reach the caller."""
+    from unittest.mock import MagicMock
+
+    from starlette.testclient import TestClient
+
+    from turnstone.core.session_routes import SessionEndpointConfig, make_create_handler
+
+    mgr = MagicMock()
+    mgr.create.side_effect = RuntimeError(
+        "workstream 'secret-detail' was retired during construction"
+    )
+    cfg = SessionEndpointConfig(
+        permission_gate=None,
+        manager_lookup=lambda _request: (mgr, None),
+        tenant_check=None,
+        not_found_label="Workstream not found",
+        audit_action_prefix="workstream",
+        create_build_kwargs=lambda *_args: {"user_id": "u1"},
+    )
+    app = Starlette(routes=[Route("/new", make_create_handler(cfg), methods=["POST"])])
+
+    r = TestClient(app).post("/new", json={})
+
+    assert r.status_code == 500
+    assert "correlation_id=" in r.json()["error"]
+    assert "secret-detail" not in r.text
 
 
 def test_closing_a_copy_another_process_took_answers_404_without_an_audit() -> None:
