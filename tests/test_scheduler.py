@@ -843,6 +843,7 @@ class TestSchedulerTick:
             (TurnstoneAPIError(429, "manager at capacity"), True),
             (TurnstoneAPIError(400, "unknown persona"), True),
             (TurnstoneAPIError(401, "token not yet valid"), True),
+            (TurnstoneAPIError(500, "failed to create workstream"), False),
             (TurnstoneAPIError(503, "Unknown model alias"), False),
             (httpx2.ReadTimeout("slow node"), False),
             (RuntimeError("unexpected"), False),

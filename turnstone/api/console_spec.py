@@ -1409,7 +1409,7 @@ CONSOLE_ENDPOINTS: list[EndpointSpec] = [
         request_model=CoordinatorCreateRequest,
         response_model=CoordinatorCreateResponse,
         response_code=200,
-        error_codes=[400, 401, 403, 429, 500, 503],
+        error_codes=[400, 401, 403, 409, 413, 500, 503],
         tags=["Coordinator"],
     ),
     EndpointSpec(
@@ -1434,11 +1434,10 @@ CONSOLE_ENDPOINTS: list[EndpointSpec] = [
             "required before the manager rehydrates it "
             "before responding; ``500`` on rehydrate failure carries a "
             "correlation id matching the server log line; ``409`` "
-            "``workstream_lease_held`` when another console holds it; ``429`` "
-            "when every coordinator slot is busy (retry later)."
+            "``workstream_lease_held`` when another console holds it."
         ),
         response_model=WorkstreamDetailResponse,
-        error_codes=[400, 403, 404, 409, 429, 500, 503],
+        error_codes=[400, 403, 404, 409, 500, 503],
         tags=["Coordinator"],
     ),
     EndpointSpec(
@@ -1467,11 +1466,10 @@ CONSOLE_ENDPOINTS: list[EndpointSpec] = [
             "SDK callers and operators a way to warm a coordinator without "
             "browsing to it.  Idempotent: ``already_loaded=true`` when the "
             "session was already in memory.  ``409`` ``workstream_lease_held`` "
-            "when another console holds the coordinator; ``429`` when every "
-            "coordinator slot is busy (retry later)."
+            "when another console holds the coordinator."
         ),
         response_model=CoordinatorOpenResponse,
-        error_codes=[400, 403, 404, 409, 429, 500, 503],
+        error_codes=[400, 403, 404, 409, 500, 503],
         tags=["Coordinator"],
     ),
     EndpointSpec(

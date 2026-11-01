@@ -538,7 +538,8 @@ saved interactive session resolves its node, calls `open`, and then connects the
 node-proxied pane.
 
 Console-hosted coordinator sessions have no count limit. The
-`server.workstream_idle_timeout` setting still controls their idle cleanup.
+`server.workstream_idle_timeout` setting still controls their idle cleanup; at
+`0`, a loaded coordinator stays loaded until it is closed.
 
 The filtered live table carries STATE, NAME, MODEL, NODE, TASK, TOKENS, and CTX
 columns. The browser maintains a local `clusterState` initialized from the

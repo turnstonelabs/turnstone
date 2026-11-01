@@ -432,7 +432,7 @@ def test_a_fork_builds_on_its_sources_loaded_model(monkeypatch: Any) -> None:
         monkeypatch, source_loaded=True, create_error=RuntimeError("stop")
     )
     assert seen["model"] == "src"
-    assert resp.status_code == 429
+    assert resp.status_code == 500
 
 
 def test_a_fork_whose_source_model_isnt_loaded_keeps_the_request_model(monkeypatch: Any) -> None:

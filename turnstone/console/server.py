@@ -5738,11 +5738,9 @@ def _bootstrap_coord_subsystem(
             child_event_bus=coord_adapter.child_event_bus,
         )
 
-    # Resolve the idle timeout before starting the subsystem's threads.
-    try:
-        idle_minutes = int(config_store.get("server.workstream_idle_timeout"))
-    except Exception:
-        idle_minutes = 0
+    # Resolve the idle timeout before starting the subsystem's threads. A failed read must raise:
+    # as 0 it would turn off idle cleanup, the only thing that unloads idle coordinators.
+    idle_minutes = int(config_store.get("server.workstream_idle_timeout"))
 
     # Build phase: construct everything as locals.  No ``app.state``
     # writes here so a concurrent dashboard request running through
