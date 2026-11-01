@@ -612,6 +612,7 @@ def test_real_bootstrap_stands_up_subsystem_end_to_end(
         _maybe_bootstrap_coord_subsystem(app, storage)
         # The real builder ran and produced a working SessionManager.
         assert isinstance(app.state.coord_mgr, SessionManager)
+        assert app.state.coord_mgr.max_active is None
         assert app.state.coord_adapter is not None
         # Registry stamped with the seeded alias.
         assert app.state.coord_registry is not None

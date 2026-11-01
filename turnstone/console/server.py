@@ -5738,11 +5738,7 @@ def _bootstrap_coord_subsystem(
             child_event_bus=coord_adapter.child_event_bus,
         )
 
-    # Pre-compute config-derived integers BEFORE any thread starts so a
-    # missing / non-numeric setting raises here rather than after
-    # ``StateWriter.start()`` has spawned a daemon we can't easily roll
-    # back.
-    max_active = int(config_store.get("coordinator.max_active"))
+    # Resolve the idle timeout before starting the subsystem's threads.
     try:
         idle_minutes = int(config_store.get("server.workstream_idle_timeout"))
     except Exception:
@@ -5773,7 +5769,7 @@ def _bootstrap_coord_subsystem(
     coord_mgr = SessionManager(
         coord_adapter,
         storage=storage,
-        max_active=max_active,
+        max_active=None,
         node_id=ClusterCollector.CONSOLE_PSEUDO_NODE_ID,
         state_writer=coord_state_writer,
         # CoordinatorAdapter implements SessionEventEmitter in full —
@@ -5909,10 +5905,7 @@ def _bootstrap_coord_subsystem(
     # Final commit — every reader gates on ``coord_mgr is not None``,
     # so this assignment is the "subsystem ready" signal.
     app.state.coord_mgr = coord_mgr
-    log.info(
-        "console.coordinator_mgr_ready max_active=%s",
-        max_active,
-    )
+    log.info("console.coordinator_mgr_ready")
 
 
 def _record_coord_key_refusal(app_state: Any, key_err: str) -> None:

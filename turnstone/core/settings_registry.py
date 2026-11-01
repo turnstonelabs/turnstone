@@ -995,19 +995,6 @@ def _build_registry() -> dict[str, SettingDef]:
             "Use ‘none’ to disable reasoning where the model supports that.",
         ),
         SettingDef(
-            "coordinator.max_active",
-            "int",
-            5,
-            "Maximum concurrent coordinator sessions",
-            "coordinator",
-            min_value=1,
-            max_value=100,
-            help="Cap on how many coordinator workstreams can run at once on this "
-            "console. When the limit is reached, POST /v1/api/workstreams/new either "
-            "evicts the oldest idle coordinator (matching SessionManager.close_idle "
-            "semantics) or returns 429 if every slot is non-idle.",
-        ),
-        SettingDef(
             "coordinator.session_jwt_ttl_seconds",
             "int",
             300,

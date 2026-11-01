@@ -350,6 +350,7 @@ class SessionManager:
     Instantiate once per kind: one for interactive on the node, one
     for coordinators on the console. The eviction pool is partitioned
     by kind — a coordinator can't evict an interactive workstream.
+    Set ``max_active=None`` to disable capacity eviction.
     """
 
     _REHYDRATE_BIND_ATTEMPTS = 3
@@ -363,14 +364,14 @@ class SessionManager:
         adapter: SessionKindAdapter,
         *,
         storage: StorageBackend,
-        max_active: int,
+        max_active: int | None,
         node_id: str | None = None,
         state_writer: StateWriter | None = None,
         event_emitter: SessionEventEmitter | None = None,
         model_validator: Callable[[str], bool] | None = None,
         default_alias_reader: Callable[[], str] | None = None,
     ) -> None:
-        if max_active < 1:
+        if max_active is not None and max_active < 1:
             raise ValueError(f"max_active must be >= 1, got {max_active}")
         self._adapter = adapter
         self._storage = storage
@@ -473,7 +474,7 @@ class SessionManager:
     # ------------------------------------------------------------------
 
     @property
-    def max_active(self) -> int:
+    def max_active(self) -> int | None:
         return self._max_active
 
     @property
@@ -3137,6 +3138,7 @@ class SessionManager:
         same lock, so an IDLE workstream whose turn/command was admitted cannot
         be evicted between the hint and the terminal claim.
         """
+        max_active = self._max_active
         persistence_recovery_attempted = False
         while True:
             with self._lock:
@@ -3146,7 +3148,7 @@ class SessionManager:
                     raise WorkstreamAlreadyExistsError(
                         f"workstream {ws_id!r} already tracked by SessionManager"
                     )
-                if len(self._workstreams) < self._max_active:
+                if max_active is None or len(self._workstreams) < max_active:
                     ws = self._install_workstream_locked(
                         ws_id,
                         user_id=user_id,
@@ -3182,7 +3184,7 @@ class SessionManager:
                     # candidate list came back empty.  No lock is held here.
                     self.reconcile_unresolved_persistence(blocking=True)
                     continue
-                raise SessionCapacityError(self._max_active)
+                raise SessionCapacityError(max_active)
 
             for victim in candidates:
                 install_exc: BaseException | None = None
@@ -3218,7 +3220,7 @@ class SessionManager:
                         if self._workstreams.get(victim.id) is not victim:
                             victim._lifecycle_terminal_active = False
                             restore_victim = True
-                        elif len(self._workstreams) < self._max_active:
+                        elif len(self._workstreams) < max_active:
                             # Another terminal path freed a different slot while
                             # we acquired this candidate. Do not over-evict.
                             victim._lifecycle_terminal_active = False

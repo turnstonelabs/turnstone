@@ -128,7 +128,7 @@ def _build_mgr(storage: SQLiteBackend) -> SessionManager:
     mgr = SessionManager(
         adapter,
         storage=storage,
-        max_active=5,
+        max_active=None,
         node_id=ClusterCollector.CONSOLE_PSEUDO_NODE_ID,
         event_emitter=adapter,
     )
@@ -188,6 +188,35 @@ def _make_client(
 # ---------------------------------------------------------------------------
 
 _COORD_HEADERS = {"X-Test-User": "user-1", "X-Test-Perms": "admin.coordinator"}
+
+
+def test_opening_six_coordinators_keeps_every_session_loaded(tmp_path, sqlite_backend_factory):
+    storage = sqlite_backend_factory(str(tmp_path / "uncapped-coord.db"))
+    mgr = _build_mgr(storage)
+    with _make_client(storage, coord_mgr=mgr, registry=_fake_registry()) as client:
+        ids = []
+        for i in range(6):
+            resp = client.post(
+                "/v1/api/workstreams/new",
+                json={"name": f"coord-{i}"},
+                headers=_COORD_HEADERS,
+            )
+            assert resp.status_code == 200, resp.text
+            ids.append(resp.json()["ws_id"])
+        loaded = [mgr.get(ws_id) for ws_id in ids]
+        assert all(ws is not None for ws in loaded)
+
+        # Repeated browser detail requests must keep the same loaded sessions.
+        for _ in range(2):
+            for ws_id, ws in zip(ids, loaded, strict=True):
+                resp = client.get(f"/v1/api/workstreams/{ws_id}", headers=_COORD_HEADERS)
+                assert resp.status_code == 200, resp.text
+                assert mgr.get(ws_id) is ws
+
+        resp = client.get("/v1/api/workstreams", headers=_COORD_HEADERS)
+        assert resp.status_code == 200, resp.text
+        assert {ws["ws_id"] for ws in resp.json()["workstreams"]} == set(ids)
+        assert mgr.eviction_count == 0
 
 
 def test_create_list_detail_lifecycle(tmp_path, sqlite_backend_factory):

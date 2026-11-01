@@ -6499,7 +6499,7 @@
         "tags": [
           "Coordinator"
         ],
-        "description": "Allocates a console-hosted ``kind=\"coordinator\"`` ChatSession.  200 on create; 429 when the ``coordinator.max_active`` cap is reached and no idle coordinator can be evicted.  Pre-1.5.0 this returned 201; the lifted ``create`` factory (Stage 2 verb lift) converges on 200 across both kinds.",
+        "description": "Allocates a console-hosted ``kind=\"coordinator\"`` ChatSession.  Returns 200 on create. Coordinator sessions have no capacity limit.",
         "requestBody": {
           "required": true,
           "content": {

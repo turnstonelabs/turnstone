@@ -25,7 +25,7 @@ An MCP server that exposes tools for executing commands across a Turnstone clust
 > | Audit | `coordinator.create` / `close` / `cancel` events on the console; `src="coordinator"` preserved on upstream hops | Service identity only |
 > | UI | `/coordinator/{ws_id}` one-pane HTML | No UI — model-only |
 > | Tool approvals | Inline approval bar in the coordinator pane | MCP approval flow |
-> | Configuration | `coordinator.model_alias`, `coordinator.max_active`, `coordinator.reasoning_effort`, `coordinator.session_jwt_ttl_seconds` | MCP server config file |
+> | Configuration | `coordinator.model_alias`, `coordinator.reasoning_effort`, `coordinator.session_jwt_ttl_seconds` | MCP server config file |
 >
 > Minimal 1.5 migration:
 >

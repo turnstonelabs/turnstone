@@ -640,7 +640,7 @@ _EMITTER_DEFAULT = object()
 def _make_manager(
     adapter: FakeAdapter | None = None,
     *,
-    max_active: int = 5,
+    max_active: int | None = 5,
     storage: FakeStorage | None = None,
     event_emitter: Any = _EMITTER_DEFAULT,
     node_id: str | None = None,
@@ -937,6 +937,31 @@ def test_create_raises_when_all_active_and_no_idle() -> None:
     ws.state = WorkstreamState.RUNNING  # block eviction
     with pytest.raises(RuntimeError, match="slots are active"):
         mgr.create(user_id="u1")
+
+
+@pytest.mark.parametrize("state", [WorkstreamState.IDLE, WorkstreamState.RUNNING])
+def test_uncapped_manager_creates_and_reopens_without_evicting(state: WorkstreamState) -> None:
+    mgr, adapter, _ = _make_manager(
+        adapter=FakeAdapter(WorkstreamKind.COORDINATOR), max_active=None
+    )
+    sessions = []
+    for _ in range(8):
+        ws = mgr.create(user_id="u1")
+        ws.state = state
+        sessions.append(ws)
+
+    assert mgr.list_all() == sessions
+    assert adapter.events_of("closed") == []
+    assert mgr.eviction_count == 0
+
+    first = sessions[0]
+    assert mgr.close(first.id)
+    reopened = mgr.open(first.id)
+    assert reopened is not None and reopened is not first
+    assert mgr.count == len(sessions)
+    assert all(mgr.get(ws.id) is ws for ws in sessions[1:])
+    assert [e.ws_id for e in adapter.events_of("closed")] == [first.id]
+    assert mgr.eviction_count == 0
 
 
 def test_create_rolls_back_slot_on_session_failure() -> None:
@@ -2111,8 +2136,9 @@ def test_reap_stale_creating_reservations_supports_node_less_cli_boot() -> None:
     assert "remote-live-create" in storage.rows
 
 
-def test_close_idle_closes_old_idle_and_keeps_active() -> None:
-    mgr, _, _ = _make_manager()
+@pytest.mark.parametrize("max_active", [5, None])
+def test_close_idle_closes_old_idle_and_keeps_active(max_active: int | None) -> None:
+    mgr, _, _ = _make_manager(max_active=max_active)
     old = mgr.create(user_id="u1")
     fresh = mgr.create(user_id="u1")
     running = mgr.create(user_id="u1")
