@@ -10,6 +10,14 @@ All development now integrates on `main`. Supported release lines are maintained
 on `stable/X.Y` branches; `stable/1.8` preserves the former stable branch.
 The separate `dev` branch is retired. See [the release process](docs/releasing.md).
 
+## [2026-10-31]
+
+### Fixed
+
+- Remove the five-session coordinator cap so opening more coordinators no longer
+  evicts idle sessions and triggers sidebar churn across browsers. Migration 087
+  removes the retired `coordinator.max_active` setting; idle cleanup still applies.
+
 ## [2026-10-30]
 
 ### Fixed
