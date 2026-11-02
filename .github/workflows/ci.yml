@@ -51,7 +51,7 @@ jobs:
       # the browser-side renderer.
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
-          node-version: "24"
+          node-version: "26"
       - run: pip install -e ".[test,discord]"
       # -v lists each test id as it starts (pytest prints the nodeid at
       # logstart), so a hang names the culprit on the last line instead of
@@ -87,7 +87,7 @@ jobs:
           python-version: "3.14"
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
-          node-version: "24"
+          node-version: "26"
       - run: pip install -e ".[test,discord]"
       - run: pytest tests/ -m "not live and not e2e_recovery" --storage-backend=postgresql -v
         env:
@@ -190,6 +190,6 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
-          node-version: "24"
+          node-version: "26"
       - run: npm ci
       - run: npm audit --audit-level=moderate
