@@ -25,7 +25,14 @@ const copies = [];
 const timers = [];
 const saved = [];
 let copyOk = true;
-const authFetch = (url) => new Promise((resolve, reject) => requests.push({url, resolve, reject}));
+let uploadAllowed = true;
+let writeScope = true;
+let readAllowed = true;
+const authListeners = [];
+const hasScope = (name) => name === "write" && writeScope;
+const hasPermission = (name) => (name === "files.read" && readAllowed) || (name === "files.write" && uploadAllowed);
+const onAuthChange = (listener) => authListeners.push(listener);
+const authFetch = (url, options) => new Promise((resolve, reject) => requests.push({url, options, resolve, reject}));
 const copyTextToClipboard = async (text) => { copies.push(text); return copyOk; };
 const redactCredentials = (text) => text;
 const renderMarkdown = (text) => text;
@@ -79,7 +86,7 @@ row(pane, "out put").click();
 assert(requests[0].url.endsWith("&path=out%20put"), "folder path is encoded");
 await listing(requests.shift(), "out put", [file("out put/hello #.js")]);
 row(pane, "out put/hello #.js").click();
-assert(requests[0].url.endsWith("/files/preview?root=workspace&path=out%20put%2Fhello%20%23.js"), "selected file uses preview route");
+assert(requests[0].url.endsWith("/files/preview?root=workspace&path=out%20put%2Fhello%20%23.js&limit=262144"), "selected file uses bounded preview route");
 assert(!href(pane), "pending file cannot download");
 await succeed(requests.shift(), "const answer = 42;\n");
 assert(href(pane).endsWith("/files/content?root=workspace&path=out%20put%2Fhello%20%23.js"), "download is original file");
@@ -528,7 +535,7 @@ await listing(requests.shift(), "", [file("same.txt")]);
 await listing(staleWorkspace, "", [file("stale.txt")]);
 assert(!row(pane, "stale.txt"), "old root listing cannot replace current root");
 row(pane, "same.txt").click();
-assert(requests[0].url.endsWith("/preview?root=data&path=same.txt"), "preview uses selected root");
+assert(requests[0].url.endsWith("/preview?root=data&path=same.txt&limit=262144"), "preview uses selected root");
 await succeed(requests.shift(), "data bytes");
 assert(href(pane).endsWith("/content?root=data&path=same.txt"), "download uses selected root");
 assert(saved.at(-1).rootId === "data", "root id persisted independently of display path");
@@ -579,4 +586,257 @@ row(pane, "output/next").click();
 pane._rootSelect.focus();
 await listing(requests.shift(), "output/next", [file("output/next/a.txt")]);
 assert(document.activeElement === pane._rootSelect, "completion does not steal focus user moved elsewhere");
+""")
+
+
+def test_upload_picker_uses_sequential_binary_requests_and_independent_results() -> None:
+    _run_files(r"""
+const pane = mount();
+assert(pane._uploadButton.type === "button" && pane._uploadButton.disabled, "upload is a native button disabled before a destination loads");
+pane.showFiles({base: "/node/node%20A", wsId: "ws/A"});
+await listing(requests.shift(), "", [folder("reports")]);
+row(pane, "reports").click();
+await listing(requests.shift(), "reports", []);
+assert(!pane._uploadButton.disabled && !pane._uploadButton.hidden, "loaded authorized directory enables uploads");
+pane._uploadButton.click();
+const files = [
+  {name: "a #?.bin", size: 4},
+  {name: "existing.txt", size: 5},
+  {name: "oversize.bin", size: 64 * 1024 * 1024 + 1},
+  {name: "empty.txt", size: 0},
+];
+pane._uploadInput.files = files;
+pane._uploadInput.dispatch("change");
+assert(pane._uploadInput.value === "", "picker resets so the same file can be chosen again");
+assert(requests.length === 1 && pane._uploadButton.disabled, "only one request runs at a time");
+assert(requests[0].url === "/node/node%20A/v1/api/workstreams/ws%2FA/files/upload?root=workspace&path=reports&name=a%20%23%3F.bin", "upload preserves origin, workstream, directory and encoded basename");
+assert(requests[0].options.method === "POST" && requests[0].options.body === files[0], "original bytes are posted without JSON or attachment wrapping");
+assert(requests[0].options.headers["Content-Type"] === "application/octet-stream", "binary content type is explicit");
+assert(pane._uploadStatus.textContent.includes("/workspace/project/reports"), "batch states its fixed destination");
+await succeed(requests.shift(), "{}", 201);
+assert(requests.length === 1 && requests[0].options.body === files[1], "second request follows first completion");
+await succeed(requests.shift(), JSON.stringify({code: "file_exists", error: "A file or folder with this name already exists"}), 409);
+assert(requests.length === 1 && requests[0].options.body === files[3], "oversized file is rejected locally while later empty file still uploads");
+await succeed(requests.shift(), "{}", 201);
+const statuses = pane._uploadResults.querySelectorAll(".filesystem-upload-result-status").map(node => node.textContent);
+assert(statuses[0] === "Uploaded" && statuses[3] === "Uploaded", "successful and empty files get explicit results");
+assert(statuses[1].includes("Already exists") && statuses[2].includes("64 MB"), "conflicts and size errors are actionable");
+assert(pane._uploadStatus.textContent.startsWith("Uploads finished · ") && !pane._uploadStatus.textContent.includes("error"), "heading keeps the destination without repeating per-file errors");
+assert(statuses[1].startsWith("Error: ") && statuses[2].startsWith("Error: "), "each failure is labeled as an error without relying on color");
+assert(!pane._uploadStatus.classList.contains("has-error") && pane._uploadProgress.hidden, "only per-file errors are emphasized and the finished progress bar is removed");
+assert(requests.length === 1 && requests[0].url.endsWith("/files?root=workspace&path=reports"), "destination refreshes after batch completion");
+await listing(requests.shift(), "reports", [file("reports/a #?.bin"), file("reports/empty.txt")]);
+assert(!pane._uploadButton.disabled, "next batch is enabled after refresh");
+""")
+
+
+def test_file_drop_uses_displayed_directory_and_rejects_folders_and_text() -> None:
+    _run_files(r"""
+const pane = mount();
+pane.showFiles({wsId: "drop"});
+await listing(requests.shift(), "", [folder("child")]);
+const root = pane.bodyEl.children[0];
+let prevented = 0;
+const fire = (type, transfer, target = root, relatedTarget = null) => {
+  const event = { dataTransfer: transfer, target, relatedTarget,
+    preventDefault() { prevented++; }, stopPropagation() {},
+  };
+  for (const {fn} of root._listeners.get(type) || []) fn(event);
+};
+const textDrop = {types: ["text/plain"], files: []};
+fire("dragenter", textDrop);
+fire("drop", textDrop);
+assert(prevented === 0 && pane._dropOverlay.hidden && !requests.length, "text and internal drags are ignored");
+const dropped = {name: "dropped.txt", size: 1};
+const transfer = {types: ["Files"], files: [dropped], items: [{kind: "file", webkitGetAsEntry: () => ({isDirectory: false})}]};
+fire("dragenter", transfer);
+fire("dragenter", transfer, row(pane, "child"));
+fire("dragleave", transfer, row(pane, "child"), root);
+assert(!pane._dropOverlay.hidden, "crossing a child does not remove the drop cue");
+fire("dragover", transfer);
+assert(transfer.dropEffect === "copy", "authorized drop advertises a copy");
+fire("drop", transfer, row(pane, "child"));
+assert(pane._dropOverlay.hidden && requests.length === 1, "drop clears its cue and begins one upload");
+assert(requests[0].url.endsWith("/files/upload?root=workspace&path=&name=dropped.txt"), "hovering a child folder does not redirect destination");
+await succeed(requests.shift(), "{}", 201);
+await listing(requests.shift(), "", [folder("child"), file("dropped.txt")]);
+fire("drop", {types: ["Files"], files: [{name: "folder", size: 0}], items: [{kind: "file", webkitGetAsEntry: () => ({isDirectory: true})}]});
+assert(!requests.length && pane._uploadStatus.textContent.includes("Folder uploads aren't supported"), "directory drop cannot create an empty file with its name");
+uploadAllowed = false;
+authListeners.forEach(listener => listener());
+fire("dragenter", transfer);
+fire("dragover", transfer);
+fire("drop", transfer);
+assert(transfer.dropEffect === "none" && !requests.length, "unauthorized OS file drops cannot navigate or upload");
+assert(pane._uploadButton.hidden && pane._dropHint.hidden, "read-only user sees no upload affordance");
+""")
+
+
+def test_upload_destination_survives_navigation_without_stale_refresh() -> None:
+    _run_files(r"""
+const pane = mount();
+pane.showFiles({base: "/node/A", wsId: "work"});
+await listing(requests.shift(), "", [folder("elsewhere")]);
+pane._uploadButton.click();
+pane._uploadInput.files = [{name: "one.txt", size: 1}, {name: "two.txt", size: 2}];
+pane._uploadInput.dispatch("change");
+const first = requests.shift();
+row(pane, "elsewhere").click();
+await listing(requests.shift(), "elsewhere", []);
+await succeed(first, "{}", 201);
+assert(requests[0].url.endsWith("/files/upload?root=workspace&path=&name=two.txt"), "queued file keeps the batch's original directory");
+await succeed(requests.shift(), "{}", 201);
+assert(!requests.length && pane._path === "elsewhere", "completion cannot refetch or navigate a different displayed directory");
+assert(pane._uploadStatus.textContent.endsWith("/workspace/project"), "result continues to name the original destination");
+""")
+
+
+def test_upload_authority_context_and_close_cancel_pending_work() -> None:
+    _run_files(r"""
+const pane = mount();
+pane.showFiles({wsId: "work"});
+await listing(requests.shift(), "", []);
+const begin = () => {
+  pane._uploadButton.click();
+  pane._uploadInput.files = [{name: "one.txt", size: 1}, {name: "two.txt", size: 2}];
+  pane._uploadInput.dispatch("change");
+  return requests.shift();
+};
+let active = begin();
+uploadAllowed = false;
+authListeners.forEach(listener => listener());
+assert(active.options.signal.aborted && pane._uploadButton.hidden, "permission loss aborts active request and hides upload");
+await succeed(active, "{}", 201);
+assert(!requests.length && !pane._uploadBatch, "late success after authority change cannot send next file or refresh");
+uploadAllowed = true;
+authListeners.forEach(listener => listener());
+active = begin();
+pane.showFiles({base: "/node/B", wsId: "other"});
+assert(active.options.signal.aborted, "conversation change aborts previous origin's upload");
+await listing(requests.shift(), "", []);
+await succeed(active, "{}", 201);
+assert(!requests.length, "old context completion cannot affect new context");
+active = begin();
+pane.onClose();
+assert(active.options.signal.aborted && filesystemAuthListeners.size === 0, "close releases the pane auth listener and aborts transport");
+await succeed(active, "{}", 201);
+assert(!requests.length, "closed pane never continues upload or refreshes");
+""")
+
+
+def test_upload_checks_all_permissions_and_stops_on_server_access_denial() -> None:
+    _run_files(r"""
+const pane = mount();
+pane.showFiles({wsId: "work"});
+await listing(requests.shift(), "", []);
+for (const revoke of [() => {writeScope = false;}, () => {readAllowed = false;}, () => {uploadAllowed = false;}]) {
+  revoke();
+  authListeners.forEach(listener => listener());
+  assert(pane._uploadButton.hidden, "each required authority gates upload");
+  pane._uploadButton.click();
+  assert(!pane._pickerDestination, "hidden upload cannot open picker when invoked programmatically");
+  writeScope = readAllowed = uploadAllowed = true;
+  authListeners.forEach(listener => listener());
+}
+pane._uploadButton.click();
+pane._uploadInput.files = [{name: "denied.txt", size: 1}, {name: "queued.txt", size: 2}];
+pane._uploadInput.dispatch("change");
+await succeed(requests.shift(), "{}", 403);
+assert(!requests.length && !pane._uploadBatch, "server access denial stops all queued requests");
+const statuses = pane._uploadResults.querySelectorAll(".filesystem-upload-result-status").map(node => node.textContent);
+assert(statuses[0].startsWith("Error: ") && statuses[0].includes("denied") && statuses[1] === "Not uploaded", "denial and unsent file get distinct statuses");
+assert(pane._uploadStatus.textContent.startsWith("Uploads stopped.") && !pane._uploadStatus.textContent.includes("denied") && pane._uploadProgress.hidden, "stopped batch keeps its specific error only beside the failed file");
+""")
+
+
+def test_upload_batch_limit_and_network_uncertainty_are_explicit() -> None:
+    _run_files(r"""
+const pane = mount();
+pane.showFiles({wsId: "work"});
+await listing(requests.shift(), "", []);
+pane._uploadButton.click();
+pane._uploadInput.files = Array.from({length: 101}, (_, index) => ({name: index + ".txt", size: 0}));
+pane._uploadInput.dispatch("change");
+assert(!requests.length && !pane._uploadBatch && pane._uploadStatus.textContent.includes("100 files"), "oversized batch is rejected before requests or result rows");
+pane._uploadButton.click();
+pane._uploadInput.files = [{name: "maybe-saved.txt", size: 1}];
+pane._uploadInput.dispatch("change");
+requests.shift().reject(new Error("network failed"));
+await flush();
+assert(pane._uploadResults.querySelector(".filesystem-upload-result-status").textContent.startsWith("Error: "), "transport failure is explicitly called an error beside the file");
+assert(pane._uploadResults.querySelector(".filesystem-upload-result-status").textContent.includes("could not be confirmed"), "transport failure instructs user to inspect destination before retry");
+assert(!requests.length, "unconfirmed upload does not silently retry");
+pane._uploadButton.click();
+pane._uploadInput.files = [{name: "next.txt", size: 1}];
+pane._uploadInput.dispatch("change");
+assert(!pane._uploadStatus.classList.contains("has-error") && !pane._uploadProgress.hidden, "new upload clears error emphasis and shows active progress");
+await succeed(requests.shift(), "{}", 201);
+assert(pane._uploadStatus.textContent.startsWith("Uploads finished · "), "successful completion uses a short heading");
+assert(!pane._uploadStatus.classList.contains("has-error") && pane._uploadProgress.hidden, "successful batch keeps neutral feedback without a finished progress bar");
+await listing(requests.shift(), "", [file("next.txt")]);
+""")
+
+
+def test_upload_inactive_workstream_stops_queue_with_recovery_guidance() -> None:
+    _run_files(r"""
+for (const detail of [
+  {code: "workstream_inactive", error: "Workstream is not active on this node. Reopen the conversation to browse its files."},
+  {},
+]) {
+  const pane = mount();
+  pane.showFiles({wsId: "closed"});
+  await listing(requests.shift(), "", []);
+  pane._uploadButton.click();
+  pane._uploadInput.files = [{name: "first.txt", size: 1}, {name: "queued.txt", size: 2}];
+  pane._uploadInput.dispatch("change");
+  await succeed(requests.shift(), JSON.stringify(detail), 409);
+  const statuses = pane._uploadResults.querySelectorAll(".filesystem-upload-result-status").map(node => node.textContent);
+  assert(!requests.length && !pane._uploadBatch, "inactive or unknown destination conflict stops the remaining batch");
+  assert(statuses[0].includes("Reopen the conversation") && !statuses[0].includes("Already exists"), "inactive destination has recovery guidance, not a filename collision");
+  assert(statuses[1] === "Not uploaded", "queued file remains unsent");
+  assert(pane._uploadButton.disabled, "stale directory cannot start another upload before it reloads");
+  pane.onClose();
+}
+""")
+
+
+def test_upload_ignores_error_body_after_context_changes() -> None:
+    _run_files(r"""
+const pane = mount();
+pane.showFiles({wsId: "old"});
+await listing(requests.shift(), "", []);
+pane._uploadButton.click();
+pane._uploadInput.files = [{name: "first.txt", size: 1}, {name: "queued.txt", size: 2}];
+pane._uploadInput.dispatch("change");
+let releaseError;
+requests.shift().resolve({ok: false, status: 409, json: () => new Promise(resolve => { releaseError = resolve; })});
+await flush();
+pane.showFiles({wsId: "new"});
+await listing(requests.shift(), "", []);
+const notice = pane._uploadStatus.textContent;
+releaseError({code: "workstream_inactive", error: "Reopen the conversation"});
+await flush();
+assert(!requests.length && pane._uploadStatus.textContent === notice, "old error body cannot replace current context feedback or restart queue");
+assert(!pane._uploadButton.disabled, "old inactive-workstream response cannot disable the new loaded directory");
+""")
+
+
+def test_upload_close_icon_stops_then_dismisses_without_late_updates() -> None:
+    _run_files(r"""
+const pane = mount();
+pane.showFiles({wsId: "work"});
+await listing(requests.shift(), "", []);
+pane._uploadButton.click();
+pane._uploadInput.files = [{name: "one.txt", size: 1}, {name: "two.txt", size: 2}];
+pane._uploadInput.dispatch("change");
+const active = requests.shift();
+assert(pane._uploadDismiss.type === "button" && pane._uploadDismiss.children[0].textContent === "×", "upload control is a native icon button");
+assert(pane._uploadDismiss.getAttribute("aria-label") === "Stop uploads" && pane._uploadDismiss.title === "Stop uploads", "active icon explains cancellation through its label and tooltip");
+pane._uploadDismiss.click();
+assert(active.options.signal.aborted && !pane._uploadBatch && !pane._uploadPanel.hidden, "stop cancels pending work while preserving results for inspection");
+assert(pane._uploadDismiss.children[0].textContent === "×" && pane._uploadDismiss.getAttribute("aria-label") === "Close upload results" && pane._uploadDismiss.title === "Close upload results", "finished icon is consistently labeled for closing results");
+pane._uploadDismiss.click();
+assert(pane._uploadPanel.hidden && document.activeElement === pane._uploadButton, "close hides results and returns focus to Upload");
+await succeed(active, "{}", 201);
+assert(!requests.length && pane._uploadPanel.hidden, "late completion cannot reopen results or continue the queue");
 """)

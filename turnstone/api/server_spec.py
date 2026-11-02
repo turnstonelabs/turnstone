@@ -57,6 +57,7 @@ from turnstone.api.server_schemas import (
     SpeechToTextResponse,
     TextToSpeechRequest,
     UploadAttachmentResponse,
+    UploadFilesystemResponse,
     WorkstreamDetailResponse,
     WorkstreamHistoryResponse,
 )
@@ -151,6 +152,35 @@ USER_AVATAR_ENDPOINTS: list[EndpointSpec] = [
         tags=["Users"],
     ),
 ]
+
+FILES_UPLOAD_ENDPOINT = EndpointSpec(
+    "/v1/api/workstreams/{ws_id}/files/upload",
+    "POST",
+    "Upload a file to the selected directory without replacing an existing entry",
+    description=(
+        "Accepts original file bytes as application/octet-stream, up to 64 MiB; empty files "
+        "are allowed. Requires files.read and files.write permissions, write scope, and an "
+        "accessible active local interactive workstream. The destination directory must "
+        "exist inside the selected shared node root. The name must be a single filename; "
+        "paths, symlinks, and special files are refused. Streams bytes through the console "
+        "proxy into private staging on the node, then publishes the complete file atomically. "
+        "An existing entry returns 409 with code file_exists and is never "
+        "overwritten. An inactive workstream returns 409 with code workstream_inactive. "
+        "This does not attach the file to a conversation or invoke the model."
+    ),
+    binary_request_media_type="application/octet-stream",
+    response_model=UploadFilesystemResponse,
+    response_code=201,
+    query_params=[
+        QueryParam("path", "Destination directory relative to the selected root", default=""),
+        QueryParam(
+            "root", "Filesystem root", default="workspace", enum=["workspace", "data", "tmp"]
+        ),
+        QueryParam("name", "Filename without directory separators", required=True),
+    ],
+    error_codes=[400, 403, 404, 409, 413, 503],
+    tags=["Files"],
+)
 
 SERVER_ENDPOINTS: list[EndpointSpec] = [
     # --- Workstream management ---
@@ -506,8 +536,12 @@ SERVER_ENDPOINTS: list[EndpointSpec] = [
         "Render a workspace file with the preview content security policy",
         description=(
             "Requires files.read permission, write scope, and an accessible active local "
-            "interactive workstream. Uses the existing per-kind preview size limits. "
-            "Symlinks are refused."
+            "interactive workstream. Without limit, uses the existing per-kind preview size "
+            "limits. For text and Markdown, limit selects a bounded prefix of up to 2097152 "
+            "source bytes, transcoded to UTF-8. X-Preview-Truncated reports whether bytes remain, "
+            "X-Preview-Bytes gives the source bytes shown, and X-File-Size gives the source file "
+            "size. These headers are also returned for a probe. Other kinds with limit return "
+            "415. Symlinks are refused."
         ),
         query_params=[
             QueryParam("path", "File path relative to the selected root"),
@@ -516,6 +550,12 @@ SERVER_ENDPOINTS: list[EndpointSpec] = [
             ),
             QueryParam("probe", "Set to 1 for a bodyless 204 availability check"),
             QueryParam("assets", "Set to 1 to permit remote HTML images and styles"),
+            QueryParam(
+                "limit",
+                "Maximum source bytes in a text or Markdown prefix (1 to 2097152 inclusive); "
+                "the UTF-8 response can be larger after charset conversion",
+                schema_type="integer",
+            ),
         ],
         error_codes=[400, 403, 404, 409, 413, 415, 503],
         tags=["Files"],
@@ -538,6 +578,7 @@ SERVER_ENDPOINTS: list[EndpointSpec] = [
         error_codes=[400, 403, 404, 409, 413, 503],
         tags=["Files"],
     ),
+    FILES_UPLOAD_ENDPOINT,
     # --- Workstream attachments ---
     EndpointSpec(
         "/v1/api/workstreams/{ws_id}/attachments",
@@ -840,6 +881,7 @@ _ALL_MODELS: list[type[BaseModel]] = [
     ListAttachmentsResponse,
     ListFilesystemResponse,
     ResolveFilesystemResponse,
+    UploadFilesystemResponse,
     SpeechToTextResponse,
     TextToSpeechRequest,
     HealthResponse,

@@ -16,6 +16,8 @@ from starlette.responses import FileResponse, PlainTextResponse, Response
 from starlette.staticfiles import StaticFiles
 
 if TYPE_CHECKING:
+    from collections.abc import AsyncIterator
+
     from starlette.middleware import Middleware
     from starlette.requests import Request
     from starlette.responses import JSONResponse
@@ -158,6 +160,74 @@ def with_filename(filename: str, message: str) -> str:
     """
     name = " ".join((filename or "").split())[:100]
     return f"{name}: {message}" if name else message
+
+
+class UploadBodyError(Exception):
+    """A client body cannot be forwarded or published as a complete upload."""
+
+    def __init__(self, message: str, status: int, *, code: str | None = None) -> None:
+        super().__init__(message)
+        self.status = status
+        self.code = code
+
+    def response(self) -> JSONResponse:
+        from starlette.responses import JSONResponse as _JSONResponse
+
+        body = {"error": str(self)}
+        if self.code is not None:
+            body["code"] = self.code
+        return _JSONResponse(body, status_code=self.status)
+
+
+class BoundedUploadStream:
+    """Single-use request stream with an authoritative byte bound."""
+
+    def __init__(self, request: Request, *, max_bytes: int) -> None:
+        self.request = request
+        self.max_bytes = max_bytes
+        self.error: UploadBodyError | None = None
+        self._started = False
+        try:
+            self.declared = int(request.headers.get("content-length", "-1"))
+        except ValueError:
+            self.declared = -1
+        if self.declared > max_bytes:
+            raise self._too_large()
+
+    def _too_large(self) -> UploadBodyError:
+        return UploadBodyError(
+            f"File exceeds the {self.max_bytes // 1024 // 1024} MiB upload limit",
+            413,
+            code="too_large",
+        )
+
+    def __aiter__(self) -> AsyncIterator[bytes]:
+        if self._started:
+            raise RuntimeError("Upload body cannot be replayed")
+        self._started = True
+        return self._iterate()
+
+    async def _iterate(self) -> AsyncIterator[bytes]:
+        from starlette.requests import ClientDisconnect
+
+        total = 0
+        try:
+            try:
+                async for chunk in self.request.stream():
+                    total += len(chunk)
+                    if total > self.max_bytes:
+                        raise self._too_large()
+                    for offset in range(0, len(chunk), 64 * 1024):
+                        yield chunk[offset : offset + 64 * 1024]
+            except ClientDisconnect as exc:
+                raise UploadBodyError("Upload interrupted before completion", 400) from exc
+            if self.declared >= 0 and total != self.declared:
+                raise UploadBodyError("Upload size did not match Content-Length", 400)
+        except UploadBodyError as exc:
+            # A transport can wrap the iterator exception; retain the local
+            # error so the proxy reports it instead of an upstream failure.
+            self.error = exc
+            raise
 
 
 class _BodyOverBudgetError(Exception):

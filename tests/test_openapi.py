@@ -93,6 +93,51 @@ class TestServerSpec:
         assert "ws_id" in param_names
         assert "limit" in param_names
 
+    def test_file_upload_contract_matches_direct_and_node_proxy(self):
+        from turnstone.api.console_spec import build_console_spec
+        from turnstone.api.server_spec import build_server_spec
+
+        path = "/v1/api/workstreams/{ws_id}/files/upload"
+        for spec, prefix in (
+            (build_server_spec(), ""),
+            (build_console_spec(), "/node/{node_id}"),
+        ):
+            upload = spec["paths"][prefix + path]["post"]
+            assert upload["requestBody"] == {
+                "required": True,
+                "content": {
+                    "application/octet-stream": {"schema": {"type": "string", "format": "binary"}}
+                },
+            }
+            query = {p["name"]: p for p in upload["parameters"] if p["in"] == "query"}
+            assert set(query) == {"root", "path", "name"}
+            assert query["name"]["required"] is True
+            assert query["root"]["schema"]["enum"] == ["workspace", "data", "tmp"]
+            assert query["path"]["schema"]["default"] == ""
+            assert {"201", "400", "403", "404", "409", "413", "503"} == set(upload["responses"])
+            assert upload["responses"]["201"]["content"]["application/json"]["schema"] == {
+                "$ref": "#/components/schemas/UploadFilesystemResponse"
+            }
+            response = spec["components"]["schemas"]["UploadFilesystemResponse"]
+            assert set(response["required"]) == {"root_id", "path", "name", "size"}
+            assert response["properties"]["size"]["minimum"] == 0
+            assert response["properties"]["size"]["maximum"] == 64 * 1024 * 1024
+            assert "files.write" in upload["description"]
+
+    def test_file_preview_documents_optional_bounded_text_prefix(self):
+        from turnstone.api.server_spec import build_server_spec
+
+        spec = build_server_spec()
+        preview = spec["paths"]["/v1/api/workstreams/{ws_id}/files/preview"]["get"]
+        limits = [p for p in preview["parameters"] if p["in"] == "query" and p["name"] == "limit"]
+        assert len(limits) == 1
+        assert limits[0]["schema"]["type"] == "integer"
+        assert limits[0]["required"] is False
+        assert "2097152" in limits[0]["description"]
+        for header in ("X-Preview-Truncated", "X-Preview-Bytes", "X-File-Size"):
+            assert header in preview["description"]
+        assert {"400", "415"} <= preview["responses"].keys()
+
     def test_history_handoff_and_failure_contract_is_public(self):
         from turnstone.api.server_spec import build_server_spec
 

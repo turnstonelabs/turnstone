@@ -3720,6 +3720,9 @@ _PROXY_PASS_HEADERS = (
     "x-content-type-options",
     "content-disposition",
     "cache-control",
+    "x-preview-truncated",
+    "x-preview-bytes",
+    "x-file-size",
 )
 
 
@@ -3750,8 +3753,26 @@ async def _proxy_post(
     request: Request, server_url: str, path: str, *, api_prefix: str = "api"
 ) -> Response:
     """Forward a non-GET request (POST/PUT/DELETE) to the target server."""
+    from turnstone.core.web_helpers import BoundedUploadStream, UploadBodyError
+
     client: httpx2.AsyncClient = request.app.state.proxy_client
-    body = await request.body()
+    upload_stream: BoundedUploadStream | None = None
+    body: bytes | BoundedUploadStream
+    if re.fullmatch(r"workstreams/[^/]+/files/upload", path):
+        from turnstone.core.auth import require_permission
+        from turnstone.core.filesystem import UPLOAD_SIZE_CAP
+
+        for permission in ("files.read", "files.write"):
+            err = require_permission(request, permission)
+            if err is not None:
+                return err
+        try:
+            upload_stream = BoundedUploadStream(request, max_bytes=UPLOAD_SIZE_CAP)
+        except UploadBodyError as exc:
+            return exc.response()
+        body = upload_stream
+    else:
+        body = await request.body()
     content_type = request.headers.get("content-type", "application/json")
     target = f"{server_url}/{api_prefix}/{path}"
     if request.url.query:
@@ -3774,9 +3795,17 @@ async def _proxy_post(
             headers=headers,
             timeout=timeout,
         )
+    except UploadBodyError as exc:
+        return exc.response()
     except REQUEST_FAILURES as exc:
+        if upload_stream is not None and upload_stream.error is not None:
+            return upload_stream.error.response()
         log.debug("Proxy %s error for %r: %s", request.method, f"{api_prefix}/{path}", exc)
         return _upstream_failure(exc, "the node", unreachable="Node unreachable")
+    except Exception:
+        if upload_stream is not None and upload_stream.error is not None:
+            return upload_stream.error.response()
+        raise
     # A busy node's 429 names its wait in Retry-After, and the browser's
     # authFetch waits that long before retrying.  Only delta-seconds pass.
     retry_after = resp.headers.get("retry-after", "")
@@ -8015,6 +8044,7 @@ _VALID_PERMISSIONS = frozenset(
         "conversation.modify",
         # Direct node filesystem browsing, distinct from tool execution.
         "files.read",
+        "files.write",
         # Projects — shared resource containers.  Granted to builtin-admin via
         # migration 062; grantable to non-admin users via a custom role.
         # ``project.read``/``project.write`` compose with the per-project ACL

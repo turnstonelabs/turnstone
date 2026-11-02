@@ -140,6 +140,26 @@
   cursor: pointer;
 }
 
+/* Bounded text previews keep their controls outside the scrolling source. */
+.preview-text-controls {
+  flex: none;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border-top: 1px solid var(--hair);
+  background: var(--panel);
+}
+.preview-text-status {
+  flex: 1 1 140px;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--ink-2);
+}
+
 /* ----- content host ----- */
 .preview-content {
   flex: 1 1 auto;

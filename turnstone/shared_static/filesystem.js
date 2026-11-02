@@ -1,9 +1,14 @@
-// A user-operated, read-only view of the originating node's file roots. The
+// A user-operated view of the originating node's file roots. The
 // directory browser and the existing preview renderer share one shell pane;
 // browsing never creates an assistant turn or copies files into attachments.
 import { ShellPane } from "./pane.js";
-import { authFetch } from "./auth.js";
+import { authFetch, hasPermission, hasScope, onAuthChange } from "./auth.js";
 import { createPreviewPane, sourceLanguage } from "./preview.js";
+
+const FILE_UPLOAD_LIMIT = 64 * 1024 * 1024;
+const FILE_UPLOAD_COUNT_LIMIT = 100;
+const filesystemAuthListeners = new Set();
+onAuthChange(() => filesystemAuthListeners.forEach((listener) => listener()));
 
 function fileElement(tag, className, text) {
   const node = document.createElement(tag);
@@ -89,6 +94,186 @@ export function createFilesystemPane(extra, hostApi) {
   pane._selectedTarget = null;
   pane._requestToken = 0;
   pane._closed = false;
+  pane._directoryReady = false;
+  pane._uploadBatch = null;
+  pane._pickerDestination = null;
+  pane._dragDepth = 0;
+
+  const uploadPermission = () =>
+    hasScope("write") && hasPermission("files.read") && hasPermission("files.write");
+
+  const uploadDestination = () => ({
+    ctx: { ...pane._ctx, rootId: pane._rootId },
+    path: pane._path,
+    label: pane._crumbs.title,
+  });
+
+  const sameDestination = (destination) => pane._ctx &&
+    pane._ctx.base === destination.ctx.base && pane._ctx.wsId === destination.ctx.wsId &&
+    pane._rootId === destination.ctx.rootId && pane._path === destination.path;
+
+  const canUpload = () => uploadPermission() && pane._ctx && pane._directoryReady &&
+    !pane._closed && !pane._uploadBatch;
+
+  const clearDrag = () => {
+    pane._dragDepth = 0;
+    if (pane._dropOverlay) pane._dropOverlay.hidden = true;
+  };
+
+  const syncUploadControls = () => {
+    if (!pane._uploadButton) return;
+    const permitted = uploadPermission();
+    pane._uploadButton.hidden = !permitted;
+    pane._uploadButton.disabled = !canUpload();
+    pane._dropHint.hidden = !permitted;
+    pane._dropHint.textContent = pane._directoryReady
+      ? "Drop files here · Up to 64 MB per file"
+      : "Load a directory to upload files.";
+  };
+
+  const uploadNotice = (message) => {
+    pane._uploadPanel.hidden = false;
+    pane._uploadStatus.textContent = "Error: " + message;
+    pane._uploadStatus.classList.add("has-error");
+    pane._uploadProgress.hidden = true;
+    pane._uploadResults.replaceChildren();
+    pane._uploadDismiss.title = "Close upload results";
+    pane._uploadDismiss.setAttribute("aria-label", pane._uploadDismiss.title);
+  };
+
+  const stopUploads = (message) => {
+    const batch = pane._uploadBatch;
+    if (!batch) return;
+    pane._uploadBatch = null;
+    batch.controller.abort();
+    for (const item of batch.items) {
+      if (item.state === "uploading") item.status.textContent = "Interrupted — check destination";
+      else if (item.state === "queued") item.status.textContent = "Not uploaded";
+    }
+    pane._uploadStatus.textContent = message + " Destination: " + batch.destination.label;
+    pane._uploadStatus.classList.remove("has-error");
+    pane._uploadProgress.hidden = true;
+    pane._uploadDismiss.title = "Close upload results";
+    pane._uploadDismiss.setAttribute("aria-label", pane._uploadDismiss.title);
+    syncUploadControls();
+  };
+
+  const uploadFiles = async (files, destination) => {
+    if (!files.length || pane._closed) return;
+    if (!canUpload()) {
+      if (!pane._uploadBatch) uploadNotice("Uploads are unavailable. Open a directory with upload access first.");
+      return;
+    }
+    if (files.length > FILE_UPLOAD_COUNT_LIMIT) {
+      uploadNotice("Choose up to 100 files per upload. No files were uploaded.");
+      return;
+    }
+    const batch = {
+      destination,
+      controller: new AbortController(),
+      items: [],
+      completed: 0,
+      uploaded: 0,
+    };
+    pane._uploadBatch = batch;
+    pane._uploadStatus.classList.remove("has-error");
+    pane._uploadPanel.hidden = false;
+    pane._uploadResults.replaceChildren();
+    pane._uploadProgress.hidden = false;
+    pane._uploadProgress.max = files.length;
+    pane._uploadProgress.value = 0;
+    pane._uploadDismiss.title = "Stop uploads";
+    pane._uploadDismiss.setAttribute("aria-label", pane._uploadDismiss.title);
+    for (const file of files) {
+      const row = fileElement("li", "filesystem-upload-result");
+      row.setAttribute("aria-atomic", "true");
+      const name = fileElement("span", "filesystem-upload-name", file.name);
+      const status = fileElement("span", "filesystem-upload-result-status", "Queued");
+      row.append(name, status);
+      pane._uploadResults.append(row);
+      batch.items.push({ file, row, status, state: "queued" });
+    }
+    syncUploadControls();
+    for (const item of batch.items) {
+      if (pane._uploadBatch !== batch || pane._closed) return;
+      item.state = "uploading";
+      item.status.textContent = "Uploading…";
+      pane._uploadStatus.textContent = "Uploading " + (batch.completed + 1) + " of " + files.length +
+        " to " + destination.label;
+      let failure = "Upload could not be confirmed. Refresh the destination before retrying.";
+      try {
+        if (item.file.size > FILE_UPLOAD_LIMIT) {
+          failure = "Larger than 64 MB — not uploaded.";
+          throw new Error(failure);
+        }
+        const response = await authFetch(
+          filesUrl(destination.ctx, "upload", destination.path) + "&name=" + encodeURIComponent(item.file.name),
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/octet-stream" },
+            body: item.file,
+            signal: batch.controller.signal,
+          },
+        );
+        if (pane._uploadBatch !== batch || pane._closed) return;
+        if (!response || !response.ok) {
+          let detail = null;
+          try { detail = await response.json(); } catch (_) { /* Proxy failures may have no JSON body. */ }
+          if (pane._uploadBatch !== batch || pane._closed) return;
+          const message = detail && typeof detail.error === "string" ? detail.error.trim().slice(0, 400) : "";
+          const conflict = response && response.status === 409 && detail?.code === "file_exists";
+          const unavailable = response && response.status === 409 && !conflict;
+          const denied = response && (response.status === 401 || response.status === 403);
+          failure = conflict
+            ? "Already exists — rename the file and upload again."
+            : response && response.status === 413
+              ? "Larger than 64 MB — not uploaded."
+              : denied
+                ? "Upload access was denied."
+                : message || (unavailable
+                  ? "Upload destination is unavailable. Reopen the conversation and try again."
+                  : failure);
+          if (denied || unavailable) {
+            item.state = "error";
+            item.row.classList.add("has-error");
+            item.status.textContent = "Error: " + failure;
+            if (unavailable) pane._directoryReady = false;
+            stopUploads("Uploads stopped. Completed files were kept.");
+            return;
+          }
+          throw new Error(failure);
+        }
+        item.state = "done";
+        item.status.textContent = "Uploaded";
+        batch.uploaded++;
+      } catch (_) {
+        if (pane._uploadBatch !== batch || pane._closed) return;
+        item.state = "error";
+        item.row.classList.add("has-error");
+        item.status.textContent = "Error: " + failure;
+      }
+      batch.completed++;
+      pane._uploadProgress.value = batch.completed;
+    }
+    if (pane._uploadBatch !== batch || pane._closed) return;
+    pane._uploadBatch = null;
+    pane._uploadStatus.textContent = "Uploads finished · " + destination.label;
+    pane._uploadProgress.hidden = true;
+    pane._uploadDismiss.title = "Close upload results";
+    pane._uploadDismiss.setAttribute("aria-label", pane._uploadDismiss.title);
+    syncUploadControls();
+    if (batch.uploaded && sameDestination(destination)) {
+      navigate(pane._path, pane._selected, pane._selectedTarget);
+    }
+  };
+
+  const onAuthChanged = () => {
+    if (pane._closed) return;
+    pane._pickerDestination = null;
+    clearDrag();
+    stopUploads("Uploads stopped because your sign-in or permissions changed. Completed files were kept.");
+    syncUploadControls();
+  };
 
   const persist = () => {
     if (pane._ctx && api.persistMeta) {
@@ -189,6 +374,7 @@ export function createFilesystemPane(extra, hostApi) {
   };
 
   const listError = (message, path, selection, targetPath) => {
+    pane._directoryReady = false;
     const error = fileElement("div", "filesystem-message filesystem-error", message);
     const retry = fileButton("Retry", "Reload this directory", () =>
       navigate(path, selection, targetPath),
@@ -205,6 +391,9 @@ export function createFilesystemPane(extra, hostApi) {
       document.activeElement === pane._up;
     const ctx = { ...pane._ctx, rootId: pane._rootId };
     pane._path = path;
+    pane._directoryReady = false;
+    clearDrag();
+    syncUploadControls();
     clearSelection();
     // Preserve pending intent for another refresh or restoration while loading.
     pane._selectedTarget = targetPath;
@@ -242,6 +431,7 @@ export function createFilesystemPane(extra, hostApi) {
       if (!Array.isArray(data.entries) || typeof data.path !== "string") {
         throw new Error("Invalid directory response");
       }
+      pane._directoryReady = true;
       pane._path = data.path;
       pane._root = data.root || "";
       if (targetPath) {
@@ -295,6 +485,7 @@ export function createFilesystemPane(extra, hostApi) {
     } finally {
       if (token === pane._requestToken && !pane._closed) {
         pane._list.removeAttribute("aria-busy");
+        syncUploadControls();
         if (retainFocus && document.activeElement === pane._list) {
           (pane._list.querySelector("button") || pane._rootSelect).focus({ preventScroll: true });
         }
@@ -312,6 +503,8 @@ export function createFilesystemPane(extra, hostApi) {
     const selectedTarget = same ? pane._selectedTarget : null;
     pane._ctx = { base: ctx.base || "", wsId: ctx.wsId };
     if (!same) {
+      pane._pickerDestination = null;
+      stopUploads("Uploads stopped because the conversation changed. Completed files were kept.");
       pane._root = "";
       pane._rootId = "workspace";
       pane._rootSelect.value = "workspace";
@@ -353,7 +546,24 @@ export function createFilesystemPane(extra, hostApi) {
     const refresh = fileButton("↻ Refresh", "Refresh files", () =>
       navigate(pane._path, pane._selected, pane._selectedTarget),
     );
-    controls.append(rootChoice, refresh);
+    pane._uploadInput = fileElement("input", "filesystem-upload-input");
+    pane._uploadInput.type = "file";
+    pane._uploadInput.multiple = true;
+    pane._uploadInput.hidden = true;
+    pane._uploadInput.setAttribute("aria-label", "Choose files to upload");
+    pane._uploadInput.addEventListener("change", () => {
+      const files = Array.from(pane._uploadInput.files || []);
+      const destination = pane._pickerDestination;
+      pane._pickerDestination = null;
+      pane._uploadInput.value = "";
+      if (destination) uploadFiles(files, destination);
+    });
+    pane._uploadButton = fileButton("↑ Upload", "Upload files to this directory", () => {
+      if (!canUpload()) return;
+      pane._pickerDestination = uploadDestination();
+      pane._uploadInput.click();
+    });
+    controls.append(rootChoice, pane._uploadButton, refresh, pane._uploadInput);
     const address = fileElement("div", "filesystem-address");
     // The node prefix stays outside the scrolling breadcrumbs so a deep path
     // cannot push it out of view.
@@ -365,6 +575,33 @@ export function createFilesystemPane(extra, hostApi) {
     address.append(fileElement("span", "filesystem-path-label", "Path"), pane._node, pane._crumbs);
     navigation.append(pane._up, address);
     toolbar.append(controls, navigation);
+    pane._uploadPanel = fileElement("section", "filesystem-uploads");
+    pane._uploadPanel.hidden = true;
+    pane._uploadPanel.setAttribute("aria-label", "Uploads");
+    const uploadHeading = fileElement("div", "filesystem-upload-heading");
+    pane._uploadStatus = fileElement("div", "filesystem-upload-status");
+    pane._uploadStatus.setAttribute("role", "status");
+    pane._uploadStatus.setAttribute("aria-live", "polite");
+    pane._uploadStatus.setAttribute("aria-atomic", "true");
+    pane._uploadDismiss = fileButton("", "Close upload results", () => {
+      if (pane._uploadBatch) stopUploads("Uploads stopped. Completed files were kept.");
+      else {
+        pane._uploadPanel.hidden = true;
+        if (!pane._uploadButton.hidden) pane._uploadButton.focus({ preventScroll: true });
+      }
+    });
+    pane._uploadDismiss.classList.add("filesystem-upload-close");
+    const uploadCloseIcon = fileElement("span", null, "×");
+    uploadCloseIcon.setAttribute("aria-hidden", "true");
+    pane._uploadDismiss.append(uploadCloseIcon);
+    uploadHeading.append(pane._uploadStatus, pane._uploadDismiss);
+    pane._uploadProgress = fileElement("progress", "filesystem-upload-progress");
+    pane._uploadProgress.setAttribute("aria-label", "Files processed");
+    pane._uploadResults = fileElement("ul", "filesystem-upload-results");
+    pane._uploadResults.tabIndex = 0;
+    pane._uploadResults.setAttribute("aria-label", "Upload results");
+    pane._uploadResults.setAttribute("aria-live", "polite");
+    pane._uploadPanel.append(uploadHeading, pane._uploadProgress, pane._uploadResults);
     const body = fileElement("div", "filesystem-body");
     const browser = fileElement("div", "filesystem-browser");
     const directory = fileElement("div", "filesystem-directory");
@@ -378,7 +615,8 @@ export function createFilesystemPane(extra, hostApi) {
     pane._list.tabIndex = -1;
     pane._status = fileElement("div", "filesystem-status");
     pane._status.setAttribute("role", "status");
-    browser.append(directory, pane._list, pane._status);
+    pane._dropHint = fileElement("div", "filesystem-drop-hint");
+    browser.append(directory, pane._list, pane._dropHint, pane._status);
     const viewer = fileElement("div", "filesystem-viewer");
     viewer.setAttribute("role", "region");
     viewer.setAttribute("aria-label", "Selected file");
@@ -388,6 +626,8 @@ export function createFilesystemPane(extra, hostApi) {
       autoRetry: false,
       responseErrors: true,
       downloadOnPreviewError: true,
+      textPreview: true,
+      downloadLimit: 64 * 1024 * 1024,
       copy: true,
       emptyText: "Choose a file to preview, copy, or download.",
     });
@@ -395,8 +635,68 @@ export function createFilesystemPane(extra, hostApi) {
     pane._preview.bodyEl = viewer;
     pane._preview.onMount();
     body.append(browser, viewer);
-    root.append(toolbar, body);
+    pane._dropOverlay = fileElement("div", "filesystem-drop-overlay");
+    pane._dropOverlay.hidden = true;
+    pane._dropOverlay.setAttribute("aria-hidden", "true");
+    const dropTitle = fileElement("strong", "filesystem-drop-title");
+    const dropDestination = fileElement("span", "filesystem-drop-destination");
+    pane._dropOverlay.append(dropTitle, dropDestination);
+    const fileDrag = (event) => Array.from(event.dataTransfer?.types || []).includes("Files");
+    const showDrop = () => {
+      const allowed = canUpload();
+      pane._dropOverlay.hidden = false;
+      dropTitle.textContent = allowed ? "Upload files to this directory" : "Uploads unavailable";
+      dropDestination.textContent = allowed ? pane._crumbs.title : pane._uploadBatch
+        ? "Wait for the current uploads to finish."
+        : "Open a directory with upload access first.";
+    };
+    root.addEventListener("dragenter", (event) => {
+      if (!fileDrag(event)) return;
+      event.preventDefault();
+      event.stopPropagation();
+      pane._dragDepth++;
+      showDrop();
+    });
+    root.addEventListener("dragover", (event) => {
+      if (!fileDrag(event)) return;
+      event.preventDefault();
+      event.stopPropagation();
+      event.dataTransfer.dropEffect = canUpload() ? "copy" : "none";
+      showDrop();
+    });
+    root.addEventListener("dragleave", (event) => {
+      if (!fileDrag(event)) return;
+      event.preventDefault();
+      event.stopPropagation();
+      if (--pane._dragDepth <= 0 || (event.relatedTarget && !root.contains(event.relatedTarget))) clearDrag();
+    });
+    root.addEventListener("drop", (event) => {
+      if (!fileDrag(event)) return;
+      event.preventDefault();
+      event.stopPropagation();
+      clearDrag();
+      if (!canUpload()) return;
+      const transfer = event.dataTransfer;
+      const items = Array.from(transfer.items || []).filter((item) => item.kind === "file");
+      const directories = items.some((item) => {
+        const entry = item.webkitGetAsEntry ? item.webkitGetAsEntry() : item.getAsEntry?.();
+        return entry && entry.isDirectory;
+      });
+      if (directories) {
+        uploadNotice("Folder uploads aren't supported. Drop files instead.");
+        return;
+      }
+      const files = Array.from(transfer.files || []);
+      if (!files.length) {
+        uploadNotice("No files could be read. Use Upload to choose files instead.");
+        return;
+      }
+      uploadFiles(files, uploadDestination());
+    });
+    root.append(toolbar, pane._uploadPanel, body, pane._dropOverlay);
     this.bodyEl.append(root);
+    filesystemAuthListeners.add(onAuthChanged);
+    syncUploadControls();
     if (extra && extra.ctx && extra.ctx.wsId) {
       pane._ctx = { base: extra.ctx.base || "", wsId: extra.ctx.wsId };
       pane._rootId = ["workspace", "data", "tmp"].includes(extra.rootId) ? extra.rootId : "workspace";
@@ -409,6 +709,10 @@ export function createFilesystemPane(extra, hostApi) {
 
   pane.onClose = () => {
     pane._closed = true;
+    pane._pickerDestination = null;
+    stopUploads("Uploads stopped because the file pane closed. Completed files were kept.");
+    filesystemAuthListeners.delete(onAuthChanged);
+    clearDrag();
     pane._requestToken++;
     if (pane._preview) pane._preview.onClose();
   };

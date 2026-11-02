@@ -1554,7 +1554,7 @@
         "tags": [
           "Files"
         ],
-        "description": "Requires files.read permission, write scope, and an accessible active local interactive workstream. Uses the existing per-kind preview size limits. Symlinks are refused.",
+        "description": "Requires files.read permission, write scope, and an accessible active local interactive workstream. Without limit, uses the existing per-kind preview size limits. For text and Markdown, limit selects a bounded prefix of up to 2097152 source bytes, transcoded to UTF-8. X-Preview-Truncated reports whether bytes remain, X-Preview-Bytes gives the source bytes shown, and X-File-Size gives the source file size. These headers are also returned for a probe. Other kinds with limit return 415. Symlinks are refused.",
         "parameters": [
           {
             "name": "ws_id",
@@ -1605,6 +1605,15 @@
               "type": "string"
             },
             "description": "Set to 1 to permit remote HTML images and styles"
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            },
+            "description": "Maximum source bytes in a text or Markdown prefix (1 to 2097152 inclusive); the UTF-8 response can be larger after charset conversion"
           }
         ],
         "responses": {
@@ -1729,6 +1738,143 @@
         "responses": {
           "200": {
             "description": "Success"
+          },
+          "400": {
+            "description": "Error 400",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Error 403",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Error 409",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Error 413",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Error 503",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/api/workstreams/{ws_id}/files/upload": {
+      "post": {
+        "summary": "Upload a file to the selected directory without replacing an existing entry",
+        "operationId": "v1_api_workstreams_{ws_id}_files_upload_post",
+        "tags": [
+          "Files"
+        ],
+        "description": "Accepts original file bytes as application/octet-stream, up to 64 MiB; empty files are allowed. Requires files.read and files.write permissions, write scope, and an accessible active local interactive workstream. The destination directory must exist inside the selected shared node root. The name must be a single filename; paths, symlinks, and special files are refused. Streams bytes through the console proxy into private staging on the node, then publishes the complete file atomically. An existing entry returns 409 with code file_exists and is never overwritten. An inactive workstream returns 409 with code workstream_inactive. This does not attach the file to a conversation or invoke the model.",
+        "parameters": [
+          {
+            "name": "ws_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "path",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": ""
+            },
+            "description": "Destination directory relative to the selected root"
+          },
+          {
+            "name": "root",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "workspace",
+              "enum": [
+                "workspace",
+                "data",
+                "tmp"
+              ]
+            },
+            "description": "Filesystem root"
+          },
+          {
+            "name": "name",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Filename without directory separators"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/octet-stream": {
+              "schema": {
+                "type": "string",
+                "format": "binary"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UploadFilesystemResponse"
+                }
+              }
+            }
           },
           "400": {
             "description": "Error 400",
@@ -5438,6 +5584,44 @@
           "selected"
         ],
         "title": "ResolveFilesystemResponse",
+        "type": "object"
+      },
+      "UploadFilesystemResponse": {
+        "properties": {
+          "root_id": {
+            "enum": [
+              "workspace",
+              "data",
+              "tmp"
+            ],
+            "title": "Root Id",
+            "type": "string"
+          },
+          "path": {
+            "description": "Created file path relative to the selected root",
+            "title": "Path",
+            "type": "string"
+          },
+          "name": {
+            "description": "Original uploaded filename",
+            "title": "Name",
+            "type": "string"
+          },
+          "size": {
+            "description": "Uploaded file size in bytes",
+            "maximum": 67108864,
+            "minimum": 0,
+            "title": "Size",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "root_id",
+          "path",
+          "name",
+          "size"
+        ],
+        "title": "UploadFilesystemResponse",
         "type": "object"
       },
       "SpeechToTextResponse": {

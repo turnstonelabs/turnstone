@@ -645,12 +645,13 @@ class AttachmentHandlers:
 
 @dataclass(frozen=True)
 class FilesystemHandlers:
-    """Read-only node-workspace routes, mounted only by interactive nodes."""
+    """Node-workspace routes, mounted only by interactive nodes."""
 
     list: Handler
     preview: Handler
     content: Handler
     resolve: Handler
+    upload: Handler
 
 
 @dataclass(frozen=True)
@@ -827,6 +828,7 @@ def register_session_routes(
         routes.append(Route(f"{p}/{{ws_id}}/files/preview", fs.preview, methods=["GET"]))
         routes.append(Route(f"{p}/{{ws_id}}/files/content", fs.content, methods=["GET"]))
         routes.append(Route(f"{p}/{{ws_id}}/files/resolve", fs.resolve, methods=["GET"]))
+        routes.append(Route(f"{p}/{{ws_id}}/files/upload", fs.upload, methods=["POST"]))
 
     # --- Bare ``{ws_id}`` detail (GET) registers LAST so the verb-
     #     suffixed patterns above win for ``{ws_id}/...`` paths.
