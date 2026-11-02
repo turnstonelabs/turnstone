@@ -68,6 +68,8 @@ docker compose up -d
 watch -n5 'docker compose ps'
 ```
 
+> Discrete-GPU operators: every tunable in `docker-compose.yml` is `${VAR:-default}` — set machine-specific values in local `.env` (untracked), e.g. single-model bring-up `docker compose up vllm-qwen litellm`. Optional KV cache: `docker compose --profile lmcache up lmcache` plus `QWEN_KV_OFFLOAD_*` in `.env`. See `.env.example` (commented block) for the full knob list.
+
 Verify the KV pools and a round-trip on each route:
 
 ```sh
@@ -87,6 +89,10 @@ curl -s localhost:4000/v1/chat/completions -H 'content-type: application/json' \
 curl -s localhost:8002/rerank -H 'content-type: application/json' \
   -d '{"model":"qwen3-reranker-4b","query":"capital of France","documents":["Paris is the capital of France","Berlin is in Germany"]}'
 ```
+
+Maximum concurrency + guard checks:
+docker compose logs vllm-qwen | grep "Maximum concurrency"
+docker compose logs vllm-qwen | grep "vllm-entrypoint: warning\|vllm-entrypoint: refusing"
 
 ## Setup — AMD Strix Halo (Ryzen AI MAX, ROCm)   ⚠️ guidance, untested here
 
@@ -215,3 +221,9 @@ co-residence or context for speed.
 **AMD `HIP error` / "gfx not supported".** Use a ROCm vLLM build for `gfx1151`, set
 `HSA_OVERRIDE_GFX_VERSION`, confirm `/dev/kfd` + `/dev/dri` are passed and the user
 is in the `video`/`render` groups.
+
+**Guard `prefer-mtp` downgrade (backend dropped, draft kept).** Quantized-only backends (`b12x`/`flashinfer_b12x`) reject BF16 spec drafts (HF#4, #54788) — guard drops the backend flag and injects `"moe_backend":"triton"` into the draft override. Throughput drops at high concurrency; acceptance wins single-stream.
+**Guard `prefer-b12x` (spec dropped, backend kept).** Loses spec acceptance; throughput wins at high concurrency.
+**Guard `fail` exit 2.** Names both flags — pin an explicit `VLLM_SPEC_CONFLICT` choice in CI.
+**Spec draft override.** Spec JSON `"moe_backend":"triton"` is the working pattern when the target uses a quantized-only backend (#54788, #64751).
+**Weight offload smoke test.** New offload knobs are inert when unset; when enabling UVA, smoke first with a small `--cpu-offload-gb` plus `--enforce-eager` before raising.
