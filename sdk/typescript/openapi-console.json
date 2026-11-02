@@ -6,6 +6,151 @@
     "description": "Cluster-wide visibility and control across all turnstone nodes."
   },
   "paths": {
+    "/node/{node_id}/v1/api/workstreams/{ws_id}/files/upload": {
+      "post": {
+        "summary": "Upload a file to the selected directory without replacing an existing entry",
+        "operationId": "node_{node_id}_v1_api_workstreams_{ws_id}_files_upload_post",
+        "tags": [
+          "Files"
+        ],
+        "description": "Accepts original file bytes as application/octet-stream, up to 64 MiB; empty files are allowed. Requires files.read and files.write permissions, write scope, and an accessible active local interactive workstream. The destination directory must exist inside the selected shared node root. The name must be a single filename; paths, symlinks, and special files are refused. Streams bytes through the console proxy into private staging on the node, then publishes the complete file atomically. An existing entry returns 409 with code file_exists and is never overwritten. An inactive workstream returns 409 with code workstream_inactive. This does not attach the file to a conversation or invoke the model.",
+        "parameters": [
+          {
+            "name": "node_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "ws_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "path",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": ""
+            },
+            "description": "Destination directory relative to the selected root"
+          },
+          {
+            "name": "root",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "workspace",
+              "enum": [
+                "workspace",
+                "data",
+                "tmp"
+              ]
+            },
+            "description": "Filesystem root"
+          },
+          {
+            "name": "name",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Filename without directory separators"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/octet-stream": {
+              "schema": {
+                "type": "string",
+                "format": "binary"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UploadFilesystemResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Error 400",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Error 403",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Error 409",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Error 413",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Error 503",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/api/cluster/overview": {
       "get": {
         "summary": "Cluster state summary",
@@ -16668,6 +16813,44 @@
           "ws_id"
         ],
         "title": "WorkstreamHistoryResponse",
+        "type": "object"
+      },
+      "UploadFilesystemResponse": {
+        "properties": {
+          "root_id": {
+            "enum": [
+              "workspace",
+              "data",
+              "tmp"
+            ],
+            "title": "Root Id",
+            "type": "string"
+          },
+          "path": {
+            "description": "Created file path relative to the selected root",
+            "title": "Path",
+            "type": "string"
+          },
+          "name": {
+            "description": "Original uploaded filename",
+            "title": "Name",
+            "type": "string"
+          },
+          "size": {
+            "description": "Uploaded file size in bytes",
+            "maximum": 67108864,
+            "minimum": 0,
+            "title": "Size",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "root_id",
+          "path",
+          "name",
+          "size"
+        ],
+        "title": "UploadFilesystemResponse",
         "type": "object"
       },
       "AuthWhoamiResponse": {

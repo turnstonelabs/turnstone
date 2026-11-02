@@ -442,8 +442,22 @@ sandbox: scripts are disabled and remote images/styles require an explicit opt-i
 Folder icons, type labels, and a breadcrumb address bar identify the current location
 and its contents. In the cluster console the address bar starts with the conversation's
 node ID, such as `node-5:`, because each node has its own locations. Recognized source
-files use the shared syntax highlighter; files over 100,000 characters remain fully
-readable and copyable with highlighting skipped.
+files use the shared syntax highlighter; text over 100,000 characters skips highlighting.
+Text and Markdown previews start with up to 256 KiB of source. **Load more** expands
+the visible prefix in 256 KiB steps, up to 2 MiB. Partial Markdown is shown as plain
+source. The pane states when a preview is partial, and **Copy shown text** copies only
+that visible portion. **Download** saves the complete original file within the download
+limit.
+
+Select **Upload** to choose files, or drag files onto the directory browser, to upload
+them to the displayed directory. Uploads require `files.write` in addition to browsing
+access; the built-in admin and operator roles include both permissions, and role
+overrides can revoke them separately. The destination stays fixed for the upload batch
+even if you browse elsewhere. Files upload one at a time, with each result shown in the
+pane. Existing names are reported as conflicts and are never overwritten. Uploads are
+limited to 100 files per batch and 64 MiB per file; empty files are allowed. The console
+streams upload bytes to private staging on the node, and the file appears after the
+upload completes. Folder uploads are not supported.
 
 **Workspace** is the node's configured `[tools] workspace_dir` (or `TURNSTONE_WORKSPACE`,
 normally `/workspace` in Docker), falling back to the server's working directory when
@@ -451,11 +465,14 @@ neither is set. **/data** and **/tmp** browse those directories on the same node
 locations are shared by workstreams; they are not private per-conversation filesystems.
 Browsing stays inside the selected root and does not follow symlinks. An unavailable
 location is reported as an error. Listings examine at most 1,000 entries and downloads
-are limited to 64 MiB. Preview limits are 512 KiB for text/Markdown, 2 MiB for tables,
-4 MiB for HTML/images, and 32 MiB for PDFs; files above a preview limit remain downloadable
+are limited to 64 MiB. Text and Markdown previews show at most the first 2 MiB; files
+within the download limit can be downloaded in full. Larger text files can still be
+previewed, with the download limit explained and Download disabled. Complete previews
+are limited to 2 MiB for tables,
+4 MiB for HTML/images, and 32 MiB for PDFs; files above those limits remain downloadable
 within the download limit.
 
-The pane is read-only and opened by the user. It does not edit or delete files,
+The pane is opened by the user. Uploads create files; the pane does not edit or delete files,
 automatically open generated files, or launch from coordinator conversations.
 Closing the Files pane leaves the conversation and files intact.
 

@@ -1675,7 +1675,7 @@ active interactive session on the addressed node. Through the console, prefix th
 `/node/{node_id}`. An inactive or rehomed session returns `409`; reopen the conversation
 before browsing again.
 
-Listing, preview, and content endpoints accept `root=workspace|data|tmp` (default `workspace`) and a `path`
+Listing, preview, content, and upload endpoints accept `root=workspace|data|tmp` (default `workspace`) and a `path`
 relative to that root. `workspace` uses `[tools] workspace_dir`, then
 `TURNSTONE_WORKSPACE`, then the server working directory. `data` and `tmp` select `/data`
 and `/tmp`. An unknown root returns `400`; a missing root returns `503`. Symlinks and
@@ -1707,9 +1707,19 @@ paths outside the browsable roots and symlinks below a root return `403`.
 
 Serve a supported file under the existing preview content security policy. HTML is
 sandboxed; `assets=1` permits remote images/styles. `probe=1` validates the file and
-returns a bodyless `204`. Text is transcoded to UTF-8. Unsupported content returns `415`;
-files exceeding their preview limit return `413` (text/Markdown 512 KiB, tables 2 MiB,
-HTML/images 4 MiB, PDFs 32 MiB).
+returns a bodyless `204`. Text is transcoded to UTF-8. Unsupported content returns `415`.
+Without `limit`, files exceeding their preview limit return `413` (text/Markdown 512 KiB,
+tables 2 MiB, HTML/images 4 MiB, PDFs 32 MiB).
+
+For text and Markdown, `limit` requests a prefix of 1 to 2,097,152 source bytes instead
+of a complete preview. Invalid limits return `400`; supplying `limit` for another kind
+returns `415`. The response includes `X-Preview-Truncated: true|false`,
+`X-Preview-Bytes` (source bytes shown), and `X-File-Size` (total source bytes). These
+headers are also present with `probe=1`. A prefix may end slightly before the requested
+limit to preserve a UTF-8 character boundary. Transcoding a legacy encoding can make
+the UTF-8 response larger than the source byte count. Increasing `limit` rereads the
+prefix from the current file; clients should replace their previous prefix, not append
+the response. Stored `open_preview` content retains its existing limits.
 
 #### `GET /v1/api/workstreams/{ws_id}/files/content`
 
@@ -1717,6 +1727,25 @@ Download the original bytes as `application/octet-stream` with attachment dispos
 and the original filename. Downloads are limited to 64 MiB (`413` above the limit),
 independently of preview support or preview limits. File responses and successful
 listings use `Cache-Control: private, no-store`.
+
+#### `POST /v1/api/workstreams/{ws_id}/files/upload`
+
+Upload original bytes to an existing directory. This additionally requires `files.write`
+permission; the built-in admin and operator roles receive it, and role overrides can
+revoke it independently of browsing. Send the file as the raw `application/octet-stream`
+request body, with `path` naming the destination directory (empty for the root) and
+`name` naming a single file, without directory separators. Empty files are allowed;
+the maximum is 64 MiB per file (`413` above the limit). Both the node and console proxy
+enforce the limit while receiving bytes. The console forwards the body as a stream,
+and the node writes it into private staging without buffering the complete file in memory.
+
+The file becomes visible only after the upload is complete. A successful request returns
+`201` with the selected `root_id`, created root-relative `path`, original `name`, and byte
+`size`. An existing file, directory, or symlink with that name returns `409` with
+`code: "file_exists"` and is never replaced. An inactive workstream returns `409` with
+`code: "workstream_inactive"`; reopen the conversation before retrying. Invalid names
+return `400`. Uploads do not create directories, add conversation
+attachments, or invoke the model. Submit multiple files as separate requests.
 
 ---
 

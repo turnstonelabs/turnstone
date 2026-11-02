@@ -316,6 +316,129 @@ assert(href(pane), "large source remains downloadable");
 """)
 
 
+@node_skip
+def test_bounded_text_load_more_preserves_content_copy_focus_and_scroll() -> None:
+    _run_preview(r"""
+const pane = mount(null, {
+  textPreview: true, copy: true, history: false, autoRetry: false,
+  contentUrl: (ctx, d, endpoint = "preview") => ctx.base + "/files/" + endpoint + "?path=" + d.file_path,
+});
+const ctx = {base: "/node/A", wsId: "ws"};
+const response = async (request, text, truncated, bytes, total) => {
+  request.resolve(new Response(text, {headers: {
+    "X-Preview-Truncated": String(truncated), "X-Preview-Bytes": String(bytes), "X-File-Size": String(total),
+  }}));
+  await flush();
+};
+pane.showPreview({...descriptor("large.txt"), file_path: "large.txt"}, ctx);
+assert(requests[0].url === "/node/A/files/preview?path=large.txt&limit=262144", "first preview requests a bounded prefix from its originating node");
+await response(requests.shift(), "first part", true, 262144, 700000);
+assert(pane._copyBtn.textContent === "Copy shown text" && pane._copyBtn.getAttribute("aria-label") === "Copy shown text", "partial copy is explicitly scoped for sighted and screen reader users");
+pane._copyBtn.click();
+await flush();
+assert(copies[0] === "first part", "partial copy contains exactly what is displayed");
+assert(href(pane) === "/node/A/files/content?path=large.txt", "download remains the complete file route");
+const oldContent = pane._contentEl.children[0];
+pane._contentEl.scrollTop = 127;
+pane._contentEl.scrollLeft = 33;
+pane._textPreviewMore.focus();
+pane._textPreviewMore.click();
+pane._textPreviewMore.click();
+assert(requests.length === 1 && requests[0].url.endsWith("limit=524288"), "duplicate load-more clicks cannot queue duplicate requests");
+assert(pane._textPreviewMore.getAttribute("aria-disabled") === "true", "pending request is announced unavailable without dropping keyboard focus");
+assert(pane._contentEl.children[0] === oldContent, "more loading leaves current source visible");
+await response(requests.shift(), "first part plus second", true, 524288, 700000);
+assert(pane._copyText === "first part plus second", "new prefix replaces rather than blindly appending potentially changed content");
+assert(document.activeElement === pane._textPreviewMore && pane._contentEl.scrollTop === 127 && pane._contentEl.scrollLeft === 33, "more completion preserves keyboard focus and reading position");
+pane._textPreviewMore.click();
+await response(requests.shift(), "complete file", false, 700000, 700000);
+assert(pane._textPreviewMore.hidden && document.activeElement === pane._contentEl, "finishing moves focus from disappearing control to readable source");
+assert(pane._copyBtn.textContent === "Copy" && pane._copyBtn.getAttribute("aria-label") === "Copy original file contents", "full copy label returns once all bytes are shown");
+""")
+
+
+@node_skip
+def test_bounded_text_errors_and_stale_completions_do_not_replace_visible_source() -> None:
+    _run_preview(r"""
+const pane = mount(null, {textPreview: true, copy: true, autoRetry: false});
+const ctx = {base: "", wsId: "ws"};
+pane.showPreview(descriptor("large.txt"), ctx);
+requests.shift().resolve(new Response("existing text", {headers: {
+  "X-Preview-Truncated": "true", "X-Preview-Bytes": "262144", "X-File-Size": "900000",
+}}));
+await flush();
+const displayed = pane._contentEl.children[0];
+pane._textPreviewMore.focus();
+pane._textPreviewMore.click();
+requests.shift().reject(new Error("network unavailable"));
+await flush();
+assert(pane._contentEl.children[0] === displayed && pane._copyText === "existing text", "incremental failures retain source and copyable bytes");
+assert(!pane._textPreviewMore.hasAttribute("aria-disabled") && document.activeElement === pane._textPreviewMore, "failed request remains retryable without losing focus");
+pane._textPreviewMore.click();
+const oldRequest = requests.shift();
+pane.showPreview(descriptor("new.txt"), ctx);
+await succeed(requests.shift(), "new text");
+await succeed(oldRequest, "stale text");
+assert(pane._copyText === "new text" && pane._textPreviewControls.hidden, "stale prefix cannot replace the new file or show old pagination");
+pane.showPreview(descriptor("closed.txt"), ctx);
+const closedRequest = requests.shift();
+pane.onClose();
+await succeed(closedRequest, "closed text");
+assert(pane._copyText === null && pane._textPreviewControls.hidden && !href(pane), "late response cannot reopen closed preview actions");
+""")
+
+
+@node_skip
+def test_bounded_markdown_uses_source_and_stops_at_display_budget() -> None:
+    _run_preview(r"""
+const pane = mount(null, {textPreview: true, copy: true});
+pane.showPreview(descriptor("large.md", "markdown"), {base: "", wsId: "ws"});
+for (let limit = 262144; limit <= 2097152; limit += 262144) {
+  assert(requests[0].url.endsWith("limit=" + limit), "prefix grows by the bounded step");
+  requests.shift().resolve(new Response("# partial markdown <script>not markup</script>", {headers: {
+    "X-Preview-Truncated": "true", "X-Preview-Bytes": String(limit), "X-File-Size": "5000000",
+  }}));
+  await flush();
+  assert(pane._contentEl.querySelector("code").textContent.includes("<script>not markup</script>") && !pane._contentEl.querySelector(".preview-markdown"), "partial Markdown remains inert source without parsing incomplete markup");
+  if (limit < 2097152) pane._textPreviewMore.click();
+}
+assert(pane._textPreviewMore.hidden && pane._textPreviewStatus.textContent.includes("Download to read the full file"), "display budget directs to full download instead of growing the DOM indefinitely");
+pane._textPreviewMore.click();
+assert(!requests.length && href(pane), "hidden load-more cannot exceed the budget and download stays available");
+const ordinary = mount();
+ordinary.showPreview(descriptor("attachment.txt"), {base: "", wsId: "ws"});
+assert(!requests[0].url.includes("limit="), "stored attachment previews keep their existing transport");
+await succeed(requests.shift());
+""")
+
+
+@node_skip
+def test_bounded_preview_explains_files_above_download_limit() -> None:
+    _run_preview(r"""
+const pane = mount(null, {textPreview: true, copy: true, downloadLimit: 64 * 1024 * 1024});
+const ctx = {wsId: "large"};
+pane.showPreview(descriptor("huge.log"), ctx);
+const prefix = async (request, size) => {
+  request.resolve(new Response("visible text", {headers: {
+    "X-Preview-Truncated": "true", "X-Preview-Bytes": "12", "X-File-Size": String(size),
+  }}));
+  await flush();
+};
+for (let limit = 256 * 1024; limit <= 2 * 1024 * 1024; limit += 256 * 1024) {
+  if (limit > 256 * 1024) pane._textPreviewMore.click();
+  await prefix(requests.shift(), 70 * 1024 * 1024);
+  assert(!href(pane) && pane._downloadLink.getAttribute("aria-disabled") === "true", "oversized file never offers a guaranteed-failing download");
+  assert(pane._textPreviewStatus.textContent.includes("Download is limited to 64 MiB"), "partial preview explains the download limit");
+  assert(!pane._textPreviewStatus.textContent.includes("Download to read the full file"), "limit message does not suggest an unavailable action");
+}
+assert(pane._textPreviewMore.hidden && pane._textPreviewStatus.textContent.includes("Preview limit reached"), "display budget remains explicit for oversized files");
+pane.showPreview(descriptor("within-limit.log"), ctx);
+await prefix(requests.shift(), 64 * 1024 * 1024);
+assert(href(pane) && !pane._downloadLink.hasAttribute("aria-disabled"), "exactly-at-limit files remain downloadable");
+assert(pane._downloadLink.getAttribute("aria-label") === "Download preview file", "next file resets the disabled explanation");
+""")
+
+
 class TestPreviewPaneModule:
     def test_factory_exported(self) -> None:
         assert "export function createPreviewPane" in _read(_PREVIEW_JS)

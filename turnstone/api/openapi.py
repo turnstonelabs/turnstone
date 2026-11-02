@@ -90,6 +90,7 @@ class EndpointSpec:
     tags: list[str] = field(default_factory=list)
     query_params: list[QueryParam] = field(default_factory=list)
     path_params: list[PathParam] = field(default_factory=list)
+    binary_request_media_type: str | None = None
 
 
 def build_openapi(
@@ -154,6 +155,13 @@ def build_openapi(
             op["requestBody"] = {
                 "required": ep.request_required,
                 "content": _json_content(ep.request_model),
+            }
+        elif ep.binary_request_media_type:
+            op["requestBody"] = {
+                "required": ep.request_required,
+                "content": {
+                    ep.binary_request_media_type: {"schema": {"type": "string", "format": "binary"}}
+                },
             }
         responses: dict[str, Any] = {}
         if ep.response_model:

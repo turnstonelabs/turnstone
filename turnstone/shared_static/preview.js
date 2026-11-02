@@ -39,6 +39,9 @@ const TABLE_ROW_CAP = 5000;
 // Tokenization is synchronous. Keep large source files readable in full while
 // avoiding a long main-thread pause (and an oversized renderer-cache entry).
 const SOURCE_HIGHLIGHT_CAP = 100000;
+const TEXT_PREVIEW_STEP = 256 * 1024;
+const TEXT_PREVIEW_MAX = 2 * 1024 * 1024;
+const MARKDOWN_RENDER_CAP = 512 * 1024;
 
 // Canonical names in the existing vendored highlight.js bundle. Keep this
 // filename classification independent of whether that optional vendor loaded:
@@ -261,7 +264,8 @@ function compareCells(a, b) {
 // Embedded Files viewers may also supply contentUrl(ctx, descriptor, endpoint),
 // history:false, autoRetry:false, copy:true, and emptyText. responseErrors shows
 // the serving route's error text; downloadOnPreviewError preserves a download
-// when only rendering was refused (size/type limits).
+// when only rendering was refused (size/type limits). textPreview requests
+// bounded text prefixes with an explicit control to load more.
 // ---------------------------------------------------------------------------
 export function createPreviewPane(extra, hostApi) {
   const api = hostApi || {};
@@ -368,7 +372,7 @@ export function createPreviewPane(extra, hostApi) {
     pane._contentEl.replaceChildren(holder);
   };
 
-  const renderText = (text, descriptor = {}) => {
+  const renderText = (text, descriptor = {}, partial = false) => {
     const language = descriptor.file_path
       ? sourceLanguage(descriptor.file_path)
       : sourceLanguage(descriptor.source) || sourceLanguage(descriptor.title);
@@ -384,7 +388,7 @@ export function createPreviewPane(extra, hostApi) {
     pane._contentEl.replaceChildren(pre);
     if (text.length > SOURCE_HIGHLIGHT_CAP) {
       pane._contentEl.append(
-        renderNote("Full source shown without syntax highlighting (large file)."),
+        renderNote(partial ? "Shown text has no syntax highlighting (large file)." : "Full source shown without syntax highlighting (large file)."),
       );
       return;
     }
@@ -525,7 +529,13 @@ export function createPreviewPane(extra, hostApi) {
     pane._copyUrl = null;
     pane._copyBtn.disabled = true;
     pane._copyBtn.textContent = "Copy";
+    pane._copyBtn.title = "Copy original file contents";
+    pane._copyBtn.setAttribute("aria-label", pane._copyBtn.title);
     pane._copyStatus.textContent = "";
+    pane._textPreviewControls.hidden = true;
+    pane._loadMoreText = null;
+    pane._downloadLink.title = "Download preview file";
+    pane._downloadLink.setAttribute("aria-label", pane._downloadLink.title);
     pane._downloadLink.hidden = false;
     setDownloadUrl(null);
     const ready = () => {
@@ -619,6 +629,96 @@ export function createPreviewPane(extra, hostApi) {
           ready();
         })
         .catch(() => failed("Could not load the preview."));
+      return;
+    }
+    if (api.textPreview && (d.kind === "text" || d.kind === "markdown")) {
+      let loadedLimit = 0;
+      let loading = false;
+      let hasMore = false;
+      const sizeLabel = (size) => size >= 1024 * 1024
+        ? (size / (1024 * 1024)).toFixed(1).replace(/\.0$/, "") + " MiB"
+        : size >= 1024 ? Math.round(size / 1024) + " KiB" : size + " B";
+      const loadText = async (limit, more) => {
+        if (loading || token !== pane._loadToken) return;
+        loading = true;
+        pane._textPreviewMore.setAttribute("aria-disabled", "true");
+        if (more) pane._textPreviewStatus.textContent = "Loading more…";
+        try {
+          const response = await authFetch(url + (url.includes("?") ? "&" : "?") + "limit=" + limit);
+          if (token !== pane._loadToken) return;
+          if (!response.ok) {
+            if (!more) {
+              await failedResponse(response);
+              return;
+            }
+            if ([401, 403, 404].includes(response.status)) {
+              setDownloadUrl(null);
+              pane._copyBtn.disabled = true;
+            }
+            throw new Error("Could not load more text (" + response.status + "). Try again.");
+          }
+          const text = await response.text();
+          if (token !== pane._loadToken) return;
+          const truncated = response.headers.get("X-Preview-Truncated") === "true";
+          const bytesHeader = response.headers.get("X-Preview-Bytes");
+          const sizeHeader = response.headers.get("X-File-Size");
+          const bytes = bytesHeader === null ? text.length : Number(bytesHeader);
+          const total = sizeHeader === null ? bytes : Number(sizeHeader);
+          const scrollTop = pane._contentEl.scrollTop;
+          const scrollLeft = pane._contentEl.scrollLeft;
+          const focusedMore = document.activeElement === pane._textPreviewMore;
+          pane._copyText = text;
+          const sourceMarkdown = d.kind === "markdown" && (truncated || text.length > MARKDOWN_RENDER_CAP);
+          if (d.kind === "markdown" && !sourceMarkdown) renderMarkdownDoc(text);
+          else renderText(text, d, truncated);
+          if (sourceMarkdown) {
+            pane._contentEl.append(renderNote("Markdown source shown for this large or partial preview."));
+          }
+          if (more) {
+            pane._contentEl.scrollTop = scrollTop;
+            pane._contentEl.scrollLeft = scrollLeft;
+          }
+          loadedLimit = limit;
+          hasMore = truncated && limit < TEXT_PREVIEW_MAX;
+          pane._copyStatus.textContent = "";
+          ready();
+          const downloadAllowed = !api.downloadLimit || total <= api.downloadLimit;
+          pane._downloadLink.title = downloadAllowed ? "Download preview file"
+            : "Download is limited to " + sizeLabel(api.downloadLimit);
+          pane._downloadLink.setAttribute("aria-label", pane._downloadLink.title);
+          if (!downloadAllowed) setDownloadUrl(null);
+          pane._copyBtn.textContent = truncated ? "Copy shown text" : "Copy";
+          pane._copyBtn.title = truncated ? "Copy shown text" : "Copy original file contents";
+          pane._copyBtn.setAttribute("aria-label", pane._copyBtn.title);
+          const canLoadMore = hasMore;
+          pane._textPreviewMore.hidden = !canLoadMore;
+          pane._textPreviewControls.hidden = !truncated && !more;
+          pane._textPreviewStatus.textContent = truncated
+            ? "Showing first " + sizeLabel(bytes) + " of " + sizeLabel(total) +
+              (downloadAllowed
+                ? (canLoadMore ? "." : ". Download to read the full file.")
+                : (canLoadMore ? "." : ". Preview limit reached.") +
+                  " Download is limited to " + sizeLabel(api.downloadLimit) + ".")
+            : "Full file loaded (" + sizeLabel(total) + ").";
+          if (focusedMore && !canLoadMore) pane._contentEl.focus({ preventScroll: true });
+        } catch (error) {
+          if (token !== pane._loadToken) return;
+          if (more) {
+            pane._textPreviewStatus.textContent = "Could not load more text. Try again.";
+          } else {
+            failed("Could not load the preview.");
+          }
+        } finally {
+          if (token === pane._loadToken) {
+            loading = false;
+            pane._textPreviewMore.removeAttribute("aria-disabled");
+          }
+        }
+      };
+      pane._loadMoreText = () => {
+        if (hasMore) loadText(Math.min(loadedLimit + TEXT_PREVIEW_STEP, TEXT_PREVIEW_MAX), true);
+      };
+      loadText(TEXT_PREVIEW_STEP, false);
       return;
     }
     // text-family kinds render client-side from fetched text.
@@ -761,6 +861,17 @@ export function createPreviewPane(extra, hostApi) {
     content.setAttribute("role", "region");
     content.setAttribute("aria-label", "Preview content");
 
+    const textControls = make("div", "preview-text-controls");
+    textControls.hidden = true;
+    const textStatus = make("span", "preview-text-status");
+    textStatus.setAttribute("role", "status");
+    const textMore = makeAction("button", "Load more", "Load more text");
+    textMore.addEventListener("click", () => pane._loadMoreText && pane._loadMoreText());
+
+    textControls.append(textStatus, textMore);
+    pane._textPreviewControls = textControls;
+    pane._textPreviewStatus = textStatus;
+    pane._textPreviewMore = textMore;
     pane._backBtn = back;
     pane._fwdBtn = fwd;
     pane._kindEl = kind;
@@ -773,7 +884,7 @@ export function createPreviewPane(extra, hostApi) {
     pane._assetsBox = assetsBox;
     pane._contentEl = content;
 
-    root.append(bar, assets, content);
+    root.append(bar, assets, content, textControls);
     this.bodyEl.append(root);
 
     // ←/→ walk history outside horizontally scrolling content. Source files
@@ -815,7 +926,9 @@ export function createPreviewPane(extra, hostApi) {
     pane._idx = -1;
     pane._copyText = null;
     pane._copyUrl = null;
+    pane._loadMoreText = null;
     if (!pane._contentEl) return;
+    pane._textPreviewControls.hidden = true;
     setDownloadUrl(null);
     pane._downloadLink.hidden = true;
     pane._copyBtn.disabled = true;

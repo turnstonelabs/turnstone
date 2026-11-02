@@ -241,19 +241,20 @@ class TestRoles:
         for p in ("persona.create", "persona.read", "persona.write"):
             assert p in perms
 
-    def test_create_and_update_role_with_file_permission(self, client):
+    @pytest.mark.parametrize("permission", ["files.read", "files.write"])
+    def test_create_and_update_role_with_file_permission(self, client, permission):
         response = client.post(
             "/v1/api/admin/roles",
-            json=_role_payload(name="filereader", permissions="read,write,files.read"),
+            json=_role_payload(name="fileaccess", permissions="read,write," + permission),
         )
         assert response.status_code == 200, response.json()
         role_id = response.json()["role_id"]
-        assert "files.read" in response.json()["permissions"].split(",")
+        assert permission in response.json()["permissions"].split(",")
         response = client.put(
-            f"/v1/api/admin/roles/{role_id}", json={"permissions": "read,files.read"}
+            f"/v1/api/admin/roles/{role_id}", json={"permissions": "read," + permission}
         )
         assert response.status_code == 200, response.json()
-        assert response.json()["permissions"] == "read,files.read"
+        assert response.json()["permissions"] == "read," + permission
 
     def test_permission_sections_js_covers_valid_permissions(self):
         """F-5: ``_PERMISSION_SECTIONS`` in governance.js mirrors
@@ -340,6 +341,7 @@ class TestRoles:
             "workstreams.close",
             "conversation.modify",
             "files.read",
+            "files.write",
             "coordinator.trust.send",
         }
         missing = sorted(seeded - _VALID_PERMISSIONS)
@@ -510,16 +512,17 @@ class TestRoleOverrides:
         assert "persona.write" in body["effective"]
         assert body["grants"] == ["persona.write"]
 
-    def test_overrides_can_revoke_and_restore_file_permission(self, client, storage):
-        _seed_builtin_admin(storage, "read,write,admin.roles,files.read")
+    @pytest.mark.parametrize("permission", ["files.read", "files.write"])
+    def test_overrides_can_revoke_and_restore_file_permission(self, client, storage, permission):
+        _seed_builtin_admin(storage, "read,write,admin.roles,files.read,files.write")
         url = "/v1/api/admin/roles/builtin-admin/overrides"
-        response = client.put(url, json={"grant": [], "revoke": ["files.read"]})
+        response = client.put(url, json={"grant": [], "revoke": [permission]})
         assert response.status_code == 200, response.json()
-        assert response.json()["revokes"] == ["files.read"]
-        assert "files.read" not in response.json()["effective"]
+        assert response.json()["revokes"] == [permission]
+        assert permission not in response.json()["effective"]
         response = client.put(url, json={"grant": [], "revoke": []})
         assert response.status_code == 200, response.json()
-        assert "files.read" in response.json()["effective"]
+        assert permission in response.json()["effective"]
 
     def test_overrides_replace_semantics(self, client, storage):
         _seed_builtin_admin(storage, "read,write,admin.roles")

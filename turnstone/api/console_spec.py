@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -172,9 +173,14 @@ from turnstone.api.server_schemas import (
     WorkstreamDetailResponse,
     WorkstreamHistoryResponse,
 )
-from turnstone.api.server_spec import SAVED_WORKSTREAMS_QUERY_PARAMS, USER_AVATAR_ENDPOINTS
+from turnstone.api.server_spec import (
+    FILES_UPLOAD_ENDPOINT,
+    SAVED_WORKSTREAMS_QUERY_PARAMS,
+    USER_AVATAR_ENDPOINTS,
+)
 
 CONSOLE_ENDPOINTS: list[EndpointSpec] = [
+    replace(FILES_UPLOAD_ENDPOINT, path="/node/{node_id}" + FILES_UPLOAD_ENDPOINT.path),
     # --- Cluster ---
     EndpointSpec(
         "/v1/api/cluster/overview",

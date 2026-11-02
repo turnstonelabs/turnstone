@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import errno
 import os
+import stat
 from contextlib import suppress
 from types import SimpleNamespace
 
@@ -75,6 +76,320 @@ def test_listing_navigation_metadata_and_source_sniff(workspace):
     subdir = fs.list_directory("folder")
     assert subdir["parent"] == ""
     assert subdir["entries"][0]["path"] == "folder/note.md"
+
+
+@pytest.mark.parametrize("root_id", ["workspace", "data", "tmp"])
+@pytest.mark.parametrize("content", [b"", b"\x00\xff original bytes\r\n"])
+def test_upload_preserves_bytes_and_targets_selected_directory(
+    workspace, monkeypatch, root_id, content
+):
+    root = workspace / root_id
+    root.mkdir()
+    if root_id == "workspace":
+        monkeypatch.setattr(fs, "get_workspace_dir", lambda: str(root))
+    else:
+        monkeypatch.setitem(fs._FIXED_ROOTS, root_id, str(root))
+    (root / "reports").mkdir()
+    result = fs.upload_file("reports", "文書 #1.bin", content, root_id=root_id)
+    assert result == {
+        "root_id": root_id,
+        "path": "reports/文書 #1.bin",
+        "name": "文書 #1.bin",
+        "size": len(content),
+    }
+    target = root / result["path"]
+    assert target.read_bytes() == content
+    assert stat.S_IMODE(target.stat().st_mode) == 0o600
+    assert list((root / "reports").iterdir()) == [target]
+
+
+@pytest.mark.parametrize("kind", ["file", "directory", "symlink"])
+def test_upload_never_replaces_existing_entries(workspace, kind):
+    target = workspace / "existing"
+    outside = workspace / "original"
+    outside.write_bytes(b"keep me")
+    if kind == "file":
+        target.write_bytes(b"keep me")
+    elif kind == "directory":
+        target.mkdir()
+    else:
+        target.symlink_to(outside)
+    before = sorted(p.name for p in workspace.iterdir())
+    with pytest.raises(fs.FilesystemError) as exc:
+        fs.upload_file("", "existing", b"replacement")
+    assert exc.value.status == 409
+    assert exc.value.code == "file_exists"
+    assert outside.read_bytes() == b"keep me"
+    if kind == "directory":
+        assert target.is_dir()
+    else:
+        assert target.read_bytes() == b"keep me"
+        assert target.is_symlink() == (kind == "symlink")
+    assert sorted(p.name for p in workspace.iterdir()) == before
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "",
+        ".",
+        "..",
+        "/absolute",
+        "../escape",
+        "a/b",
+        "a\\b",
+        "nul\0",
+        "line\n",
+        "é" * 128,
+        ".file-upload-" + "a" * 32,
+    ],
+)
+def test_upload_rejects_non_basename_names(workspace, name):
+    with pytest.raises(fs.FilesystemError) as exc:
+        fs.upload_file("", name, b"unwritten")
+    assert exc.value.status == 400
+    assert list(workspace.iterdir()) == []
+
+
+def test_upload_rejects_parent_traversal_and_symlink_directories(workspace, tmp_path):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (workspace / "escape").symlink_to(outside, target_is_directory=True)
+    for directory in ("../outside", str(outside), "escape"):
+        with pytest.raises(fs.FilesystemError):
+            fs.upload_file(directory, "file.txt", b"unwritten")
+    assert list(outside.iterdir()) == []
+
+
+def test_upload_is_hidden_until_atomic_publication_and_handles_partial_writes(
+    workspace, monkeypatch
+):
+    real_write = os.write
+    seen = []
+
+    def partial_write(fd, content):
+        stages = list(workspace.iterdir())
+        assert len(stages) == 1
+        stage = stages[0]
+        assert fs._UPLOAD_TEMP_RE.fullmatch(stage.name)
+        assert stat.S_IMODE(stage.stat().st_mode) == 0o700
+        assert fs.list_directory("")["entries"] == []
+        for path in (stage.name, stage.name + "/content"):
+            with pytest.raises(fs.FilesystemError) as exc:
+                fs.read_file(path, preview=False)
+            assert exc.value.status == 403
+        seen.append(bytes(content))
+        return real_write(fd, content[:2])
+
+    monkeypatch.setattr(os, "write", partial_write)
+    fs.upload_file("", "ready.bin", b"abcdef")
+    assert seen == [b"abcdef", b"cdef", b"ef"]
+    assert (workspace / "ready.bin").read_bytes() == b"abcdef"
+    assert [entry["name"] for entry in fs.list_directory("")["entries"]] == ["ready.bin"]
+
+
+@pytest.mark.parametrize("operation", ["write", "fsync", "link"])
+def test_upload_io_failure_removes_staging_and_does_not_publish(workspace, monkeypatch, operation):
+    def failed(*args, **kwargs):
+        raise OSError(errno.ENOSPC, "disk full")
+
+    monkeypatch.setattr(os, operation, failed)
+    with pytest.raises(fs.FilesystemError) as exc:
+        fs.upload_file("", "never.bin", b"bytes")
+    assert exc.value.status == 503
+    assert list(workspace.iterdir()) == []
+
+
+def test_upload_directory_replacement_cannot_redirect_publication(workspace, tmp_path, monkeypatch):
+    target = workspace / "reports"
+    target.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    moved = workspace / "moved"
+    real_fsync = os.fsync
+
+    def replace_directory(fd):
+        real_fsync(fd)
+        target.rename(moved)
+        target.symlink_to(outside, target_is_directory=True)
+
+    monkeypatch.setattr(os, "fsync", replace_directory)
+    fs.upload_file("reports", "file.txt", b"bytes")
+    assert (moved / "file.txt").read_bytes() == b"bytes"
+    assert list(outside.iterdir()) == []
+    assert list(moved.iterdir()) == [moved / "file.txt"]
+
+
+def test_upload_does_not_remove_a_replaced_staging_directory(workspace, monkeypatch):
+    real_link = os.link
+    replacement = None
+
+    def replace_stage(*args, **kwargs):
+        nonlocal replacement
+        real_link(*args, **kwargs)
+        replacement = next(p for p in workspace.iterdir() if p.is_dir())
+        replacement.rename(workspace / "moved-stage")
+        replacement.mkdir()
+        (replacement / "keep.txt").write_text("unrelated")
+
+    monkeypatch.setattr(os, "link", replace_stage)
+    fs.upload_file("", "file.txt", b"bytes")
+    assert (workspace / "file.txt").read_bytes() == b"bytes"
+    assert (replacement / "keep.txt").read_text() == "unrelated"
+    assert list((workspace / "moved-stage").iterdir()) == []
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("prefix", ["/v1/api", "/node/n1/v1/api"])
+async def test_upload_http_permissions_bytes_and_bounds(files_client, prefix, monkeypatch):
+    from unittest.mock import MagicMock
+
+    import httpx2
+
+    from turnstone.console.collector import ClusterCollector
+    from turnstone.console.server import create_app as create_console
+    from turnstone.core.auth import JWT_AUD_CONSOLE
+
+    client, _, workspace = files_client
+    (workspace / "reports").mkdir()
+    collector = MagicMock(spec=ClusterCollector)
+    collector.get_node_detail.return_value = {"server_url": "http://node.test"}
+    console = create_console(collector=collector, jwt_secret=_TEST_JWT_SECRET)
+    async with (
+        httpx2.AsyncClient(
+            transport=httpx2.ASGITransport(client.app), base_url="http://node.test"
+        ) as node,
+        httpx2.AsyncClient(
+            transport=httpx2.ASGITransport(console), base_url="http://console.test"
+        ) as proxy,
+    ):
+        console.state.proxy_client = node
+        proxied = prefix.startswith("/node/")
+        target = proxy if proxied else node
+        audience = JWT_AUD_CONSOLE if proxied else JWT_AUD_SERVER
+        url = f"{prefix}/workstreams/ws-A/files/upload"
+        params = {"path": "reports", "name": "file.bin"}
+        for scopes, permissions in (
+            (("read", "write"), ()),
+            (("read", "write"), ("files.read",)),
+            (("read", "write"), ("files.write",)),
+            (("read",), ("files.read", "files.write")),
+        ):
+            response = await target.post(
+                url,
+                params=params,
+                content=b"no",
+                headers=_auth("userA", scopes=scopes, permissions=permissions, audience=audience),
+            )
+            assert response.status_code == 403, response.text
+        auth = _auth("userA", permissions=("files.read", "files.write"), audience=audience)
+        body = b"\0\xff exact bytes"
+        response = await target.post(url, params=params, content=body, headers=auth)
+        assert response.status_code == 201, response.text
+        assert response.json() == {
+            "root_id": "workspace",
+            "path": "reports/file.bin",
+            "name": "file.bin",
+            "size": len(body),
+        }
+        assert (workspace / "reports/file.bin").read_bytes() == body
+        conflict = await target.post(url, params=params, content=b"replacement", headers=auth)
+        assert conflict.status_code == 409
+        assert conflict.json()["code"] == "file_exists"
+        assert (workspace / "reports/file.bin").read_bytes() == body
+        params["name"] = "empty.txt"
+        assert (await target.post(url, params=params, content=b"", headers=auth)).status_code == 201
+        assert (workspace / "reports/empty.txt").read_bytes() == b""
+        params["name"] = "streamed.bin"
+
+        async def streamed_chunks():
+            yield b"first"
+            stages = list((workspace / "reports").glob(".file-upload-*"))
+            assert len(stages) == 1
+            assert (stages[0] / "content").read_bytes() == b"first"
+            assert not (workspace / "reports/streamed.bin").exists()
+            yield b"second"
+
+        streamed = await target.post(url, params=params, content=streamed_chunks(), headers=auth)
+        assert streamed.status_code == 201, streamed.text
+        assert (workspace / "reports/streamed.bin").read_bytes() == b"firstsecond"
+        assert not list((workspace / "reports").glob(".file-upload-*"))
+        monkeypatch.setattr(fs, "UPLOAD_SIZE_CAP", 4)
+        params["name"] = "over.bin"
+        assert (
+            await target.post(url, params=params, content=b"large", headers=auth)
+        ).status_code == 413
+        read = []
+
+        async def chunks():
+            for chunk in (b"123", b"456", b"unread"):
+                read.append(chunk)
+                yield chunk
+
+        response = await target.post(url, params=params, content=chunks(), headers=auth)
+        assert response.status_code == 413
+        assert read == [b"123", b"456"]
+        assert not (workspace / "reports/over.bin").exists()
+
+
+@pytest.mark.parametrize("state", ["nonlocal", "closed", "coordinator", "private-project"])
+def test_upload_requires_active_accessible_interactive_workstream(files_client, state):
+    client, mgr, workspace = files_client
+    ws = SimpleNamespace(kind=WorkstreamKind.INTERACTIVE, _closed=state == "closed")
+    if state == "coordinator":
+        ws.kind = WorkstreamKind.COORDINATOR
+    if state == "private-project":
+        import sqlalchemy as sa
+
+        from turnstone.core.storage import get_storage
+        from turnstone.core.storage._schema import workstreams
+
+        storage = get_storage()
+        storage.create_project("private-upload", "Private", "userA", visibility="private")
+        with storage._conn() as conn:
+            conn.execute(
+                sa.update(workstreams)
+                .where(workstreams.c.ws_id == "ws-A")
+                .values(project_id="private-upload")
+            )
+            conn.commit()
+    mgr.loaded.side_effect = lambda ws_id: None if state == "nonlocal" else ws
+    response = client.post(
+        "/v1/api/workstreams/ws-A/files/upload",
+        params={"name": "file.txt"},
+        content=b"no",
+        headers=_auth(
+            "userB" if state == "private-project" else "userA",
+            permissions=("files.read", "files.write"),
+        ),
+    )
+    assert response.status_code == (403 if state == "private-project" else 409)
+    if state != "private-project":
+        assert response.json()["code"] == "workstream_inactive"
+    assert list(workspace.iterdir()) == []
+
+
+@pytest.mark.anyio
+async def test_interrupted_upload_body_is_rejected_without_publication(files_client):
+    from starlette.requests import Request
+
+    from turnstone.core.web_helpers import BoundedUploadStream, UploadBodyError
+
+    messages = iter(
+        [
+            {"type": "http.request", "body": b"partial", "more_body": True},
+            {"type": "http.disconnect"},
+        ]
+    )
+
+    async def receive():
+        return next(messages)
+
+    request = Request({"type": "http", "method": "POST", "path": "/", "headers": []}, receive)
+    with pytest.raises(UploadBodyError) as exc:
+        await fs.stream_upload_file("", "partial.txt", BoundedUploadStream(request, max_bytes=64))
+    assert exc.value.status == 400
+    assert list(files_client[2].iterdir()) == []
 
 
 def test_utf8_sniff_boundary_is_not_binary(workspace):
@@ -525,6 +840,7 @@ def test_stale_workstream_never_serves_wrong_node_files(files_client, state):
         result = client.get(f"/v1/api/workstreams/ws-A/files{suffix}", headers=_auth("userA"))
         assert result.status_code == 409
         assert "not active on this node" in result.json()["error"]
+        assert "code" not in result.json()
     mgr.open_with_outcome.assert_not_called()
 
 

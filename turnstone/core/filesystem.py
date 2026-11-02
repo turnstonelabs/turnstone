@@ -1,4 +1,4 @@
-"""Read-only, node-workspace file browsing for the interactive shell.
+"""Node-workspace file browsing and uploads for the interactive shell.
 
 Roots are node-shared, not per-workstream sandboxes. Workstream access gates
 the HTTP surface; paths are then confined to the selected root: the operator's
@@ -11,8 +11,10 @@ from __future__ import annotations
 import asyncio
 import errno
 import os
+import re
+import secrets
 import stat
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, contextmanager, suppress
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import quote
@@ -30,7 +32,7 @@ from turnstone.core.preview import (
 from turnstone.core.workstream import WorkstreamKind
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import AsyncIterable, Callable, Iterator
 
     from starlette.requests import Request
 
@@ -38,14 +40,18 @@ if TYPE_CHECKING:
 
 DIRECTORY_ENTRY_CAP = 1000
 DOWNLOAD_SIZE_CAP = 64 * 1024 * 1024
+UPLOAD_SIZE_CAP = 64 * 1024 * 1024
+TEXT_PREVIEW_SIZE_CAP = 2 * 1024 * 1024
 _SNIFF_SIZE = 8192
 _FIXED_ROOTS = {"data": "/data", "tmp": "/tmp"}
+_UPLOAD_TEMP_RE = re.compile(r"\.file-upload-[0-9a-f]{32}\Z")
 
 
 class FilesystemError(Exception):
-    def __init__(self, message: str, status: int) -> None:
+    def __init__(self, message: str, status: int, *, code: str | None = None) -> None:
         super().__init__(message)
         self.status = status
+        self.code = code
 
 
 def _root_path(root_id: str) -> Path:
@@ -72,6 +78,8 @@ def _path(raw: str) -> str:
         return ""
     if len(raw) > 4096 or "\0" in raw or any(p in ("", ".", "..") for p in raw.split("/")):
         raise FilesystemError("Expected a relative workspace path", 400)
+    if any(_UPLOAD_TEMP_RE.fullmatch(part) for part in raw.split("/")):
+        raise FilesystemError("Upload staging paths are not accessible", 403)
     return raw
 
 
@@ -132,6 +140,8 @@ def list_directory(raw_path: str, *, root_id: str = "workspace") -> dict[str, An
             if index >= DIRECTORY_ENTRY_CAP:
                 truncated = True
                 break
+            if _UPLOAD_TEMP_RE.fullmatch(entry.name):
+                continue
             try:
                 # Undecodable Unix filenames cannot round-trip through JSON.
                 entry.name.encode("utf-8")
@@ -165,6 +175,150 @@ def list_directory(raw_path: str, *, root_id: str = "workspace") -> dict[str, An
         "entries": entries,
         "truncated": truncated,
     }
+
+
+def _upload_name(raw: str) -> str:
+    try:
+        encoded = raw.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise FilesystemError("Invalid upload filename", 400) from exc
+    if (
+        not raw
+        or raw in (".", "..")
+        or len(encoded) > 255
+        or any(c in "/\\" or ord(c) < 32 or ord(c) == 127 for c in raw)
+        or _UPLOAD_TEMP_RE.fullmatch(raw)
+    ):
+        raise FilesystemError("Expected a single upload filename", 400)
+    return raw
+
+
+def _remove_upload_directory(parent_fd: int, name: str, info: os.stat_result) -> None:
+    try:
+        current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    # A replaced directory entry belongs to its replacer, not this upload.
+    if (current.st_dev, current.st_ino) == (info.st_dev, info.st_ino):
+        os.rmdir(name, dir_fd=parent_fd)
+
+
+def _remove_upload_content(stage_fd: int) -> None:
+    with suppress(FileNotFoundError):
+        os.unlink("content", dir_fd=stage_fd)
+
+
+class _UploadWriter:
+    def __init__(
+        self, fd: int, parent_fd: int, stage_fd: int, name: str, relative: str, root_id: str
+    ) -> None:
+        self.fd = fd
+        self.parent_fd = parent_fd
+        self.stage_fd = stage_fd
+        self.name = name
+        self.relative = relative
+        self.root_id = root_id
+        self.size = 0
+
+    def write(self, data: bytes) -> None:
+        if self.size + len(data) > UPLOAD_SIZE_CAP:
+            raise FilesystemError("File exceeds the upload size limit", 413)
+        remaining = memoryview(data)
+        while remaining:
+            written = os.write(self.fd, remaining)
+            if written <= 0:
+                raise OSError(errno.EIO, "Upload write made no progress")
+            remaining = remaining[written:]
+        self.size += len(data)
+
+    def publish(self) -> dict[str, Any]:
+        try:
+            os.link(
+                "content",
+                self.name,
+                src_dir_fd=self.stage_fd,
+                dst_dir_fd=self.parent_fd,
+                follow_symlinks=False,
+            )
+        except FileExistsError as exc:
+            raise FilesystemError(
+                "A file or folder with this name already exists", 409, code="file_exists"
+            ) from exc
+        return {
+            "root_id": self.root_id,
+            "path": self.relative,
+            "name": self.name,
+            "size": self.size,
+        }
+
+
+@contextmanager
+def _upload_writer(raw_path: str, name: str, root_id: str) -> Iterator[_UploadWriter]:
+    path, name, root = _path(raw_path), _upload_name(name), _root(root_id)
+    relative = _path(f"{path}/{name}" if path else name)
+    with _open_path(root, path, directory=True) as parent_fd:
+        try:
+            with ExitStack() as stack:
+                stage_name = ".file-upload-" + secrets.token_hex(16)
+                os.mkdir(stage_name, mode=0o700, dir_fd=parent_fd)
+                info = os.stat(stage_name, dir_fd=parent_fd, follow_symlinks=False)
+                stack.callback(_remove_upload_directory, parent_fd, stage_name, info)
+                stage_fd = os.open(
+                    stage_name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd
+                )
+                stack.callback(os.close, stage_fd)
+                stack.callback(_remove_upload_content, stage_fd)
+                fd = os.open(
+                    "content",
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                    mode=0o600,
+                    dir_fd=stage_fd,
+                )
+                stack.callback(os.close, fd)
+                yield _UploadWriter(fd, parent_fd, stage_fd, name, relative, root_id)
+        except OSError as exc:
+            status = 403 if exc.errno in (errno.EACCES, errno.EPERM, errno.EROFS) else 503
+            raise FilesystemError("File could not be saved to this directory", status) from exc
+
+
+def upload_file(
+    raw_path: str, name: str, data: bytes, *, root_id: str = "workspace"
+) -> dict[str, Any]:
+    """Publish a complete file without replacing any existing directory entry."""
+    with _upload_writer(raw_path, name, root_id) as writer:
+        writer.write(data)
+        os.fsync(writer.fd)
+        return writer.publish()
+
+
+async def _upload_io(operation: Callable[..., Any], *args: Any) -> Any:
+    # Threaded writes must finish before cancellation closes their descriptors.
+    task = asyncio.create_task(asyncio.to_thread(operation, *args))
+    try:
+        return await asyncio.shield(task)
+    except BaseException:
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                continue
+            except BaseException:
+                break
+        if task.done() and not task.cancelled():
+            with suppress(BaseException):
+                task.exception()
+        raise
+
+
+async def stream_upload_file(
+    raw_path: str, name: str, chunks: AsyncIterable[bytes], *, root_id: str = "workspace"
+) -> dict[str, Any]:
+    """Write bounded chunks to private staging, publishing only after complete EOF."""
+    with _upload_writer(raw_path, name, root_id) as writer:
+        async for chunk in chunks:
+            await _upload_io(writer.write, chunk)
+        await _upload_io(os.fsync, writer.fd)
+        return writer.publish()
 
 
 def read_file(
@@ -204,6 +358,59 @@ def read_file(
         if len(data) > PREVIEW_SIZE_CAPS[kind]:
             raise FilesystemError("File exceeds the preview size limit", 413)
     return data, mime, path.rsplit("/", 1)[-1]
+
+
+def read_text_preview(
+    raw_path: str, *, limit: int, root_id: str = "workspace"
+) -> tuple[bytes, str, str, dict[str, str]]:
+    """Read a bounded source prefix without splitting a UTF-8 character."""
+    if not 1 <= limit <= TEXT_PREVIEW_SIZE_CAP:
+        raise FilesystemError("Text preview limit must be between 1 and 2097152 bytes", 400)
+    path, root = _path(raw_path), _root(root_id)
+    with _open_path(root, path, directory=False) as fd:
+        before = os.fstat(fd)
+        kind, mime = _preview_type(path, os.read(fd, _SNIFF_SIZE))
+        if kind not in ("text", "markdown"):
+            raise FilesystemError("Bounded previews support text and Markdown files only", 415)
+        os.lseek(fd, 0, os.SEEK_SET)
+        chunks: list[bytes] = []
+        remaining = limit + 4
+        while remaining:
+            chunk = os.read(fd, min(64 * 1024, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        after = os.fstat(fd)
+        if (before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        ):
+            raise FilesystemError("File changed while loading its preview. Try again.", 409)
+    raw = b"".join(chunks)
+    prefix = raw[:limit]
+    try:
+        prefix.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        if exc.reason == "unexpected end of data" and len(raw) > limit:
+            first = raw[exc.start]
+            width = 2 if first < 0xE0 else 3 if first < 0xF0 else 4
+            try:
+                raw[exc.start : exc.start + width].decode("utf-8")
+            except UnicodeDecodeError:
+                pass
+            else:
+                prefix = prefix[: exc.start]
+    resolved = resolve_preview_kind("", quote(path), prefix)
+    if resolved is None or resolved[0] not in ("text", "markdown"):
+        raise FilesystemError("File is not previewable; download it to open locally", 415)
+    headers = {
+        "X-Preview-Truncated": str(len(prefix) < before.st_size).lower(),
+        "X-Preview-Bytes": str(len(prefix)),
+        "X-File-Size": str(before.st_size),
+    }
+    return transcode_text(prefix, mime).encode("utf-8"), mime, path.rsplit("/", 1)[-1], headers
 
 
 def resolve_file(raw_path: str) -> dict[str, Any]:
@@ -259,7 +466,7 @@ def resolve_file(raw_path: str) -> dict[str, Any]:
 def make_filesystem_handlers(cfg: SessionEndpointConfig) -> FilesystemHandlers:
     from turnstone.core.session_routes import FilesystemHandlers
 
-    async def gate(request: Request) -> Response | None:
+    async def gate(request: Request, *, write: bool = False) -> Response | None:
         if cfg.permission_gate is not None:
             err = cfg.permission_gate(request)
             if err is not None:
@@ -267,6 +474,10 @@ def make_filesystem_handlers(cfg: SessionEndpointConfig) -> FilesystemHandlers:
         err = require_permission(request, "files.read")
         if err is not None:
             return err
+        if write:
+            err = require_permission(request, "files.write")
+            if err is not None:
+                return err
         mgr, err = cfg.manager_lookup(request)
         if err is not None:
             return err
@@ -275,12 +486,12 @@ def make_filesystem_handlers(cfg: SessionEndpointConfig) -> FilesystemHandlers:
         ws_id = request.path_params["ws_id"]
         ws = mgr.loaded(ws_id)
         if ws is None or ws.kind != WorkstreamKind.INTERACTIVE or ws._closed:
-            return JSONResponse(
-                {
-                    "error": "Workstream is not active on this node. Reopen the conversation to browse its files."
-                },
-                status_code=409,
-            )
+            body = {
+                "error": "Workstream is not active on this node. Reopen the conversation to browse its files."
+            }
+            if write:
+                body["code"] = "workstream_inactive"
+            return JSONResponse(body, status_code=409)
         _owner, err = await asyncio.to_thread(cfg.attachment_owner_resolver, request, ws_id, mgr)
         return err
 
@@ -302,23 +513,35 @@ def make_filesystem_handlers(cfg: SessionEndpointConfig) -> FilesystemHandlers:
         err = await gate(request)
         if err is not None:
             return err
+        headers: dict[str, str] = {}
         try:
-            data, mime, filename = await asyncio.to_thread(
-                read_file,
-                request.query_params.get("path", ""),
-                preview=preview,
-                root_id=request.query_params.get("root", "workspace"),
-            )
+            path = request.query_params.get("path", "")
+            root_id = request.query_params.get("root", "workspace")
+            limit = request.query_params.get("limit") if preview else None
+            if limit is not None:
+                if not limit.isascii() or not limit.isdecimal() or len(limit) > 7:
+                    raise FilesystemError(
+                        "Text preview limit must be between 1 and 2097152 bytes", 400
+                    )
+                data, mime, filename, headers = await asyncio.to_thread(
+                    read_text_preview, path, limit=int(limit), root_id=root_id
+                )
+            else:
+                data, mime, filename = await asyncio.to_thread(
+                    read_file, path, preview=preview, root_id=root_id
+                )
         except FilesystemError as exc:
             return JSONResponse({"error": str(exc)}, status_code=exc.status)
         if preview:
-            return file_preview_response(
+            response = file_preview_response(
                 data,
                 mime,
                 filename,
                 allow_remote_assets=request.query_params.get("assets") == "1",
                 probe=request.query_params.get("probe") == "1",
             )
+            response.headers.update(headers)
+            return response
         return file_content_response(data, "application/octet-stream", filename, download=True)
 
     async def preview(request: Request) -> Response:
@@ -337,4 +560,30 @@ def make_filesystem_handlers(cfg: SessionEndpointConfig) -> FilesystemHandlers:
         except FilesystemError as exc:
             return JSONResponse({"error": str(exc)}, status_code=exc.status)
 
-    return FilesystemHandlers(list=listing, preview=preview, content=content, resolve=resolve)
+    async def upload(request: Request) -> Response:
+        from turnstone.core.web_helpers import BoundedUploadStream, UploadBodyError
+
+        err = await gate(request, write=True)
+        if err is not None:
+            return err
+        try:
+            path = _path(request.query_params.get("path", ""))
+            name = _upload_name(request.query_params.get("name", ""))
+            stream = BoundedUploadStream(request, max_bytes=UPLOAD_SIZE_CAP)
+            result = await stream_upload_file(
+                path, name, stream, root_id=request.query_params.get("root", "workspace")
+            )
+            return JSONResponse(
+                result, status_code=201, headers={"Cache-Control": "private, no-store"}
+            )
+        except UploadBodyError as exc:
+            return exc.response()
+        except FilesystemError as exc:
+            body = {"error": str(exc)}
+            if exc.code is not None:
+                body["code"] = exc.code
+            return JSONResponse(body, status_code=exc.status)
+
+    return FilesystemHandlers(
+        list=listing, preview=preview, content=content, resolve=resolve, upload=upload
+    )

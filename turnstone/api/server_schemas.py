@@ -972,6 +972,13 @@ class ResolveFilesystemResponse(ListFilesystemResponse):
     )
 
 
+class UploadFilesystemResponse(BaseModel):
+    root_id: Literal["workspace", "data", "tmp"]
+    path: str = Field(description="Created file path relative to the selected root")
+    name: str = Field(description="Original uploaded filename")
+    size: int = Field(ge=0, le=64 * 1024 * 1024, description="Uploaded file size in bytes")
+
+
 class AvailableModelInfo(BaseModel):
     alias: str
     model: str
