@@ -53,6 +53,7 @@ from turnstone.console.server import (
     coordinator_children,
     coordinator_tasks,
 )
+from turnstone.core import session_worker
 from turnstone.core.attachments import (
     classify_upload as _coord_test_classify_upload,
 )
@@ -648,6 +649,43 @@ def test_command_unknown_coordinator_404(storage):
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
     resp = _post_command(client, "0" * 32, "/model fast")
     assert resp.status_code == 404
+
+
+def test_command_refused_dispatch_on_a_live_coordinator_is_409(storage, monkeypatch):
+    """A refusal is not a missing coordinator: the console answers 409 with the
+    retry hint while the manager still holds it, so a client retries instead of
+    treating the coordinator as gone."""
+    mgr, ws, session = _quiet_coord(storage)
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    monkeypatch.setattr(session_worker, "send", lambda *a, **k: False)
+    resp = _post_command(client, ws.id, "/model fast")
+    assert resp.status_code == 409, resp.text
+    assert resp.json() == {"error": "Workstream is temporarily busy — retry shortly."}
+    session.handle_command.assert_not_called()
+
+
+def test_command_refused_dispatch_on_a_gone_coordinator_uses_the_console_label(
+    storage, monkeypatch
+):
+    mgr, ws, session = _quiet_coord(storage)
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    # The row disappears between the handler's lookup and the dispatch.
+    refused = {"yet": False}
+    real_get = mgr.get
+
+    def fake_send(*args, **kwargs):
+        refused["yet"] = True
+        return False
+
+    def fake_get(requested):
+        return None if refused["yet"] else real_get(requested)
+
+    monkeypatch.setattr(session_worker, "send", fake_send)
+    monkeypatch.setattr(mgr, "get", fake_get)
+    resp = _post_command(client, ws.id, "/model fast")
+    assert resp.status_code == 404, resp.text
+    assert resp.json() == {"error": "coordinator not found"}
+    session.handle_command.assert_not_called()
 
 
 def test_command_private_project_hidden_from_non_member(storage):

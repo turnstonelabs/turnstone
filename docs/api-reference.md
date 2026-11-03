@@ -1344,6 +1344,7 @@ or `{"status": "running"}` as above.
 | 400    | `{"error": "Empty command"}`                | Command is empty                                 |
 | 404    | `{"error": "Unknown workstream"}`           | `ws_id` not found                                |
 | 409    | `{"status": "busy", "error": ...}`          | A turn/command holds the worker                  |
+| 409    | `{"error": "Workstream is temporarily busy — retry shortly."}` | The worker slot refused the dispatch while the workstream is still live (a Stop racing the claim, a soft close in preparation, structural tool cleanup pending after a force-cancel, a session swap) — the command did **not** run; retry shortly |
 | 503    | `{"status": "error", "error": ...}`         | The command worker could not be started (resource exhaustion) — the command did **not** run; retry shortly |
 | 503    | `{"error": "workstream could not be read"}` | Its record can't be read                         |
 
@@ -1371,8 +1372,9 @@ still running after 25 s.
 | 400    | `{"error": "Empty command"}`                          | Command is empty                           |
 | 400    | `{"error": "/x is not available here. Available: /model."}` | Any command other than `/model`      |
 | 403    | `{"error": ...}`                                      | Caller lacks `admin.coordinator`           |
-| 404    | `{"error": ...}`                                      | No such coordinator, or not visible        |
+| 404    | `{"error": "coordinator not found"}`                  | No such coordinator, or not visible        |
 | 409    | `{"status": "busy", "error": ...}`                    | A turn/command holds the worker            |
+| 409    | `{"error": "Workstream is temporarily busy — retry shortly."}` | The live coordinator refused the dispatch (same refusal set as the node route) — the command did **not** run; retry shortly |
 | 503    | `{"status": "error", "error": ...}`                   | The command worker could not be started    |
 
 ---

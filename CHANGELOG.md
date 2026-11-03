@@ -14,6 +14,15 @@ The separate `dev` branch is retired. See [the release process](docs/releasing.m
 
 ### Fixed
 
+- **A slash command refused on a live workstream answers 409, not 404.** Both
+  `/command` routes answered 404 "Unknown workstream" whenever `session_worker.send`
+  declined the slot, and `send` also declines a workstream that is still live: a Stop
+  that raced the claim, a soft close in preparation, structural tool cleanup pending
+  after a force-cancel, or a session swap. Callers read that as the row being gone and
+  stopped retrying. The refusal now takes the same split rewind and retry use: 409
+  "Workstream is temporarily busy — retry shortly." while the manager still holds it,
+  404 with the route's own label once it does not, so the console no longer answers the
+  node's wording (#1500).
 - **A judge model that can't be used is never replaced by another model.** A set
   `judge.model`, `judge.output_guard_model` or per-workstream `judge_model` whose
   alias isn't loaded, or whose client can't be built, used to run on another model

@@ -2455,6 +2455,8 @@ async def command(request: Request) -> JSONResponse:
         ws.session,
         cmd,
         principal_id=_auth_user_id(request).strip(),
+        mgr=mgr,
+        not_found_label="Unknown workstream",
     )
 
 

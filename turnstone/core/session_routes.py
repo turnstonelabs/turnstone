@@ -1719,6 +1719,32 @@ class _DestructiveCommand:
     publish_clear_ui: Callable[[], None]
 
 
+def _dispatch_refused(
+    mgr: SessionManager,
+    ws_id: str,
+    not_found_label: str,
+) -> JSONResponse:
+    """Answer a refused ``session_worker.send`` (the 409/404 split).
+
+    ``send`` refuses for more reasons than a closed workstream: a Stop that
+    raced the claim capture, a soft close preparing, structural tool debt
+    pending after a force-cancel, a session swap or a full interjection
+    queue. All of those leave the workstream alive, so a caller told 404
+    concludes the row is gone and stops retrying. Answer 409 (transient,
+    retryable) while the manager still holds the workstream and reserve 404
+    for a row that is actually gone.
+
+    Both dispatch paths share this: :func:`_dispatch_destructive_command`
+    (rewind/retry) and :func:`run_slash_command` (every command route).
+    """
+    if mgr.get(ws_id) is not None:
+        return JSONResponse(
+            {"error": "Workstream is temporarily busy — retry shortly."},
+            status_code=409,
+        )
+    return JSONResponse({"error": not_found_label}, status_code=404)
+
+
 async def _dispatch_destructive_command(
     *,
     mgr: SessionManager,
@@ -1819,18 +1845,9 @@ async def _dispatch_destructive_command(
                 },
                 status_code=409,
             )
-        # ``session_worker.send`` refuses for more reasons than a closed
-        # workstream: a Stop that raced the claim capture, a soft close
-        # preparing, structural tool debt pending after a force-cancel, or
-        # a session swap. Those leave the workstream alive — answer 409
-        # (transient, retryable) and reserve 404 for a row that is
-        # actually gone.
-        if mgr.get(ws_id) is not None:
-            return JSONResponse(
-                {"error": "Workstream is temporarily busy — retry shortly."},
-                status_code=409,
-            )
-        return JSONResponse({"error": not_found_label}, status_code=404)
+        # A refusal is not necessarily a closed workstream: see
+        # ``_dispatch_refused`` for the 409/404 split.
+        return _dispatch_refused(mgr, ws_id, not_found_label)
 
     await asyncio.to_thread(command.done.wait)
     if "error" in command.outcome:
@@ -2175,6 +2192,8 @@ async def run_slash_command(
     cmd: str,
     *,
     principal_id: str,
+    mgr: SessionManager,
+    not_found_label: str,
 ) -> JSONResponse:
     """Run one slash command on the workstream's worker slot and answer for it.
 
@@ -2182,7 +2201,11 @@ async def run_slash_command(
     ``POST /v1/api/command`` and the path-keyed
     ``POST {prefix}/{ws_id}/command`` from :func:`make_command_handler`.
     Callers own authentication, the workstream lookup and any refusal of a
-    command word. ``/compact`` runs :meth:`ChatSession.compact_now`; every
+    command word; they also pass their own manager and 404 label so a
+    dispatch refusal can answer through :func:`_dispatch_refused` with the
+    same 409/404 split the destructive endpoints use (and with the node's
+    wording on the node route, the console's on the console route).
+    ``/compact`` runs :meth:`ChatSession.compact_now`; every
     other *cmd* reaches :meth:`ChatSession.handle_command` as given.
     """
     import contextlib
@@ -2211,8 +2234,11 @@ async def run_slash_command(
         ) -> JSONResponse | None:
             """Dispatch a command worker; return the refusal response or None.
 
-            One envelope for both command branches: the unknown-workstream
-            404 and the busy refusal differ only in the retry hint.  The
+            One envelope for both command branches: the dispatch refusal and
+            the busy refusal differ only in the retry hint. A refusal is not
+            necessarily a gone workstream, so it goes through
+            :func:`_dispatch_refused` (409 while the manager still holds it,
+            404 with *not_found_label* once it does not).  The
             worker slot is claimed with ``worker_kind="command"`` — the
             /send route DEFERS (never queues) while that kind holds the
             slot, so the mid-turn interjection queue and its turn-shaped
@@ -2248,7 +2274,7 @@ async def run_slash_command(
                     status_code=503,
                 )
             if not dispatched:
-                return JSONResponse({"error": "Unknown workstream"}, status_code=404)
+                return _dispatch_refused(mgr, ws.id, not_found_label)
             if busy_hit:
                 # 409, not 200: the refusal is deliberate (mutual exclusion
                 # replaced the old inline mid-turn interleave) but it must
@@ -2495,6 +2521,8 @@ def make_command_handler(
             session,
             cmd,
             principal_id=auth_user_id(request).strip(),
+            mgr=mgr,
+            not_found_label=cfg.not_found_label,
         )
 
     return command

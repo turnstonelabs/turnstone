@@ -19,6 +19,7 @@ import pytest
 from starlette.testclient import TestClient
 
 from tests._helpers import wait_until
+from turnstone.core import session_worker
 from turnstone.core.workstream import INTERJECTION_CAP_CHARS
 
 _TEST_JWT_SECRET = "test-jwt-secret-minimum-32-chars!"
@@ -1571,6 +1572,62 @@ def test_command_backstop_sits_under_console_proxy_timeout() -> None:
     from turnstone.core.session_routes import _COMMAND_RESPONSE_BACKSTOP_S
 
     assert _COMMAND_RESPONSE_BACKSTOP_S < _PROXY_CLIENT_TIMEOUT_S
+
+
+class TestCommandDispatchRefusal:
+    """A refused dispatch is not a missing workstream.
+
+    ``session_worker.send`` refuses a live workstream too (a Stop racing the
+    claim, a soft close preparing, structural tool debt pending, a session
+    swap), so answering 404 told callers the row was gone and they stopped
+    retrying. 409 while the manager still holds it, 404 only once it does
+    not.
+    """
+
+    def _create_ws(self, client) -> str:
+        resp = client.post(
+            "/v1/api/workstreams/new",
+            json={"name": "refuse-me"},
+            headers=_auth("user-1"),
+        )
+        assert resp.status_code == 200
+        return resp.json()["ws_id"]
+
+    def test_refused_dispatch_on_a_live_workstream_is_409(self, app_client, monkeypatch):
+        client, mgr = app_client
+        ws_id = self._create_ws(client)
+        monkeypatch.setattr(session_worker, "send", lambda *a, **k: False)
+        resp = client.post(
+            "/v1/api/command",
+            json={"command": "/clear", "ws_id": ws_id},
+            headers=_auth("user-1"),
+        )
+        assert resp.status_code == 409, resp.text
+        assert resp.json() == {"error": "Workstream is temporarily busy — retry shortly."}
+
+    def test_refused_dispatch_on_a_gone_workstream_is_404(self, app_client, monkeypatch):
+        client, mgr = app_client
+        ws_id = self._create_ws(client)
+        # The row disappears between the route's lookup and the dispatch.
+        refused = {"yet": False}
+        real_get = mgr.get
+
+        def fake_send(*args, **kwargs):
+            refused["yet"] = True
+            return False
+
+        def fake_get(requested):
+            return None if refused["yet"] else real_get(requested)
+
+        monkeypatch.setattr(session_worker, "send", fake_send)
+        monkeypatch.setattr(mgr, "get", fake_get)
+        resp = client.post(
+            "/v1/api/command",
+            json={"command": "/clear", "ws_id": ws_id},
+            headers=_auth("user-1"),
+        )
+        assert resp.status_code == 404, resp.text
+        assert resp.json() == {"error": "Unknown workstream"}
 
 
 class TestCompactCommandDispatch:
