@@ -1658,7 +1658,7 @@ async def list_available_models(request: Request) -> JSONResponse:
     if err:
         return err
 
-    rows = storage.list_model_definitions(enabled_only=True)
+    rows = await asyncio.to_thread(storage.list_model_definitions, enabled_only=True)
     # Only expose alias/model/provider — rows also contain api_key, base_url, etc.
     models = [{"alias": r["alias"], "model": r["model"], "provider": r["provider"]} for r in rows]
 
@@ -1678,7 +1678,6 @@ async def list_available_models(request: Request) -> JSONResponse:
         default_alias = (cs.get("model.default_alias") or "").strip()
         channel_default_alias = (cs.get("channels.default_model_alias") or "").strip()
         judge_default_alias = (cs.get("judge.model") or "").strip()
-    enabled_aliases = {r["alias"] for r in rows}
     # Coordinator default walks the standard three-tier chain (see
     # :func:`turnstone.console.coordinator_alias.resolve_coordinator_alias`),
     # the same one the session factory walks.
@@ -1693,12 +1692,10 @@ async def list_available_models(request: Request) -> JSONResponse:
         # ConfigStore failed lifespan but coord_registry is still bound —
         # report the helper's tier 3 so the home composer isn't blank.
         coordinator_default_alias = getattr(coord_registry, "default", "") or ""
-    # Judge falls back to the resolved coordinator alias when
-    # ``judge.model`` is empty *or* not a registered alias — judge.model
-    # is alias-only (matches IntentJudge.__init__), so an unknown value is
-    # operator misconfiguration that the judge itself silently inherits
-    # the session model on.
-    if not judge_default_alias or judge_default_alias not in enabled_aliases:
+    # An empty ``judge.model`` means the session's own model judges, which on this launcher is
+    # the coordinator's. A set alias is reported as configured, like the ones above: a judge
+    # naming one it can't use doesn't judge rather than moving to another model (#1529).
+    if not judge_default_alias:
         judge_default_alias = coordinator_default_alias
     return JSONResponse(
         {
@@ -14723,20 +14720,33 @@ async def _notify_nodes_model_reload(request: Request) -> dict[str, Any]:
 
 
 # The routing settings that name one model and fail closed when it isn't
-# loaded (#1359). The Models tab refuses to delete, disable or rename a
+# loaded (#1359, #1529). The Models tab refuses to delete, disable or rename a
 # definition one of them names: a routine swap (add a model, delete the old
 # default) would otherwise block every create that relies on the setting,
-# every new Slack conversation included, until someone repoints it.
-_FAIL_CLOSED_ROUTING_KEYS: tuple[str, ...] = (
+# every new Slack conversation included, or leave tool calls without the judge
+# the operator chose, until someone repoints it.
+#
+# Removing the last enabled model clears only the first four. Nothing is left to
+# route to, so they would only name a missing model, but an empty judge setting
+# hands the role to the session's own model, which only an operator may choose
+# (#1529). A set judge keeps refusing until someone repoints it.
+_CLEARED_WITH_LAST_MODEL_KEYS: tuple[str, ...] = (
     "model.default_alias",
     "model.task_alias",
     "coordinator.model_alias",
     "channels.default_model_alias",
 )
+_FAIL_CLOSED_ROUTING_KEYS: tuple[str, ...] = (
+    *_CLEARED_WITH_LAST_MODEL_KEYS,
+    "judge.model",
+    "judge.output_guard_model",
+)
 
 
-def _routing_settings_naming(storage: Any, alias: str) -> list[tuple[str, str]]:
-    """``(key, node_id)`` of each fail-closed routing setting that names *alias*.
+def _routing_settings_naming(
+    storage: Any, alias: str, keys: tuple[str, ...] = _FAIL_CLOSED_ROUTING_KEYS
+) -> list[tuple[str, str]]:
+    """``(key, node_id)`` of each of the routing settings *keys* that names *alias*.
 
     Global and per-node rows alike, read from storage rather than a cache. A
     row whose value won't decode names nothing.
@@ -14746,7 +14756,7 @@ def _routing_settings_naming(storage: Any, alias: str) -> list[tuple[str, str]]:
     named: list[tuple[str, str]] = []
     for row in storage.list_system_settings():
         key = row.get("key")
-        if key not in _FAIL_CLOSED_ROUTING_KEYS:
+        if key not in keys:
             continue
         try:
             value = deserialize_value(key, str(row.get("value") or ""))
@@ -14808,6 +14818,16 @@ def _model_in_use_refusal(storage: Any, alias: str, action: str) -> JSONResponse
         steps.append("Point that setting at another model, or clear it.")
     elif sources:
         steps.append("Point those settings at another model, or clear them.")
+    # Clearing a judge setting doesn't stop that judge: it hands the role on, which the person
+    # choosing between the two steps needs to know.  The chain rather than the values at each
+    # scope, so it holds for a node's own row as for the global one.
+    if {key for key, _ in named} & {"judge.model", "judge.output_guard_model"}:
+        steps.append(
+            "Clearing a judge setting hands its role on: a node's own row to the global one, "
+            "judge.output_guard_model to judge.model, and judge.model to each session's own "
+            "model, which then judges its own tool calls, and its tool output too when "
+            "judge.output_guard_model is empty."
+        )
     # The console's config.toml default routes while no stored default
     # outranks it, and takes over when a stored default naming this same
     # model is cleared.
@@ -14828,7 +14848,7 @@ def _model_in_use_refusal(storage: Any, alias: str, action: str) -> JSONResponse
             "error": (
                 f"'{alias}' is still named by {', '.join(sources)}. {' '.join(steps)} "
                 f"Do this before you {action} it: creates that rely on a setting naming "
-                "a missing model fail."
+                "a missing model fail, and a judge setting naming one stops that judge."
             ),
             "code": "model_in_use",
             "settings": sorted({key for key, _ in named}),
@@ -15637,14 +15657,17 @@ async def admin_update_model_definition(request: Request) -> JSONResponse:
 
     # A model a fail-closed routing setting names can't be renamed or disabled
     # out from under it (#1359). Disabling the last enabled model is allowed:
-    # nothing is left to route to, and the settings naming it are cleared.
+    # nothing is left to route to, and the routing settings naming it are
+    # cleared, though not the judge's.
     existing_alias = str(existing.get("alias") or "")
     clear_after_update: list[tuple[str, str]] = []
     if existing.get("enabled", True):
         renaming = "alias" in updates and updates["alias"] != existing_alias
         disabling = updates.get("enabled") is False
         if disabling and _is_only_enabled_definition(storage, definition_id):
-            clear_after_update = _routing_settings_naming(storage, existing_alias)
+            clear_after_update = _routing_settings_naming(
+                storage, existing_alias, _CLEARED_WITH_LAST_MODEL_KEYS
+            )
         elif renaming or disabling:
             refusal = _model_in_use_refusal(
                 storage, existing_alias, "rename" if renaming else "disable"
@@ -15752,12 +15775,15 @@ async def admin_delete_model_definition(request: Request) -> JSONResponse:
 
     # A model a fail-closed routing setting names can't be deleted out from
     # under it (#1359), unless it is the last enabled model: then nothing is
-    # left to route to, and the settings naming it are cleared with it.
+    # left to route to, and the routing settings naming it are cleared with
+    # it, though not the judge's.
     existing_alias = str(existing.get("alias") or "")
     clear_after_delete: list[tuple[str, str]] = []
     if existing.get("enabled", True):
         if _is_only_enabled_definition(storage, definition_id):
-            clear_after_delete = _routing_settings_naming(storage, existing_alias)
+            clear_after_delete = _routing_settings_naming(
+                storage, existing_alias, _CLEARED_WITH_LAST_MODEL_KEYS
+            )
         else:
             refusal = _model_in_use_refusal(storage, existing_alias, "delete")
             if refusal is not None:

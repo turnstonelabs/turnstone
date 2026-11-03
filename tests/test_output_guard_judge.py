@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import threading
 import time
-from typing import TYPE_CHECKING, Any
+from typing import Any
 from unittest.mock import MagicMock
+
+import pytest
 
 from tests._session_helpers import as_stream
 from tests._session_helpers import mock_completion_result as _mock_result
@@ -21,9 +23,6 @@ from turnstone.core.output_guard_judge import (
     _extract_json,
 )
 from turnstone.core.providers._protocol import ModelCapabilities, UsageInfo
-
-if TYPE_CHECKING:
-    import pytest
 
 
 class _VersionedConfigStore:
@@ -520,27 +519,23 @@ class TestOversizeGuard:
 
 
 class TestAliasResolution:
-    def test_unknown_alias_falls_back_to_session_model(self) -> None:
-        # Registry says alias does not exist; judge should fall back.
+    def test_an_unknown_guard_alias_builds_no_guard_judge(self) -> None:
+        """A set alias is never replaced by another model (#1529)."""
+        from turnstone.core.judge import JudgeModelUnavailableError
+
         registry = MagicMock()
-        registry.has_alias.return_value = False
-        provider = _make_provider('{"risk_level": "none", "flags": []}')
-        config = JudgeConfig(
-            output_guard_llm=True,
-            output_guard_model="nonexistent-alias",
-        )
-        judge = OutputGuardJudge(
-            config=config,
-            session_binding=_binding(
-                provider,
-                MagicMock(base_url="http://x", api_key="y"),
-                "session-model",
-                registry=registry,
-                alias="session",
-            ),
-        )
-        assert judge._model == "session-model"
-        assert judge._judge_model_alias == ""
+        registry.resolve_binding.side_effect = ValueError("unknown alias")
+        with pytest.raises(JudgeModelUnavailableError, match="nonexistent-alias"):
+            OutputGuardJudge(
+                config=JudgeConfig(output_guard_llm=True, output_guard_model="nonexistent-alias"),
+                session_binding=_binding(
+                    _make_provider('{"risk_level": "none", "flags": []}'),
+                    MagicMock(base_url="http://x", api_key="y"),
+                    "session-model",
+                    registry=registry,
+                    alias="session",
+                ),
+            )
 
     def test_known_alias_resolves(self) -> None:
         registry = MagicMock()
@@ -582,13 +577,20 @@ class TestAliasResolution:
         alias_provider = MagicMock()
         alias_provider.provider_name = "anthropic"
         alias_provider.get_capabilities.return_value = ModelCapabilities(context_window=200_000)
-        registry.resolve_binding.side_effect = lambda alias, **_kw: (
-            MagicMock(base_url=f"http://{alias}", api_key="k"),
-            f"{alias}-model",
-            None,
-            alias_provider,
-            0,
-        )
+
+        def resolve(alias: str, **_kw: Any) -> tuple[Any, ...]:
+            # Like the real registry: an alias it doesn't hold raises rather than binding.
+            if alias not in aliases:
+                raise ValueError(f"unknown model alias {alias!r}")
+            return (
+                MagicMock(base_url=f"http://{alias}", api_key="k"),
+                f"{alias}-model",
+                None,
+                alias_provider,
+                0,
+            )
+
+        registry.resolve_binding.side_effect = resolve
         return registry
 
     def _guard(self, config: JudgeConfig, registry: MagicMock) -> OutputGuardJudge:
@@ -619,25 +621,25 @@ class TestAliasResolution:
         )
         assert judge._judge_model_alias == "guard"
 
-    def test_an_unregistered_guard_alias_is_passed_over_for_judge_model(
-        self, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        with caplog.at_level("WARNING"):
-            judge = self._guard(
+    def test_a_set_guard_alias_is_final_even_with_judge_model_loaded(self) -> None:
+        """No pass-over to the next judging model either: the guard's own alias binds, or no
+        guard judge is built (#1529)."""
+        from turnstone.core.judge import JudgeModelUnavailableError
+
+        with pytest.raises(JudgeModelUnavailableError, match="typo"):
+            self._guard(
                 JudgeConfig(output_guard_llm=True, output_guard_model="typo", model="intent"),
                 self._registry("intent"),
             )
-        assert judge._judge_model_alias == "intent"
-        assert "is not a registered alias" in caplog.text
-        assert "'judge.output_guard_model', 'typo'" in caplog.text
 
-    def test_with_neither_registered_the_session_model_judges(self) -> None:
-        judge = self._guard(
-            JudgeConfig(output_guard_llm=True, output_guard_model="typo", model="also-typo"),
-            self._registry(),
-        )
-        assert judge._model == "session-model"
-        assert judge._judge_model_alias == ""
+    def test_with_neither_loaded_no_guard_judge_is_built(self) -> None:
+        from turnstone.core.judge import JudgeModelUnavailableError
+
+        with pytest.raises(JudgeModelUnavailableError):
+            self._guard(
+                JudgeConfig(output_guard_llm=True, output_guard_model="typo", model="also-typo"),
+                self._registry(),
+            )
 
     def test_a_judge_model_edit_reaches_a_guard_without_its_own_alias(self) -> None:
         registry = self._registry("a", "b", "guard")
@@ -759,45 +761,6 @@ class TestBindingFreshness:
         assert not judge.binding_is_current(
             session_binding,
             JudgeConfig(output_guard_llm=True, output_guard_model="new-guard-alias"),
-        )
-
-    def test_previously_unknown_alias_becoming_resolvable_invalidates_fallback(self) -> None:
-        registry = MagicMock()
-        registry.generation = 0
-        registry.resolve_binding.side_effect = ValueError("unknown alias")
-        session_provider = _make_provider()
-        session_binding = _binding(
-            session_provider,
-            MagicMock(base_url="http://session", api_key="s"),
-            "session-model",
-            registry=registry,
-            alias="session",
-        )
-        judge = OutputGuardJudge(
-            config=JudgeConfig(output_guard_llm=True, output_guard_model="future-guard"),
-            session_binding=session_binding,
-        )
-        assert judge._judge_model_alias == ""
-
-        alias_provider = _make_provider()
-        alias_client = MagicMock(base_url="http://guard", api_key="g")
-        registry.generation = 1
-        registry.resolve_binding.side_effect = None
-        registry.resolve_binding.return_value = (
-            alias_client,
-            "guard-model",
-            None,
-            alias_provider,
-            1,
-        )
-        session_at_1 = ResolvedModelBinding(
-            lane=session_binding.lane,
-            config=session_binding.config,
-            registry_generation=1,
-        )
-        assert not judge.binding_is_current(
-            session_at_1,
-            JudgeConfig(output_guard_llm=True, output_guard_model="future-guard"),
         )
 
 

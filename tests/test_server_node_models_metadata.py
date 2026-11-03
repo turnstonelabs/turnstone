@@ -71,7 +71,7 @@ def test_projects_all_aliases_with_default_healthy_when_no_tracker():
     # should have passed the local alias.  Lock the projected keys
     # so a future contributor doesn't reintroduce the footgun.
     for row in rows:
-        assert set(row.keys()) == {"alias", "provider", "healthy"}
+        assert set(row.keys()) == {"alias", "provider", "healthy", "offered"}
 
 
 def test_health_flag_reflects_tracker_state():
@@ -637,3 +637,56 @@ def test_model_reload_keeps_running_registry_when_the_load_fails(
     assert b"registry load failed: RuntimeError" in response.body
     assert b"pgbouncer" not in response.body  # detail stays in the node log
     assert old_reg.list_aliases() == ["a"]
+
+
+def test_hidden_aliases_are_still_published_for_the_admin_views():
+    """The Nodes tab has to show whether this node loaded the judge's alias, and whether it can
+    hold a chat is no reason to drop it (#1529)."""
+    from unittest.mock import MagicMock
+
+    reg = _registry(("main", "http://x"), ("judge-box", "http://y"))
+    settings = {"model.hide_utility_aliases": True, "judge.model": "judge-box"}
+    store = MagicMock()
+    store.get.side_effect = settings.get
+
+    entry = _collect_node_models_metadata(SimpleNamespace(registry=reg, config_store=store))
+
+    assert entry is not None
+    assert {row["alias"]: row["offered"] for row in json.loads(entry[1])} == {
+        "judge-box": False,
+        "main": True,
+    }
+
+
+def test_hidden_aliases_reach_neither_list_a_coordinator_reads(tmp_path, sqlite_backend_factory):
+    """``list_nodes`` keeps to the offered rows, so ``metadata.models`` can't show what
+    ``model_aliases`` leaves out, and the flag doesn't reach a coordinator (#1529)."""
+    from unittest.mock import MagicMock
+
+    from turnstone.console.coordinator_client import CoordinatorClient
+    from turnstone.core.child_event_bus import ChildEventBus
+
+    storage = sqlite_backend_factory(str(tmp_path / "hidden.db"))
+    reg = _registry(("main", "http://x"), ("judge-box", "http://y"))
+    settings = {"model.hide_utility_aliases": True, "judge.model": "judge-box"}
+    store = MagicMock()
+    store.get.side_effect = settings.get
+    entry = _collect_node_models_metadata(SimpleNamespace(registry=reg, config_store=store))
+    assert entry is not None
+    storage.set_node_metadata_bulk("node-1", [entry])
+
+    client = CoordinatorClient(
+        "http://console",
+        storage,
+        lambda: "token",
+        coord_ws_id="coord-1",
+        user_id="user-1",
+        http_client=MagicMock(),
+        child_event_bus=ChildEventBus(),
+    )
+    row = client.list_nodes(include_inactive=True)["nodes"][0]
+
+    assert row["model_aliases"] == ["main"]
+    assert row["metadata"]["models"]["value"] == [
+        {"alias": "main", "provider": "openai", "healthy": True}
+    ]

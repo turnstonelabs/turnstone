@@ -2302,60 +2302,45 @@ class TestModelAliasResolution:
         )
         assert judge._judge_context_window == 100_000  # session window, not 0
 
-    def test_unknown_alias_inherits_session_model(self):
-        """``judge.model`` is alias-only.  A value that doesn't resolve
-        through the registry inherits the session model (same path as
-        an empty config.model) rather than getting pinned onto the
-        session provider as a raw model id — that legacy behavior
-        silently broke whenever the session provider didn't speak the
-        configured model id (Anthropic session, ``judge.model =
-        "gpt-5-mini"`` → every verdict came back as ``llm_fallback``)."""
-        session_provider = _make_mock_provider()
-        session_provider.provider_name = "anthropic"
-        session_client = MagicMock()
-        session_client.base_url = "https://session.example/v1"
-        session_client.api_key = "session-key"
+    def test_an_alias_the_registry_lacks_builds_no_judge(self):
+        """``judge.model`` is alias-only, and a set alias is never replaced by another model
+        (#1529): one the registry doesn't hold builds no judge at all, rather than the session's
+        model judging under the configured name."""
+        from turnstone.core.judge import JudgeModelUnavailableError
+        from turnstone.core.model_registry import ModelConfig, ModelRegistry
 
-        registry = MagicMock()
-        registry.has_alias.return_value = False  # judge.model isn't an alias
-
-        config = JudgeConfig(enabled=True, model="gpt-5-mini")
-        judge = IntentJudge(
-            config=config,
-            session_binding=_binding(
-                session_provider,
-                session_client,
-                "session-default-model",
-                capabilities=ModelCapabilities(context_window=100_000),
-                registry=registry,
-                alias="session",
-            ),
+        registry = ModelRegistry(
+            models={"session": ModelConfig("session", "http://s.example/v1", "k", "session-model")},
+            default="session",
         )
+        with pytest.raises(JudgeModelUnavailableError, match="gpt-5-mini"):
+            IntentJudge(
+                config=JudgeConfig(enabled=True, model="gpt-5-mini"),
+                session_binding=_binding(
+                    _make_mock_provider(),
+                    MagicMock(base_url="https://session.example/v1", api_key="session-key"),
+                    "session-model",
+                    capabilities=ModelCapabilities(context_window=100_000),
+                    registry=registry,
+                    alias="session",
+                ),
+            )
 
-        assert judge._lane.provider is session_provider
-        assert judge._model == "session-default-model"
-        # Context window mirrors the session, not the (uncalled) caps lookup.
-        assert judge._judge_context_window == 100_000
-
-    def test_construction_failure_warns_with_cause_not_registration_advice(self, caplog):
-        """A REGISTERED alias whose binding cannot be built keeps the
-        session-model fallback, but the warning names the construction
-        cause — the register-the-alias advice would misdiagnose a row
-        that is already registered."""
+    def test_a_construction_failure_builds_no_judge_and_names_its_cause(self):
+        """A registered alias whose binding can't be built is refused the same way, and the
+        error the session logs carries the cause rather than advice to register the alias."""
+        from turnstone.core.judge import JudgeModelUnavailableError
         from turnstone.core.model_registry import ModelClientConstructionError
 
         registry = MagicMock()
-        registry.has_alias.side_effect = lambda a: a == "judge-mini"
         registry.resolve_binding.side_effect = ModelClientConstructionError(
             "provider 'openai' does not support api_surface 'messages'"
         )
-
-        with caplog.at_level("WARNING", logger="turnstone.core.judge"):
-            session_provider = _make_mock_provider()
-            judge = IntentJudge(
+        with pytest.raises(JudgeModelUnavailableError, match="does not support api_surface"):
+            IntentJudge(
                 config=JudgeConfig(enabled=True, model="judge-mini"),
                 session_binding=_binding(
-                    session_provider,
+                    _make_mock_provider(),
                     MagicMock(base_url="https://s/v1", api_key="s"),
                     "session-model",
                     capabilities=ModelCapabilities(context_window=100_000),
@@ -2364,10 +2349,23 @@ class TestModelAliasResolution:
                 ),
             )
 
-        assert judge._model == "session-model"  # fallback behavior unchanged
-        warned = [r.message for r in caplog.records if r.levelname == "WARNING"]
-        assert any("does not support api_surface" in m for m in warned)
-        assert not any("not a registered alias" in m for m in warned)
+    def test_an_unexpected_failure_propagates_as_itself(self):
+        """Only a failure to bind the alias reads as the judge model being unavailable: a bug
+        elsewhere keeps its own type, so the session logs it as one."""
+        registry = MagicMock()
+        registry.resolve_binding.side_effect = RuntimeError("boom")
+        with pytest.raises(RuntimeError, match="boom"):
+            IntentJudge(
+                config=JudgeConfig(enabled=True, model="judge-mini"),
+                session_binding=_binding(
+                    _make_mock_provider(),
+                    MagicMock(base_url="https://s/v1", api_key="s"),
+                    "session-model",
+                    capabilities=ModelCapabilities(context_window=100_000),
+                    registry=registry,
+                    alias="session",
+                ),
+            )
 
     def test_empty_model_inherits_session_model(self):
         """Empty ``config.model`` is the documented self-consistency path."""

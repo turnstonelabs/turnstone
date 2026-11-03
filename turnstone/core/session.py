@@ -3133,6 +3133,7 @@ class ChatSession:
         model_binding: ResolvedModelBinding | None = None,
         fork_reservation_token: str = "",
         workstream_lease: WorkstreamLease | None = None,
+        workstream_judge_model: str = "",
     ):
         if kind == WorkstreamKind.COORDINATOR and not user_id:
             # Coordinators carry real authority — they mint child-spawn
@@ -3702,9 +3703,21 @@ class ChatSession:
         # — see ``_emit_state``.
         self._has_persisted_error: bool = False
         self._persisted_error_revision: int = 0
-        # Intent validation judge (lazy-initialized)
+        # Intent validation judge (lazy-initialized).  A judge alias chosen for this workstream
+        # (the launcher's picker or the create API) replaces ``judge.model``, kept as the alias:
+        # the judge binds it to its provider, client and model, and doesn't judge when it can't
+        # use it.  The choice lasts as long as this session object does.
+        self._workstream_judge_model = workstream_judge_model
         self._judge_config: JudgeConfig | None = judge_config
+        if judge_config is not None and workstream_judge_model:
+            self._judge_config = dataclasses.replace(judge_config, model=workstream_judge_model)
         self._judge: IntentJudge | None = None
+        self._refused_judge_roles: dict[str, tuple[str, int | None, int | None]] = {}
+        # The alias the intent judge last couldn't bind (``None`` once it binds or is off), and
+        # the one the person was last told about.  The main loop tells them: info raised inside a
+        # task agent never reaches the web pane.
+        self._judge_unavailable_alias: str | None = None
+        self._judge_note_alias: str | None = None
         self._judge_cancel_event: threading.Event | None = None
         # EVERY live judge generation's cancel event — the main loop's
         # (also mirrored in the slot above, which carries the supersede
@@ -4026,11 +4039,11 @@ class ChatSession:
 
     @property
     def _judge_cfg(self) -> JudgeConfig | None:
-        """Live judge behavioral config — reads from ConfigStore when available.
+        """Live judge config — reads from ConfigStore when available.
 
-        The intent-model alias stays frozen from session creation.  The
-        output-guard alias is live; :meth:`_ensure_output_guard_judge` replaces
-        that judge at the next evaluation boundary when the setting changes.
+        Both aliases are live: :meth:`_ensure_judge` and
+        :meth:`_ensure_output_guard_judge` replace their judge at the next evaluation boundary
+        when its setting changes.  Only a judge chosen for this workstream stays put.
         """
         jc = self._judge_config
         if jc is None:
@@ -4064,7 +4077,7 @@ class ChatSession:
 
         return JudgeConfig(
             enabled=setting("judge.enabled"),
-            model=jc.model,
+            model=self._workstream_judge_model or setting("judge.model"),
             smart_approvals=setting("judge.smart_approvals"),
             confidence_threshold=setting("judge.confidence_threshold"),
             max_context_ratio=setting("judge.max_context_ratio"),
@@ -5064,7 +5077,8 @@ class ChatSession:
         # invites the bypass.
         aliases: list[str] = []
         if self._registry is not None:
-            aliases = sorted(a for a in self._registry.list_aliases() if a != "default")
+            offered = self._registry.offered_aliases(self._config_store)
+            aliases = [a for a in offered if a != "default"]
         aliases_str = ", ".join(f"`{a}`" for a in aliases)
         persona_line = self._persona_catalog_line()
         persona_base: dict[str, str] = {}
@@ -16915,9 +16929,12 @@ class ChatSession:
         # frozen binding object's identity as a CAS token: a concurrent model
         # rebind clears the old judge under ``_model_binding_lock`` and a late
         # constructor may neither restore nor return that stale generation.
+        from turnstone.core.judge import IntentJudge, JudgeModelUnavailableError, judge_alias
+
         for _attempt in range(2):
             judge_cfg, _config_version = self._stable_judge_cfg()
             if judge_cfg is None or not judge_cfg.enabled:
+                self._judge_unavailable_alias = None
                 return None
             with self._judge_events_lock:
                 if self._judge_shutdown:
@@ -16925,6 +16942,11 @@ class ChatSession:
             with self._model_binding_lock:
                 observed_binding = self._model_binding
                 current = self._judge
+            # Read before the attempt, so a reload that lands during it is news next batch.
+            judge_key = self._judge_role_key(judge_alias(judge_cfg))
+            if current is None and self._refused_judge_roles.get("judge") == judge_key:
+                self._judge_unavailable_alias = judge_key[0]
+                return None
 
             if current is not None:
                 try:
@@ -16954,8 +16976,6 @@ class ChatSession:
                     self._judge = None
 
             try:
-                from turnstone.core.judge import IntentJudge
-
                 candidate = IntentJudge(
                     config=judge_cfg,
                     session_binding=observed_binding,
@@ -16963,6 +16983,10 @@ class ChatSession:
                     config_store=self._config_store,
                     record_usage=self._record_aux_usage,
                 )
+            except JudgeModelUnavailableError as exc:
+                self._note_judge_role_refused("judge", judge_key, exc)
+                self._judge_unavailable_alias = judge_key[0]
+                return None
             except Exception:
                 log.warning("judge.init_failed", exc_info=True)
                 return None
@@ -17029,6 +17053,9 @@ class ChatSession:
                             return winner
                         self._judge = None
                     self._judge = candidate
+                    # Bound again, so a later failure is news worth telling once more.
+                    self._refused_judge_roles.pop("judge", None)
+                    self._judge_unavailable_alias = self._judge_note_alias = None
                     return candidate
         return None
 
@@ -17074,11 +17101,16 @@ class ChatSession:
                 self._output_guard_judge = None
                 self._output_guard_judge_cancel = None
 
-            from turnstone.core.output_guard_judge import OutputGuardJudge
+            from turnstone.core.judge import JudgeModelUnavailableError
+            from turnstone.core.output_guard_judge import OutputGuardJudge, guard_alias
 
             for _attempt in range(2):
                 jc, _construction_config_version = self._stable_judge_cfg()
                 if jc is None or not jc.output_guard_llm:
+                    break
+                # Read before the attempt, so a reload that lands during it is news next time.
+                guard_key = self._judge_role_key(guard_alias(jc))
+                if self._refused_judge_roles.get("guard") == guard_key:
                     break
                 try:
                     candidate = OutputGuardJudge(
@@ -17087,6 +17119,9 @@ class ChatSession:
                         config_store=self._config_store,
                         record_usage=self._record_aux_usage,
                     )
+                except JudgeModelUnavailableError as exc:
+                    self._note_judge_role_refused("guard", guard_key, exc)
+                    break
                 except Exception:
                     log.warning("output_guard_judge.init_failed", exc_info=True)
                     break
@@ -17105,6 +17140,7 @@ class ChatSession:
                     selected = candidate
                     self._output_guard_judge = selected
                     self._output_guard_judge_cancel = threading.Event()
+                    self._refused_judge_roles.pop("guard", None)
                     break
                 discarded.append(candidate)
             # Only a semantic model/config replacement owns a fresh budget.
@@ -17124,6 +17160,51 @@ class ChatSession:
         for candidate in discarded:
             candidate.retire()
         return selected
+
+    def _judge_role_key(self, alias: str) -> tuple[str, int | None, int | None]:
+        """What a judge role's attempt to bind *alias* is decided on.
+
+        The alias, the registry generation and the settings version: a change to any of them
+        is worth one more try, and nothing else is.  The settings version is how a node's Sync
+        to Nodes reaches a refused judge when no model definition changed, as after fixing what
+        kept a client from being built: that Sync reloads the settings but leaves the registry
+        alone.  A store or registry without an integer version (a test double) reads as
+        ``None``.
+        """
+        generation = getattr(self._registry, "generation", None)
+        version = getattr(self._config_store, "version", None)
+        return (
+            alias,
+            generation if type(generation) is int else None,
+            version if type(version) is int else None,
+        )
+
+    def _note_judge_role_refused(
+        self, role: str, key: tuple[str, int | None, int | None], exc: Exception
+    ) -> None:
+        """Record that *role* (``"judge"`` or ``"guard"``) can't bind the alias in *key*.
+
+        *key* is the one read before the attempt (:meth:`_judge_role_key`).  Logged at each
+        attempt; for the intent judge the person is told by :meth:`_tell_judge_unavailable`.
+        """
+        self._refused_judge_roles[role] = key
+        log.warning("judge.model_unavailable", role=role, alias=key[0], cause=str(exc))
+
+    def _tell_judge_unavailable(self, *, agent_gate: bool) -> None:
+        """Tell the person, once per alias, that the intent judge's model can't be used.
+
+        Never from inside a task agent: info raised there never reaches the web pane, so a
+        refusal first met there is told once the agent ends, or at the main loop's next batch.
+        The sentence is fixed: the alias and the cause stay in the log, since a workstream's
+        chosen alias is request text.
+        """
+        alias = self._judge_unavailable_alias
+        if agent_gate or alias is None or alias == self._judge_note_alias:
+            return
+        self._judge_note_alias = alias
+        self.ui.on_info(
+            "The judge model can't be used, so no LLM is judging tool calls. The log says why."
+        )
 
     def _lookup_tool_description(self, name: str) -> str:
         """Look up a tool's description from the session's tools registry.
@@ -17241,6 +17322,7 @@ class ChatSession:
             raise GenerationCancelled()
         judge = self._ensure_judge()
         if not judge:
+            self._tell_judge_unavailable(agent_gate=agent_gate)
             return None
         if owner_cancel_witness.aborted:
             raise GenerationCancelled()
@@ -20667,10 +20749,11 @@ class ChatSession:
     ) -> tuple[str | None, dict[str, Any] | None]:
         """Pull and validate the optional `model` arg for the task agent.
 
-        Returns (alias, error_item).  When the caller passed a `model` and
-        it isn't in the registry, returns an error_item shaped like the
-        existing _prepare_* error dicts so the LLM gets corrective guidance
-        and retries.  When no override was passed, returns (None, None).
+        Returns (alias, error_item).  When the caller passed a `model` that
+        isn't loaded, returns an error_item shaped like the existing
+        _prepare_* error dicts, saying why and whether trying again can help
+        (:meth:`_model_unavailable_text`).  It lists no other alias to use
+        (#1359).  When no override was passed, returns (None, None).
         """
         raw = args.get("model")
         if raw is None or raw == "":
@@ -20700,26 +20783,36 @@ class ChatSession:
                 ),
             }
         if self._registry is None or not self._registry.has_alias(alias):
-            # ``default`` excluded from the retry list so an LLM probing
-            # with a bogus alias can't enumerate it back from the error.
-            if self._registry is None:
-                available_str = "(no registry configured)"
-            else:
-                available = sorted(a for a in self._registry.list_aliases() if a != "default")
-                available_str = (
-                    ", ".join(available)
-                    if available
-                    else "(no alternative aliases configured — omit `model=`)"
-                )
+            why = self._model_unavailable_text(alias, configured=False)
             return None, {
                 "call_id": call_id,
                 "func_name": func_name,
-                "header": f"\u2717 {func_name}: unknown model alias",
+                "header": f"\u2717 {func_name}: model not available",
                 "preview": "",
                 "needs_approval": False,
-                "error": f"Error: unknown model alias '{alias}'. Available: {available_str}",
+                "error": f"Error: the model '{alias}' is not available: {why}",
             }
         return alias, None
+
+    def _model_unavailable_text(self, alias: str, *, configured: bool) -> str:
+        """Why *alias* can't run and whether trying again can help, worded for a model.
+
+        It never names another alias to use (#1359).  Retrying helps only when the alias may
+        load by itself, and only on a host that reloads its models: the CLI, with no settings
+        store, reads them once at start.  *configured* says an operator's setting named the
+        alias, so an alias nothing defines is theirs to fix; one the model named itself gets
+        the reason alone.
+        """
+        if self._registry is None:
+            return "this session has no model registry."
+        reason, retryable = self._registry.unavailable_reason(alias)
+        if retryable:
+            if self._config_store is not None:
+                return f"{reason}. Try the task again shortly."
+            return f"{reason}. It can load once the store answers and this program restarts."
+        if configured or alias in self._registry.skipped_aliases:
+            return f"{reason}. An operator has to fix it."
+        return f"{reason}."
 
     def _unloaded_task_model_error(self, call_id: str) -> dict[str, Any] | None:
         """Refuse a task_agent call whose configured task model isn't loaded.
@@ -20736,15 +20829,14 @@ class ChatSession:
         alias = registry.resolve_agent_alias("task", self._config_store)
         if not alias or registry.has_alias(alias):
             return None
-        reason, retryable = registry.unavailable_reason(alias)
-        remedy = "Try the task again shortly." if retryable else "An operator has to fix it."
+        why = self._model_unavailable_text(alias, configured=True)
         return {
             "call_id": call_id,
             "func_name": "task_agent",
             "header": f"✗ task_agent: task model '{alias}' is not available",
             "preview": "",
             "needs_approval": False,
-            "error": f"Error: the task model '{alias}' is not available: {reason}. {remedy}",
+            "error": f"Error: the task model '{alias}' is not available: {why}",
         }
 
     def _prepare_task(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
@@ -27629,6 +27721,9 @@ class ChatSession:
                     log.debug("task_agent.stash_failed call_id=%s", call_id, exc_info=True)
 
             self._publish_for_generation(origin_generation, _stash)
+            # A judge refusal met inside the agent couldn't be told from there; out of its scope
+            # now, tell it rather than wait for the main loop's next tool batch.
+            self._tell_judge_unavailable(agent_gate=False)
 
     def _audit_memory_event(
         self,

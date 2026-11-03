@@ -63,20 +63,19 @@ from turnstone.core.judge import (
     UsageRecorder,
     _config_store_version,
     _fenced_object,
-    _judge_binding_from_session,
     _JudgeBindingState,
     _positive_window,
     _UsageHandoff,
+    judge_alias,
+    resolve_judge_binding,
 )
 from turnstone.core.log import get_logger
-from turnstone.core.model_registry import ModelClientConstructionError
 from turnstone.core.model_turn import (
     ModelAdmissionError,
     ResolvedModelBinding,
     model_turn,
     require_lane_capabilities,
     resolve_max_tokens_setting,
-    resolve_model_binding,
 )
 from turnstone.core.output_guard import JUDGE_SYMBOLS
 from turnstone.core.trajectory import Turn
@@ -395,35 +394,22 @@ def _extract_json(text: str) -> dict[str, Any] | None:
 # ---------------------------------------------------------------------------
 
 
-def _configured_guard_aliases(config: JudgeConfig) -> list[tuple[str, str]]:
-    """The judging aliases the operator set, as ``(setting, alias)``, in the guard's order."""
-    return [
-        (f"judge.{field}", alias)
-        for field in ("output_guard_model", "model")
-        if (alias := str(getattr(config, field) or "").strip())
-    ]
+def guard_alias(config: JudgeConfig) -> str:
+    """``judge.output_guard_model``, else the intent judge's alias, ``""`` for the session's.
 
-
-def _guard_alias(config: JudgeConfig, registry: Any | None) -> str:
-    """The alias the guard's LLM stage asks for, or ``""`` for the session's model.
-
-    ``judge.output_guard_model``, else ``judge.model``: a judging model the
-    operator chose, kept apart from the model whose tool output is judged.  A
-    set alias the registry does not hold is passed over for the next one.
+    Construction, the freshness check and the session's record of a refusal all read it here.
     """
-    for _setting, alias in _configured_guard_aliases(config):
-        if registry is None or registry.has_alias(alias):
-            return alias
-    return ""
+    return str(config.output_guard_model or "").strip() or judge_alias(config)
 
 
 class OutputGuardJudge:
     """Synchronous, single-shot LLM judge for tool output.
 
-    Construction resolves the guard's alias inline (:func:`_guard_alias`:
-    ``judge.output_guard_model``, else ``judge.model``); on resolution
-    failure (no alias set, or none registered) the session model is used as
-    a fallback.  Mirrors :class:`IntentJudge`'s own alias resolution.
+    Construction binds the guard's alias (:func:`guard_alias`:
+    ``judge.output_guard_model``, else ``judge.model``) the way
+    :class:`IntentJudge` binds its own (:func:`~turnstone.core.judge.resolve_judge_binding`).
+    With neither set the session's model judges.  A set alias that can't be used builds no
+    guard judge (the session skips the LLM stage), never one on another model.
 
     The HTTP client is lazy-initialised on the first ``evaluate()`` call
     and reused for the lifetime of the judge instance — see
@@ -452,87 +438,20 @@ class OutputGuardJudge:
             getattr(session_binding.config, "context_window", None),
             session_caps.context_window,
         )
-        # Alias resolution mirrors IntentJudge.__init__, over the guard's two
-        # settings (``_guard_alias``).  With neither set the session model
-        # judges, silently; a set alias the registry does not hold logs a
-        # warning and is passed over for the next, then the session model.
-        # Judge model's context window drives the oversize-output guard in
-        # ``evaluate``.  It comes from the registry's ModelConfig on the alias
-        # path and the session binding's resolved window on the fallback path — NEVER
-        # ``provider.get_capabilities()``, which returns a static 200000 for
-        # every model absent from its table (i.e. every local / self-hosted
-        # judge), so a guard keyed off it would never trip for the small-window
-        # local judges it exists to protect.  ``_positive_window`` also
-        # defensively coerces any non-positive window (which would zero out the
-        # guard) to the session window, then a floor.
-        registry = session_binding.lane.registry
-        requested_alias = _guard_alias(config, registry)
-        requested_setting = ""
-        for setting, alias in _configured_guard_aliases(config):
-            if alias == requested_alias:
-                requested_setting = setting
-                break
-            log.warning(
-                "%s=%r is not a registered alias — the output guard uses the next "
-                "judging model, or the session's.  Register the model in the Models "
-                "tab and set %s to its alias.",
-                setting,
-                alias,
-                setting,
-            )
+        # Judge model's context window drives the oversize-output guard in ``evaluate``.  It comes
+        # from the registry's ModelConfig on the alias path and the session binding's resolved
+        # window on the inherited path — NEVER ``provider.get_capabilities()``, which returns a
+        # static 200000 for every model absent from its table (i.e. every local / self-hosted
+        # judge), so a guard keyed off it would never trip for the small-window local judges it
+        # exists to protect.  ``_positive_window`` also defensively coerces any non-positive
+        # window (which would zero out the guard) to the session window, then a floor.
+        requested_alias = guard_alias(config)
         config_version_at_start = _config_store_version(config_store)
-        binding = _judge_binding_from_session(session_binding, config_store)
-        resolved = False
-        construction_error: ModelClientConstructionError | None = None
-        if requested_alias and registry is not None:
-            try:
-                binding = resolve_model_binding(
-                    registry,
-                    requested_alias,
-                    config_store=config_store,
-                    backend_auth_resolver=session_binding.lane.backend_auth_resolver,
-                )
-                resolved = True
-            except ModelClientConstructionError as exc:
-                construction_error = exc
-            except (ValueError, KeyError):
-                pass
-            except Exception:
-                log.debug(
-                    "output_guard_judge.alias_resolution_failed",
-                    alias=requested_alias,
-                )
-
-        if not resolved:
-            if construction_error is not None:
-                # The alias IS registered; its binding could not be built.
-                # Same session-model fallback, but name the construction
-                # cause — the register-the-alias advice below would
-                # misdiagnose a row that is already registered.
-                log.warning(
-                    "%s=%r is registered but its client could not be constructed "
-                    "(%s) — falling back to session model %r.",
-                    requested_setting,
-                    requested_alias,
-                    construction_error,
-                    session_binding.lane.model,
-                )
-            elif requested_alias:
-                log.warning(
-                    "%s=%r is not a registered alias — falling back to session "
-                    "model %r.  Register the model in the Models tab and set %s "
-                    "to its alias.",
-                    requested_setting,
-                    requested_alias,
-                    session_binding.lane.model,
-                    requested_setting,
-                )
-            binding = _judge_binding_from_session(session_binding, config_store)
+        binding = resolve_judge_binding(requested_alias, session_binding, config_store)
 
         self._binding_state = _JudgeBindingState(
             binding=binding,
             requested_alias=requested_alias,
-            resolved_explicitly=resolved,
             config_store=config_store,
             checked_registry_generation=binding.registry_generation,
             checked_config_version=config_version_at_start,
@@ -552,15 +471,11 @@ class OutputGuardJudge:
             session_window,
         )
         self._output_budget = _resolve_output_budget(binding, config_store)
-        if not resolved:
-            # AUDIT label keeps its pre-#827 fallback semantics: "" here so
-            # recorded verdicts show ``judge_model = self._model`` (the raw
-            # model id), not the session alias — threading the alias into
-            # this field would silently change recorded judge_model values
-            # across the upgrade on default-config installs.
-            self._judge_model_alias = ""
-        else:
-            self._judge_model_alias = requested_alias
+        # AUDIT label: "" on the inherited path, so recorded verdicts show
+        # ``judge_model = self._model`` (the raw model id), not the session alias — threading the
+        # alias into this field would silently change recorded judge_model values across the
+        # upgrade on default-config installs.
+        self._judge_model_alias = requested_alias
 
         # Lazy-init in _create_client(); reused across evaluate() calls.  The
         # lifecycle lock pairs session-side retirement with active evaluations
@@ -594,7 +509,7 @@ class OutputGuardJudge:
             return False
         if not self._binding_state.is_current(
             session_binding,
-            requested_alias=_guard_alias(config, session_binding.lane.registry),
+            requested_alias=guard_alias(config),
         ):
             return False
         # ``model.max_tokens`` is not part of the lane, so a change to it alone
@@ -637,8 +552,8 @@ class OutputGuardJudge:
         Reusing one client per judge instance amortises TCP+TLS handshake
         across all ``evaluate()`` calls for the lifetime of the judge —
         at 5-20 tool calls per turn this saves 250 ms-4 s of handshake
-        latency.  IntentJudge's per-batch reuse pattern at ``judge.py:1046``
-        is the precedent.
+        latency.  IntentJudge's per-batch reuse pattern
+        (``IntentJudge._create_client``) is the precedent.
         """
         with self._lifecycle_lock:
             if self._client is not None:
