@@ -709,7 +709,11 @@ class TurnstoneBot:
     ) -> None:
         import discord
 
-        from turnstone.channels._formatter import format_approval_request, format_verdict
+        from turnstone.channels._formatter import (
+            escape_inline,
+            format_approval_request,
+            format_verdict,
+        )
         from turnstone.channels.discord.views import ApprovalView
 
         # Every decision below is about THIS event's cycle — forward its
@@ -750,7 +754,7 @@ class TurnstoneBot:
                 if verdict:
                     name = item.get("func_name") or item.get("approval_label") or "tool"
                     embed.add_field(
-                        name=f"Verdict: {name}",
+                        name=f"Verdict: {escape_inline(name, max_length=100)}",
                         value=format_verdict(verdict),
                         inline=False,
                     )
@@ -775,7 +779,7 @@ class TurnstoneBot:
     ) -> None:
         import discord
 
-        from turnstone.channels._formatter import format_verdict
+        from turnstone.channels._formatter import escape_inline, format_verdict
 
         # LLM judge verdict arrived — update the pending approval embed
         # whose cycle contains this call_id (several can be live at once
@@ -791,6 +795,7 @@ class TurnstoneBot:
         )
         if approval_msg and approval_msg.embeds:
             embed = approval_msg.embeds[0]
+            # ``format_verdict`` escapes the model-authored summary.
             verdict_data = {
                 "risk_level": event.risk_level,
                 "recommendation": event.recommendation,
@@ -798,7 +803,8 @@ class TurnstoneBot:
                 "intent_summary": event.intent_summary,
                 "tier": event.tier,
             }
-            name = event.func_name or "tool"
+            # A field name holds 256 characters; escaped, 100 fits.
+            name = escape_inline(event.func_name or "tool", max_length=100)
             # Update embed color based on LLM judge risk level.
             risk = (event.risk_level or "medium").upper()
             color_map = {

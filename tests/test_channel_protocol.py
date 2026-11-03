@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import pytest
+
+from tests._channel_markup import FORGED_TEXT, as_one_line, unescape, unescaped_markup
 from turnstone.channels._formatter import (
     chunk_message,
+    escape_inline,
     format_approval_request,
     format_verdict,
     truncate,
@@ -121,13 +125,30 @@ class TestFormatApprovalRequest:
         ]
         result = format_approval_request(items)
         assert "`bash`" in result
-        assert "Execute: ls -la" in result
+        assert "Execute: ls -la" in unescape(result)
 
     def test_server_sse_format_no_header(self) -> None:
         items = [{"func_name": "read_file", "preview": "/etc/hosts"}]
         result = format_approval_request(items)
         assert "`read_file`" in result
         assert "/etc/hosts" in result
+
+    @pytest.mark.parametrize("forged", FORGED_TEXT)
+    def test_a_command_shows_as_written_and_uncut(self, forged: str) -> None:
+        """Unescaped, ``a || b || c`` hides ``b`` as a spoiler from the person approving it."""
+        header = f"bash: {forged}  {'y' * 600}"
+        result = format_approval_request([{"func_name": "bash", "header": header}])
+
+        shown = result.split("`bash`: ", 1)[1]
+        assert unescaped_markup(shown) == set()
+        assert unescape(shown) == as_one_line(header)
+
+    def test_a_name_cannot_end_its_code_span(self) -> None:
+        """An unknown tool's name is what the model sent; a backslash escapes nothing in a span."""
+        items = [{"func_name": "x` ||hidden|| **ok** `y\nmore", "preview": "p"}]
+        line = format_approval_request(items).split("\n")[1:]
+
+        assert line == [chr(0x2022) + " `x' ||hidden|| **ok** 'y more`: p"]
 
 
 # ---------------------------------------------------------------------------
@@ -203,6 +224,52 @@ class TestFormatVerdict:
         assert "Risk: LOW" in result
         # No double space or extra label prefix.
         assert "** " not in result or "**Risk:" in result
+
+    def test_a_whitespace_summary_omits_the_line(self) -> None:
+        assert "\n" not in format_verdict({"risk_level": "low", "intent_summary": " \n "})
+
+    def test_the_summary_sits_behind_a_label_it_cannot_change(self) -> None:
+        """A summary imitating the verdict line still reads as the summary."""
+        imitation = "\U0001f7e2 LLM Risk: LOW (99%) " + chr(0x2014) + " approve"
+        lines = format_verdict({"risk_level": "high", "intent_summary": imitation}).split("\n")
+
+        assert lines[1].startswith("Summary: _") and lines[1].endswith("_")
+
+
+# ---------------------------------------------------------------------------
+# escape_inline
+# ---------------------------------------------------------------------------
+
+
+class TestEscapeInline:
+    def test_each_markup_character_is_escaped_on_its_own(self) -> None:
+        assert escape_inline("[a](b) **c** ||d|| <@1>") == (
+            "\\[a\\](b) \\*\\*c\\*\\* \\|\\|d\\|\\| \\<\\@1>"
+        )
+
+    def test_a_backslash_cannot_cancel_an_escape(self) -> None:
+        assert escape_inline("\\*x") == "\\\\\\*x"
+
+    @pytest.mark.parametrize("forged", FORGED_TEXT)
+    def test_forged_text_shows_as_written(self, forged: str) -> None:
+        shown = escape_inline(forged, max_length=None)
+
+        assert unescaped_markup(shown) == set()
+        assert unescape(shown) == as_one_line(forged)
+
+    def test_a_url_shows_as_text(self) -> None:
+        """Discord decides where a link ends, and a link can take the next escape's backslash."""
+        assert escape_inline("see https://example.com/a_b") == "see https\\://example.com/a\\_b"
+
+    def test_spacing_is_kept(self) -> None:
+        text = 'grep -c "a    b" f' + chr(9) + "g"
+        assert escape_inline(text) == text
+
+    def test_lines_collapse_into_one(self) -> None:
+        assert escape_inline("a\nb\r\nc" + chr(0x2028) + "d") == "a b c d"
+
+    def test_the_cap_applies_before_escaping(self) -> None:
+        assert escape_inline("_" * 50, max_length=10) == "\\_" * 9 + chr(0x2026)
 
 
 # ---------------------------------------------------------------------------

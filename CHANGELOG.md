@@ -65,6 +65,22 @@ The separate `dev` branch is retired. See [the release process](docs/releasing.m
   model is shown and asked, not what it can do: it can still name any loaded alias
   (#1529).
 
+### Security
+
+- **Approval cards on Discord and Slack show model-written text as written.** On Discord
+  the command and the judge's summary reached the card as Markdown, so `a || b || c` hid
+  `b` as a spoiler, and a summary (the judge's words, or a heuristic template quoting the
+  call's arguments) could add a verdict line or a masked link beneath the real one. Markdown
+  in them and in a verdict's tool name is now escaped and a tool name can't close its code
+  span, so a URL shows as text, not a link, and the summary is one line of at most 400
+  characters after a "Summary:" label. On Slack the summary kept its line breaks and
+  emphasis; it now shows on one line in a code block under the same label, which no run of
+  backticks can close, and neither a run of five or more nor a backtick at either end
+  closes a preview's any more. A URL or channel name on a Slack card no longer becomes a
+  link. A Slack card showed only the tool's name for a call awaiting approval that has no
+  preview, such as a one-line bash command; it now shows the call's header line, up to 600
+  characters. Tool names on Slack sit on one line in a code span.
+
 ## [2026-11-01]
 
 ### Fixed
