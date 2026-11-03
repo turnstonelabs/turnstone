@@ -8,6 +8,7 @@ tool-approval requests and rich media embeds for platforms that support them
 from __future__ import annotations
 
 import json
+import re
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -115,8 +116,13 @@ def format_approval_request(items: list[dict[str, Any]]) -> str:
             if isinstance(args, dict):
                 args = json.dumps(args, ensure_ascii=False)
             preview = str(args)
-        preview = truncate(preview)
-        header = item.get("header", "")
+        preview = escape_inline(preview, max_length=200)
+        # The command shows as written, uncut: Discord would hide ``b`` in ``a || b || c`` as a
+        # spoiler, and the approver has to see the whole header.
+        header = escape_inline(str(item.get("header") or ""), max_length=None)
+        # The name sits in a code span, where a backslash escapes nothing, so no backtick of its
+        # own may end the span early (an unknown tool's name is whatever the model sent).
+        name = truncate(" ".join(str(name).splitlines()).replace("`", "'"), 100)
         if header:
             lines.append(f"\u2022 `{name}`: {header}")
         elif preview:
@@ -138,7 +144,10 @@ def format_verdict(verdict: dict[str, Any]) -> str:
     rec = verdict.get("recommendation", "review")
     raw_conf = verdict.get("confidence")
     conf = int((raw_conf if raw_conf is not None else 0.5) * 100)
-    summary = verdict.get("intent_summary", "")
+    # The summary is model-authored: the judge's own words, or a heuristic template quoting
+    # the call's arguments.  One escaped line behind a label it can't change, it can't add a
+    # line, markup or a link to the card an approver acts on, or pass for the verdict line.
+    summary = escape_inline(str(verdict.get("intent_summary") or ""))
     tier = verdict.get("tier", "")
 
     emoji_map = {
@@ -152,7 +161,7 @@ def format_verdict(verdict: dict[str, Any]) -> str:
     label = f"{tier.upper()} " if tier else ""
     parts = [f"{emoji} **{label}Risk: {risk}** ({conf}%) \u2014 {rec}"]
     if summary:
-        parts.append(f"_{summary}_")
+        parts.append(f"Summary: _{summary}_")
     return "\n".join(parts)
 
 
@@ -181,6 +190,29 @@ def truncate(text: str, max_length: int = 200) -> str:
     if len(text) <= max_length:
         return text
     return text[: max_length - 1] + "\u2026"
+
+
+# Every character Discord could read as markup gets a backslash of its own, ``@`` included so
+# ``@everyone`` stays plain, and ``:`` too, so no text becomes a link: Discord decides where a link
+# ends, and one can take the backslash meant for the character after it.
+# ``discord.utils.escape_markdown`` passes a whole ``[...](...)`` span through untouched, so one
+# ``[`` early in the text left the rest raw.
+_INLINE_MARKUP = re.compile(r"[\\*_~`|<\[\]:@]")
+
+
+def escape_inline(text: str, max_length: int | None = 400) -> str:
+    """*text* as one line of literal Discord text, cut to *max_length* characters before escaping.
+
+    Line breaks become spaces and the ends are trimmed; nothing else changes, so a command keeps
+    its spacing, and a URL shows as text rather than a link.  The cut comes first, so no escape is
+    cut in half; twice the default still fits a 1024-character embed field with room for the
+    verdict line.  ``None`` keeps the whole text.  Line starts need no escaping: the text never
+    begins one.
+    """
+    flat = " ".join(text.splitlines()).strip()
+    if max_length is not None:
+        flat = truncate(flat, max_length)
+    return _INLINE_MARKUP.sub(lambda m: "\\" + m.group(0), flat)
 
 
 # ---------------------------------------------------------------------------

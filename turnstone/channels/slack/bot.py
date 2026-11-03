@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import re
 import time
 from collections import OrderedDict, deque
 from dataclasses import dataclass, field
@@ -34,7 +35,7 @@ from slack_bolt.async_app import AsyncApp
 from slack_sdk.web.async_client import AsyncWebClient
 
 from turnstone.channels._config import MAX_NOTIFY_TRACKING
-from turnstone.channels._formatter import chunk_message
+from turnstone.channels._formatter import chunk_message, truncate
 from turnstone.channels._routing import (
     MODEL_LOOKUP_FAILED_REPLY,
     ChannelRouter,
@@ -107,22 +108,42 @@ def _escape_mrkdwn(text: str) -> str:
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
+_ZWSP = "\u200b"
+# Each backtick that follows two others gets a zero-width space before it, so no run of
+# backticks, however long, holds a fence delimiter.  Splicing each disjoint triple instead left
+# one in a run of five.
+_FENCE_RUN = re.compile(r"(?<=``)`")
+
+
 def _sanitize_slack_preview(text: str, max_length: int = 1200) -> str:
     """Escape Slack mrkdwn-sensitive content for safe fenced display.
 
-    Targets the *closing-fence* injection vector: any literal ```\
-    inside the content would terminate the surrounding mrkdwn fence and
-    let the rest of the preview render as live markup (mentions, links,
-    etc.).  We splice a zero-width space inside the triple sequence so
-    Slack no longer recognizes it as a fence delimiter, and escape
-    ``&<>`` for good measure.  Single backticks are kept intact so code
-    snippets in plans / tool previews remain readable.
+    Targets the closing-fence injection vector: three backticks in a row inside the content would
+    end the surrounding fence and let the rest render as live markup (mentions, links, etc.).  A
+    zero-width space goes into every run of three or more, and before or after the content when it
+    starts or ends with a backtick, which would otherwise join the bot's own fence.  ``&<>`` are
+    escaped for good measure.  Single backticks are kept intact so code snippets in plans and
+    tool previews remain readable.
     """
     text = _escape_mrkdwn(text)
-    text = text.replace("```", "``\u200b`")
+    text = _FENCE_RUN.sub(_ZWSP + "`", text)
     if len(text) > max_length:
-        return text[: max_length - 3] + "..."
+        text = text[: max_length - 3] + "..."
+    if text.startswith("`"):
+        text = _ZWSP + text
+    if text.endswith("`"):
+        text += _ZWSP
     return text
+
+
+def _code_span_name(raw: object) -> str:
+    """A tool's name for a Slack code span: one line, at most 100 characters.
+
+    An unknown tool's name is whatever the model sent, and mrkdwn has no escape for emphasis or a
+    line break, so the span carries it, with no backtick of its own to end the span early.
+    """
+    flat = " ".join(str(raw).splitlines()).replace("`", "'").strip()
+    return _escape_mrkdwn(truncate(flat or "tool", 100))
 
 
 def _parse_ts(ts: str) -> tuple[int, int]:
@@ -1202,10 +1223,14 @@ class TurnstoneSlackBot:
         # interpolated into the bot's mrkdwn framing.
         risk = _escape_mrkdwn((event.risk_level or "medium").upper())
         verdict_text = (
-            f"*Judge Verdict: {_escape_mrkdwn(event.func_name or 'tool')}*\n"
-            f"Risk: {risk} | Confidence: {event.confidence or 'N/A'}\n"
-            f"_{_escape_mrkdwn(event.intent_summary or '')}_"
+            f"*Judge Verdict:* `{_code_span_name(event.func_name or 'tool')}`\n"
+            f"Risk: {risk} | Confidence: {event.confidence or 'N/A'}"
         )
+        # The summary goes on one line in a fence, where nothing renders: mrkdwn has no escape
+        # for emphasis, and a line of its own could pass for the verdict line above it.
+        summary = " ".join((event.intent_summary or "").splitlines()).strip()
+        if summary:
+            verdict_text += f"\nSummary:\n```{_sanitize_slack_preview(summary)}```"
         # Append the verdict section in-place on the cached blocks so
         # repeat IntentVerdictEvents stack on the same approval message
         # (matches the pre-refactor "fetch live blocks and append"
@@ -1213,7 +1238,9 @@ class TurnstoneSlackBot:
         entry.blocks.append(
             {
                 "type": "section",
-                "text": {"type": "mrkdwn", "text": verdict_text},
+                # Verbatim, so Slack doesn't turn a URL or a channel name in the summary into a
+                # link of its own; the bot's framing has none to lose.
+                "text": {"type": "mrkdwn", "text": verdict_text, "verbatim": True},
             }
         )
         try:
@@ -1290,17 +1317,20 @@ class TurnstoneSlackBot:
         body_len = 0
         truncated_items = 0
         for item in items:
-            raw_name = item.get("approval_label") or item.get("func_name") or "tool"
-            name = _escape_mrkdwn(raw_name)
-
+            name = _code_span_name(item.get("approval_label") or item.get("func_name") or "tool")
+            # A call the person decides on (awaiting approval, not already refused) shows its
+            # header when it has no preview, as a one-line bash command does.  Other items show only
+            # their name, as before, so no header of theirs can crowd it off the card.
             raw_preview = item.get("preview", "")
+            if not raw_preview and item.get("needs_approval") and not item.get("error"):
+                raw_preview = item.get("header", "")
             preview = (
                 _sanitize_slack_preview(raw_preview, max_length=_APPROVAL_PER_ITEM_PREVIEW)
                 if raw_preview
                 else ""
             )
 
-            line = f"• *{name}*\n```{preview}```" if preview else f"• *{name}*"
+            line = f"• `{name}`\n```{preview}```" if preview else f"• `{name}`"
             # +1 for the join newline
             if body_len + len(line) + 1 > _APPROVAL_TEXT_BUDGET:
                 truncated_items = len(items) - len(tool_lines)
@@ -1317,6 +1347,8 @@ class TurnstoneSlackBot:
                 "text": {
                     "type": "mrkdwn",
                     "text": "*Tool Approval Required*\n" + "\n".join(tool_lines),
+                    # As on the verdict: no URL or channel name in a command becomes a link.
+                    "verbatim": True,
                 },
             },
             {
