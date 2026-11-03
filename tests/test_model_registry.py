@@ -5,6 +5,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import logging
+import re
 import threading
 from types import SimpleNamespace
 from typing import Any
@@ -13,9 +14,10 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from tests._oidc_test_helpers import keyed_app_state
-from tests._session_helpers import scripted_chat_client
+from tests._session_helpers import log_has_field, scripted_chat_client
 from turnstone.core import model_registry as mr_module
 from turnstone.core.model_registry import (
+    UTILITY_ROLE_SETTINGS,
     DynamicAuthKeyError,
     ModelConcurrencyConfigError,
     ModelConfig,
@@ -258,6 +260,29 @@ class TestModelRegistry:
         )
         with pytest.raises(ModelClientConstructionError, match="bogus"):
             reg.resolve_binding("gw")
+
+    def test_a_build_failure_logs_the_alias_and_provider_as_fields(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The message used to carry a printf ``%r`` that the structured logger printed as is."""
+        from turnstone.core.model_registry import ModelClientConstructionError
+
+        reg = self._make_registry()
+        with (
+            caplog.at_level("WARNING", logger="turnstone.core.model_registry"),
+            patch.object(
+                mr_module, "create_client", side_effect=FileNotFoundError("no such bundle")
+            ),
+            pytest.raises(ModelClientConstructionError, match="FileNotFoundError"),
+        ):
+            reg.get_client("default")
+
+        [record] = [
+            r for r in caplog.records if "model_registry.client_construction_failed" in str(r.msg)
+        ]
+        assert log_has_field(record, "alias", "default")
+        assert log_has_field(record, "provider", reg.get_config("default").provider)
+        assert "%r" not in record.getMessage()
 
     def test_shutdown(self) -> None:
         reg = self._make_registry()
@@ -1865,6 +1890,7 @@ def _make_session(
     workstream_lease: Any | None = None,
     client_type: Any | None = None,
     parent_ws_id: str | None = None,
+    workstream_judge_model: str = "",
 ) -> Any:
     """Create a ChatSession with one factory-shaped atomic model binding.
 
@@ -1915,6 +1941,7 @@ def _make_session(
         workstream_lease=workstream_lease,
         client_type=client_type or ClientType.CLI,
         parent_ws_id=parent_ws_id,
+        workstream_judge_model=workstream_judge_model,
     )
 
 
@@ -1933,6 +1960,13 @@ def _make_durable_session(**kwargs: Any) -> Any:
 
 def _binding(session: Any) -> Any:
     return session._model_binding
+
+
+def _judge_notes(session: Any) -> int:
+    """How often the person was told that no LLM is judging tool calls."""
+    return sum(
+        "no LLM is judging tool calls" in str(c.args[0]) for c in session.ui.on_info.call_args_list
+    )
 
 
 def _lane(session: Any) -> Any:
@@ -3108,6 +3142,405 @@ class TestSessionRegistryGenerationPropagation:
         assert _client(session) is reg.get_client("b")
         assert session._registry_generation == reg.generation
 
+    def test_judge_alias_not_loaded_waits_for_a_reload_and_never_runs_the_session_model(
+        self,
+    ) -> None:
+        """A set judge alias binds, or no judge runs at all (#1529).  Nothing is tried again
+        until the registry or the settings change, a reload that loads the alias binds both
+        judges, and one that drops it leaves none again, never the session's model."""
+        from turnstone.core import judge as judge_module
+        from turnstone.core.judge import JudgeConfig
+
+        models = {"gw": ModelConfig("gw", "http://primary.example/v1", "k", "primary-model")}
+        other = {"other": ModelConfig("other", "http://other.example/v1", "k", "other-model")}
+        judges = {
+            "intent": ModelConfig("intent", "http://intent.example/v1", "k", "intent-model"),
+        }
+        reg = ModelRegistry(models=dict(models), default="gw")
+        session = _make_session(
+            registry=reg,
+            model_alias="gw",
+            judge_config=JudgeConfig(model="intent", output_guard_llm=True),
+        )
+        session.ui = MagicMock()
+
+        def batch() -> Any:
+            """One main-loop batch's intent judge, ``None`` when none runs."""
+            session._evaluate_intent([])
+            return session._judge
+
+        with patch.object(
+            judge_module, "resolve_model_binding", wraps=judge_module.resolve_model_binding
+        ) as resolve:
+            assert batch() is None
+            assert session._ensure_output_guard_judge() is None
+            tries = resolve.call_count
+            assert tries == 2
+            assert batch() is None
+            assert session._ensure_output_guard_judge() is None
+            assert resolve.call_count == tries
+
+            reg.reload({**models, **other}, "gw", app_state=_KEYED_STATE)
+            session._refresh_model_from_registry()
+            assert batch() is None
+            assert session._ensure_output_guard_judge() is None
+            assert resolve.call_count == tries + 2
+        assert _judge_notes(session) == 1
+
+        reg.reload({**models, **other, **judges}, "gw", app_state=_KEYED_STATE)
+        session._refresh_model_from_registry()
+        bound_intent = session._ensure_judge()
+        bound_guard = session._ensure_output_guard_judge()
+        assert bound_intent is not None and bound_guard is not None
+        for judge in (bound_intent, bound_guard):
+            assert judge._lane.alias == "intent"
+            assert str(judge._lane.client.base_url) == "http://intent.example/v1/"
+
+        reg.reload({**models, **other}, "gw", app_state=_KEYED_STATE)
+        session._refresh_model_from_registry()
+        assert batch() is None
+        assert session._ensure_output_guard_judge() is None
+        assert _judge_notes(session) == 2
+
+    def test_a_refusal_inside_a_task_agent_is_told_at_the_next_main_loop_batch(self) -> None:
+        """Info raised inside a task agent never reaches the web pane, so the person learns that
+        no LLM is judging from the main loop's next batch, once (#1529)."""
+        from turnstone.core.judge import JudgeConfig
+
+        reg = ModelRegistry(
+            models={"gw": ModelConfig("gw", "http://primary.example/v1", "k", "primary-model")},
+            default="gw",
+        )
+        session = _make_session(
+            registry=reg, model_alias="gw", judge_config=JudgeConfig(model="intent")
+        )
+        session.ui = MagicMock()
+
+        assert session._evaluate_intent([], agent_gate=True) is None
+        assert _judge_notes(session) == 0
+        session._evaluate_intent([])
+        session._evaluate_intent([])
+        assert _judge_notes(session) == 1
+
+    def test_a_refusal_inside_a_task_agent_is_told_when_the_agent_ends(self, tmp_db: Any) -> None:
+        """The main loop's next tool batch may not come in that turn, so the agent's own end
+        tells it (#1529)."""
+        from turnstone.core.judge import JudgeConfig
+
+        reg = ModelRegistry(
+            models={"gw": ModelConfig("gw", "http://primary.example/v1", "k", "primary-model")},
+            default="gw",
+        )
+        session = _make_session(
+            registry=reg, model_alias="gw", judge_config=JudgeConfig(model="intent")
+        )
+        session.ui = MagicMock()
+
+        def run_agent(agent_turns: Any, **kwargs: Any) -> str:
+            assert session._evaluate_intent([], agent_gate=True) is None
+            assert _judge_notes(session) == 0
+            return "done"
+
+        with patch.object(session, "_run_agent", side_effect=run_agent):
+            session._exec_task({"call_id": "c1", "prompt": "do x"})
+
+        assert _judge_notes(session) == 1
+
+    def test_a_judge_switched_off_after_an_untold_refusal_says_nothing(
+        self, tmp_db: Any, sqlite_backend_factory: Any
+    ) -> None:
+        """A refusal met inside a task agent waits to be told; a judge switched off meanwhile
+        leaves nothing to tell (#1529)."""
+        from turnstone.core.config_store import ConfigStore
+        from turnstone.core.judge import JudgeConfig
+
+        reg = ModelRegistry(
+            models={"gw": ModelConfig("gw", "http://primary.example/v1", "k", "primary-model")},
+            default="gw",
+        )
+        store = ConfigStore(sqlite_backend_factory(str(tmp_db), create_tables=True))
+        store.set("judge.model", "intent", changed_by="test")
+        session = _make_session(
+            registry=reg, model_alias="gw", config_store=store, judge_config=JudgeConfig()
+        )
+        session.ui = MagicMock()
+
+        assert session._evaluate_intent([], agent_gate=True) is None
+        store.set("judge.enabled", False, changed_by="test")
+        session._evaluate_intent([])
+        assert _judge_notes(session) == 0
+
+    def test_a_refusal_logs_its_role_alias_and_cause(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The log is the only place that names the alias and says why (#1529).  Padding and an
+        all-space guard setting are read the way the judges read them."""
+        from turnstone.core.judge import JudgeConfig
+
+        reg = ModelRegistry(
+            models={"gw": ModelConfig("gw", "http://primary.example/v1", "k", "primary-model")},
+            default="gw",
+        )
+        session = _make_session(
+            registry=reg,
+            model_alias="gw",
+            judge_config=JudgeConfig(
+                model=" intent ", output_guard_model="  ", output_guard_llm=True
+            ),
+        )
+        with caplog.at_level("WARNING", logger="turnstone.core.session"):
+            assert session._ensure_judge() is None
+            assert session._ensure_output_guard_judge() is None
+
+        records = [r for r in caplog.records if "judge.model_unavailable" in str(r.msg)]
+        assert len(records) == 2
+        for record, role in zip(records, ("judge", "guard"), strict=True):
+            assert log_has_field(record, "role", role)
+            assert log_has_field(record, "alias", "intent")
+            assert "Unknown model alias" in record.getMessage()
+        assert {role: key[0] for role, key in session._refused_judge_roles.items()} == {
+            "judge": "intent",
+            "guard": "intent",
+        }
+
+    @pytest.mark.parametrize("role", ["judge", "guard"])
+    def test_a_reload_landing_during_a_failed_bind_is_tried_at_the_next_batch(
+        self, role: str
+    ) -> None:
+        """The refusal is recorded against what was tried, not what is loaded by the time it is
+        written down (#1529)."""
+        from turnstone.core import judge as judge_module
+        from turnstone.core.judge import JudgeConfig
+
+        models = {"gw": ModelConfig("gw", "http://primary.example/v1", "k", "primary-model")}
+        judges = {
+            "intent": ModelConfig("intent", "http://intent.example/v1", "k", "intent-model"),
+        }
+        reg = ModelRegistry(models=dict(models), default="gw")
+        session = _make_session(
+            registry=reg,
+            model_alias="gw",
+            judge_config=JudgeConfig(model="intent", output_guard_llm=True),
+        )
+        ensure = session._ensure_judge if role == "judge" else session._ensure_output_guard_judge
+        real = judge_module.resolve_model_binding
+
+        def fail_then_reload(*args: Any, **kwargs: Any) -> Any:
+            try:
+                return real(*args, **kwargs)
+            except ValueError:
+                reg.reload({**models, **judges}, "gw", app_state=_KEYED_STATE)
+                raise
+
+        with patch.object(judge_module, "resolve_model_binding", side_effect=fail_then_reload):
+            assert ensure() is None
+        session._refresh_model_from_registry()
+
+        bound = ensure()
+        assert bound is not None and bound._lane.alias == "intent"
+
+    def test_repointing_the_judge_setting_binds_without_a_model_reload(
+        self, tmp_db: Any, sqlite_backend_factory: Any
+    ) -> None:
+        """The 409's own step, "point that setting at another model", reaches a refused judge
+        at its next batch (#1529)."""
+        from turnstone.core.config_store import ConfigStore
+        from turnstone.core.judge import JudgeConfig
+
+        reg = ModelRegistry(
+            models={
+                "gw": ModelConfig("gw", "http://primary.example/v1", "k", "primary-model"),
+                "set": ModelConfig("set", "http://set.example/v1", "k", "set-model"),
+            },
+            default="gw",
+        )
+        store = ConfigStore(sqlite_backend_factory(str(tmp_db), create_tables=True))
+        store.set("judge.model", "ghost", changed_by="test")
+        session = _make_session(
+            registry=reg, model_alias="gw", config_store=store, judge_config=JudgeConfig()
+        )
+        assert session._ensure_judge() is None
+
+        store.set("judge.model", "set", changed_by="test")
+        judge = session._ensure_judge()
+        assert judge is not None and judge._lane.alias == "set"
+
+    def test_a_client_fixed_after_a_refusal_binds_at_the_next_settings_reload(
+        self, tmp_db: Any, sqlite_backend_factory: Any
+    ) -> None:
+        """A node's Sync with no model definition changed reloads only the settings, and that is
+        how a judge whose client couldn't be built tries again once its cause is fixed
+        (#1529)."""
+        from turnstone.core.config_store import ConfigStore
+        from turnstone.core.judge import JudgeConfig
+
+        reg = ModelRegistry(
+            models={
+                "gw": ModelConfig("gw", "http://primary.example/v1", "k", "primary-model"),
+                "intent": ModelConfig("intent", "http://intent.example/v1", "k", "intent-model"),
+            },
+            default="gw",
+        )
+        store = ConfigStore(sqlite_backend_factory(str(tmp_db), create_tables=True))
+        store.set("judge.model", "intent", changed_by="test")
+        session = _make_session(
+            registry=reg, model_alias="gw", config_store=store, judge_config=JudgeConfig()
+        )
+        with patch.object(
+            mr_module, "create_client", side_effect=FileNotFoundError("no such bundle")
+        ):
+            assert session._ensure_judge() is None
+        # Nothing changed, so nothing is tried.
+        assert session._ensure_judge() is None
+
+        store.reload()
+        judge = session._ensure_judge()
+        assert judge is not None and judge._lane.alias == "intent"
+
+    def test_with_no_judge_nothing_rules_on_a_batch(self) -> None:
+        """No verdict, no heuristic card and no judge generation: the batch is a plain prompt,
+        as with the judge switched off (#1529)."""
+        from turnstone.core.judge import JudgeConfig
+
+        reg = ModelRegistry(
+            models={"gw": ModelConfig("gw", "http://primary.example/v1", "k", "primary-model")},
+            default="gw",
+        )
+        session = _make_session(
+            registry=reg, model_alias="gw", judge_config=JudgeConfig(model="intent")
+        )
+        items: list[dict[str, Any]] = [
+            {
+                "call_id": "c1",
+                "func_name": "bash",
+                "command": "ls",
+                "needs_approval": True,
+                "approval_label": "bash",
+            }
+        ]
+        before = dict(items[0])
+
+        assert session._evaluate_intent(items) is None
+        assert items[0] == before
+
+    def test_swapping_the_judges_model_reaches_an_open_session(
+        self, tmp_db: Any, sqlite_backend_factory: Any
+    ) -> None:
+        """The 409's own steps: repoint the setting, then delete the old model.  Both judges move
+        at their next evaluation, rather than staying off on the alias just removed (#1529)."""
+        from turnstone.core.config_store import ConfigStore
+        from turnstone.core.judge import JudgeConfig
+
+        gw = {"gw": ModelConfig("gw", "http://primary.example/v1", "k", "primary-model")}
+        old = {"old": ModelConfig("old", "http://old.example/v1", "k", "old-model")}
+        new = {"new": ModelConfig("new", "http://new.example/v1", "k", "new-model")}
+        reg = ModelRegistry(models={**gw, **old, **new}, default="gw")
+        store = ConfigStore(sqlite_backend_factory(str(tmp_db), create_tables=True))
+        store.set("judge.model", "old", changed_by="test")
+        store.set("judge.output_guard_llm", True, changed_by="test")
+        session = _make_session(
+            registry=reg,
+            model_alias="gw",
+            config_store=store,
+            judge_config=JudgeConfig(model="old"),
+        )
+        for judge in (session._ensure_judge(), session._ensure_output_guard_judge()):
+            assert judge is not None and judge._lane.alias == "old"
+
+        store.set("judge.model", "new", changed_by="test")
+        reg.reload({**gw, **new}, "gw", app_state=_KEYED_STATE)
+        session._refresh_model_from_registry()
+
+        for judge in (session._ensure_judge(), session._ensure_output_guard_judge()):
+            assert judge is not None and judge._lane.alias == "new"
+
+    def test_a_workstreams_own_judge_stays_when_the_setting_moves(
+        self, tmp_db: Any, sqlite_backend_factory: Any
+    ) -> None:
+        from turnstone.core.config_store import ConfigStore
+        from turnstone.core.judge import JudgeConfig
+
+        reg = ModelRegistry(
+            models={
+                "gw": ModelConfig("gw", "http://primary.example/v1", "k", "primary-model"),
+                "own": ModelConfig("own", "http://own.example/v1", "k", "own-model"),
+                "set": ModelConfig("set", "http://set.example/v1", "k", "set-model"),
+            },
+            default="gw",
+        )
+        store = ConfigStore(sqlite_backend_factory(str(tmp_db), create_tables=True))
+        session = _make_session(
+            registry=reg,
+            model_alias="gw",
+            config_store=store,
+            judge_config=JudgeConfig(),
+            workstream_judge_model="own",
+        )
+        judge = session._ensure_judge()
+        assert judge is not None and judge._lane.alias == "own"
+
+        store.set("judge.model", "set", changed_by="test")
+
+        assert session._ensure_judge() is judge
+
+    def test_clearing_the_setting_is_the_operators_choice_of_self_judging(
+        self, tmp_db: Any, sqlite_backend_factory: Any
+    ) -> None:
+        """The empty-setting hierarchy, on an open session too.  Only an operator clears it: the
+        Models tab leaves it set when the last model goes."""
+        from turnstone.core.config_store import ConfigStore
+        from turnstone.core.judge import JudgeConfig
+
+        reg = ModelRegistry(
+            models={
+                "gw": ModelConfig("gw", "http://primary.example/v1", "k", "primary-model"),
+                "set": ModelConfig("set", "http://set.example/v1", "k", "set-model"),
+            },
+            default="gw",
+        )
+        store = ConfigStore(sqlite_backend_factory(str(tmp_db), create_tables=True))
+        store.set("judge.model", "set", changed_by="test")
+        session = _make_session(
+            registry=reg,
+            model_alias="gw",
+            config_store=store,
+            judge_config=JudgeConfig(model="set"),
+        )
+        judge = session._ensure_judge()
+        assert judge is not None and judge._lane.alias == "set"
+
+        store.set("judge.model", "", changed_by="test")
+
+        judge = session._ensure_judge()
+        assert judge is not None and judge._lane.alias == "gw"
+
+    def test_a_judge_chosen_for_the_workstream_replaces_the_setting(self) -> None:
+        from turnstone.core.judge import JudgeConfig
+
+        reg = ModelRegistry(
+            models={
+                "gw": ModelConfig("gw", "http://primary.example/v1", "k", "primary-model"),
+                "set": ModelConfig("set", "http://set.example/v1", "k", "set-model"),
+                "picked": ModelConfig("picked", "http://picked.example/v1", "k", "picked-model"),
+            },
+            default="gw",
+        )
+
+        following = _make_session(
+            registry=reg, model_alias="gw", judge_config=JudgeConfig(model="set")
+        )
+        judge = following._ensure_judge()
+        assert judge is not None and judge._lane.alias == "set"
+
+        picked = _make_session(
+            registry=reg,
+            model_alias="gw",
+            judge_config=JudgeConfig(model="set"),
+            workstream_judge_model="picked",
+        )
+        judge = picked._ensure_judge()
+        assert judge is not None and judge._lane.alias == "picked"
+
     def test_explicit_intent_judge_refreshes_only_when_its_alias_changes(self) -> None:
         """Judge freshness follows its explicit alias, not registry churn.
 
@@ -3797,7 +4230,7 @@ class TestSessionRegistryGenerationPropagation:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """A guard alias reload cannot admit one request on a retired lane."""
-        import turnstone.core.output_guard_judge as guard_module
+        import turnstone.core.judge as judge_module
         from turnstone.core.judge import JudgeConfig
 
         reg = ModelRegistry(
@@ -3815,7 +4248,7 @@ class TestSessionRegistryGenerationPropagation:
         primary_binding = _binding(session)
         captured = threading.Event()
         release = threading.Event()
-        real_resolve = guard_module.resolve_model_binding
+        real_resolve = judge_module.resolve_model_binding
         guard_resolutions = 0
 
         def delayed_resolve(*args: Any, **kwargs: Any) -> Any:
@@ -3829,7 +4262,7 @@ class TestSessionRegistryGenerationPropagation:
                     assert release.wait(2.0)
             return candidate
 
-        monkeypatch.setattr(guard_module, "resolve_model_binding", delayed_resolve)
+        monkeypatch.setattr(judge_module, "resolve_model_binding", delayed_resolve)
         results: list[Any] = []
         worker = threading.Thread(
             target=lambda: results.append(session._ensure_output_guard_judge())
@@ -3855,7 +4288,8 @@ class TestSessionRegistryGenerationPropagation:
         assert guard is not None
         assert guard is session._output_guard_judge
         assert str(guard._lane.client.base_url) == "http://guard-b.example/v1/"
-        assert guard_resolutions == 2
+        # The first build, the freshness check that catches the reload, and the rebuild.
+        assert guard_resolutions == 3
 
 
 class TestSessionModelHold:
@@ -6913,3 +7347,112 @@ def test_session_built_judges_carry_the_session_usage_recorder() -> None:
     assert guard._record_usage == session._record_aux_usage
     assert intent._model == "intent-model"
     assert guard._model == "intent-model"
+
+
+class TestOfferedAliases:
+    """What a model choosing where general work runs gets to see (#1529)."""
+
+    @staticmethod
+    def _registry() -> ModelRegistry:
+        def cfg(alias: str, **kw: Any) -> ModelConfig:
+            return ModelConfig(alias, f"http://{alias}.example/v1", "k", f"{alias}-model", **kw)
+
+        return ModelRegistry(
+            models={
+                "main": cfg("main"),
+                "fast": cfg("fast"),
+                "judge": cfg("judge"),
+                "rerank": cfg("rerank", capabilities={"supports_rerank": True}),
+                "whisper": cfg("whisper", capabilities={"supports_transcription": True}),
+            },
+            default="main",
+        )
+
+    @staticmethod
+    def _store(**settings: Any) -> MagicMock:
+        values = {"model.hide_utility_aliases": True}
+        values.update({key.replace("__", "."): value for key, value in settings.items()})
+        store = MagicMock()
+        store.get.side_effect = values.get
+        return store
+
+    def test_models_that_cant_hold_a_chat_are_never_offered(self) -> None:
+        reg = self._registry()
+        assert reg.offered_aliases() == ["fast", "judge", "main"]
+        off = self._store(model__hide_utility_aliases=False)
+        assert reg.offered_aliases(off) == ["fast", "judge", "main"]
+
+    def test_an_empty_or_inherited_role_hides_nothing(self) -> None:
+        assert self._registry().offered_aliases(self._store()) == ["fast", "judge", "main"]
+
+    @pytest.mark.parametrize("role", UTILITY_ROLE_SETTINGS)
+    def test_a_utility_role_hides_its_alias(self, role: str) -> None:
+        store = self._store(**{role.replace(".", "__"): "judge"})
+        assert self._registry().offered_aliases(store) == ["fast", "main"]
+
+    def test_the_setting_turns_it_off(self) -> None:
+        store = self._store(judge__model="judge", model__hide_utility_aliases=False)
+        assert self._registry().offered_aliases(store) == ["fast", "judge", "main"]
+
+    def test_the_default_stays_whatever_else_names_it(self) -> None:
+        """Or a cluster sharing one model would have nothing left to offer."""
+        store = self._store(judge__model="judge", model__default_alias="judge")
+        assert "judge" in self._registry().offered_aliases(store)
+
+    @pytest.mark.parametrize(
+        "general",
+        ["coordinator__model_alias", "channels__default_model_alias", "model__task_alias"],
+    )
+    def test_another_general_role_doesnt_keep_a_utility_alias_on_offer(self, general: str) -> None:
+        """Those roles read their own settings, so hiding the alias costs them nothing."""
+        store = self._store(judge__model="judge", **{general: "judge"})
+        assert "judge" not in self._registry().offered_aliases(store)
+
+    def test_the_default_stays_when_only_config_toml_names_it(self) -> None:
+        # ``main`` is the registry's own default, set by no stored setting.
+        store = self._store(judge__model="main")
+        assert "main" in self._registry().offered_aliases(store)
+
+    def test_every_role_in_the_roles_tab_is_classified(self) -> None:
+        """A new role has to be sorted into utility or general here: left out of
+        ``UTILITY_ROLE_SETTINGS``, its alias would stay on offer unnoticed."""
+        from pathlib import Path
+
+        repo = Path(__file__).resolve().parent.parent
+        admin = (repo / "turnstone/console/static/admin.js").read_text(encoding="utf-8")
+        roles = admin.split("const MODEL_ROLES = [", 1)[1].split("\n];\n", 1)[0]
+        keys = set(re.findall(r'aliasKey: "([^"]+)"', roles))
+        assert keys - set(UTILITY_ROLE_SETTINGS) == {
+            "coordinator.model_alias",
+            "model.task_alias",
+            "channels.default_model_alias",
+        }
+        assert set(UTILITY_ROLE_SETTINGS) <= keys
+
+    def test_task_agent_is_not_offered_a_hidden_alias_but_can_still_name_it(
+        self, tmp_db: Any, sqlite_backend_factory: Any
+    ) -> None:
+        """Through a real store, so the setting's own default is what hides it."""
+        from turnstone.core.config_store import ConfigStore
+
+        store = ConfigStore(sqlite_backend_factory(str(tmp_db), create_tables=True))
+        store.set("judge.model", "judge", changed_by="test")
+        session = _make_session(registry=self._registry(), model_alias="main", config_store=store)
+
+        tool = next(t for t in session._tools if t["function"]["name"] == "task_agent")
+        described = tool["function"]["parameters"]["properties"]["model"]["description"]
+        assert "`fast`" in described
+        assert "`judge`" not in described
+        assert "`rerank`" not in described
+
+        alias, error = session._validate_agent_model_override(
+            "c1", "task_agent", {"model": "judge"}
+        )
+        assert (alias, error) == ("judge", None)
+        _, unknown = session._validate_agent_model_override("c1", "task_agent", {"model": "typo"})
+        assert unknown is not None
+        # It says why and lists nothing to switch to, hidden or not (#1359).
+        assert unknown["error"] == (
+            "Error: the model 'typo' is not available: no enabled model definition by that name "
+            "is loaded."
+        )

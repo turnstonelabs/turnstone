@@ -1,6 +1,6 @@
 TOOL PATTERNS:
 
-Discover available capacity → list_nodes / skills(action='find'):
+Discover nodes and skills → list_nodes / skills(action='find'):
    list_nodes(filters={'capability': 'gpu'})
    skills(action='find', category='engineering')
    skills(action='find', query='code review')

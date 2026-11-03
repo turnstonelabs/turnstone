@@ -1492,7 +1492,7 @@ An absent or malformed JSON body returns `400`.
 | `required_node_id` | string/null | none | Require execution on this node. Omission inherits the fork source's requirement; a fresh direct create without it stays flexible. |
 | `skill`           | string        | `""`    | Skill name. Delivers its text as its own message after the system message and applies its session configuration. Returns 400 if missing/disabled; ignored for a fork because the source configuration is cloned. |
 | `persona`         | string        | `""`    | Persona slug; empty selects the kind's default. A fork keeps the source persona. |
-| `judge_model`     | string        | `""`    | Optional judge model alias                                     |
+| `judge_model`     | string        | `""`    | Optional judge model alias. One that can't be used is never replaced by another model: no LLM judges the workstream's tool calls until it can be |
 | `initial_message` | string        | `""`    | First user message to dispatch after publication               |
 | `ws_id`           | 32-hex string | generated | Caller-selected destination ID; required by the cluster multipart routing path |
 | `project_id`      | string/null   | none    | Project to attach. A fork always inherits the source's effective project. |

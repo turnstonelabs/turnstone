@@ -166,36 +166,8 @@ def build_console_session_factory(
         # mcp_ref[0]: whether MCP tools actually surface is the persona's
         # call, same as interactive (#725).
         live_mcp_client = mcp_client_getter() if mcp_client_getter is not None else None
-        # NOTE: do not pre-resolve ``live_judge_config.model`` against the
-        # registry here.  ``IntentJudge.__init__`` does a richer resolution
-        # that also picks up the alias's *provider + client*; rewriting
-        # ``model`` to the underlying model id strands the alias and forces
-        # IntentJudge to fall back to the session's provider with a model
-        # name that provider may not even know about (e.g. coordinator on
-        # Anthropic, judge alias pointing at OpenAI gpt-5-mini → silent
-        # ``llm_fallback`` verdicts on every tool call).
-        if live_judge_config and judge_model:
-            import dataclasses
-
-            # Per-call judge_model override mirrors the server-side
-            # interactive factory: pin the alias on the JudgeConfig but
-            # leave alias→client/provider resolution to IntentJudge for
-            # the same reason as above.  ``registry.resolve`` is only
-            # called as a typo / unknown-alias guard so a misconfigured
-            # body field surfaces in the log instead of silently falling
-            # back to the session's provider.
-            try:
-                registry.resolve(judge_model)
-                live_judge_config = dataclasses.replace(
-                    live_judge_config,
-                    model=judge_model,
-                )
-            except Exception as e:
-                log.warning(
-                    "coord_factory.judge_model_resolve_failed alias=%r err=%s",
-                    judge_model,
-                    e,
-                )
+        # The session reads ``judge.model`` live, so ``live_judge_config.model`` never decides the
+        # judge: a per-call pick goes in ``workstream_judge_model`` below, as the alias it names.
 
         # Sampling knobs ride the shared assignment scheme (alias >
         # stored config > unset); the coordinator role setting slots in
@@ -241,6 +213,7 @@ def build_console_session_factory(
             web_search_backend=config_store.get("tools.web_search_backend"),
             skill=skill or None,
             judge_config=live_judge_config,
+            workstream_judge_model=judge_model or "",
             user_id=uid,
             config_store=config_store,
             client_type=ClientType(client_type)

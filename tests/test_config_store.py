@@ -321,6 +321,14 @@ class TestReload:
         assert "session.retention_days" in records[0].getMessage()
         assert "ninety days" not in caplog.text
 
+    def test_a_row_that_stops_decoding_keeps_the_value_that_last_loaded(self, storage, store):
+        # A failed read, not a cleared setting: open workstreams read judge.model live, and the
+        # default would move them to judging their own calls (#1529).
+        store.set("judge.model", "judge")
+        storage.upsert_system_setting(key="judge.model", value="{not json")
+        assert store.reload() is True
+        assert store.get("judge.model") == "judge"
+
     def test_a_stored_value_nested_too_deeply_to_parse_reads_as_the_default(
         self, storage, monkeypatch
     ):

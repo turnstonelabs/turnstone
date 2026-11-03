@@ -2101,6 +2101,23 @@ def test_smart_approval_clears_high_confidence_llm_approve() -> None:
     assert item["auto_approve_reason"] == "smart_approval"
 
 
+def test_smart_approval_with_no_judge_hands_the_batch_to_a_person_at_once() -> None:
+    """A judge alias that can't run builds no judge, so the batch carries no verdict and no
+    judge generation: nothing will rule on it.  Smart Approvals passes it to a person without
+    waiting out its window (#1529)."""
+    ui = _smart_ui()
+    ui.smart_approval_wait_seconds = 5.0
+    item = _pending_item("c1")
+    del item["_heuristic_verdict"]
+    started = time.monotonic()
+    with _patch_get_storage(MagicMock()):
+        remaining = ui._apply_smart_approvals([item])
+    assert remaining == [item]
+    assert item["needs_approval"] is True
+    assert "auto_approved" not in item
+    assert time.monotonic() - started < 1.0
+
+
 def test_smart_approval_clears_at_exact_threshold() -> None:
     """``confidence >= threshold`` — the boundary value auto-approves."""
     ui = _smart_ui()

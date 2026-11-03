@@ -1706,8 +1706,9 @@ def main() -> None:
         dest="judge_model",
         default="",
         help=(
-            "Model for judge (default: same as session model); the output guard's "
-            "LLM stage runs on it too unless judge.output_guard_model is set"
+            "Model alias for the judge (default: same as session model); a name that isn't "
+            "a usable alias stops the judge rather than using another model. The output "
+            "guard's LLM stage runs on it too unless judge.output_guard_model is set"
         ),
     )
     judge_group.add_argument(

@@ -8,8 +8,8 @@ invalidation event).
 The first load raises when storage can't be read, so a failed read never
 leaves a process on the registry defaults; a failed ``reload()`` keeps
 the settings that last loaded. A stored value that can't be decoded is
-logged as ``config_store.setting_invalid``, and its key reads as the
-default.
+logged as ``config_store.setting_invalid``; its key keeps the value that
+last loaded, or reads as the default when none has.
 
 Precedence chain for **server** entry point:
   CLI flag  >  ConfigStore (this)  >  registry default
@@ -113,6 +113,11 @@ class ConfigStore:
                 except (ValueError, KeyError):
                     # Key only: the error text quotes the stored value.
                     log.error("config_store.setting_invalid", key=key)
+                    # A row that stops decoding is a failed read, not a cleared setting: keep
+                    # the value that last loaded.  An open workstream reads ``judge.model``
+                    # live, so reading the default here would move it to judging itself.
+                    if key in self._cache:
+                        new_cache[key] = self._cache[key]
                     continue
                 new_cache[key] = value
                 if key not in self._clamp_warned:

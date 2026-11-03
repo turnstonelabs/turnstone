@@ -24,7 +24,7 @@
             },
             "model": {
               "type": "string",
-              "description": "Optional model alias. Discover available aliases per node via `list_nodes.model_aliases`."
+              "description": "Optional model alias. Leave this out unless the user asked for a specific model: the child then runs on the default model the operator chose. `list_nodes` shows the aliases each node offers (`model_aliases`)."
             },
             "target_node": {
               "type": "string",

@@ -726,8 +726,13 @@ class TestTaskExec:
         )
         assert "spare" not in item["error"] and "model=" not in item["error"]
 
-    def test_a_store_outage_suggests_trying_again(self, tmp_db) -> None:
-        session = _make_session()
+    def test_a_store_outage_suggests_trying_again(self, tmp_db, sqlite_backend_factory) -> None:
+        # A host with a settings store reloads its models on a timer, so the alias can load
+        # by itself once the store answers.
+        from turnstone.core.config_store import ConfigStore
+
+        storage = sqlite_backend_factory(str(tmp_db), create_tables=True)
+        session = _make_session(config_store=ConfigStore(storage))
         session._registry = self._routing_registry(
             task_model="gone",
             skipped_aliases={"gone": "secret://vault/llm: store unreachable"},
@@ -738,6 +743,20 @@ class TestTaskExec:
             "Error: the task model 'gone' is not available: the secret store holding "
             "its API key can't be reached. Try the task again shortly."
         )
+
+    def test_a_store_outage_on_the_cli_says_a_restart_loads_it(self, tmp_db) -> None:
+        """The CLI reads its models once, so trying again soon can't help (#1529)."""
+        session = _make_session()
+        session._registry = self._routing_registry(
+            task_model="gone",
+            skipped_aliases={"gone": "secret://vault/llm: store unreachable"},
+            retryable_skips={"gone"},
+        )
+        error = session._prepare_task("c1", {"prompt": "do x"})["error"]
+        assert error.endswith(
+            "can't be reached. It can load once the store answers and this program restarts."
+        )
+        assert "again shortly" not in error
 
     def test_a_skipped_definition_keeps_its_reason_out(self, tmp_db) -> None:
         # The loader's reason names secret paths and mounts: admins read it in
@@ -3438,7 +3457,7 @@ class TestAgentModelOverride:
         item = session._prepare_task("c1", {"prompt": "do x", "model": "bogus"})
         assert item.get("needs_approval") is False
         assert "error" in item
-        assert "unknown model alias 'bogus'" in item["error"]
+        assert "the model 'bogus' is not available" in item["error"]
         assert "default" not in item["error"]
 
     def test_prepare_task_default_model_rejected(self, tmp_db) -> None:
@@ -4539,8 +4558,9 @@ class TestLiveConfigUpdate:
         ) == (True, 0.4, 5)
         assert version == 7
 
-    def test_judge_client_config_stays_frozen(self, tmp_db, sqlite_backend_factory):
-        """LLM client fields (model, provider) are frozen from creation time."""
+    def test_a_judge_model_edit_reaches_an_open_session(self, tmp_db, sqlite_backend_factory):
+        """Frozen, a swap of the judge's model would leave every open workstream refusing on the
+        alias the operator just replaced, or judging itself after a first-time set (#1529)."""
         from turnstone.core.config_store import ConfigStore
         from turnstone.core.judge import JudgeConfig
 
@@ -4551,9 +4571,36 @@ class TestLiveConfigUpdate:
             config_store=cs,
         )
 
-        # Change the model in ConfigStore — should NOT affect the session
         cs.set("judge.model", "new-model", changed_by="test")
-        assert session._judge_cfg.model == "original-model"
+
+        assert session._judge_cfg.model == "new-model"
+        assert session._stable_judge_cfg()[0].model == "new-model"
+
+    def test_a_judge_chosen_for_the_workstream_outlasts_a_setting_edit(
+        self, tmp_db, sqlite_backend_factory
+    ):
+        from turnstone.core.config_store import ConfigStore
+        from turnstone.core.judge import JudgeConfig
+
+        storage = sqlite_backend_factory(str(tmp_db), create_tables=True)
+        cs = ConfigStore(storage)
+        session = _make_session(
+            judge_config=JudgeConfig(model="configured"),
+            config_store=cs,
+            workstream_judge_model="chosen",
+        )
+
+        cs.set("judge.model", "new-model", changed_by="test")
+
+        assert session._judge_cfg.model == "chosen"
+
+    def test_without_a_store_the_judge_model_is_the_one_it_was_given(self):
+        """The CLI's ``--judge-model``: nothing live to read."""
+        from turnstone.core.judge import JudgeConfig
+
+        session = _make_session(judge_config=JudgeConfig(model="flag-model"))
+
+        assert session._judge_cfg.model == "flag-model"
 
     def test_judge_disable_after_init_stops_future_use(self, tmp_db, sqlite_backend_factory):
         """Disabling judge.enabled after IntentJudge is created returns None."""

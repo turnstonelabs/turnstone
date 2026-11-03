@@ -28,7 +28,6 @@ from turnstone.core.deadline import (
 )
 from turnstone.core.log import get_logger
 from turnstone.core.model_backend_auth import BackendAuthUnavailableError
-from turnstone.core.model_registry import ModelClientConstructionError
 from turnstone.core.model_turn import (
     ModelLane,
     ResolvedModelBinding,
@@ -1033,7 +1032,7 @@ def _judge_binding_from_session(
     session_binding: ResolvedModelBinding,
     config_store: Any | None,
 ) -> ResolvedModelBinding:
-    """Build the session-model fallback lane with judge sampling semantics.
+    """Build the lane of a judge with no alias of its own, with judge sampling semantics.
 
     Before judges held a frozen :class:`ResolvedModelBinding`, every
     evaluation called :func:`resolve_lane`: provider/client/model and
@@ -1056,6 +1055,51 @@ def _judge_binding_from_session(
     return replace(session_binding, lane=judge_lane)
 
 
+class JudgeModelUnavailableError(Exception):
+    """A judge alias set in settings can't be bound, so no judge is built.
+
+    The alias is never replaced by another model (#1529).
+    """
+
+
+def judge_alias(config: JudgeConfig) -> str:
+    """The alias the intent judge asks for, ``""`` for the session's own model.
+
+    ``judge.model``, or a workstream's own pick.  Construction, the freshness check and the
+    session's record of a refusal all read it here, so none can name an alias another didn't try.
+    """
+    return str(config.model or "").strip()
+
+
+def resolve_judge_binding(
+    alias: str,
+    session_binding: ResolvedModelBinding,
+    config_store: Any | None,
+) -> ResolvedModelBinding:
+    """The binding of a judge asked for *alias*, read by construction and freshness alike.
+
+    The caller picks *alias* from settings alone, never from what is loaded.  Empty means the
+    session's own model judges.  A set alias binds, or this raises and no judge is built: it is
+    never replaced by another model (#1529).
+    """
+    if not alias:
+        return _judge_binding_from_session(session_binding, config_store)
+    registry = session_binding.lane.registry
+    if registry is None:
+        raise JudgeModelUnavailableError(f"judge model {alias!r} has no model registry")
+    try:
+        return resolve_model_binding(
+            registry,
+            alias,
+            config_store=config_store,
+            backend_auth_resolver=session_binding.lane.backend_auth_resolver,
+        )
+    except (ValueError, KeyError) as exc:
+        # ``UnknownModelAliasError`` and ``ModelClientConstructionError`` are both
+        # ValueErrors; anything else is a bug and propagates as itself.
+        raise JudgeModelUnavailableError(f"judge model {alias!r}: {exc}") from exc
+
+
 @dataclass
 class _JudgeBindingState:
     """Pinned judge binding plus mutable no-op generation stamps.
@@ -1068,7 +1112,6 @@ class _JudgeBindingState:
 
     binding: ResolvedModelBinding
     requested_alias: str
-    resolved_explicitly: bool
     config_store: Any | None
     checked_registry_generation: int
     checked_config_version: int | None
@@ -1082,10 +1125,10 @@ class _JudgeBindingState:
         """Return whether constructing now would select this same binding.
 
         Explicit judge aliases are checked independently of the primary session
-        alias.  An inherited/failed-alias judge instead follows the supplied
-        session binding.  A generation-only unrelated edit advances only the
-        watermark; a changed effective binding returns ``False`` so the session
-        can replace the whole judge between evaluations.
+        alias.  An inherited judge instead follows the supplied session binding.
+        A generation-only unrelated edit advances only the watermark; a changed
+        effective binding, or an alias that no longer binds, returns ``False`` so
+        the session can replace the whole judge between evaluations.
         """
         desired = self.requested_alias if requested_alias is None else requested_alias.strip()
         if desired != self.requested_alias:
@@ -1112,34 +1155,19 @@ class _JudgeBindingState:
         # temperature/effort updates do not reload the model registry.
         generation_changed = current_generation != self.checked_registry_generation
         config_changed = current_config_version != self.checked_config_version
-        if self.resolved_explicitly and not generation_changed and not config_changed:
+        if desired and not generation_changed and not config_changed:
             return True
 
-        candidate = _judge_binding_from_session(session_binding, self.config_store)
-        resolved_explicitly = False
-        if registry is not None and desired and (self.resolved_explicitly or generation_changed):
-            try:
-                candidate = resolve_model_binding(
-                    registry,
-                    desired,
-                    config_store=self.config_store,
-                    backend_auth_resolver=session_binding.lane.backend_auth_resolver,
-                )
-                resolved_explicitly = True
-            except (ModelClientConstructionError, ValueError, KeyError):
-                # Reconstructing at this generation would take the documented
-                # session-model fallback.  Compare that outcome below.
-                candidate = _judge_binding_from_session(session_binding, self.config_store)
-            except Exception:
-                log.debug("judge.binding_refresh_failed", exc_info=True)
-                return False
-
-        if resolved_explicitly != self.resolved_explicitly:
+        try:
+            candidate = resolve_judge_binding(desired, session_binding, self.config_store)
+        except Exception:
+            log.debug("judge.binding_refresh_failed", exc_info=True)
             return False
+
         if not _model_bindings_match(self.binding, candidate):
             return False
 
-        # Stamp the registry generation actually observed, not the fallback
+        # Stamp the registry generation actually observed, not an inherited
         # candidate's session-binding stamp: an unrelated reload can leave the
         # effective primary binding unchanged while its caller-supplied stamp
         # still names the previous generation.  Re-read before committing so a
@@ -1324,69 +1352,16 @@ class IntentJudge:
             session_caps.context_window,
         )
 
-        # Resolve judge model via ModelRegistry alias, otherwise self-
-        # consistency on the session model.  ``judge.model`` is alias-only
-        # — same contract as ``coordinator.model_alias`` /
-        # ``model.task_alias``.  A non-alias value
-        # used to be accepted as a raw model id pinned onto the session
-        # provider, but that path silently broke whenever the session
-        # provider didn't speak that model id (e.g. coordinator on
-        # Anthropic, ``judge.model = "gpt-5-mini"`` → every judge call
-        # returned ``llm_fallback``).  Operators register an alias
-        # instead; an unknown value here logs a warning and inherits the
-        # session model.
-        requested_alias = str(config.model or "").strip()
-        registry = session_binding.lane.registry
+        # ``judge.model`` names a registry alias, the same contract as
+        # ``coordinator.model_alias`` and ``model.task_alias``; empty means the session's own
+        # model judges its calls (self-consistency).
+        requested_alias = judge_alias(config)
         config_version_at_start = _config_store_version(config_store)
-        binding = _judge_binding_from_session(session_binding, config_store)
-        resolved = False
-        construction_error: ModelClientConstructionError | None = None
-        if requested_alias and registry is not None:
-            try:
-                # One locked registry snapshot builds provider, client, model,
-                # capabilities, extra params, and sampling facets from the SAME
-                # ModelConfig.  No second config read can mix generations.
-                binding = resolve_model_binding(
-                    registry,
-                    requested_alias,
-                    config_store=config_store,
-                    backend_auth_resolver=session_binding.lane.backend_auth_resolver,
-                )
-                resolved = True
-            except ModelClientConstructionError as exc:
-                construction_error = exc
-            except (ValueError, KeyError):
-                pass
-            except Exception:
-                log.debug("Model alias resolution failed for %r, falling back", requested_alias)
-
-        if not resolved:
-            if construction_error is not None:
-                # The alias IS registered; its binding could not be built.
-                # Same session-model fallback, but name the construction
-                # cause — the register-the-alias advice below would
-                # misdiagnose a row that is already registered.
-                log.warning(
-                    "judge.model=%r is registered but its client could not be "
-                    "constructed (%s) — falling back to session model %r.",
-                    requested_alias,
-                    construction_error,
-                    session_binding.lane.model,
-                )
-            elif requested_alias:
-                log.warning(
-                    "judge.model=%r is not a registered alias — falling back to "
-                    "session model %r.  Register the model in the Models tab and "
-                    "set judge.model to its alias.",
-                    requested_alias,
-                    session_binding.lane.model,
-                )
-            binding = _judge_binding_from_session(session_binding, config_store)
+        binding = resolve_judge_binding(requested_alias, session_binding, config_store)
 
         self._binding_state = _JudgeBindingState(
             binding=binding,
             requested_alias=requested_alias,
-            resolved_explicitly=resolved,
             config_store=config_store,
             checked_registry_generation=binding.registry_generation,
             checked_config_version=config_version_at_start,
@@ -1410,7 +1385,7 @@ class IntentJudge:
     def _fingerprint_config(config: JudgeConfig) -> tuple[str, float, float, int, bool]:
         """Constructor-consumed behavior that requires a fresh judge object."""
         return (
-            str(config.model or "").strip(),
+            judge_alias(config),
             config.max_context_ratio,
             config.timeout,
             config.parallel_evaluations,

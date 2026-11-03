@@ -184,8 +184,7 @@ def _get_config_or_none(registry: ModelRegistry | None, alias: str) -> Any | Non
     A miss (alias deleted or registry hot-reloaded mid-lookup) degrades to
     ``None`` — resolution paths must never crash a caller's construction:
     pre-extraction, a judge constructor read caps off the already-fetched
-    ModelConfig and could not fail here, and a raise would silently
-    downgrade the judge to the session model.
+    ModelConfig and could not fail here, and a raise would stop that judge.
     """
     if not registry or not alias:
         return None

@@ -2136,9 +2136,10 @@ class CoordinatorClient:
                     "source": str(r.get("source", "")),
                 }
             # Project ``metadata.models`` (a list of
-            # ``{alias, provider, healthy}`` written by the node's
+            # ``{alias, provider, healthy, offered}`` written by the node's
             # heartbeat loop — see ``_collect_node_models_metadata``
-            # in ``turnstone/server.py``) down to the healthy-alias
+            # in ``turnstone/server.py``) down to the rows offered to a
+            # coordinator, and those down to the healthy-alias
             # shortlist the coordinator passes back as ``model=`` to
             # ``spawn_workstream`` / ``spawn_batch``.  The top-level
             # field is named ``model_aliases`` (not ``models``) so it
@@ -2152,9 +2153,13 @@ class CoordinatorClient:
             models_entry = meta.get("models", {}).get("value")
             healthy_aliases: list[str] = []
             if isinstance(models_entry, list):
-                for row in models_entry:
-                    if not isinstance(row, dict):
-                        continue
+                offered_rows = [
+                    {k: v for k, v in row.items() if k != "offered"}
+                    for row in models_entry
+                    if isinstance(row, dict) and row.get("offered", True)
+                ]
+                meta["models"]["value"] = offered_rows
+                for row in offered_rows:
                     if not row.get("healthy", False):
                         continue
                     alias = row.get("alias")
