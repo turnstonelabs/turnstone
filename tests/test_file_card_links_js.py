@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from tests._js_harness_helpers import FAKE_DOM, node_skip, run_node_source
+from tests._js_harness_helpers import FAKE_DOM, PANE_DOM, node_skip, run_node_source
 
 _SHARED = Path(__file__).resolve().parents[1] / "turnstone/shared_static"
 pytestmark = node_skip
@@ -16,66 +16,9 @@ pytestmark = node_skip
 def _run(scenario: str) -> None:
     source = (
         FAKE_DOM
+        + PANE_DOM
         + r"""
-const assert = (condition, message) => { if (!condition) throw Error(message); };
-const create = document.createElement;
-document.createElement = tag => { const el = create(tag); el.style = {}; return el; };
-document.body = html;
-document.addEventListener = document.removeEventListener = () => {};
-document.querySelector = selector => html.querySelector(selector);
-document.getElementById = id => html.querySelector('#' + id);
-window.matchMedia = () => ({matches: false, addEventListener() {}});
-window.removeEventListener = () => {};
-window.setTimeout = globalThis.setTimeout = () => 0;
-window.clearTimeout = globalThis.clearTimeout = () => {};
-globalThis.setInterval = () => 0;
-globalThis.clearInterval = globalThis.cancelAnimationFrame = () => {};
-globalThis.BroadcastChannel = class {postMessage() {} addEventListener() {} close() {}};
-globalThis.CSS = {escape: value => value};
-const permissions = new Map([
-  ['turnstone_scopes', 'read,write'], ['turnstone_permissions', 'files.read'],
-]);
-globalThis.sessionStorage = {getItem: key => permissions.get(key) || null};
-const matches = FakeElement.prototype._matches;
-FakeElement.prototype._matches = function(selector) {
-  return selector.startsWith('#')
-    ? (this.id || this.getAttribute('id')) === selector.slice(1)
-    : matches.call(this, selector);
-};
-FakeElement.prototype.after = function(node) {
-  const parent = this.parentNode;
-  if (!parent || node === this) return;
-  if (node.parentNode) node.remove();
-  parent.children.splice(parent.children.indexOf(this) + 1, 0, node);
-  node.parentNode = parent;
-  node._setConnected(parent.isConnected);
-};
-FakeElement.prototype.insertBefore = function(node, before) {
-  if (!before) return this.appendChild(node);
-  if (node === before) return node;
-  if (node.parentNode) node.remove();
-  this.children.splice(this.children.indexOf(before), 0, node);
-  node.parentNode = this;
-  node._setConnected(this.isConnected);
-  return node;
-};
-Object.defineProperty(FakeElement.prototype, 'nextElementSibling', {get() {
-  return this.parentNode
-    ? this.parentNode.children[this.parentNode.children.indexOf(this) + 1] || null : null;
-}});
-Object.defineProperty(FakeElement.prototype, 'firstElementChild', {get() {return this.children[0] || null;}});
-Object.defineProperty(FakeElement.prototype, 'lastElementChild', {get() {return this.children.at(-1) || null;}});
-Object.defineProperty(FakeElement.prototype, 'innerHTML', {
-  get() {return this._html ?? this.textContent.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');},
-  set(value) {this.replaceChildren(); this._html = value;},
-});
-document.createDocumentFragment = () => document.createElement('fragment');
-document.createTextNode = text => {
-  const node = document.createElement('text'); node.textContent = String(text); return node;
-};
-globalThis.DOMParser = class {parseFromString(text) {
-  return {body: {childNodes: [document.createTextNode(text)]}};
-}};
+permissions.set('turnstone_permissions', 'files.read');
 """
         + f"const {{InteractivePane}} = await import({json.dumps((_SHARED / 'interactive.js').as_uri())});\n"
         + r"""

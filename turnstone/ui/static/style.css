@@ -775,7 +775,6 @@ body {
   white-space: pre-wrap;
   font-size: 12px;
   color: var(--fg-dim);
-  max-height: 300px;
   overflow-y: auto;
 }
 .tool-output-error {
@@ -1309,10 +1308,6 @@ audio.media-player {
   }
   .dash-row-sub {
     padding-left: 66px;
-  }
-  .tool-output,
-  .tool-output-stream {
-    max-height: 200px;
   }
 }
 

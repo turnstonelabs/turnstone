@@ -28,8 +28,10 @@
 // ---------------------------------------------------------------------------
 // PEM private key blocks (multiline, whole-block replacement)
 // ---------------------------------------------------------------------------
+// The body stops where another block could start: scanning on to the next END
+// made every BEGIN in text with no END rescan the rest of it (quadratic).
 const _RE_PRIVATE_KEY_BLOCK =
-  /-----BEGIN\s+(?:RSA\s+|EC\s+|OPENSSH\s+|PGP\s+)?PRIVATE\s+KEY-----[\s\S]*?-----END\s+(?:RSA\s+|EC\s+|OPENSSH\s+|PGP\s+)?PRIVATE\s+KEY-----/g;
+  /-----BEGIN\s+(?:RSA\s+|EC\s+|OPENSSH\s+|PGP\s+)?PRIVATE\s+KEY-----(?:(?!-----BEGIN)[\s\S])*?-----END\s+(?:RSA\s+|EC\s+|OPENSSH\s+|PGP\s+)?PRIVATE\s+KEY-----/g;
 
 // ---------------------------------------------------------------------------
 // Connection strings — preserves protocol + user, redacts only the password
@@ -164,7 +166,12 @@ const _RE_JSON_SECRET_SQ =
 //   DATABASE_URL=postgres://…   →   DATABASE_URL=[REDACTED:secret]
 //   FOO=bar                     →   not redacted (no secret-bearing key name)
 // ---------------------------------------------------------------------------
-const _RE_ENV_SECRET_LINE = /[A-Z][A-Z_0-9]+=\S+/g;
+// A match takes a whole run of key characters at once, never one starting
+// inside another: from every letter of a long run with no "=" after it, a
+// per-letter match rescanned the rest of the run (quadratic).  A run may start
+// with "_" or digits, which the key test skips, so my_TOKEN= and 9KEY= match
+// as they did.
+const _RE_ENV_SECRET_LINE = /(?<![A-Z_0-9])(?=([_0-9]*[A-Z][A-Z_0-9]+))\1=\S+/g;
 const _RE_ENV_SECRET_KEY =
   /(?:^|_)(?:SECRET|TOKEN|PASSWORD|CREDENTIAL|DSN)(?:_|$)|(?:^|_)KEY(?:_|$)|^(?:DATABASE_URL|TURNSTONE_DB_URL|DB_URL)$/i;
 
@@ -172,7 +179,7 @@ function _redactEnvLine(match) {
   const eqIdx = match.indexOf("=");
   if (eqIdx < 0) return match;
   const key = match.slice(0, eqIdx);
-  if (_RE_ENV_SECRET_KEY.test(key)) {
+  if (_RE_ENV_SECRET_KEY.test(key.replace(/^[_0-9]+/, ""))) {
     return key + "=[REDACTED:secret]";
   }
   return match;
@@ -255,6 +262,32 @@ export function redactCredentials(text) {
   result = result.replace(_RE_ENV_SECRET_LINE, _redactEnvLine);
 
   return result;
+}
+
+/**
+ * Redact a value already decoded from JSON by the rules keyed on its name
+ * (5 and 6 above), as they redact it written as "key": "value".  For a
+ * renderer that shows a parsed object's values one at a time, so that no rule
+ * runs over text spanning two values.
+ *
+ * @param {string} key - The name the value is under
+ * @param {string} value - The decoded value
+ * @returns {string} The value, or what the name rules make of it
+ */
+export function redactNamedValue(key, value) {
+  const pair = JSON.stringify({ [String(key)]: String(value) });
+  let result = pair.replace(_RE_JSON_STYLE_CRED, "$1***$3");
+  result = result.replace(_RE_JSON_SECRET_DQ, '$1[REDACTED:secret]"');
+  if (result === pair) return value;
+  try {
+    const decoded = Object.values(JSON.parse(result));
+    if (decoded.length === 1 && typeof decoded[0] === "string") {
+      return decoded[0];
+    }
+  } catch (_e) {
+    // A rule ended the value short of its closing quote: keep none of it.
+  }
+  return "[REDACTED:secret]";
 }
 
 // Pretty-print JSON WITH redaction — the sanctioned way to render a raw

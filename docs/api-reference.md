@@ -667,7 +667,7 @@ Each item in `items` (shared by `tool_info` and `approve_request`):
 | `approval_label` | string      | Display label for the approval prompt            |
 | `needs_approval` | bool        | Whether this call requires explicit approval     |
 | `error`          | string/null | Error description if the call was malformed      |
-| `arguments`      | string      | The call's arguments exactly as the model wrote them (usually JSON, possibly malformed); the same text `/history` returns for the call. `header` and `preview` shorten long values. Not on the node's cluster-wide `approve_request` |
+| `arguments`      | string      | The call's arguments exactly as the model wrote them (usually JSON, possibly malformed); the same text `/history` returns for the call. `header` and `preview` shorten long values. Not on the node's cluster-wide `approve_request`, where a verdict's `func_args` still carries the arguments cut at 16 KiB |
 
 **`tool_output_chunk`** -- incremental streaming output from a bash tool execution. Sent line-by-line as stdout is produced. The `call_id` identifies the specific tool invocation (multiple bash tools may run in parallel).
 

@@ -34,7 +34,8 @@ import {
   attachConvFullCall,
   captureConvFullCalls,
   restoreConvFullCalls,
-  closeOpenConvDetail,
+  convKeyBelongsToControl,
+  convReaderHoldsFocus,
   buildConvResultExpand,
   buildConvVerdict,
   buildConvWarning,
@@ -1225,16 +1226,10 @@ class Pane {
       if (e.target === this._sbApproval) return;
       if (e.target === this._sbFiles) return;
       if (e.target.closest(".conv-content-chip")) return;
-      // A focused button or link takes its own Enter: on Deny it denies, and on
-      // "full call" or "show all" it opens that, never approving the call.
-      // Letters and Escape still reach the shortcuts below.
-      if (e.key === "Enter" && e.target.closest("button, a[href]")) return;
-      // Escape on a full call or result someone opened closes it; a second
-      // Escape denies as before.
-      if (e.key === "Escape" && closeOpenConvDetail(e.target)) {
-        e.preventDefault();
-        return;
-      }
+      // Enter on a focused control runs that control (on Deny it denies), and
+      // Escape on a full call or "show all" does nothing: neither approves or
+      // denies from there.  Letters still reach the shortcuts below.
+      if (convKeyBelongsToControl(e.key, e.target)) return;
       // Keyboard acts on the OLDEST live cycle (the one approvalBlockEl
       // tracks); sibling cards from parallel task agents resolve by
       // their own buttons or become oldest in turn.  When the feedback
@@ -4309,6 +4304,10 @@ class Pane {
     const announced = this._takeAnnouncedBlock(items);
     const block = announced || document.createElement("div");
     const openFullCalls = announced ? captureConvFullCalls(announced) : null;
+    // Focus inside the shell is lost when it is emptied: whoever had it is
+    // reading the call, so the feedback field must not take it below.
+    const readerInShell =
+      !!announced && announced.contains(document.activeElement);
     if (announced) {
       announced.replaceChildren();
       delete announced.dataset.resultsSettled;
@@ -4402,12 +4401,19 @@ class Pane {
     if (!autoApproved) {
       this._registerApprovalCycle(cycleId, [block], items);
       const fb = block.querySelector(".conv-feedback");
+      const actions = block.querySelector(".conv-actions");
       // Focus the feedback field only for the FIRST (oldest) live cycle —
       // a sibling card arriving while the user is typing into another
-      // cycle's field must not steal focus mid-word.
-      if (this._oldestCycleId() === cycleId) {
+      // cycle's field must not steal focus mid-word.  Nor from someone
+      // reading: focus on anything else in the transcript (a "full call",
+      // a "show all") stays put, or their next Enter or Escape would decide
+      // this call; and a pane scrolled back to read is not pulled down to it.
+      // The status-bar chip brings the card up for them.
+      if (this._oldestCycleId() === cycleId && !readerInShell) {
         requestAnimationFrame(() => {
-          if (fb) fb.focus();
+          if (!fb || !this.isNearBottom()) return;
+          if (convReaderHoldsFocus(this.messagesEl, actions)) return;
+          fb.focus();
         });
       }
     }
@@ -5911,15 +5917,15 @@ function appendToolErrorBadge(blockEl) {
   blockEl.appendChild(errBadge);
 }
 
-// An output box with its "show all" control when it may be longer than the
-// box (the control shows once a measurement says it is); past `boxLines` hard
-// lines it starts folded to a short preview (0: any output does).  Box and
+// An output box with its "show all" control when the output runs past
+// `foldLines` lines (a long line counting as several): it starts folded to a
+// short preview (0: any output does).  Shorter output shows whole.  Box and
 // control travel as one node (.conv-result-wrap), since results are inserted
 // and replaced whole.
-function withResultExpand(out, boxLines) {
+function withResultExpand(out, foldLines) {
   const expand = buildConvResultExpand(out, {
     text: out.textContent,
-    boxLines,
+    boxLines: foldLines,
     fold: true,
   });
   if (!expand) return out;
@@ -5957,8 +5963,8 @@ function renderToolOutput(stripped, isError) {
   return out;
 }
 
-// Shared recipe: render tool output and fold it past 10 lines (or past a
-// box's worth of long lines) behind "show all".  The one source for the live
+// Shared recipe: render tool output and fold it past 10 lines (a long line
+// counting as several) behind "show all".  The one source for the live
 // appendToolOutput's plain-output path, the /history tool-result replay, and
 // the task-agent card recall — so the threshold can't drift between them.
 function renderCollapsibleOutput(stripped, isError) {

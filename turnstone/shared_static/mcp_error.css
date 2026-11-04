@@ -123,9 +123,10 @@
 /* The card's raw-payload <pre> carries className "tool-output" so it
    matches the hosts' generic tool-output look — but pages without those
    generic rules (the standalone coordinator page) must not render it
-   bare.  This rule carries ONLY the box properties the generic
-   .tool-output rules supply (interactive.css:122 padding/max-height/
-   overflow; :330 panel surface/border/radius): the typography properties
+   bare.  This rule carries ONLY box properties: the padding, overflow and
+   panel surface/border/radius the generic .tool-output rules supply
+   (interactive.css), and a 300px cap of its own, since the payload sits
+   behind its own disclosure with no "show all": the typography properties
    (font, size, color, wrap) stay with `.mcp-error-card details pre`
    above, which out-specifies the generic rules today — carrying them
    here too would flip that contest on interactive hosts and shift
