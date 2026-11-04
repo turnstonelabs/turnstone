@@ -186,6 +186,25 @@ class _ListenerQueue(queue.Queue[dict[str, Any]]):
 # recalls honestly as "not retained" rather than a fabricated 0-step card.
 _AGENT_TRAJECTORY_CAP = 256
 
+# ... and by size.  A step keeps its call's arguments whole, so a rebuilt card
+# can show the full call, which leaves only the store's total to bound: the
+# UTF-8 text of every retained step, which is also what /history sends.  Past
+# the budget the oldest agents go first; one larger than the whole budget is
+# not retained.
+_AGENT_TRAJECTORY_BUDGET_BYTES = 16 * 1024 * 1024
+
+
+def _trajectory_bytes(steps: list[dict[str, Any]]) -> int:
+    """The UTF-8 size of a projected sub-trajectory's text."""
+    return sum(
+        len(value.encode("utf-8", "surrogatepass"))
+        for step in steps
+        if isinstance(step, dict)
+        for value in step.values()
+        if isinstance(value, str)
+    )
+
+
 # How many resolved-cycle decisions to remember (call_id → decision) so a
 # late LLM verdict — the run-to-completion judge can deliver seconds after
 # its gate resolved — still lands with the decision the operator actually
@@ -615,6 +634,10 @@ class SessionUIBase:
         self._agent_trajectories: collections.OrderedDict[str, list[dict[str, Any]]] = (
             collections.OrderedDict()
         )
+        # Each retained entry's size and their total, against
+        # ``_AGENT_TRAJECTORY_BUDGET_BYTES``.  Same lock.
+        self._agent_trajectory_sizes: dict[str, int] = {}
+        self._agent_trajectory_bytes = 0
         # (Sub-agent ``on_info`` suppression is per-thread via the module-level
         # ``_agent_scope_var`` contextvar — no instance field.)
         # Approval blocking — each gate thread (main loop, or a parallel
@@ -1403,16 +1426,30 @@ class SessionUIBase:
     def stash_agent_trajectory(self, call_id: str, steps: list[dict[str, Any]]) -> None:
         """Retain a finished task agent's projected sub-trajectory (step items)
         keyed by its call_id so ``/history`` can rebuild the card on a fresh
-        connect / reopen while the workstream is in memory.  LRU-bounded; the
-        newest write is most-recently-used, oldest evicted past the cap.  See
-        :data:`_AGENT_TRAJECTORY_CAP` and the field comment in ``__init__``."""
+        connect / reopen while the workstream is in memory.  LRU-bounded by
+        count and by size; the newest write is most-recently-used, oldest
+        evicted past either cap, and one larger than the whole size budget
+        replaces nothing and is not retained.  See :data:`_AGENT_TRAJECTORY_CAP`,
+        :data:`_AGENT_TRAJECTORY_BUDGET_BYTES` and the field comment in
+        ``__init__``."""
         if not call_id:
             return
+        size = _trajectory_bytes(steps)
         with self._agent_children_lock:
+            if call_id in self._agent_trajectories:
+                del self._agent_trajectories[call_id]
+                self._agent_trajectory_bytes -= self._agent_trajectory_sizes.pop(call_id, 0)
+            if size > _AGENT_TRAJECTORY_BUDGET_BYTES:
+                return
             self._agent_trajectories[call_id] = steps
-            self._agent_trajectories.move_to_end(call_id)
-            while len(self._agent_trajectories) > _AGENT_TRAJECTORY_CAP:
-                self._agent_trajectories.popitem(last=False)
+            self._agent_trajectory_sizes[call_id] = size
+            self._agent_trajectory_bytes += size
+            while (
+                len(self._agent_trajectories) > _AGENT_TRAJECTORY_CAP
+                or self._agent_trajectory_bytes > _AGENT_TRAJECTORY_BUDGET_BYTES
+            ):
+                evicted, _ = self._agent_trajectories.popitem(last=False)
+                self._agent_trajectory_bytes -= self._agent_trajectory_sizes.pop(evicted, 0)
 
     def get_agent_trajectory(self, call_id: str) -> list[dict[str, Any]] | None:
         """Read a stashed sub-trajectory, or ``None`` if not retained (evicted,
@@ -2671,7 +2708,7 @@ class SessionUIBase:
                 cycle_registered = True
             self._broadcast_activity()
             self._enqueue(card)
-            self._broadcast_approve_request(card)
+            self._broadcast_approve_request(self._without_tool_arguments(card))
             self._replay_pending_verdicts(items)
             prompt_published = True
 
@@ -3573,6 +3610,12 @@ class SessionUIBase:
         fix this method emitted ``verdict`` while the dashboard
         payload used ``heuristic_verdict``, leaving JS consumers
         with two code paths for the same field.
+
+        ``arguments`` is the call's arguments as the model wrote them, the
+        same text ``/history`` serves for the stored call, so a client can
+        show the whole call where ``header`` and ``preview`` shorten it. It
+        stays on this workstream's own events: the copy for the console's
+        cluster-wide channel drops it (:meth:`_without_tool_arguments`).
         """
         out: list[dict[str, Any]] = []
         for it in items:
@@ -3586,6 +3629,9 @@ class SessionUIBase:
                 "needs_approval": it.get("needs_approval", False),
                 "error": it.get("denial_msg") if denied else it.get("error"),
             }
+            arguments = it.get("_raw_arguments")
+            if isinstance(arguments, str):
+                entry["arguments"] = arguments
             if "_heuristic_verdict" in it:
                 entry["heuristic_verdict"] = it["_heuristic_verdict"]
             if it.get("func_name") in ("write_file", "edit_file"):
@@ -3604,6 +3650,22 @@ class SessionUIBase:
                 entry["auto_approve_reason"] = it.get("auto_approve_reason", "")
             out.append(entry)
         return out
+
+    @staticmethod
+    def _without_tool_arguments(card: dict[str, Any]) -> dict[str, Any]:
+        """Copy an ``approve_request`` card with each item's ``arguments`` left out.
+
+        The console relays its cluster-wide channel beyond this workstream's own
+        readers, so that copy keeps only the ``header`` and ``preview`` summary
+        every item already carried before full arguments were sent.
+        """
+        return {
+            **card,
+            "items": [
+                {key: value for key, value in item.items() if key != "arguments"}
+                for item in card.get("items") or []
+            ],
+        }
 
     def _tag_auto_approved(
         self,

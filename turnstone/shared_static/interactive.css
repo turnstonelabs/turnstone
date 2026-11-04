@@ -137,8 +137,14 @@
   overflow: hidden;
 }
 
+/* Showing all of a long result (data-expanded, from its "show all"). */
+.tool-output[data-expanded="true"] {
+  max-height: none;
+}
+
+/* The fold's fade; the "show all" control under the box names the action. */
 .tool-output.collapsed::after {
-  content: "click to expand";
+  content: "";
   position: absolute;
   bottom: 0;
   left: 0;

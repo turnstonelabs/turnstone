@@ -31,6 +31,11 @@ import {
   buildConvBatchDisclosure,
   buildConvRow,
   buildConvCmd,
+  attachConvFullCall,
+  captureConvFullCalls,
+  restoreConvFullCalls,
+  closeOpenConvDetail,
+  buildConvResultExpand,
   buildConvVerdict,
   buildConvWarning,
   buildConvActions,
@@ -1047,7 +1052,11 @@ class Pane {
       judge_model: evt.judge_model,
     });
     const nextEl = toolDiv.nextElementSibling;
-    if (nextEl && nextEl.classList.contains("tool-output")) {
+    if (
+      nextEl &&
+      (nextEl.classList.contains("tool-output") ||
+        nextEl.classList.contains("conv-result-wrap"))
+    ) {
       nextEl.insertAdjacentElement("afterend", warning);
     } else {
       toolDiv.insertAdjacentElement("afterend", warning);
@@ -1216,6 +1225,16 @@ class Pane {
       if (e.target === this._sbApproval) return;
       if (e.target === this._sbFiles) return;
       if (e.target.closest(".conv-content-chip")) return;
+      // A focused button or link takes its own Enter: on Deny it denies, and on
+      // "full call" or "show all" it opens that, never approving the call.
+      // Letters and Escape still reach the shortcuts below.
+      if (e.key === "Enter" && e.target.closest("button, a[href]")) return;
+      // Escape on a full call or result someone opened closes it; a second
+      // Escape denies as before.
+      if (e.key === "Escape" && closeOpenConvDetail(e.target)) {
+        e.preventDefault();
+        return;
+      }
       // Keyboard acts on the OLDEST live cycle (the one approvalBlockEl
       // tracks); sibling cards from parallel task agents resolve by
       // their own buttons or become oldest in turn.  When the feedback
@@ -4289,6 +4308,7 @@ class Pane {
     // place); else build fresh.
     const announced = this._takeAnnouncedBlock(items);
     const block = announced || document.createElement("div");
+    const openFullCalls = announced ? captureConvFullCalls(announced) : null;
     if (announced) {
       announced.replaceChildren();
       delete announced.dataset.resultsSettled;
@@ -4392,6 +4412,7 @@ class Pane {
       }
     }
     this._relinkAgentCards(items);
+    restoreConvFullCalls(block, openFullCalls);
     this.scrollToBottom();
   }
 
@@ -5833,14 +5854,17 @@ function buildToolDiv(item, indexLabel) {
     row._filePath = item.file_path;
   }
   row.appendChild(buildConvCmd(item));
+  attachConvFullCall(row, item.arguments);
   return row;
 }
 
-// Synthesize the live `item` shape ({func_name, call_id, header}) from a stored
-// tool_call ({name, id, arguments}) so /history replay AND task-agent card
-// recall render the SAME .conv-row as the live path.  Header derivation mirrors
-// the live serialize: bash shows the command; other tools show `key: value`
-// lines, values clipped at 80 chars; unparseable args fall back to a raw clip.
+// Synthesize the live `item` shape ({func_name, call_id, header, arguments})
+// from a stored tool_call ({name, id, arguments}) so /history replay AND
+// task-agent card recall render the SAME .conv-row as the live path.  Header
+// derivation mirrors the live serialize: bash shows the command; other tools
+// show `key: value` lines, values clipped at 80 chars; unparseable args fall
+// back to a raw clip.  The whole text rides along as `arguments` for the
+// row's "full call".
 function synthToolItem(tc) {
   tc = tc || {};
   let header = "";
@@ -5864,7 +5888,13 @@ function synthToolItem(tc) {
   } catch (e) {
     header = String(tc.arguments || "").substring(0, 100);
   }
-  return { func_name: tc.name, call_id: tc.id || "", header, file_path: filePath };
+  return {
+    func_name: tc.name,
+    call_id: tc.id || "",
+    header,
+    file_path: filePath,
+    arguments: typeof tc.arguments === "string" ? tc.arguments : undefined,
+  };
 }
 
 // Append an "✗ error" pill to an approval block as a sibling of the
@@ -5881,24 +5911,22 @@ function appendToolErrorBadge(blockEl) {
   blockEl.appendChild(errBadge);
 }
 
-function makeCollapsible(el) {
-  el.classList.add("collapsed");
-  el.setAttribute("tabindex", "0");
-  el.setAttribute("role", "button");
-  el.setAttribute("aria-label", "Tool output (collapsed). Activate to expand.");
-  const handler = function () {
-    this.classList.remove("collapsed");
-    this.removeAttribute("tabindex");
-    this.removeAttribute("role");
-    this.removeAttribute("aria-label");
-  };
-  el.addEventListener("click", handler);
-  el.addEventListener("keydown", function (e) {
-    if (e.key === "Enter" || e.key === " ") {
-      e.preventDefault();
-      handler.call(this);
-    }
+// An output box with its "show all" control when it may be longer than the
+// box (the control shows once a measurement says it is); past `boxLines` hard
+// lines it starts folded to a short preview (0: any output does).  Box and
+// control travel as one node (.conv-result-wrap), since results are inserted
+// and replaced whole.
+function withResultExpand(out, boxLines) {
+  const expand = buildConvResultExpand(out, {
+    text: out.textContent,
+    boxLines,
+    fold: true,
   });
+  if (!expand) return out;
+  const wrap = document.createElement("div");
+  wrap.className = "conv-result-wrap";
+  wrap.append(out, expand);
+  return wrap;
 }
 
 function tryParseMedia(text) {
@@ -5929,14 +5957,12 @@ function renderToolOutput(stripped, isError) {
   return out;
 }
 
-// Shared recipe: render tool output and auto-collapse past 10 lines.  The one
-// source for the live appendToolOutput's plain-output path, the /history
-// tool-result replay, and the task-agent card recall — so the collapse
-// threshold can't drift between them.
+// Shared recipe: render tool output and fold it past 10 lines (or past a
+// box's worth of long lines) behind "show all".  The one source for the live
+// appendToolOutput's plain-output path, the /history tool-result replay, and
+// the task-agent card recall — so the threshold can't drift between them.
 function renderCollapsibleOutput(stripped, isError) {
-  const out = renderToolOutput(stripped, isError);
-  if (out.textContent.split("\n").length > 10) makeCollapsible(out);
-  return out;
+  return withResultExpand(renderToolOutput(stripped, isError), 10);
 }
 
 function buildMediaEmbed(media, rawJson) {
@@ -5961,8 +5987,7 @@ function buildMediaEmbed(media, rawJson) {
   const raw = document.createElement("div");
   raw.className = "tool-output";
   raw.textContent = tryPrettyJson(rawJson) || redactCredentials(rawJson);
-  makeCollapsible(raw);
-  wrapper.appendChild(raw);
+  wrapper.appendChild(withResultExpand(raw, 0));
 
   return wrapper;
 }

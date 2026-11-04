@@ -583,7 +583,11 @@ def test_execution_journal_bounds_completed_raw_payloads():
 
     steps = journal.project_steps()
     assert journal.retained_step_count == 100
-    assert journal.retained_step_chars < 410_000
+    # Only the last 100 steps stay.  Their arguments stay whole, for the rebuilt
+    # card's full call (the recall store bounds its total), and outputs clip.
+    assert all(step["arguments"] == "a" * 16_000 for step in steps[1:])
+    assert all(len(step["output"]) <= 2_000 for step in steps)
+    assert journal.retained_step_chars < 100 * (16_000 + 2_000 + 100)
     assert len(steps) == 101
     assert steps[0]["output"] == "(+4900 earlier steps not retained)"
     assert steps[-1]["id"] == "call-4999"

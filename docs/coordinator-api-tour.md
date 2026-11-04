@@ -133,7 +133,7 @@ with a `type` field.  The recurring shapes a UI has to handle:
 | `stream_end`        | End of a single provider stream                                                            | — |
 | `tool_result`       | A tool call completed; capable panes also receive the accepted-history replacement          | `call_id`, `name`, `output`, `is_error?`, `accepted?`, `_event_id?`, `preview?`, `effect_status?` |
 | `tool_output_chunk` | Streaming tool output (e.g. long bash command)                                             | `call_id`, `chunk` |
-| `approve_request`   | One approval cycle needs operator action; several cycles may coexist                       | `cycle_id`, `items: [{call_id, header, preview, func_name, approval_label, needs_approval}]` |
+| `approve_request`   | One approval cycle needs operator action; several cycles may coexist                       | `cycle_id`, `items: [{call_id, header, preview, func_name, approval_label, needs_approval, arguments}]` |
 | `approval_resolved` | One identified approval cycle was answered                                                 | `cycle_id`, `call_ids`, `approved`, `feedback`, `always` |
 | `state_change`      | Worker-thread state transition (also re-emitted with the current state on every fresh subscribe so refresh-mid-stream restores composer mode) | `state` ∈ `running`, `thinking`, `attention`, `evaluation`, `idle`, `error` |
 | `in_progress_snapshot` | One-shot replay of the in-progress turn's content + reasoning when this client connects mid-stream                              | `content`, `reasoning` |

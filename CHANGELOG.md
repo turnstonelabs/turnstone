@@ -64,9 +64,38 @@ The separate `dev` branch is retired. See [the release process](docs/releasing.m
   prompt's first tool pattern reads "Discover nodes and skills". These change what a
   model is shown and asked, not what it can do: it can still name any loaded alias
   (#1529).
+- **Tool cards show the whole call and the whole result.** A card's summary cut long
+  values short, and nothing on it showed the rest: an MCP argument after 200
+  characters, a fetched URL after 80, every value after 77 once the page reloaded, and
+  on coordinator cards everything past one line. Each card's call line now has a
+  **full call** button that opens the arguments exactly as the model wrote them: each
+  name over its value, strings with their own line breaks, numbers with every digit,
+  credentials redacted as elsewhere on the card. It works on live cards, after a
+  reload, in sub-agent cards and on calls awaiting approval, so a call can be read in
+  full before it is approved. A result longer than its box gets its own **show all**
+  button, which shows it at full height (past the 64 KiB display cut too) and then
+  reads **collapse**, so opening a call never unfolds its result; a long argument value
+  gets one as well, so Approve and Deny stay in reach. Opening either stops the pane
+  following new output until **Jump to latest**, and Escape closes what is open before
+  it can deny a pending call. The `tool_pending`, `tool_info` and `approve_request`
+  events now carry each call's `arguments`, the same text `/history` returns; the
+  node's cluster-wide copy of `approve_request` and the dashboard's pending-approval
+  items leave it out. A result shows what the model saw: output past a tool's context
+  budget is still not kept.
+- **Sub-agent cards rebuilt after a reload keep each call's arguments whole.** They
+  were cut at 2,000 characters; step results still are. The in-memory store those cards
+  come from is now capped at 16 MB of text per open workstream as well as 256 finished
+  sub-agents, oldest first, and a sub-agent larger than the whole cap shows as its
+  parent row only.
 
 ### Security
 
+- **Enter on a button in a card awaiting approval no longer approves the call.** In
+  the interactive and coordinator panes, Enter approved the pending call wherever focus
+  was outside a text field, so a keyboard user who tabbed to **Deny** and pressed Enter
+  approved the call, and the Deny never ran. A focused button or link now handles its
+  own Enter. The letter shortcuts and Escape work as before, and Enter still approves
+  from anywhere else in the pane.
 - **Approval cards on Discord and Slack show model-written text as written.** On Discord
   the command and the judge's summary reached the card as Markdown, so `a || b || c` hid
   `b` as a spoiler, and a summary (the judge's words, or a heuristic template quoting the
