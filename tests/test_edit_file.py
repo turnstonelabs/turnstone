@@ -458,3 +458,132 @@ class TestExecEdgeCases:
         # line1 should NOT have been edited (atomic failure)
         with open(sample_file) as f:
             assert "line1" in f.read()
+
+
+# ── Approval previews are plain text ─────────────────────────────────
+
+_COLOUR_NAMES = (
+    "RESET",
+    "BOLD",
+    "DIM",
+    "ITALIC",
+    "RED",
+    "GREEN",
+    "YELLOW",
+    "BLUE",
+    "MAGENTA",
+    "CYAN",
+    "GRAY",
+)
+
+
+def test_approval_previews_carry_no_colour_codes(session, sample_file, tmp_path, monkeypatch):
+    """A preview reaches the web cards as written, which show every control
+    character in it as a symbol; a client that wants colour adds its own.  A
+    colour code the server added would be indistinguishable from one the model
+    wrote, so the server adds none, even with colour on (a server started in a
+    terminal)."""
+    import turnstone.core.session as session_module
+    import turnstone.ui.colors as colors
+
+    esc = chr(27)
+    for index, name in enumerate(_COLOUR_NAMES):
+        monkeypatch.setattr(colors, name, f"{esc}[{index}m")
+        monkeypatch.setattr(session_module, name, f"{esc}[{index}m", raising=False)
+    _mark_read(session, sample_file)
+    link = tmp_path / "link.py"
+    link.symlink_to(sample_file)
+    items = [
+        session._prepare_edit_file(
+            "c1",
+            {
+                "path": sample_file,
+                "edits": [
+                    {"old_string": "line2", "new_string": "two"},
+                    {"old_string": "line4", "new_string": ""},
+                ],
+            },
+        ),
+        session._prepare_edit_file(
+            "c2",
+            {"path": str(link), "old_string": "line3", "new_string": "3", "replace_all": True},
+        ),
+        session._prepare_write_file("c3", {"path": sample_file, "content": "a\nb", "append": True}),
+        session._prepare_write_file("c4", {"path": str(tmp_path / "other.py"), "content": "x"}),
+        session._prepare_bash("c5", {"command": "echo one\necho two"}),
+        session._prepare_search("c6", {"query": "line", "path": str(tmp_path)}),
+    ]
+    for item in items:
+        assert item.get("preview"), item
+        assert esc not in item["preview"], (item["func_name"], item["preview"])
+
+
+def test_no_preview_builder_colours_its_text() -> None:
+    """The same as a source check, for the previews the test above can't build
+    without a coordinator or an MCP server: nothing assigned to a ``preview*``
+    name, appended to one, or set under a "preview" key names a colour constant
+    or helper."""
+    import ast
+    from pathlib import Path
+
+    source = (Path(__file__).resolve().parents[1] / "turnstone/core/session.py").read_text()
+    colour = {*_COLOUR_NAMES, "bold", "cyan", "dim", "green", "red", "yellow"}
+
+    def is_preview(node: ast.expr) -> bool:
+        return isinstance(node, ast.Name) and node.id.startswith("preview")
+
+    coloured = []
+    for node in ast.walk(ast.parse(source)):
+        values: list[ast.expr] = []
+        targets: list[ast.expr] = []
+        if isinstance(node, ast.Assign):
+            targets = node.targets
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            targets = [node.target]
+        if any(is_preview(t) for t in targets):
+            values.append(node.value)
+        elif (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr in ("append", "extend")
+            and is_preview(node.func.value)
+        ):
+            values.extend(node.args)
+        elif isinstance(node, ast.Dict):
+            values.extend(
+                v
+                for k, v in zip(node.keys, node.values, strict=True)
+                if isinstance(k, ast.Constant) and k.value == "preview"
+            )
+        for value in values:
+            coloured.extend(
+                (sub.lineno, sub.id)
+                for sub in ast.walk(value)
+                if isinstance(sub, ast.Name) and sub.id in colour
+            )
+    assert coloured == []
+
+
+def test_the_terminal_client_colours_a_preview_by_line(monkeypatch) -> None:
+    """The colour the server used to put in a preview, added by the terminal
+    client instead: removed lines red, added lines green, warnings yellow."""
+    import turnstone.ui.colors as colors
+    from turnstone.cli import _style_preview
+
+    for name, mark in (
+        ("RESET", "<0>"),
+        ("RED", "<r>"),
+        ("GREEN", "<g>"),
+        ("YELLOW", "<y>"),
+        ("DIM", "<d>"),
+    ):
+        monkeypatch.setattr(colors, name, mark)
+    preview = "    --- edit 1/2 ---\n    - old\n    + new\n    Warning: symlink\n    (append mode)\n    kept"
+    assert _style_preview(preview).split("\n") == [
+        "<y>    --- edit 1/2 ---<0>",
+        "<r>    - old<0>",
+        "<g>    + new<0>",
+        "<y>    Warning: symlink<0>",
+        "<y>    (append mode)<0>",
+        "<d>    kept<0>",
+    ]

@@ -91,6 +91,25 @@ SLASH_COMMANDS = [
 ]
 
 
+def _style_preview(preview: str) -> str:
+    """Colour an approval preview's lines as the session used to: removed lines
+    red, added lines green, edit separators, warnings and notes yellow, the rest
+    dim.  The session sends previews as plain text, so it no longer colours them
+    itself."""
+    styled: list[str] = []
+    for line in preview.split("\n"):
+        text = line.strip()
+        if text.startswith(("---", "Warning:", "(")):
+            styled.append(yellow(line))
+        elif text.startswith("-"):
+            styled.append(red(line))
+        elif text.startswith("+"):
+            styled.append(green(line))
+        else:
+            styled.append(dim(line))
+    return "\n".join(styled)
+
+
 def _completer(text: str, state: int) -> str | None:
     """Tab-complete slash commands."""
     matches = [c for c in SLASH_COMMANDS if c.startswith(text)] if text.startswith("/") else []
@@ -286,7 +305,8 @@ class TerminalUI(SessionUI):
                 else:
                     lines.append(f"  {yellow(header)}\n")
                 if item.get("preview"):
-                    styled = dim(item["preview"]) if not item.get("error") else red(item["preview"])
+                    preview = item["preview"]
+                    styled = red(preview) if item.get("error") else _style_preview(preview)
                     lines.append(styled + "\n")
                 verdict = item.get("_heuristic_verdict")
                 if verdict:
