@@ -167,6 +167,8 @@
   color: var(--err);
 }
 .conv-batch-summary {
+  min-width: 0;
+  overflow-wrap: anywhere; /* a long tool name wraps inside a narrow card */
   font-family: var(--font-mono);
   font-weight: 500;
   letter-spacing: 0;
@@ -420,6 +422,20 @@
   gap: 8px;
   min-width: 0;
 }
+/* The coordinator's line (args summary, status pill) wraps, so a pill too
+   long to sit beside the name takes a line of its own.  "full call"'s -4px
+   block margins leave 4px of the row gap around it when it wraps. */
+.conv-row-call:has(> .conv-row-args, > .conv-row-status) {
+  flex-wrap: wrap;
+  row-gap: 8px;
+}
+/* On a wrapping line the index stays beside a long name, which wraps
+   instead. */
+.conv-row-call:has(> .conv-row-args, > .conv-row-status)
+  > .conv-row-idx
+  + .conv-row-name {
+  max-width: calc(100% - 5em);
+}
 .conv-row-idx {
   flex-shrink: 0;
   padding: 1px 6px;
@@ -445,20 +461,25 @@
 }
 .conv-row-args {
   flex: 1;
-  min-width: 0;
+  min-width: min(5ch, 100%); /* a few characters, or a line of its own */
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
   font-family: var(--font-mono);
   color: var(--ink-3);
 }
+/* A pill keeps its own width; a long one wraps onto the next line at the
+   line's full width, and a long word inside it breaks rather than spilling.
+   The row gap spaces a wrapped pill.  Its text is the server's message, as
+   written: tool names, paths and echoed arguments keep their case. */
 .conv-row-call > .conv-row-status {
-  flex: 1 1 0;
+  flex: 0 1 auto;
   min-width: 0;
-  /* A short pill keeps its size, and a long word wraps inside it rather than
-     over "full call". */
-  max-width: max-content;
+  max-width: 100%;
+  margin-top: 0;
   overflow-wrap: anywhere;
+  text-transform: none;
+  letter-spacing: 0;
 }
 /* Inline auto-approve tag next to the tool name — surfaces tools that
    bypassed the operator gate (skill allowlist / blanket / "Approve all"). */
@@ -520,8 +541,9 @@
 
 /* "full call" — the end of the call line.  Opens the arguments as the model
    wrote them, under the row's shortened summary (conversation.js
-   attachConvFullCall); the caret turns from the one aria-expanded state.
-   The negative block margins keep its hit target from growing the line. */
+   attachConvFullCall); its caret (::before) turns from the one aria-expanded
+   state.  The negative block margins keep its hit target from growing the
+   line. */
 .conv-row-full-toggle {
   flex-shrink: 0;
   display: inline-flex;
@@ -551,22 +573,23 @@
   outline: 2px solid var(--accent);
   outline-offset: 1px;
 }
-.conv-row-full-caret {
+.conv-row-full-toggle::before {
+  content: "▾";
   display: inline-block;
   transition: transform 0.12s ease;
 }
-.conv-row-full-toggle[aria-expanded="false"] .conv-row-full-caret {
+.conv-row-full-toggle[aria-expanded="false"]::before {
   transform: rotate(-90deg); /* ▾ -> ▸ */
 }
 @media (prefers-reduced-motion: reduce) {
-  .conv-row-full-caret {
+  .conv-row-full-toggle::before {
     transition: none;
   }
 }
 /* The arguments: a captioned frame, outlined rather than filled so it reads
    apart from the preview and result boxes it sits among.  Each name over its
-   value, a string with its own line breaks; a long value scrolls in a box of
-   its own with "show all", like a result. */
+   value, a string with its own line breaks; a long value is capped in a box
+   of its own with "show all", like a result. */
 .conv-row-full {
   margin-top: 6px;
   padding: 6px 10px;
@@ -598,13 +621,14 @@
   color: var(--ink-3);
 }
 .conv-full-arg-value {
-  max-height: calc(14 * 1.5em); /* 14 whole lines: CONV_ARG_BOX_LINES */
-  overflow: auto;
   white-space: pre-wrap;
   word-break: break-word;
 }
-.conv-full-arg-value[data-expanded="true"] {
-  max-height: none;
+/* Capped only while its "show all" is offered and not taken
+   (buildConvResultExpand); shorter values show whole. */
+.conv-full-arg-value[data-expanded="false"] {
+  max-height: calc(14 * 1.5em); /* 14 whole lines: CONV_ARG_BOX_LINES */
+  overflow: auto;
 }
 /* A dimmed row (denied batch, memory/recall) keeps an open call readable. */
 .conv-batch--denied .conv-row[data-full-call="open"],
@@ -617,6 +641,19 @@
 }
 .conv-full-args-none {
   color: var(--ink-3);
+}
+/* Under a value or command whose redaction took shell syntax (";", "|",
+   "$(" …) with the secret: part of what runs is not shown.  Darkened off raw
+   --warn to clear AA on the light panels, as the pending kicker is. */
+.conv-redaction-note {
+  margin-top: 4px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 600;
+  color: color-mix(in srgb, var(--warn) 78%, var(--ink-2));
+}
+.conv-redaction-note::before {
+  content: "⚠ ";
 }
 
 /* Verdict badge — interactive's rich shape (risk + rec + conf, expandable
@@ -831,8 +868,8 @@
   white-space: pre-wrap;
 }
 
-/* Tool result block — paired under its row, mono pre-block.  Capped at
-   240px with internal scroll so a long output doesn't push the chat
+/* Tool result block — paired under its row, mono pre-block.  A long one is
+   capped at 13 lines behind "show all" (below), so it doesn't push the chat
    off-screen. */
 .conv-row-result:where(:not(.conv-content-chip)) {
   margin-top: 6px;
@@ -846,8 +883,6 @@
   border-radius: 0 3px 3px 0;
   white-space: pre-wrap;
   word-break: break-word;
-  max-height: 240px;
-  overflow: auto;
 }
 .conv-row.error .conv-row-result:where(:not(.conv-content-chip)) {
   border-left-color: var(--err);
@@ -859,15 +894,16 @@
   color: var(--ink-4);
   font-weight: 600;
 }
-/* Showing all of a long result (data-expanded, from its "show all"). */
-.conv-row-result[data-expanded="true"] {
-  max-height: none;
+/* A long result is capped while its "show all" is offered and not taken
+   (buildConvResultExpand); a result without one shows whole. */
+.conv-row-result[data-expanded="false"] {
+  max-height: calc(13 * 1.5em + 12px); /* 13 whole lines: CONV_RESULT_BOX_LINES */
+  overflow: auto;
 }
 
-/* "show all" — right under a result longer than its box, in either pane,
+/* "show all" — right under a result too long for its box, in either pane,
    and under a long argument value (conversation.js buildConvResultExpand).
-   Shows the whole text, then reads "collapse".  Hidden until a measurement
-   or the line count says the box clips. */
+   Shows the whole text, then reads "collapse". */
 .conv-result-expand {
   display: flex;
   align-items: center;
@@ -884,9 +920,6 @@
   border: 1px solid var(--hair);
   border-radius: var(--r-sm);
   cursor: pointer;
-}
-.conv-result-expand[hidden] {
-  display: none;
 }
 .conv-result-expand:hover {
   border-color: var(--ink-4);

@@ -16,7 +16,7 @@ def test_content_links_keep_keyboard_activation_during_pending_approval() -> Non
     keys = extract_braced(source, signature)[len(signature) : -1]
     proc = run_node_source(
         FAKE_DOM
-        + "const {buildFileChip, buildPreviewChip} = await import("
+        + "const {buildFileChip, buildPreviewChip, convKeyBelongsToControl} = await import("
         + json.dumps((_SHARED / "conversation.js").as_uri())
         + ");\n"
         + "const handleKey = function(e) {"

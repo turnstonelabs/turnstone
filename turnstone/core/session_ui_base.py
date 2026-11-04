@@ -3613,9 +3613,10 @@ class SessionUIBase:
 
         ``arguments`` is the call's arguments as the model wrote them, the
         same text ``/history`` serves for the stored call, so a client can
-        show the whole call where ``header`` and ``preview`` shorten it. It
-        stays on this workstream's own events: the copy for the console's
-        cluster-wide channel drops it (:meth:`_without_tool_arguments`).
+        show the whole call where ``header`` and ``preview`` shorten it. The
+        whole text stays on this workstream's own events: the copy for the
+        console's cluster-wide channel drops it (:meth:`_without_tool_arguments`),
+        though verdicts there still carry their capped ``func_args``.
         """
         out: list[dict[str, Any]] = []
         for it in items:
@@ -3656,8 +3657,11 @@ class SessionUIBase:
         """Copy an ``approve_request`` card with each item's ``arguments`` left out.
 
         The console relays its cluster-wide channel beyond this workstream's own
-        readers, so that copy keeps only the ``header`` and ``preview`` summary
-        every item already carried before full arguments were sent.
+        readers, so that copy leaves the whole text out and keeps what every item
+        carried before: ``header`` and ``preview``, and each verdict's
+        ``func_args``, its own copy of the arguments cut at 16 KiB, which crosses
+        under the trusted-team posture (see
+        :meth:`serialize_pending_approval_details`).
         """
         return {
             **card,

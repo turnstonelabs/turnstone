@@ -459,6 +459,8 @@ class TestJwtAndQueryCredentials:
         "http+abcde://" * 20_000,
         ("http+" + "a" * 25 + "://") * 4_000,
         "https://u:" + "pa://" * 40_000,
+        "A" * 320_000,
+        "-----BEGIN PRIVATE KEY-----\n" * 12_000,
     ],
     ids=[
         "run",
@@ -468,6 +470,8 @@ class TestJwtAndQueryCredentials:
         "suffixed-schemes",
         "long-suffixed-schemes",
         "password-separators",
+        "env-key-run",
+        "unterminated-keys",
     ],
 )
 def test_redaction_is_linear_in_a_long_run(text) -> None:
@@ -477,7 +481,8 @@ def test_redaction_is_linear_in_a_long_run(text) -> None:
     # Escaped starts are allowed only after a character that ends the run.
     # Likewise every scheme in nested "https://" rescanned the rest of the run
     # for a connection string's "@" until each userinfo part stopped at the
-    # next "/".
+    # next "/", every letter of a long run of capitals looked for an env line's
+    # "=", and every BEGIN line looked for an END to the end of the text.
     import time
 
     start = time.perf_counter()
@@ -485,6 +490,36 @@ def test_redaction_is_linear_in_a_long_run(text) -> None:
     elapsed = time.perf_counter() - start
     assert redacted == text
     assert elapsed < 2.0
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("my_TOKEN=abcdef", "my_TOKEN=[REDACTED:secret]"),
+        ("_SECRET_KEY=x", "_SECRET_KEY=[REDACTED:secret]"),
+        ("x_PASSWORD=x", "x_PASSWORD=[REDACTED:secret]"),
+        ("9KEY=x", "9KEY=[REDACTED:secret]"),
+        ("_DATABASE_URL=x", "_DATABASE_URL=[REDACTED:secret]"),
+        ("ABC_def_TOKEN=x y", "ABC_def_TOKEN=[REDACTED:secret] y"),
+        ("MONKEY=banana", "MONKEY=banana"),
+    ],
+)
+def test_an_env_key_names_a_secret_from_any_start_of_its_run(text, expected) -> None:
+    # The env rule takes a whole run of key characters at once.  A run that
+    # starts with "_" or digits names a secret as its letters do, as it did when
+    # a match could start at any letter.
+    assert redact_credentials(text) == expected
+    assert ("env_file_leak" in evaluate_output(text).flags) == (expected != text)
+
+
+def test_a_private_key_block_ends_before_the_next_one_starts() -> None:
+    # The body stops where another block could start, so a BEGIN with no END is
+    # left as it is, as it is with no key after it, and the complete key after
+    # it is redacted on its own.
+    key = "-----BEGIN PRIVATE KEY-----\nMIIEvQ\n-----END PRIVATE KEY-----"
+    unterminated = "-----BEGIN PRIVATE KEY-----\ncut off\n"
+    assert redact_credentials(unterminated + key) == unterminated + "[REDACTED:private_key]"
+    assert redact_credentials(unterminated) == unterminated
 
 
 def test_builtin_credential_order_matches_the_registry_priorities() -> None:

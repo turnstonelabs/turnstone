@@ -37,8 +37,9 @@ import {
   buildConvBatchShell,
   buildConvRow,
   attachConvFullCall,
-  closeOpenConvDetail,
-  convFullCallPanel,
+  convCallSummaryEnd,
+  convKeyBelongsToControl,
+  convReaderHoldsFocus,
   buildConvVerdict,
   buildConvWarning,
   buildConvActions,
@@ -637,17 +638,10 @@ function createCoordinatorPane(root, wsId, opts) {
     // its own click (reveal), never the approve arm below — and the
     // preventDefault there would swallow that click outright.
     if (ae && ae === sbApprovalEl) return;
-    // Any focused button or link takes its own Enter too: on Deny it denies,
-    // and on "full call" or "show all" it opens that, never approving the
-    // batch.  D, Escape and Shift+A still resolve from there.
-    if (e.key === "Enter" && ae && ae.closest && ae.closest("button, a[href]"))
-      return;
-    // Escape on a full call or result someone opened closes it; a second
-    // Escape denies as before.
-    if (e.key === "Escape" && closeOpenConvDetail(ae)) {
-      e.preventDefault();
-      return;
-    }
+    // Enter on any other focused control runs that control (on Deny it
+    // denies), and Escape on a full call or "show all" does nothing: neither
+    // resolves the batch from there.  D and Shift+A still do.
+    if (convKeyBelongsToControl(e.key, ae)) return;
     // Ignore browser/OS accelerators (Cmd+D bookmark, Ctrl+D, Alt+D) — only bare
     // keys + Shift+A resolve, else a stray accelerator silently denies the batch.
     if (e.ctrlKey || e.metaKey || e.altKey) return;
@@ -2023,17 +2017,7 @@ function createCoordinatorPane(root, wsId, opts) {
         }
         prevBadge.remove();
       }
-      if (verdict) {
-        const frag = buildConvVerdict(verdict);
-        // After the call's summary: its line, and its full-call panel.
-        const callEl =
-          convFullCallPanel(row) || row.querySelector(".conv-row-call");
-        if (callEl && callEl.nextSibling) {
-          row.insertBefore(frag, callEl.nextSibling);
-        } else {
-          row.appendChild(frag);
-        }
-      }
+      if (verdict) _insertAfterCallSummary(row, buildConvVerdict(verdict));
       // Persist the verdict's tier on the row so the batch's header
       // tier badge can escalate from ⚙ heuristic → ⚖ llm when a later
       // intent_verdict lands an LLM verdict.  Default to "heuristic"
@@ -2067,14 +2051,18 @@ function createCoordinatorPane(root, wsId, opts) {
     const batch = row.closest(".conv-batch");
     if (batch) setConvBatchExpanded(batch, true, { blocker: true });
     _appendVerdictLineTo(row, null);
-    const frag = buildConvVerdict(null, { judgePending: true });
-    const callEl =
-      convFullCallPanel(row) || row.querySelector(".conv-row-call");
-    if (callEl && callEl.nextSibling) {
-      row.insertBefore(frag, callEl.nextSibling);
-    } else {
-      row.appendChild(frag);
-    }
+    _insertAfterCallSummary(
+      row,
+      buildConvVerdict(null, { judgePending: true }),
+    );
+  }
+
+  // A verdict, or the judge's placeholder, goes after the call's summary: its
+  // line, and its full-call panel once opened.
+  function _insertAfterCallSummary(row, frag) {
+    const end = convCallSummaryEnd(row);
+    if (end && end.nextSibling) row.insertBefore(frag, end.nextSibling);
+    else row.appendChild(frag);
   }
 
   function _appendResultToRow(row, output, isError, opts) {
@@ -2366,8 +2354,15 @@ function createCoordinatorPane(root, wsId, opts) {
     _syncApprovalChip();
   }
 
+  // Not from someone reading: focus on anything else in the transcript (a
+  // "full call", a "show all") stays put, or their next Enter would approve
+  // the batch; and a transcript scrolled back is not pulled down to it.
+  // Within the batch's own actions a verdict still moves focus between
+  // Approve and Deny.
   function _focusBatchPrimary(batch, prefer) {
-    if (!batch) return;
+    if (!batch || !scrollFollow.isFollowing()) return;
+    const actions = batch.querySelector(".conv-actions");
+    if (convReaderHoldsFocus(messagesEl, actions)) return;
     const role = prefer === "deny" ? "deny" : "approve";
     const btn = batch.querySelector(
       '.conv-actions button[data-role="' + role + '"]',

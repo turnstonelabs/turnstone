@@ -81,9 +81,12 @@ _RE_CAMO_CAPS_ACTION = re.compile(
 
 # -- Priority 2: Credential / secret leakage (HIGH) ------------------------
 
+# The body stops where another block could start: scanning on to the next END
+# made every BEGIN in text with no END rescan the rest of it, which was
+# quadratic (9 seconds for 320 KB of BEGIN lines).
 _RE_PRIVATE_KEY_BLOCK = re.compile(
     r"-----BEGIN\s+(?:RSA\s+|EC\s+|OPENSSH\s+|PGP\s+)?PRIVATE\s+KEY-----"
-    r"[\s\S]*?"
+    r"(?:(?!-----BEGIN)[\s\S])*?"
     r"-----END\s+(?:RSA\s+|EC\s+|OPENSSH\s+|PGP\s+)?PRIVATE\s+KEY-----",
 )
 # Database connection strings AND http(s) URLs that carry RFC-3986
@@ -113,13 +116,35 @@ _RE_CONNECTION_STRING = re.compile(
     _CONNECTION_SCHEME + r"[^:@\s]+:(?:(?!" + _CONNECTION_SCHEME + r")[^@\s])+@",
     re.IGNORECASE,
 )
-_RE_ENV_SECRET_LINE = re.compile(r"[A-Z][A-Z_0-9]+=\S+")
+# A match takes a whole run of key characters at once (group 1), never one
+# starting inside another: from every letter of a long run with no "=" after it,
+# a per-letter match rescanned the rest of the run, which was quadratic (0.9
+# seconds for a 40 KB run).  A run may start with "_" or digits, which
+# _env_key_is_secret skips, so ``my_TOKEN=`` and ``9KEY=`` match as they did.
+_RE_ENV_SECRET_LINE = re.compile(r"(?<![A-Z_0-9])(?=([_0-9]*[A-Z][A-Z_0-9]+))\1=\S+")
 _RE_ENV_SECRET_KEY = re.compile(
     r"(?:^|_)(?:SECRET|TOKEN|PASSWORD|CREDENTIAL|DSN)(?:_|$)"
     r"|(?:^|_)KEY(?:_|$)"
     r"|^(?:DATABASE_URL|TURNSTONE_DB_URL|DB_URL)$",
     re.IGNORECASE,
 )
+
+
+def _env_key_is_secret(key: str) -> bool:
+    """Whether an env-line key names a secret, past the "_" and digits a key
+    run may start with."""
+    return bool(_RE_ENV_SECRET_KEY.search(key.lstrip("_0123456789")))
+
+
+def _has_env_secret(text: str) -> bool:
+    return any(_env_key_is_secret(m.group(1)) for m in _RE_ENV_SECRET_LINE.finditer(text))
+
+
+def _redact_env(m: re.Match[str]) -> str:
+    key = m.group(1)
+    return key + "=[REDACTED:secret]" if _env_key_is_secret(key) else m.group()
+
+
 _RE_JSON_SECRET = re.compile(
     r'"(?:api_key|apikey|api_secret|secret_key|secret|password|passwd|'
     r"token|access_token|refresh_token|auth_token|private_key|"
@@ -968,8 +993,7 @@ def _check_credentials(
         found = True
         risk = "high"
 
-    env_lines = _RE_ENV_SECRET_LINE.findall(text)
-    if any(_RE_ENV_SECRET_KEY.search(ln.split("=", 1)[0]) for ln in env_lines):
+    if _has_env_secret(text):
         _add_flag(flags, "credential_leak")
         flags.append("env_file_leak")
         ann.append("Output contains .env-style assignments with secret-bearing keys.")
@@ -1009,10 +1033,6 @@ def _redact_credentials(text: str) -> str:
     result = _RE_CONNECTION_STRING.sub(_redact_conn, result)
     for pattern, redact_type in _CREDENTIAL_PATTERNS:
         result = pattern.sub(f"[REDACTED:{redact_type}]", result)
-
-    def _redact_env(m: re.Match[str]) -> str:
-        key = m.group().split("=", 1)[0]
-        return key + "=[REDACTED:secret]" if _RE_ENV_SECRET_KEY.search(key) else m.group()
 
     result = _RE_ENV_SECRET_LINE.sub(_redact_env, result)
 
@@ -1203,8 +1223,7 @@ def _check_credentials_complex(
         found = True
         risk = "high"
 
-    env_lines = _RE_ENV_SECRET_LINE.findall(text)
-    if any(_RE_ENV_SECRET_KEY.search(ln.split("=", 1)[0]) for ln in env_lines):
+    if _has_env_secret(text):
         _add_flag(flags, "credential_leak")
         _add_flag(flags, "env_file_leak")
         ann.append("Output contains .env-style assignments with secret-bearing keys.")
@@ -1236,10 +1255,6 @@ def _redact_credentials_complex(text: str) -> str:
         return re.sub(r"://([^:@\s]+):([^@\s]+)@", r"://\1:[REDACTED:password]@", m.group())
 
     result = _RE_CONNECTION_STRING.sub(_redact_conn, result)
-
-    def _redact_env(m: re.Match[str]) -> str:
-        key = m.group().split("=", 1)[0]
-        return key + "=[REDACTED:secret]" if _RE_ENV_SECRET_KEY.search(key) else m.group()
 
     result = _RE_ENV_SECRET_LINE.sub(_redact_env, result)
 

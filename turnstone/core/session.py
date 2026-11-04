@@ -1486,9 +1486,11 @@ class _TaskExecutionJournal:
     Model turns remain in ``context_turns`` only as long as they are useful to
     the provider. Cancellation needs exact state only for the currently issued
     batch plus aggregate effect dispositions for completed calls; recall needs
-    only the most recent clipped steps. These purpose-built projections avoid
-    retaining every raw assistant/native block and multi-megabyte tool payload
-    after compaction.
+    only the most recent ``_AGENT_STEP_COUNT_CAP`` steps, each with its call's
+    arguments whole (the rebuilt card's full call) and its output clipped at
+    ``_AGENT_STEP_OUTPUT_CAP``. These purpose-built projections avoid retaining
+    every raw assistant/native block and tool output after compaction; the
+    recall store's byte budget applies once the run's steps are stashed.
     """
 
     def __init__(self, turns: list[Turn]) -> None:
@@ -1537,7 +1539,8 @@ class _TaskExecutionJournal:
 
     @property
     def retained_step_chars(self) -> int:
-        """Test/diagnostic payload size after recall clipping."""
+        """Test/diagnostic size of the retained recall steps: whole arguments,
+        clipped outputs."""
 
         return sum(len(str(value)) for step in self._recent_steps for value in step.values())
 

@@ -189,6 +189,157 @@ globalThis.triggerResize = (target) => {
 };
 """
 
+# The browser around a whole pane, past FAKE_DOM: the document and window calls
+# the panes make at construction, and the node methods their renderers use.
+# Opt-in, after FAKE_DOM, for suites that run InteractivePane, the coordinator
+# pane or the conversation builders.
+PANE_DOM = r"""
+const assert = (condition, message) => { if (!condition) throw Error(message); };
+const create = document.createElement;
+document.createElement = tag => { const el = create(tag); el.style = {}; return el; };
+document.body = html;
+document.addEventListener = document.removeEventListener = () => {};
+document.querySelector = selector => html.querySelector(selector);
+document.getElementById = id => html.querySelector('#' + id);
+window.matchMedia = () => ({matches: false, addEventListener() {}});
+window.removeEventListener = () => {};
+window.setTimeout = globalThis.setTimeout = () => 0;
+window.clearTimeout = globalThis.clearTimeout = () => {};
+globalThis.setInterval = () => 0;
+globalThis.clearInterval = globalThis.cancelAnimationFrame = () => {};
+globalThis.BroadcastChannel = class {postMessage() {} addEventListener() {} close() {}};
+globalThis.CSS = {escape: value => value};
+const permissions = new Map([['turnstone_scopes', 'read,write']]);
+globalThis.sessionStorage = {getItem: key => permissions.get(key) || null};
+const matches = FakeElement.prototype._matches;
+FakeElement.prototype._matches = function(selector) {
+  return selector.startsWith('#')
+    ? (this.id || this.getAttribute('id')) === selector.slice(1)
+    : matches.call(this, selector);
+};
+FakeElement.prototype.after = function(node) {
+  const parent = this.parentNode;
+  if (!parent || node === this) return;
+  if (node.parentNode) node.remove();
+  parent.children.splice(parent.children.indexOf(this) + 1, 0, node);
+  node.parentNode = parent;
+  node._setConnected(parent.isConnected);
+};
+FakeElement.prototype.insertAdjacentElement = function(where, node) {
+  if (where !== 'afterend') throw Error('unexpected insertAdjacentElement ' + where);
+  this.after(node);
+  return node;
+};
+FakeElement.prototype.insertBefore = function(node, before) {
+  if (!before) return this.appendChild(node);
+  if (node === before) return node;
+  if (node.parentNode) node.remove();
+  this.children.splice(this.children.indexOf(before), 0, node);
+  node.parentNode = this;
+  node._setConnected(this.isConnected);
+  return node;
+};
+Object.defineProperty(FakeElement.prototype, 'nextElementSibling', {get() {
+  return this.parentNode
+    ? this.parentNode.children[this.parentNode.children.indexOf(this) + 1] || null : null;
+}});
+Object.defineProperty(FakeElement.prototype, 'nextSibling', {get() {
+  return this.nextElementSibling;
+}});
+Object.defineProperty(FakeElement.prototype, 'firstElementChild', {get() {return this.children[0] || null;}});
+Object.defineProperty(FakeElement.prototype, 'lastElementChild', {get() {return this.children.at(-1) || null;}});
+Object.defineProperty(FakeElement.prototype, 'innerHTML', {
+  get() {return this._html ?? this.textContent.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');},
+  set(value) {this.replaceChildren(); this._html = value;},
+});
+const appendNodes = FakeElement.prototype.append;
+FakeElement.prototype.append = function(...nodes) {
+  appendNodes.apply(this, nodes.map(node => typeof node === 'string' ? document.createTextNode(node) : node));
+};
+FakeElement.prototype.dispatchEvent = function(event) {
+  for (let cur = this; cur; cur = event.bubbles ? cur.parentNode : null) {
+    for (const entry of [...(cur._listeners.get(event.type) || [])]) entry.fn(event);
+  }
+  return true;
+};
+document.createDocumentFragment = () => document.createElement('fragment');
+document.createTextNode = text => {
+  const node = document.createElement('text'); node.textContent = String(text); return node;
+};
+// Renderers insert DOM nodes; prose HTML parsing is outside these fixtures.
+globalThis.DOMParser = class {parseFromString(text) {
+  return {body: {childNodes: [document.createTextNode(text)]}};
+}};
+"""
+
+# Selectors past FAKE_DOM's, opt-in after PANE_DOM: comma lists, compound
+# tag/class/attribute selectors (``a[href]``, ``[role="button"]``) and
+# descendant combinators, so code calling ``closest("button, a[href]")`` or
+# ``querySelector(".a .b")`` matches as a browser would.
+FULL_SELECTORS = r"""
+{
+  const baseMatches = FakeElement.prototype._matches;
+  FakeElement.prototype._matches = function(selector) {
+    selector = selector.trim();
+    if (selector.includes(',')) return selector.split(',').some(part => this._matches(part));
+    const m = selector.match(/^([a-zA-Z][\w-]*)?((?:\.[\w-]+)*)((?:\[[\w-]+(?:="[^"]*")?\])*)$/);
+    if (!m || (!m[1] && !m[2] && !m[3])) return baseMatches.call(this, selector);
+    const [, tag, classes, attrs] = m;
+    if (tag && this.tagName.toLowerCase() !== tag.toLowerCase()) return false;
+    for (const name of classes.split('.').filter(Boolean)) {
+      if (!this.classList.contains(name)) return false;
+    }
+    for (const attr of attrs.match(/\[[^\]]+\]/g) || []) {
+      const [, name, expected] = attr.match(/^\[([\w-]+)(?:="([^"]*)")?\]$/);
+      const value = name.startsWith('data-')
+        ? this.dataset[name.slice(5).replace(/-([a-z])/g, (_, c) => c.toUpperCase())]
+        : this.getAttribute(name) ?? (name === 'href' ? this.href : undefined);
+      if (expected === undefined ? value == null : String(value) !== expected) return false;
+    }
+    return true;
+  };
+  const baseQuery = FakeElement.prototype.querySelectorAll;
+  FakeElement.prototype.querySelectorAll = function(selector) {
+    const found = [];
+    for (const part of selector.split(',').map(s => s.trim())) {
+      let scope = [this];
+      for (const step of part.split(/\s+/).filter(s => s !== '>')) {
+        const next = [];
+        for (const node of scope) {
+          for (const el of baseQuery.call(node, step)) if (!next.includes(el)) next.push(el);
+        }
+        scope = next;
+      }
+      for (const el of scope) if (!found.includes(el)) found.push(el);
+    }
+    return found;
+  };
+}
+"""
+
+# Animation frames run when the test flushes them, after the code that asked,
+# as a browser runs them, instead of FAKE_DOM's immediate call.  Opt-in.
+QUEUED_FRAMES = r"""
+const frames = [];
+globalThis.requestAnimationFrame = fn => { frames.push(fn); return frames.length; };
+const flushFrames = () => { while (frames.length) frames.shift()(); };
+"""
+
+# Focus as a browser keeps it, opt-in: removing the focused node (or a node
+# holding it) hands focus to the body, and parentElement is the parent node.
+BROWSER_FOCUS = r"""
+Object.defineProperty(FakeElement.prototype, 'parentElement', {get() {
+  return this.parentNode && this.parentNode.tagName ? this.parentNode : null;
+}});
+const removeNode = FakeElement.prototype.remove;
+FakeElement.prototype.remove = function() {
+  const active = document.activeElement;
+  const held = !!active && this.contains(active);
+  removeNode.call(this);
+  if (held) document.activeElement = document.body;
+};
+"""
+
 
 def has_node() -> bool:
     return shutil.which("node") is not None

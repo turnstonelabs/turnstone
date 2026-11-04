@@ -584,7 +584,8 @@ def test_execution_journal_bounds_completed_raw_payloads():
     steps = journal.project_steps()
     assert journal.retained_step_count == 100
     # Only the last 100 steps stay.  Their arguments stay whole, for the rebuilt
-    # card's full call (the recall store bounds its total), and outputs clip.
+    # card's full call, and outputs clip; the count cap bounds the journal, and
+    # the recall store's byte budget applies once the steps are stashed.
     assert all(step["arguments"] == "a" * 16_000 for step in steps[1:])
     assert all(len(step["output"]) <= 2_000 for step in steps)
     assert journal.retained_step_chars < 100 * (16_000 + 2_000 + 100)
