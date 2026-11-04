@@ -5,7 +5,7 @@
    register their message scroller; the L-shell and standalone coordinator
    mount the same two-state control. */
 
-import { setConvBatchExpanded } from "./conversation.js";
+import { refitConvResults, setConvBatchExpanded } from "./conversation.js";
 
 const STORAGE_KEY = "turnstone_interface.transcript_presentation";
 const MODE_ATTRIBUTE = "data-transcript-presentation";
@@ -245,6 +245,11 @@ export function setTranscriptPresentation(mode, options) {
     prepareFocusForMode(next);
     currentMode = next;
     applyRootMode(currentMode);
+    // Batches compact presentation folded are back, with results that had no
+    // layout to measure.
+    if (currentMode === "default") {
+      for (const scroller of scrollers.keys()) refitConvResults(scroller);
+    }
     syncControls();
     restoreBottomPins(snapshots);
   }

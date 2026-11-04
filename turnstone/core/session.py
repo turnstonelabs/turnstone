@@ -1337,15 +1337,17 @@ _AGENT_GUARD_WINDOW_CHARS: int = 2 * _AGENT_TOOL_OUTPUT_CAP
 # than global uniqueness.
 _WEB_FETCH_PDF_REF_ID = "web-fetch-pdf"
 
-# Per-step output/arguments cap for a recalled task-agent sub-trajectory (the
-# projected step items /history attaches for the card rebuild).  Keeps the
-# recall payload small — the card shows a summary, not the full tool output.
+# Per-step output cap for a recalled task-agent sub-trajectory (the projected
+# step items /history attaches for the card rebuild).  Keeps the recall payload
+# small — the card shows a summary, not the full tool output.  A step's
+# arguments stay whole, so the rebuilt card can show the full call; the recall
+# store bounds its total size instead (session_ui_base
+# _AGENT_TRAJECTORY_BUDGET_BYTES).
 _AGENT_STEP_OUTPUT_CAP: int = 2000
 
-# Cap on the NUMBER of recalled steps per task agent.  With the per-step output
-# cap above, this bounds each stash entry's size (the LRU caps the agent count,
-# not per-entry bytes), so a 100+-tool agent can't blow the memory budget; the
-# overflow is replaced by one honest "(+N not retained)" marker step.
+# Cap on the NUMBER of recalled steps per task agent, so a 100+-tool agent's
+# entry stays a recent window; the overflow is replaced by one honest
+# "(+N not retained)" marker step.
 _AGENT_STEP_COUNT_CAP: int = 100
 # Provider-generated ids/names are bounded only by one response. Keep current
 # pending calls exact for execution/cancellation pairing, but bound the durable
@@ -1554,7 +1556,7 @@ class _TaskExecutionJournal:
             recall_step = {
                 "id": _bound_agent_identity(tool_call.id, _AGENT_STEP_ID_CAP),
                 "name": _bound_agent_identity(name, _AGENT_STEP_NAME_CAP),
-                "arguments": _clip_agent_text(tool_call.arguments, _AGENT_STEP_OUTPUT_CAP),
+                "arguments": tool_call.arguments,
                 "output": "",
                 "is_error": False,
             }
@@ -12628,6 +12630,11 @@ class ChatSession:
         # The safe path can synthesize an error item after a preparer raises;
         # every issued tool still carries the same execution authority field.
         item["_principal_id"] = principal
+        # The arguments as the model wrote them, for the web cards' complete view of the call.
+        # The stored turn keeps this same text, so /history replays what the live events showed.
+        function = tc.get("function")
+        raw_arguments = function.get("arguments") if isinstance(function, dict) else None
+        item["_raw_arguments"] = raw_arguments if isinstance(raw_arguments, str) else ""
         return item
 
     def bind_acting_user(self, user_id: str) -> None:

@@ -1,6 +1,6 @@
 /* Per-pane follow state shared by coordinator and interactive conversations. */
 
-import { focusTemporarily } from "./conversation.js";
+import { focusTemporarily, refitConvResults } from "./conversation.js";
 
 const BOTTOM_THRESHOLD_PX = 48;
 
@@ -154,8 +154,22 @@ export function mountConversationScroll(scroller) {
     touchY = y;
   });
   listen(button, "click", jumpToLatest);
+  // Someone opened a full call or a long result to read it: new output must
+  // not scroll it away.
+  listen(scroller, "conv-detail-open", () => setFollowing(false));
+  let lastWidth = scroller.clientWidth;
   const observer = new ResizeObserver(() => {
-    if (!visible()) return;
+    if (!visible()) {
+      // Shown again at any width, its results need measuring.
+      lastWidth = 0;
+      return;
+    }
+    // A new width rewraps every result, and a pane shown again lays its
+    // results out for the first time: which ones clip may have changed.
+    if (scroller.clientWidth !== lastWidth) {
+      lastWidth = scroller.clientWidth;
+      refitConvResults(scroller);
+    }
     if (distanceFromBottom() <= 1) setFollowing(true);
     schedule();
   });

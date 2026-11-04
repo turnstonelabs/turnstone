@@ -36,11 +36,15 @@ import {
   maxSeverityItem,
   buildConvBatchShell,
   buildConvRow,
+  attachConvFullCall,
+  closeOpenConvDetail,
+  convFullCallPanel,
   buildConvVerdict,
   buildConvWarning,
   buildConvActions,
   buildConvStatus,
   buildConvResult,
+  convResultExpandControl,
   buildPreviewChip,
   batchKicker,
   clearConvVerdictPending,
@@ -633,6 +637,17 @@ function createCoordinatorPane(root, wsId, opts) {
     // its own click (reveal), never the approve arm below — and the
     // preventDefault there would swallow that click outright.
     if (ae && ae === sbApprovalEl) return;
+    // Any focused button or link takes its own Enter too: on Deny it denies,
+    // and on "full call" or "show all" it opens that, never approving the
+    // batch.  D, Escape and Shift+A still resolve from there.
+    if (e.key === "Enter" && ae && ae.closest && ae.closest("button, a[href]"))
+      return;
+    // Escape on a full call or result someone opened closes it; a second
+    // Escape denies as before.
+    if (e.key === "Escape" && closeOpenConvDetail(ae)) {
+      e.preventDefault();
+      return;
+    }
     // Ignore browser/OS accelerators (Cmd+D bookmark, Ctrl+D, Alt+D) — only bare
     // keys + Shift+A resolve, else a stray accelerator silently denies the batch.
     if (e.ctrlKey || e.metaKey || e.altKey) return;
@@ -1613,7 +1628,8 @@ function createCoordinatorPane(root, wsId, opts) {
   // shell line at a glance; everything else gets "<name>: <key=val …>"
   // with values truncated.  The full pretty-printed args drop into the
   // preview block underneath, capped at a few hundred chars to match
-  // the live preview's footprint.
+  // the live preview's footprint.  The whole text rides along as
+  // `arguments`, as on the live items, for the row's "full call".
   function synthesizeHistoricalToolCall(name, callId, parsedArgs, argsRaw) {
     let header = name;
     let preview = "";
@@ -1658,6 +1674,7 @@ function createCoordinatorPane(root, wsId, opts) {
       func_name: name,
       header: header,
       preview: preview,
+      arguments: argsRaw,
     };
   }
 
@@ -1906,7 +1923,11 @@ function createCoordinatorPane(root, wsId, opts) {
       const errPill = document.createElement("span");
       errPill.className = "conv-row-status conv-row-status--error";
       errPill.textContent = "✗ " + (item.error || "blocked");
-      callLine.appendChild(errPill);
+      // Ahead of "full call", which keeps the line's right edge.
+      callLine.insertBefore(
+        errPill,
+        callLine.querySelector(".conv-row-full-toggle"),
+      );
       row.classList.add("error");
     }
     // If a runtime tool_result already landed an .error on this row,
@@ -1923,6 +1944,7 @@ function createCoordinatorPane(root, wsId, opts) {
       indexLabel: indexLabel || "",
       argsText: _formatBatchArgs(item),
     });
+    attachConvFullCall(row, item.arguments);
     // Apply status pills + data-needs-approval through the shared helper so
     // initial render and upgrade-in-place can't drift.
     _refreshRowStatus(row, item);
@@ -2003,7 +2025,9 @@ function createCoordinatorPane(root, wsId, opts) {
       }
       if (verdict) {
         const frag = buildConvVerdict(verdict);
-        const callEl = row.querySelector(".conv-row-call");
+        // After the call's summary: its line, and its full-call panel.
+        const callEl =
+          convFullCallPanel(row) || row.querySelector(".conv-row-call");
         if (callEl && callEl.nextSibling) {
           row.insertBefore(frag, callEl.nextSibling);
         } else {
@@ -2044,7 +2068,8 @@ function createCoordinatorPane(root, wsId, opts) {
     if (batch) setConvBatchExpanded(batch, true, { blocker: true });
     _appendVerdictLineTo(row, null);
     const frag = buildConvVerdict(null, { judgePending: true });
-    const callEl = row.querySelector(".conv-row-call");
+    const callEl =
+      convFullCallPanel(row) || row.querySelector(".conv-row-call");
     if (callEl && callEl.nextSibling) {
       row.insertBefore(frag, callEl.nextSibling);
     } else {
@@ -2063,8 +2088,14 @@ function createCoordinatorPane(root, wsId, opts) {
     if ((isError || exceptionalEffect) && batch) {
       setConvBatchExpanded(batch, true, { blocker: true });
     }
-    row
-      .querySelectorAll(".conv-row-result")
+    // The row's own result and its "show all", not the controls of an open
+    // full call's argument values.
+    Array.from(row.children)
+      .filter(
+        (child) =>
+          child.classList.contains("conv-row-result") ||
+          child.classList.contains("conv-result-expand"),
+      )
       .forEach((existing) => existing.remove());
     if (opts && opts.accepted) {
       clearConvVerdictPending(row);
@@ -2096,6 +2127,8 @@ function createCoordinatorPane(root, wsId, opts) {
     // across upgrade-in-place when the error came from a tool_result.
     if (isError) block.classList.add("conv-row-result--error");
     row.appendChild(block);
+    const expand = convResultExpandControl(block);
+    if (expand) row.appendChild(expand);
     const images = buildToolImages(opts && opts.attachments, { wsId: wsId });
     if (images) block.appendChild(images);
     // Accepted and replayed preview rows retain the transcript affordance even
@@ -2489,6 +2522,7 @@ function createCoordinatorPane(root, wsId, opts) {
         // do).  Preserves runtime tool_result errors via the
         // .conv-row-result--error marker.
         _refreshRowStatus(entry.row, it);
+        attachConvFullCall(entry.row, it.arguments);
         const cached = judgeVerdicts.get(it.call_id);
         const v = it.judge_verdict || it.heuristic_verdict || cached;
         if (v) {

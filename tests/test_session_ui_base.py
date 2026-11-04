@@ -1242,6 +1242,55 @@ def test_file_targets_survive_live_and_pending_card_projection() -> None:
     assert pending[1]["file_path"] == "/tmp/code.js"
 
 
+def test_serialize_approval_items_carries_the_arguments_as_written() -> None:
+    """The full text goes out unchanged, empty included; an item the session never stamped
+    (no ``_raw_arguments``) carries no field rather than an invented one."""
+    raw = '{"query": "' + "q" * 500 + '", "note": "line one\\nline two"}'
+    out = _make_ui()._serialize_approval_items(
+        [
+            {"call_id": "c1", "func_name": "mcp__docs__search", "_raw_arguments": raw},
+            {"call_id": "c2", "func_name": "bash", "_raw_arguments": ""},
+            {"call_id": "c3", "func_name": "bash"},
+        ]
+    )
+    assert out[0]["arguments"] == raw
+    assert out[1]["arguments"] == ""
+    assert "arguments" not in out[2]
+
+
+def test_full_arguments_stay_on_the_workstream_stream() -> None:
+    """The prompt's own stream carries each call's full arguments; the copy for the console's
+    cluster-wide channel and the cross-tenant dashboard keep only the header and preview."""
+    broadcast: list[dict[str, Any]] = []
+
+    class _BroadcastUI(_ConcreteUI):
+        def _broadcast_approve_request(self, detail: dict[str, Any]) -> None:
+            broadcast.append(detail)
+
+    ui = _BroadcastUI(ws_id="ws-1", user_id="u1")
+    ui._APPROVAL_WAIT_TIMEOUT = 0.05
+    lq = ui._register_listener()
+    raw = '{"command": "curl https://example.com/' + "p" * 300 + '"}'
+    item = {**_pending_item("t-1"), "_raw_arguments": raw}
+
+    with _patch_get_storage(MagicMock()), _patch_policies({}):
+        ui.approve_tools([item])
+
+    events = _drain(lq)
+    early = [e for e in events if e.get("type") == "tool_pending"]
+    prompts = [e for e in events if e.get("type") == "approve_request"]
+    assert [e["items"][0]["arguments"] for e in early] == [raw]
+    assert [e["items"][0]["arguments"] for e in prompts] == [raw]
+    assert len(broadcast) == 1
+    assert broadcast[0]["cycle_id"] == prompts[0]["cycle_id"]
+    assert broadcast[0]["items"][0]["header"] == "Tool: bash"
+    assert "arguments" not in broadcast[0]["items"][0]
+
+    _register_card_cycle(ui, prompts[0])
+    pending = ui.serialize_pending_approval_details()[0]["items"]
+    assert "arguments" not in pending[0]
+
+
 def test_record_auto_approves_appends_only_tagged_items() -> None:
     """Items without ``auto_approved=True`` are skipped — the ring
     buffer is meant to surface bypassed-the-gate calls, not a
@@ -3345,6 +3394,52 @@ class TestAgentTrajectoryStash:
         assert ui.get_agent_trajectory("t0") is None
         assert ui.get_agent_trajectory("t2") is None
         assert ui.get_agent_trajectory(f"t{_AGENT_TRAJECTORY_CAP + 2}") is not None
+
+    @staticmethod
+    def _steps(arguments: str) -> list[dict[str, Any]]:
+        return [{"id": "c", "name": "write_file", "arguments": arguments, "output": "ok"}]
+
+    def test_size_budget_evicts_the_oldest_first(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Steps keep whole arguments, so the store is bounded by its total UTF-8 text."""
+        monkeypatch.setattr("turnstone.core.session_ui_base._AGENT_TRAJECTORY_BUDGET_BYTES", 100)
+        ui = _make_ui()
+        # 40 bytes each: "c" + "write_file" + 27 bytes of arguments + "ok".
+        for call_id in ("a", "b", "c"):
+            ui.stash_agent_trajectory(call_id, self._steps("x" * 27))
+        assert ui.get_agent_trajectory("a") is None
+        assert ui.get_agent_trajectory("b") is not None
+        assert ui.get_agent_trajectory("c") is not None
+        assert ui._agent_trajectory_bytes == 80
+
+    def test_size_counts_utf8_bytes_and_restash_replaces_its_share(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr("turnstone.core.session_ui_base._AGENT_TRAJECTORY_BUDGET_BYTES", 100)
+        ui = _make_ui()
+        ui.stash_agent_trajectory("a", self._steps("é" * 30))  # 60 bytes of arguments
+        assert ui._agent_trajectory_bytes == 13 + 60
+        ui.stash_agent_trajectory("a", self._steps("x"))
+        assert ui._agent_trajectory_bytes == 14
+        ui.stash_agent_trajectory("b", self._steps("x" * 70))
+        assert ui.get_agent_trajectory("a") is not None, "a smaller restash freed its old share"
+
+    def test_one_larger_than_the_budget_is_not_retained(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr("turnstone.core.session_ui_base._AGENT_TRAJECTORY_BUDGET_BYTES", 100)
+        ui = _make_ui()
+        ui.stash_agent_trajectory("small", self._steps("x"))
+        ui.stash_agent_trajectory("small", self._steps("x" * 200))
+        ui.stash_agent_trajectory("huge", self._steps("x" * 200))
+        # Not retained is the honest unknown: the card renders the flat parent row.
+        assert ui.get_agent_trajectory("small") is None
+        assert ui.get_agent_trajectory("huge") is None
+        assert ui._agent_trajectory_bytes == 0
+
+    def test_the_budget_is_sixteen_mebibytes(self) -> None:
+        from turnstone.core.session_ui_base import _AGENT_TRAJECTORY_BUDGET_BYTES
+
+        assert _AGENT_TRAJECTORY_BUDGET_BYTES == 16 * 1024 * 1024
 
 
 # ---------------------------------------------------------------------------

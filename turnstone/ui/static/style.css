@@ -801,7 +801,7 @@ body {
   overflow: hidden;
 }
 .tool-output.collapsed::after {
-  content: "click to expand";
+  content: "";
   position: absolute;
   bottom: 0;
   left: 0;

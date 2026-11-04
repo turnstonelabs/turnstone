@@ -6729,23 +6729,24 @@ class TestTaskExecutionJournalProjection:
         steps = _TaskExecutionJournal(turns).project_steps()
         assert [s["output"] for s in steps] == ["out-A", "out-B"]
 
-    def test_file_path_survives_clipped_task_arguments(self):
+    def test_task_arguments_stay_whole_for_the_full_call(self):
+        """A recalled step keeps its call's arguments whole (the rebuilt card opens the
+        full call); only its output is clipped.  The recall store bounds the total."""
         from turnstone.core.session import _AGENT_STEP_OUTPUT_CAP
         from turnstone.core.trajectory import ToolCall, Turn
 
         path = "/workspace/reports/quarterly.html"
-        arguments = json.dumps({"content": "x" * (_AGENT_STEP_OUTPUT_CAP + 100), "path": path})
+        arguments = json.dumps({"content": "x" * (_AGENT_STEP_OUTPUT_CAP * 20), "path": path})
         turns = [
             Turn.assistant(
                 tool_calls=(ToolCall(id="write", name="write_file", arguments=arguments),)
             ),
-            Turn.tool("write", "Wrote report"),
+            Turn.tool("write", "Wrote report " + "y" * (_AGENT_STEP_OUTPUT_CAP * 2)),
         ]
         [step] = _TaskExecutionJournal(turns).project_steps()
         assert step["file_path"] == path
-        assert len(step["arguments"]) <= _AGENT_STEP_OUTPUT_CAP
-        with pytest.raises(json.JSONDecodeError):
-            json.loads(step["arguments"])
+        assert step["arguments"] == arguments
+        assert len(step["output"]) <= _AGENT_STEP_OUTPUT_CAP
 
     @pytest.mark.parametrize("name", ["write_file", "edit_file"])
     @pytest.mark.parametrize("failure", ["syntax", "recursion", "overlong-integer"])
@@ -8866,6 +8867,40 @@ class TestSafePrepareTool:
         # Sanity: the diagnostic context survives.
         assert "Error executing bash" in output
         assert "RuntimeError" in output
+
+
+class TestPreparedItemsKeepTheArgumentsAsWritten:
+    """Every issued tool item carries the model's arguments verbatim, for the web cards'
+    complete view of the call: the text the stored turn keeps and ``/history`` serves."""
+
+    def test_a_prepared_call_keeps_its_raw_text(self, tmp_db):
+        session = _make_session()
+        raw = '{"command": "printf \'%s\\\\n\' ' + "a" * 400 + '", "timeout": 30}'
+        tc = {"id": "call_1", "function": {"name": "bash", "arguments": raw}}
+
+        item = session._prepare_tool_for_principal(tc, "user-a")
+
+        assert item["_raw_arguments"] == raw
+        assert item["func_name"] == "bash"
+
+    @pytest.mark.parametrize(
+        ("function", "expected"),
+        [
+            ({"name": "bash", "arguments": '{"command": '}, '{"command": '),
+            ({"name": "no_such_tool", "arguments": '{"q": 1}'}, '{"q": 1}'),
+            ({"name": "bash", "arguments": None}, ""),
+            ("bash", ""),
+        ],
+        ids=["malformed-json", "unknown-tool", "no-arguments", "non-dict-function"],
+    )
+    def test_refused_and_malformed_calls_keep_it_too(self, tmp_db, function, expected):
+        session = _make_session()
+        tc = {"id": "call_1", "function": function}
+
+        item = session._prepare_tool_for_principal(tc, "user-a", safe=True)
+
+        assert item["error"]
+        assert item["_raw_arguments"] == expected
 
 
 class TestToolBatchPolicy:

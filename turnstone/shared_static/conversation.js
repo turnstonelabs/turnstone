@@ -627,6 +627,14 @@ function _batchHasProtectedFocus(batch) {
   return !head || !head.contains(active);
 }
 
+// A full call or result someone opened to read: an automatic fold would hide
+// it, so it waits, as it does for focused detail.
+function _batchHasOpenDetail(batch) {
+  return !!batch.querySelector(
+    '.conv-row[data-full-call="open"], [data-expanded="true"]',
+  );
+}
+
 // Focus a non-interactive element without pre-selecting an answer: a
 // temporary tabindex, so the element takes focus (and a visible ring)
 // while Space and Enter stay unarmed on any action button or link inside
@@ -723,7 +731,13 @@ export function setConvBatchExpanded(batch, expanded, options) {
   }
   const playing = _playingBatchMedia(batch);
   if (!expanded && !options.manual) {
-    if (_batchHasProtectedFocus(batch) || playing.length) return false;
+    if (
+      _batchHasProtectedFocus(batch) ||
+      playing.length ||
+      _batchHasOpenDetail(batch)
+    ) {
+      return false;
+    }
   }
   if (!expanded && options.manual) {
     for (const media of playing) {
@@ -738,6 +752,8 @@ export function setConvBatchExpanded(batch, expanded, options) {
   if (expanded) delete batch.dataset.compactFolded;
   else batch.dataset.compactFolded = "true";
   _syncConvBatchDisclosure(batch, expanded);
+  // Results folded away had no layout to measure.
+  if (expanded && !wasExpanded) refitConvResults(batch);
   return wasExpanded !== expanded;
 }
 
@@ -1270,20 +1286,481 @@ export function buildConvResult(output, opts) {
   // above: the server ships tool output verbatim, and a single multi-MB
   // result (an agent cat-ing a large file) becomes a multi-MB pre-wrap text
   // node that stalls layout on insert and is rebuilt on every full
-  // re-render.  The transcript shows the head; the full output stays in
-  // history/storage.
-  const RAW_CAP = 64 * 1024;
-  if (pretty.length > RAW_CAP) {
-    pretty =
-      pretty.slice(0, RAW_CAP) +
-      "\n… (" +
-      pretty.length.toLocaleString() +
-      " chars total — truncated for display)";
-  }
+  // re-render.  The transcript shows the head; "show all" renders the rest
+  // when someone asks for it.
+  const shown = _displayCut(pretty);
   const body = document.createElement("span");
-  body.textContent = redactCredentials(pretty);
+  body.textContent = redactCredentials(shown);
   block.appendChild(body);
+  // A result longer than the box gets "show all", which also renders the
+  // characters past the cut, on request (convResultExpandControl hands the
+  // control to the caller that places the box).
+  const expand = buildConvResultExpand(block, {
+    text: pretty,
+    boxLines: CONV_RESULT_BOX_LINES,
+    cut:
+      shown === pretty ? null : { body, full: () => redactCredentials(pretty) },
+  });
+  if (expand) _resultExpands.set(block, expand);
   return block;
+}
+
+// Text longer than this renders as its head and a note until someone asks for
+// all of it (RAW_CAP: see buildConvResult).
+const RAW_CAP = 64 * 1024;
+
+function _displayCut(text) {
+  if (text.length <= RAW_CAP) return text;
+  return (
+    text.slice(0, RAW_CAP) +
+    "\n… (" +
+    text.length.toLocaleString() +
+    " chars total — truncated for display)"
+  );
+}
+
+// The hard lines .conv-row-result shows before it scrolls: 240px less 12px of
+// padding at 11px type and a 1.5 line height (conversation.css).
+const CONV_RESULT_BOX_LINES = 13;
+// The same for an argument value in an open full call: 14 lines, no padding.
+const CONV_ARG_BOX_LINES = 14;
+
+// ===========================================================================
+// Complete tool call and long results
+//
+// A row's summary (the server's header and preview, or replay's `key: value`
+// lines) shortens long values.  "full call" opens the call's arguments as the
+// model wrote them: live tool events carry that text as `arguments`, and
+// /history serves the same text for the stored call, so a live row and its
+// replay open the same view.  A long result, and a long argument value in an
+// open full call, has its own "show all", so opening one never unfolds
+// another.  A click that opens either tells the pane to stop following new
+// output (the bubbling `conv-detail-open` event), so the next token can't
+// scroll it away.
+// ===========================================================================
+
+let _fullCallSeq = 0;
+// row -> {text, toggle, panel}: the raw text stays off the DOM until opened.
+const _fullCalls = new WeakMap();
+
+// The pieces of a row that summarize its call.  The panel goes right after
+// them, ahead of any verdict or result, so it reads as their expansion.
+const _SUMMARY_CLASSES = [
+  "conv-row-call",
+  "conv-row-cmd",
+  "conv-row-diff",
+  "conv-diff-omit",
+];
+
+function _noteDetailOpened(el) {
+  if (typeof el.dispatchEvent !== "function") return;
+  if (typeof CustomEvent !== "function") return;
+  el.dispatchEvent(new CustomEvent("conv-detail-open", { bubbles: true }));
+}
+
+// No text, or an empty JSON object: a full call would only say so.
+function _noArguments(text) {
+  return /^\s*(\{\s*\})?\s*$/.test(text);
+}
+
+// Add the "full call" control to a .conv-row (from buildConvRow).  Anything
+// but a string `argumentsText` with something in it leaves the row as it is,
+// so an event without the field keeps just the summary.  Idempotent: a row
+// keeps the control (and its open state) it already has.
+export function attachConvFullCall(row, argumentsText) {
+  if (!row || typeof argumentsText !== "string" || _fullCalls.has(row)) return;
+  if (_noArguments(argumentsText)) return;
+  const children = Array.from(row.children || []);
+  const callLine = children.find((child) =>
+    child.classList.contains("conv-row-call"),
+  );
+  if (!callLine) return;
+  const panel = document.createElement("div");
+  panel.className = "conv-row-full";
+  panel.id = "conv-row-full-" + (_fullCallSeq += 1);
+  panel.hidden = true;
+  // Named by its caption: the panel does not follow its toggle in the DOM.
+  panel.setAttribute("role", "group");
+  panel.setAttribute("aria-labelledby", panel.id + "-caption");
+  const toggle = document.createElement("button");
+  toggle.type = "button";
+  toggle.className = "conv-row-full-toggle";
+  toggle.setAttribute("aria-expanded", "false");
+  toggle.setAttribute("aria-controls", panel.id);
+  const name = row.dataset.toolName;
+  toggle.setAttribute("aria-label", name ? "Full call: " + name : "Full call");
+  const caret = document.createElement("span");
+  caret.className = "conv-row-full-caret";
+  caret.setAttribute("aria-hidden", "true");
+  caret.textContent = "▾"; // CSS turns it while the call is closed
+  const label = document.createElement("span");
+  label.textContent = "full call";
+  toggle.append(caret, label);
+  toggle.addEventListener("click", () => {
+    const open = row.dataset.fullCall !== "open";
+    setConvFullCallOpen(row, open);
+    if (open) _noteDetailOpened(toggle);
+  });
+  callLine.appendChild(toggle);
+  let anchor = callLine;
+  for (const child of children) {
+    if (_SUMMARY_CLASSES.some((cls) => child.classList.contains(cls))) {
+      anchor = child;
+    }
+  }
+  const next = children[children.indexOf(anchor) + 1] || null;
+  if (next) row.insertBefore(panel, next);
+  else row.appendChild(panel);
+  _fullCalls.set(row, { text: argumentsText, toggle, panel });
+}
+
+// The row's full-call panel, for a caller placing something after it.
+export function convFullCallPanel(row) {
+  const entry = row ? _fullCalls.get(row) : null;
+  return entry ? entry.panel : null;
+}
+
+// Open or close a row's full call.  The panel is built on each open and
+// emptied on close, so a long call holds no DOM while it is closed.
+export function setConvFullCallOpen(row, open) {
+  const entry = row ? _fullCalls.get(row) : null;
+  if (!entry) return false;
+  if (open) {
+    const caption = document.createElement("div");
+    caption.className = "conv-full-args-caption";
+    caption.id = entry.panel.id + "-caption";
+    caption.textContent = "arguments · as written";
+    entry.panel.replaceChildren(
+      caption,
+      buildConvFullCallArguments(entry.text),
+    );
+    row.dataset.fullCall = "open";
+  } else {
+    entry.panel.replaceChildren();
+    delete row.dataset.fullCall;
+  }
+  entry.panel.hidden = !open;
+  entry.toggle.setAttribute("aria-expanded", open ? "true" : "false");
+  return true;
+}
+
+// Which rows under `root` have their full call open, by call id, and whose
+// control has focus.  A pane that rebuilds a batch in place (the early-paint
+// shell upgrading) hands this to restoreConvFullCalls afterwards, so a call
+// someone is reading stays open.
+export function captureConvFullCalls(root) {
+  const open = new Set();
+  let focused = null;
+  for (const row of root ? root.querySelectorAll(".conv-row") : []) {
+    const entry = _fullCalls.get(row);
+    const id = row.dataset.callId;
+    if (!entry || !id) continue;
+    if (row.dataset.fullCall === "open") open.add(id);
+    if (document.activeElement === entry.toggle) focused = id;
+  }
+  return { open, focused };
+}
+
+export function restoreConvFullCalls(root, captured) {
+  if (!root || !captured) return;
+  for (const row of root.querySelectorAll(".conv-row")) {
+    const id = row.dataset.callId;
+    if (!id) continue;
+    if (captured.open.has(id) && row.dataset.fullCall !== "open") {
+      setConvFullCallOpen(row, true);
+    }
+    const entry = _fullCalls.get(row);
+    if (entry && captured.focused === id) {
+      entry.toggle.focus({ preventScroll: true });
+    }
+  }
+}
+
+// Escape on a control with something open closes that, ahead of the approval
+// shortcuts that read Escape as a denial; anywhere else inside an open full
+// call it closes the panel and hands focus back to its toggle.  Each Escape
+// closes one level, and only one with nothing open around it denies.  True
+// when it closed something.
+export function closeOpenConvDetail(target) {
+  if (!target || !target.classList) return false;
+  if (
+    (target.classList.contains("conv-row-full-toggle") &&
+      target.getAttribute("aria-expanded") === "true") ||
+    (target.classList.contains("conv-result-expand") &&
+      target.dataset.expanded === "true")
+  ) {
+    target.click();
+    return true;
+  }
+  const panel = target.closest ? target.closest(".conv-row-full") : null;
+  const row = panel ? panel.parentNode : null;
+  const entry = row ? _fullCalls.get(row) : null;
+  if (!entry || row.dataset.fullCall !== "open") return false;
+  setConvFullCallOpen(row, false);
+  entry.toggle.focus({ preventScroll: true });
+  return true;
+}
+
+// A number keeps the digits the model wrote: plain parsing rounds integers
+// past 2^53 (snowflake-style ids) and drops a trailing ".0".  An engine
+// without JSON.rawJSON parses as usual.
+const _keepNumberSource =
+  typeof JSON.rawJSON === "function"
+    ? (_key, value, context) =>
+        typeof value === "number" &&
+        context &&
+        typeof context.source === "string"
+          ? JSON.rawJSON(context.source)
+          : value
+    : undefined;
+
+function _isRawJson(value) {
+  return typeof JSON.isRawJSON === "function" && JSON.isRawJSON(value);
+}
+
+function _fullCallValueText(value) {
+  return typeof value === "string" ? value : JSON.stringify(value, null, 2);
+}
+
+// [[key, text], …] for an object's top-level values, [] for no arguments,
+// [[null, text]] for anything else: other JSON printed, text that does not
+// parse as written.
+function _fullCallEntries(raw) {
+  if (!raw.trim()) return [];
+  let parsed;
+  try {
+    parsed = JSON.parse(raw, _keepNumberSource);
+  } catch (_e) {
+    return [[null, raw]];
+  }
+  try {
+    if (
+      parsed !== null &&
+      typeof parsed === "object" &&
+      !Array.isArray(parsed) &&
+      !_isRawJson(parsed)
+    ) {
+      return Object.keys(parsed).map((key) => [
+        key,
+        _fullCallValueText(parsed[key]),
+      ]);
+    }
+    return [[null, _fullCallValueText(parsed)]];
+  } catch (_e) {
+    // A structure too deep to print.
+    return [[null, raw]];
+  }
+}
+
+// The call's arguments as labelled values: each top-level key over its value,
+// a string as written (line breaks kept), anything else as indented JSON.  A
+// long value gets a box of its own with "show all", like a result, so every
+// name and the approval buttons stay in reach.  The raw text is redacted
+// before it is parsed, so the rules keyed on a name ("password": …) still see
+// it, and each decoded key and value again, for a secret a JSON escape hid.
+export function buildConvFullCallArguments(text) {
+  const wrap = document.createElement("div");
+  wrap.className = "conv-full-args";
+  const entries = _fullCallEntries(
+    redactCredentials(String(text == null ? "" : text)),
+  );
+  if (!entries.length) {
+    const none = document.createElement("div");
+    none.className = "conv-full-args-none";
+    none.textContent = "(no arguments)";
+    wrap.appendChild(none);
+    return wrap;
+  }
+  for (const [key, valueText] of entries) {
+    const arg = document.createElement("div");
+    arg.className = "conv-full-arg";
+    if (key !== null) {
+      const name = document.createElement("div");
+      name.className = "conv-full-arg-name";
+      name.textContent = redactCredentials(stripAnsi(key));
+      arg.appendChild(name);
+    }
+    const full = redactCredentials(stripAnsi(valueText));
+    const shown = _displayCut(full);
+    const value = document.createElement("div");
+    value.className = "conv-full-arg-value";
+    value.textContent = shown;
+    arg.appendChild(value);
+    const expand = buildConvResultExpand(value, {
+      text: full,
+      boxLines: CONV_ARG_BOX_LINES,
+      cut: shown === full ? null : { body: value, full: () => full },
+    });
+    if (expand) arg.appendChild(expand);
+    wrap.appendChild(arg);
+  }
+  return wrap;
+}
+
+let _resultBoxSeq = 0;
+// A box surely clips text with more hard lines than it shows (a line can only
+// wrap into more), or with more characters than it holds even on a very wide
+// pane: about 250 a line over its 13 to 16 lines.  In between, only a
+// measurement tells, and text this small never clips any box.
+const RESULT_BOX_CHARS = 4000;
+const RESULT_TINY_CHARS = 160;
+const RESULT_TINY_LINES = 4;
+// box -> its "show all" control, for a caller that places it (buildConvResult).
+const _resultExpands = new WeakMap();
+// control -> {box, cut, state}, for measuring whether the box clips.
+const _resultFits = new WeakMap();
+const _pendingFits = new Set();
+let _fitScheduled = false;
+
+function _countLines(text) {
+  let lines = 1;
+  for (let i = text.indexOf("\n"); i !== -1; i = text.indexOf("\n", i + 1)) {
+    lines += 1;
+  }
+  return lines;
+}
+
+function _countLabel(n, unit) {
+  return n.toLocaleString() + " " + unit + (n === 1 ? "" : "s");
+}
+
+function _selectingText() {
+  const selection =
+    typeof window !== "undefined" && typeof window.getSelection === "function"
+      ? window.getSelection()
+      : null;
+  return !!selection && String(selection) !== "";
+}
+
+function _scrollParent(el) {
+  if (typeof getComputedStyle !== "function") return null;
+  for (let node = el.parentElement; node; node = node.parentElement) {
+    const overflowY = getComputedStyle(node).overflowY;
+    if (overflowY === "auto" || overflowY === "scroll") return node;
+  }
+  return null;
+}
+
+// Collapsing a long box above the viewport would yank the page under the
+// reader: keep the control where it was on screen.
+function _keepInView(el, change) {
+  const scroller =
+    typeof el.getBoundingClientRect === "function" ? _scrollParent(el) : null;
+  const before = scroller ? el.getBoundingClientRect().top : 0;
+  change();
+  if (scroller) scroller.scrollTop += el.getBoundingClientRect().top - before;
+}
+
+// The "show all" control for a box (the coordinator's .conv-row-result, the
+// interactive pane's .tool-output, an argument value), or null for text too
+// small to need one.  The caller places it right after the box.  Showing all
+// lifts the box's height cap, and the label turns to "collapse".  The control
+// starts hidden unless the line count already proves the box clips; a
+// measurement once the box has a layout settles it.  opts:
+//   text      -- the whole text
+//   boxLines  -- the hard lines the box shows before it scrolls
+//   fold      -- fold text longer than that to the interactive pane's short
+//                preview (.collapsed); a click on the preview shows all
+//   cut       -- {body, full}: `body` shows a cut of the text; showing all
+//                puts full() there (and collapsing, the cut again)
+export function buildConvResultExpand(box, opts) {
+  opts = opts || {};
+  const text = String(opts.text == null ? "" : opts.text);
+  const boxLines = Number(opts.boxLines) || 0;
+  const lines = text ? _countLines(text) : 0;
+  const cut = opts.cut || null;
+  if (
+    !cut &&
+    lines <= Math.min(RESULT_TINY_LINES, boxLines) &&
+    text.length <= RESULT_TINY_CHARS
+  ) {
+    return null;
+  }
+  const state = { fold: !!opts.fold && lines > boxLines };
+  if (!box.id) box.id = "conv-result-" + (_resultBoxSeq += 1);
+  const size =
+    lines > boxLines
+      ? _countLabel(lines, "line")
+      : _countLabel(text.length, "char");
+  const control = document.createElement("button");
+  control.type = "button";
+  control.className = "conv-result-expand";
+  control.setAttribute("aria-controls", box.id);
+  control.hidden = !(cut || lines > boxLines || text.length > RESULT_BOX_CHARS);
+  const cutText = cut ? cut.body.textContent : null;
+  const show = (all) => {
+    if (all) box.dataset.expanded = "true";
+    else delete box.dataset.expanded;
+    control.dataset.expanded = all ? "true" : "false";
+    if (state.fold) box.classList.toggle("collapsed", !all);
+    if (cut) cut.body.textContent = all ? cut.full() : cutText;
+    control.textContent = all ? "collapse" : "show all · " + size;
+  };
+  show(false);
+  control.addEventListener("click", () => {
+    if (box.dataset.expanded === "true") {
+      _keepInView(control, () => show(false));
+    } else {
+      show(true);
+      _noteDetailOpened(control);
+    }
+  });
+  if (state.fold) {
+    box.addEventListener("click", () => {
+      if (!box.classList.contains("collapsed") || _selectingText()) return;
+      show(true);
+      _noteDetailOpened(box);
+    });
+  }
+  _resultFits.set(control, { box, cut, state });
+  _scheduleResultFit(control);
+  return control;
+}
+
+// Whether a box really clips, measured once it has a layout: every box
+// waiting is read in one frame and then written, so a replay of many results
+// costs one layout.  A box with no layout yet (a hidden pane, a folded batch)
+// keeps the line-count guess until refitConvResults asks again.  A box that
+// fits loses its control, and its fold if it had one.
+function _scheduleResultFit(control) {
+  _pendingFits.add(control);
+  if (_fitScheduled || typeof requestAnimationFrame !== "function") return;
+  _fitScheduled = true;
+  requestAnimationFrame(_flushResultFits);
+}
+
+function _flushResultFits() {
+  _fitScheduled = false;
+  const measured = [];
+  for (const control of _pendingFits) {
+    const fit = _resultFits.get(control);
+    if (!fit || fit.cut || control.dataset.expanded === "true") continue;
+    const box = fit.box;
+    if (!box.isConnected || !box.clientHeight) continue;
+    measured.push([control, fit, box.scrollHeight > box.clientHeight + 1]);
+  }
+  _pendingFits.clear();
+  for (const [control, fit, clipped] of measured) {
+    control.hidden = !clipped;
+    if (!clipped && fit.state.fold) {
+      fit.state.fold = false;
+      fit.box.classList.remove("collapsed");
+    }
+  }
+}
+
+// Measure every "show all" under `root` again: a pane calls this when it is
+// shown or its width changes, a batch or a sub-agent card when it unfolds.
+export function refitConvResults(root) {
+  if (!root || typeof root.querySelectorAll !== "function") return;
+  for (const control of root.querySelectorAll(".conv-result-expand")) {
+    _scheduleResultFit(control);
+  }
+}
+
+// The "show all" control buildConvResult made for its box, if any.
+export function convResultExpandControl(box) {
+  return (box && _resultExpands.get(box)) || null;
 }
 
 // Shared open-content control for file results and stored previews. Callers
@@ -1427,6 +1904,8 @@ export function buildAgentCardBody() {
     const collapsed = wrap.dataset.collapsed === "true";
     wrap.dataset.collapsed = collapsed ? "false" : "true";
     toggle.setAttribute("aria-expanded", collapsed ? "true" : "false");
+    // Step results rendered while collapsed had no layout to measure.
+    if (collapsed) refitConvResults(body);
   });
   wrap.append(toggle, body);
   return { wrap, body, label, context, issue, toggle };

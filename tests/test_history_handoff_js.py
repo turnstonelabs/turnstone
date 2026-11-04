@@ -561,6 +561,8 @@ function buildConvResult(output, opts) {
   node.classList.add("conv-row-result");
   return node;
 }
+function convResultExpandControl() { return null; }
+function attachConvFullCall() {}
 let previewOpens = 0;
 function buildPreviewChip(preview, onOpen) {
   const node = makeNode("preview");
