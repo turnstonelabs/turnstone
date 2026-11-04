@@ -6617,15 +6617,18 @@ function _rememberModelResponseControl(spec) {
 // settings-registry key onto a UX label.  ``effortKey`` is optional —
 // roles whose registry entry has a paired ``*.reasoning_effort``
 // setting render a second selector inline.  Adding a new role (e.g.
-// ``perception.audio.model``) is purely additive: drop a row here once
-// the SettingDef lands in turnstone/core/settings_registry.py.
+// ``perception.audio.model``) takes a row here once the SettingDef lands
+// in turnstone/core/settings_registry.py, and a place in
+// UTILITY_ROLE_SETTINGS (turnstone/core/model_registry.py) if the role gives
+// a model one narrow job; test_every_role_in_the_roles_tab_is_classified
+// fails until it is classified one way or the other.
 // ``fallbackKind`` controls how the empty/blank option in the alias
-// dropdown is labelled.  Coordinator and Judge fall back to a single
-// well-defined alias (model.default_alias / coordinator alias) so we
-// surface that concrete model in the placeholder.  The Task agent
-// cascades through ``[model].task_model → [model].agent_model →
-// session model`` per turnstone/core/settings_registry.py, and the
-// Output guard judge through ``judge.output_guard_model → judge.model →
+// dropdown is labelled.  The Coordinator falls back to a single
+// well-defined alias (model.default_alias) so we surface that concrete
+// model in the placeholder.  The Task agent cascades through
+// ``[model].task_model → [model].agent_model → session model`` per
+// turnstone/core/settings_registry.py, the Judge is the session's own
+// model, and the Output guard judge cascades through ``judge.model →
 // session model`` — there's no single "default" to advertise, so the
 // blank reads "(inherit)" to match the vocabulary of the
 // reasoning-effort dropdowns.
@@ -6641,9 +6644,9 @@ const MODEL_ROLES = [
   {
     label: "Judge",
     description:
-      "Intent-validation judge that scores tool calls before approval. Also runs the output guard when no output guard judge is set.",
+      "Intent-validation judge that scores tool calls before approval. Also runs the output guard when no output guard judge is set. Empty uses the session's model.",
     aliasKey: "judge.model",
-    fallbackKind: "default",
+    fallbackKind: "inherit",
   },
   {
     label: "Output guard judge",
@@ -7297,8 +7300,8 @@ function _renderModelRoles(container, values, schema) {
     // Format the blank/inherit option in the same "alias (model)" shape
     // as the other rows so the dropdown reads consistently — without
     // this the empty row was bare "(default — flatspark)" while every
-    // other row carried a "(/models/...)" suffix.  Plan/Task agent and
-    // the Output guard judge fall back through a multi-step chain
+    // other row carried a "(/models/...)" suffix.  Plan/Task agent, the
+    // Judge and the Output guard judge inherit through a chain
     // (config.toml → agent_model → session; judge.model → session) that
     // has no single concrete "default", so they get a plain "(inherit)"
     // instead of the misleading "(default — <coordinator-alias>)".

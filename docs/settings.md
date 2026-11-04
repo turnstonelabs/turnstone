@@ -359,6 +359,26 @@ so operators can pick a cheaper/faster model for autonomous loops:
 Both are live-editable from the Settings tab and take effect on the
 next sub-agent invocation — no restart required.
 
+### Aliases offered to AI agents
+
+`model.hide_utility_aliases`, on by default, keeps an alias set for Judge, Output
+guard judge, Speech-to-text, Text-to-speech, Perception or Reranker out of the lists
+AI agents see: a coordinator's `list_nodes` and `task_agent`'s alias list. The
+default alias stays listed whatever else names it, so a cluster sharing one model
+keeps it. Every role still runs on the alias its setting names, and people's model
+pickers and the admin console's node views still list it. Rerankers and speech-only
+models are never listed for agents.
+
+This limits what an agent is shown, not what it can do. Which model a coordinator
+picks is the model's own decision, and one that learned a hidden alias some other
+way can still name it, and the call works.
+
+An edit reaches `list_nodes` with the node's next heartbeat, normally within 30
+seconds. The list in `task_agent`'s tool description changes when a session next
+rebuilds its tools (a reload that changes the models, or an MCP tool change) or
+reopens. That rewrite changes the start of the prompt, so a provider with prompt
+caching may miss its cache on the next turn.
+
 ---
 
 ## Bootstrap vs ConfigStore
@@ -379,7 +399,7 @@ initialization:
 
 | Section | Settings |
 |---------|----------|
-| `model` | default_alias, auth_audience_allowlist, auth_fail_closed, temperature, max_tokens, reasoning_effort, task_alias, task_effort |
+| `model` | default_alias, auth_audience_allowlist, auth_fail_closed, temperature, max_tokens, reasoning_effort, task_alias, task_effort, hide_utility_aliases |
 | `session` | instructions, retention_days, compact_max_tokens, auto_compact_pct |
 | `tools` | timeout, approval_timeout_seconds, truncation, agent_max_turns, skip_permissions, search, search_threshold, search_max_results |
 | `audio` | stt_model_alias, stt_prompt, tts_model_alias, tts_voice |

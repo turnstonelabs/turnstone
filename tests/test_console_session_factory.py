@@ -289,6 +289,51 @@ def test_unknown_explicit_alias_preserves_registry_value_error() -> None:
     registry.resolve_binding.assert_called_once_with("ghost")
 
 
+def test_a_per_call_judge_model_reaches_the_session_apart_from_the_setting() -> None:
+    """It reaches ``ChatSession`` as ``workstream_judge_model``, unresolved and apart from
+    ``judge_config``: an alias the session can't use builds no judge, never one on the configured
+    model (#1529)."""
+    from unittest.mock import patch
+
+    from tests._coord_test_helpers import _fake_registry
+
+    factory = build_console_session_factory(
+        registry=_fake_registry(),
+        config_store=_FakeConfigStore({"judge.enabled": True, "judge.model": "configured"}),  # type: ignore[arg-type]
+        node_id="console",
+        coord_client_factory=lambda ws_id, uid: MagicMock(),
+    )
+    ui = MagicMock()
+    ui._user_id = ""
+
+    with patch("turnstone.console.session_factory.ChatSession") as chat_session:
+        factory(ui, ws_id="w1", judge_model="ghost")
+
+    kwargs = chat_session.call_args.kwargs
+    assert kwargs["workstream_judge_model"] == "ghost"
+    assert kwargs["judge_config"].model == "configured"
+
+
+def test_no_per_call_judge_model_leaves_the_session_following_the_setting() -> None:
+    from unittest.mock import patch
+
+    from tests._coord_test_helpers import _fake_registry
+
+    factory = build_console_session_factory(
+        registry=_fake_registry(),
+        config_store=_FakeConfigStore({"judge.enabled": True, "judge.model": "configured"}),  # type: ignore[arg-type]
+        node_id="console",
+        coord_client_factory=lambda ws_id, uid: MagicMock(),
+    )
+    ui = MagicMock()
+    ui._user_id = ""
+
+    with patch("turnstone.console.session_factory.ChatSession") as chat_session:
+        factory(ui, ws_id="w1")
+
+    assert chat_session.call_args.kwargs["workstream_judge_model"] == ""
+
+
 # ---------------------------------------------------------------------------
 # Coordinator MCP gate (#725) — flag × getter matrix, resolved per construction
 # ---------------------------------------------------------------------------
@@ -383,3 +428,45 @@ def test_mcp_getter_resolved_per_construction() -> None:
         second = cs.call_args.kwargs["mcp_client"]
     assert first is None
     assert second is manager
+
+
+def test_the_node_factory_hands_a_chosen_judge_to_the_session_as_is() -> None:
+    """The node builds its factory inside ``server.main``, so this reads that ``ChatSession`` call
+    with ast, which ignores comments and layout where a text match wouldn't (#1529)."""
+    import ast
+    import inspect
+    import textwrap
+
+    from turnstone import server
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(server.main)))
+    calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and ast.unparse(node.func) == "ChatSession"
+        and any(k.arg == "judge_config" for k in node.keywords)
+    ]
+    assert len(calls) == 1
+    keywords = {k.arg: ast.unparse(k.value) for k in calls[0].keywords}
+    assert keywords["workstream_judge_model"] == "judge_model or ''"
+    # Nothing checks the alias first and keeps ``judge.model`` when it doesn't resolve.
+    assert not any(
+        isinstance(node, ast.Call) and ast.unparse(node) == "registry.resolve(judge_model)"
+        for node in ast.walk(tree)
+    )
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [("   ", None), ("", None), (["x"], None), (None, None), (" set ", "set")],
+)
+def test_the_node_create_api_drops_a_blank_judge_pick(raw: Any, expected: str | None) -> None:
+    """A blank pick would strip to "" in the session and judge with its own model, so the node's
+    create builder, which the console's create proxy also reaches, keeps it out (#1529)."""
+    from turnstone.server import _interactive_create_build_kwargs
+
+    body = {} if raw is None else {"judge_model": raw}
+    kwargs = _interactive_create_build_kwargs(MagicMock(), body, "u1", None, "", 0)
+
+    assert kwargs["judge_model"] == expected

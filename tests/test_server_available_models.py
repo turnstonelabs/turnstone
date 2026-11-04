@@ -10,12 +10,12 @@ chain has to stay honest:
   (#1359). It is the model a new workstream launches on, or fails on: the
   pickers label one that isn't loaded rather than hide it.
 * ``channel_default_alias`` ← ``channels.default_model_alias``, loaded or not.
-* ``judge_default_alias``   ← ``judge.model``, but *only* when it names an
-  enabled alias.  An unset / whitespace / unknown / disabled value stays
-  blank: at runtime the judge then inherits the per-workstream agent model
-  (``session_factory``: ``judge_config.model or model``), which the UI
-  renders as "Default (agent model)".  Surfacing a fixed alias there would
-  mislabel the common follow-the-agent case.
+* ``judge_default_alias``   ← ``judge.model`` as configured, loaded or not: a
+  judge naming an alias it can't use doesn't judge rather than moving to
+  another model (#1529), and the picker labels it as not available.  An unset
+  or whitespace value stays blank: the workstream's own model judges, which
+  the UI renders as "Default (agent model)".  Surfacing a fixed alias there
+  would mislabel the common follow-the-agent case.
 
 These tests pin the judge branch (added so the server dashboard matches
 the coordinator launcher) alongside the pre-existing model default.
@@ -116,10 +116,10 @@ def test_judge_explicit_enabled_alias_passes_through() -> None:
     assert body["judge_default_alias"] == "judge-fast"
 
 
-def test_judge_set_to_unknown_alias_stays_blank() -> None:
-    """``judge.model`` naming a non-enabled alias falls back to the agent
-    model at runtime, so the field is blanked rather than echoing a value
-    workstream creation can't honour."""
+def test_judge_set_to_unknown_alias_is_reported_as_configured() -> None:
+    """``judge.model`` naming an alias this node hasn't loaded is reported as
+    is: the judge doesn't move to the agent model, so "Default (agent model)"
+    would be wrong, and the picker labels it as not available."""
     body = _get_models(
         _make_client(
             aliases={"primary": "vendor/primary"},
@@ -129,7 +129,7 @@ def test_judge_set_to_unknown_alias_stays_blank() -> None:
             },
         )
     )
-    assert body["judge_default_alias"] == ""
+    assert body["judge_default_alias"] == "ghost"
 
 
 def test_judge_whitespace_only_value_stays_blank() -> None:

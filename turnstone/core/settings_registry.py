@@ -149,6 +149,19 @@ def _build_registry() -> dict[str, SettingDef]:
             "\u2014 point this at a cheaper/faster model than your conversation model.",
         ),
         SettingDef(
+            "model.hide_utility_aliases",
+            "bool",
+            True,
+            "Keep aliases set for a utility role out of the lists AI agents see",
+            "model",
+            help="When on, an alias set for Judge, Output guard judge, Speech-to-text, "
+            "Text-to-speech, Perception or Reranker isn't listed for a coordinator choosing a "
+            "child's model or for task_agent, unless it is also the default. Every role still "
+            "runs on the alias its setting names. Asking for a hidden alias by name still "
+            "works, and the model pickers still list it. Rerankers and speech-only models are "
+            "never listed for agents, since they can't hold a chat.",
+        ),
+        SettingDef(
             "model.task_effort",
             "str",
             "",
@@ -672,9 +685,9 @@ def _build_registry() -> dict[str, SettingDef]:
             "judge",
             help="The judge can use a different AI model than the main conversation. "
             "Specify a registered alias from the Models tab, or leave empty to use the "
-            "same model as the session (self-consistency). Values that aren’t "
-            "registered aliases inherit the session model and log a warning — "
-            "register the model in the Models tab and reference it by alias. "
+            "same model as the session (self-consistency). A set alias that can't be "
+            "used is never replaced by another model: until it can be, tool calls get no "
+            "LLM verdict and Smart Approvals won't approve them. "
             "The output guard's LLM stage uses this model too unless "
             "judge.output_guard_model names its own.",
         ),
@@ -689,6 +702,9 @@ def _build_registry() -> dict[str, SettingDef]:
             "confidence at or above judge.confidence_threshold. 'review' and 'deny' "
             "recommendations, low-confidence verdicts, and judge errors (timeouts / fallbacks) "
             "always still require human approval. Requires judge.enabled and a working LLM judge. "
+            "With judge.model empty, the session's own model judges its own tool calls. "
+            "Setting judge.model keeps the judge separate only while the workstream runs on "
+            "another alias. "
             "Disabled by default \u2014 opt in once you trust the judge on your workload.",
         ),
         SettingDef(
@@ -791,6 +807,8 @@ def _build_registry() -> dict[str, SettingDef]:
             "judge",
             help="Model alias used for the LLM stage when output_guard_llm is enabled. "
             "Empty uses judge.model, and the session's model when that is empty too. "
+            "A set alias that can't be used is never replaced by another model: the regex "
+            "verdict stands alone until it can be. "
             "Set it to give the guard a model of its own: the guard judges every tool "
             "result, so on judge.model it shares that alias's admission limit with the "
             "intent judge, and long tool output needs a context window to match. "

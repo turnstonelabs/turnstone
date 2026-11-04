@@ -1647,10 +1647,13 @@ async def list_available_models(request: Request) -> JSONResponse:
             }
         )
     # Include effective defaults for clients (web UI, channel gateway). The
-    # default and channel aliases are reported as configured even when their
-    # model isn't loaded here: a create that relies on one fails with
-    # ``model_not_loaded`` rather than moving to another model (#1359), and the
-    # pickers label it as not available instead of hiding it.
+    # default, channel and judge aliases are reported as configured even when
+    # their model isn't loaded here: a create that relies on a default or channel
+    # alias fails with ``model_not_loaded``, and a judge naming an alias it can't
+    # use doesn't judge, rather than moving to another model (#1359, #1529). The
+    # pickers label it as not available instead of hiding it. An empty
+    # ``judge.model`` stays blank: the workstream's own model judges, which the
+    # UI renders as "Default (agent model)".
     cs = getattr(request.app.state, "config_store", None)
     default_alias = registry.effective_default(cs)
     channel_default_alias = ""
@@ -1658,15 +1661,6 @@ async def list_available_models(request: Request) -> JSONResponse:
     if cs is not None:
         channel_default_alias = (cs.get("channels.default_model_alias") or "").strip()
         judge_default_alias = (cs.get("judge.model") or "").strip()
-    enabled_aliases = set(registry.list_aliases())
-    # ``judge.model`` is alias-only.  When unset — or pointing at a
-    # disabled/removed alias — the judge inherits the per-workstream agent
-    # model at runtime (see session_factory: ``judge_config.model or
-    # model``).  Leave the field blank in that case so the UI renders
-    # "Default (agent model)" rather than a misleading fixed alias; only
-    # an explicitly-configured, enabled alias surfaces a concrete default.
-    if judge_default_alias and judge_default_alias not in enabled_aliases:
-        judge_default_alias = ""
     # STT/TTS are media roles: report a default only when the configured alias
     # exists AND is capability-eligible (the same gate the endpoints apply), so
     # the UI shows the mic / playback affordances only when they actually work.
@@ -2883,6 +2877,9 @@ def _interactive_create_build_kwargs(
     # later session-side lookups. The factory strips the lookup key
     # but the raw value used to flow through unchanged.
     canonical_skill = str(skill_data["name"]) if skill_data and skill_data.get("name") else None
+    # A blank pick is no pick: the session would strip it to "" and judge with its own model.
+    judge_raw = body.get("judge_model")
+    judge_model = (judge_raw.strip() if isinstance(judge_raw, str) else "") or None
     return {
         "user_id": uid,
         "name": body.get("name", ""),
@@ -2892,7 +2889,7 @@ def _interactive_create_build_kwargs(
         "skill_version": applied_skill_version,
         "ws_id": requested_ws_id,
         "client_type": body.get("client_type", "") or "",
-        "judge_model": body.get("judge_model", "") or None,
+        "judge_model": judge_model,
         "parent_ws_id": body.get("parent_ws_id") or None,
         "project_id": body.get("project_id") or None,
         "required_node_id": body.get("required_node_id"),
@@ -5029,11 +5026,15 @@ def _collect_node_models_metadata(app_state: Any) -> tuple[str, str, str] | None
     """Build the ``("models", json_value, "auto")`` node_metadata entry.
 
     Each model alias on the live registry is projected to
-    ``{alias, provider, healthy}`` — the alias is what the coordinator
+    ``{alias, provider, healthy, offered}`` — the alias is what the coordinator
     passes back as ``spawn_workstream(model=...)``, ``provider`` lets
-    coordinators classify or filter (e.g. "any anthropic node"), and
+    coordinators classify or filter (e.g. "any anthropic node"),
     ``healthy`` reflects the backend's :class:`BackendHealthTracker`
-    state at call time.  The underlying model identifier (``cfg.model``)
+    state at call time, and ``offered`` says whether a coordinator should see
+    it (:meth:`~turnstone.core.model_registry.ModelRegistry.offered_aliases`,
+    so per-node role settings count).  ``list_nodes`` shows a coordinator only
+    the offered rows, while the admin views read every alias the node loaded.
+    The underlying model identifier (``cfg.model``)
     is intentionally omitted — coordinators kept reaching for the
     provider-side string when they should have been passing the local
     alias, and dropping it removes the footgun.  Operators who need
@@ -5056,6 +5057,7 @@ def _collect_node_models_metadata(app_state: Any) -> tuple[str, str, str] | None
         return None
     health_reg = getattr(app_state, "health_registry", None)
     aliases_info: list[dict[str, Any]] = []
+    offered = set(registry.offered_aliases(getattr(app_state, "config_store", None)))
     # Iterate aliases in a stable order — ``list_aliases`` returns dict
     # insertion order, so two structurally identical registries built
     # from different sources (config.toml vs. DB rows in different
@@ -5079,6 +5081,7 @@ def _collect_node_models_metadata(app_state: Any) -> tuple[str, str, str] | None
                 "alias": alias,
                 "provider": cfg.provider,
                 "healthy": healthy,
+                "offered": alias in offered,
             }
         )
     return ("models", json.dumps(aliases_info), "auto")
@@ -6485,27 +6488,6 @@ def main() -> None:
 
         # Re-resolve from ConfigStore so new workstreams pick up hot-reloaded settings.
         live_judge_config = _build_judge_config()
-        if live_judge_config and judge_model:
-            import dataclasses
-
-            # Override the config-default judge model with the per-call
-            # alias, but DON'T replace the alias with the resolved
-            # underlying model id.  IntentJudge.__init__ does the full
-            # resolution (alias → client + provider + model) and
-            # pre-rewriting ``model`` to the underlying id strands the
-            # alias context — IntentJudge then has no way to recover the
-            # alias's provider/client and falls back to the session's
-            # provider with a model name that provider may not support
-            # (silent ``llm_fallback`` verdicts).  ``registry.resolve``
-            # is called purely as a typo / unknown-alias guard.
-            try:
-                registry.resolve(judge_model)
-                live_judge_config = dataclasses.replace(
-                    live_judge_config,
-                    model=judge_model,
-                )
-            except Exception as e:
-                log.warning("Failed to resolve judge_model %r: %s", judge_model, e)
 
         # Sampling knobs ride the shared assignment scheme (alias > stored
         # config > unset); unset means the wire omits the field and the
@@ -6547,6 +6529,7 @@ def main() -> None:
             web_search_backend=config_store.get("tools.web_search_backend"),
             skill=skill or None,
             judge_config=live_judge_config,
+            workstream_judge_model=judge_model or "",
             user_id=uid,
             config_store=config_store,
             client_type=ClientType(client_type)

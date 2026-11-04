@@ -4280,7 +4280,9 @@ def test_default_labels_name_a_model_the_list_lacks() -> None:
     assert "not available" not in label_fn
     node_src = _APP_JS.read_text(encoding="utf-8")
     picker_fn = node_src.split("function _populateModelSelect(", 1)[1].split("\n}\n", 1)[0]
-    assert 'defaultAlias + " (not available)"' in picker_fn
+    assert 'alias + " (not available)"' in picker_fn
+    # A judge alias this node hasn't loaded doesn't judge (#1529), so it reads the same way.
+    assert 'defaultLabel(defaults.judge_default_alias || "")' in picker_fn
     admin_src = _CONSOLE_ADMIN_JS.read_text(encoding="utf-8")
     schedule_fn = admin_src.split("function _decorateScheduleModelPlaceholder(", 1)[1].split(
         "\n}\n", 1

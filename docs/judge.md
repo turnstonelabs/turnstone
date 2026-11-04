@@ -34,7 +34,8 @@ persisted to the `intent_verdicts` table for audit and future calibration.
 
 Server and console workstreams read database-backed `judge.*` settings from
 the settings registry. Edit them at **Admin → Judge** or through the admin
-settings API; changes take effect for the next judge batch without a restart.
+settings API; changes take effect for the next judge batch without a restart,
+on open workstreams too. A workstream given its own judge model keeps that one.
 The principal settings are:
 
 ```text
@@ -64,11 +65,16 @@ to a human rather than executing the safe-looking subset piecemeal.
 
 Every other outcome reaches a human: `review` / `deny` recommendations,
 confidence below the threshold, judge errors or timeouts (`llm_fallback`), a
+judge model that can't be used (no judge runs, so nothing rules), a
 missing/duplicate call ID, an unjudged sibling, and any call the deterministic
 heuristic rules explicitly flagged `deny` or `critical`. That heuristic floor
 blocks only explicit danger verdicts — it is **not** a general "never lower the
 heuristic" rule. The heuristic's default for an unmatched tool is `review`, and
 letting a confident LLM upgrade that default is the feature's purpose.
+
+With `judge.model` empty, the session's own model judges its own tool calls.
+Setting `judge.model` keeps the judge apart from the model it judges only while
+the workstream runs on a different alias.
 
 The Smart Approvals enabled flag, threshold, and bounded verdict wait are
 captured as one immutable snapshot when each gate batch starts. A settings
@@ -130,6 +136,34 @@ CLI flags override `config.toml` values.
 - **Cross-provider**: A model alias carries its provider, endpoint, and
   credential configuration together, so a judge alias may use a different
   provider from the session without separate judge connection settings.
+- **An alias that can't be used**: A set `judge.model` whose alias isn't loaded,
+  or whose client can't be built, is never replaced by another model. That judge
+  doesn't run, as if it were switched off: tool calls get no verdict or risk
+  rating, and each waits for a person unless a policy or blanket approval already
+  covers it. The log says why (`judge.model_unavailable`), and the web UI and the
+  terminal show a one-time note; channel bots don't. The judge tries the alias
+  again after Sync to Nodes, a settings edit, or a timed reload (when
+  `[secrets]` configures a store) that finds a change. A Sync or a settings edit
+  also covers a client that couldn't be built, such as one missing its
+  certificate bundle; a timed reload that finds nothing changed doesn't. The CLI
+  reads its models once, so there it takes a restart. A batch already waiting on
+  a person stays with them when the judge comes back. The Models tab refuses to
+  delete, disable or rename a model that `judge.model` or
+  `judge.output_guard_model` names. Deleting or disabling the last enabled model
+  is allowed and leaves both settings as they are, since an empty setting would
+  hand judging to the session's own model, so a set judge stays off until
+  someone repoints it.
+- **Hiding it from AI agents**: With `model.hide_utility_aliases` on (the default),
+  an alias set for judging isn't listed for a coordinator choosing a child's model
+  or for `task_agent`, unless it is also the default. That limits what they're
+  shown, not what they can do: a model that learned the alias some other way can
+  still name it, and a person can still pick it, so nothing here keeps an alias to
+  judging alone.
+- **Per workstream**: A judge model picked for one workstream (the launcher's
+  judge picker, the create API's `judge_model`) replaces `judge.model` for that
+  workstream while it stays open, and one that can't be used is handled the same
+  way, never replaced by `judge.model`. It isn't saved with the workstream: a
+  reopened workstream, and a coordinator's children, follow `judge.model`.
 - **Google models**: The judge supports `google` aliases, including read-only
   evidence tools. Provider-native reasoning state such as Gemini
   `thought_signature` stays attached to the pinned model lane across evidence
@@ -527,10 +561,12 @@ Configure both at runtime through the admin Judge settings.
 
 The LLM stage (`judge.output_guard_llm`, off by default) runs the model named
 by `judge.output_guard_model`, else the one named by `judge.model`, else the
-session's model; a set alias that is not registered is passed over with a
-warning. On `judge.model` the guard shares that alias's `max_concurrency` with
-the intent judge, and long tool output needs a context window to match, so
-setting `judge.output_guard_model` gives the guard a model of its own. A
+session's model. An empty setting defers to the next; a set alias is final, so
+when its model can't be used no guard judge runs and the regex stage judges tool
+output alone until it can be. Only the log says so (`judge.model_unavailable`).
+On `judge.model` the guard shares that alias's `max_concurrency` with the intent
+judge, and long tool output needs a context window to match, so setting
+`judge.output_guard_model` gives the guard a model of its own. A
 workstream's own judge model (the launcher's judge picker, the create API's
 `judge_model`, the CLI's `--judge-model`) is its `judge.model`, so it runs the
 guard too unless `judge.output_guard_model` is set. The judge reads the tool

@@ -13,14 +13,10 @@ The default, channel and coordinator aliases are reported as configured
 even when no enabled row matches: a create that relies on one fails with
 ``model_not_loaded`` rather than moving to another model (#1359), and the
 pickers name it rather than hide it.
-* ``judge_default_alias`` ← ``judge.model``, falling back to the
-  resolved coordinator alias when empty *or* pointing at a value that
-  isn't an enabled alias.  ``judge.model`` is alias-only — same
-  contract as the other model roles — and
-  :class:`turnstone.core.judge.IntentJudge` silently inherits the
-  session model when an unknown value is configured, so the API
-  surfaces the resolved coordinator alias rather than echoing the
-  misconfigured string.
+* ``judge_default_alias`` ← ``judge.model`` as configured, loaded or not: a
+  judge naming an alias it can't use doesn't judge rather than moving to
+  another model (#1529).  Empty means the session's own model judges, which
+  on this launcher is the resolved coordinator alias.
 
 These tests pin each branch so the home composer's resolved-alias
 placeholder stays correct as the precedence rules evolve.
@@ -287,13 +283,11 @@ def test_judge_explicit_enabled_alias_passes_through(
     assert body["judge_default_alias"] == "judge-fast"
 
 
-def test_judge_set_to_unknown_value_inherits_coordinator(
+def test_judge_set_to_unknown_value_is_reported_as_configured(
     storage: SQLiteBackend,
 ) -> None:
-    """``judge.model`` is alias-only — same contract as the other model
-    roles.  An unknown value silently inherits the session model in
-    :class:`IntentJudge`, so the API surfaces the resolved coordinator
-    alias rather than echoing the misconfigured string."""
+    """The judge doesn't move to another model, so the placeholder doesn't
+    name one: it names what's configured, like the other model roles."""
     _seed_model(storage, definition_id="m1", alias="primary")
     body = _get_models(
         _make_client(
@@ -305,14 +299,13 @@ def test_judge_set_to_unknown_value_inherits_coordinator(
         )
     )
     assert body["coordinator_default_alias"] == "primary"
-    assert body["judge_default_alias"] == "primary"
+    assert body["judge_default_alias"] == "anthropic/claude-haiku-4-5"
 
 
-def test_judge_set_to_disabled_alias_inherits_coordinator(
+def test_judge_set_to_disabled_alias_is_reported_as_configured(
     storage: SQLiteBackend,
 ) -> None:
-    """Disabled-alias case is handled identically to the unknown-value
-    case — both trip the alias-not-resolved path."""
+    """Disabled-alias case is handled identically to the unknown-value case."""
     _seed_model(storage, definition_id="m1", alias="primary")
     _seed_model(storage, definition_id="m2", alias="judge-old", enabled=False)
     body = _get_models(
@@ -324,7 +317,7 @@ def test_judge_set_to_disabled_alias_inherits_coordinator(
             },
         )
     )
-    assert body["judge_default_alias"] == "primary"
+    assert body["judge_default_alias"] == "judge-old"
 
 
 # ---------------------------------------------------------------------------

@@ -10,6 +10,77 @@ All development now integrates on `main`. Supported release lines are maintained
 on `stable/X.Y` branches; `stable/1.8` preserves the former stable branch.
 The separate `dev` branch is retired. See [the release process](docs/releasing.md).
 
+## [2026-11-03]
+
+### Fixed
+
+- **A judge model that can't be used is never replaced by another model.** A set
+  `judge.model`, `judge.output_guard_model` or per-workstream `judge_model` whose
+  alias isn't loaded, or whose client can't be built, used to run on another model
+  with only a log warning: the session's, or for the output guard the next judge
+  setting's. Smart Approvals acted on those verdicts, so the model doing the work
+  could approve its own tool calls. Now that judge doesn't run, as if it were switched
+  off: tool calls get no verdict or risk rating, Smart Approvals approves none of them,
+  and each waits for a person unless a policy or blanket approval already covers it.
+  The output guard's regex stage judges alone. Each try logs why
+  (`judge.model_unavailable`), and for the intent judge the web UI and terminal show a
+  one-time note; channel bots don't. A judge tries again after Sync to Nodes, a settings
+  edit, or a model reload that changes something. An empty setting inherits as before. After upgrading, check any `judge.model` that
+  holds a raw model id or a removed alias: it no longer judges until it names a loaded
+  model (#1529).
+- **The Models tab refuses to remove a model a judge setting names.** Deleting,
+  disabling or renaming a model that `judge.model` or `judge.output_guard_model` names
+  answers 409 `model_in_use`, as for the routing settings, and says what clearing the
+  setting hands the role to. Removing the last enabled model leaves both settings in
+  place, so a set judge stays off until someone repoints it (#1529).
+- **The model pickers report `judge.model` as configured.** One that isn't loaded used
+  to read as blank, so the node picker showed "Default (agent model)" and the console's
+  showed the coordinator's alias. The node picker now labels it "(not available)", and
+  the console's names the configured alias (#1529).
+- **An edit of `judge.model` now reaches open workstreams at their next judge batch.**
+  It used to wait until they reopened. A workstream given its own judge model keeps
+  that one while it stays open (#1529).
+- **A stored setting that stops decoding keeps the value that last loaded.** A reload
+  used to read it as its default, which for `judge.model` moved open workstreams to
+  judging their own calls. A first load still reads it as the default (#1529).
+- **`task_agent` says why a model it named can't run, and lists no others.** The error
+  for an alias that isn't loaded used to call it unknown and list other aliases to use.
+  It now says why and whether trying again can help. On the CLI, which reads its models
+  once, a secret store outage says a restart loads it rather than to try again shortly
+  (#1529).
+- A client that can't be built logs `model_registry.client_construction_failed` with
+  the alias and provider as fields. The message used to print a literal `%r` (#1529).
+
+### Added
+
+- **AI agents are no longer offered models meant for other jobs.** A new setting,
+  `model.hide_utility_aliases`, on by default, keeps an alias set for Judge, Output guard
+  judge, Speech-to-text, Text-to-speech, Perception or Reranker out of a coordinator's
+  `list_nodes` and `task_agent`'s alias list. The default alias stays listed, and naming
+  a hidden alias still works. Rerankers and speech-only models are never listed, since
+  they can't hold a chat. Rows in `node_metadata`'s `models` entry gain an `offered` flag,
+  and the admin console's node views still show every alias. The spawn tools now ask a
+  coordinator to leave `model` out unless the user asked for one, and the coordinator
+  prompt's first tool pattern reads "Discover nodes and skills". These change what a
+  model is shown and asked, not what it can do: it can still name any loaded alias
+  (#1529).
+
+### Security
+
+- **Approval cards on Discord and Slack show model-written text as written.** On Discord
+  the command and the judge's summary reached the card as Markdown, so `a || b || c` hid
+  `b` as a spoiler, and a summary (the judge's words, or a heuristic template quoting the
+  call's arguments) could add a verdict line or a masked link beneath the real one. Markdown
+  in them and in a verdict's tool name is now escaped and a tool name can't close its code
+  span, so a URL shows as text, not a link, and the summary is one line of at most 400
+  characters after a "Summary:" label. On Slack the summary kept its line breaks and
+  emphasis; it now shows on one line in a code block under the same label, which no run of
+  backticks can close, and neither a run of five or more nor a backtick at either end
+  closes a preview's any more. A URL or channel name on a Slack card no longer becomes a
+  link. A Slack card showed only the tool's name for a call awaiting approval that has no
+  preview, such as a one-line bash command; it now shows the call's header line, up to 600
+  characters. Tool names on Slack sit on one line in a code span.
+
 ## [2026-11-01]
 
 ### Fixed

@@ -4385,7 +4385,7 @@
           },
           "judge_model": {
             "default": "",
-            "description": "Optional judge model alias for this workstream. Empty uses the server's configured judge model. The output guard's LLM stage runs on it too unless judge.output_guard_model is set.",
+            "description": "Optional judge model alias for this workstream. Empty uses the server's configured judge model. The output guard's LLM stage runs on it too unless judge.output_guard_model is set. An alias that can't be used is never replaced by another model: no LLM judges the workstream's tool calls until it can be.",
             "title": "Judge Model",
             "type": "string"
           },

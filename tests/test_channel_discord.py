@@ -10,6 +10,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import httpx2
 import pytest
 
+from tests._channel_markup import FORGED_TEXT, as_one_line, unescape, unescaped_markup
+
 # discord.utils.escape_markdown passes 'count' as positional to re.sub,
 # which is deprecated in Python 3.13+, and discord.Client's event
 # registration calls asyncio.iscoroutinefunction, deprecated in 3.14+.
@@ -881,6 +883,70 @@ class TestApprovalVerdictDisplay:
 
         # Message should be edited
         msg.edit.assert_awaited_once()
+
+    @pytest.mark.parametrize("forged", FORGED_TEXT)
+    def test_the_card_shows_a_command_as_written(self, forged):
+        """Unescaped, ``a || b || c`` hides ``b`` as a spoiler from the person approving it."""
+        from turnstone.sdk.events import ApproveRequestEvent
+
+        bot = self._make_bot()
+        thread = AsyncMock()
+        thread.send = AsyncMock(return_value=MagicMock())
+        header = f"bash: {forged}"
+        items = [{"func_name": "bash", "header": header, "needs_approval": True}]
+        _run(bot._on_ws_event("ws-1", thread, ApproveRequestEvent(ws_id="ws-1", items=items)))
+
+        shown = thread.send.call_args[1]["embed"].description.split("`bash`: ", 1)[1]
+        assert unescaped_markup(shown) == set()
+        assert unescape(shown) == as_one_line(header)
+
+    def _judge_verdict_field(self, *, func_name: str, intent_summary: str) -> dict:
+        """The field a judge verdict adds to a pending approval card."""
+        from turnstone.sdk.events import IntentVerdictEvent
+
+        bot = self._make_bot()
+        msg = MagicMock()
+        embed = MagicMock()
+        msg.embeds = [embed]
+        msg.edit = AsyncMock()
+        bot._pending_approval_msgs[("ws-1", "cyc-1")] = (msg, frozenset({"c-1"}))
+        event = IntentVerdictEvent(
+            ws_id="ws-1",
+            call_id="c-1",
+            func_name=func_name,
+            risk_level="high",
+            recommendation="deny",
+            confidence=0.9,
+            intent_summary=intent_summary,
+            tier="llm",
+        )
+        _run(bot._on_ws_event("ws-1", AsyncMock(), event))
+        return embed.add_field.call_args[1]
+
+    @pytest.mark.parametrize("forged", FORGED_TEXT)
+    def test_intent_verdict_summary_cannot_forge_the_card(self, forged):
+        """A summary the model wrote can't add a verdict line or a masked link of its own."""
+        field = self._judge_verdict_field(func_name="mcp__srv__tool", intent_summary=forged)
+
+        assert field["name"] == "Judge Verdict: mcp\\_\\_srv\\_\\_tool"
+        first, summary = field["value"].split("\n")
+        assert "HIGH" in first and "deny" in first
+        assert summary.startswith("Summary: _") and summary.endswith("_")
+        inner = summary.removeprefix("Summary: _").removesuffix("_")
+        assert unescaped_markup(inner) == set()
+        assert unescape(inner) == as_one_line(forged)
+
+    def test_a_long_intent_verdict_summary_still_fits_the_field(self):
+        """Escaping can double the text, and Discord refuses a field value over 1024 characters."""
+        field = self._judge_verdict_field(func_name="bash", intent_summary="*" * 5000)
+
+        assert len(field["value"]) <= 1024
+
+    def test_a_long_tool_name_still_fits_the_field_title(self):
+        """Discord refuses a field name over 256 characters, and the verdict then never shows."""
+        field = self._judge_verdict_field(func_name="_" * 400, intent_summary="x")
+
+        assert len(field["name"]) <= 256
 
     def test_intent_verdict_without_pending_approval_is_noop(self):
         """IntentVerdictEvent without a pending approval message should not error."""

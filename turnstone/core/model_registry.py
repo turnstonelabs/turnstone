@@ -534,6 +534,17 @@ def _api_surface_of(cfg: ModelConfig) -> str | None:
 # Registry
 # ---------------------------------------------------------------------------
 
+# The Roles tab's roles that give a model one narrow job. An alias only these name isn't offered
+# to a model choosing where general work runs (``ModelRegistry.offered_aliases``).
+UTILITY_ROLE_SETTINGS: tuple[str, ...] = (
+    "judge.model",
+    "judge.output_guard_model",
+    "audio.stt_model_alias",
+    "audio.tts_model_alias",
+    "perception.model_alias",
+    "tools.reranker_alias",
+)
+
 
 def serves_chat(capabilities: Mapping[str, Any], model: str) -> bool:
     """Whether a definition can hold a chat, and so be picked as the default.
@@ -719,9 +730,9 @@ class ModelRegistry:
                 # embed filesystem paths; the full detail goes to the
                 # server log instead.
                 log.warning(
-                    "Client construction failed for model alias %r (provider %s)",
-                    alias,
-                    cfg.provider,
+                    "model_registry.client_construction_failed",
+                    alias=alias,
+                    provider=cfg.provider,
                     exc_info=True,
                 )
                 raise ModelClientConstructionError(
@@ -979,6 +990,24 @@ class ModelRegistry:
                     return setting
             return self.task_effort
         return None
+
+    def offered_aliases(self, config_store: Any | None = None) -> list[str]:
+        """The aliases to offer a model choosing where general work runs, sorted.
+
+        A model that can't hold a chat (:func:`serves_chat`) is never offered.  With
+        ``model.hide_utility_aliases`` on, neither is an alias a utility role names
+        (:data:`UTILITY_ROLE_SETTINGS`), where an empty role names nothing.  The default stays
+        whatever else names it, so a small cluster sharing one model keeps it.  This shapes what
+        is offered, not what runs: every role reads its own setting, and naming a hidden alias
+        still works.  With no store (the CLI) there is no setting to read, so only the first
+        rule applies: a judge set by ``--judge-model`` or ``[judge] model`` stays listed.
+        """
+        configs = self._models
+        offered = {a for a, cfg in configs.items() if serves_chat(cfg.capabilities, cfg.model)}
+        if config_store is None or not config_store.get("model.hide_utility_aliases"):
+            return sorted(offered)
+        utility = {str(config_store.get(key) or "").strip() for key in UTILITY_ROLE_SETTINGS}
+        return sorted(offered - (utility - {self.effective_default(config_store)}))
 
     @property
     def count(self) -> int:

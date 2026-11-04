@@ -5043,8 +5043,40 @@ def test_the_guards_remedies_read_as_separate_steps(
         "'gpt' is still named by model.task_alias, [model] default in the console's "
         "config.toml. Point that setting at another model, or clear it. Change that "
         "config.toml line and restart the console. Do this before you delete it: creates "
-        "that rely on a setting naming a missing model fail."
+        "that rely on a setting naming a missing model fail, and a judge setting naming "
+        "one stops that judge."
     )
+
+
+@pytest.mark.parametrize("key", ["judge.model", "judge.output_guard_model"])
+def test_removing_a_model_a_judge_setting_names_is_refused(
+    storage: SQLiteBackend, key: str
+) -> None:
+    # Losing it would stop that judge, so a routine swap has to repoint the setting first.
+    _seed_model_def(storage, definition_id="m1", alias="judge", model="m")
+    _seed_model_def(storage, definition_id="m2", alias="spare", model="m")
+    _put_setting(storage, key, "judge")
+    client = _routing_client(storage, _make_registry(alias="spare", extras={"judge": "m"}))
+
+    deleted = client.delete("/v1/api/admin/model-definitions/m1")
+    disabled = client.put("/v1/api/admin/model-definitions/m1", json={"enabled": False})
+    renamed = client.put("/v1/api/admin/model-definitions/m1", json={"alias": "judge2"})
+
+    for resp in (deleted, disabled, renamed):
+        assert resp.status_code == 409, resp.text
+        assert resp.json()["code"] == "model_in_use"
+        assert resp.json()["settings"] == [key]
+    row = storage.get_model_definition("m1")
+    assert row is not None and row["alias"] == "judge" and row["enabled"]
+    # Clearing hands the role on rather than stopping it, down to the session's own model,
+    # which the step it sits beside should say (ruling: self-judging only when a person
+    # chooses it).
+    assert (
+        "Clearing a judge setting hands its role on: a node's own row to the global one, "
+        "judge.output_guard_model to judge.model, and judge.model to each session's own "
+        "model, which then judges its own tool calls, and its tool output too when "
+        "judge.output_guard_model is empty."
+    ) in deleted.json()["error"]
 
 
 def test_deleting_the_default_model_is_refused(storage: SQLiteBackend) -> None:
@@ -5117,6 +5149,29 @@ def test_removing_the_last_enabled_model_clears_the_settings_naming_it(
     assert storage.get_system_setting("model.default_alias") is None
     assert storage.get_system_setting("coordinator.model_alias", node_id="node-1") is None
     assert _setting(storage, "model.task_alias") == "off"  # names another model
+
+
+@pytest.mark.parametrize("how", ["delete", "disable"])
+def test_removing_the_last_enabled_model_leaves_the_judge_settings(
+    storage: SQLiteBackend, how: str
+) -> None:
+    """Cleared, the session's own model would start judging its own calls, with Smart Approvals
+    still acting on it, and nobody chose that (#1529). A set judge keeps refusing instead."""
+    _seed_model_def(storage, definition_id="m1", alias="only", model="m")
+    _put_setting(storage, "model.default_alias", "only")
+    _put_setting(storage, "judge.model", "only")
+    _put_setting(storage, "judge.output_guard_model", "only", node_id="node-1")
+    client = _routing_client(storage, _make_registry(alias="only"))
+
+    if how == "delete":
+        resp = client.delete("/v1/api/admin/model-definitions/m1")
+    else:
+        resp = client.put("/v1/api/admin/model-definitions/m1", json={"enabled": False})
+
+    assert resp.status_code == 200, resp.text
+    assert storage.get_system_setting("model.default_alias") is None
+    assert _setting(storage, "judge.model") == "only"
+    assert _setting(storage, "judge.output_guard_model", node_id="node-1") == "only"
 
 
 def test_disabling_the_last_enabled_model_clears_the_settings_naming_it(

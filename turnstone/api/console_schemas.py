@@ -191,7 +191,9 @@ class ConsoleCreateWsRequest(BaseModel):
         default="",
         description=(
             "Override judge model alias for this workstream; the output guard's LLM "
-            "stage runs on it too unless judge.output_guard_model is set"
+            "stage runs on it too unless judge.output_guard_model is set. An alias that "
+            "can't be used is never replaced by another model: no LLM judges the "
+            "workstream's tool calls until it can be"
         ),
     )
 
