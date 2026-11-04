@@ -35,7 +35,7 @@ import {
   captureConvFullCalls,
   restoreConvFullCalls,
   convKeyBelongsToControl,
-  convReaderHoldsFocus,
+  convFocusIsFree,
   buildConvResultExpand,
   buildConvVerdict,
   buildConvWarning,
@@ -1230,6 +1230,16 @@ class Pane {
       // Escape on a full call or "show all" does nothing: neither approves or
       // denies from there.  Letters still reach the shortcuts below.
       if (convKeyBelongsToControl(e.key, e.target)) return;
+      // A key in any other text field (the composer, disabled while a call is
+      // pending but perhaps still focused) belongs to that field.
+      const t = e.target;
+      if (
+        (t.tagName === "TEXTAREA" ||
+          t.tagName === "INPUT" ||
+          t.isContentEditable) &&
+        !t.classList.contains("conv-feedback")
+      )
+        return;
       // Keyboard acts on the OLDEST live cycle (the one approvalBlockEl
       // tracks); sibling cards from parallel task agents resolve by
       // their own buttons or become oldest in turn.  When the feedback
@@ -1273,6 +1283,9 @@ class Pane {
         }
         return;
       }
+      // Browser and OS accelerators (Ctrl+A select-all, Cmd+A, Alt+N) are not
+      // shortcuts, as in the coordinator.
+      if (e.ctrlKey || e.metaKey || e.altKey) return;
       const k = e.key.toLowerCase();
       if (k === "y" || e.key === "Enter") {
         e.preventDefault();
@@ -4299,15 +4312,14 @@ class Pane {
   }
 
   showInlineToolBlock(items, autoApproved, judgePending, cycleId) {
+    // Who held focus before this card empties a shell or disables the
+    // composer: the feedback field below takes focus only if no one did.
+    const focusBefore = document.activeElement;
     // Reuse the early-paint announce shell if it's for this batch (upgrade in
     // place); else build fresh.
     const announced = this._takeAnnouncedBlock(items);
     const block = announced || document.createElement("div");
     const openFullCalls = announced ? captureConvFullCalls(announced) : null;
-    // Focus inside the shell is lost when it is emptied: whoever had it is
-    // reading the call, so the feedback field must not take it below.
-    const readerInShell =
-      !!announced && announced.contains(document.activeElement);
     if (announced) {
       announced.replaceChildren();
       delete announced.dataset.resultsSettled;
@@ -4401,18 +4413,23 @@ class Pane {
     if (!autoApproved) {
       this._registerApprovalCycle(cycleId, [block], items);
       const fb = block.querySelector(".conv-feedback");
-      const actions = block.querySelector(".conv-actions");
-      // Focus the feedback field only for the FIRST (oldest) live cycle —
-      // a sibling card arriving while the user is typing into another
-      // cycle's field must not steal focus mid-word.  Nor from someone
-      // reading: focus on anything else in the transcript (a "full call",
-      // a "show all") stays put, or their next Enter or Escape would decide
-      // this call; and a pane scrolled back to read is not pulled down to it.
-      // The status-bar chip brings the card up for them.
-      if (this._oldestCycleId() === cycleId && !readerInShell) {
+      // Focus the feedback field only for the FIRST (oldest) live cycle, in
+      // the pane the user is on, and only from no one.  Focus anyone holds
+      // (another card's feedback field, a "full call" or "show all", the
+      // composer with text in it, a field in another pane) stays put, or
+      // their next keys would land in this card and Enter would approve it.
+      // Where sending a message leaves focus (the empty composer, or the Send
+      // button) is free too: this card is what comes next.  A pane scrolled
+      // back to read is not pulled down to it; the status-bar chip brings it
+      // up.
+      if (this._oldestCycleId() === cycleId) {
+        const free = (el) =>
+          convFocusIsFree(el, this.el, this.messagesEl) ||
+          ((el === this.inputEl || el === this.sendBtn) && !this.inputEl.value);
         requestAnimationFrame(() => {
-          if (!fb || !this.isNearBottom()) return;
-          if (convReaderHoldsFocus(this.messagesEl, actions)) return;
+          if (!fb || !this.isNearBottom() || !this._host.isFocused(this))
+            return;
+          if (!free(focusBefore) || !free(document.activeElement)) return;
           fb.focus();
         });
       }

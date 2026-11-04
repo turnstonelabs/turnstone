@@ -81,13 +81,17 @@ _RE_CAMO_CAPS_ACTION = re.compile(
 
 # -- Priority 2: Credential / secret leakage (HIGH) ------------------------
 
-# The body stops where another block could start: scanning on to the next END
-# made every BEGIN in text with no END rescan the rest of it, which was
-# quadratic (9 seconds for 320 KB of BEGIN lines).
+# RSA, EC, DSA, OpenSSH, encrypted and PGP keys, and unlabelled PKCS#8 ones.
+# A block runs to its END line or, cut off before one (grep -A, head -n), to
+# the next BEGIN, so a cut-off key before a whole one goes with it.  The body
+# never scans past a BEGIN: scanning on to the next END made every BEGIN in
+# text with no END rescan the rest of it, which was quadratic (9 seconds for
+# 320 KB of BEGIN lines).  A BEGIN with neither after it stays as written.
+_PRIVATE_KEY_LABEL = r"(?:(?:RSA|EC|DSA|OPENSSH|ENCRYPTED|PGP)\s+)?PRIVATE\s+KEY(?:\s+BLOCK)?"
 _RE_PRIVATE_KEY_BLOCK = re.compile(
-    r"-----BEGIN\s+(?:RSA\s+|EC\s+|OPENSSH\s+|PGP\s+)?PRIVATE\s+KEY-----"
+    r"-----BEGIN\s+" + _PRIVATE_KEY_LABEL + r"-----"
     r"(?:(?!-----BEGIN)[\s\S])*?"
-    r"-----END\s+(?:RSA\s+|EC\s+|OPENSSH\s+|PGP\s+)?PRIVATE\s+KEY-----",
+    r"(?:-----END\s+" + _PRIVATE_KEY_LABEL + r"-----|(?=-----BEGIN))",
 )
 # Database connection strings AND http(s) URLs that carry RFC-3986
 # userinfo (``user:pass@host``).  Adding http(s) here means a
@@ -117,11 +121,17 @@ _RE_CONNECTION_STRING = re.compile(
     re.IGNORECASE,
 )
 # A match takes a whole run of key characters at once (group 1), never one
-# starting inside another: from every letter of a long run with no "=" after it,
-# a per-letter match rescanned the rest of the run, which was quadratic (0.9
-# seconds for a 40 KB run).  A run may start with "_" or digits, which
+# starting inside another: the lookbehind lets a match start only where a run
+# does, since from every letter of a long run with no "=" after it a per-letter
+# match rescanned the rest of the run, which was quadratic (0.9 seconds for a
+# 40 KB run).  The pattern opens with a plain character class so the engine can
+# skip ahead to where a run could start; opening with the lookbehind made it
+# try every position.  A run may start with "_" or digits, which
 # _env_key_is_secret skips, so ``my_TOKEN=`` and ``9KEY=`` match as they did.
-_RE_ENV_SECRET_LINE = re.compile(r"(?<![A-Z_0-9])(?=([_0-9]*[A-Z][A-Z_0-9]+))\1=\S+")
+_RE_ENV_SECRET_LINE = re.compile(
+    r"([A-Z_0-9](?<![A-Z_0-9]{2})"
+    r"(?:(?<=[A-Z])[A-Z_0-9]++|(?<=[_0-9])[_0-9]*+[A-Z][A-Z_0-9]++))=\S+"
+)
 _RE_ENV_SECRET_KEY = re.compile(
     r"(?:^|_)(?:SECRET|TOKEN|PASSWORD|CREDENTIAL|DSN)(?:_|$)"
     r"|(?:^|_)KEY(?:_|$)"

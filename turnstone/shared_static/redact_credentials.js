@@ -28,10 +28,21 @@
 // ---------------------------------------------------------------------------
 // PEM private key blocks (multiline, whole-block replacement)
 // ---------------------------------------------------------------------------
-// The body stops where another block could start: scanning on to the next END
-// made every BEGIN in text with no END rescan the rest of it (quadratic).
-const _RE_PRIVATE_KEY_BLOCK =
-  /-----BEGIN\s+(?:RSA\s+|EC\s+|OPENSSH\s+|PGP\s+)?PRIVATE\s+KEY-----(?:(?!-----BEGIN)[\s\S])*?-----END\s+(?:RSA\s+|EC\s+|OPENSSH\s+|PGP\s+)?PRIVATE\s+KEY-----/g;
+// RSA, EC, DSA, OpenSSH, encrypted and PGP keys, and unlabelled PKCS#8 ones.
+// A block runs to its END line or, cut off before one (grep -A, head -n), to
+// the next BEGIN, so a cut-off key before a whole one goes with it.  The body
+// never scans past a BEGIN: scanning on to the next END made every BEGIN in
+// text with no END rescan the rest of it (quadratic).  A BEGIN with neither
+// after it stays as written.
+const _PRIVATE_KEY_LABEL = String.raw`(?:(?:RSA|EC|DSA|OPENSSH|ENCRYPTED|PGP)\s+)?PRIVATE\s+KEY(?:\s+BLOCK)?`;
+const _RE_PRIVATE_KEY_BLOCK = new RegExp(
+  String.raw`-----BEGIN\s+${_PRIVATE_KEY_LABEL}-----(?:(?!-----BEGIN)[\s\S])*?` +
+    String.raw`(?:-----END\s+${_PRIVATE_KEY_LABEL}-----|(?=-----BEGIN))`,
+  "g",
+);
+const _RE_PRIVATE_KEY_BEGIN = new RegExp(
+  String.raw`-----BEGIN\s+${_PRIVATE_KEY_LABEL}-----`,
+);
 
 // ---------------------------------------------------------------------------
 // Connection strings — preserves protocol + user, redacts only the password
@@ -143,8 +154,15 @@ const _RE_QUERY_CRED =
 // JSON-style simple redaction (legacy _redactApiKeys compat)
 //   {"api_key": "abc"}   →   {"api_key": "***"}
 // ---------------------------------------------------------------------------
-const _RE_JSON_STYLE_CRED =
-  /(["'](?:api_key|apiKey|api-key|token)["']\s*:\s*["'])([^"']*)(['"])/gi;
+// The names this rule and the next key on, shared with redactNamedValue so a
+// name added here is redacted there too.
+const _MASKED_NAMES = "api_key|apiKey|api-key|token";
+const _SECRET_NAMES =
+  "api_key|apikey|api_secret|secret_key|secret|password|passwd|token|access_token|refresh_token|auth_token|private_key|client_secret|webhook_secret|signing_key|encryption_key|x_api_key|x-api-key|authorization";
+const _RE_JSON_STYLE_CRED = new RegExp(
+  String.raw`(["'](?:${_MASKED_NAMES})["']\s*:\s*["'])([^"']*)(['"])`,
+  "gi",
+);
 
 // ---------------------------------------------------------------------------
 // JSON secret keys — comprehensive set matching backend
@@ -155,10 +173,16 @@ const _RE_JSON_STYLE_CRED =
 // $1 captures the key + colon + opening quote; only the value is replaced, so
 // the key stays intact even when value == key name.  /i already covers casing,
 // so keys are listed once (no separate |Authorization alternative needed).
-const _RE_JSON_SECRET_DQ =
-  /("(?:api_key|apikey|api_secret|secret_key|secret|password|passwd|token|access_token|refresh_token|auth_token|private_key|client_secret|webhook_secret|signing_key|encryption_key|x_api_key|x-api-key|authorization)"\s*:\s*")[^"]{8,}"/gi;
-const _RE_JSON_SECRET_SQ =
-  /('(?:api_key|apikey|api_secret|secret_key|secret|password|passwd|token|access_token|refresh_token|auth_token|private_key|client_secret|webhook_secret|signing_key|encryption_key|x_api_key|x-api-key|authorization)'\s*:\s*')[^']{8,}'/gi;
+const _RE_JSON_SECRET_DQ = new RegExp(
+  String.raw`("(?:${_SECRET_NAMES})"\s*:\s*")[^"]{8,}"`,
+  "gi",
+);
+const _RE_JSON_SECRET_SQ = new RegExp(
+  String.raw`('(?:${_SECRET_NAMES})'\s*:\s*')[^']{8,}'`,
+  "gi",
+);
+const _RE_MASKED_NAME = new RegExp("^(?:" + _MASKED_NAMES + ")$", "i");
+const _RE_SECRET_NAME = new RegExp("^(?:" + _SECRET_NAMES + ")$", "i");
 
 // ---------------------------------------------------------------------------
 // ENV secret line redaction — matches the backend's two-regex pipeline
@@ -166,12 +190,15 @@ const _RE_JSON_SECRET_SQ =
 //   DATABASE_URL=postgres://…   →   DATABASE_URL=[REDACTED:secret]
 //   FOO=bar                     →   not redacted (no secret-bearing key name)
 // ---------------------------------------------------------------------------
-// A match takes a whole run of key characters at once, never one starting
-// inside another: from every letter of a long run with no "=" after it, a
-// per-letter match rescanned the rest of the run (quadratic).  A run may start
-// with "_" or digits, which the key test skips, so my_TOKEN= and 9KEY= match
-// as they did.
-const _RE_ENV_SECRET_LINE = /(?<![A-Z_0-9])(?=([_0-9]*[A-Z][A-Z_0-9]+))\1=\S+/g;
+// A match takes a whole run of key characters at once (group 1), never one
+// starting inside another: the lookbehind lets a match start only where a run
+// does, since from every letter of a long run with no "=" after it a
+// per-letter match rescanned the rest of the run (quadratic).  The pattern
+// opens with a plain character class so the engine can skip ahead to where a
+// run could start.  A run may start with "_" or digits, which the key test
+// skips, so my_TOKEN= and 9KEY= match as they did.
+const _RE_ENV_SECRET_LINE =
+  /([A-Z_0-9](?<![A-Z_0-9]{2})(?:(?<=[A-Z])[A-Z_0-9]+|(?<=[_0-9])[_0-9]*[A-Z][A-Z_0-9]+))=\S+/g;
 const _RE_ENV_SECRET_KEY =
   /(?:^|_)(?:SECRET|TOKEN|PASSWORD|CREDENTIAL|DSN)(?:_|$)|(?:^|_)KEY(?:_|$)|^(?:DATABASE_URL|TURNSTONE_DB_URL|DB_URL)$/i;
 
@@ -266,28 +293,38 @@ export function redactCredentials(text) {
 
 /**
  * Redact a value already decoded from JSON by the rules keyed on its name
- * (5 and 6 above), as they redact it written as "key": "value".  For a
- * renderer that shows a parsed object's values one at a time, so that no rule
- * runs over text spanning two values.
+ * (5 and 6 above), decided by the name alone: a value under a rule-5 name is
+ * masked whole, and one under a rule-6 name is replaced when it is at least
+ * rule 6's eight characters as JSON writes it.  For a renderer that shows a
+ * parsed object's values one at a time, so that no rule runs over text
+ * spanning two values, and a quote inside a value can't end a match early.
  *
  * @param {string} key - The name the value is under
  * @param {string} value - The decoded value
  * @returns {string} The value, or what the name rules make of it
  */
 export function redactNamedValue(key, value) {
-  const pair = JSON.stringify({ [String(key)]: String(value) });
-  let result = pair.replace(_RE_JSON_STYLE_CRED, "$1***$3");
-  result = result.replace(_RE_JSON_SECRET_DQ, '$1[REDACTED:secret]"');
-  if (result === pair) return value;
-  try {
-    const decoded = Object.values(JSON.parse(result));
-    if (decoded.length === 1 && typeof decoded[0] === "string") {
-      return decoded[0];
-    }
-  } catch (_e) {
-    // A rule ended the value short of its closing quote: keep none of it.
+  const name = String(key);
+  if (_RE_MASKED_NAME.test(name)) return "***";
+  if (
+    _RE_SECRET_NAME.test(name) &&
+    JSON.stringify(String(value)).length - 2 >= 8
+  ) {
+    return "[REDACTED:secret]";
   }
-  return "[REDACTED:secret]";
+  return value;
+}
+
+/**
+ * Where the first private-key BEGIN line in `text` starts, or -1.  In text
+ * redactCredentials has been over, one that remains is a block with neither
+ * its END nor another BEGIN after it, which may run on past the text's end.
+ *
+ * @param {string} text - Text to search
+ * @returns {number} The index of the BEGIN line, or -1
+ */
+export function privateKeyBeginIndex(text) {
+  return String(text).search(_RE_PRIVATE_KEY_BEGIN);
 }
 
 // Pretty-print JSON WITH redaction — the sanctioned way to render a raw

@@ -13,7 +13,11 @@
 // never innerHTML.  Builders return a detached element and let the caller append
 // + scroll, so they stay pane- and transport-agnostic.
 
-import { redactCredentials, redactNamedValue } from "./redact_credentials.js";
+import {
+  privateKeyBeginIndex,
+  redactCredentials,
+  redactNamedValue,
+} from "./redact_credentials.js";
 
 // ANSI / CSI escape stripper — a tool that emits control sequences (bash through
 // MCP, or a child node) must land as readable text in the result block.
@@ -23,6 +27,20 @@ export function stripAnsi(s) {
     // eslint-disable-next-line no-control-regex
     /\x1b(?:\[[0-9;?]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)?|[()#][A-Za-z0-9]|.)/g,
     "",
+  );
+}
+
+// Control characters in the model's own words (a command, a preview, the full
+// call), shown rather than stripped: an escape sequence or carriage return
+// could otherwise hide what follows it from the reader while a shell still
+// runs it.  Each becomes its Control Pictures symbol (ESC shows as U+241B);
+// line feed and tab stay as they are.  Tool output goes through stripAnsi.
+function _showControls(text) {
+  return text.replace(
+    // eslint-disable-next-line no-control-regex
+    /[\x00-\x08\x0b-\x1f\x7f]/g,
+    (c) =>
+      String.fromCharCode(c === "\x7f" ? 0x2421 : 0x2400 + c.charCodeAt(0)),
   );
 }
 
@@ -884,13 +902,19 @@ export function buildConvRow(item, opts) {
     name.appendChild(auto);
   }
   call.appendChild(name);
+  let redactedCommand = false;
   if (opts.argsText) {
     const args = document.createElement("span");
     args.className = "conv-row-args";
-    args.textContent = redactCredentials(opts.argsText);
+    const argsText = String(opts.argsText);
+    const hidden = redactCredentials(argsText);
+    redactedCommand = hidden !== argsText && item.func_name === "bash";
+    args.textContent = _showControls(hidden);
     call.appendChild(args);
   }
   row.appendChild(call);
+  // A bash card's summary is its command: say when redaction changed it.
+  if (redactedCommand) row.appendChild(_redactionNote("command"));
   return row;
 }
 
@@ -900,15 +924,18 @@ export function buildConvRow(item, opts) {
 export function buildConvCmd(item) {
   item = item || {};
   const frag = document.createDocumentFragment();
-  const headerText = stripAnsi(item.header || "");
+  // The server sends the header and preview as plain text: a control
+  // character in them is the model's, and shows.
+  const headerText = String(item.header || "");
   const cleaned = headerText.replace(/^[^\s]+\s+\w+:\s*/, "");
   const cmdText = cleaned || headerText;
-  let hidShell = false;
+  let redacted = false;
   if (cmdText) {
     const cmd = document.createElement("div");
     cmd.className = "conv-row-cmd";
-    const shownCmd = redactCredentials(cmdText);
-    hidShell = _hidesShellSyntax(cmdText, shownCmd);
+    const hidden = redactCredentials(cmdText);
+    if (hidden !== cmdText) redacted = true;
+    const shownCmd = _showControls(hidden);
     if (item.func_name === "bash") {
       const dollar = document.createElement("span");
       dollar.className = "conv-row-cmd-dollar";
@@ -932,10 +959,10 @@ export function buildConvCmd(item) {
     // Redact credentials ONCE on the full text before splitting, rather than
     // running 7 regex sweeps per line (~2800 passes at 400 lines).
     const MAX_PREVIEW_LINES = 400;
-    const raw = stripAnsi(item.preview);
-    const redacted = redactCredentials(raw);
-    if (_hidesShellSyntax(raw, redacted)) hidShell = true;
-    let lines = redacted.split("\n");
+    const raw = String(item.preview);
+    const hidden = redactCredentials(raw);
+    if (hidden !== raw) redacted = true;
+    let lines = _showControls(hidden).split("\n");
     const omitted = lines.length - MAX_PREVIEW_LINES;
     if (omitted > 0) lines = lines.slice(0, MAX_PREVIEW_LINES);
     lines.forEach((line, i) => {
@@ -969,10 +996,8 @@ export function buildConvCmd(item) {
       frag.appendChild(more);
     }
   }
-  if (hidShell) {
-    frag.appendChild(
-      _redactionNote(item.func_name === "bash" ? "command" : "summary"),
-    );
+  if (redacted && item.func_name === "bash") {
+    frag.appendChild(_redactionNote("command"));
   }
   return frag;
 }
@@ -1295,17 +1320,10 @@ export function buildConvResult(output, opts) {
   // result (an agent cat-ing a large file) becomes a multi-MB pre-wrap text
   // node that stalls layout on insert and is rebuilt on every full
   // re-render.  The transcript shows the head; "show all" renders the rest
-  // when someone asks for it.  The head is redacted before it is cut, over a
-  // window reaching past the cut, so a secret the cut runs through is still
-  // matched whole and none of it shows.
+  // when someone asks for it.
   const isCut = pretty.length > RAW_CAP;
   const body = document.createElement("span");
-  body.textContent = isCut
-    ? _displayCut(
-        redactCredentials(pretty.slice(0, RAW_CAP + REDACT_WINDOW)),
-        pretty.length,
-      )
-    : redactCredentials(pretty);
+  body.textContent = isCut ? _redactedHead(pretty) : redactCredentials(pretty);
   block.appendChild(body);
   // A result longer than its box gets "show all", which also renders the
   // characters past the cut, on request (convResultExpandControl hands the
@@ -1325,6 +1343,27 @@ const RAW_CAP = 64 * 1024;
 // How far past the cut a head is redacted before it is cut: longer than any
 // credential the redaction rules match.
 const REDACT_WINDOW = 16 * 1024;
+
+// The redacted head of text past RAW_CAP, and a note of its length.  The head
+// is redacted over a window reaching REDACT_WINDOW past the cut, so a secret
+// the cut runs through is matched whole.  When the text runs past the window,
+// the head shows nothing the window could not see whole: a secret the
+// window's own end runs through is left as it is, at the very end of the
+// redacted window and shorter than REDACT_WINDOW, so the window's last
+// REDACT_WINDOW characters never show, however much earlier redactions
+// shortened it; and a private-key block still open in the window (neither its
+// END nor another BEGIN in it) may close past it, where show all redacts it,
+// so the head stops before it.
+function _redactedHead(text) {
+  const head = redactCredentials(text.slice(0, RAW_CAP + REDACT_WINDOW));
+  let safe = head.length;
+  if (text.length > RAW_CAP + REDACT_WINDOW) {
+    safe = Math.max(0, head.length - REDACT_WINDOW);
+    const open = privateKeyBeginIndex(head);
+    if (open !== -1) safe = Math.min(safe, open);
+  }
+  return _displayCut(head.slice(0, Math.min(RAW_CAP, safe)), text.length);
+}
 
 // The head of `text` and a note of its length, for text past RAW_CAP.
 // `total`: the length to report when `text` is a window of longer text.
@@ -1460,7 +1499,12 @@ export function setConvFullCallOpen(row, open) {
     caption.className = "conv-full-args-caption";
     caption.id = panel.id + "-caption";
     caption.textContent = "arguments · as written";
-    panel.replaceChildren(caption, buildConvFullCallArguments(entry.text));
+    panel.replaceChildren(
+      caption,
+      buildConvFullCallArguments(entry.text, {
+        shell: row.dataset.toolName === "bash",
+      }),
+    );
     row.dataset.fullCall = "open";
   } else {
     if (panel) panel.replaceChildren();
@@ -1534,8 +1578,9 @@ export function restoreConvFullCalls(root, captured) {
 
 // While a call awaits approval, both panes read Enter as approve and Escape as
 // deny.  A key aimed at a control in the transcript is that control's: Enter
-// on a button, link, disclosure or select runs it, and Escape on a full call
-// or a "show all" does nothing, so neither key decides the call from there.
+// on a button, link, disclosure, select or role=button element (rendered
+// markdown's image placeholder is one) runs it, and Escape on a full call or a
+// "show all" does nothing, so neither key decides the call from there.
 // True when the approval shortcuts should leave `key` alone.  A text field is
 // not such a control: the interactive pane's feedback field approves on
 // Enter.
@@ -1550,16 +1595,20 @@ export function convKeyBelongsToControl(key, el) {
   return false;
 }
 
-// Whether someone has focus on something in `container` that an automatic
-// focus move would take from them: anything focused inside it except within
-// `own` (the pending card's own actions, where a verdict may still move focus
-// between Approve and Deny).  Panes check this when the move runs, not when
-// they schedule it.
-export function convReaderHoldsFocus(container, own) {
-  const active = document.activeElement;
-  if (!active || !container || active === container) return false;
-  if (!container.contains(active)) return false;
-  return !(own && own.contains(active));
+// Whether an automatic focus move would take focus from no one: nothing has
+// it, or only the page, the pane's transcript, or the pane's root or something
+// around it (the console's focusable pane section, which a click on transcript
+// text focuses) does.  Anything else focused is someone's (a control in the
+// transcript, a composer, a field in another pane), and moving focus would
+// hand their next key to the card.  Panes check this when the move runs, not
+// when they schedule it.
+export function convFocusIsFree(active, root, transcript) {
+  return (
+    !active ||
+    active === document.body ||
+    active === transcript ||
+    (typeof active.contains === "function" && active.contains(root))
+  );
 }
 
 // A number keeps the digits the model wrote: plain parsing rounds integers
@@ -1579,18 +1628,12 @@ function _isRawJson(value) {
   return typeof JSON.isRawJSON === "function" && JSON.isRawJSON(value);
 }
 
-// Shell syntax a redaction removed.  A rule that runs to the next space or
-// "@" can take ";", "|" or "$(" with the secret, so a value reads as one
-// harmless command while the rest of it runs.  Counted, not located: the
-// reader learns that something is hidden, never what.
-const _RE_SHELL_SYNTAX = /[;|&$`()<>\n]/g;
-
-function _hidesShellSyntax(before, after) {
-  const count = (text) => (text.match(_RE_SHELL_SYNTAX) || []).length;
-  return count(after) < count(before);
-}
-
-// Said under a value or command whose redaction took shell syntax with it.
+// Said under a bash command, or a value of a bash call's full call, that
+// redaction changed.  A redaction marker can stand for more than a secret (a
+// quote, an escaped space, ";" or "$(", whole arguments inside a key block),
+// so the command shown may not parse as the one that runs.  Said whenever
+// redaction changed it, not only when it can tell: the reader learns that
+// something is hidden, never what.
 function _redactionNote(what) {
   const note = document.createElement("div");
   note.className = "conv-redaction-note";
@@ -1598,14 +1641,13 @@ function _redactionNote(what) {
   return note;
 }
 
-// One string as the full call shows it: escape sequences stripped, then
-// redacted alone and by the name it is under ("password": …).
+// One string as the full call shows it: redacted alone and by the name it is
+// under ("password": …), then its control characters shown.
 function _redactArgumentString(key, value, state) {
-  const plain = stripAnsi(value);
-  let shown = redactCredentials(plain);
-  if (key !== null) shown = redactNamedValue(key, shown);
-  if (_hidesShellSyntax(plain, shown)) state.hidShell = true;
-  return shown;
+  let hidden = redactCredentials(value);
+  if (key !== null) hidden = redactNamedValue(key, hidden);
+  if (hidden !== value) state.redacted = true;
+  return _showControls(hidden);
 }
 
 // The parsed arguments with every string redacted on its own, under its
@@ -1628,19 +1670,17 @@ function _redactArguments(value, key, state) {
   return out;
 }
 
-// [{key, text, hidShell}, …]: one per top-level value of an object, none for
+// [{key, text, redacted}, …]: one per top-level value of an object, none for
 // no arguments, one with a null key for anything else (other JSON printed, or
 // text that does not parse, redacted whole as written).
 function _fullCallEntries(raw) {
   if (!raw.trim()) return [];
   const entry = (key, value) => {
-    const state = { hidShell: false };
-    const redacted = _redactArguments(value, key, state);
+    const state = { redacted: false };
+    const shown = _redactArguments(value, key, state);
     const text =
-      typeof redacted === "string"
-        ? redacted
-        : JSON.stringify(redacted, null, 2);
-    return { key, text, hidShell: state.hidShell };
+      typeof shown === "string" ? shown : JSON.stringify(shown, null, 2);
+    return { key, text, redacted: state.redacted };
   };
   let parsed;
   try {
@@ -1668,9 +1708,10 @@ function _fullCallEntries(raw) {
 // a string as written (line breaks kept), anything else as indented JSON.  A
 // long value gets a capped box of its own with "show all", like a result, so
 // every name and the approval buttons stay in reach.  Each string is redacted
-// on its own (_redactArguments), and a value whose redaction took shell syntax
-// with it says so.
-export function buildConvFullCallArguments(text) {
+// on its own (_redactArguments).  opts.shell: a bash call, whose values say so
+// when redaction changed them.
+export function buildConvFullCallArguments(text, opts) {
+  const shell = !!(opts && opts.shell);
   const wrap = document.createElement("div");
   wrap.className = "conv-full-args";
   const entries = _fullCallEntries(String(text == null ? "" : text));
@@ -1681,13 +1722,13 @@ export function buildConvFullCallArguments(text) {
     wrap.appendChild(none);
     return wrap;
   }
-  for (const { key, text: full, hidShell } of entries) {
+  for (const { key, text: full, redacted } of entries) {
     const arg = document.createElement("div");
     arg.className = "conv-full-arg";
     if (key !== null) {
       const name = document.createElement("div");
       name.className = "conv-full-arg-name";
-      name.textContent = redactCredentials(stripAnsi(key));
+      name.textContent = _showControls(redactCredentials(key));
       arg.appendChild(name);
     }
     const shown = _displayCut(full);
@@ -1701,7 +1742,7 @@ export function buildConvFullCallArguments(text) {
       cut: shown === full ? null : { body: value, full: () => full },
     });
     if (expand) arg.appendChild(expand);
-    if (hidShell) arg.appendChild(_redactionNote("value"));
+    if (shell && redacted) arg.appendChild(_redactionNote("value"));
     wrap.appendChild(arg);
   }
   return wrap;

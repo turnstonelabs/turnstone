@@ -347,7 +347,7 @@ from turnstone.prompts import (
     build_shared_workstream_declaration,
     compose_system_message,
 )
-from turnstone.ui.colors import DIM, GRAY, GREEN, RED, RESET, YELLOW, bold, cyan, dim
+from turnstone.ui.colors import GRAY, GREEN, RED, RESET, bold, cyan, dim
 
 log = get_logger(__name__)
 
@@ -19828,10 +19828,12 @@ class ChatSession:
         if timeout is not None:
             timeout = max(1, min(timeout, 600))  # clamp 1-600s
 
-        # Show full command in preview for multi-line scripts
+        # Show full command in preview for multi-line scripts.  Previews are
+        # plain text: a client colours them itself, so a colour code in one is
+        # always the model's and is shown.
         preview = ""
         if is_multiline:
-            preview = f"{DIM}{textwrap.indent(command, '    ')}{RESET}"
+            preview = textwrap.indent(command, "    ")
 
         # ``is_background`` accepted as an undocumented alias (Gemini's shell
         # tool trained that name); ``run_in_background`` is the documented one.
@@ -20034,7 +20036,7 @@ class ChatSession:
                 "error": "Error: missing query",
             }
         path = os.path.expanduser(args.get("path", "") or ".")
-        preview = f"    {DIM}/{pattern}/ in {path}{RESET}"
+        preview = f"    /{pattern}/ in {path}"
         return {
             "call_id": call_id,
             "func_name": "search",
@@ -20128,14 +20130,12 @@ class ChatSession:
         # Build preview
         preview_parts = []
         if is_symlink:
-            preview_parts.append(f"    {YELLOW}Warning: symlink — actual target: {resolved}{RESET}")
+            preview_parts.append(f"    Warning: symlink — actual target: {resolved}")
         if is_overwrite:
-            preview_parts.append(
-                f"    {YELLOW}Warning: overwriting existing file not previously read{RESET}"
-            )
+            preview_parts.append("    Warning: overwriting existing file not previously read")
         if is_append:
-            preview_parts.append(f"    {YELLOW}(append mode){RESET}")
-        preview_parts.append(f"{DIM}{textwrap.indent(content, '    ')}{RESET}")
+            preview_parts.append("    (append mode)")
+        preview_parts.append(textwrap.indent(content, "    "))
 
         verb = "append" if is_append else "write"
         header = f"\u2699 write_file ({verb}): {path} ({len(content)} chars)"
@@ -20340,21 +20340,21 @@ class ChatSession:
         # Build diff preview
         preview_parts = []
         if is_symlink:
-            preview_parts.append(f"    {YELLOW}Warning: symlink — actual target: {resolved}{RESET}")
+            preview_parts.append(f"    Warning: symlink — actual target: {resolved}")
         if replace_all:
             occ = content.count(edits[0]["old_string"])
-            preview_parts.append(f"    {YELLOW}(replace_all: {occ} occurrences){RESET}")
+            preview_parts.append(f"    (replace_all: {occ} occurrences)")
         for i, edit in enumerate(edits):
             if len(edits) > 1:
-                preview_parts.append(f"    {YELLOW}--- edit {i + 1}/{len(edits)} ---{RESET}")
+                preview_parts.append(f"    --- edit {i + 1}/{len(edits)} ---")
             for line in edit["old_string"].splitlines():
-                preview_parts.append(f"    {RED}- {line}{RESET}")
+                preview_parts.append(f"    - {line}")
             if edit["new_string"]:
                 for line in edit["new_string"].splitlines():
-                    preview_parts.append(f"    {GREEN}+ {line}{RESET}")
+                    preview_parts.append(f"    + {line}")
             else:
                 n = len(edit["old_string"])
-                preview_parts.append(f"    {YELLOW}(deletion — {n} chars removed){RESET}")
+                preview_parts.append(f"    (deletion — {n} chars removed)")
 
         count = len(edits)
         if is_symlink:
@@ -21864,7 +21864,7 @@ class ChatSession:
             first_line = initial_message.splitlines()[0]
             preview_line = first_line[:120] + ("..." if len(first_line) > 120 else "")
             header_bits = [f"\u2699 spawn_workstream: {preview_line}"]
-            preview_body = f"{DIM}{textwrap.indent(initial_message, '    ')}{RESET}"
+            preview_body = textwrap.indent(initial_message, "    ")
         else:
             header_bits = ["\u2699 spawn idle workstream"]
             preview_body = ""
@@ -22189,7 +22189,7 @@ class ChatSession:
             return self._coord_tool_error(call_id, "spawn_batch", first_err or "batch rejected")
 
         header = f"\u2699 spawn_batch: {len(normalised)} children"
-        preview_body = f"{DIM}{chr(10).join(preview_rows)}{RESET}"
+        preview_body = chr(10).join(preview_rows)
         item: dict[str, Any] = {
             "call_id": call_id,
             "func_name": "spawn_batch",
@@ -22456,7 +22456,7 @@ class ChatSession:
         first_line = message.splitlines()[0]
         preview_line = first_line[:120] + ("..." if len(first_line) > 120 else "")
         header = f"\u2699 send_to_workstream {ws_id}: {preview_line}"
-        preview_body = f"{DIM}{textwrap.indent(message, '    ')}{RESET}"
+        preview_body = textwrap.indent(message, "    ")
         # Trust only relaxes own-subtree sends; foreign ws_ids always
         # prompt for approval even under trust.
         needs_approval = True
@@ -25370,10 +25370,9 @@ class ChatSession:
                 "error": "arguments must be a JSON object with string values",
             }
         arguments = {str(k): str(v) for k, v in raw_arguments.items()}
-        preview_parts = [f"    {DIM}name: {name}"]
+        preview_parts = [f"    name: {name}"]
         if arguments:
             preview_parts.append(f"    arguments: {arguments}")
-        preview_parts.append(RESET)
         return {
             "call_id": call_id,
             "func_name": "use_prompt",

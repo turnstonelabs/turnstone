@@ -39,7 +39,7 @@ import {
   attachConvFullCall,
   convCallSummaryEnd,
   convKeyBelongsToControl,
-  convReaderHoldsFocus,
+  convFocusIsFree,
   buildConvVerdict,
   buildConvWarning,
   buildConvActions,
@@ -2277,8 +2277,8 @@ function createCoordinatorPane(root, wsId, opts) {
 
   // Chip click: bring the batch the keyboard shortcuts act on into view and
   // focus its HEAD, not its primary action — a "show me" click must never
-  // arm Space on Approve.  (The paint-time focus on the primary action stays
-  // where it is; that one follows a judge verdict the reviewer asked for.)
+  // arm Space on Approve.  A deny verdict landing later still moves focus
+  // from the head to Deny (_focusBatchPrimary); an approve verdict leaves it.
   // Falls back to any --pending batch (all mid-resolve) so the click never
   // lands on nothing while the chip is showing.  The head focus uses
   // preventScroll internally, so the smooth scroll keeps the viewport.
@@ -2354,25 +2354,37 @@ function createCoordinatorPane(root, wsId, opts) {
     _syncApprovalChip();
   }
 
-  // Not from someone reading: focus on anything else in the transcript (a
-  // "full call", a "show all") stays put, or their next Enter would approve
-  // the batch; and a transcript scrolled back is not pulled down to it.
-  // Within the batch's own actions a verdict still moves focus between
-  // Approve and Deny.
+  // A verdict moves focus to the action it recommends only from no one:
+  // nothing holds focus (or only the page, this pane's transcript, or its
+  // root or the section around it) and the pane is following.  Focus anyone
+  // holds (a control in the transcript, the composer, a field in another
+  // pane) stays put, or their next key would decide the batch, and a
+  // transcript scrolled back is not pulled down.  One move protects instead:
+  // a deny verdict moves focus to Deny from this batch's own head or actions
+  // (where the status-bar chip or an earlier verdict put it), so Enter there
+  // denies.  Nothing moves focus onto Approve from where someone put it.
   function _focusBatchPrimary(batch, prefer) {
-    if (!batch || !scrollFollow.isFollowing()) return;
-    const actions = batch.querySelector(".conv-actions");
-    if (convReaderHoldsFocus(messagesEl, actions)) return;
+    if (!batch) return;
     const role = prefer === "deny" ? "deny" : "approve";
     const btn = batch.querySelector(
       '.conv-actions button[data-role="' + role + '"]',
     );
-    if (btn) {
-      try {
-        btn.focus({ preventScroll: false });
-      } catch (_) {
-        /* noop */
-      }
+    if (!btn) return;
+    const ae = document.activeElement;
+    const following = scrollFollow.isFollowing();
+    if (convFocusIsFree(ae, root, messagesEl)) {
+      if (!following) return;
+    } else {
+      const head = batch.querySelector(".conv-batch-head");
+      const actions = batch.querySelector(".conv-actions");
+      const ownCard =
+        (head && head.contains(ae)) || (actions && actions.contains(ae));
+      if (role !== "deny" || !ownCard) return;
+    }
+    try {
+      btn.focus({ preventScroll: !following });
+    } catch (_) {
+      /* noop */
     }
   }
 

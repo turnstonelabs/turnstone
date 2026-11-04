@@ -450,17 +450,21 @@ class TestJwtAndQueryCredentials:
 
 
 @pytest.mark.parametrize(
-    "text",
+    ("text", "expected"),
     [
-        "eyJ" * 100_000,
-        "%3DeyJ" * 50_000,
-        "\\u0022eyJ" * 30_000,
-        "https://h.example/" + "https://" * 32_000,
-        "http+abcde://" * 20_000,
-        ("http+" + "a" * 25 + "://") * 4_000,
-        "https://u:" + "pa://" * 40_000,
-        "A" * 320_000,
-        "-----BEGIN PRIVATE KEY-----\n" * 12_000,
+        ("eyJ" * 100_000, None),
+        ("%3DeyJ" * 50_000, None),
+        ("\\u0022eyJ" * 30_000, None),
+        ("https://h.example/" + "https://" * 32_000, None),
+        ("http+abcde://" * 20_000, None),
+        (("http+" + "a" * 25 + "://") * 4_000, None),
+        ("https://u:" + "pa://" * 40_000, None),
+        ("A" * 320_000, None),
+        # Each cut-off block runs to the next BEGIN; the last has none after it.
+        (
+            "-----BEGIN PRIVATE KEY-----\n" * 12_000,
+            "[REDACTED:private_key]" * 11_999 + "-----BEGIN PRIVATE KEY-----\n",
+        ),
     ],
     ids=[
         "run",
@@ -474,7 +478,7 @@ class TestJwtAndQueryCredentials:
         "unterminated-keys",
     ],
 )
-def test_redaction_is_linear_in_a_long_run(text) -> None:
+def test_redaction_is_linear_in_a_long_run(text, expected) -> None:
     # Base64 of JSON repeats "eyJ" inside one long run of token characters.
     # A JWT match allowed to start at each one rescans the rest of the run
     # every time, which is quadratic: the first input took 46 seconds that way.
@@ -488,7 +492,7 @@ def test_redaction_is_linear_in_a_long_run(text) -> None:
     start = time.perf_counter()
     redacted = redact_credentials(text)
     elapsed = time.perf_counter() - start
-    assert redacted == text
+    assert redacted == (text if expected is None else expected)
     assert elapsed < 2.0
 
 
@@ -512,14 +516,42 @@ def test_an_env_key_names_a_secret_from_any_start_of_its_run(text, expected) -> 
     assert ("env_file_leak" in evaluate_output(text).flags) == (expected != text)
 
 
-def test_a_private_key_block_ends_before_the_next_one_starts() -> None:
-    # The body stops where another block could start, so a BEGIN with no END is
-    # left as it is, as it is with no key after it, and the complete key after
-    # it is redacted on its own.
+def test_a_cut_off_private_key_runs_to_the_next_begin() -> None:
+    # A block cut off before its END (grep -A, head -n) runs to the next BEGIN,
+    # a certificate's included, so a cut-off key before a complete one is
+    # redacted with it, as it was when a block ran on to the next END.  The
+    # complete key after it is redacted on its own, and a BEGIN with neither
+    # after it is left as it is.
     key = "-----BEGIN PRIVATE KEY-----\nMIIEvQ\n-----END PRIVATE KEY-----"
-    unterminated = "-----BEGIN PRIVATE KEY-----\ncut off\n"
-    assert redact_credentials(unterminated + key) == unterminated + "[REDACTED:private_key]"
+    cert = "-----BEGIN CERTIFICATE-----\nMIIC\n-----END CERTIFICATE-----"
+    unterminated = "-----BEGIN RSA PRIVATE KEY-----\nMIIEow cut off\n"
+    redacted = redact_credentials("log\n" + unterminated + key + "\ndone")
+    assert redacted == "log\n[REDACTED:private_key][REDACTED:private_key]\ndone"
+    assert redact_credentials(unterminated + cert) == "[REDACTED:private_key]" + cert
+    r = evaluate_output(unterminated + cert)
+    assert "private_key_leak" in r.flags
+    assert r.sanitized == "[REDACTED:private_key]" + cert
     assert redact_credentials(unterminated) == unterminated
+
+
+@pytest.mark.parametrize(
+    "label",
+    [
+        "PRIVATE KEY",
+        "RSA PRIVATE KEY",
+        "EC PRIVATE KEY",
+        "DSA PRIVATE KEY",
+        "OPENSSH PRIVATE KEY",
+        "ENCRYPTED PRIVATE KEY",
+        "PGP PRIVATE KEY BLOCK",
+    ],
+)
+def test_every_private_key_header_is_redacted(label) -> None:
+    block = f"-----BEGIN {label}-----\nMIIBuw\n-----END {label}-----"
+    assert redact_credentials("key:\n" + block + "\n") == "key:\n[REDACTED:private_key]\n"
+    r = evaluate_output(block)
+    assert "private_key_leak" in r.flags
+    assert r.sanitized == "[REDACTED:private_key]"
 
 
 def test_builtin_credential_order_matches_the_registry_priorities() -> None:

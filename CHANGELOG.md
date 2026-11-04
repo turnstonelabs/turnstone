@@ -71,10 +71,12 @@ The separate `dev` branch is retired. See [the release process](docs/releasing.m
   **full call** button that opens the arguments exactly as the model wrote them: each
   name over its value, strings with their own line breaks, numbers with every digit,
   credentials redacted as elsewhere on the card. Each value is redacted on its own, so
-  a redaction can't take a neighbouring argument with it, and a value whose redaction
-  removed shell syntax such as `;` or `$(` says part of it is hidden; a bash card's
-  command line says so too. It works on live cards, after a reload, in sub-agent cards
-  and on calls awaiting approval, so a call can be read in full before it is approved.
+  a redaction can't take a neighbouring argument with it, though a private key split
+  across two values is not redacted there. On a bash card, a command or value that
+  redaction changed says part of it is hidden, since a redaction marker can stand for a
+  quote, a space or whole arguments as well as the secret. It works on live cards,
+  after a reload, in sub-agent cards and on calls awaiting approval, so a call can be
+  read in full before it is approved.
   A result too long for its box is capped there with its own **show all** button,
   which shows it at full height (past the 64 KiB display cut too) and then reads
   **collapse**, so opening a call never unfolds its result; a long argument value gets
@@ -99,22 +101,40 @@ The separate `dev` branch is retired. See [the release process](docs/releasing.m
   outside a text field, so a keyboard user who tabbed to **Deny** and pressed Enter
   approved the call, and the Deny never ran. A focused button, link, disclosure or
   menu now handles its own Enter, and Escape on **full call** or **show all** does
-  nothing. A newly arrived approval card, or a judge's verdict, no longer moves focus
-  off a control someone is using or pulls a pane scrolled back to read, so a key meant
-  for that control can't approve or deny a call they haven't seen; the status bar's
-  approval chip brings the card up. The letter shortcuts work as before, and Enter and
+  nothing. A newly arrived approval card, or a judge's verdict, also moved focus to
+  itself from wherever it was: from a control in the transcript, from **Deny** to
+  **Approve**, and from a text field, the coordinator's composer or another pane's
+  included, so the next keys typed there approved or denied a call no one had read.
+  Focus now moves only when nothing holds it (in the interactive pane the empty
+  composer or the **Send** button, where focus rests after a message is sent, counts as
+  nothing) and never in a pane scrolled back to read; the status bar's approval chip
+  brings the card up. One move still protects: a deny verdict moves focus to **Deny**
+  from the card itself. Outside the feedback field, Ctrl, Cmd and Alt key combinations
+  in the interactive pane no longer approve or deny, so Ctrl+A on a focused button no
+  longer approves the tool for good. The letter shortcuts work as before, and Enter and
   Escape still approve and deny from anywhere else in the pane.
+- **Tool cards show the control characters a model writes.** The bash command line,
+  the approval preview and the full call deleted escape sequences, and an operating
+  system command sequence took every character after it, so a card could show
+  `ls -la` for a command that went on to fetch and run a script. Control characters in
+  the model's text now show as symbols (an escape as `␛`). The server no longer colours
+  approval previews itself, so every code in one is the model's; the terminal client
+  colours a preview's added and removed lines on its own.
 - **Redacting `.env`-style lines and private keys no longer stalls on long text.** A
   long run of capital letters with no `=` after it, or many `BEGIN PRIVATE KEY` lines
   with no `END`, made each candidate rescan the rest of the text, so the time grew
   with the square of the length: 9 seconds for 320 KB of such tool output on the
   server, 10 seconds per click on a 160 KB result in the web cards. Both rules now stop
-  where the next match could start. A private-key block with no `END` line is left as
-  it is, as it already was unless a complete key followed it.
+  where the next match could start. A key cut off before its `END` line (`grep -A`,
+  `head -n`) is redacted up to the next `BEGIN` line, as it was when a complete key
+  followed it, and left as it is when no `BEGIN` follows.
+- **DSA, encrypted and PGP private keys are redacted.** Only RSA, EC, OpenSSH and
+  unlabelled private-key blocks were, so the others reached the model, the judge's
+  provider and the web cards whole.
 - **A private key cut by the coordinator's 64 KiB display limit no longer shows.** The
   result was cut before it was redacted, so a key the cut ran through lost its `END`
   line and its first lines showed in the clear. The text is now redacted before it is
-  cut.
+  cut, and the cut stops short of any text the redaction could not see whole.
 - **Approval cards on Discord and Slack show model-written text as written.** On Discord
   the command and the judge's summary reached the card as Markdown, so `a || b || c` hid
   `b` as a spoiler, and a summary (the judge's words, or a heuristic template quoting the
