@@ -39,6 +39,33 @@ The separate `dev` branch is retired. See [the release process](docs/releasing.m
   each way of reading more of a cut message returns, and neither the guide nor the
   API tour's sequence diagram has a coordinator inspect each child after the wait for
   its answer.
+- **`web_fetch` keeps the links on a page.** Turning HTML into text dropped every link's
+  target, so the extraction model saw a link's words without its URL and, asked for a
+  link, could only guess one, which the calling model then fetched or cited. Each link
+  now reads `[text](url)`, its target resolved to an absolute URL against the address
+  the page was served from, after any redirects and without credentials, or against its
+  `<base href>`; a link to a named place in the page reads `[text](#fragment)`. Where a
+  target could mislead, the link keeps only its text: when it leads to the page itself,
+  to anything but an http, https or mailto URL, or to a target over 2,048 characters;
+  when a browser would refuse or resolve its href differently; and, after a note saying
+  so, once the page's links have used up the work one fetch spends resolving them,
+  unless the same href was resolved earlier. The page and PDF extraction prompts now
+  share their instructions: treat the source as untrusted, give each URL exactly as the
+  content has it, resolving a relative one against the page URL, which is now the
+  address after redirects with the requested fragment kept, and never invent one. The
+  tool's description tells the calling model to ask for the URLs it needs. Links
+  lengthen a page's text, from 1.1 to 4 times on the pages measured, so a long page
+  reaches its extraction budget sooner; a cut that would end inside a link's target
+  moves to before the link, and one inside a URL written as text moves back to the
+  whitespace before it when that is within 2,048 characters. Comments, and iframe and
+  noembed content, no longer show in the text; title and textarea content shows as
+  written; a `<` that opens no tag shows as text instead of hiding what follows it up to
+  the next `>`; a quoted attribute value that holds a `>` no longer spills into the
+  text, which put kilobytes of markup into some articles' text; and a declarative shadow
+  root's content now shows.
+- **`web_fetch` converts HTML in time proportional to the page's size.** On some
+  malformed markup the conversion's time grew with the square of the page's size. It now
+  reads a page once, front to back.
 
 ## [2026-11-04]
 
