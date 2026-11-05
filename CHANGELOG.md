@@ -10,6 +10,43 @@ All development now integrates on `main`. Supported release lines are maintained
 on `stable/X.Y` branches; `stable/1.8` preserves the former stable branch.
 The separate `dev` branch is retired. See [the release process](docs/releasing.md).
 
+## [2026-11-04]
+
+### Security
+
+- **The terminal client shows the control characters in text it didn't write.** A
+  carriage return or an escape sequence in a call's command could reprint the approval
+  prompt's line, so the terminal showed `ls -la` for a command that went on to fetch
+  and run a script. The model's reply, printed just before the card, could also turn
+  line wrap off or hide text, so the end of a card never showed even when the card held
+  no control character, and the judge's verdict, printed under the card while the prompt
+  waits, could move the cursor up and rewrite it. Control characters in the model's
+  reply and reasoning, a call's card, the judge's verdict, tool and server errors, and
+  the terminal UI's other lines from outside text (sub-agent steps, system turns, output
+  warnings, background notices) now show as symbols, as on the web cards (an escape as
+  `␛`), and so do those in the doctor command's replies. C1 controls, which some
+  terminals act on as escapes (U+009B starts a command as `ESC [` does), show as an
+  escape and its 7-bit form (`␛[`), and a lone surrogate, which a JSON escape can carry
+  and which stdout writes out as raw bytes under a C, POSIX or C.UTF-8 locale, as `�`.
+  The client's own colours still apply. A carriage return just before a line feed in a
+  reply, reasoning or an error prints as the line break it is; a card shows every one,
+  since in a command it changes what runs. A verdict's summary, which quotes the call or
+  is the judge's own words, prints on one line of at most 400 characters, so its line
+  feeds can't push the card off screen. Text the CLI prints outside the terminal UI's
+  lines still prints as sent, for example messages the session composes with its own
+  colours, such as `/history`, workstream names and titles in the prompt, the status
+  line and the `/ws` notices, and `/cluster`'s lines, whose activity quotes the start of
+  a call awaiting approval (#1559).
+- **The coordinator's children tree redacts a call awaiting approval and shows its
+  control characters, as the tool cards do.** A child's pending call showed its preview
+  with credentials in the clear and its control characters unseen, the verdict's
+  summary quoted the command with any key in it, and a one-line bash command, which has
+  no preview, showed no command at all, only the tool's name and the verdict. The block
+  now shows the whole preview in its scroll box, or the call's header line when it has
+  none. That text, the verdict's summary, reasoning and evidence, and the policy-block
+  banner have their credentials redacted and their control characters shown as
+  symbols, and a bash command that redaction changed says part of it is hidden (#1559).
+
 ## [2026-11-03]
 
 ### Fixed

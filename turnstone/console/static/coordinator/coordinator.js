@@ -45,6 +45,7 @@ import {
   buildConvActions,
   buildConvStatus,
   buildConvResult,
+  buildConvApprovalPreview,
   convResultExpandControl,
   buildPreviewChip,
   batchKicker,
@@ -58,6 +59,7 @@ import {
   focusConvBatchHead,
   focusTemporarily,
   setToolOutputReviewState,
+  convShownText,
   stripAnsi,
 } from "/shared/conversation.js";
 import {
@@ -5169,15 +5171,11 @@ function createCoordinatorPane(root, wsId, opts) {
     if (v && v.intent_summary) {
       const p = document.createElement("div");
       p.className = "approval-summary";
-      p.textContent = v.intent_summary;
+      p.textContent = convShownText(v.intent_summary).text;
       sub.appendChild(p);
     }
-    if (item.preview) {
-      const pre = document.createElement("pre");
-      pre.className = "approval-preview";
-      pre.textContent = item.preview;
-      sub.appendChild(pre);
-    }
+    const shown = buildConvApprovalPreview(item);
+    if (shown) sub.appendChild(shown);
     return sub;
   }
 
@@ -5257,7 +5255,7 @@ function createCoordinatorPane(root, wsId, opts) {
         (child.name || child.ws_id || "child") +
         " — " +
         (primary && primary.header
-          ? primary.header
+          ? convShownText(primary.header).text
           : items.length + " tool calls"),
     );
 
@@ -5352,17 +5350,23 @@ function createCoordinatorPane(root, wsId, opts) {
       banner.className = "approval-policy-block";
       const denied = items.find((it) => it.error && !it.needs_approval);
       banner.textContent =
-        "\u26d4 " + ((denied && denied.error) || "blocked by tool policy");
+        "\u26d4 " +
+        (denied && denied.error
+          ? convShownText(denied.error).text
+          : "blocked by tool policy");
       block.appendChild(banner);
       return block;
     }
 
     // Body: intent_summary (if any) + reasoning teaser + \u25b8 more.
+    // The verdict's words go through the preview's treatment too: a rule's
+    // template quotes the call's arguments, so a key the preview redacts
+    // would otherwise show one line above it.
     const summary = verdict && verdict.intent_summary;
     if (summary) {
       const p = document.createElement("div");
       p.className = "approval-summary";
-      p.textContent = summary;
+      p.textContent = convShownText(summary).text;
       block.appendChild(p);
     }
     const reasoning = verdict && verdict.reasoning;
@@ -5382,7 +5386,7 @@ function createCoordinatorPane(root, wsId, opts) {
         lead.textContent = "\u21b3 judge: ";
         reasonLine.appendChild(lead);
         const text = document.createElement("span");
-        text.textContent = reasoning;
+        text.textContent = convShownText(reasoning).text;
         reasonLine.appendChild(text);
         block.appendChild(reasonLine);
       }
@@ -5428,7 +5432,7 @@ function createCoordinatorPane(root, wsId, opts) {
           ul.className = "approval-evidence";
           evidence.forEach((line) => {
             const li = document.createElement("li");
-            li.textContent = _evidenceLineText(line);
+            li.textContent = convShownText(_evidenceLineText(line)).text;
             ul.appendChild(li);
           });
           disclosure.appendChild(ul);
@@ -5452,12 +5456,8 @@ function createCoordinatorPane(root, wsId, opts) {
     }
 
     // Preview \u2014 what's actually being run for the primary item.
-    if (primary.preview) {
-      const pre = document.createElement("pre");
-      pre.className = "approval-preview";
-      pre.textContent = primary.preview;
-      block.appendChild(pre);
-    }
+    const shown = buildConvApprovalPreview(primary);
+    if (shown) block.appendChild(shown);
 
     // Action row: Deny + Approve.  Buttons are addEventListener-bound
     // (not inline onclick) since the row is dynamically created and
