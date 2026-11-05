@@ -86,13 +86,11 @@ WAIT_MAX_WS_IDS: int = 32
 # wait_for_workstream again with the same ws_ids — each call re-arms freshly.
 WAIT_MAX_TIMEOUT: float = 600.0
 
-# Maximum ``event.wait`` interval in the bus-driven wait loop.
-# A long-running stuck child would otherwise look dead in the sidebar UI
-# because the ``wait_progress`` SSE emission piggybacks on the wait loop
-# — capping at 2 s keeps the heartbeat visible without flooding storage.
-# The pre-bus loop polled every 500 ms; 2 s preserves a similar liveness
-# feel while cutting per-listener SSE traffic ~4x in the
-# steady-state-quiescent case.  Tunable if profiling shows storage-read
+# Maximum ``event.wait`` interval in the bus-driven wait loop.  A long-running stuck child would
+# otherwise look dead to an SSE listener because the ``wait_progress`` emission piggybacks on the
+# wait loop — capping at 2 s keeps the heartbeat visible without flooding storage.  The pre-bus
+# loop polled every 500 ms; 2 s preserves a similar liveness feel while cutting per-listener SSE
+# traffic ~4x in the steady-state-quiescent case.  Tunable if profiling shows storage-read
 # pressure on state-change wakes.
 #
 # **Worst-case completion latency**: 2 s.  ``SessionManager.set_state``
@@ -107,15 +105,6 @@ WAIT_MAX_TIMEOUT: float = 600.0
 # a follow-up ``inspect_workstream`` (the pre-bus pattern this tool
 # replaces) was already paying multi-second model-turn latency per probe.
 WAIT_HEARTBEAT_INTERVAL: float = 2.0
-
-# Per-ws cap on the inline ``message`` field bundled into wait_for_workstream
-# results.  Sized so a fan-out of 32 children at the cap is ~320 KiB of
-# tool output — large but not catastrophic on commercial models, and
-# typical waits run with a handful of children.  Truncation is from the
-# END (the lead is usually more informative than the tail) and sets a
-# ``truncated=True`` flag so the model can opt into a follow-up read if
-# the trailing bytes matter.
-WAIT_MESSAGE_MAX_BYTES: int = 10 * 1024
 
 # How many tail messages ``wait_for_workstream`` reads when extracting a
 # child's last assistant turn.  The conversation tail almost always
@@ -145,6 +134,15 @@ _NODE_METADATA_READ_FAILED = "the node metadata could not be read."
 _WAIT_SENTINEL_CLOSED = "(workstream closed)"
 _WAIT_SENTINEL_NOT_FOUND = "(no workstream with this id among your children)"
 _WAIT_SENTINEL_NO_RECENT_ASSISTANT = "(no recent assistant output)"
+# The fit keeps these whole before any other message, so a closed or unknown child never reads as
+# a cut message while anything can stay whole.
+_WAIT_SENTINELS: frozenset[str] = frozenset(
+    {_WAIT_SENTINEL_CLOSED, _WAIT_SENTINEL_NOT_FOUND, _WAIT_SENTINEL_NO_RECENT_ASSISTANT}
+)
+
+# A wait result entry's message fields.  The ``wait_ended`` event leaves them out: the children's
+# text rides the tool result.
+_WAIT_MESSAGE_FIELDS: frozenset[str] = frozenset({"message", "truncated", "message_chars"})
 
 # ---------------------------------------------------------------------------
 # Model-supplied workstream-id validation — the coordinator LLM hand-copies
@@ -1412,28 +1410,22 @@ class CoordinatorClient:
         ``since`` change ended it first (results carry whatever last
         state was observed).
 
-        ``message`` carries the child's last assistant message text for
-        ``idle`` / ``error`` states, or a short status sentinel for
-        ``closed`` / ``not_found``.  Non-terminal entries (e.g. ``running``
-        after a timeout) and ``deleted`` rows carry ``None`` — hard
-        deletes cascade rows out of storage so a real ``deleted`` state
-        is never observed; the legacy/synthetic-row path falls into the
-        same null-message shape as a still-running ws.  Capped at
-        ``WAIT_MESSAGE_MAX_BYTES`` UTF-8 bytes per ws — when the cap
-        triggers, ``truncated`` is ``True`` so the model can opt into a
-        follow-up ``inspect_workstream`` for the rest.  Bundled inline
-        so the coordinator LLM doesn't need an extra round-trip per
-        child to see what came back.  Only a completed wait (or a
-        not_found abort) bundles every finished child's message; one
-        that a ``since`` change ends first bundles only the finished
-        ``changed`` children's (see ``since`` below).  A wait that times
-        out or is interrupted returns states only, ``None`` for every
-        entry and no storage read for them (#1339).  The model waits
-        again after either, and the wait that completes carries the
-        finished children's messages, so a re-issued wait never repeats
-        a child's text in the model's context.  A child that closed
-        before the completing wait carries only the ``closed`` sentinel
-        there; ``inspect_workstream`` still reads its transcript.
+        ``message`` carries the child's last assistant message text for ``idle`` / ``error`` states,
+        or a short status sentinel for ``closed`` / ``not_found``.  Non-terminal entries (e.g.
+        ``running`` after a timeout) and ``deleted`` rows carry ``None`` — hard deletes cascade rows
+        out of storage so a real ``deleted`` state is never observed; the legacy/synthetic-row path
+        falls into the same null-message shape as a still-running ws.  The message comes whole, with
+        ``truncated`` False: the coordinator session fits the messages into the room it grants the
+        result when it admits it (:func:`_fit_wait_result`), cutting the longest, marking them
+        ``truncated`` and giving them ``message_chars``.  Bundled inline so the coordinator LLM
+        doesn't need an extra round-trip per child to see what came back.  Only a completed wait (or
+        a not_found abort) bundles every finished child's message; one that a ``since`` change ends
+        first bundles only the finished ``changed`` children's (see ``since`` below).  A wait that
+        times out or is interrupted returns states only, ``None`` for every entry and no storage
+        read for them (#1339).  The model waits again after either, and the wait that completes
+        carries the finished children's messages, so a re-issued wait never repeats a child's text
+        in the model's context.  A child that closed before the completing wait carries only the
+        ``closed`` sentinel there; ``inspect_workstream`` still reads its transcript.
 
         ``since`` — optional prior snapshot (typically the ``results``
         dict from an earlier ``wait_for_workstream`` call).  It adds a
@@ -1499,12 +1491,10 @@ class CoordinatorClient:
         list it, so ``stalled`` names the stalls that ended the wait, as
         ``changed`` names the changes.  See :meth:`_dispatch_state`.
 
-        ``progress_callback`` is invoked once per poll cycle with the
-        current snapshot dict + elapsed seconds.  Swallows callback
-        errors so a buggy observer can't break the wait loop.  Used
-        by the coordinator-side wait dashboard (#14) to emit
-        ``wait_progress`` SSE events; tests pass it to assert loop
-        cadence.
+        ``progress_callback`` is invoked once per poll cycle with the current snapshot dict +
+        elapsed seconds.  Swallows callback errors so a buggy observer can't break the wait loop.
+        The coordinator session uses it to emit ``wait_progress`` SSE events (#14); tests pass it
+        to assert loop cadence.
 
         ``interrupt`` ends the wait early for a reason outside the
         children (#1339).  It is consulted once per tick, after the
@@ -1832,7 +1822,7 @@ class CoordinatorClient:
                 # Block until a child state-change notify fires, the
                 # caller sets the Event, or the heartbeat cap expires (so
                 # a stuck child still emits a periodic ``wait_progress``
-                # for the sidebar UX).  Heartbeat cap is the only timer.
+                # for SSE listeners).  Heartbeat cap is the only timer.
                 # See ``WAIT_HEARTBEAT_INTERVAL`` (module top) for the
                 # worst-case completion-latency rationale: 2 s is a
                 # deliberate 4x trade vs the pre-bus 0.5 s poll.  Foreign
@@ -3012,22 +3002,148 @@ def _format_inspect_tiered(result: dict[str, Any], *, budget: int = _INSPECT_OUT
 # ---------------------------------------------------------------------------
 
 
-def _truncate_wait_message(text: str, max_bytes: int) -> tuple[str, bool]:
-    """Cap ``text`` to ``max_bytes`` UTF-8 bytes, truncating from the END.
+def _wait_result_json(value: Any) -> str:
+    """Serialize a wait result, or one of its values, as the model reads it.
 
-    Returns ``(text, truncated)``.  Encodes to UTF-8 first so the cap is a
-    real wire-size cap rather than a character-count proxy.  ``errors='ignore'``
-    on the decode silently drops a trailing partial codepoint when the byte
-    cut lands mid-multi-byte-sequence — keeps the truncated string valid
-    UTF-8 (so JSON serialization can't fail) without an explicit boundary
-    walk.
+    :func:`_fit_wait_result` measures every size with this, so the room it shares is the room the
+    sent string takes.
     """
-    if max_bytes <= 0:
-        return "", bool(text)
-    encoded = text.encode("utf-8")
-    if len(encoded) <= max_bytes:
-        return text, False
-    return encoded[:max_bytes].decode("utf-8", errors="ignore"), True
+    return json.dumps(value, separators=(",", ":"), default=str)
+
+
+def _json_text_chars(text: str) -> int:
+    """Characters ``text`` takes in :func:`_wait_result_json`'s output, without its quotes.
+
+    Escapes count at their serialized width: a newline takes two characters, and a non-ASCII
+    character six, or twelve outside the BMP.
+    """
+    return len(_wait_result_json(text)) - 2
+
+
+def _json_text_prefix(text: str, limit: int) -> str:
+    """The longest prefix of ``text`` that takes at most ``limit`` serialized characters."""
+    # Every character takes at least one serialized character, so the prefix is at most ``limit``
+    # long.  Serialized width only grows with the prefix, so a binary search finds the cut.
+    lo, hi = 0, min(len(text), max(0, limit))
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if _json_text_chars(text[:mid]) <= limit:
+            lo = mid
+        else:
+            hi = mid - 1
+    return text[:lo]
+
+
+def _share_room(sizes: dict[str, int], room: int) -> dict[str, int]:
+    """Split ``room`` between entries of the given ``sizes``, fairly.
+
+    Smallest first, each entry takes what it needs or an even share of the room still left,
+    whichever is less, so entries under an even share take all they need and the larger ones split
+    the rest evenly.
+    """
+    shares: dict[str, int] = {}
+    room = max(0, room)
+    order = sorted(sizes, key=sizes.__getitem__)
+    for left, key in zip(range(len(order), 0, -1), order, strict=True):
+        shares[key] = min(sizes[key], room // left)
+        room -= shares[key]
+    return shares
+
+
+def _wait_states(results: dict[str, Any]) -> dict[str, Any]:
+    """Each child's wait result entry without its message fields, as ``wait_ended`` carries it."""
+    return {
+        wid: (
+            {key: value for key, value in entry.items() if key not in _WAIT_MESSAGE_FIELDS}
+            if isinstance(entry, dict)
+            else entry
+        )
+        for wid, entry in results.items()
+    }
+
+
+def _fit_wait_result(result: dict[str, Any], *, budget: int) -> str:
+    """Serialize a wait result with its messages fitted into ``budget`` characters.
+
+    A result that fits is sent as it is.  Otherwise as many messages as fit stay whole, status texts
+    (a closed child, an unknown id) first and then the smallest, and the rest share what is left
+    evenly, each cut from the end (the lead is usually more informative than the tail), marked
+    ``truncated`` and given ``message_chars``, the whole message's length.  Keeping the smallest
+    whole cuts the fewest messages, so the fewest need a follow-up read.  A message an earlier fit
+    cut stays cut.  Only messages are cut, never a child's state, id or name, so the JSON survives
+    any budget that holds the result with every message cut to nothing; below that the result goes
+    out in its shortest form, the messages cheaper whole than cut kept whole and the rest emptied,
+    and the fold's own cut decides.  ``result`` is never mutated.
+    """
+    entries = result.get("results")
+    if not isinstance(entries, dict):
+        return _wait_result_json(result)
+    texts = {
+        wid: entry["message"]
+        for wid, entry in entries.items()
+        if isinstance(entry, dict) and isinstance(entry.get("message"), str)
+    }
+    if not texts:
+        return _wait_result_json(result)
+    emptied = {wid: {**entries[wid], "message": ""} for wid in texts}
+    skeleton = len(_wait_result_json({**result, "results": {**entries, **emptied}}))
+    # A message takes at least its length in serialized characters, so a result over the budget
+    # by this bound alone can't fit whole, and isn't serialized whole to find that out.
+    if skeleton + sum(len(text) for text in texts.values()) <= budget:
+        whole = _wait_result_json(result)
+        if len(whole) <= budget:
+            return whole
+    # A message an earlier fit cut stays cut and keeps the whole message's length it carries.
+    sticky = {
+        wid
+        for wid in texts
+        if entries[wid].get("truncated") is True
+        and isinstance(entries[wid].get("message_chars"), int)
+    }
+    whole_chars = {
+        wid: entries[wid]["message_chars"] if wid in sticky else len(text)
+        for wid, text in texts.items()
+    }
+
+    def _cut(wid: str, message: str) -> dict[str, Any]:
+        return {
+            **entries[wid],
+            "message": message,
+            "truncated": True,
+            "message_chars": whole_chars[wid],
+        }
+
+    # Entry widths add up in the serialized result, so every choice is priced from the skeleton:
+    # a whole message adds its width, a cut one its marker fields plus the text it keeps.  A marker
+    # an odd entry would make negative counts as nothing, which only overprices the cut.
+    marker = {
+        wid: max(0, len(_wait_result_json(_cut(wid, ""))) - len(_wait_result_json(emptied[wid])))
+        for wid in texts
+    }
+    # No message can stay whole past the room the skeleton leaves, and only one no wider than its
+    # marker can be cheaper whole than cut, so none is measured past both.
+    cap = max(budget - skeleton, *marker.values()) + 1
+    sizes = {wid: _json_text_chars(text[:cap]) for wid, text in texts.items()}
+    # Start from the shortest form: every message cut to nothing but those no wider than their
+    # marker, which take less room whole, so it is never longer than the result whole.  Then keep
+    # whole what still fits, status texts first and then the smallest, skipping any that doesn't,
+    # so each message left out needs more than the room that is left.
+    candidates = sorted(
+        (wid for wid in texts if wid not in sticky),
+        key=lambda wid: (texts[wid] not in _WAIT_SENTINELS, sizes[wid]),
+    )
+    whole_ids = {wid for wid in candidates if sizes[wid] <= marker[wid]}
+    total = skeleton + sum(sizes[wid] if wid in whole_ids else marker[wid] for wid in texts)
+    for wid in candidates:
+        if wid not in whole_ids and total + sizes[wid] - marker[wid] <= budget:
+            whole_ids.add(wid)
+            total += sizes[wid] - marker[wid]
+    cut = [wid for wid in texts if wid not in whole_ids]
+    shares = _share_room({wid: sizes[wid] for wid in cut}, budget - total)
+    fitted = dict(entries)
+    for wid in cut:
+        fitted[wid] = _cut(wid, _json_text_prefix(texts[wid], shares[wid]))
+    return _wait_result_json({**result, "results": fitted})
 
 
 def _last_assistant_text(storage: Any, ws_id: str) -> str | None:
@@ -3106,19 +3222,12 @@ def _load_last_error(storage: Any, ws_id: str) -> str | None:
     return str(raw) if raw else ""
 
 
-def _wait_message_for(
-    storage: Any,
-    ws_id: str,
-    state: str,
-    *,
-    max_bytes: int = WAIT_MESSAGE_MAX_BYTES,
-) -> tuple[str | None, bool]:
-    """Return ``(message, truncated)`` for a wait_for_workstream result entry.
+def _wait_message_for(storage: Any, ws_id: str, state: str) -> str | None:
+    """Return the whole ``message`` for a wait_for_workstream result entry.
 
-    The returned tuple is appended to each per-ws snapshot as
-    ``message`` / ``truncated`` so the coordinator LLM doesn't need a
-    follow-up ``inspect_workstream`` round-trip to read what each child
-    actually produced.
+    The message is appended to each per-ws snapshot so the coordinator LLM doesn't need a follow-up
+    ``inspect_workstream`` round-trip to read what each child actually produced.  It is never cut
+    here: the coordinator session fits the result to its budget (:func:`_fit_wait_result`).
 
     Branching by ``state``:
 
@@ -3136,38 +3245,34 @@ def _wait_message_for(
     - ``closed`` / ``not_found`` — short status sentinel.  No
       message-history read because there's nothing meaningful to
       return — a partial last message could be misleading mid-thought.
-    - any other state (e.g. ``running``, or a ``deleted`` synthetic /
-      legacy row) — ``(None, False)`` so the coordinator sees null
-      inline and knows to keep waiting / inspect explicitly.  Hard
-      deletes cascade rows out of storage, so the wait poll never
-      observes a real ``deleted`` state in normal operation.
+    - any other state (e.g. ``running``, or a ``deleted`` synthetic / legacy row) — ``None`` so the
+      coordinator sees null inline and knows to keep waiting / inspect explicitly.  Hard deletes
+      cascade rows out of storage, so the wait poll never observes a real ``deleted`` state in
+      normal operation.
 
-    Storage failures during the message or last-error read collapse to
-    ``(None, False)`` so a transient read error degrades gracefully (the
-    wait itself already completed; the model just gets ``message: null``
-    for the affected ws and can fall back to inspect).
+    Storage failures during the message or last-error read collapse to ``None`` so a transient read
+    error degrades gracefully (the wait itself already completed; the model just gets ``message:
+    null`` for the affected ws and can fall back to inspect).
     """
     if state == "not_found":
-        return _WAIT_SENTINEL_NOT_FOUND, False
+        return _WAIT_SENTINEL_NOT_FOUND
     if state == "closed":
-        return _WAIT_SENTINEL_CLOSED, False
+        return _WAIT_SENTINEL_CLOSED
     if state == "error":
         last_error = _load_last_error(storage, ws_id)
         if last_error is None:
-            return None, False
+            return None
         if last_error:
-            return _truncate_wait_message(last_error, max_bytes)
+            return last_error
         # No persisted error — fall through to the assistant-tail walk
         # below so a legacy / pre-fix error row still surfaces SOMETHING
         # (the last assistant turn before the failure, if any).
     if state in ("idle", "error"):
         text = _last_assistant_text(storage, ws_id)
         if text is None:
-            return None, False
-        if not text:
-            return _WAIT_SENTINEL_NO_RECENT_ASSISTANT, False
-        return _truncate_wait_message(text, max_bytes)
-    return None, False
+            return None
+        return text or _WAIT_SENTINEL_NO_RECENT_ASSISTANT
+    return None
 
 
 def _since_entry_changed(snap: dict[str, Any], prev: dict[str, Any]) -> bool:
@@ -3188,6 +3293,9 @@ def _enrich_wait_results(
     changed: Collection[str] = (),
 ) -> dict[str, dict[str, Any]]:
     """Return a fresh copy of each wait snapshot with ``message`` and ``truncated``.
+
+    Each message is whole and ``truncated`` False; the coordinator session cuts the messages that
+    don't fit its budget and marks them (:func:`_fit_wait_result`).
 
     Only a wait that completed, or one that aborted on not_found ids, carries
     every finished child's message.  A wait that timed out or was interrupted
@@ -3235,29 +3343,28 @@ def _enrich_wait_results(
         for wid, snap in snaps.items()
         if wid in bundled and str(snap.get("state") or "") in ("idle", "error")
     ]
-    io_pairs: dict[str, tuple[str | None, bool]] = {}
+    io_messages: dict[str, str | None] = {}
     if io_wids:
 
-        def _enrich(wid: str) -> tuple[str, str | None, bool]:
+        def _enrich(wid: str) -> tuple[str, str | None]:
             state = str(snaps[wid].get("state") or "")
-            msg, trunc = _wait_message_for(storage, wid, state)
-            return wid, msg, trunc
+            return wid, _wait_message_for(storage, wid, state)
 
         with concurrent.futures.ThreadPoolExecutor(
             max_workers=min(8, len(io_wids)),
             thread_name_prefix="coord-wait-enrich",
         ) as ex:
-            for wid, msg, trunc in ex.map(_enrich, io_wids):
-                io_pairs[wid] = (msg, trunc)
+            for wid, msg in ex.map(_enrich, io_wids):
+                io_messages[wid] = msg
 
     enriched: dict[str, dict[str, Any]] = {}
     for wid, snap in snaps.items():
         state = str(snap.get("state") or "")
-        if wid in io_pairs:
-            msg, trunc = io_pairs[wid]
+        if wid in io_messages:
+            message = io_messages[wid]
         elif wid in bundled and state in WAIT_TERMINAL_STATES:
-            msg, trunc = _wait_message_for(storage, wid, state)
+            message = _wait_message_for(storage, wid, state)
         else:
-            msg, trunc = None, False
-        enriched[wid] = {**snap, "message": msg, "truncated": trunc}
+            message = None
+        enriched[wid] = {**snap, "message": message, "truncated": False}
     return enriched

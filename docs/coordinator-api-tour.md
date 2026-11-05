@@ -250,8 +250,10 @@ for every id in a `{results, denied, truncated}` envelope.
 `wait_for_workstream` is a **model-side tool**, not an HTTP endpoint
 — the coordinator's LLM invokes it with a list of child ws_ids, the
 session's worker thread blocks inside the tool, and a sequence of
-`wait_started` / `wait_progress` / `wait_ended` SSE events is emitted
-for the UI to drive a "waiting on N children" indicator.
+`wait_started` / `wait_progress` / `wait_ended` SSE events, each
+carrying the call's `call_id`, lets an SSE listener follow the wait.
+No console page renders them; the coordinator page shows the tool
+row's summary line.
 
 ![wait_for_workstream sequence](diagrams/png/27-coordinator-wait-for-workstream.png)
 
@@ -317,6 +319,23 @@ Key properties:
   output twice.  A child that closed before the completing wait
   shows only the `closed` sentinel there; `inspect_workstream` still
   reads what it produced.
+- **Messages fit the room one tool result has** — a message comes
+  whole when the result has room for it: the coordinator session fits
+  the result when it adds it to the coordinator's context, against the
+  room it grants then (after any compaction, and after the results
+  before it in the same batch).  When the finished children's messages
+  don't all fit, as many as fit stay whole, status texts first and then
+  the smallest, so the fewest are cut, and the rest share what is left,
+  each cut from the end and marked `truncated: true` with
+  `message_chars`, the whole message's length.  Only messages are cut,
+  so every child's entry and state survive whenever the result has
+  room for them with every message cut to nothing (about 160 to 210
+  characters a child).  A wait wider than that goes out in its shortest
+  form, with the messages that take less room whole than cut kept whole
+  and the rest emptied, and the session's generic cut decides what of it
+  survives.  The `wait_ended` event carries each
+  child's `state`, `tokens`, `updated` and `name`, without the message:
+  the tool result carries the text.
 - **`since` adds a trigger, not a completion** — given an earlier
   result's `results` as `since`, the wait also returns as soon as a
   listed child differs from its snapshot, naming those children in

@@ -104,6 +104,71 @@ class TestHeadlessLaneOwnership:
         historical_call = next(turn.tool_calls[0] for turn in first_wire_turns if turn.tool_calls)
         assert historical_call.arguments == "{}"
 
+    def test_a_wait_result_is_fitted_where_the_loop_has_no_admission(self, tmp_db):
+        """The headless loop appends results without the drain's admission, and a wait returns
+        its children's messages whole, so the loop fits it to the most any admission grants one
+        result: every child's entry stays, and the turn never outgrows the session ceiling."""
+        import json
+
+        from turnstone.core.model_turn import ModelTurnResult
+        from turnstone.core.trajectory import Role, ToolCall, Turn
+        from turnstone.eval.core import HeadlessSession
+
+        session = HeadlessSession(client=MagicMock(), model="eval-model", context_window=16384)
+        ids = [f"{i:032x}" for i in range(8)]
+        wait_output = json.dumps(
+            {
+                "results": {
+                    wid: {
+                        "state": "idle",
+                        "tokens": 3,
+                        "updated": "2026-11-05T10:00:00",
+                        "name": f"child-{i}",
+                        "message": "findings " * 2200,
+                        "truncated": False,
+                    }
+                    for i, wid in enumerate(ids)
+                },
+                "complete": True,
+                "elapsed": 1.0,
+                "mode": "all",
+            },
+            separators=(",", ":"),
+        )
+        call = {
+            "id": "w1",
+            "type": "function",
+            "function": {"name": "wait_for_workstream", "arguments": "{}"},
+        }
+        results = [
+            ModelTurnResult(
+                turn=Turn.assistant(
+                    "", tool_calls=(ToolCall(id="w1", name="wait_for_workstream", arguments="{}"),)
+                ),
+                finish_reason="tool_calls",
+                usage=None,
+                tool_calls=[call],
+            ),
+            ModelTurnResult(
+                turn=Turn.assistant("done"), finish_reason="stop", usage=None, tool_calls=[]
+            ),
+        ]
+        try:
+            with (
+                patch.object(session, "_execute_tools", return_value=([("w1", wait_output)], "")),
+                patch("turnstone.eval.core.model_turn", side_effect=results),
+            ):
+                session._run_headless_loop(max_turns=2)
+            (tool_turn,) = [turn for turn in session.messages if turn.role is Role.TOOL]
+            ceiling = session._result_limit_chars(floor_chars=2048)
+        finally:
+            session.close()
+        assert len(wait_output) > ceiling
+        assert len(tool_turn.text) <= ceiling
+        entries = json.loads(tool_turn.text)["results"]
+        assert list(entries) == ids
+        assert all(entry["message_chars"] == len("findings " * 2200) for entry in entries.values())
+
 
 class TestRunResourceLifecycle:
     """A run must leave nothing behind.

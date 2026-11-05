@@ -620,13 +620,10 @@ def get_workstream_reservation_token(ws_id: str) -> str:
 # can't desync writer and readers.
 LAST_ERROR_CONFIG_KEY = "last_error"
 
-# Hard cap on persisted error text. Provider error bodies are sometimes
-# multi-KiB JSON blobs (full request echo + headers); without a cap one
-# such error per workstream would bloat workstream_config and the model
-# prompt the coord LLM ingests on inspect.  1024 chars matches the
-# practical "useful for triage" length while staying well under the
-# WAIT_MESSAGE_MAX_BYTES (10 KiB) cap so the truncate happens here at
-# write time, not later at the wait surface.
+# Hard cap on persisted error text. Provider error bodies are sometimes multi-KiB JSON blobs (full
+# request echo + headers); without a cap one such error per workstream would bloat
+# workstream_config and the model prompt the coord LLM ingests on inspect and wait.  1024 chars
+# matches the practical "useful for triage" length.
 LAST_ERROR_MAX_LEN = 1024
 
 

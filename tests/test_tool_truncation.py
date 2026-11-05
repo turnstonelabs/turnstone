@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import json
 import re
 import time
 from types import SimpleNamespace
@@ -508,6 +509,68 @@ def test_text_with_images_obeys_per_result_and_shared_admission_limits(session, 
         ]
     assert sum(scanned.values()) == 3200
     assert len(output[0]["text"]) > 10000  # Admission must not mutate the executor's result.
+
+
+def _wait_output(messages: dict[str, str]) -> str:
+    """A completed wait_for_workstream result as its executor hands it to the drain."""
+    return json.dumps(
+        {
+            "results": {
+                wid: {
+                    "state": "idle",
+                    "tokens": 3,
+                    "updated": "2026-11-05T10:00:00",
+                    "name": f"child-{i}",
+                    "message": text,
+                    "truncated": False,
+                }
+                for i, (wid, text) in enumerate(messages.items())
+            },
+            "complete": True,
+            "elapsed": 1.0,
+            "mode": "all",
+        },
+        separators=(",", ":"),
+    )
+
+
+@pytest.mark.parametrize("guard_breaks_json", [False, True])
+def test_a_wait_result_the_guard_lengthens_is_fitted_again_at_the_limit(session, guard_breaks_json):
+    """Admission fits a wait result whole to the drain's limit; when redaction then lengthens it
+    past that limit, the re-cut fits it again so every child's entry survives, and one whose
+    guarded text no longer parses is cut at the limit like any result."""
+    session._judge_config = JudgeConfig(output_guard=True, output_guard_llm=False)
+    session.tool_truncation = 3200
+    session._manual_tool_truncation = True
+    ids = [f"{i:032x}" for i in range(3)]
+    output = _wait_output({wid: "a secret here " * 400 for wid in ids})
+    calls = [{"id": "tc_w", "function": {"name": "wait_for_workstream", "arguments": "{}"}}]
+
+    def guard(call_id, text, *_args, **_kwargs):
+        grown = text.replace("secret", "[REDACTED:secret]")
+        return (grown.replace('"results"', "results") if guard_breaks_json else grown), None
+
+    with _send_with_tool_batch(
+        session,
+        calls,
+        [("tc_w", output)],
+        _remaining_token_budget=MagicMock(return_value=100_000),
+        _compact_messages=MagicMock(return_value=False),
+        _evaluate_output=MagicMock(side_effect=guard),
+    ):
+        session.send("wait")
+
+    (text,) = _tool_turn_texts(session)
+    assert len(text) <= 3200
+    if guard_breaks_json:
+        assert text.count("chars truncated") == 1
+        return
+    parsed = json.loads(text)
+    assert list(parsed["results"]) == ids
+    for entry in parsed["results"].values():
+        assert entry["state"] == "idle"
+        assert entry["truncated"] is True
+        assert "[REDACTED:secret]" in entry["message"]
 
 
 @pytest.mark.parametrize("image_between_text", [False, True])

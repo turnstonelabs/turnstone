@@ -10,6 +10,36 @@ All development now integrates on `main`. Supported release lines are maintained
 on `stable/X.Y` branches; `stable/1.8` preserves the former stable branch.
 The separate `dev` branch is retired. See [the release process](docs/releasing.md).
 
+## [2026-11-05]
+
+### Changed
+
+- **The `wait_ended` event carries each child's state without its message.** Its
+  per-child `results` hold `state`, `tokens`, `updated` and `name`, as `wait_progress`
+  does, and the wait's tool result carries the children's text. A consumer that read
+  messages from `wait_ended` reads them from the tool result instead.
+
+### Fixed
+
+- **`wait_for_workstream` brings a child's message whole when the coordinator has room
+  for it.** The wait cut each finished child's message at 10 KiB whatever the
+  coordinator's context could hold, so a long report took a second call to
+  `inspect_workstream` and put its first 10 KiB in the context twice. On a small
+  context, a wait whose children's messages together outgrew the room one tool result
+  has was cut in the middle of its JSON, so the model lost some children's ids and
+  states along with their text. The session now fits the result when it adds it to the
+  coordinator's context, against the room it grants then: after any compaction, after
+  the results before it in the same batch, and never less than the 2,048 characters a
+  wait result always gets, and fits it again when redaction lengthens it. A message
+  that fits comes whole; when they don't all fit, as many as fit stay whole, smallest
+  first, so the fewest need a follow-up read, and the rest share what is left, each cut
+  from the end and marked `truncated` with `message_chars`, the whole message's length.
+  A wait result is bounded like any other tool result, by the session's per-result
+  ceiling. The tool's description and the guide for coordinator skill authors say what
+  each way of reading more of a cut message returns, and neither the guide nor the
+  API tour's sequence diagram has a coordinator inspect each child after the wait for
+  its answer.
+
 ## [2026-11-04]
 
 ### Security

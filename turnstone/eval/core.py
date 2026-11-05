@@ -38,7 +38,7 @@ from turnstone.core.attachments import Attachment, classify_upload
 from turnstone.core.model_turn import cap_tool_calls, model_turn, require_lane_capabilities
 from turnstone.core.providers import LLMProvider, create_client, create_provider
 from turnstone.core.providers._http_client import shutdown_on_close
-from turnstone.core.session import ChatSession
+from turnstone.core.session import _ADMISSION_REFITS, _TRUNCATION_FLOOR_CHARS, ChatSession
 from turnstone.core.storage import get_storage, init_storage, reset_storage
 from turnstone.core.tools import INTERACTIVE_TOOLS, PRIMARY_KEY_MAP
 from turnstone.core.trajectory import Turn, final_assistant_text, turn_from_dict, turns_from_dicts
@@ -523,6 +523,14 @@ class HeadlessSession(ChatSession):
             results, _ = self._execute_tools(capped_calls)
 
             for tc, (tc_id, raw_output) in zip(capped_calls, results, strict=False):
+                # This loop has no admission step, so a result whose tool admission fits (a wait
+                # returns its children's messages whole) is fitted here, to the most any admission
+                # grants one result.
+                refit = _ADMISSION_REFITS.get(tc["function"]["name"])
+                if refit is not None and isinstance(raw_output, str):
+                    raw_output = refit(
+                        raw_output, self._result_limit_chars(floor_chars=_TRUNCATION_FLOOR_CHARS)
+                    )
                 # Flatten list content (image tool results) to text for logging
                 if isinstance(raw_output, list):
                     output = " ".join(
