@@ -74,7 +74,7 @@ turnstone/
     ratelimit.py      Per-user token-bucket rate limiter (RateLimiter, TokenBucket)
     edit.py           File edit utilities (find_occurrences, pick_nearest)
     safety.py         Command safety validation (blocked patterns, sanitization)
-    web.py            Web utilities (HTML stripping, SSRF prevention)
+    web.py            Web utilities (HTML to text, SSRF prevention)
   api/
     schemas.py        Shared Pydantic v2 models (auth, errors, WorkstreamState)
     server_schemas.py Server endpoint request/response models

@@ -1,6 +1,6 @@
 {
   "name": "web_fetch",
-  "description": "Fetch a URL or PDF and extract specific information from it. You must provide a question or extraction guidance. The content is fetched, analyzed, and only relevant information is returned (not the raw page or document).",
+  "description": "Fetch a URL or PDF and extract specific information from it. You must provide a question or extraction guidance. The content is fetched, analyzed, and only relevant information is returned (not the raw page or document). Links on a web page keep their URLs, so ask for the URLs you need instead of guessing them.",
   "parameters": {
     "type": "object",
     "properties": {
