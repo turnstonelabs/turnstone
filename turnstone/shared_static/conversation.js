@@ -35,6 +35,9 @@ export function stripAnsi(s) {
 // could otherwise hide what follows it from the reader while a shell still
 // runs it.  Each becomes its Control Pictures symbol (ESC shows as U+241B);
 // line feed and tab stay as they are.  Tool output goes through stripAnsi.
+// The terminal client's show_controls (turnstone/ui/colors.py) shows the same
+// symbols, C1 controls as well, which some terminals act on, and lone
+// surrogates as U+FFFD, as a browser shows them anyway.
 function _showControls(text) {
   return text.replace(
     // eslint-disable-next-line no-control-regex
@@ -42,6 +45,16 @@ function _showControls(text) {
     (c) =>
       String.fromCharCode(c === "\x7f" ? 0x2421 : 0x2400 + c.charCodeAt(0)),
   );
+}
+
+// A call's text as the cards show it (its command line, preview or approval
+// block): credentials redacted, then the model's control characters shown.
+// `redacted` says whether redaction changed it, so a bash card can say part
+// of its command is hidden.
+export function convShownText(text) {
+  const raw = String(text == null ? "" : text);
+  const hidden = redactCredentials(raw);
+  return { text: _showControls(hidden), redacted: hidden !== raw };
 }
 
 // Structured `.msg.watch-result` card for a `watch_triggered` operator-context
@@ -906,10 +919,9 @@ export function buildConvRow(item, opts) {
   if (opts.argsText) {
     const args = document.createElement("span");
     args.className = "conv-row-args";
-    const argsText = String(opts.argsText);
-    const hidden = redactCredentials(argsText);
-    redactedCommand = hidden !== argsText && item.func_name === "bash";
-    args.textContent = _showControls(hidden);
+    const shown = convShownText(opts.argsText);
+    redactedCommand = shown.redacted && item.func_name === "bash";
+    args.textContent = shown.text;
     call.appendChild(args);
   }
   row.appendChild(call);
@@ -933,9 +945,9 @@ export function buildConvCmd(item) {
   if (cmdText) {
     const cmd = document.createElement("div");
     cmd.className = "conv-row-cmd";
-    const hidden = redactCredentials(cmdText);
-    if (hidden !== cmdText) redacted = true;
-    const shownCmd = _showControls(hidden);
+    const shown = convShownText(cmdText);
+    if (shown.redacted) redacted = true;
+    const shownCmd = shown.text;
     if (item.func_name === "bash") {
       const dollar = document.createElement("span");
       dollar.className = "conv-row-cmd-dollar";
@@ -959,10 +971,9 @@ export function buildConvCmd(item) {
     // Redact credentials ONCE on the full text before splitting, rather than
     // running 7 regex sweeps per line (~2800 passes at 400 lines).
     const MAX_PREVIEW_LINES = 400;
-    const raw = String(item.preview);
-    const hidden = redactCredentials(raw);
-    if (hidden !== raw) redacted = true;
-    let lines = _showControls(hidden).split("\n");
+    const shown = convShownText(item.preview);
+    if (shown.redacted) redacted = true;
+    let lines = shown.text.split("\n");
     const omitted = lines.length - MAX_PREVIEW_LINES;
     if (omitted > 0) lines = lines.slice(0, MAX_PREVIEW_LINES);
     lines.forEach((line, i) => {
@@ -997,6 +1008,27 @@ export function buildConvCmd(item) {
     }
   }
   if (redacted && item.func_name === "bash") {
+    frag.appendChild(_redactionNote("command"));
+  }
+  return frag;
+}
+
+// What a call awaiting approval does, as the coordinator's children tree
+// shows it: its preview, or its header line when it has none (a one-line
+// bash command), shown as the cards show it.  Whole, not cut at the cards'
+// line count: the block has no full call to open, and its box scrolls.  A
+// bash call whose text redaction changed says part of the command is hidden.
+// Null when the item carries neither.
+export function buildConvApprovalPreview(item) {
+  item = item || {};
+  const shown = convShownText(item.preview || item.header || "");
+  if (!shown.text) return null;
+  const frag = document.createDocumentFragment();
+  const pre = document.createElement("pre");
+  pre.className = "approval-preview";
+  pre.textContent = shown.text;
+  frag.appendChild(pre);
+  if (shown.redacted && item.func_name === "bash") {
     frag.appendChild(_redactionNote("command"));
   }
   return frag;
@@ -1728,7 +1760,7 @@ export function buildConvFullCallArguments(text, opts) {
     if (key !== null) {
       const name = document.createElement("div");
       name.className = "conv-full-arg-name";
-      name.textContent = _showControls(redactCredentials(key));
+      name.textContent = convShownText(key).text;
       arg.appendChild(name);
     }
     const shown = _displayCut(full);

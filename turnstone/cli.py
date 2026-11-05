@@ -44,6 +44,7 @@ from turnstone.ui.colors import (
     dim,
     green,
     red,
+    show_controls,
     yellow,
 )
 from turnstone.ui.markdown import MarkdownRenderer
@@ -95,19 +96,73 @@ def _style_preview(preview: str) -> str:
     """Colour an approval preview's lines as the session used to: removed lines
     red, added lines green, edit separators, warnings and notes yellow, the rest
     dim.  The session sends previews as plain text, so it no longer colours them
-    itself."""
+    itself.
+
+    Takes the preview as the session sent it: each line's marker is read as
+    written, where a form feed or another whitespace control still counts as
+    indentation, and the line is printed with its control characters shown.
+    """
     styled: list[str] = []
     for line in preview.split("\n"):
         text = line.strip()
+        shown = show_controls(line)
         if text.startswith(("---", "Warning:", "(")):
-            styled.append(yellow(line))
+            styled.append(yellow(shown))
         elif text.startswith("-"):
-            styled.append(red(line))
+            styled.append(red(shown))
         elif text.startswith("+"):
-            styled.append(green(line))
+            styled.append(green(shown))
         else:
-            styled.append(dim(line))
+            styled.append(dim(shown))
     return "\n".join(styled)
+
+
+def _shown(values: dict[str, Any]) -> dict[str, Any]:
+    """A copy of *values* to print from, each string in it, and each string in a
+    list in it, through ``show_controls``.
+
+    For the dicts the session hands the UI (an approval item, a verdict, an output
+    assessment, a sub-agent step), so a top-level field printed from one is shown
+    without anyone remembering to.  One level only: a nested dict (an item's
+    heuristic verdict) comes back as the same object, unshown, so a writer that
+    prints from one takes a copy of it too, and a tool's arguments, which a model
+    can nest deeper than Python recurses, are never walked.  The session reads
+    back what the UI writes into the original (a denial), and policy checks use
+    its labels, so only printing reads the copy.
+    """
+    copy: dict[str, Any] = {}
+    for key, value in values.items():
+        if isinstance(value, str):
+            value = show_controls(value)
+        elif isinstance(value, list):
+            value = [show_controls(v) if isinstance(v, str) else v for v in value]
+        copy[key] = value
+    return copy
+
+
+def _show_lines(text: str) -> str:
+    """*text* shown, a CR LF line ending as a plain line feed.
+
+    For reasoning and for error text from a provider, a server or a tool: a
+    carriage return just before a line feed rewrites nothing, and any other
+    still shows.  An approval card keeps every one, since in a command it
+    changes what runs (``cd /tmp`` followed by one fails).
+    """
+    return show_controls(text.replace("\r\n", "\n"))
+
+
+_SUMMARY_MAX = 400
+
+
+def _one_line(summary: object) -> str:
+    """A verdict's summary on one line of at most 400 characters, as the web and
+    channel cards show it, each run of whitespace as one space.
+
+    The heuristic summary quotes the call's arguments and the judge's has no
+    limit, so its line feeds could push the card and its RISK line off screen.
+    """
+    line = " ".join(str(summary).split())
+    return line if len(line) <= _SUMMARY_MAX else line[: _SUMMARY_MAX - 1] + "…"
 
 
 def _completer(text: str, state: int) -> str | None:
@@ -130,7 +185,14 @@ def setup_readline() -> None:
 
 
 class TerminalUI(SessionUI):
-    """Terminal-based UI using ANSI colors, MarkdownRenderer, and Spinner."""
+    """Terminal-based UI using ANSI colors, MarkdownRenderer, and Spinner.
+
+    Text from a model or from outside (a tool, a server, the judge) goes through
+    ``show_controls`` before the UI colours and prints it, so it can't move the
+    cursor, rewrite a line, or leave the terminal in a mode (line wrap off,
+    hidden text) that changes how a later approval card reads.  ``on_info``
+    messages are composed by the session with its own colours and print as sent.
+    """
 
     def __init__(self) -> None:
         self.md = MarkdownRenderer()
@@ -138,6 +200,9 @@ class TerminalUI(SessionUI):
         self._print_lock = threading.Lock()
         self.auto_approve = False
         self.auto_approve_tools: set[str] = set()
+        # A carriage return that ended a reasoning token, held until the next
+        # token shows whether a line feed follows it.
+        self._reasoning_cr = False
 
     def _show(self, text: str, *, stderr: bool = False) -> None:
         """Show *text*, on stdout, or on stderr when *stderr* is set.
@@ -196,14 +261,32 @@ class TerminalUI(SessionUI):
             self.spinner = None
 
     def on_reasoning_token(self, text: str) -> None:
-        self._show(f"{DIM}{text}{RESET}")
+        # A CR LF is a line ending and prints as one, though a token may end
+        # between the two; any other carriage return shows.
+        if self._reasoning_cr:
+            text = "\r" + text
+            self._reasoning_cr = False
+        if text.endswith("\r"):
+            text = text[:-1]
+            self._reasoning_cr = True
+        if text:
+            self._show(f"{DIM}{_show_lines(text)}{RESET}")
+
+    def _end_reasoning(self) -> None:
+        """Show a carriage return the reasoning ended on: no line feed follows."""
+        if self._reasoning_cr:
+            self._reasoning_cr = False
+            self._show(f"{DIM}{show_controls(chr(13))}{RESET}")
 
     def on_content_token(self, text: str) -> None:
+        self._end_reasoning()
+        # The renderer shows the reply's control characters line by line.
         rendered = self.md.feed(text)
         if rendered:
             self._show(rendered)
 
     def on_stream_end(self) -> None:
+        self._end_reasoning()
         remainder = self.md.flush()
         self.md.in_code_block = False
         self._show(f"{remainder}\n")
@@ -297,7 +380,8 @@ class TerminalUI(SessionUI):
                 return False, "Cancelled by user"
             # All headers, previews, and heuristic verdicts
             lines: list[str] = []
-            for item in items:
+            for raw in items:
+                item = _shown(raw)
                 header = item.get("header") or item.get("func_name", "")
                 if item.get("error"):
                     lines.append(f"  {red(header)}\n")
@@ -305,11 +389,17 @@ class TerminalUI(SessionUI):
                 else:
                     lines.append(f"  {yellow(header)}\n")
                 if item.get("preview"):
-                    preview = item["preview"]
-                    styled = red(preview) if item.get("error") else _style_preview(preview)
+                    # _style_preview reads each line's marker as written, and
+                    # shows the line itself.
+                    styled = (
+                        red(item["preview"])
+                        if item.get("error")
+                        else _style_preview(raw["preview"])
+                    )
                     lines.append(styled + "\n")
                 verdict = item.get("_heuristic_verdict")
                 if verdict:
+                    verdict = _shown(verdict)
                     risk = verdict.get("risk_level", "medium")
                     rec = verdict.get("recommendation", "review")
                     conf = int(verdict.get("confidence", 0.5) * 100)
@@ -319,7 +409,7 @@ class TerminalUI(SessionUI):
                         f"  {color}RISK: {risk} (confidence: {conf}%) \u2014 {rec}{RESET}\n"
                     )
                     if summary:
-                        lines.append(f"  Intent: {summary}\n")
+                        lines.append(f"  Intent: {_one_line(summary)}\n")
             if needs_person:
                 # The prompt below goes to the terminal whichever workstream is
                 # in front, so the card it asks about goes there too.
@@ -334,15 +424,16 @@ class TerminalUI(SessionUI):
 
             # Prompt
             no_input = False
+            asked = [_shown(it) for it in pending]
             try:
                 if len(pending) == 1:
-                    label = pending[0].get("approval_label", pending[0]["func_name"])
+                    label = asked[0].get("approval_label", asked[0]["func_name"])
                     prompt_text = (
                         f"    \001{BOLD}\002Allow {label}?\001{RESET}\002 "
                         f"\001{DIM}\002[y/n/a(lways), optional message]\001{RESET}\002 "
                     )
                 else:
-                    labels = ", ".join(it.get("approval_label", it["func_name"]) for it in pending)
+                    labels = ", ".join(it.get("approval_label", it["func_name"]) for it in asked)
                     prompt_text = (
                         f"    \001{BOLD}\002Allow {len(pending)} tools ({labels})?\001{RESET}\002 "
                         f"\001{DIM}\002[y/n/a(lways), optional message]\001{RESET}\002 "
@@ -408,6 +499,7 @@ class TerminalUI(SessionUI):
         # names what was shown, and the header carries the target for the
         # operator to open themselves.
         if is_error:
+            name, output = show_controls(name), _show_lines(output)
             self._show(f"{RED}\u2717 {name}: {output}{RESET}\n", stderr=True)
 
     def on_tool_output_chunk(self, call_id: str, chunk: str) -> None:
@@ -416,6 +508,7 @@ class TerminalUI(SessionUI):
     def on_agent_step(self, parent_call_id: str, item: dict[str, Any]) -> None:
         # CLI keeps an inline "leg" per sub-agent step — the structured nesting
         # card is web-only.
+        item = _shown(item)
         hdr = item.get("header") or item.get("func_name") or "tool"
         self._show(f"{DIM}  - {hdr}{RESET}\n")
 
@@ -434,7 +527,9 @@ class TerminalUI(SessionUI):
         self._show(f"{message}\n")
 
     def on_error(self, message: str) -> None:
-        self._show(f"{RED}{message}{RESET}\n")
+        # Plain text from the session, often carrying a provider's, an MCP
+        # server's or a tool's own words.
+        self._show(f"{RED}{_show_lines(message)}{RESET}\n")
 
     def on_system_turn(self, content: str, source: str, meta: dict[str, Any] | None = None) -> None:
         """Render a first-class operator-context system turn as an
@@ -445,8 +540,8 @@ class TerminalUI(SessionUI):
         per-kind fields the web card uses) is unused here: the formatted body
         in ``content`` already reads well in a terminal.
         """
-        label = "operator" + (f" · {source}" if source else "")
-        self._show(f"{YELLOW}[{label}]{RESET} {content}\n")
+        label = "operator" + (f" · {show_controls(source)}" if source else "")
+        self._show(f"{YELLOW}[{label}]{RESET} {show_controls(content)}\n")
 
     # No on_compaction override: TerminalUI subclasses SessionUI
     # explicitly, and the inherited protocol default body IS the
@@ -469,6 +564,10 @@ class TerminalUI(SessionUI):
         cycle-registry concern — the terminal renders every verdict it
         receives and ignores it.
         """
+        # Printed under an approval card while its prompt waits, so the judge's
+        # words could otherwise move the cursor up and rewrite the card, or push
+        # it off screen.
+        verdict = _shown(verdict)
         risk = verdict.get("risk_level", "medium")
         rec = verdict.get("recommendation", "review")
         summary = verdict.get("intent_summary", "")
@@ -478,7 +577,7 @@ class TerminalUI(SessionUI):
         color = _VERDICT_COLORS.get(risk, "")
         text = f"\n  {color}\u25b8 {tier.upper()} VERDICT: {risk.upper()} ({conf}%) \u2014 {rec}{RESET}"
         if summary:
-            text += f"\n    {summary}"
+            text += f"\n    {_one_line(summary)}"
         self._show(text + "\n")
 
     def record_output_assessment(
@@ -497,6 +596,7 @@ class TerminalUI(SessionUI):
 
     def on_output_warning(self, call_id: str, assessment: dict[str, Any]) -> None:
         """Display output guard warning when risk signals are detected."""
+        assessment = _shown(assessment)
         risk = assessment.get("risk_level", "none")
         if risk == "none":
             return
@@ -624,11 +724,16 @@ class WorkstreamTerminalUI(TerminalUI):
         the terminal at once, whatever a switch does meanwhile, and neither waits
         behind an open prompt.
         """
+        message = show_controls(message)
         if self.is_foreground:
             self._write_terminal(f"{message}\n")
             return
         ws = self.manager.get(self.ws_id)
-        label = f"{self.manager.index_of(self.ws_id)}:{ws.name}" if ws is not None else self.ws_id
+        label = (
+            f"{self.manager.index_of(self.ws_id)}:{show_controls(ws.name)}"
+            if ws is not None
+            else self.ws_id
+        )
         self._write_terminal(yellow(f"Workstream {label}: {message}") + "\n")
 
     def on_tool_output_chunk(self, call_id: str, chunk: str) -> None:
@@ -646,7 +751,9 @@ class WorkstreamTerminalUI(TerminalUI):
         """
         if self.is_foreground:
             return True
-        tool_names = ", ".join(it.get("approval_label", it.get("func_name", "?")) for it in pending)
+        tool_names = ", ".join(
+            it.get("approval_label", it.get("func_name", "?")) for it in map(_shown, pending)
+        )
         self._show(f"{YELLOW}Waiting for approval: {tool_names}{RESET}\n")
         # Foreground state is persistent, so close must not set this event
         # merely to wake us: a later durability refusal would leave a live
@@ -677,7 +784,7 @@ class WorkstreamTerminalUI(TerminalUI):
         keeper's, for a lost lease), and never under the print lock: an open
         prompt can hold it.
         """
-        self._replay(f"{name or self.ws_id} closed; its buffered output")
+        self._replay(f"{show_controls(name or self.ws_id)} closed; its buffered output")
 
     def _replay(self, title: str) -> None:
         """Take the buffer and write it to the terminal, under *title*.
