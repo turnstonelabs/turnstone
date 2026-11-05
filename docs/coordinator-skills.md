@@ -93,8 +93,8 @@ Explicitly **not** in the coordinator set:
 
 If your skill needs a coordinator to "run a command" or "read a
 file", write the delegate pattern instead: spawn a child with an
-appropriate skill, `wait_for_workstream`, then `inspect_workstream`
-for the output.  The coordinator stays the orchestrator.
+appropriate skill and `wait_for_workstream`, whose results carry the
+child's answer.  The coordinator stays the orchestrator.
 
 ---
 
@@ -259,14 +259,25 @@ Two distinct semantics, different cost profiles:
   again.  Both carry `dispatch_age_s`.
 - **`inspect_workstream(ws_id=...)`** — single read of the child's
   state + tail.  Costs a full assistant turn (judge, tokens, stream).
-  Prefer this for "what does the final message say?" after the child
-  has already resolved (via `wait_for_workstream` or a known
-  transition).
+  Prefer this for what led up to a child's answer (its earlier turns
+  and tool results).  The child's final message itself already rides
+  in the completing wait's `results`.  A message the wait marked
+  `truncated` carries `message_chars`, its whole length.  To read more
+  of it, wait on that child alone while it is still idle on that
+  answer: it then gets all of a result's room, which helps only a
+  message that shared its wait (a child that was alone in its wait
+  already had all the room).  `inspect_workstream` with
+  `message_limit=1` returns the message whole only when it fits
+  inspect's budget: at most 32,768 characters of JSON, less on a small
+  context, with a newline taking two characters and a non-ASCII
+  character six.  A longer message comes back as its first 600 and last
+  300 characters, or a 400-character preview on a small context.
 
-Rule of thumb: wait once for a fan-out, then inspect once per
-child for the content.  A loop of inspect-every-few-seconds is a
-token-burning antipattern — on 3+ children it rounds to a 10×
-efficiency hit over a wait+inspect pair.
+Rule of thumb: wait once for a fan-out and read each finished child's
+`message` from its results.  Inspecting a child the wait already
+answered for spends a turn and puts the same text in context twice.  A
+loop of inspect-every-few-seconds is a token-burning antipattern — on
+3+ children it rounds to a 10× efficiency hit over a single wait.
 
 ---
 
@@ -285,8 +296,7 @@ and tell me what happened" and the work fits in one workstream.
 tasks(action='add', title='audit /auth for CSRF')
 spawn_workstream(skill='engineer', initial_message='audit /auth ...')
 wait_for_workstream(ws_ids=[<child>], timeout=300)
-inspect_workstream(ws_id=<child>)
-→ synthesise the final message into a user-facing response
+→ synthesise the child's message (in the wait's results) into a user-facing response
 tasks(action='update', task_id='t_01', status='done')
 close_workstream(ws_id=<child>, reason='audit complete')
 ```
@@ -304,8 +314,7 @@ tasks seeds:
   t_03 benchmark Gemini 2.5 latency on summarisation
 spawn_batch(children=[...3 briefs...])
 wait_for_workstream(ws_ids=[c1, c2, c3], mode='all', timeout=600)
-inspect_workstream(ws_id=c1); ...(c2); ...(c3)
-→ synthesise head-to-head comparison
+→ synthesise head-to-head comparison from the three messages in its results
 tasks → all done
 close_all_children(reason='benchmark complete')
 ```
@@ -331,7 +340,7 @@ for task in tasks:
     tasks(action='update', task_id=task.id, note='ws=<child_ws_id>')
 wait_for_workstream(ws_ids=[...], mode='all', timeout=...)
 for child in children:
-    inspect_workstream(ws_id=child)
+    # its message is in the wait's results
     tasks(action='update', task_id=..., status='done', note='result summary')
 → synthesise
 ```

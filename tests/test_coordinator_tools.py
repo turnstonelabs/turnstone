@@ -95,8 +95,9 @@ class _StubUI:
         return True, None
 
 
-@pytest.fixture
-def coord_session(monkeypatch):
+def _build_coord_session(
+    monkeypatch, *, context_window: int = 16384
+) -> tuple[ChatSession, MagicMock, _StubUI]:
     """Build a coordinator ChatSession with a mocked CoordinatorClient.
 
     Patches heavyweight init steps (_load_skills, _init_system_messages,
@@ -117,7 +118,7 @@ def coord_session(monkeypatch):
         temperature=0.0,
         max_tokens=1024,
         tool_timeout=30,
-        context_window=16384,
+        context_window=context_window,
         ws_id="coord-1",
         user_id="user-1",
         client_type=ClientType.WEB,
@@ -125,6 +126,12 @@ def coord_session(monkeypatch):
         coord_client=coord_client,
     )
     return sess, coord_client, ui
+
+
+@pytest.fixture
+def coord_session(monkeypatch):
+    """A coordinator ChatSession with a 16K context and a mocked CoordinatorClient."""
+    return _build_coord_session(monkeypatch)
 
 
 # ---------------------------------------------------------------------------
@@ -973,6 +980,220 @@ def test_wait_ended_by_a_stall_is_not_called_a_timeout(coord_session):
     (ended,) = [e for e in events if e["type"] == "wait_ended"]
     assert ended["complete"] is False
     assert ended["stalled"] == ["a"]
+
+
+# ---------------------------------------------------------------------------
+# wait_for_workstream — the children's messages fit the room one result has
+# ---------------------------------------------------------------------------
+
+
+def _wait_with_messages(messages: dict[str, str], *, complete: bool = True) -> dict[str, Any]:
+    """A wait result whose idle children carry ``messages`` whole, as the client returns them."""
+    return {
+        "results": {
+            wid: {
+                "state": "idle",
+                "tokens": 3,
+                "updated": "2026-11-04T10:00:00",
+                "name": f"child-{i}",
+                "message": text,
+                "truncated": False,
+            }
+            for i, (wid, text) in enumerate(messages.items())
+        },
+        "complete": complete,
+        "elapsed": 1.0,
+        "mode": "all",
+    }
+
+
+def _admit(
+    sess: ChatSession,
+    output: str,
+    *,
+    batch_tokens: int | None = None,
+    running_tokens: int | None = None,
+) -> Any:
+    """Admit ``output`` the way the batch drain admits a wait result: the per-result cap from the
+    batch's allowance (``batch_tokens``, the session's remaining budget by default), and the
+    allowance the results before it in the batch left (``running_tokens``, all of it by default)."""
+    batch = sess._remaining_token_budget() if batch_tokens is None else batch_tokens
+    truncation, _pool = sess._admit_tool_result(
+        "wait_for_workstream",
+        "call-1",
+        output,
+        budget_tokens=batch if running_tokens is None else running_tokens,
+        maximum_chars=sess._tool_result_truncation_limit(batch_budget_tokens=batch),
+        verbatim_pool=0,
+    )
+    return truncation
+
+
+def _assert_every_child_kept(text: str, texts: dict[str, str], limit: int) -> dict[str, Any]:
+    """``text`` fits ``limit`` and keeps every child's entry: whole messages as sent, cut ones a
+    prefix marked with the whole message's length.  Returns the parsed entries."""
+    assert len(text) <= limit
+    parsed = json.loads(text.removeprefix("Error: "))
+    assert list(parsed["results"]) == list(texts)
+    for wid, whole in texts.items():
+        entry = parsed["results"][wid]
+        assert entry["state"] == "idle"
+        if entry["truncated"]:
+            assert entry["message_chars"] == len(whole)
+            assert whole.startswith(entry["message"])
+        else:
+            assert entry["message"] == whole
+    entries: dict[str, Any] = parsed["results"]
+    return entries
+
+
+def _assert_cut_but_every_child_kept(text: str, texts: dict[str, str], limit: int) -> None:
+    entries = _assert_every_child_kept(text, texts, limit)
+    assert all(entry["truncated"] is True for entry in entries.values())
+
+
+def test_wait_admission_fits_the_messages_so_every_child_survives(coord_session):
+    """Messages that together overflow the room admission grants are fitted into it instead of
+    the fold cutting the JSON, which would drop children's entries along with their text.  The
+    executor returns the result whole, and ``wait_ended`` carries the children's states without
+    their messages."""
+    sess, coord, ui = coord_session
+    events: list[dict[str, Any]] = []
+    ui._enqueue = events.append  # type: ignore[attr-defined]
+    ids = [f"{i:032x}" for i in range(3)]
+    texts = {wid: f"{wid} findings " * 800 for wid in ids}
+    result = _wait_with_messages(texts)
+    coord.wait_for_workstream.return_value = result
+    item = sess._prepare_tool(_tc("wait_for_workstream", {"ws_ids": ids, "mode": "all"}))
+    _call_id, output = sess._exec_wait_for_workstream(item)
+    assert json.loads(output) == result
+    admitted = _admit(sess, output)
+    assert admitted.truncated is False
+    assert len(admitted.text) < len(output)
+    budget = sess._remaining_token_budget()
+    limit = sess._result_limit_chars(
+        remaining_budget_tokens=budget,
+        floor_chars=2048,
+        maximum_chars=sess._tool_result_truncation_limit(batch_budget_tokens=budget),
+    )
+    _assert_cut_but_every_child_kept(admitted.text, texts, limit)
+    assert ui.tool_results[-1][2] == "complete after 1.0s (3/3 resolved)"
+    (ended,) = [e for e in events if e["type"] == "wait_ended"]
+    assert ended["results"] == {
+        wid: {"state": "idle", "tokens": 3, "updated": "2026-11-04T10:00:00", "name": f"child-{i}"}
+        for i, wid in enumerate(ids)
+    }
+
+
+@pytest.mark.parametrize(
+    ("case", "batch_tokens", "running_tokens", "size", "whole"),
+    [
+        # Nothing left when the wait returns and nothing freed: the floor every wait result
+        # gets still holds every child.
+        ("exhausted", 0, 0, 3000, False),
+        # A compaction owed when the wait returned freed room before admission: the messages
+        # the old fixed cut let through whole still come whole.
+        ("after compaction", 20_000, 20_000, 4000, True),
+        # A share under the floor: the floor admits the small messages whole.
+        ("floor", 100, 100, 250, True),
+        # Earlier results in the batch used the running allowance up.
+        ("after siblings", 20_000, 0, 3000, False),
+    ],
+)
+def test_wait_admission_sizes_messages_to_the_room_it_grants(
+    coord_session, case, batch_tokens, running_tokens, size, whole
+):
+    """The executor's sizing never reads the allowance, which can move before admission: here
+    the session reads as full while the wait runs, and the room admission grants decides."""
+    sess, coord, _ui = coord_session
+    sess._remaining_token_budget = lambda: 0  # type: ignore[method-assign]
+    ids = [f"{i:032x}" for i in range(3 if case != "after compaction" else 2)]
+    texts = {wid: (wid[:2] + " ") * (size // 3) for wid in ids}
+    coord.wait_for_workstream.return_value = _wait_with_messages(texts)
+    item = sess._prepare_tool(_tc("wait_for_workstream", {"ws_ids": ids, "mode": "all"}))
+    _call_id, output = sess._exec_wait_for_workstream(item)
+    admitted = _admit(sess, output, batch_tokens=batch_tokens, running_tokens=running_tokens)
+    assert admitted.truncated is False
+    if whole:
+        parsed = json.loads(admitted.text)
+        for wid, text in texts.items():
+            assert parsed["results"][wid]["message"] == text
+            assert parsed["results"][wid]["truncated"] is False
+    else:
+        _assert_cut_but_every_child_kept(admitted.text, texts, 2048)
+
+
+def test_wait_brings_a_long_message_whole_when_the_result_has_room(monkeypatch):
+    """A message far past the 10 KiB the wait used to cut it at comes whole
+    when one result's room holds it, so reading it takes no follow-up
+    inspect_workstream."""
+    sess, coord, _ui = _build_coord_session(monkeypatch, context_window=200_000)
+    wid = "a" * 32
+    text = "A section of the report. " * 2400
+    coord.wait_for_workstream.return_value = _wait_with_messages({wid: text})
+    item = sess._prepare_tool(_tc("wait_for_workstream", {"ws_ids": [wid]}))
+    _call_id, output = sess._exec_wait_for_workstream(item)
+    admitted = _admit(sess, output)
+    assert admitted.truncated is False
+    entry = json.loads(admitted.text)["results"][wid]
+    assert len(text) > 50_000
+    assert entry["message"] == text
+    assert entry["truncated"] is False
+    assert "message_chars" not in entry
+
+
+def test_wait_result_is_bounded_by_the_session_ceiling(monkeypatch):
+    """However wide the fan-out, what a wait puts in the context never exceeds the session
+    ceiling every tool result stays under, and every child keeps its entry within it: most
+    reports whole, the fewest cut."""
+    sess, coord, _ui = _build_coord_session(monkeypatch, context_window=1_000_000)
+    texts = {f"{i:032x}": "report " * 4300 for i in range(32)}
+    coord.wait_for_workstream.return_value = _wait_with_messages(texts)
+    item = sess._prepare_tool(_tc("wait_for_workstream", {"ws_ids": list(texts), "mode": "all"}))
+    _call_id, output = sess._exec_wait_for_workstream(item)
+    assert sum(len(text) for text in texts.values()) > sess.tool_truncation
+    admitted = _admit(sess, output)
+    assert admitted.truncated is False
+    entries = _assert_every_child_kept(admitted.text, texts, sess.tool_truncation)
+    cut = [wid for wid, entry in entries.items() if entry["truncated"]]
+    assert 0 < len(cut) < len(texts) / 2
+
+
+def test_a_not_found_abort_fits_the_messages_it_carries(coord_session):
+    """The abort on an id that can't be observed keeps the finished
+    children's messages; behind its ``Error:`` prefix they fit the room
+    as on a completed wait, and the recovery hints and status text stay whole.
+    The live error card, shown before admission, is fitted to the session ceiling."""
+    sess, coord, ui = coord_session
+    found, missing = "b" * 32, "c" * 32
+    result = _wait_with_messages({found: "x" * 50_000}, complete=False)
+    sentinel = "(no workstream with this id among your children)"
+    result["results"][missing] = {
+        "state": "not_found",
+        "tokens": 0,
+        "updated": "",
+        "name": "",
+        "message": sentinel,
+        "truncated": False,
+    }
+    hint = {"ws_id": missing, "error": "no workstream with this id", "did_you_mean": []}
+    result.update(error="no workstream with this id", not_found=[hint])
+    coord.wait_for_workstream.return_value = result
+    item = sess._prepare_tool(_tc("wait_for_workstream", {"ws_ids": [found, missing]}))
+    _call_id, output = sess._exec_wait_for_workstream(item)
+    card = ui.tool_results[-1][2]
+    assert ui.tool_results[-1][3] is True
+    assert card.startswith("Error: ")
+    assert len(card) <= sess.tool_truncation < len(output)
+    admitted = _admit(sess, output)
+    assert admitted.truncated is False
+    assert admitted.text.startswith("Error: ")
+    parsed = json.loads(admitted.text.removeprefix("Error: "))
+    assert parsed["results"][found]["truncated"] is True
+    assert parsed["results"][found]["message_chars"] == 50_000
+    assert parsed["results"][missing]["message"] == sentinel
+    assert parsed["results"][missing]["truncated"] is False
+    assert parsed["not_found"] == [hint]
 
 
 def test_a_wait_runs_its_batch_in_model_order(coord_session):
