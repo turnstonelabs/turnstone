@@ -79,6 +79,13 @@ The separate `dev` branch is retired. See [the release process](docs/releasing.m
   linear time.** These lookups read a page's first 64 KB; on some malformed markup their
   time grew with the square of that length. Each now scans it front to back and finds
   what it found before (#1568).
+- **The output guard no longer reports a credential leak in text it already redacted.**
+  An env line, a JSON secret or a connection string whose value was already a
+  `[REDACTED:...]` marker matched its rule again, so a child's tool result that the
+  child's guard had redacted came back as a new high-risk credential leak every time
+  `inspect_workstream` read it. A value that is exactly a marker now passes. A marker
+  with more text in the same value, or a real secret elsewhere in the result, is
+  flagged and redacted as before.
 
 ## [2026-11-04]
 
