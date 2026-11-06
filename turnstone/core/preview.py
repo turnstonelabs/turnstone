@@ -288,9 +288,25 @@ def _name_ext(name: str) -> str:
 # must appear early is wasted work.
 _HEAD_SCAN_LIMIT = 65536
 _BASE_TAG_RE = re.compile(r"<base[\s>/]", re.IGNORECASE)
-_HEAD_OPEN_RE = re.compile(r"<head(?:\s[^>]*)?>", re.IGNORECASE)
-_HTML_OPEN_RE = re.compile(r"<html(?:\s[^>]*)?>", re.IGNORECASE)
-_DOCTYPE_RE = re.compile(r"<!doctype[^>]*>", re.IGNORECASE)
+# Tag openers, each matched without its attributes, and the title's end tag. A lookup finds the
+# first opener of its kind, then the ">" after it, and a title lookup then the first "</title>".
+# When the first opener never closes, no later one can, and when no "</title>" follows the first
+# title, none follows a later one, so each lookup finds what a search for the whole tag would, in
+# linear time.
+_HEAD_OPEN_RE = re.compile(r"<head(?=[\s>])", re.IGNORECASE)
+_HTML_OPEN_RE = re.compile(r"<html(?=[\s>])", re.IGNORECASE)
+_DOCTYPE_RE = re.compile(r"<!doctype", re.IGNORECASE)
+_TITLE_OPEN_RE = re.compile(r"<title", re.IGNORECASE)
+_TITLE_CLOSE_RE = re.compile(r"</title>", re.IGNORECASE)
+
+
+def _tag_end(text: str, opener: re.Pattern[str]) -> int | None:
+    """The index just past the ``>`` ending the first tag *opener* matches, or None."""
+    m = opener.search(text)
+    if m is None:
+        return None
+    close = text.find(">", m.end())
+    return None if close < 0 else close + 1
 
 
 def inject_base_href(html_text: str, base_url: str) -> str:
@@ -308,23 +324,23 @@ def inject_base_href(html_text: str, base_url: str) -> str:
     if _BASE_TAG_RE.search(head_slice):
         return html_text
     tag = f'<base href="{html.escape(base_url, quote=True)}">'
-    m = _HEAD_OPEN_RE.search(head_slice) or _HTML_OPEN_RE.search(head_slice)
-    if not m:
-        m = _DOCTYPE_RE.search(head_slice)
-    if m:
-        return html_text[: m.end()] + tag + html_text[m.end() :]
+    for opener in (_HEAD_OPEN_RE, _HTML_OPEN_RE, _DOCTYPE_RE):
+        end = _tag_end(head_slice, opener)
+        if end is not None:
+            return html_text[:end] + tag + html_text[end:]
     return tag + html_text
-
-
-_TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.IGNORECASE | re.DOTALL)
 
 
 def page_title(html_text: str) -> str | None:
     """The document's ``<title>`` text (unescaped, whitespace-collapsed), or None."""
-    m = _TITLE_RE.search(html_text[:_HEAD_SCAN_LIMIT])
-    if not m:
+    head_slice = html_text[:_HEAD_SCAN_LIMIT]
+    start = _tag_end(head_slice, _TITLE_OPEN_RE)
+    if start is None:
         return None
-    title = " ".join(html.unescape(m.group(1)).split())
+    end_tag = _TITLE_CLOSE_RE.search(head_slice, start)
+    if end_tag is None:
+        return None
+    title = " ".join(html.unescape(head_slice[start : end_tag.start()]).split())
     return title[:200] or None
 
 
