@@ -534,6 +534,38 @@ def test_inspect_exec_dispatches_to_client(coord_session):
     assert "child-x" in output
 
 
+def test_inspect_exec_marks_its_result_as_a_json_document(coord_session):
+    """The output guard reads an inspect result by the strings it holds, not
+    its keys (#1522); a failed inspect's error text is guarded as text."""
+    from turnstone.core.output_guard import ControllerJSON
+
+    sess, coord, _ui = coord_session
+    coord.inspect.return_value = {
+        "ws_id": "child-x",
+        "skill_id": "general",
+        "state": "idle",
+        "messages": [{"role": "system", "content": "pointer"}],
+    }
+    item = sess._prepare_tool(_tc("inspect_workstream", {"ws_id": "child-x"}))
+    _call_id, output = sess._exec_inspect_workstream(item)
+    assert isinstance(output, ControllerJSON)
+    assert json.loads(output)["messages"] == [{"role": "system", "content": "pointer"}]
+
+    # Provider-native content holds keys the child's model wrote, which a
+    # document read leaves unread, so that inspect is guarded as text.
+    with_blocks = sess._prepare_tool(
+        _tc("inspect_workstream", {"ws_id": "child-x", "include_provider_content": True})
+    )
+    _call_id, output = sess._exec_inspect_workstream(with_blocks)
+    assert not isinstance(output, ControllerJSON)
+    assert json.loads(output)["messages"] == [{"role": "system", "content": "pointer"}]
+
+    coord.inspect.side_effect = RuntimeError("storage down")
+    _call_id, output = sess._exec_inspect_workstream(item)
+    assert output.startswith("Error: inspect_workstream failed")
+    assert not isinstance(output, ControllerJSON)
+
+
 def test_inspect_exec_sizes_the_formatter_to_the_fold_cap(coord_session):
     """The tiered formatter is handed the cap the result fold will apply, so it
     degrades to a tier the fold admits whole instead of the fold splicing a

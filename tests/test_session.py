@@ -8202,6 +8202,33 @@ class TestBatchEvaluateOutputs:
         ]
 
 
+class TestEvaluateOutputJsonDocument:
+    """``_evaluate_output`` reads a framework-encoded JSON document by its strings (#1522)."""
+
+    def test_the_mark_or_the_flag_selects_the_document_read(self) -> None:
+        from turnstone.core.judge import JudgeConfig
+        from turnstone.core.output_guard import ControllerJSON
+
+        session = _make_session(judge_config=JudgeConfig(output_guard=True))
+        doc = json.dumps(
+            {"messages": [{"role": "system", "content": "pointer"}]}, separators=(",", ":")
+        )
+
+        _out, read_as_text = session._evaluate_output("c1", doc, "inspect_workstream")
+        assert read_as_text is not None
+        assert "role_injection" in read_as_text.flags
+        # A caller holding the marked text needs no flag; one whose text lost
+        # the mark (the result fold rebuilds strings) passes it.
+        assert session._evaluate_output("c2", ControllerJSON(doc), "inspect_workstream") == (
+            doc,
+            None,
+        )
+        assert session._evaluate_output("c3", doc, "inspect_workstream", json_document=True) == (
+            doc,
+            None,
+        )
+
+
 def test_send_preamble_failure_leaves_no_principal_or_attachment_cache() -> None:
     """Send-owned identity/cache state begins only inside its cleanup bracket."""
     session = _make_session()

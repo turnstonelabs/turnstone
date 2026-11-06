@@ -86,6 +86,19 @@ The separate `dev` branch is retired. See [the release process](docs/releasing.m
   `inspect_workstream` read it. A value that is exactly a marker now passes. A marker
   with more text in the same value, or a real secret elsewhere in the result, is
   flagged and redacted as before.
+- **An `inspect_workstream` result no longer reads as a role injection, and the
+  output guard reads the child's text as written.** The guard scanned the result's
+  JSON encoding, so every system turn in the child's history, such as the memory
+  pointer the session adds, matched the `{"role":"system"` role-injection marker, and
+  the coordinator got a high-risk advisory on every inspect. The encoding also
+  escapes the child's text, so role JSON, a `"password": "..."` secret, an override
+  phrase split across lines or hex shellcode inside a message went unseen, and
+  redacting an env line's value could delete the message after it. The guard now
+  reads each string the result holds as text on its own, and still redacts a string
+  under a secret-named key. Three cases are still evaluated as text, as before: a
+  result that the result fold cut, an inspect that includes provider-native content,
+  whose keys the child's model wrote, and an earlier inspect result stored in the
+  history a coordinator inspects when it inspects itself (#1522).
 
 ## [2026-11-04]
 
