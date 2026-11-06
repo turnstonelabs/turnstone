@@ -12,6 +12,16 @@ The separate `dev` branch is retired. See [the release process](docs/releasing.m
 
 ## [2026-11-05]
 
+### Security
+
+- **Passwords in `postgres://` connection strings are redacted.** The connection-string
+  rule knew only the `postgresql://` spelling, so a URL such as
+  `postgres://user:password@host/db` kept its password in a tool result the model and
+  the output guard's judge read, and in the text `redact_credentials` scrubs for close
+  reasons, audit details and logs, unless an env line's secret-named key (such as
+  `DATABASE_URL=`) redacted the whole value. Both spellings now have their password
+  redacted, in the browser's display redaction too.
+
 ### Added
 
 - **A task agent's open step list on the web cards closes from its end too.** A **hide

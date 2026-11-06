@@ -51,8 +51,9 @@ const _RE_PRIVATE_KEY_BEGIN = new RegExp(
 // The optional +suffix covers SQLAlchemy dialect+driver URLs
 // (postgresql+psycopg2, postgresql+asyncpg, mysql+pymysql) and
 // mongodb+srv — enumerating drivers is a losing game, the suffix
-// shape isn't.  Schemes are case-insensitive per RFC 3986 (/i):
-// POSTGRESQL:// leaks the same password postgresql:// does.
+// shape isn't.  PostgreSQL takes both postgres:// and postgresql://.
+// Schemes are case-insensitive per RFC 3986 (/i): POSTGRESQL:// leaks
+// the same password postgresql:// does.
 // ---------------------------------------------------------------------------
 // The password stops where another connection string could start; scanning
 // on to the next "@" rescanned a long run of nested "https://" once per
@@ -61,7 +62,7 @@ const _RE_PRIVATE_KEY_BEGIN = new RegExp(
 // part already stops at the ":" every scheme contains.  The driver suffix is
 // bounded so that every place a match can start also ends a password.
 const _CONNECTION_SCHEME =
-  "(?:postgresql|mysql|mongodb|rediss?|amqps?|sqlite|https?)(?:\\+[a-z0-9]{0,20})?:\\/\\/";
+  "(?:postgres(?:ql)?|mysql|mongodb|rediss?|amqps?|sqlite|https?)(?:\\+[a-z0-9]{0,20})?:\\/\\/";
 const _RE_CONNECTION_STRING = new RegExp(
   _CONNECTION_SCHEME + "[^:@\\s]+:(?:(?!" + _CONNECTION_SCHEME + ")[^@\\s])+@",
   "gi",
