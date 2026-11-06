@@ -66,6 +66,10 @@ The separate `dev` branch is retired. See [the release process](docs/releasing.m
 - **`web_fetch` converts HTML in time proportional to the page's size.** On some
   malformed markup the conversion's time grew with the square of the page's size. It now
   reads a page once, front to back.
+- **`open_preview` finds a web page's title, and the place for its `<base href>`, in
+  linear time.** These lookups read a page's first 64 KB; on some malformed markup their
+  time grew with the square of that length. Each now scans it front to back and finds
+  what it found before (#1568).
 
 ## [2026-11-04]
 

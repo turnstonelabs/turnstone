@@ -9,10 +9,14 @@ attaches.  The tool executor and the HTTP route are covered separately
 
 from __future__ import annotations
 
+import time
+from unittest.mock import patch
+
 import pytest
 
 from turnstone.core.attachments import IMAGE_SIZE_CAP, PDF_SIZE_CAP, TEXT_DOC_SIZE_CAP
 from turnstone.core.preview import (
+    _HEAD_SCAN_LIMIT,
     PREVIEW_BLOB_KIND,
     PREVIEW_KINDS,
     PREVIEW_SERVE_MIMES,
@@ -157,6 +161,76 @@ class TestHtmlHelpers:
         assert page_title("<title>a &amp; b\n   c</title>") == "a & b c"
         assert page_title("<p>no title</p>") is None
         assert page_title("<title></title>") is None
+
+    def test_base_href_skips_a_head_opener_that_never_closes(self):
+        # No ">" ends the <head> opener in the scanned slice, so the tag goes after <html>.
+        out = inject_base_href('<html lang="en"><head data-x="1"', "https://a.example/")
+        assert out == '<html lang="en"><base href="https://a.example/"><head data-x="1"'
+
+    def test_base_href_follows_a_head_opener_across_lines(self):
+        out = inject_base_href('<head\n  data-x="1"><meta x></head>', "https://a.example/")
+        assert out.startswith('<head\n  data-x="1"><base href="https://a.example/"><meta x>')
+
+    def test_base_href_openers_match_in_any_case_after_any_whitespace(self):
+        out = inject_base_href("<HTML\n  lang=en><HEAD\tdata-x=1><meta x>", "https://a.example/")
+        assert out.startswith('<HTML\n  lang=en><HEAD\tdata-x=1><base href="https://a.example/">')
+        out = inject_base_href("<HTML\n  lang=en><body>x</body>", "https://a.example/")
+        assert out.startswith('<HTML\n  lang=en><base href="https://a.example/"><body>')
+
+    def test_base_href_skips_longer_tag_names(self):
+        out = inject_base_href("<html><body><header>x</header></body></html>", "https://a.example/")
+        assert out.startswith('<html><base href="https://a.example/"><body><header>')
+        out = inject_base_href("<!doctype html><html-include src=a><p>x</p>", "https://a.example/")
+        assert out.startswith('<!doctype html><base href="https://a.example/"><html-include src=a>')
+
+    def test_base_href_ignores_an_opener_past_the_scanned_slice(self):
+        late = "x" * _HEAD_SCAN_LIMIT + "<head><p>"
+        assert inject_base_href(late, "https://a.example/") == (
+            '<base href="https://a.example/">' + late
+        )
+
+    def test_page_title_needs_a_closed_title_in_the_scanned_slice(self):
+        assert page_title('<TITLE id="t">Docs</TITLE>') == "Docs"
+        assert page_title("</title><title>x</title>") == "x"
+        assert page_title("<title>never closed") is None
+        assert page_title("<title") is None
+        assert page_title("x" * _HEAD_SCAN_LIMIT + "<title>late</title>") is None
+        assert page_title("x" * (_HEAD_SCAN_LIMIT - 10) + "<title>cut</title>") is None
+
+
+_RAISED_SCAN_LIMIT = 1 << 20
+
+
+class TestHtmlHelpersLinearTime:
+    """The head lookups take time linear in the slice of the page they read.
+
+    The patterns before them searched again from every opener, so markup that never closes took time
+    growing with the square of the slice. These tests raise the slice to 1 MiB, where that growth
+    would overrun the bound many times over, and run with coverage paused (no_cover), as the page
+    conversion's linear-time tests in test_html.py do.
+    """
+
+    @pytest.mark.no_cover
+    @pytest.mark.parametrize(
+        "unit",
+        ["<title>", "<title ", "<head ", "<html ", "<!doctype ", "<head <html <!doctype <title "],
+        ids=[
+            "title-never-ends",
+            "title-tag-never-closes",
+            "head-tag-never-closes",
+            "html-tag-never-closes",
+            "doctype-never-closes",
+            "mixed",
+        ],
+    )
+    def test_markup_that_never_closes_costs_linear_time(self, unit):
+        html_text = unit * (_RAISED_SCAN_LIMIT // len(unit))
+        with patch("turnstone.core.preview._HEAD_SCAN_LIMIT", _RAISED_SCAN_LIMIT):
+            start = time.perf_counter()
+            inject_base_href(html_text, "https://a.example/")
+            page_title(html_text)
+            elapsed = time.perf_counter() - start
+        assert elapsed < 2.0
 
 
 _LOCKED_HTML_CSP = (
