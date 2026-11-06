@@ -12,6 +12,15 @@ The separate `dev` branch is retired. See [the release process](docs/releasing.m
 
 ## [2026-11-05]
 
+### Added
+
+- **A task agent's open step list on the web cards closes from its end too.** A **hide
+  steps** control under the last step folds the card back to its "N steps" bar and keeps
+  that bar in view, so a long list no longer has to be scrolled back up to close. It is
+  for the pointer; the "N steps" bar stays the keyboard's way to fold the card. The
+  control is absent while a step in the card waits for approval, where it would sit just
+  under Approve and Deny.
+
 ### Changed
 
 - **The `wait_ended` event carries each child's state without its message.** Its
