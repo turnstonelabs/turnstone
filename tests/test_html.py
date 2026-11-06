@@ -640,9 +640,13 @@ class TestStripHtmlLinearTime:
     """Pathological markup converts in linear time.
 
     The patterns before the forward scan searched again from every "<", so unclosed tags
-    and scripts took time growing with the square of the page.
+    and scripts took time growing with the square of the page. The tests that time a
+    conversion run with coverage paused (no_cover): the C tracer CI uses on Python 3.13
+    slows them several times over, and inputs small enough to absorb that would no longer
+    make a scan that copies the page at each tag overrun the bound.
     """
 
+    @pytest.mark.no_cover
     @pytest.mark.parametrize(
         "html",
         [
@@ -708,28 +712,52 @@ class TestStripHtmlLinearTime:
         [
             ("<a href=#>x</a>" * 200_000, _PAGE),
             ("<a href=javascript:x>x</a>" * 100_000, _PAGE),
-            (
-                '<base href="/'
-                + "%C3%A9" * 340
-                + '/">'
-                + "".join(f"<a href=x{i}>x</a>" for i in range(20_000)),
-                _PAGE,
-            ),
-            (
-                "".join(f"<a href=?q{i}>x</a>" for i in range(20_000)),
-                "https://example.com/" + "a" * 2000,
-            ),
         ],
-        ids=["self-links", "script-links", "over-cap-under-long-base", "over-cap-under-long-page"],
+        ids=["self-links", "script-links"],
     )
+    @pytest.mark.no_cover
     def test_links_that_keep_only_their_text_cost_bounded_work(self, html, page_url):
-        # A link refused after it is resolved adds no text, so the text budget cannot stop
-        # these; the resolution budget and the per-href memo do.
+        # These links add only their text, so the text budget cannot stop them: the memo
+        # parses a repeated self-link once, and the scheme check refuses a script link with
+        # no parse.
         start = time.perf_counter()
         strip_html(html, page_url=page_url, stop_after_chars=_UNBOUNDED)
         assert time.perf_counter() - start < 2.0
 
+    @pytest.mark.parametrize(
+        ("html", "page_url"),
+        [
+            (
+                '<base href="/'
+                + "%C3%A9" * 340
+                + '/">'
+                + "".join(f"<a href=x{i}>x</a>" for i in range(6_000)),
+                _PAGE,
+            ),
+            (
+                "".join(f"<a href=?q{i}>x</a>" for i in range(6_000)),
+                "https://example.com/" + "a" * 2048,
+            ),
+        ],
+        ids=["over-cap-under-long-base", "over-cap-under-long-page"],
+    )
+    def test_links_past_the_resolution_budget_cost_no_parse(self, html, page_url):
+        # Each of these distinct links would be refused after a parse against a 2 KB base,
+        # its target over the cap. Past the budget, a link not resolved before costs no
+        # parse: about 50 of the 6,000 are parsed with this budget, where ignoring it, or
+        # checking it only after the parse, would parse all 6,000.
+        with (
+            patch("turnstone.core.web._RESOLVE_BUDGET_CHARS", 100_000),
+            patch.object(
+                _PageText, "_resolve", autospec=True, side_effect=_PageText._resolve
+            ) as parses,
+        ):
+            text, _ = strip_html(html, page_url=page_url, stop_after_chars=_UNBOUNDED)
+        assert parses.call_count <= 100_000 // 2_000 + 1
+        assert "shows only its text" in text
+
     def test_spent_resolution_budget_is_noted_in_the_text(self):
+        # The shipped budget, charged a 2 KB base's length for each relative link under it.
         base = '<base href="/' + "%C3%A9" * 340 + '/">'
         links = "".join(f"<a href=x{i}>x</a>" for i in range(5_000))
         text, _ = strip_html(
@@ -737,6 +765,13 @@ class TestStripHtmlLinearTime:
         )
         assert "shows only its text" in text
         assert text.endswith("y")
+
+    def test_refused_href_is_resolved_once(self):
+        # A link to the page itself is refused after its parse; its repeats reuse that
+        # result and spend none of the budget.
+        with patch("turnstone.core.web._RESOLVE_BUDGET_CHARS", 1_000):
+            text = _strip('<a href="#">x</a>' * 1_000)
+        assert text == "x" * 1_000
 
     def test_budget_note_comes_before_the_first_link_it_affects(self):
         # A link already resolved keeps its target after the note, which says so.
@@ -761,8 +796,7 @@ class TestStripHtmlLinearTime:
     def test_repeated_href_is_resolved_once(self):
         # Navigation repeats the same links; charging each repeat would spend the budget
         # on a page whose distinct links fit in it.
-        text, _ = strip_html(
-            '<a href="/x">x</a>' * 100_000, page_url=_PAGE, stop_after_chars=_UNBOUNDED
-        )
-        assert text.count("[x](https://example.com/x)") == 100_000
+        with patch("turnstone.core.web._RESOLVE_BUDGET_CHARS", 1_000):
+            text = _strip('<a href="/x">x</a>' * 1_000)
+        assert text.count("[x](https://example.com/x)") == 1_000
         assert "shows only its text" not in text
