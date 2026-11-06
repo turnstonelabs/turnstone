@@ -501,7 +501,7 @@ payloads in fetched web pages, credential leakage in command output, encoded
 payloads, and adversarial URLs.
 
 The guard runs as a synchronous heuristic on the tool result text with a
-configurable time budget (default 5 seconds). Pattern checks run in priority
+configurable time budget (default 30 seconds). Pattern checks run in priority
 order: prompt injection first, then credentials, then encoded payloads, then
 lower-priority checks. If the budget is exhausted mid-evaluation, whatever
 flags have been found so far are returned.
@@ -509,6 +509,29 @@ flags have been found so far are returned.
 The guard **annotates but does not gate** — it surfaces warnings via the
 `on_output_warning` SSE event and optionally redacts detected credentials
 from the output before it enters the conversation.
+
+The child history `inspect_workstream` returns, which the framework encodes as
+JSON around text from elsewhere, is evaluated by the strings it holds: each
+string is read as text on its own, and the keys are not read. Other tools'
+results, `wait_for_workstream`'s included, are still evaluated as text. A
+child's system turn, which the encoding writes as `{"role":"system",...}`, is
+therefore no role injection, and role JSON, a secret or an override phrase
+inside a message is read as written, not through the escapes the encoding adds.
+A string of eight or more characters under a secret-named key (`"token"`,
+`"password"` and the other JSON-secret names) is still redacted, as the
+JSON-secret rule redacts it in text. A redacted document is encoded again; one
+the result fold cut, which no longer parses, is evaluated as text.
+
+Reading by strings has limits. No rule runs from one string into the next, so a
+private key cut off in one message and ended in a later one is not redacted,
+nor is the second line of an env value whose first line an earlier redaction
+replaced. The strings are read in order under the one time budget, each through
+every check, and any left when the budget runs out are neither read nor
+redacted. An inspect that includes provider-native content
+(`include_provider_content`), whose keys the child's model wrote, is evaluated
+as text. So is an earlier inspect result stored in the history being inspected,
+as when a coordinator inspects itself: it is one string there, and its child's
+system turns read as role injection again.
 
 ### Detection priorities
 

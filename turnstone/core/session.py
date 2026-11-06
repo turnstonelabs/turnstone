@@ -226,7 +226,7 @@ from turnstone.core.nudge_queue import (
     Entry,
     NudgeQueue,
 )
-from turnstone.core.output_guard import ControllerText
+from turnstone.core.output_guard import ControllerJSON, ControllerText
 from turnstone.core.pdf import PDF_TEXT_CHAR_CAP
 from turnstone.core.personas import (
     PersonaSnapshot,
@@ -354,7 +354,7 @@ from turnstone.ui.colors import GRAY, GREEN, RED, RESET, bold, cyan, dim
 log = get_logger(__name__)
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterable, Iterator, Mapping
+    from collections.abc import Callable, Collection, Iterable, Iterator, Mapping
 
     from turnstone.core.compaction import MessageMeasure
     from turnstone.core.config_store import ConfigStore
@@ -13639,10 +13639,15 @@ class ChatSession:
                 if self._generation != my_generation:
                     return
                 # Results the framework wrote itself (a denial) pass the guard by
-                # (``ControllerText``).  Admission rebuilds the strings, which
-                # drops the mark, so note them as they arrive.
+                # (``ControllerText``), and one it encoded as JSON (an inspect) is
+                # guarded by the strings it holds (``ControllerJSON``).  Admission
+                # rebuilds the strings, which drops the mark, so note them as they
+                # arrive.
                 _controller_ids = {
                     tc_id for tc_id, output in results if isinstance(output, ControllerText)
+                }
+                _json_document_ids = {
+                    tc_id for tc_id, output in results if isinstance(output, ControllerJSON)
                 }
 
                 # Same construction as the duplicate-id gate above; one
@@ -13854,6 +13859,7 @@ class ChatSession:
                             for tc_id, o in _guarded_texts
                         ],
                         my_generation=my_generation,
+                        json_document_ids=_json_document_ids,
                     )
                 del _guarded_texts
                 # Output-guard inference is a blocking boundary.  A force
@@ -13881,6 +13887,7 @@ class ChatSession:
                                     _tc_names.get(tc_id, ""),
                                     tool_args=_tc_args.get(tc_id, ""),
                                     my_generation=my_generation,
+                                    json_document=tc_id in _json_document_ids,
                                 )
                         elif isinstance(output, list):
                             assessment = self._guard_list_result(
@@ -17942,6 +17949,7 @@ class ChatSession:
         my_generation: int = 0,
         principal_id: str | None = None,
         cancel_ref: StreamAbortRef | None = None,
+        json_document: bool = False,
     ) -> tuple[str, OutputAssessment | None]:
         """Run the output guard on tool result text.
 
@@ -17963,6 +17971,12 @@ class ChatSession:
         ``cancel_ref`` binds parallel child work to the operation that
         initiated it.  Once aborted, the guard emits no judge request, audit
         row, warning, or sanitized result for a successor generation.
+
+        ``json_document`` says the text is a JSON document the framework
+        encoded, which the heuristic reads by the strings it holds; a
+        :class:`~turnstone.core.output_guard.ControllerJSON` says so itself.  A
+        caller whose text lost that mark (the result fold rebuilds strings)
+        passes the flag.
 
         Returns ``(possibly_sanitized_output, acted_assessment)``.  The
         acted assessment is the model-facing projection, ``None`` when there
@@ -18006,6 +18020,7 @@ class ChatSession:
             patterns=og_patterns,
             trusted_marker_nonce=self._envelope_nonce,
             trusted_sender_label_nonce=self._sender_label_nonce,
+            json_document=json_document or isinstance(output, ControllerJSON),
         )
         _check_owner()
         wants_redaction = heuristic.sanitized is not None and jc is not None and jc.redact_secrets
@@ -18288,10 +18303,12 @@ class ChatSession:
         items: list[tuple[str, str, str, str]],
         *,
         my_generation: int = 0,
+        json_document_ids: Collection[str] = frozenset(),
     ) -> dict[str, tuple[str, OutputAssessment | None]]:
         """Run ``_evaluate_output`` for each ``(call_id, output, func_name,
         tool_args)`` 4-tuple concurrently, return a dict keyed by
-        ``call_id`` (perf-2).
+        ``call_id`` (perf-2).  ``json_document_ids`` holds the call ids whose
+        output is a JSON document the framework encoded (``json_document``).
 
         Bounded thread pool (4 workers) — high enough to parallelise the
         common 5-20 tool-calls-per-turn case, low enough to avoid blowing
@@ -18319,6 +18336,7 @@ class ChatSession:
                     func_name,
                     tool_args=tool_args,
                     my_generation=my_generation,
+                    json_document=tc_id in json_document_ids,
                 ): tc_id
                 for tc_id, output, func_name, tool_args in items
             }
@@ -22583,7 +22601,13 @@ class ChatSession:
         )
         desc = f"{result.get('state', '?')} ({len(result.get('messages', []))} msgs)"
         self._report_tool_result(call_id, "inspect_workstream", desc)
-        return call_id, output
+        # Marked, the guard reads the child's strings, not the JSON around them
+        # (``ControllerJSON``), and leaves the keys unread.  Provider-native content
+        # holds keys the child's model wrote, so an inspect that includes it is
+        # guarded as text.
+        if item.get("include_provider_content", False):
+            return call_id, output
+        return call_id, ControllerJSON(output)
 
     def _prepare_send_to_workstream(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
         if self._coord_client is None:
