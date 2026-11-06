@@ -3,7 +3,7 @@
 # Single image for all services: server, console, channel, eval
 # =============================================================================
 
-FROM python:3.14-slim
+FROM python:3.15-slim
 
 LABEL org.opencontainers.image.title="turnstone" \
       org.opencontainers.image.description="Multi-node AI orchestration platform"
