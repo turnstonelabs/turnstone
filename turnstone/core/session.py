@@ -28965,7 +28965,6 @@ class ChatSession:
         pdf_data: bytes | None = None
         binary_kind: str | None = None
         text = ""
-        page_url = url
         page_complete = True
         try:
             resp = fetch_with_ssrf_guard(
