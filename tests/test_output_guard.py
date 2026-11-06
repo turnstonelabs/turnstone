@@ -280,6 +280,26 @@ class TestCredentialLeakage:
             assert "s3cret_pass" not in r.sanitized, url
             assert ":[REDACTED:password]@" in r.sanitized, url
 
+    @pytest.mark.parametrize("mode", ["builtin", "configurable"])
+    def test_short_postgres_scheme_connection_string(self, mode) -> None:
+        # PostgreSQL takes postgres:// as well as postgresql://.  The short form
+        # kept its password unless an env line's secret-named key redacted it.
+        patterns = _builtin_registry_patterns() if mode == "configurable" else None
+        for url in (
+            "postgres://admin:s3cret_pass@db.internal:5432/prod",
+            "POSTGRES://admin:s3cret_pass@db.internal/prod",
+            "postgres+asyncpg://admin:s3cret_pass@db.internal/prod",
+        ):
+            r = evaluate_output("dsn: " + url, patterns=patterns)
+            assert "connection_string_leak" in r.flags, url
+            assert r.sanitized is not None, url
+            assert "s3cret_pass" not in r.sanitized, url
+            assert ":[REDACTED:password]@" in r.sanitized, url
+        assert (
+            redact_credentials("postgres://u:pw12345@h/db")
+            == "postgres://u:[REDACTED:password]@h/db"
+        )
+
     def test_uppercase_scheme_connection_string(self) -> None:
         # RFC 3986 schemes are case-insensitive; an uppercase scheme must
         # not bypass redaction.
@@ -460,6 +480,7 @@ class TestJwtAndQueryCredentials:
         ("http+abcde://" * 20_000, None),
         (("http+" + "a" * 25 + "://") * 4_000, None),
         ("https://u:" + "pa://" * 40_000, None),
+        ("postgres://u:" + "postgres://" * 30_000, None),
         ("A" * 320_000, None),
         # Each cut-off block runs to the next BEGIN; the last has none after it.
         (
@@ -475,6 +496,7 @@ class TestJwtAndQueryCredentials:
         "suffixed-schemes",
         "long-suffixed-schemes",
         "password-separators",
+        "short-postgres-schemes",
         "env-key-run",
         "unterminated-keys",
     ],

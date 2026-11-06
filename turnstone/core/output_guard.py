@@ -105,6 +105,7 @@ _RE_PRIVATE_KEY_BLOCK = re.compile(
 # covers SQLAlchemy dialect+driver URLs (``postgresql+psycopg2``,
 # ``postgresql+asyncpg``, ``mysql+pymysql``) and ``mongodb+srv`` —
 # enumerating drivers is a losing game, the suffix shape isn't.
+# PostgreSQL takes both ``postgres://`` and ``postgresql://``.
 # Schemes are case-insensitive per RFC 3986, hence IGNORECASE:
 # ``POSTGRESQL://`` leaks the same password ``postgresql://`` does.
 # The password stops where another connection string could start: scanning
@@ -116,7 +117,7 @@ _RE_PRIVATE_KEY_BLOCK = re.compile(
 # bounded so that every place a match can start also ends a password.
 # Group 1 is the password.
 _CONNECTION_SCHEME = (
-    r"(?:postgresql|mysql|mongodb|rediss?|amqps?|sqlite|https?)(?:\+[a-z0-9]{0,20})?://"
+    r"(?:postgres(?:ql)?|mysql|mongodb|rediss?|amqps?|sqlite|https?)(?:\+[a-z0-9]{0,20})?://"
 )
 _RE_CONNECTION_STRING = re.compile(
     _CONNECTION_SCHEME + r"[^:@\s]+:((?:(?!" + _CONNECTION_SCHEME + r")[^@\s])+)@",
