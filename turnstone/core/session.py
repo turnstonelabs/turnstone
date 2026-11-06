@@ -8513,8 +8513,10 @@ class ChatSession:
         text → placeholder.  Image → image_url typed by its content (a
         placeholder unless it is PNG, JPEG or WebP), or perception first when
         the primary has no vision.  Audio → STT transcript → perception →
-        placeholder.  Perception (the ``perception.model_alias`` role) is the
-        universal bottom tier: it engages only when the primary can't handle the
+        placeholder. Audio reaches perception only when STT is unset or
+        successfully returns an empty transcript. Perception (the
+        ``perception.model_alias`` role) is the universal bottom tier: it
+        engages only when the primary can't handle the
         kind and a capable perception model is configured.  A PDF rasterized to
         images returns several parts."""
         kind = att.get("kind")
@@ -8576,8 +8578,11 @@ class ChatSession:
         cancel_ref: _CancelRef | None = None,
         principal_id: str | None = None,
     ) -> dict[str, Any]:
-        """Non-omni primary + audio: STT transcript (preferred), else perception
-        (if the perception model can hear), else a placeholder."""
+        """Non-omni primary + audio: STT transcript or failure placeholder.
+
+        Only an unset STT role or successful empty transcript falls through to
+        perception (if it can hear), then the no-backend placeholder.
+        """
         transcript = self._stt_transcript_part(
             att,
             cancel_ref=cancel_ref,
@@ -8609,18 +8614,34 @@ class ChatSession:
         cancel_ref: _CancelRef | None = None,
         principal_id: str | None = None,
     ) -> dict[str, Any] | None:
-        """Transcribe via the STT role, or ``None`` when no STT role is
-        configured or the transcript is empty (caller falls through to
-        perception).  Only engages a configured backend — never a surprise call."""
+        """Transcribe via the STT role, with a placeholder if it is unusable.
+
+        Return ``None`` only when STT is unset or successfully returns an empty
+        transcript, allowing the caller to try perception.
+        """
         from turnstone.core.audio import resolve_role_alias, transcribe_cached
 
+        configured_alias = (
+            (self._config_store.get("audio.stt_model_alias") or "").strip()
+            if self._config_store is not None
+            else ""
+        )
+        if not configured_alias:
+            return None
+        name = str(att.get("filename") or "audio")
+        unusable = {
+            "type": "text",
+            "text": (
+                f"[audio attachment '{safe_attachment_label(name)}' — "
+                f"STT model alias '{safe_attachment_label(configured_alias)}' is unusable]"
+            ),
+        }
         raw = att.get("content")
         alias = resolve_role_alias(
             config_store=self._config_store, registry=self._registry, role="stt"
         )
         if not alias or not isinstance(raw, bytes):
-            return None
-        name = str(att.get("filename") or "audio")
+            return unusable
         effective_principal = (
             (self._mcp_effective_user_id or "") if principal_id is None else principal_id
         ).strip()
@@ -8637,6 +8658,8 @@ class ChatSession:
             ),
             cancel_ref=cancel_ref,
         )
+        if transcript is None:
+            return unusable
         if not transcript:
             return None
         # Transcribed speech is untrusted the same way typed message content is.

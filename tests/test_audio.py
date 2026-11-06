@@ -632,20 +632,38 @@ class TestTranscribeCached:
         assert audio.transcribe_cached(**kw) == "hello world"
         assert len(calls) == 1  # second served from cache
 
-    def test_backend_failure_returns_empty_and_is_not_cached(self, monkeypatch):
+    def test_backend_failure_returns_none_and_is_not_cached(self, monkeypatch):
         audio._clear_transcript_cache_for_test()
         calls = []
         reg = _FakeRegistry("w", _Cfg("whisper-1"), MagicMock())
 
         def boom(binding, **kwargs):
             calls.append(1)
-            raise audio.AudioBackendError("down")
+            if len(calls) == 1:
+                raise audio.AudioBackendError("down")
+            return self._result("recovered")
 
         monkeypatch.setattr(audio, "_transcribe_binding", boom)
         kw = dict(registry=reg, alias="w", content_hash="h2", data=b"x", filename="a.wav")
-        assert audio.transcribe_cached(**kw) == ""
-        audio.transcribe_cached(**kw)
+        assert audio.transcribe_cached(**kw) is None
+        assert audio.transcribe_cached(**kw) == "recovered"
+        assert audio.transcribe_cached(**kw) == "recovered"
         assert len(calls) == 2  # failure not cached -> retried
+
+    def test_successful_empty_transcript_is_cached(self, monkeypatch):
+        audio._clear_transcript_cache_for_test()
+        backend = MagicMock(return_value=self._result(""))
+        monkeypatch.setattr(audio, "_transcribe_binding", backend)
+        kw = dict(
+            registry=_FakeRegistry("w", _Cfg("whisper-1"), MagicMock()),
+            alias="w",
+            content_hash="empty",
+            data=b"x",
+            filename="a.wav",
+        )
+        assert audio.transcribe_cached(**kw) == ""
+        assert audio.transcribe_cached(**kw) == ""
+        backend.assert_called_once()
 
     @pytest.mark.parametrize("failure_seam", ["resolve", "transcribe"])
     def test_abort_during_backend_failure_propagates_cancellation(
@@ -684,7 +702,7 @@ class TestTranscribeCached:
 
         assert audio._transcript_cache == {}
 
-    def test_disappeared_alias_returns_empty_before_backend_dispatch(self, monkeypatch):
+    def test_disappeared_alias_returns_none_before_backend_dispatch(self, monkeypatch):
         audio._clear_transcript_cache_for_test()
         transcribe = MagicMock()
         monkeypatch.setattr(audio, "_transcribe_binding", transcribe)
@@ -698,7 +716,7 @@ class TestTranscribeCached:
             filename="a.wav",
         )
 
-        assert result == ""
+        assert result is None
         transcribe.assert_not_called()
         assert audio._transcript_cache == {}
 
