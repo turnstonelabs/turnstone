@@ -526,7 +526,10 @@ When `redact_secrets` is enabled (default), detected credentials in tool output
 are replaced with `[REDACTED:<type>]` markers before the output enters the
 conversation. The original unredacted output is never shown to the model, nor
 to the output guard's LLM stage, which reads the redacted text.
-Redaction types: `api_key`, `private_key`, `password`, `secret`.
+Redaction types: `api_key`, `private_key`, `password`, `secret`. A value that is
+exactly one of these markers holds no secret, so text redacted once, such as a
+child's tool result that `inspect_workstream` reads back, is not reported as a
+credential leak again.
 
 A URL query or fragment parameter named `token`, `access_token`,
 `refresh_token`, `id_token`, `auth_token`, `api_token`, `session_token`,

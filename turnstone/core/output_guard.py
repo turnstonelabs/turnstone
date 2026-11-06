@@ -113,11 +113,12 @@ _RE_PRIVATE_KEY_BLOCK = re.compile(
 # matched unless it holds one of these schemes itself, and the user part
 # already stops at the ":" every scheme contains. The driver suffix is
 # bounded so that every place a match can start also ends a password.
+# Group 1 is the password.
 _CONNECTION_SCHEME = (
     r"(?:postgresql|mysql|mongodb|rediss?|amqps?|sqlite|https?)(?:\+[a-z0-9]{0,20})?://"
 )
 _RE_CONNECTION_STRING = re.compile(
-    _CONNECTION_SCHEME + r"[^:@\s]+:(?:(?!" + _CONNECTION_SCHEME + r")[^@\s])+@",
+    _CONNECTION_SCHEME + r"[^:@\s]+:((?:(?!" + _CONNECTION_SCHEME + r")[^@\s])+)@",
     re.IGNORECASE,
 )
 # A match takes a whole run of key characters at once (group 1), never one
@@ -146,8 +147,25 @@ def _env_key_is_secret(key: str) -> bool:
     return bool(_RE_ENV_SECRET_KEY.search(key.lstrip("_0123456789")))
 
 
+# What a redaction leaves in place of a secret.  A value that is exactly one
+# holds no secret, so the rules that would match it again (an env line, a JSON
+# secret, a connection string's password) don't flag it: text redacted once,
+# such as a child's tool result read back through inspect_workstream, would
+# otherwise flag a credential leak every time it is read.
+_RE_REDACTION_MARKER = re.compile(r"\[REDACTED:[a-z_]+\]")
+
+
+def _is_redaction_marker(text: str, start: int, end: int) -> bool:
+    """Whether ``text[start:end]`` is exactly a redaction marker."""
+    return _RE_REDACTION_MARKER.fullmatch(text, start, end) is not None
+
+
 def _has_env_secret(text: str) -> bool:
-    return any(_env_key_is_secret(m.group(1)) for m in _RE_ENV_SECRET_LINE.finditer(text))
+    # A match's value runs from after its "=" to its end.
+    return any(
+        _env_key_is_secret(m.group(1)) and not _is_redaction_marker(text, m.end(1) + 1, m.end())
+        for m in _RE_ENV_SECRET_LINE.finditer(text)
+    )
 
 
 def _redact_env(m: re.Match[str]) -> str:
@@ -174,6 +192,24 @@ _RE_JSON_SECRET_SQ = re.compile(
     r"authorization)'\s*:\s*'([^']{8,})'",
     re.IGNORECASE,
 )
+
+
+def _has_json_secret(text: str) -> bool:
+    """Whether ``text`` gives a secret-named key, quoted either way, a value not yet redacted."""
+    return any(
+        not _is_redaction_marker(text, m.start(1), m.end(1))
+        for pattern in (_RE_JSON_SECRET, _RE_JSON_SECRET_SQ)
+        for m in pattern.finditer(text)
+    )
+
+
+def _has_connection_secret(text: str) -> bool:
+    """Whether ``text`` holds a connection string whose password is not yet redacted."""
+    return any(
+        not _is_redaction_marker(text, m.start(1), m.end(1))
+        for m in _RE_CONNECTION_STRING.finditer(text)
+    )
+
 
 # A JSON Web Token: base64url header and payload, both JSON objects (so both
 # start "eyJ"), and a signature that is empty for an unsigned token. It must
@@ -996,7 +1032,7 @@ def _check_credentials(
         found = True
         risk = "high"
 
-    if _RE_CONNECTION_STRING.search(text):
+    if _has_connection_secret(text):
         _add_flag(flags, "credential_leak")
         flags.append("connection_string_leak")
         ann.append("Output contains a connection string with embedded credentials.")
@@ -1010,7 +1046,7 @@ def _check_credentials(
         found = True
         risk = "high"
 
-    if _RE_JSON_SECRET.search(text) or _RE_JSON_SECRET_SQ.search(text):
+    if _has_json_secret(text):
         _add_flag(flags, "credential_leak")
         flags.append("json_secret_leak")
         ann.append(
@@ -1209,12 +1245,18 @@ def _check_credentials_complex(
     text: str,
     flags: list[str],
     ann: list[str],
+    *,
+    redact_text: str | None = None,
 ) -> tuple[str, str | None]:
     """Complex credential checks that require custom redaction logic.
 
     Handles private key blocks, connection strings (need targeted sub-replacement
     to preserve protocol/username), env-line parsing (two-regex pipeline), and
     JSON secret detection (capture group redaction).
+
+    Detection reads ``text``; redaction applies to ``redact_text`` when given,
+    the text earlier rules already redacted.  A value those rules replaced is a
+    marker there, which detection would take for one the tool's text held.
     """
     risk = "none"
     found = False
@@ -1226,7 +1268,7 @@ def _check_credentials_complex(
         found = True
         risk = "high"
 
-    if _RE_CONNECTION_STRING.search(text):
+    if _has_connection_secret(text):
         _add_flag(flags, "credential_leak")
         _add_flag(flags, "connection_string_leak")
         ann.append("Output contains a connection string with embedded credentials.")
@@ -1240,7 +1282,7 @@ def _check_credentials_complex(
         found = True
         risk = "high"
 
-    if _RE_JSON_SECRET.search(text) or _RE_JSON_SECRET_SQ.search(text):
+    if _has_json_secret(text):
         _add_flag(flags, "credential_leak")
         _add_flag(flags, "json_secret_leak")
         ann.append(
@@ -1249,8 +1291,9 @@ def _check_credentials_complex(
         found = True
         risk = "high"
 
-    sanitized = _redact_credentials_complex(text) if found else None
-    return risk, sanitized
+    if not found:
+        return risk, None
+    return risk, _redact_credentials_complex(text if redact_text is None else redact_text)
 
 
 def _redact_credentials_complex(text: str) -> str:
@@ -1463,9 +1506,12 @@ def evaluate_output(
                     ),
                 )
             elif cat == "credentials":
-                # Chain redaction: apply complex checks to already-sanitized text
+                # Chain redaction: the complex checks read the tool's own text and
+                # redact the text the patterns above already redacted.
                 cred_input = sanitized if sanitized is not None else output
-                cred_risk, cred_san = _check_credentials_complex(cred_input, flags, ann)
+                cred_risk, cred_san = _check_credentials_complex(
+                    output, flags, ann, redact_text=cred_input
+                )
                 risk = _max_risk(risk, cred_risk)
                 if cred_san:
                     sanitized = cred_san

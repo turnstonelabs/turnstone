@@ -591,6 +591,124 @@ def test_connection_string_password_redacts_at_any_length(text, expected) -> Non
     assert redact_credentials(text) == expected
 
 
+# Secrets in each shape a credential rule recognises, for tests that compare reads.
+_SECRET_SAMPLES = pytest.mark.parametrize(
+    "text",
+    [
+        "OPENAI_API_KEY=sk-proj-abc123def456ghi789jklmno012pqr345",
+        "DB_HOST=localhost\nSECRET_KEY=abc123xyz\nAPI_TOKEN=tok_987654",
+        '{"password": "hunter2hunter2", "api_key": "sk-abcdefghijklmnopqrstuvwx"}',
+        "headers = {'Authorization': 'Bearer canstillseethis'}",
+        "DATABASE_URL=postgresql://admin:s3cret_pass@db.internal:5432/prod",
+        "uri: mongodb+srv://admin:s3cretpw@cluster.mongodb.net/db",
+        "postgresql://admin:sk-abcdefghijklmnopqrstuvwx@db/app",
+        "Authorization: Bearer abcdefghijklmnopqrstuvwxyz0123\nAPI_KEY=abcd1234efgh5678",
+        "-----BEGIN RSA PRIVATE KEY-----\nMIIBogIBAAJBAK\n-----END RSA PRIVATE KEY-----",
+        f"https://x.example/cb?access_token={_JWT}&x=1",
+    ],
+    ids=[
+        "prefix",
+        "env",
+        "json",
+        "single-quoted",
+        "env-url",
+        "url",
+        "url-prefix",
+        "pattern-and-env",
+        "pem",
+        "query",
+    ],
+)
+
+
+@pytest.mark.parametrize("mode", ["builtin", "configurable"])
+class TestRedactedValues:
+    """A value a redaction already replaced holds no secret, so reading it again flags nothing.
+
+    A child's tool result is stored as its guard returned it, so an inspect of
+    the child read every marker the child's guard wrote and flagged each one as
+    a fresh credential leak.
+    """
+
+    @_SECRET_SAMPLES
+    def test_redacted_output_reads_clean(self, mode, text) -> None:
+        patterns = _builtin_registry_patterns() if mode == "configurable" else None
+        first = evaluate_output(text, patterns=patterns)
+        assert "credential_leak" in first.flags
+        assert first.sanitized is not None
+        again = evaluate_output(first.sanitized, patterns=patterns)
+        assert again.risk_level == "none", again.flags
+        assert again.sanitized is None
+
+    @pytest.mark.parametrize(
+        ("text", "flag"),
+        [
+            ("API_KEY=[REDACTED:secret]abc12345", "env_file_leak"),
+            ('{"password": "[REDACTED:secret] hunter2hunter2"}', "json_secret_leak"),
+            ("{'token': 'x[REDACTED:secret]'}", "json_secret_leak"),
+            ("postgresql://admin:[REDACTED:password]s3cret@db/app", "connection_string_leak"),
+        ],
+    )
+    def test_a_marker_with_more_beside_it_still_flags(self, mode, text, flag) -> None:
+        patterns = _builtin_registry_patterns() if mode == "configurable" else None
+        r = evaluate_output(text, patterns=patterns)
+        assert flag in r.flags
+        assert r.sanitized is not None
+
+    def test_a_real_secret_beside_a_marker_is_still_redacted(self, mode) -> None:
+        patterns = _builtin_registry_patterns() if mode == "configurable" else None
+        r = evaluate_output("API_KEY=[REDACTED:secret]\nSECRET_TOKEN=abc123xyz", patterns=patterns)
+        assert "env_file_leak" in r.flags
+        assert r.sanitized == "API_KEY=[REDACTED:secret]\nSECRET_TOKEN=[REDACTED:secret]"
+
+
+@_SECRET_SAMPLES
+def test_both_modes_flag_and_redact_a_secret_alike(text) -> None:
+    # With a rule registry the patterns redact first, and the complex checks run
+    # after them.  Those checks read the tool's own text: in the redacted text a
+    # value the patterns just replaced is a marker, which the checks would take
+    # for an earlier redaction and drop its finding.
+    builtin = evaluate_output(text)
+    configurable = evaluate_output(text, patterns=_builtin_registry_patterns())
+    assert sorted(configurable.flags) == sorted(builtin.flags)
+    assert configurable.sanitized == builtin.sanitized
+
+
+@pytest.mark.no_cover
+@pytest.mark.parametrize(
+    "text",
+    [
+        "https://h.example/" + "https://" * 32_000,
+        "http+abcde://" * 20_000,
+        "https://u:" + "pa://" * 40_000,
+        "postgresql://u:[REDACTED:password]@h " * 10_000,
+        '"password": "[REDACTED:secret]", ' * 10_000,
+        "API_KEY=[REDACTED:secret]\n" * 10_000,
+        '"password": "' + "a" * 300_000,
+        '"password":"' * 30_000,
+    ],
+    ids=[
+        "nested-schemes",
+        "suffixed-schemes",
+        "password-separators",
+        "redacted-passwords",
+        "redacted-json",
+        "redacted-env",
+        "unterminated-json",
+        "json-openings",
+    ],
+)
+def test_credential_detection_is_linear_in_a_long_run(text) -> None:
+    # Detection looks at every connection string, JSON secret and env line for
+    # one whose value isn't already a marker, so each must cost one pass.
+    # Measured near 0.1 seconds for each input; a pass per match takes minutes.
+    start = time.perf_counter()
+    r = evaluate_output(text)
+    elapsed = time.perf_counter() - start
+    assert "credential_leak" not in r.flags
+    assert elapsed < 2.0
+
+
 class TestEncodedPayloads:
     """Detect encoded/obfuscated payloads."""
 
