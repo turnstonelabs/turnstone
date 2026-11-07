@@ -10,6 +10,16 @@ All development now integrates on `main`. Supported release lines are maintained
 on `stable/X.Y` branches; `stable/1.8` preserves the former stable branch.
 The separate `dev` branch is retired. See [the release process](docs/releasing.md).
 
+## [2026-11-06]
+
+### Added
+
+- **An expand all button opens every section of the admin Settings and Nodes tabs.** It
+  sits in each tab's toolbar; once every section is open it reads **collapse all** and
+  folds them back. It follows sections opened or closed one at a time, and it is disabled
+  while the tab has no sections to show: before they load, while the Nodes tab reloads its
+  node metadata, and after a failed load.
+
 ## [2026-11-05]
 
 ### Security

@@ -4213,12 +4213,74 @@ function _onSettingsHeaderKey(e, el) {
 
 function _toggleSettingsSection(headerEl) {
   const section = headerEl.parentElement;
-  if (section.hasAttribute("data-collapsed")) {
-    section.removeAttribute("data-collapsed");
-    headerEl.setAttribute("aria-expanded", "true");
-  } else {
-    section.setAttribute("data-collapsed", "");
-    headerEl.setAttribute("aria-expanded", "false");
+  _setSettingsSectionCollapsed(
+    section,
+    !section.hasAttribute("data-collapsed"),
+  );
+}
+
+function _setSettingsSectionCollapsed(section, collapsed) {
+  if (collapsed) section.setAttribute("data-collapsed", "");
+  else section.removeAttribute("data-collapsed");
+  section
+    .querySelector(".settings-section-header")
+    .setAttribute("aria-expanded", collapsed ? "false" : "true");
+}
+
+// The expand all / collapse all button in the Settings and Node Metadata
+// toolbars.  Its aria-controls names the container its tab renders sections
+// into, and it reads their data-collapsed state each time, so it keeps no flag
+// of its own: it expands every section while any is collapsed and collapses
+// them all once every one is open.
+function _expandAllContainer(btn) {
+  return document.getElementById(btn.getAttribute("aria-controls"));
+}
+
+function _anySectionCollapsed(sections) {
+  for (let i = 0; i < sections.length; i++) {
+    if (sections[i].hasAttribute("data-collapsed")) return true;
+  }
+  return false;
+}
+
+function _syncExpandAll(btn, container) {
+  const sections = container.querySelectorAll(".settings-section");
+  btn.disabled = sections.length === 0;
+  btn.textContent =
+    sections.length === 0 || _anySectionCollapsed(sections)
+      ? "expand all"
+      : "collapse all";
+}
+
+function toggleAllSections(btn) {
+  const sections =
+    _expandAllContainer(btn).querySelectorAll(".settings-section");
+  const collapse = !_anySectionCollapsed(sections);
+  for (let i = 0; i < sections.length; i++) {
+    _setSettingsSectionCollapsed(sections[i], collapse);
+  }
+}
+
+// Each button watches its container: a render or a loading or error message
+// replaces the container's children, and a section toggle flips
+// data-collapsed, so the observer sees every change and no render path has to
+// remember to refresh the button.  The container is looked up once, here:
+// closing the admin pane takes it out of the document, and a load that
+// finishes after the close still writes into it.
+function _initExpandAllButtons() {
+  const buttons = document.querySelectorAll(".settings-expand-all");
+  for (let i = 0; i < buttons.length; i++) {
+    const btn = buttons[i];
+    const container = _expandAllContainer(btn);
+    new MutationObserver(function () {
+      _syncExpandAll(btn, container);
+    }).observe(container, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+      attributeFilter: ["data-collapsed"],
+    });
+    _syncExpandAll(btn, container);
   }
 }
 
@@ -9438,3 +9500,7 @@ function _deleteNodeMeta(nodeId, key) {
 // console <body>, so the document-level delegation below covers every admin
 // table (including those rendered by governance.js, which loads after).
 _initKebabMenus();
+
+// The expand all buttons and their containers are static markup above this
+// script, so they can be wired now.
+_initExpandAllButtons();
