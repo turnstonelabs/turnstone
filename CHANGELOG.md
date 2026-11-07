@@ -40,6 +40,15 @@ The separate `dev` branch is retired. See [the release process](docs/releasing.m
   JSON Schema, such as refusing an array schema without `items`, are not checked.
   `jsonschema` is now a direct dependency (it was already installed with `mcp`).
 
+### Security
+
+- **An MCP server's error text, log messages and tools left out no longer carry
+  invisible formatting characters into the log or the admin console.** They could hold
+  direction overrides, zero-width or tag characters, which reorder or hide what is
+  shown. Every character Python does not count as printable now reads as a space (a
+  carriage return as nothing), as in the console's log previews. That includes the
+  joiners and direction marks some scripts and emoji sequences use.
+
 ## [2026-11-05]
 
 ### Security

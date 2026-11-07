@@ -1670,22 +1670,26 @@ def _prompt_entries(server_name: str, prompts: list[mcp_types.Prompt]) -> list[d
 
 # Longest recorded or reported server-error text; see :func:`_sanitize_error_text`.
 _MAX_ERROR_TEXT_LEN = 256
-# A server's error text can carry control characters, which would rewrite a terminal that shows
-# the log or forge a line in it: each reads as a space, and a carriage return as nothing.
-_ERROR_TEXT_CONTROLS: dict[int, str | None] = {
-    **dict.fromkeys([*range(0x20), *range(0x7F, 0xA0), 0x2028, 0x2029], " "),
-    0x0D: None,
-}
 
 
 def _sanitize_error_text(msg: str, limit: int = _MAX_ERROR_TEXT_LEN) -> str:
     """Single-line, bounded rendering of a server's error text, with no control characters.
 
     ONE pipeline for every surface that reports one (``_last_error``, the pool discovery record,
-    the connection test) so a future sanitizer hardening cannot land on one and silently miss
-    another.
+    the connection test, the tools a catalog leaves out, the server's own log messages) so a future
+    sanitizer hardening cannot land on one and silently miss another.
+
+    Each character ``str.isprintable`` refuses reads as a space, as in the console's log previews
+    (``turnstone/console/log_preview.py``), and a carriage return as nothing. That covers the
+    controls that would rewrite a terminal showing the log or forge a line in it, and the format
+    characters (direction overrides, zero-width and tag characters) that would reorder or hide what
+    the admin console shows. Joiners and direction marks go too, so text in a script that needs them
+    reads with a space where each was.
     """
-    return msg[: max(limit * 4, 1024)].translate(_ERROR_TEXT_CONTROLS).strip()[:limit]
+    text = msg[: max(limit * 4, 1024)].replace(chr(13), "")
+    if not text.isprintable():
+        text = "".join(ch if ch.isprintable() else " " for ch in text)
+    return text.strip()[:limit]
 
 
 class ServerUnreachableError(ConnectionError):

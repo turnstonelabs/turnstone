@@ -929,6 +929,41 @@ def test_an_error_text_reads_on_one_line_with_no_control_characters() -> None:
     assert _sanitize_error_text(text) == "MCP error 1:  [2Jfake line two three"
 
 
+def test_an_error_text_shows_no_invisible_formatting_characters() -> None:
+    """A direction override or a zero-width character would reorder or hide what the admin console
+    shows of a server's text, such as a tool name or the reason it is left out."""
+    rlo, pdf, zwsp, bom = chr(0x202E), chr(0x202C), chr(0x200B), chr(0xFEFF)
+    text = f"tool {rlo}gnirts{pdf} is{zwsp}invalid{bom}"
+
+    assert _sanitize_error_text(text) == "tool  gnirts  is invalid"
+
+
+@pytest.mark.parametrize(
+    "code_point",
+    [
+        pytest.param(0x0085, id="next-line"),
+        pytest.param(0x2028, id="line-separator"),
+        pytest.param(0x202E, id="direction-override"),
+        pytest.param(0x2067, id="direction-isolate"),
+        pytest.param(0x200B, id="zero-width-space"),
+        pytest.param(0x200D, id="zero-width-joiner"),
+        pytest.param(0xFEFF, id="byte-order-mark"),
+        pytest.param(0x00AD, id="soft-hyphen"),
+        pytest.param(0xE0041, id="tag-character"),
+    ],
+)
+def test_each_character_python_cannot_print_reads_as_a_space(code_point: int) -> None:
+    """The rule of the console's log previews: each character ``str.isprintable`` refuses."""
+    assert _sanitize_error_text("a" + chr(code_point) + "b") == "a b"
+
+
+def test_printable_text_comes_back_as_it_was() -> None:
+    accented, cjk, emoji = chr(0xE9), chr(0x6F22), chr(0x1F600)
+    text = f"caf{accented} {cjk} {emoji} ok"
+
+    assert _sanitize_error_text(text) == text
+
+
 def test_recorded_wording_is_one_line() -> None:
     mgr = MCPClientManager({})
     capture = _AuthCapture(first_error=(307, False), first_error_redirect=True)
