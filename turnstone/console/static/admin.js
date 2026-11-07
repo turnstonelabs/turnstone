@@ -9304,8 +9304,8 @@ function _renderNodeMetadata() {
       "<span>" +
       escapeHtml(nid) +
       " <small>(" +
-      meta.length +
-      " keys)</small></span>";
+      (meta.length === 1 ? "1 key" : meta.length + " keys") +
+      ")</small></span>";
     html += "</div>";
     html +=
       '<div class="settings-section-body" id="nm-body-' +
