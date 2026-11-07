@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "turnstone"
-version = "1.9.1"
+version = "1.9.3"
 description = "Multi-node AI orchestration platform with tool use, agent routing, and cluster simulation."
 readme = "README.md"
 license = "Apache-2.0"
@@ -50,6 +50,9 @@ dependencies = [
     # Released in lockstep with httpx2, which pins the matching version.
     "httpcore2>=2.12,<3",
     "mcp>=2.3,<3",
+    # Checks each MCP tool's input schema against its dialect's metaschema before the tool is
+    # published. The floor is mcp's own.
+    "jsonschema>=4.20",
     "starlette>=1.3.1",  # CVE-2026-54282 (path->authority host spoof) + CVE-2026-54283 (url-encoded form DoS); supersedes the PYSEC-2026-161 host-header path-injection floor
     "uvicorn>=0.34",
     "sse-starlette>=2.0",
@@ -84,7 +87,7 @@ Issues = "https://github.com/turnstonelabs/turnstone/issues"
 test = ["pytest>=9.0", "pytest-cov>=6.0", "slack-bolt>=1.18", "aiohttp>=3.9", "fonttools[woff]>=4.66.1,<5"]
 # ruff stays equal to the ruff-pre-commit rev in .pre-commit-config.yaml, which CI's lint job runs,
 # so a local check reports what CI reports.
-dev = ["ruff==0.17.3", "mypy>=1.14"]
+dev = ["ruff==0.17.4", "mypy>=1.14"]
 discord = ["discord.py>=2.4"]
 slack = ["slack-bolt>=1.18", "aiohttp>=3.9"]
 all = ["turnstone[discord,slack]"]
@@ -117,7 +120,7 @@ include = [
   "turnstone/shared_static/*.js",
   "turnstone/shared_static/katex-0.19.1/**/*",
   "turnstone/shared_static/hljs-11.12.0/**/*",
-  "turnstone/shared_static/mermaid-12.2.0/**/*",
+  "turnstone/shared_static/mermaid-12.3.0/**/*",
   "turnstone/shared_static/hls-1.7.4/**/*",
   "turnstone/shared_static/inter-4.001.1/**/*",
   "turnstone/shared_static/jetbrains-mono-2.304/**/*",
@@ -211,6 +214,10 @@ ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
 module = ["croniter", "croniter.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["jsonschema", "jsonschema.*"]
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]

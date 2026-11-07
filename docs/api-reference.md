@@ -2848,10 +2848,15 @@ appears only as `scheme://host:port`. `tls_skip_verify` comes first, as `true`, 
 server that skips verification, and as `false` on the edit that turns it off.
 
 Each server's `status` maps a node id (and `console`, for the console's own connection) to that
-connection's state. `has_error` is true while the last connect failed, and `error` says why. A
-server from a node's configuration file has no row: it is listed with `source: "config"` and the
-transport its nodes report, and with placeholders for its other settings, such as an empty
-`command` and `url` and a `tls_skip_verify` of `false`.
+connection's state. `has_error` is true while the last connect failed, and `error` says why.
+`skipped_tools` lists the tools the server lists but its catalog leaves out, because their input
+schema is not valid JSON Schema: models are not offered them. Each is a `{name, reason}` object
+whose `reason` names the schema field that is wrong and what is wrong with it, never the field's
+value, for example `inputSchema.properties.Offset.type is not one of ['array', 'boolean',
+'integer', 'null', 'number', 'object', 'string'] (2 more errors)`. A server from a node's
+configuration file has no row: it is listed with `source: "config"` and the transport its nodes
+report, and with placeholders for its other settings, such as an empty `command` and `url` and a
+`tls_skip_verify` of `false`.
 
 #### Test connection
 
@@ -2889,6 +2894,7 @@ rest of the URL; a header holding a `secret://` reference is recorded by name wi
 {
   "ok": false,
   "tools": [],
+  "skipped_tools": [],
   "resources": 0,
   "prompts": 0,
   "error": "HTTP 401 Unauthorized: the server requires authorization",
@@ -2897,7 +2903,9 @@ rest of the URL; a header holding a `secret://` reference is recorded by name wi
 }
 ```
 
-On success `ok` is true, `tools` holds the tool names, and `error`, `kind` and `status` are null.
+On success `ok` is true, `tools` holds the names of the tools a save would publish,
+`skipped_tools` the tools it would leave out (as a server's `status` lists them), and `error`,
+`kind` and `status` are null.
 `kind` says what to check: `unreachable` (host or port), `tls` (certificate or scheme), `http`
 (URL path, credentials or the server's sessions, with the HTTP `status`), `timeout` (no answer
 within the connect timeout), `not_mcp` (the URL answers with something else, such as a web page

@@ -641,21 +641,26 @@ The tab has two views toggled via a pill control: **Servers** and
   retries. Saving refuses a Streamable HTTP URL that cannot be parsed and
   a header that no request could carry (a stray space at either end of a
   value, a character outside ASCII), whether the server comes from the
-  form, an import or the registry
+  form, an import or the registry. A connected server that lists a tool
+  whose input schema is not valid JSON Schema shows a **tools skipped**
+  badge: models are not offered that tool, and the server's details name
+  each tool left out and the schema field that is wrong. Its other tools
+  work as usual
 - **Test connection** -- the add and edit forms test a Streamable HTTP
   server with no authorization or static headers before you save it. The
   console connects once with the form's values, the way a save would, and
   shows the server's tools and its resource and prompt counts, or why the
   connection failed: the HTTP status, a TLS failure, a timeout, a URL that
   serves a web page or other non-MCP content, or the catalog entry that
-  fails validation. Nothing is saved. The test runs from the console's
-  network position; nodes connect from their own, so a host that only
-  nodes can reach fails the test but works once saved. OAuth servers need
-  a sign-in first and stdio servers run on each node, so neither can be
-  tested. The console runs two tests at a time and turns away a third
-  until one ends. Each test is audited (`mcp_server.test`, with the
-  scheme, host, port and outcome, and whether certificate verification
-  was skipped)
+  fails validation. It also lists the tools a save would leave out because
+  their input schema is not valid JSON Schema. Nothing is saved. The test
+  runs from the console's network position; nodes connect from their own,
+  so a host that only nodes can reach fails the test but works once saved.
+  OAuth servers need a sign-in first and stdio servers run on each node, so
+  neither can be tested. The console runs two tests at a time and turns
+  away a third until one ends. Each test is audited (`mcp_server.test`,
+  with the scheme, host, port and outcome, and whether certificate
+  verification was skipped)
 - **Skip certificate verification** -- the form offers it for a Streamable
   HTTP server with no authorization or static headers. It is off by
   default, and the form explains the risk: the console and every node

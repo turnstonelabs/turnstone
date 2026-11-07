@@ -1039,9 +1039,18 @@ export interface MemoryIndexHealthResponse {
 
 // -- Console API: MCP Servers -----------------------------------------------
 
+/** A tool a server lists that its catalog leaves out: its input schema is not valid JSON Schema. */
+export interface McpSkippedTool {
+  name: string;
+  /** The field of the input schema that is wrong, and what is wrong with it. */
+  reason: string;
+}
+
 export interface McpServerStatus {
   connected: boolean;
   tools: number;
+  /** Absent from read-scoped status reads, as the error text is. */
+  skipped_tools?: McpSkippedTool[];
   resources: number;
   prompts: number;
   error: string;
@@ -1123,8 +1132,10 @@ export interface McpConnectionTestRequest {
 
 export interface McpConnectionTestResponse {
   ok: boolean;
-  /** The server's tool names, and how many resources and prompts it lists. */
+  /** The names of the tools a save would publish, and how many resources and prompts it lists. */
   tools: string[];
+  /** The tools a save would leave out. */
+  skipped_tools: McpSkippedTool[];
   resources: number;
   prompts: number;
   error: string | null;

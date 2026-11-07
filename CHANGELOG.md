@@ -10,20 +10,10 @@ All development now integrates on `main`. Supported release lines are maintained
 on `stable/X.Y` branches; `stable/1.8` preserves the former stable branch.
 The separate `dev` branch is retired. See [the release process](docs/releasing.md).
 
-## [2026-11-06]
-
-### Added
-
-- **An expand all button opens every section of the admin Settings and Nodes tabs.** It
-  sits in each tab's toolbar; once every section is open it reads **collapse all** and
-  folds them back. It follows sections opened or closed one at a time, and it is disabled
-  while the tab has no sections to show: before they load, while the Nodes tab reloads its
-  node metadata, and after a failed load.
+## [2026-11-07]
 
 ### Fixed
 
-- **A node with one metadata key reads "(1 key)"** in its header on the admin Nodes tab,
-  not "(1 keys)".
 - **A selected STT model alias that can't run no longer hands audio to perception.** When
   `audio.stt_model_alias` names an alias that is missing, can't transcribe, or whose backend
   fails, the audio attachment gets a placeholder naming the alias instead of reaching the
@@ -31,354 +21,191 @@ The separate `dev` branch is retired. See [the release process](docs/releasing.m
   falls through to perception. Audio whose stored content can't be read gets the unreadable
   attachment placeholder.
 
-## [2026-11-05]
+## [1.9.3]
 
-### Security
-
-- **Passwords in `postgres://` connection strings are redacted.** The connection-string
-  rule knew only the `postgresql://` spelling, so a URL such as
-  `postgres://user:password@host/db` kept its password in a tool result the model and
-  the output guard's judge read, and in the text `redact_credentials` scrubs for close
-  reasons, audit details and logs, unless an env line's secret-named key (such as
-  `DATABASE_URL=`) redacted the whole value. Both spellings now have their password
-  redacted, in the browser's display redaction too.
+> **Before upgrading:** the database advances from migration 086 to 088.
+> Migrations run automatically; upgrade every process that shares the database
+> together.
+>
+> - 087 deletes the retired `coordinator.max_active` setting, since coordinators
+>   no longer have a session cap.
+> - 088 gives the built-in admin and operator roles the new `files.write`
+>   permission. Holders can upload files into a node's workspace, `/data` and
+>   `/tmp` from the Files pane. Revoke it with a role override where that is too
+>   broad; viewer and custom roles are unchanged.
+> - A `judge.model`, `judge.output_guard_model` or per-workstream `judge_model`
+>   that names a model that isn't loaded, such as a raw model id or a removed
+>   alias, no longer runs on another model: that judge stays off until it names
+>   a loaded model. Check these settings after upgrading.
+> - The `wait_ended` event no longer carries the children's messages, and a
+>   session create that fails for any reason but a full node answers `500`
+>   instead of `429`. See **Changed** and **Fixed** below.
 
 ### Added
 
-- **A task agent's open step list on the web cards closes from its end too.** A **hide
-  steps** control under the last step folds the card back to its "N steps" bar and keeps
-  that bar in view, so a long list no longer has to be scrolled back up to close. It is
-  for the pointer; the "N steps" bar stays the keyboard's way to fold the card. The
-  control is absent while a step in the card waits for approval, where it would sit just
-  under Approve and Deny.
+- **Upload files from the Files pane.** Select **Upload**, or drag files onto the
+  directory browser, to upload them to the directory shown. Uploads need
+  `files.write` as well as browsing access, never replace an existing name
+  (`409`), take up to 100 files per batch and 64 MiB per file, and don't create
+  directories. The console streams the bytes to private staging on the node, and
+  a file appears once its upload completes. See
+  [Files pane](docs/console.md#files-pane) and
+  [its API](docs/api-reference.md#workspace-files).
+- **Large text files preview in part.** Text and Markdown previews in the Files
+  pane start with the first 256 KiB, and **Load more** extends them in 256 KiB
+  steps up to 2 MiB; above 512 KiB they used to be refused. **Copy shown text**
+  copies the visible part, and **Download** still saves the whole file. The
+  preview API takes `limit` for a prefix and reports it in `X-Preview-Truncated`,
+  `X-Preview-Bytes` and `X-File-Size`.
+- **Tool cards show the whole call and the whole result.** Each card's call line
+  has a **full call** button that opens the arguments exactly as the model wrote
+  them, credentials redacted, on live cards, after a reload, in sub-agent cards
+  and on calls awaiting approval, so a call can be read in full before it is
+  approved. A result too long for its box gets a **show all** button, which also
+  shows past the 64 KiB display cut. The `tool_pending`, `tool_info` and
+  `approve_request` events now carry each call's `arguments`. Sub-agent cards
+  rebuilt after a reload keep each call's arguments whole instead of cutting
+  them at 2,000 characters; the store they come from is capped at 16 MB of text
+  per open workstream.
+- **Coordinators and `task_agent` are no longer offered models meant for other
+  jobs (#1529).** A new setting, `model.hide_utility_aliases`, on by default,
+  keeps an alias set for Judge, Output guard judge, Speech-to-text,
+  Text-to-speech, Perception or Reranker out of a coordinator's `list_nodes` and
+  `task_agent`'s alias list. Rerankers and speech-only models, which can't hold a
+  chat, are never listed. The default alias stays listed, naming a hidden alias
+  still works, and the admin console still shows every alias. Rows in
+  `node_metadata`'s `models` entry gain an `offered` flag.
+- **A task agent's open step list closes from its end.** A **hide steps** control
+  under the last step folds the card back to its "N steps" bar. It is absent
+  while a step in the card waits for approval.
+- **Expand all on the admin Settings and Nodes tabs.** A toolbar button opens
+  every section, then reads **collapse all**. A node with one metadata key now
+  reads "(1 key)", not "(1 keys)".
 
 ### Changed
 
-- **The `wait_ended` event carries each child's state without its message.** Its
-  per-child `results` hold `state`, `tokens`, `updated` and `name`, as `wait_progress`
-  does, and the wait's tool result carries the children's text. A consumer that read
-  messages from `wait_ended` reads them from the tool result instead.
+- **`wait_ended` carries each child's state without its message.** Its per-child
+  `results` hold `state`, `tokens`, `updated` and `name`, as `wait_progress`
+  does; a consumer that read messages there reads them from the wait's tool
+  result instead.
+- **The container image runs npx-based MCP servers on Node.js 26** (was 24).
 
 ### Fixed
 
-- **`wait_for_workstream` brings a child's message whole when the coordinator has room
-  for it.** The wait cut each finished child's message at 10 KiB whatever the
-  coordinator's context could hold, so a long report took a second call to
-  `inspect_workstream` and put its first 10 KiB in the context twice. On a small
-  context, a wait whose children's messages together outgrew the room one tool result
-  has was cut in the middle of its JSON, so the model lost some children's ids and
-  states along with their text. The session now fits the result when it adds it to the
-  coordinator's context, against the room it grants then: after any compaction, after
-  the results before it in the same batch, and never less than the 2,048 characters a
-  wait result always gets, and fits it again when redaction lengthens it. A message
-  that fits comes whole; when they don't all fit, as many as fit stay whole, smallest
-  first, so the fewest need a follow-up read, and the rest share what is left, each cut
-  from the end and marked `truncated` with `message_chars`, the whole message's length.
-  A wait result is bounded like any other tool result, by the session's per-result
-  ceiling. The tool's description and the guide for coordinator skill authors say what
-  each way of reading more of a cut message returns, and neither the guide nor the
-  API tour's sequence diagram has a coordinator inspect each child after the wait for
-  its answer.
-- **`web_fetch` keeps the links on a page.** Turning HTML into text dropped every link's
-  target, so the extraction model saw a link's words without its URL and, asked for a
-  link, could only guess one, which the calling model then fetched or cited. Each link
-  now reads `[text](url)`, its target resolved to an absolute URL against the address
-  the page was served from, after any redirects and without credentials, or against its
-  `<base href>`; a link to a named place in the page reads `[text](#fragment)`. Where a
-  target could mislead, the link keeps only its text: when it leads to the page itself,
-  to anything but an http, https or mailto URL, or to a target over 2,048 characters;
-  when a browser would refuse or resolve its href differently; and, after a note saying
-  so, once the page's links have used up the work one fetch spends resolving them,
-  unless the same href was resolved earlier. The page and PDF extraction prompts now
-  share their instructions: treat the source as untrusted, give each URL exactly as the
-  content has it, resolving a relative one against the page URL, which is now the
-  address after redirects with the requested fragment kept, and never invent one. The
-  tool's description tells the calling model to ask for the URLs it needs. Links
-  lengthen a page's text, from 1.1 to 4 times on the pages measured, so a long page
-  reaches its extraction budget sooner; a cut that would end inside a link's target
-  moves to before the link, and one inside a URL written as text moves back to the
-  whitespace before it when that is within 2,048 characters. Comments, and iframe and
-  noembed content, no longer show in the text; title and textarea content shows as
-  written; a `<` that opens no tag shows as text instead of hiding what follows it up to
-  the next `>`; a quoted attribute value that holds a `>` no longer spills into the
-  text, which put kilobytes of markup into some articles' text; and a declarative shadow
-  root's content now shows.
-- **`web_fetch` converts HTML in time proportional to the page's size.** On some
-  malformed markup the conversion's time grew with the square of the page's size. It now
-  reads a page once, front to back.
-- **`open_preview` finds a web page's title, and the place for its `<base href>`, in
-  linear time.** These lookups read a page's first 64 KB; on some malformed markup their
-  time grew with the square of that length. Each now scans it front to back and finds
-  what it found before (#1568).
-- **The output guard no longer reports a credential leak in text it already redacted.**
-  An env line, a JSON secret or a connection string whose value was already a
-  `[REDACTED:...]` marker matched its rule again, so a child's tool result that the
-  child's guard had redacted came back as a new high-risk credential leak every time
-  `inspect_workstream` read it. A value that is exactly a marker now passes. A marker
-  with more text in the same value, or a real secret elsewhere in the result, is
-  flagged and redacted as before.
-- **An `inspect_workstream` result no longer reads as a role injection, and the
-  output guard reads the child's text as written.** The guard scanned the result's
-  JSON encoding, so every system turn in the child's history, such as the memory
-  pointer the session adds, matched the `{"role":"system"` role-injection marker, and
-  the coordinator got a high-risk advisory on every inspect. The encoding also
-  escapes the child's text, so role JSON, a `"password": "..."` secret, an override
-  phrase split across lines or hex shellcode inside a message went unseen, and
-  redacting an env line's value could delete the message after it. The guard now
-  reads each string the result holds as text on its own, and still redacts a string
-  under a secret-named key. Three cases are still evaluated as text, as before: a
-  result that the result fold cut, an inspect that includes provider-native content,
-  whose keys the child's model wrote, and an earlier inspect result stored in the
-  history a coordinator inspects when it inspects itself (#1522).
-
-## [2026-11-04]
+- **A judge model that can't be used is never replaced by another model
+  (#1529).** A set `judge.model`, `judge.output_guard_model` or per-workstream
+  `judge_model` whose alias isn't loaded, or whose client can't be built, used to
+  run on another model, such as the session's own, so the model doing the work
+  could approve its own tool calls through Smart Approvals. That judge now
+  doesn't run: tool calls get no verdict, each waits for a person unless a
+  policy or blanket approval covers it, and the output guard's regex stage
+  judges alone. Each try logs `judge.model_unavailable`, the web UI and terminal
+  show a one-time note, and the judge tries again after Sync to Nodes, a
+  settings edit or a model reload.
+- **Judge settings stay visible and in force (#1529).** The Models tab refuses to
+  delete, disable or rename a model that `judge.model` or
+  `judge.output_guard_model` names (`409 model_in_use`); the model pickers show
+  an unloaded `judge.model` as configured instead of blank; an edit of
+  `judge.model` reaches open workstreams at their next judge batch; and a stored
+  setting that stops decoding keeps the value that last loaded instead of its
+  default. `task_agent` says why a model it named can't run and no longer
+  suggests others.
+- **Opening more coordinators no longer evicts idle ones.** The five-session
+  coordinator cap is removed, so opening coordinators no longer evicts idle
+  sessions and churns the sidebar across browsers. Idle cleanup still applies.
+- **A session create reports a full node only when every slot is busy.** Any
+  other failure answered `429` with the raw error text, which the browser
+  retried as a rate limit; it now answers `500` with a correlation id, and a
+  scheduled task records the firing as unresolved instead of retrying it.
+- **An MCP tool with an invalid input schema no longer breaks the conversations
+  that offer it.** A provider that checks tool schemas refused every request
+  offering such a tool. A tool whose input schema is not valid JSON Schema, or
+  holds NaN or an infinity, is now left out of its server's catalog, and the
+  server's other tools stay available. The log, the server's status
+  (`skipped_tools`), the admin console's MCP Servers list (**tools skipped**) and
+  the connection test name each tool left out and the field that is wrong.
+  Provider rules beyond JSON Schema are not checked. `jsonschema` is now a
+  direct dependency.
+- **`wait_for_workstream` brings a child's message whole when the coordinator
+  has room for it.** It cut every message at 10 KiB, and on a small context a
+  large wait could be cut mid-JSON, losing children's ids and states. The result
+  is now fitted to the room the coordinator's context grants it: when the
+  messages don't all fit, as many as fit stay whole, smallest first, and the
+  rest share what is left, each cut from the end and marked `truncated` with
+  `message_chars`.
+- **`web_fetch` keeps the links on a page.** Each link now reads `[text](url)`,
+  its target resolved to an absolute URL, so the extraction model no longer has
+  to guess a link it was asked for; a target that could mislead keeps only its
+  text. The page and PDF extraction prompts tell the model to give URLs exactly
+  as the content has them and never invent one. Links lengthen a page's text, so
+  a long page reaches its extraction budget sooner. The HTML conversion also
+  drops comments and iframe content, keeps the text after a stray `<`, and no
+  longer spills markup from attribute values into the text.
+- **HTML handling in `web_fetch` and `open_preview` takes linear time (#1568).**
+  On some malformed markup, converting a page, or finding its title and where its
+  `<base href>` goes, took time growing with the square of its size.
+- **The output guard reads an `inspect_workstream` result's text, not its JSON
+  (#1522).** Every inspect raised a role-injection advisory from the child's own
+  system turns, while secrets and injection text escaped inside the JSON went
+  unseen. A value that is exactly a redaction marker also no longer counts as a
+  new credential leak each time a child's redacted result is read.
 
 ### Security
 
-- **The terminal client shows the control characters in text it didn't write.** A
-  carriage return or an escape sequence in a call's command could reprint the approval
-  prompt's line, so the terminal showed `ls -la` for a command that went on to fetch
-  and run a script. The model's reply, printed just before the card, could also turn
-  line wrap off or hide text, so the end of a card never showed even when the card held
-  no control character, and the judge's verdict, printed under the card while the prompt
-  waits, could move the cursor up and rewrite it. Control characters in the model's
-  reply and reasoning, a call's card, the judge's verdict, tool and server errors, and
-  the terminal UI's other lines from outside text (sub-agent steps, system turns, output
-  warnings, background notices) now show as symbols, as on the web cards (an escape as
-  `␛`), and so do those in the doctor command's replies. C1 controls, which some
-  terminals act on as escapes (U+009B starts a command as `ESC [` does), show as an
-  escape and its 7-bit form (`␛[`), and a lone surrogate, which a JSON escape can carry
-  and which stdout writes out as raw bytes under a C, POSIX or C.UTF-8 locale, as `�`.
-  The client's own colours still apply. A carriage return just before a line feed in a
-  reply, reasoning or an error prints as the line break it is; a card shows every one,
-  since in a command it changes what runs. A verdict's summary, which quotes the call or
-  is the judge's own words, prints on one line of at most 400 characters, so its line
-  feeds can't push the card off screen. Text the CLI prints outside the terminal UI's
-  lines still prints as sent, for example messages the session composes with its own
-  colours, such as `/history`, workstream names and titles in the prompt, the status
-  line and the `/ws` notices, and `/cluster`'s lines, whose activity quotes the start of
-  a call awaiting approval (#1559).
-- **The coordinator's children tree redacts a call awaiting approval and shows its
-  control characters, as the tool cards do.** A child's pending call showed its preview
-  with credentials in the clear and its control characters unseen, the verdict's
-  summary quoted the command with any key in it, and a one-line bash command, which has
-  no preview, showed no command at all, only the tool's name and the verdict. The block
-  now shows the whole preview in its scroll box, or the call's header line when it has
-  none. That text, the verdict's summary, reasoning and evidence, and the policy-block
-  banner have their credentials redacted and their control characters shown as
-  symbols, and a bash command that redaction changed says part of it is hidden (#1559).
+- **Keys and focus no longer approve a call no one meant to approve.** In the
+  interactive and coordinator panes, Enter on a focused **Deny** button approved
+  the call, and a newly arrived approval card or verdict took focus from
+  wherever it was, a text field included, so the next keys typed approved or
+  denied it. A focused control now handles its own Enter, focus moves to a card
+  only when nothing holds it and never in a pane scrolled back, and in the
+  interactive pane Ctrl, Cmd and Alt combinations no longer approve or deny.
+- **Control characters a model or tool writes are shown, not obeyed (#1559).**
+  Tool cards, the approval preview and full call, the terminal client and the
+  coordinator's children tree show them as symbols (an escape as `␛`), so a
+  carriage return or escape sequence can no longer make a command read `ls -la`
+  when it goes on to fetch and run a script. An MCP server's error text, log
+  messages and skipped tool names show every unprintable character, direction
+  overrides and zero-width characters included, as a space.
+- **The children tree redacts a call awaiting approval.** Its preview, the
+  verdict and the policy-block banner showed credentials in the clear, and a
+  one-line bash command showed no command at all; it now shows the call's
+  header line.
+- **More secrets are redacted.** Passwords in `postgres://` URLs, and DSA,
+  encrypted and PGP private keys, are redacted in tool results, the judge's
+  input, logs and the web cards. A private key cut by the coordinator's 64 KiB
+  display limit no longer shows its first lines, and redacting `.env`-style lines
+  or private keys no longer takes time growing with the square of the text's
+  length (9 seconds for 320 KB on the server).
+- **Discord and Slack approval cards show model-written text as written.**
+  Markdown in a command or the judge's summary is escaped, so it can't hide part
+  of a command or add a verdict line or link beneath the real one; the summary
+  is one line of at most 400 characters. On Slack, a call with no preview shows
+  its header line instead of only the tool's name.
 
-## [2026-11-03]
+## [1.9.2]
 
-### Fixed
-
-- **A judge model that can't be used is never replaced by another model.** A set
-  `judge.model`, `judge.output_guard_model` or per-workstream `judge_model` whose
-  alias isn't loaded, or whose client can't be built, used to run on another model
-  with only a log warning: the session's, or for the output guard the next judge
-  setting's. Smart Approvals acted on those verdicts, so the model doing the work
-  could approve its own tool calls. Now that judge doesn't run, as if it were switched
-  off: tool calls get no verdict or risk rating, Smart Approvals approves none of them,
-  and each waits for a person unless a policy or blanket approval already covers it.
-  The output guard's regex stage judges alone. Each try logs why
-  (`judge.model_unavailable`), and for the intent judge the web UI and terminal show a
-  one-time note; channel bots don't. A judge tries again after Sync to Nodes, a settings
-  edit, or a model reload that changes something. An empty setting inherits as before. After upgrading, check any `judge.model` that
-  holds a raw model id or a removed alias: it no longer judges until it names a loaded
-  model (#1529).
-- **The Models tab refuses to remove a model a judge setting names.** Deleting,
-  disabling or renaming a model that `judge.model` or `judge.output_guard_model` names
-  answers 409 `model_in_use`, as for the routing settings, and says what clearing the
-  setting hands the role to. Removing the last enabled model leaves both settings in
-  place, so a set judge stays off until someone repoints it (#1529).
-- **The model pickers report `judge.model` as configured.** One that isn't loaded used
-  to read as blank, so the node picker showed "Default (agent model)" and the console's
-  showed the coordinator's alias. The node picker now labels it "(not available)", and
-  the console's names the configured alias (#1529).
-- **An edit of `judge.model` now reaches open workstreams at their next judge batch.**
-  It used to wait until they reopened. A workstream given its own judge model keeps
-  that one while it stays open (#1529).
-- **A stored setting that stops decoding keeps the value that last loaded.** A reload
-  used to read it as its default, which for `judge.model` moved open workstreams to
-  judging their own calls. A first load still reads it as the default (#1529).
-- **`task_agent` says why a model it named can't run, and lists no others.** The error
-  for an alias that isn't loaded used to call it unknown and list other aliases to use.
-  It now says why and whether trying again can help. On the CLI, which reads its models
-  once, a secret store outage says a restart loads it rather than to try again shortly
-  (#1529).
-- A client that can't be built logs `model_registry.client_construction_failed` with
-  the alias and provider as fields. The message used to print a literal `%r` (#1529).
-
-### Added
-
-- **AI agents are no longer offered models meant for other jobs.** A new setting,
-  `model.hide_utility_aliases`, on by default, keeps an alias set for Judge, Output guard
-  judge, Speech-to-text, Text-to-speech, Perception or Reranker out of a coordinator's
-  `list_nodes` and `task_agent`'s alias list. The default alias stays listed, and naming
-  a hidden alias still works. Rerankers and speech-only models are never listed, since
-  they can't hold a chat. Rows in `node_metadata`'s `models` entry gain an `offered` flag,
-  and the admin console's node views still show every alias. The spawn tools now ask a
-  coordinator to leave `model` out unless the user asked for one, and the coordinator
-  prompt's first tool pattern reads "Discover nodes and skills". These change what a
-  model is shown and asked, not what it can do: it can still name any loaded alias
-  (#1529).
-- **Tool cards show the whole call and the whole result.** A card's summary cut long
-  values short, and nothing on it showed the rest: an MCP argument after 200
-  characters, a fetched URL after 80, every value after 77 once the page reloaded, and
-  on coordinator cards everything past one line. Each card's call line now has a
-  **full call** button that opens the arguments exactly as the model wrote them: each
-  name over its value, strings with their own line breaks, numbers with every digit,
-  credentials redacted as elsewhere on the card. Each value is redacted on its own, so
-  a redaction can't take a neighbouring argument with it, though a private key split
-  across two values is not redacted there. On a bash card, a command or value that
-  redaction changed says part of it is hidden, since a redaction marker can stand for a
-  quote, a space or whole arguments as well as the secret. It works on live cards,
-  after a reload, in sub-agent cards and on calls awaiting approval, so a call can be
-  read in full before it is approved.
-  A result too long for its box is capped there with its own **show all** button,
-  which shows it at full height (past the 64 KiB display cut too) and then reads
-  **collapse**, so opening a call never unfolds its result; a long argument value gets
-  one as well, so Approve and Deny stay in reach. Anything shorter shows whole, so no
-  box hides text without a way to open it. Opening either stops the pane following new
-  output until **Jump to latest**. The `tool_pending`, `tool_info` and
-  `approve_request` events now carry each call's `arguments`, the same text `/history`
-  returns. The node's cluster-wide copy of `approve_request` and the dashboard's
-  pending-approval items leave that text out; as before, a verdict on them carries its
-  own copy of the arguments, cut at 16 KiB. A result shows what the model saw: output
-  past a tool's context budget is still not kept.
-- **Sub-agent cards rebuilt after a reload keep each call's arguments whole.** They
-  were cut at 2,000 characters; step results still are. The in-memory store those cards
-  come from is now capped at 16 MB of text per open workstream as well as 256 finished
-  sub-agents, oldest first, and a sub-agent larger than the whole cap shows as its
-  parent row only.
-
-### Security
-
-- **A key meant for a control no longer decides a call awaiting approval.** In the
-  interactive and coordinator panes, Enter approved the pending call wherever focus was
-  outside a text field, so a keyboard user who tabbed to **Deny** and pressed Enter
-  approved the call, and the Deny never ran. A focused button, link, disclosure or
-  menu now handles its own Enter, and Escape on **full call** or **show all** does
-  nothing. A newly arrived approval card, or a judge's verdict, also moved focus to
-  itself from wherever it was: from a control in the transcript, from **Deny** to
-  **Approve**, and from a text field, the coordinator's composer or another pane's
-  included, so the next keys typed there approved or denied a call no one had read.
-  Focus now moves only when nothing holds it (in the interactive pane the empty
-  composer or the **Send** button, where focus rests after a message is sent, counts as
-  nothing) and never in a pane scrolled back to read; the status bar's approval chip
-  brings the card up. One move still protects: a deny verdict moves focus to **Deny**
-  from the card itself. Outside the feedback field, Ctrl, Cmd and Alt key combinations
-  in the interactive pane no longer approve or deny, so Ctrl+A on a focused button no
-  longer approves the tool for good. The letter shortcuts work as before, and Enter and
-  Escape still approve and deny from anywhere else in the pane.
-- **Tool cards show the control characters a model writes.** The bash command line,
-  the approval preview and the full call deleted escape sequences, and an operating
-  system command sequence took every character after it, so a card could show
-  `ls -la` for a command that went on to fetch and run a script. Control characters in
-  the model's text now show as symbols (an escape as `␛`). The server no longer colours
-  approval previews itself, so every code in one is the model's; the terminal client
-  colours a preview's added and removed lines on its own.
-- **Redacting `.env`-style lines and private keys no longer stalls on long text.** A
-  long run of capital letters with no `=` after it, or many `BEGIN PRIVATE KEY` lines
-  with no `END`, made each candidate rescan the rest of the text, so the time grew
-  with the square of the length: 9 seconds for 320 KB of such tool output on the
-  server, 10 seconds per click on a 160 KB result in the web cards. Both rules now stop
-  where the next match could start. A key cut off before its `END` line (`grep -A`,
-  `head -n`) is redacted up to the next `BEGIN` line, as it was when a complete key
-  followed it, and left as it is when no `BEGIN` follows.
-- **DSA, encrypted and PGP private keys are redacted.** Only RSA, EC, OpenSSH and
-  unlabelled private-key blocks were, so the others reached the model, the judge's
-  provider and the web cards whole.
-- **A private key cut by the coordinator's 64 KiB display limit no longer shows.** The
-  result was cut before it was redacted, so a key the cut ran through lost its `END`
-  line and its first lines showed in the clear. The text is now redacted before it is
-  cut, and the cut stops short of any text the redaction could not see whole.
-- **Approval cards on Discord and Slack show model-written text as written.** On Discord
-  the command and the judge's summary reached the card as Markdown, so `a || b || c` hid
-  `b` as a spoiler, and a summary (the judge's words, or a heuristic template quoting the
-  call's arguments) could add a verdict line or a masked link beneath the real one. Markdown
-  in them and in a verdict's tool name is now escaped and a tool name can't close its code
-  span, so a URL shows as text, not a link, and the summary is one line of at most 400
-  characters after a "Summary:" label. On Slack the summary kept its line breaks and
-  emphasis; it now shows on one line in a code block under the same label, which no run of
-  backticks can close, and neither a run of five or more nor a backtick at either end
-  closes a preview's any more. A URL or channel name on a Slack card no longer becomes a
-  link. A Slack card showed only the tool's name for a call awaiting approval that has no
-  preview, such as a one-line bash command; it now shows the call's header line, up to 600
-  characters. Tool names on Slack sit on one line in a code span.
-
-## [2026-11-01]
-
-### Fixed
-
-- A session create reports a full node only when every session slot is busy. Any
-  other runtime failure during a create also answered 429 with the raw error text,
-  so the browser retried it as a rate limit; it now answers 500 with a correlation
-  id. A scheduled task that hits one records the firing as unresolved instead of
-  retrying it. The coordinator API no longer documents a 429 for create, detail or
-  open, and its create now lists the 409 and 413 it can answer.
-
-## [2026-10-31]
-
-### Fixed
-
-- Remove the five-session coordinator cap so opening more coordinators no longer
-  evicts idle sessions and triggers sidebar churn across browsers. Migration 087
-  removes the retired `coordinator.max_active` setting; idle cleanup still applies.
-
-## [2026-10-30]
-
-### Fixed
-
-- HTTP dictation makes one backend attempt with a 25-second budget shared by
-  preparation, credential minting, DNS, connection setup, upload and response
-  I/O, so a silent backend no longer holds speech capacity through long SDK
-  retries. In-turn transcription keeps its existing timeout and retry behavior
-  (#1509).
-- **A coordinator no longer reads a child it just messaged as finished.** A
-  child shows a dispatched message only once its turn starts, a few seconds
-  later, so a `wait_for_workstream` right after `spawn_workstream`,
-  `spawn_batch` or `send_to_workstream` returned at once with an empty result
-  or the child's previous answer, and a fast model resent the brief. Wait and
-  inspect now report such a child as `starting`, and as `stalled` after 120
-  seconds, with `dispatch_age_s`; the first wait that sees a stall returns
-  early and lists it in `stalled`. Spawn results say when the node didn't take
-  the first message (`initial_message_status`).
-- **A `since` wait no longer reports `complete` before it is.** A
-  `wait_for_workstream` given `since` returned `complete: true` as soon as a
-  listed child changed, even when it had only started working. `complete` now
-  means the any/all condition held; the new `changed` field lists the children
-  whose change ended the wait.
-
-### Security
-
-- **Streamed dictation needs write scope.** `POST
-  /api/workstreams/{ws_id}/speech-to-text/stream`, the route the browser's
-  microphone uses, accepted a read-only token, directly and through the console
-  proxy, while the JSON `speech-to-text` route required write. Both now require
-  write, so a read-only caller can no longer spend the speech-to-text model's
-  capacity or have a backend credential minted for it.
-- **Coordinator governance routes check token scope (#1517).** `POST
-  /api/workstreams/{ws_id}/trust`, `/restrict` and `/close_all_children`
-  accepted a read-only token held by a user with the coordinator permissions,
-  directly and through the console proxy. `trust` now requires `approve` scope,
-  since it lets a coordinator's sends to its own subtree skip approval;
-  `restrict` and `close_all_children` require `write`. Password and SSO
-  sessions are unaffected, since the permissions these routes check already give
-  them `approve`. An API token limited to `read,write`, or a session exchanged
-  from one, can no longer turn trust on or off.
-- **Workstream routes take their scope from the HTTP method.** Every request
-  under `/api/workstreams/` other than GET or HEAD now requires at least
-  `write`, so a route added there can no longer fall through to `read` the way
-  the streamed dictation route and the coordinator routes did.
-
-## [2026-10-29]
-
-> **Before upgrading:** the database advances from migration 084 to 085, which
-> records what each pending MCP sign-in was started against. A sign-in begun
-> before the upgrade fails as expired; connecting again works. A user whose MCP
-> grant was recorded before 1.8.2 with a templated (`{tenantid}`) issuer is
-> asked to connect again at its next refresh.
+> **Before upgrading:** the database advances from migration 084 to 086.
+> Migrations run automatically; upgrade every process that shares the database
+> together.
+>
+> - 085 records what each pending MCP sign-in was started against. A sign-in
+>   begun before the upgrade fails as expired; connecting again works.
+> - 086 gives the built-in admin and operator roles the `files.read` permission.
+>   Holders can read and download any file the node's process can read under its
+>   workspace (its working directory when none is set), `/data` and `/tmp`, with
+>   no model turn or tool approval. Revoke it with a role override where that is
+>   too broad; viewer and custom roles are unchanged.
+> - A user whose MCP grant was recorded before 1.8.2 with a templated
+>   (`{tenantid}`) issuer is asked to connect again at its next refresh.
+> - The consent callback compares `iss` exactly. A server whose Authorization
+>   Server URL names a multi-tenant alias (such as `.../organizations/v2.0`)
+>   can't complete a new consent with an authorization server that sends `iss`
+>   naming the tenant. Set the tenant's own issuer; changing that URL asks the
+>   server's users to connect again.
+> - A caller holding only `read` scope (a read-only API token, a session
+>   exchanged from one, or a viewer) can no longer make a request under
+>   `/api/workstreams/` other than GET or HEAD, and a coordinator's `trust` route
+>   now needs `approve` scope. See **Security** below.
 >
 > Custom storage backends must:
 > - accept and return the new pending-flow fields (`as_issuer`,
@@ -386,8 +213,9 @@ The separate `dev` branch is retired. See [the release process](docs/releasing.m
 > - purge an MCP server's name-keyed OAuth rows inside the transaction that
 >   creates, updates or deletes it, and take `purge_oauth_rows`,
 >   `oauth_client_secret_ct` (written in the same statement; the
->   `MCP_SECRET_UNCHANGED` default leaves it) and `expected` (write only while
->   those columns hold those values) on `update_mcp_server`;
+>   `MCP_SECRET_UNCHANGED` default leaves it and `None` clears it) and `expected`
+>   (write only while those columns hold those values) on `update_mcp_server`; a
+>   rename purges the old and new names' rows whatever `purge_oauth_rows` says;
 > - take `expected_as_issuer` and `expected_access_token_ct` on
 >   `update_oauth_token_after_refresh`, writing only while the row still holds
 >   them, and provide `delete_oauth_token_if_unchanged`;
@@ -397,120 +225,158 @@ The separate `dev` branch is retired. See [the release process](docs/releasing.m
 >   `upsert_oidc_user_credential_for_identity` and
 >   `delete_prompt_template_if_enabled`, each as one transaction;
 >   `delete_oidc_identity` and `delete_oidc_user_credential` are gone (an
->   identity and its credential go only through `unlink_oidc_identity`);
+>   identity and its credential now go through `unlink_oidc_identity`, or with
+>   the account in `delete_user`, which deletes the credential before the
+>   delegated rows);
 > - return only enabled servers' grants from
->   `list_mcp_user_token_reconcile_targets`.
+>   `list_mcp_user_token_reconcile_targets`;
+> - raise `StorageUnavailableError` or SQLAlchemy's `DBAPIError` when a write
+>   fails, which is what the console answers as `503`.
 
-### Security
+### Added
 
-- **MCP sign-ins check the authorization server's `iss` (#1408).** The consent
-  callback compares the response's `iss` with the issuer the user was sent to,
-  and refuses a missing one when the authorization server advertises it
-  (RFC 9207); one that neither sends nor advertises `iss` is not checked this
-  way. The callback also refuses when the server's URL, audience, auth type or
-  authorization server changed since Connect was clicked, checked before the
-  code exchange and again in the transaction that stores the token, so the
-  code goes only to the token endpoint of the authorization server the user was
-  sent to and no token is stored for a server changed meanwhile. A consent
-  replaces the user's earlier grant in that one step, and of two at once the
-  later one stands. An error from the authorization server is shown once the
-  state, the user and `iss` check out, and a response that repeats any
-  parameter is refused.
-- **An MCP server's authorization server stays pinned.** Once discovered, it
-  moves only when an operator changes the server's URL or Authorization Server
-  URL, or when a value stored by an earlier version is refused on its text
-  alone (an IP-literal host, or a bare `localhost` host for a remote server),
-  which is discovered again. A lookup of its host that fails, or that answers
-  with a refused address, now fails the connect or refresh instead of
-  discovering it again. A refresh or a disconnect sends a stored refresh token
-  only to the authorization server that issued it, compared exactly; a grant
-  from any other, including one recorded before 1.8.2 with a templated issuer,
-  is removed, and the user is asked to connect again. A refresh that finishes
-  or fails after the user consented again no longer overwrites or removes the
-  new grant.
-- **An MCP server change and the purge of its sign-ins land together.** A change
-  that rebinds a server's tokens (its name, auth type, URL, authorization server
-  or audience, or an on-behalf-of server's scopes) and every deletion purge its
-  per-user tokens and pending sign-ins in the same transaction; when that fails,
-  the change answers `503` and nothing is changed. A create, update or deletion
-  whose commit was cut off reads the server again: one that landed is audited
-  and reloaded as usual, and when that can't be told the reply says the change
-  may have been saved. Creating or renaming a server also clears tokens left
-  under its new name.
-- **A dynamically registered client never keeps an earlier secret.**
-  Registration saves the client id together with the secret the authorization
-  server returned (or clears the secret when there is none), in one write that
-  applies only while no other registration has saved a client and the server
-  still points where discovery found it; a connect that loses that race uses the
-  winner's client, and one whose write fails, or whose server moved, is refused.
-  A change of the Server URL or the Authorization Server URL of a server that
-  registers dynamically (before or after the save) drops the registered client's
-  id and secret, so that secret never reaches another authorization server. A
-  client secret now commits with the server change it comes with.
-- **Unlinking an OIDC identity takes its delegated access with it, in one
-  step.** The captured credential and the user's minted on-behalf-of MCP and
-  delegated model tokens are deleted in the same transaction as the identity;
-  when storage fails, the unlink answers `503`, changes nothing, and can be
-  retried. The console and every node registered within the last hour then
-  drop the user's cached model tokens from memory, where none is kept longer
-  than that hour, and a host that can't confirm it is named in the reply
-  (`status: "incomplete"`), the audit and the admin page, which also warns when
-  the reply can't be read. Deleting a user evicts the same way. An admin can no
-  longer unlink their own identity.
-- **A delegated token minted while its user is unlinked is never used.**
-  On-behalf-of MCP and model tokens are stored only while the credential that
-  minted them still exists (and an MCP server is still sign-in passthrough),
-  checked in the same transaction, and a token read or minted across a memory
-  eviction is not kept in memory. A token whose store fails is discarded too,
-  and that user's next mint for the server or model waits 30 seconds. A
-  sign-in in progress when its identity is unlinked no longer stores the
-  credential again; it fails instead.
-- **A disabled MCP prompt stays disabled.** When its server stops listing a
-  prompt an admin has disabled, the skill is kept, still disabled, and the
-  prompt returns to it if the server lists it again. An update to a skill
-  deleted meanwhile answers `404` in the admin API, and the `skills` tool
-  reports it to the model; neither records the change as done.
-- **A disabled per-user MCP server is no longer called.** Every tool call,
-  resource read and prompt get for an `oauth_user` or `oauth_obo` server
-  checks that the server is still enabled, before any token refresh or mint
-  (the retry after a `401` included), and a disabled one answers
-  `mcp_server_disabled` on every host without waiting for the reload. Each
-  call checks again once it holds the user's connection to the server, which
-  also refuses a call to a server deleted meanwhile. The first refused call
-  takes the server out of the user's live sessions, and each refusal is
-  logged. Connect for a disabled server answers `404`, the admin tab no
-  longer offers it, the dashboard no longer lists it as waiting for consent,
-  and a consent in progress when it is disabled stores no grant. Session
-  starts neither refresh nor connect it, and the token sweep no longer
-  refreshes its grants.
+- **Files pane.** Browse and retrieve files on a conversation's node without a
+  model turn: select **Files** above an interactive conversation's composer to
+  open its workspace, `/data` or `/tmp`, preview HTML, images, PDFs, Markdown,
+  tables and text, copy source, and download. Successful `write_file` and
+  `edit_file` cards link to the file. The pane is read-only, stays inside the
+  selected location and does not follow symlinks. It requires `files.read`,
+  `write` scope and an active session. These locations are shared by the node's
+  workstreams, so project access does not make them private. See
+  [Files pane](docs/console.md#files-pane) and
+  [its API](docs/api-reference.md#workspace-files).
 
 ### Changed
 
 - **`oauth_registration_mode` accepts only `preregistered` and `dcr`.** The
-  documented `dynamic` never registered a client; setting it is now refused
-  with `400`, while a row that stores it keeps it until changed.
-- **An MCP server update answers `409` when another request changed the
-  server meanwhile.** The update decides its purge and its client changes from
-  the server as it read it, and now applies only while the server still holds
-  those values; otherwise nothing is written.
+  documented `dynamic` never registered a client; setting it now answers `400`,
+  while a row that stores it keeps it until changed.
+- **An MCP server update answers `409` when another request changed the server's
+  name, auth type, URL, Authorization Server URL, audience, scopes or
+  registration mode meanwhile.** Nothing is written in that case.
 - **The OIDC unlink reply reports memory eviction per host.**
   `model_memo_nodes_invalidated` and `model_memo_nodes_failed` give way to
   `model_memo` (the console's result and the nodes evicted, failed and not
   reached) and `model_memo_unconfirmed`; deleting a user replies the same way.
-  The unlink and the user deletion are audited as soon as they commit
+  The unlink and the deletion are audited as soon as they commit
   (`oidc_identity.delete`, `user.delete`), and the eviction's outcome follows as
   `oidc_identity.delete.memo_eviction` or `user.delete.memo_eviction`. A write
-  whose commit was cut off but which took effect answers `incomplete` with the
-  unlink's counts `null`; when that can't be told, the reply is a `503` saying
-  the change may have been saved. The unlink confirmation now says that the
-  next OIDC sign-in creates a new user.
-- **Skills mirrored from an MCP server cannot be unlocked or renamed.**
-  Unlocking one answers `400`, and the skill editor no longer offers it. A
-  locked skill's update applies only its runtime config and ignores every other
-  field; renaming a mirrored skill unlocked before this release answers `400`.
-- **A skill update leaves an optional field sent as `null` unchanged.** It used
-  to store the text `None` in fields such as the name or content, clear the
-  tags, or reset the priority.
+  whose commit was cut off but took effect answers `incomplete` with the unlink's
+  counts `null`; when that can't be told, the reply is a `503` saying the change
+  may have been saved.
+- **Skills mirrored from an MCP server cannot be unlocked or renamed.** Unlocking
+  one answers `400`. A locked skill's update applies only its runtime config and
+  ignores every other field, and renaming a mirrored skill unlocked before this
+  release answers `400`.
+- **A skill update treats `null` as "leave unchanged" for optional fields such as
+  the name, content, tags and priority.** It used to store the text `None` in the
+  name or content, clear the tags, or reset the priority. `description`, `kind`,
+  `enabled`, `auto_approve` and `allowed_tools` answer `400` to `null`.
+
+### Fixed
+
+- **A coordinator no longer reads a child it just messaged as finished.** A
+  `wait_for_workstream` right after `spawn_workstream`, `spawn_batch` or
+  `send_to_workstream` could return at once with an empty result or the child's
+  previous answer, and a fast model resent the brief. Wait and inspect now report
+  a child that hasn't started a spawn's first message, or a send to it while
+  idle, as `starting`, and as `stalled` after 120 seconds, with `dispatch_age_s`;
+  the first wait that sees a stall returns early and lists it in `stalled`. The
+  report lapses after 10 minutes, and a console restart or a send from elsewhere
+  shows none. Spawn results say when the node didn't take the first message
+  (`initial_message_status`). A response that includes a wait now runs its tool
+  calls one at a time, in order.
+- **A `wait_for_workstream` given `since` no longer reports `complete` early.**
+  It returned `complete: true` as soon as a listed child changed, even one that
+  had only started working. `complete` now means the any/all condition held; the
+  new `changed` field lists the children whose change ended the wait.
+- **Dictation can't hold speech capacity through long retries (#1509).** HTTP
+  dictation makes one backend attempt with a 25-second budget shared by
+  preparation, credential minting, DNS, connection setup, upload and response
+  I/O. A backend error or timeout answers `502`, or ends a streamed transcript
+  that has already begun, and a long clip may now fail where it used to succeed
+  late. In-turn transcription keeps its timeout and retries.
+- **A configuration-file MCP server with a `url` and no `type` shows its real
+  transport (#1494).** It connects over Streamable HTTP, but the console showed
+  it as stdio with an empty command and no URL.
+
+### Security
+
+- **MCP sign-ins check the authorization server's `iss` (#1408).** The consent
+  callback compares `iss` with the issuer the user was sent to, and refuses a
+  missing one when the authorization server advertises it (RFC 9207); one that
+  neither sends nor advertises `iss` gets no protection from this check. The
+  callback also refuses when the server's URL, audience, auth type or
+  authorization server changed since Connect was clicked, before the code
+  exchange and again when storing the token. A response that repeats any
+  parameter is refused.
+- **An MCP server's authorization server stays pinned.** Once discovered, it
+  moves only when an operator changes the server's URL or Authorization Server
+  URL or takes it off `oauth_user`, or when a value stored by an earlier version
+  is refused on its text alone (an IP-literal host, or a bare `localhost` host
+  for a remote server). A lookup of its host that fails or answers with a refused
+  address now fails the connect or refresh. A refresh or disconnect sends a
+  stored refresh token only to the authorization server that issued it; a grant
+  from any other is removed, and the user is asked to connect again. A refresh
+  that finishes or fails after the user consented again no longer overwrites or
+  removes the new grant.
+- **An MCP server change and the purge of its sign-ins land together.** A change
+  that rebinds a server's tokens (its name, auth type, URL, authorization server
+  or audience, or an on-behalf-of server's scopes), and every deletion, purge its
+  per-user tokens and pending sign-ins in one transaction; when that fails, the
+  change answers `503` and nothing is changed. A write whose commit was cut off
+  reads the server again, and when that can't tell, the reply says the change may
+  have been saved. Creating or renaming a server also clears tokens left under
+  its new name.
+- **A dynamically registered client never keeps an earlier secret.** Registration
+  saves the client id and secret in one write that applies only while no other
+  registration has saved a client and the server still points where discovery
+  found it. Changing the Server URL or Authorization Server URL of a server that
+  registers dynamically drops both, so that secret never reaches another
+  authorization server.
+- **Unlinking an OIDC identity takes its delegated access with it, in one step.**
+  The captured credential and the user's on-behalf-of MCP and delegated model
+  tokens are deleted in the identity's transaction; when storage fails, the
+  unlink answers `503` and changes nothing. The console and every node registered
+  within the last hour then drop the user's cached model tokens, which no host
+  keeps in memory longer than that hour, and a host that can't confirm it is
+  named in the reply (`status: "incomplete"`), the audit and the admin page.
+  Deleting a user evicts the same way. An admin can no longer unlink their own
+  identity.
+- **A delegated token minted while its user is unlinked is never used.**
+  On-behalf-of MCP and model tokens are stored only while the credential that
+  minted them still exists (and an MCP server is still sign-in passthrough),
+  checked in the same transaction. A token whose store fails is discarded, and
+  that user's next mint for the server or model waits 30 seconds. A sign-in in
+  progress when its identity is unlinked now fails instead of storing the
+  credential again.
+- **A disabled per-user MCP server is no longer called.** Every tool call,
+  resource read and prompt get for an `oauth_user` or `oauth_obo` server checks
+  that the server is still enabled, before any token refresh or mint, and a
+  disabled one answers `mcp_server_disabled` on every host without waiting for
+  the reload. The first refused call takes the server out of the user's live
+  sessions, and each refusal is logged. Connect for a disabled server answers
+  `404`, a consent in progress when it is disabled stores no grant, and session
+  starts and the token sweep no longer refresh its grants.
+- **A disabled MCP prompt stays disabled.** When its server stops listing a prompt
+  an admin has disabled, the skill is kept, still disabled, and the prompt returns
+  to it if the server lists it again. An update to a skill deleted meanwhile
+  answers `404` in the admin API, and the `skills` tool reports it to the model.
+- **Streamed dictation needs write scope.** `POST
+  /api/workstreams/{ws_id}/speech-to-text/stream`, the route the browser's
+  microphone uses, accepted a read-only token, directly and through the console
+  proxy. A read-only caller can no longer spend the speech-to-text model's
+  capacity or have a backend credential minted for it.
+- **Coordinator governance routes check token scope (#1517).** `POST
+  /api/workstreams/{ws_id}/trust`, `/restrict` and `/close_all_children` accepted
+  a read-only token held by a user with the coordinator permissions. `trust` now
+  requires `approve` scope, and the other two `write`. Password and SSO sessions
+  of users with these permissions are unaffected, since those permissions give
+  them `approve`; an API token limited to `read,write`, or a session exchanged
+  from one, can no longer turn trust on or off.
+- **Workstream routes take their scope from the HTTP method.** Every request under
+  `/api/workstreams/` other than GET or HEAD now requires at least `write`, so a
+  route added there can no longer fall through to `read`.
 
 ## [1.9.1]
 

@@ -186,6 +186,7 @@ export type {
   ListSettingSchemaResponse,
   UpdateSettingOptions,
   // MCP server types
+  McpSkippedTool,
   McpServerStatus,
   McpServerDetail,
   ListMcpServersResponse,

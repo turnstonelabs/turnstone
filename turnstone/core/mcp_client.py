@@ -25,8 +25,10 @@ import contextlib
 import contextvars
 import functools
 import gc
+import hashlib
 import json
 import logging
+import math
 import os
 import random
 import signal
@@ -37,7 +39,7 @@ import urllib.parse
 import uuid
 import weakref
 from contextlib import AsyncExitStack
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
 from http import HTTPStatus
 from pathlib import Path
@@ -98,6 +100,8 @@ from turnstone.core.sse_limits import MAX_SSE_EVENT_SIZE
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Coroutine, Sequence
+
+    from jsonschema.protocols import Validator
 
     from turnstone.core.mcp_utils import ConnectFailureKind
 
@@ -869,6 +873,37 @@ def _make_capturing_http_client(
 # MCP ↔ OpenAI schema conversion
 # ---------------------------------------------------------------------------
 
+# Longest tool name a server's status shows for a tool its catalog leaves out.
+_SKIPPED_TOOL_NAME_MAX_LEN = 128
+# Most tools a log line about a catalog's tools left out names; it counts the rest.
+_SKIPPED_TOOLS_LOGGED_MAX = 10
+# Input-schema verdicts by a digest of the schema's compact JSON text; see
+# :func:`_cached_input_schema_problem`.
+_INPUT_SCHEMA_VERDICTS: dict[bytes, str | None] = {}
+_INPUT_SCHEMA_VERDICTS_MAX = 4096
+# hashlib hands off the GIL for an update of 2 KiB or more; the digest is fed less at a time.
+_INPUT_SCHEMA_DIGEST_CHUNK = 2047
+# The verdict on a schema deeper than the validator's recursion reaches, which depends on how deep
+# the caller's own stack is.
+_INPUT_SCHEMA_TOO_DEEP = "inputSchema is nested too deeply to check"
+
+
+@dataclass(frozen=True)
+class SkippedTool:
+    """A tool an MCP server lists that its catalog leaves out, and why.
+
+    Both fields are display text, on one line and bounded. ``reason`` names the field of the tool's
+    input schema that is wrong and what is wrong with it, never the field's value.
+    """
+
+    name: str
+    reason: str
+
+
+def _tool_input_schema(tool: mcp_types.Tool) -> dict[str, Any]:
+    """*tool*'s input schema, or an empty object schema when it has none."""
+    return tool.input_schema or {"type": "object", "properties": {}}
+
 
 def _mcp_to_openai(server_name: str, tool: mcp_types.Tool) -> dict[str, Any]:
     """Convert a single MCP tool definition to OpenAI function-calling format.
@@ -876,19 +911,171 @@ def _mcp_to_openai(server_name: str, tool: mcp_types.Tool) -> dict[str, Any]:
     The tool name is prefixed ``mcp__{server}__{original}`` to avoid
     collisions with built-in tools and to identify the owning server.
     """
-    input_schema = tool.input_schema or {
-        "type": "object",
-        "properties": {},
-    }
     description = tool.description or ""
     return {
         "type": "function",
         "function": {
             "name": f"mcp__{server_name}__{tool.name}",
             "description": description,
-            "parameters": input_schema,
+            "parameters": _tool_input_schema(tool),
         },
     }
+
+
+def _input_schema_problem(schema: dict[str, Any]) -> str | None:
+    """What makes *schema*, a tool's input schema, invalid JSON Schema, or None when it is valid.
+
+    The schema is checked against the metaschema of the dialect its ``$schema`` names when that is
+    draft-06, draft-07, 2019-09 or 2020-12, under either URI scheme, and against 2020-12, the
+    dialect MCP assumes, otherwise. Earlier drafts are checked as 2020-12 too: draft-03 takes any
+    string as a type name, which a provider that checks schemas refuses. Only the structure is
+    checked: with format checks off, a ``pattern`` is not compiled as a Python regular expression,
+    whose syntax differs from the ECMA-262 syntax JSON Schema uses, so a pattern that only Python
+    rejects does not make the schema invalid. The words name the first wrong field by its path and
+    say what is wrong with it, and count the others; like :func:`_invalid_page_error`, they leave
+    out the field's value. A schema holding NaN or an infinity is invalid: the SDK parses ``NaN``,
+    ``Infinity`` and an out-of-range literal such as ``1e400``, but no JSON text carries them, and
+    the provider SDKs refuse to send a request that holds one. A schema nested too deeply for the
+    validator's recursion is reported as such: a schema that cannot be checked is not taken as
+    valid.
+    """
+    stack: list[tuple[tuple[str | int, ...], Any]] = [((), schema)]
+    while stack:
+        where, value = stack.pop()
+        if isinstance(value, float) and not math.isfinite(value):
+            return _schema_problem_text(where, "is NaN or an infinity, which JSON cannot carry")
+        if isinstance(value, dict):
+            stack.extend(((*where, key), item) for key, item in reversed(value.items()))
+        elif isinstance(value, list):
+            stack.extend(((*where, i), item) for i, item in reversed(list(enumerate(value))))
+    # Imported here, as the SDK does: the validator's import costs every process that never
+    # connects to a server.
+    from jsonschema import (
+        Draft6Validator,
+        Draft7Validator,
+        Draft201909Validator,
+        Draft202012Validator,
+    )
+    from jsonschema.exceptions import best_match
+
+    dialects: dict[str, type[Validator]] = {
+        "json-schema.org/draft-06/schema": Draft6Validator,
+        "json-schema.org/draft-07/schema": Draft7Validator,
+        "json-schema.org/draft/2019-09/schema": Draft201909Validator,
+        "json-schema.org/draft/2020-12/schema": Draft202012Validator,
+    }
+    declared = schema.get("$schema")
+    dialect: type[Validator] = Draft202012Validator
+    if isinstance(declared, str):
+        # A URI scheme is case-insensitive; without one, the URI names no dialect.
+        scheme, separator, rest = declared.strip().partition("://")
+        if separator and scheme.lower() in ("http", "https"):
+            dialect = dialects.get(rest.removesuffix("#"), Draft202012Validator)
+    metaschema = dialect(dialect.META_SCHEMA, format_checker=None)
+    try:
+        errors = list(metaschema.iter_errors(schema))
+        error = best_match(errors)
+    except RecursionError:
+        return _INPUT_SCHEMA_TOO_DEEP
+    if error is None:
+        return None
+    # A ``type`` that names no JSON Schema type fails both branches of the metaschema's anyOf, and
+    # the two errors tie; the one from the list of type names says what the field may be.
+    error = next((e for e in error.context if e.validator == "enum"), error)
+    # The validator's messages open with the offending value; keep what they say about it.
+    value = repr(error.instance)
+    if error.message.startswith(value):
+        words = error.message[len(value) :].strip()
+    else:
+        words = "is not valid JSON Schema"
+    # The 2020-12 metaschema joins the metaschemas of its vocabularies, and each checks the same
+    # value: a field that is not a schema at all is reported once by each. Count each error once.
+    more = len({(tuple(e.absolute_path), e.message) for e in errors}) - 1
+    suffix = f" ({more} more error{'s' if more > 1 else ''})" if more else ""
+    return _schema_problem_text(error.absolute_path, f"{words}{suffix}")
+
+
+def _schema_problem_text(parts: Sequence[str | int], words: str) -> str:
+    """The path *parts* into a tool's input schema, then *words*, on one bounded line.
+
+    The path reads ``inputSchema`` then ``.name`` for a key and ``[i]`` for an index. A path too
+    long for the line loses its start, so the words, and the field they are about, always show.
+    """
+    path = "inputSchema" + "".join(f"[{p}]" if isinstance(p, int) else f".{p}" for p in parts)
+    room = _MAX_ERROR_TEXT_LEN - len(words) - 1
+    if len(path) > room:
+        kept = max(room - len("inputSchema..."), 0)
+        path = "inputSchema..." + (path[-kept:] if kept else "")
+    return _sanitize_error_text(f"{path} {words}")
+
+
+def _cached_input_schema_problem(schema: dict[str, Any]) -> str | None:
+    """:func:`_input_schema_problem`, remembered by a digest of the schema's text.
+
+    Listing a catalog again (a refresh, a reconnect, each user's connect to a per-user server)
+    mostly repeats schemas already checked, and a check costs some hundreds of times as much as
+    writing the schema out and hashing it. The text goes into the digest less than 2 KiB at a time:
+    hashlib hands off the GIL for more, and while another thread is busy, each hand-off holds this
+    one up for as long as a switch interval. The verdicts are cleared all at once when they fill, so
+    a server that keeps changing its schemas cannot grow them. A schema too deep to check is checked
+    again each time, since that verdict depends on the caller's stack as well as on the schema.
+    """
+    try:
+        data = memoryview(json.dumps(schema, separators=(",", ":")).encode())
+    except (TypeError, ValueError, RecursionError):
+        return _input_schema_problem(schema)
+    digest = hashlib.sha256()
+    for start in range(0, len(data), _INPUT_SCHEMA_DIGEST_CHUNK):
+        digest.update(data[start : start + _INPUT_SCHEMA_DIGEST_CHUNK])
+    key = digest.digest()
+    try:
+        return _INPUT_SCHEMA_VERDICTS[key]
+    except KeyError:
+        pass
+    verdict = _input_schema_problem(schema)
+    if verdict != _INPUT_SCHEMA_TOO_DEEP:
+        if len(_INPUT_SCHEMA_VERDICTS) >= _INPUT_SCHEMA_VERDICTS_MAX:
+            _INPUT_SCHEMA_VERDICTS.clear()
+        _INPUT_SCHEMA_VERDICTS[key] = verdict
+    return verdict
+
+
+def _split_tools(
+    tools: Sequence[mcp_types.Tool],
+) -> tuple[list[mcp_types.Tool], tuple[SkippedTool, ...]]:
+    """*tools*, split into those a catalog publishes and those it leaves out.
+
+    A tool whose input schema is not valid JSON Schema is left out, whichever model the catalog
+    serves. A provider that checks the schemas it is sent refuses the whole request when one is
+    invalid, so the tool would fail every model request that offers it; with tool search, that is
+    every request after a search loads it, for the rest of the conversation. The server's other
+    tools stay published, and its status lists the tools left out, each with its reason. The
+    connection test splits here; every path that publishes a catalog goes through
+    :func:`_catalog_tools`.
+    """
+    published: list[mcp_types.Tool] = []
+    skipped: list[SkippedTool] = []
+    for tool in tools:
+        problem = _cached_input_schema_problem(_tool_input_schema(tool))
+        if problem is None:
+            published.append(tool)
+        else:
+            name = _sanitize_error_text(tool.name, _SKIPPED_TOOL_NAME_MAX_LEN)
+            skipped.append(SkippedTool(name, problem))
+    return published, tuple(skipped)
+
+
+def _catalog_tools(
+    server_name: str, tools: Sequence[mcp_types.Tool]
+) -> tuple[list[dict[str, Any]], tuple[SkippedTool, ...]]:
+    """*server_name*'s catalog entries for its *tools*, and the tools the catalog leaves out.
+
+    The one way to turn a server's tools into catalog entries, so no path can publish a tool
+    without the check of :func:`_split_tools`. Nothing is logged here: the path logs what it
+    leaves out once it publishes (:meth:`MCPClientManager._publish_tool_catalog`).
+    """
+    published, skipped = _split_tools(tools)
+    return [_mcp_to_openai(server_name, tool) for tool in published], skipped
 
 
 class MCPSecretReferenceError(RuntimeError):
@@ -1483,22 +1670,26 @@ def _prompt_entries(server_name: str, prompts: list[mcp_types.Prompt]) -> list[d
 
 # Longest recorded or reported server-error text; see :func:`_sanitize_error_text`.
 _MAX_ERROR_TEXT_LEN = 256
-# A server's error text can carry control characters, which would rewrite a terminal that shows
-# the log or forge a line in it: each reads as a space, and a carriage return as nothing.
-_ERROR_TEXT_CONTROLS: dict[int, str | None] = {
-    **dict.fromkeys([*range(0x20), *range(0x7F, 0xA0), 0x2028, 0x2029], " "),
-    0x0D: None,
-}
 
 
 def _sanitize_error_text(msg: str, limit: int = _MAX_ERROR_TEXT_LEN) -> str:
     """Single-line, bounded rendering of a server's error text, with no control characters.
 
     ONE pipeline for every surface that reports one (``_last_error``, the pool discovery record,
-    the connection test) so a future sanitizer hardening cannot land on one and silently miss
-    another.
+    the connection test, the tools a catalog leaves out, the server's own log messages) so a future
+    sanitizer hardening cannot land on one and silently miss another.
+
+    Each character ``str.isprintable`` refuses reads as a space, as in the console's log previews
+    (``turnstone/console/log_preview.py``), and a carriage return as nothing. That covers the
+    controls that would rewrite a terminal showing the log or forge a line in it, and the format
+    characters (direction overrides, zero-width and tag characters) that would reorder or hide what
+    the admin console shows. Joiners and direction marks go too, so text in a script that needs them
+    reads with a space where each was.
     """
-    return msg[: max(limit * 4, 1024)].translate(_ERROR_TEXT_CONTROLS).strip()[:limit]
+    text = msg[: max(limit * 4, 1024)].replace(chr(13), "")
+    if not text.isprintable():
+        text = "".join(ch if ch.isprintable() else " " for ch in text)
+    return text.strip()[:limit]
 
 
 class ServerUnreachableError(ConnectionError):
@@ -1740,9 +1931,14 @@ def classify_connect_failure(
 
 @dataclass(frozen=True)
 class ConnectionProbe:
-    """What one connection test found: the server's catalog, or why it could not be read."""
+    """What one connection test found: the server's catalog, or why it could not be read.
+
+    ``tools`` names the tools a connect would publish; ``skipped_tools`` are the ones it would leave
+    out (:func:`_split_tools`).
+    """
 
     tools: list[str] = field(default_factory=list)
+    skipped_tools: tuple[SkippedTool, ...] = ()
     resources: int = 0
     prompts: int = 0
     failure: ConnectFailure | None = None
@@ -2065,8 +2261,10 @@ async def _probe_http_server(
         failure = classify_connect_failure(exc, capture)
         message = _sanitize_error_text(failure.message, _PROBE_ERROR_MAX_LEN)
         return ConnectionProbe(failure=replace(failure, message=message))
+    published, skipped_tools = _split_tools(tools)
     return ConnectionProbe(
-        tools=[tool.name for tool in tools],
+        tools=[tool.name for tool in published],
+        skipped_tools=skipped_tools,
         resources=len(resources) + len(templates),
         prompts=len(prompts),
     )
@@ -2087,9 +2285,10 @@ def probe_http_server(
     labels the server in error messages; the URL's host stands in when it is empty.
     *tls_skip_verify* accepts any certificate, as a saved server with that setting does.
 
-    Blocks the calling thread for up to :func:`probe_http_server_max_s`. The test runs on an event
-    loop of its own, so a fault inside the SDK stays in this thread instead of stalling the
-    caller's loop.
+    Blocks the calling thread for up to :func:`probe_http_server_max_s`, plus the time the check of
+    the listed tools' input schemas takes once the server has answered (a few milliseconds a tool),
+    which no timeout cuts short. The test runs on an event loop of its own, so a fault inside the
+    SDK stays in this thread instead of stalling the caller's loop.
     """
     label = name or urllib.parse.urlparse(url).hostname or url
     loop = asyncio.new_event_loop()
@@ -2169,6 +2368,9 @@ class StaticServerState:
     http_capture: _AuthCapture | None = None
     http_fired_event: asyncio.Event | None = None
     tools: list[dict[str, Any]] = field(default_factory=list)
+    # The tools the server lists that ``tools`` leaves out (see ``_split_tools``): published and
+    # withdrawn with ``tools`` (see ``MCPClientManager._publish_tool_catalog``).
+    skipped_tools: tuple[SkippedTool, ...] = ()
     resources: list[dict[str, Any]] = field(default_factory=list)
     prompts: list[dict[str, Any]] = field(default_factory=list)
     # Dispatch counter for the health-loop eviction interlock (mirrors
@@ -2224,6 +2426,9 @@ class PoolEntryState:
     # in; left ``None`` here so 200-entry pools don't retain 600 empty
     # list objects.
     tools: list[dict[str, Any]] | None = None
+    # The tools the server lists that ``tools`` leaves out (see ``_split_tools``): published and
+    # withdrawn with ``tools`` (see ``MCPClientManager._publish_tool_catalog``).
+    skipped_tools: tuple[SkippedTool, ...] = ()
     resources: list[dict[str, Any]] | None = None
     prompts: list[dict[str, Any]] | None = None
     last_used: float = 0.0
@@ -4110,7 +4315,7 @@ class MCPClientManager:
                 timeout=self._CONNECT_TIMEOUT,
                 reap_grace=self._OWNER_CANCEL_GRACE_S,
             )
-            server_tools: list[dict[str, Any]] = [_mcp_to_openai(name, tool) for tool in tools]
+            server_tools, skipped_tools = _catalog_tools(name, tools)
             server_resources = _resource_entries(name, resources, templates)
             server_prompts = _prompt_entries(name, prompts)
 
@@ -4137,7 +4342,7 @@ class MCPClientManager:
         state.supports_resource_list_changed = supports_resource_list_changed
         state.supports_prompts = supports_prompts
         state.supports_prompt_list_changed = supports_prompt_list_changed
-        state.tools = server_tools
+        self._publish_tool_catalog(state, name, server_tools, skipped_tools)
         state.resources = server_resources
         state.prompts = server_prompts
         self._rebuild_tools()
@@ -4765,7 +4970,7 @@ class MCPClientManager:
         # failure tears the transport down and must leave the entry's
         # (retained) catalog exactly as it was, never half-updated with
         # the per-user maps still holding the old view.
-        server_tools = [_mcp_to_openai(server_name, tool) for tool in tools]
+        server_tools, skipped_tools = _catalog_tools(server_name, tools)
 
         # Phase 7b — discover resources (capability-gated). Same anyio /
         # ``asyncio.timeout`` invariant as the tool discovery above (R1).
@@ -4834,7 +5039,7 @@ class MCPClientManager:
                 f"MCP pool server '{server_name}' transport died before catalog commit"
             )
 
-        entry.tools = server_tools
+        self._publish_tool_catalog(entry, server_name, server_tools, skipped_tools)
         entry.resources = server_resources if resources_cap is not None else None
         entry.prompts = server_prompts if prompts_cap is not None else None
 
@@ -5832,6 +6037,44 @@ class MCPClientManager:
 
     # -- tool refresh --------------------------------------------------------
 
+    def _publish_tool_catalog(
+        self,
+        state: StaticServerState | PoolEntryState,
+        server_name: str,
+        tools: list[dict[str, Any]],
+        skipped: tuple[SkippedTool, ...],
+    ) -> None:
+        """Publish *tools* and *skipped*, from :func:`_catalog_tools`, as *state*'s catalog.
+
+        Every path that publishes a server's tools does it here, at its commit point, so the tools
+        left out always change with the tools published. A warning names them, and the user whose
+        catalog it is for a per-user server, when they differ in any order from the ones *state*
+        published last. A refresh or re-list that finds the same tools left out logs nothing. A
+        catalog published afresh logs them once: after a failure that withdrew the catalog, after
+        the server was added again, and at each user's connect to a per-user server.
+        """
+        previous = state.skipped_tools
+        state.tools = tools
+        state.skipped_tools = skipped
+        if not skipped or frozenset(skipped) == frozenset(previous):
+            return
+        named = "; ".join(f"{t.name!r} ({t.reason})" for t in skipped[:_SKIPPED_TOOLS_LOGGED_MAX])
+        unnamed = len(skipped) - _SKIPPED_TOOLS_LOGGED_MAX
+        user = (
+            f" [user={_sanitize_error_text(state.key[0], 64)}]"
+            if isinstance(state, PoolEntryState)
+            else ""
+        )
+        log.warning(
+            "MCP server '%s'%s lists %d tool(s) whose input schema is not valid JSON Schema, "
+            "left out of its catalog: %s%s",
+            server_name,
+            user,
+            len(skipped),
+            named,
+            f"; and {unnamed} more" if unnamed > 0 else "",
+        )
+
     def _rebuild_tools(self) -> None:
         """Rebuild merged ``_tools`` and ``_tool_map`` from per-server state.
 
@@ -6041,10 +6284,10 @@ class MCPClientManager:
         # sibling (:meth:`_refresh_pool_server_tools`) already complies.
         async with asyncio.timeout(self._CONNECT_TIMEOUT):
             tools = await _list_all_tools(session, name)
-        server_tools = [_mcp_to_openai(name, tool) for tool in tools]
+        server_tools, skipped_tools = _catalog_tools(name, tools)
         new_names = {t["function"]["name"] for t in server_tools}
 
-        state.tools = server_tools
+        self._publish_tool_catalog(state, name, server_tools, skipped_tools)
         self._rebuild_tools()
 
         added = sorted(new_names - old_names)
@@ -6093,9 +6336,9 @@ class MCPClientManager:
             # list_tools was in flight — this result belongs to the
             # old entry; publishing it would clobber the new one.
             return [], []
-        server_tools = [_mcp_to_openai(server_name, tool) for tool in tools]
+        server_tools, skipped_tools = _catalog_tools(server_name, tools)
         new_names = {t["function"]["name"] for t in server_tools}
-        entry.tools = server_tools
+        self._publish_tool_catalog(entry, server_name, server_tools, skipped_tools)
         self._rebuild_user_tool_map(user_id)
         # Fire user-keyed AND admin (None) listeners. Other users'
         # listeners do NOT see this change — the pool catalog is private.
@@ -7698,6 +7941,7 @@ class MCPClientManager:
             prompts_changed = bool(failed_state and failed_state.prompts)
             if failed_state is not None:
                 failed_state.tools = []
+                failed_state.skipped_tools = ()
                 failed_state.resources = []
                 failed_state.prompts = []
                 failed_state.supports_list_changed = False
@@ -7870,6 +8114,7 @@ class MCPClientManager:
                     fail_state = self._static_servers.get(name)
                     if fail_state is not None:
                         fail_state.tools = []
+                        fail_state.skipped_tools = ()
                         fail_state.resources = []
                         fail_state.prompts = []
                         self._drop_static_session_and_stamp(name, fail_state)
@@ -8100,6 +8345,7 @@ class MCPClientManager:
             return text
         tools, resources, prompts = state.tools, state.resources, state.prompts
         state.tools, state.resources, state.prompts = [], [], []
+        state.skipped_tools = ()
         if tools:
             self._rebuild_tools()
         if resources:
@@ -8180,6 +8426,11 @@ class MCPClientManager:
         return {
             "connected": connected,
             "tools": len(state.tools) if state is not None and state.session is not None else 0,
+            "skipped_tools": (
+                [asdict(tool) for tool in state.skipped_tools]
+                if state is not None and state.session is not None
+                else []
+            ),
             "resources": (
                 len(state.resources) if state is not None and state.session is not None else 0
             ),
@@ -8204,22 +8455,24 @@ class MCPClientManager:
     ) -> dict[str, Any]:
         """Live status for an ``auth_type='oauth_user'`` server, scoped to *user_id*.
 
-        These have no global session (stripped from ``_server_configs`` /
-        ``_static_servers``); they connect per-user into ``_user_pool_entries``.
-        ``connected`` and the catalog counts reflect ONLY the requesting user's
-        warm pool entry — never another user's. The per-user pool is per-user
-        data, and ``connected`` / ``tools`` / ``resources`` / ``prompts`` reach
-        read-scoped callers over the wire, so deriving them from an arbitrary
-        other user's pool would leak that user's catalog (and its existence) to
-        anyone with read scope. A request with no user context (``user_id``
-        falsy, e.g. an operator refresh/reconnect) reports ``connected=False``.
+        These have no global session (stripped from ``_server_configs`` / ``_static_servers``); they
+        connect per-user into ``_user_pool_entries``. ``connected`` and the catalog counts reflect
+        ONLY the requesting user's warm pool entry — never another user's. The per-user pool is
+        per-user data, and ``connected`` / ``tools`` / ``resources`` / ``prompts`` reach read-scoped
+        callers over the wire, so deriving them from an arbitrary other user's pool would leak that
+        user's catalog (and its existence) to anyone with read scope. A request with no user context
+        (``user_id`` falsy) reports ``connected=False``.
 
-        ``aggregate=True`` is the admin cluster-health view: ``connected`` and a
-        representative catalog count reflect ANY user's warm pool. It is gated at
-        the endpoint on the ``admin.mcp`` permission, whose holders already see
-        cross-user MCP state (consent counts, server config), so it is not a new
-        disclosure — it restores the "in use by anyone" pill for operators
-        without exposing one user's pool to another read-scoped user.
+        ``aggregate=True`` is the cluster-health view: ``connected``, a representative catalog count
+        and the tools that catalog leaves out reflect ANY user's warm pool. Callers pass it for
+        holders of ``admin.mcp``, who already see cross-user MCP state (consent counts, server
+        config), and for the approve-scoped operator refresh and reconnect results
+        (:func:`turnstone.core.mcp_utils.public_server_status`), which act for the cluster rather
+        than for one user and show the aggregate, ``skipped_tools`` included, to any approve-scoped
+        caller. A read-scoped token can hold ``admin.mcp``, so it is the read projection
+        (:func:`turnstone.core.mcp_utils.strip_server_status_for_read`), not this flag, that keeps
+        ``error`` and ``skipped_tools`` from read scope. A status read by a caller who lacks
+        ``admin.mcp`` stays scoped to that caller's own pool.
         """
         # Snapshot with list(): the mcp-loop thread mutates _user_pool_entries
         # (prime insert / idle eviction) concurrently with status polls from the
@@ -8250,6 +8503,9 @@ class MCPClientManager:
         return {
             "connected": bool(warm),
             "tools": len(rep.tools) if rep is not None and rep.tools else 0,
+            "skipped_tools": [asdict(tool) for tool in rep.skipped_tools]
+            if rep is not None
+            else [],
             "resources": len(rep.resources) if rep is not None and rep.resources else 0,
             "prompts": len(rep.prompts) if rep is not None and rep.prompts else 0,
             "error": self._last_error.get(name, ""),
@@ -9548,11 +9804,11 @@ class MCPClientManager:
                 if _is_dead_transport(relist_err, capture=capture):
                     raise
                 raise mismatch from relist_err
-            server_tools = [_mcp_to_openai(server_name, tool) for tool in tools]
+            server_tools, skipped_tools = _catalog_tools(server_name, tools)
             if pool_key is not None:
                 entry = self._user_pool_entries.get(pool_key)
                 if entry is not None and entry.session is session:
-                    entry.tools = server_tools
+                    self._publish_tool_catalog(entry, server_name, server_tools, skipped_tools)
                     self._rebuild_user_tool_map(pool_key[0])
                     self._notify_user_tool_listeners(pool_key[0])
             else:
@@ -9560,7 +9816,9 @@ class MCPClientManager:
                 cur_state = self._static_servers.get(server_name)
                 if cur_state is not None and cur_state.session is session:
                     if not lock.locked() and cur_state.tools is pre_tools:
-                        cur_state.tools = server_tools
+                        self._publish_tool_catalog(
+                            cur_state, server_name, server_tools, skipped_tools
+                        )
                         self._rebuild_tools()
                         self._notify_listeners()
                     else:
@@ -10695,6 +10953,7 @@ class MCPClientManager:
             # to rebuild an unchanged list.
             return
         evict.tools = None
+        evict.skipped_tools = ()
         evict.resources = None
         evict.prompts = None
         # Wake the user's sessions so their merged tool / resource /

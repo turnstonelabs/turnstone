@@ -38,6 +38,12 @@ from turnstone.core.tools import INTERACTIVE_TOOLS, TOOLS, merge_mcp_tools
 # Helpers
 # ---------------------------------------------------------------------------
 
+# Why a tool whose property ``n`` names no JSON Schema type is left out of its catalog.
+_BROKEN_TYPE_REASON = (
+    "inputSchema.properties.n.type is not one of "
+    "['array', 'boolean', 'integer', 'null', 'number', 'object', 'string']"
+)
+
 
 def _dispatch_stub(mock_future: MagicMock) -> Any:
     """Stand-in for ``asyncio.run_coroutine_threadsafe`` in sync-bridge tests.
@@ -6511,6 +6517,78 @@ class TestMcpV2ProtocolFeatures:
         assert res is ok_result
         mock_list.assert_awaited_once_with(session, "srv")
         assert session.call_tool.await_count == 2
+
+    def test_header_retry_relist_leaves_out_a_tool_whose_input_schema_is_invalid(
+        self, running_loop_mgr
+    ) -> None:
+        """The re-list publishes like every other catalog path: a tool whose input schema is not
+        valid JSON Schema is left out, and the server's status lists it."""
+        from mcp.shared.exceptions import MCPError
+        from mcp.types import HEADER_MISMATCH, CallToolResult, TextContent
+
+        mgr, loop, _ = running_loop_mgr
+        session = MagicMock()
+        session.protocol_version = "2026-07-28"
+        session.call_tool = AsyncMock(
+            side_effect=[
+                MCPError(code=HEADER_MISMATCH, message="Stale x-mcp header projection"),
+                CallToolResult(content=[TextContent(type="text", text="retried-ok")]),
+            ]
+        )
+        state = _seed_static_state(mgr, "srv", session=session, tools=[])
+        listed = [
+            mcp_types.Tool(name="deploy", input_schema={"type": "object"}),
+            mcp_types.Tool(
+                name="broken",
+                input_schema={"type": "object", "properties": {"n": {"type": "dateTime"}}},
+            ),
+        ]
+
+        with patch("turnstone.core.mcp_client._list_all_tools", new=AsyncMock(return_value=listed)):
+            _run_on_loop(loop, mgr._call_tool_with_header_retry(session, "srv", "deploy", {}))
+
+        assert [tool["function"]["name"] for tool in state.tools] == ["mcp__srv__deploy"]
+        assert mgr.get_server_status("srv")["skipped_tools"] == [
+            {"name": "broken", "reason": _BROKEN_TYPE_REASON}
+        ]
+
+    def test_pool_header_retry_relist_leaves_out_a_tool_whose_input_schema_is_invalid(
+        self, running_loop_mgr
+    ) -> None:
+        """The per-user re-list publishes into the user's pool entry the same way."""
+        from mcp.shared.exceptions import MCPError
+        from mcp.types import HEADER_MISMATCH, CallToolResult, TextContent
+
+        from turnstone.core.mcp_client import PoolEntryState, SkippedTool
+
+        mgr, loop, _ = running_loop_mgr
+        session = MagicMock()
+        session.protocol_version = "2026-07-28"
+        session.call_tool = AsyncMock(
+            side_effect=[
+                MCPError(code=HEADER_MISMATCH, message="Stale x-mcp header projection"),
+                CallToolResult(content=[TextContent(type="text", text="retried-ok")]),
+            ]
+        )
+        key = ("user-1", "srv")
+        entry = PoolEntryState(key=key, open_lock=MagicMock(), session=session, tools=[])
+        mgr._user_pool_entries[key] = entry
+        listed = [
+            mcp_types.Tool(name="deploy", input_schema={"type": "object"}),
+            mcp_types.Tool(
+                name="broken",
+                input_schema={"type": "object", "properties": {"n": {"type": "dateTime"}}},
+            ),
+        ]
+
+        with patch("turnstone.core.mcp_client._list_all_tools", new=AsyncMock(return_value=listed)):
+            _run_on_loop(
+                loop,
+                mgr._call_tool_with_header_retry(session, "srv", "deploy", {}, pool_key=key),
+            )
+
+        assert [tool["function"]["name"] for tool in entry.tools or []] == ["mcp__srv__deploy"]
+        assert entry.skipped_tools == (SkippedTool("broken", _BROKEN_TYPE_REASON),)
 
     def test_decode_tool_result_renders_structured_content_when_content_empty(self) -> None:
         """When CallToolResult.content has no text blocks, structured_content is serialized."""
