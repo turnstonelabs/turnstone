@@ -2717,7 +2717,8 @@ h3.skill-spec-heading {
 }
 
 /* Docs link in toolbar */
-.settings-docs-link {
+.settings-docs-link,
+.settings-expand-all {
   font-family: var(--font-ui);
   font-size: 10px;
   font-weight: 500;
@@ -2726,18 +2727,36 @@ h3.skill-spec-heading {
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
   padding: 2px 8px;
-  margin-left: auto;
   transition:
     color 0.15s,
     border-color 0.15s;
 }
-.settings-docs-link:hover {
+.settings-docs-link:hover,
+.settings-expand-all:hover:enabled {
   color: var(--accent);
   border-color: var(--accent-dim);
 }
-.settings-docs-link:focus-visible {
+.settings-docs-link:focus-visible,
+.settings-expand-all:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 2px;
+}
+/* The expand toggle takes the toolbar's auto margin, so it sits at the right
+   (with the docs link beside it on the Settings tab). Its min-width fits
+   "collapse all" (72.4px in Inter with the body's font features, border
+   included), so flipping the label doesn't move its left edge. */
+.settings-expand-all {
+  margin-left: auto;
+  min-width: 73px;
+  white-space: nowrap;
+  background: transparent;
+  line-height: inherit;
+  font-feature-settings: inherit;
+  cursor: pointer;
+}
+.settings-expand-all:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
 }
 
 /* Settings mobile */
@@ -3639,6 +3658,7 @@ h3.skill-spec-heading {
   .settings-save-btn,
   .settings-reset-btn,
   .settings-docs-link,
+  .settings-expand-all,
   .settings-help-btn {
     transition: none;
   }
