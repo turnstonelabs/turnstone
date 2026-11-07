@@ -1,4 +1,7 @@
 # Turnstone local inference — 3 models co-resident on ONE unified-memory
+# Discrete-GPU operators: all tunables are ${VAR:-default} (reference values
+# are the defaults). Machine-specific values live ONLY in local untracked
+# `.env` — never in this file. See .env.example (commented block).
 # accelerator (NVIDIA DGX Spark / GB10, or AMD Ryzen AI MAX "Strix Halo"),
 # behind a LiteLLM gateway serving BOTH chat API routes at once:
 #
@@ -25,11 +28,12 @@ services:
   # default 2 to 8 for better throughput under concurrent load.
   vllm-qwen:
     image: ${VLLM_IMAGE:-vllm/vllm-openai:latest}
+    entrypoint: ["/usr/local/bin/vllm-entrypoint.sh"]
     command:
       - --model
       - ${QWEN_MODEL:-nvidia/Qwen3.6-27B-NVFP4}
       - --served-model-name
-      - qwen3.6-27b
+      - ${QWEN_SERVED_NAME:-qwen3.6-27b}
       - --host
       - "0.0.0.0"
       - --port
@@ -38,16 +42,16 @@ services:
       - --load-format
       - runai_streamer
       - --gpu-memory-utilization
-      - "0.50"
+      - "${QWEN_GPU_UTIL:-0.50}"
       - --max-model-len
-      - "262144"
+      - "${QWEN_MAX_MODEL_LEN:-262144}"
       - --max-num-batched-tokens
-      - "8192"
+      - "${QWEN_MAX_BATCHED_TOKENS:-8192}"
       - --max-num-seqs
-      - "8"
+      - "${QWEN_MAX_SEQS:-8}"
       - --enable-prefix-caching
       - --speculative-config
-      - '{"method": "mtp", "num_speculative_tokens": 2}'
+      - '{"method": "mtp", "num_speculative_tokens": ${QWEN_SPEC_TOKENS:-2}}'
       - --reasoning-parser
       - qwen3
       - --enable-auto-tool-choice
@@ -60,11 +64,24 @@ services:
       HF_TOKEN: ${HF_TOKEN:-}
       TRITON_CACHE_DIR: /root/.triton/cache
       TORCHINDUCTOR_CACHE_DIR: /root/.cache/torch/inductor
+      VLLM_SPEC_CONFLICT: ${VLLM_SPEC_CONFLICT:-prefer-mtp}
+      MOE_BACKEND: ${QWEN_MOE_BACKEND:-}
+      LINEAR_BACKEND: ${QWEN_LINEAR_BACKEND:-}
+      ATTENTION_BACKEND: ${QWEN_ATTENTION_BACKEND:-}
+      CPU_OFFLOAD_GB: ${QWEN_CPU_OFFLOAD_GB:-}
+      CPU_OFFLOAD_PARAMS: ${QWEN_CPU_OFFLOAD_PARAMS:-}
+      OFFLOAD_BACKEND: ${QWEN_OFFLOAD_BACKEND:-}
+      KV_OFFLOADING_SIZE: ${QWEN_KV_OFFLOAD_SIZE:-}
+      KV_OFFLOADING_BACKEND: ${QWEN_KV_OFFLOAD_BACKEND:-}
+      LMCACHE_HOST: ${LMCACHE_HOST:-lmcache}
+      LMCACHE_PORT: ${LMCACHE_PORT:-5555}
+      CUTE_DSL_ARCH: ${CUTE_DSL_ARCH:-}
     volumes:
       - ${HF_CACHE:-./hf-cache}:/hf
       - ${COMPILE_CACHE:-./compile-cache}/triton:/root/.triton/cache
       - ${COMPILE_CACHE:-./compile-cache}/torch:/root/.cache/torch/inductor
       - ${COMPILE_CACHE:-./compile-cache}/flashinfer:/root/.cache/flashinfer
+      - ./vllm-entrypoint.sh:/usr/local/bin/vllm-entrypoint.sh:ro
     ports:
       - "${QWEN_PORT:-8000}:8000"
     healthcheck:
@@ -91,22 +108,23 @@ services:
       args:
         VLLM_IMAGE: ${VLLM_IMAGE:-vllm/vllm-openai:latest}
     image: turnstone-inference/vllm-gemma-audio
+    entrypoint: ["/usr/local/bin/vllm-entrypoint.sh"]
     command:
       - --model
       - ${GEMMA_MODEL:-google/gemma-4-12b-it}
       - --served-model-name
-      - gemma-4-12b
+      - ${GEMMA_SERVED_NAME:-gemma-4-12b}
       - --host
       - "0.0.0.0"
       - --port
       - "8000"
       - --trust-remote-code
       - --gpu-memory-utilization
-      - "0.24"
+      - "${GEMMA_GPU_UTIL:-0.24}"
       - --max-model-len
-      - "131072"
+      - "${GEMMA_MAX_MODEL_LEN:-131072}"
       - --max-num-batched-tokens
-      - "4096"
+      - "${GEMMA_MAX_BATCHED_TOKENS:-4096}"
       - --enable-auto-tool-choice
       - --reasoning-parser
       - gemma4
@@ -117,8 +135,10 @@ services:
     environment:
       HF_HOME: /hf
       HF_TOKEN: ${HF_TOKEN:-}
+      VLLM_SPEC_CONFLICT: ${VLLM_SPEC_CONFLICT:-prefer-mtp}
     volumes:
       - ${HF_CACHE:-./hf-cache}:/hf
+      - ./vllm-entrypoint.sh:/usr/local/bin/vllm-entrypoint.sh:ro
     ports:
       - "${GEMMA_PORT:-8001}:8000"
     healthcheck:
@@ -145,11 +165,12 @@ services:
   # build needs it explicitly.
   vllm-reranker:
     image: ${VLLM_IMAGE:-vllm/vllm-openai:latest}
+    entrypoint: ["/usr/local/bin/vllm-entrypoint.sh"]
     command:
       - --model
       - ${RERANKER_MODEL:-Qwen/Qwen3-Reranker-4B}
       - --served-model-name
-      - qwen3-reranker-4b
+      - ${RERANKER_SERVED_NAME:-qwen3-reranker-4b}
       - --host
       - "0.0.0.0"
       - --port
@@ -159,12 +180,14 @@ services:
       - --hf-overrides
       - '{"architectures":["Qwen3ForSequenceClassification"],"classifier_from_token":["no","yes"],"is_original_qwen3_reranker":true}'
       - --gpu-memory-utilization
-      - "0.10"
+      - "${RERANKER_GPU_UTIL:-0.10}"
     environment:
       HF_HOME: /hf
       HF_TOKEN: ${HF_TOKEN:-}
+      VLLM_SPEC_CONFLICT: ${VLLM_SPEC_CONFLICT:-prefer-mtp}
     volumes:
       - ${HF_CACHE:-./hf-cache}:/hf
+      - ./vllm-entrypoint.sh:/usr/local/bin/vllm-entrypoint.sh:ro
     ports:
       - "${RERANKER_PORT:-8002}:8000"
     healthcheck:
@@ -198,4 +221,30 @@ services:
         condition: service_healthy
       vllm-gemma:
         condition: service_healthy
+    restart: unless-stopped
+
+  # --- optional KV cache : standalone LMCache (profile-gated, OFF by default) --
+  # Reference path never starts this. `docker compose --profile lmcache up
+  # lmcache` first (or add `--profile lmcache` to the vllm up), then set
+  # QWEN_KV_OFFLOAD_BACKEND=lmcache + QWEN_KV_OFFLOAD_SIZE=<GiB> in local .env.
+  lmcache:
+    image: ${LMCACHE_IMAGE:-lmcache/standalone:nightly}
+    command:
+      - /opt/venv/bin/lmcache
+      - server
+      - --host
+      - "0.0.0.0"
+      - --port
+      - "${LMCACHE_PORT:-5555}"
+      - --l1-size-gb
+      - ${LMCACHE_L1_GB:-20}
+      - --eviction-policy
+      - LRU
+      - --l2-adapter
+      - '{"type": "fs", "base_path": "/data/lmcache"}'
+    volumes:
+      - ${LMCACHE_DIR:-./lmcache-data}:/data/lmcache
+    ports:
+      - "${LMCACHE_PORT:-5555}:${LMCACHE_PORT:-5555}"
+    profiles: ["lmcache"]
     restart: unless-stopped
