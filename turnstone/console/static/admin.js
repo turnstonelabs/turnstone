@@ -4624,6 +4624,8 @@ function _renderMcpServers(items) {
     let totalTools = 0,
       totalRes = 0,
       totalPrompts = 0;
+    // Names of the tools any connected node leaves out of the catalog.
+    const skippedNames = new Set();
     // Phase 9: aggregate the most-recent refresh entry across nodes
     // so the admin pill reflects "the freshest known state" rather
     // than picking an arbitrary node.
@@ -4636,6 +4638,9 @@ function _renderMcpServers(items) {
         totalTools += ns.tools || 0;
         totalRes += ns.resources || 0;
         totalPrompts += ns.prompts || 0;
+        const skipped = Array.isArray(ns.skipped_tools) ? ns.skipped_tools : [];
+        for (let k = 0; k < skipped.length; k++)
+          skippedNames.add(skipped[k].name);
       }
       if (ns.error || ns.has_error) {
         anyError = true;
@@ -4741,6 +4746,23 @@ function _renderMcpServers(items) {
       s.tls_skip_verify === true
         ? ' <span class="scope-badge scope-scan-medium" title="Certificate verification is off: any certificate this server presents is accepted">no cert check</span>'
         : "";
+    // Amber too: connected, but some of its tools are not offered to models.
+    // The title names ten at most; the server's details list every one.
+    const skippedList = Array.from(skippedNames);
+    const skippedBadge = skippedList.length
+      ? ' <span class="scope-badge scope-scan-medium" title="' +
+        escapeHtml(
+          "Left out because the input schema is not valid JSON Schema: " +
+            skippedList.slice(0, 10).join(", ") +
+            (skippedList.length > 10
+              ? " and " + (skippedList.length - 10) + " more"
+              : "") +
+            ". Open the server for details.",
+        ) +
+        '">' +
+        escapeHtml(_mcpCount(skippedList.length, "tool") + " skipped") +
+        "</span>"
+      : "";
     const detailAttr = isConfig
       ? 'data-mcp-detail-name="' + escapeHtml(s.name) + '"'
       : 'data-mcp-detail="' + escapeHtml(s.server_id) + '"';
@@ -4813,6 +4835,7 @@ function _renderMcpServers(items) {
       "</a>" +
       nameBadge +
       tlsBadge +
+      skippedBadge +
       "</span>" +
       '<span class="admin-col admin-col-mtransport"><span class="mcp-transport-badge ' +
       transportCls +
@@ -5466,6 +5489,21 @@ function testMcpConnection() {
         );
         if (d.tools.length)
           resultDiv.appendChild(_detectResultLine(d.tools.join(", ")));
+        const skipped = Array.isArray(d.skipped_tools) ? d.skipped_tools : [];
+        if (skipped.length) {
+          resultDiv.appendChild(
+            _detectResultLine(
+              "⚠ " +
+                _mcpCount(skipped.length, "tool") +
+                " left out: input schema not valid JSON Schema",
+              "yellow",
+            ),
+          );
+          for (let i = 0; i < skipped.length; i++)
+            resultDiv.appendChild(
+              _detectResultLine(skipped[i].name + ": " + skipped[i].reason),
+            );
+        }
       } else {
         resultDiv.appendChild(_detectResultLine("✗ " + d.error, "red"));
       }
@@ -5681,6 +5719,22 @@ function _openMcpDetail(s) {
           '<br><span style="color:var(--red);font-size:11px">' +
           escapeHtml(ns.error) +
           "</span>";
+      }
+      const skipped = Array.isArray(ns.skipped_tools) ? ns.skipped_tools : [];
+      if (skipped.length) {
+        nodeInfo +=
+          '<br><span style="color:var(--yellow);font-size:11px">' +
+          escapeHtml(
+            _mcpCount(skipped.length, "tool") +
+              " left out: input schema not valid JSON Schema",
+          ) +
+          "</span>";
+        for (let k = 0; k < skipped.length; k++) {
+          nodeInfo +=
+            '<br><span style="color:var(--fg-dim);font-size:11px">' +
+            escapeHtml(skipped[k].name + ": " + skipped[k].reason) +
+            "</span>";
+        }
       }
       // The dot alone would make the healthy state color-only — pair it
       // with a text token, mirroring the error-text sibling above.

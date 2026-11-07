@@ -820,9 +820,21 @@ class McpServerInfo(BaseModel):
     updated: str
 
 
+class McpSkippedTool(BaseModel):
+    """A tool a server lists that its catalog leaves out: its input schema is not valid JSON Schema.
+
+    ``reason`` names the field of the input schema that is wrong and what is wrong with it.
+    """
+
+    name: str
+    reason: str
+
+
 class McpServerStatus(BaseModel):
     connected: bool = False
     tools: int = 0
+    # Left out of a read-scoped status read, as the error text is.
+    skipped_tools: list[McpSkippedTool] = Field(default_factory=list)
     resources: int = 0
     prompts: int = 0
     error: str = ""
@@ -926,8 +938,11 @@ class McpConnectionTestRequest(BaseModel):
 
 class McpConnectionTestResponse(BaseModel):
     ok: bool = False
-    # The server's tool names, and how many resources and prompts it lists.
+    # The names of the tools a save would publish, and how many resources and prompts the server
+    # lists.
     tools: list[str] = Field(default_factory=list)
+    # The tools a save would leave out.
+    skipped_tools: list[McpSkippedTool] = Field(default_factory=list)
     resources: int = 0
     prompts: int = 0
     error: str | None = None

@@ -29,7 +29,7 @@ import time
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, cast
@@ -13480,6 +13480,7 @@ async def admin_test_mcp_server(request: Request) -> JSONResponse:
         {
             "ok": failure is None,
             "tools": probe.tools,
+            "skipped_tools": [asdict(tool) for tool in probe.skipped_tools],
             "resources": probe.resources,
             "prompts": probe.prompts,
             "error": failure.message if failure else None,

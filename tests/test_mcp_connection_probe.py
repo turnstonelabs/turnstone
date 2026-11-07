@@ -1316,6 +1316,7 @@ def test_endpoint_tests_a_real_server(upstream: tuple[str, Upstream], storage: A
     assert ok.json() == {
         "ok": True,
         "tools": ["alpha", "beta"],
+        "skipped_tools": [],
         "resources": 2,
         "prompts": 1,
         "error": None,
@@ -1326,6 +1327,7 @@ def test_endpoint_tests_a_real_server(upstream: tuple[str, Upstream], storage: A
     assert rejected.json() == {
         "ok": False,
         "tools": [],
+        "skipped_tools": [],
         "resources": 0,
         "prompts": 0,
         "error": "HTTP 401 Unauthorized: the server requires authorization",
