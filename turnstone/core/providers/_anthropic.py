@@ -1879,8 +1879,8 @@ class AnthropicProvider:
                     _attach_terminal_blocks(sc)
 
             elif event_type == "message_start":
-                if hasattr(event.message, "usage") and event.message.usage:
-                    u = event.message.usage
+                u = getattr(event.message, "usage", None)
+                if u:
                     inp = getattr(u, "input_tokens", 0) or 0
                     cc = getattr(u, "cache_creation_input_tokens", 0) or 0
                     cr = getattr(u, "cache_read_input_tokens", 0) or 0
