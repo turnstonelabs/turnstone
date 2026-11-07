@@ -35,48 +35,54 @@ end note
 
 LLM -> CS : tool_call wait_for_workstream\n(ws_ids=[child], mode="any", timeout=60)
 activate CS
-CS -> CS : _prepare_wait_for_workstream\n(validate ws_ids, timeout, mode)
+CS -> CS : _prepare_wait_for_workstream\n(the batch runs in model order)
 CS -> UI : emit wait_started\n{call_id, ws_ids, mode, timeout}
 
-CS -> CC : wait_for_workstream(ws_ids, timeout,\nmode, progress_callback)
+CS -> CC : wait_for_workstream(ws_ids, timeout, mode,\nsince, progress_callback, interrupt, wake_event)
 activate CC
+CC -> CC : validate ws_ids\n(a garbled id fails here;\na foreign one on the first tick)
 
-loop every 500ms up to timeout
-    CC -> DB : read workstreams row(s)
+loop until the mode condition, a since change, a stall,\nan unknown id, the timeout or a user message
+    CC -> DB : read rows + token counts\n(two batch reads per tick)
     DB --> CC : {state, updated, tokens, ...}
-    alt state in {idle, error, closed, deleted}
+    CC -> CS : progress_callback(snap)
+    CS -> UI : emit wait_progress\n{call_id, elapsed, results?}\n(on change, or a 5 s heartbeat)
+    alt real-terminal state (idle, error, closed, deleted)
         note over CC
-          real-terminal state ->
-          completion condition met
+          mode condition met ->
+          complete, leave the loop
         end note
     else still running / thinking / attention
-        CC -> CS : progress_callback(snap)\n(diff-on-change or 5s heartbeat)
-        CS -> UI : emit wait_progress\n{call_id, elapsed, results?}
+        CC -> CC : block on the wake event:\na child state change, a user message\nor the 2 s heartbeat
     end
 end
 
-CC --> CS : {complete, elapsed,\nresults: {ws_id: snap}}
+CC -> DB : read each finished child's message, whole\n(an error child's stored error first)
+CC --> CS : {complete, elapsed, mode,\nresults: {ws_id: {state, ..., message}}}
 deactivate CC
 
-CS -> UI : emit wait_ended\n{call_id, complete, elapsed, results}
 CS -> UI : on_tool_result\n("wait_for_workstream",\n"complete after Ns (R/N resolved)")
-CS --> LLM : tool_result (full results dict)
+CS -> UI : emit wait_ended\n{call_id, complete, elapsed,\nresults: states only}
+CS -> CS : batch admission fits the result\nto the room it grants: as many messages\nwhole as fit, the rest cut\n(truncated, message_chars)
+CS --> LLM : tool_result (fitted results)
 deactivate CS
 
 note left of UI
-  Sidebar "waiting on N children" indicator
-  keys on call_id - started / progress / ended
-  scope to a single wait invocation so
-  nested waits render independent badges.
+  wait_started / wait_progress / wait_ended
+  carry call_id, so each wait stays separate
+  for an SSE listener; no page renders them:
+  the coordinator page shows the tool row's
+  summary line.
 end note
 
-== After wait: inspect + close ==
+== After wait: close ==
 
-LLM -> CS : tool_call inspect_workstream(ws_id=child)
-CS -> CC : inspect(ws_id)
-CC -> DB : read row + tail
-CC --> CS : {state, messages, tokens, ...}
-CS --> LLM : tool_result (serialised)
+note right of LLM
+  Each finished child's last message
+  arrives in the wait's results;
+  inspect_workstream is for a child's
+  earlier turns, or a cut message.
+end note
 
 LLM -> CS : tool_call close_workstream\n(ws_id=child, reason="...")
 CS -> CC : close_workstream(ws_id, reason)

@@ -1116,7 +1116,8 @@
   border-radius: var(--r-sm);
   background: var(--panel-2);
 }
-.conv-agent-toggle {
+.conv-agent-toggle,
+.conv-agent-foot {
   display: flex;
   align-items: center;
   gap: 6px;
@@ -1134,7 +1135,8 @@
   cursor: pointer;
   text-align: left;
 }
-.conv-agent-toggle:hover {
+.conv-agent-toggle:hover,
+.conv-agent-foot:hover {
   color: var(--ink-2);
   background: color-mix(in srgb, var(--ink) 5%, transparent);
 }
@@ -1239,6 +1241,27 @@
 .conv-agent-body:empty {
   border-top: 0; /* no orphan hairline before the first step paints */
 }
+/* The open card's end repeats the collapse (buildAgentCardBody), its words
+   set like the header's label.  Gone while the card is shut, before its first
+   step, and while a step in it waits for approval, where it would sit just
+   under Approve and Deny. */
+.conv-agent-foot {
+  border-top: 1px solid var(--hair);
+  letter-spacing: 0;
+  text-transform: none;
+}
+.conv-agent-foot-caret {
+  font-size: 11px;
+  color: var(--ink-3);
+}
+.conv-agent[data-collapsed="true"] > .conv-agent-foot,
+.conv-agent-body:empty + .conv-agent-foot {
+  display: none;
+}
+/* Its own rule: a browser that can't parse :has() drops this one alone. */
+.conv-agent:has(.conv-actions) > .conv-agent-foot {
+  display: none;
+}
 /* Nested step rows read a touch lighter than top-level tool rows. */
 .conv-agent-body .conv-row {
   padding: 6px 10px;
@@ -1281,8 +1304,15 @@
 .conv-agent-body .tool-output + .conv-row {
   border-top: 1px solid var(--hair);
 }
+/* The last step's "show all" sits on the card's end control: keep a gap so a
+   click a pixel low doesn't fold the whole card (and the same air above the
+   next step's hairline elsewhere). */
+.conv-agent-body .conv-result-wrap > .conv-result-expand {
+  margin-bottom: 4px;
+}
 @media (max-width: 700px) {
-  .conv-agent-toggle {
+  .conv-agent-toggle,
+  .conv-agent-foot {
     min-height: 44px; /* WCAG 2.5.5 touch target */
   }
 }

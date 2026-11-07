@@ -74,7 +74,7 @@ turnstone/
     ratelimit.py      Per-user token-bucket rate limiter (RateLimiter, TokenBucket)
     edit.py           File edit utilities (find_occurrences, pick_nearest)
     safety.py         Command safety validation (blocked patterns, sanitization)
-    web.py            Web utilities (HTML stripping, SSRF prevention)
+    web.py            Web utilities (HTML to text, SSRF prevention)
   api/
     schemas.py        Shared Pydantic v2 models (auth, errors, WorkstreamState)
     server_schemas.py Server endpoint request/response models
@@ -1723,9 +1723,12 @@ maximum (16 Mi characters).
 
 The fold is the only place a main-session result is cut. Executors hand it
 their complete result, so the marker's omitted count is the producer's real
-size rather than the size of an earlier projection. The provisional copy an
-executor passes to `on_tool_result` is capped separately for display and never
-becomes model context.
+size rather than the size of an earlier projection. The one exception is a
+`wait_for_workstream` result: admission fits its children's messages inside the
+JSON to the cap the fold applies, each cut message marked with its whole length,
+and the fold cuts only a result still too wide for the room with every message
+cut to nothing. The provisional copy an executor passes to `on_tool_result` is
+capped separately for display and never becomes model context.
 
 Executor streaming and `on_tool_result` are provisional display channels, not
 model context. The result fold applies context sizing and output guarding once,
@@ -1761,8 +1764,11 @@ cut result past its cap, so such a result is cut again at the drain's limit
 before folding: the guarded rendering is split at the drain's marker and its
 two edges re-render as edges, so the second cut never runs into the first
 marker, and the omitted count still includes the middle the drain removed. A
-result the guard left alone, one the drain admitted whole, or one whose text no
-longer locates the marker exactly once passes as the guard left it: what the
+`wait_for_workstream` result the drain fitted and admitted whole is fitted again
+at the drain's limit, so its messages absorb what redaction added; one whose
+guarded JSON no longer parses is cut at that limit like any result. A result
+the guard left alone, any other one the drain admitted whole, or one whose text
+no longer locates the marker exactly once passes as the guard left it: what the
 guard produced is what the model sees, and the pre-send hard-compaction guard
 remains the backstop for a batch that grew past its allowance. The drain keeps
 only its renderings across the guard, so an executor's complete result is
@@ -1792,6 +1798,7 @@ is not forced into one shape where doing so would discard semantics:
 | judge argument fields | head of the budget plus a counted note that is extra to the budget | one budget is divided across many fields, so budgets smaller than the note are routine, and a field shown empty would read to the judge as an edit that replaces nothing |
 | compaction blocks | shared exact-cap 2/3 head + 1/3 tail | preserves more opening context while retaining the conclusion |
 | `search`, `inspect_workstream` | bespoke degradation ladder sized to the fold's cap, then the fold's cut as a backstop | generic head/tail would silently drop middle files or middle messages the formatter deliberately kept |
+| `wait_for_workstream` | the executor returns the result whole and admission fits it to the cap the fold applies, after any mid-turn compaction, the batch's earlier results and the structural floor: as many children's messages as fit stay whole, status texts first and then the smallest, and the rest share what is left, each cut from the end and marked `truncated` with `message_chars`; fitted again after redaction lengthens it, with the fold's cut the backstop for a result too wide even with every message cut to nothing | a head/tail cut of the JSON would drop children's entries (their ids and states) along with their text, an estimate made when the wait returns can't see the compaction or the siblings that move the cap, and keeping the smallest whole cuts the fewest messages, so the fewest need a follow-up read |
 | `web_search` snippets and `web_fetch` text | shared exact-cap head within surface-specific result/document budgets | search snippets and top-heavy pages are ordered prefixes; the web document share still scales with the pinned lane |
 | PDF extraction | context/capability document budget plus byte/page/worker limits; the isolated worker reports the true size and hands over its bounded prefix, and the parent renders the marker with the shared primitive (a zero allowance still returns the marker as a receipt of what was dropped) | the worker runs under `-E -P` with a deliberately minimal import path, so rendering in the parent keeps one copy of the primitive instead of a worker-side twin |
 | provider/transport streams | protocol token/byte/timeout limits | byte and token boundaries cannot be represented honestly as a character-slice policy |

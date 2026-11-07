@@ -1840,13 +1840,15 @@ function _scrollParent(el) {
 }
 
 // Collapsing a long box above the viewport would yank the page under the
-// reader: keep the control where it was on screen.
-function _keepInView(el, change) {
+// reader: keep the control where it was on screen.  `edge` is the side of
+// `el` that stays put: its top, or its bottom for a card folding up from its
+// end.
+function _keepInView(el, change, edge = "top") {
   const scroller =
     typeof el.getBoundingClientRect === "function" ? _scrollParent(el) : null;
-  const before = scroller ? el.getBoundingClientRect().top : 0;
+  const before = scroller ? el.getBoundingClientRect()[edge] : 0;
   change();
-  if (scroller) scroller.scrollTop += el.getBoundingClientRect().top - before;
+  if (scroller) scroller.scrollTop += el.getBoundingClientRect()[edge] - before;
 }
 
 // The "show all" control for a box (the coordinator's .conv-row-result, the
@@ -2057,11 +2059,44 @@ export function buildAgentCardBody() {
   const body = document.createElement("div");
   body.className = "conv-agent-body";
   body.id = bodyId;
-  toggle.addEventListener("click", () => {
-    const collapsed = wrap.dataset.collapsed === "true";
-    wrap.dataset.collapsed = collapsed ? "false" : "true";
-    toggle.setAttribute("aria-expanded", collapsed ? "true" : "false");
+  const setCollapsed = (collapsed) => {
+    wrap.dataset.collapsed = collapsed ? "true" : "false";
+    toggle.setAttribute("aria-expanded", collapsed ? "false" : "true");
+  };
+  // Set by a fold from the card's end, and held through the rest of that
+  // double- or triple-click, which the header lets go (below).
+  let foldedFromEnd = false;
+  toggle.addEventListener("click", (event) => {
+    const echo = foldedFromEnd && event.detail > 1;
+    foldedFromEnd = echo;
+    if (!echo) setCollapsed(wrap.dataset.collapsed !== "true");
   });
-  wrap.append(toggle, body);
+  // An open card's steps can run far past the screen, so the card's end
+  // repeats the collapse.  CSS shows this control only while the card is open
+  // with a step in it and no step waiting for approval, where it would sit
+  // just under Approve and Deny.  Folding keeps the card's bottom edge where it
+  // was on screen, so what follows doesn't move and the header comes to rest
+  // under the pointer.  The rest of a double- or triple-click lands there, and
+  // the header lets it go, so the card folds once instead of reopening at its
+  // first step.  Pointer only: not a button, so nothing can focus it (a
+  // tabindex="-1" button still takes focus from a click or a find-in-page
+  // match), out of the accessibility tree, and a press leaves focus where it
+  // was.  The header is the keyboard's and a screen reader's way to fold the
+  // card.
+  const foot = document.createElement("div");
+  foot.className = "conv-agent-foot";
+  foot.setAttribute("aria-hidden", "true");
+  const footCaret = document.createElement("span");
+  footCaret.className = "conv-agent-foot-caret";
+  footCaret.textContent = "▴";
+  const footLabel = document.createElement("span");
+  footLabel.textContent = "hide steps";
+  foot.append(footCaret, footLabel);
+  foot.addEventListener("mousedown", (event) => event.preventDefault());
+  foot.addEventListener("click", () => {
+    foldedFromEnd = true;
+    _keepInView(wrap, () => setCollapsed(true), "bottom");
+  });
+  wrap.append(toggle, body, foot);
   return { wrap, body, label, context, issue, toggle };
 }

@@ -2913,23 +2913,18 @@ def test_wait_for_workstream_running_child_message_is_null(populated_storage):
     assert result["results"]["child-b"]["truncated"] is False
 
 
-def test_wait_for_workstream_truncates_oversize_message(populated_storage):
-    """A message past WAIT_MESSAGE_MAX_BYTES is truncated from the
-    END (preserve the lead) and ``truncated=True`` so the coord LLM
-    knows to inspect for the rest if it needs the full text."""
-    from turnstone.console.coordinator_client import WAIT_MESSAGE_MAX_BYTES
-
-    big = "A" * (WAIT_MESSAGE_MAX_BYTES * 2)
+def test_wait_for_workstream_returns_a_long_message_whole(populated_storage):
+    """The client never cuts a message: one far past the 10 KiB the wait
+    used to cap it at comes back whole, ``truncated`` False.  The session
+    fits the result to its budget (``_fit_wait_result``)."""
+    big = "A" * (64 * 1024)
     populated_storage.save_message("child-a", "user", "hi")
     populated_storage.save_message("child-a", "assistant", big)
     client = _make_read_client(populated_storage)
     result = client.wait_for_workstream(["child-a"], timeout=5, mode="any")
     snap = result["results"]["child-a"]
-    # Truncated — exactly the cap in bytes (single-byte chars), with the
-    # head preserved.
-    assert snap["truncated"] is True
-    assert len(snap["message"].encode("utf-8")) == WAIT_MESSAGE_MAX_BYTES
-    assert snap["message"].startswith("AAAA")
+    assert snap["message"] == big
+    assert snap["truncated"] is False
 
 
 def test_wait_for_workstream_storage_failure_leaves_message_null(populated_storage, monkeypatch):
@@ -3587,50 +3582,304 @@ def test_the_dispatch_record_forgets_its_oldest_past_the_cap(dispatch_storage, m
 # ---------------------------------------------------------------------------
 
 
-def test_truncate_wait_message_below_cap_is_passthrough():
-    from turnstone.console.coordinator_client import _truncate_wait_message
-
-    text, trunc = _truncate_wait_message("hello", 100)
-    assert text == "hello"
-    assert trunc is False
-
-
-def test_truncate_wait_message_exact_cap_is_passthrough():
-    from turnstone.console.coordinator_client import _truncate_wait_message
-
-    text, trunc = _truncate_wait_message("a" * 5, 5)
-    assert text == "aaaaa"
-    assert trunc is False
-
-
-def test_truncate_wait_message_oversize_truncates_to_byte_cap():
-    from turnstone.console.coordinator_client import _truncate_wait_message
-
-    text, trunc = _truncate_wait_message("a" * 10, 5)
-    assert text == "aaaaa"
-    assert trunc is True
+def _wait_result_with(messages: dict[str, str | None]) -> dict[str, Any]:
+    """A completed wait result whose children carry ``messages``, as the client builds it."""
+    return {
+        "results": {
+            wid: {
+                "state": "idle" if message is not None else "running",
+                "tokens": 7,
+                "updated": "2026-11-04T10:00:00",
+                "name": f"child-{wid}",
+                "message": message,
+                "truncated": False,
+            }
+            for wid, message in messages.items()
+        },
+        "complete": True,
+        "elapsed": 1.5,
+        "mode": "any",
+    }
 
 
-def test_truncate_wait_message_handles_utf8_boundary():
-    """A multi-byte codepoint must never be split — back off to a valid
-    UTF-8 boundary even if it lands a couple bytes under the cap."""
-    from turnstone.console.coordinator_client import _truncate_wait_message
-
-    # "café" is 5 bytes (c=1, a=1, f=1, é=2).  Cap at 4 bytes lands
-    # mid-codepoint on the é; truncation must back off to 3 bytes.
-    text, trunc = _truncate_wait_message("café", 4)
-    assert trunc is True
-    assert text == "caf"
-    # And the result must be valid UTF-8 — re-encoding doesn't error.
-    text.encode("utf-8")
+def _whole_count(out: str) -> int:
+    return sum(1 for entry in json.loads(out)["results"].values() if not entry.get("truncated"))
 
 
-def test_truncate_wait_message_zero_or_negative_cap_returns_empty():
-    from turnstone.console.coordinator_client import _truncate_wait_message
+def test_fit_wait_result_sends_a_result_that_fits_as_it_is():
+    from turnstone.console.coordinator_client import _fit_wait_result, _wait_result_json
 
-    text, trunc = _truncate_wait_message("anything", 0)
-    assert text == ""
-    assert trunc is True
+    result = _wait_result_with({"a": "x" * 500, "b": None})
+    whole = _wait_result_json(result)
+    assert _fit_wait_result(result, budget=len(whole)) == whole
+
+
+def test_fit_wait_result_cuts_a_lone_message_to_fill_the_budget():
+    """A lone message gets all the room the rest of the result leaves, cut from the end and
+    marked with its whole length, and nothing but the message fields changes."""
+    from turnstone.console.coordinator_client import _fit_wait_result
+
+    text = "".join(f"line {i}: findings " for i in range(2000))
+    result = _wait_result_with({"a": text})
+    out = _fit_wait_result(result, budget=4000)
+    # Plain ASCII takes one character a character, so the cut fills the budget exactly.
+    assert len(out) == 4000
+    parsed = json.loads(out)
+    entry = parsed["results"]["a"]
+    assert entry["truncated"] is True
+    assert entry["message_chars"] == len(text)
+    assert text.startswith(entry["message"])
+    fields = ("message", "truncated", "message_chars")
+    assert {k: v for k, v in entry.items() if k not in fields} == {
+        k: v for k, v in result["results"]["a"].items() if k not in fields
+    }
+    assert {k: v for k, v in parsed.items() if k != "results"} == {
+        k: v for k, v in result.items() if k != "results"
+    }
+    # The input is never mutated.
+    assert result["results"]["a"]["message"] == text
+    assert result["results"]["a"]["truncated"] is False
+    assert "message_chars" not in result["results"]["a"]
+
+
+def test_fit_wait_result_keeps_the_smallest_whole_so_the_fewest_are_cut():
+    """As many messages as fit stay whole, smallest first, and only the rest are cut, sharing
+    what is left evenly."""
+    from turnstone.console.coordinator_client import _fit_wait_result, _wait_result_json
+
+    texts = {"short": "s" * 300, "mid": "m" * 2000, "long_a": "a" * 9000, "long_b": "b" * 12000}
+    result = _wait_result_with({**texts, "busy": None})
+    whole_len = len(_wait_result_json(result))
+    # Room for all but the longest whole: only it is cut, and the cut fills the budget.
+    out = _fit_wait_result(result, budget=whole_len - 1000)
+    assert len(out) == whole_len - 1000
+    entries = json.loads(out)["results"]
+    for wid in ("short", "mid", "long_a", "busy"):
+        assert entries[wid] == result["results"][wid]
+    assert entries["long_b"]["truncated"] is True
+    assert entries["long_b"]["message_chars"] == 12000
+    # Room for the two shortest whole: the two longest share the rest.
+    out = _fit_wait_result(result, budget=whole_len - 15000)
+    assert len(out) <= whole_len - 15000
+    entries = json.loads(out)["results"]
+    assert entries["short"] == result["results"]["short"]
+    assert entries["mid"] == result["results"]["mid"]
+    assert entries["long_a"]["truncated"] is entries["long_b"]["truncated"] is True
+    assert abs(len(entries["long_a"]["message"]) - len(entries["long_b"]["message"])) <= 1
+
+
+def test_fit_wait_result_cuts_the_fewest_of_many_equal_answers():
+    """A wide fan-out of one-line answers just over the room loses one or two of them, not
+    every answer cut to a sliver."""
+    from turnstone.console.coordinator_client import _fit_wait_result, _wait_result_json
+
+    answers = {f"{i:032x}": "Merged PR #100 after the test suite passed." for i in range(32)}
+    result = _wait_result_with(answers)
+    whole_len = len(_wait_result_json(result))
+    for over, kept in ((1, 31), (10, 31), (50, 30)):
+        out = _fit_wait_result(result, budget=whole_len - over)
+        assert len(out) <= whole_len - over
+        assert _whole_count(out) == kept
+
+
+def test_fit_wait_result_never_sends_a_fit_longer_than_the_result():
+    """Cutting a message shorter than the cut marker would lengthen the result: when nothing
+    fits, the result goes out whole for the fold's own cut, never grown."""
+    from turnstone.console.coordinator_client import _fit_wait_result, _wait_result_json
+
+    result = _wait_result_with({f"{i:032x}": "done." for i in range(32)})
+    whole = _wait_result_json(result)
+    assert _fit_wait_result(result, budget=len(whole) - 50) == whole
+
+
+def test_fit_wait_result_counts_escapes_at_their_serialized_width():
+    """Newlines, quotes and non-ASCII text take more room in the JSON than their length; the fit
+    measures what the model reads, so the result stays within the budget, a cut never splits an
+    escape, and a result whose length fits but whose escapes don't is still cut."""
+    from turnstone.console.coordinator_client import _fit_wait_result, _wait_result_json
+
+    piece = "caf" + chr(0xE9) + chr(10) + '"quoted"' + chr(0x1F600) + " "
+    text = piece * 400
+    result = _wait_result_with({"a": text, "b": "plain " * 1000})
+    whole_len = len(_wait_result_json(result))
+    for budget in (1500, 1501, 1502, 1503, 3000, 7777, whole_len - 1):
+        out = _fit_wait_result(result, budget=budget)
+        assert len(out) <= budget
+        entry = json.loads(out)["results"]["a"]
+        assert text.startswith(entry["message"])
+        assert entry["truncated"] is True
+        assert entry["message_chars"] == len(text)
+
+
+def test_fit_wait_result_never_drops_a_child_under_a_tight_budget():
+    """However little room the messages get, every child keeps its entry and
+    state; a budget below the result without its messages empties them."""
+    from turnstone.console.coordinator_client import _fit_wait_result
+
+    ids = [f"{i:032x}" for i in range(5)]
+    result = _wait_result_with({wid: "m" * 5000 for wid in ids})
+    for budget in (2000, 100):
+        parsed = json.loads(_fit_wait_result(result, budget=budget))
+        assert list(parsed["results"]) == ids
+        assert all(entry["state"] == "idle" for entry in parsed["results"].values())
+        assert all(entry["truncated"] is True for entry in parsed["results"].values())
+    tiny = json.loads(_fit_wait_result(result, budget=100))
+    assert all(entry["message"] == "" for entry in tiny["results"].values())
+
+
+def test_fit_wait_result_refit_keeps_cut_messages_cut_with_their_whole_length():
+    """The post-guard re-cut fits what admission already fitted: a message the first fit cut
+    stays cut and keeps the whole message's length, and the re-fit stays within its budget.  Its
+    old cut never counts as a whole message, so the re-fit cuts it further before it cuts a
+    message that is still whole."""
+    from turnstone.console.coordinator_client import _fit_wait_result
+
+    texts = {"a": "a" * 30_000, "b": "b" * 3_000, "c": "c" * 400}
+    result = _wait_result_with(texts)
+    first = json.loads(_fit_wait_result(result, budget=5_000))
+    assert [first["results"][wid]["truncated"] for wid in texts] == [True, False, False]
+    out = _fit_wait_result(first, budget=4_500)
+    assert len(out) <= 4_500
+    again = json.loads(out)["results"]
+    assert again["a"]["truncated"] is True
+    assert again["a"]["message_chars"] == 30_000
+    assert len(again["a"]["message"]) < len(first["results"]["a"]["message"])
+    assert again["b"] == first["results"]["b"]
+    assert again["c"] == first["results"]["c"]
+
+
+def test_fit_wait_result_skips_a_status_text_that_doesnt_fit():
+    """A status text that doesn't fit whole is passed over, not a place to stop: a shorter
+    answer after it stays whole while it fits beside the status text cut.  Once the status text
+    fits whole it goes first, as a cut status would read as a message to re-read.  No whole
+    message is marked cut, and below the room for every message cut to nothing the result goes
+    out in its shortest form."""
+    from turnstone.console.coordinator_client import (
+        _WAIT_SENTINEL_NOT_FOUND,
+        _fit_wait_result,
+        _wait_result_json,
+    )
+
+    answer = "Merged after the docs fix."
+    result = _wait_result_with({"gone": _WAIT_SENTINEL_NOT_FOUND, "done": answer})
+
+    def _with(**messages: str) -> int:
+        entries = dict(result["results"])
+        for wid, kept in messages.items():
+            whole = entries[wid]["message"]
+            entries[wid] = {**entries[wid], "message": kept, "truncated": True}
+            entries[wid]["message_chars"] = len(whole)
+        return len(_wait_result_json({**result, "results": entries}))
+
+    shortest = _with(gone="", done="")
+    answer_whole = _with(gone="")
+    status_whole = _with(done="")
+    whole_len = len(_wait_result_json(result))
+    assert shortest < answer_whole < status_whole < whole_len
+    for budget in range(shortest - 20, whole_len):
+        out = _fit_wait_result(result, budget=budget)
+        assert len(out) == shortest if budget < shortest else len(out) <= budget
+        entries = json.loads(out)["results"]
+        if answer_whole <= budget < status_whole:
+            assert entries["done"] == result["results"]["done"]
+        if budget >= status_whole:
+            assert entries["gone"] == result["results"]["gone"]
+        assert not (entries["done"]["truncated"] and entries["done"]["message"] == answer)
+
+
+def test_fit_wait_result_stays_within_budget_for_odd_entry_shapes():
+    """Hand-built entries never push a fit past its budget or past the result whole: a string
+    message_chars only overprices a cut, and an entry marked truncated without a whole length
+    isn't treated as one an earlier fit cut."""
+    from turnstone.console.coordinator_client import _fit_wait_result, _wait_result_json
+
+    odd = _wait_result_with({f"m{i}": "x" * (300 * (i + 1)) for i in range(4)})
+    for entry in odd["results"].values():
+        entry["message_chars"] = "12"
+    shortest = len(_fit_wait_result(odd, budget=0))
+    for budget in range(shortest, len(_wait_result_json(odd)), 7):
+        assert len(_fit_wait_result(odd, budget=budget)) <= budget
+    marked = _wait_result_with({f"e{i}": "" for i in range(5)})
+    for entry in marked["results"].values():
+        entry["truncated"] = True
+    assert _fit_wait_result(marked, budget=10) == _wait_result_json(marked)
+
+
+def test_fit_wait_result_keeps_status_texts_whole_first():
+    """A closed child's, an unknown id's or a silent child's status text stays whole before any
+    other message, so it never reads as a cut message while anything can stay whole."""
+    from turnstone.console.coordinator_client import (
+        _WAIT_SENTINEL_CLOSED,
+        _WAIT_SENTINEL_NO_RECENT_ASSISTANT,
+        _WAIT_SENTINEL_NOT_FOUND,
+        _fit_wait_result,
+        _wait_result_json,
+    )
+
+    statuses = {
+        "closed": _WAIT_SENTINEL_CLOSED,
+        "gone": _WAIT_SENTINEL_NOT_FOUND,
+        "quiet": _WAIT_SENTINEL_NO_RECENT_ASSISTANT,
+    }
+    result = _wait_result_with({**statuses, "long": "z" * 10_000})
+    long_cut = {**result["results"]["long"], "message": "", "truncated": True}
+    expected = {**result, "results": {**result["results"], "long": long_cut}}
+    expected["results"]["long"]["message_chars"] = 10_000
+    budget = len(_wait_result_json(expected)) + 50
+    expected["results"]["long"]["message"] = "z" * 50
+    assert _fit_wait_result(result, budget=budget) == _wait_result_json(expected)
+
+
+def test_json_text_chars_measures_with_the_serializer_the_result_uses():
+    """The width the fit gives a message is its width in the result's own serialization, so a
+    change to that serializer moves both together."""
+    from turnstone.console.coordinator_client import _json_text_chars, _wait_result_json
+
+    for text in ("plain", "caf" + chr(0xE9), chr(0x1F600) + chr(10) + '"', chr(0x4E2D) * 5):
+        assert _json_text_chars(text) == len(_wait_result_json({"m": text})) - len('{"m":""}')
+
+
+def test_wait_states_leave_out_the_message_fields():
+    from turnstone.console.coordinator_client import _wait_states
+
+    entries = {
+        "a": {
+            "state": "idle",
+            "tokens": 3,
+            "updated": "t",
+            "name": "n",
+            "message": "x",
+            "truncated": True,
+            "message_chars": 9,
+        },
+        "b": {"state": "starting", "tokens": 0, "dispatch_age_s": 4, "message": None},
+    }
+    assert _wait_states(entries) == {
+        "a": {"state": "idle", "tokens": 3, "updated": "t", "name": "n"},
+        "b": {"state": "starting", "tokens": 0, "dispatch_age_s": 4},
+    }
+
+
+def test_share_room_gives_small_entries_what_they_need():
+    from turnstone.console.coordinator_client import _share_room
+
+    assert _share_room({"a": 10, "b": 50, "c": 100}, 120) == {"a": 10, "b": 50, "c": 60}
+    assert _share_room({"a": 10, "b": 50, "c": 100}, 1000) == {"a": 10, "b": 50, "c": 100}
+    assert _share_room({"a": 10, "b": 50}, 0) == {"a": 0, "b": 0}
+    assert _share_room({"a": 10, "b": 50}, -5) == {"a": 0, "b": 0}
+
+
+def test_json_text_prefix_stops_before_an_escape_that_would_overflow():
+    from turnstone.console.coordinator_client import _json_text_prefix
+
+    quote = 'a"b'
+    assert _json_text_prefix(quote, 2) == "a"
+    assert _json_text_prefix(quote, 3) == 'a"'
+    assert _json_text_prefix(quote, 4) == quote
+    astral = "x" + chr(0x1F600)
+    assert _json_text_prefix(astral, 12) == "x"
+    assert _json_text_prefix(astral, 13) == astral
+    assert _json_text_prefix("anything", 0) == ""
 
 
 def test_last_assistant_text_returns_content_when_present(populated_storage):

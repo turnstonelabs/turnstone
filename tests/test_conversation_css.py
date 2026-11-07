@@ -185,6 +185,47 @@ def test_linked_by_console_and_both_standalone_pages() -> None:
         assert "/shared/conversation.css" in html, f"{page.name} must link conversation.css"
 
 
+def _rules(css: str) -> list[tuple[list[str], str]]:
+    """Every style rule as (selectors, declarations), @media bodies included."""
+    css = re.sub(r"/\*.*?\*/", "", css, flags=re.S)
+    return [
+        ([part.strip() for part in m[1].split(",")], m[2])
+        for m in re.finditer(r"([^{}]+)\{([^{}]*)\}", css)
+    ]
+
+
+def test_agent_card_end_control_shows_only_on_an_open_card_with_steps() -> None:
+    """The control at a task-agent card's end repeats its collapse, so it is
+    gone while the card is shut and before the first step, when it would sit
+    under the header it repeats.  It is gone too while a step in the card waits
+    for approval: it would sit just under Approve and Deny, and a slip onto it
+    would hide the prompt the turn is waiting on.  Nothing else hides it, and
+    the :has() rule stands alone, so a browser that can't parse :has() keeps
+    the other two."""
+    rules = _rules(_css())
+    hiding = {
+        selector
+        for selectors, declarations in rules
+        if re.search(r"display:\s*none", declarations)
+        for selector in selectors
+        if ".conv-agent-foot" in selector
+    }
+    assert hiding == {
+        '.conv-agent[data-collapsed="true"] > .conv-agent-foot',
+        ".conv-agent-body:empty + .conv-agent-foot",
+        ".conv-agent:has(.conv-actions) > .conv-agent-foot",
+    }, hiding
+    for selectors, _ in rules:
+        if any(":has(" in s and ".conv-agent-foot" in s for s in selectors):
+            assert len(selectors) == 1, selectors
+    assert any(
+        ".conv-agent-foot" in selectors and re.search(r"display:\s*flex", declarations)
+        for selectors, declarations in rules
+    ), "the control lays out like the header it repeats"
+    chip = _rule_body(_css(), ".conv-agent-body .conv-result-wrap > .conv-result-expand")
+    assert re.search(r"margin-bottom:\s*[1-9]", chip), "the last step's show all keeps clear of it"
+
+
 def _rule_body(css: str, selector: str) -> str:
     """Return the declaration block for a selector (first match).
 

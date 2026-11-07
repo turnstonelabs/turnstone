@@ -17,7 +17,7 @@ from pathlib import Path
 
 import pytest
 
-from tests._js_harness_helpers import FAKE_DOM, node_skip
+from tests._js_harness_helpers import BROWSER_FOCUS, FAKE_DOM, node_skip
 from turnstone.core.watch import build_watch_reminder
 
 _CONVERSATION_JS = (
@@ -134,6 +134,93 @@ def test_agent_card_exposes_hidden_context_badge() -> None:
     assert 'issue.className = "conv-agent-step-issue";' in body
     assert "issue.hidden = true;" in body
     assert "return { wrap, body, label, context, issue, toggle };" in body
+
+
+@node_skip
+def test_agent_card_folds_from_its_end() -> None:
+    """An open task-agent card repeats its collapse after the last step, so a
+    long step list closes without scrolling back up to the header.  Folding
+    keeps the card's bottom edge where it was on screen, so what follows the
+    card doesn't move.  The control is for the pointer only: nothing can focus
+    it, it is out of the accessibility tree, and a press leaves focus where it
+    was."""
+    script = (
+        FAKE_DOM
+        + BROWSER_FOCUS
+        + f"""
+const conv = await import({json.dumps(_CONVERSATION_JS.as_uri())});
+const assert = (condition, message) => {{ if (!condition) throw new Error(message); }};
+const scroller = new FakeElement("div");
+html.appendChild(scroller);
+globalThis.getComputedStyle = (el) => ({{ overflowY: el === scroller ? "auto" : "visible" }});
+const card = conv.buildAgentCardBody();
+scroller.appendChild(card.wrap);
+const foot = card.wrap.children.at(-1);
+assert(foot.className === "conv-agent-foot", "the card ends with its fold control");
+assert(foot.tagName === "DIV" && !foot.hasAttribute("tabindex"),
+  "not a button and no tabindex, so nothing can focus it");
+assert(foot.getAttribute("aria-hidden") === "true", "out of the accessibility tree");
+let pressKeptFocus = false;
+foot._listeners.get("mousedown").forEach((row) =>
+  row.fn({{ target: foot, preventDefault: () => {{ pressKeptFocus = true; }} }}));
+assert(pressKeptFocus, "a press takes no focus");
+const words = foot.children.at(-1);
+assert(words.textContent === "hide steps", "it says what it hides: " + words.textContent);
+
+card.toggle.click();
+assert(card.wrap.dataset.collapsed === "false", "the header opens the card");
+assert(card.toggle.getAttribute("aria-expanded") === "true", "and says so");
+// Open, the card ends 700px down the screen; folding takes 3,972px of steps
+// out of it, and its top doesn't move.
+scroller.scrollTop = 5000;
+card.wrap.getBoundingClientRect = () => ({{
+  top: -3300,
+  bottom: card.wrap.dataset.collapsed === "true" ? -3272 : 700,
+}});
+const composer = new FakeElement("textarea");
+html.appendChild(composer);
+composer.focus();
+foot.click();
+assert(card.wrap.dataset.collapsed === "true", "the control at the end folds the card");
+assert(card.toggle.getAttribute("aria-expanded") === "false", "the header says it is shut");
+assert(scroller.scrollTop === 1028, "the card's bottom stays put: " + scroller.scrollTop);
+assert(document.activeElement === composer, "focus stays where it was");
+card.toggle.click();
+assert(card.wrap.dataset.collapsed === "false", "the header still opens the card");
+card.toggle.click();
+assert(card.wrap.dataset.collapsed === "true", "and shuts it");
+
+// The fold parks the header under the pointer, where the second click of a
+// double-click on "hide steps" lands: that click must not reopen the card.
+const clickWith = (el, detail) =>
+  el._listeners.get("click").forEach((row) => row.fn({{ target: el, detail }}));
+clickWith(card.toggle, 1);
+foot.click();
+clickWith(card.toggle, 2);
+assert(card.wrap.dataset.collapsed === "true", "a double-click on hide steps folds once");
+clickWith(card.toggle, 3);
+assert(card.wrap.dataset.collapsed === "true", "and so does a triple-click");
+clickWith(card.toggle, 1);
+assert(card.wrap.dataset.collapsed === "false", "a click after it reopens the card");
+clickWith(card.toggle, 2);
+assert(card.wrap.dataset.collapsed === "true",
+  "a double-click's second click on the header alone toggles");
+for (const detail of [1, 0]) {{
+  clickWith(card.toggle, 1);
+  foot.click();
+  clickWith(card.toggle, detail);
+  assert(card.wrap.dataset.collapsed === "false",
+    "a single click or a key on the header reopens a card folded from its end: " + detail);
+}}
+"""
+    )
+    result = subprocess.run(
+        ["node", "--input-type=module", "-e", script],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode == 0, result.stderr
 
 
 @node_skip

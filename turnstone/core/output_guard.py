@@ -17,6 +17,7 @@ tune via ``judge.output_guard_budget_seconds``.  Dependencies: stdlib only.
 
 from __future__ import annotations
 
+import json
 import re
 import time
 from dataclasses import dataclass, field
@@ -25,7 +26,7 @@ from typing import TYPE_CHECKING, Any
 from turnstone.core import fence
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Iterator, Mapping
 
 # -- Priority 1: Prompt injection markers (HIGH) ---------------------------
 
@@ -104,6 +105,7 @@ _RE_PRIVATE_KEY_BLOCK = re.compile(
 # covers SQLAlchemy dialect+driver URLs (``postgresql+psycopg2``,
 # ``postgresql+asyncpg``, ``mysql+pymysql``) and ``mongodb+srv`` —
 # enumerating drivers is a losing game, the suffix shape isn't.
+# PostgreSQL takes both ``postgres://`` and ``postgresql://``.
 # Schemes are case-insensitive per RFC 3986, hence IGNORECASE:
 # ``POSTGRESQL://`` leaks the same password ``postgresql://`` does.
 # The password stops where another connection string could start: scanning
@@ -113,11 +115,12 @@ _RE_PRIVATE_KEY_BLOCK = re.compile(
 # matched unless it holds one of these schemes itself, and the user part
 # already stops at the ":" every scheme contains. The driver suffix is
 # bounded so that every place a match can start also ends a password.
+# Group 1 is the password.
 _CONNECTION_SCHEME = (
-    r"(?:postgresql|mysql|mongodb|rediss?|amqps?|sqlite|https?)(?:\+[a-z0-9]{0,20})?://"
+    r"(?:postgres(?:ql)?|mysql|mongodb|rediss?|amqps?|sqlite|https?)(?:\+[a-z0-9]{0,20})?://"
 )
 _RE_CONNECTION_STRING = re.compile(
-    _CONNECTION_SCHEME + r"[^:@\s]+:(?:(?!" + _CONNECTION_SCHEME + r")[^@\s])+@",
+    _CONNECTION_SCHEME + r"[^:@\s]+:((?:(?!" + _CONNECTION_SCHEME + r")[^@\s])+)@",
     re.IGNORECASE,
 )
 # A match takes a whole run of key characters at once (group 1), never one
@@ -146,8 +149,25 @@ def _env_key_is_secret(key: str) -> bool:
     return bool(_RE_ENV_SECRET_KEY.search(key.lstrip("_0123456789")))
 
 
+# What a redaction leaves in place of a secret.  A value that is exactly one
+# holds no secret, so the rules that would match it again (an env line, a JSON
+# secret, a connection string's password) don't flag it: text redacted once,
+# such as a child's tool result read back through inspect_workstream, would
+# otherwise flag a credential leak every time it is read.
+_RE_REDACTION_MARKER = re.compile(r"\[REDACTED:[a-z_]+\]")
+
+
+def _is_redaction_marker(text: str, start: int, end: int) -> bool:
+    """Whether ``text[start:end]`` is exactly a redaction marker."""
+    return _RE_REDACTION_MARKER.fullmatch(text, start, end) is not None
+
+
 def _has_env_secret(text: str) -> bool:
-    return any(_env_key_is_secret(m.group(1)) for m in _RE_ENV_SECRET_LINE.finditer(text))
+    # A match's value runs from after its "=" to its end.
+    return any(
+        _env_key_is_secret(m.group(1)) and not _is_redaction_marker(text, m.end(1) + 1, m.end())
+        for m in _RE_ENV_SECRET_LINE.finditer(text)
+    )
 
 
 def _redact_env(m: re.Match[str]) -> str:
@@ -155,25 +175,67 @@ def _redact_env(m: re.Match[str]) -> str:
     return key + "=[REDACTED:secret]" if _env_key_is_secret(key) else m.group()
 
 
+# Keys, matched without regard to case, whose value of eight or more characters
+# is a secret: in a JSON object or dict literal written as text, and in a JSON
+# document the framework encoded (_evaluate_json_document).
+_JSON_SECRET_KEYS = (
+    "api_key",
+    "apikey",
+    "api_secret",
+    "secret_key",
+    "secret",
+    "password",
+    "passwd",
+    "token",
+    "access_token",
+    "refresh_token",
+    "auth_token",
+    "private_key",
+    "client_secret",
+    "webhook_secret",
+    "signing_key",
+    "encryption_key",
+    "x_api_key",
+    "x-api-key",
+    "authorization",
+)
+_JSON_SECRET_KEY_SET = frozenset(_JSON_SECRET_KEYS)
+_JSON_SECRET_MIN_CHARS = 8
+_JSON_SECRET_ANNOTATION = (
+    "Output contains JSON with secret-bearing keys (api_key, password, token, etc.)."
+)
+# The key alternation and the value floor ("{8,}") as the two patterns spell them.
+_JSON_SECRET_KEY_ALTERNATION = "|".join(_JSON_SECRET_KEYS)
+_JSON_SECRET_REPEAT = "{" + str(_JSON_SECRET_MIN_CHARS) + ",}"
 _RE_JSON_SECRET = re.compile(
-    r'"(?:api_key|apikey|api_secret|secret_key|secret|password|passwd|'
-    r"token|access_token|refresh_token|auth_token|private_key|"
-    r"client_secret|webhook_secret|signing_key|encryption_key|"
-    r"x_api_key|x-api-key|"
-    r'authorization)"\s*:\s*"([^"]{8,})"',
+    r'"(?:' + _JSON_SECRET_KEY_ALTERNATION + r')"\s*:\s*"([^"]' + _JSON_SECRET_REPEAT + r')"',
     re.IGNORECASE,
 )
 # Single-quoted sibling — Python dict reprs / JS object literals emit single
 # quotes (e.g. {'Authorization': 'Bearer ...'}); the double-quoted form above
-# misses them.  Same key set, same 8-char value floor, group(1) == value.
+# misses them.  Same key set, same value floor, group(1) == value.
 _RE_JSON_SECRET_SQ = re.compile(
-    r"'(?:api_key|apikey|api_secret|secret_key|secret|password|passwd|"
-    r"token|access_token|refresh_token|auth_token|private_key|"
-    r"client_secret|webhook_secret|signing_key|encryption_key|"
-    r"x_api_key|x-api-key|"
-    r"authorization)'\s*:\s*'([^']{8,})'",
+    r"'(?:" + _JSON_SECRET_KEY_ALTERNATION + r")'\s*:\s*'([^']" + _JSON_SECRET_REPEAT + r")'",
     re.IGNORECASE,
 )
+
+
+def _has_json_secret(text: str) -> bool:
+    """Whether ``text`` gives a secret-named key, quoted either way, a value not yet redacted."""
+    return any(
+        not _is_redaction_marker(text, m.start(1), m.end(1))
+        for pattern in (_RE_JSON_SECRET, _RE_JSON_SECRET_SQ)
+        for m in pattern.finditer(text)
+    )
+
+
+def _has_connection_secret(text: str) -> bool:
+    """Whether ``text`` holds a connection string whose password is not yet redacted."""
+    return any(
+        not _is_redaction_marker(text, m.start(1), m.end(1))
+        for m in _RE_CONNECTION_STRING.finditer(text)
+    )
+
 
 # A JSON Web Token: base64url header and payload, both JSON objects (so both
 # start "eyJ"), and a signature that is empty for an unsigned token. It must
@@ -326,6 +388,28 @@ class ControllerText(str):
     would turn operator authority against the user.  The mark lives on the
     string, so string operations drop it: text rebuilt on its way to the guard
     is guarded as before.
+    """
+
+    __slots__ = ()
+
+
+class ControllerJSON(str):
+    """A JSON document the framework encoded around text from elsewhere.
+
+    ``inspect_workstream`` returns a child's history this way.  The guard reads
+    each string value the document holds as text on its own
+    (:func:`evaluate_output`'s ``json_document``), not the encoding, and leaves
+    the keys unread.  Mark a document only when its keys are the framework's:
+    provider-native content holds keys a model wrote, so an inspect that
+    includes it is returned unmarked and guarded as text.  Scanning the encoding
+    matched the framework's own keys (every system turn's ``{"role":"system"``),
+    missed text whose quotes, newlines and backslashes the encoding had escaped,
+    and let a redaction that ends at whitespace run on into the values after it,
+    since compact JSON has none between them.  A redacted document is encoded
+    again with compact separators and ASCII escapes, as
+    ``json.dumps(value, separators=(",", ":"))`` writes it.  As with
+    :class:`ControllerText`, string operations drop the mark, so a caller that
+    rebuilds the text notes the result first.
     """
 
     __slots__ = ()
@@ -996,7 +1080,7 @@ def _check_credentials(
         found = True
         risk = "high"
 
-    if _RE_CONNECTION_STRING.search(text):
+    if _has_connection_secret(text):
         _add_flag(flags, "credential_leak")
         flags.append("connection_string_leak")
         ann.append("Output contains a connection string with embedded credentials.")
@@ -1010,12 +1094,10 @@ def _check_credentials(
         found = True
         risk = "high"
 
-    if _RE_JSON_SECRET.search(text) or _RE_JSON_SECRET_SQ.search(text):
+    if _has_json_secret(text):
         _add_flag(flags, "credential_leak")
         flags.append("json_secret_leak")
-        ann.append(
-            "Output contains JSON with secret-bearing keys (api_key, password, token, etc.)."
-        )
+        ann.append(_JSON_SECRET_ANNOTATION)
         found = True
         risk = "high"
 
@@ -1209,12 +1291,18 @@ def _check_credentials_complex(
     text: str,
     flags: list[str],
     ann: list[str],
+    *,
+    redact_text: str | None = None,
 ) -> tuple[str, str | None]:
     """Complex credential checks that require custom redaction logic.
 
     Handles private key blocks, connection strings (need targeted sub-replacement
     to preserve protocol/username), env-line parsing (two-regex pipeline), and
     JSON secret detection (capture group redaction).
+
+    Detection reads ``text``; redaction applies to ``redact_text`` when given,
+    the text earlier rules already redacted.  A value those rules replaced is a
+    marker there, which detection would take for one the tool's text held.
     """
     risk = "none"
     found = False
@@ -1226,7 +1314,7 @@ def _check_credentials_complex(
         found = True
         risk = "high"
 
-    if _RE_CONNECTION_STRING.search(text):
+    if _has_connection_secret(text):
         _add_flag(flags, "credential_leak")
         _add_flag(flags, "connection_string_leak")
         ann.append("Output contains a connection string with embedded credentials.")
@@ -1240,17 +1328,16 @@ def _check_credentials_complex(
         found = True
         risk = "high"
 
-    if _RE_JSON_SECRET.search(text) or _RE_JSON_SECRET_SQ.search(text):
+    if _has_json_secret(text):
         _add_flag(flags, "credential_leak")
         _add_flag(flags, "json_secret_leak")
-        ann.append(
-            "Output contains JSON with secret-bearing keys (api_key, password, token, etc.)."
-        )
+        ann.append(_JSON_SECRET_ANNOTATION)
         found = True
         risk = "high"
 
-    sanitized = _redact_credentials_complex(text) if found else None
-    return risk, sanitized
+    if not found:
+        return risk, None
+    return risk, _redact_credentials_complex(text if redact_text is None else redact_text)
 
 
 def _redact_credentials_complex(text: str) -> str:
@@ -1397,6 +1484,7 @@ def evaluate_output(
     patterns: Mapping[str, tuple[OutputGuardPatternDef, ...]] | None = None,
     trusted_marker_nonce: str = "",
     trusted_sender_label_nonce: str = "",
+    json_document: bool = False,
 ) -> OutputAssessment:
     """Evaluate tool output for security signals.
 
@@ -1423,6 +1511,12 @@ def evaluate_output(
             the same way and independently of ``trusted_marker_nonce`` —
             either token's leak is a HIGH finding.  Empty turns off leak
             detection for this token.
+        json_document: The output is a JSON document the framework encoded
+            (:class:`ControllerJSON`), evaluated by the strings it holds
+            (:func:`_evaluate_json_document`).  The strings are read in order,
+            each through every check, under the one budget: once it runs out,
+            the strings after it are neither read nor redacted.  Output that
+            doesn't parse, as when the result fold cut it, is evaluated as text.
 
     Returns:
         Frozen OutputAssessment with flags, risk level, annotations, and
@@ -1430,6 +1524,17 @@ def evaluate_output(
     """
     if not output:
         return _clean()
+
+    if json_document:
+        document = _evaluate_json_document(
+            output,
+            budget_seconds=budget_seconds,
+            patterns=patterns,
+            trusted_marker_nonce=trusted_marker_nonce,
+            trusted_sender_label_nonce=trusted_sender_label_nonce,
+        )
+        if document is not None:
+            return document
 
     deadline = time.monotonic() + budget_seconds
     flags: list[str] = []
@@ -1463,9 +1568,12 @@ def evaluate_output(
                     ),
                 )
             elif cat == "credentials":
-                # Chain redaction: apply complex checks to already-sanitized text
+                # Chain redaction: the complex checks read the tool's own text and
+                # redact the text the patterns above already redacted.
                 cred_input = sanitized if sanitized is not None else output
-                cred_risk, cred_san = _check_credentials_complex(cred_input, flags, ann)
+                cred_risk, cred_san = _check_credentials_complex(
+                    output, flags, ann, redact_text=cred_input
+                )
                 risk = _max_risk(risk, cred_risk)
                 if cred_san:
                     sanitized = cred_san
@@ -1514,6 +1622,103 @@ def evaluate_output(
     risk = _max_risk(risk, _check_info_disclosure(output, flags, ann))
 
     return _build(flags, risk, ann, sanitized)
+
+
+def _evaluate_json_document(
+    output: str,
+    *,
+    budget_seconds: float,
+    patterns: Mapping[str, tuple[OutputGuardPatternDef, ...]] | None,
+    trusted_marker_nonce: str,
+    trusted_sender_label_nonce: str,
+) -> OutputAssessment | None:
+    """Evaluate a JSON document the framework encoded by the strings it holds.
+
+    Each string value is evaluated as text on its own, so no rule reads the
+    framework's keys or the escapes the encoding added.  The keys pass unread,
+    with one rule kept from scanning the encoded text, where a JSON secret
+    spans a key and its value: a string of :data:`_JSON_SECRET_MIN_CHARS` or
+    more under a secret-named key is redacted whole.  The findings merge into
+    one assessment.  The strings are read in order under one time budget, and
+    those left when it runs out are neither read nor redacted.  No rule runs
+    from one string into the next.  A document with a string redacted is
+    encoded again (see :class:`ControllerJSON`); one without keeps its text.
+
+    Returns ``None`` when ``output`` doesn't parse, or is nested too deep to
+    encode again, for the caller to evaluate it as text.
+    """
+    try:
+        document = json.loads(output)
+    except (ValueError, RecursionError):
+        return None
+    deadline = time.monotonic() + budget_seconds
+    flags: list[str] = []
+    ann: list[str] = []
+    risk = "none"
+    redacted = False
+    holder: list[Any] = [document]
+    for container, key, value in _json_document_strings(holder):
+        found = evaluate_output(
+            value,
+            budget_seconds=max(0.0, deadline - time.monotonic()),
+            patterns=patterns,
+            trusted_marker_nonce=trusted_marker_nonce,
+            trusted_sender_label_nonce=trusted_sender_label_nonce,
+        )
+        flags.extend(found.flags)
+        ann.extend(found.annotations)
+        risk = _max_risk(risk, found.risk_level)
+        text = value if found.sanitized is None else found.sanitized
+        # The string as the document holds it: one a rule above just redacted is
+        # still a secret, while one that was a marker already holds none.
+        if (
+            isinstance(key, str)
+            and key.lower() in _JSON_SECRET_KEY_SET
+            and len(value) >= _JSON_SECRET_MIN_CHARS
+            and _RE_REDACTION_MARKER.fullmatch(value) is None
+        ):
+            flags.extend(("credential_leak", "json_secret_leak"))
+            ann.append(_JSON_SECRET_ANNOTATION)
+            risk = "high"
+            text = "[REDACTED:secret]"
+        if text != value:
+            container[key] = text
+            redacted = True
+        if time.monotonic() > deadline:
+            break
+    sanitized: str | None = None
+    if redacted:
+        try:
+            sanitized = json.dumps(holder[0], separators=(",", ":"))
+        except RecursionError:
+            # Deeper than the encoder can write back, which the framework never
+            # makes; evaluated as text, it is still redacted.
+            return None
+    return _build(flags, risk, ann, sanitized)
+
+
+def _json_document_strings(holder: list[Any]) -> list[tuple[Any, Any, str]]:
+    """Every string value in ``holder``, in reading order, as ``(container, key, value)``.
+
+    ``container[key]`` is ``value``.  The walk keeps its own stack, so a deeply
+    nested document can't run out of the interpreter's.
+    """
+    found: list[tuple[Any, Any, str]] = []
+    stack: list[tuple[Any, Iterator[tuple[Any, Any]]]] = [(holder, iter(enumerate(holder)))]
+    while stack:
+        container, entries = stack[-1]
+        for key, value in entries:
+            if isinstance(value, str):
+                found.append((container, key, value))
+            elif isinstance(value, dict):
+                stack.append((value, iter(value.items())))
+                break
+            elif isinstance(value, list):
+                stack.append((value, iter(enumerate(value))))
+                break
+        else:
+            stack.pop()
+    return found
 
 
 def _build(

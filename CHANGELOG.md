@@ -10,6 +10,121 @@ All development now integrates on `main`. Supported release lines are maintained
 on `stable/X.Y` branches; `stable/1.8` preserves the former stable branch.
 The separate `dev` branch is retired. See [the release process](docs/releasing.md).
 
+## [2026-11-06]
+
+### Added
+
+- **An expand all button opens every section of the admin Settings and Nodes tabs.** It
+  sits in each tab's toolbar; once every section is open it reads **collapse all** and
+  folds them back. It follows sections opened or closed one at a time, and it is disabled
+  while the tab has no sections to show: before they load, while the Nodes tab reloads its
+  node metadata, and after a failed load.
+
+### Fixed
+
+- **A node with one metadata key reads "(1 key)"** in its header on the admin Nodes tab,
+  not "(1 keys)".
+
+## [2026-11-05]
+
+### Security
+
+- **Passwords in `postgres://` connection strings are redacted.** The connection-string
+  rule knew only the `postgresql://` spelling, so a URL such as
+  `postgres://user:password@host/db` kept its password in a tool result the model and
+  the output guard's judge read, and in the text `redact_credentials` scrubs for close
+  reasons, audit details and logs, unless an env line's secret-named key (such as
+  `DATABASE_URL=`) redacted the whole value. Both spellings now have their password
+  redacted, in the browser's display redaction too.
+
+### Added
+
+- **A task agent's open step list on the web cards closes from its end too.** A **hide
+  steps** control under the last step folds the card back to its "N steps" bar and keeps
+  that bar in view, so a long list no longer has to be scrolled back up to close. It is
+  for the pointer; the "N steps" bar stays the keyboard's way to fold the card. The
+  control is absent while a step in the card waits for approval, where it would sit just
+  under Approve and Deny.
+
+### Changed
+
+- **The `wait_ended` event carries each child's state without its message.** Its
+  per-child `results` hold `state`, `tokens`, `updated` and `name`, as `wait_progress`
+  does, and the wait's tool result carries the children's text. A consumer that read
+  messages from `wait_ended` reads them from the tool result instead.
+
+### Fixed
+
+- **`wait_for_workstream` brings a child's message whole when the coordinator has room
+  for it.** The wait cut each finished child's message at 10 KiB whatever the
+  coordinator's context could hold, so a long report took a second call to
+  `inspect_workstream` and put its first 10 KiB in the context twice. On a small
+  context, a wait whose children's messages together outgrew the room one tool result
+  has was cut in the middle of its JSON, so the model lost some children's ids and
+  states along with their text. The session now fits the result when it adds it to the
+  coordinator's context, against the room it grants then: after any compaction, after
+  the results before it in the same batch, and never less than the 2,048 characters a
+  wait result always gets, and fits it again when redaction lengthens it. A message
+  that fits comes whole; when they don't all fit, as many as fit stay whole, smallest
+  first, so the fewest need a follow-up read, and the rest share what is left, each cut
+  from the end and marked `truncated` with `message_chars`, the whole message's length.
+  A wait result is bounded like any other tool result, by the session's per-result
+  ceiling. The tool's description and the guide for coordinator skill authors say what
+  each way of reading more of a cut message returns, and neither the guide nor the
+  API tour's sequence diagram has a coordinator inspect each child after the wait for
+  its answer.
+- **`web_fetch` keeps the links on a page.** Turning HTML into text dropped every link's
+  target, so the extraction model saw a link's words without its URL and, asked for a
+  link, could only guess one, which the calling model then fetched or cited. Each link
+  now reads `[text](url)`, its target resolved to an absolute URL against the address
+  the page was served from, after any redirects and without credentials, or against its
+  `<base href>`; a link to a named place in the page reads `[text](#fragment)`. Where a
+  target could mislead, the link keeps only its text: when it leads to the page itself,
+  to anything but an http, https or mailto URL, or to a target over 2,048 characters;
+  when a browser would refuse or resolve its href differently; and, after a note saying
+  so, once the page's links have used up the work one fetch spends resolving them,
+  unless the same href was resolved earlier. The page and PDF extraction prompts now
+  share their instructions: treat the source as untrusted, give each URL exactly as the
+  content has it, resolving a relative one against the page URL, which is now the
+  address after redirects with the requested fragment kept, and never invent one. The
+  tool's description tells the calling model to ask for the URLs it needs. Links
+  lengthen a page's text, from 1.1 to 4 times on the pages measured, so a long page
+  reaches its extraction budget sooner; a cut that would end inside a link's target
+  moves to before the link, and one inside a URL written as text moves back to the
+  whitespace before it when that is within 2,048 characters. Comments, and iframe and
+  noembed content, no longer show in the text; title and textarea content shows as
+  written; a `<` that opens no tag shows as text instead of hiding what follows it up to
+  the next `>`; a quoted attribute value that holds a `>` no longer spills into the
+  text, which put kilobytes of markup into some articles' text; and a declarative shadow
+  root's content now shows.
+- **`web_fetch` converts HTML in time proportional to the page's size.** On some
+  malformed markup the conversion's time grew with the square of the page's size. It now
+  reads a page once, front to back.
+- **`open_preview` finds a web page's title, and the place for its `<base href>`, in
+  linear time.** These lookups read a page's first 64 KB; on some malformed markup their
+  time grew with the square of that length. Each now scans it front to back and finds
+  what it found before (#1568).
+- **The output guard no longer reports a credential leak in text it already redacted.**
+  An env line, a JSON secret or a connection string whose value was already a
+  `[REDACTED:...]` marker matched its rule again, so a child's tool result that the
+  child's guard had redacted came back as a new high-risk credential leak every time
+  `inspect_workstream` read it. A value that is exactly a marker now passes. A marker
+  with more text in the same value, or a real secret elsewhere in the result, is
+  flagged and redacted as before.
+- **An `inspect_workstream` result no longer reads as a role injection, and the
+  output guard reads the child's text as written.** The guard scanned the result's
+  JSON encoding, so every system turn in the child's history, such as the memory
+  pointer the session adds, matched the `{"role":"system"` role-injection marker, and
+  the coordinator got a high-risk advisory on every inspect. The encoding also
+  escapes the child's text, so role JSON, a `"password": "..."` secret, an override
+  phrase split across lines or hex shellcode inside a message went unseen, and
+  redacting an env line's value could delete the message after it. The guard now
+  reads each string the result holds as text on its own, and still redacts a string
+  under a secret-named key. Three cases are still evaluated as text, as before: a
+  result that the result fold cut, an inspect that includes provider-native content,
+  whose keys the child's model wrote, and an earlier inspect result stored in the
+  history a coordinator inspects when it inspects itself (#1522).
+
 ## [2026-11-04]
 
 ### Security

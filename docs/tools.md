@@ -337,58 +337,71 @@ Fetch a web page or PDF and extract specific information from it.
 | `question` | string | yes      | What to extract or answer from the page or PDF. |
 
 - **What it does**: Fetches the URL and uses the LLM to answer the question from
-  the fetched content. HTML is stripped to plain text. A PNG, JPEG, GIF or WebP
-  image, or other binary content that isn't a PDF (a NUL character among the
-  first 8,192 characters of its decoded text), is refused with an error giving
-  its size and, if known, its type; nothing is extracted. A response whose bytes
-  begin with PDF magic uses the attachment PDF ladder: native document input
-  when the active model supports it, ordered page images for a vision model,
-  configured perception, then local text extraction. If none can read the PDF,
-  the tool returns an explicit error instead of asking the model to infer from
-  an empty document. Local PDF rendering and text extraction run in a one-shot
-  child under memory, CPU, wall-time, and output limits; exceeding that shared
-  attachment safety envelope fails the fetch explicitly, and so does a host that
-  can't run that child. Decoded HTML/plain text and locally extracted PDF text
-  use at most half the active model lane's calibrated context after prompt,
-  response, and safety reserves; the final request is checked again before
-  provider I/O. If no document allowance remains, the tool returns an error
-  instead of invoking extraction without source content. The fixed worker output
-  envelope is an additional PDF-only host-safety ceiling. Rasterization supplies
-  at most ten pages and explicitly tells the model when later pages were
-  omitted; that notice survives the perception cache. Fetched PDFs are
-  request-local and are not added to conversation history or attachment storage.
-  Every hop, the URL itself included, is SSRF-screened before it is requested,
-  and a hostname is looked up only once its call is approved, so a denied call
-  makes no DNS query. Private/internal addresses are refused by default; enable
-  `tools.allow_private_network` (console Settings → Tools) to make them
-  approvable for self-hosted setups whose services live on the local network.
-  The approval prompt marks such requests. A private IP address is marked from
-  the first request; a hostname is marked after an executed request has found
-  it private, which refuses that request and asks the model to repeat the
-  call, so the repeat is approved as a private-network request. Task agents
+  the fetched content. HTML becomes plain text that keeps each link as
+  `[text](url)`, its target resolved to an absolute URL against the address the
+  page was served from (after any redirects, without credentials) or against its
+  `<base href>`; a link to a named place in the page reads `[text](#fragment)`.
+  A link keeps only its text when its target could mislead: when it leads to the
+  page itself, to anything but an http, https or mailto URL, or to a target over
+  2,048 characters; when a browser would refuse or resolve its href differently
+  (a backslash, three slashes, an empty host, a bad port); and, after a note
+  saying so, once the page's links have used up the resolution work one fetch
+  allows, unless the same href was resolved earlier. Title and textarea content
+  is text, and the conversion stops once its text passes 10,485,760 characters,
+  saying where it stopped. Both the page and the PDF extraction model are told
+  to treat the source as untrusted, to give each URL exactly as the content has
+  it, resolving a relative one against the page URL (the address after
+  redirects, with the requested fragment), and never to invent one. A PNG, JPEG,
+  GIF or WebP image, or other binary content that isn't a PDF (a NUL character
+  among the first 8,192 characters of its decoded text), is refused with an
+  error giving its size and, if known, its type; nothing is extracted. A
+  response whose bytes begin with PDF magic uses the attachment PDF ladder:
+  native document input when the active model supports it, ordered page images
+  for a vision model, configured perception, then local text extraction. If none
+  can read the PDF, the tool returns an explicit error instead of asking the
+  model to infer from an empty document. Local PDF rendering and text extraction
+  run in a one-shot child under memory, CPU, wall-time, and output limits;
+  exceeding that shared attachment safety envelope fails the fetch explicitly,
+  and so does a host that can't run that child. Decoded HTML/plain text and
+  locally extracted PDF text use at most half the active model lane's calibrated
+  context after prompt, response, and safety reserves; the final request is
+  checked again before provider I/O. If no document allowance remains, the tool
+  returns an error instead of invoking extraction without source content. The
+  fixed worker output envelope is an additional PDF-only host-safety ceiling.
+  Rasterization supplies at most ten pages and explicitly tells the model when
+  later pages were omitted; that notice survives the perception cache. Fetched
+  PDFs are request-local and are not added to conversation history or attachment
+  storage. Every hop, the URL itself included, is SSRF-screened before it is
+  requested, and a hostname is looked up only once its call is approved, so a
+  denied call makes no DNS query. Private/internal addresses are refused by
+  default; enable `tools.allow_private_network` (console Settings → Tools) to
+  make them approvable for self-hosted setups whose services live on the local
+  network. The approval prompt marks such requests. A private IP address is
+  marked from the first request; a hostname is marked after an executed request
+  has found it private, which refuses that request and asks the model to repeat
+  the call, so the repeat is approved as a private-network request. Task agents
   also send these tagged requests through the approval gate, including its
   configured approval policies. If a remembered hostname no longer resolves
-  wholly private, that request is refused and its private tag is forgotten;
-  a now-public hostname can be retried as an ordinary request. A public site
-  redirecting into private space is refused regardless. Cloud metadata
-  endpoints and link-local, multicast and reserved addresses are refused even
-  with the opt-in enabled, including as a redirect target from a private address
-  you approved. An address is judged by what it actually reaches, so an IPv6
+  wholly private, that request is refused and its private tag is forgotten; a
+  now-public hostname can be retried as an ordinary request. A public site
+  redirecting into private space is refused regardless. Cloud metadata endpoints
+  and link-local, multicast and reserved addresses are refused even with the
+  opt-in enabled, including as a redirect target from a private address you
+  approved. An address is judged by what it actually reaches, so an IPv6
   transition address (NAT64, 6to4, Teredo) wrapping an internal IPv4 is treated
-  as an internal destination. A local-use NAT64 wrapper in `64:ff9b:1::/48`
-  is refused when any valid layout decodes into a refused range, even if its
-  actual IPv4 destination is public; the private-network opt-in cannot restore
-  access. The standard `64:ff9b::/96` DNS64 prefix still admits public IPv4
-  destinations. Each hop connects only to the addresses returned by its
-  screen, without another hostname lookup. The original hostname is kept for
-  HTTP routing, TLS SNI, and certificate verification. Certificates are
-  verified against the operating system's trust store; `SSL_CERT_FILE` or
-  `SSL_CERT_DIR` replaces it with a custom CA bundle for the whole process, so
-  that bundle must also hold any public roots other connections need. A
-  redirect gets a fresh screen and connection. Requests routed through
-  `HTTP_PROXY`, `HTTPS_PROXY`, or `ALL_PROXY` are refused because a proxy could
-  resolve the destination independently. Hosts excluded by `NO_PROXY` can
-  connect directly.
+  as an internal destination. A local-use NAT64 wrapper in `64:ff9b:1::/48` is
+  refused when any valid layout decodes into a refused range, even if its actual
+  IPv4 destination is public; the private-network opt-in cannot restore access.
+  The standard `64:ff9b::/96` DNS64 prefix still admits public IPv4
+  destinations. Each hop connects only to the addresses returned by its screen,
+  without another hostname lookup. The original hostname is kept for HTTP
+  routing, TLS SNI, and certificate verification. Certificates are verified
+  against the operating system's trust store; `SSL_CERT_FILE` or `SSL_CERT_DIR`
+  replaces it with a custom CA bundle for the whole process, so that bundle must
+  also hold any public roots other connections need. A redirect gets a fresh
+  screen and connection. Requests routed through `HTTP_PROXY`, `HTTPS_PROXY`, or
+  `ALL_PROXY` are refused because a proxy could resolve the destination
+  independently. Hosts excluded by `NO_PROXY` can connect directly.
 - **Request headers**: Every request, redirects included, identifies as
   `User-Agent: turnstone/1.0` and prefers HTML and English (`Accept`,
   `Accept-Language`). As in browsers, requests to https URLs and loopback hosts
