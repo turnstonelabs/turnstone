@@ -3542,9 +3542,18 @@ class TestConnectionTestEndpoint:
         probe.assert_not_called()
 
     def test_reports_the_catalog_and_saves_nothing(self, client, storage):
-        from turnstone.core.mcp_client import ConnectionProbe
+        from turnstone.core.mcp_client import ConnectionProbe, SkippedTool
 
-        found = ConnectionProbe(tools=["search", "fetch"], resources=1, prompts=0)
+        reason = (
+            "inputSchema.properties.id.type is not one of "
+            "['array', 'boolean', 'integer', 'null', 'number', 'object', 'string']"
+        )
+        found = ConnectionProbe(
+            tools=["search", "fetch"],
+            skipped_tools=(SkippedTool("lookup", reason),),
+            resources=1,
+            prompts=0,
+        )
         with patch("turnstone.core.mcp_client.probe_http_server", return_value=found) as probe:
             r = client.post(
                 "/v1/api/admin/mcp-servers/test",
@@ -3559,6 +3568,7 @@ class TestConnectionTestEndpoint:
         assert r.json() == {
             "ok": True,
             "tools": ["search", "fetch"],
+            "skipped_tools": [{"name": "lookup", "reason": reason}],
             "resources": 1,
             "prompts": 0,
             "error": None,
@@ -3588,6 +3598,7 @@ class TestConnectionTestEndpoint:
         assert r.json() == {
             "ok": False,
             "tools": [],
+            "skipped_tools": [],
             "resources": 0,
             "prompts": 0,
             "error": "HTTP 404 Not Found: no MCP endpoint at this URL",
@@ -5011,6 +5022,11 @@ class TestInternalMcpReconnectOneEndpoint:
 # Node fan-out status endpoint: GET /v1/api/_internal/mcp-status
 # ---------------------------------------------------------------------------
 
+_SKIP_REASON = (
+    "inputSchema.properties.id.type is not one of "
+    "['array', 'boolean', 'integer', 'null', 'number', 'object', 'string']"
+)
+
 
 class TestInternalMcpStatusEndpoint:
     """HTTP-level tests for the node-side aggregate status endpoint.
@@ -5057,6 +5073,7 @@ class TestInternalMcpStatusEndpoint:
             "srv-http": {
                 "connected": True,
                 "tools": 1,
+                "skipped_tools": [{"name": "lookup", "reason": _SKIP_REASON}],
                 "resources": 1,
                 "prompts": 0,
                 "error": "",
@@ -5085,6 +5102,8 @@ class TestInternalMcpStatusEndpoint:
             # through verbose exception messages at read scope.
             assert "error" not in entry
             assert "has_error" in entry
+            # The tools a catalog leaves out are for the admins who fix the server.
+            assert "skipped_tools" not in entry
         # Coarse error indicator preserved.
         assert servers["srv-stdio"]["has_error"] is True
         assert servers["srv-http"]["has_error"] is False
@@ -5111,6 +5130,7 @@ class TestInternalMcpStatusEndpoint:
         assert servers["srv-stdio"]["has_error"] is True
         assert servers["srv-http"]["error"] == ""
         assert servers["srv-http"]["has_error"] is False
+        assert servers["srv-http"]["skipped_tools"] == [{"name": "lookup", "reason": _SKIP_REASON}]
         for entry in servers.values():
             assert "command" not in entry
             assert "url" not in entry
@@ -5125,6 +5145,7 @@ class TestInternalMcpStatusEndpoint:
         assert r.status_code == 200
         servers = r.json()["servers"]
         assert all("error" not in entry for entry in servers.values())
+        assert all("skipped_tools" not in entry for entry in servers.values())
         assert servers["srv-stdio"]["has_error"] is True
         assert "secret-mcp-bin" not in r.text
 

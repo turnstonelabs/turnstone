@@ -907,6 +907,22 @@ MCP-compatible service.
 
 3. **Schema conversion**: Each MCP tool's `inputSchema` is converted to OpenAI
    function-calling format. The tool name is prefixed: `mcp__{server}__{tool}`.
+   A tool whose `inputSchema` is not valid JSON Schema is left out of the catalog, for
+   every model, including models that would have accepted it: providers that check
+   tool schemas refuse a whole request when one is invalid, so the tool would fail
+   every request that offers it (with tool search, every request after a search loads
+   it). The schema is checked against the metaschema of the dialect its `$schema`
+   names when that is draft-06, draft-07, 2019-09 or 2020-12 (under either URI
+   scheme), and against 2020-12 otherwise. Only its structure is checked: a `pattern`
+   is not compiled, since JSON Schema patterns follow ECMA-262 syntax rather than
+   Python's. A schema holding NaN or an infinity, which no JSON request can carry, is
+   left out too. Rules a provider adds beyond JSON Schema are not checked: a provider
+   that refuses, say, an array schema without `items` still refuses requests that
+   offer such a tool. The server's other tools are published as usual. Its status
+   lists each tool left out with the schema field that is wrong (`skipped_tools`,
+   shown in the admin console's MCP Servers tab), and a warning in the log names them
+   when a catalog first leaves them out and whenever they change (once for each user's
+   catalog of a per-user server).
 
 4. **Merging**: MCP tools are appended after the role's built-in tools via
    `merge_mcp_tools()`. Built-in tools appear first, giving them natural LLM priority.

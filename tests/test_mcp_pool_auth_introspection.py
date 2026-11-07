@@ -2040,15 +2040,20 @@ class TestOAuthUserServerStatus:
         via the aggregate view — not the per-user default (user_id=None), which
         would render every in-use oauth_user server disconnected/empty right after
         a successful refresh."""
+        from turnstone.core.mcp_client import SkippedTool
         from turnstone.server import _public_server_status
 
         mgr = MCPClientManager({})
         mgr._oauth_user_server_names = {"pool-srv"}
         self._warm(mgr, "user-A", "pool-srv", n_tools=2)
+        skipped = SkippedTool("lookup", "inputSchema.type is not of type 'string'")
+        mgr._user_pool_entries[("user-A", "pool-srv")].skipped_tools = (skipped,)
 
         status = _public_server_status(mgr, "pool-srv")
         assert status["connected"] is True
         assert status["tools"] == 2
+        # The operator who refreshes the server is told which tools its catalog leaves out.
+        assert status["skipped_tools"] == [{"name": skipped.name, "reason": skipped.reason}]
 
 
 # Suppress unused-import warning for AsyncMock.

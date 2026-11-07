@@ -24,6 +24,21 @@ The separate `dev` branch is retired. See [the release process](docs/releasing.m
 
 - **A node with one metadata key reads "(1 key)"** in its header on the admin Nodes tab,
   not "(1 keys)".
+- **An MCP tool with an invalid input schema no longer breaks the conversations that
+  offer it.** Each tool's `inputSchema` went to the model provider as the server listed
+  it, and a provider that checks tool schemas refuses a whole request when one is
+  invalid. One malformed tool (a property whose `type` is `""` or `"dateTime"`, say)
+  failed every request that offered it: with tool search, every request after a search
+  loaded it, for the rest of the conversation. A tool whose input schema is not valid
+  JSON Schema, or holds NaN or an infinity, is now left out of its server's catalog for
+  every model, including models that would have accepted it, and the server's other
+  tools stay available. A warning in the log names the tools left out when a catalog
+  first leaves them out and whenever they change. The server's status lists each one
+  and the schema field that is wrong (`skipped_tools`): the admin console's MCP Servers
+  list marks the server **tools skipped**, its details name each tool, and the
+  connection test lists the tools a save would leave out. Rules a provider adds beyond
+  JSON Schema, such as refusing an array schema without `items`, are not checked.
+  `jsonschema` is now a direct dependency (it was already installed with `mcp`).
 
 ## [2026-11-05]
 

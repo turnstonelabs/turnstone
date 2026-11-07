@@ -50,6 +50,9 @@ dependencies = [
     # Released in lockstep with httpx2, which pins the matching version.
     "httpcore2>=2.12,<3",
     "mcp>=2.3,<3",
+    # Checks each MCP tool's input schema against its dialect's metaschema before the tool is
+    # published. The floor is mcp's own.
+    "jsonschema>=4.20",
     "starlette>=1.3.1",  # CVE-2026-54282 (path->authority host spoof) + CVE-2026-54283 (url-encoded form DoS); supersedes the PYSEC-2026-161 host-header path-injection floor
     "uvicorn>=0.34",
     "sse-starlette>=2.0",
@@ -211,6 +214,10 @@ ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
 module = ["croniter", "croniter.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["jsonschema", "jsonschema.*"]
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]

@@ -21,6 +21,8 @@ ConnectFailureKind = Literal[
 _SERVER_STATUS_PUBLIC_KEYS: tuple[str, ...] = (
     "connected",
     "tools",
+    # The tools the server lists that its catalog leaves out, each as {name, reason}.
+    "skipped_tools",
     "resources",
     "prompts",
     "error",
@@ -29,8 +31,10 @@ _SERVER_STATUS_PUBLIC_KEYS: tuple[str, ...] = (
     "consecutive_failures",
 )
 
+# The admins who configure a server act on its error text and the tools it leaves out; no
+# read-scope view shows either.
 _READ_STATUS_PUBLIC_KEYS: tuple[str, ...] = tuple(
-    k for k in _SERVER_STATUS_PUBLIC_KEYS if k != "error"
+    k for k in _SERVER_STATUS_PUBLIC_KEYS if k not in ("error", "skipped_tools")
 )
 
 
@@ -56,7 +60,8 @@ def strip_server_status_for_read(full: dict[str, Any]) -> dict[str, Any]:
 
     Drops the verbose ``error`` text and replaces it with a coarse
     ``has_error: bool`` so dashboards can light up a failure indicator
-    without leaking the underlying exception detail.
+    without leaking the underlying exception detail. Drops
+    ``skipped_tools`` too.
     """
     out = {k: full[k] for k in _READ_STATUS_PUBLIC_KEYS if k in full}
     out["has_error"] = bool(full.get("error"))

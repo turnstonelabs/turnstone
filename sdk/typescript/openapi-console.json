@@ -13092,6 +13092,13 @@
             "title": "Tools",
             "type": "integer"
           },
+          "skipped_tools": {
+            "items": {
+              "$ref": "#/components/schemas/McpSkippedTool"
+            },
+            "title": "Skipped Tools",
+            "type": "array"
+          },
           "resources": {
             "default": 0,
             "title": "Resources",
@@ -13129,6 +13136,25 @@
           }
         },
         "title": "McpServerStatus",
+        "type": "object"
+      },
+      "McpSkippedTool": {
+        "description": "A tool a server lists that its catalog leaves out: its input schema is not valid JSON Schema.\n\n``reason`` names the field of the input schema that is wrong and what is wrong with it.",
+        "properties": {
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "reason": {
+            "title": "Reason",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "reason"
+        ],
+        "title": "McpSkippedTool",
         "type": "object"
       },
       "CreateMcpServerRequest": {
@@ -13600,6 +13626,13 @@
               "type": "string"
             },
             "title": "Tools",
+            "type": "array"
+          },
+          "skipped_tools": {
+            "items": {
+              "$ref": "#/components/schemas/McpSkippedTool"
+            },
+            "title": "Skipped Tools",
             "type": "array"
           },
           "resources": {
