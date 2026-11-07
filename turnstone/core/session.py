@@ -8635,12 +8635,10 @@ class ChatSession:
         text → placeholder.  Image → image_url typed by its content (a
         placeholder unless it is PNG, JPEG or WebP), or perception first when
         the primary has no vision.  Audio → STT transcript → perception →
-        placeholder. Audio reaches perception only when STT is unset or
-        successfully returns an empty transcript. Perception (the
-        ``perception.model_alias`` role) is the universal bottom tier: it
-        engages only when the primary can't handle the
-        kind and a capable perception model is configured.  A PDF rasterized to
-        images returns several parts."""
+        placeholder. Audio reaches perception only when STT is unset or successfully returns an
+        empty transcript. Perception (the ``perception.model_alias`` role) is the universal
+        bottom tier: it engages only when the primary can't handle the kind and a capable
+        perception model is configured.  A PDF rasterized to images returns several parts."""
         kind = att.get("kind")
         if kind == "pdf":
             materialized = self._materialize_pdf_attachment(
@@ -8741,16 +8739,19 @@ class ChatSession:
         Return ``None`` only when STT is unset or successfully returns an empty
         transcript, allowing the caller to try perception.
         """
-        from turnstone.core.audio import resolve_role_alias, transcribe_cached
-
-        configured_alias = (
-            (self._config_store.get("audio.stt_model_alias") or "").strip()
-            if self._config_store is not None
-            else ""
+        from turnstone.core.audio import (
+            configured_role_alias,
+            resolve_role_alias,
+            transcribe_cached,
         )
+
+        configured_alias = configured_role_alias(self._config_store, "stt")
         if not configured_alias:
             return None
         name = str(att.get("filename") or "audio")
+        raw = att.get("content")
+        if not isinstance(raw, bytes):
+            return unreadable_placeholder(name)
         unusable = {
             "type": "text",
             "text": (
@@ -8758,11 +8759,10 @@ class ChatSession:
                 f"STT model alias '{safe_attachment_label(configured_alias)}' is unusable]"
             ),
         }
-        raw = att.get("content")
         alias = resolve_role_alias(
             config_store=self._config_store, registry=self._registry, role="stt"
         )
-        if not alias or not isinstance(raw, bytes):
+        if not alias:
             return unusable
         effective_principal = (
             (self._mcp_effective_user_id or "") if principal_id is None else principal_id

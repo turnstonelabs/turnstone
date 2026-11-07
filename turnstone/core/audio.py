@@ -390,6 +390,14 @@ def is_speech_only_model(capabilities: Mapping[str, Any], model: str) -> bool:
     return False
 
 
+def configured_role_alias(config_store: Any | None, role: str) -> str:
+    """The role's alias setting, stripped; ``""`` when unset."""
+    key = _ROLE_SETTING.get(role)
+    if config_store is None or not key:
+        return ""
+    return (config_store.get(key) or "").strip()
+
+
 def resolve_role_alias(*, config_store: Any | None, registry: Any | None, role: str) -> str | None:
     """Return the configured, capability-eligible alias for *role*, or ``None``.
 
@@ -399,12 +407,9 @@ def resolve_role_alias(*, config_store: Any | None, registry: Any | None, role: 
     ``None`` so the caller surfaces a 503 (or hides the affordance) rather than
     calling a backend that can't serve audio.
     """
-    if registry is None or config_store is None:
+    if registry is None:
         return None
-    key = _ROLE_SETTING.get(role)
-    if not key:
-        return None
-    alias = (config_store.get(key) or "").strip()
+    alias = configured_role_alias(config_store, role)
     if not alias or not registry.has_alias(alias):
         return None
     if not model_supports_role(registry.get_config(alias), role):

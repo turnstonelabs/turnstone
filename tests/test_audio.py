@@ -206,6 +206,13 @@ class TestResolveRoleAlias:
     def test_none_when_no_registry_or_store(self):
         assert audio.resolve_role_alias(config_store=None, registry=None, role="stt") is None
 
+    def test_configured_role_alias_strips_and_defaults_to_empty(self):
+        cs = _FakeConfigStore(**{"audio.stt_model_alias": "  voice \n"})
+        assert audio.configured_role_alias(cs, "stt") == "voice"
+        assert audio.configured_role_alias(cs, "tts") == ""
+        assert audio.configured_role_alias(cs, "nope") == ""
+        assert audio.configured_role_alias(None, "stt") == ""
+
 
 # ---------------------------------------------------------------------------
 # transcribe / synthesize — boundary: mocked OpenAI-SDK client

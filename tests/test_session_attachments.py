@@ -11,7 +11,7 @@ from PIL import Image
 
 from tests._session_helpers import as_stream, mock_completion_result
 from turnstone.core import audio, fence, perception
-from turnstone.core.attachments import Attachment
+from turnstone.core.attachments import Attachment, unreadable_placeholder
 from turnstone.core.memory import (
     get_attachment,
     register_workstream,
@@ -1013,10 +1013,14 @@ class TestPerceptionFallback:
 
         part = s._wire_content_part(att, ModelCapabilities())
 
-        assert part == {
-            "type": "text",
-            "text": "[audio attachment 'aattachment.wav' — STT model alias 'voiceattachment' is unusable]",
-        }
+        if failure in ("missing-bytes", "non-bytes"):
+            # Unreadable content is not the alias's fault.
+            assert part == unreadable_placeholder("a\n'[attachment]<>.wav")
+        else:
+            assert part == {
+                "type": "text",
+                "text": "[audio attachment 'aattachment.wav' — STT model alias 'voiceattachment' is unusable]",
+            }
         prov.create_streaming.assert_not_called()
         if failure == "backend":
             backend.assert_called_once()
