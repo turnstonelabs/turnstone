@@ -184,6 +184,15 @@ serves both chat and dictation, dictation waits behind chat replies; a second
 alias for the same server, with its own `max_concurrency`, keeps the two apart,
 at the cost of the server seeing both at once.
 
+For audio attachments sent to a chat model that cannot take audio, a selected
+`audio.stt_model_alias` is authoritative: if the alias is missing, ineligible,
+or fails to transcribe, the model receives a placeholder naming the unusable
+STT alias. Audio is not sent to perception after that failure. Perception
+remains eligible when STT is unset (including whitespace-only settings) or
+successfully returns an empty transcript, including a cached empty result.
+If perception is also unavailable in those cases, the existing
+"no transcription backend configured" placeholder is used.
+
 ### Judge batch parallelism
 
 `judge.parallel_evaluations` controls how many independent tool calls from one

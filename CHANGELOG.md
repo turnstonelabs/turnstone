@@ -24,6 +24,12 @@ The separate `dev` branch is retired. See [the release process](docs/releasing.m
 
 - **A node with one metadata key reads "(1 key)"** in its header on the admin Nodes tab,
   not "(1 keys)".
+- **A selected STT model alias that can't run no longer hands audio to perception.** When
+  `audio.stt_model_alias` names an alias that is missing, can't transcribe, or whose backend
+  fails, the audio attachment gets a placeholder naming the alias instead of reaching the
+  perception model. An unset STT setting, or a transcript that comes back empty, still
+  falls through to perception. Audio whose stored content can't be read gets the unreadable
+  attachment placeholder.
 
 ## [2026-11-05]
 
