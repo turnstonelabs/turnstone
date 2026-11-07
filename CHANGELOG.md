@@ -20,6 +20,11 @@ The separate `dev` branch is retired. See [the release process](docs/releasing.m
   while the tab has no sections to show: before they load, while the Nodes tab reloads its
   node metadata, and after a failed load.
 
+### Fixed
+
+- **A node with one metadata key reads "(1 key)"** in its header on the admin Nodes tab,
+  not "(1 keys)".
+
 ## [2026-11-05]
 
 ### Security
