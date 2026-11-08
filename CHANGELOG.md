@@ -10,6 +10,20 @@ All development now integrates on `main`. Supported release lines are maintained
 on `stable/X.Y` branches; `stable/1.8` preserves the former stable branch.
 The separate `dev` branch is retired. See [the release process](docs/releasing.md).
 
+## [2026-11-08]
+
+### Changed
+
+- **Helm: the server and console containers run under tini as PID 1.** The
+  chart's `command:` replaces the image's entrypoint, which would leave
+  Turnstone itself as PID 1, and Turnstone never reaps orphaned processes, such
+  as the helpers a stdio MCP server leaves behind. The pods therefore shared
+  their process namespace, so that the pause container was PID 1 and reaped
+  them. The chart now names tini in each container's command, as the image's
+  entrypoint does, and the pods no longer share a process namespace, so
+  `kubectl debug` needs `--target` to see a service's processes. Chart 0.3.7
+  needs an image that carries tini, which every 1.9 image does.
+
 ## [1.9.3]
 
 > **Before upgrading:** the database advances from migration 086 to 088.
