@@ -12,7 +12,6 @@ import turnstone.core.secret_refs._resolver as resolver_module
 import turnstone.core.session as session_module
 from tests._secret_refs_helpers import install_fake_resolver
 from tests._session_helpers import log_has_field
-from turnstone.core.auth import JWT_AUD_CHANNEL
 from turnstone.core.secret_refs import (
     SecretBackendError,
     SecretConfigError,
@@ -82,10 +81,10 @@ def test_notify_tokens_are_signed_with_the_resolved_secret(monkeypatch):
 
     headers = session_module._notify_auth_headers()
     token = headers["Authorization"].removeprefix("Bearer ")
-    claims = jwt.decode(token, "r" * 48, algorithms=["HS256"], audience=JWT_AUD_CHANNEL)
-    assert claims["aud"] == JWT_AUD_CHANNEL
+    claims = jwt.decode(token, "r" * 48, algorithms=["HS256"], audience=auth_module.JWT_AUD_CHANNEL)
+    assert claims["aud"] == auth_module.JWT_AUD_CHANNEL
     with pytest.raises(jwt.InvalidSignatureError):
-        jwt.decode(token, reference, algorithms=["HS256"], audience=JWT_AUD_CHANNEL)
+        jwt.decode(token, reference, algorithms=["HS256"], audience=auth_module.JWT_AUD_CHANNEL)
 
 
 def test_notify_goes_on_without_a_token_when_the_reference_cannot_be_resolved(monkeypatch, caplog):
