@@ -29,9 +29,6 @@ spec:
         app.kubernetes.io/component: console
     spec:
       serviceAccountName: {{ include "turnstone.serviceAccountName" . }}
-      # The pause container becomes PID 1 and reaps orphaned processes, such as the
-      # helpers a stdio MCP server leaves behind; Turnstone as PID 1 never would.
-      shareProcessNamespace: true
       {{- with .Values.console.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
@@ -48,7 +45,14 @@ spec:
         - name: console
           image: {{ include "turnstone.image" . }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          # command replaces the image's entrypoint, and with it entrypoint.sh,
+          # whose migrations the service and the migrate Job already run; tini
+          # is named here so that, as PID 1, it reaps orphaned processes, such
+          # as the helpers a stdio MCP server leaves behind, and forwards
+          # signals to the service.
           command:
+            - tini
+            - --
             - turnstone-console
             - --host=0.0.0.0
             - --port={{ .Values.console.service.port }}

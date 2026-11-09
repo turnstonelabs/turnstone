@@ -10,6 +10,34 @@ All development now integrates on `main`. Supported release lines are maintained
 on `stable/X.Y` branches; `stable/1.8` preserves the former stable branch.
 The separate `dev` branch is retired. See [the release process](docs/releasing.md).
 
+## [2026-11-08]
+
+### Added
+
+- **Helm: MCP servers as sidecars of the server pod.** `server.sidecars` lists
+  containers that run in the server pod and share its `/workspace` with the
+  model's shell and file tools, for MCP servers that work on the agent's
+  files. Each entry is a container spec plus the `port` it listens on, and
+  the install notes print the localhost URL to register in the console.
+  Sidecars receive none of the chart's secret env and no service-account
+  token. Read [the chart README](deploy/helm/turnstone/README.md#mcp-servers)
+  before adding one: it says what a sidecar can reach and what reaches it.
+
+### Changed
+
+- **Helm: the chart requires Kubernetes 1.29 or newer.** Sidecars render as
+  native sidecars, which need it; `kubeVersion` in Chart.yaml enforces it, so
+  an install or upgrade on an older cluster stops with a clear message.
+- **Helm: the server and console containers run under tini as PID 1.** The
+  chart's `command:` replaces the image's entrypoint, which would leave
+  Turnstone itself as PID 1, and Turnstone never reaps orphaned processes, such
+  as the helpers a stdio MCP server leaves behind. The pods therefore shared
+  their process namespace, so that the pause container was PID 1 and reaped
+  them. The chart now names tini in each container's command, as the image's
+  entrypoint does, and the pods no longer share a process namespace, so
+  `kubectl debug` needs `--target` to see a service's processes. Chart 0.3.7
+  needs an image that carries tini, which every 1.9 image does.
+
 ## [2026-11-07]
 
 ### Fixed

@@ -18,9 +18,11 @@ spec:
         app.kubernetes.io/component: server
     spec:
       serviceAccountName: {{ include "turnstone.serviceAccountName" . }}
-      # The pause container becomes PID 1 and reaps orphaned processes, such as the
-      # helpers a stdio MCP server leaves behind; Turnstone as PID 1 never would.
-      shareProcessNamespace: true
+      {{- if .Values.server.sidecars }}
+      # Sidecars get no service-account token: the pod stops mounting it, and
+      # the server container gets the same token through a volume of its own.
+      automountServiceAccountToken: false
+      {{- end }}
       {{- with .Values.server.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
@@ -33,11 +35,24 @@ spec:
       tolerations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      {{- if .Values.server.sidecars }}
+      # MCP sidecars are started before the server and stopped after it; each
+      # shares the workspace volume below. See values.yaml, server.sidecars.
+      initContainers:
+        {{- include "turnstone.server.sidecars" . | trim | nindent 8 }}
+      {{- end }}
       containers:
         - name: server
           image: {{ include "turnstone.image" . }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          # command replaces the image's entrypoint, and with it entrypoint.sh,
+          # whose migrations the service and the migrate Job already run; tini
+          # is named here so that, as PID 1, it reaps orphaned processes, such
+          # as the helpers a stdio MCP server leaves behind, and forwards
+          # signals to the service.
           command:
+            - tini
+            - --
             - turnstone-server
             - --host
             - "0.0.0.0"
@@ -89,3 +104,37 @@ spec:
             periodSeconds: 20
           resources:
             {{- toYaml .Values.server.resources | nindent 12 }}
+          {{- if .Values.server.sidecars }}
+          volumeMounts:
+            - name: workspace
+              mountPath: /workspace
+            - name: kube-api-access
+              mountPath: /var/run/secrets/kubernetes.io/serviceaccount
+              readOnly: true
+          {{- end }}
+      {{- if .Values.server.sidecars }}
+      volumes:
+        # Shared with every sidecar. The image names /workspace in the model's
+        # tool descriptions (TURNSTONE_WORKSPACE), so the paths agree.
+        - name: workspace
+          emptyDir: {}
+        # What automountServiceAccountToken would have mounted, for the server
+        # container only.
+        - name: kube-api-access
+          projected:
+            defaultMode: 420
+            sources:
+              - serviceAccountToken:
+                  path: token
+                  expirationSeconds: 3607
+              - configMap:
+                  name: kube-root-ca.crt
+                  items:
+                    - key: ca.crt
+                      path: ca.crt
+              - downwardAPI:
+                  items:
+                    - path: namespace
+                      fieldRef:
+                        fieldPath: metadata.namespace
+      {{- end }}

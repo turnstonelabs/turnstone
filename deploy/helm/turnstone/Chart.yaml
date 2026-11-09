@@ -2,8 +2,10 @@ apiVersion: v2
 name: turnstone
 description: Multi-node AI orchestration platform with tool use, agent routing, and cluster simulation
 type: application
-version: 0.3.6
+version: 0.3.8
 appVersion: "1.9.3"
+# server.sidecars render as native sidecars, which need 1.29.
+kubeVersion: ">=1.29.0-0"
 
 dependencies:
   - name: postgresql
