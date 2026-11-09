@@ -14722,7 +14722,10 @@ def test_web_fetch_text_zero_document_budget_skips_extraction() -> None:
             {"call_id": "text-no-budget", "url": "https://example.com/"}
         )
 
-    assert answer == "Error: fetched content cannot fit within the active model's document budget"
+    assert (
+        answer
+        == "Error: fetched content cannot fit within the document budget of web_fetch's model"
+    )
     utility.assert_not_called()
 
 
@@ -15264,7 +15267,8 @@ class TestWebFetchPdf:
             )
 
         assert (
-            answer == "Error: fetched content cannot fit within the active model's document budget"
+            answer
+            == "Error: fetched content cannot fit within the document budget of web_fetch's model"
         )
         utility.assert_not_called()
 

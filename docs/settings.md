@@ -139,8 +139,8 @@ Each model definition may set `max_concurrency` to limit simultaneous model
 generations for that alias in one Turnstone process. `0` or an omitted value
 means unlimited. The gate is shared by every role using the alias—interactive
 turns, coordinators, task agents, judges, output guards, perception, compaction,
-title generation, speech-to-text and speech synthesis—and a streaming generation
-holds its slot until the stream is fully drained or closed.
+title generation, web_fetch reading, speech-to-text and speech synthesis—and a
+streaming generation holds its slot until the stream is fully drained or closed.
 
 Admission is strictly per alias. Two aliases remain independent even when they
 point to the same URL; Turnstone does not infer shared capacity from endpoint
@@ -183,6 +183,17 @@ generation and keeps the model client's timeout and retries. When one alias
 serves both chat and dictation, dictation waits behind chat replies; a second
 alias for the same server, with its own `max_concurrency`, keeps the two apart,
 at the cost of the server seeing both at once.
+
+### Audio attachments for models that can't hear
+
+When the chat model can't take audio and `audio.stt_model_alias` is set, an
+audio attachment goes to that speech-to-text model and to no other model. If the
+alias is missing, can't transcribe, or its backend fails, the chat model gets a
+placeholder naming the alias, and if the transcript comes back empty, a
+placeholder saying the alias found no speech. With `audio.stt_model_alias` empty
+(or only whitespace), the perception model (`perception.model_alias`) gets the
+audio instead, if it can take audio; otherwise the placeholder says no
+transcription backend is configured.
 
 ### Judge batch parallelism
 
@@ -358,6 +369,32 @@ so operators can pick a cheaper/faster model for autonomous loops:
 
 Both are live-editable from the Settings tab and take effect on the
 next sub-agent invocation — no restart required.
+
+### web_fetch model
+
+`tools.web_fetch_alias` (Models → Roles → Web fetch) names the model that reads
+what `web_fetch` fetches and answers the question asked about it, in
+conversations and task agents alike. When it's empty, the model that called
+`web_fetch` reads the page: the session's model, or the task agent's model at
+the effort its own turns use. A set alias reads with its own sampling settings
+and `max_tokens`, even when it is the session's alias. While it can't be used
+(it isn't loaded, or its client can't be built), `web_fetch` refuses the call
+before asking for approval and never reads with another model instead. That
+check makes no call to the model's server: it builds the model's client, which
+catches a missing certificate bundle and, on the `openai`, `google` and `xai`
+providers, a missing key. A problem that shows only once a request is sent, such
+as a key the server rejects or a missing key on another provider, still shows
+after the page is fetched, and the read still never moves to another model. The
+Models tab won't delete, disable or rename a model the setting names, except the
+last enabled model, whose removal clears it. The page budget follows the reading
+model's context window, and its capabilities decide how a fetched PDF is read.
+
+That model reads the raw, untrusted page, and only its answer reaches the
+conversation, so it is the one that has to ignore instructions planted in a
+page; smaller models do that less reliably. The page and the question go to it
+whatever model the conversation runs on. A host without a settings store, such
+as the CLI, reads with the caller's model. Changes take effect on the next
+fetch.
 
 ### Aliases offered to AI agents
 

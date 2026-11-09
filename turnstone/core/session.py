@@ -210,6 +210,7 @@ from turnstone.core.model_turn import (
     require_lane_capabilities,
     resolve_effort_setting,
     resolve_lane,
+    resolve_max_tokens_setting,
     resolve_model_binding,
     resolve_temperature_setting,
     same_model_lane_binding,
@@ -1338,6 +1339,23 @@ _AGENT_GUARD_WINDOW_CHARS: int = 2 * _AGENT_TOOL_OUTPUT_CAP
 # transient turn is never persisted, so this needs request consistency rather
 # than global uniqueness.
 _WEB_FETCH_PDF_REF_ID = "web-fetch-pdf"
+
+
+# Names the alias web_fetch reads pages with; empty means the model that called web_fetch.
+_WEB_FETCH_ALIAS_SETTING = "tools.web_fetch_alias"
+
+
+class _WebFetchModelUnavailableError(Exception):
+    """The alias ``tools.web_fetch_alias`` names can't be bound, so web_fetch can't read pages.
+
+    It is never replaced by another model, neither the session's nor the caller's. *cause* is
+    set when the alias is loaded but its client couldn't be built.
+    """
+
+    def __init__(self, alias: str, cause: str | None = None) -> None:
+        super().__init__(alias)
+        self.alias = alias
+        self.cause = cause
 
 
 def _web_extraction_instructions(source: str) -> str:
@@ -8631,14 +8649,13 @@ class ChatSession:
         """The active model's inline part(s) for one blob: native where
         supported, else the fallback ladder for a kind it can't read.
 
-        PDF → rasterized page images (vision primary) → perception → extracted
-        text → placeholder.  Image → image_url typed by its content (a
-        placeholder unless it is PNG, JPEG or WebP), or perception first when
-        the primary has no vision.  Audio → STT transcript → perception →
-        placeholder.  Perception (the ``perception.model_alias`` role) is the
-        universal bottom tier: it engages only when the primary can't handle the
-        kind and a capable perception model is configured.  A PDF rasterized to
-        images returns several parts."""
+        PDF → rasterized page images (vision primary) → perception → extracted text → placeholder.
+        Image → image_url typed by its content (a placeholder unless it is PNG, JPEG or WebP), or
+        perception first when the primary has no vision.  Audio → STT transcript when an STT alias
+        is set (a placeholder when the alias can't be used or finds no speech), else perception →
+        placeholder.  Perception (the ``perception.model_alias`` role) is the universal bottom tier:
+        it engages only when the primary can't handle the kind and a capable perception model is
+        configured.  A PDF rasterized to images returns several parts."""
         kind = att.get("kind")
         if kind == "pdf":
             materialized = self._materialize_pdf_attachment(
@@ -8698,10 +8715,15 @@ class ChatSession:
         cancel_ref: _CancelRef | None = None,
         principal_id: str | None = None,
     ) -> dict[str, Any]:
-        """Non-omni primary + audio: STT transcript (preferred), else perception
-        (if the perception model can hear), else a placeholder."""
+        """Non-omni primary + audio: the unreadable placeholder when the content isn't bytes, else
+        the STT part when an STT alias is set, else perception (if the perception model can hear),
+        else a placeholder."""
+        raw = att.get("content")
+        if not isinstance(raw, bytes):
+            return unreadable_placeholder(str(att.get("filename") or "audio"))
         transcript = self._stt_transcript_part(
             att,
+            raw,
             cancel_ref=cancel_ref,
             principal_id=principal_id,
         )
@@ -8727,22 +8749,34 @@ class ChatSession:
     def _stt_transcript_part(
         self,
         att: dict[str, Any],
+        raw: bytes,
         *,
         cancel_ref: _CancelRef | None = None,
         principal_id: str | None = None,
     ) -> dict[str, Any] | None:
-        """Transcribe via the STT role, or ``None`` when no STT role is
-        configured or the transcript is empty (caller falls through to
-        perception).  Only engages a configured backend — never a surprise call."""
-        from turnstone.core.audio import resolve_role_alias, transcribe_cached
+        """Transcribe via the STT role: the transcript, or a placeholder naming the alias when it
+        can't be used or its transcript is empty.  ``None`` only when no STT alias is set, so the
+        caller tries perception."""
+        from turnstone.core.audio import (
+            configured_role_alias,
+            resolve_role_alias,
+            transcribe_cached,
+        )
 
-        raw = att.get("content")
+        configured_alias = configured_role_alias(self._config_store, "stt")
+        if not configured_alias:
+            return None
+        name = str(att.get("filename") or "audio")
+        prefix = (
+            f"[audio attachment '{safe_attachment_label(name)}' — "
+            f"STT model alias '{safe_attachment_label(configured_alias)}'"
+        )
+        failed = {"type": "text", "text": f"{prefix} could not transcribe it]"}
         alias = resolve_role_alias(
             config_store=self._config_store, registry=self._registry, role="stt"
         )
-        if not alias or not isinstance(raw, bytes):
-            return None
-        name = str(att.get("filename") or "audio")
+        if not alias:
+            return failed
         effective_principal = (
             (self._mcp_effective_user_id or "") if principal_id is None else principal_id
         ).strip()
@@ -8759,8 +8793,10 @@ class ChatSession:
             ),
             cancel_ref=cancel_ref,
         )
+        if transcript is None:
+            return failed
         if not transcript:
-            return None
+            return {"type": "text", "text": f"{prefix} found no speech]"}
         # Transcribed speech is untrusted the same way typed message content is.
         # The resolver's attachment pass (``neutralize_attachment_part``) defangs
         # trusted markers and removes the session's tokens from this part, as
@@ -9850,7 +9886,8 @@ class ChatSession:
         clean_trailing_info: Callable[[str], str] | None = None,
     ) -> ModelTurnResult:
         """Run a lightweight internal completion (title gen, compaction,
-        extraction) through ``model_turn`` on the session's primary lane.
+        extraction) through ``model_turn`` on *lane*, the session's primary
+        lane when none is given.
 
         Inline-reasoning segregation is SEAM-OWNED (``drain_stream`` runs
         ``split_inline_reasoning``): ``result.content`` is think-tag-free
@@ -9920,8 +9957,11 @@ class ChatSession:
         turn.  Extraction leaves it out: its answer becomes a tool result, which
         the output guard reads as it came and the fold cleans on the wire.
 
-        A held session refuses here (:meth:`_raise_if_held`): every caller
-        runs on the session's own lane, a stand-in while held.
+        A held session refuses here (:meth:`_raise_if_held`), whichever lane
+        the call names.  The session's own lane is a stand-in while held; a
+        call on another alias (a task agent's compaction, a web_fetch read on
+        ``tools.web_fetch_alias`` or a task agent's alias) is refused all the
+        same.
         """
         self._raise_if_held()
         lane = lane or self._primary_lane()
@@ -20683,6 +20723,9 @@ class ChatSession:
                 "needs_approval": False,
                 "error": screen_err,
             }
+        unavailable = self._unusable_web_fetch_model_error(call_id)
+        if unavailable is not None:
+            return unavailable
         q_preview = question[:200] + ("..." if len(question) > 200 else "")
         preview = f"    {url}\n    Q: {q_preview}"
         private_tag = " (private network)" if private_origin else ""
@@ -20965,21 +21008,23 @@ class ChatSession:
             }
         return alias, None
 
-    def _model_unavailable_text(self, alias: str, *, configured: bool) -> str:
+    def _model_unavailable_text(
+        self, alias: str, *, configured: bool, retry_noun: str = "task"
+    ) -> str:
         """Why *alias* can't run and whether trying again can help, worded for a model.
 
         It never names another alias to use (#1359).  Retrying helps only when the alias may
         load by itself, and only on a host that reloads its models: the CLI, with no settings
         store, reads them once at start.  *configured* says an operator's setting named the
         alias, so an alias nothing defines is theirs to fix; one the model named itself gets
-        the reason alone.
+        the reason alone.  *retry_noun* names what to try again: the task, or the fetch.
         """
         if self._registry is None:
             return "this session has no model registry."
         reason, retryable = self._registry.unavailable_reason(alias)
         if retryable:
             if self._config_store is not None:
-                return f"{reason}. Try the task again shortly."
+                return f"{reason}. Try the {retry_noun} again shortly."
             return f"{reason}. It can load once the store answers and this program restarts."
         if configured or alias in self._registry.skipped_aliases:
             return f"{reason}. An operator has to fix it."
@@ -26780,6 +26825,11 @@ class ChatSession:
         # without consulting a later shared-workstream actor.
         cancel_scope.check()
         lane = self._lane_for_backend_auth_principal(lane, agent_principal)
+        # With tools.web_fetch_alias empty, web_fetch reads with the model that
+        # called it: this agent's lane, at the effort its own turns use.
+        web_fetch_caller_lane = dataclasses.replace(
+            lane, reasoning_effort=agent_reasoning_effort or lane.reasoning_effort
+        )
         agent_context_window = self._context_window_for_lane(lane)
         bound_measure = self._message_measure(lane_producer(lane))
         context_estimator = PromptTokenEstimator(
@@ -26860,11 +26910,13 @@ class ChatSession:
             execute_item = prepared
             if tool_name == "web_fetch":
                 # Keep provider handles out of judge/approval/UI payloads; the
-                # ref exists only on the execution copy that consumes it.
+                # ref and the lane exist only on the execution copy that
+                # consumes them.
                 execute_item = {
                     **prepared,
                     "_model_cancel_ref": cancel_scope.cancel_ref,
                     "_origin_generation": origin_generation,
+                    "_caller_lane": web_fetch_caller_lane,
                 }
             # This is the final admission read before crossing the executor
             # boundary.  A cancellation that wins before it is a confirmed
@@ -28916,6 +28968,98 @@ class ChatSession:
             self._report_tool_result(call_id, "edit_file", msg, is_error=True)
             return call_id, msg
 
+    def _web_fetch_alias(self) -> str:
+        """The alias ``tools.web_fetch_alias`` names, ``""`` when it names none.
+
+        Read from settings at use time, never from what is loaded. A host with no settings
+        store, such as the CLI, has no setting to read.
+        """
+        if self._config_store is None:
+            return ""
+        return str(self._config_store.get(_WEB_FETCH_ALIAS_SETTING) or "").strip()
+
+    def _web_fetch_model_error(self, alias: str, *, cause: str | None = None) -> str:
+        """What web_fetch returns while the alias its setting names can't run.
+
+        It says why and whether trying again can help, and never names another model (#1359).
+        *cause* is a client construction failure, named as the hold's refusal names it.
+        """
+        if cause is not None:
+            return (
+                f"Error: web_fetch's model '{alias}' can't be used: its client couldn't be "
+                f"built ({cause}). An operator has to fix it."
+            )
+        why = self._model_unavailable_text(alias, configured=True, retry_noun="fetch")
+        return f"Error: web_fetch's model '{alias}' is not available: {why}"
+
+    def _unusable_web_fetch_model_error(self, call_id: str) -> dict[str, Any] | None:
+        """Refuse a web_fetch whose set model can't be used, before the approval prompt.
+
+        The check is the one the read binds with (:meth:`_web_fetch_binding`), so an alias that
+        isn't loaded and one whose client can't be built are both refused here: nobody is asked
+        to approve a fetch that can't be read, and nothing is fetched. Nothing substitutes
+        another model, and the error doesn't steer the caller to one.
+        """
+        try:
+            self._web_fetch_binding()
+        except _WebFetchModelUnavailableError as exc:
+            return {
+                "call_id": call_id,
+                "func_name": "web_fetch",
+                "header": f"✗ web_fetch: its model '{exc.alias}' is not available",
+                "preview": "",
+                "needs_approval": False,
+                "error": self._web_fetch_model_error(exc.alias, cause=exc.cause),
+            }
+        return None
+
+    def _web_fetch_binding(self) -> tuple[ModelLane, int] | None:
+        """The lane ``tools.web_fetch_alias`` names and its output allowance, ``None`` if unset.
+
+        A set alias reads with its own binding, sampling settings and ``max_tokens`` rung, even
+        when it names the caller's own alias. One that can't be bound raises
+        :class:`_WebFetchModelUnavailableError` and is never replaced by another model. Binding
+        makes no network call: it looks the alias up and builds its SDK client object (cached
+        once built), which catches a missing certificate bundle and, on SDKs that require a key
+        at construction, a missing key. A problem that shows only when a request is sent still
+        shows at the read.
+        """
+        alias = self._web_fetch_alias()
+        if not alias:
+            return None
+        registry = self._registry
+        if registry is None:
+            raise _WebFetchModelUnavailableError(alias)
+        try:
+            binding = resolve_model_binding(
+                registry,
+                alias,
+                config_store=self._config_store,
+                backend_auth_resolver=self._model_backend_auth_token,
+            )
+        except ModelClientConstructionError as exc:
+            raise _WebFetchModelUnavailableError(alias, cause=str(exc)) from exc
+        except (ValueError, KeyError) as exc:
+            # ``UnknownModelAliasError`` is a ValueError; anything else is a bug and
+            # propagates as itself.
+            raise _WebFetchModelUnavailableError(alias) from exc
+        max_tokens = resolve_max_tokens_setting(binding.config, self._config_store)
+        return binding.lane, self.max_tokens if max_tokens is None else max_tokens
+
+    def _web_fetch_lane(self, item: dict[str, Any]) -> tuple[ModelLane, int]:
+        """The lane web_fetch reads a page with, and the output allowance it starts from.
+
+        The alias ``tools.web_fetch_alias`` names (:meth:`_web_fetch_binding`), else the model
+        that called web_fetch, as that caller runs it: a task agent hands its lane over on the
+        execution copy (``_caller_lane``), and otherwise it is the session's primary lane.
+        """
+        bound = self._web_fetch_binding()
+        if bound is not None:
+            return bound
+        caller_lane = item.get("_caller_lane")
+        lane = caller_lane if caller_lane is not None else self._primary_lane()
+        return lane, self.max_tokens
+
     def _exec_web_fetch(self, item: dict[str, Any]) -> tuple[str, str]:
         """Fetch a URL, then summarize/extract using an API call."""
         model_cancel_ref = item.get("_model_cancel_ref")
@@ -28972,7 +29116,9 @@ class ChatSession:
             )
 
         def _no_document_budget() -> tuple[str, str]:
-            msg = "Error: fetched content cannot fit within the active model's document budget"
+            msg = (
+                "Error: fetched content cannot fit within the document budget of web_fetch's model"
+            )
             _report_fetch_result(msg, is_error=True)
             return call_id, msg
 
@@ -29066,15 +29212,21 @@ class ChatSession:
 
         # Pin one lane and its estimator for the complete extraction request.
         # PDF representation choice and all document context limits must agree
-        # with the model generation that ultimately receives the wire.
+        # with the model generation that ultimately receives the wire. The lane
+        # is the alias tools.web_fetch_alias names, else the caller's own.
         item_principal = item.get("_principal_id")
         principal_id = (
             (self._mcp_effective_user_id or "") if item_principal is None else str(item_principal)
         ).strip()
-        lane = self._primary_lane()
+        try:
+            lane, allowance = self._web_fetch_lane(item)
+        except _WebFetchModelUnavailableError as exc:
+            msg = self._web_fetch_model_error(exc.alias, cause=exc.cause)
+            _report_fetch_result(msg, is_error=True)
+            return call_id, msg
         capabilities = require_lane_capabilities(lane)
         budget = self._utility_budget_snapshot(lane)
-        web_max_tokens = min(budget.max_tokens, budget.context_window // 4)
+        web_max_tokens = min(allowance, budget.context_window // 4)
         if capabilities.max_output_tokens:
             web_max_tokens = min(web_max_tokens, capabilities.max_output_tokens)
         budget = dataclasses.replace(budget, max_tokens=web_max_tokens)
@@ -29157,7 +29309,7 @@ class ChatSession:
                     return _no_document_budget()
                 if not materialized.readable:
                     msg = (
-                        "Error: fetched PDF could not be read by the current model "
+                        "Error: fetched PDF could not be read by web_fetch's model "
                         "or available fallbacks"
                     )
                     _report_fetch_result(msg, is_error=True)
@@ -29272,8 +29424,9 @@ class ChatSession:
         # Phase 3: summarization API call. The captured lane carries the
         # operator-resolved temperature and effort; do not reread the mutable
         # session after budgeting against that lane. max_tokens is likewise the
-        # snapshotted session allowance capped to the response reserve and the
-        # lane's advertised output limit.
+        # snapshotted allowance (a set web_fetch alias's own, else the
+        # session's) capped to the response reserve and the lane's advertised
+        # output limit.
         _check_fetch_cancelled()
         try:
             result = self._utility_completion(

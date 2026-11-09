@@ -336,7 +336,7 @@ Fetch a web page or PDF and extract specific information from it.
 | `url`      | string | yes      | The URL to fetch (must start with `http://` or `https://`). |
 | `question` | string | yes      | What to extract or answer from the page or PDF. |
 
-- **What it does**: Fetches the URL and uses the LLM to answer the question from
+- **What it does**: Fetches the URL and has a model answer the question from
   the fetched content. HTML becomes plain text that keeps each link as
   `[text](url)`, its target resolved to an absolute URL against the address the
   page was served from (after any redirects, without credentials) or against its
@@ -356,14 +356,14 @@ Fetch a web page or PDF and extract specific information from it.
   among the first 8,192 characters of its decoded text), is refused with an
   error giving its size and, if known, its type; nothing is extracted. A
   response whose bytes begin with PDF magic uses the attachment PDF ladder:
-  native document input when the active model supports it, ordered page images
+  native document input when the reading model supports it, ordered page images
   for a vision model, configured perception, then local text extraction. If none
   can read the PDF, the tool returns an explicit error instead of asking the
   model to infer from an empty document. Local PDF rendering and text extraction
   run in a one-shot child under memory, CPU, wall-time, and output limits;
   exceeding that shared attachment safety envelope fails the fetch explicitly,
   and so does a host that can't run that child. Decoded HTML/plain text and
-  locally extracted PDF text use at most half the active model lane's calibrated
+  locally extracted PDF text use at most half the reading model's calibrated
   context after prompt, response, and safety reserves; the final request is
   checked again before provider I/O. If no document allowance remains, the tool
   returns an error instead of invoking extraction without source content. The
@@ -402,6 +402,22 @@ Fetch a web page or PDF and extract specific information from it.
   screen and connection. Requests routed through `HTTP_PROXY`, `HTTPS_PROXY`, or
   `ALL_PROXY` are refused because a proxy could resolve the destination
   independently. Hosts excluded by `NO_PROXY` can connect directly.
+- **Which model reads the page**: The alias set in `tools.web_fetch_alias`
+  (console **Models → Roles → Web fetch**), in conversations and task agents
+  alike. When it's empty, the model that called web_fetch reads: the session's
+  model, or the task agent's model at the effort its own turns use. A set alias
+  reads with its own settings, even when it is the session's alias. While it
+  can't be used (it isn't loaded, or its client can't be built), web_fetch
+  refuses the call before asking for approval, and it never reads with another
+  model instead. The reading model sees the raw, untrusted page and only its
+  answer reaches the conversation, so it is the one that has to ignore
+  instructions planted in a page; smaller models do that less reliably. The
+  output guard checks that answer by pattern, and with its LLM stage only when
+  `judge.output_guard_llm` is on (off by default). The page and the question go
+  to the reading model whatever model the conversation runs on: with the setting
+  pointing at a hosted model, a conversation on a local model sends its fetches
+  there, and with the setting empty, so does a task agent running on a hosted
+  model.
 - **Request headers**: Every request, redirects included, identifies as
   `User-Agent: turnstone/1.0` and prefers HTML and English (`Accept`,
   `Accept-Language`). As in browsers, requests to https URLs and loopback hosts

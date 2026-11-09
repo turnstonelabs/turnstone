@@ -12,8 +12,30 @@ The separate `dev` branch is retired. See [the release process](docs/releasing.m
 
 ## [2026-11-08]
 
+### Added
+
+- **Helm: MCP servers as sidecars of the server pod.** `server.sidecars` lists
+  containers that run in the server pod and share its `/workspace` with the
+  model's shell and file tools, for MCP servers that work on the agent's
+  files. Each entry is a container spec plus the `port` it listens on, and
+  the install notes print the localhost URL to register in the console.
+  Sidecars receive none of the chart's secret env and no service-account
+  token. Read [the chart README](deploy/helm/turnstone/README.md#mcp-servers)
+  before adding one: it says what a sidecar can reach and what reaches it.
+- **Pick the model web_fetch reads pages with.** Models → Roles → Web fetch
+  (`tools.web_fetch_alias`) names the model that reads a fetched page or PDF and
+  answers the question, in conversations and task agents. Empty keeps the model
+  that called web_fetch. A set alias that can't be used (it isn't loaded, or its
+  client can't be built) makes web_fetch refuse the call before approval rather
+  than read with another model. This model reads the untrusted page itself, so
+  it has to ignore instructions planted in it; smaller models do that less
+  reliably. See [the settings guide](docs/settings.md#web_fetch-model).
+
 ### Changed
 
+- **Helm: the chart requires Kubernetes 1.29 or newer.** Sidecars render as
+  native sidecars, which need it; `kubeVersion` in Chart.yaml enforces it, so
+  an install or upgrade on an older cluster stops with a clear message.
 - **Helm: the server and console containers run under tini as PID 1.** The
   chart's `command:` replaces the image's entrypoint, which would leave
   Turnstone itself as PID 1, and Turnstone never reaps orphaned processes, such
@@ -23,6 +45,30 @@ The separate `dev` branch is retired. See [the release process](docs/releasing.m
   entrypoint does, and the pods no longer share a process namespace, so
   `kubectl debug` needs `--target` to see a service's processes. Chart 0.3.7
   needs an image that carries tini, which every 1.9 image does.
+- **A task agent's web_fetch reads with the task agent's model.** When
+  `tools.web_fetch_alias` is empty, a task agent's web_fetch now reads pages
+  with the task agent's model at its effort, not the conversation's model. When
+  a task agent runs on its own model (`model.task_alias`, `[model].task_model`
+  or `[model].agent_model` in config.toml, or the model the call names with
+  `model=`), the raw pages it fetches, approved private-network pages included,
+  go to that model's endpoint, count against its bill and context window, and
+  follow its PDF handling, and that model is the one that has to ignore
+  instructions planted in them. A task agent on the conversation's model reads
+  at the task effort when one is set (`model.task_effort`, or
+  `[model].task_effort` in config.toml). Set `tools.web_fetch_alias` to choose
+  the model that reads pages.
+
+## [2026-11-07]
+
+### Fixed
+
+- **A selected STT model alias that can't run no longer hands audio to
+  perception.** When `audio.stt_model_alias` names an alias that is missing,
+  can't transcribe, or whose backend fails, an audio attachment gets a
+  placeholder naming the alias instead of reaching the perception model, and a
+  transcript that comes back empty gets a placeholder saying the alias found no
+  speech. Perception still takes audio attachments when `audio.stt_model_alias`
+  is empty.
 
 ## [1.9.3]
 

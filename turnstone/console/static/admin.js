@@ -6744,10 +6744,10 @@ function _rememberModelResponseControl(spec) {
 // model in the placeholder.  The Task agent cascades through
 // ``[model].task_model → [model].agent_model → session model`` per
 // turnstone/core/settings_registry.py, the Judge is the session's own
-// model, and the Output guard judge cascades through ``judge.model →
-// session model`` — there's no single "default" to advertise, so the
-// blank reads "(inherit)" to match the vocabulary of the
-// reasoning-effort dropdowns.
+// model, Web fetch reads with the model that called it, and the Output
+// guard judge cascades through ``judge.model → session model`` — there's
+// no single "default" to advertise, so the blank reads "(inherit)" to
+// match the vocabulary of the reasoning-effort dropdowns.
 const MODEL_ROLES = [
   {
     label: "Coordinator",
@@ -6780,6 +6780,13 @@ const MODEL_ROLES = [
     fallbackKind: "inherit",
   },
   {
+    label: "Web fetch",
+    description:
+      "Reads what web_fetch fetches (a web page or PDF) and answers the AI's question about it, in conversations and task agents. It reads untrusted pages, so it has to ignore instructions planted in them; smaller models do that less reliably. Empty uses the model that called web_fetch: the session's model, or the task agent's.",
+    aliasKey: "tools.web_fetch_alias",
+    fallbackKind: "inherit",
+  },
+  {
     label: "Channel adapter",
     description:
       "Workstreams created by channel adapters (Discord, Slack) when no model is specified at creation time.",
@@ -6789,7 +6796,7 @@ const MODEL_ROLES = [
   {
     label: "Speech-to-text",
     description:
-      "Transcribes microphone audio in the workstream composer (voice input), and is the preferred transcript for audio attachments. Point at a transcription model (Whisper-style) or an audio-capable omni model — the omni path transcribes via chat. Empty disables the mic affordance; audio attachments then fall back to the Perception model if one is configured.",
+      "Transcribes microphone audio in the workstream composer (voice input), and audio attachments for a chat model that can't take audio. Point at a transcription model (Whisper-style) or an audio-capable omni model — the omni path transcribes via chat. If it can't transcribe an attachment, or hears no speech in it, the chat model gets a placeholder; the attachment never goes to the Perception model. Empty disables the mic affordance; audio attachments then go to the Perception model if one is configured.",
     aliasKey: "audio.stt_model_alias",
     fallbackKind: "disabled",
     mediaCapability: "supports_transcription",

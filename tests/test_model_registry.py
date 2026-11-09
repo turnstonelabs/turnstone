@@ -7401,7 +7401,12 @@ class TestOfferedAliases:
 
     @pytest.mark.parametrize(
         "general",
-        ["coordinator__model_alias", "channels__default_model_alias", "model__task_alias"],
+        [
+            "coordinator__model_alias",
+            "channels__default_model_alias",
+            "model__task_alias",
+            "tools__web_fetch_alias",
+        ],
     )
     def test_another_general_role_doesnt_keep_a_utility_alias_on_offer(self, general: str) -> None:
         """Those roles read their own settings, so hiding the alias costs them nothing."""
@@ -7426,6 +7431,7 @@ class TestOfferedAliases:
             "coordinator.model_alias",
             "model.task_alias",
             "channels.default_model_alias",
+            "tools.web_fetch_alias",
         }
         assert set(UTILITY_ROLE_SETTINGS) <= keys
 
