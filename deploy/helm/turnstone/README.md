@@ -19,7 +19,9 @@ helm install turnstone deploy/helm/turnstone \
 ```
 
 `auth.jwtSecret` takes the value inline instead; the render stops when neither
-is set. Either may hold a `secret://` reference, which the server and the
+is set. A changed value, inline or in an existing Secret, needs
+`kubectl rollout restart` of both Deployments so that every pod holds the
+same secret. Either may hold a `secret://` reference, which the server and the
 console resolve at startup once the configuration file below enables a secret
 store, so the Secret then carries only the reference.
 
@@ -181,6 +183,13 @@ when it changes, so a change needs `kubectl rollout restart` of both
 Deployments. If the Secret or its `config.toml` key is missing, the pods wait
 in ContainerCreating with a FailedMount event. Set `config.file` or
 `config.existingSecret`, not both.
+
+The pod templates carry a sha256 of `config.file` so that a changed text rolls
+the pods. Anyone who can read pods can read it, and a weak secret in an
+otherwise known file could be guessed from it, so use generated values. The
+inline `auth.jwtSecret` is not hashed: a digest of the signing secret alone
+would let the same readers guess a weak one offline, which is why a changed
+secret needs the rollout restart described above.
 
 The usual reason to use it is the `[secrets]` table, which lets a model's
 `api_key`, an MCP server's static header, the JWT signing secret or the OIDC

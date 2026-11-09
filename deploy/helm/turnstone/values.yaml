@@ -119,7 +119,9 @@ llm:
 # Secret with a TURNSTONE_JWT_SECRET key) or from `jwtSecret` inline; one of
 # them is required, and the render stops without it. Either may hold a
 # secret:// reference, resolved by the server and the console at startup once
-# `config.file` or `config.existingSecret` enables a secret store.
+# `config.file` or `config.existingSecret` enables a secret store. A changed
+# value, inline or in an existing Secret, needs a rollout restart of both
+# Deployments so that every pod holds the same secret.
 auth:
   jwtSecret: ""
   existingSecret: ""

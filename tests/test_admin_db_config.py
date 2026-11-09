@@ -11,6 +11,7 @@ TURNSTONE_DB_URL before every admin invocation.
 from __future__ import annotations
 
 import argparse
+import os
 from typing import TYPE_CHECKING
 from unittest.mock import patch
 
@@ -35,7 +36,7 @@ def _build_args(config_path: str | None) -> argparse.Namespace:
     Skips ``add_config_arg`` (which reads ``sys.argv``) — the test
     constructs the args programmatically instead.
     """
-    config_mod.set_config_path(config_path or "/nonexistent/turnstone-admin-test.toml")
+    config_mod.set_config_path(config_path or os.devnull)  # exists, reads as empty
     parser = argparse.ArgumentParser()
     config_mod.apply_config(parser, ["database"])
     sub = parser.add_subparsers(dest="command")
