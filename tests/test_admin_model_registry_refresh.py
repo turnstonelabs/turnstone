@@ -5043,9 +5043,57 @@ def test_the_guards_remedies_read_as_separate_steps(
         "'gpt' is still named by model.task_alias, [model] default in the console's "
         "config.toml. Point that setting at another model, or clear it. Change that "
         "config.toml line and restart the console. Do this before you delete it: creates "
-        "that rely on a setting naming a missing model fail, and a judge setting naming "
-        "one stops that judge."
+        "that rely on a setting naming a missing model fail and task_agent refuses its calls "
+        "while model.task_alias names a missing model."
     )
+
+
+@pytest.mark.parametrize(
+    ("settings", "stops"),
+    [
+        (
+            {"judge.output_guard_model": "gpt"},
+            "a judge setting naming a missing model stops that judge.",
+        ),
+        (
+            {"model.task_alias": "gpt"},
+            "task_agent refuses its calls while model.task_alias names a missing model.",
+        ),
+        (
+            {"tools.web_fetch_alias": "gpt"},
+            "web_fetch can't read pages while tools.web_fetch_alias names a missing model.",
+        ),
+        (
+            {"model.default_alias": "gpt", "tools.web_fetch_alias": "gpt"},
+            "creates that rely on a setting naming a missing model fail and web_fetch can't "
+            "read pages while tools.web_fetch_alias names a missing model.",
+        ),
+        (
+            {"model.task_alias": "gpt", "judge.model": "gpt", "tools.web_fetch_alias": "gpt"},
+            "task_agent refuses its calls while model.task_alias names a missing model, a "
+            "judge setting naming a missing model stops that judge, and web_fetch can't read "
+            "pages while tools.web_fetch_alias names a missing model.",
+        ),
+    ],
+)
+def test_the_refusal_says_only_what_the_naming_settings_stop(
+    storage: SQLiteBackend, settings: dict[str, str], stops: str
+) -> None:
+    from turnstone.console.server import _model_in_use_refusal
+
+    for key, value in settings.items():
+        _put_setting(storage, key, value)
+    refusal = _model_in_use_refusal(storage, "gpt", "delete")
+    assert refusal is not None
+    error = json.loads(bytes(refusal.body))["error"]
+    assert error.endswith(f"Do this before you delete it: {stops}")
+
+
+def test_every_fail_closed_routing_setting_says_what_it_stops() -> None:
+    """A setting added to the guard without a clause would fail every refusal it is in."""
+    from turnstone.console.server import _FAIL_CLOSED_ROUTING_KEYS, _ROUTING_KEY_STOPS
+
+    assert set(_ROUTING_KEY_STOPS) == set(_FAIL_CLOSED_ROUTING_KEYS)
 
 
 @pytest.mark.parametrize("key", ["judge.model", "judge.output_guard_model"])
@@ -5077,6 +5125,25 @@ def test_removing_a_model_a_judge_setting_names_is_refused(
         "model, which then judges its own tool calls, and its tool output too when "
         "judge.output_guard_model is empty."
     ) in deleted.json()["error"]
+
+
+def test_removing_the_model_web_fetch_reads_with_is_refused(storage: SQLiteBackend) -> None:
+    # web_fetch would refuse every fetch until someone repointed the setting.
+    _seed_model_def(storage, definition_id="m1", alias="reader", model="m")
+    _seed_model_def(storage, definition_id="m2", alias="spare", model="m")
+    _put_setting(storage, "tools.web_fetch_alias", "reader")
+    client = _routing_client(storage, _make_registry(alias="spare", extras={"reader": "m"}))
+
+    deleted = client.delete("/v1/api/admin/model-definitions/m1")
+    disabled = client.put("/v1/api/admin/model-definitions/m1", json={"enabled": False})
+    renamed = client.put("/v1/api/admin/model-definitions/m1", json={"alias": "reader2"})
+
+    for resp in (deleted, disabled, renamed):
+        assert resp.status_code == 409, resp.text
+        assert resp.json()["code"] == "model_in_use"
+        assert resp.json()["settings"] == ["tools.web_fetch_alias"]
+    row = storage.get_model_definition("m1")
+    assert row is not None and row["alias"] == "reader" and row["enabled"]
 
 
 def test_deleting_the_default_model_is_refused(storage: SQLiteBackend) -> None:
@@ -5140,6 +5207,7 @@ def test_removing_the_last_enabled_model_clears_the_settings_naming_it(
     _seed_model_def(storage, definition_id="m2", alias="off", model="m", enabled=False)
     _put_setting(storage, "model.default_alias", "only")
     _put_setting(storage, "coordinator.model_alias", "only", node_id="node-1")
+    _put_setting(storage, "tools.web_fetch_alias", "only")
     _put_setting(storage, "model.task_alias", "off")
     client = _routing_client(storage, _make_registry(alias="only"))
 
@@ -5148,6 +5216,7 @@ def test_removing_the_last_enabled_model_clears_the_settings_naming_it(
     assert resp.status_code == 200, resp.text
     assert storage.get_system_setting("model.default_alias") is None
     assert storage.get_system_setting("coordinator.model_alias", node_id="node-1") is None
+    assert storage.get_system_setting("tools.web_fetch_alias") is None
     assert _setting(storage, "model.task_alias") == "off"  # names another model
 
 

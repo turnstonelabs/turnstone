@@ -146,7 +146,10 @@ def _build_registry() -> dict[str, SettingDef]:
             "[model].task_model in config.toml, then [model].agent_model, then the session "
             "model. When this model isn't loaded, task_agent refuses the call instead of "
             "using another model. Task_agent fires frequently for autonomous subtasks "
-            "\u2014 point this at a cheaper/faster model than your conversation model.",
+            "\u2014 point this at a cheaper/faster model than your conversation model. "
+            "While tools.web_fetch_alias is empty, this model also reads the pages "
+            "task_agent fetches, so it is the one that has to ignore instructions "
+            "planted in them.",
         ),
         SettingDef(
             "model.hide_utility_aliases",
@@ -295,6 +298,22 @@ def _build_registry() -> dict[str, SettingDef]:
             "multicast and reserved addresses stay refused even with this on, "
             "including as a redirect target from a private address you approved — no "
             "legitimate service of yours lives there.",
+        ),
+        SettingDef(
+            "tools.web_fetch_alias",
+            "str",
+            "",
+            "Model alias web_fetch reads pages with (empty = the model that called it)",
+            "tools",
+            help="Which model reads what web_fetch fetches, a web page or a PDF, and answers "
+            "the question asked about it, in conversations and in task agents. Empty uses "
+            "the model that called web_fetch: the session's model, or the task agent's. "
+            "This model reads the untrusted page and only its answer reaches the "
+            "conversation, so it is the one that has to ignore instructions planted in a "
+            "page; smaller models do that less reliably. A set alias that can't be used is "
+            "never replaced by another model: web_fetch returns an error until it can be. "
+            "The page budget follows this model's context window, and its capabilities "
+            "decide how a fetched PDF is read.",
         ),
         SettingDef(
             "tools.search",
