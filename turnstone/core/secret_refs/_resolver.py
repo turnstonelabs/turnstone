@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import threading
 import time
 from dataclasses import dataclass
@@ -31,6 +33,38 @@ log = get_logger(__name__)
 # a registry load during a store outage costs one timeout, not one per
 # reference.
 FAILURE_COOLDOWN_SECONDS = 5.0
+
+
+# Digests of the process's bootstrap secrets (the JWT signing secret, the OIDC
+# client secret), whatever their source. A fetch for anything else that resolves
+# to one of them is refused: the file root and the Vault scope are the reach of
+# everyone allowed to write a reference, and a bootstrap secret kept there would
+# otherwise be theirs to read through a model key or an MCP header.
+_bootstrap_digests: set[bytes] = set()
+_bootstrap_lock = threading.Lock()
+
+
+def _digest(value: str) -> bytes:
+    return hashlib.sha256(value.encode("utf-8")).digest()
+
+
+def register_bootstrap_secret(value: str) -> None:
+    """Remember a bootstrap secret's digest, so no other reference may resolve to it."""
+    if not value:
+        return
+    with _bootstrap_lock:
+        _bootstrap_digests.add(_digest(value))
+
+
+def _is_bootstrap_secret(value: str) -> bool:
+    candidate = _digest(value)
+    with _bootstrap_lock:
+        digests = list(_bootstrap_digests)
+    # Every digest is compared, so the time taken does not say which one matched.
+    matched = False
+    for digest in digests:
+        matched |= hmac.compare_digest(digest, candidate)
+    return matched
 
 
 class SecretBackend(Protocol):
@@ -100,7 +134,27 @@ class SecretResolver:
     def cache_ttl_seconds(self) -> float:
         return self._config.cache_ttl_seconds
 
-    def fetch(self, reference: str) -> str:
+    def fetch(self, reference: str, *, bootstrap: bool = False) -> str:
+        """Resolve *reference*; the class docstring covers caching and outages.
+
+        A value equal to a registered bootstrap secret is refused unless the caller
+        is resolving a bootstrap secret itself (``bootstrap=True``), and the check
+        runs on every answer, cached ones included, so a value that was resolved
+        before the bootstrap secret registered is refused at its next use.
+        """
+        value = self._fetch(reference)
+        if not bootstrap and _is_bootstrap_secret(value):
+            with self._lock:
+                self._cache.pop(parse_reference(reference).text, None)
+            log.error("secret_refs.bootstrap_value_refused", reference=reference)
+            raise SecretResolveError(
+                f"{reference}: resolves to a bootstrap secret (the JWT signing secret or the OIDC "
+                "client secret), which a model key or MCP header may not name",
+                retryable=False,
+            )
+        return value
+
+    def _fetch(self, reference: str) -> str:
         ref = parse_reference(reference)
         backend = self._backend_for(ref)
         now = self._clock()
@@ -266,10 +320,12 @@ def invalidate_cache() -> None:
 
 
 def reset_for_tests() -> None:
-    """Drop the process-wide resolver so the next use rebuilds it from config."""
+    """Drop the process-wide resolver and the bootstrap registry; the next use rebuilds both."""
     global _instance
     with _instance_lock:
         previous = _instance
         _instance = None
     if previous is not None:
         previous.close()
+    with _bootstrap_lock:
+        _bootstrap_digests.clear()

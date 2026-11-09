@@ -132,6 +132,22 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _gateway_jwt_secret() -> str:
+    """``TURNSTONE_JWT_SECRET`` as the gateway shares it with the server and console.
+
+    A ``secret://`` reference is resolved once here, and the gateway stops when it
+    cannot be, as the hosts do; it then needs the same ``[secrets]`` table,
+    selected with ``TURNSTONE_CONFIG``. Empty stays empty: the gateway fails
+    closed on requests instead.
+    """
+    secret = os.environ.get("TURNSTONE_JWT_SECRET", "").strip()
+    if not secret:
+        return ""
+    from turnstone.core.secret_refs import resolve_bootstrap_secret
+
+    return resolve_bootstrap_secret("TURNSTONE_JWT_SECRET", secret)
+
+
 def _build_token_factories(
     jwt_secret: str,
 ) -> tuple[Callable[[], str] | None, Callable[[], str] | None]:
@@ -384,7 +400,7 @@ def main() -> None:
     )
     storage = get_storage()
 
-    jwt_secret = os.environ.get("TURNSTONE_JWT_SECRET", "").strip()
+    jwt_secret = _gateway_jwt_secret()
     console_token_factory, server_token_factory = _build_token_factories(jwt_secret)
 
     console_url, server_url = _resolve_service_urls(

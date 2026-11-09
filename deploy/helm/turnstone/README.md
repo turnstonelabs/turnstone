@@ -19,7 +19,9 @@ helm install turnstone deploy/helm/turnstone \
 ```
 
 `auth.jwtSecret` takes the value inline instead; the render stops when neither
-is set.
+is set. Either may hold a `secret://` reference, which the server and the
+console resolve at startup once the configuration file below enables a secret
+store, so the Secret then carries only the reference.
 
 The notes printed after install say how to reach the server and the console.
 `values.yaml` documents the settings; the ones most installs touch:
@@ -181,10 +183,10 @@ in ContainerCreating with a FailedMount event. Set `config.file` or
 `config.existingSecret`, not both.
 
 The usual reason to use it is the `[secrets]` table, which lets a model's
-`api_key` or an MCP server's static header hold a `secret://` reference
-instead of the value (see `docs/security.md`, "Secret References"). The table
-must be the same on the console and every node, which the shared Secret gives
-you.
+`api_key`, an MCP server's static header, the JWT signing secret or the OIDC
+client secret hold a `secret://` reference instead of the value (see
+`docs/security.md`, "Secret References"). The table must be the same on the
+console and every node, which the shared Secret gives you.
 
 ```yaml
 config:

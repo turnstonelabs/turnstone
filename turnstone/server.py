@@ -41,6 +41,8 @@ from turnstone.core.oauth.runtime import shutdown_oauth_runtime
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable
 
+    from turnstone.core.oauth.oidc import OIDCConfig
+
 from sse_starlette import EventSourceResponse
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
@@ -5724,6 +5726,7 @@ def create_app(
     mcp_ref: list[Any] | None = None,
     oauth: OAuthContext | None = None,
     model_token_client: OAuthModelTokenClient | None = None,
+    oidc_config: OIDCConfig | None = None,
     registry: Any = None,
     idle_timeout: int = 0,
     node_id: str = "",
@@ -6141,10 +6144,14 @@ def create_app(
 
     app.state.login_limiter = LoginRateLimiter()
 
-    # OIDC configuration (opt-in via env vars)
-    from turnstone.core.oauth.oidc import load_oidc_config
+    # OIDC configuration (opt-in via env vars). The server's main() loads it
+    # before the registry build and the MCP connects and hands it in, so that
+    # its client secret registers as a bootstrap value before anything resolves
+    # a reference; test apps built without one load it here.
+    if oidc_config is None:
+        from turnstone.core.oauth.oidc import load_oidc_config
 
-    oidc_config = load_oidc_config()
+        oidc_config = load_oidc_config()
     oauth_context(app.state).oidc_config = oidc_config
     app.state.jwks_data = None  # populated after async discovery
 
@@ -6287,6 +6294,18 @@ def main() -> None:
     except SecretConfigError as exc:
         log.error("secret_refs.config_invalid", error=str(exc))
         raise SystemExit(1) from exc
+
+    # The JWT secret, resolved now if it is a reference: nothing below (model
+    # detection, MCP connects) should run only to exit for want of it.
+    from turnstone.core.auth import load_jwt_secret
+
+    jwt_secret = load_jwt_secret()
+
+    # The OIDC client secret too: the registry build and the MCP connects below
+    # send resolved references, and the guard refuses only registered values.
+    from turnstone.core.oauth.oidc import load_oidc_config
+
+    oidc_config = load_oidc_config()
 
     # Prune stale / empty workstreams on startup
     from turnstone.core.memory import prune_workstreams
@@ -6640,10 +6659,8 @@ def main() -> None:
     _metrics.set_judge_enabled(judge_config.enabled if judge_config else False)
 
     # Auth config
-    from turnstone.core.auth import load_jwt_secret
     from turnstone.core.storage import get_storage
 
-    jwt_secret = load_jwt_secret()
     log.info("Auth: enabled (JWT)")
 
     # Build the ASGI app
@@ -6670,6 +6687,7 @@ def main() -> None:
         global_listeners_lock=global_listeners_lock,
         skip_permissions=_skip_perms,
         jwt_secret=jwt_secret,
+        oidc_config=oidc_config,
         auth_storage=get_storage(),
         health_registry=health_registry,
         rate_limiter=rate_limiter,

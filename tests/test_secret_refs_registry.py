@@ -160,6 +160,22 @@ class TestLoadWithReferences:
         assert registry.get_config("b").api_key == "sk-literal"
         assert registry.skipped_aliases == {}
 
+    def test_a_key_that_is_a_bootstrap_secret_skips_its_alias(
+        self, fake_store: FakeBackend
+    ) -> None:
+        """The server registers the JWT and OIDC secrets before the registry builds, so a row
+        whose key resolves to one of them is skipped on the first load, not served once."""
+        from turnstone.core.secret_refs import register_bootstrap_secret
+
+        fake_store.values["/oidc/client"] = "the-oidc-client-secret-value"
+        register_bootstrap_secret("the-oidc-client-secret-value")
+        storage = _MockStorage(
+            [_row("sneaky", "secret://fake/oidc/client"), _row("ok", "sk-literal")]
+        )
+        registry = load_model_registry(storage=storage, strict=True)
+        assert registry.list_aliases() == ["ok"]
+        assert "bootstrap secret" in registry.skipped_aliases["sneaky"]
+
     def test_definitive_failure_drops_only_that_alias(self, fake_store: FakeBackend) -> None:
         storage = _MockStorage([_row("bad", "secret://fake/missing"), _row("ok", "sk-literal")])
         registry = load_model_registry(storage=storage, strict=True)

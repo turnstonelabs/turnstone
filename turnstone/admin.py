@@ -460,7 +460,9 @@ def _cmd_tls_list(args: argparse.Namespace) -> None:
     url = f"{console_url}/v1/api/admin/tls/certs"
     headers = {}
     # Prefer JWT via ServiceTokenManager when JWT secret is available
-    jwt_secret = os.environ.get("TURNSTONE_JWT_SECRET", "").strip()
+    from turnstone.core.auth import jwt_secret_if_configured
+
+    jwt_secret = jwt_secret_if_configured() or ""
     if jwt_secret:
         from turnstone.core.auth import JWT_AUD_CONSOLE, ServiceTokenManager
 
@@ -650,9 +652,12 @@ def _cmd_orphan_conversations(args: argparse.Namespace) -> None:
 
 
 def _cmd_rerank_calibrate(args: argparse.Namespace) -> None:
+    from turnstone.core.bootstrap_secrets import register_bootstrap_values
     from turnstone.core.config import get_rerank_instruction
     from turnstone.core.config_store import ConfigStore
     from turnstone.core.rerank_calibrate import calibrate_model, merge_calibration_into_caps
+
+    register_bootstrap_values()  # a stored key may not resolve to a bootstrap secret
 
     storage = _get_storage(args)
     try:

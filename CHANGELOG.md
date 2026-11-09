@@ -14,6 +14,20 @@ The separate `dev` branch is retired. See [the release process](docs/releasing.m
 
 ### Added
 
+- **`[auth] jwt_secret` and `[oidc] client_secret` may be `secret://`
+  references.** In config.toml or in `TURNSTONE_JWT_SECRET` and
+  `TURNSTONE_OIDC_CLIENT_SECRET`. Each is resolved once at startup; the
+  server, the console and the channel gateway stop when the reference cannot
+  be resolved, and a tool logs a warning and goes on without it. A value
+  rotated in the store reaches a process at its next start; the JWT secret
+  must match on the console, every node and the channel gateway, so restart
+  them together. Every process refuses a model key or MCP header reference
+  that resolves to either value as that process has it configured, so a
+  bootstrap secret kept in the store stays out of reach of everyone who may
+  write a reference. The `tls list` and `/cluster` commands now read the
+  secret the way the services do, from `TURNSTONE_JWT_SECRET` or `[auth]
+  jwt_secret`, where they read only the environment before. The first two
+  items of #1335.
 - **Helm: a configuration file for the server and console, and secret
   mounts.** `config.file` holds the text of a config.toml, rendered into a
   Secret and mounted read-only in both pods, and a change rolls them;

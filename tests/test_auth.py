@@ -2555,3 +2555,118 @@ class TestBuiltinAdminDefaultPermissions:
             "added this grant, update the security contract in "
             "``console/server.py`` _VALID_PERMISSIONS docstring first."
         )
+
+
+def _fresh_jwt_memo(monkeypatch):
+    import turnstone.core.auth as auth_module
+
+    monkeypatch.setattr(auth_module, "_resolved_jwt_secret", None)
+
+
+def test_load_jwt_secret_resolves_a_reference_from_env(monkeypatch):
+    from tests._secret_refs_helpers import install_fake_resolver
+
+    _fresh_jwt_memo(monkeypatch)
+    backend = install_fake_resolver(monkeypatch, {"/auth/jwt": "x" * 48})
+    monkeypatch.setenv("TURNSTONE_JWT_SECRET", "secret://fake/auth/jwt")
+    assert load_jwt_secret() == "x" * 48
+    assert load_jwt_secret() == "x" * 48
+    assert backend.calls == 1, "resolved once per process, then remembered"
+    from turnstone.core.secret_refs import SecretResolveError, resolve
+
+    with pytest.raises(SecretResolveError, match="bootstrap secret"):
+        resolve("secret://fake/auth/jwt")  # a model key or MCP header may not name it
+
+
+def test_load_jwt_secret_resolves_a_reference_from_config(monkeypatch):
+    from tests._secret_refs_helpers import install_fake_resolver
+
+    _fresh_jwt_memo(monkeypatch)
+    install_fake_resolver(monkeypatch, {"/auth/jwt": "y" * 48})
+    monkeypatch.delenv("TURNSTONE_JWT_SECRET", raising=False)
+    monkeypatch.setattr(
+        "turnstone.core.config.load_config",
+        lambda section=None: {"jwt_secret": "secret://fake/auth/jwt"},
+    )
+    assert load_jwt_secret() == "y" * 48
+
+
+def test_load_jwt_secret_unresolved_reference_exits(monkeypatch, caplog):
+    """A reference nothing can serve stops the process; nothing runs without the JWT secret.
+
+    The references are longer than the minimum secret length, so a failure that returned
+    the reference text unchanged would not be hidden by the length check."""
+    import logging
+
+    from tests._secret_refs_helpers import install_fake_resolver
+    from tests._session_helpers import log_has_field
+
+    _fresh_jwt_memo(monkeypatch)
+    install_fake_resolver(monkeypatch, {})
+    missing = "secret://fake/auth/jwt-that-the-store-does-not-hold"
+    assert len(missing) >= 32
+    monkeypatch.setenv("TURNSTONE_JWT_SECRET", missing)
+    with caplog.at_level(logging.ERROR), pytest.raises(SystemExit) as exc:
+        load_jwt_secret()
+    assert exc.value.code == 1
+    assert any(log_has_field(r, "setting", "[auth] jwt_secret") for r in caplog.records)
+    assert any(log_has_field(r, "reference", missing) for r in caplog.records)
+
+    unknown_backend = "secret://vault/auth/jwt-with-no-such-backend-configured"
+    monkeypatch.setenv("TURNSTONE_JWT_SECRET", unknown_backend)
+    with pytest.raises(SystemExit) as exc:
+        load_jwt_secret()
+    assert exc.value.code == 1
+
+
+def test_load_jwt_secret_resolved_value_still_needs_the_minimum_length(monkeypatch, caplog):
+    import logging
+
+    from tests._secret_refs_helpers import install_fake_resolver
+
+    _fresh_jwt_memo(monkeypatch)
+    backend = install_fake_resolver(monkeypatch, {"/auth/jwt-resolving-to-a-short-value": "short"})
+    monkeypatch.setenv("TURNSTONE_JWT_SECRET", "secret://fake/auth/jwt-resolving-to-a-short-value")
+    with caplog.at_level(logging.ERROR), pytest.raises(SystemExit) as exc:
+        load_jwt_secret()
+    assert exc.value.code == 1
+    assert backend.calls == 1, "the store answered; the length check refused the value"
+    assert any("at least" in r.getMessage() for r in caplog.records)
+    assert not any("bootstrap_unresolved" in r.getMessage() for r in caplog.records)
+
+
+def test_the_jwt_secret_is_resolved_once_per_process(monkeypatch):
+    """One value per process: a rotation in the store reaches a host at its next start."""
+    from tests._secret_refs_helpers import FakeClock, install_fake_resolver
+    from turnstone.core.auth import jwt_secret_if_configured
+
+    _fresh_jwt_memo(monkeypatch)
+    clock = FakeClock()
+    backend = install_fake_resolver(monkeypatch, {"/auth/jwt": "x" * 48}, clock=clock)
+    monkeypatch.setenv("TURNSTONE_JWT_SECRET", "secret://fake/auth/jwt")
+    assert load_jwt_secret() == "x" * 48
+    clock.now += 10_000  # past the resolver's own cache
+    backend.values["/auth/jwt"] = "y" * 48  # rotated in the store
+    assert load_jwt_secret() == "x" * 48
+    assert jwt_secret_if_configured() == "x" * 48
+    assert backend.calls == 1
+
+
+def test_jwt_secret_if_configured_never_exits(monkeypatch, caplog):
+    """The notify path and the CLI helpers go on without a token instead of stopping."""
+    import logging
+
+    from tests._secret_refs_helpers import install_fake_resolver
+    from turnstone.core.auth import jwt_secret_if_configured
+
+    _fresh_jwt_memo(monkeypatch)
+    install_fake_resolver(monkeypatch, {"/auth/jwt": "z" * 48})
+    monkeypatch.setenv("TURNSTONE_JWT_SECRET", "secret://fake/auth/jwt")
+    assert jwt_secret_if_configured() == "z" * 48
+    monkeypatch.setenv("TURNSTONE_JWT_SECRET", "secret://fake/auth/missing-from-the-store")
+    with caplog.at_level(logging.WARNING):
+        assert jwt_secret_if_configured() is None
+    assert any("bootstrap_unresolved" in r.getMessage() for r in caplog.records)
+    monkeypatch.delenv("TURNSTONE_JWT_SECRET", raising=False)
+    monkeypatch.setattr("turnstone.core.config.load_config", lambda section=None: {})
+    assert jwt_secret_if_configured() is None

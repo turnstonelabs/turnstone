@@ -17,6 +17,10 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
+from turnstone.core.secret_refs._bootstrap import (
+    resolve_bootstrap_secret,
+    try_resolve_bootstrap_secret,
+)
 from turnstone.core.secret_refs._errors import (
     SecretBackendError,
     SecretConfigError,
@@ -36,6 +40,7 @@ from turnstone.core.secret_refs._resolver import (
     get_resolver,
     invalidate_cache,
     load_secrets_config,
+    register_bootstrap_secret,
     reset_for_tests,
 )
 
@@ -88,6 +93,9 @@ __all__ = [
     "load_secrets_config",
     "parse_reference",
     "refresh_seconds",
+    "resolve_bootstrap_secret",
+    "try_resolve_bootstrap_secret",
+    "register_bootstrap_secret",
     "reset_for_tests",
     "resolve",
     "resolve_mapping",

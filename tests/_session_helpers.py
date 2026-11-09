@@ -110,6 +110,7 @@ def log_has_field(record: logging.LogRecord, key: str, value: str | int | float)
         candidate in message
         for candidate in (
             f"{key}={value}",
+            f"{key}={value!r}",  # the console renderer quotes a value with spaces
             f"'{key}': {value!r}",
             f'"{key}": {json.dumps(value)}',
         )

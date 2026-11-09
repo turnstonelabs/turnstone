@@ -117,7 +117,9 @@ llm:
 
 # -- Authentication. The JWT signing secret comes from `existingSecret` (a
 # Secret with a TURNSTONE_JWT_SECRET key) or from `jwtSecret` inline; one of
-# them is required, and the render stops without it.
+# them is required, and the render stops without it. Either may hold a
+# secret:// reference, resolved by the server and the console at startup once
+# `config.file` or `config.existingSecret` enables a secret store.
 auth:
   jwtSecret: ""
   existingSecret: ""

@@ -980,25 +980,64 @@ def parse_scopes(scopes_str: str) -> frozenset[str]:
 # ---------------------------------------------------------------------------
 
 
-def load_jwt_secret() -> str:
-    """Load JWT signing secret from env or config.
+# The JWT secret as resolved in this process: (as configured, as resolved). In
+# the server, the console and the CLI tools every reader goes through
+# load_jwt_secret or jwt_secret_if_configured, so a secret:// reference is
+# fetched once per process and all of them sign and verify with one value; the
+# reference text is never used as a key. The channel gateway resolves its copy
+# at start through its own helper.
+_resolved_jwt_secret: tuple[str, str] | None = None
 
-    Raises :class:`SystemExit` if no secret is configured.  A JWT secret
-    is required for auth, inter-service communication, and session tokens.
+
+def configured_jwt_secret() -> str:
+    """The JWT signing secret as configured, stripped.
+
+    ``TURNSTONE_JWT_SECRET`` wins, else ``[auth] jwt_secret`` in config.toml. A
+    ``secret://`` reference is returned as written; the callers resolve it.
     """
     secret = os.environ.get("TURNSTONE_JWT_SECRET", "").strip()
     if not secret:
         from turnstone.core.config import load_config
 
-        auth_cfg = load_config("auth")
-        secret = str(auth_cfg.get("jwt_secret", "")).strip()
+        secret = str(load_config("auth").get("jwt_secret", "")).strip()
+    return secret
 
-    if not secret:
+
+def _remembered_jwt_secret(configured: str) -> str | None:
+    if _resolved_jwt_secret is not None and _resolved_jwt_secret[0] == configured:
+        return _resolved_jwt_secret[1]
+    return None
+
+
+def _remember_jwt_secret(configured: str, secret: str) -> str:
+    global _resolved_jwt_secret
+    _resolved_jwt_secret = (configured, secret)
+    return secret
+
+
+def load_jwt_secret() -> str:
+    """Load the JWT signing secret from env or config and resolve it once.
+
+    Either source may hold a ``secret://`` reference. Raises :class:`SystemExit`
+    if no secret is configured, if the reference cannot be resolved, or if the
+    resolved value is shorter than ``_MIN_SECRET_LENGTH``. Every host calls
+    this at startup; the other readers in the process then share the value.
+    """
+    configured = configured_jwt_secret()
+    if not configured:
         log.error(
             "TURNSTONE_JWT_SECRET is required but not set. "
             'Generate one with: python -c "import secrets; print(secrets.token_hex(32))"'
         )
         raise SystemExit(1)
+
+    secret = _remembered_jwt_secret(configured)
+    if secret is None:
+        from turnstone.core.secret_refs import resolve_bootstrap_secret
+
+        secret = _remember_jwt_secret(
+            configured, resolve_bootstrap_secret("[auth] jwt_secret", configured)
+        )
 
     if len(secret) < _MIN_SECRET_LENGTH:
         log.error(
@@ -1008,6 +1047,28 @@ def load_jwt_secret() -> str:
         )
         raise SystemExit(1)
     return secret
+
+
+def jwt_secret_if_configured() -> str | None:
+    """The resolved JWT secret, or ``None`` when none is configured or a
+    reference cannot be resolved right now.
+
+    For paths that must not stop the process, such as a notify delivery or a
+    CLI helper: they log and go on without a token. In a host that called
+    :func:`load_jwt_secret` at startup this is the value it resolved.
+    """
+    configured = configured_jwt_secret()
+    if not configured:
+        return None
+    secret = _remembered_jwt_secret(configured)
+    if secret is not None:
+        return secret
+    from turnstone.core.secret_refs import try_resolve_bootstrap_secret
+
+    secret = try_resolve_bootstrap_secret("[auth] jwt_secret", configured)
+    if secret is None:
+        return None
+    return _remember_jwt_secret(configured, secret)
 
 
 def create_jwt(
