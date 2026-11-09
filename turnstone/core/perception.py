@@ -12,8 +12,9 @@ It is a *bottom-tier, universal* safety net:
 
 * vision: native ``supports_pdf``/``supports_vision`` → rasterize-to-vision-primary
   (PDF) → **perception** (if the perception model has vision) → extract-text / placeholder.
-* audio: native ``supports_audio_input`` → STT transcription role → **perception**
-  (if the perception model has audio input) → placeholder.
+* audio: native ``supports_audio_input`` → the STT transcription role when one is set (a
+  transcript or a placeholder, never perception), else **perception** (if the perception
+  model has audio input) → placeholder.
 
 A vision-capable primary still receives the real image / rasterized pages, and a
 configured STT model still wins for audio — perception only fills the remaining

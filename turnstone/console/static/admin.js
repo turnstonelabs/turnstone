@@ -6789,7 +6789,7 @@ const MODEL_ROLES = [
   {
     label: "Speech-to-text",
     description:
-      "Transcribes microphone audio in the workstream composer (voice input), and is the preferred transcript for audio attachments. Point at a transcription model (Whisper-style) or an audio-capable omni model — the omni path transcribes via chat. Empty disables the mic affordance; audio attachments then fall back to the Perception model if one is configured.",
+      "Transcribes microphone audio in the workstream composer (voice input), and audio attachments for a chat model that can't take audio. Point at a transcription model (Whisper-style) or an audio-capable omni model — the omni path transcribes via chat. If it can't transcribe an attachment, or hears no speech in it, the chat model gets a placeholder; the attachment never goes to the Perception model. Empty disables the mic affordance; audio attachments then go to the Perception model if one is configured.",
     aliasKey: "audio.stt_model_alias",
     fallbackKind: "disabled",
     mediaCapability: "supports_transcription",

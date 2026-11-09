@@ -3,14 +3,15 @@
 from __future__ import annotations
 
 from io import BytesIO
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 from PIL import Image
 
 from tests._session_helpers import as_stream, mock_completion_result
-from turnstone.core import fence, perception
-from turnstone.core.attachments import Attachment
+from turnstone.core import audio, fence, perception
+from turnstone.core.attachments import Attachment, unreadable_placeholder
 from turnstone.core.memory import (
     get_attachment,
     register_workstream,
@@ -745,6 +746,8 @@ class TestAudioFallbackIdentityAndCancellation:
     ):
         s = _make_session(mock_openai_client)
         s._acting_user_id = "user-a"
+        s._config_store = MagicMock()
+        s._config_store.get.return_value = "voice"
         auth = MagicMock(return_value=None)
         monkeypatch.setattr(s, "_model_backend_auth_token_for_principal", auth)
         monkeypatch.setattr("turnstone.core.audio.resolve_role_alias", lambda **kwargs: "voice")
@@ -760,7 +763,7 @@ class TestAudioFallbackIdentityAndCancellation:
 
         part = s._audio_fallback_part(self._att(), principal_id="user-a")
 
-        assert "hello" in part["text"]
+        assert part["text"] == "[Transcript of audio attachment 'a.wav' (untrusted)]\n\nhello"
         assert captured["principal_id"] == "user-a"
         assert auth.call_args.kwargs["principal_id"] == "user-a"
 
@@ -774,6 +777,8 @@ class TestAudioFallbackIdentityAndCancellation:
         generation = s._claim_generation(principal_id="user-a")
         cancel_ref = _CancelRef(s, generation)
         handle = MagicMock()
+        s._config_store = MagicMock()
+        s._config_store.get.return_value = "voice"
         monkeypatch.setattr("turnstone.core.audio.resolve_role_alias", lambda **kwargs: "voice")
         monkeypatch.setattr("turnstone.core.session.get_attachments", lambda ids: [self._att()])
 
@@ -961,15 +966,130 @@ class TestPerceptionFallback:
         assert [p["type"] for p in sent[1:]] == ["image_url", "image_url"]
         assert prov.create_streaming.call_args.kwargs["resolve_attachments"] is None
 
-    def test_audio_perception_when_omni_and_no_stt(self, tmp_db, mock_openai_client):
+    @pytest.mark.parametrize("stt_alias", ["", "   "])
+    def test_audio_perception_when_omni_and_no_stt(self, tmp_db, mock_openai_client, stt_alias):
         s = _make_session(mock_openai_client)
         self._with_perception(s, perc_caps=ModelCapabilities(supports_audio_input=True))
+        s._config_store.get = lambda k, *a: "omni" if k == "perception.model_alias" else stt_alias
         part = s._wire_content_part(
             self._att("audio", b"RIFFxxxxWAVE", "a.wav", "audio/wav"),
             ModelCapabilities(supports_audio_input=False),
         )
         assert part["type"] == "text"
         assert "DESCRIPTION" in part["text"]
+
+    @pytest.mark.parametrize("content", [None, "RIFF"])
+    def test_unreadable_audio_without_stt_skips_perception(
+        self, tmp_db, mock_openai_client, content
+    ):
+        s = _make_session(mock_openai_client)
+        prov = self._with_perception(s, perc_caps=ModelCapabilities(supports_audio_input=True))
+
+        part = s._wire_content_part(
+            self._att("audio", content, "a.wav", "audio/wav"), ModelCapabilities()
+        )
+
+        assert part == unreadable_placeholder("a.wav")
+        prov.create_streaming.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "failure", ["missing", "ineligible", "backend", "missing-bytes", "non-bytes"]
+    )
+    def test_selected_stt_failure_skips_perception(
+        self, tmp_db, mock_openai_client, monkeypatch, failure
+    ):
+        audio._clear_transcript_cache_for_test()
+        s = _make_session(mock_openai_client)
+        prov = self._with_perception(s, perc_caps=ModelCapabilities(supports_audio_input=True))
+        alias = "voice\n'[attachment]<>"
+        s._config_store.get = lambda k, *a: (
+            alias
+            if k == "audio.stt_model_alias"
+            else "omni"
+            if k == "perception.model_alias"
+            else ""
+        )
+        cfg = SimpleNamespace(
+            model="whisper-1",
+            provider="openai",
+            capabilities={"supports_transcription": failure != "ineligible"},
+        )
+        s._registry.has_alias = lambda a: a == "omni" or (a == alias and failure != "missing")
+        s._registry.get_config.return_value = cfg
+        s._registry.resolve_binding = lambda a: (object(), "whisper-1", cfg, prov, 0)
+        backend = MagicMock(side_effect=audio.AudioBackendError("down"))
+        monkeypatch.setattr(audio, "_transcribe_binding", backend)
+        att = self._att("audio", b"RIFF", "a\n'[attachment]<>.wav", "audio/wav")
+        if failure == "missing-bytes":
+            att.pop("content")
+        elif failure == "non-bytes":
+            att["content"] = "RIFF"
+
+        part = s._wire_content_part(att, ModelCapabilities())
+
+        if failure in ("missing-bytes", "non-bytes"):
+            # Unreadable content is not the alias's fault.
+            assert part == unreadable_placeholder("a\n'[attachment]<>.wav")
+        else:
+            assert part == {
+                "type": "text",
+                "text": (
+                    "[audio attachment 'aattachment.wav' — "
+                    "STT model alias 'voiceattachment' could not transcribe it]"
+                ),
+            }
+        prov.create_streaming.assert_not_called()
+        if failure == "backend":
+            backend.assert_called_once()
+        else:
+            backend.assert_not_called()
+
+        native = s._wire_content_part(
+            self._att("audio", b"RIFF", "a.wav", "audio/wav"),
+            ModelCapabilities(supports_audio_input=True),
+        )
+        assert native["type"] == "input_audio"
+        assert backend.call_count == (1 if failure == "backend" else 0)
+        prov.create_streaming.assert_not_called()
+
+    @pytest.mark.parametrize("can_hear", [True, False])
+    @pytest.mark.parametrize(
+        ("transcript", "lines"),
+        [
+            ("hello", ["[Transcript of audio attachment 'a.wav' (untrusted)]", "", "hello"]),
+            # Silence is the STT model's answer; it never goes on to perception.
+            ("", ["[audio attachment 'a.wav' — STT model alias 'voice' found no speech]"]),
+        ],
+    )
+    def test_set_stt_alias_answers_without_perception(
+        self, tmp_db, mock_openai_client, monkeypatch, can_hear, transcript, lines
+    ):
+        audio._clear_transcript_cache_for_test()
+        s = _make_session(mock_openai_client)
+        prov = self._with_perception(s, perc_caps=ModelCapabilities(supports_audio_input=can_hear))
+        s._config_store.get = lambda k, *a: (
+            "voice"
+            if k == "audio.stt_model_alias"
+            else "omni"
+            if k == "perception.model_alias"
+            else ""
+        )
+        cfg = SimpleNamespace(model="whisper-1", provider="openai", capabilities={})
+        s._registry.has_alias = lambda a: a in ("voice", "omni")
+        s._registry.get_config.return_value = cfg
+        s._registry.resolve_binding = lambda a: (object(), "whisper-1", cfg, prov, 0)
+        backend = MagicMock(
+            return_value=audio.TranscriptionResult(transcript, "voice", "whisper-1")
+        )
+        monkeypatch.setattr(audio, "_transcribe_binding", backend)
+        att = self._att("audio", b"RIFF", "a.wav", "audio/wav")
+
+        for _ in range(2):
+            part = s._wire_content_part(att, ModelCapabilities())
+            assert part["type"] == "text"
+            assert part["text"].splitlines() == lines
+        backend.assert_called_once()  # the transcript is cached, an empty one too
+        prov.create_streaming.assert_not_called()
 
     def test_perception_skipped_when_model_lacks_modality(self, tmp_db, mock_openai_client):
         # Perception model has vision but not audio → audio falls through to the

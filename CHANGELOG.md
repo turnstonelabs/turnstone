@@ -38,6 +38,18 @@ The separate `dev` branch is retired. See [the release process](docs/releasing.m
   `kubectl debug` needs `--target` to see a service's processes. Chart 0.3.7
   needs an image that carries tini, which every 1.9 image does.
 
+## [2026-11-07]
+
+### Fixed
+
+- **A selected STT model alias that can't run no longer hands audio to
+  perception.** When `audio.stt_model_alias` names an alias that is missing,
+  can't transcribe, or whose backend fails, an audio attachment gets a
+  placeholder naming the alias instead of reaching the perception model, and a
+  transcript that comes back empty gets a placeholder saying the alias found no
+  speech. Perception still takes audio attachments when `audio.stt_model_alias`
+  is empty.
+
 ## [1.9.3]
 
 > **Before upgrading:** the database advances from migration 086 to 088.
