@@ -174,6 +174,26 @@ def _env_or_cfg_str(env_name: str, cfg: Mapping[str, Any], key: str, default: st
     return val
 
 
+def register_oidc_client_secret() -> None:
+    """Register the configured OIDC client secret as a bootstrap value without enabling OIDC.
+
+    For tool processes, which resolve stored references before, or without, loading the OIDC
+    configuration. A reference is resolved only when issuer and client_id are set, as
+    :func:`load_oidc_config` does, and one that cannot be resolved is logged and skipped rather
+    than ending the process; the CLI, when a dynamic-auth model needs the secret later, loads the
+    configuration itself and does stop.
+    """
+    from turnstone.core.config import load_config
+    from turnstone.core.secret_refs import try_resolve_bootstrap_secret
+
+    cfg = load_config("oidc")
+    issuer = _env_or_cfg_str("TURNSTONE_OIDC_ISSUER", cfg, "issuer")
+    client_id = _env_or_cfg_str("TURNSTONE_OIDC_CLIENT_ID", cfg, "client_id")
+    client_secret = _env_or_cfg_str("TURNSTONE_OIDC_CLIENT_SECRET", cfg, "client_secret")
+    if issuer and client_id and client_secret:
+        try_resolve_bootstrap_secret("[oidc] client_secret", client_secret)
+
+
 def _env_or_cfg_bool(env_name: str, cfg: Mapping[str, Any], key: str, default: bool) -> bool:
     """Resolve a boolean field: env var (stripped) wins when set, else config, else default."""
     raw = os.environ.get(env_name, "").strip().lower()
@@ -186,7 +206,11 @@ def load_oidc_config() -> OIDCConfig:
     """Build :class:`OIDCConfig` from env vars with config.toml fallback.
 
     Returns ``OIDCConfig(enabled=False)`` when the required fields
-    (issuer, client_id, client_secret) are not all present.
+    (issuer, client_id, client_secret) are not all present. The client secret
+    may be a ``secret://`` reference, resolved once here when issuer and
+    client_id are set; the process stops if it cannot be. When OIDC is enabled
+    the client secret registers as a bootstrap value, so a host calls this
+    before anything resolves a model key or MCP header reference.
     """
     from turnstone.core.config import load_config
 
@@ -195,6 +219,16 @@ def load_oidc_config() -> OIDCConfig:
     issuer = _env_or_cfg_str("TURNSTONE_OIDC_ISSUER", cfg, "issuer")
     client_id = _env_or_cfg_str("TURNSTONE_OIDC_CLIENT_ID", cfg, "client_id")
     client_secret = _env_or_cfg_str("TURNSTONE_OIDC_CLIENT_SECRET", cfg, "client_secret")
+    from turnstone.core.secret_refs import is_reference, resolve_bootstrap_secret
+
+    if is_reference(client_secret):
+        # Resolved only when OIDC is otherwise configured: a reference left behind
+        # after turning SSO off neither contacts the store nor stops the boot, and
+        # the reference text never stands in for the secret.
+        if issuer and client_id:
+            client_secret = resolve_bootstrap_secret("[oidc] client_secret", client_secret)
+        else:
+            client_secret = ""
     scopes = _env_or_cfg_str("TURNSTONE_OIDC_SCOPES", cfg, "scopes", "openid email profile")
     provider_name = _env_or_cfg_str("TURNSTONE_OIDC_PROVIDER_NAME", cfg, "provider_name", "SSO")
     role_claim = _env_or_cfg_str("TURNSTONE_OIDC_ROLE_CLAIM", cfg, "role_claim")
@@ -300,6 +334,9 @@ def load_oidc_config() -> OIDCConfig:
     enabled = bool(issuer and client_id and client_secret)
 
     if enabled:
+        from turnstone.core.secret_refs import register_bootstrap_secret
+
+        register_bootstrap_secret(client_secret)
         log.info(
             "OIDC enabled: issuer=%s provider=%s%s",
             issuer,

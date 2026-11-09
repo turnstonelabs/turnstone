@@ -3088,3 +3088,145 @@ class TestLongLivedHTTPClientPassthrough:
         assert oauth_context(state).oidc_config.enabled is False
         assert state.oidc_http_client is None
         assert state.jwks_data is None
+
+
+def _no_oidc_env(monkeypatch):
+    for name in ("ISSUER", "CLIENT_ID", "CLIENT_SECRET", "SCOPES", "PROVIDER_NAME"):
+        monkeypatch.delenv(f"TURNSTONE_OIDC_{name}", raising=False)
+
+
+def test_load_oidc_config_client_secret_reference_from_env(monkeypatch):
+    from tests._secret_refs_helpers import install_fake_resolver
+
+    _no_oidc_env(monkeypatch)
+    install_fake_resolver(monkeypatch, {"/oidc/client": "from-the-store"})
+    monkeypatch.setenv("TURNSTONE_OIDC_ISSUER", "https://auth.example.com")
+    monkeypatch.setenv("TURNSTONE_OIDC_CLIENT_ID", "cid")
+    monkeypatch.setenv("TURNSTONE_OIDC_CLIENT_SECRET", "secret://fake/oidc/client")
+    monkeypatch.setattr("turnstone.core.config.load_config", lambda section=None: {})
+    cfg = load_oidc_config()
+    assert cfg.enabled is True
+    assert cfg.client_secret == "from-the-store"
+
+
+def test_load_oidc_config_client_secret_reference_from_config(monkeypatch):
+    from tests._secret_refs_helpers import install_fake_resolver
+
+    _no_oidc_env(monkeypatch)
+    install_fake_resolver(monkeypatch, {"/oidc/client": "from-the-file"})
+    monkeypatch.setattr(
+        "turnstone.core.config.load_config",
+        lambda section=None: {
+            "issuer": "https://auth.example.com",
+            "client_id": "cid",
+            "client_secret": "secret://fake/oidc/client",
+        },
+    )
+    cfg = load_oidc_config()
+    assert cfg.enabled is True
+    assert cfg.client_secret == "from-the-file"
+
+
+def test_load_oidc_config_unresolved_reference_exits(monkeypatch, caplog):
+    import logging
+
+    from tests._secret_refs_helpers import install_fake_resolver
+    from tests._session_helpers import log_has_field
+
+    _no_oidc_env(monkeypatch)
+    install_fake_resolver(monkeypatch, {})
+    monkeypatch.setenv("TURNSTONE_OIDC_ISSUER", "https://auth.example.com")
+    monkeypatch.setenv("TURNSTONE_OIDC_CLIENT_ID", "cid")
+    monkeypatch.setenv("TURNSTONE_OIDC_CLIENT_SECRET", "secret://fake/oidc/missing")
+    monkeypatch.setattr("turnstone.core.config.load_config", lambda section=None: {})
+    with caplog.at_level(logging.ERROR), pytest.raises(SystemExit) as exc:
+        load_oidc_config()
+    assert exc.value.code == 1
+    assert any(log_has_field(r, "setting", "[oidc] client_secret") for r in caplog.records)
+
+
+def test_load_oidc_config_reference_left_behind_with_oidc_off_is_not_resolved(monkeypatch):
+    """SSO turned off by clearing the issuer: a leftover reference neither reaches the store
+    nor stops the boot, and the reference text does not stand in for the secret."""
+    from tests._secret_refs_helpers import install_fake_resolver
+
+    _no_oidc_env(monkeypatch)
+    backend = install_fake_resolver(monkeypatch, {})
+    monkeypatch.setenv("TURNSTONE_OIDC_CLIENT_SECRET", "secret://fake/oidc/missing")
+    monkeypatch.setattr("turnstone.core.config.load_config", lambda section=None: {})
+    cfg = load_oidc_config()
+    assert cfg.enabled is False
+    assert cfg.client_secret == ""
+    assert backend.calls == 0
+
+
+def test_load_oidc_config_literal_secret_is_untouched(monkeypatch):
+    _no_oidc_env(monkeypatch)
+    monkeypatch.setenv("TURNSTONE_OIDC_ISSUER", "https://auth.example.com")
+    monkeypatch.setenv("TURNSTONE_OIDC_CLIENT_ID", "cid")
+    monkeypatch.setenv("TURNSTONE_OIDC_CLIENT_SECRET", "literal-secret")
+    monkeypatch.setattr("turnstone.core.config.load_config", lambda section=None: {})
+    assert load_oidc_config().client_secret == "literal-secret"
+
+
+def test_load_oidc_config_registers_the_client_secret_as_a_bootstrap_value(monkeypatch):
+    """A model key or MCP header reference may not resolve to the OIDC client secret."""
+    from tests._secret_refs_helpers import install_fake_resolver
+    from turnstone.core.secret_refs import SecretResolveError, resolve
+
+    _no_oidc_env(monkeypatch)
+    monkeypatch.setenv("TURNSTONE_OIDC_ISSUER", "https://auth.example.com")
+    monkeypatch.setenv("TURNSTONE_OIDC_CLIENT_ID", "cid")
+    monkeypatch.setenv("TURNSTONE_OIDC_CLIENT_SECRET", "literal-client-secret-value")
+    monkeypatch.setattr("turnstone.core.config.load_config", lambda section=None: {})
+    assert load_oidc_config().enabled is True
+    install_fake_resolver(monkeypatch, {"/alias/oidc": "literal-client-secret-value"})
+    with pytest.raises(SecretResolveError, match="bootstrap secret"):
+        resolve("secret://fake/alias/oidc")
+
+
+def test_load_oidc_config_disabled_registers_nothing(monkeypatch):
+    from tests._secret_refs_helpers import install_fake_resolver
+    from turnstone.core.secret_refs import resolve
+
+    _no_oidc_env(monkeypatch)
+    monkeypatch.setenv("TURNSTONE_OIDC_CLIENT_SECRET", "unused-client-secret-value")
+    monkeypatch.setattr("turnstone.core.config.load_config", lambda section=None: {})
+    assert load_oidc_config().enabled is False
+    install_fake_resolver(monkeypatch, {"/alias/oidc": "unused-client-secret-value"})
+    assert resolve("secret://fake/alias/oidc") == "unused-client-secret-value"
+
+
+def test_register_oidc_client_secret_protects_the_value_without_enabling_oidc(monkeypatch):
+    from tests._secret_refs_helpers import install_fake_resolver
+    from turnstone.core.oauth.oidc import register_oidc_client_secret
+    from turnstone.core.secret_refs import SecretResolveError, resolve
+
+    _no_oidc_env(monkeypatch)
+    monkeypatch.setenv("TURNSTONE_OIDC_ISSUER", "https://auth.example.com")
+    monkeypatch.setenv("TURNSTONE_OIDC_CLIENT_ID", "cid")
+    monkeypatch.setenv("TURNSTONE_OIDC_CLIENT_SECRET", "tool-process-client-secret")
+    monkeypatch.setattr("turnstone.core.config.load_config", lambda section=None: {})
+    register_oidc_client_secret()
+    install_fake_resolver(monkeypatch, {"/alias/oidc": "tool-process-client-secret"})
+    with pytest.raises(SecretResolveError, match="bootstrap secret"):
+        resolve("secret://fake/alias/oidc")
+
+
+def test_register_oidc_client_secret_never_exits(monkeypatch, caplog):
+    import logging
+
+    from tests._secret_refs_helpers import install_fake_resolver
+    from turnstone.core.oauth.oidc import register_oidc_client_secret
+    from turnstone.core.secret_refs import resolve
+
+    _no_oidc_env(monkeypatch)
+    install_fake_resolver(monkeypatch, {"/other": "other-value"})
+    monkeypatch.setenv("TURNSTONE_OIDC_ISSUER", "https://auth.example.com")
+    monkeypatch.setenv("TURNSTONE_OIDC_CLIENT_ID", "cid")
+    monkeypatch.setenv("TURNSTONE_OIDC_CLIENT_SECRET", "secret://fake/oidc/missing")
+    monkeypatch.setattr("turnstone.core.config.load_config", lambda section=None: {})
+    with caplog.at_level(logging.WARNING):
+        register_oidc_client_secret()
+    assert any("bootstrap_unresolved" in r.getMessage() for r in caplog.records)
+    assert resolve("secret://fake/other") == "other-value"

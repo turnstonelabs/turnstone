@@ -376,13 +376,15 @@ deployments.
 
 | Setting | Config key | Env var | Default |
 |---------|-----------|---------|---------|
-| Signing secret | `[auth] jwt_secret` | `TURNSTONE_JWT_SECRET` | Auto-generated ephemeral (warning logged) |
+| Signing secret | `[auth] jwt_secret` | `TURNSTONE_JWT_SECRET` | required |
 | Expiry | `[auth] jwt_expiry_hours` | — | 24 hours |
 | Algorithm | — | — | HS256 (not configurable) |
 | Minimum secret length | — | — | 32 characters (exits if shorter) |
 
-All services require `TURNSTONE_JWT_SECRET` and exit at startup if it is
-missing or shorter than 32 characters.
+The server and the console require a signing secret (`TURNSTONE_JWT_SECRET` or
+`[auth] jwt_secret`) and exit at startup if it is missing or shorter than 32
+characters (of the resolved value, when it is a `secret://` reference); the
+channel gateway rejects every notify request instead when its copy is missing.
 
 ---
 
@@ -571,9 +573,28 @@ value would be masked, and the value it names is fetched when it is needed and
 kept only in memory: the database never holds it. References work in the
 Models tab, in the MCP Servers tab (headers of a `streamable-http` server,
 including those installed from the registry or imported), and in config.toml
-`[models.*]` entries. They do not work for MCP stdio `env` values or for the
-bootstrap secrets in config.toml itself (`[auth] jwt_secret`, `[database] url`,
-the `[security]` keyring, `[oidc] client_secret`).
+`[models.*]` entries. They do not work for MCP stdio `env` values, for
+`[database] url` or for the `[security]` keyring. Two bootstrap secrets take
+one: `[auth] jwt_secret` and `[oidc] client_secret`, in config.toml or in their
+environment variables (`TURNSTONE_JWT_SECRET`, `TURNSTONE_OIDC_CLIENT_SECRET`).
+Each is resolved once at startup; the server, the console and the channel
+gateway stop if it cannot be, so the store must answer at boot (the service
+manager's restart policy is the retry), while a tool logs a warning and goes on
+without it. The store's own credentials still arrive as files or config. The
+value is not refreshed afterwards: one rotated in the store reaches a process
+at its next start, and the JWT secret must match on the console, every node
+and the channel gateway, so restart them together. The gateway resolves a
+reference in `TURNSTONE_JWT_SECRET` too, and then needs the same `[secrets]`
+table, selected with `TURNSTONE_CONFIG`. The value rule below applies to these
+values as well: a referenced JWT secret or client secret must be printable
+ASCII. Every Turnstone process refuses a model key or MCP header reference that
+resolves to either value as that process has it configured: the server and the
+console register the two while loading them, and the CLI, the admin commands
+and the doctor register the values their own environment and config.toml name
+before their first resolve, skipping with a warning one they cannot resolve.
+Run the tools with the services' configuration where the guard should hold for
+their secrets. A bootstrap secret kept in the store thus stays out of reach of
+everyone allowed to write a reference, as the rule on the file root intends.
 
 A reference must be the whole value: store `Bearer xyz` in the secret and
 reference it, rather than writing `Bearer secret://...`. `${VAR}` is never
@@ -708,11 +729,13 @@ author's behalf. Where a saved reference's value goes is decided as it is for a
 literal key: `admin.models` can change a definition's endpoint, or Detect
 another endpoint with its saved key, and `admin.mcp` can change an MCP server's
 URL. Scope the store accordingly: give Turnstone a dedicated Vault role whose
-policy covers only its runtime secrets, and a dedicated file root. The console
-validates a reference when it is saved (syntax, a configured backend, and one
-resolution), so a typo never reaches the database, and the audit row of the
-save, or of a connection test, records the reference. Sending a definition back
-unchanged, reference included, needs neither the gate nor the store.
+policy covers only the secrets it references, runtime and bootstrap (a runtime
+reference to a bootstrap value is refused), and a dedicated file root. The
+console validates a reference when it is saved (syntax, a configured backend,
+and one resolution), so a typo never reaches the database, and the audit row
+of the save, or of a connection test, records the reference. Sending a
+definition back unchanged, reference included, needs neither the gate nor the
+store.
 
 `admin.models` also decides the cluster's default model in one case: adding or
 enabling the cluster's first chat model stores it as `model.default_alias` when

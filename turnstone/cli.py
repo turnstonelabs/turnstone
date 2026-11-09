@@ -984,7 +984,9 @@ def _handle_cluster_command(cmd_line: str, console_url: str | None) -> None:
         return
 
     headers: dict[str, str] = {}
-    jwt_secret = os.environ.get("TURNSTONE_JWT_SECRET", "").strip()
+    from turnstone.core.auth import jwt_secret_if_configured
+
+    jwt_secret = jwt_secret_if_configured() or ""
     if jwt_secret:
         from turnstone.core.auth import JWT_AUD_CONSOLE, ServiceTokenManager
 
@@ -1938,6 +1940,12 @@ def main() -> None:
     except SecretConfigError as exc:
         print(f"config.toml: {exc}", file=sys.stderr)
         sys.exit(1)
+
+    # The bootstrap secrets register first, so no model key or MCP header below
+    # may resolve to one of them.
+    from turnstone.core.bootstrap_secrets import register_bootstrap_values
+
+    register_bootstrap_values()
 
     # Build model registry (reads [models.*] sections from config.toml)
     from turnstone.core.model_registry import load_model_registry

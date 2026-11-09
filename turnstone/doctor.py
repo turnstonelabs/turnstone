@@ -1175,6 +1175,9 @@ def resolve_doctor_brain(
                 if "models" in cf.sections:
                     set_config_path(str(cf.path))
                     break
+        from turnstone.core.bootstrap_secrets import register_bootstrap_values
+
+        register_bootstrap_values()  # a stored key may not resolve to a bootstrap secret
         registry = load_model_registry(
             storage=storage, allow_empty=True, detect_context_windows=True
         )

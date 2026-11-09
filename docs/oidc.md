@@ -41,7 +41,7 @@ SSO; create a local admin first.
 [oidc]
 issuer = "https://identity.example.com"
 client_id = "your-client-id"
-client_secret = "your-client-secret"
+client_secret = "your-client-secret"  # or a secret:// reference
 redirect_base = "https://app.example.com"
 provider_name = "SSO"
 password_enabled = true
@@ -67,7 +67,7 @@ the installer does not copy OIDC variables from `.env` into the services.
 |----------|----------|---------|-------------|
 | `TURNSTONE_OIDC_ISSUER` | Yes | — | Issuer URL (e.g. `https://accounts.google.com`). Must serve `/.well-known/openid-configuration`. |
 | `TURNSTONE_OIDC_CLIENT_ID` | Yes | — | OAuth 2.0 client ID from your provider |
-| `TURNSTONE_OIDC_CLIENT_SECRET` | Yes | — | OAuth 2.0 client secret (confidential client) |
+| `TURNSTONE_OIDC_CLIENT_SECRET` | Yes | — | OAuth 2.0 client secret (confidential client); may be a `secret://` reference, resolved at startup |
 | `TURNSTONE_OIDC_SCOPES` | No | `openid email profile` | Space-separated OAuth scopes to request |
 | `TURNSTONE_OIDC_PROVIDER_NAME` | No | `SSO` | Display name for the login button (e.g. "Google", "Okta") |
 | `TURNSTONE_OIDC_ROLE_CLAIM` | No | — | ID token claim containing role/group values (see [Role Mapping](#role-mapping)) |

@@ -2893,14 +2893,13 @@ def _notify_auth_headers() -> dict[str, str]:
         log.debug("notify.auth_configured", source="TURNSTONE_CHANNEL_AUTH_TOKEN")
         return {"Authorization": f"Bearer {static_token}"}
 
-    # JWT via ServiceTokenManager
-    jwt_secret = os.environ.get("TURNSTONE_JWT_SECRET", "").strip()
-    secret_source = "TURNSTONE_JWT_SECRET"
-    if not jwt_secret:
-        from turnstone.core.config import load_config
+    # JWT via ServiceTokenManager, with the secret every reader in this process
+    # shares: a secret:// reference was resolved once at startup, and the
+    # reference text is never the key.
+    from turnstone.core.auth import jwt_secret_if_configured
 
-        jwt_secret = str(load_config("auth").get("jwt_secret", "")).strip()
-        secret_source = "config.toml [auth].jwt_secret"
+    jwt_secret = jwt_secret_if_configured()
+    secret_source = "TURNSTONE_JWT_SECRET or config.toml [auth].jwt_secret"
     if not jwt_secret:
         log.warning(
             "notify.auth_missing",
