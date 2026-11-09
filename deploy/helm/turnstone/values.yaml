@@ -50,6 +50,34 @@ server:
   nodeSelector: {}
   affinity: {}
   tolerations: []
+  # -- MCP servers that run in the server pod and share its /workspace with the
+  # model's shell and file tools, for servers that work on the agent's files.
+  # Each entry is a container spec (name, image, env, resources, securityContext
+  # and so on) plus `port`, the port it listens on for Streamable HTTP, and an
+  # optional `path` (default /mcp). The chart mounts the shared workspace at
+  # /workspace in every entry, runs them as sidecars that are started before
+  # the server, and prints each one's http://localhost:<port><path> in the
+  # install notes for registration in the console. Sidecars receive none of
+  # the chart's secret env and no service-account token. See README.md, "MCP
+  # servers", before adding one.
+  sidecars: []
+  #  - name: toolchain
+  #    image: registry.example.com/mcp/toolchain@sha256:...
+  #    port: 9001
+  #    env:
+  #      - name: MCP_BEARER_TOKEN
+  #        valueFrom:
+  #          secretKeyRef:
+  #            name: toolchain-mcp-token
+  #            key: token
+  #    resources:
+  #      requests: {cpu: 50m, memory: 64Mi}
+  #      limits: {cpu: 500m, memory: 256Mi}
+  #    securityContext:
+  #      runAsUser: 1000
+  #      runAsNonRoot: true
+  #      allowPrivilegeEscalation: false
+  #      capabilities: {drop: [ALL]}
 
 # -- Turnstone console (cluster dashboard)
 console:

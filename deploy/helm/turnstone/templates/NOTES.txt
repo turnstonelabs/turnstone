@@ -29,4 +29,22 @@ Components deployed:
 {{- if .Values.postgresql.enabled }}
   - PostgreSQL (bitnami subchart)
 {{- end }}
+{{- if .Values.server.sidecars }}
 
+MCP sidecars in the server pod. Register each one in the console (MCP Servers,
+Add Server, transport streamable-http):
+{{- range .Values.server.sidecars }}
+  - {{ .name }}: http://localhost:{{ .port }}{{ .path | default "/mcp" }}
+{{- end }}
+
+These localhost URLs work only from the server pods, so the console's own
+status row for such a server, and the dialog's connection test, show an error;
+save without the test. That is expected: coordinators run in the console and
+have no node filesystem.
+
+Where the image can require a bearer token, register the server with Static
+headers (Authorization: Bearer ...). With No authorization, anything in the pod
+can call it, the model's shell included, and a sidecar that listens on all
+interfaces answers any pod in the cluster at the pod IP unless a NetworkPolicy
+blocks it.
+{{- end }}

@@ -12,8 +12,22 @@ The separate `dev` branch is retired. See [the release process](docs/releasing.m
 
 ## [2026-11-08]
 
+### Added
+
+- **Helm: MCP servers as sidecars of the server pod.** `server.sidecars` lists
+  containers that run in the server pod and share its `/workspace` with the
+  model's shell and file tools, for MCP servers that work on the agent's
+  files. Each entry is a container spec plus the `port` it listens on, and
+  the install notes print the localhost URL to register in the console.
+  Sidecars receive none of the chart's secret env and no service-account
+  token. Read [the chart README](deploy/helm/turnstone/README.md#mcp-servers)
+  before adding one: it says what a sidecar can reach and what reaches it.
+
 ### Changed
 
+- **Helm: the chart requires Kubernetes 1.29 or newer.** Sidecars render as
+  native sidecars, which need it; `kubeVersion` in Chart.yaml enforces it, so
+  an install or upgrade on an older cluster stops with a clear message.
 - **Helm: the server and console containers run under tini as PID 1.** The
   chart's `command:` replaces the image's entrypoint, which would leave
   Turnstone itself as PID 1, and Turnstone never reaps orphaned processes, such
