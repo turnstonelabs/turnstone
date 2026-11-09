@@ -314,7 +314,7 @@ CreateKwargsBuilder = Callable[
     dict[str, Any],
 ]
 # (request, ws, body, uid) -> extra response fields. Optional
-# kind-specific transaction gate fired after attachment validation but
+# kind-specific transaction gate fired after the attachments are staged but
 # before ``mgr.commit_create`` / audit / lifecycle publication. Interactive
 # uses it for the atomic storage fork; coord has no pre-commit work today.
 # Expected failures raise :class:`CreatePreCommitError`, causing the generic
@@ -3432,17 +3432,17 @@ def make_create_handler(
     """Lifted body for ``POST {prefix}/new`` — workstream creation.
 
     Both kinds share the create sequence (parse body → resolve uid
-    → kind-specific validate → resolve skill → ``mgr.create`` (with
-    ``defer_emit_created=True``) → save attachments → optional pre-commit
-    gate → ``mgr.discard`` on failure / ``mgr.commit_create`` on success
-    → audit → kind-specific post-install → respond). Per-kind divergence
-    captured by the cfg + ``audit_emit``:
+    → kind-specific validate → resolve skill → check attachments →
+    ``mgr.create`` (with ``defer_emit_created=True``) → stage attachments
+    → optional pre-commit gate → ``mgr.discard`` on failure /
+    ``mgr.commit_create`` on success → audit → kind-specific post-install
+    → respond). Per-kind divergence captured by the cfg + ``audit_emit``:
 
     - ``cfg.create_supports_attachments`` — when ``True``, the body
       may arrive as ``multipart/form-data`` with a ``meta`` JSON
-      field + ``file`` parts; uploads are validated post-create and
-      the workstream is rolled back if any file fails (interactive's
-      pre-lift pattern, lifted to coord here for parity).
+      field + ``file`` parts; each file is classified before the create
+      and staged after it, and an exception while staging rolls the
+      workstream back. Both kinds take files this way, for parity.
     - ``cfg.create_supports_user_id_override`` — when ``True``, a
       ``user_id`` body field overrides the auth-derived uid if the
       auth token is from a trusted service. Interactive ``True`` so
@@ -3454,7 +3454,7 @@ def make_create_handler(
     - ``cfg.create_build_kwargs`` — kind-specific kwargs for
       ``mgr.create``. Required when the kind mounts a create handler.
     - ``cfg.create_pre_commit`` — kind-specific atomic gate after attachment
-      validation and before any audit/lifecycle publication (interactive's
+      staging and before any audit/lifecycle publication (interactive's
       transactional fork; coord has none).
     - ``cfg.create_post_install`` — kind-specific tail end (e.g.
       interactive's UI bookkeeping + skill_config + initial-message worker
@@ -3464,14 +3464,14 @@ def make_create_handler(
 
     Ordering invariants (load-bearing — easy to break in a refactor):
 
-    1. ``mgr.create(defer_emit_created=True)`` runs FIRST so the
-       slot + storage row + session exist before any post-create
-       work touches them.
-    2. Attachment validation runs BEFORE ``commit_create`` so a
-       rejected upload produces zero lifecycle events. Failure path
-       is ``mgr.discard`` + ``delete_workstream``; success path
-       falls through.
-    3. ``cfg.create_pre_commit`` runs after validation but BEFORE commit,
+    1. ``mgr.create(defer_emit_created=True)`` runs before any
+       post-create work, so the slot + storage row + session exist
+       before that work touches them.
+    2. Attachments are classified BEFORE ``mgr.create``, so a refused file
+       reserves no slot and produces zero lifecycle events. Staging the
+       classified files after the create can fail only by an exception,
+       which the rollback (``mgr.discard`` + ``delete_workstream``) covers.
+    3. ``cfg.create_pre_commit`` runs after staging but BEFORE commit,
        audit, and publication. A refusal discards the destination while its
        deferred lifecycle is still invisible.
     4. ``mgr.commit_create(ws)`` runs BEFORE ``audit_emit`` and
@@ -3564,9 +3564,11 @@ def make_create_handler(
         import secrets
 
         from turnstone.core.attachments import (
-            IMAGE_SIZE_CAP,
+            CREATE_ATTACHMENTS_TOTAL_CAP,
+            LARGEST_KIND_SIZE_CAP,
             any_upload_needs_flattening,
-            validate_and_save_uploaded_files,
+            classify_uploaded_files,
+            stage_classified_files,
         )
         from turnstone.core.auth import require_any_permission
         from turnstone.core.web_helpers import (
@@ -3594,17 +3596,17 @@ def make_create_handler(
         # default content type for both kinds.
         content_type = (request.headers.get("content-type") or "").lower()
         uploaded_files: list[tuple[str, str, bytes]] = []
+        classified: list[tuple[str, str, str, bytes]] = []
         body: dict[str, Any]
         if cfg.create_supports_attachments and content_type.startswith("multipart/form-data"):
-            # Multipart cap: up to 10 files × the image cap, plus slack
-            # for JSON meta + multipart framing. Per-file size is
-            # enforced inside :func:`validate_and_save_uploaded_files`
-            # against the kind-specific cap.
+            # Multipart cap: up to 10 files, none over the largest kind cap and all of them
+            # within the create total, plus slack for JSON meta + multipart framing. Each file's
+            # own kind cap is enforced by :func:`classify_uploaded_files` before the create.
             parsed = await read_multipart_create_or_400(
                 request,
                 max_files=10,
-                max_per_file_bytes=IMAGE_SIZE_CAP,
-                max_total_bytes=10 * IMAGE_SIZE_CAP,
+                max_per_file_bytes=LARGEST_KIND_SIZE_CAP,
+                max_total_bytes=CREATE_ATTACHMENTS_TOTAL_CAP,
             )
             if isinstance(parsed, JSONResponse):
                 return parsed
@@ -3952,8 +3954,16 @@ def make_create_handler(
                 # **extra_session_kwargs into the session factory.
                 kwargs["persona"] = persona_snapshot.name
                 kwargs["persona_snapshot"] = persona_snapshot
-            # Deferred emit — committed below post-attachment-
-            # validation. See handler docstring's Ordering invariants.
+            # Classify the files before ``mgr.create``, so a refused file creates nothing: no
+            # slot, no row and no event. The classified list is staged after the create.
+            if uploaded_files:
+                classified, file_refusal = await asyncio.to_thread(
+                    classify_uploaded_files, uploaded_files
+                )
+                if file_refusal is not None:
+                    return file_refusal
+            # Deferred emit — committed below, after the attachments are
+            # staged. See handler docstring's Ordering invariants.
             create_task = asyncio.ensure_future(
                 asyncio.to_thread(mgr.create, defer_emit_created=True, **kwargs)
             )
@@ -4043,8 +4053,8 @@ def make_create_handler(
                 status_code=500,
             )
 
-        # --- Attachment validation + save + rollback --------------------
-        # Validate post-create so ``ws_id`` is bound. Rollback uses
+        # --- Attachment staging + rollback ------------------------------
+        # Stage post-create so ``ws_id`` is bound. Rollback uses
         # ``mgr.discard`` (no ``emit_closed`` because the create was
         # deferred) + ``delete_workstream`` for the storage row. See
         # handler docstring's Ordering invariants for the rationale.
@@ -4064,8 +4074,8 @@ def make_create_handler(
         committed = False
         try:
             attachment_ids: list[str] = []
-            if uploaded_files:
-                # Saving flattens the images, so when one may need it, the save takes the
+            if classified:
+                # Staging flattens the images, so when one may need it, the staging takes the
                 # surface's flatten gate and waits for it on the loop, as an upload does (see
                 # gated_upload_content).
                 helpers = cfg.attachment_helpers
@@ -4073,20 +4083,9 @@ def make_create_handler(
                     any_upload_needs_flattening, uploaded_files
                 )
                 async with helpers.flatten_gate if helpers and gated else contextlib.nullcontext():
-                    saved_ids, save_err = cast(
-                        "tuple[list[str], JSONResponse | None]",
-                        await _finish_before_unwind(
-                            asyncio.to_thread(
-                                validate_and_save_uploaded_files,
-                                uploaded_files,
-                                ws.id,
-                                uid,
-                            )
-                        ),
+                    attachment_ids = await _finish_before_unwind(
+                        asyncio.to_thread(stage_classified_files, classified, ws.id, uid)
                     )
-                if save_err is not None:
-                    return save_err
-                attachment_ids = saved_ids
 
             # --- Kind-specific transaction gate -------------------------
             # Interactive performs its storage fork here: after every upload
@@ -6449,7 +6448,7 @@ def make_attachment_handlers(cfg: SessionEndpointConfig) -> AttachmentHandlers:
 
     async def upload(request: Request) -> Response:
         from turnstone.core.attachment_buffer import get_attachment_buffer
-        from turnstone.core.attachments import PDF_SIZE_CAP, gated_upload_content
+        from turnstone.core.attachments import LARGEST_KIND_SIZE_CAP, gated_upload_content
         from turnstone.core.web_helpers import read_multipart_file_or_400
 
         # The file-classification policy (sniff order, per-kind caps, allowlists)
@@ -6473,7 +6472,9 @@ def make_attachment_handlers(cfg: SessionEndpointConfig) -> AttachmentHandlers:
         if err:
             return err
 
-        got = await read_multipart_file_or_400(request, field="file", max_bytes=PDF_SIZE_CAP)
+        got = await read_multipart_file_or_400(
+            request, field="file", max_bytes=LARGEST_KIND_SIZE_CAP
+        )
         if isinstance(got, JSONResponse):
             return got
         filename, claimed_mime, data = got

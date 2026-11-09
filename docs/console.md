@@ -202,9 +202,10 @@ All fields are optional:
   a specific `node_id` when both are supplied.
 
 The endpoint also accepts the same multipart create shape as a node: one
-JSON-encoded `meta` field plus up to ten `file` parts. Files require an
-`initial_message` in the dashboard launcher. Files cannot be combined with
-`resume_ws`; fork first and upload on the new workstream.
+JSON-encoded `meta` field plus up to ten `file` parts, at most 64 MiB in
+total. Files require an `initial_message` in the dashboard launcher. Files
+cannot be combined with `resume_ws`; fork first and upload on the new
+workstream.
 
 Response:
 

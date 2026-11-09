@@ -308,10 +308,11 @@ with open("notes.txt", "rb") as f:
     )
 ```
 
-Limits: images ≤ 4 MiB (png/jpeg/webp), text ≤ 512 KiB (UTF-8),
-10 pending per (workstream, user). The SDK auto-generates `ws_id` on the
-client so cluster-routed callers bind attachments to the owning node
-before the request lands.
+Limits: images ≤ 4 MiB (png/jpeg/webp), PDFs ≤ 32 MiB, audio ≤ 25 MiB,
+text ≤ 512 KiB (UTF-8), and at most 64 MiB in total for the files of one
+`create_workstream` call. The SDK auto-generates `ws_id` on the client so
+cluster-routed callers bind attachments to the owning node before the
+request lands.
 
 ### Forking a workstream
 

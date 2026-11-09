@@ -249,13 +249,6 @@ let _forkFromWsId = "";
 // and ship them all in one multipart create request on submit.
 let _newWsStagedFiles = [];
 
-// Per-kind size caps (mirrored from turnstone/core/attachments.py so the
-// browser can fail fast before uploading).  Keep in sync.
-const _NEW_WS_IMAGE_CAP = 4 * 1024 * 1024;
-const _NEW_WS_TEXT_CAP = 512 * 1024;
-const _NEW_WS_PDF_CAP = 32 * 1024 * 1024;
-const _NEW_WS_MAX_FILES = 10;
-
 function _newWsRenderChips() {
   const chipsEl = document.getElementById("new-ws-attach-chips");
   if (!chipsEl) return;
@@ -290,11 +283,34 @@ function _newWsRenderChips() {
   }
 }
 
-// Mirrors turnstone/server.py classifier — magic-byte image allowlist plus
-// text/* MIMEs, allowlisted application/* MIMEs, and known text extensions.
-// Surfaces unsupported types client-side so the user sees a clear error
-// instead of a generic create failure after the server rejects.
+// Mirrors classify_upload in turnstone/core/attachments.py so the browser can
+// refuse a file before uploading it: the image types sent to a model, PDFs and
+// audio by type or extension, then text/* MIMEs, allowlisted application/*
+// MIMEs and known text extensions.  The server sniffs each file and has the
+// final say.  Shared by the new-workstream modal and the dashboard composer.
+// Keep in sync with the server and with the console launcher's _HOME_* copy in
+// turnstone/console/static/app.js.
 const _ATTACH_IMAGE_MIMES = ["image/png", "image/jpeg", "image/webp"];
+const _ATTACH_AUDIO_MIMES = [
+  "audio/aac",
+  "audio/flac",
+  "audio/mp3",
+  "audio/mp4",
+  "audio/mpeg",
+  "audio/ogg",
+  "audio/wav",
+  "audio/webm",
+  "audio/x-wav",
+];
+const _ATTACH_AUDIO_EXTENSIONS = [
+  ".aac",
+  ".flac",
+  ".m4a",
+  ".mp3",
+  ".ogg",
+  ".wav",
+  ".webm",
+];
 const _ATTACH_TEXT_APP_MIMES = [
   "application/json",
   "application/xml",
@@ -330,25 +346,65 @@ const _ATTACH_TEXT_EXTENSIONS = [
   ".yml",
 ];
 
-function _isPdf(file) {
-  return (
-    (file.type || "").toLowerCase() === "application/pdf" ||
-    (file.name || "").toLowerCase().endsWith(".pdf")
-  );
-}
+// Byte caps for each kind, and for all of one create's files together.
+const _ATTACH_KIND_CAPS = {
+  image: 4 * 1024 * 1024,
+  pdf: 32 * 1024 * 1024,
+  audio: 25 * 1024 * 1024,
+  text: 512 * 1024,
+};
+const _ATTACH_TOTAL_CAP = 64 * 1024 * 1024;
+const _ATTACH_MAX_FILES = 10;
 
-function _isAttachmentAllowed(file) {
+// The kind the server should classify `file` as, or "" for a file it refuses.
+function _attachmentKind(file) {
   const mime = (file.type || "").toLowerCase();
-  if (_ATTACH_IMAGE_MIMES.indexOf(mime) !== -1) return true;
-  if (_isPdf(file)) return true;
-  if (mime.indexOf("text/") === 0) return true;
-  if (_ATTACH_TEXT_APP_MIMES.indexOf(mime) !== -1) return true;
   const name = (file.name || "").toLowerCase();
   const dot = name.lastIndexOf(".");
-  if (dot >= 0 && _ATTACH_TEXT_EXTENSIONS.indexOf(name.substr(dot)) !== -1) {
-    return true;
+  const ext = dot >= 0 ? name.substr(dot) : "";
+  if (_ATTACH_IMAGE_MIMES.indexOf(mime) !== -1) return "image";
+  if (mime === "application/pdf" || ext === ".pdf") return "pdf";
+  if (
+    _ATTACH_AUDIO_MIMES.indexOf(mime) !== -1 ||
+    _ATTACH_AUDIO_EXTENSIONS.indexOf(ext) !== -1
+  ) {
+    return "audio";
   }
-  return false;
+  if (mime.indexOf("text/") === 0) return "text";
+  if (_ATTACH_TEXT_APP_MIMES.indexOf(mime) !== -1) return "text";
+  if (_ATTACH_TEXT_EXTENSIONS.indexOf(ext) !== -1) return "text";
+  return "";
+}
+
+// Why `file` can't join the `staged` files of one create, or "" when it can.
+// Drag-drop bypasses the <input accept="..."> filter, so every way in checks.
+function _attachmentRefusal(file, staged) {
+  if (staged.length >= _ATTACH_MAX_FILES) {
+    return "At most " + _ATTACH_MAX_FILES + " attachments per workstream";
+  }
+  const kind = _attachmentKind(file);
+  if (!kind) {
+    return (
+      "Unsupported file type: " +
+      file.name +
+      " (allowed: png/jpeg/webp images, PDF, audio, text)"
+    );
+  }
+  const cap = _ATTACH_KIND_CAPS[kind];
+  if (file.size > cap) {
+    return file.name + " exceeds the " + _formatAttachSize(cap) + " cap";
+  }
+  let total = file.size;
+  for (let i = 0; i < staged.length; i++) total += staged[i].size;
+  if (total > _ATTACH_TOTAL_CAP) {
+    return (
+      file.name +
+      " would take the attachments over the " +
+      _formatAttachSize(_ATTACH_TOTAL_CAP) +
+      " total"
+    );
+  }
+  return "";
 }
 
 // File clipboard items preserve their existing priority. Only when none were
@@ -396,6 +452,7 @@ function _newWsError(msg) {
 
 function _newWsAddFiles(files) {
   let handled = false;
+  let refusal = "";
   for (let i = 0; i < files.length; i++) {
     const f = files[i];
     const paste = window.TurnstonePasteText;
@@ -407,34 +464,16 @@ function _newWsAddFiles(files) {
       handled = true;
       continue;
     }
-    if (_newWsStagedFiles.length >= _NEW_WS_MAX_FILES) {
-      _newWsError(
-        "At most " + _NEW_WS_MAX_FILES + " attachments per workstream",
-      );
-      return handled;
-    }
-    if (!_isAttachmentAllowed(f)) {
-      _newWsError(
-        "Unsupported file type: " +
-          f.name +
-          " (allowed: png/jpeg/webp images, PDF, text)",
-      );
-      return handled;
-    }
-    const isImage = (f.type || "").indexOf("image/") === 0;
-    const cap = isImage
-      ? _NEW_WS_IMAGE_CAP
-      : _isPdf(f)
-        ? _NEW_WS_PDF_CAP
-        : _NEW_WS_TEXT_CAP;
-    if (f.size > cap) {
-      _newWsError(f.name + " exceeds the " + _formatAttachSize(cap) + " cap");
-      return handled;
+    const fileRefusal = _attachmentRefusal(f, _newWsStagedFiles);
+    if (fileRefusal) {
+      // Skip the refused file and go on: the rest of the drop may fit.
+      refusal = fileRefusal;
+      continue;
     }
     _newWsStagedFiles.push(f);
     handled = true;
   }
-  _newWsError("");
+  _newWsError(refusal);
   _newWsRenderChips();
   return handled;
 }
@@ -1635,12 +1674,6 @@ function dashboardResumeSession(wsId) {
 // stomp on each other's state.
 let _dashboardStagedFiles = [];
 
-// Per-kind size caps mirrored from turnstone/core/attachments.py — keep in sync.
-const _DASH_IMAGE_CAP = 4 * 1024 * 1024;
-const _DASH_TEXT_CAP = 512 * 1024;
-const _DASH_PDF_CAP = 32 * 1024 * 1024;
-const _DASH_MAX_FILES = 10;
-
 function _renderDashboardChips() {
   const chipsEl = document.getElementById("dashboard-attach-chips");
   if (!chipsEl) return;
@@ -1678,6 +1711,7 @@ function _renderDashboardChips() {
 
 function _addDashboardFiles(files) {
   let handled = false;
+  let refusal = "";
   for (let i = 0; i < files.length; i++) {
     const f = files[i];
     const paste = window.TurnstonePasteText;
@@ -1689,37 +1723,16 @@ function _addDashboardFiles(files) {
       handled = true;
       continue;
     }
-    if (_dashboardStagedFiles.length >= _DASH_MAX_FILES) {
-      _dashboardError(
-        "At most " + _DASH_MAX_FILES + " attachments per workstream",
-      );
-      return handled;
-    }
-    // Drag-drop bypasses the <input accept="..."> filter, so re-check
-    // against the server's allowlist before the upload roundtrip.
-    if (!_isAttachmentAllowed(f)) {
-      _dashboardError(
-        "Unsupported file type: " +
-          f.name +
-          " (allowed: png/jpeg/webp images, PDF, text)",
-      );
-      return handled;
-    }
-    const isImage = (f.type || "").indexOf("image/") === 0;
-    const cap = isImage
-      ? _DASH_IMAGE_CAP
-      : _isPdf(f)
-        ? _DASH_PDF_CAP
-        : _DASH_TEXT_CAP;
-    if (f.size > cap) {
-      _dashboardError(
-        f.name + " exceeds the " + _formatAttachSize(cap) + " cap",
-      );
-      return handled;
+    const fileRefusal = _attachmentRefusal(f, _dashboardStagedFiles);
+    if (fileRefusal) {
+      // Skip the refused file and go on: the rest of the drop may fit.
+      refusal = fileRefusal;
+      continue;
     }
     _dashboardStagedFiles.push(f);
     handled = true;
   }
+  if (refusal) _dashboardError(refusal);
   _renderDashboardChips();
   _refreshDashboardSubmitLabel();
   return handled;
@@ -1954,6 +1967,14 @@ function dashboardSubmit() {
         project_id: body.project_id || null,
         persona: body.persona || "",
       };
+      // The create took the message and the files it sent: clear them, and keep any file
+      // staged while it ran.
+      input.value = "";
+      _dashboardStagedFiles = _dashboardStagedFiles.filter(function (f) {
+        return staged.indexOf(f) === -1;
+      });
+      _renderDashboardChips();
+      _refreshDashboardSubmitLabel();
       switchTab(data.ws_id);
       hideDashboard();
     })

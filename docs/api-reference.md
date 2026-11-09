@@ -1463,16 +1463,21 @@ Creates a new workstream, subject to the configured
 The endpoint accepts **either** `application/json` (legacy shape) **or**
 `multipart/form-data` when you want to upload attachments at creation
 time.  Multipart requests carry one `meta` field containing the JSON body
-shown below plus zero-or-more `file` parts; each file is validated and
-reserved onto the new workstream's first turn before the dispatch worker
-runs, so queued multimodal turns cannot lose files to racing sends.  If
-validation fails the fresh workstream is rolled back so no published row or
-phantom create/close event leaks.  Validation stops at the first file it
+shown below plus zero-or-more `file` parts.  Every file is checked before the
+workstream is created, so a refused file leaves no row, takes no slot and
+publishes no create or close event.  The check stops at the first file it
 refuses, and the error starts with that file's name (`party.gif: GIF images
-are not supported. Use PNG, JPEG or WebP.`).  An image is stored as
+are not supported. Use PNG, JPEG or WebP.`).  The files are then staged for
+the new workstream: with `initial_message` they are resolved onto that first
+turn before the dispatch worker runs, and otherwise they wait for the next
+send.  An image is stored as
 `POST /v1/api/workstreams/{ws_id}/attachments` stores it, with any
 transparent areas filled in, and the response's `attachment_ids` name the
 stored copies.
+
+A create takes at most ten files. Each one is held to the cap for its kind,
+the same caps `POST /v1/api/workstreams/{ws_id}/attachments` applies, and
+together they may total at most **64 MiB** (`413` above that).
 
 **Request body:**
 
@@ -1754,8 +1759,8 @@ attachments, or invoke the model. Submit multiple files as separate requests.
 
 ### `POST /v1/api/workstreams/{ws_id}/attachments`
 
-Upload an image or text document and attach it to the caller's next user
-turn on this workstream.
+Upload an image, PDF, audio file or text document and attach it to the
+caller's next user turn on this workstream.
 
 - Images (png/jpeg/webp) are capped at **4 MiB** and validated via
   magic-byte sniff on upload. GIF is refused, since vision providers do not
@@ -1770,14 +1775,17 @@ turn on this workstream.
   lossless WebP stays lossless. An image over 8.4 megapixels, an animated
   image, a colour-keyed PNG that isn't 8-bit, and one that would grow past the
   cap are stored as uploaded.
+- PDFs are capped at **32 MiB** and recognised by their `%PDF-` header.
+- Audio (WAV, MP3, AAC, OGG, FLAC, M4A or WebM, recognised by its magic
+  bytes) is capped at **25 MiB**.
 - Text documents (any `text/*` MIME, allow-listed application MIMEs, or
   known text extensions) are capped at **512 KiB** and must be UTF-8.
-- Per-(workstream, user) pending cap is **10** attachments.
 
-The attachment moves through three states: `pending → reserved →
-consumed`.  Reservation tokens are threaded through
-`POST /v1/api/workstreams/{ws_id}/send` so a queued multimodal turn cannot lose its file to
-an overlapping send.
+An upload waits in the node's memory until a send attaches it (`attachment_ids`
+on `POST /v1/api/workstreams/{ws_id}/send`, or every staged upload when that
+field is omitted), and only then is it stored. An unsent upload expires after an
+hour and is lost if the node restarts; when unsent uploads pass the node's total
+size ceiling, the oldest are dropped first.
 
 Ownership failures are masked as `404` so non-owners cannot enumerate
 workstream existence.

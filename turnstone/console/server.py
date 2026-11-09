@@ -1721,7 +1721,11 @@ async def create_workstream(request: Request) -> JSONResponse:
     - ``node_id`` omitted or ``"auto"`` → console picks the node with most headroom
     - ``node_id`` set to ``"pool"`` → console picks any available node
     """
-    from turnstone.core.attachments import IMAGE_SIZE_CAP, classify_uploaded_files
+    from turnstone.core.attachments import (
+        CREATE_ATTACHMENTS_TOTAL_CAP,
+        LARGEST_KIND_SIZE_CAP,
+        classify_uploaded_files,
+    )
     from turnstone.core.auth import require_any_permission
     from turnstone.core.web_helpers import read_json_or_400, read_multipart_create_or_400
 
@@ -1751,8 +1755,8 @@ async def create_workstream(request: Request) -> JSONResponse:
         parsed = await read_multipart_create_or_400(
             request,
             max_files=10,
-            max_per_file_bytes=IMAGE_SIZE_CAP,
-            max_total_bytes=10 * IMAGE_SIZE_CAP,
+            max_per_file_bytes=LARGEST_KIND_SIZE_CAP,
+            max_total_bytes=CREATE_ATTACHMENTS_TOTAL_CAP,
         )
         if isinstance(parsed, JSONResponse):
             return parsed

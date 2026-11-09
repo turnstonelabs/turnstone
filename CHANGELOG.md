@@ -58,6 +58,25 @@ The separate `dev` branch is retired. See [the release process](docs/releasing.m
   `[model].task_effort` in config.toml). Set `tools.web_fetch_alias` to choose
   the model that reads pages.
 
+### Fixed
+
+- **PDF and audio files can be attached when starting a workstream.** The
+  dashboard composer, the New workstream dialog and the console launcher
+  refused them as an unsupported type, although a workstream's own composer
+  takes both. A create also held every file to the 4 MiB image cap, so the API
+  refused most PDFs and longer audio files at creation too. Each file is now
+  held to its own type's cap (PDF 32 MiB, audio 25 MiB, images 4 MiB, text
+  512 KiB), and one create's files may total 64 MiB. A file the server refuses
+  now stops the create before anything is created.
+- **A refused file no longer hides or drops the rest of a drop.** When the
+  dashboard composer or the New workstream dialog refused a file, the files
+  dropped before it were staged without showing as chips and went out with the
+  create, and the files after it were dropped. All three composers now say why
+  a file was refused and still stage and show the others.
+- **The dashboard clears after starting a workstream.** Its message and staged
+  files stayed after a create, so they went out again with the next one. A file
+  staged while the create runs is kept.
+
 ## [2026-11-07]
 
 ### Fixed

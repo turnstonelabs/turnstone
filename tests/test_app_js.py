@@ -13,10 +13,11 @@ import json
 import re
 import subprocess
 from pathlib import Path
+from typing import Any
 
 import pytest
 
-from tests._js_harness_helpers import run_node_source, slice_braced_block
+from tests._js_harness_helpers import extract_braced, run_node_source, slice_braced_block
 from tests._js_harness_helpers import strip_js_comments as _strip_js_comments
 
 _APP_JS = Path(__file__).resolve().parent.parent / "turnstone/ui/static/app.js"
@@ -4340,33 +4341,421 @@ def test_default_labels_name_a_model_the_list_lacks() -> None:
     assert "' is not stored here or reported by any node. " in models_fn
 
 
-def test_dashboard_and_new_ws_attachments_accept_pdf() -> None:
-    """The dashboard and new-workstream pickers accept PDFs, as the server does."""
-    from tests._js_harness_helpers import extract_braced
-    from turnstone.core.attachments import PDF_SIZE_CAP
+# The browser's checks before a create uploads its files: the interactive UI's
+# copy (new-workstream modal and dashboard composer) and the console launcher's.
+_ATTACH_CONST_NAMES = (
+    "IMAGE_MIMES",
+    "AUDIO_MIMES",
+    "AUDIO_EXTENSIONS",
+    "TEXT_APP_MIMES",
+    "TEXT_EXTENSIONS",
+    "KIND_CAPS",
+    "TOTAL_CAP",
+    "MAX_FILES",
+)
+_ATTACH_POLICIES = [
+    pytest.param(_APP_JS, "_ATTACH", "_attachmentKind", id="interactive"),
+    pytest.param(_CONSOLE_APP_JS, "_HOME", "_homeAttachmentKind", id="console"),
+]
 
-    src = _APP_JS.read_text(encoding="utf-8")
-    consts = re.findall(r"^const _ATTACH_\w+ = \[.*?\];", src, re.S | re.M)
-    assert len(consts) == 3, "attachment allowlist constants not found in app.js"
+
+def _attach_policy_source(src: str, prefix: str) -> str:
+    """The ``<prefix>_*`` attachment constants declared in ``src``, as runnable JS."""
+    decls = []
+    for name in _ATTACH_CONST_NAMES:
+        m = re.search(
+            rf"^const {prefix}_{name} = (?:\[.*?\]|\{{.*?\}}|[^\n]*?);$", src, re.S | re.M
+        )
+        assert m, f"{prefix}_{name} not found"
+        decls.append(m.group(0))
+    return "\n".join(decls)
+
+
+def _attach_policy(path: Path, prefix: str) -> dict[str, Any]:
+    src = path.read_text(encoding="utf-8")
+    fields = ", ".join(f"{name}: {prefix}_{name}" for name in _ATTACH_CONST_NAMES)
+    proc = run_node_source(
+        _attach_policy_source(src, prefix) + f"\nconsole.log(JSON.stringify({{ {fields} }}));"
+    )
+    assert proc.returncode == 0, proc.stderr
+    policy: dict[str, Any] = json.loads(proc.stdout)
+    return policy
+
+
+def _default_accept_entries() -> set[str]:
+    """The entries of the shared composer's ATTACH_DEFAULT_ACCEPT (a workstream's own picker)."""
+    composer = (_APP_JS.parents[2] / "shared_static" / "composer.js").read_text(encoding="utf-8")
+    decl = re.search(r"var ATTACH_DEFAULT_ACCEPT =(.*?);", composer, re.S)
+    assert decl, "ATTACH_DEFAULT_ACCEPT not found in composer.js"
+    return set("".join(re.findall(r'"([^"]*)"', decl.group(1))).split(","))
+
+
+def test_pre_create_attachment_limits_match_the_server() -> None:
+    """Both copies hold the server's caps and types, so they refuse what a create would."""
+    from turnstone.core.attachments import (
+        _TEXT_ATTACHMENT_EXTENSIONS,
+        ALLOWED_AUDIO_MIMES,
+        AUDIO_SIZE_CAP,
+        CREATE_ATTACHMENTS_TOTAL_CAP,
+        IMAGE_SIZE_CAP,
+        MODEL_IMAGE_MIMES,
+        PDF_SIZE_CAP,
+        TEXT_DOC_SIZE_CAP,
+    )
+
+    interactive = _attach_policy(_APP_JS, "_ATTACH")
+    assert interactive["KIND_CAPS"] == {
+        "image": IMAGE_SIZE_CAP,
+        "pdf": PDF_SIZE_CAP,
+        "audio": AUDIO_SIZE_CAP,
+        "text": TEXT_DOC_SIZE_CAP,
+    }
+    assert interactive["TOTAL_CAP"] == CREATE_ATTACHMENTS_TOTAL_CAP
+    assert interactive["MAX_FILES"] == 10
+    assert sorted(interactive["IMAGE_MIMES"]) == sorted(MODEL_IMAGE_MIMES)
+    assert sorted(interactive["AUDIO_MIMES"]) == sorted(ALLOWED_AUDIO_MIMES)
+    assert sorted(interactive["TEXT_EXTENSIONS"]) == sorted(_TEXT_ATTACHMENT_EXTENSIONS)
+    # The audio extensions are the rest of a workstream picker's extensions.
+    picker_extensions = {e for e in _default_accept_entries() if e.startswith(".")}
+    assert sorted(interactive["AUDIO_EXTENSIONS"]) == sorted(
+        picker_extensions - _TEXT_ATTACHMENT_EXTENSIONS - {".pdf"}
+    )
+    assert _attach_policy(_CONSOLE_APP_JS, "_HOME") == interactive
+
+
+@pytest.mark.parametrize(("path", "prefix", "kind_fn"), _ATTACH_POLICIES)
+def test_pre_create_attachment_kinds(path: Path, prefix: str, kind_fn: str) -> None:
+    """PDFs and audio are taken by type or by extension; types the server refuses are not."""
+    src = path.read_text(encoding="utf-8")
+    cases = {
+        ("a.pdf", "application/pdf"): "pdf",
+        ("b.PDF", ""): "pdf",
+        ("c.mp3", "audio/mpeg"): "audio",
+        ("d.m4a", "audio/x-m4a"): "audio",
+        ("e.wav", ""): "audio",
+        ("f.png", "image/png"): "image",
+        ("g.gif", "image/gif"): "",
+        ("h.md", ""): "text",
+        ("i.exe", "application/x-msdownload"): "",
+    }
+    files = [{"name": name, "type": mime} for name, mime in cases]
     harness = "\n".join(
         [
-            *consts,
-            extract_braced(src, "function _isPdf(file) {"),
-            extract_braced(src, "function _isAttachmentAllowed(file) {"),
-            "const ok = (f) => { if (!_isAttachmentAllowed(f)) throw new Error(f.name); };",
-            "ok({ name: 'a.pdf', type: 'application/pdf' });",
-            "ok({ name: 'b.PDF', type: '' });",
-            "if (_isAttachmentAllowed({ name: 'c.exe', type: 'application/x-msdownload' }))"
-            " throw new Error('c.exe');",
+            _attach_policy_source(src, prefix),
+            extract_braced(src, f"function {kind_fn}(file) {{"),
+            f"const files = {json.dumps(files)};",
+            f"console.log(JSON.stringify(files.map((f) => {kind_fn}(f))));",
         ]
     )
     proc = run_node_source(harness)
-    assert proc.returncode == 0, f"PDF not accepted.  stderr={proc.stderr!r}"
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout) == list(cases.values())
 
-    for name in ("_NEW_WS_PDF_CAP", "_DASH_PDF_CAP"):
-        assert f"const {name} = {PDF_SIZE_CAP // (1024 * 1024)} * 1024 * 1024;" in src
 
+_ATTACH_SIZE_HELPERS = """
+const MiB = 1024 * 1024;
+const pdf = (size) => ({ name: "doc.pdf", type: "application/pdf", size });
+const mp3 = (size) => ({ name: "talk.mp3", type: "audio/mpeg", size });
+"""
+
+
+def test_pre_create_attachment_refusals() -> None:
+    """Each kind keeps its own cap, and one create's files share the total."""
+    src = _APP_JS.read_text(encoding="utf-8")
+    harness = "\n".join(
+        [
+            _attach_policy_source(src, "_ATTACH"),
+            extract_braced(src, "function _formatAttachSize(n) {"),
+            extract_braced(src, "function _attachmentKind(file) {"),
+            extract_braced(src, "function _attachmentRefusal(file, staged) {"),
+            _ATTACH_SIZE_HELPERS,
+            "const staged = [pdf(30 * MiB), mp3(24 * MiB)];",
+            "console.log(JSON.stringify([",
+            "  _attachmentRefusal(pdf(32 * MiB), []),",
+            "  _attachmentRefusal(pdf(32 * MiB + 1), []),",
+            "  _attachmentRefusal(mp3(25 * MiB + 1), []),",
+            "  _attachmentRefusal(pdf(10 * MiB), staged),",
+            "  _attachmentRefusal(pdf(10 * MiB + 1), staged),",
+            "  _attachmentRefusal(pdf(1), Array(10).fill(pdf(1))),",
+            '  _attachmentRefusal({ name: "x.exe", type: "", size: 1 }, []),',
+            "]));",
+        ]
+    )
+    proc = run_node_source(harness)
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout) == [
+        "",
+        "doc.pdf exceeds the 32.0 MB cap",
+        "talk.mp3 exceeds the 25.0 MB cap",
+        "",
+        "doc.pdf would take the attachments over the 64.0 MB total",
+        "At most 10 attachments per workstream",
+        "Unsupported file type: x.exe (allowed: png/jpeg/webp images, PDF, audio, text)",
+    ]
+
+
+def test_both_pre_create_composers_stage_through_the_shared_check() -> None:
+    src = _APP_JS.read_text(encoding="utf-8")
+    for fn, staged in (
+        ("_newWsAddFiles", "_newWsStagedFiles"),
+        ("_addDashboardFiles", "_dashboardStagedFiles"),
+    ):
+        body = slice_braced_block(src, src.index(f"function {fn}(files) {{"))
+        assert body and f"_attachmentRefusal(f, {staged})" in body, fn
+
+
+def _console_stage_harness() -> list[str]:
+    """``_homeStageFile`` and the launcher code it calls, with the page around it stubbed."""
+    src = _CONSOLE_APP_JS.read_text(encoding="utf-8")
+    return [
+        _attach_policy_source(src, "_HOME"),
+        extract_braced(src, "function _homeFormatSize(n) {"),
+        extract_braced(src, "function _homeAttachmentKind(file) {"),
+        extract_braced(src, "function _homeStageFile(file) {"),
+        "globalThis.window = {};",
+        'let _launcherKind = "coordinator";',
+        "let _homeStagedFiles = [];",
+        'let lastError = "";',
+        "function _homeShowError(msg) { lastError = msg; }",
+        "function _homeRenderChips() {}",
+        _ATTACH_SIZE_HELPERS,
+        "const named = (f, name) => ({ ...f, name });",
+    ]
+
+
+def test_console_launcher_stages_pdf_and_audio_within_the_total() -> None:
+    harness = "\n".join(
+        [
+            *_console_stage_harness(),
+            "const steps = [",
+            "  pdf(33 * MiB), pdf(30 * MiB), mp3(24 * MiB), pdf(10 * MiB + 1), pdf(10 * MiB),",
+            "];",
+            "console.log(JSON.stringify(steps.map((f) => _homeStageFile(f) || lastError)));",
+        ]
+    )
+    proc = run_node_source(harness)
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout) == [
+        "doc.pdf exceeds the 32.0 MB cap",
+        True,
+        True,
+        "doc.pdf would take the attachments over the 64.0 MB total",
+        True,
+    ]
+
+
+def test_console_launcher_refuses_an_eleventh_file_and_an_unsupported_type() -> None:
+    harness = "\n".join(
+        [
+            *_console_stage_harness(),
+            "for (let i = 0; i < 10; i++) {",
+            '  _homeStageFile({ name: "n" + i + ".md", type: "text/markdown", size: 1 });',
+            "}",
+            "const results = [",
+            '  _homeStageFile({ name: "n10.md", type: "text/markdown", size: 1 }) || lastError,',
+            "];",
+            "_homeStagedFiles = [];",
+            "results.push(",
+            '  _homeStageFile({ name: "x.exe", type: "application/x-msdownload", size: 1 }) ||',
+            "    lastError,",
+            ");",
+            "console.log(JSON.stringify(results));",
+        ]
+    )
+    proc = run_node_source(harness)
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout) == [
+        "At most 10 attachments per workstream",
+        "Unsupported file type: x.exe (allowed: png/jpeg/webp images, PDF, audio, text)",
+    ]
+
+
+def test_console_launcher_keeps_a_refusal_shown_when_later_files_are_accepted() -> None:
+    # The composer stages a drop one file at a time, so a file accepted after a refused one
+    # must not clear the refusal, or the user never learns why a file is missing.
+    harness = "\n".join(
+        [
+            *_console_stage_harness(),
+            "const drop = [",
+            '  named(pdf(30 * MiB), "a.pdf"),',
+            '  named(pdf(30 * MiB), "b.pdf"),',
+            '  named(pdf(10 * MiB), "c.pdf"),',
+            '  { name: "notes.md", type: "text/markdown", size: 10 },',
+            "];",
+            "drop.forEach((f) => _homeStageFile(f));",
+            "const staged = _homeStagedFiles.map((f) => f.name);",
+            "console.log(JSON.stringify({ staged, shown: lastError }));",
+        ]
+    )
+    proc = run_node_source(harness)
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout) == {
+        "staged": ["a.pdf", "b.pdf", "notes.md"],
+        "shown": "c.pdf would take the attachments over the 64.0 MB total",
+    }
+
+
+@pytest.mark.parametrize(
+    ("fn", "staged", "error_fn", "render_fns"),
+    [
+        ("_newWsAddFiles", "_newWsStagedFiles", "_newWsError", ["_newWsRenderChips"]),
+        (
+            "_addDashboardFiles",
+            "_dashboardStagedFiles",
+            "_dashboardError",
+            ["_renderDashboardChips", "_refreshDashboardSubmitLabel"],
+        ),
+    ],
+    ids=["new-workstream", "dashboard"],
+)
+def test_a_refused_file_mid_batch_is_skipped_and_the_rest_staged(
+    fn: str, staged: str, error_fn: str, render_fns: list[str]
+) -> None:
+    # A refused file is named and skipped, and the files around it are staged and shown as
+    # chips, as the console launcher does, so nothing goes out with the create unseen.
+    src = _APP_JS.read_text(encoding="utf-8")
+    harness = "\n".join(
+        [
+            _attach_policy_source(src, "_ATTACH"),
+            extract_braced(src, "function _formatAttachSize(n) {"),
+            extract_braced(src, "function _attachmentKind(file) {"),
+            extract_braced(src, "function _attachmentRefusal(file, staged) {"),
+            extract_braced(src, f"function {fn}(files) {{"),
+            "globalThis.window = {};",
+            f"let {staged} = [];",
+            'let shownError = "";',
+            "let renderedNames = null;",
+            f"function {error_fn}(msg) {{ shownError = msg; }}",
+            *[
+                f"function {name}() {{ renderedNames = {staged}.map((f) => f.name); }}"
+                for name in render_fns
+            ],
+            _ATTACH_SIZE_HELPERS,
+            'const drop = ["a.pdf", "b.pdf", "c.pdf"].map((name) => ({ ...pdf(30 * MiB), name }));',
+            'drop.push({ name: "notes.md", type: "text/markdown", size: 10 });',
+            f"const handled = {fn}(drop);",
+            "console.log(JSON.stringify({ handled, renderedNames, shownError }));",
+        ]
+    )
+    proc = run_node_source(harness)
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout) == {
+        "handled": True,
+        "renderedNames": ["a.pdf", "b.pdf", "notes.md"],
+        "shownError": "c.pdf would take the attachments over the 64.0 MB total",
+    }
+
+
+def _dashboard_submit_harness() -> list[str]:
+    """``dashboardSubmit`` and the staging it uses, with the page and the network stubbed.
+
+    The stubbed create answers ``globalThis.createReply`` when a test sets it, and succeeds
+    otherwise.
+    """
+    src = _APP_JS.read_text(encoding="utf-8")
+    return [
+        _attach_policy_source(src, "_ATTACH"),
+        extract_braced(src, "function _formatAttachSize(n) {"),
+        extract_braced(src, "function _attachmentKind(file) {"),
+        extract_braced(src, "function _attachmentRefusal(file, staged) {"),
+        extract_braced(src, "function _addDashboardFiles(files) {"),
+        extract_braced(src, "function hideDashboard() {"),
+        extract_braced(src, "function dashboardSubmit() {"),
+        """
+globalThis.window = {};
+const els = {
+  "dashboard-input": { value: "summarize these", disabled: false },
+  "dashboard-submit-btn": { disabled: false },
+  "dashboard-model": { value: "" },
+  "dashboard-judge-model": { value: "" },
+  "dashboard-skill": { value: "" },
+  "dashboard-project": { value: "" },
+  "dashboard-persona": { value: "" },
+};
+globalThis.document = { getElementById: (id) => els[id] || null };
+class FormData {
+  constructor() { this.parts = []; }
+  append(key, value) { this.parts.push([key, value && value.name ? value.name : value]); }
+}
+globalThis.FormData = FormData;
+const sent = [];
+globalThis.authFetch = (url, opts) => {
+  sent.push(opts.body instanceof FormData ? opts.body.parts : opts.body);
+  const reply = globalThis.createReply || { ws_id: "w1", name: "n" };
+  return Promise.resolve({ json: () => Promise.resolve(reply) });
+};
+const workstreams = {};
+function switchTab() {}
+let _dashboardStagedFiles = [];
+let shown = "";
+let rendered = null;
+function _dashboardError(msg) { shown = msg; }
+function _renderDashboardChips() { rendered = _dashboardStagedFiles.map((f) => f.name); }
+function _refreshDashboardSubmitLabel() {}
+""",
+        _ATTACH_SIZE_HELPERS,
+        "const named = (f, name) => ({ ...f, name });",
+    ]
+
+
+def test_a_dashboard_create_clears_its_message_and_files() -> None:
+    # The sent files would otherwise stay staged, count toward the next create's total and
+    # go out with it again. A file dropped while the create runs isn't part of it, so it stays.
+    harness = "\n".join(
+        [
+            *_dashboard_submit_harness(),
+            '_addDashboardFiles([named(pdf(30 * MiB), "a.pdf"), named(pdf(30 * MiB), "b.pdf")]);',
+            "dashboardSubmit();",
+            '_addDashboardFiles([named(pdf(1 * MiB), "late.pdf")]);',
+            "await new Promise((r) => setTimeout(r, 10));",
+            'const sentFiles = sent[0].filter(([k]) => k === "file").map(([, v]) => v);',
+            'const input = els["dashboard-input"].value;',
+            "const staged = _dashboardStagedFiles.map((f) => f.name);",
+            "const afterCreate = { staged, rendered, input };",
+            '_addDashboardFiles([named(pdf(10 * MiB), "next.pdf")]);',
+            "const next = _dashboardStagedFiles.map((f) => f.name);",
+            "console.log(JSON.stringify({ sentFiles, afterCreate, next, shown }));",
+        ]
+    )
+    proc = run_node_source(harness)
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout) == {
+        "sentFiles": ["a.pdf", "b.pdf"],
+        "afterCreate": {"staged": ["late.pdf"], "rendered": ["late.pdf"], "input": ""},
+        "next": ["late.pdf", "next.pdf"],
+        "shown": "",
+    }
+
+
+def test_a_failed_dashboard_create_keeps_its_message_and_files() -> None:
+    harness = "\n".join(
+        [
+            *_dashboard_submit_harness(),
+            'globalThis.createReply = { error: "No capacity" };',
+            '_addDashboardFiles([named(pdf(1 * MiB), "a.pdf")]);',
+            "dashboardSubmit();",
+            "await new Promise((r) => setTimeout(r, 10));",
+            "const staged = _dashboardStagedFiles.map((f) => f.name);",
+            'const input = els["dashboard-input"].value;',
+            "console.log(JSON.stringify({ staged, input, shown }));",
+        ]
+    )
+    proc = run_node_source(harness)
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout) == {
+        "staged": ["a.pdf"],
+        "input": "summarize these",
+        "shown": "No capacity",
+    }
+
+
+def test_pre_create_pickers_offer_what_the_workstream_composer_takes() -> None:
+    """The dashboard and new-workstream pickers list every type a workstream's composer does."""
+    shared = _default_accept_entries()
     index = (_APP_JS.parent / "index.html").read_text(encoding="utf-8")
     for input_id in ("dashboard-attach-input", "new-ws-attach-input"):
-        tag = re.search(r"<input[^>]*" + input_id + r"[^>]*>", index, re.S)
-        assert tag and "application/pdf" in tag.group(0), input_id
+        tag = re.search(r'<input[^>]*id="' + input_id + r'"[^>]*>', index, re.S)
+        accept = tag and re.search(r'accept="([^"]*)"', tag.group(0))
+        assert accept, input_id
+        missing = shared - set(accept.group(1).split(","))
+        assert not missing, (input_id, sorted(missing))

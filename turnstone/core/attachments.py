@@ -36,6 +36,11 @@ TEXT_DOC_SIZE_CAP: int = 512 * 1024
 PDF_SIZE_CAP: int = 32 * 1024 * 1024
 AUDIO_SIZE_CAP: int = 25 * 1024 * 1024
 
+# A create's multipart parse holds each file to the largest kind cap (its own kind's cap applies
+# when it is classified) and all of the create's files together to the total.
+LARGEST_KIND_SIZE_CAP: int = max(IMAGE_SIZE_CAP, TEXT_DOC_SIZE_CAP, PDF_SIZE_CAP, AUDIO_SIZE_CAP)
+CREATE_ATTACHMENTS_TOTAL_CAP: int = 64 * 1024 * 1024
+
 ALLOWED_IMAGE_MIMES: frozenset[str] = frozenset(
     {"image/png", "image/jpeg", "image/gif", "image/webp"}
 )
@@ -398,35 +403,27 @@ def any_upload_needs_flattening(files: list[tuple[str, str, bytes]]) -> bool:
     )
 
 
-def validate_and_save_uploaded_files(
-    files: list[tuple[str, str, bytes]],
+def stage_classified_files(
+    classified: list[tuple[str, str, str, bytes]],
     ws_id: str,
     user_id: str,
-) -> tuple[list[str], JSONResponse | None]:
-    """Classify + stage a list of ``(filename, claimed_mime, data)`` tuples.
+) -> list[str]:
+    """Stage files :func:`classify_uploaded_files` accepted, for ``(ws_id, user_id)``.
 
-    Applies the same validation rules as the upload endpoint (magic-byte image
-    sniffing, UTF-8 text decode, per-kind size cap) and stages each file in the
-    per-node :class:`~turnstone.core.attachment_buffer.AttachmentBuffer`.  The
-    returned ids are the content hashes the buffer computed — re-uploading
-    identical bytes is idempotent (same id).  The per-(ws,user) pending cap and
-    its lock are gone; the buffer's own size/TTL ceilings bound a flood.
+    Each ``(filename, kind, mime, data)`` is staged in the per-node
+    :class:`~turnstone.core.attachment_buffer.AttachmentBuffer` as
+    :func:`stored_upload_content` returns it, so an image is stored flattened.  The returned ids
+    are the content hashes the buffer computed: re-uploading identical bytes is idempotent (same
+    id).  The buffer's own size and TTL ceilings bound a flood.
 
-    Kind-agnostic: both interactive and coordinator create-with-attachments
-    paths call into this helper from the lifted ``make_create_handler``
-    factory.
-
-    Returns ``(attachment_ids, None)`` on success, or ``([], JSONResponse)`` when
-    a file is refused: every file is checked before any is staged.
+    Both kinds' create-with-attachments call this from the lifted ``make_create_handler``, after
+    ``mgr.create``, with the list the handler classified before it.
     """
     from turnstone.core.attachment_buffer import get_attachment_buffer
 
-    classified, refusal = classify_uploaded_files(files)
-    if refusal is not None:
-        return [], refusal
     saved_ids: list[str] = []
     if not classified:
-        return saved_ids, None
+        return saved_ids
 
     buffer = get_attachment_buffer()
     for filename, kind, mime, data in classified:
@@ -439,7 +436,7 @@ def validate_and_save_uploaded_files(
             content=stored_upload_content(kind, data),
         )
         saved_ids.append(staged.attachment_id)
-    return saved_ids, None
+    return saved_ids
 
 
 def resolve_staged_attachments(
