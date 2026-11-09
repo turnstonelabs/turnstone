@@ -14,6 +14,11 @@ DEFAULT_CACHE_TTL_SECONDS = 300.0
 DEFAULT_VAULT_TIMEOUT_SECONDS = 5.0
 
 VAULT_AUTH_METHODS = ("jwt", "approle")
+# Where Kubernetes mounts the pod's service-account token. A file root that
+# contains it would let a secret://file reference send the token to a URL of
+# its author's choosing. Checked only where the file exists, so deployments
+# without one (systemd, compose) are untouched.
+_SERVICE_ACCOUNT_TOKEN = "/var/run/secrets/kubernetes.io/serviceaccount/token"
 
 
 @dataclass(frozen=True)
@@ -96,6 +101,11 @@ def _file_config(section: Any, *, config_path: Path | None) -> FileBackendConfig
         raise SecretConfigError(
             "config.toml [secrets.file] root: must not contain config.toml itself; "
             "use a dedicated directory for secret files"
+        )
+    if os.path.exists(_SERVICE_ACCOUNT_TOKEN) and _under(root, _SERVICE_ACCOUNT_TOKEN):
+        raise SecretConfigError(
+            "config.toml [secrets.file] root: must not contain the service-account token at "
+            f"{_SERVICE_ACCOUNT_TOKEN}; use a dedicated directory for secret files"
         )
     return FileBackendConfig(root=root)
 

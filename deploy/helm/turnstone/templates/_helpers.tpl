@@ -335,3 +335,70 @@ pod has no other volume for sidecars, and the token volume is the server's.
 - {{ toYaml $container | indent 2 | trim }}
 {{- end -}}
 {{- end -}}
+
+{{/*
+Configuration file and secret mounts, shared by the server and console pods.
+config.file is mounted at /etc/turnstone; each config.secretMounts entry is a
+Secret volume at its own path. Sidecars get neither. The checks run in the
+volumeMounts define, which every pod that renders the volumes also renders.
+Volume names come from the list index, so they are unique and valid whatever
+the Secret is called. A mount may not equal, contain or lie under a path the
+chart reserves (the configuration directory, the service-account token under
+both of its names, the workspace) or another mount; /var/run is read as /run
+for the comparison, which is what the image makes of it.
+*/}}
+{{- define "turnstone.configFile.volumeMounts" -}}
+{{- if and .Values.config.secretMounts (not .Values.config.file) -}}
+{{- fail "config.secretMounts: needs config.file, which names the file root the mounts serve" -}}
+{{- end -}}
+{{- if .Values.config.file }}
+- name: config-file
+  mountPath: /etc/turnstone
+  readOnly: true
+{{- end }}
+{{- $paths := dict -}}
+{{- $secrets := dict -}}
+{{- range $i, $m := .Values.config.secretMounts -}}
+{{- if not (kindIs "map" $m) -}}
+{{- fail "config.secretMounts: every entry is a map with name and mountPath" -}}
+{{- end -}}
+{{- $name := toString (required "config.secretMounts: every entry needs a name" $m.name) -}}
+{{- if hasKey $secrets $name -}}
+{{- fail (printf "config.secretMounts[%s]: listed twice; mount each Secret once" $name) -}}
+{{- end -}}
+{{- $_ := set $secrets $name true -}}
+{{- $path := required (printf "config.secretMounts[%s]: mountPath is required" $name) $m.mountPath -}}
+{{- $clean := clean (toString $path) -}}
+{{- $norm := regexReplaceAll "^/var/run(/|$)" $clean "/run${1}" -}}
+{{- if or (not (hasPrefix "/" $norm)) (eq $norm "/") -}}
+{{- fail (printf "config.secretMounts[%s]: mountPath must be an absolute path below /, got %v" $name $path) -}}
+{{- end -}}
+{{- range $taken := list "/etc/turnstone" "/run/secrets/kubernetes.io/serviceaccount" "/var/run/secrets/kubernetes.io/serviceaccount" "/workspace" -}}
+{{- if or (eq $norm $taken) (hasPrefix (printf "%s/" $taken) $norm) (hasPrefix (printf "%s/" $norm) $taken) -}}
+{{- fail (printf "config.secretMounts[%s]: mountPath %v overlaps %s, a path the chart reserves" $name $path $taken) -}}
+{{- end -}}
+{{- end -}}
+{{- range $other, $owner := $paths -}}
+{{- if or (eq $norm $other) (hasPrefix (printf "%s/" $other) $norm) (hasPrefix (printf "%s/" $norm) $other) -}}
+{{- fail (printf "config.secretMounts[%s]: mountPath %v overlaps the mount of %s at %s" $name $path (index $owner 0) (index $owner 1)) -}}
+{{- end -}}
+{{- end -}}
+{{- $_ := set $paths $norm (list $name $clean) }}
+- name: secret-mount-{{ $i }}
+  mountPath: {{ $clean | quote }}
+  readOnly: true
+{{- end -}}
+{{- end -}}
+
+{{- define "turnstone.configFile.volumes" -}}
+{{- if .Values.config.file }}
+- name: config-file
+  configMap:
+    name: {{ include "turnstone.fullname" . }}-config-file
+{{- end }}
+{{- range $i, $m := .Values.config.secretMounts }}
+- name: secret-mount-{{ $i }}
+  secret:
+    secretName: {{ $m.name | quote }}
+{{- end }}
+{{- end -}}

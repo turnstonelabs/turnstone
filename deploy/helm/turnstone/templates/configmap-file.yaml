@@ -1,0 +1,42 @@
+{{- if .Values.config.file }}
+{{- /* fromToml answers a one-key {Error: "toml: ..."} map for text it cannot parse. */}}
+{{- $parsed := fromToml .Values.config.file }}
+{{- if and (hasKey $parsed "Error") (eq (len $parsed) 1) (hasPrefix "toml:" (toString (get $parsed "Error"))) }}
+{{- fail (printf "config.file: not valid TOML: %v" (get $parsed "Error")) }}
+{{- end }}
+{{- /* What the chart sets through env, and what must not sit in a ConfigMap. */}}
+{{- $db := get $parsed "database" }}
+{{- range $k := list "backend" "url" "path" "listen_url" }}
+{{- if and (kindIs "map" $db) (hasKey $db $k) }}
+{{- fail (printf "config.file: leave [database] %s out; the chart owns the database connection, and a file value would override or redirect it" $k) }}
+{{- end }}
+{{- end }}
+{{- $auth := get $parsed "auth" }}
+{{- if and (kindIs "map" $auth) (hasKey $auth "jwt_secret") }}
+{{- fail "config.file: leave [auth] jwt_secret out of a ConfigMap; set auth.existingSecret, which the chart passes as TURNSTONE_JWT_SECRET" }}
+{{- end }}
+{{- $security := get $parsed "security" }}
+{{- if and (kindIs "map" $security) (or (hasKey $security "mcp_token_encryption_key") (hasKey $security "mcp_token_encryption_keys")) }}
+{{- fail "config.file: leave the [security] encryption keys out of a ConfigMap; the chart has no place for them yet" }}
+{{- end }}
+{{- $oidc := get $parsed "oidc" }}
+{{- if and (kindIs "map" $oidc) (hasKey $oidc "client_secret") }}
+{{- fail "config.file: leave [oidc] client_secret out of a ConfigMap; the chart has no place for it yet" }}
+{{- end }}
+{{- $secretsTable := get $parsed "secrets" }}
+{{- $vault := "" }}
+{{- if kindIs "map" $secretsTable }}
+{{- $vault = get $secretsTable "vault" }}
+{{- end }}
+{{- if and (kindIs "map" $vault) (hasKey $vault "secret_id") }}
+{{- fail "config.file: leave [secrets.vault] secret_id out of a ConfigMap; mount its Secret with config.secretMounts outside the [secrets.file] root and set secret_id_file" }}
+{{- end }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "turnstone.fullname" . }}-config-file
+  labels:
+    {{- include "turnstone.labels" . | nindent 4 }}
+data:
+  {{- dict "config.toml" .Values.config.file | toYaml | nindent 2 }}
+{{- end }}

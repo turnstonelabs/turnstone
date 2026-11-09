@@ -14,6 +14,13 @@ The separate `dev` branch is retired. See [the release process](docs/releasing.m
 
 ### Added
 
+- **Helm: a configuration file for the server and console, and secret
+  mounts.** `config.file` holds the text of a config.toml, mounted read-only
+  in both pods, and a change rolls them; `config.secretMounts` mounts
+  Kubernetes Secrets at the paths you give. Together they turn on `secret://`
+  references on Kubernetes, so a model key or an MCP header can name a
+  mounted Secret or a Vault field instead of holding the value. See
+  [the chart README](deploy/helm/turnstone/README.md#configuration-file).
 - **Helm: MCP servers as sidecars of the server pod.** `server.sidecars` lists
   containers that run in the server pod and share its `/workspace` with the
   model's shell and file tools, for MCP servers that work on the agent's
@@ -88,6 +95,21 @@ The separate `dev` branch is retired. See [the release process](docs/releasing.m
   transcript that comes back empty gets a placeholder saying the alias found no
   speech. Perception still takes audio attachments when `audio.stt_model_alias`
   is empty.
+
+### Removed
+
+- **The startup warning that config.toml is group- or world-readable.** A
+  read-only mount in a container is root-owned and readable by design, and a
+  process that does not own the file could never follow the advice to change
+  its mode.
+
+### Security
+
+- **A `[secrets.file]` root may not contain the pod's service-account
+  token.** Where Kubernetes mounts one, such a root is refused at startup, as a
+  root holding config.toml or the Vault login credential already was. A
+  `secret://file` reference under it could have sent the token to a URL of its
+  author's choosing.
 
 ## [1.9.3]
 
