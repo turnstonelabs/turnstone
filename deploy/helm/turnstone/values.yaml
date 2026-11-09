@@ -126,19 +126,54 @@ auth:
   jwtSecret: ""
   existingSecret: ""
 
+# -- Single sign-on through an OpenID Connect provider. Setting `issuer`,
+# `clientId`, `scopes`, `providerName` or the client secret requires `issuer`,
+# `clientId`, `redirectBase` and the client secret, from `existingSecret` (a
+# Secret with a TURNSTONE_OIDC_CLIENT_SECRET key) or `clientSecret` inline;
+# the render stops otherwise and names what is missing. `redirectBase` alone
+# is allowed: per-user MCP authorization needs it and nothing else. The values
+# reach both pods as the TURNSTONE_OIDC_* env the application reads, the
+# client secret from the Secret like the JWT secret, so a changed client
+# secret needs a rollout restart while a changed issuer, client id, redirect
+# base, scopes or provider name rolls the pods by itself. The client secret
+# may be a secret:// reference, resolved at startup once `config.file` or
+# `config.existingSecret` enables a secret store. Single sign-on completes on
+# the UI at `redirectBase`'s origin, normally the console's host; a login
+# started at another host does not complete. The rarer settings (the role
+# claim and map, password_enabled, allow_private_network,
+# trusted_endpoint_hosts, capture_user_credential, obo_grant_profile) go in
+# the `[oidc]` table of `config.file`, which may not repeat the keys set here.
+# Values are strings; quote a numeric client id. See docs/oidc.md and
+# README.md, "Single sign-on".
+oidc:
+  # The provider's issuer URL, which serves /.well-known/openid-configuration.
+  issuer: ""
+  clientId: ""
+  clientSecret: ""
+  existingSecret: ""
+  # The origin users log in at, scheme://host[:port] and nothing after it (a
+  # trailing slash is dropped); register
+  # <redirectBase>/v1/api/auth/oidc/callback at the provider.
+  redirectBase: ""
+  # Space-separated; empty means the application's default (openid email
+  # profile).
+  scopes: ""
+  # The login button's label; empty means SSO.
+  providerName: ""
+
 # -- Configuration file for the server and console. `file` is the text of a
 # config.toml, rendered into a Secret and mounted read-only at
 # /etc/turnstone/config.toml in both pods (TURNSTONE_CONFIG points there); a
 # change rolls both Deployments. Use it for settings the chart has no value
-# for: the `[secrets]` table that turns on secret:// references, and the
-# startup secrets the chart cannot take otherwise (the `[security]` encryption
-# keys, `[oidc] client_secret`, a Vault `secret_id`), which the Secret keeps
-# out of plain view. The chart refuses what it owns: the `[database]`
-# connection keys and `[auth] jwt_secret`. Its port flags beat the file. Text
-# the chart cannot parse as TOML is refused at install; a file the application
-# cannot read or parse, or a `[secrets]` table it rejects, stops the pods at
-# startup. See
-# README.md, "Configuration file".
+# for: the `[secrets]` table that turns on secret:// references, the rarer
+# `[oidc]` settings, and the startup secrets the chart cannot take otherwise
+# (the `[security]` encryption keys, a Vault `secret_id`), which the Secret
+# keeps out of plain view. The chart refuses what it owns: the `[database]`
+# connection keys, `[auth] jwt_secret` and the `[oidc]` keys that `oidc.*`
+# sets. Its port flags beat the file. Text the chart cannot parse as TOML is
+# refused at install; a file the application cannot read or parse, or a
+# `[secrets]` table it rejects, stops the pods at startup. See README.md,
+# "Configuration file".
 config:
   file: ""
   # file: |

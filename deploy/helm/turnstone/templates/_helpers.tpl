@@ -282,6 +282,82 @@ Determine the secret name for auth tokens.
 {{- end }}
 
 {{/*
+Single sign-on. The oidc.* values reach the server and console pods as the
+TURNSTONE_OIDC_* env the application reads, the client secret from the chart's
+Secret or oidc.existingSecret, like the JWT secret. Setting any value but the
+redirect base turns it on, so the four the application needs are checked in
+turnstone.oidc.check, which the env define every pod renders and the chart's
+Secret both run first: a partial configuration stops the render instead of the
+pods logging at startup that single sign-on is off, and a numeric value from a
+values file is refused with its name rather than failing inside b64enc. The
+redirect base alone is allowed, since per-user MCP authorization needs it and
+nothing else; its shape is checked the way the application checks it, which
+otherwise drops the value and turns single sign-on off at startup.
+*/}}
+{{- define "turnstone.oidc.secretName" -}}
+{{- if .Values.oidc.existingSecret }}
+{{- .Values.oidc.existingSecret }}
+{{- else }}
+{{- printf "%s-secrets" (include "turnstone.fullname" .) }}
+{{- end }}
+{{- end }}
+
+{{- define "turnstone.oidc.check" -}}
+{{- $o := .Values.oidc -}}
+{{- range $k := list "issuer" "clientId" "clientSecret" "existingSecret" "redirectBase" "scopes" "providerName" -}}
+{{- $v := get $o $k -}}
+{{- if and $v (not (kindIs "string" $v)) -}}
+{{- fail (printf "oidc.%s: must be a string; quote it in the values file or pass it with --set-string (scopes is one space-separated string)" $k) -}}
+{{- end -}}
+{{- end -}}
+{{- if or $o.issuer $o.clientId $o.clientSecret $o.existingSecret $o.scopes $o.providerName -}}
+{{- $missing := list -}}
+{{- if not $o.issuer }}{{- $missing = append $missing "oidc.issuer" }}{{- end -}}
+{{- if not $o.clientId }}{{- $missing = append $missing "oidc.clientId" }}{{- end -}}
+{{- if not $o.redirectBase }}{{- $missing = append $missing "oidc.redirectBase" }}{{- end -}}
+{{- if not (or $o.clientSecret $o.existingSecret) }}{{- $missing = append $missing "oidc.clientSecret or oidc.existingSecret" }}{{- end -}}
+{{- if $missing -}}
+{{- fail (printf "oidc: single sign-on needs oidc.issuer, oidc.clientId, oidc.redirectBase and the client secret together; missing: %s (oidc.redirectBase alone is allowed, for per-user MCP authorization)" (join ", " $missing)) -}}
+{{- end -}}
+{{- if not (regexMatch "^(?i:https?)://" $o.issuer) -}}
+{{- fail (printf "oidc.issuer: the provider's issuer URL, starting with https://, got %s" $o.issuer) -}}
+{{- end -}}
+{{- end -}}
+{{- if and $o.redirectBase (not (regexMatch "^(?i:https?)://([^/?#@:\\[\\]\\s]+|\\[[0-9A-Fa-f:.]+\\])(:(6553[0-5]|655[0-2][0-9]|65[0-4][0-9]{2}|6[0-4][0-9]{3}|[1-5]?[0-9]{1,4}))?/?$" $o.redirectBase)) -}}
+{{- fail (printf "oidc.redirectBase: the origin users log in at, scheme://host[:port] and nothing after it, got %s" $o.redirectBase) -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "turnstone.oidc.env" -}}
+{{- include "turnstone.oidc.check" . -}}
+{{- $o := .Values.oidc -}}
+{{- $sso := or $o.issuer $o.clientId $o.clientSecret $o.existingSecret $o.scopes $o.providerName -}}
+{{- if $o.redirectBase -}}
+- name: TURNSTONE_OIDC_REDIRECT_BASE
+  value: {{ $o.redirectBase | trimSuffix "/" | quote }}
+{{- end }}
+{{- if $sso }}
+- name: TURNSTONE_OIDC_ISSUER
+  value: {{ $o.issuer | quote }}
+- name: TURNSTONE_OIDC_CLIENT_ID
+  value: {{ $o.clientId | quote }}
+{{- with $o.scopes }}
+- name: TURNSTONE_OIDC_SCOPES
+  value: {{ . | quote }}
+{{- end }}
+{{- with $o.providerName }}
+- name: TURNSTONE_OIDC_PROVIDER_NAME
+  value: {{ . | quote }}
+{{- end }}
+- name: TURNSTONE_OIDC_CLIENT_SECRET
+  valueFrom:
+    secretKeyRef:
+      name: {{ include "turnstone.oidc.secretName" . }}
+      key: TURNSTONE_OIDC_CLIENT_SECRET
+{{- end -}}
+{{- end -}}
+
+{{/*
 Container image reference.
 */}}
 {{- define "turnstone.image" -}}

@@ -91,6 +91,9 @@ spec:
                 secretKeyRef:
                   name: {{ include "turnstone.auth.secretName" . }}
                   key: TURNSTONE_JWT_SECRET
+            {{- with include "turnstone.oidc.env" . }}
+            {{- . | nindent 12 }}
+            {{- end }}
           readinessProbe:
             httpGet:
               path: /health

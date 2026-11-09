@@ -14,6 +14,17 @@ The separate `dev` branch is retired. See [the release process](docs/releasing.m
 
 ### Added
 
+- **Helm: single sign-on from values.** `oidc.issuer`, `oidc.clientId`,
+  `oidc.redirectBase` and the client secret (`oidc.clientSecret` inline or
+  `oidc.existingSecret`) reach the server and console pods as the
+  `TURNSTONE_OIDC_*` environment the application reads and turn on login
+  through an OpenID Connect provider at `oidc.redirectBase`; `oidc.scopes`
+  and `oidc.providerName` are optional, and `oidc.redirectBase` alone serves
+  per-user MCP authorization without single sign-on. The render stops when a
+  required value is missing, and the client secret may be a `secret://`
+  reference. The rarer settings keep their place in the `[oidc]` table of
+  `config.file`, which may not repeat the keys the values set. See
+  [the chart README](deploy/helm/turnstone/README.md#single-sign-on).
 - **`[auth] jwt_secret` and `[oidc] client_secret` may be `secret://`
   references.** In config.toml or in `TURNSTONE_JWT_SECRET` and
   `TURNSTONE_OIDC_CLIENT_SECRET`. Each is resolved once at startup; the
