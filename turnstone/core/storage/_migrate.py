@@ -146,13 +146,16 @@ def _main() -> None:
     """Apply migrations with the database settings the services start with."""
     import os
 
-    from turnstone.core.config import load_config
+    from turnstone.core.config import ConfigError, load_config
     from turnstone.core.log import configure_logging
     from turnstone.core.storage import get_storage, init_storage
 
     configure_logging(level="INFO", service="migrate")
     # config.toml [database] first, then the environment, as the node reads them.
-    database = load_config("database")
+    try:
+        database = load_config("database")
+    except ConfigError as exc:  # the loader has logged why
+        raise SystemExit(1) from exc
 
     def setting(key: str, env_name: str, default: str = "") -> str:
         value = database.get(key)

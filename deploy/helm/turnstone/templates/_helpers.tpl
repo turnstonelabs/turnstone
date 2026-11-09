@@ -274,8 +274,10 @@ Determine the secret name for auth tokens.
 {{- define "turnstone.auth.secretName" -}}
 {{- if .Values.auth.existingSecret }}
 {{- .Values.auth.existingSecret }}
-{{- else }}
+{{- else if .Values.auth.jwtSecret }}
 {{- printf "%s-secrets" (include "turnstone.fullname" .) }}
+{{- else }}
+{{- fail "auth: set auth.existingSecret or auth.jwtSecret; the JWT signing secret is required, and without it the server would exit at startup" }}
 {{- end }}
 {{- end }}
 
@@ -338,9 +340,12 @@ pod has no other volume for sidecars, and the token volume is the server's.
 
 {{/*
 Configuration file and secret mounts, shared by the server and console pods.
-config.file is mounted at /etc/turnstone; each config.secretMounts entry is a
-Secret volume at its own path. Sidecars get neither. The checks run in the
-volumeMounts define, which every pod that renders the volumes also renders.
+The file (config.file rendered into the chart's Secret, or the config.toml key
+of config.existingSecret) is mounted at /etc/turnstone; each
+config.secretMounts entry is a Secret volume at its own path. Sidecars get
+neither. The mount checks run in the volumeMounts define, which every pod that
+renders the volumes also renders; the file-source checks live in
+secret-file.yaml.
 Volume names come from the list index, so they are unique and valid whatever
 the Secret is called. A mount may not equal, contain or lie under a path the
 chart reserves (the configuration directory, the service-account token under
@@ -348,10 +353,10 @@ both of its names, the workspace) or another mount; /var/run is read as /run
 for the comparison, which is what the image makes of it.
 */}}
 {{- define "turnstone.configFile.volumeMounts" -}}
-{{- if and .Values.config.secretMounts (not .Values.config.file) -}}
-{{- fail "config.secretMounts: needs config.file, which names the file root the mounts serve" -}}
+{{- if and .Values.config.secretMounts (not (or .Values.config.file .Values.config.existingSecret)) -}}
+{{- fail "config.secretMounts: needs a configuration file (config.file or config.existingSecret), which names the file root the mounts serve" -}}
 {{- end -}}
-{{- if .Values.config.file }}
+{{- if or .Values.config.file .Values.config.existingSecret }}
 - name: config-file
   mountPath: /etc/turnstone
   readOnly: true
@@ -391,10 +396,13 @@ for the comparison, which is what the image makes of it.
 {{- end -}}
 
 {{- define "turnstone.configFile.volumes" -}}
-{{- if .Values.config.file }}
+{{- if or .Values.config.file .Values.config.existingSecret }}
 - name: config-file
-  configMap:
-    name: {{ include "turnstone.fullname" . }}-config-file
+  secret:
+    secretName: {{ .Values.config.existingSecret | default (printf "%s-config-file" (include "turnstone.fullname" .)) | quote }}
+    items:
+      - key: config.toml
+        path: config.toml
 {{- end }}
 {{- range $i, $m := .Values.config.secretMounts }}
 - name: secret-mount-{{ $i }}

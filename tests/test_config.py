@@ -1,6 +1,7 @@
 """Tests for turnstone.core.config — unified TOML config loading."""
 
 import argparse
+import os
 
 import pytest
 
@@ -45,12 +46,96 @@ def test_load_config_section(tmp_path):
     assert load_config("nonexistent") == {}
 
 
-def test_load_config_invalid_toml(tmp_path):
-    _reset_cache()
+def test_load_config_invalid_toml_raises(tmp_path, monkeypatch):
+    """A file that exists but cannot be parsed stops the process, every time."""
+    from turnstone.core.config import ConfigError
+
+    monkeypatch.setattr(config_mod, "_config_path", config_mod._config_path)
+    monkeypatch.setattr(config_mod, "_cache", None)
     cfg = tmp_path / "config.toml"
     cfg.write_text("this is not valid toml [[[")
     set_config_path(str(cfg))
-    assert load_config() == {}
+    with pytest.raises(ConfigError, match="config.toml"):
+        load_config()
+    with pytest.raises(ConfigError):
+        load_config("api")
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads any file")
+def test_load_config_unreadable_file_raises(tmp_path, monkeypatch):
+    from turnstone.core.config import ConfigError
+
+    monkeypatch.setattr(config_mod, "_config_path", config_mod._config_path)
+    monkeypatch.setattr(config_mod, "_cache", None)
+    cfg = tmp_path / "config.toml"
+    cfg.write_text('[api]\nbase_url = "http://x"\n')
+    cfg.chmod(0o000)
+    set_config_path(str(cfg))
+    try:
+        with pytest.raises(ConfigError):
+            load_config()
+    finally:
+        cfg.chmod(0o600)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root enters any directory")
+def test_load_config_locked_parent_directory_raises(tmp_path, monkeypatch):
+    """A directory the process cannot enter is a failed read, not an absent file."""
+    from turnstone.core.config import ConfigError
+
+    monkeypatch.setattr(config_mod, "_config_path", config_mod._config_path)
+    monkeypatch.setattr(config_mod, "_cache", None)
+    locked = tmp_path / "etc"
+    locked.mkdir()
+    cfg = locked / "config.toml"
+    cfg.write_text('[api]\nbase_url = "http://x"\n')
+    locked.chmod(0o000)
+    set_config_path(str(cfg))
+    try:
+        with pytest.raises(ConfigError):
+            load_config()
+    finally:
+        locked.chmod(0o700)
+
+
+def test_load_config_directory_path_raises(tmp_path, monkeypatch):
+    from turnstone.core.config import ConfigError
+
+    monkeypatch.setattr(config_mod, "_config_path", config_mod._config_path)
+    monkeypatch.setattr(config_mod, "_cache", None)
+    set_config_path(str(tmp_path))
+    with pytest.raises(ConfigError):
+        load_config()
+
+
+def test_cached_getter_is_not_poisoned_by_a_broken_file(tmp_path, monkeypatch):
+    """A getter that fails on a broken file answers from the fixed file later."""
+    from turnstone.core.config import ConfigError
+
+    monkeypatch.setattr(config_mod, "_config_path", config_mod._config_path)
+    monkeypatch.setattr(config_mod, "_cache", None)
+    monkeypatch.setattr(config_mod, "_workspace_dir", None)
+    monkeypatch.setattr(config_mod, "_workspace_dir_loaded", False)
+    monkeypatch.delenv("TURNSTONE_WORKSPACE", raising=False)
+    cfg = tmp_path / "config.toml"
+    cfg.write_text("[[[")
+    set_config_path(str(cfg))
+    with pytest.raises(ConfigError):
+        config_mod.get_workspace_dir()
+    assert config_mod._workspace_dir_loaded is False
+    cfg.write_text('[tools]\nworkspace_dir = "/srv/work"\n')
+    config_mod._cache = None  # the fixed file is re-read; the path is unchanged
+    assert config_mod.get_workspace_dir() == "/srv/work"
+
+
+def test_apply_config_exits_on_a_broken_file(tmp_path, monkeypatch):
+    monkeypatch.setattr(config_mod, "_config_path", config_mod._config_path)
+    monkeypatch.setattr(config_mod, "_cache", None)
+    cfg = tmp_path / "config.toml"
+    cfg.write_text("[[[")
+    set_config_path(str(cfg))
+    with pytest.raises(SystemExit):
+        apply_config(argparse.ArgumentParser(), ["api"])
 
 
 def test_load_config_caches(tmp_path):

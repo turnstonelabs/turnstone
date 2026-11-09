@@ -82,17 +82,15 @@ spec:
             # configurable per cluster.
             - name: TURNSTONE_CONSOLE_URL
               value: "http://{{ include "turnstone.fullname" . }}-console.{{ .Release.Namespace }}.svc:{{ .Values.console.service.port }}"
-            {{- if .Values.config.file }}
+            {{- if or .Values.config.file .Values.config.existingSecret }}
             - name: TURNSTONE_CONFIG
               value: /etc/turnstone/config.toml
             {{- end }}
-          {{- if or .Values.auth.existingSecret .Values.auth.jwtSecret }}
             - name: TURNSTONE_JWT_SECRET
               valueFrom:
                 secretKeyRef:
                   name: {{ include "turnstone.auth.secretName" . }}
                   key: TURNSTONE_JWT_SECRET
-          {{- end }}
           readinessProbe:
             httpGet:
               path: /health
@@ -107,11 +105,11 @@ spec:
             periodSeconds: 20
           resources:
             {{- toYaml .Values.console.resources | nindent 12 }}
-          {{- if or .Values.config.file .Values.config.secretMounts }}
+          {{- if or .Values.config.file .Values.config.existingSecret .Values.config.secretMounts }}
           volumeMounts:
             {{- include "turnstone.configFile.volumeMounts" . | trim | nindent 12 }}
           {{- end }}
-      {{- if or .Values.config.file .Values.config.secretMounts }}
+      {{- if or .Values.config.file .Values.config.existingSecret .Values.config.secretMounts }}
       volumes:
         {{- include "turnstone.configFile.volumes" . | trim | nindent 8 }}
       {{- end }}

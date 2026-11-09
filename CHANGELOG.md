@@ -15,12 +15,15 @@ The separate `dev` branch is retired. See [the release process](docs/releasing.m
 ### Added
 
 - **Helm: a configuration file for the server and console, and secret
-  mounts.** `config.file` holds the text of a config.toml, mounted read-only
-  in both pods, and a change rolls them; `config.secretMounts` mounts
-  Kubernetes Secrets at the paths you give. Together they turn on `secret://`
-  references on Kubernetes, so a model key or an MCP header can name a
-  mounted Secret or a Vault field instead of holding the value. See
-  [the chart README](deploy/helm/turnstone/README.md#configuration-file).
+  mounts.** `config.file` holds the text of a config.toml, rendered into a
+  Secret and mounted read-only in both pods, and a change rolls them;
+  `config.existingSecret` mounts a Secret of your own instead;
+  `config.secretMounts` mounts Kubernetes Secrets at the paths you give.
+  Together they turn on `secret://` references on Kubernetes, so a model key
+  or an MCP header can name a mounted Secret or a Vault field instead of
+  holding the value, and give the startup secrets the chart could not take
+  before (the `[security]` encryption keys, `[oidc] client_secret`) a place.
+  See [the chart README](deploy/helm/turnstone/README.md#configuration-file).
 - **Helm: MCP servers as sidecars of the server pod.** `server.sidecars` lists
   containers that run in the server pod and share its `/workspace` with the
   model's shell and file tools, for MCP servers that work on the agent's
@@ -40,6 +43,16 @@ The separate `dev` branch is retired. See [the release process](docs/releasing.m
 
 ### Changed
 
+- **Helm: a render without a JWT signing secret stops at install.** With
+  `auth.existingSecret` and `auth.jwtSecret` both empty, the chart used to
+  render and the server exited at startup; the render now stops with the
+  reason.
+- **A config.toml that cannot be read or parsed stops the process.** The
+  loader used to continue as though the file were absent, running with none
+  of its settings, with a warning for a file it could not parse and silently
+  for one it could not reach; it now raises, and every service that reads the
+  file stops at startup with the reason logged. A missing file is still an
+  empty configuration.
 - **Helm: the chart requires Kubernetes 1.29 or newer.** Sidecars render as
   native sidecars, which need it; `kubeVersion` in Chart.yaml enforces it, so
   an install or upgrade on an older cluster stops with a clear message.

@@ -587,9 +587,9 @@ and names it.
 
 Backends are configured under `[secrets]` in config.toml, and the table must be
 the same on the console and every node that shares the database. A malformed
-table stops the process at startup. With the Helm chart, `config.file` and
-`config.secretMounts` in `values.yaml` put the same file and Secret mounts in
-both pods; see `deploy/helm/turnstone/README.md`.
+table stops the process at startup. With the Helm chart, `config.file` (or
+`config.existingSecret`) and `config.secretMounts` in `values.yaml` put the
+same file and Secret mounts in both pods; see `deploy/helm/turnstone/README.md`.
 
 ```toml
 [secrets]
@@ -724,7 +724,8 @@ the default.
 The Terraform deployment passes configuration through the environment and
 mounts no config.toml, so `[secrets]` cannot be set there yet; references are
 for deployments that ship a config.toml (systemd, compose, and the Helm chart
-through `config.file`; see `deploy/helm/turnstone/README.md`).
+through `config.file` or `config.existingSecret`; see
+`deploy/helm/turnstone/README.md`).
 
 ---
 

@@ -7,9 +7,8 @@ PostgreSQL. The chart needs Kubernetes 1.29 or newer.
 
 ## Install
 
-Create the JWT signing secret once, then point the chart at it; a secret
-passed with `--set` would have to be repeated on every upgrade, and a new
-value would sign everyone out.
+The JWT signing secret is required. Create it once and name it, so that
+upgrades and renders never change it:
 
 ```sh
 kubectl create secret generic turnstone-auth \
@@ -19,11 +18,15 @@ helm install turnstone deploy/helm/turnstone \
   --set auth.existingSecret=turnstone-auth
 ```
 
+`auth.jwtSecret` takes the value inline instead; the render stops when neither
+is set.
+
 The notes printed after install say how to reach the server and the console.
 `values.yaml` documents the settings; the ones most installs touch:
 
 - `image.tag`: the image tag; empty means the chart's `appVersion`.
-- `auth.existingSecret` (or `auth.jwtSecret`): the JWT signing secret.
+- `auth.existingSecret` (or `auth.jwtSecret`): the JWT signing secret; one
+  is required.
 - `database.external.*` and `postgresql.enabled`: use an existing PostgreSQL
   instead of the bundled one.
 - `llm.apiKey` or `llm.existingSecret`: the fallback API key for model
@@ -31,6 +34,8 @@ The notes printed after install say how to reach the server and the console.
 - `server.replicas`: each replica is a node, and a session lives on one of
   them.
 - `server.sidecars`: MCP servers in the server pod; see below.
+- `config.file` (or `config.existingSecret`) and `config.secretMounts`: a
+  configuration file and Secret mounts; see below.
 - `ingress.*`: expose the server or the console.
 
 ## MCP servers
@@ -152,23 +157,34 @@ What to know before choosing a sidecar:
 
 The chart passes its own settings through env and command-line flags. For
 settings it has no value for, `config.file` holds the text of a config.toml,
-written verbatim to a ConfigMap and mounted read-only at
-`/etc/turnstone/config.toml` in the server and console pods; a changed file
-rolls both Deployments. The chart refuses what it sets itself, the
-`[database]` connection keys, since a file value would beat its env; its port
-flags beat the file. No secret belongs in it either, since it is a ConfigMap.
-The chart refuses the ones it can name, `[auth] jwt_secret`, the `[security]`
-encryption keys, `[oidc] client_secret` and `[secrets.vault] secret_id`, and
-has no other place for the first three yet; a model key or an MCP header
-belongs in the file only as a `secret://` reference. Text the chart cannot
-parse as TOML is refused at install; a `[secrets]` table the application
-rejects stops the pods at startup.
+rendered into a Secret and mounted read-only at `/etc/turnstone/config.toml`
+in the server and console pods; a changed file rolls both Deployments. The
+chart refuses what it owns: the `[database]` connection keys, since a file
+value would beat its env, and `[auth] jwt_secret`, which it takes from
+`auth.jwtSecret` or `auth.existingSecret`; its port flags beat the file.
+Because the file is a Secret, the startup secrets the chart cannot take
+otherwise may live in it: the `[security]` encryption keys that per-user MCP
+accounts need, the `[oidc]` `client_secret` for single sign-on, and a Vault
+approle `secret_id`. Text the chart cannot parse as TOML is refused at
+install; a file the application cannot read or parse, or a `[secrets]` table
+it rejects, stops the pods at startup. Like
+config.toml on any host, the file is readable by what runs in the server
+container; the sidecar section above says where the boundary is.
+
+To keep the file out of your values, put it in a Secret of your own under the
+key `config.toml` and name it in `config.existingSecret` instead. The chart
+mounts it the same way but does not look inside it: it refuses nothing, so
+leave the `[database]` connection keys out of it, and it cannot roll the pods
+when it changes, so a change needs `kubectl rollout restart` of both
+Deployments. If the Secret or its `config.toml` key is missing, the pods wait
+in ContainerCreating with a FailedMount event. Set `config.file` or
+`config.existingSecret`, not both.
 
 The usual reason to use it is the `[secrets]` table, which lets a model's
 `api_key` or an MCP server's static header hold a `secret://` reference
 instead of the value (see `docs/security.md`, "Secret References"). The table
-must be the same on the console and every node, which the shared ConfigMap
-gives you.
+must be the same on the console and every node, which the shared Secret gives
+you.
 
 ```yaml
 config:
@@ -210,11 +226,11 @@ The sidecar example reads `token`; in the console, register the header
 Pick a dedicated directory for the root. Not `/run/secrets` or
 `/var/run/secrets`: the pod's service-account token lives under them,
 `/var/run` is `/run` in the image, and the application refuses such a root at
-startup. For a Vault approle credential, mount its Secret the same way outside
-the root, at `/run/turnstone/vault` for example, and point `secret_id_file` at
-the key's file there. The chart refuses a mount that overlaps a path it
-reserves, the configuration directory, the service-account token and the
-workspace, or another mount.
+startup. A Vault approle credential can sit in the file as `secret_id`, or be
+mounted the same way outside the root, at `/run/turnstone/vault` for example,
+with `secret_id_file` pointing at the key's file there. The chart refuses a
+mount that overlaps a path it reserves, the configuration directory, the
+service-account token and the workspace, or another mount.
 
 A reference keeps a value out of the database and out of what the console
 shows. Like a sidecar's token, it is no boundary against the model's shell; the
