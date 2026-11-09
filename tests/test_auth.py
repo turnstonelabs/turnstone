@@ -2558,9 +2558,7 @@ class TestBuiltinAdminDefaultPermissions:
 
 
 def _fresh_jwt_memo(monkeypatch):
-    import turnstone.core.auth as auth_module
-
-    monkeypatch.setattr(auth_module, "_resolved_jwt_secret", None)
+    monkeypatch.setattr("turnstone.core.auth._resolved_jwt_secret", None)
 
 
 def test_load_jwt_secret_resolves_a_reference_from_env(monkeypatch):
