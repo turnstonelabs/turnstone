@@ -4338,3 +4338,35 @@ def test_default_labels_name_a_model_the_list_lacks() -> None:
     models_fn = admin_src.split("function _renderModels(", 1)[1].split("\n}\n", 1)[0]
     assert "' is disabled. Enable it, or set another default." in models_fn
     assert "' is not stored here or reported by any node. " in models_fn
+
+
+def test_dashboard_and_new_ws_attachments_accept_pdf() -> None:
+    """The dashboard and new-workstream pickers accept PDFs, as the server does."""
+    from tests._js_harness_helpers import extract_braced
+    from turnstone.core.attachments import PDF_SIZE_CAP
+
+    src = _APP_JS.read_text(encoding="utf-8")
+    consts = re.findall(r"^const _ATTACH_\w+ = \[.*?\];", src, re.S | re.M)
+    assert len(consts) == 3, "attachment allowlist constants not found in app.js"
+    harness = "\n".join(
+        [
+            *consts,
+            extract_braced(src, "function _isPdf(file) {"),
+            extract_braced(src, "function _isAttachmentAllowed(file) {"),
+            "const ok = (f) => { if (!_isAttachmentAllowed(f)) throw new Error(f.name); };",
+            "ok({ name: 'a.pdf', type: 'application/pdf' });",
+            "ok({ name: 'b.PDF', type: '' });",
+            "if (_isAttachmentAllowed({ name: 'c.exe', type: 'application/x-msdownload' }))"
+            " throw new Error('c.exe');",
+        ]
+    )
+    proc = run_node_source(harness)
+    assert proc.returncode == 0, f"PDF not accepted.  stderr={proc.stderr!r}"
+
+    for name in ("_NEW_WS_PDF_CAP", "_DASH_PDF_CAP"):
+        assert f"const {name} = {PDF_SIZE_CAP // (1024 * 1024)} * 1024 * 1024;" in src
+
+    index = (_APP_JS.parent / "index.html").read_text(encoding="utf-8")
+    for input_id in ("dashboard-attach-input", "new-ws-attach-input"):
+        tag = re.search(r"<input[^>]*" + input_id + r"[^>]*>", index, re.S)
+        assert tag and "application/pdf" in tag.group(0), input_id

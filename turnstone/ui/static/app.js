@@ -253,6 +253,7 @@ let _newWsStagedFiles = [];
 // browser can fail fast before uploading).  Keep in sync.
 const _NEW_WS_IMAGE_CAP = 4 * 1024 * 1024;
 const _NEW_WS_TEXT_CAP = 512 * 1024;
+const _NEW_WS_PDF_CAP = 32 * 1024 * 1024;
 const _NEW_WS_MAX_FILES = 10;
 
 function _newWsRenderChips() {
@@ -329,9 +330,17 @@ const _ATTACH_TEXT_EXTENSIONS = [
   ".yml",
 ];
 
+function _isPdf(file) {
+  return (
+    (file.type || "").toLowerCase() === "application/pdf" ||
+    (file.name || "").toLowerCase().endsWith(".pdf")
+  );
+}
+
 function _isAttachmentAllowed(file) {
   const mime = (file.type || "").toLowerCase();
   if (_ATTACH_IMAGE_MIMES.indexOf(mime) !== -1) return true;
+  if (_isPdf(file)) return true;
   if (mime.indexOf("text/") === 0) return true;
   if (_ATTACH_TEXT_APP_MIMES.indexOf(mime) !== -1) return true;
   const name = (file.name || "").toLowerCase();
@@ -408,12 +417,16 @@ function _newWsAddFiles(files) {
       _newWsError(
         "Unsupported file type: " +
           f.name +
-          " (allowed: png/jpeg/gif/webp images, text)",
+          " (allowed: png/jpeg/webp images, PDF, text)",
       );
       return handled;
     }
     const isImage = (f.type || "").indexOf("image/") === 0;
-    const cap = isImage ? _NEW_WS_IMAGE_CAP : _NEW_WS_TEXT_CAP;
+    const cap = isImage
+      ? _NEW_WS_IMAGE_CAP
+      : _isPdf(f)
+        ? _NEW_WS_PDF_CAP
+        : _NEW_WS_TEXT_CAP;
     if (f.size > cap) {
       _newWsError(f.name + " exceeds the " + _formatAttachSize(cap) + " cap");
       return handled;
@@ -1625,6 +1638,7 @@ let _dashboardStagedFiles = [];
 // Per-kind size caps mirrored from turnstone/core/attachments.py — keep in sync.
 const _DASH_IMAGE_CAP = 4 * 1024 * 1024;
 const _DASH_TEXT_CAP = 512 * 1024;
+const _DASH_PDF_CAP = 32 * 1024 * 1024;
 const _DASH_MAX_FILES = 10;
 
 function _renderDashboardChips() {
@@ -1687,12 +1701,16 @@ function _addDashboardFiles(files) {
       _dashboardError(
         "Unsupported file type: " +
           f.name +
-          " (allowed: png/jpeg/gif/webp images, text)",
+          " (allowed: png/jpeg/webp images, PDF, text)",
       );
       return handled;
     }
     const isImage = (f.type || "").indexOf("image/") === 0;
-    const cap = isImage ? _DASH_IMAGE_CAP : _DASH_TEXT_CAP;
+    const cap = isImage
+      ? _DASH_IMAGE_CAP
+      : _isPdf(f)
+        ? _DASH_PDF_CAP
+        : _DASH_TEXT_CAP;
     if (f.size > cap) {
       _dashboardError(
         f.name + " exceeds the " + _formatAttachSize(cap) + " cap",
