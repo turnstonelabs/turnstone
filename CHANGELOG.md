@@ -10,147 +10,126 @@ All development now integrates on `main`. Supported release lines are maintained
 on `stable/X.Y` branches; `stable/1.8` preserves the former stable branch.
 The separate `dev` branch is retired. See [the release process](docs/releasing.md).
 
-## [2026-11-08]
+## [1.9.4]
+
+> **Before upgrading:** the database stays at migration 088.
+>
+> - A config file named by `--config` or `TURNSTONE_CONFIG` must exist, and a
+>   config.toml that can't be read or parsed now stops the process instead of
+>   running without its settings. Check that each service starts.
+> - With `tools.web_fetch_alias` empty, a task agent's `web_fetch` reads pages
+>   with the task agent's model, so a task agent on its own model sends the
+>   pages it fetches to that model's endpoint. See **Changed** below.
+> - The Helm chart needs Kubernetes 1.29 or newer and a JWT signing secret
+>   (`auth.existingSecret` or `auth.jwtSecret`), and its pods no longer share a
+>   process namespace, so `kubectl debug` needs `--target`.
 
 ### Added
 
-- **Helm: single sign-on from values.** `oidc.issuer`, `oidc.clientId`,
-  `oidc.redirectBase` and the client secret (`oidc.clientSecret` inline or
-  `oidc.existingSecret`) reach the server and console pods as the
-  `TURNSTONE_OIDC_*` environment the application reads and turn on login
-  through an OpenID Connect provider at `oidc.redirectBase`; `oidc.scopes`
-  and `oidc.providerName` are optional, and `oidc.redirectBase` alone serves
-  per-user MCP authorization without single sign-on. The render stops when a
-  required value is missing, and the client secret may be a `secret://`
-  reference. The rarer settings keep their place in the `[oidc]` table of
-  `config.file`, which may not repeat the keys the values set. See
-  [the chart README](deploy/helm/turnstone/README.md#single-sign-on).
+- **Pick the model `web_fetch` reads pages with (#1590).** Models → Roles → Web
+  fetch (`tools.web_fetch_alias`) names the model that reads a fetched page or
+  PDF and answers the question, in conversations and task agents; empty keeps
+  the model that called `web_fetch`. A set alias that can't be used makes
+  `web_fetch` refuse the call before approval rather than read with another
+  model. This model reads the untrusted page itself, so it has to ignore
+  instructions planted in it; smaller models do that less reliably. See
+  [the settings guide](docs/settings.md#web_fetch-model).
 - **`[auth] jwt_secret` and `[oidc] client_secret` may be `secret://`
-  references.** In config.toml or in `TURNSTONE_JWT_SECRET` and
-  `TURNSTONE_OIDC_CLIENT_SECRET`. Each is resolved once at startup; the
-  server, the console and the channel gateway stop when the reference cannot
-  be resolved, and a tool logs a warning and goes on without it. A value
-  rotated in the store reaches a process at its next start; the JWT secret
-  must match on the console, every node and the channel gateway, so restart
-  them together. Every process refuses a model key or MCP header reference
-  that resolves to either value as that process has it configured, so a
-  bootstrap secret kept in the store stays out of reach of everyone who may
-  write a reference. The `tls list` and `/cluster` commands now read the
-  secret the way the services do, from `TURNSTONE_JWT_SECRET` or `[auth]
-  jwt_secret`, where they read only the environment before. The first two
-  items of #1335.
-- **Helm: a configuration file for the server and console, and secret
-  mounts.** `config.file` holds the text of a config.toml, rendered into a
-  Secret and mounted read-only in both pods, and a change rolls them;
-  `config.existingSecret` mounts a Secret of your own instead;
-  `config.secretMounts` mounts Kubernetes Secrets at the paths you give.
-  Together they turn on `secret://` references on Kubernetes, so a model key
-  or an MCP header can name a mounted Secret or a Vault field instead of
-  holding the value, and give the startup secrets the chart could not take
-  before (the `[security]` encryption keys, `[oidc] client_secret`) a place.
-  See [the chart README](deploy/helm/turnstone/README.md#configuration-file).
-- **Helm: MCP servers as sidecars of the server pod.** `server.sidecars` lists
-  containers that run in the server pod and share its `/workspace` with the
-  model's shell and file tools, for MCP servers that work on the agent's
-  files. Each entry is a container spec plus the `port` it listens on, and
-  the install notes print the localhost URL to register in the console.
-  Sidecars receive none of the chart's secret env and no service-account
-  token. Read [the chart README](deploy/helm/turnstone/README.md#mcp-servers)
-  before adding one: it says what a sidecar can reach and what reaches it.
-- **Pick the model web_fetch reads pages with.** Models → Roles → Web fetch
-  (`tools.web_fetch_alias`) names the model that reads a fetched page or PDF and
-  answers the question, in conversations and task agents. Empty keeps the model
-  that called web_fetch. A set alias that can't be used (it isn't loaded, or its
-  client can't be built) makes web_fetch refuse the call before approval rather
-  than read with another model. This model reads the untrusted page itself, so
-  it has to ignore instructions planted in it; smaller models do that less
-  reliably. See [the settings guide](docs/settings.md#web_fetch-model).
+  references (#1335).** In config.toml or in `TURNSTONE_JWT_SECRET` and
+  `TURNSTONE_OIDC_CLIENT_SECRET`. Each is resolved once at startup: the server,
+  console and channel gateway stop when it can't be, and a tool warns and goes
+  on without it. A rotated value takes effect at the next start, and the JWT
+  secret must match everywhere, so restart the console, every node and the
+  gateway together. A model key or MCP header reference that resolves to either
+  secret is refused, so a bootstrap secret kept in the store stays out of reach
+  of anyone who can write a reference. `tls list` and `/cluster` now read the
+  JWT secret from `[auth] jwt_secret` as well as the environment.
+- **Helm: a configuration file and secret mounts.** `config.file` holds a
+  config.toml, rendered into a Secret and mounted read-only in the server and
+  console pods, and a change rolls them; `config.existingSecret` mounts your own
+  Secret instead, and `config.secretMounts` mounts Kubernetes Secrets at the
+  paths you give. Together they turn on `secret://` references on Kubernetes
+  and give startup secrets the chart could not take before, such as the
+  `[security]` encryption keys, a place. See
+  [the chart README](deploy/helm/turnstone/README.md#configuration-file).
+- **Helm: single sign-on from values.** `oidc.issuer`, `oidc.clientId`,
+  `oidc.redirectBase` and the client secret (`oidc.clientSecret` or
+  `oidc.existingSecret`, which may be a `secret://` reference) turn on login
+  through an OpenID Connect provider; `oidc.scopes` and `oidc.providerName` are
+  optional, and `oidc.redirectBase` alone serves per-user MCP authorization
+  without single sign-on. The render stops when a required value is missing.
+  Rarer `[oidc]` settings go in `config.file`, which may not repeat the keys the
+  values set. See
+  [the chart README](deploy/helm/turnstone/README.md#single-sign-on).
+- **Helm: MCP servers as sidecars of the server pod (#1326).** `server.sidecars`
+  lists containers that share the server pod's `/workspace` with the model's
+  shell and file tools, each a container spec plus the `port` it listens on; the
+  install notes print the localhost URL to register in the console. Sidecars
+  get none of the chart's secret env and no service-account token. Read
+  [the chart README](deploy/helm/turnstone/README.md#mcp-servers) first: it says
+  what a sidecar can reach and what reaches it.
 
 ### Changed
 
-- **A config path named by `--config` or `TURNSTONE_CONFIG` must exist.** A
-  named file that is not there used to be an empty configuration, silently;
-  it now stops the process with the path logged. The default path may still
-  be absent. `turnstone-doctor` notes such a path in its install profile and
-  reads the configuration files it discovered instead.
-- **Helm: a render without a JWT signing secret stops at install.** With
-  `auth.existingSecret` and `auth.jwtSecret` both empty, the chart used to
-  render and the server exited at startup; the render now stops with the
-  reason.
-- **A config.toml that cannot be read or parsed stops the process.** The
-  loader used to continue as though the file were absent, running with none
-  of its settings, with a warning for a file it could not parse and silently
-  for one it could not reach; it now raises, and every service that reads the
-  file stops at startup with the reason logged. Only the default path may be
-  absent.
-- **Helm: the chart requires Kubernetes 1.29 or newer.** Sidecars render as
-  native sidecars, which need it; `kubeVersion` in Chart.yaml enforces it, so
-  an install or upgrade on an older cluster stops with a clear message.
-- **Helm: the server and console containers run under tini as PID 1.** The
-  chart's `command:` replaces the image's entrypoint, which would leave
-  Turnstone itself as PID 1, and Turnstone never reaps orphaned processes, such
-  as the helpers a stdio MCP server leaves behind. The pods therefore shared
-  their process namespace, so that the pause container was PID 1 and reaped
-  them. The chart now names tini in each container's command, as the image's
-  entrypoint does, and the pods no longer share a process namespace, so
-  `kubectl debug` needs `--target` to see a service's processes. Chart 0.3.7
-  needs an image that carries tini, which every 1.9 image does.
-- **A task agent's web_fetch reads with the task agent's model.** When
-  `tools.web_fetch_alias` is empty, a task agent's web_fetch now reads pages
-  with the task agent's model at its effort, not the conversation's model. When
-  a task agent runs on its own model (`model.task_alias`, `[model].task_model`
-  or `[model].agent_model` in config.toml, or the model the call names with
-  `model=`), the raw pages it fetches, approved private-network pages included,
-  go to that model's endpoint, count against its bill and context window, and
-  follow its PDF handling, and that model is the one that has to ignore
-  instructions planted in them. A task agent on the conversation's model reads
-  at the task effort when one is set (`model.task_effort`, or
-  `[model].task_effort` in config.toml). Set `tools.web_fetch_alias` to choose
-  the model that reads pages.
-
-### Fixed
-
-- **PDF and audio files can be attached when starting a workstream.** The
-  dashboard composer, the New workstream dialog and the console launcher
-  refused them as an unsupported type, although a workstream's own composer
-  takes both. A create also held every file to the 4 MiB image cap, so the API
-  refused most PDFs and longer audio files at creation too. Each file is now
-  held to its own type's cap (PDF 32 MiB, audio 25 MiB, images 4 MiB, text
-  512 KiB), and one create's files may total 64 MiB. A file the server refuses
-  now stops the create before anything is created.
-- **A refused file no longer hides or drops the rest of a drop.** When the
-  dashboard composer or the New workstream dialog refused a file, the files
-  dropped before it were staged without showing as chips and went out with the
-  create, and the files after it were dropped. All three composers now say why
-  a file was refused and still stage and show the others.
-- **The dashboard clears after starting a workstream.** Its message and staged
-  files stayed after a create, so they went out again with the next one. A file
-  staged while the create runs is kept.
-
-## [2026-11-07]
-
-### Fixed
-
-- **A selected STT model alias that can't run no longer hands audio to
-  perception.** When `audio.stt_model_alias` names an alias that is missing,
-  can't transcribe, or whose backend fails, an audio attachment gets a
-  placeholder naming the alias instead of reaching the perception model, and a
-  transcript that comes back empty gets a placeholder saying the alias found no
-  speech. Perception still takes audio attachments when `audio.stt_model_alias`
-  is empty.
+- **A config file that is missing or broken stops the process.** A path named
+  by `--config` or `TURNSTONE_CONFIG` that doesn't exist, or a config.toml that
+  can't be read or parsed, used to run as an empty configuration with at most a
+  warning; every service now stops at startup with the path and reason logged.
+  Only the default path may be absent. `turnstone-doctor` notes a missing named
+  path and reads the configuration files it discovered instead.
+- **A task agent's `web_fetch` reads with the task agent's model.** With
+  `tools.web_fetch_alias` empty, it used the conversation's model. A task agent
+  on its own model (`model.task_alias`, `[model].task_model` or
+  `[model].agent_model` in config.toml, or the call's `model=`) now sends the
+  raw pages it fetches, approved private-network pages included, to that
+  model's endpoint, against its bill and context window, and that model has to
+  ignore instructions planted in them. A task agent on the conversation's model
+  reads at the task effort when one is set. Set `tools.web_fetch_alias` to
+  choose the model that reads pages.
+- **Helm: Kubernetes 1.29 or newer.** Sidecars render as native sidecars, which
+  need it; `kubeVersion` stops an install or upgrade on an older cluster.
+- **Helm: a render without a JWT signing secret stops.** With
+  `auth.existingSecret` and `auth.jwtSecret` both empty, the server used to exit
+  at startup; the render now stops with the reason.
+- **Helm: the server and console run under tini as PID 1.** The chart's
+  `command:` replaced the image's entrypoint, so the pods shared a process
+  namespace to have orphaned processes, such as a stdio MCP server's helpers,
+  reaped. Each container's command now names tini, as the image's entrypoint
+  does, and the pods no longer share a process namespace, so `kubectl debug`
+  needs `--target` to see a service's processes.
 
 ### Removed
 
 - **The startup warning that config.toml is group- or world-readable.** A
-  read-only mount in a container is root-owned and readable by design, and a
-  process that does not own the file could never follow the advice to change
-  its mode.
+  read-only container mount is root-owned and readable by design, and a process
+  that doesn't own the file can't change its mode.
+
+### Fixed
+
+- **PDF and audio files can be attached when starting a workstream.** The
+  dashboard composer, the New workstream dialog and the console launcher refused
+  them, and a create held every file to the 4 MiB image cap. Each file now has
+  its own type's cap (PDF 32 MiB, audio 25 MiB, images 4 MiB, text 512 KiB), one
+  create's files may total 64 MiB, and a file the server refuses stops the
+  create before anything is created.
+- **A refused file no longer hides or drops the rest of a drop.** The files
+  dropped before it went out with the create without showing, and the files
+  after it were lost. All three composers now say why a file was refused and
+  still stage and show the others.
+- **The dashboard clears after starting a workstream.** Its message and staged
+  files stayed and went out again with the next create. A file staged while the
+  create runs is kept.
+- **A speech-to-text alias that can't run no longer hands audio to perception
+  (#1572).** When `audio.stt_model_alias` names an alias that is missing, can't
+  transcribe or fails, an audio attachment gets a placeholder naming the alias,
+  and an empty transcript gets one saying the alias found no speech. Perception
+  still takes audio attachments when the setting is empty.
 
 ### Security
 
-- **A `[secrets.file]` root may not contain the pod's service-account
-  token.** Where Kubernetes mounts one, such a root is refused at startup, as a
-  root holding config.toml or the Vault login credential already was. A
+- **A `[secrets.file]` root may not contain the pod's service-account token.**
+  Where Kubernetes mounts one, such a root is refused at startup, as a root
+  holding config.toml or the Vault login credential already was; a
   `secret://file` reference under it could have sent the token to a URL of its
   author's choosing.
 
