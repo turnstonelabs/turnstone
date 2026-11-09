@@ -1,8 +1,9 @@
 """Tests for the multipart variant of POST /v1/api/workstreams/new.
 
 Exercises:
-- The pure helpers ``validate_and_save_uploaded_files`` (stages to the
-  per-node buffer) and ``resolve_staged_attachments`` (peeks them back).
+- The pure helpers ``classify_uploaded_files``, ``stage_classified_files``
+  (stages to the per-node buffer) and ``resolve_staged_attachments`` (peeks
+  them back).
 - The full create endpoint via TestClient with a FakeSession factory so
   the initial-message dispatch thread runs end-to-end without an LLM.
 """
@@ -53,14 +54,12 @@ def _auth(user: str) -> dict[str, str]:
 # ---------------------------------------------------------------------------
 
 
-class TestValidateAndSaveUploadedFiles:
+class TestClassifyAndStageUploadedFiles:
     def test_stages_image_and_text_to_buffer(self, tmp_path):
         import hashlib
 
         from turnstone.core.attachment_buffer import get_attachment_buffer
-        from turnstone.core.attachments import (
-            validate_and_save_uploaded_files as _validate_and_save_uploaded_files,
-        )
+        from turnstone.core.attachments import classify_uploaded_files, stage_classified_files
 
         buf = get_attachment_buffer()
         buf.clear()
@@ -69,8 +68,9 @@ class TestValidateAndSaveUploadedFiles:
                 ("hi.png", "image/png", PNG_1x1),
                 ("notes.md", "text/markdown", b"# Hello\n"),
             ]
-            ids, err = _validate_and_save_uploaded_files(files, "ws-X", "userA")
+            classified, err = classify_uploaded_files(files)
             assert err is None
+            ids = stage_classified_files(classified, "ws-X", "userA")
             assert len(ids) == 2
             # Ids are content hashes (content-addressed staging).
             assert ids[0] == hashlib.sha256(PNG_1x1).hexdigest()
@@ -89,9 +89,7 @@ class TestValidateAndSaveUploadedFiles:
         from PIL import Image
 
         from turnstone.core.attachment_buffer import get_attachment_buffer
-        from turnstone.core.attachments import (
-            validate_and_save_uploaded_files as _validate_and_save_uploaded_files,
-        )
+        from turnstone.core.attachments import classify_uploaded_files, stage_classified_files
 
         src = Image.new("RGBA", (40, 20), (255, 255, 255, 0))
         src.paste((255, 255, 255, 255), (10, 5, 30, 15))
@@ -100,9 +98,11 @@ class TestValidateAndSaveUploadedFiles:
         buf = get_attachment_buffer()
         buf.clear()
         try:
-            files = [("title.png", "image/png", uploaded.getvalue())]
-            ids, err = _validate_and_save_uploaded_files(files, "ws-X", "userA")
+            classified, err = classify_uploaded_files(
+                [("title.png", "image/png", uploaded.getvalue())]
+            )
             assert err is None
+            ids = stage_classified_files(classified, "ws-X", "userA")
             staged = buf.get(ids[0], ws_id="ws-X", user_id="userA")
             assert staged is not None
             assert ids[0] == hashlib.sha256(staged.content).hexdigest()
@@ -112,49 +112,26 @@ class TestValidateAndSaveUploadedFiles:
         finally:
             buf.clear()
 
-    def test_rejects_oversized_image(self, tmp_path):
-        from turnstone.core.attachments import IMAGE_SIZE_CAP
-        from turnstone.core.attachments import (
-            validate_and_save_uploaded_files as _validate_and_save_uploaded_files,
-        )
-        from turnstone.core.storage import init_storage, reset_storage
+    def test_rejects_oversized_image(self):
+        from turnstone.core.attachments import IMAGE_SIZE_CAP, classify_uploaded_files
 
-        reset_storage()
-        init_storage("sqlite", path=str(tmp_path / "t.db"), run_migrations=False)
-        try:
-            # Magic-byte-valid PNG header padded past the cap.
-            oversized = PNG_1x1 + b"\x00" * (IMAGE_SIZE_CAP + 1)
-            files = [("big.png", "image/png", oversized)]
-            ids, err = _validate_and_save_uploaded_files(files, "ws-X", "userA")
-            assert err is not None
-            assert err.status_code == 413
-            assert ids == []
-        finally:
-            reset_storage()
+        # Magic-byte-valid PNG header padded past the cap.
+        oversized = PNG_1x1 + b"\x00" * (IMAGE_SIZE_CAP + 1)
+        classified, err = classify_uploaded_files([("big.png", "image/png", oversized)])
+        assert err is not None
+        assert err.status_code == 413
+        assert classified == []
 
-    def test_rejects_unsupported_text(self, tmp_path):
-        from turnstone.core.attachments import (
-            validate_and_save_uploaded_files as _validate_and_save_uploaded_files,
-        )
-        from turnstone.core.storage import init_storage, reset_storage
+    def test_rejects_unsupported_text(self):
+        from turnstone.core.attachments import classify_uploaded_files
 
-        reset_storage()
-        init_storage("sqlite", path=str(tmp_path / "t.db"), run_migrations=False)
-        try:
-            # No image magic, MIME isn't text/*, extension not allowlisted
-            files = [("evil.bin", "application/octet-stream", b"\x00\x01\x02")]
-            ids, err = _validate_and_save_uploaded_files(files, "ws-X", "userA")
-            assert err is not None
-            assert err.status_code == 400
-            assert json.loads(bytes(err.body))["error"].startswith("evil.bin: ")
-            assert ids == []
-        finally:
-            reset_storage()
-
-
-# (The per-user pending-upload cap was removed with the content-addressing
-# cutover; ``validate_and_save_uploaded_files`` no longer 409s — the buffer's
-# own size/TTL ceilings bound a flood.)
+        # No image magic, MIME isn't text/*, extension not allowlisted
+        files = [("evil.bin", "application/octet-stream", b"\x00\x01\x02")]
+        classified, err = classify_uploaded_files(files)
+        assert err is not None
+        assert err.status_code == 400
+        assert json.loads(bytes(err.body))["error"].startswith("evil.bin: ")
+        assert classified == []
 
 
 class TestGatedUploadContent:
@@ -765,10 +742,19 @@ class TestCreateMultipart:
         assert len(staged) == 1
         assert staged[0].filename == "notes.md"
 
-    def test_create_rejects_oversized_image_and_rolls_back(self, app_client):
+    def test_create_rejects_oversized_image_before_any_create(self, app_client, monkeypatch):
         from turnstone.core.attachments import IMAGE_SIZE_CAP
 
         client, _, gq = app_client
+        mgr = client.app.state.workstreams
+        creates: list[str] = []
+        real_create = mgr.create
+
+        def counting_create(*args, **kwargs):
+            creates.append(kwargs.get("name", ""))
+            return real_create(*args, **kwargs)
+
+        monkeypatch.setattr(mgr, "create", counting_create)
         oversized = PNG_1x1 + b"\x00" * (IMAGE_SIZE_CAP + 1)
         meta = {"name": "fails"}
         resp = client.post(
@@ -778,7 +764,8 @@ class TestCreateMultipart:
             headers=_auth("userA"),
         )
         assert resp.status_code == 413
-        assert resp.json()["error"].startswith("big.png: File too large")
+        assert resp.json()["error"].startswith("big.png: Image too large")
+        assert creates == [], "a refused file must stop the request before mgr.create"
         # Regression: ws_created must NOT have been emitted for a request
         # that's about to be rejected.  Otherwise SSE consumers see a
         # phantom workstream flash on dashboards.
@@ -787,6 +774,67 @@ class TestCreateMultipart:
             events.append(gq.get_nowait())
         kinds = {e.get("type") for e in events}
         assert "ws_created" not in kinds, f"phantom ws_created emitted for failed create: {events}"
+
+    def test_a_refused_file_leaves_a_full_manager_untouched(self, app_client):
+        # The files are classified before the create reserves anything, so a refused one
+        # changes nothing, even when every slot is taken.
+        from turnstone.core.attachments import IMAGE_SIZE_CAP
+
+        client, _, _gq = app_client
+        mgr = client.app.state.workstreams
+        for i in range(mgr.max_active):
+            resp = client.post(
+                "/v1/api/workstreams/new", json={"name": f"idle-{i}"}, headers=_auth("userA")
+            )
+            assert resp.status_code == 200, resp.text
+        assert mgr.count == mgr.max_active
+        loaded = {ws.id for ws in mgr.list_all()}
+        oversized = PNG_1x1 + b"\x00" * (IMAGE_SIZE_CAP + 1)
+        resp = client.post(
+            "/v1/api/workstreams/new",
+            data={"meta": json.dumps({"name": "refused"})},
+            files=[("file", ("big.png", oversized, "image/png"))],
+            headers=_auth("userA"),
+        )
+        assert resp.status_code == 413
+        assert resp.json()["error"].startswith("big.png: Image too large")
+        assert {ws.id for ws in mgr.list_all()} == loaded
+
+    def test_create_takes_a_pdf_over_the_image_cap(self, app_client):
+        # The parse once held every file to the image cap, so a create refused a
+        # PDF that an upload to an open workstream takes.
+        from turnstone.core.attachment_buffer import get_attachment_buffer
+        from turnstone.core.attachments import IMAGE_SIZE_CAP
+
+        client, _, _gq = app_client
+        pdf = b"%PDF-1.4\n" + b"0" * (IMAGE_SIZE_CAP + 1)
+        resp = client.post(
+            "/v1/api/workstreams/new",
+            data={"meta": json.dumps({"name": "report"})},
+            files=[("file", ("report.pdf", pdf, "application/pdf"))],
+            headers=_auth("userA"),
+        )
+        assert resp.status_code == 200, resp.text
+        staged = get_attachment_buffer().list_for(ws_id=resp.json()["ws_id"], user_id="userA")
+        assert [(s.filename, s.kind) for s in staged] == [("report.pdf", "pdf")]
+
+    def test_create_refuses_files_over_the_create_total(self, app_client, monkeypatch):
+        from turnstone.core import attachments
+
+        client, _, _gq = app_client
+        monkeypatch.setattr(attachments, "CREATE_ATTACHMENTS_TOTAL_CAP", 1024 * 1024)
+        pdf = b"%PDF-1.4\n" + b"0" * (600 * 1024)
+        resp = client.post(
+            "/v1/api/workstreams/new",
+            data={"meta": json.dumps({"name": "two reports"})},
+            files=[
+                ("file", ("a.pdf", pdf, "application/pdf")),
+                ("file", ("b.pdf", pdf, "application/pdf")),
+            ],
+            headers=_auth("userA"),
+        )
+        assert resp.status_code == 413
+        assert "cap is 1,048,576 bytes" in resp.json()["error"]
 
     def test_create_missing_meta_returns_400(self, app_client):
         client, _, _gq = app_client

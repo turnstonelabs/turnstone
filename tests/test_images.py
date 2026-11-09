@@ -864,9 +864,9 @@ def test_every_image_entry_path_flattens() -> None:
                 )
             if "_encode_image_data_uri" in called:
                 entries[f"{where}:{fn.name}"] = "flatten_image" in names
-            if isinstance(fn, ast.AsyncFunctionDef) and "validate_and_save_uploaded_files" in names:
-                # Saving flattens, so a handler holds its surface's gate while a worker thread
-                # saves; without it, the waits for the flatten slot fill the default executor.
+            if isinstance(fn, ast.AsyncFunctionDef) and "stage_classified_files" in names:
+                # Staging flattens, so a handler holds its surface's gate while a worker thread
+                # stages; without it, the waits for the flatten slot fill the default executor.
                 gated = {
                     node.id
                     for block in nodes
@@ -877,14 +877,14 @@ def test_every_image_entry_path_flattens() -> None:
                     for node in ast.walk(block)
                     if isinstance(node, ast.Name)
                 }
-                entries[f"{where}:{fn.name} gate"] = "validate_and_save_uploaded_files" in gated
+                entries[f"{where}:{fn.name} gate"] = "stage_classified_files" in gated
                 # ...only when an image may need flattening, so a create of documents can't
                 # queue behind someone else's images.
                 entries[f"{where}:{fn.name} gate when needed"] = (
                     "any_upload_needs_flattening" in names
                 )
     assert {
-        "turnstone/core/attachments.py:validate_and_save_uploaded_files",
+        "turnstone/core/attachments.py:stage_classified_files",
         "turnstone/core/session_routes.py:upload",
         "turnstone/core/session_routes.py:create gate",
         "turnstone/core/session_routes.py:create gate when needed",

@@ -303,11 +303,24 @@ async def test_second_cancellation_cannot_interrupt_create_rollback(
 
 
 def test_partial_multipart_failure_drops_staged_refs_before_same_id_successor(
-    app_client: Any,
+    app_client: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A partially staged failed request cannot lend uploads to its successor."""
+    from turnstone.core import attachments
     from turnstone.core.attachment_buffer import get_attachment_buffer
 
+    real_stage = attachments.stage_classified_files
+    staged_first: list[str] = []
+
+    def stage_first_then_fail(
+        classified: list[tuple[str, str, str, bytes]], ws_id: str, user_id: str
+    ) -> list[str]:
+        # Staging after the create can fail only by an exception. Stage the first file for
+        # real, then fail, so the rollback has to drop that staged upload along with the row.
+        staged_first.extend(real_stage(classified[:1], ws_id, user_id))
+        raise RuntimeError("staging failed")
+
+    monkeypatch.setattr(attachments, "stage_classified_files", stage_first_then_fail)
     client, mgr = app_client
     storage = client.app.state.auth_storage
     assert storage is not None
@@ -319,13 +332,14 @@ def test_partial_multipart_failure_drops_staged_refs_before_same_id_successor(
             "/v1/api/workstreams/new",
             data={"meta": json.dumps({"ws_id": ws_id, "name": "partial"})},
             files=[
-                ("file", ("valid.md", b"first file stages", "text/markdown")),
-                ("file", ("invalid.bin", b"\x00\x01\x02", "application/octet-stream")),
+                ("file", ("first.md", b"first file stages", "text/markdown")),
+                ("file", ("second.md", b"second file", "text/markdown")),
             ],
             headers=_auth("user-1"),
         )
 
-        assert failed.status_code == 400, failed.text
+        assert failed.status_code == 500, failed.text
+        assert len(staged_first) == 1, "the first file has to stage before the failure"
         assert storage.get_workstream(ws_id) is None
         assert buffer.list_for(ws_id=ws_id, user_id="user-1") == []
         with mgr._lock:

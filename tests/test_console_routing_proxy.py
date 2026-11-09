@@ -902,6 +902,46 @@ class TestClusterCreate:
         assert payload[0] == "a.txt" and payload[1] == b"hello world"
         client.close()
 
+    def test_cluster_create_forwards_a_pdf_over_the_image_cap(self) -> None:
+        # The proxy's parse once held every file to the image cap.
+        from turnstone.core.attachments import IMAGE_SIZE_CAP
+
+        pdf = b"%PDF-1.4\n" + b"0" * (IMAGE_SIZE_CAP + 1)
+        mock_post = _make_proxy_post(json_data={"ws_id": "withpdf"})
+        client = TestClient(self._app_with_node(mock_post), raise_server_exceptions=False)
+        meta = {"node_id": "node-a", "name": "p", "initial_message": "summarize"}
+        resp = client.post(
+            "/v1/api/cluster/workstreams/new",
+            data={"meta": json.dumps(meta)},
+            files={"file": ("report.pdf", pdf, "application/pdf")},
+            headers=_TEST_AUTH_HEADERS,
+        )
+        assert resp.status_code == 200, resp.text
+        _name, payload = mock_post.call_args.kwargs["files"][0]
+        assert payload[0] == "report.pdf" and payload[1] == pdf
+        client.close()
+
+    def test_cluster_create_refuses_files_over_the_create_total(self, monkeypatch) -> None:
+        from turnstone.core import attachments
+
+        monkeypatch.setattr(attachments, "CREATE_ATTACHMENTS_TOTAL_CAP", 1024 * 1024)
+        pdf = b"%PDF-1.4\n" + b"0" * (600 * 1024)
+        mock_post = _make_proxy_post(json_data={"ws_id": "never"})
+        client = TestClient(self._app_with_node(mock_post), raise_server_exceptions=False)
+        resp = client.post(
+            "/v1/api/cluster/workstreams/new",
+            data={"meta": json.dumps({"node_id": "node-a", "name": "p"})},
+            files=[
+                ("file", ("a.pdf", pdf, "application/pdf")),
+                ("file", ("b.pdf", pdf, "application/pdf")),
+            ],
+            headers=_TEST_AUTH_HEADERS,
+        )
+        assert resp.status_code == 413
+        assert "cap is 1,048,576 bytes" in resp.json()["error"]
+        mock_post.assert_not_called()
+        client.close()
+
     def test_cluster_create_names_a_refused_file_before_dispatch(self) -> None:
         # The node would refuse it too, but its 400 would reach the launcher
         # only as the opaque 502, so the console checks the files first.

@@ -1485,13 +1485,39 @@ let _homeCoordBusy = false;
 // pattern interactive uses for its new-ws modal + dashboard composer).
 let _homeStagedFiles = [];
 
-// Per-kind size caps + allowlist mirrored from turnstone/core/attachments.py
-// so the browser can fail fast.  Keep in sync with the interactive
-// UI's _ATTACH_* constants in turnstone/ui/static/app.js.
-const _HOME_IMAGE_CAP = 4 * 1024 * 1024;
-const _HOME_TEXT_CAP = 512 * 1024;
+// Per-kind size caps, the most one create's files may total, and the
+// allowlist, mirrored from turnstone/core/attachments.py so the browser can
+// fail fast.  Keep in sync with the interactive UI's _ATTACH_* constants in
+// turnstone/ui/static/app.js.
+const _HOME_KIND_CAPS = {
+  image: 4 * 1024 * 1024,
+  pdf: 32 * 1024 * 1024,
+  audio: 25 * 1024 * 1024,
+  text: 512 * 1024,
+};
+const _HOME_TOTAL_CAP = 64 * 1024 * 1024;
 const _HOME_MAX_FILES = 10;
 const _HOME_IMAGE_MIMES = ["image/png", "image/jpeg", "image/webp"];
+const _HOME_AUDIO_MIMES = [
+  "audio/aac",
+  "audio/flac",
+  "audio/mp3",
+  "audio/mp4",
+  "audio/mpeg",
+  "audio/ogg",
+  "audio/wav",
+  "audio/webm",
+  "audio/x-wav",
+];
+const _HOME_AUDIO_EXTENSIONS = [
+  ".aac",
+  ".flac",
+  ".m4a",
+  ".mp3",
+  ".ogg",
+  ".wav",
+  ".webm",
+];
 const _HOME_TEXT_APP_MIMES = [
   "application/json",
   "application/xml",
@@ -1533,17 +1559,24 @@ function _homeFormatSize(n) {
   return (n / (1024 * 1024)).toFixed(1) + " MB";
 }
 
-function _homeIsAttachmentAllowed(file) {
+// The kind the server should classify `file` as, or "" for a file it refuses.
+function _homeAttachmentKind(file) {
   const mime = (file.type || "").toLowerCase();
-  if (_HOME_IMAGE_MIMES.indexOf(mime) !== -1) return true;
-  if (mime.indexOf("text/") === 0) return true;
-  if (_HOME_TEXT_APP_MIMES.indexOf(mime) !== -1) return true;
   const name = (file.name || "").toLowerCase();
   const dot = name.lastIndexOf(".");
-  if (dot >= 0 && _HOME_TEXT_EXTENSIONS.indexOf(name.substr(dot)) !== -1) {
-    return true;
+  const ext = dot >= 0 ? name.substr(dot) : "";
+  if (_HOME_IMAGE_MIMES.indexOf(mime) !== -1) return "image";
+  if (mime === "application/pdf" || ext === ".pdf") return "pdf";
+  if (
+    _HOME_AUDIO_MIMES.indexOf(mime) !== -1 ||
+    _HOME_AUDIO_EXTENSIONS.indexOf(ext) !== -1
+  ) {
+    return "audio";
   }
-  return false;
+  if (mime.indexOf("text/") === 0) return "text";
+  if (_HOME_TEXT_APP_MIMES.indexOf(mime) !== -1) return "text";
+  if (_HOME_TEXT_EXTENSIONS.indexOf(ext) !== -1) return "text";
+  return "";
 }
 
 // One owner for the launcher's message row (#home-coord-error): validation
@@ -1571,16 +1604,15 @@ function _homeRenderChips() {
   for (let i = 0; i < _homeStagedFiles.length; i++) {
     (function (idx) {
       const f = _homeStagedFiles[idx];
-      const isImage = (f.type || "").indexOf("image/") === 0;
+      const kind = _homeAttachmentKind(f);
       const chip = document.createElement("span");
-      chip.className =
-        "composer-chip composer-chip-" + (isImage ? "image" : "text");
+      chip.className = "composer-chip composer-chip-" + kind;
       chip.setAttribute("role", "listitem");
 
       const icon = document.createElement("span");
       icon.className = "composer-chip-icon";
       icon.setAttribute("aria-hidden", "true");
-      icon.textContent = isImage ? "🖼" : "📄";
+      icon.textContent = window.kindIcon ? window.kindIcon(kind) : "📄";
       chip.appendChild(icon);
 
       const name = document.createElement("span");
@@ -1633,25 +1665,39 @@ function _homeStageFile(file) {
   }
   if (_homeStagedFiles.length >= _HOME_MAX_FILES) {
     _homeShowError(
-      "At most " + _HOME_MAX_FILES + " attachments per coordinator",
+      "At most " + _HOME_MAX_FILES + " attachments per workstream",
     );
     return false;
   }
-  if (!_homeIsAttachmentAllowed(file)) {
+  const kind = _homeAttachmentKind(file);
+  if (!kind) {
     _homeShowError(
       "Unsupported file type: " +
         file.name +
-        " (allowed: png/jpeg/gif/webp images, text)",
+        " (allowed: png/jpeg/webp images, PDF, audio, text)",
     );
     return false;
   }
-  const isImage = (file.type || "").indexOf("image/") === 0;
-  const cap = isImage ? _HOME_IMAGE_CAP : _HOME_TEXT_CAP;
+  const cap = _HOME_KIND_CAPS[kind];
   if (file.size > cap) {
     _homeShowError(file.name + " exceeds the " + _homeFormatSize(cap) + " cap");
     return false;
   }
-  _homeShowError("");
+  let total = file.size;
+  for (let i = 0; i < _homeStagedFiles.length; i++) {
+    total += _homeStagedFiles[i].size;
+  }
+  if (total > _HOME_TOTAL_CAP) {
+    _homeShowError(
+      file.name +
+        " would take the attachments over the " +
+        _homeFormatSize(_HOME_TOTAL_CAP) +
+        " total",
+    );
+    return false;
+  }
+  // Accepting a file leaves the message row alone, so a refusal earlier in the same
+  // drop stays shown.  Submitting, switching kinds or removing the last chip clears it.
   _homeStagedFiles.push(file);
   _homeRenderChips();
   return true;

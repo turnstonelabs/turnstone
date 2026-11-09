@@ -950,19 +950,60 @@ def test_create_with_multipart_attachments_and_initial_message_resolves(storage)
         _reg._storage = _old_storage
 
 
-def test_create_attachment_failure_no_phantom_create_close_pair(storage):
-    """Regression for the ``defer_emit_created`` follow-up — when a
-    multipart create rolls back on attachment validation failure,
-    the cluster collector sees zero events: no phantom
-    ``ws_created``, no orphan ``ws_closed``. Pre-fix, coord's
-    ``mgr.create`` fired ``emit_created`` synchronously and the
-    rollback path called ``mgr.close`` which fired ``emit_closed``,
-    surfacing a quick create→close pair on the cluster events
-    stream."""
+def test_create_attachment_failure_no_phantom_create_close_pair(storage, monkeypatch):
+    """A coordinator create whose files fail to stage after ``mgr.create`` is rolled back unseen.
+
+    The create's lifecycle events wait until it commits (``defer_emit_created``), so the rollback
+    discards it without the cluster collector seeing a ``ws_created`` or an orphan ``ws_closed``,
+    and the manager keeps no slot for it.
+    """
+    from turnstone.core import attachments
+
+    def fail_staging(classified, ws_id, user_id):
+        raise RuntimeError("staging failed")
+
+    monkeypatch.setattr(attachments, "stage_classified_files", fail_staging)
     mgr = _build_mgr(storage)
     # Pull the collector MagicMock out of the adapter so we can
     # introspect call counts after the failed create.
     coord_collector = mgr._adapter._collector  # type: ignore[attr-defined]
+    client = _make_client(
+        storage, coord_mgr=mgr, registry=_fake_registry(), raise_server_exceptions=False
+    )
+
+    import turnstone.core.storage._registry as _reg
+
+    _old_storage = _reg._storage
+    _reg._storage = storage
+    try:
+        resp = client.post(
+            "/v1/api/workstreams/new",
+            data={"meta": '{"name": "rollback-target"}'},
+            files={"file": ("notes.md", b"# notes\n", "text/markdown")},
+            headers=_COORD_HEADERS,
+        )
+        assert resp.status_code == 500, resp.text
+        # The rollback discarded the slot.
+        assert mgr.count == 0
+        # ``MagicMock`` records every method call, so no calls to these is the check.
+        assert coord_collector.emit_console_ws_created.call_count == 0
+        assert coord_collector.emit_console_ws_closed.call_count == 0
+    finally:
+        _reg._storage = _old_storage
+
+
+def test_create_refuses_an_empty_file_before_creating(storage, monkeypatch):
+    """A refused file stops a coordinator create before ``mgr.create``: no slot, no events."""
+    mgr = _build_mgr(storage)
+    coord_collector = mgr._adapter._collector  # type: ignore[attr-defined]
+    creates: list[str] = []
+    real_create = mgr.create
+
+    def counting_create(*args, **kwargs):
+        creates.append(kwargs.get("name", ""))
+        return real_create(*args, **kwargs)
+
+    monkeypatch.setattr(mgr, "create", counting_create)
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
 
     import turnstone.core.storage._registry as _reg
@@ -970,22 +1011,16 @@ def test_create_attachment_failure_no_phantom_create_close_pair(storage):
     _old_storage = _reg._storage
     _reg._storage = storage
     try:
-        # Empty file body → ``validate_and_save_uploaded_files``
-        # returns the 400 "Empty file" path which the lifted body
-        # surfaces directly. The rollback path runs after.
         resp = client.post(
             "/v1/api/workstreams/new",
-            data={"meta": '{"name": "rollback-target"}'},
+            data={"meta": '{"name": "refused"}'},
             files={"file": ("blank.bin", b"", "application/octet-stream")},
             headers=_COORD_HEADERS,
         )
         assert resp.status_code == 400, resp.text
-        # Manager is empty — slot was discarded.
+        assert resp.json()["error"] == "blank.bin: Empty file"
+        assert creates == []
         assert mgr.count == 0
-        # The collector saw NEITHER create nor close events for any
-        # ws_id. ``MagicMock`` records every method call, so an empty
-        # list of calls to these specific methods is the regression
-        # check.
         assert coord_collector.emit_console_ws_created.call_count == 0
         assert coord_collector.emit_console_ws_closed.call_count == 0
     finally:
