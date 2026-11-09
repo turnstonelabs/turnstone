@@ -6744,10 +6744,10 @@ function _rememberModelResponseControl(spec) {
 // model in the placeholder.  The Task agent cascades through
 // ``[model].task_model → [model].agent_model → session model`` per
 // turnstone/core/settings_registry.py, the Judge is the session's own
-// model, and the Output guard judge cascades through ``judge.model →
-// session model`` — there's no single "default" to advertise, so the
-// blank reads "(inherit)" to match the vocabulary of the
-// reasoning-effort dropdowns.
+// model, Web fetch reads with the model that called it, and the Output
+// guard judge cascades through ``judge.model → session model`` — there's
+// no single "default" to advertise, so the blank reads "(inherit)" to
+// match the vocabulary of the reasoning-effort dropdowns.
 const MODEL_ROLES = [
   {
     label: "Coordinator",
@@ -6777,6 +6777,13 @@ const MODEL_ROLES = [
       "task_agent sub-agent — runs autonomous subtasks dispatched by the parent.",
     aliasKey: "model.task_alias",
     effortKey: "model.task_effort",
+    fallbackKind: "inherit",
+  },
+  {
+    label: "Web fetch",
+    description:
+      "Reads what web_fetch fetches (a web page or PDF) and answers the AI's question about it, in conversations and task agents. It reads untrusted pages, so it has to ignore instructions planted in them; smaller models do that less reliably. Empty uses the model that called web_fetch: the session's model, or the task agent's.",
+    aliasKey: "tools.web_fetch_alias",
     fallbackKind: "inherit",
   },
   {

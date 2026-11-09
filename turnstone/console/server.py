@@ -14724,24 +14724,42 @@ async def _notify_nodes_model_reload(request: Request) -> dict[str, Any]:
 # loaded (#1359, #1529). The Models tab refuses to delete, disable or rename a
 # definition one of them names: a routine swap (add a model, delete the old
 # default) would otherwise block every create that relies on the setting,
-# every new Slack conversation included, or leave tool calls without the judge
-# the operator chose, until someone repoints it.
+# every new Slack conversation included, stop web_fetch reading pages, or
+# leave tool calls without the judge the operator chose, until someone
+# repoints it.
 #
-# Removing the last enabled model clears only the first four. Nothing is left to
-# route to, so they would only name a missing model, but an empty judge setting
-# hands the role to the session's own model, which only an operator may choose
-# (#1529). A set judge keeps refusing until someone repoints it.
+# Removing the last enabled model clears every one but the judge's. Nothing is
+# left to route to, so they would only name a missing model, but an empty judge
+# setting hands the role to the session's own model, which only an operator may
+# choose (#1529). A set judge keeps refusing until someone repoints it.
 _CLEARED_WITH_LAST_MODEL_KEYS: tuple[str, ...] = (
     "model.default_alias",
     "model.task_alias",
     "coordinator.model_alias",
     "channels.default_model_alias",
+    "tools.web_fetch_alias",
 )
 _FAIL_CLOSED_ROUTING_KEYS: tuple[str, ...] = (
     *_CLEARED_WITH_LAST_MODEL_KEYS,
     "judge.model",
     "judge.output_guard_model",
 )
+
+# What a missing model stops, for each fail-closed routing setting. The 409 names only the
+# clauses of the settings that name the model; a test holds every setting above to an entry.
+_STOPS_CREATES = "creates that rely on a setting naming a missing model fail"
+_STOPS_JUDGE = "a judge setting naming a missing model stops that judge"
+_ROUTING_KEY_STOPS: dict[str, str] = {
+    "model.default_alias": _STOPS_CREATES,
+    "model.task_alias": "task_agent refuses its calls while model.task_alias names a missing model",
+    "coordinator.model_alias": _STOPS_CREATES,
+    "channels.default_model_alias": _STOPS_CREATES,
+    "judge.model": _STOPS_JUDGE,
+    "judge.output_guard_model": _STOPS_JUDGE,
+    "tools.web_fetch_alias": (
+        "web_fetch can't read pages while tools.web_fetch_alias names a missing model"
+    ),
+}
 
 
 def _routing_settings_naming(
@@ -14833,8 +14851,10 @@ def _model_in_use_refusal(storage: Any, alias: str, action: str) -> JSONResponse
     # outranks it, and takes over when a stored default naming this same
     # model is cleared.
     stored = _stored_default_alias(storage)
+    stops = {_ROUTING_KEY_STOPS[key] for key, _ in named}
     if _console_config_default() == alias and stored in ("", alias):
         sources.append("[model] default in the console's config.toml")
+        stops.add(_STOPS_CREATES)
         if stored:
             steps.append(
                 "Clearing model.default_alias hands the default to that config.toml line, "
@@ -14844,12 +14864,16 @@ def _model_in_use_refusal(storage: Any, alias: str, action: str) -> JSONResponse
             steps.append("Change that config.toml line and restart the console.")
     if not sources:
         return None
+    # Only what the settings naming this model stop, in the table's order.
+    clauses = [clause for clause in dict.fromkeys(_ROUTING_KEY_STOPS.values()) if clause in stops]
+    if len(clauses) > 1:
+        clauses[-1] = f"and {clauses[-1]}"
     return JSONResponse(
         {
             "error": (
                 f"'{alias}' is still named by {', '.join(sources)}. {' '.join(steps)} "
-                f"Do this before you {action} it: creates that rely on a setting naming "
-                "a missing model fail, and a judge setting naming one stops that judge."
+                f"Do this before you {action} it: "
+                f"{(', ' if len(clauses) > 2 else ' ').join(clauses)}."
             ),
             "code": "model_in_use",
             "settings": sorted({key for key, _ in named}),
