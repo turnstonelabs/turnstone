@@ -286,3 +286,52 @@ Container image reference.
 {{- $tag := .Values.image.tag | default .Chart.AppVersion }}
 {{- printf "%s:%s" .Values.image.repository $tag }}
 {{- end }}
+
+{{/*
+MCP sidecars for the server pod: one native sidecar per server.sidecars entry.
+An entry is a container spec plus `port` (required; checked here, printed by
+NOTES.txt) and `path` (default /mcp; NOTES.txt only). Every entry gets the
+shared workspace mount and restartPolicy Always; nothing else is added or
+changed. An entry's own volumeMounts may name only the workspace volume: the
+pod has no other volume for sidecars, and the token volume is the server's.
+*/}}
+{{- define "turnstone.server.sidecars" -}}
+{{- $used := dict (toString .Values.server.service.port) "the server container" -}}
+{{- $names := dict "server" true -}}
+{{- range .Values.server.sidecars -}}
+{{- if not (kindIs "map" .) -}}
+{{- fail "server.sidecars: every entry is a map with at least name, image and port" -}}
+{{- end -}}
+{{- $name := required "server.sidecars: every entry needs a name" .name -}}
+{{- if hasKey $names (toString $name) -}}
+{{- fail (printf "server.sidecars: the name %s is already taken" $name) -}}
+{{- end -}}
+{{- $_ := set $names (toString $name) true -}}
+{{- $port := required (printf "server.sidecars[%s]: port is required" $name) .port -}}
+{{- $p := int $port -}}
+{{- if or (lt $p 1) (gt $p 65535) (ne (toString $p) (toString $port)) -}}
+{{- fail (printf "server.sidecars[%s]: port must be a whole number from 1 to 65535, got %v" $name $port) -}}
+{{- end -}}
+{{- if hasKey $used (toString $p) -}}
+{{- fail (printf "server.sidecars[%s]: port %v is already used by %s" $name $port (get $used (toString $p))) -}}
+{{- end -}}
+{{- $_ := set $used (toString $p) (printf "sidecar %s" $name) -}}
+{{- $path := default "/mcp" .path -}}
+{{- if not (hasPrefix "/" (toString $path)) -}}
+{{- fail (printf "server.sidecars[%s]: path must start with /, got %s" $name $path) -}}
+{{- end -}}
+{{- range .volumeMounts -}}
+{{- if ne (toString .name) "workspace" -}}
+{{- fail (printf "server.sidecars[%s]: a volumeMount may name only the workspace volume, got %s" $name (toString .name)) -}}
+{{- end -}}
+{{- if eq (clean (toString .mountPath)) "/workspace" -}}
+{{- fail (printf "server.sidecars[%s]: the chart already mounts the workspace at /workspace" $name) -}}
+{{- end -}}
+{{- end -}}
+{{- $container := omit . "port" "path" -}}
+{{- $_ := set $container "restartPolicy" "Always" -}}
+{{- $mounts := append (default (list) $container.volumeMounts) (dict "name" "workspace" "mountPath" "/workspace") -}}
+{{- $_ := set $container "volumeMounts" $mounts }}
+- {{ toYaml $container | indent 2 | trim }}
+{{- end -}}
+{{- end -}}
