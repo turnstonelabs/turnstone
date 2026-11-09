@@ -18,14 +18,18 @@ Needs docker and openssl on the host. The images are pinned (`hashicorp/vault:2.
 
 The process reads a config.toml the script writes into a private temporary directory (only
 `[secrets]`, with an approle login), through `TURNSTONE_CONFIG`. The driver refuses to run when
-the config loader would read any other file, so an operator's own config.toml is never read.
+the config loader would read any other file, so an operator's own config.toml is never read. It
+also refuses to run when the `turnstone` package it imports is not this checkout's; the script
+puts the checkout first on `PYTHONPATH`, so an installed copy is never exercised in its place.
 
 ## What the store holds
 
 - KV v2 at the development server's `secret/` mount: `turnstone/openai` (`api_key`),
   `turnstone/mcp` (`authorization`, a whole `Bearer ...` value), `turnstone/rotating`,
   `turnstone/newline` (written with `api_key=@file` from a file that ends in a newline),
-  `turnstone/padded` (a value with a trailing space), and `other/denied`, outside the policy.
+  `turnstone/padded` (a value with a trailing space), `turnstone/auth` (`jwt_secret`) and
+  `turnstone/oidc` (`client_secret`) as the bootstrap secrets, `turnstone/alias` (`api_key`
+  holding the same value as the JWT secret), and `other/denied`, outside the policy.
 - Policy `turnstone-read`: read on `secret/data/turnstone/*` only.
 - approle roles `turnstone` (token_ttl 1h) and `turnstone-short` (token_ttl 5 s); jwt auth that
   trusts a key pair generated for the run, with role `turnstone` (audience `turnstone-e2e`).
@@ -50,11 +54,22 @@ the config loader would read any other file, so an operator's own config.toml is
   can carry, is refused without being quoted, and the registry leaves its definition out.
 - **V9** a sealed store: the last value is served, a reference never resolved is refused as
   retryable, and it resolves after the unseal.
+- **V10** bootstrap references: `TURNSTONE_JWT_SECRET` and `TURNSTONE_OIDC_CLIENT_SECRET` set to
+  references resolve from the store through `load_jwt_secret` and `load_oidc_config`; a runtime
+  reference to `turnstone/alias`, which holds the JWT value, is refused as a bootstrap secret
+  without quoting it, another key still resolves, and a registry loaded over SQLite leaves out
+  the definition whose key is that alias while loading the other.
 
 The checks read the backend's private token state (`_token`, `_logins_done`, `_expires_at`) to
 see which logins happened; whether a token is still valid is asked of the store.
 
 ## Results
+
+RUN 2026-11-08, ALL VERIFIED on Vault 2.1.2 and OpenBao 2.5.0: V1–V10, and the live test passed
+against each. V10 is new: the first run of it exercised the environment's installed `turnstone`
+package rather than the checkout (the driver runs as a script, so the repo root was not on the
+path) and failed on every count; the script now exports the repo root on `PYTHONPATH` and the
+driver refuses to run with any `turnstone` package but this checkout's.
 
 RUN 2026-10-11, ALL VERIFIED on Vault 2.1.2 and OpenBao 2.5.0: V1–V9, and the live test passed
 against each. V4 was the first live run of the revoke after a re-login

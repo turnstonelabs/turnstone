@@ -19,10 +19,15 @@ def _reset_cache():
     config_mod._config_path = None
 
 
-def test_load_config_missing_file(tmp_path):
-    _reset_cache()
+def test_load_config_missing_file(tmp_path, monkeypatch):
+    """A path named by --config or TURNSTONE_CONFIG must exist; only the default may be absent."""
+    from turnstone.core.config import ConfigError
+
+    monkeypatch.setattr(config_mod, "_config_path", config_mod._config_path)
+    monkeypatch.setattr(config_mod, "_cache", None)
     set_config_path(str(tmp_path / "nope.toml"))
-    assert load_config() == {}
+    with pytest.raises(ConfigError, match="nope.toml"):
+        load_config()
 
 
 def test_load_config_valid_toml(tmp_path):
@@ -96,6 +101,34 @@ def test_load_config_locked_parent_directory_raises(tmp_path, monkeypatch):
             load_config()
     finally:
         locked.chmod(0o700)
+
+
+def test_named_config_path_that_does_not_exist_raises(tmp_path, monkeypatch, caplog):
+    """TURNSTONE_CONFIG naming a missing file is a mistake, not an empty config, and the log
+    names the path. The --config case is test_load_config_missing_file."""
+    import logging
+
+    from tests._session_helpers import log_has_field
+    from turnstone.core.config import ConfigError
+
+    monkeypatch.setattr(config_mod, "_config_path", None)
+    monkeypatch.setattr(config_mod, "_cache", None)
+    missing = tmp_path / "also-missing.toml"
+    monkeypatch.setenv("TURNSTONE_CONFIG", str(missing))
+    with caplog.at_level(logging.ERROR), pytest.raises(ConfigError, match="also-missing.toml"):
+        load_config()
+    assert any(
+        "config.missing" in r.getMessage() and log_has_field(r, "path", str(missing))
+        for r in caplog.records
+    )
+
+
+def test_the_default_config_path_may_be_absent(tmp_path, monkeypatch):
+    monkeypatch.setattr(config_mod, "_config_path", None)
+    monkeypatch.setattr(config_mod, "_cache", None)
+    monkeypatch.setattr(config_mod, "_DEFAULT_CONFIG_PATH", tmp_path / "absent" / "config.toml")
+    monkeypatch.delenv("TURNSTONE_CONFIG", raising=False)
+    assert load_config() == {}
 
 
 def test_load_config_directory_path_raises(tmp_path, monkeypatch):
@@ -208,16 +241,22 @@ def test_apply_config_missing_keys_keep_defaults(tmp_path):
     assert args.port == 8080  # original default kept
 
 
-def test_apply_config_no_file(tmp_path):
-    _reset_cache()
+def test_apply_config_no_file(tmp_path, monkeypatch):
+    """A named file that is not there stops the process; an absent default is no config."""
+    monkeypatch.setattr(config_mod, "_config_path", config_mod._config_path)
+    monkeypatch.setattr(config_mod, "_cache", None)
     set_config_path(str(tmp_path / "nope.toml"))
-
+    with pytest.raises(SystemExit) as exc:
+        apply_config(argparse.ArgumentParser(), ["api"])
+    assert exc.value.code == 1
+    monkeypatch.setattr(config_mod, "_config_path", None)
+    monkeypatch.setattr(config_mod, "_cache", None)
+    monkeypatch.setattr(config_mod, "_DEFAULT_CONFIG_PATH", tmp_path / "absent" / "config.toml")
+    monkeypatch.delenv("TURNSTONE_CONFIG", raising=False)
     parser = argparse.ArgumentParser()
-    parser.add_argument("--host", default="localhost")
-
-    apply_config(parser, ["server"])
-    args = parser.parse_args([])
-    assert args.host == "localhost"
+    parser.add_argument("--base-url", default="http://unchanged")
+    apply_config(parser, ["api"])
+    assert parser.parse_args([]).base_url == "http://unchanged"
 
 
 def test_apply_config_model_section(tmp_path):

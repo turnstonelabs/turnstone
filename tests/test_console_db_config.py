@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 from typing import TYPE_CHECKING
 from unittest.mock import patch
 
@@ -36,7 +37,7 @@ def _reset_config_cache() -> None:
 
 
 def _build_args(config_path: str | None) -> argparse.Namespace:
-    config_mod.set_config_path(config_path or "/nonexistent/turnstone-console-test.toml")
+    config_mod.set_config_path(config_path or os.devnull)  # exists, reads as empty
     parser = argparse.ArgumentParser()
     config_mod.apply_config(parser, ["database"])
     return parser.parse_args([])

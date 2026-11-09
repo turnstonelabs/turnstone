@@ -143,8 +143,10 @@ class TestMigrateEntrypoint:
         monkeypatch.setattr(
             turnstone.core.storage, "get_storage", lambda: types.SimpleNamespace(close=lambda: None)
         )
-        # No config.toml unless a test writes one, so the developer's own can't leak in.
-        monkeypatch.setenv("TURNSTONE_CONFIG", str(tmp_path / "config.toml"))
+        # No config.toml unless a test writes one, so the developer's own can't leak in. It
+        # stands in for the default path: a path named by TURNSTONE_CONFIG would have to exist.
+        monkeypatch.delenv("TURNSTONE_CONFIG", raising=False)
+        monkeypatch.setattr(config_mod, "_DEFAULT_CONFIG_PATH", tmp_path / "config.toml")
         monkeypatch.setattr(config_mod, "_cache", None)
         monkeypatch.setattr(config_mod, "_config_path", None)
         for name, value in self._ENV.items():

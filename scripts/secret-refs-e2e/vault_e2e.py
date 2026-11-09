@@ -21,6 +21,9 @@ token state to see which logins happened; the store itself answers for what a to
      registry leaves its definition out
   V9 a sealed store: the last value is served, a reference never resolved is refused as
      retryable, and it resolves once the store is unsealed
+  V10 bootstrap references: TURNSTONE_JWT_SECRET and the OIDC client secret resolve from the
+     store through the real loaders, a runtime reference to a path holding the JWT value is
+     refused, and a stored model definition with that key is left out of the registry
 
 Env (set by vault_e2e.sh): TURNSTONE_CONFIG, STORE_FLAVOR, STORE_ADDR, STORE_ROOT_TOKEN,
 STORE_CONTAINER, STORE_CLI, STORE_UNSEAL_KEY, STORE_WORK, SHORT_ROLE_ID, SHORT_SECRET_ID.
@@ -54,6 +57,9 @@ MCP = "secret://vault/turnstone/mcp#authorization"
 DENIED = "secret://vault/other/denied#api_key"
 NEWLINE = "secret://vault/turnstone/newline#api_key"
 PADDED = "secret://vault/turnstone/padded#api_key"
+JWT_REF = "secret://vault/turnstone/auth#jwt_secret"
+OIDC_REF = "secret://vault/turnstone/oidc#client_secret"
+JWT_ALIAS = "secret://vault/turnstone/alias#api_key"
 
 
 def record(ok: bool, msg: str) -> None:
@@ -302,6 +308,80 @@ def v7_v8_process_wide() -> None:
     )
 
 
+def v10_bootstrap_references() -> None:
+    """The real loaders resolve the two bootstrap references from the store; the guard then refuses
+    a runtime reference to a path that holds the JWT value, in the resolver and in a registry load
+    over SQLite, while another key still resolves."""
+    from unittest.mock import patch
+
+    from turnstone.core.auth import load_jwt_secret
+    from turnstone.core.model_registry import load_model_registry
+    from turnstone.core.oauth.oidc import load_oidc_config
+    from turnstone.core.secret_refs import resolve
+
+    held_jwt = raw_field("turnstone/auth", "jwt_secret")
+    held_oidc = raw_field("turnstone/oidc", "client_secret")
+    bootstrap_env = {
+        "TURNSTONE_JWT_SECRET": JWT_REF,
+        "TURNSTONE_OIDC_ISSUER": "https://idp.example.com",
+        "TURNSTONE_OIDC_CLIENT_ID": "e2e-client",
+        "TURNSTONE_OIDC_CLIENT_SECRET": OIDC_REF,
+    }
+    with patch.dict(os.environ, bootstrap_env):
+        try:
+            jwt_secret = load_jwt_secret()
+            oidc = load_oidc_config()
+        except SystemExit as exc:  # the loaders stop the process on an unresolved reference
+            record(False, f"V10 bootstrap references: a loader exited with status {exc.code}")
+            return
+        alias_refusal: str = ""
+        try:
+            resolve(JWT_ALIAS)
+        except SecretResolveError as exc:
+            alias_refusal = str(exc)
+        still_resolves = resolve(OPENAI) == "sk-e2e-v1"
+        db = Path(ENV["STORE_WORK"]) / "e2e-bootstrap.db"
+        storage = SQLiteBackend(str(db))
+        try:
+            storage.create_model_definition(
+                "b1",
+                "sneaky",
+                "e2e-model",
+                base_url="https://llm.example.com/v1",
+                api_key=JWT_ALIAS,
+                context_window=8192,
+            )
+            storage.create_model_definition(
+                "b2",
+                "fine",
+                "e2e-model",
+                base_url="https://llm.example.com/v1",
+                api_key=OPENAI,
+                context_window=8192,
+            )
+            registry = load_model_registry(storage=storage)
+        finally:
+            storage.close()
+    reason = registry.skipped_aliases.get("sneaky", "<loaded>")
+    ok = (
+        jwt_secret == held_jwt
+        and oidc.enabled
+        and oidc.client_secret == held_oidc
+        and "bootstrap secret" in alias_refusal
+        and held_jwt not in alias_refusal
+        and still_resolves
+        and registry.list_aliases() == ["fine"]
+        and "bootstrap secret" in reason
+    )
+    record(
+        ok,
+        f"V10 bootstrap references: jwt_ok={jwt_secret == held_jwt} "
+        f"oidc_ok={oidc.enabled and oidc.client_secret == held_oidc} "
+        f"alias refused={'bootstrap secret' in alias_refusal} other key still resolves="
+        f"{still_resolves} registry skipped sneaky={'bootstrap secret' in reason}",
+    )
+
+
 def v9_sealed(resolver: SecretResolver) -> None:
     known = resolver.fetch(OPENAI)
     store_cli("operator", "seal")
@@ -348,6 +428,13 @@ def main() -> int:
     if config_file_path() != Path(ENV["TURNSTONE_CONFIG"]):
         print(f"refusing to run: this process would read {config_file_path()}")
         return 2
+    import turnstone
+
+    package = Path(turnstone.__file__).resolve().parent
+    checkout = Path(__file__).resolve().parents[2] / "turnstone"
+    if package != checkout:
+        print(f"refusing to run: this process would exercise {package}, not {checkout}")
+        return 2
 
     print(f"store: {ENV['STORE_FLAVOR']} at {ENV['STORE_ADDR']}")
     resolver = SecretResolver(parse_secrets_config(load_config("secrets")))
@@ -359,6 +446,7 @@ def main() -> int:
         v5_lease_end()
         v6_rotation(resolver)
         v7_v8_process_wide()
+        v10_bootstrap_references()
         v9_sealed(resolver)
     finally:
         resolver.close()

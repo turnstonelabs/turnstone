@@ -33,14 +33,20 @@ _config_path: Path | None = None
 _cache: dict[str, Any] | None = None
 
 
-def _resolve_config_path() -> Path:
-    """Return the effective config file path."""
+def _named_config_path() -> Path | None:
+    """Return the path named by ``--config`` or ``TURNSTONE_CONFIG``, or None for the default."""
     if _config_path is not None:
         return _config_path
     env = os.environ.get("TURNSTONE_CONFIG", "").strip()
     if env:
         return Path(env).expanduser()
-    return _DEFAULT_CONFIG_PATH
+    return None
+
+
+def _resolve_config_path() -> Path:
+    """Return the effective config file path."""
+    named = _named_config_path()
+    return named if named is not None else _DEFAULT_CONFIG_PATH
 
 
 def config_file_path() -> Path:
@@ -60,27 +66,34 @@ def set_config_path(path: str) -> None:
 
 
 class ConfigError(RuntimeError):
-    """config.toml exists but cannot be read or parsed."""
+    """config.toml cannot be read or parsed, or a named path does not exist."""
 
 
 def load_config(section: str | None = None) -> dict[str, Any]:
     """Load config.toml and return the full dict or a specific section.
 
-    A missing file is an empty configuration. A file that exists but cannot be
-    read or parsed raises :class:`ConfigError`: a process must not run with none
-    of its settings as though the file were absent. The result is cached after
-    the first successful load; a failure leaves nothing cached, so every caller
-    fails the same way.
+    The default path may be absent, which is an empty configuration. A path named by
+    ``--config`` or ``TURNSTONE_CONFIG`` that does not exist, and a file that exists but
+    cannot be read or parsed, raise :class:`ConfigError`: a process must not run with none
+    of its settings as though the file were absent. The result is cached after the first
+    successful load; a failure leaves nothing cached, so every caller fails the same way.
     """
     global _cache
     if _cache is None:
-        cfg_path = _resolve_config_path()
+        named = _named_config_path()
+        cfg_path = named if named is not None else _DEFAULT_CONFIG_PATH
         # The read decides: is_file() answers False when a parent directory
         # cannot be entered, which would turn a permission problem into an
         # empty configuration.
         try:
             text: str | None = cfg_path.read_text(encoding="utf-8")
-        except (FileNotFoundError, NotADirectoryError):
+        except (FileNotFoundError, NotADirectoryError) as exc:
+            if named is not None:
+                # Named by --config or TURNSTONE_CONFIG: a path that is not there is
+                # a mistake, not an empty configuration. Only the default path may be
+                # absent.
+                log.error("config.missing", path=str(cfg_path), error=str(exc))
+                raise ConfigError(f"{cfg_path}: {exc}") from exc
             text = None
         except (OSError, UnicodeDecodeError) as exc:
             log.error("config.unreadable", path=str(cfg_path), error=str(exc))

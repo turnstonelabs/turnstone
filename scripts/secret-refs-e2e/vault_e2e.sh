@@ -7,6 +7,9 @@
 #   scripts/secret-refs-e2e/vault_e2e.sh [vault|openbao|both]    (default: both)
 set -euo pipefail
 cd "$(dirname "$0")/../.."   # repo root
+# The driver runs as a script, so Python would import the turnstone package the environment
+# installed, which may be another checkout; this checkout's code is what the run is about.
+export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
 
 VAULT_IMAGE=${VAULT_IMAGE:-hashicorp/vault:2.1.2}
 OPENBAO_IMAGE=${OPENBAO_IMAGE:-openbao/openbao:2.5.0}
@@ -77,6 +80,12 @@ run_one() {
   store kv put secret/turnstone/mcp authorization="Bearer mcp-e2e-v1" </dev/null >/dev/null
   store kv put secret/turnstone/rotating api_key=sk-rotate-v1 </dev/null >/dev/null
   store kv put secret/other/denied api_key=sk-denied </dev/null >/dev/null
+  # Bootstrap secrets (V10): the JWT signing secret and the OIDC client secret, plus a path under
+  # the policy that holds the JWT value, which no model key or MCP header may name.
+  local jwt_value=e2e-jwt-signing-secret-long-enough-for-the-floor
+  store kv put secret/turnstone/auth jwt_secret="$jwt_value" </dev/null >/dev/null
+  store kv put secret/turnstone/oidc client_secret=e2e-oidc-client-secret-value </dev/null >/dev/null
+  store kv put secret/turnstone/alias api_key="$jwt_value" </dev/null >/dev/null
   # A field written from a file keeps the file's trailing newline; one with a trailing space
   # cannot be sent in a header (V8).
   printf 'sk-e2e-newline\n' | docker exec -i "$CONTAINER" sh -c 'cat > /tmp/key.txt'

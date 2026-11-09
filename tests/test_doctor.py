@@ -21,6 +21,7 @@ from turnstone.doctor import (
     InstallProfile,
     VersionReport,
     _compose_image_tag,
+    _config_notes,
     _derive_health_urls,
     _discover_config_files,
     _DoctorLLM,
@@ -711,6 +712,25 @@ class TestPreflightHelpers:
         found = _discover_config_files(tmp_path, {})
         assert any(cf.path == cfg.resolve() for cf in found)
 
+    def test_a_named_config_the_loader_refuses_is_noted(self, tmp_path: Path) -> None:
+        """Every service refuses such a path, so the profile must say so plainly."""
+        missing = tmp_path / "missing.toml"
+        (note,) = _config_notes({"TURNSTONE_CONFIG": str(missing)})
+        assert str(missing) in note and "stops at startup" in note
+        assert "is not a readable file here" in note
+        (directory_note,) = _config_notes({"TURNSTONE_CONFIG": str(tmp_path)})
+        assert "is not a readable file here" in directory_note
+        broken = tmp_path / "broken.toml"
+        broken.write_text("[models\n")
+        (broken_note,) = _config_notes({"TURNSTONE_CONFIG": str(broken)})
+        assert str(broken) in broken_note and "cannot be read or parsed" in broken_note
+        present = tmp_path / "config.toml"
+        present.write_text("")
+        assert _config_notes({"TURNSTONE_CONFIG": str(present)}) == []
+        assert _config_notes({}) == []
+        report = render_profile_report(_make_profile(tmp_path, notes=[note]))
+        assert f"- Note: {note}" in report
+
     def test_resolve_db_config_config_wins_over_env(self) -> None:
         cf = ConfigFileInfo(
             path=Path("/x"), sections=["database"], db={"backend": "postgresql", "url": "u"}
@@ -977,6 +997,46 @@ base_url = "http://laptop:8000/v1"
         )
         monkeypatch.setenv("TURNSTONE_CONFIG", str(ambient))
         db_path = str(tmp_path / "doctor-cfg.db")
+        reset_storage()
+        st = init_storage("sqlite", path=db_path, run_migrations=True)
+        try:
+            monkeypatch.setattr("turnstone.doctor._validate_connection", lambda llm: (True, ""))
+            profile = _make_profile(
+                tmp_path,
+                config_files=[ConfigFileInfo(path=cfg, sections=["models"], db={})],
+                db_config={"backend": "sqlite", "url": "", "path": db_path},
+            )
+            brain, verdict = resolve_doctor_brain(profile, st, "")
+            assert brain is not None, verdict.detail
+            assert brain.model == "cfg-model"
+        finally:
+            reset_storage()
+
+    @pytest.mark.parametrize("problem", ["missing", "unparseable"])
+    def test_falls_back_to_the_discovered_config_when_the_named_one_is_refused(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, problem: str
+    ) -> None:
+        """TURNSTONE_CONFIG naming a file that is not there, or one the loader refuses,
+        stops every service; doctor must still run and read [models.*] from the file its
+        discovery pass found (the profile note says what it skipped)."""
+        import turnstone.core.config as config_mod
+        from turnstone.core.storage import init_storage, reset_storage
+
+        cfg = tmp_path / "etc-config.toml"
+        cfg.write_text(
+            """[models.local]
+base_url = "http://localhost:9/v1"
+model = "cfg-model"
+context_window = 8192
+"""
+        )
+        monkeypatch.setattr(config_mod, "_config_path", None)
+        monkeypatch.setattr(config_mod, "_cache", None)
+        ambient = tmp_path / f"{problem}.toml"
+        if problem == "unparseable":
+            ambient.write_text("[models\n")
+        monkeypatch.setenv("TURNSTONE_CONFIG", str(ambient))
+        db_path = str(tmp_path / "doctor-refused.db")
         reset_storage()
         st = init_storage("sqlite", path=db_path, run_migrations=True)
         try:

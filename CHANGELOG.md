@@ -57,6 +57,11 @@ The separate `dev` branch is retired. See [the release process](docs/releasing.m
 
 ### Changed
 
+- **A config path named by `--config` or `TURNSTONE_CONFIG` must exist.** A
+  named file that is not there used to be an empty configuration, silently;
+  it now stops the process with the path logged. The default path may still
+  be absent. `turnstone-doctor` notes such a path in its install profile and
+  reads the configuration files it discovered instead.
 - **Helm: a render without a JWT signing secret stops at install.** With
   `auth.existingSecret` and `auth.jwtSecret` both empty, the chart used to
   render and the server exited at startup; the render now stops with the
@@ -65,8 +70,8 @@ The separate `dev` branch is retired. See [the release process](docs/releasing.m
   loader used to continue as though the file were absent, running with none
   of its settings, with a warning for a file it could not parse and silently
   for one it could not reach; it now raises, and every service that reads the
-  file stops at startup with the reason logged. A missing file is still an
-  empty configuration.
+  file stops at startup with the reason logged. Only the default path may be
+  absent.
 - **Helm: the chart requires Kubernetes 1.29 or newer.** Sidecars render as
   native sidecars, which need it; `kubeVersion` in Chart.yaml enforces it, so
   an install or upgrade on an older cluster stops with a clear message.

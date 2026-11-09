@@ -486,9 +486,9 @@ def _parse_config_sections(path: Path) -> tuple[list[str], dict[str, str]]:
 def _discover_config_files(project_dir: Path, env: dict[str, str]) -> list[ConfigFileInfo]:
     """Discover config.toml files the way Turnstone resolves them, plus systemd/cwd."""
     candidates: list[Path] = []
-    tc = env.get("TURNSTONE_CONFIG")
+    tc = env.get("TURNSTONE_CONFIG", "").strip()
     if tc:
-        candidates.append(Path(tc))
+        candidates.append(Path(tc).expanduser())  # as the loader reads it
     candidates += [
         Path.home() / ".config" / "turnstone" / "config.toml",
         Path("/etc/turnstone/config.toml"),
@@ -510,6 +510,31 @@ def _discover_config_files(project_dir: Path, env: dict[str, str]) -> list[Confi
         sections, db = _parse_config_sections(rp)
         out.append(ConfigFileInfo(path=rp, sections=sections, db=db))
     return out
+
+
+def _config_notes(env: dict[str, str]) -> list[str]:
+    """What the install profile should say about the config.toml that TURNSTONE_CONFIG names.
+
+    Every case the loader refuses (``turnstone.core.config.load_config``) gets a note, since doctor
+    goes on without that file and the report must say so.
+    """
+    named = env.get("TURNSTONE_CONFIG", "").strip()
+    if not named:
+        return []
+    path = Path(named).expanduser()
+    if not path.is_file():
+        problem = "is not a readable file here"
+    else:
+        try:
+            tomllib.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError, RecursionError) as exc:
+            problem = f"cannot be read or parsed ({exc})"
+        else:
+            return []
+    return [
+        f"TURNSTONE_CONFIG names {named}, which {problem}: a service started with this "
+        "environment stops at startup; doctor read no settings from it."
+    ]
 
 
 def _resolve_db_config(config_files: list[ConfigFileInfo], env: dict[str, str]) -> dict[str, str]:
@@ -604,6 +629,7 @@ def detect_install_profile(project_dir: Path, env: dict[str, str] | None = None)
         kinds.append("pip")
 
     config_files = _discover_config_files(project_dir, env)
+    notes = _config_notes(env)
     db_config = _resolve_db_config(config_files, env)
     env_present = _relevant_env(env)
     health_urls = _derive_health_urls(env)
@@ -623,6 +649,7 @@ def detect_install_profile(project_dir: Path, env: dict[str, str] | None = None)
         env_present=env_present,
         db_config=db_config,
         health_urls=health_urls,
+        notes=notes,
     )
 
 
@@ -651,6 +678,7 @@ def render_profile_report(profile: InstallProfile) -> str:
             lines.append(f"    {cf.path}{secs}")
     else:
         lines.append("- Config files: none found")
+    lines += [f"- Note: {note}" for note in profile.notes]
 
     db = profile.db_config
     db_url = _redact_url_credentials(db.get("url", "")) if db.get("url") else ""
@@ -1158,7 +1186,7 @@ def resolve_doctor_brain(
     # Bound before the try: the loader can raise past its own skip handling.
     skipped: dict[str, str] = {}
     try:
-        from turnstone.core.config import load_config, set_config_path
+        from turnstone.core.config import ConfigError, load_config, set_config_path
         from turnstone.core.config_store import ConfigStore
         from turnstone.core.model_registry import load_model_registry
 
@@ -1170,7 +1198,15 @@ def resolve_doctor_brain(
         # node's may live where it does not look (/etc/turnstone under
         # systemd, a project dir); the
         # discovery pass found it, so read [models.*] from there.
-        if not load_config("models"):
+        try:
+            has_models = bool(load_config("models"))
+        except ConfigError:
+            # TURNSTONE_CONFIG names a file that is not there, or one that cannot
+            # be read or parsed; the loader has logged why and the install
+            # profile notes it. The node's own file may still be among the
+            # discovered ones.
+            has_models = False
+        if not has_models:
             for cf in profile.config_files:
                 if "models" in cf.sections:
                     set_config_path(str(cf.path))
