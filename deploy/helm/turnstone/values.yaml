@@ -58,8 +58,9 @@ server:
   # /workspace in every entry, runs them as sidecars that are started before
   # the server, and prints each one's http://localhost:<port><path> in the
   # install notes for registration in the console. Sidecars receive none of
-  # the chart's secret env and no service-account token. See README.md, "MCP
-  # servers", before adding one.
+  # the chart's secret env, no service-account token and none of the
+  # configuration file or Secret mounts. See README.md, "MCP servers", before
+  # adding one.
   sidecars: []
   #  - name: toolchain
   #    image: registry.example.com/mcp/toolchain@sha256:...
@@ -118,6 +119,45 @@ llm:
 auth:
   jwtSecret: ""
   existingSecret: ""
+
+# -- Configuration file for the server and console. `file` is the text of a
+# config.toml, written verbatim to a ConfigMap and mounted read-only at
+# /etc/turnstone/config.toml in both pods (TURNSTONE_CONFIG points there); a
+# change rolls both Deployments. Use it for settings the chart has no value
+# for, such as the `[secrets]` table that turns on secret:// references.
+# The chart refuses what it sets itself (the `[database]` connection keys)
+# and the secrets it can name (`[auth] jwt_secret`, the `[security]`
+# encryption keys, `[oidc] client_secret`, `[secrets.vault] secret_id`); a
+# model key or an MCP header belongs here only as a secret:// reference. Its
+# port flags beat the file. Text
+# the chart cannot parse as TOML is refused at install; a `[secrets]` table
+# the application rejects stops the pods at startup. See README.md,
+# "Configuration file".
+config:
+  file: ""
+  # file: |
+  #   [secrets]
+  #   cache_ttl_seconds = 300
+  #
+  #   [secrets.file]
+  #   root = "/run/turnstone/secrets"
+  #
+  #   [secrets.vault]
+  #   address = "https://vault.example.com:8200"
+  #   auth = "jwt"
+  #   auth_mount = "kubernetes"
+  #   role = "turnstone"
+  #   jwt_path = "/var/run/secrets/kubernetes.io/serviceaccount/token"
+  #   mount = "secret"
+  # -- Kubernetes Secrets mounted read-only into both pods, each at the path
+  # given: under the `[secrets.file] root` for secret://file references, or
+  # elsewhere for a Vault approle `secret_id_file`, which may not live under
+  # the root. Each key of the Secret becomes a file in that directory. The
+  # Secrets must exist before the pods start. Sidecars get none of these
+  # mounts, nor the configuration file.
+  secretMounts: []
+  #  - name: toolchain-mcp-token
+  #    mountPath: /run/turnstone/secrets/toolchain-mcp-token
 
 # -- Ingress configuration
 ingress:

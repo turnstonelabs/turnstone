@@ -109,13 +109,19 @@ What to know before choosing a sidecar:
   sidecar that listens on all interfaces also answers any pod in the cluster
   at the pod's IP unless a NetworkPolicy blocks it. Bind it to 127.0.0.1 where
   the image allows, and where it can require a bearer token, set one and
-  register it under Static headers.
+  register it under Static headers, as a `secret://` reference where the
+  configuration file below enables them. The token keeps the sidecar from
+  answering a stray request and, as a reference, out of the database; it is
+  not a boundary against the model itself, whose shell runs in the server
+  container. The approval gate on shell commands is that boundary, and no
+  secret backend changes it.
 - **Trust.** A sidecar shares the pod's network namespace, and its image is
   trusted like the server's. Run it as a non-root user with no added
   capabilities, as in the example. What the chart withholds from sidecars is
-  the Kubernetes service-account token and its own secret env; an identity
-  granted to the pod outside the chart, through a cloud metadata endpoint for
-  example, is reachable from every container.
+  the Kubernetes service-account token, the configuration file and Secret
+  mounts below, and its own secret env; an identity granted to the pod outside
+  the chart, through a cloud metadata endpoint for example, is reachable from
+  every container.
 - **Startup.** The server container starts once every sidecar's process is
   running, not once it listens; the server's MCP client retries until the
   tools appear. A `startupProbe` (`tcpSocket` on the port) holds the server
@@ -141,3 +147,79 @@ What to know before choosing a sidecar:
 - **Resources.** Sidecar requests and limits count against the pod; set them.
 - **Replicas.** Each server replica has its own workspace volume and its own
   sidecars. A session lives on one node, so this is consistent.
+
+## Configuration file
+
+The chart passes its own settings through env and command-line flags. For
+settings it has no value for, `config.file` holds the text of a config.toml,
+written verbatim to a ConfigMap and mounted read-only at
+`/etc/turnstone/config.toml` in the server and console pods; a changed file
+rolls both Deployments. The chart refuses what it sets itself, the
+`[database]` connection keys, since a file value would beat its env; its port
+flags beat the file. No secret belongs in it either, since it is a ConfigMap.
+The chart refuses the ones it can name, `[auth] jwt_secret`, the `[security]`
+encryption keys, `[oidc] client_secret` and `[secrets.vault] secret_id`, and
+has no other place for the first three yet; a model key or an MCP header
+belongs in the file only as a `secret://` reference. Text the chart cannot
+parse as TOML is refused at install; a `[secrets]` table the application
+rejects stops the pods at startup.
+
+The usual reason to use it is the `[secrets]` table, which lets a model's
+`api_key` or an MCP server's static header hold a `secret://` reference
+instead of the value (see `docs/security.md`, "Secret References"). The table
+must be the same on the console and every node, which the shared ConfigMap
+gives you.
+
+```yaml
+config:
+  file: |
+    [secrets]
+    cache_ttl_seconds = 300
+
+    [secrets.file]
+    root = "/run/turnstone/secrets"
+
+    [secrets.vault]
+    address = "https://vault.example.com:8200"
+    auth = "jwt"
+    auth_mount = "kubernetes"
+    role = "turnstone"
+    jwt_path = "/var/run/secrets/kubernetes.io/serviceaccount/token"
+    mount = "secret"
+  secretMounts:
+    - name: toolchain-mcp-token
+      mountPath: /run/turnstone/secrets/toolchain-mcp-token
+```
+
+`secretMounts` mounts Kubernetes Secrets read-only into both pods at the path
+given, each key a file; it needs a configuration file, and the Secrets must
+exist before the pods start. Under the `[secrets.file] root`, each key's file
+can be named by a reference. A reference must be the whole value, so a header
+needs a key that holds the whole header:
+
+```sh
+kubectl create secret generic toolchain-mcp-token \
+  --from-literal=token="$TOKEN" \
+  --from-literal=authorization="Bearer $TOKEN"
+```
+
+The sidecar example reads `token`; in the console, register the header
+`Authorization` as
+`secret://file/run/turnstone/secrets/toolchain-mcp-token/authorization`.
+
+Pick a dedicated directory for the root. Not `/run/secrets` or
+`/var/run/secrets`: the pod's service-account token lives under them,
+`/var/run` is `/run` in the image, and the application refuses such a root at
+startup. For a Vault approle credential, mount its Secret the same way outside
+the root, at `/run/turnstone/vault` for example, and point `secret_id_file` at
+the key's file there. The chart refuses a mount that overlaps a path it
+reserves, the configuration directory, the service-account token and the
+workspace, or another mount.
+
+A reference keeps a value out of the database and out of what the console
+shows. Like a sidecar's token, it is no boundary against the model's shell; the
+sidecar section above says what is.
+
+For Vault's Kubernetes auth method, the example's `jwt_path` is the pod's
+service-account token: both pods automount it, and with sidecars the chart
+projects it into the server container alone.

@@ -113,6 +113,56 @@ class TestParseSecretsConfig:
         ok = parse_secrets_config({"file": {"root": str(tmp_path / "run")}}, config_path=config)
         assert ok.file is not None
 
+    def test_file_root_may_not_contain_the_service_account_token(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        token = tmp_path / "run" / "secrets" / "kubernetes.io" / "serviceaccount" / "token"
+        token.parent.mkdir(parents=True)
+        token.write_text("jwt")
+        target = "turnstone.core.secret_refs._config._SERVICE_ACCOUNT_TOKEN"
+        monkeypatch.setattr(target, str(token))
+        with pytest.raises(SecretConfigError, match="service-account token"):
+            parse_secrets_config({"file": {"root": str(tmp_path / "run" / "secrets")}})
+        with pytest.raises(SecretConfigError, match="service-account token"):
+            parse_secrets_config({"file": {"root": str(tmp_path)}})
+        ok = parse_secrets_config({"file": {"root": str(tmp_path / "run" / "turnstone")}})
+        assert ok.file is not None
+        # Where no token is mounted (systemd, compose), the rule is inert.
+        monkeypatch.setattr(target, str(tmp_path / "absent" / "token"))
+        ok = parse_secrets_config({"file": {"root": str(tmp_path)}})
+        assert ok.file is not None
+
+    def test_token_rule_follows_the_kubelet_symlinks(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """/var/run is a link to /run in the image, and the kubelet reaches the token
+        through ..data -> ..<timestamp>; the rule compares resolved paths."""
+        import os
+
+        sa = tmp_path / "run" / "secrets" / "kubernetes.io" / "serviceaccount"
+        (sa / "..2026_11_08").mkdir(parents=True)
+        (sa / "..2026_11_08" / "token").write_text("jwt")
+        os.symlink("..2026_11_08", sa / "..data")
+        os.symlink("..data/token", sa / "token")
+        (tmp_path / "var").mkdir()
+        os.symlink("../run", tmp_path / "var" / "run")
+        target = "turnstone.core.secret_refs._config._SERVICE_ACCOUNT_TOKEN"
+        monkeypatch.setattr(
+            target,
+            str(
+                tmp_path / "var" / "run" / "secrets" / "kubernetes.io" / "serviceaccount" / "token"
+            ),
+        )
+        for root in (
+            tmp_path / "run" / "secrets",
+            tmp_path / "var" / "run" / "secrets",
+            sa / "..data",
+        ):
+            with pytest.raises(SecretConfigError, match="service-account token"):
+                parse_secrets_config({"file": {"root": str(root)}})
+        ok = parse_secrets_config({"file": {"root": str(tmp_path / "run" / "turnstone")}})
+        assert ok.file is not None
+
     def test_vault_credential_file_may_not_live_under_the_file_root(self, tmp_path: Path) -> None:
         vault = {"address": "https://v", "auth": "approle", "role_id": "r"}
         with pytest.raises(SecretConfigError, match="secret_id_file: must not be under"):

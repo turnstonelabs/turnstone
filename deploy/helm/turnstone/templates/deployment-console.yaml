@@ -24,6 +24,11 @@ spec:
       app.kubernetes.io/component: console
   template:
     metadata:
+      {{- if .Values.config.file }}
+      annotations:
+        # The file is read at startup, so a changed text rolls the pods.
+        checksum/config-file: {{ .Values.config.file | sha256sum }}
+      {{- end }}
       labels:
         {{- include "turnstone.selectorLabels" . | nindent 8 }}
         app.kubernetes.io/component: console
@@ -77,6 +82,10 @@ spec:
             # configurable per cluster.
             - name: TURNSTONE_CONSOLE_URL
               value: "http://{{ include "turnstone.fullname" . }}-console.{{ .Release.Namespace }}.svc:{{ .Values.console.service.port }}"
+            {{- if .Values.config.file }}
+            - name: TURNSTONE_CONFIG
+              value: /etc/turnstone/config.toml
+            {{- end }}
           {{- if or .Values.auth.existingSecret .Values.auth.jwtSecret }}
             - name: TURNSTONE_JWT_SECRET
               valueFrom:
@@ -98,3 +107,11 @@ spec:
             periodSeconds: 20
           resources:
             {{- toYaml .Values.console.resources | nindent 12 }}
+          {{- if or .Values.config.file .Values.config.secretMounts }}
+          volumeMounts:
+            {{- include "turnstone.configFile.volumeMounts" . | trim | nindent 12 }}
+          {{- end }}
+      {{- if or .Values.config.file .Values.config.secretMounts }}
+      volumes:
+        {{- include "turnstone.configFile.volumes" . | trim | nindent 8 }}
+      {{- end }}

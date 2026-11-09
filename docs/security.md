@@ -587,14 +587,16 @@ and names it.
 
 Backends are configured under `[secrets]` in config.toml, and the table must be
 the same on the console and every node that shares the database. A malformed
-table stops the process at startup.
+table stops the process at startup. With the Helm chart, `config.file` and
+`config.secretMounts` in `values.yaml` put the same file and Secret mounts in
+both pods; see `deploy/helm/turnstone/README.md`.
 
 ```toml
 [secrets]
 cache_ttl_seconds = 300          # how long a fetched value is reused
 
 [secrets.file]
-root = "/run/secrets"            # secret://file/run/secrets/openai reads this file
+root = "/run/turnstone/secrets"  # secret://file/run/turnstone/secrets/openai
 
 [secrets.vault]                  # Vault or OpenBao, KV v2
 address = "https://vault.example.com:8200"
@@ -610,9 +612,9 @@ mount = "secret"                 # secret://vault/turnstone/openai#api_key
 - **file** reads a whole file (minus one trailing newline) whose absolute path,
   as written and after symlinks are followed, lies under `root`. Container and
   Kubernetes secret mounts fit this shape. The root must be a dedicated
-  directory: it may not contain config.toml or the Vault login credential
-  (`secret_id_file`, `jwt_path`), both refused at startup, and it should not be
-  a mount that also holds a service-account token.
+  directory: it may not contain config.toml, the Vault login credential
+  (`secret_id_file`, `jwt_path`) or the pod's service-account token where
+  Kubernetes mounts one, all refused at startup.
 - **vault** reads one field of a KV v2 secret at `<mount>/<path>`. The process
   logs in with `jwt` (`role` plus `jwt_path`, the file holding the workload's
   token; a Kubernetes workload sets `auth_mount = "kubernetes"` and points
@@ -719,10 +721,10 @@ default. Setting the default directly needs `admin.settings`, but this grants
 nothing new: `admin.models` can always change the endpoint of the model that is
 the default.
 
-The Helm chart and the Terraform deployment pass configuration through the
-environment and mount no config.toml today, so `[secrets]` cannot be set
-there yet; references are for deployments that ship a config.toml (systemd,
-compose).
+The Terraform deployment passes configuration through the environment and
+mounts no config.toml, so `[secrets]` cannot be set there yet; references are
+for deployments that ship a config.toml (systemd, compose, and the Helm chart
+through `config.file`; see `deploy/helm/turnstone/README.md`).
 
 ---
 

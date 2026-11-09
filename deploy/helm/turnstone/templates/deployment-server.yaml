@@ -13,6 +13,11 @@ spec:
       app.kubernetes.io/component: server
   template:
     metadata:
+      {{- if .Values.config.file }}
+      annotations:
+        # The file is read at startup, so a changed text rolls the pods.
+        checksum/config-file: {{ .Values.config.file | sha256sum }}
+      {{- end }}
       labels:
         {{- include "turnstone.selectorLabels" . | nindent 8 }}
         app.kubernetes.io/component: server
@@ -83,6 +88,10 @@ spec:
                   fieldPath: status.podIP
             - name: TURNSTONE_ADVERTISE_URL
               value: "http://$(POD_IP):{{ .Values.server.service.port }}"
+            {{- if .Values.config.file }}
+            - name: TURNSTONE_CONFIG
+              value: /etc/turnstone/config.toml
+            {{- end }}
           {{- if or .Values.auth.existingSecret .Values.auth.jwtSecret }}
             - name: TURNSTONE_JWT_SECRET
               valueFrom:
@@ -104,16 +113,25 @@ spec:
             periodSeconds: 20
           resources:
             {{- toYaml .Values.server.resources | nindent 12 }}
-          {{- if .Values.server.sidecars }}
+          {{- if or .Values.server.sidecars .Values.config.file .Values.config.secretMounts }}
           volumeMounts:
+            {{- if .Values.server.sidecars }}
             - name: workspace
               mountPath: /workspace
             - name: kube-api-access
               mountPath: /var/run/secrets/kubernetes.io/serviceaccount
               readOnly: true
+            {{- end }}
+            {{- with (include "turnstone.configFile.volumeMounts" . | trim) }}
+            {{- . | nindent 12 }}
+            {{- end }}
           {{- end }}
-      {{- if .Values.server.sidecars }}
+      {{- if or .Values.server.sidecars .Values.config.file .Values.config.secretMounts }}
       volumes:
+        {{- with (include "turnstone.configFile.volumes" . | trim) }}
+        {{- . | nindent 8 }}
+        {{- end }}
+        {{- if .Values.server.sidecars }}
         # Shared with every sidecar. The image names /workspace in the model's
         # tool descriptions (TURNSTONE_WORKSPACE), so the paths agree.
         - name: workspace
@@ -137,4 +155,5 @@ spec:
                     - path: namespace
                       fieldRef:
                         fieldPath: metadata.namespace
+        {{- end }}
       {{- end }}
