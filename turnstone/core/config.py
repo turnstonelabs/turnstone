@@ -59,21 +59,40 @@ def set_config_path(path: str) -> None:
     _cache = None  # invalidate cache so next load_config() re-reads
 
 
+class ConfigError(RuntimeError):
+    """config.toml exists but cannot be read or parsed."""
+
+
 def load_config(section: str | None = None) -> dict[str, Any]:
     """Load config.toml and return the full dict or a specific section.
 
-    Returns empty dict if file doesn't exist or can't be parsed.
-    Result is cached after first call.
+    A missing file is an empty configuration. A file that exists but cannot be
+    read or parsed raises :class:`ConfigError`: a process must not run with none
+    of its settings as though the file were absent. The result is cached after
+    the first successful load; a failure leaves nothing cached, so every caller
+    fails the same way.
     """
     global _cache
     if _cache is None:
-        _cache = {}
         cfg_path = _resolve_config_path()
-        if cfg_path.is_file():
+        # The read decides: is_file() answers False when a parent directory
+        # cannot be entered, which would turn a permission problem into an
+        # empty configuration.
+        try:
+            text: str | None = cfg_path.read_text(encoding="utf-8")
+        except (FileNotFoundError, NotADirectoryError):
+            text = None
+        except (OSError, UnicodeDecodeError) as exc:
+            log.error("config.unreadable", path=str(cfg_path), error=str(exc))
+            raise ConfigError(f"{cfg_path}: {exc}") from exc
+        loaded: dict[str, Any] = {}
+        if text is not None:
             try:
-                _cache = tomllib.loads(cfg_path.read_text(encoding="utf-8"))
-            except Exception as exc:
-                log.warning("Failed to parse %s: %s", cfg_path, exc)
+                loaded = tomllib.loads(text)
+            except (tomllib.TOMLDecodeError, RecursionError) as exc:
+                log.error("config.unparseable", path=str(cfg_path), error=str(exc))
+                raise ConfigError(f"{cfg_path}: {exc}") from exc
+        _cache = loaded
     if section:
         result = _cache.get(section, {})
         return result if isinstance(result, dict) else {}
@@ -187,8 +206,8 @@ def get_searxng_url() -> str | None:
     global _searxng_url, _searxng_url_loaded
     if _searxng_url_loaded:
         return _searxng_url
-    _searxng_url_loaded = True
     cfg_url = load_config("tools").get("searxng_url", "").strip()
+    _searxng_url_loaded = True
     if cfg_url:
         _searxng_url = cfg_url
         return _searxng_url
@@ -207,8 +226,8 @@ def get_searxng_engines() -> str:
     global _searxng_engines, _searxng_engines_loaded
     if _searxng_engines_loaded:
         return _searxng_engines or ""
-    _searxng_engines_loaded = True
     cfg = load_config("tools").get("searxng_engines", "").strip()
+    _searxng_engines_loaded = True
     _searxng_engines = cfg or os.environ.get("TURNSTONE_SEARXNG_ENGINES", "").strip()
     return _searxng_engines
 
@@ -237,8 +256,8 @@ def get_workspace_dir() -> str | None:
     global _workspace_dir, _workspace_dir_loaded
     if _workspace_dir_loaded:
         return _workspace_dir
-    _workspace_dir_loaded = True
     cfg_dir = load_config("tools").get("workspace_dir", "").strip()
+    _workspace_dir_loaded = True
     if cfg_dir:
         _workspace_dir = cfg_dir
         return _workspace_dir
@@ -266,8 +285,8 @@ def get_rerank_instruction() -> str:
     """
     global _rerank_instruction, _rerank_instruction_loaded
     if not _rerank_instruction_loaded:
-        _rerank_instruction_loaded = True
         cfg = load_config("tools").get("rerank_instruction", "").strip()
+        _rerank_instruction_loaded = True
         _rerank_instruction = cfg or os.environ.get("TURNSTONE_RERANK_INSTRUCTION", "").strip()
     return _rerank_instruction or ""
 
@@ -286,9 +305,15 @@ def apply_config(parser: argparse.ArgumentParser, sections: list[str]) -> None:
     """Set argparse defaults from config file.
 
     Only sets defaults for keys present in the config file.
-    Called before ``parse_args()`` so CLI flags still override.
+    Called before ``parse_args()`` so CLI flags still override. A config.toml
+    that cannot be read or parsed ends the process here, after the loader has
+    logged why; the server, console, CLI, admin, eval and optimizer entry
+    points call this before anything else reads the file.
     """
-    cfg = load_config()
+    try:
+        cfg = load_config()
+    except ConfigError as exc:
+        raise SystemExit(1) from exc
     if not cfg:
         return
     defaults: dict[str, object] = {}
