@@ -35,6 +35,7 @@ The notes printed after install say how to reach the server and the console.
   instead of the bundled one.
 - `llm.apiKey` or `llm.existingSecret`: the fallback API key for model
   definitions that leave theirs empty.
+- `oidc.*`: single sign-on through an OpenID Connect provider; see below.
 - `server.replicas`: each replica is a node, and a session lives on one of
   them.
 - `server.sidecars`: MCP servers in the server pod; see below.
@@ -157,6 +158,49 @@ What to know before choosing a sidecar:
 - **Replicas.** Each server replica has its own workspace volume and its own
   sidecars. A session lives on one node, so this is consistent.
 
+## Single sign-on
+
+`oidc.*` turns on login through an OpenID Connect provider. Setting
+`oidc.issuer`, `oidc.clientId`, `oidc.scopes`, `oidc.providerName` or the
+client secret requires `oidc.issuer`, `oidc.clientId`, `oidc.redirectBase` and
+the client secret, from `oidc.existingSecret` (a Secret with a
+`TURNSTONE_OIDC_CLIENT_SECRET` key) or `oidc.clientSecret` inline; the render
+stops otherwise and names what is missing. `oidc.redirectBase` is the origin
+users log in at, `scheme://host[:port]` and nothing after it (a trailing slash
+is dropped), normally the console's host, since the console serves every
+node's UI under `/node/<id>/`. Register
+`<redirectBase>/v1/api/auth/oidc/callback` at the provider, and finish the
+setup wizard before turning this on, so that a local admin exists. Single
+sign-on completes on the UI at that origin; a login started at another host
+does not complete, and that host offers the password form unless
+`password_enabled` is off. `oidc.redirectBase` on its own is allowed: per-user
+MCP authorization needs it and nothing else.
+
+```yaml
+oidc:
+  issuer: https://identity.example.com
+  clientId: turnstone
+  existingSecret: turnstone-oidc
+  redirectBase: https://turnstone.example.com
+  providerName: Example SSO
+```
+
+The values reach the server and console pods as the `TURNSTONE_OIDC_*`
+environment the application reads, the client secret from the Secret like the
+JWT secret, so a changed client secret needs `kubectl rollout restart` of both
+Deployments, while a changed issuer, client id, redirect base, scopes or
+provider name rolls them by itself. Values are strings; quote a numeric client
+id. The client secret may be a `secret://` reference, which the configuration
+file below enables, so the Secret then carries only the reference. The rarer
+settings (the role claim and map, `password_enabled`, `allow_private_network`,
+`trusted_endpoint_hosts`, `capture_user_credential`, `obo_grant_profile`) go
+in the `[oidc]` table of `config.file`. Once `oidc.issuer` is set, the chart
+refuses that table's `issuer`, `client_id` and `client_secret`, and
+`redirect_base`, `scopes` or `provider_name` when the matching value is set,
+since the environment would override them silently; with
+`config.existingSecret` it cannot look, and the environment wins.
+`docs/oidc.md` describes every setting and the providers.
+
 ## Configuration file
 
 The chart passes its own settings through env and command-line flags. For
@@ -164,16 +208,17 @@ settings it has no value for, `config.file` holds the text of a config.toml,
 rendered into a Secret and mounted read-only at `/etc/turnstone/config.toml`
 in the server and console pods; a changed file rolls both Deployments. The
 chart refuses what it owns: the `[database]` connection keys, since a file
-value would beat its env, and `[auth] jwt_secret`, which it takes from
-`auth.jwtSecret` or `auth.existingSecret`; its port flags beat the file.
-Because the file is a Secret, the startup secrets the chart cannot take
-otherwise may live in it: the `[security]` encryption keys that per-user MCP
-accounts need, the `[oidc]` `client_secret` for single sign-on, and a Vault
-approle `secret_id`. Text the chart cannot parse as TOML is refused at
-install; a file the application cannot read or parse, or a `[secrets]` table
-it rejects, stops the pods at startup. Like
-config.toml on any host, the file is readable by what runs in the server
-container; the sidecar section above says where the boundary is.
+value would beat its env, `[auth] jwt_secret`, which it takes from
+`auth.jwtSecret` or `auth.existingSecret`, and the `[oidc]` keys that
+`oidc.*` sets; its port flags beat the file. Because the file is a Secret,
+the startup secrets the chart cannot take otherwise may live in it, the
+`[security]` encryption keys that per-user MCP accounts need and a Vault
+approle `secret_id`, as may the `[oidc]` settings the `oidc.*` values do not
+cover. Text the chart cannot parse as TOML is refused at install; a file the
+application cannot read or parse, or a `[secrets]` table it rejects, stops
+the pods at startup. Like config.toml on any host, the file is readable by
+what runs in the server container; the sidecar section above says where the
+boundary is.
 
 To keep the file out of your values, put it in a Secret of your own under the
 key `config.toml` and name it in `config.existingSecret` instead. The chart

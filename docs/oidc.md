@@ -29,7 +29,13 @@ Configure OIDC in the `[oidc]` section of the shared `config.toml` used by the
 console and server nodes. Docker deployments can prepare and mount this file
 through the installer's optional OAuth/SSO step or the
 [shared config overlay](docker.md#shared-bootstrap-config). For other
-deployments, select the file with `TURNSTONE_CONFIG` on each process.
+deployments, select the file with `TURNSTONE_CONFIG` on each process. On
+Kubernetes, the Helm chart's `oidc.*` values set the issuer, client id,
+redirect base, scopes and provider name for both pods, and pass the client
+secret from a Kubernetes Secret as `TURNSTONE_OIDC_CLIENT_SECRET`, as the
+chart passes the JWT secret; a `secret://` reference keeps the value itself in
+the store. The chart's `config.file` carries the rest of this table; see
+[the chart README](../deploy/helm/turnstone/README.md#single-sign-on).
 
 ### Shared config example
 
