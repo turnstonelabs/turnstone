@@ -978,6 +978,20 @@ class TestPerceptionFallback:
         assert part["type"] == "text"
         assert "DESCRIPTION" in part["text"]
 
+    @pytest.mark.parametrize("content", [None, "RIFF"])
+    def test_unreadable_audio_without_stt_skips_perception(
+        self, tmp_db, mock_openai_client, content
+    ):
+        s = _make_session(mock_openai_client)
+        prov = self._with_perception(s, perc_caps=ModelCapabilities(supports_audio_input=True))
+
+        part = s._wire_content_part(
+            self._att("audio", content, "a.wav", "audio/wav"), ModelCapabilities()
+        )
+
+        assert part == unreadable_placeholder("a.wav")
+        prov.create_streaming.assert_not_called()
+
     @pytest.mark.parametrize(
         "failure", ["missing", "ineligible", "backend", "missing-bytes", "non-bytes"]
     )
@@ -1019,7 +1033,10 @@ class TestPerceptionFallback:
         else:
             assert part == {
                 "type": "text",
-                "text": "[audio attachment 'aattachment.wav' — STT model alias 'voiceattachment' is unusable]",
+                "text": (
+                    "[audio attachment 'aattachment.wav' — "
+                    "STT model alias 'voiceattachment' could not transcribe it]"
+                ),
             }
         prov.create_streaming.assert_not_called()
         if failure == "backend":
@@ -1036,8 +1053,16 @@ class TestPerceptionFallback:
         prov.create_streaming.assert_not_called()
 
     @pytest.mark.parametrize("can_hear", [True, False])
-    def test_empty_stt_success_still_allows_perception(
-        self, tmp_db, mock_openai_client, monkeypatch, can_hear
+    @pytest.mark.parametrize(
+        ("transcript", "lines"),
+        [
+            ("hello", ["[Transcript of audio attachment 'a.wav' (untrusted)]", "", "hello"]),
+            # Silence is the STT model's answer; it never goes on to perception.
+            ("", ["[audio attachment 'a.wav' — STT model alias 'voice' found no speech]"]),
+        ],
+    )
+    def test_set_stt_alias_answers_without_perception(
+        self, tmp_db, mock_openai_client, monkeypatch, can_hear, transcript, lines
     ):
         audio._clear_transcript_cache_for_test()
         s = _make_session(mock_openai_client)
@@ -1053,17 +1078,18 @@ class TestPerceptionFallback:
         s._registry.has_alias = lambda a: a in ("voice", "omni")
         s._registry.get_config.return_value = cfg
         s._registry.resolve_binding = lambda a: (object(), "whisper-1", cfg, prov, 0)
-        backend = MagicMock(return_value=audio.TranscriptionResult("", "voice", "whisper-1"))
+        backend = MagicMock(
+            return_value=audio.TranscriptionResult(transcript, "voice", "whisper-1")
+        )
         monkeypatch.setattr(audio, "_transcribe_binding", backend)
         att = self._att("audio", b"RIFF", "a.wav", "audio/wav")
 
         for _ in range(2):
             part = s._wire_content_part(att, ModelCapabilities())
-            assert ("DESCRIPTION" if can_hear else "no transcription backend configured") in part[
-                "text"
-            ]
-        backend.assert_called_once()
-        assert prov.create_streaming.call_count == (1 if can_hear else 0)
+            assert part["type"] == "text"
+            assert part["text"].splitlines() == lines
+        backend.assert_called_once()  # the transcript is cached, an empty one too
+        prov.create_streaming.assert_not_called()
 
     def test_perception_skipped_when_model_lacks_modality(self, tmp_db, mock_openai_client):
         # Perception model has vision but not audio → audio falls through to the

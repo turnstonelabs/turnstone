@@ -184,14 +184,16 @@ serves both chat and dictation, dictation waits behind chat replies; a second
 alias for the same server, with its own `max_concurrency`, keeps the two apart,
 at the cost of the server seeing both at once.
 
-For audio attachments sent to a chat model that cannot take audio, a selected
-`audio.stt_model_alias` is authoritative: if the alias is missing, ineligible,
-or fails to transcribe, the model receives a placeholder naming the unusable
-STT alias. Audio is not sent to perception after that failure. Perception
-remains eligible when STT is unset (including whitespace-only settings) or
-successfully returns an empty transcript, including a cached empty result.
-If perception is also unavailable in those cases, the existing
-"no transcription backend configured" placeholder is used.
+### Audio attachments for models that can't hear
+
+When the chat model can't take audio and `audio.stt_model_alias` is set, an
+audio attachment goes to that speech-to-text model and to no other model. If the
+alias is missing, can't transcribe, or its backend fails, the chat model gets a
+placeholder naming the alias, and if the transcript comes back empty, a
+placeholder saying the alias found no speech. With `audio.stt_model_alias` empty
+(or only whitespace), the perception model (`perception.model_alias`) gets the
+audio instead, if it can take audio; otherwise the placeholder says no
+transcription backend is configured.
 
 ### Judge batch parallelism
 

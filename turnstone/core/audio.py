@@ -840,11 +840,11 @@ def transcribe_cached(
 ) -> str | None:
     """Memoized, non-raising :func:`transcribe` for the wire fallback.
 
-    Keyed by principal, concrete alias, registry generation, and content hash.
-    Returns ``None`` on an ordinary resolution/backend failure (a placeholder
-    is rendered upstream) and does *not* cache failures, so a transient outage doesn't
-    poison the memo.  Cancellation and dynamic-auth refusal remain control flow
-    and propagate to the caller. Successful strings, including ``""``, are cached.
+    Keyed by principal, concrete alias, registry generation, and content hash.  Returns ``None`` on
+    an ordinary resolution or backend failure (a placeholder is rendered upstream) and does *not*
+    cache failures, so a transient outage doesn't poison the memo; successful strings, ``""``
+    included, are cached.  Cancellation and dynamic-auth refusal remain control flow and propagate
+    to the caller.
 
     It runs inside a chat turn, before the turn takes its own model's slot, so
     it waits for a slot on the STT alias as a generation would: until one frees

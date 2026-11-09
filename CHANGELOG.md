@@ -42,12 +42,13 @@ The separate `dev` branch is retired. See [the release process](docs/releasing.m
 
 ### Fixed
 
-- **A selected STT model alias that can't run no longer hands audio to perception.** When
-  `audio.stt_model_alias` names an alias that is missing, can't transcribe, or whose backend
-  fails, the audio attachment gets a placeholder naming the alias instead of reaching the
-  perception model. An unset STT setting, or a transcript that comes back empty, still
-  falls through to perception. Audio whose stored content can't be read gets the unreadable
-  attachment placeholder.
+- **A selected STT model alias that can't run no longer hands audio to
+  perception.** When `audio.stt_model_alias` names an alias that is missing,
+  can't transcribe, or whose backend fails, an audio attachment gets a
+  placeholder naming the alias instead of reaching the perception model, and a
+  transcript that comes back empty gets a placeholder saying the alias found no
+  speech. Perception still takes audio attachments when `audio.stt_model_alias`
+  is empty.
 
 ## [1.9.3]
 
