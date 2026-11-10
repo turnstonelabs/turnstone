@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import os
+import pathlib
 import re
 import shutil
 import subprocess
@@ -340,6 +341,733 @@ FakeElement.prototype.remove = function() {
 };
 """
 
+# Node removal as pane teardown does it, opt-in after PANE_DOM: ``removeChild``
+# detaches a child and returns it, and throws for a node that is not a child,
+# as a browser does.
+REMOVE_CHILD = r"""
+FakeElement.prototype.removeChild = function(child) {
+  if (!child || child.parentNode !== this) {
+    throw new DOMException('removeChild: the node is not a child of this node', 'NotFoundError');
+  }
+  child.remove();
+  return child;
+};
+"""
+
+# A browser EventSource the test drives, opt-in.  Needs nothing else; with
+# FAKE_DOM loaded it is also installed as ``window.EventSource``.  Errors thrown
+# by a listener are collected in ``reportedErrors`` (shared with FAKE_CLOCK and
+# FAKE_VISIBILITY) instead of reaching the control that fired the event, as a
+# browser reports them instead of throwing them at the network.
+FAKE_EVENT_SOURCE = r"""
+{
+  const reported = (globalThis.reportedErrors = globalThis.reportedErrors || []);
+  const NUL = String.fromCharCode(0);
+  const STATES = ['CONNECTING', 'OPEN', 'CLOSED'];
+  class FakeEventSource {
+    static instances = [];
+    static baseURL = 'http://example.com/';
+    #url;
+    #withCredentials;
+    #readyState = 0;
+    #lastEventId = '';
+    // type -> entries in registration order: {fn, removed}.  An on<type> handler
+    // holds one entry from the moment it is set to a non-null value until it is
+    // set back to null; the entry calls whatever the handler is at dispatch time.
+    #listeners = new Map();
+    #handlers = {open: null, message: null, error: null};
+    #handlerEntries = {};
+    constructor(url, init) {
+      if (arguments.length === 0) throw new TypeError('EventSource: a URL is required');
+      this.#url = new URL(String(url), FakeEventSource.baseURL).href;
+      this.#withCredentials = !!(init && init.withCredentials);
+      // Test-side record, not part of the browser interface.
+      this.init = init;
+      this.attempts = [{lastEventIdHeader: null}];
+      this.closeCalled = false;
+      FakeEventSource.instances.push(this);
+    }
+    get url() { return this.#url; }
+    get withCredentials() { return this.#withCredentials; }
+    get readyState() { return this.#readyState; }
+    get onopen() { return this.#handlers.open; }
+    set onopen(value) { this.#setHandler('open', value); }
+    get onmessage() { return this.#handlers.message; }
+    set onmessage(value) { this.#setHandler('message', value); }
+    get onerror() { return this.#handlers.error; }
+    set onerror(value) { this.#setHandler('error', value); }
+    #setHandler(type, value) {
+      const callable = typeof value === 'function' || (value && typeof value === 'object');
+      const next = callable ? value : null;
+      this.#handlers[type] = next;
+      const entry = this.#handlerEntries[type];
+      if (next === null && entry) {
+        delete this.#handlerEntries[type];
+        this.#removeEntry(type, entry);
+      } else if (next !== null && !entry) {
+        const added = {fn: event => {
+          const handler = this.#handlers[type];
+          if (typeof handler === 'function') handler.call(this, event);
+        }, removed: false};
+        this.#handlerEntries[type] = added;
+        this.#entries(type).push(added);
+      }
+    }
+    #entries(type) {
+      if (!this.#listeners.has(type)) this.#listeners.set(type, []);
+      return this.#listeners.get(type);
+    }
+    #removeEntry(type, entry) {
+      entry.removed = true;
+      this.#listeners.set(type, this.#entries(type).filter(row => row !== entry));
+    }
+    close() {
+      this.closeCalled = true;
+      this.#readyState = 2;
+    }
+    addEventListener(type, fn) {
+      if (!fn) return;
+      const rows = this.#entries(type);
+      if (!rows.some(row => row.fn === fn)) rows.push({fn, removed: false});
+    }
+    removeEventListener(type, fn) {
+      const entry = this.#entries(type).find(row => row.fn === fn);
+      if (entry) this.#removeEntry(type, entry);
+    }
+    // DOM "inner invoke": walk a copy of the list taken at dispatch, so a
+    // listener added during the dispatch waits for the next event, and skip an
+    // entry removed by an earlier listener in this same dispatch.
+    #fire(event) {
+      event.target = event.currentTarget = this;
+      for (const entry of [...this.#entries(event.type)]) {
+        if (entry.removed) continue;
+        const fn = entry.fn;
+        try {
+          if (typeof fn === 'function') fn.call(this, event);
+          else fn.handleEvent(event);
+        } catch (err) {
+          reported.push({where: 'EventSource ' + event.type + ' listener', err});
+          console.error('uncaught in EventSource ' + event.type + ' listener', err);
+        }
+      }
+    }
+    #require(state, control) {
+      if (this.#readyState === state) return;
+      throw new Error('FakeEventSource.' + control + '(): readyState is ' +
+        STATES[this.#readyState] + ', needs ' + STATES[state]);
+    }
+    // The pending connection attempt succeeded: announce the connection.
+    open() {
+      if (this.#readyState === 2) return false;
+      this.#require(0, 'open');
+      this.#readyState = 1;
+      this.#fire({type: 'open'});
+      return true;
+    }
+    // One frame, as the decoded data field (a non-string is JSON-encoded), with
+    // an optional id field and event type.
+    deliver(data, {id, event} = {}) {
+      if (this.#readyState === 2) return false;
+      this.#require(1, 'deliver');
+      if (id !== undefined && !String(id).includes(NUL)) this.#lastEventId = String(id);
+      const text = typeof data === 'string' ? data : JSON.stringify(data);
+      if (text === '') return false;
+      this.#fire({type: event || 'message', data: text, lastEventId: this.#lastEventId,
+        origin: new URL(this.#url).origin});
+      return true;
+    }
+    // The connection dropped (or a retry hit a network error): the browser
+    // reestablishes on this same object.
+    drop() {
+      if (this.#readyState === 2) return false;
+      this.#readyState = 0;
+      this.attempts.push({lastEventIdHeader: this.#lastEventId === '' ? null : this.#lastEventId});
+      this.#fire({type: 'error'});
+      return true;
+    }
+    // The pending connection attempt got a fatal response: fail the connection.
+    fail() {
+      if (this.#readyState === 2) return false;
+      this.#require(0, 'fail');
+      this.#readyState = 2;
+      this.#fire({type: 'error'});
+      return true;
+    }
+    static latest() { return FakeEventSource.instances.at(-1) || null; }
+    static live() { return FakeEventSource.instances.filter(es => es.readyState !== 2); }
+  }
+  for (const [value, name] of STATES.entries()) {
+    Object.defineProperty(FakeEventSource, name, {value, enumerable: true});
+    Object.defineProperty(FakeEventSource.prototype, name, {value, enumerable: true});
+  }
+  globalThis.FakeEventSource = globalThis.EventSource = FakeEventSource;
+  if (globalThis.window) globalThis.window.EventSource = FakeEventSource;
+}
+"""
+"""The browser EventSource behaviors FAKE_EVENT_SOURCE models, each with the HTML
+or DOM spec rule it comes from (WHATWG HTML, "Server-sent events" and "Event
+handlers"; WHATWG DOM, "Dispatching events").  The rule ids are the ones
+EVENT_SOURCE_CONTRACT checks.  A real browser must pass the same checks; the
+``es-contract`` scenario in scripts/recovery_e2e.py is meant to run them there.
+
+ES1  ``CONNECTING`` 0, ``OPEN`` 1, ``CLOSED`` 2 exist on the interface object and
+     on instances (EventSource IDL constants).
+ES2  A new source is CONNECTING; ``url`` is the constructor URL resolved against
+     the document base, so it is absolute; ``withCredentials`` mirrors the init
+     dictionary and defaults to false (constructor steps).  ``url``,
+     ``withCredentials`` and ``readyState`` are read-only accessors.
+ES3  The source object has no ``lastEventId`` member: the id is exposed only on
+     each MessageEvent (the EventSource IDL has no such attribute).
+ES4  When the connection is announced, readyState becomes OPEN and ``open``
+     fires, unless the source is CLOSED by then ("announce the connection").
+ES5  ``MessageEvent.lastEventId`` is the source's last event ID string: "" until
+     an ``id:`` field arrives; an ``id:`` sets it; frames without one leave it
+     unchanged, so they carry the previous id ("the buffer does not get reset");
+     an explicit empty ``id:`` sets it back to ""; an id containing NUL is
+     ignored (event stream interpretation, the "id" field; "dispatch the event"
+     step 1).
+ES6  A frame with an empty data buffer dispatches no event, but its id still
+     sets the last event ID string ("dispatch the event" steps 1-2).
+ES7  A frame with an ``event:`` type is dispatched under that type: listeners
+     added for the type receive it and ``onmessage`` does not ("dispatch the
+     event" step 6).
+ES8  When an open connection drops, readyState becomes CONNECTING and ``error``
+     fires (handlers see CONNECTING); the same object reconnects, sending
+     ``Last-Event-ID`` with the last event ID string when it is not empty, and
+     fires ``open`` again when the new connection is announced ("reestablish
+     the connection" steps 1 and 5).
+ES9  A fatal response to a connection attempt (not 200, wrong MIME type) sets
+     readyState CLOSED and fires ``error``; no reconnect follows, on a first
+     connection or a reconnect alike ("fail the connection").
+ES10 ``close()`` sets readyState CLOSED synchronously and fires no event; no
+     ``open``, ``message`` or ``error`` fires afterwards, since each queued task
+     returns early on CLOSED (the close() method; the announce, dispatch and
+     reestablish tasks).
+ES11 ``close()`` while reconnecting cancels the reconnect: no ``open`` follows
+     ("reestablish the connection" step 5 returns unless CONNECTING).
+ES12 An ``on<type>`` handler takes its place among the type's listeners when it
+     is first set to a non-null value: listeners added before it run first; a
+     handler replaced by another function keeps that place; a handler set to
+     null loses it, and set again it joins at the end (HTML "Event handlers":
+     activating and deactivating an event handler).
+ES13 A listener removed by an earlier listener during a dispatch does not run
+     for that event, and a listener added during the dispatch waits for the next
+     event (DOM "inner invoke": the listener list is cloned before the walk and
+     an entry whose removed flag is set is skipped).
+
+Test-side controls (not part of the browser interface):
+
+- ``FakeEventSource.instances`` lists every source in creation order;
+  ``latest()`` and ``live()`` (not CLOSED) are shortcuts.
+- ``es.open()`` announces the pending connection attempt (first or reconnect).
+- ``es.deliver(data, {id, event})`` delivers one frame on an OPEN source; ``data``
+  is the decoded data field, not wire text (a non-string is JSON-encoded).
+- ``es.drop()`` drops the connection (ES8); a later ``es.open()`` is the reconnect.
+- ``es.fail()`` refuses the pending attempt (ES9); an OPEN source must
+  ``drop()`` first, as an open stream cannot receive a second response.
+- ``es.attempts`` records each connection attempt's ``Last-Event-ID`` header
+  (``null`` when not sent); ``es.closeCalled`` records a ``close()`` call by the
+  client, as opposed to CLOSED reached through ``fail()``; ``es.init`` is the
+  constructor's second argument.
+- Every control fires its event synchronously, as if the browser's queued task
+  ran at once, and is a no-op returning false on a CLOSED source (ES10).  A
+  control used out of order (``deliver`` before ``open``) throws: that is a
+  test bug, not browser behavior.
+
+Not modelled: wire parsing (``retry:``, comments, multi-line data, BOM), the
+reconnection delay (the test decides when the reconnect succeeds), a browser
+that gives up after repeated network errors, and CORS.
+"""
+
+# The ES-rule checks above as one self-contained script: it defines
+# ``checkEventSourceContract(driver)``, which builds sources with the global
+# ``EventSource`` and asks the driver to make the server act.  In node the
+# driver uses FakeEventSource's own controls; the ``es-contract`` scenario in
+# scripts/recovery_e2e.py is meant to run the same function against a real
+# EventSource with a server-backed driver.  The driver interface (every method
+# may return a promise; unchanged by ES12 and ES13, which use only ``send``):
+#
+#   url(name)                 URL of a stream the driver controls, root-relative
+#   open(name)                accept the pending connection attempt
+#   send(name, frame)         write one frame {data, id?, event?}; data "" is an
+#                             id-only frame
+#   drop(name)                end the response; the browser retries
+#   fail(name)                answer the pending attempt with a fatal status
+#   lastEventIdHeader(name)   Last-Event-ID of the latest attempt, or null
+#   settle()                  wait until the browser has processed the above
+#
+# Driver calls on a source the client closed must not throw.  The function
+# resolves to the list of rule ids it checked and throws on the first broken one.
+EVENT_SOURCE_CONTRACT = r"""
+async function checkEventSourceContract(driver) {
+  const checked = [];
+  const check = (condition, rule, detail) => {
+    if (!condition) throw new Error('EventSource contract ' + rule + ' broken: ' + detail);
+    if (!checked.includes(rule)) checked.push(rule);
+  };
+  const record = source => {
+    const log = [];
+    for (const type of ['open', 'message', 'error']) {
+      source['on' + type] = event => log.push({type: event.type, state: source.readyState,
+        data: event.data, lastEventId: event.lastEventId, target: event.target});
+    }
+    return log;
+  };
+  const types = log => log.map(entry => entry.type).join(',');
+  const step = async promise => { await promise; await driver.settle(); };
+
+  check(EventSource.CONNECTING === 0 && EventSource.OPEN === 1 && EventSource.CLOSED === 2,
+    'ES1', 'constants on the interface');
+  const urlA = driver.url('a');
+  const a = new EventSource(urlA);
+  const logA = record(a);
+  check(a.CONNECTING === 0 && a.OPEN === 1 && a.CLOSED === 2, 'ES1', 'constants on an instance');
+  check(a.readyState === EventSource.CONNECTING, 'ES2', 'a new source is ' + a.readyState);
+  check(/^[a-z]+:[/][/]/.test(a.url) && a.url.endsWith(urlA), 'ES2', 'url is ' + a.url);
+  check(a.withCredentials === false, 'ES2', 'withCredentials defaults to false');
+  const b = new EventSource(driver.url('b'), {withCredentials: true});
+  check(b.withCredentials === true, 'ES2', 'withCredentials mirrors the init dictionary');
+  b.close();
+  check(!('lastEventId' in a), 'ES3', 'the source object exposes lastEventId');
+
+  await step(driver.open('a'));
+  check(a.readyState === EventSource.OPEN && types(logA) === 'open', 'ES4',
+    'after the announce: state ' + a.readyState + ', events ' + types(logA));
+  check(logA[0].state === EventSource.OPEN && logA[0].target === a, 'ES4',
+    'open fires on the source with readyState OPEN');
+
+  const messages = () => logA.filter(entry => entry.type === 'message');
+  const last = () => messages().at(-1) || {};
+  await step(driver.send('a', {data: 'first'}));
+  check(last().data === 'first' && last().lastEventId === '', 'ES5',
+    'lastEventId before any id is ' + JSON.stringify(last().lastEventId));
+  await step(driver.send('a', {data: 'second', id: '7'}));
+  check(last().lastEventId === '7', 'ES5', 'an id field sets lastEventId');
+  await step(driver.send('a', {data: 'third'}));
+  check(last().data === 'third' && last().lastEventId === '7', 'ES5',
+    'a frame without an id carries ' + JSON.stringify(last().lastEventId));
+  const before = messages().length;
+  await step(driver.send('a', {data: '', id: '8'}));
+  check(messages().length === before, 'ES6', 'an empty data buffer dispatched an event');
+  await step(driver.send('a', {data: 'fourth'}));
+  check(last().data === 'fourth' && last().lastEventId === '8', 'ES6',
+    'the id of an empty frame still applies, got ' + JSON.stringify(last().lastEventId));
+  const named = [];
+  a.addEventListener('custom', event => named.push(event));
+  await step(driver.send('a', {data: 'named', event: 'custom'}));
+  check(named.length === 1 && named[0].data === 'named' && named[0].lastEventId === '8', 'ES7',
+    'a typed frame reaches its listeners');
+  check(last().data === 'fourth', 'ES7', 'a typed frame reached onmessage');
+  check(!('lastEventId' in a), 'ES3', 'the source object exposes lastEventId after ids');
+
+  const logHandler = a.onmessage;
+  check(typeof logHandler === 'function', 'ES12', 'onmessage reads back the handler set on it');
+  const order = [];
+  const earlier = () => order.push('earlier');
+  const later = () => order.push('later');
+  a.onmessage = null;
+  a.addEventListener('message', earlier);
+  a.onmessage = () => order.push('handler');
+  a.addEventListener('message', later);
+  await step(driver.send('a', {data: 'order-1'}));
+  check(order.join() === 'earlier,handler,later', 'ES12',
+    'the handler runs in the place it was first set: ' + order.join());
+  order.length = 0;
+  a.onmessage = () => order.push('replaced');
+  await step(driver.send('a', {data: 'order-2'}));
+  check(order.join() === 'earlier,replaced,later', 'ES12',
+    'a replaced handler keeps its place: ' + order.join());
+  order.length = 0;
+  a.onmessage = null;
+  a.onmessage = () => order.push('reset');
+  await step(driver.send('a', {data: 'order-3'}));
+  check(order.join() === 'earlier,later,reset', 'ES12',
+    'a handler set again after null joins at the end: ' + order.join());
+  a.removeEventListener('message', earlier);
+  a.removeEventListener('message', later);
+  order.length = 0;
+  const removed = () => order.push('removed');
+  const added = () => order.push('added');
+  const remover = () => {
+    order.push('remover');
+    a.removeEventListener('message', removed);
+    a.addEventListener('message', added);
+  };
+  a.addEventListener('message', remover);
+  a.addEventListener('message', removed);
+  await step(driver.send('a', {data: 'order-4'}));
+  check(order.join() === 'reset,remover', 'ES13',
+    'listeners removed or added during a dispatch: ' + order.join());
+  order.length = 0;
+  a.removeEventListener('message', remover);
+  await step(driver.send('a', {data: 'order-5'}));
+  check(order.join() === 'reset,added', 'ES13',
+    'a listener added during a dispatch runs on the next event: ' + order.join());
+  a.removeEventListener('message', added);
+  a.onmessage = logHandler;
+
+  await step(driver.drop('a'));
+  check(logA.at(-1).type === 'error' && logA.at(-1).state === EventSource.CONNECTING, 'ES8',
+    'a drop fires error with readyState ' + logA.at(-1).state);
+  check(a.readyState === EventSource.CONNECTING, 'ES8', 'a dropped source is ' + a.readyState);
+  await step(driver.open('a'));
+  check(a.readyState === EventSource.OPEN && types(logA).endsWith('error,open'), 'ES8',
+    'the reconnect re-announces on the same object: ' + types(logA));
+  check((await driver.lastEventIdHeader('a')) === '8', 'ES8', 'the reconnect sent Last-Event-ID');
+  await step(driver.send('a', {data: 'after-reconnect'}));
+  check(last().lastEventId === '8', 'ES5', 'the id persists across a reconnect');
+  await step(driver.send('a', {data: 'reset', id: ''}));
+  check(last().lastEventId === '', 'ES5', 'an explicit empty id resets lastEventId');
+
+  const settled = logA.length;
+  a.close();
+  check(a.readyState === EventSource.CLOSED && logA.length === settled, 'ES10',
+    'close() is synchronous and fires nothing');
+  await step(driver.send('a', {data: 'late', id: '9'}));
+  await step(driver.drop('a'));
+  check(logA.length === settled && a.readyState === EventSource.CLOSED, 'ES10',
+    'events reached a closed source: ' + types(logA.slice(settled)));
+
+  const c = new EventSource(driver.url('c'));
+  const logC = record(c);
+  await step(driver.open('c'));
+  await step(driver.drop('c'));
+  await step(driver.fail('c'));
+  check(types(logC) === 'open,error,error' &&
+    logC.map(entry => entry.state).join(',') === '1,0,2', 'ES9',
+    'a refused reconnect: ' + JSON.stringify(logC.map(entry => [entry.type, entry.state])));
+  await step(driver.settle());
+  check(c.readyState === EventSource.CLOSED && logC.length === 3, 'ES9', 'a failed source retried');
+  const d = new EventSource(driver.url('d'));
+  const logD = record(d);
+  await step(driver.fail('d'));
+  check(types(logD) === 'error' && logD[0].state === EventSource.CLOSED, 'ES9',
+    'a refused first connection: ' + types(logD));
+
+  const e = new EventSource(driver.url('e'));
+  const logE = record(e);
+  await step(driver.open('e'));
+  await step(driver.drop('e'));
+  e.close();
+  await step(driver.open('e'));
+  check(types(logE) === 'open,error' && e.readyState === EventSource.CLOSED, 'ES11',
+    'a close while reconnecting still reopened: ' + types(logE));
+  return checked;
+}
+"""
+
+# A virtual clock, opt-in, after PANE_DOM (whose no-op timers it replaces):
+# setTimeout / setInterval / clear*, Date.now and performance.now read it.
+# Timer ids start at 1.  ``await clock.advance(ms)`` fires every timer due
+# within ``ms`` in due order (ties in arming order), including timers armed by
+# the callbacks it runs, and drains microtasks between firings; a callback that
+# throws is collected in ``reportedErrors``.  ``await flush()`` drains
+# microtasks without moving time.  ``pinRandom(value)`` fixes Math.random, which
+# every jittered delay reads.  Animation frames replace FAKE_DOM's immediate
+# call: a frame callback runs at the next flush, after the code that asked has
+# stored its handle (as in a browser, where frames run after the current task),
+# and each flush runs at most three frame rounds, so a callback that keeps
+# requesting frames cannot spin.  Timers follow the HTML nesting clamp: a timer
+# armed from a timer callback nested more than five deep waits at least 4 ms (a
+# callback that re-arms a 0 ms timeout therefore moves virtual time); a timer
+# that still fires a thousand times without time moving (re-armed from a
+# microtask, which the clamp does not see) makes ``advance`` throw, naming it.
+FAKE_CLOCK = r"""
+{
+  const reported = (globalThis.reportedErrors = globalThis.reportedErrors || []);
+  const realSetImmediate = globalThis.setImmediate;
+  const drain = () => new Promise(resolve => realSetImmediate(resolve));
+  const frames = new Map();
+  let nextFrame = 1;
+  const runFrames = () => {
+    const due = [...frames.values()];
+    frames.clear();
+    for (const fn of due) {
+      try {
+        fn(now - start);
+      } catch (err) {
+        reported.push({where: 'animation frame', err});
+        console.error('uncaught in animation frame', err);
+      }
+    }
+  };
+  const flush = async () => {
+    for (let i = 0; i < 3; i += 1) {
+      await drain();
+      runFrames();
+    }
+    await drain();
+  };
+  const timers = new Map();
+  const start = Date.UTC(2026, 0, 1);
+  const SAME_INSTANT_LIMIT = 1000;
+  let now = start;
+  let nextId = 1;
+  let order = 0;
+  // The timer whose callback is running, for the HTML timer nesting level.
+  let running = null;
+  // HTML timer initialization: the nesting level is the running timer's (0
+  // outside a timer callback); past five, a timeout under 4 ms becomes 4 ms.
+  const clamped = (requested, nesting) => (nesting > 5 && requested < 4 ? 4 : requested);
+  const arm = (fn, delay, args, repeat) => {
+    if (typeof fn !== 'function') return 0;
+    const id = nextId++;
+    const requested = Math.max(0, Number(delay) || 0);
+    const nesting = running ? running.nesting : 0;
+    timers.set(id, {id, fn, args, requested, repeat, nesting: nesting + 1, order: order++,
+      due: now + clamped(requested, nesting)});
+    return id;
+  };
+  const describeTimer = timer =>
+    timer.fn.name || String(timer.fn).replace(/[ ]*[\n][ ]*/g, ' ').slice(0, 80);
+  const cancel = id => { timers.delete(id); };
+  const nextDue = limit => {
+    let best = null;
+    for (const timer of timers.values()) {
+      if (timer.due > limit) continue;
+      const earlier = timer.due < (best ? best.due : Infinity);
+      const tieFirst = best && timer.due === best.due && timer.order < best.order;
+      if (!best || earlier || tieFirst) best = timer;
+    }
+    return best;
+  };
+  const clock = {
+    get now() { return now; },
+    get elapsed() { return now - start; },
+    pending() {
+      return [...timers.values()]
+        .sort((x, y) => x.due - y.due || x.order - y.order)
+        .map(timer => ({id: timer.id, inMs: timer.due - now, repeat: timer.repeat}));
+    },
+    async advance(ms) {
+      const until = now + Math.max(0, Number(ms) || 0);
+      let sameInstant = 0;
+      await flush();
+      for (let timer = nextDue(until); timer; timer = nextDue(until)) {
+        sameInstant = timer.due > now ? 1 : sameInstant + 1;
+        if (sameInstant > SAME_INSTANT_LIMIT) {
+          throw new Error('FAKE_CLOCK: timer "' + describeTimer(timer) + '" fired ' +
+            SAME_INSTANT_LIMIT + ' times without virtual time moving: a callback keeps ' +
+            're-arming a 0 ms timer outside the nested-timer clamp');
+        }
+        now = Math.max(now, timer.due);
+        if (!timer.repeat) {
+          timers.delete(timer.id);
+        } else {
+          timer.due = now + clamped(timer.requested, timer.nesting);
+          timer.nesting += 1;
+          timer.order = order++;
+        }
+        running = timer;
+        try {
+          timer.fn(...timer.args);
+        } catch (err) {
+          reported.push({where: 'timer callback', err});
+          console.error('uncaught in timer callback', err);
+        } finally {
+          running = null;
+        }
+        await flush();
+      }
+      now = until;
+      await flush();
+    },
+  };
+  const win = globalThis.window || {};
+  win.setTimeout = globalThis.setTimeout = (fn, delay, ...args) => arm(fn, delay, args, false);
+  win.setInterval = globalThis.setInterval = (fn, delay, ...args) => arm(fn, delay, args, true);
+  win.clearTimeout = globalThis.clearTimeout = cancel;
+  win.clearInterval = globalThis.clearInterval = cancel;
+  win.requestAnimationFrame = globalThis.requestAnimationFrame = fn => {
+    const id = nextFrame++;
+    frames.set(id, fn);
+    return id;
+  };
+  win.cancelAnimationFrame = globalThis.cancelAnimationFrame = id => { frames.delete(id); };
+  Date.now = () => now;
+  try {
+    performance.now = () => now - start;
+  } catch (err) {
+    console.warn('performance.now stays on the real clock', err);
+  }
+  globalThis.clock = clock;
+  globalThis.flush = flush;
+  globalThis.pinRandom = value => { Math.random = () => value; };
+}
+"""
+
+# fetch as a queue the test answers, opt-in.  Every call is recorded in
+# ``network.requests`` ({url, method, init, signal, state}) and stays pending
+# until the test calls ``request.reply(body, {status, headers})`` (a non-string
+# body is sent as JSON) or ``request.fail(error)`` (default: a TypeError, as a
+# browser rejects on a network failure).  The request's AbortSignal is honored:
+# an abort rejects the call with the signal's reason, and a later reply to the
+# aborted request is discarded.  Responses are real ``Response`` objects.
+# ``network.pending(pattern)`` / ``seen(pattern)`` / ``take(pattern)`` find
+# requests by a path suffix (query ignored), a RegExp over the URL or a
+# predicate.  An abort after the reply errors the body, so a later
+# ``await response.json()`` rejects with the abort reason, as in a browser; a
+# body already read is unaffected.  ``await network.reply(pattern, ...)`` and
+# ``network.fail`` answer
+# the oldest pending match and then flush (FAKE_CLOCK's flush when loaded).
+FAKE_FETCH = r"""
+{
+  const realSetImmediate = globalThis.setImmediate;
+  // FAKE_CLOCK's flush also runs animation frames; without it, drain microtasks.
+  const settle = async () => {
+    if (typeof globalThis.flush === 'function') return globalThis.flush();
+    for (let i = 0; i < 3; i += 1) await new Promise(resolve => realSetImmediate(resolve));
+  };
+  const NULL_BODY = [101, 103, 204, 205, 304];
+  const requests = [];
+  const matches = (request, pattern) => {
+    if (pattern == null) return true;
+    if (typeof pattern === 'function') return !!pattern(request);
+    if (pattern instanceof RegExp) return pattern.test(request.url);
+    return request.url.split('?')[0].endsWith(pattern);
+  };
+  const describe = () =>
+    requests.map(r => r.method + ' ' + r.url + ' (' + r.state + ')').join(', ');
+  const fakeFetch = (input, init) => {
+    init = init || {};
+    const url = typeof input === 'string' ? input : String((input && input.url) || input);
+    const signal = init.signal || null;
+    const method = String(init.method || 'GET').toUpperCase();
+    const request = {url, method, init, signal, state: 'pending'};
+    requests.push(request);
+    return new Promise((resolve, reject) => {
+      request.reply = (body, {status = 200, headers = {}} = {}) => {
+        if (request.state === 'aborted') return false;
+        if (request.state !== 'pending') {
+          throw new Error('request already ' + request.state + ': ' + url);
+        }
+        request.state = 'replied';
+        const text = body == null ? null : typeof body === 'string' ? body : JSON.stringify(body);
+        const head = new Headers(headers);
+        if (text != null && typeof body !== 'string' && !head.has('content-type'))
+          head.set('content-type', 'application/json');
+        let stream = null;
+        if (text != null && !NULL_BODY.includes(status)) {
+          // Bytes are handed over only when the body is read, so an abort before
+          // that read can still error it (Fetch "abort fetch").
+          const bytes = new TextEncoder().encode(text);
+          stream = new ReadableStream({
+            start(controller) { request.bodyController = controller; },
+            pull(controller) { controller.enqueue(bytes); controller.close(); },
+          }, {highWaterMark: 0});
+        }
+        resolve(new Response(stream, {status, headers: head}));
+        return true;
+      };
+      request.fail = error => {
+        if (request.state === 'aborted') return false;
+        if (request.state !== 'pending') {
+          throw new Error('request already ' + request.state + ': ' + url);
+        }
+        request.state = 'failed';
+        reject(error || new TypeError('Failed to fetch'));
+        return true;
+      };
+      const onAbort = () => {
+        const reason =
+          signal.reason ?? new DOMException('The operation was aborted.', 'AbortError');
+        if (request.state === 'replied') {
+          // A no-op once the body was read to the end (the stream is closed).
+          if (request.bodyController) request.bodyController.error(reason);
+          return;
+        }
+        if (request.state !== 'pending') return;
+        request.state = 'aborted';
+        reject(reason);
+      };
+      if (signal) {
+        if (signal.aborted) onAbort();
+        else signal.addEventListener('abort', onAbort, {once: true});
+      }
+    });
+  };
+  globalThis.fetch = fakeFetch;
+  if (globalThis.window) globalThis.window.fetch = fakeFetch;
+  globalThis.network = {
+    requests,
+    seen: pattern => requests.filter(r => matches(r, pattern)),
+    pending: pattern => requests.filter(r => r.state === 'pending' && matches(r, pattern)),
+    take(pattern) {
+      const found = this.pending(pattern);
+      if (!found.length) {
+        throw new Error('no pending request matches ' + pattern + '; seen: ' + describe());
+      }
+      return found[0];
+    },
+    async reply(pattern, body, options) {
+      this.take(pattern).reply(body, options);
+      await settle();
+    },
+    async fail(pattern, error) {
+      this.take(pattern).fail(error);
+      await settle();
+    },
+    settle,
+  };
+}
+"""
+
+# Tab visibility, opt-in, after PANE_DOM (whose no-op document listeners it
+# replaces with recording ones that dispatch as a browser does: a listener is
+# added once per function, ``once`` is honored, a listener removed during a
+# dispatch is skipped, and a throw is collected in ``reportedErrors``).
+# ``document.hidden`` / ``visibilityState`` read the state; ``visibility.hide()``
+# / ``show()`` change it and dispatch ``visibilitychange`` synchronously, only on
+# a real change, as a browser does.  ``visibility.listenerCount(type)`` counts
+# the document listeners for a type.
+FAKE_VISIBILITY = r"""
+{
+  const reported = (globalThis.reportedErrors = globalThis.reportedErrors || []);
+  const listeners = new Map();
+  let hidden = false;
+  Object.defineProperty(document, 'hidden', {configurable: true, get: () => hidden});
+  Object.defineProperty(document, 'visibilityState', {configurable: true,
+    get: () => (hidden ? 'hidden' : 'visible')});
+  document.addEventListener = (type, fn, options) => {
+    if (!fn) return;
+    const rows = listeners.get(type) || [];
+    if (rows.some(row => row.fn === fn)) return;
+    rows.push({fn, once: !!(options && typeof options === 'object' && options.once)});
+    listeners.set(type, rows);
+  };
+  document.removeEventListener = (type, fn) => {
+    for (const row of listeners.get(type) || []) if (row.fn === fn) row.removed = true;
+    listeners.set(type, (listeners.get(type) || []).filter(row => row.fn !== fn));
+  };
+  document.dispatchEvent = event => {
+    for (const row of [...(listeners.get(event.type) || [])]) {
+      if (row.removed) continue;
+      if (row.once) document.removeEventListener(event.type, row.fn);
+      try {
+        if (typeof row.fn === 'function') row.fn.call(document, event);
+        else row.fn.handleEvent(event);
+      } catch (err) {
+        reported.push({where: 'document ' + event.type + ' listener', err});
+        console.error('uncaught in document ' + event.type + ' listener', err);
+      }
+    }
+    return true;
+  };
+  const change = next => {
+    if (hidden === next) return;
+    hidden = next;
+    document.dispatchEvent({type: 'visibilitychange', target: document, currentTarget: document,
+      bubbles: true});
+  };
+  globalThis.visibility = {
+    get hidden() { return hidden; },
+    hide() { change(true); },
+    show() { change(false); },
+    listenerCount: (type = 'visibilitychange') => (listeners.get(type) || []).length,
+  };
+}
+"""
+
 
 def has_node() -> bool:
     return shutil.which("node") is not None
@@ -389,6 +1117,31 @@ def demodulize(path: Path) -> str:
     )
     src = re.sub(r"^export\s*\{[^}]*\};\s*$", "", src, flags=re.M)
     return src
+
+
+_REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
+_SHARED_STATIC = _REPO_ROOT / "turnstone/shared_static"
+_COORDINATOR_JS = _REPO_ROOT / "turnstone/console/static/coordinator/coordinator.js"
+
+
+def coordinator_module_for_node(directory: Path) -> Path:
+    """Write coordinator.js under ``directory`` as a module node can import.
+
+    The pane imports its shared modules as ``from "/shared/..."``, a path the
+    console serves and node cannot resolve; each such import is pointed at the
+    shared directory on disk and nothing else changes.  Fails when no import
+    matched, so a changed import form cannot leave a copy that silently loads
+    without its shared modules rewritten.  Returns the written path.
+    """
+    source = _COORDINATOR_JS.read_text(encoding="utf-8")
+    pattern = 'from "/shared/'
+    count = source.count(pattern)
+    assert count > 0, f"no {pattern!r} import in {_COORDINATOR_JS}; the rewrite matched nothing"
+    module = directory / "coordinator.mjs"
+    module.write_text(
+        source.replace(pattern, 'from "' + _SHARED_STATIC.as_uri() + "/"), encoding="utf-8"
+    )
+    return module
 
 
 def slice_braced_block(source: str, anchor: int) -> str | None:
