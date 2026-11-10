@@ -1001,7 +1001,7 @@ class TestOpenWorkstream:
 
         r = client.post("/v1/api/workstreams/some-alias/open")
         assert r.status_code == 200
-        mock_mgr.open_with_outcome.assert_called_once_with("ws-resolved")
+        mock_mgr.open_with_outcome.assert_called_once_with("ws-resolved", refuse_closed=False)
         mock_mgr.create.assert_not_called()
 
     @patch("turnstone.core.memory.resolve_workstream")
@@ -1023,7 +1023,7 @@ class TestOpenWorkstream:
         assert r.status_code == 200
         mock_resolve.assert_called_once_with("my-friendly-alias")
         mock_mgr.get.assert_called_once_with("ws-canonical-id")
-        mock_mgr.open_with_outcome.assert_called_once_with("ws-canonical-id")
+        mock_mgr.open_with_outcome.assert_called_once_with("ws-canonical-id", refuse_closed=False)
 
     @patch("turnstone.core.memory.resolve_workstream")
     def test_open_post_load_callback_fires_with_request_and_ws(self, mock_resolve, _inject_storage):
@@ -2527,7 +2527,7 @@ class TestDetailInteractive:
         r = client.get("/v1/api/workstreams/ws-building")
 
         assert r.status_code == 200
-        mock_mgr.open_with_outcome.assert_called_once_with("ws-building")
+        mock_mgr.open_with_outcome.assert_called_once_with("ws-building", refuse_closed=False)
         post_load.assert_not_called()
 
     def test_a_writer_gets_the_holder_for_a_copy_whose_lease_moved(self):
@@ -2712,7 +2712,7 @@ class TestDetailInteractive:
         r = client.get(f"/v1/api/workstreams/{ws_id}")
         assert r.status_code == 200
         assert r.json()["name"] == "rehydrated"
-        mock_mgr.open_with_outcome.assert_called_once_with(ws_id)
+        mock_mgr.open_with_outcome.assert_called_once_with(ws_id, refuse_closed=False)
 
     def test_404_on_missing_ws_id(self):
         mock_mgr = MagicMock()
@@ -3015,7 +3015,7 @@ class TestTenantCheckOnReadEndpoints:
         assert body["name"] == "rehydrated-ws"
         # Lazy rehydrate path engaged — the handler called mgr.open after
         # the cold-cache tenant_check resolved through storage.
-        mock_mgr.open_with_outcome.assert_called_once_with(ws_id)
+        mock_mgr.open_with_outcome.assert_called_once_with(ws_id, refuse_closed=False)
         # Pin the offload — see the history test for the rationale.
         assert cold_check in offloaded, (
             f"tenant_check must be invoked through asyncio.to_thread; got {offloaded}"

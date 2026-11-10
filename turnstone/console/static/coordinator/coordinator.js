@@ -2972,20 +2972,26 @@ function createCoordinatorPane(root, wsId, opts) {
       return;
     }
     if (!resp.ok) {
+      // Read the body once; a non-JSON body leaves only the status to report.
+      let body = null;
+      try {
+        body = await resp.json();
+      } catch (_) {
+        body = null;
+      }
       if (resp.status === 409) {
+        // Another console holding the session's lease (on PostgreSQL also a crashed
+        // console's, until it lapses) is not history still being saved.
         const msg =
-          "Conversation history is still being saved. Try ending the session again shortly.";
+          body && body.code === "workstream_lease_held"
+            ? "This session is open on another console. End it there, or try again in a minute."
+            : "Conversation history is still being saved. Try ending the session again shortly.";
         if (typeof toast !== "undefined" && toast.error) toast.error(msg);
         else window.alert(msg);
         return;
       }
       let detail = "HTTP " + resp.status;
-      try {
-        const body = await resp.json();
-        if (body && body.error) detail += " — " + body.error;
-      } catch (_) {
-        /* non-JSON body — fall back to status code */
-      }
+      if (body && body.error) detail += " — " + body.error;
       const msg = "Could not end session: " + detail;
       if (typeof toast !== "undefined" && toast.error) toast.error(msg);
       else window.alert(msg);

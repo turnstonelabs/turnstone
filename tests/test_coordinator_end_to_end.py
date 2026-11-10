@@ -162,6 +162,7 @@ def _make_client(
                     _coord_endpoint_config,
                     audit_emit=_audit_close_coordinator,
                     supports_close_reason=False,
+                    close_unloaded_rows=True,
                 ),
                 methods=["POST"],
             ),

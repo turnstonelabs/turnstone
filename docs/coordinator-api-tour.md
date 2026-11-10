@@ -159,6 +159,14 @@ model has produced for the in-progress turn. A tab refresh mid-approval,
 mid-tool-execution, or mid-stream therefore restores the composer mode and
 partial assistant text without waiting for the response to complete.
 
+A writer's `/events` on a coordinator that is not loaded but was live when
+its console stopped resumes it first (it takes the owner lease and
+announces the coordinator to dashboards), so a stream that dials back
+after a console restart gets its session back. A closed coordinator, or a
+caller with read scope only, gets 404; a refused resume answers 409 (lease
+held elsewhere), 503 (history, settings or model unavailable) or 500 with
+a correlation id.
+
 `history_resync` is stronger than a numeric replay gap. The server closes that
 stream; fetch and render `/history` again, then open a new stream with its new
 cursor/token pair. The API and SDK expose these primitives but deliberately do
@@ -488,6 +496,13 @@ If any accepted live conversation row still requires persistence
 reconciliation, close returns `409 {"error":"workstream has unresolved
 persistence"}`. The coordinator remains loaded, its journal is retained, and
 no history is discarded; retry after storage recovers.
+
+A coordinator that is not loaded here but whose row is still live (its
+console stopped) is closed without loading it: `closed` is written under
+the owner lease, so an open pane's next redial cannot bring it back. A
+closed or missing coordinator answers 404; another console holding it
+answers `409` with `code: workstream_lease_held`; a close that could not
+be recorded answers 503, and retrying is safe.
 
 ---
 

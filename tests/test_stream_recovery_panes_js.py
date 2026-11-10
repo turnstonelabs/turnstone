@@ -33,6 +33,7 @@ from tests._js_harness_helpers import (
     node_skip,
     run_node_source,
 )
+from tests._resume_stream_contract import resumed_stream_frames
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -346,8 +347,9 @@ def test_stream_error_does_not_request_the_workstream(
     run_pane: Callable[..., None], client: str
 ) -> None:
     """A stream error never requests the workstream resource: for a writer that
-    GET rehydrates an unloaded workstream, and the stream layer must not open,
-    reopen or rehydrate one."""
+    GET reopens an unloaded workstream, closed ones included, and the stream
+    layer must not reopen a closed one. The console's coordinator /events route
+    resumes a coordinator that was live at a restart, and refuses a closed one."""
     run_pane(
         client,
         r"""
@@ -987,6 +989,86 @@ for (let i = 0; i < 600; i += 1) {
 expect(sources().length === 7, 'a refused stream redials six times then stops',
   sources().length + ' streams');
 """,
+    )
+
+
+@pytest.mark.parametrize("client", _CLIENTS)
+def test_a_stream_the_server_resumed_after_refused_dials_reloads_and_goes_live(
+    run_pane: Callable[..., None], client: str
+) -> None:
+    """The console restarts under an open pane: its redials are refused while it is down, then
+    one is answered by a resumed session, with the frames the console's coordinator events
+    route sends after a resume (tests/_resume_stream_contract.py, which the handler test holds
+    the real route to). The pane reloads its history, goes live again on the reconnect, and
+    never tells its host it is dead; the coordinator pane requests its workstream snapshot only
+    on first paint."""
+    run_pane(
+        client,
+        r"""
+pinRandom(0);
+let deadCalls = 0;
+const host = document.createElement('div');
+html.appendChild(host);
+let ctl;
+if (CLIENT === 'interactive') {
+  const {createInteractivePane} = await import(SHARED + '/interactive.js');
+  ctl = createInteractivePane(host, WS, {nodeId: 'lab', onDead: () => { deadCalls += 1; }});
+} else {
+  const {createCoordinatorPane} = await import(COORDINATOR);
+  ctl = createCoordinatorPane(host, WS, {onDead: () => { deadCalls += 1; }});
+}
+ctl.connect();
+await flush();
+if (CLIENT === 'coordinator') {
+  await network.reply(WS_PATH, {ws_id: WS, name: 'coordinator', state: 'idle'});
+}
+await network.reply('/history', {messages: [user('before the restart')], cursor: 10});
+const first = FakeEventSource.latest();
+first.open();
+first.deliver({type: 'state_change', state: 'idle'}, {id: 11});
+await flush();
+// The console stops: the stream drops, and each redial is refused while it is down.
+first.drop();
+first.fail();
+let refused = 1;
+while (refused < 5) {
+  await clock.advance(500);
+  const current = FakeEventSource.latest();
+  if (current.readyState === EventSource.CONNECTING) {
+    current.fail();
+    refused += 1;
+  }
+}
+while (FakeEventSource.latest().readyState !== EventSource.CONNECTING) await clock.advance(500);
+const resumed = FakeEventSource.latest();
+expect(stream(resumed).params.get('last_event_id') === '11', 'the redial presents its cursor',
+  stream(resumed).params.get('last_event_id'));
+resumed.open();
+for (const frame of PARAMS.frames) {
+  resumed.deliver(frame.data, frame.id === undefined ? {} : {id: frame.id});
+}
+await clock.advance(0);
+expect(network.pending('/history').length === 1, 'the envelope reloads the history');
+await network.reply('/history', {messages: [user('before the restart'),
+  user('while it was down')], cursor: 14, handoff_token: 'tok-2'});
+const reconnected = FakeEventSource.latest();
+expect(reconnected !== resumed && stream(reconnected).params.get('last_event_id') === '14',
+  'the reload reconnects at its cursor', stream(reconnected).url);
+reconnected.open();
+await flush();
+expect(textOf(host).includes('while it was down'), 'the reloaded history rendered');
+expect(host.querySelector('.ws-sb-disconnected') === null, 'the status is live again',
+  host.querySelector('.ws-sb-tokens').textContent);
+expect(!ctl.isDead() && deadCalls === 0, 'the host is never told the pane is dead',
+  String(deadCalls));
+if (CLIENT === 'coordinator') {
+  expect(network.seen(WS_PATH).length === 1, 'no workstream snapshot after the first',
+    String(network.seen(WS_PATH).length));
+}
+""",
+        params={
+            "frames": resumed_stream_frames("ws/2", lost_count=0, earliest_available_id=12),
+        },
     )
 
 

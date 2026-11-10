@@ -1658,7 +1658,11 @@ CONSOLE_ENDPOINTS: list[EndpointSpec] = [
             "accepted live conversation row still requires persistence reconciliation; "
             "the coordinator remains loaded and its history journal is retained. "
             "Returns 503 when cancellation cleanup has not yet finished; retrying "
-            "close is safe."
+            "close is safe. A coordinator that is not loaded here but whose row is "
+            "still live is closed without loading it: ``closed`` is written under the "
+            "owner lease, so an open pane's next redial cannot bring it back. A closed or "
+            "missing one answers 404, 409 ``workstream_lease_held`` while another console "
+            "holds it, and 503 when the close could not be recorded (retrying is safe)."
         ),
         response_model=StatusResponse,
         error_codes=[403, 404, 409, 500, 503],
@@ -1681,6 +1685,12 @@ CONSOLE_ENDPOINTS: list[EndpointSpec] = [
             "Pass ?tool_turn=1 to receive final accepted tool rows as typed "
             "tool_result events with accepted=true; without it, accepted tool rows "
             "use the same pre-row strong-repair projection. "
+            "A writer's subscription to a coordinator that is not loaded but was live "
+            "when its console stopped resumes it first (it takes the owner lease and "
+            "announces it to dashboards); a closed coordinator, or a caller with read "
+            "scope only, gets 404. A refused resume answers 409 (lease held elsewhere, "
+            "wrong node), 503 (history, settings or model unavailable) or 500 with a "
+            "correlation id. "
             "Pings every 5s.  "
             "Body is text/event-stream — the response schema is omitted "
             "from the catalog because OpenAPI 3.1 has no first-class SSE "
@@ -1707,7 +1717,7 @@ CONSOLE_ENDPOINTS: list[EndpointSpec] = [
                 schema_type="integer",
             ),
         ],
-        error_codes=[403, 404, 409, 503],
+        error_codes=[403, 404, 409, 500, 503],
         tags=["Coordinator"],
     ),
     EndpointSpec(

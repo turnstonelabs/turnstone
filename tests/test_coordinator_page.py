@@ -876,6 +876,11 @@ def test_coordinator_close_409_uses_plain_retry_copy():
     assert (
         "Conversation history is still being saved. Try ending the session again shortly." in close
     )
+    # Another console's lease is a 409 too, told apart by its code.
+    assert 'body.code === "workstream_lease_held"' in close
+    assert (
+        "This session is open on another console. End it there, or try again in a minute." in close
+    )
     # The stream stays up across the POST, so a refused close keeps a live pane with nothing to
     # resume (row 18).
     assert "sync." not in close, "close-session must leave the stream alone"

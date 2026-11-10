@@ -69,6 +69,7 @@ from turnstone.core.session_routes import (
     make_create_handler,
     make_dequeue_handler,
     make_detail_handler,
+    make_events_handler,
     make_export_handler,
     make_history_handler,
     make_list_handler,
@@ -139,6 +140,8 @@ _coord_endpoint_config = SessionEndpointConfig(
     list_kind=WorkstreamKind.COORDINATOR,
     # As the console wires it (#1359).
     model_wording=COORDINATOR_MODEL_WORDING,
+    # As the console wires it: a writer's stream resumes a coordinator live at restart.
+    events_resume_live=True,
 )
 
 
@@ -224,6 +227,7 @@ def _make_client(
                     _coord_endpoint_config,
                     audit_emit=_audit_close_coordinator,
                     supports_close_reason=False,
+                    close_unloaded_rows=True,
                 ),
                 methods=["POST"],
             ),
@@ -248,6 +252,11 @@ def _make_client(
             Route(
                 "/v1/api/workstreams/{ws_id}/history",
                 make_history_handler(_coord_endpoint_config),
+                methods=["GET"],
+            ),
+            Route(
+                "/v1/api/workstreams/{ws_id}/events",
+                make_events_handler(_coord_endpoint_config),
                 methods=["GET"],
             ),
             Route(
@@ -2775,13 +2784,16 @@ def test_coord_events_replay_yields_only_connected_when_no_pending():
 
 
 def test_coord_events_returns_404_on_missing_ws(storage):
-    """Cross-kind / missing ws_id surfaces as 404 with
-    ``cfg.not_found_label`` ("coordinator not found") via the lifted
-    body's ``mgr.get`` None-return contract."""
+    """A missing ws_id surfaces as 404 with ``cfg.not_found_label``
+    ("coordinator not found"), even for a writer on a mount that resumes
+    live coordinators: the tenant check refuses it before any open. The
+    body pins that the handler answered, not an unmatched route."""
     mgr = _build_mgr(storage)
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
     resp = client.get("/v1/api/workstreams/nonexistent-id/events", headers=_COORD_HEADERS)
     assert resp.status_code == 404
+    assert resp.json() == {"error": "coordinator not found"}
+    assert mgr.get("nonexistent-id") is None
 
 
 # ---------------------------------------------------------------------------
@@ -2834,7 +2846,7 @@ def test_open_rehydrates_when_not_in_memory(storage, monkeypatch):
     assert "already_loaded" not in body
     # The open takes a single positional arg now — no per-caller
     # ownership / admin plumbing.
-    mgr.open_with_outcome.assert_called_once_with("coord-rehy")
+    mgr.open_with_outcome.assert_called_once_with("coord-rehy", refuse_closed=False)
 
 
 def test_open_returns_404_when_unknown_ws_id(storage, monkeypatch):
