@@ -244,11 +244,11 @@ class RecoveryServer:
         # counting cannot substitute.
         self.history_ok = 0
         self.rewind_requests = 0
-        # Per-ws SSE connection opens (``GET …/events`` — the EventSource the
-        # pane's connectSSE builds).  A TRANSPORT-FREE heal (the #890 idle-edge
-        # staleness backstop, a quiesced REST refetch) must leave this FLAT; a
-        # reload-based backstop would bump it once per reconnect (the round-5
-        # storm).  Same lock-free single-writer int discipline as above.
+        # Per-ws SSE connection opens (``GET …/events`` — the EventSource the pane's stream layer
+        # builds: the interactive pane's sync core, the coordinator's connectSSE).  A
+        # TRANSPORT-FREE heal (the #890 idle-edge staleness backstop, a quiesced REST refetch)
+        # must leave this FLAT; a reload-based backstop would bump it once per reconnect (the
+        # round-5 storm).  Same lock-free single-writer int discipline as above.
         self.events_requests = 0
         # Global-lane SSE connection opens (``GET …/events/global`` — the
         # roster stream app.js's connectGlobalSSE builds).  The
@@ -641,9 +641,10 @@ class RecoveryServer:
         self._history_tokenless_remaining = count
 
     def delay_history(self, ms: int) -> None:
-        """Hold each ``GET …/history`` ``ms`` ms before forwarding (0
-        clears).  Opens the clear_ui-refetch quiesce window that the row
-        affordance gate (``busy || _historyStale``) must close."""
+        """Hold each ``GET …/history`` ``ms`` ms before forwarding (0 clears).  Opens the
+        clear_ui-refetch quiesce window that the row affordance gate (``busy ||
+        sync.historyStale`` in the interactive pane, ``busy || historyStale`` in the coordinator)
+        must close."""
         self._history_delay_ms = ms
 
     @property

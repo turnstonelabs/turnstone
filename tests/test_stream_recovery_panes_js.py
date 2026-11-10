@@ -153,6 +153,9 @@ const firstPaint = async (history = {messages: []}) => {
   return FakeEventSource.latest();
 };
 const user = content => ({role: 'user', content});
+// A click as a browser dispatches it: the listeners get an event they can stop.
+const press = button => button.dispatchEvent({type: 'click', bubbles: true, target: button,
+  stopPropagation() {}, preventDefault() {}});
 """
 
 # Outside the body's try block: the verdict needs both after the body threw.
@@ -418,16 +421,7 @@ expect(network.seen(WS_PATH).length === before,
     )
 
 
-_DEGRADED_COOLDOWN = {
-    "interactive": Gap(
-        "interactive does not yet keep the stream closed for the whole overflow cooldown "
-        "(its 5 s closed-stream beat reopens it)",
-        "no new stream before the cooldown elapses",
-    )
-}
-
-
-@pytest.mark.parametrize("client", _clients(_DEGRADED_COOLDOWN))
+@pytest.mark.parametrize("client", _CLIENTS)
 def test_three_overflow_closes_enter_the_degraded_cooldown(
     run_pane: Callable[..., None], client: str
 ) -> None:
@@ -455,7 +449,6 @@ expect(sources().length === 1, 'no new stream before the cooldown elapses', sour
 await clock.advance(1);
 expect(sources().length === 2, 'one stream after the cooldown', sources().length);
 """,
-        gaps=_DEGRADED_COOLDOWN,
     )
 
 
@@ -505,16 +498,7 @@ if (PARAMS.outcome === 'rendered') {
     )
 
 
-_RESYNC_LOAD_WINDOW = {
-    "interactive": Gap(
-        "interactive does not yet keep the stream down while a resync loads /history "
-        "(its 5 s closed-stream beat reopens it)",
-        "no stream opens while the resync loads",
-    )
-}
-
-
-@pytest.mark.parametrize("client", _clients(_RESYNC_LOAD_WINDOW))
+@pytest.mark.parametrize("client", _CLIENTS)
 def test_no_stream_opens_while_a_resync_loads(run_pane: Callable[..., None], client: str) -> None:
     """While a truncated resync's /history is in flight the stream stays down,
     even when a transient error shortly before armed the closed-stream check."""
@@ -534,7 +518,6 @@ expect(network.pending('/history').length === 1 && es.closeCalled, 'the resync i
 await clock.advance(10000);
 expect(sources().length === 1, 'no stream opens while the resync loads', sources().length);
 """,
-        gaps=_RESYNC_LOAD_WINDOW,
     )
 
 
@@ -609,15 +592,7 @@ expect(transcriptText().includes('before rewind'), 'the transcript before the re
     )
 
 
-_SEND_INSIDE_REFETCH = {
-    "interactive": Gap(
-        "interactive does not yet decline a refetch render while the user's send is in flight",
-        "a send inside the refetch keeps its row: the render is declined",
-    )
-}
-
-
-@pytest.mark.parametrize("client", _clients(_SEND_INSIDE_REFETCH))
+@pytest.mark.parametrize("client", _CLIENTS)
 def test_send_inside_a_seedless_refetch_keeps_its_row(
     run_pane: Callable[..., None], client: str
 ) -> None:
@@ -639,26 +614,26 @@ await network.reply('/history', {messages: [user('after rewind')]});
 expect(transcriptText().includes('my new message'),
   'a send inside the refetch keeps its row: the render is declined');
 """,
-        gaps=_SEND_INSIDE_REFETCH,
     )
 
 
 _TRIMMED_SEEDLESS = {
-    client: Gap(
-        f"{client} does not yet decline a refetch render when /history returns a cursor",
-        "a seedless render of a trimmed /history is declined",
+    "coordinator": Gap(
+        "coordinator renders a trimmed /history seedless and keeps its stream, so the trimmed "
+        "turn is never replayed from the cursor",
+        "the stream is rebuilt at the cursor /history returned",
     )
-    for client in _CLIENTS
 }
 
 
 @pytest.mark.parametrize("client", _clients(_TRIMMED_SEEDLESS))
-def test_seedless_refetch_of_a_trimmed_history_is_declined(
+def test_a_refetch_of_a_trimmed_history_renders_seeded_and_reconnects_from_its_cursor(
     run_pane: Callable[..., None], client: str
 ) -> None:
-    """/history returns a cursor when it trimmed a running turn that only a
-    seeded load can restore, so a ``clear_ui`` refetch does not render it, and
-    the transcript already on screen stays (a wipe is not a decline)."""
+    """/history returns a cursor when it trimmed a running turn it expects the caller to replay
+    from that cursor, so a ``clear_ui`` refetch of it renders as a seeded load does: the trimmed
+    history replaces the transcript and the stream is rebuilt at the cursor, whose replay
+    restores the turn."""
     run_pane(
         client,
         r"""
@@ -667,10 +642,11 @@ es.open();
 es.deliver({type: 'clear_ui'}, {id: 4});
 await flush();
 await network.reply('/history', {messages: [user('after rewind')], cursor: 3});
-expect(!transcriptText().includes('after rewind'),
-  'a seedless render of a trimmed /history is declined');
-expect(transcriptText().includes('before rewind'),
-  'the transcript stays on screen when the trimmed render is declined');
+expect(transcriptText().includes('after rewind') && !transcriptText().includes('before rewind'),
+  'the trimmed /history renders');
+const next = FakeEventSource.latest();
+expect(next !== es && stream(next).params.get('last_event_id') === '3',
+  'the stream is rebuilt at the cursor /history returned', next.url);
 """,
         gaps=_TRIMMED_SEEDLESS,
     )
@@ -747,6 +723,160 @@ await network.reply('/history', {detail: 'unavailable'}, {status: 500});
 expect(transcriptText().includes('Type a message to start'),
   'a failed first paint keeps the placeholder');
 expect(sources().length === 1, 'the stream opens after a failed first paint');
+""",
+    )
+
+
+def test_interactive_approval_cards_keep_working_after_a_failed_reload(
+    run_pane: Callable[..., None],
+) -> None:
+    """Interactive only: a reload drops the reply bubble refs and nothing else, so an
+    approval card still on screen after the reload's /history failed still resolves its cycle
+    (its click posts the decision) instead of going dead under the user's cursor."""
+    run_pane(
+        "interactive",
+        r"""
+const es = await firstPaint({messages: [user('run it')]});
+es.open();
+es.deliver({type: 'approve_request', cycle_id: 'cy1',
+  items: [{call_id: 'c1', func_name: 'bash', needs_approval: true, header: 'bash',
+    preview: 'ls'}]}, {id: 4});
+await flush();
+const approve = pane.transcript().querySelector('.conv-btn--approve');
+expect(approve, 'the approval card is on screen');
+es.deliver({type: 'history_resync'});
+await flush();
+expect(network.pending('/history').length === 1, 'the repair reloads /history');
+await network.reply('/history', {detail: 'unavailable'}, {status: 503});
+expect(approve.isConnected, 'a failed reload leaves the card on screen');
+// The fake DOM's inputs carry no value; a browser's empty feedback box reads "".
+for (const input of pane.transcript().querySelectorAll('input')) input.value = '';
+approve.click();
+await flush();
+expect(network.pending('/approve').length === 1, 'the card still posts its decision',
+  network.seen('/approve').length + ' approve requests');
+""",
+    )
+
+
+def test_interactive_server_busy_turn_is_not_a_send_in_flight(
+    run_pane: Callable[..., None],
+) -> None:
+    """Interactive only: the seedless render steps aside for the user's own send, not for any
+    busy pane.  A server turn with no reply bubble yet (busy, nothing streaming) still lets a
+    clear_ui refetch render."""
+    run_pane(
+        "interactive",
+        r"""
+const es = await firstPaint({messages: [user('before rewind')]});
+es.open();
+es.deliver({type: 'state_change', state: 'running'}, {id: 4});
+await flush();
+es.deliver({type: 'clear_ui'}, {id: 5});
+await flush();
+await network.reply('/history', {messages: [user('after rewind')]});
+expect(transcriptText().includes('after rewind') && !transcriptText().includes('before rewind'),
+  'a server-busy pane with no reply streaming renders the refetch');
+""",
+    )
+
+
+def test_interactive_dead_controller_contract(run_pane: Callable[..., None]) -> None:
+    """Interactive only: the factory surface the shell drives when the stream gives up.  The
+    controller reports ``isDead()``, fires ``onDead`` exactly once (the shell paints its
+    reconnect banner), reads "Disconnected" in a dim status bar, keeps exposing its transport
+    base, and ignores re-login and visibility: its recovery is the shell's revive, which may
+    need a different node."""
+    run_pane(
+        "interactive",
+        r"""
+pinRandom(0);
+const {createInteractivePane} = await import(SHARED + '/interactive.js');
+const deadRoot = document.createElement('div');
+html.appendChild(deadRoot);
+let deadCalls = 0;
+const deadCtl = createInteractivePane(deadRoot, WS, {nodeId: 'lab', onDead: () => {
+  deadCalls += 1;
+}});
+expect(deadCtl.base === '/node/lab', 'the controller exposes its transport base', deadCtl.base);
+deadCtl.connect();
+await flush();
+await network.reply('/history', {messages: []});
+const es = FakeEventSource.latest();
+es.open();
+es.drop();
+es.fail();
+for (let i = 0; i < 400 && !deadCtl.isDead(); i += 1) {
+  await clock.advance(500);
+  const current = FakeEventSource.latest();
+  if (current.readyState === EventSource.CONNECTING) current.fail();
+}
+expect(deadCtl.isDead(), 'refused redials leave the controller dead');
+expect(deadCalls === 1, 'onDead fires once', String(deadCalls));
+const tokens = deadRoot.querySelector('.ws-sb-tokens');
+expect(tokens.textContent === 'Disconnected', 'the status bar reads Disconnected',
+  tokens.textContent);
+expect(deadRoot.querySelector('.ws-sb-disconnected') !== null, 'the status bar stays dim');
+const count = sources().length;
+deadCtl.onLogin();
+visibility.hide();
+visibility.show();
+await clock.advance(120000);
+expect(sources().length === count && deadCalls === 1,
+  'a dead controller ignores re-login and visibility');
+expect(visibility.listenerCount() === 0, 'a dead controller holds no visibility listener');
+""",
+    )
+
+
+def test_interactive_reasoning_bubble_counts_as_a_streaming_reply(
+    run_pane: Callable[..., None],
+) -> None:
+    """Interactive only: a reasoning-only segment (no content bubble yet) is as detachable as
+    a content one, so a clear_ui refetch declines to render under it."""
+    run_pane(
+        "interactive",
+        r"""
+const es = await firstPaint({messages: [user('before rewind')]});
+es.open();
+es.deliver({type: 'reasoning', text: 'thinking it over'}, {id: 4});
+await flush();
+es.deliver({type: 'clear_ui'}, {id: 5});
+await flush();
+await network.reply('/history', {messages: [user('after rewind')]});
+expect(!transcriptText().includes('after rewind') && transcriptText().includes('thinking it over'),
+  'the render is declined under a reasoning-only reply');
+""",
+    )
+
+
+def test_interactive_events_reach_a_handle_event_installed_after_construction(
+    run_pane: Callable[..., None],
+) -> None:
+    """Interactive only: the pane hands its sync core a dispatch that goes through
+    ``handleEvent`` on every call, so a wrapper installed after construction (the browser
+    harness wraps it) sees every event."""
+    run_pane(
+        "interactive",
+        r"""
+const {createInteractivePane} = await import(SHARED + '/interactive.js');
+const ownRoot = document.createElement('div');
+html.appendChild(ownRoot);
+const ownCtl = createInteractivePane(ownRoot, WS, {nodeId: 'lab'});
+const wrapped = [];
+const handleEvent = ownCtl.pane.handleEvent.bind(ownCtl.pane);
+ownCtl.pane.handleEvent = event => {
+  wrapped.push(event.type);
+  return handleEvent(event);
+};
+ownCtl.connect();
+await flush();
+await network.reply('/history', {messages: []});
+const es = FakeEventSource.latest();
+es.open();
+es.deliver({type: 'state_change', state: 'idle'}, {id: 3});
+await flush();
+expect(wrapped.join(',') === 'state_change', 'the late wrapper saw the event', wrapped.join(','));
 """,
     )
 
@@ -868,21 +998,21 @@ expect(opened.params.get('last_event_id') === '5' && opened.params.get('history_
     )
 
 
-_CLOSED_STREAM_BACKOFF = {
-    "interactive": Gap(
-        "interactive does not yet back off before redialling a closed stream "
-        "(it redials at the 5 s check)",
-        "no redial before the check plus the first backoff step",
-    )
+_REFUSED_REDIAL = {
+    "coordinator": Gap(
+        "coordinator still waits for its 5 s closed check before backing off a refused stream",
+        "one redial after the first backoff step",
+    ),
 }
 
 
-@pytest.mark.parametrize("client", _clients(_CLOSED_STREAM_BACKOFF))
-def test_closed_stream_redials_after_the_check_and_backoff(
+@pytest.mark.parametrize("client", _clients(_REFUSED_REDIAL))
+def test_a_refused_stream_redials_after_the_first_backoff_step(
     run_pane: Callable[..., None], client: str
 ) -> None:
-    """A stream the browser gave up on (CLOSED) is redialled once the 5 s check
-    finds it closed and the first backoff step (1 s plus up to 500 ms) passes."""
+    """A stream the browser gave up on (CLOSED when its error arrives) is redialled after the
+    first backoff step alone (1 s, plus 250 ms of jitter at the pinned random): the error
+    decides, no later check."""
     run_pane(
         client,
         r"""
@@ -891,32 +1021,29 @@ const es = await firstPaint();
 es.open();
 es.drop();
 es.fail();
-await clock.advance(5999);
-expect(sources().length === 1, 'no redial before the check plus the first backoff step');
-await clock.advance(501);
-expect(sources().length === 2, 'one redial after the check and backoff', sources().length);
+await clock.advance(1249);
+expect(sources().length === 1, 'no redial inside the first backoff step');
+await clock.advance(1);
+expect(sources().length === 2, 'one redial after the first backoff step', sources().length);
 """,
-        gaps=_CLOSED_STREAM_BACKOFF,
+        gaps=_REFUSED_REDIAL,
     )
 
 
 _STRIKE_BUDGET = {
-    "interactive": Gap(
-        "interactive does not yet allow six strikes before giving up on a refused stream "
-        "(it stops after three)",
-        "a refused stream redials five times then stops",
-    ),
     "coordinator": Gap(
         "coordinator does not yet stop redialling a refused stream (it never gives up)",
-        "a refused stream redials five times then stops",
+        "a refused stream redials six times then stops",
     ),
 }
 
 
 @pytest.mark.parametrize("client", _clients(_STRIKE_BUDGET))
-def test_closed_stream_stops_after_six_strikes(run_pane: Callable[..., None], client: str) -> None:
-    """A stream refused on every redial stops after the sixth consecutive closed
-    check: the first stream plus five redials, about a minute, then nothing."""
+def test_a_refused_stream_stops_at_the_seventh_refusal(
+    run_pane: Callable[..., None], client: str
+) -> None:
+    """A stream refused on every redial stops at the seventh consecutive refusal: the first
+    stream plus six redials, about a minute, then nothing."""
     run_pane(
         client,
         r"""
@@ -925,12 +1052,12 @@ const es = await firstPaint();
 es.open();
 es.drop();
 es.fail();
-for (let i = 0; i < 40; i += 1) {
-  await clock.advance(15000);
+for (let i = 0; i < 600; i += 1) {
+  await clock.advance(500);
   const latest = FakeEventSource.latest();
   if (latest.readyState === EventSource.CONNECTING) latest.fail();
 }
-expect(sources().length === 6, 'a refused stream redials five times then stops',
+expect(sources().length === 7, 'a refused stream redials six times then stops',
   sources().length + ' streams');
 """,
         gaps=_STRIKE_BUDGET,
@@ -938,10 +1065,6 @@ expect(sources().length === 6, 'a refused stream redials five times then stops',
 
 
 _RELOGIN_HEALTHY = {
-    "interactive": Gap(
-        "interactive does not yet leave a healthy stream alone on re-login (it reloads /history)",
-        "a re-login leaves a healthy stream alone",
-    ),
     "coordinator": Gap(
         "coordinator does not yet leave a healthy stream alone on re-login (it redials)",
         "a re-login leaves a healthy stream alone",
@@ -966,4 +1089,193 @@ expect(!es.closeCalled && sources().length === 1, 'a re-login leaves a healthy s
 expect(network.seen('/history').length === historyLoads, 'a re-login does not reload /history');
 """,
         gaps=_RELOGIN_HEALTHY,
+    )
+
+
+def test_interactive_dead_mid_reasoning_removes_the_reasoning_indicator(
+    run_pane: Callable[..., None],
+) -> None:
+    """Interactive only: dead ends the reasoning clock with the turn's other timers, so a
+    reasoning indicator showing when the stream gives up is removed, not left ticking."""
+    run_pane(
+        "interactive",
+        r"""
+pinRandom(0);
+const es = await firstPaint({messages: [user('think about it')]});
+es.open();
+es.deliver({type: 'state_change', state: 'thinking'}, {id: 4});
+es.deliver({type: 'reasoning', text: 'thinking it over'}, {id: 5});
+await flush();
+expect(root.querySelector('.reasoning-activity-status') !== null,
+  'the reasoning indicator shows while the model reasons');
+es.drop();
+es.fail();
+const tokens = root.querySelector('.ws-sb-tokens');
+for (let i = 0; i < 400 && tokens.textContent !== 'Disconnected'; i += 1) {
+  await clock.advance(500);
+  const current = FakeEventSource.latest();
+  if (current.readyState === EventSource.CONNECTING) current.fail();
+}
+expect(tokens.textContent === 'Disconnected', 'the stream is dead', tokens.textContent);
+expect(root.querySelector('.reasoning-activity-status') === null,
+  'dead removes the reasoning indicator');
+""",
+    )
+
+
+_RETRY_WITH_A_CURSOR = {
+    "coordinator": Gap(
+        "coordinator declines a seedless render while a tool call is live and never promotes a "
+        "cursor-bearing refetch, so a Retry whose batch starts first keeps the replaced reply",
+        "the replaced reply is gone",
+    ),
+}
+
+
+@pytest.mark.parametrize("client", _clients(_RETRY_WITH_A_CURSOR))
+def test_retry_with_a_tool_batch_starting_before_history_answers(
+    run_pane: Callable[..., None], client: str
+) -> None:
+    """An ordinary Retry: the click posts /retry, the server truncates, publishes clear_ui and
+    re-dispatches the turn, whose tool batch starts before /history answers, trimmed, with a
+    cursor.  The refetch is promoted to a seeded render: the trimmed history renders (the
+    replaced reply goes), the stream is rebuilt presenting the cursor, and its replay shows the
+    regenerated batch exactly once."""
+    run_pane(
+        client,
+        r"""
+const es = await firstPaint({messages: [user('list the files'),
+  {role: 'assistant', content: 'the replaced reply'}]});
+es.open();
+es.deliver({type: 'state_change', state: 'idle'}, {id: 4});
+await flush();
+const retry = pane.transcript().querySelector('.msg-retry-btn');
+expect(retry, 'the last reply offers Retry');
+press(retry);
+await flush();
+expect(network.pending('/retry').length === 1, 'Retry posts /retry');
+await network.reply('/retry', {status: 'ok'});
+es.deliver({type: 'clear_ui'}, {id: 5});
+await flush();
+const batch = [[6, {type: 'state_change', state: 'running'}],
+  [7, {type: 'tool_info', items: [{call_id: 'c1', func_name: 'bash', header: 'bash',
+    preview: 'ls -la'}]}]];
+for (const [id, event] of batch) es.deliver(event, {id});
+await flush();
+await network.reply('/history', {messages: [user('list the files')], cursor: 5});
+expect(!transcriptText().includes('the replaced reply'), 'the replaced reply is gone');
+const next = FakeEventSource.latest();
+expect(next !== es && stream(next).params.get('last_event_id') === '5',
+  'the stream is rebuilt presenting the cursor', next.url);
+next.open();
+for (const [id, event] of batch) next.deliver(event, {id});
+await flush();
+const count = (transcriptText().match(/ls -la/g) || []).length;
+expect(count === 1, 'the regenerated batch shows once', String(count));
+""",
+        gaps=_RETRY_WITH_A_CURSOR,
+    )
+
+
+@pytest.mark.parametrize("client", _CLIENTS)
+def test_rewind_end_to_end(run_pane: Callable[..., None], client: str) -> None:
+    """Rewind from a user message: the click posts /rewind with the turn count, the server's
+    clear_ui refetches /history, and the rewound transcript replaces the old one."""
+    run_pane(
+        client,
+        r"""
+const es = await firstPaint({messages: [user('first question'),
+  {role: 'assistant', content: 'first answer'}, user('second question'),
+  {role: 'assistant', content: 'second answer'}]});
+es.open();
+es.deliver({type: 'state_change', state: 'idle'}, {id: 4});
+await flush();
+const second = pane.transcript().querySelectorAll('.msg.user')[1];
+const rewind = second.querySelectorAll('.msg-action-btn')
+  .find(button => button.querySelector('.icon-rewind'));
+expect(rewind, 'the user message offers Rewind');
+press(rewind);
+await flush();
+const post = network.pending('/rewind')[0];
+expect(post && JSON.parse(post.init.body).turns === 1, 'Rewind posts the turn count',
+  post && post.init.body);
+await network.reply('/rewind', {status: 'ok'});
+es.deliver({type: 'clear_ui'}, {id: 5});
+await flush();
+await network.reply('/history', {messages: [user('first question'),
+  {role: 'assistant', content: 'first answer'}]});
+expect(transcriptText().includes('first answer') && !transcriptText().includes('second'),
+  'the rewound transcript renders');
+""",
+    )
+
+
+@pytest.mark.parametrize("client", _CLIENTS)
+def test_edit_and_resend_end_to_end(run_pane: Callable[..., None], client: str) -> None:
+    """Edit and resend: the edit posts /rewind, the server's clear_ui refetches /history, and
+    once that refetch settles the edited text is sent (one /send carrying it) and shows on the
+    rewound transcript."""
+    run_pane(
+        client,
+        r"""
+FakeElement.prototype.setSelectionRange = () => {};
+const es = await firstPaint({messages: [user('original question'),
+  {role: 'assistant', content: 'original answer'}]});
+es.open();
+es.deliver({type: 'state_change', state: 'idle'}, {id: 4});
+await flush();
+const message = pane.transcript().querySelectorAll('.msg.user')[0];
+const edit = message.querySelectorAll('.msg-action-btn')
+  .find(button => button.querySelector('.icon-edit'));
+expect(edit, 'the user message offers Edit');
+press(edit);
+await flush();
+message.querySelector('.msg-edit-textarea').value = 'edited question';
+press(message.querySelector('.msg-edit-btn-send'));
+await flush();
+const post = network.pending('/rewind')[0];
+expect(post && JSON.parse(post.init.body).turns === 1, 'the edit posts /rewind',
+  post && post.init.body);
+await network.reply('/rewind', {status: 'ok'});
+es.deliver({type: 'clear_ui'}, {id: 5});
+await flush();
+expect(network.seen('/send').length === 0, 'nothing is sent before the refetch settles');
+await network.reply('/history', {messages: []});
+const sends = network.seen('/send');
+expect(sends.length === 1 && JSON.parse(sends[0].init.body).message === 'edited question',
+  'the edited text is sent once the refetch settles', sends.map(r => r.init.body).join(' | '));
+expect(transcriptText().includes('edited question') && !transcriptText().includes('original'),
+  'the edit shows on the rewound transcript');
+""",
+    )
+
+
+@pytest.mark.parametrize("client", _CLIENTS)
+def test_nothing_from_the_earlier_stream_paints_after_teardown(
+    run_pane: Callable[..., None], client: str
+) -> None:
+    """The shell closes a pane client-side when a different user signs in; after that teardown
+    nothing the earlier stream still carries paints: not a reply, not a clear_ui, and not the
+    /history it had in flight."""
+    run_pane(
+        client,
+        r"""
+const es = await firstPaint({messages: [user('the earlier question')]});
+es.open();
+es.deliver({type: 'clear_ui'}, {id: 4});
+await flush();
+const transcript = pane.transcript();
+const before = textOf(transcript);
+await pane.destroy();
+es.deliver({type: 'content', text: 'a late reply'}, {id: 5});
+es.deliver({type: 'clear_ui'}, {id: 6});
+await flush();
+for (const request of network.pending('/history')) {
+  request.reply({messages: [user('a late history')]});
+}
+await flush();
+await clock.advance(60000);
+expect(textOf(transcript) === before, 'nothing paints after teardown', textOf(transcript));
+expect(sources().length === 1, 'no stream reopens');
+""",
     )

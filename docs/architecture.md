@@ -811,8 +811,10 @@ non-idle background workstreams above the input prompt.
   Split via right-click context menu, pane header buttons, or keyboard
   (`Ctrl+\`, `Ctrl+Shift+\`). Max 6 panes; no duplicate workstreams across panes.
   Layout persisted to `localStorage`.
-- **Per-pane SSE**: `Pane.connectSSE(wsId)` opens
-  `/v1/api/workstreams/{ws_id}/events` for each pane's event stream independently.
+- **Per-pane SSE**: each interactive pane's sync core (`WorkstreamSync` in
+  `shared_static/workstream_sync.js`) owns that pane's `/v1/api/workstreams/{ws_id}/events`
+  stream and its `/history` loads: first paint, reconnects at the last event id, overflow and
+  truncation recovery, and closing on a hidden tab. The pane renders the events it dispatches.
 - **Global SSE**: `connectGlobalSSE()` opens `/v1/api/events/global` which
   receives `ws_state` broadcasts from all workstreams, used to update tab
   indicators and pane headers without switching.

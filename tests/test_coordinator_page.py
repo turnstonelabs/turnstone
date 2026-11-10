@@ -837,7 +837,7 @@ def test_coordinator_history_stale_latch_contract():
     assert "!refetchesInFlight" in backstop_arm, (
         "the backstop must yield to an in-flight refetch — without the "
         "guard it stomps a same-snapshot fetch with a double render "
-        "(mirrors interactive's !_replayQueue pin)."
+        "(mirrors the sync core's queue guard on its backstop and stale retry)."
     )
     assert "!currentAssistantEl" in backstop_arm and "!currentReasoningEl" in backstop_arm, (
         "the backstop's ref guards are LOAD-BEARING (coord's "
@@ -877,7 +877,7 @@ def test_coordinator_history_stale_latch_contract():
     retry_fire = _strip_comments(body[retry_arm : body.index("STALE_RETRY_JITTER_MS", retry_arm)])
     assert "!refetchesInFlight" in retry_fire, (
         "the retry's fire guard must yield to an in-flight refetch "
-        "(mirrors interactive's !_replayQueue pin)."
+        "(mirrors the sync core's queue guard on its backstop and stale retry)."
     )
     assert "visHandler" in retry_fire, (
         "the retry's fire guard must carry the teardown sentinel for the "

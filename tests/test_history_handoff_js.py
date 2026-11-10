@@ -19,6 +19,7 @@ from tests._js_harness_helpers import strip_js_comments as _strip_comments
 
 _ROOT = Path(__file__).resolve().parent.parent
 _INTERACTIVE = _ROOT / "turnstone/shared_static/interactive.js"
+_SYNC = _ROOT / "turnstone/shared_static/workstream_sync.js"
 _COORDINATOR = _ROOT / "turnstone/console/static/coordinator/coordinator.js"
 _SHARED_HANDOFF = _ROOT / "turnstone/shared_static/history_handoff.js"
 _QUEUE = _ROOT / "turnstone/shared_static/composer_queue.js"
@@ -142,156 +143,6 @@ currentAssistantEl = pane.currentAssistantEl = new FakeElement("div");
 receive({ type: "state_change", state: "thinking" });
 if (status()) throw new Error("answer streaming acquired a reasoning indicator");
 reasoningActivity.finish();
-"""
-    _run_module(tmp_path, script)
-
-
-def test_interactive_stale_backstop_waits_for_replay_tail_runtime(
-    tmp_path: Path,
-) -> None:
-    """A replay prelude idle must not split its canonical backlog around history."""
-
-    source = _INTERACTIVE.read_text(encoding="utf-8")
-    begin_replay = _as_function(source, "  _beginReplayQuiesce(token) {")
-    end_replay = _as_function(source, "  _endReplayQuiesce(token) {")
-    defer_backstop = _as_function(source, "  _deferStaleHistoryBackstop() {")
-    handle_event = _as_function(source, "  handleEvent(evt) {")
-
-    # These are the race owners that can change after a synthetic replay_ok
-    # idle queues the microtask but before the canonical backlog finishes.
-    for guard in (
-        "queueMicrotask(() => {",
-        "this.wsId !== staleWs",
-        "staleToken !== this._historyLoadToken",
-        "!this._historyStale",
-        "this._replayQueue",
-        "this.busy",
-        "this.currentAssistantEl",
-        "this.currentReasoningEl",
-        "this._pendingTruncatedResync",
-        "this._truncatedFromCursor != null",
-        "this._resyncTimer != null",
-        "!this.el",
-        "!this.el.isConnected",
-    ):
-        assert guard in defer_backstop
-
-    script = """
-function resetCompactionHolder() {}
-function streamingRender(body, text) { body.textContent = text; }
-function streamingRenderFinalize(body, text) { body.textContent = text; }
-"""
-    script += "\n" + begin_replay
-    script += "\n" + end_replay
-    script += "\n" + defer_backstop
-    script += "\n" + handle_event
-    script += r"""
-
-const sentinel = "DUPE-runtime";
-let backstops = 0;
-let releaseHeal = null;
-const pane = {
-  wsId: "ws-1",
-  _historyLoadToken: 7,
-  _historyStale: true,
-  _replayQueue: null,
-  _staleBackstopMicrotaskPending: false,
-  _pendingTruncatedResync: false,
-  _truncatedFromCursor: null,
-  _resyncTimer: null,
-  busy: false,
-  currentAssistantEl: null,
-  currentAssistantBodyEl: null,
-  currentReasoningEl: null,
-  contentBuffer: "",
-  _cancelTimeout: null,
-  _forceTimeout: null,
-  _compaction: {},
-  _agentContexts: new Map(),
-  _agentCompactions: new Map(),
-  _streamHealth: { renderThrows: 0 },
-  _actingUserId: null,
-  pendingApproval: false,
-  el: { isConnected: true },
-  inputEl: { focus() {} },
-  _host: { isFocused() { return false; } },
-  assistantRows: [],
-  userRows: [],
-  setBusy(value) { this.busy = value; },
-  _attachRetryToLastAssistant() {},
-  _acceptUserTurn(evt) { this.userRows.push(evt.content); },
-  _reasoningActivity: { finish() {}, hideWaiting() {}, attach() {} },
-  removeEmptyState() {},
-  scrollToBottom() {},
-  _newAssistantBubble() {
-    const body = { textContent: "" };
-    this.currentAssistantBodyEl = body;
-    this.currentAssistantEl = { body };
-    this.assistantRows.push(body);
-  },
-  replayHistory() {
-    this.assistantRows = [{ textContent: sentinel }];
-    this._historyStale = false;
-  },
-  _refetchHistory(_wsId, token) {
-    backstops += 1;
-    return new Promise((resolve) => {
-      releaseHeal = () => {
-        this.replayHistory();
-        this._endReplayQuiesce(token);
-        resolve();
-      };
-    });
-  },
-  _beginReplayQuiesce: _beginReplayQuiesce,
-  _endReplayQuiesce: _endReplayQuiesce,
-  _deferStaleHistoryBackstop: _deferStaleHistoryBackstop,
-  handleEvent: handleEvent,
-};
-
-// This is the production replay_ok ordering: its synthetic current-state idle
-// precedes the canonical ring slice for the turn that landed during /history.
-pane._replayQueue = {
-  token: 7,
-  events: [
-    { type: "state_change", state: "idle" },
-    { type: "user_turn", content: "gap" },
-    { type: "content", text: sentinel },
-    { type: "stream_end" },
-    { type: "state_change", state: "idle" },
-  ],
-};
-pane._endReplayQuiesce(7);
-
-if (backstops !== 0)
-  throw new Error("synthetic idle refetched before the canonical backlog tail");
-if (pane._replayQueue !== null)
-  throw new Error("canonical backlog was diverted into a replacement queue");
-if (pane.userRows.join("|") !== "gap")
-  throw new Error("canonical user turn was not delivered in FIFO order");
-if (
-  pane.assistantRows.length !== 1 ||
-  pane.assistantRows[0].textContent !== sentinel
-)
-  throw new Error("canonical content did not paint exactly once before heal");
-
-await Promise.resolve();
-if (backstops !== 1)
-  throw new Error("multiple idle edges did not collapse to one stale backstop");
-if (!pane._replayQueue || pane._replayQueue.events.length !== 0)
-  throw new Error("stale backstop did not quiesce its delayed history repaint");
-if (typeof releaseHeal !== "function")
-  throw new Error("delayed history repaint was not captured");
-
-releaseHeal();
-await Promise.resolve();
-if (pane._replayQueue !== null)
-  throw new Error("successful stale heal left replay quiesced");
-if (
-  pane.assistantRows.length !== 1 ||
-  pane.assistantRows[0].textContent !== sentinel
-)
-  throw new Error("history repaint plus replay backlog duplicated assistant content");
 """
     _run_module(tmp_path, script)
 
@@ -1222,6 +1073,15 @@ if (host.painted.length !== 2)
     )
 
 
+# What a live row arm must never reach for: the stream layer's reload and redial
+# entry points, in each pane's vocabulary (the interactive pane's stream layer is
+# its sync core; the coordinator still holds its own).
+_STREAM_ENTRY_POINTS = {
+    _INTERACTIVE: ("this.sync.", "authFetch(", "fetch("),
+    _COORDINATOR: ("refetchHistory", "connectSSE"),
+}
+
+
 @pytest.mark.parametrize(
     ("path", "accept_call", "accept_def", "render_call", "set_name", "next_case"),
     [
@@ -1231,7 +1091,7 @@ if (host.painted.length !== 2)
             "  _acceptUserTurn(evt) {",
             "this.addUserMessage(",
             "this._renderedUserEventIds",
-            'case "stream_overflow"',
+            None,
         ),
         (
             _COORDINATOR,
@@ -1250,7 +1110,7 @@ def test_user_turn_projects_exactly_once_without_rest_or_stream_reopen(
     accept_def: str,
     render_call: str,
     set_name: str,
-    next_case: str,
+    next_case: str | None,
 ) -> None:
     """An upgraded pane renders the live row once without refetch/redial."""
 
@@ -1259,8 +1119,8 @@ def test_user_turn_projects_exactly_once_without_rest_or_stream_reopen(
     case_end = body.index('case "system_turn"', case_start)
     case = _strip_comments(body[case_start:case_end])
     assert accept_call in case
-    assert "refetchHistory" not in case
-    assert "connectSSE" not in case
+    for forbidden in _STREAM_ENTRY_POINTS[path]:
+        assert forbidden not in case, f"the user_turn arm reaches for {forbidden!r}"
 
     accept_start = body.index(accept_def)
     accept_end = body.index("\n  }", accept_start) + 4
@@ -1273,8 +1133,8 @@ def test_user_turn_projects_exactly_once_without_rest_or_stream_reopen(
     assert "acceptUserTurnEvent(" in accept
     assert f"renderedEventIds: {set_name}" in accept
     assert render_call in accept
-    assert "refetchHistory" not in accept
-    assert "connectSSE" not in accept
+    for forbidden in _STREAM_ENTRY_POINTS[path]:
+        assert forbidden not in accept, f"the user_turn reducer reaches for {forbidden!r}"
 
     shared = _strip_comments(_QUEUE.read_text(encoding="utf-8"))
     reducer_start = shared.index("export function acceptUserTurnEvent(evt, host) {")
@@ -1287,10 +1147,20 @@ def test_user_turn_projects_exactly_once_without_rest_or_stream_reopen(
     # other paint, and it sits inside the same record-after-paint window.
     assert reducer.index("host.renderNudgeMarker()") < record
 
-    truncated_start = body.index('case "replay_truncated"')
-    truncated_end = body.index(next_case, truncated_start)
-    truncated = body[truncated_start:truncated_end]
-    assert "projection_unsupported" not in truncated
+    # A projection_unsupported marker must not steer the replay_truncated decision.  The
+    # coordinator still handles replay_truncated in its own switch; the interactive pane's sync
+    # core routes it and decides in #decideTruncatedResync (the anchors keep the pin from passing
+    # vacuously after a rename).
+    if next_case is not None:
+        truncated_start = body.index('case "replay_truncated"')
+        truncated_end = body.index(next_case, truncated_start)
+        truncated = body[truncated_start:truncated_end]
+        assert "projection_unsupported" not in truncated
+    else:
+        sync = _strip_comments(_SYNC.read_text(encoding="utf-8"))
+        assert 'data.type === "replay_truncated"' in sync
+        assert "#decideTruncatedResync() {" in sync
+        assert "projection_unsupported" not in sync
 
 
 @pytest.mark.parametrize(
@@ -1324,20 +1194,23 @@ def test_accepted_tool_turn_upserts_once_without_rest_or_stream_reopen(
     render = case.index(append_call)
     record = case.index("recordAcceptedToolEvent(")
     assert seen < render < record
-    for forbidden in ("refetchHistory", "connectSSE", "EventSource"):
-        assert forbidden not in case
+    for forbidden in (*_STREAM_ENTRY_POINTS[path], "EventSource"):
+        assert forbidden not in case, f"the tool_result arm reaches for {forbidden!r}"
 
 
 def test_tool_turn_capability_is_browser_only_and_url_sticky() -> None:
-    """Every browser redial opts in; SDK/channel consumers stay legacy-safe."""
+    """Every browser redial opts in; SDK/channel consumers stay legacy-safe.
 
-    for path in (_INTERACTIVE, _COORDINATOR):
-        body = _strip_comments(path.read_text(encoding="utf-8"))
-        connect_start = body.index("connectSSE(")
-        source_start = body.index("new EventSource", connect_start)
-        connect = body[connect_start:source_start]
-        assert '"user_turn=1"' in connect
-        assert '"&tool_turn=1"' in connect
+    The interactive pane's stream URL is the sync core's ``buildEventsUrl``,
+    executed in test_build_events_url_orders_cursor_capabilities_and_token
+    (tests/test_workstream_sync_js.py); the coordinator still builds its own."""
+
+    body = _strip_comments(_COORDINATOR.read_text(encoding="utf-8"))
+    connect_start = body.index("connectSSE(")
+    source_start = body.index("new EventSource", connect_start)
+    connect = body[connect_start:source_start]
+    assert '"user_turn=1"' in connect
+    assert '"&tool_turn=1"' in connect
 
     for path in (_PY_SDK, _PY_CHANNEL, _TS_SDK):
         assert "tool_turn" not in _strip_comments(path.read_text(encoding="utf-8"))
@@ -1366,17 +1239,19 @@ def test_tool_turn_history_seed_and_reused_id_contracts_are_pinned() -> None:
 
 @pytest.mark.parametrize(
     ("path", "refetch_call"),
-    [
-        (_INTERACTIVE, "this._refetchHistory(this.wsId, token)"),
-        (_COORDINATOR, "refetchHistory()"),
-    ],
-    ids=["pre-projection-interactive", "pre-projection-coordinator"],
+    [(_COORDINATOR, "refetchHistory()")],
+    ids=["pre-projection-coordinator"],
 )
 def test_tokenless_bootstrap_uses_pre_projection_in_place_clear_ui_contract(
     path: Path,
     refetch_call: str,
 ) -> None:
-    """The old clear_ui reducer repairs one open listener and cannot loop."""
+    """The old clear_ui reducer repairs one open listener and cannot loop.
+
+    The interactive pane's clear_ui is the sync core's seedless refetch, which
+    never closes or opens a source (executed in
+    test_failed_clear_ui_refetch_keeps_the_transcript and
+    test_a_seedless_render_proceeds_when_every_term_holds_and_keeps_the_cursor)."""
 
     body = path.read_text(encoding="utf-8")
     start = body.index('case "clear_ui"')
@@ -1393,9 +1268,21 @@ def test_tokenless_bootstrap_uses_pre_projection_in_place_clear_ui_contract(
         assert forbidden not in clear_ui
 
 
-@pytest.mark.parametrize("path", [_INTERACTIVE, _COORDINATOR], ids=["interactive", "coordinator"])
-def test_history_handoff_manual_state_is_fail_closed(path: Path) -> None:
-    """Budget exhaustion exposes manual actions without constructing EventSource."""
+@pytest.mark.parametrize(
+    ("path", "connect_anchor", "repairing_check"),
+    [
+        (_SYNC, "  #connect() {", "isRepairing(this.#wsId)"),
+        (_COORDINATOR, "connectSSE(", "isRepairing(wsId)"),
+    ],
+    ids=["sync-core", "coordinator"],
+)
+def test_history_handoff_manual_state_is_fail_closed(
+    path: Path, connect_anchor: str, repairing_check: str
+) -> None:
+    """Budget exhaustion exposes manual actions without constructing EventSource.
+
+    The interactive pane's repair wiring is the sync core's (the pane holds no
+    repair state at all: test_the_pane_holds_no_stream_or_history_transport)."""
 
     body = path.read_text(encoding="utf-8")
     # The attempt budget, the backoff, and the parked prompt live once in the
@@ -1409,7 +1296,11 @@ def test_history_handoff_manual_state_is_fail_closed(path: Path) -> None:
         "nextHistoryHandoffDelay(",
         "buildHistoryHandoffPrompt(",
     ):
-        assert reimplemented not in body, f"{reimplemented} must stay shared"
+        for holder in (path, _INTERACTIVE):
+            holder_body = holder.read_text(encoding="utf-8")
+            assert reimplemented not in holder_body, (
+                f"{holder.name}: {reimplemented} must stay shared"
+            )
     shared_body = _SHARED_HANDOFF.read_text(encoding="utf-8")
     assert "historyHandoffAttemptAllowed(" in shared_body
     assert "HISTORY_HANDOFF_MAX_ATTEMPTS" in shared_body
@@ -1422,10 +1313,10 @@ def test_history_handoff_manual_state_is_fail_closed(path: Path) -> None:
     assert '"Retry now"' in shared_body
     assert '"Reload page"' in shared_body
 
-    connect_start = body.index("connectSSE(")
+    connect_start = body.index(connect_anchor)
     source_start = body.index("new EventSource", connect_start)
     connect_prefix = body[connect_start:source_start]
-    assert "isRepairing(wsId)" in connect_prefix
+    assert repairing_check in connect_prefix
     assert "schedule();" in connect_prefix
     assert "return;" in connect_prefix
 
@@ -1444,15 +1335,16 @@ def test_repair_mode_downgrades_completed_tokenless_render_to_bootstrap() -> Non
     over; the previous per-pane character-window checks re-asserted the same
     branch twice and could not see the branch ORDER at all.
     """
-    for path in (_INTERACTIVE, _COORDINATOR):
+    for path, settle_call, has_token in (
+        (_SYNC, "this.#repair.settle({", "hasToken: this.#handoffToken != null"),
+        (_COORDINATOR, "historyRepair.settle({", "hasToken: historyHandoffToken != null"),
+    ):
         body = path.read_text(encoding="utf-8")
         assert 'return "rendered";' in body
-        assert "historyRepair.settle({" in body
-        # The proof token stays pane-owned; the pane reports only whether the
-        # same response armed one.
-        assert "hasToken: this._historyHandoffToken != null" in body or (
-            "hasToken: historyHandoffToken != null" in body
-        )
+        assert settle_call in body
+        # The proof token stays with its holder (the sync core, or the
+        # coordinator pane); it reports only whether the same response armed one.
+        assert has_token in body
         assert 'outcome === "rendered"' not in body, "the verdict must stay shared"
 
     shared = _strip_comments(_SHARED_HANDOFF.read_text(encoding="utf-8"))

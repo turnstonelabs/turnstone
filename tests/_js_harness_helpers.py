@@ -1014,8 +1014,10 @@ FAKE_FETCH = r"""
 
 # Tab visibility, opt-in, after PANE_DOM (whose no-op document listeners it
 # replaces with recording ones that dispatch as a browser does: a listener is
-# added once per function, ``once`` is honored, a listener removed during a
-# dispatch is skipped, and a throw is collected in ``reportedErrors``).
+# added once per function, ``once`` is honored, an AbortSignal passed as
+# ``signal`` removes the listener when it aborts (an already-aborted one adds
+# nothing), a listener removed during a dispatch is skipped, and a throw is
+# collected in ``reportedErrors``).
 # ``document.hidden`` / ``visibilityState`` read the state; ``visibility.hide()``
 # / ``show()`` change it and dispatch ``visibilitychange`` synchronously, only on
 # a real change, as a browser does.  ``visibility.listenerCount(type)`` counts
@@ -1030,10 +1032,15 @@ FAKE_VISIBILITY = r"""
     get: () => (hidden ? 'hidden' : 'visible')});
   document.addEventListener = (type, fn, options) => {
     if (!fn) return;
+    const signal = options && typeof options === 'object' ? options.signal : null;
+    if (signal && signal.aborted) return;
     const rows = listeners.get(type) || [];
     if (rows.some(row => row.fn === fn)) return;
     rows.push({fn, once: !!(options && typeof options === 'object' && options.once)});
     listeners.set(type, rows);
+    if (signal) {
+      signal.addEventListener('abort', () => document.removeEventListener(type, fn), {once: true});
+    }
   };
   document.removeEventListener = (type, fn) => {
     for (const row of listeners.get(type) || []) if (row.fn === fn) row.removed = true;

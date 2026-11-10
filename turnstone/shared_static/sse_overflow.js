@@ -13,12 +13,11 @@
 // gap, or falls to the replay_truncated → /history floor once the gap
 // outgrows the ring.
 //
-// The two surfaces keep their OWN transport/DOM glue (interactive.js is a
-// class whose methods hang off `this` and route through disconnectSSE;
-// coordinator.js is a closure with an inline stream close) but share these two
-// pure helpers + the constants, so the trip threshold and the escalation
-// ladder — the review-hardened, drift-prone part — have a single source of
-// truth instead of two copies that silently diverge.
+// The two consumers keep their OWN transport glue (the interactive pane's sync core in
+// workstream_sync.js, and coordinator.js, a closure with an inline stream close) but share these
+// two pure helpers + the constants, so the trip threshold and the escalation ladder — the
+// review-hardened, drift-prone part — have a single source of truth instead of two copies that
+// silently diverge.
 export const OVERFLOW_TRIP_COUNT = 3;
 export const OVERFLOW_TRIP_WINDOW_MS = 60000;
 export const DEGRADED_COOLDOWN_BASE_MS = 15000;
