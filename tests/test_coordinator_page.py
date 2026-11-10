@@ -425,7 +425,7 @@ def test_coord_dedups_system_turn_against_history_by_event_id():
         "the coord history loop (and live handler) must record system-turn ids."
     )
     assert "renderedSystemEventIds.clear(" in body, (
-        "refetchHistory must reset the dedup set so a re-render doesn't "
+        "renderHistory must reset the dedup set so a re-render doesn't "
         "false-skip after clear_ui / replay_truncated."
     )
 
@@ -463,7 +463,7 @@ def test_coord_dedups_system_turn_against_history_by_event_id():
     # the last branch) — so adding comments/fields inside the branch can't
     # false-fail a pin that only cares about the wiring.
     assert 'role === "system"' in body
-    sys_replay = body.index('role === "system"', body.index("refetchHistory"))
+    sys_replay = body.index('role === "system"', body.index("function renderHistory("))
     next_role = re.search(r"role\s*===", body[sys_replay + 1 :])
     replay_end = sys_replay + 1 + next_role.start() if next_role else sys_replay + 1500
     replay_window = body[sys_replay:replay_end]
@@ -702,9 +702,15 @@ def test_coordinator_refetch_failure_preserves_the_pane():
     # bare ValueError every time an at-site comment grows.
     fn = body[start : body.index("\n  function ", start + 1)]
     guard = fn.index("if (!hist) return;")
-    wipe = fn.index("messagesEl.replaceChildren();")
-    resets = fn.index("toolRows.clear();")
-    assert guard < wipe and guard < resets, (
+    # The wipe and the tracking resets live in renderHistory, which refetchHistory calls; neither
+    # the call nor either step may precede the guard.
+    render = _extract_braced(body, "  function renderHistory(messages) {")
+    assert "messagesEl.replaceChildren();" in render and "toolRows.clear();" in render
+    ahead = fn[:guard]
+    assert guard < fn.index("renderHistory(hist.messages);") and not any(
+        step in ahead
+        for step in ("renderHistory(", "messagesEl.replaceChildren();", "toolRows.clear();")
+    ), (
         "refetchHistory must bail on a failed fetch BEFORE wiping the "
         "pane or clearing the tool-row maps — a failed /history must be "
         "a DOM no-op."
@@ -937,31 +943,28 @@ def test_coordinator_history_stale_latch_contract():
         "redials keep the pending heal intent (terminal-only cancel)."
     )
 
-    # 7. Render-time gate (r5-derived, seedless-scoped after the
-    #    coord-restart family find): the post-await re-checks sit between
-    #    the failure guard and the wipe, so the latch-clear (below the
-    #    wipe) sits below every skip point by construction.  Universal
-    #    terms: dispatch currency (seq) and the content refs (skipping
-    #    always beats stranding a ref; seeded callers null theirs before
-    #    fetching, so it never blocks them).  SEEDLESS-only terms —
-    #    keyed on the seedCursor ARG: the event-driven live-tool-call
-    #    set (liveToolCalls — never a DOM probe, which the render's own
-    #    orphan repaint forges: the r6 critical; on the SEEDED resync
-    #    even genuine residue must not block — the render IS the
-    #    recovery, and a universal term wedged coord-restart outright),
-    #    the optimistic-send busySource flavor, and stream-OPENness
-    #    (CONNECTING keeps the handle with a frozen cursor and a
-    #    pending replay).  Plain ``busy`` must not appear:
-    #    it means a turn is EXECUTING, not that this DOM holds live
-    #    state (the r5 critical).
+    # 7. Render-time gate (r5-derived, seedless-scoped after the coord-restart family find): the
+    #    post-await re-checks sit between the failure guard and the latch-clear, which precedes
+    #    the renderHistory call (whose first act is the wipe), so the latch-clear sits below
+    #    every skip point by construction.  Universal terms: dispatch currency (seq) and the
+    #    content refs (skipping always beats stranding a ref; seeded callers null theirs
+    #    before fetching, so it never blocks them).  SEEDLESS-only terms — keyed on the
+    #    seedCursor ARG: the event-driven live-tool-call set (liveToolCalls — never a DOM
+    #    probe, which the render's own orphan repaint forges: the r6 critical; on the SEEDED
+    #    resync even genuine residue must not block — the render IS the recovery, and a
+    #    universal term wedged coord-restart outright), the optimistic-send busySource
+    #    flavor, and stream-OPENness (CONNECTING keeps the handle with a frozen cursor and a
+    #    pending replay).  Plain ``busy`` must not appear: it means a turn is EXECUTING, not
+    #    that this DOM holds live state (the r5 critical).
     hist_guard = body.index("if (!hist) return;", fetch_start)
-    wipe = body.index("messagesEl.replaceChildren();", fetch_start)
     latch_clear = body.index("historyStale = false;", fetch_start)
-    assert hist_guard < wipe < latch_clear, (
-        "the wipe must sit between the failure guard and the latch-clear "
-        "— every gate skip above the wipe then leaves the latch set."
+    render_call = body.index("renderHistory(hist.messages);", fetch_start)
+    assert hist_guard < latch_clear < render_call, (
+        "the latch-clear must sit between the failure guard and the renderHistory call "
+        "(whose first act is the wipe) — every gate skip above the clear then leaves the "
+        "latch set."
     )
-    gate_code = _strip_comments(body[hist_guard:wipe])
+    gate_code = _strip_comments(body[hist_guard:latch_clear])
     for term, why in (
         ("if (seq !== refetchSeq) return;", "dispatch-currency (seq)"),
         (
@@ -1059,6 +1062,11 @@ def test_coordinator_history_stale_latch_contract():
         "refetchHistory may READ the live set exactly once (the gate) "
         "and never write it — a render that touched liveness could "
         "forge the very signal that guards it (the r6 lesson)."
+    )
+    render_code = _strip_comments(_extract_braced(body, "  function renderHistory(messages) {"))
+    assert "liveToolCalls" not in render_code, (
+        "renderHistory must never read or write the live set (the r6 lesson); the count "
+        "above covers refetchHistory only."
     )
     # The await must be BOUNDED (r7): an accepted-but-never-answered
     # /history would pin refetchesInFlight above zero for the life of
@@ -1304,7 +1312,7 @@ def test_compact_presentation_coordinator_wiring_and_ordering():
     assert 'getTranscriptPresentation() === "compact"' in live
     assert '_announcePolite("Completed: "' in live
 
-    replay = _extract_braced(body, "  async function refetchHistory(seedCursor = false) {")
+    replay = _extract_braced(body, "  function renderHistory(messages) {")
     occurrence = replay.index("if (occurrence && occurrence.row)")
     replay_append = replay.index("_appendResultToRow(", occurrence)
     replay_cleanup = replay.index("_unsetBatchRunningIfAllResults(", replay_append)
@@ -1693,9 +1701,9 @@ def test_coordinator_js_status_bar_approval_chip():
     )
     morph = extract_braced(body, "function _morphBatchResolved(batch, opts) {")
     assert "_syncApprovalChip();" in morph
-    refetch = extract_braced(body, "async function refetchHistory(seedCursor = false) {")
-    wipe = refetch.index("messagesEl.replaceChildren();")
-    assert wipe < refetch.index("_syncApprovalChip();", wipe), (
+    render = extract_braced(body, "function renderHistory(messages) {")
+    wipe = render.index("messagesEl.replaceChildren();")
+    assert wipe < render.index("_syncApprovalChip();", wipe), (
         "the history wipe must recount (a history render never paints a pending batch)"
     )
     # Click target == keyboard target, and that target must really be pending.

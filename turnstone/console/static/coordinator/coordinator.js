@@ -7001,9 +7001,6 @@ function createCoordinatorPane(root, wsId, opts) {
         evtSource.readyState !== EventSource.OPEN)
     )
       return;
-    const scrollTop = messagesEl.scrollTop;
-    messagesEl.replaceChildren();
-    _syncApprovalChip();
     // A full committed-history render repairs any recorded truncation gap —
     // whether this render came from the truncated resync itself or from an
     // unrelated clear_ui rebuild — so it supersedes ALL pending repair
@@ -7046,14 +7043,6 @@ function createCoordinatorPane(root, wsId, opts) {
       clearTimeout(staleRetryTimer);
       staleRetryTimer = null;
     }
-    toolRows.clear();
-    latestToolRowElements.clear();
-    toolResultNodes.clear();
-    activeBatch = null;
-    renderedSystemEventIds.clear();
-    renderedUserEventIds.clear();
-    renderedToolEventIds.clear();
-    resetCompactionHolder(compactionHolder);
     // Fresh-connect fast-forward: when the trailing turn is an executing
     // in-flight tool batch the server can replay, /history returns a
     // non-null ``cursor`` and OMITS that turn. Seed ``lastEventId`` so the
@@ -7066,6 +7055,42 @@ function createCoordinatorPane(root, wsId, opts) {
     // with no reconnect and must NOT rewind lastEventId off the live
     // position. Mirrors ui/static/app.js.
     if (seedCursor && hist.cursor != null) lastEventId = hist.cursor;
+    renderHistory(hist.messages);
+    // The token asserts that this exact REST revision was fully rendered.
+    // Arm it only after every synchronous render step succeeds; otherwise the
+    // caller's rejected promise must not reconnect under a false assertion.
+    if (seedCursor) {
+      historyHandoffToken =
+        typeof hist.handoff_token === "string" && hist.handoff_token
+          ? hist.handoff_token
+          : null;
+    }
+    // The outcome tells the repair settle whether a TOKENLESS response was a
+    // completed render (the server's deliberate cold storage-only read —
+    // downgrade to the tokenless bootstrap) or a failure (fail closed).
+    return "rendered";
+  }
+
+  // Wipe the message column and rebuild it from a /history payload, all
+  // synchronously.  The wipe is the first DOM mutation, and the per-transcript
+  // pane state the render rebuilds (the tool-row maps, the dedup sets, the
+  // pending-approval batch, the compaction holder and the approval chip)
+  // resets alongside it, so no stale entry points at detached DOM.  A render
+  // bug throws to the caller.  The fetch, the render-time gate, the repair and
+  // latch clears, the cursor seed and the handoff token stay in
+  // refetchHistory, which calls this only for a payload that passed its gate.
+  function renderHistory(messages) {
+    const scrollTop = messagesEl.scrollTop;
+    messagesEl.replaceChildren();
+    _syncApprovalChip();
+    toolRows.clear();
+    latestToolRowElements.clear();
+    toolResultNodes.clear();
+    activeBatch = null;
+    renderedSystemEventIds.clear();
+    renderedUserEventIds.clear();
+    renderedToolEventIds.clear();
+    resetCompactionHolder(compactionHolder);
     // Map call_id → tool name resolved from the most recent
     // assistant tool_calls.  Storage's `tool` rows carry only
     // tool_call_id + content; the function name lives on the
@@ -7097,7 +7122,7 @@ function createCoordinatorPane(root, wsId, opts) {
     // for case c.  Without this neutral state, painting Approve
     // buttons on a non-pending orphan was misleading and could
     // 409-on-submit because the call_id wasn't in pending_items.
-    const historyMessages = hist.messages || [];
+    const historyMessages = messages || [];
     const historyBatchOutcomes = indexHistoryToolOutcomes(historyMessages);
 
     // Render an assistant turn's tool_calls as a single batch
@@ -7218,7 +7243,7 @@ function createCoordinatorPane(root, wsId, opts) {
       }
     }
 
-    (hist.messages || []).forEach((m) => {
+    (messages || []).forEach((m) => {
       const role = m.role || "tool";
 
       // The server /history projection collapses multipart user content
@@ -7407,21 +7432,8 @@ function createCoordinatorPane(root, wsId, opts) {
     // live-turn-ends case — without this a reloaded or rewound coordinator
     // showed assistant turns with no retry button.
     _refreshRetryButton();
-    // The token asserts that this exact REST revision was fully rendered.
-    // Arm it only after every synchronous render step succeeds; otherwise the
-    // caller's rejected promise must not reconnect under a false assertion.
-    if (seedCursor) {
-      historyHandoffToken =
-        typeof hist.handoff_token === "string" && hist.handoff_token
-          ? hist.handoff_token
-          : null;
-    }
     messagesEl.scrollTop = scrollTop;
     _scheduleScroll();
-    // The outcome tells the repair settle whether a TOKENLESS response was a
-    // completed render (the server's deliberate cold storage-only read —
-    // downgrade to the tokenless bootstrap) or a failure (fail closed).
-    return "rendered";
   }
 
   // Re-arm the stream after a 401 re-auth: reset backoff + reconnect now.
