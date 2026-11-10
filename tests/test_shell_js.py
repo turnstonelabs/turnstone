@@ -24,6 +24,7 @@ import pytest
 
 from tests._js_harness_helpers import (
     FAKE_DOM,
+    PANE_DOM,
     extract_braced,
     node_skip,
     run_node_source,
@@ -34,6 +35,7 @@ from tests._js_harness_helpers import (
 _ROOT = Path(__file__).resolve().parent.parent
 _SHARED = _ROOT / "turnstone/shared_static"
 _SHELL_JS = _SHARED / "shell.js"
+_AUTH_JS = _SHARED / "auth.js"
 _PANE_JS = _SHARED / "pane.js"
 _SHELL_CSS = _SHARED / "shell.css"
 _CONSOLE_INDEX = _ROOT / "turnstone/console/static/index.html"
@@ -188,30 +190,59 @@ def test_console_index_loads_shell_module_and_caps() -> None:
     assert "TURNSTONE_SHELL_CAPS" in body, "console index must set the shell capability flags"
 
 
-@pytest.mark.parametrize("index", [_CONSOLE_INDEX, _UI_INDEX], ids=["console", "node"])
-def test_served_module_graph_has_one_auth_instance(index: Path) -> None:
+@pytest.mark.parametrize(
+    ("index", "static_root"),
+    [
+        (_CONSOLE_INDEX, _CONSOLE_INDEX.parent),
+        (_UI_INDEX, _UI_INDEX.parent),
+        (_ROOT / "turnstone/console/static/coordinator/index.html", _CONSOLE_INDEX.parent),
+    ],
+    ids=["console", "node", "coordinator"],
+)
+def test_served_module_graph_has_one_auth_instance(index: Path, static_root: Path) -> None:
     """URL queries identify distinct ESM instances even when file contents match.
 
     Two auth instances share sessionStorage but own separate change listeners;
     the first writer can suppress the second instance's login notification.
-    Traverse the actual versioned entry points and static imports as the browser
-    resolves them, so either duplicating auth or losing it fails this guard.
+    Traverse the actual versioned entry points, the page's inline module scripts
+    and their static imports as the browser resolves them (``/static/`` is each
+    page's own static root), so either duplicating auth or losing it fails this
+    guard.
     """
     from turnstone.core.web_helpers import version_html
+
+    import_re = re.compile(r"^\s*import\s+(?:[^;]*?\bfrom\s+)?[\"']([^\"']+)[\"']", re.MULTILINE)
 
     class ModuleScripts(HTMLParser):
         def __init__(self):
             super().__init__()
             self.urls: list[str] = []
+            self.inline: list[str] = []
+            self._in_inline = False
 
         def handle_starttag(self, tag, attrs):
             attrs = dict(attrs)
-            if tag == "script" and attrs.get("type") == "module" and attrs.get("src"):
-                self.urls.append(attrs["src"])
+            if tag == "script" and attrs.get("type") == "module":
+                if attrs.get("src"):
+                    self.urls.append(attrs["src"])
+                else:
+                    self._in_inline = True
+                    self.inline.append("")
 
+        def handle_endtag(self, tag):
+            if tag == "script":
+                self._in_inline = False
+
+        def handle_data(self, data):
+            if self._in_inline:
+                self.inline[-1] += data
+
+    page = "https://console.test/"
     parser = ModuleScripts()
     parser.feed(version_html(index.read_text()))
-    pending = [urljoin("https://console.test/", url) for url in parser.urls]
+    pending = [urljoin(page, url) for url in parser.urls]
+    for body in parser.inline:
+        pending.extend(urljoin(page, spec) for spec in import_re.findall(strip_js_comments(body)))
     seen: set[str] = set()
     while pending:
         url = pending.pop()
@@ -222,15 +253,32 @@ def test_served_module_graph_has_one_auth_instance(index: Path) -> None:
         source = (
             _SHARED / path.removeprefix("/shared/")
             if path.startswith("/shared/")
-            else index.parent / path.removeprefix("/static/")
+            else static_root / path.removeprefix("/static/")
         )
         body = strip_js_comments(source.read_text())
-        imports = re.findall(
-            r"^\s*import\s+(?:[^;]*?\bfrom\s+)?[\"']([^\"']+)[\"']", body, re.MULTILINE
-        )
-        pending.extend(urljoin(url, specifier) for specifier in imports)
+        pending.extend(urljoin(url, specifier) for specifier in import_re.findall(body))
     auth_urls = {url for url in seen if urlsplit(url).path == "/shared/auth.js"}
     assert len(auth_urls) == 1, auth_urls
+
+
+def test_console_stream_probe_routes_a_version_mismatch_to_the_upgrade_reload() -> None:
+    """The console's cluster-stream probe is the one raw-fetch 401 reader left (neither pane
+    probes any more): a 401 whose body says ``version_mismatch`` means the server was upgraded
+    under the page, so it goes to ``noteVersionMismatch()`` (the re-login then reloads for the new
+    assets); any other 401, or an unreadable body, is an expired session. A pin on the source's
+    shape: the console app has no harness that runs its stream handler."""
+    app = strip_js_comments(_CONSOLE_APP.read_text(encoding="utf-8"))
+    start = app.index("evtSource.onerror = function () {")
+    onerror = slice_braced_block(app, start)
+    assert onerror is not None
+    branch = onerror[onerror.index("if (r.status === 401) {") :]
+    read = branch.index("return r.json().then(")
+    mismatch = branch.index('if (body && body.code === "version_mismatch")')
+    note = branch.index("noteVersionMismatch();")
+    login = branch.index("else showLogin();")
+    assert read < mismatch < note < login
+    fallback = branch[login:]
+    assert "showLogin();" in fallback[len("else showLogin();") :], "an unreadable body logs in"
 
 
 def test_persona_picker_surfaces_wired() -> None:
@@ -758,10 +806,10 @@ def test_step4_coordinator_pane_registered_and_wired() -> None:
     the console loads the coordinator controller + its migrated chrome CSS."""
     shell = _SHELL_JS.read_text(encoding="utf-8")
     assert 'registerType("coordinator"' in shell, "shell must register the coordinator pane type"
-    assert "createCoordinatorPane(this.bodyEl, id" in shell, (
-        "onMount must build the controller into the pane body"
+    assert "createCoordinatorPane(pane.bodyEl, id" in shell, (
+        "the controller must be built into the pane body"
     )
-    assert "this._ctl.connect()" in shell and "this._ctl.destroy()" in shell, (
+    assert "pane._ctl.connect()" in shell and "this._ctl.destroy()" in shell, (
         "per-pane Tier-2 connect on activate, destroy on close"
     )
     assert "pm.close(pane.id)" in shell, (
@@ -1281,7 +1329,7 @@ def test_interactive_pane_dead_session_revive() -> None:
     dead, and an explicit reopen (onReopen) revives — tear down the dead
     controller, re-resolve the node (POST /open), rebuild."""
     shell = _SHELL_JS.read_text(encoding="utf-8")
-    assert "const showDeadBanner = ()" in shell, "the dead banner painter must exist"
+    assert "function paintDeadBanner(pane, onClick)" in shell, "the dead banner painter must exist"
     assert "pane-dead-banner" in shell, "the banner carries its own style hook"
     css = _SHELL_CSS.read_text(encoding="utf-8")
     assert ".pane-dead-banner" in css and ".pane-dead-banner:focus-visible" in css, (
@@ -1290,8 +1338,8 @@ def test_interactive_pane_dead_session_revive() -> None:
     )
     assert "Session disconnected" in shell, "the banner states the terminal condition"
     assert "const revive = (freshNodeId)" in shell, "the revive path must exist"
-    assert "onDead: showDeadBanner" in shell, (
-        "the controller's terminal give-up must surface the banner"
+    assert shell.count("onDead: () => paintDeadBanner(pane, () => revive()),") == 2, (
+        "both controllers' terminal give-up must surface the one banner"
     )
     # Revive is full teardown + re-resolve: unsubscribe login, destroy, rebuild.
     ridx = shell.index("const revive =")
@@ -1334,16 +1382,23 @@ def _pane_on_close(shell: str, type_name: str) -> str:
 
 
 def _run_user_change(scenario: str) -> None:
-    """Run ``scenario`` against the shell's user-change rule wired as the shell wires it: the
-    real PaneManager holding an interactive and a coordinator pane (each with the onClose the
-    shell installs, and a controller) beside a dashboard, with fetch recording every request."""
+    """Run ``scenario`` against the user-change rule wired as the shell wires it: auth.js's
+    ``onUserChange`` with the shell's own callback, the real PaneManager holding an interactive
+    and a coordinator pane (each with the onClose the shell installs, and a controller) beside a
+    dashboard, and fetch recording every request.  ``signIn`` sets the stored user id and
+    ``authChanged`` publishes an auth change."""
     shell = _SHELL_JS.read_text(encoding="utf-8")
-    watch = slice_braced_block(shell, shell.index("function watchUserChanges("))
-    assert watch is not None
+    auth = _AUTH_JS.read_text(encoding="utf-8")
+    watch = slice_braced_block(auth, auth.index("export function onUserChange("))
+    stored = slice_braced_block(auth, auth.index("function _storedUserId("))
+    assert watch is not None and stored is not None
+    at = shell.index("onUserChange(() => ")
+    callback = shell[at + len("onUserChange(") : shell.index("\n  });\n", at) + 4]
     source = (
         FAKE_DOM
         + f"\nconst {{ PaneManager, ShellPane }} = await import({json.dumps(_PANE_JS.as_uri())});\n"
-        + f"function watchUserChanges(pm, readUserId) {watch}\n"
+        + f"function onUserChange(callback) {watch}\n"
+        + f"function _storedUserId() {stored}\n"
         + f"const interactiveOnClose = {_pane_on_close(shell, 'interactive')};\n"
         + f"const coordinatorOnClose = {_pane_on_close(shell, 'coordinator')};\n"
         + r"""
@@ -1367,7 +1422,10 @@ FakeElement.prototype.insertBefore = function (child, anchor) {
 FakeElement.prototype.removeChild = function (child) { child.remove(); };
 FakeElement.prototype.matches = function (selector) { return this._matches(selector); };
 ResizeObserver.prototype.unobserve = function () {};
-globalThis.sessionStorage = localStorage;
+let userId = "";
+globalThis.sessionStorage = {getItem: key => (key === "ts.user_id" ? userId : null)};
+const authSubscribers = [];
+const onAuthChange = cb => authSubscribers.push(cb);
 const requests = [];
 globalThis.fetch = async (url, init) => { requests.push(url); return {ok: true, status: 200}; };
 const unsubscribed = [];
@@ -1390,9 +1448,11 @@ for (const type of ["interactive", "coordinator"]) {
 pm.openPane("dashboard");
 pm.openPane("interactive", "ws-a");
 pm.openPane("coordinator", "ws-c");
-let userId = "";
 const signIn = id => { userId = id; };
-const authChanged = watchUserChanges(pm, () => userId);
+const authChanged = () => authSubscribers.forEach(cb => cb());
+"""
+        + f"onUserChange({callback});\n"
+        + r"""
 const open = () => ["interactive:ws-a", "coordinator:ws-c"].filter(id => {
   const [type, raw] = id.split(":");
   return pm.hasPane(type, raw);
@@ -1466,12 +1526,17 @@ assert.ok(pm.hasPane("interactive", "ws-b"), "the new user is now the known one"
 
 
 def test_the_shell_checks_for_a_different_user_on_every_auth_change() -> None:
-    """The rule hangs on the shell's one auth-change listener and reads the stored user id; the
-    login fan-out runs in other tabs while the id is still empty, so it cannot carry it."""
+    """The rule is auth.js's ``onUserChange``, which rides the auth-change signal and reads the
+    stored user id (the login fan-out runs in other tabs while the id is still empty, so it cannot
+    carry it); the shell registers it once and closes every conversational pane."""
+    auth = strip_js_comments(_AUTH_JS.read_text(encoding="utf-8"))
+    watch = slice_braced_block(auth, auth.index("export function onUserChange("))
+    assert watch is not None and "onAuthChange(function () {" in watch
+    stored = slice_braced_block(auth, auth.index("function _storedUserId("))
+    assert stored is not None and 'sessionStorage.getItem("ts.user_id")' in stored
     shell = strip_js_comments(_SHELL_JS.read_text(encoding="utf-8"))
-    assert 'watchUserChanges(pm, () =>\n    storedItem("ts.user_id"),\n  )' in shell
-    listener = slice_braced_block(shell, shell.index("onAuthChange(() => "))
-    assert listener is not None and "closeConversationsOnUserChange();" in listener
+    assert shell.count("onUserChange(") == 1
+    assert "for (const tab of pm.statefulTabs()) pm.close(tab.id);" in shell
 
 
 def test_shell_closes_pane_on_ws_closed() -> None:
@@ -1484,7 +1549,7 @@ def test_shell_closes_pane_on_ws_closed() -> None:
     assert "const notifySessionClosed = (wsId)" in shell
     assert 'pm.getPane("interactive", wsId)' in shell
     assert "if (p) pm.close(p.id)" in shell, "ws_closed closes the pane, not mark-dead"
-    assert "showDeadBanner" in shell, "the banner lane must survive for non-closed deaths"
+    assert "paintDeadBanner" in shell, "the banner lane must survive for non-closed deaths"
     ts_shell = shell[shell.index("window.TS_SHELL = {") :][:200]
     assert "panes: pm" in ts_shell and "notifySessionClosed" in ts_shell, (
         "the seam must be exported on TS_SHELL for the console's Tier-1 handler"
@@ -1497,24 +1562,220 @@ def test_shell_closes_pane_on_ws_closed() -> None:
     )
 
 
-def test_coordinator_pane_reconnects_on_reopen() -> None:
-    """The coordinator variant of resume-with-a-pre-existing-tab: the saved-list
-    resume POSTs /open BEFORE openPane, so the dead pane just needs a fresh
-    stream — onReopen calls the controller's reconnect(), which resets backoff
-    and reconnects only when the source is gone or CLOSED (OPEN is healthy;
-    CONNECTING means native retry / a fresh connect is already in flight)."""
+def _run_coordinator_registration(scenario: str) -> None:
+    """Run ``scenario`` against the coordinator pane type exactly as the shell registers it (the
+    factory sliced from shell.js) on the real PaneManager, with a recording fake controller:
+    ``controllers`` lists every one built, each with ``opts``, ``connects``, ``logins``,
+    ``destroyed`` and a settable ``dead``."""
     shell = _SHELL_JS.read_text(encoding="utf-8")
-    assert "this._ctl.reconnect()" in shell, (
-        "the coordinator pane's onReopen must drive the controller's reconnect"
+    at = shell.index('pm.registerType("coordinator", (id) => ')
+    factory = slice_braced_block(shell, at)
+    banner = slice_braced_block(shell, shell.index("function paintDeadBanner("))
+    assert factory is not None and banner is not None
+    source = (
+        FAKE_DOM
+        + f"\nconst {{ PaneManager, ShellPane }} = await import({json.dumps(_PANE_JS.as_uri())});\n"
+        + r"""
+import assert from "node:assert/strict";
+Object.defineProperties(FakeElement.prototype, {
+  style: {get() { return this._style ??= {}; }},
+  parentElement: {get() { return this.parentNode; }},
+  firstChild: {get() { return this.children[0] || null; }},
+  nextSibling: {get() {
+    const siblings = this.parentNode?.children || [];
+    return siblings[siblings.indexOf(this) + 1] || null;
+  }},
+});
+FakeElement.prototype.insertBefore = function (child, anchor) {
+  child.remove();
+  const index = anchor ? this.children.indexOf(anchor) : this.children.length;
+  this.children.splice(index, 0, child);
+  child.parentNode = this;
+  child._setConnected(this.isConnected);
+};
+FakeElement.prototype.prepend = function (child) { this.insertBefore(child, this.children[0]); };
+FakeElement.prototype.removeChild = function (child) { child.remove(); };
+FakeElement.prototype.replaceChildren = function () {
+  for (const child of [...this.children]) child.remove();
+};
+FakeElement.prototype.matches = function (selector) { return this._matches(selector); };
+ResizeObserver.prototype.unobserve = function () {};
+globalThis.sessionStorage = localStorage;
+const subscribed = [];
+const unsubscribed = [];
+globalThis.window.TS_LOGIN = {subscribe: fn => subscribed.push(fn), unsubscribe: fn => unsubscribed.push(fn)};
+const tabs = document.createElement("div");
+const panes = document.createElement("div");
+document.documentElement.append(tabs, panes);
+const pm = new PaneManager({tabbarEl: tabs, panesEl: panes});
+const wsTitle = id => id;
+const glyph = () => document.createElement("span");
+const stateForWs = () => "idle";
+const convTabMenu = () => [];
+const controllers = [];
+function createCoordinatorPane(root, id, opts) {
+  const chrome = document.createElement("div");
+  chrome.className = "coord-chrome";
+  root.appendChild(chrome);
+  const ctl = {
+    opts, connects: 0, logins: 0, destroyed: false, dead: false,
+    connect() { ctl.connects += 1; },
+    onLogin() { ctl.logins += 1; },
+    isDead() { return ctl.dead; },
+    destroy() { ctl.destroyed = true; },
+  };
+  controllers.push(ctl);
+  return ctl;
+}
+function paintDeadBanner(pane, onClick) """
+        + banner
+        + """
+pm.registerType("coordinator", (id) => """
+        + factory
+        + """);
+pm.registerType("dashboard", () => new ShellPane({type: "dashboard", closable: false}));
+pm.openPane("dashboard");
+const pane = pm.openPane("coordinator", "ws-c");
+const banner = () => pane.bodyEl.querySelector(".pane-dead-banner");
+"""
+        + scenario
     )
-    coord = (_ROOT / "turnstone/console/static/coordinator/coordinator.js").read_text(
-        encoding="utf-8"
+    proc = run_node_source(source)
+    assert proc.returncode == 0, (
+        f"coordinator registration harness failed:\n{proc.stderr}\n{proc.stdout}"
     )
-    assert "function reconnect()" in coord
-    assert "readyState !== EventSource.CLOSED) return" in coord.replace("\n", " "), (
-        "reconnect must only act on a missing/CLOSED stream"
+
+
+@node_skip
+def test_a_dead_coordinator_pane_shows_the_banner_and_its_click_rebuilds_the_pane() -> None:
+    """The coordinator's dead state is wired as the interactive pane's: the controller's onDead
+    paints one click-to-reconnect banner; the click tears the dead controller down (leaving the
+    login fan-out), clears the body and builds and connects a fresh controller, whose connect
+    re-runs the workstream snapshot GET.  Activating a dead pane shows the banner, never a
+    connect."""
+    _run_coordinator_registration(
+        r"""
+const first = controllers[0];
+assert.equal(first.connects, 1, "activation connects once");
+assert.equal(subscribed.length, 1, "the controller joins the login fan-out");
+first.dead = true;
+first.opts.onDead();
+first.opts.onDead();
+assert.ok(banner(), "dead paints the banner");
+assert.equal(pane.bodyEl.querySelectorAll(".pane-dead-banner").length, 1, "only once");
+pm.activate("dashboard");
+pm.activate(pane.id);
+assert.equal(first.connects, 1, "activating a dead pane connects nothing");
+banner().click();
+assert.ok(first.destroyed && unsubscribed.includes(first.onLogin), "the dead controller goes");
+assert.equal(controllers.length, 2, "a fresh controller is built");
+const second = controllers[1];
+assert.equal(second.connects, 1, "and connected");
+assert.ok(!banner(), "the banner goes with the rebuild");
+assert.equal(pane.bodyEl.querySelectorAll(".coord-chrome").length, 1, "the body holds one chrome");
+"""
     )
-    assert "reconnect: reconnect," in coord, "the factory must return reconnect"
+
+
+def _run_standalone_coordinator_page(scenario: str) -> None:
+    """Run ``scenario`` against the standalone coordinator page's bootstrap module (sliced from
+    its index.html) with a recording fake pane factory and auth hook: ``paneOpts`` is what the
+    page handed the factory, ``userChanged()`` fires its user-change callback and ``reloads``
+    counts page reloads."""
+    # PANE_DOM brings its own ``assert``; node's strict assert is ``check`` here.
+    page = (_ROOT / "turnstone/console/static/coordinator/index.html").read_text(encoding="utf-8")
+    start = page.index('<script type="module">\n      // Standalone coordinator page')
+    script = page[page.index(">", start) + 1 : page.index("</script>", start)]
+    line = 'import { createCoordinatorPane } from "/static/coordinator/coordinator.js";'
+    assert script.count(line) == 1, line
+    script = script.replace(line, "")
+    source = (
+        FAKE_DOM
+        + PANE_DOM
+        + r"""
+import check from "node:assert/strict";
+let reloads = 0;
+globalThis.window.location = {reload: () => { reloads += 1; }};
+document.documentElement.dataset.wsId = "ws-c";
+let paneOpts = null;
+let connects = 0;
+let logins = 0;
+function createCoordinatorPane(root, wsId, opts) {
+  check.equal(wsId, "ws-c");
+  paneOpts = opts;
+  const messages = document.createElement("div");
+  messages.id = "coord-messages";
+  root.appendChild(messages);
+  return {connect() { connects += 1; }, onLogin() { logins += 1; }};
+}
+let userChanged = null;
+window.onUserChange = callback => { userChanged = callback; };
+"""
+        + script
+        + scenario
+    )
+    proc = run_node_source(source)
+    assert proc.returncode == 0, f"standalone page harness failed:\n{proc.stderr}\n{proc.stdout}"
+
+
+@node_skip
+def test_the_standalone_coordinator_page_offers_a_reconnect_when_the_stream_dies() -> None:
+    """With no shell, the page itself answers ``dead``: one error row in the transcript whose
+    Reconnect button reloads the page (rebuilding its one pane re-runs the snapshot GET and the
+    first load).  Login still resumes the pane."""
+    _run_standalone_coordinator_page(
+        r"""
+check.equal(connects, 1, "the page connects its pane");
+paneOpts.onDead();
+paneOpts.onDead();
+const rows = document.getElementById("coord-messages").querySelectorAll(".msg.error");
+check.equal(rows.length, 1, "one reconnect row, however often dead is announced");
+const button = rows[0].querySelector(".msg-action-btn");
+check.equal(button.textContent, "Reconnect");
+check.equal(reloads, 0);
+button.click();
+check.equal(reloads, 1, "Reconnect rebuilds the pane by reloading the page");
+window.onLoginSuccess();
+check.equal(logins, 1, "the login hook still resumes the pane");
+"""
+    )
+
+
+@node_skip
+def test_the_standalone_coordinator_page_reloads_when_a_different_user_signs_in() -> None:
+    """The page registers auth.js's user-change rule (the one the shell uses) and reloads on it,
+    so the earlier user's stream stops painting and the workstream is shown as the new user.  It
+    reaches the rule through auth.js's window bridge (one auth instance; the served-graph test
+    covers the page's imports)."""
+    auth = strip_js_comments(_AUTH_JS.read_text(encoding="utf-8"))
+    bridge = auth[auth.index("Object.assign(window, {") :]
+    assert "onUserChange," in bridge[: bridge.index("});")]
+    _run_standalone_coordinator_page(
+        r"""
+check.equal(typeof userChanged, "function", "the page registers a user-change callback");
+check.equal(reloads, 0);
+userChanged();
+check.equal(reloads, 1);
+"""
+    )
+
+
+@node_skip
+def test_an_explicit_reopen_rebuilds_a_dead_coordinator_and_redials_a_live_one() -> None:
+    """The saved-list resume (which POSTs /open first) re-opens an open pane: a live controller
+    gets onLogin() (it redials at once only a stream that failed), a dead one is rebuilt."""
+    _run_coordinator_registration(
+        r"""
+const first = controllers[0];
+pm.openPane("coordinator", "ws-c");
+assert.equal(first.logins, 1, "a live pane is asked to redial");
+assert.equal(controllers.length, 1, "and is not rebuilt");
+first.dead = true;
+pm.openPane("coordinator", "ws-c");
+assert.ok(first.destroyed && controllers.length === 2, "a dead pane is rebuilt");
+assert.equal(controllers[1].connects, 1, "and the rebuilt controller connects");
+"""
+    )
 
 
 # ---------------------------------------------------------------------------

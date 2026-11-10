@@ -201,7 +201,7 @@ def test_live_and_history_surfaces_render_scoped_images(tmp_path, surface):
     assert coordinator.count(needle) == 1
     coordinator = coordinator.replace(
         needle,
-        "    _imageTest: {receive: handleEvent, replay: refetchHistory}," + chr(10) + needle,
+        "    _imageTest: {receive: handleEvent, replay: renderHistory}," + chr(10) + needle,
     )
     module = tmp_path / "coordinator.mjs"
     module.write_text(coordinator)
@@ -240,13 +240,8 @@ if (surface === 'interactive') {
   root = document.createElement('div'); html.appendChild(root);
   pane = createCoordinatorPane(root, wsId, {});
   receive = pane._imageTest.receive;
-  replay = async messages => {
-    globalThis.fetch = async url => {
-      if (!url.endsWith('/history')) throw Error('unexpected request: ' + url);
-      return {ok: true, status: 200, json: async () => ({messages, history_revision: 1})};
-    };
-    await pane._imageTest.replay(true);
-  };
+  // The view's renderHistory, as the sync core calls it (interactive: replayHistory).
+  replay = async messages => pane._imageTest.replay(messages);
   destroy = () => pane.destroy();
 }
 const attachment = id => [{kind: 'image', attachment_id: id, filename: 'camera.png', mime_type: 'image/png'}];

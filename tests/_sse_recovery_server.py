@@ -244,11 +244,10 @@ class RecoveryServer:
         # counting cannot substitute.
         self.history_ok = 0
         self.rewind_requests = 0
-        # Per-ws SSE connection opens (``GET …/events`` — the EventSource the pane's stream layer
-        # builds: the interactive pane's sync core, the coordinator's connectSSE).  A
-        # TRANSPORT-FREE heal (the #890 idle-edge staleness backstop, a quiesced REST refetch)
-        # must leave this FLAT; a reload-based backstop would bump it once per reconnect (the
-        # round-5 storm).  Same lock-free single-writer int discipline as above.
+        # Per-ws SSE connection opens (``GET …/events`` — the EventSource each pane's sync core
+        # builds).  A TRANSPORT-FREE heal (the #890 idle-edge staleness backstop, a quiesced REST
+        # refetch) must leave this FLAT; a reload-based backstop would bump it once per reconnect
+        # (the round-5 storm).  Same lock-free single-writer int discipline as above.
         self.events_requests = 0
         # Global-lane SSE connection opens (``GET …/events/global`` — the
         # roster stream app.js's connectGlobalSSE builds).  The
@@ -553,10 +552,11 @@ class RecoveryServer:
     def emit_tool_pending(self, ws_id: str, call_id: str) -> int:
         """Publish a live ``tool_pending`` phase without persisting a turn.
 
-        This drives the coordinator's event-owned ``liveToolCalls`` gate in
-        isolation.  ``on_agent_step`` is the production hook that emits this
-        exact envelope; the synthetic item is intentionally not added to
-        history, so a later authoritative repaint must remove its DOM shell.
+        This puts a live tool phase on the stream in isolation (the queue detector of the
+        coord-heal-midturn scenario delivers it while a refetch is in flight).  ``on_agent_step``
+        is the production hook that emits this exact envelope; the synthetic item is
+        intentionally not added to history, so a later authoritative repaint must remove its DOM
+        shell.
         """
         ws = self._manager.get(ws_id)
         ui = ws.ui if ws is not None else None
@@ -569,7 +569,7 @@ class RecoveryServer:
                 "call_id": call_id,
                 "func_name": "recovery_probe",
                 "approval_label": "recovery probe",
-                "header": "recovery render-gate probe",
+                "header": "recovery queue probe",
                 "needs_approval": False,
             },
         )
@@ -643,8 +643,7 @@ class RecoveryServer:
     def delay_history(self, ms: int) -> None:
         """Hold each ``GET …/history`` ``ms`` ms before forwarding (0 clears).  Opens the
         clear_ui-refetch quiesce window that the row affordance gate (``busy ||
-        sync.historyStale`` in the interactive pane, ``busy || historyStale`` in the coordinator)
-        must close."""
+        sync.historyStale`` in both panes) must close."""
         self._history_delay_ms = ms
 
     @property

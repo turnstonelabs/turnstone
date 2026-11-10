@@ -455,8 +455,19 @@ function connectSSE() {
     fetch("/v1/api/cluster/overview")
       .then(function (r) {
         if (r.status === 401) {
-          showLogin();
-          return;
+          // A version_mismatch body means the server was upgraded under this
+          // page: the re-login must reload it so the new assets load.  Any other
+          // 401 (or an unreadable body) is an expired session.
+          return r.json().then(
+            function (body) {
+              if (body && body.code === "version_mismatch")
+                noteVersionMismatch();
+              else showLogin();
+            },
+            function () {
+              showLogin();
+            },
+          );
         }
         sseReconnectTimer = setTimeout(connectSSE, retryDelay);
         retryDelay = Math.min(retryDelay * 2, 30000);

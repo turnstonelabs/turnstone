@@ -870,7 +870,7 @@ assert(JSON.stringify(decisions) === '[true,true,false,true]', 'Enter in the fee
 def test_keys_on_a_control_never_decide_the_call_in_the_coordinator() -> None:
     handler = _handler(
         _COORDINATOR.read_text(encoding="utf-8"),
-        'root.addEventListener("keydown", function (e) ',
+        'root.addEventListener(\n    "keydown",\n    function (e) ',
     )
     _run(
         f"const {{convKeyBelongsToControl}} = await import({_shared('conversation.js')});\n"

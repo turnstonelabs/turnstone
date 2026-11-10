@@ -1413,14 +1413,10 @@ async def global_events_sse(request: Request) -> Response:
         def _format_event(event: dict[str, Any]) -> dict[str, str]:
             """Strip ``_event_id`` from the wire dict, attach SSE ``id:``.
 
-            The id is ``"{boot_epoch}-{counter}"`` — GLOBAL-LANE ONLY
-            (#881).  Do not propagate the epoch tag to the per-ws
-            formatter in ``make_events_handler``: per-ws ids must stay
-            bare ints — their counter is storage-seeded across restarts
-            (epoch unnecessary), clients seed cursors from ``/history``'s
-            integer ``cursor``, and coordinator.js's counter-reset
-            detector does ``Number(event.lastEventId)`` comparisons that
-            an epoch prefix would turn into ``NaN`` and silently kill.
+            The id is ``"{boot_epoch}-{counter}"`` — GLOBAL-LANE ONLY (#881).  Do not
+            propagate the epoch tag to the per-ws formatter in ``make_events_handler``: per-ws
+            ids must stay bare ints — their counter is storage-seeded across restarts (epoch
+            unnecessary), and clients seed cursors from ``/history``'s integer ``cursor``.
             """
             ev_copy = dict(event)
             eid = ev_copy.pop("_event_id", None)

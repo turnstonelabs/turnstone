@@ -25,7 +25,14 @@
 
 import { PaneManager, ShellPane, openPopupMenu } from "./pane.js";
 import { mountRail, mountManage, glyph, setRowBadge } from "./rail.js";
-import { authFetch, hasScope, hasPermission, onAuthChange, whenPermissionsReady } from "./auth.js";
+import {
+  authFetch,
+  hasScope,
+  hasPermission,
+  onAuthChange,
+  onUserChange,
+  whenPermissionsReady,
+} from "./auth.js";
 import { openAvatarDialog, paintAvatar, readStoredAvatar } from "./avatar.js";
 import { readRefusal } from "./utils.js";
 // The interactive pane is a real ES module beside us in /shared (step 5a) — the
@@ -821,28 +828,13 @@ async function mountShell() {
       pane._ctl = createInteractivePane(pane.bodyEl, id, {
         nodeId,
         onClose: () => pm.close(pane.id),
-        onDead: showDeadBanner,
+        onDead: () => paintDeadBanner(pane, () => revive()),
       });
       pane._ctl.connect();
       if (window.TS_LOGIN && pane._ctl.onLogin) {
         pane._loginArmed = true;
         window.TS_LOGIN.subscribe(pane._ctl.onLogin);
       }
-    };
-    // Terminal dead session (the controller exhausted its reconnects, or Tier-1
-    // said ws_closed): keep the conversation readable, but surface ONE
-    // actionable affordance.  Reviving is never automatic — a deliberately
-    // closed session must not resurrect on a timer; the user (or an explicit
-    // reopen gesture) decides.
-    const showDeadBanner = () => {
-      if (pane._closed || pane._deadBanner) return;
-      const b = document.createElement("button");
-      b.type = "button";
-      b.className = "pane-status pane-status--retry pane-dead-banner";
-      b.textContent = "Session disconnected — click to reconnect.";
-      b.addEventListener("click", () => revive());
-      pane.bodyEl.prepend(b);
-      pane._deadBanner = b;
     };
     // Tear down the dead controller and re-run the resolve + connect path.
     // forceResolve: the session may need (re)opening on its node (POST /open)
@@ -936,7 +928,8 @@ async function mountShell() {
       pm.setTabGlyph(pane.id, glyph(stateForWs(id))); // live Tier-1 state glyph
       if (this._ctl) {
         if (this._ctl.isDead && this._ctl.isDead()) {
-          showDeadBanner(); // visible terminal state; reviving is the user's call
+          // Visible terminal state; reviving is the user's call.
+          paintDeadBanner(pane, () => revive());
           return;
         }
         this._ctl.connect(); // built — idempotent re-mark focus
@@ -997,30 +990,56 @@ async function mountShell() {
               if (pane._ctl && pane._ctl.closeSession) pane._ctl.closeSession();
             },
           });
-        pane.onMount = function () {
-          this._ctl = createCoordinatorPane(this.bodyEl, id, {
+        const buildController = () => {
+          pane._ctl = createCoordinatorPane(pane.bodyEl, id, {
             onClose: () => pm.close(pane.id),
+            onDead: () => paintDeadBanner(pane, () => revive()),
           });
         };
-        pane.onActivate = function () {
-          pm.setTabGlyph(pane.id, glyph(stateForWs(id))); // live Tier-1 state glyph
-          if (this._ctl && !this._connected) {
-            this._connected = true;
-            this._ctl.connect();
-            if (window.TS_LOGIN && this._ctl.onLogin) {
-              window.TS_LOGIN.subscribe(this._ctl.onLogin);
-            }
+        const connectController = () => {
+          pane._connected = true;
+          pane._ctl.connect();
+          if (window.TS_LOGIN && pane._ctl.onLogin) {
+            window.TS_LOGIN.subscribe(pane._ctl.onLogin);
           }
         };
+        // Tear the dead controller down and build a fresh one in the cleared
+        // body: its connect re-runs the explicit workstream snapshot GET, which
+        // reopens an unloaded session, then the first load.
+        const revive = () => {
+          if (pane._closed || !pane._ctl) return;
+          if (pane._deadBanner) {
+            pane._deadBanner.remove();
+            pane._deadBanner = null;
+          }
+          if (window.TS_LOGIN && pane._ctl.onLogin)
+            window.TS_LOGIN.unsubscribe(pane._ctl.onLogin);
+          pane._ctl.destroy();
+          pane.bodyEl.replaceChildren();
+          buildController();
+          connectController();
+        };
+        pane.onMount = function () {
+          buildController();
+        };
+        // Connect once; a dead pane (its banner already up) is never reconnected here.
+        pane.onActivate = function () {
+          pm.setTabGlyph(pane.id, glyph(stateForWs(id))); // live Tier-1 state glyph
+          if (this._ctl && !this._connected) connectController();
+        };
         // Explicit re-open (saved-list resume with this pane already open): the
-        // resume already POSTed /open, so a coordinator whose stream went dead
-        // (session was closed, console restarted) just needs a fresh connect —
-        // reconnect() no-ops on a healthy OPEN stream.
+        // resume already POSTed /open.  A dead pane is rebuilt; a live one gets
+        // onLogin(), which redials a stream that failed at once and leaves a
+        // healthy one alone.  The interactive pane instead revives through the
+        // node resolve, because its controller is bound to a node a resume may
+        // have moved; the coordinator's is console-local, so a redial suffices.
         pane.onReopen = function () {
-          if (this._connected && this._ctl && this._ctl.reconnect)
-            this._ctl.reconnect();
+          if (!this._connected || !this._ctl) return;
+          if (this._ctl.isDead()) revive();
+          else this._ctl.onLogin();
         };
         pane.onClose = function () {
+          this._closed = true; // a dead banner's click must not rebuild after close
           if (this._ctl) {
             if (window.TS_LOGIN && this._ctl.onLogin)
               window.TS_LOGIN.unsubscribe(this._ctl.onLogin);
@@ -1117,15 +1136,20 @@ async function mountShell() {
   };
   whenPermissionsReady(syncFilesAccess);
   // One shell-level listener, not one leaked subscription per conversation.
-  // Drop rendered file content whenever identity or effective authority changes,
-  // and every conversation when a different user signs in.
-  const closeConversationsOnUserChange = watchUserChanges(pm, () =>
-    storedItem("ts.user_id"),
-  );
+  // Drop rendered file content whenever identity or effective authority changes.
   onAuthChange(() => {
     syncFilesAccess();
     if (pm.hasPane("filesystem")) pm.close("filesystem");
-    closeConversationsOnUserChange();
+  });
+  // A stream authorised as one user must not keep painting for another: when a
+  // different user signs in, close every conversational pane client-side
+  // (destroy its controller, drop its tab) and leave its session open on the
+  // server.  After a page reload the previous id is gone and rehydrated tabs
+  // come back, which is fine: no stream from before the reload exists, and a
+  // rehydrated pane fetches /history and opens /events with the new user's
+  // cookie, so the server authorises it as the new user.
+  onUserChange(() => {
+    for (const tab of pm.statefulTabs()) pm.close(tab.id);
   });
 
   // Tier-1 lifecycle → pane signal.  The console's ws_closed handler calls
@@ -1294,28 +1318,20 @@ function displayNameFor(caps) {
   }
 }
 
-// A stream authorised as one user must not keep painting for another: each open
-// pane's transcript and live stream were authorised for, and show, the earlier
-// principal.  When the stored user id turns into a different non-empty id,
-// close every conversational pane client-side (destroy its controller, drop its
-// tab) and leave its session open on the server.  An empty id (signed out, or a
-// login broadcast from another tab before whoami restores the id) waits for the
-// next non-empty one.  That is also why this listens to auth changes rather
-// than the login fan-out: in other tabs the fan-out runs while the id is still
-// empty.  After a page reload the previous id is gone and rehydrated tabs come
-// back, which is fine: no stream from before the reload exists, and a
-// rehydrated pane fetches /history and opens /events with the new user's
-// cookie, so the server authorises it as the new user.
-function watchUserChanges(pm, readUserId) {
-  let known = readUserId();
-  return () => {
-    const userId = readUserId();
-    if (!userId) return;
-    if (known && userId !== known) {
-      for (const tab of pm.statefulTabs()) pm.close(tab.id);
-    }
-    known = userId;
-  };
+// A conversational pane whose stream is terminally dead (the controller gave up,
+// or Tier-1 said ws_closed): keep the conversation readable, but surface ONE
+// actionable affordance.  Reviving is never automatic — a deliberately closed
+// session must not resurrect on a timer; the user (or an explicit reopen
+// gesture) decides.  Painted once; a closed pane gets none.
+function paintDeadBanner(pane, onClick) {
+  if (pane._closed || pane._deadBanner) return;
+  const b = document.createElement("button");
+  b.type = "button";
+  b.className = "pane-status pane-status--retry pane-dead-banner";
+  b.textContent = "Session disconnected — click to reconnect.";
+  b.addEventListener("click", onClick);
+  pane.bodyEl.prepend(b);
+  pane._deadBanner = b;
 }
 
 function storedItem(key) {

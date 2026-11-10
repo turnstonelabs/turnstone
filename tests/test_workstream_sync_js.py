@@ -342,7 +342,7 @@ expect(wrapped.join(',') === 'content,content', 'the late wrapper saw both event
 expect(sync.inspect().health.renderThrows === 1, 'the throw is counted',
   sync.inspect().health.renderThrows);
 expect(view.dispatched.map(event => event.text).join('') === 'b', 'the next event still dispatched');
-expect(logged.some(line => line.startsWith('workstream sync: dispatch failed for content ' +
+expect(logged.some(line => line.startsWith('workstream sync ws/2: dispatch failed for content ' +
   '(render-throw total 1)')), 'the dispatch line carries the running total', logged.join(' | '));
 """
     )
@@ -1353,8 +1353,11 @@ expect(sources().every(source => new URL(source.url).pathname === WS_PATH + '/ev
 
 
 def test_missed_fires_once_for_a_new_truncation_gap() -> None:
-    """A new gap is missed once; the same gap re-announced by a retry, the resync that repairs it
-    and the reconnect after it add nothing."""
+    """A new gap is missed once and the same gap re-announced by a retry adds nothing.  The
+    resync that heals it by adopting a cursor is missed again: the envelope said the gap opened,
+    and whatever the stream does not carry whole (a sidebar) moved on before the heal, so the
+    pane re-reads it then too.  The reconnect after the heal presents the cursor and adds
+    nothing."""
     _run(
         r"""
 pinRandom(0);
@@ -1373,7 +1376,153 @@ await clock.advance(0);
 await network.reply('/history', {messages: [], cursor: 12});
 latest().open();
 await flush();
-expect(missed.length === 1, 'the repair adds nothing', missed.length);
+expect(missed.length === 2, 'the heal that adopts a cursor is missed too', missed.length);
+"""
+    )
+
+
+def test_a_first_stream_that_opens_late_is_missed_and_a_prompt_one_is_not() -> None:
+    """The first open follows first paint closely enough to vouch for it only when it was prompt:
+    a hidden first paint, a hide while the first dial is in flight, a refused or errored first
+    dial and the login park each make the first open late, and late is a miss (the pane re-reads
+    what the stream does not carry whole)."""
+    _run(
+        r"""
+pinRandom(0);
+// Prompt: no miss.
+const es = await live({messages: []});
+expect(missed.length === 0, 'a prompt first open is not missed', missed.length);
+sync.destroy();
+
+// Hidden first paint: the connect waits for the show edge.
+const hidden = newSync();
+const hiddenMissed = [];
+hidden.on('missed', () => hiddenMissed.push(1));
+visibility.hide();
+hidden.start();
+await flush();
+await network.reply('/history', {messages: []});
+expect(hidden.status === 'paused', 'a hidden first paint defers the stream', hidden.status);
+visibility.show();
+await flush();
+latest().open();
+await flush();
+expect(hiddenMissed.length === 1, 'a first open after the show edge is missed',
+  hiddenMissed.length);
+hidden.destroy();
+
+// Hidden while the first dial is still connecting: the show edge dials again.
+const hiddenDialing = newSync();
+const hiddenDialingMissed = [];
+hiddenDialing.on('missed', () => hiddenDialingMissed.push(1));
+hiddenDialing.start();
+await flush();
+await network.reply('/history', {messages: []});
+expect(hiddenDialing.status === 'connecting', 'the first dial is in flight',
+  hiddenDialing.status);
+visibility.hide();
+await clock.advance(60000);
+visibility.show();
+await flush();
+latest().open();
+await flush();
+expect(hiddenDialingMissed.length === 1, 'a first open after a hide mid-dial is missed',
+  hiddenDialingMissed.length);
+hiddenDialing.destroy();
+
+// Refused first dial: the redial's open is late.
+const refused = newSync();
+const refusedMissed = [];
+refused.on('missed', () => refusedMissed.push(1));
+refused.start();
+await flush();
+await network.reply('/history', {messages: []});
+latest().fail();
+await clock.advance(1000);
+latest().open();
+await flush();
+expect(refusedMissed.length === 1, 'a first open after a refused dial is missed',
+  refusedMissed.length);
+refused.destroy();
+
+// Errored first dial the browser re-establishes itself.
+const errored = newSync();
+const erroredMissed = [];
+errored.on('missed', () => erroredMissed.push(1));
+errored.start();
+await flush();
+await network.reply('/history', {messages: []});
+latest().drop();
+await clock.advance(3000);
+latest().open();
+await flush();
+expect(erroredMissed.length === 1, 'a first open after an errored dial is missed',
+  erroredMissed.length);
+errored.destroy();
+
+// Parked behind the login overlay.
+const parked = newSync();
+const parkedMissed = [];
+parked.on('missed', () => parkedMissed.push(1));
+parked.start();
+await flush();
+await network.reply('/history', {messages: []});
+loginOverlay.style.display = 'flex';
+latest().fail();
+expect(parked.status === 'auth', 'the refusal parks behind the login', parked.status);
+loginOverlay.style.display = 'none';
+parked.retryNow();
+latest().open();
+await flush();
+expect(parkedMissed.length === 1, 'a first open after the login park is missed',
+  parkedMissed.length);
+parked.destroy();
+"""
+    )
+
+
+def test_each_failed_history_request_warns_once_and_an_abort_says_nothing() -> None:
+    """One warning per failed /history (a status, a network error, a deadline expiry), each
+    naming the workstream; an abort for supersession or teardown is not a failure and logs
+    nothing."""
+    _run(
+        r"""
+pinRandom(0);
+const es = await live({messages: [user('v1')]});
+const warnings = () => logged.filter(line => line.includes('history request'));
+await send(es, {type: 'clear_ui'}, 4);
+await network.reply('/history', {detail: 'unavailable'}, {status: 503});
+expect(warnings().length === 1 &&
+  warnings()[0] === 'workstream sync ws/2: history request failed (status 503)',
+  'a status failure warns once', warnings().join(' | '));
+await clock.advance(2000);
+await network.fail('/history');
+expect(warnings().length === 2 && warnings()[1].startsWith('workstream sync ws/2: history ' +
+  'request failed Failed to fetch'), 'a network error warns once', warnings().join(' | '));
+await send(es, {type: 'clear_ui'}, 5);
+await clock.advance(15000);
+expect(warnings().length === 3 &&
+  warnings()[2] === 'workstream sync ws/2: history request gave up after 15000 ms',
+  'a deadline expiry warns once', warnings().join(' | '));
+await clock.advance(2000);
+expect(network.pending('/history').length === 1, 'the stale retry is in flight');
+await send(es, {type: 'history_resync'});
+expect(warnings().length === 3, 'a supersession says nothing', warnings().join(' | '));
+sync.destroy();
+await flush();
+expect(warnings().length === 3, 'a teardown says nothing', warnings().join(' | '));
+
+// A fetch that ignores the abort and answers with a status after the deadline: the expiry
+// already reported that request.
+let answerLate;
+const deaf = newSync({fetch: () => new Promise(resolve => { answerLate = resolve; })});
+deaf.start();
+await clock.advance(15000);
+expect(warnings().length === 4, 'the expiry warns', warnings().join(' | '));
+answerLate({ok: false, status: 503});
+await flush();
+expect(warnings().length === 4, 'a reply after the abort says nothing', warnings().join(' | '));
+deaf.destroy();
 """
     )
 
@@ -1481,7 +1630,7 @@ expect(historyCount() === 1 && sync.inspect().health.foreignFrames === 2,
 expect(sync.inspect().cursor === '6',
   'their ids still moved the cursor: they arrived on this stream');
 expect(logged.some(line => line.includes(
-  'workstream sync: dropping a frame stamped for workstream ws/other (total 2)')),
+  'workstream sync ws/2: dropping a frame stamped for workstream ws/other (total 2)')),
   'the warning carries the running total', logged.join(' | '));
 """
     )
@@ -1541,7 +1690,7 @@ expect(dispatchedTypes() === 'content', 'malformed frames dispatch nothing', dis
 expect(sync.inspect().health.malformedFrames === 2 && sync.inspect().cursor === '6',
   'counted, and the cursor moved', JSON.stringify(sync.inspect().health));
 expect(logged.some(line =>
-  line.startsWith('workstream sync: dropping malformed SSE frame (total 2)')),
+  line.startsWith('workstream sync ws/2: dropping malformed SSE frame (total 2)')),
   'the malformed line carries the running total', logged.join(' | '));
 visibility.hide();
 visibility.show();
@@ -2914,17 +3063,16 @@ def test_the_staleness_latch_is_cleared_only_by_the_render_step() -> None:
 
 def test_the_cursor_comes_only_off_the_message_event_and_infers_nothing() -> None:
     """The event id lives on the MessageEvent, never on the source object; and since ids can
-    arrive lower without any reset, nothing does arithmetic on a cursor to infer a gap (the
-    coordinator's own cursor included, until it moves onto the core)."""
+    arrive lower without any reset, nothing does arithmetic on a cursor to infer a gap.  Both
+    panes are on the core, so neither holds or compares a cursor of its own."""
     code = _code(_MODULE)
     readers = re.findall(r"(\w+)\.lastEventId", code)
     assert readers == ["event"], f"lastEventId read off {readers}"
     assert "this.#cursor = id;" in code
     for field in ("#cursor", "#gapCursor"):
         assert not re.search(r"this\." + re.escape(field) + r"\s*[-+]\s*\d", code), field
-    coordinator = _code(_COORDINATOR)
-    assert "lastEventId = event.lastEventId;" in coordinator
-    assert not re.search(r"\blastEventId\s*[-+]\s*1\b", coordinator)
+    for pane in (_INTERACTIVE, _COORDINATOR):
+        assert "lastEventId" not in _code(pane), pane.name
 
 
 def test_the_overflow_ladder_math_has_one_source() -> None:
