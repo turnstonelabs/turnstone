@@ -1,8 +1,9 @@
 /* Shared fail-closed history-handoff repair policy.
  *
- * DOM, fetch, and EventSource lifecycles stay pane-owned; the safety-critical
- * attempt budget and deadline live here so interactive and coordinator cannot
- * drift. A manual click is always allowed after automatic recovery parks.
+ * The fetch and EventSource lifecycles are the sync core's (workstream_sync.js,
+ * which both panes run on) and the DOM is the pane's; the safety-critical
+ * attempt budget and deadline live here, apart from the core's transport code.
+ * A manual click is always allowed after automatic recovery parks.
  */
 
 export const HISTORY_HANDOFF_MAX_ATTEMPTS = 4;
@@ -55,7 +56,7 @@ export function createHistoryHandoffDeadline(
 }
 
 /* One repair-backoff step: the jittered delay to sleep now plus the doubled
- * base for the next step, both capped. Both panes must pace identically. */
+ * base for the next step, both capped. */
 export function nextHistoryHandoffDelay(currentMs, { jitterMs, maxMs }) {
   return {
     delayMs: Math.min(currentMs + Math.random() * jitterMs, maxMs),
@@ -64,8 +65,8 @@ export function nextHistoryHandoffDelay(currentMs, { jitterMs, maxMs }) {
 }
 
 /* The parked-repair prompt. Copy, structure, and class hooks are part of the
- * shared contract (tests and both panes key off them); placement, scroll, and
- * retry gating stay pane-owned. */
+ * shared contract (tests key off them); placement and scroll are the pane's
+ * (through the core's placeRepairPrompt), retry gating the core's. */
 export function buildHistoryHandoffPrompt({ onRetry, onReload }) {
   const prompt = document.createElement("div");
   prompt.className = "msg error history-handoff-repair";
@@ -95,28 +96,26 @@ export function buildHistoryHandoffPrompt({ onRetry, onReload }) {
   return prompt;
 }
 
-/* The repair state machine itself, owned once.
+/* The repair state machine itself, owned once: seven slots — pending latch,
+ * backoff timer, backoff base, in-flight attempt, attempt count, manual-only
+ * latch, parked prompt — and the clear / park / begin / schedule / settle logic
+ * over them.  Its one client is the sync core, which supplies the deps: where
+ * the prompt goes, how history loads, how the transport reopens, the parked
+ * phase, and whether the instance is still alive.  The core keeps the handoff
+ * proof token; this owns only the recovery policy.
  *
- * Both panes held the same seven slots — pending latch, backoff timer, backoff
- * base, in-flight attempt, attempt count, manual-only latch, parked prompt —
- * and ran the same clear / park / begin / schedule / settle logic over them.
- * Everything that differs arrives through deps: where the prompt goes, how
- * history loads, how the transport reopens, what the status line reads, and
- * whether the pane is still alive. The pane keeps its own handoff proof token;
- * this owns only the recovery policy.
- *
- * `scope` is the workstream the repair intent belongs to. A pane reassignment
- * supersedes the intent rather than repairing the wrong transcript.
+ * `scope` is the workstream the repair intent belongs to (always the core's own
+ * workstream: one instance per pane, for its life).
  *
  * deps:
  *   load(scope, manualAttempt)  run one /history attempt for that scope
  *   connect(scope)              reopen the transport once the latch clears
  *   placePrompt(prompt)         attach the parked prompt and scroll to it
- *   showPaused()                pane status display for a parked repair
+ *   showPaused()                the parked phase
  *   setStale(stale)             the transcript mutation latch
  *   deferToShowEdge()           record that a hidden tab skipped an attempt
- *   isAlive()                   false once the stream lifecycle is released
- *   baseDelayMs / jitterMs / maxMs   backoff pacing (pane-supplied constants)
+ *   isAlive()                   false once the instance is dead or destroyed
+ *   baseDelayMs / jitterMs / maxMs   backoff pacing (the core's constants)
  */
 export function createHistoryHandoffRepair(deps) {
   let pending = false;
@@ -262,7 +261,7 @@ export function createHistoryHandoffRepair(deps) {
       attemptTeardown = null;
     },
 
-    /* The one repair verdict, for both panes. */
+    /* The one repair verdict. */
     settle({ outcome, hasToken, manualAttempt }) {
       if (hasToken || outcome === "rendered") {
         // A token means the full render completed and armed the proof from

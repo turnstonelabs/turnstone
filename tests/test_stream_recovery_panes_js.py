@@ -1,29 +1,20 @@
 """Workstream stream and recovery behavior, executed through each pane's public surface.
 
-Both panes (``shared_static/interactive.js`` and the console coordinator) run
-whole under node with the browser fakes from tests/_js_harness_helpers.py.  A
-test may touch only what survives the planned replacement of both stream layers
-by one shared module: the pane's construction and its public controller
-(interactive: ``createInteractivePane`` and its ``connect`` / ``onLogin`` /
-``destroy``; coordinator: ``createCoordinatorPane`` and the same three), the
-EventSource fake (the frames it delivers, its errors, the URLs it was opened
-with), the fetch queue, the virtual clock, tab visibility and the rendered DOM.
-No test reads or calls a private field or method of either pane.
-
-Every test runs against both clients.  Where a client does not yet have the
-behavior the shared module will give both, its case is a strict xfail whose
-reason names the behavior and the client that lacks it, so it flips loudly when
-the rewrite lands.  A strict xfail only counts when the pane fails the one
-expectation named for that gap, matched by its whole label: any other failed
-expectation, a harness error, or a throw inside a pane callback fails the test
-outright.
+Both panes (``shared_static/interactive.js`` and the console coordinator) run whole under node
+with the browser fakes from tests/_js_harness_helpers.py, and both run on the shared sync core
+(``shared_static/workstream_sync.js``).  A test touches only the pane's construction and its
+public controller, the EventSource fake (the frames it delivers, its errors, the URLs it was
+opened with), the fetch queue, the virtual clock, tab visibility and the rendered DOM; no test
+reads or calls a private field or method of either pane.  Most tests run for both clients; a
+surface only one pane has (the interactive empty state, the coordinator's snapshot GET, sidebar
+and controller) gets a single-client test.  A failed expectation, a harness error, or a throw
+inside a pane callback fails the test.
 """
 
 from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -35,6 +26,7 @@ from tests._js_harness_helpers import (
     FAKE_EVENT_SOURCE,
     FAKE_FETCH,
     FAKE_VISIBILITY,
+    FULL_SELECTORS,
     PANE_DOM,
     REMOVE_CHILD,
     coordinator_module_for_node,
@@ -58,30 +50,6 @@ class PaneExpectationError(AssertionError):
 
 class PaneHarnessError(Exception):
     """The pane script failed outside a behavior expectation."""
-
-
-@dataclass(frozen=True)
-class Gap:
-    """A behavior a client does not have yet: the xfail reason (the behavior and
-    the client lacking it), and the whole label of the one expectation that must
-    be the failing one."""
-
-    reason: str
-    expectation: str
-
-
-def _clients(gaps: dict[str, Gap]) -> list[Any]:
-    return [
-        pytest.param(
-            client,
-            marks=pytest.mark.xfail(
-                strict=True, raises=PaneExpectationError, reason=gaps[client].reason
-            ),
-        )
-        if client in gaps
-        else client
-        for client in _CLIENTS
-    ]
 
 
 # The per-client driver: mounts the pane through its public factory and gives
@@ -160,7 +128,7 @@ const press = button => button.dispatchEvent({type: 'click', bubbles: true, targ
 
 # Outside the body's try block: the verdict needs both after the body threw.
 # ``expect(condition, label, detail)``: the label is fixed text, unique within a
-# test, and is what a gap matches; the optional detail carries the values seen.
+# test; the optional detail carries the values seen.
 _VERDICT_JS = r"""
 class Expectation extends Error {
   constructor(label, detail) {
@@ -191,6 +159,7 @@ def _script(client: str, body: str, params: dict[str, Any], coordinator: Path) -
     return (
         FAKE_DOM
         + PANE_DOM
+        + FULL_SELECTORS
         + REMOVE_CHILD
         + FAKE_CLOCK
         + FAKE_VISIBILITY
@@ -214,20 +183,14 @@ def _script(client: str, body: str, params: dict[str, Any], coordinator: Path) -
     )
 
 
-def _verdict(proc: Any, gap: Gap | None) -> None:
+def _verdict(proc: Any) -> None:
     if proc.returncode == 0:
         return
     output = f"{proc.stderr}\n{proc.stdout}"
     match = re.search(r"^PANE-EXPECTATION-FAILED: (.*)$", proc.stderr, re.M)
     if match is None:
         raise PaneHarnessError(f"pane script failed outside an expectation:\n{output}")
-    label = match.group(1)
-    if gap is not None and label != gap.expectation:
-        raise PaneHarnessError(
-            f"expected the gap ({gap.reason}) at '{gap.expectation}', "
-            f"but the pane failed at: {label}\n{output}"
-        )
-    raise PaneExpectationError(f"{label}\n{output}")
+    raise PaneExpectationError(f"{match.group(1)}\n{output}")
 
 
 @pytest.fixture
@@ -237,20 +200,9 @@ def run_pane(tmp_path: Path) -> Callable[..., None]:
     (the only rewrite; no internals are spliced in)."""
     coordinator = coordinator_module_for_node(tmp_path)
 
-    def run(
-        client: str,
-        body: str,
-        *,
-        gaps: dict[str, Gap] | None = None,
-        params: dict[str, Any] | None = None,
-    ) -> None:
-        gap = (gaps or {}).get(client)
-        if gap is not None and body.count("'" + gap.expectation + "'") != 1:
-            raise PaneHarnessError(
-                f"the gap label {gap.expectation!r} must appear exactly once in the test body"
-            )
+    def run(client: str, body: str, *, params: dict[str, Any] | None = None) -> None:
         proc = run_node_source(_script(client, body, params or {}, coordinator), timeout=60)
-        _verdict(proc, gap)
+        _verdict(proc)
 
     return run
 
@@ -389,16 +341,7 @@ expect(transcriptText().includes('after reconnect'), 'the reconnected stream ren
     )
 
 
-_NO_WORKSTREAM_PROBE = {
-    "coordinator": Gap(
-        "coordinator does not yet stop requesting the workstream on a stream error "
-        "(that GET rehydrates a closed session)",
-        "a stream error does not request the workstream resource",
-    )
-}
-
-
-@pytest.mark.parametrize("client", _clients(_NO_WORKSTREAM_PROBE))
+@pytest.mark.parametrize("client", _CLIENTS)
 def test_stream_error_does_not_request_the_workstream(
     run_pane: Callable[..., None], client: str
 ) -> None:
@@ -417,7 +360,6 @@ es.open();
 expect(network.seen(WS_PATH).length === before,
   'a stream error does not request the workstream resource');
 """,
-        gaps=_NO_WORKSTREAM_PROBE,
     )
 
 
@@ -521,15 +463,7 @@ expect(sources().length === 1, 'no stream opens while the resync loads', sources
     )
 
 
-_HELD_DURING_REFETCH = {
-    "coordinator": Gap(
-        "coordinator does not yet hold content events during a refetch",
-        "content during the refetch is held, not painted live",
-    )
-}
-
-
-@pytest.mark.parametrize("client", _clients(_HELD_DURING_REFETCH))
+@pytest.mark.parametrize("client", _CLIENTS)
 def test_content_during_a_clear_ui_refetch_is_held_until_the_render(
     run_pane: Callable[..., None], client: str
 ) -> None:
@@ -554,19 +488,10 @@ expect(text.indexOf('live tail') > text.indexOf('after rewind'),
   'the held content replays after the render');
 expect(text.split('live tail').length === 2, 'the held content renders once');
 """,
-        gaps=_HELD_DURING_REFETCH,
     )
 
 
-_RECONNECT_GENERATION = {
-    "coordinator": Gap(
-        "coordinator does not yet decline a refetch render across a reconnect (#904)",
-        "a render across a reconnect is declined",
-    )
-}
-
-
-@pytest.mark.parametrize("client", _clients(_RECONNECT_GENERATION))
+@pytest.mark.parametrize("client", _CLIENTS)
 def test_reconnect_inside_a_seedless_refetch_declines_its_render(
     run_pane: Callable[..., None], client: str
 ) -> None:
@@ -588,7 +513,6 @@ await network.reply('/history', {messages: [user('after rewind')]});
 expect(!transcriptText().includes('after rewind'), 'a render across a reconnect is declined');
 expect(transcriptText().includes('before rewind'), 'the transcript before the reconnect stays');
 """,
-        gaps=_RECONNECT_GENERATION,
     )
 
 
@@ -617,16 +541,7 @@ expect(transcriptText().includes('my new message'),
     )
 
 
-_TRIMMED_SEEDLESS = {
-    "coordinator": Gap(
-        "coordinator renders a trimmed /history seedless and keeps its stream, so the trimmed "
-        "turn is never replayed from the cursor",
-        "the stream is rebuilt at the cursor /history returned",
-    )
-}
-
-
-@pytest.mark.parametrize("client", _clients(_TRIMMED_SEEDLESS))
+@pytest.mark.parametrize("client", _CLIENTS)
 def test_a_refetch_of_a_trimmed_history_renders_seeded_and_reconnects_from_its_cursor(
     run_pane: Callable[..., None], client: str
 ) -> None:
@@ -648,19 +563,10 @@ const next = FakeEventSource.latest();
 expect(next !== es && stream(next).params.get('last_event_id') === '3',
   'the stream is rebuilt at the cursor /history returned', next.url);
 """,
-        gaps=_TRIMMED_SEEDLESS,
     )
 
 
-_DESTROY_DURING_FIRST_PAINT = {
-    "coordinator": Gap(
-        "coordinator does not yet stop first paint from opening a stream after destroy",
-        "no stream opens after destroy",
-    )
-}
-
-
-@pytest.mark.parametrize("client", _clients(_DESTROY_DURING_FIRST_PAINT))
+@pytest.mark.parametrize("client", _CLIENTS)
 def test_destroy_during_the_first_history_load_opens_no_stream(
     run_pane: Callable[..., None], client: str
 ) -> None:
@@ -679,7 +585,6 @@ await clock.advance(60000);
 expect(sources().length === 0, 'no stream opens after destroy');
 expect(visibility.listenerCount() === 0, 'no visibility listener survives destroy');
 """,
-        gaps=_DESTROY_DURING_FIRST_PAINT,
     )
 
 
@@ -727,14 +632,15 @@ expect(sources().length === 1, 'the stream opens after a failed first paint');
     )
 
 
-def test_interactive_approval_cards_keep_working_after_a_failed_reload(
-    run_pane: Callable[..., None],
+@pytest.mark.parametrize("client", _CLIENTS)
+def test_approval_cards_keep_working_after_a_failed_reload(
+    run_pane: Callable[..., None], client: str
 ) -> None:
-    """Interactive only: a reload drops the reply bubble refs and nothing else, so an
+    """A reload drops the reply bubble refs and nothing else, so an
     approval card still on screen after the reload's /history failed still resolves its cycle
     (its click posts the decision) instead of going dead under the user's cursor."""
     run_pane(
-        "interactive",
+        client,
         r"""
 const es = await firstPaint({messages: [user('run it')]});
 es.open();
@@ -759,14 +665,15 @@ expect(network.pending('/approve').length === 1, 'the card still posts its decis
     )
 
 
-def test_interactive_server_busy_turn_is_not_a_send_in_flight(
-    run_pane: Callable[..., None],
+@pytest.mark.parametrize("client", _CLIENTS)
+def test_a_server_busy_turn_is_not_a_send_in_flight(
+    run_pane: Callable[..., None], client: str
 ) -> None:
-    """Interactive only: the seedless render steps aside for the user's own send, not for any
+    """The seedless render steps aside for the user's own send, not for any
     busy pane.  A server turn with no reply bubble yet (busy, nothing streaming) still lets a
     clear_ui refetch render."""
     run_pane(
-        "interactive",
+        client,
         r"""
 const es = await firstPaint({messages: [user('before rewind')]});
 es.open();
@@ -829,13 +736,59 @@ expect(visibility.listenerCount() === 0, 'a dead controller holds no visibility 
     )
 
 
-def test_interactive_reasoning_bubble_counts_as_a_streaming_reply(
-    run_pane: Callable[..., None],
+def test_coordinator_dead_controller_contract(run_pane: Callable[..., None]) -> None:
+    """Coordinator only: the controller surface a host drives when the stream gives up, as the
+    interactive pane's.  It reports ``isDead()``, fires ``onDead`` exactly once (the host paints
+    its reconnect affordance), reads "Disconnected" in a dim status bar, and ignores re-login and
+    visibility: its recovery is rebuilding the pane."""
+    run_pane(
+        "coordinator",
+        r"""
+pinRandom(0);
+const {createCoordinatorPane} = await import(COORDINATOR);
+const deadRoot = document.createElement('div');
+html.appendChild(deadRoot);
+let deadCalls = 0;
+const deadCtl = createCoordinatorPane(deadRoot, WS, {onDead: () => { deadCalls += 1; }});
+deadCtl.connect();
+await flush();
+await network.reply(WS_PATH, {ws_id: WS, name: 'coordinator', state: 'idle'});
+await network.reply('/history', {messages: []});
+const es = FakeEventSource.latest();
+es.open();
+es.drop();
+es.fail();
+for (let i = 0; i < 400 && !deadCtl.isDead(); i += 1) {
+  await clock.advance(500);
+  const current = FakeEventSource.latest();
+  if (current.readyState === EventSource.CONNECTING) current.fail();
+}
+expect(deadCtl.isDead() && deadCtl.sync.dead, 'refused redials leave the controller dead');
+expect(deadCalls === 1, 'onDead fires once', String(deadCalls));
+const tokens = deadRoot.querySelector('.ws-sb-tokens');
+expect(tokens.textContent === 'Disconnected', 'the status bar reads Disconnected',
+  tokens.textContent);
+expect(deadRoot.querySelector('.ws-sb-disconnected') !== null, 'the status bar stays dim');
+const count = sources().length;
+deadCtl.onLogin();
+visibility.hide();
+visibility.show();
+await clock.advance(120000);
+expect(sources().length === count && deadCalls === 1,
+  'a dead controller ignores re-login and visibility');
+expect(visibility.listenerCount() === 0, 'a dead controller holds no visibility listener');
+""",
+    )
+
+
+@pytest.mark.parametrize("client", _CLIENTS)
+def test_a_reasoning_bubble_counts_as_a_streaming_reply(
+    run_pane: Callable[..., None], client: str
 ) -> None:
-    """Interactive only: a reasoning-only segment (no content bubble yet) is as detachable as
+    """A reasoning-only segment (no content bubble yet) is as detachable as
     a content one, so a clear_ui refetch declines to render under it."""
     run_pane(
-        "interactive",
+        client,
         r"""
 const es = await firstPaint({messages: [user('before rewind')]});
 es.open();
@@ -881,14 +834,6 @@ expect(wrapped.join(',') === 'state_change', 'the late wrapper saw the event', w
     )
 
 
-_DESTROY_DURING_SNAPSHOT = Gap(
-    "coordinator does not yet stop first paint from opening a stream after a destroy "
-    "during its workstream snapshot request",
-    "no stream opens after a destroy during the snapshot request",
-)
-
-
-@pytest.mark.xfail(strict=True, raises=PaneExpectationError, reason=_DESTROY_DURING_SNAPSHOT.reason)
 def test_coordinator_destroy_during_its_snapshot_opens_no_stream(
     run_pane: Callable[..., None],
 ) -> None:
@@ -907,7 +852,6 @@ for (const history of network.pending('/history')) history.reply({messages: []})
 await clock.advance(60000);
 expect(sources().length === 0, 'no stream opens after a destroy during the snapshot request');
 """,
-        gaps={"coordinator": _DESTROY_DURING_SNAPSHOT},
     )
 
 
@@ -998,15 +942,7 @@ expect(opened.params.get('last_event_id') === '5' && opened.params.get('history_
     )
 
 
-_REFUSED_REDIAL = {
-    "coordinator": Gap(
-        "coordinator still waits for its 5 s closed check before backing off a refused stream",
-        "one redial after the first backoff step",
-    ),
-}
-
-
-@pytest.mark.parametrize("client", _clients(_REFUSED_REDIAL))
+@pytest.mark.parametrize("client", _CLIENTS)
 def test_a_refused_stream_redials_after_the_first_backoff_step(
     run_pane: Callable[..., None], client: str
 ) -> None:
@@ -1026,19 +962,10 @@ expect(sources().length === 1, 'no redial inside the first backoff step');
 await clock.advance(1);
 expect(sources().length === 2, 'one redial after the first backoff step', sources().length);
 """,
-        gaps=_REFUSED_REDIAL,
     )
 
 
-_STRIKE_BUDGET = {
-    "coordinator": Gap(
-        "coordinator does not yet stop redialling a refused stream (it never gives up)",
-        "a refused stream redials six times then stops",
-    ),
-}
-
-
-@pytest.mark.parametrize("client", _clients(_STRIKE_BUDGET))
+@pytest.mark.parametrize("client", _CLIENTS)
 def test_a_refused_stream_stops_at_the_seventh_refusal(
     run_pane: Callable[..., None], client: str
 ) -> None:
@@ -1060,19 +987,10 @@ for (let i = 0; i < 600; i += 1) {
 expect(sources().length === 7, 'a refused stream redials six times then stops',
   sources().length + ' streams');
 """,
-        gaps=_STRIKE_BUDGET,
     )
 
 
-_RELOGIN_HEALTHY = {
-    "coordinator": Gap(
-        "coordinator does not yet leave a healthy stream alone on re-login (it redials)",
-        "a re-login leaves a healthy stream alone",
-    ),
-}
-
-
-@pytest.mark.parametrize("client", _clients(_RELOGIN_HEALTHY))
+@pytest.mark.parametrize("client", _CLIENTS)
 def test_relogin_leaves_a_healthy_stream_alone(run_pane: Callable[..., None], client: str) -> None:
     """The login fan-out resumes a stream that needs it and leaves a live one
     alone: no close, no new stream, no /history reload."""
@@ -1088,17 +1006,17 @@ await clock.advance(1000);
 expect(!es.closeCalled && sources().length === 1, 'a re-login leaves a healthy stream alone');
 expect(network.seen('/history').length === historyLoads, 'a re-login does not reload /history');
 """,
-        gaps=_RELOGIN_HEALTHY,
     )
 
 
-def test_interactive_dead_mid_reasoning_removes_the_reasoning_indicator(
-    run_pane: Callable[..., None],
+@pytest.mark.parametrize("client", _CLIENTS)
+def test_dead_mid_reasoning_removes_the_reasoning_indicator(
+    run_pane: Callable[..., None], client: str
 ) -> None:
-    """Interactive only: dead ends the reasoning clock with the turn's other timers, so a
+    """Dead ends the reasoning clock with the turn's other timers, so a
     reasoning indicator showing when the stream gives up is removed, not left ticking."""
     run_pane(
-        "interactive",
+        client,
         r"""
 pinRandom(0);
 const es = await firstPaint({messages: [user('think about it')]});
@@ -1123,16 +1041,7 @@ expect(root.querySelector('.reasoning-activity-status') === null,
     )
 
 
-_RETRY_WITH_A_CURSOR = {
-    "coordinator": Gap(
-        "coordinator declines a seedless render while a tool call is live and never promotes a "
-        "cursor-bearing refetch, so a Retry whose batch starts first keeps the replaced reply",
-        "the replaced reply is gone",
-    ),
-}
-
-
-@pytest.mark.parametrize("client", _clients(_RETRY_WITH_A_CURSOR))
+@pytest.mark.parametrize("client", _CLIENTS)
 def test_retry_with_a_tool_batch_starting_before_history_answers(
     run_pane: Callable[..., None], client: str
 ) -> None:
@@ -1170,10 +1079,9 @@ expect(next !== es && stream(next).params.get('last_event_id') === '5',
 next.open();
 for (const [id, event] of batch) next.deliver(event, {id});
 await flush();
-const count = (transcriptText().match(/ls -la/g) || []).length;
+const count = pane.transcript().querySelectorAll('.conv-batch').length;
 expect(count === 1, 'the regenerated batch shows once', String(count));
 """,
-        gaps=_RETRY_WITH_A_CURSOR,
     )
 
 
@@ -1277,5 +1185,272 @@ await flush();
 await clock.advance(60000);
 expect(textOf(transcript) === before, 'nothing paints after teardown', textOf(transcript));
 expect(sources().length === 1, 'no stream reopens');
+""",
+    )
+
+
+def test_coordinator_missed_reloads_the_sidebar_and_a_covered_gap_does_not(
+    run_pane: Callable[..., None],
+) -> None:
+    """Coordinator only: the sidebar (children, tasks, live badges) is re-read on the core's
+    ``missed`` event, a reconnect whose replay cannot vouch for the gap (no cursor to present).
+    A gap the cursor covers, however long, reloads nothing: the ring replay redelivers the
+    child and task events itself."""
+    run_pane(
+        "coordinator",
+        r"""
+const sidebar = () => network.seen('/children').length + network.seen('/tasks').length;
+const es = await firstPaint();
+es.open();
+await flush();
+const afterFirstPaint = sidebar();
+expect(afterFirstPaint === 2, 'first paint loads children and tasks once', String(afterFirstPaint));
+es.drop();
+await clock.advance(1000);
+es.open();
+await flush();
+expect(sidebar() === afterFirstPaint + 2, 'a reconnect with no cursor reloads the sidebar',
+  String(sidebar()));
+es.deliver({type: 'status'}, {id: 7});
+await flush();
+const covered = sidebar();
+es.drop();
+await clock.advance(120000);
+es.open();
+await flush();
+expect(sidebar() === covered, 'a gap the cursor covers reloads nothing', String(sidebar()));
+""",
+    )
+
+
+@pytest.mark.parametrize("client", _CLIENTS)
+def test_relogin_redials_a_refused_stream_at_once(
+    run_pane: Callable[..., None], client: str
+) -> None:
+    """The login fan-out (and the coordinator host's explicit re-open of a live pane, which calls
+    the same ``onLogin``) redials a refused stream at once instead of waiting out its backoff."""
+    run_pane(
+        client,
+        r"""
+pinRandom(0);
+const es = await firstPaint();
+es.open();
+await flush();
+const count = sources().length;
+es.drop();
+es.fail();
+expect(sources().length === count, 'a refused stream waits for its backoff');
+await pane.login();
+expect(sources().length === count + 1, 're-login redials at once', String(sources().length));
+""",
+    )
+
+
+@pytest.mark.parametrize("client", _CLIENTS)
+def test_the_status_bar_shows_the_phase_and_is_dim_until_live(
+    run_pane: Callable[..., None], client: str
+) -> None:
+    """Both panes paint the stream's phase the same way: dim with the phase's words while the
+    stream is not live; live lifts the dim and shows the counters, or the placeholder when no
+    status event ever arrived."""
+    run_pane(
+        client,
+        r"""
+const es = await firstPaint();
+const tokens = root.querySelector('.ws-sb-tokens');
+const dim = () => root.querySelector('.ws-sb-disconnected') !== null;
+expect(dim() && tokens.textContent === 'Connecting' + String.fromCharCode(0x2026),
+  'connecting is dim and says so', tokens.textContent);
+es.open();
+await flush();
+expect(!dim() && tokens.textContent === '0 / ' + String.fromCharCode(0x2014),
+  'live lifts the dim and shows the placeholder', tokens.textContent);
+es.drop();
+await flush();
+expect(dim() && tokens.textContent === 'Reconnecting' + String.fromCharCode(0x2026),
+  'a drop dims and says reconnecting', tokens.textContent);
+es.open();
+await flush();
+expect(!dim(), 'the reopen lifts the dim again');
+""",
+    )
+
+
+def test_coordinator_a_failed_snapshot_is_dead_to_its_host(run_pane: Callable[..., None]) -> None:
+    """Coordinator only: a first paint whose workstream snapshot GET fails has nothing to stream,
+    so the pane reports dead the way a stream that gave up does (the host's reconnect rebuilds
+    it and runs the GET again): ``isDead()``, ``onDead`` once, "Disconnected", and no /history
+    or stream.  A pane closed during the GET reports nothing."""
+    run_pane(
+        "coordinator",
+        r"""
+const {createCoordinatorPane} = await import(COORDINATOR);
+const mount = (onDead) => {
+  const host = document.createElement('div');
+  html.appendChild(host);
+  return {host, ctl: createCoordinatorPane(host, WS, {onDead})};
+};
+let deadCalls = 0;
+const failed = mount(() => { deadCalls += 1; });
+failed.ctl.connect();
+await flush();
+await network.reply(WS_PATH, {detail: 'unavailable'}, {status: 503});
+await flush();
+expect(failed.ctl.isDead() && deadCalls === 1, 'a failed snapshot is dead, announced once',
+  deadCalls);
+expect(failed.host.querySelector('.ws-sb-tokens').textContent === 'Disconnected',
+  'the status bar says so');
+expect(network.seen('/history').length === 0 && sources().length === 0,
+  'nothing loads or streams');
+let closedCalls = 0;
+const closed = mount(() => { closedCalls += 1; });
+closed.ctl.connect();
+await flush();
+closed.ctl.destroy();
+await network.reply(WS_PATH, {detail: 'unavailable'}, {status: 503});
+await flush();
+expect(closedCalls === 0, 'a pane closed during the GET reports nothing', closedCalls);
+""",
+    )
+
+
+def test_coordinator_a_rebuilt_pane_on_the_same_root_answers_a_key_once(
+    run_pane: Callable[..., None],
+) -> None:
+    """Coordinator only: a host rebuilds a dead pane into the same root, so the destroyed pane's
+    root listeners must go with it; one approval key press then sends one decision."""
+    run_pane(
+        "coordinator",
+        r"""
+const {createCoordinatorPane} = await import(COORDINATOR);
+const host = document.createElement('div');
+html.appendChild(host);
+const pending = cycle => ({type: 'approve_request', cycle_id: cycle,
+  items: [{call_id: 'c-' + cycle, func_name: 'bash', needs_approval: true, header: 'bash',
+    preview: 'ls'}]});
+const build = async () => {
+  const ctl = createCoordinatorPane(host, WS, {});
+  ctl.connect();
+  await flush();
+  await network.reply(WS_PATH, {ws_id: WS, name: 'coordinator', state: 'idle'});
+  await network.reply('/history', {messages: []});
+  return ctl;
+};
+const first = await build();
+FakeEventSource.latest().open();
+FakeEventSource.latest().deliver(pending('one'), {id: 4});
+await flush();
+first.destroy();
+host.replaceChildren();
+await build();
+FakeEventSource.latest().open();
+FakeEventSource.latest().deliver(pending('two'), {id: 5});
+await flush();
+host.dispatchEvent({type: 'keydown', key: 'd', bubbles: false, target: host,
+  preventDefault() {}});
+await flush();
+const posts = network.seen('/approve');
+expect(posts.length === 1, 'one key press sends one decision', String(posts.length));
+expect(JSON.parse(posts[0].init.body).cycle_id === 'two', 'from the live pane',
+  posts[0].init.body);
+""",
+    )
+
+
+def test_coordinator_a_hidden_first_paint_reloads_the_sidebar_when_the_stream_opens(
+    run_pane: Callable[..., None],
+) -> None:
+    """Coordinator only: a first paint in a hidden tab defers the stream to the show edge, so the
+    sidebar read at first paint may have moved on by the time the stream opens; that late first
+    open is ``missed`` and the sidebar is read again."""
+    run_pane(
+        "coordinator",
+        r"""
+const sidebar = () => network.seen('/children').length + network.seen('/tasks').length;
+visibility.hide();
+await pane.start();
+await pane.beforeHistory();
+await network.reply('/history', {messages: []});
+expect(sidebar() === 2 && sources().length === 0, 'first paint reads the sidebar, no stream yet',
+  String(sidebar()));
+visibility.show();
+await flush();
+FakeEventSource.latest().open();
+await flush();
+expect(sidebar() === 4, 'the late first open reads it again', String(sidebar()));
+""",
+    )
+
+
+def test_coordinator_first_paint_replays_a_pending_approval_below_the_history(
+    run_pane: Callable[..., None],
+) -> None:
+    """Coordinator only: the snapshot's pending approval is replayed after the history render
+    (below it, not wiped by it) and before the stream connects, so the live approve_request for
+    the same cycle upgrades that batch in place instead of adding a second one."""
+    run_pane(
+        "coordinator",
+        r"""
+await pane.start();
+const item = {call_id: 'c1', func_name: 'bash', needs_approval: true, header: 'bash',
+  preview: 'ls'};
+await network.reply(WS_PATH, {ws_id: WS, name: 'coordinator', state: 'running',
+  pending_approval: true,
+  pending_approval_details: [{items: [item], cycle_id: 'cy1', judge_pending: false}]});
+expect(sources().length === 0, 'no stream before the history renders');
+await network.reply('/history', {messages: [user('run it')]});
+const transcript = pane.transcript();
+const rows = [...transcript.children];
+const userRow = rows.findIndex(row => row.classList.contains('user'));
+const batchRow = rows.findIndex(row => row.classList.contains('conv-batch'));
+expect(userRow >= 0 && batchRow > userRow, 'the replayed batch sits below the history',
+  userRow + ' ' + batchRow);
+const es = FakeEventSource.latest();
+es.open();
+es.deliver({type: 'approve_request', cycle_id: 'cy1', items: [item]}, {id: 4});
+await flush();
+expect(transcript.querySelectorAll('.conv-batch').length === 1,
+  'the live approve_request upgrades the replayed batch in place');
+""",
+    )
+
+
+@pytest.mark.parametrize("client", _CLIENTS)
+def test_an_edit_composed_before_a_sign_in_change_is_not_sent(
+    run_pane: Callable[..., None], client: str
+) -> None:
+    """The latched edit-and-resend belongs to the identity that composed it: when the sign-in
+    changes before the rewind's refetch settles, the rewind stands but the edit is not sent as
+    whoever is signed in now; the text goes back to the composer with a one-line note."""
+    run_pane(
+        client,
+        r"""
+FakeElement.prototype.setSelectionRange = () => {};
+sessionStorage.setItem = () => {};
+sessionStorage.removeItem = () => {};
+const auth = await import(SHARED + '/auth.js');
+const es = await firstPaint({messages: [user('original question'),
+  {role: 'assistant', content: 'original answer'}]});
+es.open();
+es.deliver({type: 'state_change', state: 'idle'}, {id: 4});
+await flush();
+const message = pane.transcript().querySelectorAll('.msg.user')[0];
+press(message.querySelectorAll('.msg-action-btn').find(b => b.querySelector('.icon-edit')));
+await flush();
+message.querySelector('.msg-edit-textarea').value = 'edited question';
+press(message.querySelector('.msg-edit-btn-send'));
+await flush();
+await network.reply('/rewind', {status: 'ok'});
+const before = auth.authGeneration();
+auth.showLogin();
+expect(auth.authGeneration() !== before, 'the sign-in changed');
+es.deliver({type: 'clear_ui'}, {id: 5});
+await flush();
+for (const request of network.pending('/history')) request.reply({messages: []});
+await flush();
+expect(network.seen('/send').length === 0, 'the edit is not sent as the new identity');
+expect(root.querySelector('.composer-input').value === 'edited question',
+  'the text is back in the composer', root.querySelector('.composer-input').value);
+expect(transcriptText().includes('Edit not sent: the signed-in user changed.'), 'the pane says so');
 """,
     )

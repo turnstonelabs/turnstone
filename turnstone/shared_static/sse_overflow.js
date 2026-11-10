@@ -13,11 +13,10 @@
 // gap, or falls to the replay_truncated → /history floor once the gap
 // outgrows the ring.
 //
-// The two consumers keep their OWN transport glue (the interactive pane's sync core in
-// workstream_sync.js, and coordinator.js, a closure with an inline stream close) but share these
-// two pure helpers + the constants, so the trip threshold and the escalation ladder — the
-// review-hardened, drift-prone part — have a single source of truth instead of two copies that
-// silently diverge.
+// The consumer is the shared sync core (workstream_sync.js), which both panes run on; it keeps the
+// transport glue, and these two pure helpers + the constants stay here, so the trip threshold and
+// the escalation ladder — the review-hardened, drift-prone part — have one source of truth that
+// its tests and the e2e harness read too.
 export const OVERFLOW_TRIP_COUNT = 3;
 export const OVERFLOW_TRIP_WINDOW_MS = 60000;
 export const DEGRADED_COOLDOWN_BASE_MS = 15000;
@@ -60,10 +59,9 @@ export const TRUNCATED_RESYNC_JITTER_MS = 10000;
 // their windows on floor + this); raising either requires widening those.
 export const STALE_RETRY_JITTER_MS = 500;
 
-// The floor the jitter is additive OVER.  Exported rather than left as a
-// literal in each client because FOUR sites must move together: both panes'
-// retry arms and both e2e non-occurrence windows, which size themselves on
-// floor + jitter and go vacuous if the retry can fire before they open.
+// The floor the jitter is additive OVER.  Exported rather than left as a literal because the
+// sync core's retry arm and the e2e non-occurrence windows must move together: the windows size
+// themselves on floor + jitter and go vacuous if the retry can fire before they open.
 export const STALE_RETRY_BASE_MS = 2000;
 
 // Rolling-window trip check.  Prunes `times` in place (entries older than

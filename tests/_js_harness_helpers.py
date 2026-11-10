@@ -87,8 +87,14 @@ class FakeElement {
   hasAttribute(name) { return Object.hasOwn(this.attributes, name); }
   removeAttribute(name) { delete this.attributes[name]; }
   addEventListener(name, fn, options) {
+    // An aborted signal removes the listener, as a browser does.
+    const signal = options && typeof options === 'object' ? options.signal : null;
+    if (signal && signal.aborted) return;
     if (!this._listeners.has(name)) this._listeners.set(name, []);
     this._listeners.get(name).push({ fn, once: !!(options && options.once) });
+    if (signal) {
+      signal.addEventListener('abort', () => this.removeEventListener(name, fn), { once: true });
+    }
   }
   removeEventListener(name, fn) {
     const rows = this._listeners.get(name) || [];

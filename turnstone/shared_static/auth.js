@@ -49,10 +49,10 @@ if (_authChannel) {
   };
 }
 
-// Raw-fetch callers (the SSE-error probes, which must inspect a 401's status
-// without authFetch's throw-on-401 contract) route a version_mismatch body
-// here so the post-re-login reload still picks up the new assets — the same
-// flag+overlay path authFetch takes below.
+// Raw-fetch callers (the console's cluster-stream probe, which must inspect a
+// 401's status without authFetch's throw-on-401 contract) route a
+// version_mismatch body here so the post-re-login reload still picks up the new
+// assets — the same flag+overlay path authFetch takes below.
 export function noteVersionMismatch() {
   _authUpgradeReload = true;
   showLogin("upgrade");
@@ -156,6 +156,33 @@ export function authGeneration() {
 /** Subscribe to identity, permission, scope, or authentication-loss changes. */
 export function onAuthChange(callback) {
   _authSubscribers.add(callback);
+}
+
+/**
+ * Call `callback` whenever a different user signs in: the stored user id
+ * turns into a non-empty id that differs from the last non-empty one.  An
+ * empty id (signed out, or a login broadcast from another tab before whoami
+ * restores the id) waits for the next non-empty one, which is also why this
+ * rides the auth-change signal rather than the login fan-out: in other tabs
+ * the fan-out runs while the id is still empty.  A page showing workstreams
+ * uses it so a stream authorised as one user stops painting for another.
+ */
+export function onUserChange(callback) {
+  let known = _storedUserId();
+  onAuthChange(function () {
+    const userId = _storedUserId();
+    if (!userId) return;
+    if (known && userId !== known) callback();
+    known = userId;
+  });
+}
+
+function _storedUserId() {
+  try {
+    return sessionStorage.getItem("ts.user_id") || "";
+  } catch (e) {
+    return "";
+  }
 }
 
 function _publishAuthChange() {
@@ -1014,5 +1041,6 @@ Object.assign(window, {
   hasScope,
   authGeneration,
   onAuthChange,
+  onUserChange,
   whenPermissionsReady,
 });

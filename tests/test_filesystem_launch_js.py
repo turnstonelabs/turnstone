@@ -160,16 +160,12 @@ def test_authority_changes_clear_files_and_update_all_launchers() -> None:
     source = (_SHARED / "shell.js").read_text()
     start = source.index("  const syncFilesAccess = () => {")
     end = source.index("  // Tier-1 lifecycle", start)
-    # The same listener runs the shell's user-change rule; its helpers come from the module scope.
-    helpers = "".join(
-        source[source.index(head) : source.index("\n}\n", source.index(head)) + 3]
-        for head in ("function watchUserChanges(", "function storedItem(")
-    )
     proc = run_node_source(
         FAKE_DOM
-        + helpers
         + """
-globalThis.sessionStorage = {getItem: (key) => (key === "ts.user_id" ? "user-1" : null)};
+// The user-change rule beside the listener is auth.js's (tested in test_shell_js.py); here it
+// never fires, so the guard below pins that an authority change closes no conversation.
+const onUserChange = () => {};
 const buttons = [document.createElement("button"), document.createElement("button")];
 document.querySelectorAll = () => buttons;
 let canWrite = true;
@@ -183,7 +179,6 @@ let filePaneOpen = true;
 let closes = 0;
 const pm = {
   hasPane: () => filePaneOpen,
-  statefulTabs: () => [{id: "interactive:ws-a", rawId: "ws-a"}],
   close(id) {
     if (id !== "filesystem") throw new Error("Must not close conversations");
     closes++;

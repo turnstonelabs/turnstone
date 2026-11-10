@@ -75,12 +75,29 @@ function paintStatusBar(els, evt) {
 }
 
 /**
- * Reset the tokens cell to its placeholder text.  Called by the
- * coord dashboard on SSE reconnect when no prior status event has
- * been seen, so the transient "Reconnecting…" copy doesn't stick.
+ * Reset the tokens cell to its placeholder text.  Called when a stream
+ * goes live with no status event ever seen, so the transient
+ * "Reconnecting…" copy doesn't stick.
  */
 function resetTokensPlaceholder(tokensEl) {
   if (tokensEl) tokensEl.textContent = "0 / —";
+}
+
+/**
+ * Show a stream phase in a pane's status bar, the same way in every pane:
+ * dim while the stream is not live, with the phase's words (`text`, the
+ * sync core's STREAM_STATUS_TEXT entry) in the tokens cell; live repaints
+ * the last status event through `repaint`, or the placeholder when none
+ * ever arrived.  A phase with no words leaves the cell as it is.
+ */
+function paintStreamPhase(els, phase, text, lastStatus, repaint) {
+  els.barEl.classList.toggle("ws-sb-disconnected", phase !== "live");
+  if (phase === "live") {
+    if (lastStatus) repaint(lastStatus);
+    else resetTokensPlaceholder(els.tokensEl);
+  } else if (text) {
+    els.tokensEl.textContent = text;
+  }
 }
 
 /**
@@ -180,7 +197,7 @@ function scrollToApprovalTarget(el) {
 
 export const StatusBar = {
   paint: paintStatusBar,
-  resetTokensPlaceholder: resetTokensPlaceholder,
+  paintStreamPhase: paintStreamPhase,
   paintWarnChip: paintWarnChip,
   paintApprovalChip: paintApprovalChip,
   scrollToApprovalTarget: scrollToApprovalTarget,

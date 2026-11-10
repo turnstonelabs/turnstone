@@ -64,7 +64,7 @@ import {
 } from "./transcript_presentation.js";
 import { redactCredentials, tryPrettyJson } from "./redact_credentials.js";
 import { tryParseMcpError, buildMcpErrorEmbed } from "./mcp_error.js";
-import { authFetch, hasScope, hasPermission } from "./auth.js";
+import { authFetch, authGeneration, hasScope, hasPermission } from "./auth.js";
 import { showToast } from "./toast.js";
 import { Composer } from "./composer.js";
 import {
@@ -296,7 +296,10 @@ class Pane {
     this._finalizeThrows = 0;
     this._cancelTimeout = null;
     this._forceTimeout = null;
+    // The latched edit-and-resend text and the auth generation it was composed
+    // under, so an edit is never sent as a different signed-in user.
     this._pendingEditSend = null;
+    this._pendingEditGeneration = 0;
     // Voice I/O (mic STT + per-message TTS playback)
     this._voiceRoles = { stt: false, tts: false };
     this._micBtn = null;
@@ -1276,19 +1279,19 @@ class Pane {
     });
   }
 
-  // Show the stream's phase in the status bar: dim while the stream is not
-  // live, with the phase's words in the tokens cell; live repaints the last
-  // status counters, or the placeholder when none ever arrived.  Dead also
-  // ends the turn's Stop-button timers, voice I/O and reasoning clock, which
-  // nothing will settle now.
+  // Show the stream's phase in the status bar with the painter every pane
+  // uses: dim while the stream is not live, the phase's words in the tokens
+  // cell; live repaints the last status counters, or the placeholder when none
+  // ever arrived.  Dead also ends the turn's Stop-button timers, voice I/O and
+  // reasoning clock, which nothing will settle now.
   _renderStreamStatus(phase) {
-    this.statusBarEl.classList.toggle("ws-sb-disconnected", phase !== "live");
-    if (phase === "live") {
-      if (this._lastStatusEvt) this.updateStatus(this._lastStatusEvt);
-      else StatusBar.resetTokensPlaceholder(this._sbTokens);
-    } else if (STREAM_STATUS_TEXT[phase]) {
-      this._sbTokens.textContent = STREAM_STATUS_TEXT[phase];
-    }
+    StatusBar.paintStreamPhase(
+      { barEl: this.statusBarEl, tokensEl: this._sbTokens },
+      phase,
+      STREAM_STATUS_TEXT[phase],
+      this._lastStatusEvt,
+      (evt) => this.updateStatus(evt),
+    );
     if (phase === "dead") this._stopTurnActivity();
   }
 
@@ -1311,8 +1314,8 @@ class Pane {
   // whether the refetch rendered, failed, was declined or was superseded,
   // and also after the pane was torn down; its bubble lands on whatever
   // transcript is showing and the rewound truth arrives with the next
-  // completed render.  Only a render throw drops the edit, releases the
-  // composer and says why.
+  // completed render.  A render throw drops the edit, releases the composer
+  // and says why; so does a changed sign-in, handing the text back.
   _onResetSettled({ outcome, error }) {
     if (outcome === "threw") {
       this._pendingEditSend = null;
@@ -1323,6 +1326,22 @@ class Pane {
     if (!this._pendingEditSend) return;
     const editText = this._pendingEditSend;
     this._pendingEditSend = null;
+    // Signed in as someone else (or signed out) since the edit was composed: the
+    // rewind stands, but the text is not sent as whoever is signed in now.  A
+    // mounted pane hands it back.
+    if (authGeneration() !== this._pendingEditGeneration) {
+      this.setBusy(false);
+      if (this.sync.status !== "destroyed") {
+        this.composer.value = mergeRejectedComposerText(
+          editText,
+          this.composer.value,
+        );
+        this.addInfoMessage(
+          "Edit not sent: the signed-in user changed. Your text is back in the composer.",
+        );
+      }
+      return;
+    }
     const editClientSendId = mintClientSendId();
     const editPriority = parsePriority(editText);
     this.setBusy(true, "optimistic");
@@ -2478,6 +2497,7 @@ class Pane {
     // Store pending send — dispatched by _onResetSettled once the
     // rewind's clear_ui refetch of /history settles.
     this._pendingEditSend = newText;
+    this._pendingEditGeneration = authGeneration();
     authFetch(
       this._base +
         "/v1/api/workstreams/" +

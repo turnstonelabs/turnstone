@@ -37,8 +37,10 @@
 // Events (on(name, fn) returns an unsubscribe; a throwing listener is logged and never stops
 // another listener or the core):
 //   status          the phase, on every change
-//   missed          replay cannot vouch for continuity, so state the stream does not carry (a
-//                   sidebar) should be re-read
+//   missed          continuity since what the pane last read is broken: a gap was reported, a
+//                   reconnect replayed fresh, the first stream opened late (hidden, refused or
+//                   errored first dial, or parked behind the login), or a reload adopted a
+//                   cursor; state the stream does not carry whole (a sidebar) should be re-read
 //   reloaded        { first, outcome } after a seeded load settles, before the connect (a
 //                   promoted refetch is a render, not a load, and emits none)
 //   reset-settled   { outcome, error? } exactly once per clear_ui, also after destroy and also for
@@ -98,6 +100,9 @@ const STRIKE_LIMIT = 7;
 const HISTORY_DEADLINE_MAX_MS = 120000;
 
 const EVENT_NAMES = new Set(["status", "missed", "reloaded", "reset-settled"]);
+// The phases on the direct path from start() to the first open. Any other phase before that open
+// (paused, reconnecting, backoff, auth, a repair) means the first stream opened late.
+const PROMPT_FIRST_OPEN_PHASES = new Set(["loading", "connecting", "live"]);
 const VIEW_METHODS = [
   "dispatch",
   "renderHistory",
@@ -105,7 +110,6 @@ const VIEW_METHODS = [
   "liveState",
   "placeRepairPrompt",
 ];
-const LOG = "workstream sync: ";
 
 function workstreamPath(base, wsId) {
   return (base || "") + "/v1/api/workstreams/" + encodeURIComponent(wsId);
@@ -249,6 +253,12 @@ export class WorkstreamSync {
   // establishes nothing. Must stay a number; undefined would decline every seedless render.
   #epoch = 0;
   #strikes = 0;
+  // The first stream did not open promptly (the tab was hidden, a first dial was refused or
+  // errored, the login park, a repair), so whatever the pane read at first paint may have moved
+  // on before it opened. Set in #setPhase, the one place every such detour passes.
+  #firstOpenLate = false;
+  // Every console line names the workstream, so one pane's report can be told from another's.
+  #log;
   #historyDeadlineMs = HISTORY_HANDOFF_FETCH_TIMEOUT_MS;
   // Events held while a seedless refetch is in flight (null otherwise). Armed synchronously before
   // the fetch's await, owned by the refetch that armed it, and flushed through the router after
@@ -300,6 +310,7 @@ export class WorkstreamSync {
       }
     }
     this.#wsId = wsId;
+    this.#log = "workstream sync " + wsId + ": ";
     this.#base = base || "";
     this.#fetch = fetch;
     this.#view = view;
@@ -397,6 +408,7 @@ export class WorkstreamSync {
   #setPhase(next) {
     if (this.#phase === next) return;
     if (this.#terminal() && !(this.#phase === "dead" && next === "destroyed")) return;
+    if (this.#health.opens === 0 && !PROMPT_FIRST_OPEN_PHASES.has(next)) this.#firstOpenLate = true;
     this.#phase = next;
     this.#emit("status", next);
   }
@@ -412,7 +424,7 @@ export class WorkstreamSync {
       try {
         listener(payload);
       } catch (error) {
-        console.error(LOG + "a " + name + " listener failed", error);
+        console.error(this.#log + "a " + name + " listener failed", error);
       }
     }
   }
@@ -502,7 +514,7 @@ export class WorkstreamSync {
       source = new EventSource(url);
     } catch (error) {
       // Counted like a refused connection, so the strike budget bounds it.
-      console.error(LOG + "could not open the event stream", error);
+      console.error(this.#log + "could not open the event stream", error);
       this.#refused();
       return;
     }
@@ -524,9 +536,11 @@ export class WorkstreamSync {
     this.#health.opens += 1;
     this.#strikes = 0;
     // A reconnect that presented no cursor got a fresh replay, which cannot vouch for what
-    // happened while the stream was down. With a gap on record the connect presented the gap
-    // cursor, and the envelope already said so.
-    const missed = !firstOpen && !this.#sourcePresentsCursor && this.#gapCursor == null;
+    // happened while the stream was down; a first stream that opened late cannot vouch for what
+    // happened since first paint. A prompt first open follows first paint closely enough. With a
+    // gap on record the connect presented the gap cursor, and the envelope already said so.
+    const missed =
+      (firstOpen ? this.#firstOpenLate : !this.#sourcePresentsCursor) && this.#gapCursor == null;
     this.#setPhase("live");
     if (missed && source === this.#source) this.#emit("missed");
   }
@@ -613,7 +627,7 @@ export class WorkstreamSync {
     if (data.ws_id && data.ws_id !== this.#wsId) {
       this.#health.foreignFrames += 1;
       console.warn(
-        LOG +
+        this.#log +
           "dropping a frame stamped for workstream " +
           data.ws_id +
           " (total " +
@@ -647,7 +661,7 @@ export class WorkstreamSync {
   #dropMalformedFrame(error) {
     this.#health.malformedFrames += 1;
     console.warn(
-      LOG + "dropping malformed SSE frame (total " + this.#health.malformedFrames + ")",
+      this.#log + "dropping malformed SSE frame (total " + this.#health.malformedFrames + ")",
       error,
     );
   }
@@ -669,7 +683,7 @@ export class WorkstreamSync {
     } catch (error) {
       this.#health.renderThrows += 1;
       console.error(
-        LOG +
+        this.#log +
           "dispatch failed for " +
           event.type +
           " (render-throw total " +
@@ -730,7 +744,7 @@ export class WorkstreamSync {
   #countTruncationGap() {
     this.#health.truncatedGaps += 1;
     console.warn(
-      LOG +
+      this.#log +
         "replay window could not cover the reconnect gap (total " +
         this.#health.truncatedGaps +
         ")",
@@ -749,7 +763,7 @@ export class WorkstreamSync {
   #noteStreamOverflow() {
     this.#health.overflows += 1;
     console.warn(
-      LOG +
+      this.#log +
         "server closed the stream after a send-queue overflow (total " +
         this.#health.overflows +
         "); reconnect will replay the gap",
@@ -884,11 +898,11 @@ export class WorkstreamSync {
     let outcome;
     try {
       if (!hadGap) this.#view.resetLiveState();
-      outcome = await this.#loadSeeded(gen, first, hadGap);
+      outcome = await this.#loadSeeded(gen, first);
     } catch (error) {
       // A render throw ends like a failed load (the connect still follows, the repair fails
       // closed), but stays loud.
-      console.error(LOG + "history load/render failed", error);
+      console.error(this.#log + "history load/render failed", error);
       outcome = "threw";
     } finally {
       // Before the generation check, so a superseded attempt still frees the repair's slot.
@@ -911,14 +925,15 @@ export class WorkstreamSync {
     this.#connect();
   }
 
-  async #loadSeeded(gen, first, hadGap) {
+  async #loadSeeded(gen, first) {
     const data = await this.#fetchHistory();
     if (gen !== this.#generation) return "superseded";
     if (!data) return "failed";
     this.#render(data, true);
     // Replay from the adopted cursor covers the transcript, not what the stream missed while it
-    // was down. A gap already on record announced itself when it arrived.
-    if (!first && !hadGap && data.cursor != null) this.#emit("missed");
+    // was down. That holds for a reload that heals a recorded gap too: the envelope announced the
+    // gap when it arrived, and the stream state since then (a sidebar) moved on before this heal.
+    if (!first && data.cursor != null) this.#emit("missed");
     return "rendered";
   }
 
@@ -991,7 +1006,9 @@ export class WorkstreamSync {
   // The stale retry and the backstop are fire-and-forget: no composer state rides them to
   // un-strand, so a render throw is only logged, loudly.
   #refetchLoudly() {
-    this.#refetch().catch((error) => console.error(LOG + "history load/render failed", error));
+    this.#refetch().catch((error) =>
+      console.error(this.#log + "history load/render failed", error),
+    );
   }
 
   // Replay the backlog in arrival order through the router. A queued clear_ui arms a new queue
@@ -1051,7 +1068,7 @@ export class WorkstreamSync {
       this.#armStaleRetry(gen);
     } catch (error) {
       settled.error = error;
-      console.error(LOG + "history load/render failed", error);
+      console.error(this.#log + "history load/render failed", error);
     } finally {
       // Exactly once per clear_ui, on every path and also after destroy: the rewind already
       // committed server-side, so a pending edit must still send unless the render threw.
@@ -1106,6 +1123,9 @@ export class WorkstreamSync {
       if (data) {
         this.#historyDeadlineMs = HISTORY_HANDOFF_FETCH_TIMEOUT_MS;
       } else if (expired) {
+        console.warn(
+          this.#log + "history request gave up after " + this.#historyDeadlineMs + " ms",
+        );
         this.#historyDeadlineMs = Math.min(this.#historyDeadlineMs * 2, HISTORY_DEADLINE_MAX_MS);
       }
       return data;
@@ -1115,16 +1135,26 @@ export class WorkstreamSync {
     }
   }
 
+  // One warning per failed request (a status, a network error, an unreadable body); an aborted
+  // one says nothing here: a supersession or teardown is not a failure, and #fetchHistory reports
+  // a deadline expiry itself.
   async #requestHistory(signal) {
     const request = this.#fetch;
     try {
       const response = await request(workstreamPath(this.#base, this.#wsId) + "/history", {
         signal,
       });
-      if (!response || !response.ok) return null;
+      if (!response || !response.ok) {
+        if (!signal.aborted) {
+          const status = response ? response.status : "none";
+          console.warn(this.#log + "history request failed (status " + status + ")");
+        }
+        return null;
+      }
       const data = await response.json();
       return data !== null && typeof data === "object" ? data : null;
-    } catch {
+    } catch (error) {
+      if (!signal.aborted) console.warn(this.#log + "history request failed", error);
       return null;
     }
   }

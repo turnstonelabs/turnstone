@@ -479,7 +479,6 @@ const scrollFollow = { isFollowing: () => true };
 const latestToolRowElements = new Map();
 const toolResultNodes = new Map();
 const renderedToolEventIds = new Set();
-const liveToolCalls = new Set();
 const judgeVerdicts = new Map();
 const messagesEl = makeNode("messages");
 let activeBatch = null;
@@ -1073,17 +1072,16 @@ if (host.painted.length !== 2)
     )
 
 
-# What a live row arm must never reach for: the stream layer's reload and redial
-# entry points, in each pane's vocabulary (the interactive pane's stream layer is
-# its sync core; the coordinator still holds its own).
+# What a live row arm must never reach for: the stream layer (each pane's sync core)
+# and any request of its own.
 _STREAM_ENTRY_POINTS = {
     _INTERACTIVE: ("this.sync.", "authFetch(", "fetch("),
-    _COORDINATOR: ("refetchHistory", "connectSSE"),
+    _COORDINATOR: ("sync.", "authFetch(", "fetch("),
 }
 
 
 @pytest.mark.parametrize(
-    ("path", "accept_call", "accept_def", "render_call", "set_name", "next_case"),
+    ("path", "accept_call", "accept_def", "render_call", "set_name"),
     [
         (
             _INTERACTIVE,
@@ -1091,7 +1089,6 @@ _STREAM_ENTRY_POINTS = {
             "  _acceptUserTurn(evt) {",
             "this.addUserMessage(",
             "this._renderedUserEventIds",
-            None,
         ),
         (
             _COORDINATOR,
@@ -1099,7 +1096,6 @@ _STREAM_ENTRY_POINTS = {
             "  function acceptUserTurn(ev) {",
             "appendUserMessageWithAttachments(",
             "renderedUserEventIds",
-            'case "tool_pending"',
         ),
     ],
     ids=["interactive", "coordinator"],
@@ -1110,7 +1106,6 @@ def test_user_turn_projects_exactly_once_without_rest_or_stream_reopen(
     accept_def: str,
     render_call: str,
     set_name: str,
-    next_case: str | None,
 ) -> None:
     """An upgraded pane renders the live row once without refetch/redial."""
 
@@ -1147,20 +1142,14 @@ def test_user_turn_projects_exactly_once_without_rest_or_stream_reopen(
     # other paint, and it sits inside the same record-after-paint window.
     assert reducer.index("host.renderNudgeMarker()") < record
 
-    # A projection_unsupported marker must not steer the replay_truncated decision.  The
-    # coordinator still handles replay_truncated in its own switch; the interactive pane's sync
-    # core routes it and decides in #decideTruncatedResync (the anchors keep the pin from passing
-    # vacuously after a rename).
-    if next_case is not None:
-        truncated_start = body.index('case "replay_truncated"')
-        truncated_end = body.index(next_case, truncated_start)
-        truncated = body[truncated_start:truncated_end]
-        assert "projection_unsupported" not in truncated
-    else:
-        sync = _strip_comments(_SYNC.read_text(encoding="utf-8"))
-        assert 'data.type === "replay_truncated"' in sync
-        assert "#decideTruncatedResync() {" in sync
-        assert "projection_unsupported" not in sync
+    # A projection_unsupported marker must not steer the replay_truncated decision.  Both panes'
+    # sync core routes it and decides in #decideTruncatedResync, and neither pane handles it (the
+    # anchors keep the pin from passing vacuously after a rename).
+    assert 'case "replay_truncated"' not in body
+    sync = _strip_comments(_SYNC.read_text(encoding="utf-8"))
+    assert 'data.type === "replay_truncated"' in sync
+    assert "#decideTruncatedResync() {" in sync
+    assert "projection_unsupported" not in sync
 
 
 @pytest.mark.parametrize(
@@ -1201,16 +1190,13 @@ def test_accepted_tool_turn_upserts_once_without_rest_or_stream_reopen(
 def test_tool_turn_capability_is_browser_only_and_url_sticky() -> None:
     """Every browser redial opts in; SDK/channel consumers stay legacy-safe.
 
-    The interactive pane's stream URL is the sync core's ``buildEventsUrl``,
-    executed in test_build_events_url_orders_cursor_capabilities_and_token
-    (tests/test_workstream_sync_js.py); the coordinator still builds its own."""
+    Both panes' stream URL is the sync core's ``buildEventsUrl``, executed in
+    test_build_events_url_orders_cursor_capabilities_and_token
+    (tests/test_workstream_sync_js.py); neither pane builds one of its own."""
 
-    body = _strip_comments(_COORDINATOR.read_text(encoding="utf-8"))
-    connect_start = body.index("connectSSE(")
-    source_start = body.index("new EventSource", connect_start)
-    connect = body[connect_start:source_start]
-    assert '"user_turn=1"' in connect
-    assert '"&tool_turn=1"' in connect
+    for pane in (_INTERACTIVE, _COORDINATOR):
+        code = _strip_comments(pane.read_text(encoding="utf-8"))
+        assert "user_turn=1" not in code and "new EventSource" not in code, pane.name
 
     for path in (_PY_SDK, _PY_CHANNEL, _TS_SDK):
         assert "tool_turn" not in _strip_comments(path.read_text(encoding="utf-8"))
@@ -1237,54 +1223,12 @@ def test_tool_turn_history_seed_and_reused_id_contracts_are_pinned() -> None:
     assert "buildPreviewChip(opts.preview" in coordinator
 
 
-@pytest.mark.parametrize(
-    ("path", "refetch_call"),
-    [(_COORDINATOR, "refetchHistory()")],
-    ids=["pre-projection-coordinator"],
-)
-def test_tokenless_bootstrap_uses_pre_projection_in_place_clear_ui_contract(
-    path: Path,
-    refetch_call: str,
-) -> None:
-    """The old clear_ui reducer repairs one open listener and cannot loop.
-
-    The interactive pane's clear_ui is the sync core's seedless refetch, which
-    never closes or opens a source (executed in
-    test_failed_clear_ui_refetch_keeps_the_transcript and
-    test_a_seedless_render_proceeds_when_every_term_holds_and_keeps_the_cursor)."""
-
-    body = path.read_text(encoding="utf-8")
-    start = body.index('case "clear_ui"')
-    end = body.index('case "history_resync"', start)
-    clear_ui = _strip_comments(body[start:end])
-    assert refetch_call in clear_ui
-    for forbidden in (
-        "disconnectSSE",
-        "suspendStream",
-        "_loadHistoryThenConnect",
-        "loadHistoryThenReconnect",
-        "connectSSE",
-    ):
-        assert forbidden not in clear_ui
-
-
-@pytest.mark.parametrize(
-    ("path", "connect_anchor", "repairing_check"),
-    [
-        (_SYNC, "  #connect() {", "isRepairing(this.#wsId)"),
-        (_COORDINATOR, "connectSSE(", "isRepairing(wsId)"),
-    ],
-    ids=["sync-core", "coordinator"],
-)
-def test_history_handoff_manual_state_is_fail_closed(
-    path: Path, connect_anchor: str, repairing_check: str
-) -> None:
+def test_history_handoff_manual_state_is_fail_closed() -> None:
     """Budget exhaustion exposes manual actions without constructing EventSource.
 
-    The interactive pane's repair wiring is the sync core's (the pane holds no
-    repair state at all: test_the_pane_holds_no_stream_or_history_transport)."""
+    Both panes' repair wiring is the sync core's; neither pane holds repair state."""
 
-    body = path.read_text(encoding="utf-8")
+    body = _SYNC.read_text(encoding="utf-8")
     # The attempt budget, the backoff, and the parked prompt live once in the
     # shared controller. Each pane must reach them THROUGH it: re-deriving any
     # of them pane-side is exactly the drift this consolidation removes, so
@@ -1296,7 +1240,7 @@ def test_history_handoff_manual_state_is_fail_closed(
         "nextHistoryHandoffDelay(",
         "buildHistoryHandoffPrompt(",
     ):
-        for holder in (path, _INTERACTIVE):
+        for holder in (_SYNC, _INTERACTIVE, _COORDINATOR):
             holder_body = holder.read_text(encoding="utf-8")
             assert reimplemented not in holder_body, (
                 f"{holder.name}: {reimplemented} must stay shared"
@@ -1313,10 +1257,12 @@ def test_history_handoff_manual_state_is_fail_closed(
     assert '"Retry now"' in shared_body
     assert '"Reload page"' in shared_body
 
-    connect_start = body.index(connect_anchor)
+    for pane in (_INTERACTIVE, _COORDINATOR):
+        assert "createHistoryHandoffRepair(" not in pane.read_text(encoding="utf-8"), pane.name
+    connect_start = body.index("  #connect() {")
     source_start = body.index("new EventSource", connect_start)
     connect_prefix = body[connect_start:source_start]
-    assert repairing_check in connect_prefix
+    assert "isRepairing(this.#wsId)" in connect_prefix
     assert "schedule();" in connect_prefix
     assert "return;" in connect_prefix
 
@@ -1335,17 +1281,15 @@ def test_repair_mode_downgrades_completed_tokenless_render_to_bootstrap() -> Non
     over; the previous per-pane character-window checks re-asserted the same
     branch twice and could not see the branch ORDER at all.
     """
-    for path, settle_call, has_token in (
-        (_SYNC, "this.#repair.settle({", "hasToken: this.#handoffToken != null"),
-        (_COORDINATOR, "historyRepair.settle({", "hasToken: historyHandoffToken != null"),
-    ):
-        body = path.read_text(encoding="utf-8")
-        assert 'return "rendered";' in body
-        assert settle_call in body
-        # The proof token stays with its holder (the sync core, or the
-        # coordinator pane); it reports only whether the same response armed one.
-        assert has_token in body
-        assert 'outcome === "rendered"' not in body, "the verdict must stay shared"
+    body = _SYNC.read_text(encoding="utf-8")
+    assert 'return "rendered";' in body
+    assert "this.#repair.settle({" in body
+    # The proof token stays with its holder (the sync core); it reports only
+    # whether the same response armed one.  Neither pane settles a repair.
+    assert "hasToken: this.#handoffToken != null" in body
+    assert 'outcome === "rendered"' not in body, "the verdict must stay shared"
+    for pane in (_INTERACTIVE, _COORDINATOR):
+        assert "settle({" not in pane.read_text(encoding="utf-8"), pane.name
 
     shared = _strip_comments(_SHARED_HANDOFF.read_text(encoding="utf-8"))
     settle_start = shared.index("settle({ outcome, hasToken, manualAttempt }) {")

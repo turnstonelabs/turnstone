@@ -54,8 +54,34 @@
       //  coordinator module loaded the factory.
       import { createCoordinatorPane } from "/static/coordinator/coordinator.js";
       const wsId = document.documentElement.dataset.wsId || "";
+      // The stream gave up for good (dead): one visible way back.  This page
+      // holds one pane, so rebuilding it is reloading the page, which re-runs
+      // the workstream snapshot GET and the first load.  Styled as the history
+      // repair prompt is (an error row with an action), so the page needs no CSS
+      // of its own.
+      function showReconnect() {
+        const messages = document.getElementById("coord-messages");
+        if (!messages || document.getElementById("coord-dead")) return;
+        const row = document.createElement("div");
+        row.id = "coord-dead";
+        row.className = "msg error";
+        row.setAttribute("role", "alert");
+        const copy = document.createElement("div");
+        copy.textContent = "Session disconnected.";
+        const actions = document.createElement("div");
+        actions.className = "msg-actions";
+        const reconnect = document.createElement("button");
+        reconnect.type = "button";
+        reconnect.className = "msg-action-btn";
+        reconnect.textContent = "Reconnect";
+        reconnect.addEventListener("click", () => window.location.reload());
+        actions.append(reconnect);
+        row.append(copy, actions);
+        messages.append(row);
+      }
       const pane = createCoordinatorPane(document.body, wsId, {
         standalone: true,
+        onDead: showReconnect,
       });
       if (pane) {
         pane.connect();
@@ -63,6 +89,13 @@
           pane.onLogin();
         };
       }
+      // A stream authorised as one user must not keep painting for another: a
+      // different user signing in reloads the page, which shows the workstream
+      // as that user (or the server refuses it).  Through auth.js's window
+      // bridge, as the pane reaches authFetch: the auth.js tag above runs first
+      // (deferred modules run in document order), and an import here could load
+      // a second auth.js instance whose auth changes never fire.
+      window.onUserChange(() => window.location.reload());
     </script>
   </body>
 </html>

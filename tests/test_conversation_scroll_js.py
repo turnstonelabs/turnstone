@@ -359,6 +359,7 @@ const v = view();
 const posts = [];
 const STALE_RETRY_BASE_MS = 2000, STALE_RETRY_JITTER_MS = 0;
 const mintClientSendId = () => 'edit-send-id';
+const authGeneration = () => 1;
 const parsePriority = text => ({ displayText: text, priority: 'notice' });
 const authFetch = (url, init) => {
   posts.push({ url, body: JSON.parse(init.body) });
@@ -386,7 +387,7 @@ v.scroll(200);
         source += """
 const pane = new Pane();
 Object.assign(pane, {
-  wsId: 'ws', _base: '', _pendingEditSend: 'edited local message',
+  wsId: 'ws', _base: '', _pendingEditSend: 'edited local message', _pendingEditGeneration: 1,
   _scrollFollow: v.follow, messagesEl: v.scroller,
   removeEmptyState() {}, _addUserMsgActions() {},
   setBusy(value, source) { this.busy = value; this.busySource = source; },
@@ -397,11 +398,13 @@ pane._onResetSettled({ outcome: 'failed' });
 await Promise.resolve(); await Promise.resolve();
 """
     else:
+        # The coordinator is on the same sync core: its edit-and-resend continuation is the
+        # reset-settled listener, sliced here and settled "failed".
         body = _COORDINATOR.read_text()
         source = common + "\n".join(
             extract_braced(body, marker)
             for marker in (
-                "  function handleEvent(ev) {",
+                "  function onResetSettled({ outcome, error }) {",
                 "  function appendUserMessageWithAttachments(text, attachments, opts) {",
                 "  function appendMsg(role, html, opts) {",
                 "  function appendText(role, text, opts) {",
@@ -414,13 +417,12 @@ const scrollFollow = v.follow, messagesEl = v.scroller;
 const _MSG_VARIANTS = { user: 'user' }, esc = text => text;
 const setSafeHtml = (el, html) => { el.textContent = html; };
 const _addUserMsgActions = () => {};
-const refetchHistory = () => Promise.resolve();
-let historyStale = false, staleRetryTimer = null, visHandler = () => {};
-let _pendingEditSend = 'edited local message', busy = false, busySource = '';
+let _pendingEditSend = 'edited local message', _pendingEditGeneration = 1;
+let busy = false, busySource = '';
 function setBusy(value, source) { busy = value; busySource = source; }
-handleEvent({ type: 'clear_ui' });
+// A failed refetch keeps the transcript on screen; the committed edit still sends.
+onResetSettled({ outcome: 'failed' });
 await Promise.resolve(); await Promise.resolve();
-clearTimeout(staleRetryTimer);
 """
     _run(
         source
