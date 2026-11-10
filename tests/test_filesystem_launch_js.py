@@ -160,9 +160,16 @@ def test_authority_changes_clear_files_and_update_all_launchers() -> None:
     source = (_SHARED / "shell.js").read_text()
     start = source.index("  const syncFilesAccess = () => {")
     end = source.index("  // Tier-1 lifecycle", start)
+    # The same listener runs the shell's user-change rule; its helpers come from the module scope.
+    helpers = "".join(
+        source[source.index(head) : source.index("\n}\n", source.index(head)) + 3]
+        for head in ("function watchUserChanges(", "function storedItem(")
+    )
     proc = run_node_source(
         FAKE_DOM
+        + helpers
         + """
+globalThis.sessionStorage = {getItem: (key) => (key === "ts.user_id" ? "user-1" : null)};
 const buttons = [document.createElement("button"), document.createElement("button")];
 document.querySelectorAll = () => buttons;
 let canWrite = true;
@@ -176,6 +183,7 @@ let filePaneOpen = true;
 let closes = 0;
 const pm = {
   hasPane: () => filePaneOpen,
+  statefulTabs: () => [{id: "interactive:ws-a", rawId: "ws-a"}],
   close(id) {
     if (id !== "filesystem") throw new Error("Must not close conversations");
     closes++;

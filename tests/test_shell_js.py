@@ -11,6 +11,7 @@ temp ``.mjs`` first.
 
 from __future__ import annotations
 
+import json
 import re
 import shutil
 import subprocess
@@ -22,6 +23,7 @@ from urllib.parse import urljoin, urlsplit
 import pytest
 
 from tests._js_harness_helpers import (
+    FAKE_DOM,
     extract_braced,
     node_skip,
     run_node_source,
@@ -1320,6 +1322,156 @@ def test_interactive_pane_dead_session_revive() -> None:
     assert "liveNode || (pane.meta && pane.meta.nodeId)" in shell, (
         "the live Tier-1 node must lead the resolve-hint chain"
     )
+
+
+def _pane_on_close(shell: str, type_name: str) -> str:
+    """The ``pane.onClose`` function the shell installs for one registered pane type."""
+    start = shell.index(f'pm.registerType("{type_name}"')
+    at = shell.index("pane.onClose = function () ", start)
+    body = slice_braced_block(shell, at)
+    assert body is not None
+    return "function () " + body
+
+
+def _run_user_change(scenario: str) -> None:
+    """Run ``scenario`` against the shell's user-change rule wired as the shell wires it: the
+    real PaneManager holding an interactive and a coordinator pane (each with the onClose the
+    shell installs, and a controller) beside a dashboard, with fetch recording every request."""
+    shell = _SHELL_JS.read_text(encoding="utf-8")
+    watch = slice_braced_block(shell, shell.index("function watchUserChanges("))
+    assert watch is not None
+    source = (
+        FAKE_DOM
+        + f"\nconst {{ PaneManager, ShellPane }} = await import({json.dumps(_PANE_JS.as_uri())});\n"
+        + f"function watchUserChanges(pm, readUserId) {watch}\n"
+        + f"const interactiveOnClose = {_pane_on_close(shell, 'interactive')};\n"
+        + f"const coordinatorOnClose = {_pane_on_close(shell, 'coordinator')};\n"
+        + r"""
+import assert from "node:assert/strict";
+Object.defineProperties(FakeElement.prototype, {
+  style: {get() { return this._style ??= {}; }},
+  parentElement: {get() { return this.parentNode; }},
+  firstChild: {get() { return this.children[0] || null; }},
+  nextSibling: {get() {
+    const siblings = this.parentNode?.children || [];
+    return siblings[siblings.indexOf(this) + 1] || null;
+  }},
+});
+FakeElement.prototype.insertBefore = function (child, anchor) {
+  child.remove();
+  const index = anchor ? this.children.indexOf(anchor) : this.children.length;
+  this.children.splice(index, 0, child);
+  child.parentNode = this;
+  child._setConnected(this.isConnected);
+};
+FakeElement.prototype.removeChild = function (child) { child.remove(); };
+FakeElement.prototype.matches = function (selector) { return this._matches(selector); };
+ResizeObserver.prototype.unobserve = function () {};
+globalThis.sessionStorage = localStorage;
+const requests = [];
+globalThis.fetch = async (url, init) => { requests.push(url); return {ok: true, status: 200}; };
+const unsubscribed = [];
+globalThis.window.TS_LOGIN = {unsubscribe: fn => unsubscribed.push(fn)};
+const tabs = document.createElement("div");
+const panes = document.createElement("div");
+document.documentElement.append(tabs, panes);
+const pm = new PaneManager({tabbarEl: tabs, panesEl: panes});
+const destroyed = [];
+const onClose = {interactive: interactiveOnClose, coordinator: coordinatorOnClose};
+pm.registerType("dashboard", () => new ShellPane({type: "dashboard", closable: false}));
+for (const type of ["interactive", "coordinator"]) {
+  pm.registerType(type, id => {
+    const pane = new ShellPane({type, id, stateful: true});
+    pane._ctl = {destroy: () => destroyed.push(type + ":" + id), onLogin() {}};
+    pane.onClose = onClose[type];
+    return pane;
+  });
+}
+pm.openPane("dashboard");
+pm.openPane("interactive", "ws-a");
+pm.openPane("coordinator", "ws-c");
+let userId = "";
+const signIn = id => { userId = id; };
+const authChanged = watchUserChanges(pm, () => userId);
+const open = () => ["interactive:ws-a", "coordinator:ws-c"].filter(id => {
+  const [type, raw] = id.split(":");
+  return pm.hasPane(type, raw);
+});
+"""
+        + scenario
+    )
+    proc = run_node_source(source)
+    assert proc.returncode == 0, f"user-change harness failed:\n{proc.stderr}\n{proc.stdout}"
+
+
+@node_skip
+def test_the_same_user_keeps_every_conversation() -> None:
+    """A login by the user already known (a token refresh, or a re-login after expiry) closes
+    nothing, and neither does the first id the page learns."""
+    _run_user_change(
+        r"""
+signIn("user-1");
+authChanged();
+signIn("user-1");
+authChanged();
+assert.deepEqual(open(), ["interactive:ws-a", "coordinator:ws-c"]);
+assert.deepEqual(destroyed, []);
+"""
+    )
+
+
+@node_skip
+def test_signing_out_and_back_in_as_the_same_user_keeps_every_conversation() -> None:
+    """An empty id (signed out, or another tab's login before whoami restores the id) is not a
+    user: the comparison is against the last non-empty id."""
+    _run_user_change(
+        r"""
+signIn("user-1");
+authChanged();
+signIn("");
+authChanged();
+signIn("user-1");
+authChanged();
+assert.deepEqual(open(), ["interactive:ws-a", "coordinator:ws-c"]);
+assert.deepEqual(destroyed, []);
+"""
+    )
+
+
+@node_skip
+def test_a_different_user_closes_every_conversation_client_side() -> None:
+    """A different non-empty id closes every interactive and coordinator pane: the controller
+    is destroyed and the tab dropped, the dashboard stays, and no request reaches the server
+    (the sessions stay open there for their owner).  An empty id in between changes nothing."""
+    _run_user_change(
+        r"""
+signIn("user-1");
+authChanged();
+signIn("");
+authChanged();
+assert.equal(open().length, 2, "signing out alone closes nothing");
+signIn("user-2");
+authChanged();
+assert.deepEqual(open(), []);
+assert.deepEqual(destroyed.sort(), ["coordinator:ws-c", "interactive:ws-a"]);
+assert.equal(unsubscribed.length, 2, "each controller left the login fan-out");
+assert.ok(pm.hasPane("dashboard"), "the dashboard stays");
+assert.deepEqual(requests, [], "no /close or any other request");
+pm.openPane("interactive", "ws-b");
+signIn("user-2");
+authChanged();
+assert.ok(pm.hasPane("interactive", "ws-b"), "the new user is now the known one");
+"""
+    )
+
+
+def test_the_shell_checks_for_a_different_user_on_every_auth_change() -> None:
+    """The rule hangs on the shell's one auth-change listener and reads the stored user id; the
+    login fan-out runs in other tabs while the id is still empty, so it cannot carry it."""
+    shell = strip_js_comments(_SHELL_JS.read_text(encoding="utf-8"))
+    assert 'watchUserChanges(pm, () =>\n    storedItem("ts.user_id"),\n  )' in shell
+    listener = slice_braced_block(shell, shell.index("onAuthChange(() => "))
+    assert listener is not None and "closeConversationsOnUserChange();" in listener
 
 
 def test_shell_closes_pane_on_ws_closed() -> None:

@@ -370,31 +370,31 @@ v.scroller.appendChild = el => { v.scroller.scrollHeight += 200; return append(e
 v.scroll(200);
 """
     if surface == "interactive":
+        # The interactive pane's clear_ui refetch is its sync core's; the edit-and-resend
+        # continuation hangs off the core's reset-settled event (that it fires once with
+        # "failed" is executed in tests/test_workstream_sync_js.py).
         body = _INTERACTIVE.read_text()
         methods = "\n".join(
             extract_braced(body, marker)
             for marker in (
                 "  scrollToBottom(force) {",
                 "  addUserMessage(text, attachments, opts) {",
-                "  handleEvent(evt) {",
+                "  _onResetSettled({ outcome, error }) {",
             )
         )
         source = "class Pane {\n" + methods + "\n}\n" + common
         source += """
 const pane = new Pane();
 Object.assign(pane, {
-  wsId: 'ws', _base: '', _historyLoadToken: 1, _pendingEditSend: 'edited local message',
+  wsId: 'ws', _base: '', _pendingEditSend: 'edited local message',
   _scrollFollow: v.follow, messagesEl: v.scroller,
-  _beginReplayQuiesce() {},
-  // A failed refetch resolves and retains the old transcript; the committed edit still sends.
-  _refetchHistory() { return Promise.resolve(); },
   removeEmptyState() {}, _addUserMsgActions() {},
   setBusy(value, source) { this.busy = value; this.busySource = source; },
   addErrorMessage(message) { throw Error(message); },
 });
-pane.handleEvent({ type: 'clear_ui' });
+// A failed refetch keeps the transcript on screen; the committed edit still sends.
+pane._onResetSettled({ outcome: 'failed' });
 await Promise.resolve(); await Promise.resolve();
-clearTimeout(pane._staleRetryTimer);
 """
     else:
         body = _COORDINATOR.read_text()

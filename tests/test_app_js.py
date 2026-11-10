@@ -22,6 +22,9 @@ from tests._js_harness_helpers import strip_js_comments as _strip_js_comments
 
 _APP_JS = Path(__file__).resolve().parent.parent / "turnstone/ui/static/app.js"
 _INTERACTIVE_JS = Path(__file__).resolve().parent.parent / "turnstone/shared_static/interactive.js"
+_WORKSTREAM_SYNC_JS = (
+    Path(__file__).resolve().parent.parent / "turnstone/shared_static/workstream_sync.js"
+)
 _MCP_ERROR_JS = Path(__file__).resolve().parent.parent / "turnstone/shared_static/mcp_error.js"
 _SHELL_JS = Path(__file__).resolve().parent.parent / "turnstone/shared_static/shell.js"
 _REDACT_CREDENTIALS_JS = (
@@ -256,169 +259,6 @@ def test_replay_history_renders_persisted_verdict_badge() -> None:
         "otherwise the audit-trail data persisted to intent_verdicts "
         "doesn't surface on saved-workstream replays."
     )
-
-
-def test_refetch_history_seeds_resume_cursor_only_on_initial_connect() -> None:
-    """``_refetchHistory`` must seed ``_lastEventId`` from a non-null
-    ``data.cursor`` so the initial ``connectSSE`` opens with
-    ``?last_event_id=`` and takes the ``replay_ok`` fast-forward —
-    rebuilding the executing in-flight turn that ``/history`` omitted
-    (the fresh-connect-during-parallel-batch fix).
-
-    Two load-bearing guards are pinned here:
-
-    1. The seed is gated on ``seedCursor`` so ONLY callers that
-       reconnect (``_loadHistoryThenConnect`` — first paint, ws switch,
-       and both truncated-resync branches) seed it; the clear_ui
-       re-render caller runs on a LIVE stream with no reconnect and
-       must NOT rewind ``_lastEventId`` off the live position.
-    2. ``connectSSE`` gates the ``?last_event_id=`` param on
-       ``!= null`` (not truthiness) so a valid cursor of 0 — a brand-new
-       ws's first-turn boundary — isn't silently dropped to the fresh
-       snapshot path."""
-    body = _INTERACTIVE_JS.read_text(encoding="utf-8")
-    # ``_refetchHistory`` is an ``async`` method, which the shared
-    # ``_pane_method_offset`` header regex doesn't match — anchor on the
-    # definition directly and bound at the next method.
-    start = body.index("async _refetchHistory(")
-    end = body.index("handleEvent(", start)
-    fn = body[start:end]
-    # (1a) seed is gated on BOTH seedCursor AND a non-null cursor.
-    seed_re = re.compile(
-        r"if\s*\(\s*seedCursor\s*&&\s*data\.cursor\s*!=\s*null\s*\)\s*"
-        r"this\._lastEventId\s*=\s*data\.cursor"
-    )
-    assert seed_re.search(fn), (
-        "_refetchHistory must seed this._lastEventId only when "
-        "seedCursor AND data.cursor != null — so re-render callers don't "
-        "rewind the live stream and a 0 cursor still fast-forwards."
-    )
-    assert "seedCursor = false" in fn, (
-        "seedCursor must default false so the clear_ui re-render caller "
-        "(which passes only 2 args and stays on the live stream) never "
-        "seeds the cursor."
-    )
-    # (1b) the initial-connect path opts in with seedCursor=true.
-    assert "_refetchHistory(wsId, token, true)" in body, (
-        "_loadHistoryThenConnect must call _refetchHistory(..., true) so "
-        "the reconnecting initial-connect path is the only seeder."
-    )
-    # (2) connectSSE gates the last_event_id param on != null, not
-    # truthiness, and a recorded truncation gap overrides the live cursor
-    # (the connect-chokepoint half of the gap-repair guarantee).
-    assert re.search(
-        r"const connectCursor =\s*this\._truncatedFromCursor != null\s*"
-        r"\?\s*this\._truncatedFromCursor\s*:\s*this\._lastEventId;",
-        body,
-    ), (
-        "connectSSE must present the truncation-time cursor while a gap "
-        "is on record — the advanced live cursor would draw replay_ok "
-        "and silently forget the gap."
-    )
-    assert re.search(
-        r"if\s*\(\s*connectCursor\s*!=\s*null\s*\)\s*\{\s*"
-        r"evtUrl\s*\+=\s*\"\?last_event_id=\"",
-        body,
-    ), (
-        "connectSSE must gate the ?last_event_id= param on "
-        "connectCursor != null (not truthiness) — else a cursor of 0 "
-        "(brand-new ws first turn) is dropped to the fresh snapshot path."
-    )
-
-
-def test_initial_history_handoff_token_is_one_shot_and_resyncs_on_mismatch() -> None:
-    """The opaque /history handoff belongs only to the next SSE bootstrap.
-
-    It must survive a hidden-tab deferral, compose with a valid cursor of 0,
-    and be consumed only after an EventSource is constructed.  A server-side
-    revision mismatch takes the full REST-history path; it must never try to
-    heal a missing committed row with numeric ring replay.
-    """
-    body = _INTERACTIVE_JS.read_text(encoding="utf-8")
-    start = body.index("  connectSSE(wsId) {")
-    end = body.index("  _onVisibilityChange() {", start)
-    connect = body[start:end]
-
-    hidden = connect.index("if (document.hidden)")
-    capability = connect.index('"user_turn=1"')
-    handoff_query = connect.index('"history_token="')
-    construct = connect.index("new EventSource(evtUrl)")
-    consume = connect.index("this._historyHandoffToken = null;", construct)
-    assert capability < hidden < handoff_query < construct < consume, (
-        "the bootstrap token must survive hidden-tab deferral and be consumed "
-        "only by a successfully constructed EventSource"
-    )
-    assert 'evtUrl += "?last_event_id="' in connect
-    assert '(evtUrl.includes("?") ? "&" : "?")' in connect, (
-        "history_token must compose with ?last_event_id=0 instead of replacing it"
-    )
-    assert connect.count('"user_turn=1"') == 1
-
-    refetch_start = body.index("async _refetchHistory(")
-    refetch_end = body.index("_beginReplayQuiesce(", refetch_start)
-    refetch = body[refetch_start:refetch_end]
-    assert re.search(
-        r"if\s*\(seedCursor\)\s*\{\s*this\._historyHandoffToken\s*=\s*"
-        r"typeof data\.handoff_token === \"string\"",
-        refetch,
-    ), "only a seeded history fetch may arm the initial SSE handoff"
-
-    mismatch = body.index('case "history_resync"')
-    truncated = body.index('case "replay_truncated"', mismatch)
-    mismatch_case = body[mismatch:truncated]
-    assert "this._historyRepair.begin(this.wsId);" in mismatch_case
-    assert "last_event_id" not in mismatch_case
-
-    # Once the server says the rendered history revision is stale, every
-    # reconnect chokepoint must fail closed until a new response has rendered
-    # and supplied its proof.  A failed fetch schedules one capped retry; it
-    # must not fall through to a cursorless/tokenless EventSource.  The latch,
-    # budget, backoff, and parked prompt moved into the shared controller
-    # (history_handoff.createHistoryHandoffRepair) — those are pinned there,
-    # once; what stays pinned HERE is the pane's use of it.
-    repair_guard = connect.index("if (this._historyRepair.isRepairing(wsId))")
-    assert repair_guard < handoff_query < construct
-    guard_end = connect.index("if (this._historyHandoffToken != null)", repair_guard)
-    guard = connect[repair_guard:guard_end]
-    assert "this._historyRepair.schedule();" in guard
-    assert "return;" in guard
-
-    load_start = body.index("_loadHistoryThenConnect(wsId, manualAttempt = false)")
-    load_end = body.index("async _refetchHistory(", load_start)
-    load = body[load_start:load_end]
-    # Admission before any work, then the budget charge, then exactly one
-    # handover of the verdict; the non-repair tail keeps its own reconnect.
-    admit = load.index("this._historyRepair.admitAttempt(manualAttempt)")
-    start_attempt = load.index("this._historyRepair.startAttempt(manualAttempt,", admit)
-    settle = load.index("this._historyRepair.settle({", start_attempt)
-    ordinary = load.index("// Ordinary first paint", settle)
-    assert admit < start_attempt < settle < ordinary
-    assert "hasToken: this._historyHandoffToken != null" in load[settle:ordinary]
-    assert "this.connectSSE(wsId);" not in load[settle:ordinary]
-    assert "return;" in load[settle:ordinary]
-
-    # Both terminal paths invalidate the in-flight load and kill the timer;
-    # a late retry/fetch settlement cannot resurrect the pane.
-    assert body.count("pane._historyRepair.clear();") >= 2
-
-    # The strong repair attempt has a logical 15s deadline, not merely an
-    # AbortController timeout: authFetch's Retry-After sleep is not abort-aware
-    # and old runtimes can lack AbortController entirely. The pane still owns
-    # this per-attempt bound (the coordinator bounds every /history centrally
-    # instead), and hands the controller a teardown that expires and settles
-    # the race so no detached pane waits for the deadline.
-    assert "Promise.race([" in load
-    assert "createHistoryHandoffDeadline(" in load
-    assert "deadlineHandle.promise" in load
-    assert "HISTORY_HANDOFF_FETCH_TIMEOUT_MS" in load
-    assert "if (repairAttempt && repairAttempt.expired) return;" in refetch
-    teardown = load[start_attempt:settle]
-    assert "deadlineHandle.dispose({ expire: true, resolve: true })" in teardown, (
-        "the mid-flight teardown must expire AND settle the race through the "
-        "module's dispose() — direct state-slot pokes are the drift the "
-        "shared handle exists to prevent."
-    )
-    assert "repairCtrl.abort()" in teardown
 
 
 def test_shared_utils_no_longer_defines_replay_advisories_after_tool() -> None:
@@ -2069,27 +1909,9 @@ def _onerror_preserves_native_reconnect(body: str, source_var: str) -> tuple[boo
     return True, "all close() calls are in terminal branches (401 / login / reassign)"
 
 
-def test_pane_connectsse_onerror_preserves_native_reconnect() -> None:
-    """``Pane.connectSSE``'s onerror must not close evtSource on
-    transient errors — PR-D's reconnect-with-replay depends on native
-    EventSource auto-reconnect firing with the ``Last-Event-ID`` header."""
-    body = _strip_js_comments(_INTERACTIVE_JS.read_text(encoding="utf-8"))
-    # Slice the Pane.connectSSE method body, then the onerror handler
-    # inside it.  Reuse the indent-agnostic class-method finder.
-    method_start = _pane_method_offset(body, "connectSSE")
-    method = _slice_balanced_body(body, method_start)
-    assert method is not None, "Pane.connectSSE method body not found"
-    # ``_onerror_block`` re-strips internally; passing the already-
-    # stripped method body is idempotent (no comments left to strip).
-    onerror = _onerror_block(method, "this.evtSource.onerror")
-    assert onerror is not None, "Pane.connectSSE.onerror not found"
-    passed, reason = _onerror_preserves_native_reconnect(onerror, "this.evtSource")
-    assert passed, f"Pane.connectSSE.onerror regressed: {reason}"
-
-
 def test_connectglobalsse_onerror_preserves_native_reconnect() -> None:
-    """``connectGlobalSSE`` is the global-SSE counterpart of
-    Pane.connectSSE — same close-defeats-reconnect contract."""
+    """``connectGlobalSSE`` is the global-SSE counterpart of the per-pane stream (the sync
+    core's ``#onError`` in workstream_sync.js) — same close-defeats-reconnect contract."""
     body = _strip_js_comments(_APP_JS.read_text(encoding="utf-8"))
     fn = _slice_function_body(body, "connectGlobalSSE")
     assert fn is not None, "connectGlobalSSE not found"
@@ -2380,7 +2202,7 @@ def test_coord_post_gap_sidebar_refresh_is_replay_aware() -> None:
 
 def test_coord_defers_truncated_resync_and_consumes_at_idle() -> None:
     """replay_truncated seen mid-stream must be DEFERRED, not dropped (matches
-    interactive's _pendingTruncatedResync): tearing down + refetching
+    the sync core's #resyncPending): tearing down + refetching
     immediately would detach the live bubble (content OR a reasoning-only
     one), but skipping outright leaves the ring-evicted turns lost for the
     session.  The guard covers both streaming targets and latches otherwise;
@@ -2654,7 +2476,7 @@ def test_sse_cursor_captured_from_message_event_never_the_source_object() -> Non
     On a DOMString this is behaviorally identical to truthiness (the
     valid id "0" is a truthy STRING; only "" and null/undefined are
     falsy here), so the pin is for cross-site symmetry with the NUMERIC
-    cursor gates (``_lastEventId != null`` / ``data.cursor != null``),
+    cursor gates (``lastEventId != null`` / ``data.cursor != null``),
     where truthiness genuinely drops a valid 0 — one visual idiom for
     every cursor guard keeps a future editor from "simplifying" the
     numeric ones to match a terser string form.
@@ -2684,9 +2506,10 @@ def test_sse_cursor_captured_from_message_event_never_the_source_object() -> Non
     dead_form = re.compile(r"(?:this\.)?\w*[Ee]vtSource\.lastEventId")
     for path, capture in (
         (
-            _INTERACTIVE_JS,
-            r'if \(e\.lastEventId != null && e\.lastEventId !== ""\) \{\s*'
-            r"this\._lastEventId = e\.lastEventId;",
+            _WORKSTREAM_SYNC_JS,
+            r"const id = event\.lastEventId;\s*"
+            r'if \(id != null && id !== ""\) \{\s*'
+            r"this\.#cursor = id;",
         ),
         (
             _COORD_JS,
@@ -2709,6 +2532,15 @@ def test_sse_cursor_captured_from_message_event_never_the_source_object() -> Non
             f"{path.name}: MessageEvent cursor capture (with the "
             '``!= null && !== ""`` guard) not found'
         )
+    # The per-workstream stream's capture lives in the sync core, where the id
+    # is read off the message event and off nothing else; the interactive pane
+    # keeps no cursor of its own.
+    core_code = _strip_js_comments(_WORKSTREAM_SYNC_JS.read_text(encoding="utf-8"))
+    readers = re.findall(r"(\w+)\.lastEventId", core_code)
+    assert readers == ["event"], (
+        f"workstream_sync.js: lastEventId read off {readers} — only the message event carries it"
+    )
+    assert "lastEventId" not in _strip_js_comments(_INTERACTIVE_JS.read_text(encoding="utf-8"))
     app_code = _strip_js_comments(_APP_JS.read_text(encoding="utf-8"))
     # Presentation: manual reconnects carry the stored cursor as a query
     # param, behind the same string-guard idiom (see docstring above for
@@ -2748,29 +2580,17 @@ def test_sse_cursor_captured_from_message_event_never_the_source_object() -> Non
 
 
 def test_interactive_history_is_rest_first_not_sse() -> None:
-    """PR A converged interactive onto coord's REST-first history
-    model: first paint and post-rewind re-render fetch ``GET /history``
-    over REST (``_loadHistoryThenConnect`` / ``_refetchHistory``), and
-    the server no longer replays the conversation inline over SSE — so
-    the client must no longer consume a ``history`` SSE event. Guards
-    against a regression that re-couples first paint to the removed
-    inline-history replay."""
+    """PR A converged interactive onto coord's REST-first history model: first
+    paint and the post-rewind re-render fetch ``GET /history`` over REST (the
+    sync core's seeded reload and seedless refetch, executed in
+    tests/test_stream_recovery_panes_js.py and tests/test_workstream_sync_js.py),
+    and the server no longer replays the conversation inline over SSE.  So the
+    pane must not consume a ``history`` SSE event, and it renders the
+    server-projected /history payload straight through replayHistory."""
     body = _INTERACTIVE_JS.read_text(encoding="utf-8")
-    assert "_loadHistoryThenConnect" in body, (
-        "REST-first first-paint helper missing — interactive must fetch "
-        "history via GET /history before connecting SSE (coord's model)."
+    assert "renderHistory: (messages) => this.replayHistory(messages)," in body, (
+        "the pane must render the projected REST /history payload through replayHistory"
     )
-    assert "_refetchHistory" in body
-    # Race/identity guard (PR #595 review follow-up): a load-generation token
-    # must discard a superseded refetch so a slow ws-A load cannot render over
-    # ws-B after a tab switch / child open.
-    assert "_historyLoadToken" in body, (
-        "missing the load-generation guard — a stale history refetch can "
-        "render the wrong workstream's history"
-    )
-    # Pre-PR-A interactive had no REST /history fetch; the quoted URL
-    # segment only appears in the new fetch concatenation.
-    assert '"/history"' in body
     # The inline SSE ``history`` event is no longer emitted server-side,
     # so the client must not handle it (history is REST-only now).
     assert 'case "history":' not in body
@@ -2781,9 +2601,6 @@ def test_interactive_history_is_rest_first_not_sse() -> None:
     assert "normalizeHistoryMessages" not in body, (
         "the client-side history normaliser was retired — interactive must "
         "consume the server-projected /history shape directly"
-    )
-    assert "this.replayHistory(data.messages" in body, (
-        "interactive must feed the projected REST /history payload straight to replayHistory"
     )
     idx = (Path(__file__).resolve().parent.parent / "turnstone/ui/static/index.html").read_text(
         encoding="utf-8"

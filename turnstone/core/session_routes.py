@@ -3195,14 +3195,12 @@ def make_events_handler(cfg: SessionEndpointConfig) -> Handler:
                         }
 
                     if replay_status == "truncated":
-                        # Node-side visibility for every replay-window
-                        # miss (evicted ring AND the empty-ring
-                        # rehydrate case) — pairs with the client's
-                        # ``_streamHealth.truncatedGaps`` counter so
-                        # a field report of missing turns can be
-                        # matched to server evidence.  ``lost_count``
-                        # is a lower bound on the evicted path, exact
-                        # on the empty-ring path.
+                        # Node-side visibility for every replay-window miss (evicted ring AND
+                        # the empty-ring rehydrate case) — pairs with the client sync core's
+                        # ``health.truncatedGaps`` counter (``sync.inspect()``) so a field
+                        # report of missing turns can be matched to server evidence.
+                        # ``lost_count`` is a lower bound on the evicted path, exact on the
+                        # empty-ring path.
                         log.info(
                             "ws.events.replay_truncated ws=%s lost>=%d earliest=%d",
                             ws_id[:8],

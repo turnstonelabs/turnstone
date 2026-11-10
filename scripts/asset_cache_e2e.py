@@ -2,18 +2,19 @@
 """Browser regression for the two-layer frontend cache contract.
 
 This harness serves a versioned entry module which imports the real,
-unversioned ``shared/interactive.js`` module.  It loads an old pane build in a
-real Chrome profile, switches the server to a same-version replacement whose
-pane has the same byte length and mtime, then performs a normal browser reload
-without clearing or disabling the HTTP cache.
+unversioned ``shared/interactive.js`` pane, which in turn imports the
+unversioned ``shared/workstream_sync.js`` stream module.  It loads an old build
+in a real Chrome profile, switches the server to a same-version replacement
+whose stream module has the same byte length and mtime, then performs a normal
+browser reload without clearing or disabling the HTTP cache.
 
-The old fixture advertises ``user_turn=0&tool_turn=0`` in its EventSource URL;
-the current source advertises both capabilities as ``1``.  A passing run
-therefore proves both layers of the contract:
+The old fixture's stream module advertises ``user_turn=0&tool_turn=0`` in its
+EventSource URL; the current source advertises both capabilities as ``1``.  A
+passing run therefore proves both layers of the contract:
 
 * the package-versioned entry URL revalidates and may return 304; and
-* its unversioned transitive pane import revalidates by content and returns the
-  current bytes rather than surviving from the prior build.
+* its unversioned transitive stream-module import revalidates by content and
+  returns the current bytes rather than surviving from the prior build.
 
 The page also loads representative KaTeX, Highlight.js, and HLS.js assets.
 Their installed version directories are discovered from ``shared_static`` at
@@ -69,6 +70,7 @@ _PAGE_HTML = """<!doctype html>
           this.readyState = RecordingEventSource.CONNECTING;
           window.__assetCacheUrls.push(this.url);
         }
+        addEventListener() {}
         close() {
           this.readyState = RecordingEventSource.CLOSED;
         }
@@ -95,7 +97,12 @@ _BOOT_JS = """import { InteractivePane } from "/shared/interactive.js";
 const fixtureWorkstreamId = "00000000-0000-0000-0000-000000000001";
 const pane = new InteractivePane(fixtureWorkstreamId, { base: "" });
 document.getElementById("pane").appendChild(pane.el);
-pane.connectSSE(fixtureWorkstreamId);
+// The first stream follows the first /history load, which this server answers
+// with a 404; the connect happens whatever the load's outcome.
+pane.sync.start();
+for (let i = 0; i < 200 && !window.__assetCacheUrls.length; i += 1) {
+  await new Promise((resolve) => setTimeout(resolve, 25));
+}
 const url = window.__assetCacheUrls.at(-1) || "";
 const generation = url.includes("user_turn=1") && url.includes("tool_turn=1")
   ? "CURRENT"
@@ -179,17 +186,14 @@ class RecordingApp:
         await self._app(scope, receive, record_send)
 
 
-def _old_interactive(current: bytes) -> bytes:
+def _old_stream_module(current: bytes) -> bytes:
     old = current
-    for needle, replacement in (
-        (b'"user_turn=1"', b'"user_turn=0"'),
-        (b'"&tool_turn=1"', b'"&tool_turn=0"'),
-    ):
+    for needle, replacement in ((b'"user_turn=1&tool_turn=1"', b'"user_turn=0&tool_turn=0"'),):
         if old.count(needle) != 1:
             raise RuntimeError(f"expected exactly one {needle.decode()} capability literal")
         old = old.replace(needle, replacement, 1)
     if len(old) != len(current):
-        raise AssertionError("old and current pane fixtures must have equal byte length")
+        raise AssertionError("old and current stream-module fixtures must have equal byte length")
     return old
 
 
@@ -233,10 +237,10 @@ def _prepare_builds(scratch: Path) -> tuple[Path, Path, Path, tuple[str, ...]]:
     static_dir.mkdir()
     (static_dir / "asset_cache_boot.js").write_text(_BOOT_JS, encoding="utf-8")
 
-    current_asset = current_shared / "interactive.js"
-    old_asset = old_shared / "interactive.js"
+    current_asset = current_shared / "workstream_sync.js"
+    old_asset = old_shared / "workstream_sync.js"
     current = current_asset.read_bytes()
-    old_asset.write_bytes(_old_interactive(current))
+    old_asset.write_bytes(_old_stream_module(current))
 
     # Reproduce the metadata collision which defeated Starlette's default ETag.
     fixed_mtime_ns = 1_700_000_000_123_456_789
@@ -248,7 +252,7 @@ def _prepare_builds(scratch: Path) -> tuple[Path, Path, Path, tuple[str, ...]]:
         current_stat.st_size,
         current_stat.st_mtime_ns,
     ):
-        raise AssertionError("pane fixture size/mtime collision was not preserved")
+        raise AssertionError("stream-module fixture size/mtime collision was not preserved")
     return old_shared, current_shared, static_dir, vendor_paths
 
 
@@ -339,27 +343,27 @@ def _one(state: CacheState, phase: str, path: str) -> dict[str, Any]:
 
 def _verify_trace(state: CacheState, vendor_paths: tuple[str, ...]) -> tuple[str, list[str]]:
     entry_path = "/static/asset_cache_boot.js"
-    pane_path = "/shared/interactive.js"
+    stream_path = "/shared/workstream_sync.js"
     old_entry = _one(state, "old", entry_path)
     current_entry = _one(state, "current", entry_path)
-    old_pane = _one(state, "old", pane_path)
-    current_pane = _one(state, "current", pane_path)
+    old_stream = _one(state, "old", stream_path)
+    current_stream = _one(state, "current", stream_path)
 
     expected_query = f"v={__version__}"
     if old_entry["query"] != expected_query or current_entry["query"] != expected_query:
         raise AssertionError("entry URL did not retain the same package version across builds")
-    if old_entry["status"] != 200 or old_pane["status"] != 200:
+    if old_entry["status"] != 200 or old_stream["status"] != 200:
         raise AssertionError("old build did not populate the browser cache")
     if current_entry["status"] != 304 or not current_entry["if_none_match"]:
         raise AssertionError(f"versioned entry did not revalidate to 304: {current_entry!r}")
-    if current_pane["status"] != 200 or not current_pane["if_none_match"]:
+    if current_stream["status"] != 200 or not current_stream["if_none_match"]:
         raise AssertionError(
-            f"transitive pane did not revalidate to current bytes: {current_pane!r}"
+            f"transitive stream module did not revalidate to current bytes: {current_stream!r}"
         )
-    if old_pane["etag"] == current_pane["etag"]:
-        raise AssertionError("content-derived pane validators did not change")
-    if current_pane["cache_control"] != "no-cache":
-        raise AssertionError("transitive pane lost its revalidation policy")
+    if old_stream["etag"] == current_stream["etag"]:
+        raise AssertionError("content-derived stream module validators did not change")
+    if current_stream["cache_control"] != "no-cache":
+        raise AssertionError("transitive stream module lost its revalidation policy")
 
     vendor_trace = []
     immutable = "public, max-age=31536000, immutable"

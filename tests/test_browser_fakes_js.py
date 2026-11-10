@@ -342,7 +342,8 @@ if (!missing.includes('seen: GET /v1/api/thing/history?x=1 (replied)'))
 
 def test_fake_visibility_dispatches_on_change_only() -> None:
     """hide() and show() flip document.hidden and dispatch visibilitychange once
-    per real change; a listener registers once per function and can be removed."""
+    per real change; a listener registers once per function and can be removed,
+    directly or by aborting the signal it was added with."""
     _run(
         FAKE_DOM
         + PANE_DOM
@@ -360,5 +361,13 @@ assert(seen.join() === 'true/hidden,false/visible', 'dispatch on change only: ' 
 document.removeEventListener('visibilitychange', listener);
 visibility.hide();
 assert(seen.length === 2 && visibility.listenerCount() === 0, 'removed listener still fired');
+const lifetime = new AbortController();
+document.addEventListener('visibilitychange', listener, {signal: lifetime.signal});
+assert(visibility.listenerCount() === 1, 'a signalled listener registers');
+lifetime.abort();
+visibility.show();
+assert(seen.length === 2 && visibility.listenerCount() === 0, 'an aborted signal removes it');
+document.addEventListener('visibilitychange', listener, {signal: lifetime.signal});
+assert(visibility.listenerCount() === 0, 'an already-aborted signal adds nothing');
 """
     )

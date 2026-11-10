@@ -2750,12 +2750,9 @@ function boot() {
 // "interrupted while page was loading" and leaves the new page
 // stuck on "Loading…".  Best-effort close on unload frees the slots.
 //
-// Per-pane teardown goes through `disconnectSSE()` instead of a bare
-// `evtSource.close()` so the pane's `_cancelTimeout` / `_forceTimeout`
-// timers also get cleared.  Otherwise — in the edge case where
-// beforeunload fires but navigation is then cancelled (see the
-// defensive-reconnect block below) — those timers can still fire on
-// a now-disconnected pane and mutate UI state.
+// Only the global list stream is closed here.  Each pane's stream belongs to its sync core
+// (workstream_sync.js), which closes it at the pane's destroy or on a hidden tab; the pane's
+// turn timers stop only at its destroy or a dead stream.
 //
 // Tactical only — the canonical fix is console-side SSE fan-in
 // tracked at https://github.com/turnstonelabs/turnstone/issues/540.
@@ -2780,15 +2777,13 @@ window.addEventListener("beforeunload", function () {
 // browser-UI / OS-level interruption.  Idempotent — when SSEs are alive
 // the check is a no-op, so this is also safe on every tab return.
 //
-// Reconnect condition handles both shapes the beforeunload handler can
-// leave behind: `disconnectSSE()` nulls `evtSource`; older non-handler
-// close paths may leave it non-null in CLOSED state.  Either way means
-// "not actively streaming for a pane that has a workstream attached".
+// Reconnect condition handles both shapes a close can leave behind: the beforeunload handler
+// nulls `globalEvtSource`; a stream the browser gave up on stays non-null in CLOSED state.
+// Either way means "the global list stream is not streaming".
 //
-// Per-pane visibility-based DISCONNECT (close-on-hidden) lives in the
-// shared Pane itself (interactive.js visibilitychange handler), which
-// also reconnects its own stream with the saved Last-Event-ID on show —
-// this helper only revives the GLOBAL list stream.
+// Per-pane visibility-based DISCONNECT (close-on-hidden) lives in each pane's sync core
+// (workstream_sync.js), which also reopens its own stream at its last event id on show — this
+// helper only revives the GLOBAL list stream.
 function _reconnectDeadSSEs() {
   if (!globalEvtSource || globalEvtSource.readyState === EventSource.CLOSED) {
     connectGlobalSSE();

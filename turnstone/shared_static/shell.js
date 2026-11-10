@@ -1117,10 +1117,15 @@ async function mountShell() {
   };
   whenPermissionsReady(syncFilesAccess);
   // One shell-level listener, not one leaked subscription per conversation.
-  // Drop rendered file content whenever identity or effective authority changes.
+  // Drop rendered file content whenever identity or effective authority changes,
+  // and every conversation when a different user signs in.
+  const closeConversationsOnUserChange = watchUserChanges(pm, () =>
+    storedItem("ts.user_id"),
+  );
   onAuthChange(() => {
     syncFilesAccess();
     if (pm.hasPane("filesystem")) pm.close("filesystem");
+    closeConversationsOnUserChange();
   });
 
   // Tier-1 lifecycle → pane signal.  The console's ws_closed handler calls
@@ -1287,6 +1292,30 @@ function displayNameFor(caps) {
   } catch (e) {
     return "account";
   }
+}
+
+// A stream authorised as one user must not keep painting for another: each open
+// pane's transcript and live stream were authorised for, and show, the earlier
+// principal.  When the stored user id turns into a different non-empty id,
+// close every conversational pane client-side (destroy its controller, drop its
+// tab) and leave its session open on the server.  An empty id (signed out, or a
+// login broadcast from another tab before whoami restores the id) waits for the
+// next non-empty one.  That is also why this listens to auth changes rather
+// than the login fan-out: in other tabs the fan-out runs while the id is still
+// empty.  After a page reload the previous id is gone and rehydrated tabs come
+// back, which is fine: no stream from before the reload exists, and a
+// rehydrated pane fetches /history and opens /events with the new user's
+// cookie, so the server authorises it as the new user.
+function watchUserChanges(pm, readUserId) {
+  let known = readUserId();
+  return () => {
+    const userId = readUserId();
+    if (!userId) return;
+    if (known && userId !== known) {
+      for (const tab of pm.statefulTabs()) pm.close(tab.id);
+    }
+    known = userId;
+  };
 }
 
 function storedItem(key) {

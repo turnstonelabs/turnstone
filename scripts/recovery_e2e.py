@@ -27,6 +27,8 @@ Usage::
     python3 scripts/recovery_e2e.py --scenario await-window-gate # E6 (#900)
     python3 scripts/recovery_e2e.py --scenario destroy-invalidation # E7 (#900)
     python3 scripts/recovery_e2e.py --scenario reconnect-in-await # E8 (#900 r2)
+    python3 scripts/recovery_e2e.py --scenario slow-history      # E9 (#905)
+    python3 scripts/recovery_e2e.py --scenario retry-running-batch # E10
     python3 scripts/recovery_e2e.py --scenario coord-rewind-window        # G1 (#894)
     python3 scripts/recovery_e2e.py --scenario coord-rewind-failed-window # G2 (#894)
     python3 scripts/recovery_e2e.py --scenario coord-stale-backstop       # G3 (#894)
@@ -69,10 +71,11 @@ pre-restart rows stay, no empty-state, sentinel un-healed — with the backend
 proof ``history_fail_remaining == 0``; then the connect-chokepoint retry's
 second /history heals it.  Stamps ``RECOVERY-READY-FAILFETCH-stale1-healed1``.
 
-Scenario E1 (stale-ref-reload): a mid-content transport teardown leaves a
-live assistant-bubble ref; a same-ws UNARMED re-auth reload (the factory's
-onLogin fan-out) must reset it so the next turn's text builds a FRESH bubble
-instead of concatenating into the stale one.  Stamps
+Scenario E1 (stale-ref-reload): turn 1's events stop reaching the pane right
+after its first content (as a mid-content drop would), leaving a live
+assistant-bubble ref; a ``history_resync`` then runs the handoff repair, a
+same-ws UNARMED reload, which must reset it so the next turn's text builds a
+FRESH bubble instead of concatenating into the stale one.  Stamps
 ``RECOVERY-READY-STALEREF-fresh1``.
 
 Scenario E2 (rewind-window): three completed turns; a REAL rewind click POSTs
@@ -172,6 +175,17 @@ the turn and the flush repaints it.  The connection generation is the only
 term that sees it (object identity cannot: a native reconnect reuses the same
 EventSource).  Verified by control: stripping the term stamps ``dupes2``.
 Stamps ``RECOVERY-READY-RECONNECTAWAIT-dupes1-healed1``.
+
+Scenario E9 (slow-history): a /history slower than the first deadline (#905).
+Every /history is held 20 s; a rewind's clear_ui refetch expires at 15 s and
+the one stale retry, with the deadline doubled to 30 s, outlasts the hold and
+renders the rewound transcript.  Stamps ``RECOVERY-READY-SLOWHIST-rows1-latch0-hist2``.
+
+Scenario E10 (retry-running-batch): an ordinary Retry whose regenerated turn
+starts a tool batch before the clear_ui refetch's /history answers, mid-batch,
+with a cursor.  The refetch is promoted to a seeded render: the trimmed history
+renders and the stream reopens at the cursor, whose replay shows the batch once.
+Stamps ``RECOVERY-READY-RETRYBATCH-replaced0-latch0-batch1-cursor1-busy1-reopen1``.
 
 The #894 coordinator ports (G family — the coord pane's ``historyStale``
 latch; coord state is closure-private, so where E2-E4 read pane fields the
@@ -431,6 +445,8 @@ SECOND_SENTINEL = "SECOND-a7f3"
 # Heal sentinel for scenario E6 (await-window-gate): its scripted fourth turn
 # drives the later organic repair edge and proves that repair rendered.
 BACKSTOP_SENTINEL = "BACKSTOP-b2e4"
+# Scenario E10's replaced reply: the text Retry must remove from the transcript.
+REPLACED_SENTINEL = "REPLACED-c9d1"
 # Scenario E8's duplicate-detector sentinel.  Its whole job is to be COUNTED,
 # not merely found: the artefact #900's stream-generation term prevents is a
 # turn rendered twice, and every other detector in this file counts
@@ -496,9 +512,11 @@ PAGE_HTML = r"""<!doctype html>
       // The ONLY code on this page, or in the runner's evaluated expressions,
       // that reads Pane internals.  Scenario code calls window.__adapter; when
       // the pane's stream/recovery internals change, this block changes and
-      // nothing else should have to.  Public pane surface (messagesEl, el,
-      // busy, inputEl, sendMessage, wsId) and the factory controller's
-      // connect()/destroy() stay direct.
+      // nothing else should have to.  Stream state comes from the pane's sync
+      // core snapshot (pane.sync.inspect()); render state from a few pane
+      // fields.  Public pane surface (messagesEl, el, busy, inputEl,
+      // sendMessage, wsId) and the factory controller's connect()/destroy()
+      // stay direct.
       //
       // Stream facts are counted HERE, per pane, at the transport: never by
       // wrapping the pane's event dispatch, because transport events
@@ -517,7 +535,7 @@ PAGE_HTML = r"""<!doctype html>
         function ownerOf(rec) {
           if (!rec.pane) {
             for (const p of panes) {
-              if (p.evtSource === rec.es) {
+              if (p.sync && p.sync.inspect().source === rec.es) {
                 rec.pane = p;
                 break;
               }
@@ -580,6 +598,16 @@ PAGE_HTML = r"""<!doctype html>
           }
           return method;
         }
+        function snapshot(pane, accessor) {
+          const sync = need(pane, "sync", accessor);
+          if (!sync || typeof sync.inspect !== "function") {
+            throw new Error(
+              "adapter." + accessor + ": pane.sync has no inspect()" +
+                " (pane internals changed; update the adapter block)",
+            );
+          }
+          return sync.inspect();
+        }
         function needRegistered(pane, accessor) {
           if (panes.indexOf(pane) === -1) {
             throw new Error("adapter." + accessor + ": pane was never registered");
@@ -588,23 +616,16 @@ PAGE_HTML = r"""<!doctype html>
 
         window.__adapter = {
           // Credit this pane's streams to it; every pane on the page registers.
-          // Attribution reads the pane's source field, so register checks it.
+          // Attribution reads the source in the pane's sync snapshot, so
+          // register checks it.
           register(pane) {
-            need(pane, "evtSource", "register");
+            snapshot(pane, "register");
             panes.push(pane);
             return pane;
           },
           // First paint of a bare-class pane: history, then the stream.
           start(pane) {
-            needMethod(pane, "_loadHistoryThenConnect", "start").call(pane, pane.wsId);
-          },
-          // E1's same-workstream unarmed reload (the re-auth reload it mimics).
-          reload(pane) {
-            needMethod(pane, "_loadHistoryThenConnect", "reload").call(pane, pane.wsId);
-          },
-          // E1's mid-content transport drop.
-          dropTransport(pane) {
-            needMethod(pane, "disconnectSSE", "dropTransport").call(pane);
+            need(pane, "sync", "start").start();
           },
           // Intercept CONTENT dispatch: fn(evt, dispatch) runs for every event
           // the pane's reducer receives (live or flushed) and calls
@@ -634,39 +655,39 @@ PAGE_HTML = r"""<!doctype html>
           },
           // URL of the source the pane holds now; null when it holds none.
           sourceUrl(pane) {
-            const source = need(pane, "evtSource", "sourceUrl");
+            const source = snapshot(pane, "sourceUrl").source;
             return source ? source.url : null;
           },
           // The pane holds a source and it is OPEN.  CONNECTING (a native
           // reconnect pending) is false.
           transportOpen(pane) {
-            const source = need(pane, "evtSource", "transportOpen");
+            const source = snapshot(pane, "transportOpen").source;
             return !!source && source.readyState === RealES.OPEN;
           },
           // The pane holds no source, or holds one that is CLOSED.  CONNECTING
           // is false here too, so transportOpen and transportDown are NOT
           // complements: a reconnecting source is neither.
           transportDown(pane) {
-            const source = need(pane, "evtSource", "transportDown");
+            const source = snapshot(pane, "transportDown").source;
             return !source || source.readyState === RealES.CLOSED;
           },
           // The pane holds no source at all: close-on-hide and a disconnect
           // release it.  A held source in any state, CLOSED included, is false.
           transportReleased(pane) {
-            return need(pane, "evtSource", "transportReleased") === null;
+            return snapshot(pane, "transportReleased").source === null;
           },
           // The transcript-staleness latch is set: rewind and edit stay gated
           // until a successful history render clears it.
           historyStale(pane) {
-            return need(pane, "_historyStale", "historyStale") === true;
+            return snapshot(pane, "historyStale").historyStale === true;
           },
           // A seedless refetch is in flight and live events queue behind it.
           isQuiesced(pane) {
-            return need(pane, "_replayQueue", "isQuiesced") != null;
+            return snapshot(pane, "isQuiesced").quiesced === true;
           },
           // The pane's document-level visibilitychange listener is registered.
           visibilityHooked(pane) {
-            return need(pane, "_visHandler", "visibilityHooked") != null;
+            return snapshot(pane, "visibilityHooked").listening === true;
           },
           // The reply bubble's body ref is set.  The field exists only once the
           // pane has painted a bubble; E1 asks right after one.
@@ -924,24 +945,26 @@ PAGE_HTML = r"""<!doctype html>
         // the page never auto-sends there.
       });
 
-      // stale-ref-reload: tear the transport down the instant the first
-      // assistant `content` paints.
-      function installContentTeardown() {
-        window.__teardownDone = 0;
+      // stale-ref-reload: from the instant the first assistant `content`
+      // paints, hold every later event back from the pane until the runner
+      // releases the hold (once the stream that carried them is gone).
+      function installContentHold() {
+        window.__holdStarted = 0;
+        window.__holding = false;
         adapter.wrapDispatch(pane, function (ev, dispatch) {
+          if (window.__holding) return undefined;
           const r = dispatch(ev);
           // The fix's regression trap needs a NON-null streaming ref
           // surviving into an unarmed same-ws reload.  The scripted provider
           // emits `content` atomically and the segment's stream_end frame
           // (which nulls those refs) follows with no pollable gap, so the
-          // teardown must RIDE the content event: once it has been applied
-          // (the live bubble now set), drop the transport for real before
-          // stream_end can dispatch — leaving exactly the stale ref a
-          // mid-content transport drop would.
-          if (!window.__teardownDone && ev && ev.type === "content") {
-            window.__teardownDone = 1;
-            adapter.dropTransport(pane);
-            // Non-vacuity guard: record that the teardown genuinely left a
+          // hold must RIDE the content event: once it has been applied (the
+          // live bubble now set), nothing after it reaches the pane, stream_end
+          // included — leaving exactly the stale ref a mid-content drop would.
+          if (!window.__holdStarted && ev && ev.type === "content") {
+            window.__holdStarted = 1;
+            window.__holding = true;
+            // Non-vacuity guard: record that the hold genuinely left a
             // live streaming ref (the stale-ref precondition).  If the
             // segment's stream_end had already nulled it, the reload reset
             // is a no-op and a green verdict would be meaningless — so
@@ -1142,14 +1165,15 @@ PAGE_HTML = r"""<!doctype html>
         };
       } else if (scenario === "stale-ref-reload") {
         // Scenario E1 — regression trap for the #890 streaming-ref reset.
-        // installContentTeardown's hook left a stale live bubble;
-        // the runner then re-auth reloads (unarmed, same-ws) and drives turn
-        // 2.  Phase 1 (post reload, pre turn-2) captures the FIRST assistant
-        // bubble element + its text; __verifyStaleRef proves turn 2's
-        // sentinel landed in a DIFFERENT (fresh) bubble and the captured
-        // bubble is byte-for-byte unchanged.  Pre-fix the unarmed reload kept
-        // the stale ref and turn 2 concatenated into the old bubble.
-        installContentTeardown();
+        // installContentHold's hold left a stale live bubble; the runner then
+        // emits history_resync (whose handoff repair is an unarmed same-ws
+        // reload) and drives turn 2.  Phase 1 (post reload, pre turn-2)
+        // captures the FIRST assistant bubble element + its text;
+        // __verifyStaleRef proves turn 2's sentinel landed in a DIFFERENT
+        // (fresh) bubble and the captured bubble is byte-for-byte unchanged.
+        // Pre-fix the unarmed reload kept the stale ref and turn 2
+        // concatenated into the old bubble.
+        installContentHold();
         window.__stalePhase1 = { rows: 0, text: "" };
         window.__captureStaleRefPhase1 = function () {
           const first = pane.messagesEl.querySelector(".msg.assistant");
@@ -2940,21 +2964,23 @@ def run_fail_refetch(chrome: str) -> str:
 
 
 def run_stale_ref(chrome: str) -> str:
-    """Scenario E1 — regression test for the #890 streaming-ref reset.  A
-    mid-content transport teardown leaves a live assistant bubble ref; a
-    same-ws UNARMED re-auth reload (the factory's onLogin fan-out) must reset
-    it, so the NEXT turn's text builds a FRESH bubble instead of concatenating
-    into the stale one.  No node restart: the page's teardown hook drops the
-    transport on turn 1's content, the runner re-auth reloads through a forced
-    /history failure, then drives turn 2 and proves the sentinel landed in a
-    different bubble with the first bubble unchanged."""
+    """Scenario E1 — regression test for the #890 streaming-ref reset.  Turn
+    1's events stop reaching the pane right after its first content, leaving a
+    live assistant bubble ref; a same-ws UNARMED reload (the handoff repair a
+    ``history_resync`` starts) must reset it, so the NEXT turn's text builds a
+    FRESH bubble instead of concatenating into the stale one.  No node restart:
+    the page's hook holds every event after turn 1's content back from the
+    pane, the runner emits ``history_resync`` with the repair's first /history
+    forced to fail, releases the hold once that stream is gone, then drives
+    turn 2 and proves the sentinel landed in a different bubble with the first
+    bubble unchanged."""
     node = _boot_node()
     # Turn 1 carries assistant CONTENT (the bubble that must go stale) AND a
     # paced bash, so the turn is genuinely mid-flight when the transport drops
     # (unlike run_restart's pure-bash turn, which sets no content ref — the
     # concatenation bug is specifically about a content bubble).  The content
-    # event trips the page's teardown hook; the bash + closing text then
-    # complete server-side during the outage.
+    # event starts the page's content hold; the bash + closing text then
+    # complete server-side while it holds.
     turn1 = {
         "content": "First-turn assistant answer.",
         "tool_calls": [
@@ -2986,24 +3012,26 @@ def run_stale_ref(chrome: str) -> str:
             f"&scenario=stale-ref-reload&second={SECOND_SENTINEL}"
         )
         _set_cookie_and_navigate(cdp, node.base_url, node.token, url)
-        # The page auto-sends turn 1; its content event trips the teardown
-        # hook (the pane's REAL transport drop, mid-segment).  Poll the flag
-        # rather than guess a sleep.
-        if not _poll_until(lambda: cdp.evaluate("window.__teardownDone === 1"), 20):
-            raise AssertionError("stale-ref: mid-content teardown never fired")
-        # Turn 1 completes server-side during the outage.
+        # The page auto-sends turn 1; its content event trips the hold (every
+        # later event of the turn stays away from the pane, mid-segment).
+        # Poll the flag rather than guess a sleep.
+        if not _poll_until(lambda: cdp.evaluate("window.__holdStarted === 1"), 20):
+            raise AssertionError("stale-ref: mid-content hold never fired")
+        # Turn 1 completes server-side while its events are held back.
         node.wait_turn(ws_id, timeout=30)
-        # Arm one /history failure, then re-auth reload EXACTLY as the
-        # factory's onLogin does — same-ws, unarmed (no truncation cursor was
-        # ever recorded, so nothing schedules a jittered resync).
+        # Arm one /history failure, then start the handoff repair: a same-ws,
+        # UNARMED reload (no truncation cursor was ever recorded) that closes
+        # the stream first.
         node.fail_history(1)
-        cdp.evaluate("window.__adapter.reload(window.__pane)")
-        # Failed fetch + cursorless reconnect; the only backend edge is the
-        # fail budget draining to 0 (no resync jitter here).
+        node.emit_history_resync(ws_id)
+        # The repair's first attempt fails; the next one renders and
+        # reconnects with proof.  The held stream is gone by now, so release
+        # the hold for the reconnect's events.
         if not _poll_until(lambda: node.history_fail_remaining == 0, 10, 0.05):
             raise AssertionError("stale-ref: forced /history failure never fired")
+        cdp.evaluate("window.__holding = false")
         # The reconnect must be open before turn 2 (its listener catches the
-        # content), and the reload must have reset the stale ref.
+        # content), and the repair's reload must have reset the stale ref.
         _poll_until(lambda: cdp.evaluate(_OPENS_JS + " >= 2"), 10)
         phase1 = cdp.evaluate("JSON.stringify(window.__captureStaleRefPhase1())")
         # Drive turn 2 in-page via authFetch (the SECOND_SENTINEL final text).
@@ -3828,6 +3856,182 @@ def run_destroy_invalidation(chrome: str) -> str:
         print(f"  destroy-invalidation sse_opens={sse_opens} vis_null={vis_null}")
         cdp.evaluate(f"window.__verifyDestroyInvalidation({sse_opens})")
         return _poll_title(cdp, 15)
+    finally:
+        if cdp is not None:
+            cdp.close()
+        _kill(proc)
+        node.stop()
+
+
+def run_slow_history(chrome: str) -> str:
+    """Scenario E9 — a /history slower than the first deadline still renders (#905).
+
+    The server finishes a reconstruction even when the client aborts, so a retry bounded by the
+    same 15 s only repeats the server's work and never renders.  The core doubles the bound after
+    each expiry in a row (15, 30, 60, then 120 s) and resets it on any payload.
+
+    Three completed turns => three user rows; every /history is then held 20 s at the fault
+    layer.  A REAL rewind click on the second row POSTs, and its clear_ui refetch expires at 15 s:
+    the latch is set and the three rows stand.  The one stale retry, about 2 s later on the open,
+    idle stream, runs with a 30 s bound and outlasts the hold: the rewound transcript renders.
+
+    DETECTOR: one user row with the latch clear, after exactly two /history requests from the
+    click on.  Without the growth both attempts expire at 15 s and nothing else retries: three
+    rows with the latch set (``rows3-latch1-hist2``)."""
+    node, ws_id = _seed_three_completed_turns("browser-slow-history")
+    profile = Path(_scratch()) / "chrome-slow-history"
+    proc, cdp_port = _launch_chrome(chrome, profile)
+    cdp: CDP | None = None
+    try:
+        cdp = CDP(_page_ws_url(cdp_port))
+        url = f"{node.base_url}/recovery?ws_id={ws_id}&scenario=slow-history"
+        _set_cookie_and_navigate(cdp, node.base_url, node.token, url)
+        if not _poll_until(lambda: cdp.evaluate(_ROWS_JS) == 3, 20, 0.2):
+            raise AssertionError("slow-history: three user rows never rendered")
+        # The same handoff gap E2 waits out: a click before the stream is open draws a strong
+        # resync instead of the clear_ui refetch this scenario is about.
+        if not _poll_until(lambda: cdp.evaluate(_OPENS_JS + " >= 1"), 10, 0.05):
+            raise AssertionError("slow-history: SSE stream never opened")
+        baseline = node.history_requests
+        node.delay_history(20000)
+        if not cdp.evaluate("window.__clickRewind(1)"):
+            raise AssertionError("slow-history: second-row rewind button missing")
+        if not _poll_until(lambda: node.rewind_requests == 1, 5, 0.05):
+            raise AssertionError("slow-history: rewind never POSTed")
+        if not _poll_until(lambda: cdp.evaluate(_QUIESCED_JS), 5, 0.05):
+            raise AssertionError("slow-history: clear_ui never started its refetch")
+        # 15 s to the first expiry, 2-2.5 s to the retry, 20 s of hold, plus margin.
+        _poll_until(
+            lambda: cdp.evaluate(_ROWS_JS + " === 1 && !" + _STALE_JS),
+            50,
+            0.25,
+        )
+        rows = cdp.evaluate(_ROWS_JS)
+        stale = 1 if cdp.evaluate(_STALE_JS) else 0
+        requests = node.history_requests - baseline
+        node.delay_history(0)
+        tag = f"SLOWHIST-rows{rows}-latch{stale}-hist{requests}"
+        print(f"  slow-history rows={rows} latch={stale} history_requests={requests}")
+        ok = rows == 1 and stale == 0 and requests == 2
+        return f"RECOVERY-READY-{tag}" if ok else f"RECOVERY-FAILED-{tag}"
+    finally:
+        if cdp is not None:
+            cdp.close()
+        _kill(proc)
+        node.stop()
+
+
+# Records, per /history response the page receives, whether it carried a cursor (1), did not (0)
+# or had no readable JSON body (-1).  Installed by the runner after first paint; the pane's fetch
+# reads the global at call time.
+_RECORD_HISTORY_CURSORS_JS = r"""
+(() => {
+  const real = window.fetch;
+  window.__historyCursors = [];
+  window.fetch = async (...args) => {
+    const response = await real(...args);
+    if (String(args[0]).split("?")[0].endsWith("/history")) {
+      response.clone().json().then(
+        (data) => window.__historyCursors.push(data && data.cursor != null ? 1 : 0),
+        () => window.__historyCursors.push(-1),
+      );
+    }
+    return response;
+  };
+  return true;
+})()
+"""
+
+
+def run_retry_running_batch(chrome: str) -> str:
+    """Scenario E10 — an ordinary Retry whose regenerated turn starts a tool batch before the
+    clear_ui refetch's /history answers.
+
+    One completed turn is seeded before navigation; its reply is the one Retry replaces.  A REAL
+    Retry click POSTs /retry: the server truncates, publishes clear_ui and re-dispatches the
+    turn, a paced bash.  Every /history is held 1 s at the fault layer, so the refetch is answered
+    mid-batch, where /history trims the executing tool call and returns a cursor.  The core
+    promotes that refetch to a seeded render: the trimmed history renders (the replaced reply
+    goes), the queue is dropped, and the stream is rebuilt at the cursor, whose replay delivers
+    the batch.
+
+    DETECTOR, read while the batch still runs (busy1), without waiting for the turn to end: the
+    replaced reply is gone, the latch is clear, the batch shows once and the stream reopened once
+    (reopen1).  NON-VACUITY: the page recorded a cursor on the refetch's response (cursor1).
+    Removing the promotion leaves a seedless render that looks right here, because Retry's
+    clear_ui precedes every frame of the regenerated turn, so its queue holds them all; only the
+    reopen term sees it (``reopen0``).  The case where a seedless render loses rows (a bootstrap
+    clear_ui mid-batch) is executed in the core suite."""
+    from tests._sse_recovery_server import final_text_script, parallel_bash_script
+
+    node = _boot_node()
+    paced = parallel_bash_script({"r0": "for i in $(seq 1 60); do echo r-$i; sleep 0.1; done"})
+    ws_id = node.create_workstream(
+        final_text_script(REPLACED_SENTINEL),
+        paced,
+        final_text_script("regenerated turn closed"),
+        name="browser-retry-running-batch",
+    )
+    node.send(ws_id, "list the files")
+    node.wait_turn(ws_id)
+    profile = Path(_scratch()) / "chrome-retry-running-batch"
+    proc, cdp_port = _launch_chrome(chrome, profile)
+    cdp: CDP | None = None
+    replaced_js = (
+        "(window.__pane.messagesEl.textContent || '').includes("
+        + json.dumps(REPLACED_SENTINEL)
+        + ")"
+    )
+    batches_js = "window.__pane.messagesEl.querySelectorAll('.conv-batch').length"
+    try:
+        cdp = CDP(_page_ws_url(cdp_port))
+        url = f"{node.base_url}/recovery?ws_id={ws_id}&scenario=retry-running-batch"
+        _set_cookie_and_navigate(cdp, node.base_url, node.token, url)
+        if not _poll_until(
+            lambda: cdp.evaluate(_ROWS_JS) == 1 and cdp.evaluate(replaced_js), 20, 0.2
+        ):
+            raise AssertionError("retry-running-batch: the seeded turn never rendered")
+        if not _poll_until(lambda: cdp.evaluate(_OPENS_JS + " >= 1"), 10, 0.05):
+            raise AssertionError("retry-running-batch: SSE stream never opened")
+        if not cdp.evaluate(_RECORD_HISTORY_CURSORS_JS):
+            raise AssertionError("retry-running-batch: could not record /history cursors")
+        opens_before = cdp.evaluate(_OPENS_JS)
+        node.delay_history(1000)
+        clicked = cdp.evaluate(
+            "(() => { const b = window.__pane.messagesEl.querySelector('.msg-retry-btn');"
+            " if (!b) return false; b.click(); return true; })()"
+        )
+        if not clicked:
+            raise AssertionError("retry-running-batch: the last reply offers no Retry")
+        if not _poll_until(lambda: cdp.evaluate(_QUIESCED_JS), 5, 0.05):
+            raise AssertionError("retry-running-batch: clear_ui never started its refetch")
+        if not _poll_until(lambda: cdp.evaluate("window.__historyCursors.length >= 1"), 8, 0.05):
+            raise AssertionError("retry-running-batch: the refetch never answered")
+        node.delay_history(0)
+        _poll_until(lambda: not cdp.evaluate(_QUIESCED_JS), 5, 0.05)
+        _poll_until(lambda: cdp.evaluate(_OPEN_JS), 5, 0.05)
+        _poll_until(lambda: cdp.evaluate(batches_js) >= 1, 3, 0.05)
+        replaced = 1 if cdp.evaluate(replaced_js) else 0
+        stale = 1 if cdp.evaluate(_STALE_JS) else 0
+        batches = cdp.evaluate(batches_js)
+        cursor = cdp.evaluate("window.__historyCursors[0]")
+        busy = 1 if cdp.evaluate("window.__pane.busy") else 0
+        reopen = cdp.evaluate(_OPENS_JS) - opens_before
+        node.wait_turn(ws_id, timeout=30)
+        tag = (
+            f"RETRYBATCH-replaced{replaced}-latch{stale}-batch{batches}-cursor{cursor}"
+            f"-busy{busy}-reopen{reopen}"
+        )
+        print(f"  retry-running-batch {tag}")
+        ok = (
+            replaced == 0
+            and stale == 0
+            and batches == 1
+            and cursor == 1
+            and busy == 1
+            and reopen == 1
+        )
+        return f"RECOVERY-READY-{tag}" if ok else f"RECOVERY-FAILED-{tag}"
     finally:
         if cdp is not None:
             cdp.close()
@@ -5089,14 +5293,14 @@ class Scenario:
 
 
 # E1: its recorded control (74eedff1: drop the unarmed reload's streaming-ref
-# reset) stays READY.  The reload fails its /history on purpose and reconnects
-# with no cursor and no handoff token; since #1005 the server answers exactly
-# that connect with a clear_ui bootstrap frame, the pane's refetch renders, and
-# replayHistory resets the same refs.  Removing either reset alone stays READY;
-# only removing both fails it.
+# reset) stays READY.  The only unarmed reload left is the handoff repair, and
+# the repair never reconnects without a completed render: a failed attempt
+# keeps the stream closed and retries.  That render resets the same refs twice
+# over (the sync core's reset just before renderHistory, and replayHistory's
+# own), so removing any one of the three resets stays READY.
 _E1_UNCONTROLLED = (
-    "the reload's ref reset is backed up by replayHistory's own reset (run by the "
-    "server's tokenless clear_ui bootstrap since #1005); no single removal fails it"
+    "every reconnect after an unarmed reload (the handoff repair) follows a completed "
+    "render, which resets the reply refs itself; no single removal fails it"
 )
 # G7: its recorded control (b85f7929: the /history flight key without the
 # truncation generation) stays READY.  load_messages runs under the session's
@@ -5131,6 +5335,8 @@ SCENARIOS: tuple[Scenario, ...] = (
     Scenario("await-window-gate", "E6", "scenario E6 (awaitgate):", run_await_window_gate),
     Scenario("destroy-invalidation", "E7", "scenario E7 (destroyinval):", run_destroy_invalidation),
     Scenario("reconnect-in-await", "E8", "scenario E8 (reconnectawait):", run_reconnect_in_await),
+    Scenario("slow-history", "E9", "scenario E9 (slowhistory):", run_slow_history),
+    Scenario("retry-running-batch", "E10", "scenario E10 (retrybatch):", run_retry_running_batch),
     Scenario(
         "coord-rewind-window", "G1", "scenario G1 (coord-rewindwin):", run_coord_rewind_window
     ),
@@ -5262,6 +5468,7 @@ _CONTROL_RUN: _ControlRun | None = None
 
 
 _I = "/shared/interactive.js"
+_WS = "/shared/workstream_sync.js"
 _CO = "/coord-static/coordinator.js"
 
 # One control per scenario that has an honest one; a scenario without one says why in its
@@ -5287,7 +5494,7 @@ CONTROLS: tuple[Control, ...] = (
         removes="the stream cursor is never captured from the MessageEvent",
         expected=r"RECOVERY-FAILED-RESTART-rows1-busy0-disc0-healed1-trunc0",
         origin="added with the controls table",
-        edit=SourceEdit(_I, "        this._lastEventId = e.lastEventId;\n", ""),
+        edit=SourceEdit(_WS, "      this.#cursor = id;\n", ""),
     ),
     Control(
         scenario="coord-restart",
@@ -5308,9 +5515,9 @@ CONTROLS: tuple[Control, ...] = (
         ),
         origin="added with the controls table",
         edit=SourceEdit(
-            _I,
-            "      if (r && r.ok) data = await r.json();\n",
-            "      if (r) data = await r.json();\n",
+            _WS,
+            "      if (!response || !response.ok) return null;\n",
+            "      if (!response) return null;\n",
         ),
     ),
     Control(
@@ -5320,7 +5527,7 @@ CONTROLS: tuple[Control, ...] = (
         origin="history 74eedff1",
         edit=SourceEdit(
             _I,
-            "  _rewindToMessage(msgEl) {\n    if (this.busy || this._historyStale) return;\n",
+            "  _rewindToMessage(msgEl) {\n    if (this.busy || this.sync.historyStale) return;\n",
             "  _rewindToMessage(msgEl) {\n    if (this.busy) return;\n",
         ),
     ),
@@ -5331,7 +5538,7 @@ CONTROLS: tuple[Control, ...] = (
         origin="history 74eedff1",
         edit=SourceEdit(
             _I,
-            "  _rewindToMessage(msgEl) {\n    if (this.busy || this._historyStale) return;\n",
+            "  _rewindToMessage(msgEl) {\n    if (this.busy || this.sync.historyStale) return;\n",
             "  _rewindToMessage(msgEl) {\n    if (this.busy) return;\n",
         ),
     ),
@@ -5340,11 +5547,7 @@ CONTROLS: tuple[Control, ...] = (
         removes="the transport-free backstop, in favour of a reload that reconnects",
         expected=r"RECOVERY-FAILED-STALEBACKSTOP-heal1-sse1-hist1-gated1-posts2-rows\d+",
         origin="docstring",
-        edit=SourceEdit(
-            _I,
-            "            this._deferStaleHistoryBackstop();\n",
-            "            this._loadHistoryThenConnect(this.wsId);\n",
-        ),
+        edit=SourceEdit(_WS, "      this.#deferStaleBackstop();\n", "      this.#reload();\n"),
     ),
     Control(
         scenario="hidden-retry",
@@ -5352,12 +5555,10 @@ CONTROLS: tuple[Control, ...] = (
         expected=r"RECOVERY-FAILED-HIDDENRETRY-hidden1-heal1-sse1-posts2-rows\d+",
         origin="history 8effe656, 4007fab8",
         edit=SourceEdit(
-            _I,
-            "                    !this.currentReasoningEl &&\n"
-            "                    this.evtSource &&\n"
-            "                    this.evtSource.readyState === EventSource.OPEN\n"
-            "                  ) {\n",
-            "                    !this.currentReasoningEl\n                  ) {\n",
+            _WS,
+            "      if (gen !== this.#generation || !this.#historyStale || this.#queue || "
+            "!this.#sourceOpen()) {\n",
+            "      if (gen !== this.#generation || !this.#historyStale || this.#queue) {\n",
         ),
     ),
     Control(
@@ -5365,25 +5566,14 @@ CONTROLS: tuple[Control, ...] = (
         removes="the stream-openness terms from the seedless render gate",
         expected=r"RECOVERY-FAILED-AWAITGATE-rows1-latch0-heal1",
         origin="docstring",
-        edit=SourceEdit(
-            _I,
-            "      (!!this.evtSource &&\n"
-            "        this.evtSource.readyState === EventSource.OPEN &&\n"
-            "        this._connectEpoch === epoch);\n",
-            "      this._connectEpoch === epoch;\n",
-        ),
+        edit=SourceEdit(_WS, "        open: this.#sourceOpen(),\n", "        open: true,\n"),
     ),
     Control(
         scenario="destroy-invalidation",
-        removes="destroy()'s history load-token bump",
+        removes="destroy()'s teardown of its sync core (the generation bump, aborts and listener)",
         expected=r"RECOVERY-FAILED-DESTROYINVAL-sse1-detached1-vis0",
         origin="history 539b91d3",
-        edit=SourceEdit(
-            _I,
-            "      // neither).  Every future terminal path must bump this too.\n"
-            "      pane._historyLoadToken = (pane._historyLoadToken || 0) + 1;\n",
-            "      // neither).  Every future terminal path must bump this too.\n",
-        ),
+        edit=SourceEdit(_I, "      pane.sync.destroy();\n", ""),
     ),
     Control(
         scenario="reconnect-in-await",
@@ -5391,10 +5581,35 @@ CONTROLS: tuple[Control, ...] = (
         expected=r"RECOVERY-FAILED-RECONNECTAWAIT-dupes2-healed1",
         origin="history 7ed5d90a",
         edit=SourceEdit(
-            _I,
-            "        this.evtSource.readyState === EventSource.OPEN &&\n"
-            "        this._connectEpoch === epoch);\n",
-            "        this.evtSource.readyState === EventSource.OPEN);\n",
+            _WS,
+            "        sameConnection: this.#epoch === epoch,\n",
+            "        sameConnection: true,\n",
+        ),
+    ),
+    Control(
+        scenario="slow-history",
+        removes="the /history deadline's growth after an expiry",
+        expected=r"RECOVERY-FAILED-SLOWHIST-rows3-latch1-hist2",
+        origin="docstring",
+        edit=SourceEdit(
+            _WS,
+            "        this.#historyDeadlineMs = Math.min(this.#historyDeadlineMs * 2, "
+            "HISTORY_DEADLINE_MAX_MS);\n",
+            "",
+        ),
+    ),
+    Control(
+        scenario="retry-running-batch",
+        removes="the promotion of a cursor-bearing refetch, leaving a seedless render",
+        expected=r"RECOVERY-FAILED-RETRYBATCH-replaced0-latch0-batch1-cursor1-busy1-reopen0",
+        origin="docstring",
+        edit=SourceEdit(
+            _WS,
+            "      if (data.cursor != null) {\n"
+            "        this.#promote(data);\n"
+            '        return "rendered";\n'
+            "      }\n",
+            "",
         ),
     ),
     Control(
@@ -5474,7 +5689,12 @@ CONTROLS: tuple[Control, ...] = (
             r" not downgrade to bootstrap \(history=6, events=0, prompt=1\)"
         ),
         origin="added with the controls table",
-        edit=SourceEdit(_I, '      return "rendered";\n', ""),
+        edit=SourceEdit(
+            _WS,
+            '    if (!first && !hadGap && data.cursor != null) this.#emit("missed");\n'
+            '    return "rendered";\n',
+            '    if (!first && !hadGap && data.cursor != null) this.#emit("missed");\n',
+        ),
     ),
     Control(
         scenario="coord-handoff-repair-budget",

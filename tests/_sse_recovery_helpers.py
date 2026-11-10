@@ -1,10 +1,9 @@
 """Browser-fidelity SSE recovery harness helpers.
 
-The load-bearing assembly for ``tests/test_sse_recovery_e2e.py``: a
-``BrowserlikeSSEClient`` that speaks the exact wire contract the real
-``turnstone/shared_static/interactive.js`` pane speaks, and the
-assertion helpers the scenarios share. The server boot machinery lives
-in ``_sse_recovery_server.py``.
+The load-bearing assembly for ``tests/test_sse_recovery_e2e.py``: a ``BrowserlikeSSEClient`` that
+speaks the exact wire contract the real interactive pane speaks through its sync core
+(``turnstone/shared_static/workstream_sync.js``), and the assertion helpers the scenarios share.
+The server boot machinery lives in ``_sse_recovery_server.py``.
 
 Why a raw-socket SSE reader (and not ``httpx2.stream``): the slow-consumer
 overflow scenario needs the consumer to STALL — stop reading the socket
@@ -18,26 +17,20 @@ both; httpx2 (used here only for the plain ``/history`` request/response)
 gives neither. This is ALSO closer to the browser: EventSource has a
 bounded receive buffer, not an unbounded one.
 
-Client contract mirrored from interactive.js (line references are to
-that file on the ``fix/sse-truncated-resync`` branch):
+Client contract mirrored from the sync core (method names are its private ones in
+``workstream_sync.js``):
 
-- ``_last_event_id`` advances ONLY from SSE ``id:`` fields, and only
-  ring-buffer events carry one — synthetic replay frames (connected /
-  status / state_change / in_progress_snapshot / replay_truncated /
-  stream_overflow) do not, exactly like ``EventSource.lastEventId``
-  (interactive.js onmessage ~1378).
-- reconnect presents ``connectCursor = _truncatedFromCursor ??
-  _lastEventId`` as ``?last_event_id=`` (manual path) or a
-  ``Last-Event-ID`` header (native EventSource auto-reconnect path)
-  (interactive.js connectSSE ~1328).
-- on a ``replay_truncated`` envelope the client records the
-  truncation-time cursor keep-oldest (``_truncatedFromCursor =
-  _lastEventId`` only when null) and runs ``_loadHistoryThenConnect``
-  (disconnect → /history → adopt cursor → reconnect); a FAILED
-  /history leaves the record armed so the reconnect re-presents the
-  truncation-time cursor and re-draws the envelope (interactive.js
-  handleEvent replay_truncated ~2303, _loadHistoryThenConnect ~1604,
-  _refetchHistory seedCursor ~1706).
+- ``_last_event_id`` advances ONLY from SSE ``id:`` fields, and only ring-buffer events carry one
+  — synthetic replay frames (connected / status / state_change / in_progress_snapshot /
+  replay_truncated / stream_overflow) do not, exactly like ``EventSource.lastEventId``
+  (``#onMessage``).
+- reconnect presents the truncation-time cursor when one is recorded, else the last event id, as
+  ``?last_event_id=`` (manual path) or a ``Last-Event-ID`` header (native EventSource
+  auto-reconnect path) (``#connect``).
+- on a ``replay_truncated`` envelope the client records the truncation-time cursor keep-oldest
+  (only when none is recorded) and reloads (disconnect → /history → adopt cursor → reconnect); a
+  FAILED /history leaves the record armed so the reconnect re-presents the truncation-time cursor
+  and re-draws the envelope (``#recordTruncationGap``, ``#decideTruncatedResync``, ``#reload``).
 """
 
 from __future__ import annotations
@@ -349,9 +342,9 @@ class BrowserlikeSSEClient:
         return result
 
     def seed_from_history(self) -> dict[str, Any]:
-        """The seedCursor step: fetch /history, adopt a non-null resume
-        cursor into ``_last_event_id``, and clear the truncation record on
-        a successful render (replayHistory clears ``_truncatedFromCursor``).
+        """The seeded load: fetch /history, adopt a non-null resume cursor into
+        ``_last_event_id``, and clear the truncation record on a successful render (the sync
+        core clears its truncation-time cursor at the render step).
         """
         data = self.fetch_history()
         cursor = data.get("cursor")
@@ -363,7 +356,7 @@ class BrowserlikeSSEClient:
     def load_history_then_connect(
         self, *, fail_history: bool = False, native: bool = False
     ) -> dict[str, Any] | None:
-        """Reproduce interactive.js ``_loadHistoryThenConnect``.
+        """Reproduce the sync core's reload (``#reload`` in workstream_sync.js).
 
         Disconnect first, drop the live cursor (``_last_event_id = None``)
         but KEEP ``_truncated_from_cursor`` armed, then fetch /history and
