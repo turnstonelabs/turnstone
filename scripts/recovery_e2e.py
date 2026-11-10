@@ -40,9 +40,24 @@ Usage::
     python3 scripts/recovery_e2e.py --scenario tool-turn-two-pane
     python3 scripts/recovery_e2e.py --scenario roster-restart    # F1 (#881)
     python3 scripts/recovery_e2e.py --scenario roster-restart-native  # F2 (#881)
+    python3 scripts/recovery_e2e.py --scenario es-contract  # the EventSource contract, real browser
     python3 scripts/recovery_e2e.py --scenario both   # A+B only (legacy)
     python3 scripts/recovery_e2e.py --keep-open 8971  # serve the storm page
                                                       # for manual inspection
+    python3 scripts/recovery_e2e.py --control hidden-retry  # one negative control
+    python3 scripts/recovery_e2e.py --controls        # every negative control
+    python3 scripts/recovery_e2e.py --check-controls  # control needles only, no browser
+
+NEGATIVE CONTROLS (``CONTROLS``): each runs one scenario against a mutated copy
+of a served client module, held in memory and served by the fault layer, and
+passes only when the scenario stamps the failing verdict recorded for it.  The
+contract is at the "Negative controls" section near the end of this file.
+
+THE PANE ADAPTER: each pane page carries one delimited adapter block
+(``window.__adapter``).  Every read of pane state beyond the public DOM and
+controller, by page code or by a runner-side expression, goes through it, and
+stream facts (opens, ``replay_truncated`` frames) are counted there per pane at
+the transport rather than by wrapping the pane's event dispatch.
 
 The #890 guard-before-wipe family (against the interactive pane; the
 coordinator ports are the G family below):
@@ -381,6 +396,7 @@ import base64
 import contextlib
 import json
 import os
+import re
 import shutil
 import socket
 import struct
@@ -389,8 +405,12 @@ import sys
 import threading
 import time
 import urllib.request
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -426,6 +446,22 @@ DUPLICATE_SENTINEL = "DUPE-c9a7"
 _ROWS_JS = "window.__pane.messagesEl.querySelectorAll('.msg.user').length"
 _COORD_ROWS_JS = "document.getElementById('coord-messages').querySelectorAll('.msg.user').length"
 
+# Runner-side reads of pane state go through the page's adapter block (``window.__adapter``),
+# never a pane field.  _OPENS_JS and _OPEN_JS work on both pane pages (the coordinator page's
+# accessors ignore the pane argument: one pane per page); the opens reads answer 0 on a page whose
+# module has not registered its pane yet (an unregistered pane makes the accessor throw).
+# _PEER_OPENS_JS needs the two-pane page.  _STALE_JS, _QUIESCED_JS and _RELEASED_JS are
+# interactive-only: the coordinator keeps that state closure-private, and its block throws for
+# them.
+_OPENS_JS = "(window.__adapter && window.__pane ? window.__adapter.opens(window.__pane) : 0)"
+_OPEN_JS = "window.__adapter.transportOpen(window.__pane)"
+_PEER_OPENS_JS = (
+    "(window.__adapter && window.__peerPane ? window.__adapter.opens(window.__peerPane) : 0)"
+)
+_STALE_JS = "window.__adapter.historyStale(window.__pane)"
+_QUIESCED_JS = "window.__adapter.isQuiesced(window.__pane)"
+_RELEASED_JS = "window.__adapter.transportReleased(window.__pane)"
+
 # ---------------------------------------------------------------------------
 # The recovery page — served same-origin by the node at /recovery.
 # ---------------------------------------------------------------------------
@@ -454,6 +490,200 @@ PAGE_HTML = r"""<!doctype html>
       // Minimal globals interactive.js reads on the standalone path.
       window.showToast = function (m) { console.log("toast:", m); };
       window.showLogin = function () {};
+    </script>
+    <script>
+      // ==== PANE ADAPTER (interactive page) ==================================
+      // The ONLY code on this page, or in the runner's evaluated expressions,
+      // that reads Pane internals.  Scenario code calls window.__adapter; when
+      // the pane's stream/recovery internals change, this block changes and
+      // nothing else should have to.  Public pane surface (messagesEl, el,
+      // busy, inputEl, sendMessage, wsId) and the factory controller's
+      // connect()/destroy() stay direct.
+      //
+      // Stream facts are counted HERE, per pane, at the transport: never by
+      // wrapping the pane's event dispatch, because transport events
+      // (replay_truncated, stream_overflow, history_resync) need not reach the
+      // pane's reducer.  The attribution lives here too: on the two-pane page
+      // both panes dial byte-identical URLs, so a page-level counter cannot
+      // tell them apart.  Each EventSource the page constructs is credited to
+      // the registered pane holding it (this classic script runs before the
+      // module, so every pane connect constructs the wrapper).
+      (function () {
+        const RealES = window.EventSource;
+        const panes = [];
+        const streams = [];
+        const openHooks = new Map();
+
+        function ownerOf(rec) {
+          if (!rec.pane) {
+            for (const p of panes) {
+              if (p.evtSource === rec.es) {
+                rec.pane = p;
+                break;
+              }
+            }
+          }
+          return rec.pane;
+        }
+        function total(pane, key) {
+          let n = 0;
+          for (const rec of streams) if (ownerOf(rec) === pane) n += rec[key];
+          return n;
+        }
+        function AttributedES(url, opts) {
+          const es = new RealES(url, opts);
+          const rec = { es: es, pane: null, opens: 0, truncated: 0 };
+          streams.push(rec);
+          // The pane stores the source as soon as construction returns.
+          queueMicrotask(function () {
+            ownerOf(rec);
+          });
+          es.addEventListener("open", function () {
+            rec.opens += 1;
+            const pane = ownerOf(rec);
+            const opens = pane ? total(pane, "opens") : 0;
+            (openHooks.get(pane) || []).forEach(function (fn) {
+              fn(opens);
+            });
+          });
+          es.addEventListener("message", function (e) {
+            ownerOf(rec);
+            try {
+              const d = JSON.parse(e.data);
+              if (d && d.type === "replay_truncated") rec.truncated += 1;
+            } catch (_) {}
+          });
+          return es;
+        }
+        AttributedES.prototype = RealES.prototype;
+        AttributedES.CONNECTING = RealES.CONNECTING;
+        AttributedES.OPEN = RealES.OPEN;
+        AttributedES.CLOSED = RealES.CLOSED;
+        window.EventSource = AttributedES;
+
+        // Every accessor that reads pane state throws when the field behind it
+        // is missing, so a renamed internal fails the run loudly instead of
+        // reading as "not set" and letting a detector pass untested.
+        function need(pane, name, accessor) {
+          if (!pane || typeof pane !== "object" || !(name in pane)) {
+            throw new Error(
+              "adapter." + accessor + ": pane has no " + name +
+                " (pane internals changed; update the adapter block)",
+            );
+          }
+          return pane[name];
+        }
+        function needMethod(pane, name, accessor) {
+          const method = need(pane, name, accessor);
+          if (typeof method !== "function") {
+            throw new Error("adapter." + accessor + ": pane." + name + " is not a method");
+          }
+          return method;
+        }
+        function needRegistered(pane, accessor) {
+          if (panes.indexOf(pane) === -1) {
+            throw new Error("adapter." + accessor + ": pane was never registered");
+          }
+        }
+
+        window.__adapter = {
+          // Credit this pane's streams to it; every pane on the page registers.
+          // Attribution reads the pane's source field, so register checks it.
+          register(pane) {
+            need(pane, "evtSource", "register");
+            panes.push(pane);
+            return pane;
+          },
+          // First paint of a bare-class pane: history, then the stream.
+          start(pane) {
+            needMethod(pane, "_loadHistoryThenConnect", "start").call(pane, pane.wsId);
+          },
+          // E1's same-workstream unarmed reload (the re-auth reload it mimics).
+          reload(pane) {
+            needMethod(pane, "_loadHistoryThenConnect", "reload").call(pane, pane.wsId);
+          },
+          // E1's mid-content transport drop.
+          dropTransport(pane) {
+            needMethod(pane, "disconnectSSE", "dropTransport").call(pane);
+          },
+          // Intercept CONTENT dispatch: fn(evt, dispatch) runs for every event
+          // the pane's reducer receives (live or flushed) and calls
+          // dispatch(evt) to deliver one.
+          wrapDispatch(pane, fn) {
+            const dispatch = needMethod(pane, "handleEvent", "wrapDispatch").bind(pane);
+            pane.handleEvent = function (evt) {
+              return fn(evt, dispatch);
+            };
+          },
+          // fn(opens) after every stream open credited to this pane.
+          onOpen(pane, fn) {
+            needRegistered(pane, "onOpen");
+            if (!openHooks.has(pane)) openHooks.set(pane, []);
+            openHooks.get(pane).push(fn);
+          },
+          // Stream opens credited to the pane, native reconnects included.
+          opens(pane) {
+            needRegistered(pane, "opens");
+            return total(pane, "opens");
+          },
+          // replay_truncated frames received on the pane's streams, counted at
+          // arrival (before any queue flush, and even if a queue is dropped).
+          truncatedSeen(pane) {
+            needRegistered(pane, "truncatedSeen");
+            return total(pane, "truncated");
+          },
+          // URL of the source the pane holds now; null when it holds none.
+          sourceUrl(pane) {
+            const source = need(pane, "evtSource", "sourceUrl");
+            return source ? source.url : null;
+          },
+          // The pane holds a source and it is OPEN.  CONNECTING (a native
+          // reconnect pending) is false.
+          transportOpen(pane) {
+            const source = need(pane, "evtSource", "transportOpen");
+            return !!source && source.readyState === RealES.OPEN;
+          },
+          // The pane holds no source, or holds one that is CLOSED.  CONNECTING
+          // is false here too, so transportOpen and transportDown are NOT
+          // complements: a reconnecting source is neither.
+          transportDown(pane) {
+            const source = need(pane, "evtSource", "transportDown");
+            return !source || source.readyState === RealES.CLOSED;
+          },
+          // The pane holds no source at all: close-on-hide and a disconnect
+          // release it.  A held source in any state, CLOSED included, is false.
+          transportReleased(pane) {
+            return need(pane, "evtSource", "transportReleased") === null;
+          },
+          // The transcript-staleness latch is set: rewind and edit stay gated
+          // until a successful history render clears it.
+          historyStale(pane) {
+            return need(pane, "_historyStale", "historyStale") === true;
+          },
+          // A seedless refetch is in flight and live events queue behind it.
+          isQuiesced(pane) {
+            return need(pane, "_replayQueue", "isQuiesced") != null;
+          },
+          // The pane's document-level visibilitychange listener is registered.
+          visibilityHooked(pane) {
+            return need(pane, "_visHandler", "visibilityHooked") != null;
+          },
+          // The reply bubble's body ref is set.  The field exists only once the
+          // pane has painted a bubble; E1 asks right after one.
+          liveBubble(pane) {
+            return need(pane, "currentAssistantBodyEl", "liveBubble") != null;
+          },
+          // The pane holds a context reading for this task-agent call id.
+          agentContextHeld(pane, callId) {
+            return need(pane, "_agentContexts", "agentContextHeld").has(callId);
+          },
+          // The tool row the pane resolves for this call id, or null.
+          toolRow(pane, callId) {
+            return needMethod(pane, "_toolRow", "toolRow").call(pane, callId);
+          },
+        };
+      })();
+      // ==== END PANE ADAPTER =================================================
     </script>
     <script type="module">
       import {
@@ -498,19 +728,18 @@ PAGE_HTML = r"""<!doctype html>
         document.getElementById("mount").appendChild(pane.el);
       }
       pane.wsId = wsId;
+      // Every pane on this page is registered with the adapter (block above).
+      const adapter = window.__adapter;
+      adapter.register(pane);
       window.__pane = pane;
       let peerPane = null;
       if (
         scenario === "user-turn-two-pane" ||
         scenario === "tool-turn-two-pane"
       ) {
-        // The standalone default host is a shared singleton. Give each pane a
-        // shallow copy before wrapping onStreamOpen so instrumentation remains
-        // per-pane instead of nesting twice on the same callback object.
-        pane._host = { ...pane._host };
         peerPane = new InteractivePane(wsId, { base: "" });
-        peerPane._host = { ...peerPane._host };
         peerPane.wsId = wsId;
+        adapter.register(peerPane);
         document.getElementById("mount").appendChild(peerPane.el);
         window.__peerPane = peerPane;
       }
@@ -573,7 +802,6 @@ PAGE_HTML = r"""<!doctype html>
         // ordering where _toolRow still resolves the prior terminal task1 row;
         // then replay the real parent events and require the retained reading
         // to relink to the successor occurrence.
-        const handleAgentEvent = pane.handleEvent.bind(pane);
         let delayedReusedParents = [];
         window.__reuseDelayArmed = false;
         window.__reuseContextBeforeParent = false;
@@ -582,7 +810,7 @@ PAGE_HTML = r"""<!doctype html>
           delayedReusedParents = [];
           window.__reuseDelayArmed = true;
         };
-        pane.handleEvent = function (evt) {
+        adapter.wrapDispatch(pane, function (evt, dispatch) {
           const delayedParent =
             window.__reuseDelayArmed &&
             evt &&
@@ -596,7 +824,7 @@ PAGE_HTML = r"""<!doctype html>
             delayedReusedParents.push(evt);
             return;
           }
-          const result = handleAgentEvent(evt);
+          const result = dispatch(evt);
           if (
             window.__reuseDelayArmed &&
             evt &&
@@ -604,13 +832,15 @@ PAGE_HTML = r"""<!doctype html>
             evt.parent_call_id === "task1" &&
             delayedReusedParents.length
           ) {
-            window.__reuseContextBeforeParent =
-              pane._agentContexts.has("task1");
+            window.__reuseContextBeforeParent = adapter.agentContextHeld(
+              pane,
+              "task1",
+            );
             window.__reuseDelayArmed = false;
             const delayed = delayedReusedParents;
             delayedReusedParents = [];
-            delayed.forEach((parentEvt) => handleAgentEvent(parentEvt));
-            const row = pane._toolRow("task1");
+            delayed.forEach((parentEvt) => dispatch(parentEvt));
+            const row = adapter.toolRow(pane, "task1");
             window.__reuseRelinked = !!(
               row &&
               row.querySelector(
@@ -619,7 +849,7 @@ PAGE_HTML = r"""<!doctype html>
             );
           }
           return result;
-        };
+        });
       }
 
       // Count top-level tool rows and escaped sub-agent children.
@@ -658,7 +888,7 @@ PAGE_HTML = r"""<!doctype html>
       function sendOnce(msg) {
         if (sent) return;
         sent = true;
-        // The pane's SSE is open (host.onStreamOpen fired), so the listener is
+        // The pane's SSE is open (its open event fired), so the listener is
         // registered before this /send -- no missed events.
         window
           .authFetch("/v1/api/workstreams/" + encodeURIComponent(wsId) + "/send", {
@@ -679,69 +909,47 @@ PAGE_HTML = r"""<!doctype html>
         return true;
       };
 
-      // Drive /send once the stream is live (wrap the default host hook).
-      const origOpen = pane._host.onStreamOpen.bind(pane._host);
-      pane._host.onStreamOpen = function (p) {
-        origOpen(p);
-        window.__streamOpen = (window.__streamOpen || 0) + 1;
+      // Drive /send once the stream is live.
+      adapter.onOpen(pane, function (opens) {
         if (scenario === "storm" && !agentResume) sendOnce("run the storm");
         else if (
           (scenario === "restart" ||
             scenario === "fail-refetch" ||
             scenario === "stale-ref-reload") &&
-          window.__streamOpen === 1
+          opens === 1
         )
           sendOnce("run a turn");
         // rewind-window drives its turns SERVER-side before navigation, when
         // no page listener exists; the initial /history paints those rows, so
         // the page never auto-sends there.
-      };
+      });
 
-      if (peerPane) {
-        const peerOrigOpen = peerPane._host.onStreamOpen.bind(peerPane._host);
-        peerPane._host.onStreamOpen = function (p) {
-          peerOrigOpen(p);
-          window.__peerStreamOpen = (window.__peerStreamOpen || 0) + 1;
-        };
-      }
-
-      // Shared transport instrumentation for the truncated-recovery
-      // scenarios: count replay_truncated envelopes (the original restart
-      // idiom) and, for stale-ref-reload, tear the transport down the
-      // instant the first assistant `content` paints.
-      function installStreamWrap() {
-        window.__truncatedSeen = 0;
+      // stale-ref-reload: tear the transport down the instant the first
+      // assistant `content` paints.
+      function installContentTeardown() {
         window.__teardownDone = 0;
-        const origHandle = pane.handleEvent.bind(pane);
-        pane.handleEvent = function (ev) {
-          if (ev && ev.type === "replay_truncated") window.__truncatedSeen += 1;
-          const r = origHandle(ev);
-          // stale-ref-reload: the fix's regression trap needs a NON-null
-          // streaming ref surviving into an unarmed same-ws reload.  The
-          // scripted provider emits `content` atomically and the segment's
-          // stream_end frame (which nulls those refs) follows with no
-          // pollable gap, so the teardown must RIDE the content event: once
-          // it has been applied (currentAssistantEl now set), close the
-          // EventSource via the REAL disconnectSSE() before stream_end can
-          // dispatch — leaving exactly the stale ref a mid-content transport
-          // drop would.
-          if (
-            scenario === "stale-ref-reload" &&
-            !window.__teardownDone &&
-            ev &&
-            ev.type === "content"
-          ) {
+        adapter.wrapDispatch(pane, function (ev, dispatch) {
+          const r = dispatch(ev);
+          // The fix's regression trap needs a NON-null streaming ref
+          // surviving into an unarmed same-ws reload.  The scripted provider
+          // emits `content` atomically and the segment's stream_end frame
+          // (which nulls those refs) follows with no pollable gap, so the
+          // teardown must RIDE the content event: once it has been applied
+          // (the live bubble now set), drop the transport for real before
+          // stream_end can dispatch — leaving exactly the stale ref a
+          // mid-content transport drop would.
+          if (!window.__teardownDone && ev && ev.type === "content") {
             window.__teardownDone = 1;
-            pane.disconnectSSE();
+            adapter.dropTransport(pane);
             // Non-vacuity guard: record that the teardown genuinely left a
             // live streaming ref (the stale-ref precondition).  If the
             // segment's stream_end had already nulled it, the reload reset
             // is a no-op and a green verdict would be meaningless — so
             // __verifyStaleRef fails loudly when this is false.
-            window.__staleRefWasSet = pane.currentAssistantBodyEl != null;
+            window.__staleRefWasSet = adapter.liveBubble(pane);
           }
           return r;
-        };
+        });
       }
 
       // First paint the REAL way: /history then connect SSE.  Under the
@@ -751,8 +959,8 @@ PAGE_HTML = r"""<!doctype html>
       // starts.
       if (ctl) ctl.connect();
       else {
-        pane._loadHistoryThenConnect(wsId);
-        if (peerPane) peerPane._loadHistoryThenConnect(wsId);
+        adapter.start(pane);
+        if (peerPane) adapter.start(peerPane);
       }
 
       // Count a sentinel's OCCURRENCES in the transcript text.  Every other
@@ -770,17 +978,6 @@ PAGE_HTML = r"""<!doctype html>
         }
         return n;
       };
-      // Drop and re-establish the transport in place — scenario E8's
-      // reconnect-inside-the-await.  Deliberately NOT __hide()/__show():
-      // a hide leaves evtSource null, which the gate's presence term
-      // already decides, so the negative control would pass for the wrong
-      // reason.  This lands OPEN with a bumped generation, which only the
-      // generation term can see.
-      window.__redial = function () {
-        pane.disconnectSSE();
-        pane.connectSSE(pane.wsId);
-      };
-
       // Shared by the rewind scenarios (E2/E3): click the REAL rewind
       // button on the idx-th user row.  Depends only on `pane`.
       window.__clickRewind = function (idx) {
@@ -846,7 +1043,6 @@ PAGE_HTML = r"""<!doctype html>
       } else if (scenario === "restart") {
         // The runner drives hide -> (restart node) -> show via window.__hide/
         // __show. We watch for the truncated-triggered rebuild + idle settle.
-        installStreamWrap();
         window.__verifyRestart = function () {
           // Browser-level restart RECOVERY, full contract: the runner hid
           // the tab MID-turn (cursor frozen below the commits that land
@@ -872,17 +1068,18 @@ PAGE_HTML = r"""<!doctype html>
           const healed =
             healedSentinel !== "" &&
             (pane.messagesEl.textContent || "").includes(healedSentinel);
+          const trunc = adapter.truncatedSeen(pane);
           const ok =
             c.topLevel >= 1 &&
             idle &&
             !disc &&
             healed &&
-            window.__truncatedSeen >= 1;
+            trunc >= 1;
           document.title = ok
-            ? "RECOVERY-READY-RESTART-rows" + c.topLevel + "-trunc" + window.__truncatedSeen
+            ? "RECOVERY-READY-RESTART-rows" + c.topLevel + "-trunc" + trunc
             : "RECOVERY-FAILED-RESTART-rows" + c.topLevel +
               "-busy" + (pane.busy ? 1 : 0) + "-disc" + (disc ? 1 : 0) +
-              "-healed" + (healed ? 1 : 0) + "-trunc" + window.__truncatedSeen;
+              "-healed" + (healed ? 1 : 0) + "-trunc" + trunc;
         };
       } else if (scenario === "fail-refetch") {
         // Scenario D — a FAILED truncated-resync /history (the runner arms
@@ -892,7 +1089,6 @@ PAGE_HTML = r"""<!doctype html>
         // hidden-window sentinel is NOT healed yet.  PHASE 2: the connect
         // chokepoint's retry redraws replay_truncated and the SECOND
         // /history succeeds, healing the gap.
-        installStreamWrap();
         window.__failFetchStale = { rows: 0, ok: false };
         window.__verifyFailFetchStale = function () {
           const rows = pane.messagesEl.querySelectorAll(
@@ -907,7 +1103,7 @@ PAGE_HTML = r"""<!doctype html>
             rows >= 1 &&
             !emptyState &&
             healedAbsent &&
-            window.__truncatedSeen >= 1;
+            adapter.truncatedSeen(pane) >= 1;
           window.__failFetchStale = {
             rows: rows,
             emptyState: emptyState,
@@ -925,10 +1121,16 @@ PAGE_HTML = r"""<!doctype html>
           );
           const stale = window.__failFetchStale || { ok: false };
           const ok = stale.ok && healed && rows >= 1 && !pane.busy;
+          // On failure the phase-1 capture's own fields ride along (p1rows,
+          // p1empty), so a stale0 says which part of the preserve broke.
           document.title = ok
             ? "RECOVERY-READY-FAILFETCH-stale1-healed1"
             : "RECOVERY-FAILED-FAILFETCH-stale" +
               (stale.ok ? 1 : 0) +
+              "-p1rows" +
+              (stale.rows || 0) +
+              "-p1empty" +
+              (stale.emptyState ? 1 : 0) +
               "-healed" +
               (healed ? 1 : 0) +
               "-rows" +
@@ -936,18 +1138,18 @@ PAGE_HTML = r"""<!doctype html>
               "-busy" +
               (pane.busy ? 1 : 0) +
               "-trunc" +
-              window.__truncatedSeen;
+              adapter.truncatedSeen(pane);
         };
       } else if (scenario === "stale-ref-reload") {
         // Scenario E1 — regression trap for the #890 streaming-ref reset.
-        // installStreamWrap's teardown hook left a stale currentAssistantEl;
+        // installContentTeardown's hook left a stale live bubble;
         // the runner then re-auth reloads (unarmed, same-ws) and drives turn
         // 2.  Phase 1 (post reload, pre turn-2) captures the FIRST assistant
         // bubble element + its text; __verifyStaleRef proves turn 2's
         // sentinel landed in a DIFFERENT (fresh) bubble and the captured
         // bubble is byte-for-byte unchanged.  Pre-fix the unarmed reload kept
         // the stale ref and turn 2 concatenated into the old bubble.
-        installStreamWrap();
+        installContentTeardown();
         window.__stalePhase1 = { rows: 0, text: "" };
         window.__captureStaleRefPhase1 = function () {
           const first = pane.messagesEl.querySelector(".msg.assistant");
@@ -1219,7 +1421,7 @@ PAGE_HTML = r"""<!doctype html>
           // resolved WITHOUT reconnecting (the fault-layer non-occurrence
           // detector — it stamps 1 the moment the bump is removed).
           const detached = !pane.el.parentNode;
-          const visNull = pane._visHandler === null;
+          const visNull = !adapter.visibilityHooked(pane);
           const ok = sseOpens === 0 && detached && visNull;
           document.title = ok
             ? "RECOVERY-READY-DESTROYINVAL-sse0-vis0"
@@ -1265,38 +1467,63 @@ COORD_PAGE_HTML = r"""<!doctype html>
   </head>
   <body>
     <script>
-      // Transport-level instrumentation: the coordinator's handleEvent and
-      // cursor are closure-private (unlike interactive's class methods), and
-      // its chrome deliberately builds NO header/SSE indicator — so every
-      // scenario signal is read off the wire by wrapping EventSource BEFORE
-      // any module loads (classic script = runs before the deferred module
-      // set, so the pane's connectSSE always constructs the wrapper):
-      //   __truncatedSeen — replay_truncated frames (the envelope);
-      //   __esOpens      — stream opens (drives the send; a listener is
-      //                    registered before /send so no events are missed);
-      //   __idFrames     — id-bearing frames, i.e. exactly the frames that
-      //                    advance the pane's reconnect cursor (same
-      //                    ``!= null && !== ""`` guard as the pane) — the
-      //                    hide fires only after this proves a live mid-turn
-      //                    cursor.
-      window.__truncatedSeen = 0;
-      window.__esOpens = 0;
-      window.__idFrames = 0;
+      // ==== PANE ADAPTER (coordinator page) ==================================
+      // The ONLY code on this page, or in the runner's evaluated expressions,
+      // that observes the coordinator pane beyond its public chrome and its
+      // returned controller.  The pane's handleEvent, cursor and latch are
+      // closure-private and its chrome deliberately builds NO header/SSE
+      // indicator, so today every fact here is read off the wire by wrapping
+      // EventSource BEFORE any module loads (classic script = runs before the
+      // deferred module set, so the pane's connectSSE always constructs the
+      // wrapper).  One pane per page, so the counts are that pane's; the
+      // accessors take the pane anyway, for one call shape across pages:
+      //   opens(pane)         — stream opens (drives the send; a listener is
+      //                         registered before /send so no events are
+      //                         missed);
+      //   truncatedSeen(pane) — replay_truncated frames (the envelope);
+      //   idFrames(pane)      — id-bearing frames, i.e. exactly the frames
+      //                         that advance the pane's reconnect cursor (same
+      //                         ``!= null && !== ""`` guard as the pane) — the
+      //                         hide fires only after this proves a live
+      //                         mid-turn cursor;
+      //   sourceUrl(pane)     — URL of the most recently constructed stream;
+      //   transportOpen(pane) — the most recently constructed stream is OPEN
+      //                         (CONNECTING is false);
+      //   transportDown(pane) — no stream constructed yet, or the most recent
+      //                         one is CLOSED (CONNECTING is false here too, so
+      //                         the two are NOT complements).
+      // The pane's latch, quiesce and source field are not observable from
+      // outside, so historyStale, isQuiesced, transportReleased and
+      // visibilityHooked throw here rather than answer.
       (function () {
         const RealES = window.EventSource;
+        let opens = 0;
+        let truncated = 0;
+        let idFrames = 0;
+        let lastUrl = null;
+        let lastSource = null;
+        function unobservable(accessor) {
+          return function () {
+            throw new Error(
+              "adapter." + accessor + ": not observable on the coordinator page " +
+                "(the pane keeps this state closure-private)",
+            );
+          };
+        }
         function CountingES(url, opts) {
-          window.__lastEventSourceUrl = String(url);
+          lastUrl = String(url);
           const es = new RealES(url, opts);
+          lastSource = es;
           es.addEventListener("open", function () {
-            window.__esOpens += 1;
+            opens += 1;
           });
           es.addEventListener("message", function (e) {
             if (e.lastEventId != null && e.lastEventId !== "") {
-              window.__idFrames += 1;
+              idFrames += 1;
             }
             try {
               const d = JSON.parse(e.data);
-              if (d && d.type === "replay_truncated") window.__truncatedSeen += 1;
+              if (d && d.type === "replay_truncated") truncated += 1;
             } catch (_) {}
           });
           return es;
@@ -1306,7 +1533,33 @@ COORD_PAGE_HTML = r"""<!doctype html>
         CountingES.OPEN = RealES.OPEN;
         CountingES.CLOSED = RealES.CLOSED;
         window.EventSource = CountingES;
+
+        window.__adapter = {
+          opens(_pane) {
+            return opens;
+          },
+          truncatedSeen(_pane) {
+            return truncated;
+          },
+          idFrames(_pane) {
+            return idFrames;
+          },
+          sourceUrl(_pane) {
+            return lastUrl;
+          },
+          transportOpen(_pane) {
+            return !!lastSource && lastSource.readyState === RealES.OPEN;
+          },
+          transportDown(_pane) {
+            return !lastSource || lastSource.readyState === RealES.CLOSED;
+          },
+          historyStale: unobservable("historyStale"),
+          isQuiesced: unobservable("isQuiesced"),
+          transportReleased: unobservable("transportReleased"),
+          visibilityHooked: unobservable("visibilityHooked"),
+        };
       })();
+      // ==== END PANE ADAPTER =================================================
     </script>
     <script src="/shared/theme.js"></script>
     <script type="module" src="/shared/utils.js"></script>
@@ -1343,8 +1596,9 @@ COORD_PAGE_HTML = r"""<!doctype html>
         document.dispatchEvent(new Event("visibilitychange"));
       };
 
-      // Drive /send once the stream has OPENED at the transport (__esOpens —
-      // the pane's listener is registered by then, so no events are missed).
+      // Drive /send once the stream has OPENED at the transport (the
+      // adapter's opens — the pane's listener is registered by then, so no
+      // events are missed).
       // The chrome has no SSE pill to poll: the header was deliberately
       // dropped (see buildCoordChrome's comment).  coord-restart only: the
       // #894 rewind scenarios (G1-G3) seed their turns server-side before
@@ -1363,7 +1617,7 @@ COORD_PAGE_HTML = r"""<!doctype html>
       }
       if (scenario === "coord-restart") {
         const sendPoll = setInterval(() => {
-          if (window.__esOpens >= 1) {
+          if (window.__adapter.opens(pane) >= 1) {
             clearInterval(sendPoll);
             sendOnce("run a turn");
           }
@@ -1592,28 +1846,96 @@ COORD_PAGE_HTML = r"""<!doctype html>
         // reconnect must present the frozen mid-turn cursor and draw
         // replay_truncated (trunc>=1), the dead-stream resync must rebuild
         // from /history with the hidden-window turns present (healed), the
-        // stream must have re-opened after the show (__esOpens >= 2), the
+        // stream must have re-opened after the show (two opens), the
         // status bar must not be stuck dim (.ws-sb-disconnected removed by
         // the post-recovery onopen), and the tool rows must be intact.
         const messages = document.getElementById("coord-messages");
         const rows = messages
           ? messages.querySelectorAll(".conv-row[data-call-id]").length
           : 0;
-        const reopened = window.__esOpens >= 2;
+        const reopened = window.__adapter.opens(pane) >= 2;
+        const trunc = window.__adapter.truncatedSeen(pane);
         const disc =
           document.querySelector("#coord-status-bar.ws-sb-disconnected") !== null;
         const healed =
           healedSentinel !== "" &&
           ((messages && messages.textContent) || "").includes(healedSentinel);
-        const ok =
-          rows >= 1 && reopened && !disc && healed && window.__truncatedSeen >= 1;
+        const ok = rows >= 1 && reopened && !disc && healed && trunc >= 1;
         document.title = ok
-          ? "RECOVERY-READY-COORD-rows" + rows + "-trunc" + window.__truncatedSeen
+          ? "RECOVERY-READY-COORD-rows" + rows + "-trunc" + trunc
           : "RECOVERY-FAILED-COORD-rows" + rows +
             "-reopened" + (reopened ? 1 : 0) +
             "-disc" + (disc ? 1 : 0) + "-healed" + (healed ? 1 : 0) +
-            "-trunc" + window.__truncatedSeen;
+            "-trunc" + trunc;
       };
+    </script>
+  </body>
+</html>
+"""
+
+# ---------------------------------------------------------------------------
+# The EventSource contract page — served same-origin by the node at
+# /es-contract.  It runs tests._js_harness_helpers.EVENT_SOURCE_CONTRACT, the
+# same script the node tests run against the fake EventSource, against the
+# browser's real one.  The driver acts through the fault layer's controllable
+# streams (tests._sse_recovery_server.ContractStreams): every control is a
+# fetch that returns once the server has written to the stream socket, and
+# ``settle`` then gives the browser a fixed beat to process it (everything is on
+# loopback).  The contract text is inserted when the page is served, never
+# copied here.
+# ---------------------------------------------------------------------------
+
+ES_CONTRACT_PAGE_HTML = r"""<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>es contract</title>
+  </head>
+  <body>
+    <script>
+/*EVENT_SOURCE_CONTRACT*/
+    </script>
+    <script>
+      (function () {
+        const SETTLE_MS = 300;
+        async function control(name, action, frame) {
+          const r = await fetch(
+            "/es-contract/control/" + encodeURIComponent(name) + "/" + action,
+            {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify(frame || {}),
+            },
+          );
+          if (!r.ok) {
+            throw new Error("contract control " + action + " " + name + ": HTTP " + r.status);
+          }
+          return r.json();
+        }
+        const driver = {
+          url: (name) => "/es-contract/stream/" + encodeURIComponent(name),
+          open: (name) => control(name, "open"),
+          send: (name, frame) => control(name, "send", frame),
+          drop: (name) => control(name, "drop"),
+          fail: (name) => control(name, "fail"),
+          lastEventIdHeader: async (name) => {
+            const r = await fetch(
+              "/es-contract/control/" + encodeURIComponent(name) + "/last-event-id",
+            );
+            return (await r.json()).value;
+          },
+          settle: () => new Promise((resolve) => setTimeout(resolve, SETTLE_MS)),
+        };
+        checkEventSourceContract(driver).then(
+          (checked) => {
+            window.__esContractChecked = checked;
+            document.title = "RECOVERY-READY-ESCONTRACT-" + checked.join("-");
+          },
+          (err) => {
+            document.title = "RECOVERY-FAILED-ESCONTRACT: " + ((err && err.message) || String(err));
+          },
+        );
+      })();
     </script>
   </body>
 </html>
@@ -1735,6 +2057,11 @@ def _free_port() -> int:
 
 
 def _launch_chrome(chrome: str, profile: Path) -> tuple[subprocess.Popen[bytes], int]:
+    if _CONTROL_RUN is not None:
+        # A control must load the mutated module, never a copy the reused
+        # profile cached from an earlier run (the /coord-static mount sends no
+        # Cache-Control, so the browser may reuse it without asking).
+        shutil.rmtree(profile, ignore_errors=True)
     cdp_port = _free_port()
     proc = subprocess.Popen(
         [
@@ -1781,6 +2108,20 @@ def _page_route() -> Any:
     return Route("/recovery", recovery_page)
 
 
+def _es_contract_route() -> Any:
+    from starlette.responses import HTMLResponse
+    from starlette.routing import Route
+
+    async def es_contract_page(_request: Any) -> HTMLResponse:
+        from tests._js_harness_helpers import EVENT_SOURCE_CONTRACT
+
+        return HTMLResponse(
+            ES_CONTRACT_PAGE_HTML.replace("/*EVENT_SOURCE_CONTRACT*/", EVENT_SOURCE_CONTRACT)
+        )
+
+    return Route("/es-contract", es_contract_page)
+
+
 def _coord_routes() -> list[Any]:
     """The coordinator scenario's same-origin extras: the pane page, and the
     console's coordinator static tree under the ``/coord-static`` prefix —
@@ -1815,9 +2156,20 @@ def _boot_node(port: int = 0, sock: Any = None) -> Any:
     # /recovery passes the middleware. init storage per boot (shared singleton).
     # ``sock``: a pre-bound placeholder for the gap-free restart handoff
     # (see RecoveryServer's ``sock`` parameter).
+    # ``_CONTROL_RUN``: every node a control's scenario boots, restarts
+    # included, serves the control's mutated module in place of the file.
     reset_storage()
     init_storage("sqlite", path=os.path.join(_scratch(), "recovery_e2e.db"), run_migrations=True)
-    return RecoveryServer(extra_routes=[_page_route(), *_coord_routes()], port=port, sock=sock)
+    run = _CONTROL_RUN
+    node = RecoveryServer(
+        extra_routes=[_page_route(), _es_contract_route(), *_coord_routes()],
+        port=port,
+        sock=sock,
+        served_overrides=run.overrides if run is not None else None,
+    )
+    if run is not None:
+        run.nodes.append(node)
+    return node
 
 
 def _scratch() -> str:
@@ -2433,14 +2785,16 @@ def run_coord_restart(chrome: str) -> str:
         # coordinator chrome has no status/SSE text elements (the header was
         # deliberately dropped) and paints no streamed output line, so the
         # signal is transport-level — id-bearing frames received by the page
-        # (__idFrames; exactly the frames that advance the pane's reconnect
-        # cursor).  The turn must also still be RUNNING server-side, or the
+        # (the adapter's idFrames; exactly the frames that advance the pane's
+        # reconnect cursor).  The turn must also still be RUNNING server-side, or the
         # frozen cursor could sit at/above the committed counter and the
         # reconnect would take the lossless replay_ok path (trunc0).  The
         # paced bash runs >=2s, so this lands mid-turn.
         deadline = time.monotonic() + 15
         while time.monotonic() < deadline:
-            frames = cdp.evaluate("window.__idFrames || 0")
+            frames = cdp.evaluate(
+                "(window.__adapter ? window.__adapter.idFrames(window.__pane) : 0)"
+            )
             if isinstance(frames, int) and frames >= 2 and node.ws_state(ws_id) == "running":
                 break
             time.sleep(0.2)
@@ -2633,7 +2987,7 @@ def run_stale_ref(chrome: str) -> str:
         )
         _set_cookie_and_navigate(cdp, node.base_url, node.token, url)
         # The page auto-sends turn 1; its content event trips the teardown
-        # hook (REAL pane.disconnectSSE() mid-segment).  Poll the exposed flag
+        # hook (the pane's REAL transport drop, mid-segment).  Poll the flag
         # rather than guess a sleep.
         if not _poll_until(lambda: cdp.evaluate("window.__teardownDone === 1"), 20):
             raise AssertionError("stale-ref: mid-content teardown never fired")
@@ -2643,14 +2997,14 @@ def run_stale_ref(chrome: str) -> str:
         # factory's onLogin does — same-ws, unarmed (no truncation cursor was
         # ever recorded, so nothing schedules a jittered resync).
         node.fail_history(1)
-        cdp.evaluate("window.__pane._loadHistoryThenConnect(window.__pane.wsId)")
+        cdp.evaluate("window.__adapter.reload(window.__pane)")
         # Failed fetch + cursorless reconnect; the only backend edge is the
         # fail budget draining to 0 (no resync jitter here).
         if not _poll_until(lambda: node.history_fail_remaining == 0, 10, 0.05):
             raise AssertionError("stale-ref: forced /history failure never fired")
         # The reconnect must be open before turn 2 (its listener catches the
         # content), and the reload must have reset the stale ref.
-        _poll_until(lambda: cdp.evaluate("(window.__streamOpen || 0) >= 2"), 10)
+        _poll_until(lambda: cdp.evaluate(_OPENS_JS + " >= 2"), 10)
         phase1 = cdp.evaluate("JSON.stringify(window.__captureStaleRefPhase1())")
         # Drive turn 2 in-page via authFetch (the SECOND_SENTINEL final text).
         _send_in_page(cdp, "second turn")
@@ -2730,7 +3084,7 @@ def run_rewind_window(chrome: str) -> str:
         # is specifically meant to exercise.  Coordinator G1 carries the same
         # transport-open gate.
         if not _poll_until(
-            lambda: cdp.evaluate("(window.__streamOpen || 0) >= 1"),
+            lambda: cdp.evaluate(_OPENS_JS + " >= 1"),
             10,
             0.05,
         ):
@@ -2743,7 +3097,7 @@ def run_rewind_window(chrome: str) -> str:
         if not cdp.evaluate("window.__clickRewind(1)"):
             raise AssertionError("rewind-window: second-row rewind button missing")
         # Wait for the clear_ui refetch to arm the quiesce (observable edge).
-        if not _poll_until(lambda: cdp.evaluate("window.__pane._replayQueue != null"), 5, 0.05):
+        if not _poll_until(lambda: cdp.evaluate(_QUIESCED_JS), 5, 0.05):
             raise AssertionError("rewind-window: clear_ui never armed the quiesce")
         # Click #2 — the rewind button on the FIRST user row WHILE the quiesce
         # is armed: the #890 gate must return before POSTing.
@@ -2758,10 +3112,7 @@ def run_rewind_window(chrome: str) -> str:
         # user row (2nd-of-3 row rewound 2 turns => one user turn remains).
         node.delay_history(0)
         _poll_until(
-            lambda: (
-                (not cdp.evaluate("window.__pane._replayQueue != null"))
-                and cdp.evaluate(_ROWS_JS) == 1
-            ),
+            lambda: (not cdp.evaluate(_QUIESCED_JS)) and cdp.evaluate(_ROWS_JS) == 1,
             8,
         )
         print(f"  rewind-window rewind_requests={posts}")
@@ -2836,9 +3187,7 @@ def run_rewind_failed_window(chrome: str) -> str:
         # is the crux the scenario exists for — a pre-latch gate keyed on the
         # quiesce would now be OPEN; only the latch holds it.
         if not _poll_until(
-            lambda: cdp.evaluate(
-                "window.__pane._replayQueue == null && window.__pane._historyStale === true"
-            ),
+            lambda: cdp.evaluate("!" + _QUIESCED_JS + " && " + _STALE_JS),
             5,
             0.05,
         ):
@@ -2969,9 +3318,7 @@ def run_stale_backstop(chrome: str) -> str:
         # (_replayQueue -> null) while the _historyStale latch SURVIVES — the
         # backstop's precondition (and the idle-edge guard is !_replayQueue).
         if not _poll_until(
-            lambda: cdp.evaluate(
-                "window.__pane._replayQueue == null && window.__pane._historyStale === true"
-            ),
+            lambda: cdp.evaluate("!" + _QUIESCED_JS + " && " + _STALE_JS),
             5,
             0.05,
         ):
@@ -3008,7 +3355,7 @@ def run_stale_backstop(chrome: str) -> str:
         # only change via a successful /history render.  Deadline-bounded so a
         # regressed looping backstop times out to a clean FAILED, never a hang.
         healed = _poll_until(
-            lambda: cdp.evaluate(_ROWS_JS + " === 1 && window.__pane._historyStale === false"),
+            lambda: cdp.evaluate(_ROWS_JS + " === 1 && !" + _STALE_JS),
             20,
             0.2,
         )
@@ -3112,7 +3459,7 @@ def run_hidden_retry(chrome: str) -> str:
         # settles ~0.3s after the failure).  close-on-hide tears the
         # transport down and deliberately leaves the retry armed.
         cdp.evaluate("window.__hide && window.__hide()")
-        if not _poll_until(lambda: cdp.evaluate("window.__pane.evtSource === null"), 5, 0.05):
+        if not _poll_until(lambda: cdp.evaluate(_RELEASED_JS), 5, 0.05):
             raise AssertionError("hidden-retry: close-on-hide never dropped the transport")
         hidden_baseline = node.history_requests
         # NON-occurrence window: the retry fires at STALE_RETRY_BASE_MS plus up
@@ -3129,7 +3476,7 @@ def run_hidden_retry(chrome: str) -> str:
         hidden_delta = node.history_requests - hidden_baseline
         # The latch must still be SET — a skipped retry heals nothing, which
         # is exactly why the backstop still owns the repair below.
-        latch_held = cdp.evaluate("window.__pane._historyStale === true")
+        latch_held = cdp.evaluate(_STALE_JS)
         # Show: the reconnect presents the frozen cursor (replay_ok, nothing
         # lost) and carries no synthetic state_change, so the latch survives
         # it.  A server-origin idle edge then drives the settle the backstop
@@ -3140,7 +3487,7 @@ def run_hidden_retry(chrome: str) -> str:
             raise AssertionError("hidden-retry: show-edge reconnect never arrived")
         node.emit_idle_edge(ws_id)
         healed = _poll_until(
-            lambda: cdp.evaluate(_ROWS_JS + " === 1 && window.__pane._historyStale === false"),
+            lambda: cdp.evaluate(_ROWS_JS + " === 1 && !" + _STALE_JS),
             20,
             0.2,
         )
@@ -3238,13 +3585,13 @@ def run_await_window_gate(chrome: str) -> str:
         # Kill the transport mid-await.  The payload is already committed
         # server-side; only the RENDER decision is still open.
         cdp.evaluate("window.__hide && window.__hide()")
-        if not _poll_until(lambda: cdp.evaluate("window.__pane.evtSource === null"), 5, 0.05):
+        if not _poll_until(lambda: cdp.evaluate(_RELEASED_JS), 5, 0.05):
             raise AssertionError("await-window-gate: close-on-hide never dropped the transport")
         # Clear the knob for any LATER arrival; the already-held fetch is
         # sleeping on the duration it captured at arrival and serves that
         # out regardless — which is why the poll below must outlast it.
         node.delay_history(0)
-        if not _poll_until(lambda: cdp.evaluate("window.__pane._replayQueue === null"), 12, 0.1):
+        if not _poll_until(lambda: cdp.evaluate("!" + _QUIESCED_JS), 12, 0.1):
             raise AssertionError("await-window-gate: the quiesce never released")
         # The payload must have been GOOD — otherwise a declined render and a
         # failed fetch are indistinguishable (see the docstring).
@@ -3255,7 +3602,7 @@ def run_await_window_gate(chrome: str) -> str:
                 "a declined render cannot be distinguished from a failed fetch"
             )
         rows = cdp.evaluate(_ROWS_JS)
-        latch_held = cdp.evaluate("window.__pane._historyStale === true")
+        latch_held = cdp.evaluate(_STALE_JS)
         # The heal still belongs to the backstop: show, then drive an organic
         # settle with a plain send and watch the rewound truth land.
         events_before_show = node.events_requests
@@ -3266,7 +3613,8 @@ def run_await_window_gate(chrome: str) -> str:
         healed = _poll_until(
             lambda: cdp.evaluate(
                 _ROWS_JS
-                + " === 2 && window.__pane._historyStale === false"
+                + " === 2 && !"
+                + _STALE_JS
                 + " && (window.__pane.messagesEl.textContent||'').includes("
                 + json.dumps(BACKSTOP_SENTINEL)
                 + ")"
@@ -3311,9 +3659,12 @@ def run_reconnect_in_await(chrome: str) -> str:
     transcript survives, and the flushed replay paints the new turn exactly
     ONCE.  Strip the term and the same run stamps ``dupes2``.
 
-    The redial is a REAL disconnect+connect, deliberately not ``__hide()``:
-    a hide leaves ``evtSource`` null, which the presence term already decides,
-    so a hide-based control would pass for the wrong reason."""
+    The drop and the redial are the page's close-on-hide and show edge.  A
+    fetch that resolved while the tab was hidden would meet no transport,
+    which the presence term already decides; what makes this the generation
+    term's case is that the show edge has reopened the stream BEFORE the held
+    fetch resolves, which the non-vacuity check below asserts.  With this
+    choreography, stripping the generation term still stamps ``dupes2``."""
     from tests._sse_recovery_server import final_text_script
 
     node, ws_id = _seed_three_completed_turns(
@@ -3348,9 +3699,9 @@ def run_reconnect_in_await(chrome: str) -> str:
         node.delay_history(6000)
         if not _poll_until(lambda: node.history_requests == retry_baseline + 1, 8, 0.05):
             raise AssertionError("reconnect-in-await: the retry never fetched on the live stream")
-        # (1) Drop the transport.  The cursor freezes here.
-        cdp.evaluate("window.__pane.disconnectSSE()")
-        if not _poll_until(lambda: cdp.evaluate("window.__pane.evtSource === null"), 5, 0.05):
+        # (1) Drop the transport with a close-on-hide.  The cursor freezes here.
+        cdp.evaluate("window.__hide()")
+        if not _poll_until(lambda: cdp.evaluate(_RELEASED_JS), 5, 0.05):
             raise AssertionError("reconnect-in-await: the transport never dropped")
         # (2) Commit a turn while the stream is DOWN, so the server holds
         #     events past the frozen cursor with no way to have delivered them.
@@ -3359,22 +3710,16 @@ def run_reconnect_in_await(chrome: str) -> str:
         # nothing extra and only add a timing race.
         node.send(ws_id, "gap turn")
         node.wait_turn(ws_id)
-        # (3) Re-establish, still inside the await.  This is the whole point:
-        #     readyState goes back to OPEN, so only the generation moved.
-        cdp.evaluate("window.__redial()")
-        if not _poll_until(
-            lambda: cdp.evaluate(
-                "!!window.__pane.evtSource && "
-                "window.__pane.evtSource.readyState === EventSource.OPEN"
-            ),
-            10,
-            0.05,
-        ):
-            raise AssertionError("reconnect-in-await: the redial never reached OPEN")
+        # (3) Re-establish with the show edge, still inside the await.  This
+        #     is the whole point: readyState goes back to OPEN, so only the
+        #     generation moved.
+        cdp.evaluate("window.__show()")
+        if not _poll_until(lambda: cdp.evaluate(_OPEN_JS), 10, 0.05):
+            raise AssertionError("reconnect-in-await: the show edge never reached OPEN")
         # NON-VACUITY, the leg this scenario turns on: the held fetch must
         # still be OUTSTANDING right now.  If it already resolved — a slow box
-        # can push the disconnect/send/wait_turn/redial sequence past the hold
-        # — the payload landed while evtSource was still null, the PRESENCE
+        # can push the hide/send/wait_turn/show sequence past the hold — the
+        # payload landed while the transport was still down, the PRESENCE
         # term declined it, and a green verdict would never have touched the
         # generation term at all.
         if node.history_ok != ok_baseline:
@@ -3397,7 +3742,7 @@ def run_reconnect_in_await(chrome: str) -> str:
         # stream — lands the rewound-plus-gap transcript (2 user rows, latch
         # cleared).  Counting before that would race the heal.
         healed = _poll_until(
-            lambda: cdp.evaluate(_ROWS_JS + " === 2 && window.__pane._historyStale === false"),
+            lambda: cdp.evaluate(_ROWS_JS + " === 2 && !" + _STALE_JS),
             25,
             0.2,
         )
@@ -3432,8 +3777,8 @@ def run_destroy_invalidation(chrome: str) -> str:
     The runner holds the FIRST ``/history`` open at the fault layer, destroys
     the controller mid-flight, and lets the load resolve into the void.
     DETECTOR: ``events_requests`` must still be 0 — the load resolved without
-    reconnecting — with the pane detached and ``_visHandler`` null behind it.
-    Remove the bump and the ``.finally`` fires: sse1, and a non-null handler
+    reconnecting — with the pane detached and no visibility handler registered
+    behind it.  Remove the bump and the ``.finally`` fires: sse1, and a handler
     still bound to the document."""
     node, ws_id = _seed_three_completed_turns("browser-destroy-invalidation")
     profile = Path(_scratch()) / "chrome-destroy-invalidation"
@@ -3479,7 +3824,7 @@ def run_destroy_invalidation(chrome: str) -> str:
                 ".finally under test never ran"
             )
         sse_opens = node.events_requests
-        vis_null = cdp.evaluate("window.__pane._visHandler === null")
+        vis_null = cdp.evaluate("!window.__adapter.visibilityHooked(window.__pane)")
         print(f"  destroy-invalidation sse_opens={sse_opens} vis_null={vis_null}")
         cdp.evaluate(f"window.__verifyDestroyInvalidation({sse_opens})")
         return _poll_title(cdp, 15)
@@ -3518,7 +3863,7 @@ def run_coord_rewind_window(chrome: str) -> str:
         # the fresh no-replay branch), the latch never sets, and the
         # scenario false-fails.  Gate on the transport wrapper's counter,
         # like the coord page's coord-restart send gate.
-        if not _poll_until(lambda: cdp.evaluate("window.__esOpens") >= 1, 10, 0.05):
+        if not _poll_until(lambda: cdp.evaluate(_OPENS_JS) >= 1, 10, 0.05):
             raise AssertionError("coord-rewind-window: SSE stream never opened")
         # Relative baseline (never assume how many /history the boot ran).
         hist_baseline = node.history_requests
@@ -3587,7 +3932,7 @@ def run_coord_rewind_failed_window(chrome: str) -> str:
             raise AssertionError("coord-rewind-failed-window: three user rows never rendered")
         # SSE-open gate — see run_coord_rewind_window: a pre-connect rewind
         # drops its clear_ui and false-fails the scenario.
-        if not _poll_until(lambda: cdp.evaluate("window.__esOpens") >= 1, 10, 0.05):
+        if not _poll_until(lambda: cdp.evaluate(_OPENS_JS) >= 1, 10, 0.05):
             raise AssertionError("coord-rewind-failed-window: SSE stream never opened")
         hist_baseline = node.history_requests
         # Arm ONE forced /history 500: the NEXT /history — the rewind's
@@ -3689,7 +4034,7 @@ def _coord_stick_latch(cdp: CDP, node: Any, tag: str) -> None:
     match exactly."""
     if not _poll_until(lambda: cdp.evaluate(_COORD_ROWS_JS) == 3, 20, 0.2):
         raise AssertionError(f"{tag}: three user rows never rendered")
-    if not _poll_until(lambda: cdp.evaluate("window.__esOpens") >= 1, 10, 0.05):
+    if not _poll_until(lambda: cdp.evaluate(_OPENS_JS) >= 1, 10, 0.05):
         raise AssertionError(f"{tag}: SSE stream never opened")
     node.fail_history(2)
     if not cdp.evaluate("window.__clickCoordRewind(1)"):
@@ -3945,7 +4290,7 @@ def run_coord_hidden_retry(chrome: str) -> str:
         if not _poll_until(lambda: cdp.evaluate(_COORD_ROWS_JS) == 3, 20, 0.2):
             raise AssertionError("coord-hidden-retry: three user rows never rendered")
         # SSE-open gate — see run_coord_rewind_window.
-        if not _poll_until(lambda: cdp.evaluate("window.__esOpens") >= 1, 10, 0.05):
+        if not _poll_until(lambda: cdp.evaluate(_OPENS_JS) >= 1, 10, 0.05):
             raise AssertionError("coord-hidden-retry: SSE stream never opened")
         node.fail_history(1)
         if not cdp.evaluate("window.__clickCoordRewind(1)"):
@@ -4055,7 +4400,7 @@ def run_coord_orphan_rewind(chrome: str) -> str:
         _set_cookie_and_navigate(cdp, node.base_url, node.token, url)
         # First poll on this page (no seeded rows to wait for), so the
         # evaluate can race the page load and return None — coalesce.
-        if not _poll_until(lambda: (cdp.evaluate("window.__esOpens") or 0) >= 1, 15, 0.05):
+        if not _poll_until(lambda: (cdp.evaluate(_OPENS_JS) or 0) >= 1, 15, 0.05):
             raise AssertionError("coord-orphan-rewind: SSE stream never opened")
         # Drive the paced turn and kill the node while its bash streams —
         # the tool rows on screen prove the batch was mid-flight.
@@ -4174,7 +4519,7 @@ def run_coord_joined_flight(chrome: str) -> str:
         _set_cookie_and_navigate(cdp_a, node.base_url, node.token, url)
         if not _poll_until(lambda: cdp_a.evaluate(_COORD_ROWS_JS) == 3, 20, 0.2):
             raise AssertionError("coord-joined-flight: A's three user rows never rendered")
-        if not _poll_until(lambda: (cdp_a.evaluate("window.__esOpens") or 0) >= 1, 10, 0.05):
+        if not _poll_until(lambda: (cdp_a.evaluate(_OPENS_JS) or 0) >= 1, 10, 0.05):
             raise AssertionError("coord-joined-flight: A's SSE stream never opened")
         load_baseline = node.load_calls
         # Hold every reconstruction open INSIDE load_messages (the flight
@@ -4253,8 +4598,7 @@ def run_handoff_repair_budget(chrome: str, *, coordinator: bool = False) -> str:
         route = "coord-recovery" if coordinator else "recovery"
         url = f"{node.base_url}/{route}?ws_id={ws_id}&scenario={scenario}"
         _set_cookie_and_navigate(cdp, node.base_url, node.token, url)
-        open_expr = "window.__esOpens || 0" if coordinator else "window.__streamOpen || 0"
-        if not _poll_until(lambda: cdp.evaluate(open_expr) >= 1, 15, 0.1):
+        if not _poll_until(lambda: cdp.evaluate(_OPENS_JS) >= 1, 15, 0.1):
             raise AssertionError(f"{scenario}: initial EventSource never opened")
 
         history0 = node.history_requests
@@ -4305,14 +4649,18 @@ def run_handoff_repair_budget(chrome: str, *, coordinator: bool = False) -> str:
         ):
             raise AssertionError(
                 f"{scenario}: rendered tokenless 200 did not downgrade to bootstrap "
-                f"(history={node.history_requests - history0}, events={node.events_requests - events0})"
+                f"(history={node.history_requests - history0}, "
+                f"events={node.events_requests - events0}, "
+                f"prompt={1 if cdp.evaluate(prompt_expr) else 0})"
             )
         tokenless_stream = (
-            cdp.evaluate("!((window.__lastEventSourceUrl || '').includes('history_token='))")
+            cdp.evaluate(
+                "!((window.__adapter.sourceUrl(window.__pane) || '').includes('history_token='))"
+            )
             if coordinator
             else cdp.evaluate(
-                "!!window.__pane.evtSource && "
-                "!window.__pane.evtSource.url.includes('history_token=')"
+                "!!window.__adapter.sourceUrl(window.__pane) && "
+                "!window.__adapter.sourceUrl(window.__pane).includes('history_token=')"
             )
         )
         if not tokenless_stream:
@@ -4344,11 +4692,13 @@ def run_handoff_repair_budget(chrome: str, *, coordinator: bool = False) -> str:
         ):
             raise AssertionError(f"{scenario}: proven repair did not reconnect once")
         tokened = (
-            cdp.evaluate("(window.__lastEventSourceUrl || '').includes('history_token=')")
+            cdp.evaluate(
+                "(window.__adapter.sourceUrl(window.__pane) || '').includes('history_token=')"
+            )
             if coordinator
             else cdp.evaluate(
-                "!!window.__pane.evtSource && "
-                "window.__pane.evtSource.url.includes('history_token=')"
+                "!!window.__adapter.sourceUrl(window.__pane) && "
+                "window.__adapter.sourceUrl(window.__pane).includes('history_token=')"
             )
         )
         if not tokened:
@@ -4407,19 +4757,17 @@ def run_user_turn_two_pane(chrome: str) -> str:
         _set_cookie_and_navigate(cdp, node.base_url, node.token, url)
         opened = _poll_until(
             lambda: (
-                (cdp.evaluate("window.__streamOpen || 0") or 0) == 1
-                and (cdp.evaluate("window.__peerStreamOpen || 0") or 0) == 1
+                (cdp.evaluate(_OPENS_JS) or 0) == 1 and (cdp.evaluate(_PEER_OPENS_JS) or 0) == 1
             ),
             20,
             0.1,
         )
         if not opened:
             diagnostics = cdp.evaluate(
-                "({originOpens:window.__streamOpen||0,"
-                "peerOpens:window.__peerStreamOpen||0,"
-                "originUrl:window.__pane&&window.__pane.evtSource&&window.__pane.evtSource.url,"
-                "peerUrl:window.__peerPane&&window.__peerPane.evtSource&&"
-                "window.__peerPane.evtSource.url,title:document.title})"
+                "({originOpens:window.__adapter.opens(window.__pane),"
+                "peerOpens:window.__adapter.opens(window.__peerPane),"
+                "originUrl:window.__adapter.sourceUrl(window.__pane),"
+                "peerUrl:window.__adapter.sourceUrl(window.__peerPane),title:document.title})"
             )
             raise AssertionError(
                 "user-turn-two-pane: both initial streams did not open once "
@@ -4428,26 +4776,27 @@ def run_user_turn_two_pane(chrome: str) -> str:
             )
 
         capability_urls = cdp.evaluate(
-            "({origin: window.__pane.evtSource.url, peer: window.__peerPane.evtSource.url})"
+            "({origin: window.__adapter.sourceUrl(window.__pane),"
+            " peer: window.__adapter.sourceUrl(window.__peerPane)})"
         )
         if not all("user_turn=1" in capability_urls[name] for name in ("origin", "peer")):
             raise AssertionError(f"user-turn-two-pane: capability missing from {capability_urls!r}")
 
         # Count reducer deliveries themselves as well as DOM rows. This catches
         # a duplicate event that happened to be hidden by DOM/event-id dedup.
+        # Repair frames are transport facts: the adapter counts them per pane,
+        # and the baselines start the count here.
         cdp.evaluate(
-            "window.__originUserEvents=0; window.__peerUserEvents=0; "
-            "window.__originRepairEvents=0; window.__peerRepairEvents=0; "
-            "const oh=window.__pane.handleEvent.bind(window.__pane); "
-            "window.__pane.handleEvent=function(e){"
+            "(function(){const a=window.__adapter;"
+            "window.__originUserEvents=0; window.__peerUserEvents=0;"
+            "window.__originRepairBase=a.truncatedSeen(window.__pane);"
+            "window.__peerRepairBase=a.truncatedSeen(window.__peerPane);"
+            "a.wrapDispatch(window.__pane,function(e,dispatch){"
             "if(e&&e.type==='user_turn')window.__originUserEvents++;"
-            "if(e&&e.type==='replay_truncated')window.__originRepairEvents++;"
-            "return oh(e);}; "
-            "const ph=window.__peerPane.handleEvent.bind(window.__peerPane); "
-            "window.__peerPane.handleEvent=function(e){"
+            "return dispatch(e);});"
+            "a.wrapDispatch(window.__peerPane,function(e,dispatch){"
             "if(e&&e.type==='user_turn')window.__peerUserEvents++;"
-            "if(e&&e.type==='replay_truncated')window.__peerRepairEvents++;"
-            "return ph(e);}; true"
+            "return dispatch(e);});})(); true"
         )
         history0 = node.history_requests
         events0 = node.events_requests
@@ -4458,7 +4807,14 @@ def run_user_turn_two_pane(chrome: str) -> str:
             "window.__peerPane.messagesEl.querySelectorAll('.msg.user').length===1"
         )
         if not _poll_until(lambda: bool(cdp.evaluate(rows_expr)), 12, 0.05):
-            raise AssertionError("user-turn-two-pane: canonical rows did not render once")
+            counts = cdp.evaluate(
+                "({origin: window.__pane.messagesEl.querySelectorAll('.msg.user').length,"
+                " peer: window.__peerPane.messagesEl.querySelectorAll('.msg.user').length})"
+            )
+            raise AssertionError(
+                "user-turn-two-pane: canonical rows did not render once "
+                f"(origin={counts['origin']}, peer={counts['peer']})"
+            )
         node.wait_turn(ws_id, timeout=30)
         time.sleep(0.5)
 
@@ -4472,8 +4828,12 @@ def run_user_turn_two_pane(chrome: str) -> str:
             "originText:text(o),peerText:text(p),"
             "originId:o&&o.dataset.eventId,peerId:p&&p.dataset.eventId,"
             "originEvents:window.__originUserEvents,peerEvents:window.__peerUserEvents,"
-            "originRepair:window.__originRepairEvents,peerRepair:window.__peerRepairEvents,"
-            "originOpens:window.__streamOpen,peerOpens:window.__peerStreamOpen};})()"
+            "originRepair:window.__adapter.truncatedSeen(window.__pane)"
+            "-window.__originRepairBase,"
+            "peerRepair:window.__adapter.truncatedSeen(window.__peerPane)"
+            "-window.__peerRepairBase,"
+            "originOpens:window.__adapter.opens(window.__pane),"
+            "peerOpens:window.__adapter.opens(window.__peerPane)};})()"
         )
         if state != {
             "originRows": 1,
@@ -4529,19 +4889,17 @@ def run_tool_turn_two_pane(chrome: str) -> str:
         _set_cookie_and_navigate(cdp, node.base_url, node.token, url)
         opened = _poll_until(
             lambda: (
-                (cdp.evaluate("window.__streamOpen || 0") or 0) == 1
-                and (cdp.evaluate("window.__peerStreamOpen || 0") or 0) == 1
+                (cdp.evaluate(_OPENS_JS) or 0) == 1 and (cdp.evaluate(_PEER_OPENS_JS) or 0) == 1
             ),
             20,
             0.1,
         )
         if not opened:
             diagnostics = cdp.evaluate(
-                "({originOpens:window.__streamOpen||0,"
-                "peerOpens:window.__peerStreamOpen||0,"
-                "originUrl:window.__pane&&window.__pane.evtSource&&window.__pane.evtSource.url,"
-                "peerUrl:window.__peerPane&&window.__peerPane.evtSource&&"
-                "window.__peerPane.evtSource.url,title:document.title})"
+                "({originOpens:window.__adapter.opens(window.__pane),"
+                "peerOpens:window.__adapter.opens(window.__peerPane),"
+                "originUrl:window.__adapter.sourceUrl(window.__pane),"
+                "peerUrl:window.__adapter.sourceUrl(window.__peerPane),title:document.title})"
             )
             raise AssertionError(
                 "tool-turn-two-pane: both initial streams did not open once "
@@ -4550,7 +4908,8 @@ def run_tool_turn_two_pane(chrome: str) -> str:
             )
 
         capability_urls = cdp.evaluate(
-            "({origin: window.__pane.evtSource.url, peer: window.__peerPane.evtSource.url})"
+            "({origin: window.__adapter.sourceUrl(window.__pane),"
+            " peer: window.__adapter.sourceUrl(window.__peerPane)})"
         )
         for name in ("origin", "peer"):
             if "tool_turn=1" not in capability_urls[name]:
@@ -4560,22 +4919,22 @@ def run_tool_turn_two_pane(chrome: str) -> str:
 
         # Count reducer deliveries separately from DOM convergence. Each tool
         # emits a preliminary receipt and one accepted replacement; only the
-        # accepted frames are the durable projection under test.
+        # accepted frames are the durable projection under test.  Repair
+        # frames are transport facts: the adapter counts them per pane, and the
+        # baselines start the count here.
         cdp.evaluate(
-            "window.__originAcceptedToolEvents=[]; window.__peerAcceptedToolEvents=[]; "
-            "window.__originRepairEvents=0; window.__peerRepairEvents=0; "
-            "const oh=window.__pane.handleEvent.bind(window.__pane); "
-            "window.__pane.handleEvent=function(e){"
+            "(function(){const a=window.__adapter;"
+            "window.__originAcceptedToolEvents=[]; window.__peerAcceptedToolEvents=[];"
+            "window.__originRepairBase=a.truncatedSeen(window.__pane);"
+            "window.__peerRepairBase=a.truncatedSeen(window.__peerPane);"
+            "a.wrapDispatch(window.__pane,function(e,dispatch){"
             "if(e&&e.type==='tool_result'&&e.accepted===true)"
             "window.__originAcceptedToolEvents.push({id:e.call_id,name:e.name,output:e.output});"
-            "if(e&&e.type==='replay_truncated')window.__originRepairEvents++;"
-            "return oh(e);}; "
-            "const ph=window.__peerPane.handleEvent.bind(window.__peerPane); "
-            "window.__peerPane.handleEvent=function(e){"
+            "return dispatch(e);});"
+            "a.wrapDispatch(window.__peerPane,function(e,dispatch){"
             "if(e&&e.type==='tool_result'&&e.accepted===true)"
             "window.__peerAcceptedToolEvents.push({id:e.call_id,name:e.name,output:e.output});"
-            "if(e&&e.type==='replay_truncated')window.__peerRepairEvents++;"
-            "return ph(e);}; true"
+            "return dispatch(e);});})(); true"
         )
         history0 = node.history_requests
         events0 = node.events_requests
@@ -4600,8 +4959,12 @@ def run_tool_turn_two_pane(chrome: str) -> str:
             "return {origin:project(window.__pane),peer:project(window.__peerPane),"
             "originEvents:window.__originAcceptedToolEvents,"
             "peerEvents:window.__peerAcceptedToolEvents,"
-            "originRepair:window.__originRepairEvents,peerRepair:window.__peerRepairEvents,"
-            "originOpens:window.__streamOpen,peerOpens:window.__peerStreamOpen};})()"
+            "originRepair:window.__adapter.truncatedSeen(window.__pane)"
+            "-window.__originRepairBase,"
+            "peerRepair:window.__adapter.truncatedSeen(window.__peerPane)"
+            "-window.__peerRepairBase,"
+            "originOpens:window.__adapter.opens(window.__pane),"
+            "peerOpens:window.__adapter.opens(window.__peerPane)};})()"
         )
         for pane_name in ("origin", "peer"):
             batches = state[pane_name]
@@ -4682,155 +5045,667 @@ def keep_open(port: int) -> None:
         node.stop()
 
 
+def run_es_contract(chrome: str) -> str:
+    """The shared EventSource contract, run against the browser's real EventSource.
+
+    The fake EventSource in tests/_js_harness_helpers.py claims to model the browser, and the
+    node tests check it against EVENT_SOURCE_CONTRACT.  This runs the same contract function in
+    Chrome, driven through the fault layer's controllable streams, so the fake and the browser
+    are held to one script.  Stamps ``RECOVERY-READY-ESCONTRACT-<rules checked>``, or
+    ``RECOVERY-FAILED-ESCONTRACT: <the broken rule and what the browser did>``."""
+    node = _boot_node()
+    profile = Path(_scratch()) / "chrome-es-contract"
+    proc, cdp_port = _launch_chrome(chrome, profile)
+    cdp: CDP | None = None
+    try:
+        cdp = CDP(_page_ws_url(cdp_port))
+        _set_cookie_and_navigate(cdp, node.base_url, node.token, f"{node.base_url}/es-contract")
+        return _poll_title(cdp, 120)
+    finally:
+        if cdp is not None:
+            cdp.close()
+        _kill(proc)
+        node.stop()
+
+
+def run_coord_handoff_repair_budget(chrome: str) -> str:
+    return run_handoff_repair_budget(chrome, coordinator=True)
+
+
+@dataclass(frozen=True)
+class Scenario:
+    """One harness scenario.
+
+    ``label`` is printed verbatim before the verdict.  ``uncontrolled`` is None
+    when ``CONTROLS`` holds a negative control for the scenario; otherwise it
+    says why none exists, and a READY verdict prints as ``READY (no control)``.
+    """
+
+    name: str
+    sid: str
+    label: str
+    run: Callable[[str], str]
+    uncontrolled: str | None = None
+
+
+# E1: its recorded control (74eedff1: drop the unarmed reload's streaming-ref
+# reset) stays READY.  The reload fails its /history on purpose and reconnects
+# with no cursor and no handoff token; since #1005 the server answers exactly
+# that connect with a clear_ui bootstrap frame, the pane's refetch renders, and
+# replayHistory resets the same refs.  Removing either reset alone stays READY;
+# only removing both fails it.
+_E1_UNCONTROLLED = (
+    "the reload's ref reset is backed up by replayHistory's own reset (run by the "
+    "server's tokenless clear_ui bootstrap since #1005); no single removal fails it"
+)
+# G7: its recorded control (b85f7929: the /history flight key without the
+# truncation generation) stays READY.  load_messages runs under the session's
+# history visibility lock and the rewind takes the same lock, so with viewer B's
+# flight parked inside load_messages the rewind waits it out (a rewind POST
+# measured 3.00 s behind a 3 s hold) and A's refetch never meets B's flight.
+_G7_UNCONTROLLED = (
+    "the rewind serializes behind B's parked flight (history visibility lock), so "
+    "A's refetch never overlaps it and the flight key is never tested"
+)
+# es-contract checks the browser's EventSource against the shared contract; the
+# contract's own negative cases are its control.
+_ES_CONTRACT_UNCONTROLLED = "self-checking: the contract's own cases are its control"
+
+# Every scenario, in run order.
+SCENARIOS: tuple[Scenario, ...] = (
+    Scenario("storm", "A", "scenario A (storm):  ", run_storm),
+    Scenario("restart", "B", "scenario B (restart):", run_restart),
+    Scenario("coord-restart", "C", "scenario C (coord):  ", run_coord_restart),
+    Scenario("fail-refetch", "D", "scenario D (failref):", run_fail_refetch),
+    Scenario(
+        "stale-ref-reload",
+        "E1",
+        "scenario E1 (staleref):",
+        run_stale_ref,
+        uncontrolled=_E1_UNCONTROLLED,
+    ),
+    Scenario("rewind-window", "E2", "scenario E2 (rewindwin):", run_rewind_window),
+    Scenario("rewind-failed-window", "E3", "scenario E3 (rewindfail):", run_rewind_failed_window),
+    Scenario("stale-backstop", "E4", "scenario E4 (stalebackstop):", run_stale_backstop),
+    Scenario("hidden-retry", "E5", "scenario E5 (hiddenretry):", run_hidden_retry),
+    Scenario("await-window-gate", "E6", "scenario E6 (awaitgate):", run_await_window_gate),
+    Scenario("destroy-invalidation", "E7", "scenario E7 (destroyinval):", run_destroy_invalidation),
+    Scenario("reconnect-in-await", "E8", "scenario E8 (reconnectawait):", run_reconnect_in_await),
+    Scenario(
+        "coord-rewind-window", "G1", "scenario G1 (coord-rewindwin):", run_coord_rewind_window
+    ),
+    Scenario(
+        "coord-rewind-failed-window",
+        "G2",
+        "scenario G2 (coord-rewindfail):",
+        run_coord_rewind_failed_window,
+    ),
+    Scenario(
+        "coord-stale-backstop",
+        "G3",
+        "scenario G3 (coord-stalebackstop):",
+        run_coord_stale_backstop,
+    ),
+    Scenario(
+        "coord-heal-midturn", "G4", "scenario G4 (coord-healmidturn):", run_coord_heal_midturn
+    ),
+    Scenario(
+        "coord-hidden-retry", "G5", "scenario G5 (coord-hiddenretry):", run_coord_hidden_retry
+    ),
+    Scenario(
+        "coord-orphan-rewind",
+        "G6",
+        "scenario G6 (coord-orphanrewind):",
+        run_coord_orphan_rewind,
+    ),
+    Scenario(
+        "coord-joined-flight",
+        "G7",
+        "scenario G7 (coord-joinedflight):",
+        run_coord_joined_flight,
+        uncontrolled=_G7_UNCONTROLLED,
+    ),
+    Scenario(
+        "handoff-repair-budget", "H1", "scenario H1 (handoff-budget):", run_handoff_repair_budget
+    ),
+    Scenario(
+        "coord-handoff-repair-budget",
+        "H2",
+        "scenario H2 (coord-handoff-budget):",
+        run_coord_handoff_repair_budget,
+    ),
+    Scenario(
+        "user-turn-two-pane", "I1", "scenario I1 (user-turn-two-pane):", run_user_turn_two_pane
+    ),
+    Scenario(
+        "tool-turn-two-pane", "I2", "scenario I2 (tool-turn-two-pane):", run_tool_turn_two_pane
+    ),
+    Scenario("roster-restart", "F1", "scenario F1 (roster-manual):", run_roster_restart),
+    Scenario(
+        "roster-restart-native", "F2", "scenario F2 (roster-native):", run_roster_restart_native
+    ),
+    Scenario(
+        "es-contract",
+        "ES",
+        "scenario ES (es-contract):",
+        run_es_contract,
+        uncontrolled=_ES_CONTRACT_UNCONTROLLED,
+    ),
+)
+
+# ---------------------------------------------------------------------------
+# Negative controls
+#
+# A control proves a scenario can still fail: it runs the scenario against a mutated copy of one
+# served client module and PASSES only when the scenario stamps the failing verdict recorded here.
+# READY is a control failure, and so is any other failure: a module that no longer parses, a
+# precondition that trips first, or a stamp that moved.  The mutated module is held in memory and
+# served by the fault layer (``RecoveryServer``'s served overrides); nothing is written to the
+# tree.  A needle that no longer occurs exactly ``count`` times is an ERROR, never a silent pass on
+# the unmutated file, and so is a mutated module the browser never requested.
+#
+# The expected verdict is the part that carries over when the code under a control is rewritten;
+# the needle is the part that moves with the code.
+# ---------------------------------------------------------------------------
+
+_REPO = Path(__file__).resolve().parent.parent
+
+# Served URL prefix -> the package directory the node (or this harness's
+# /coord-static mount) serves it from.
+_SERVED_ROOTS = {
+    "/shared/": _REPO / "turnstone" / "shared_static",
+    "/coord-static/": _REPO / "turnstone" / "console" / "static" / "coordinator",
+    "/static/": _REPO / "turnstone" / "ui" / "static",
+}
+
+
+@dataclass(frozen=True)
+class SourceEdit:
+    """Replace ``needle`` (exactly ``count`` occurrences) in one served file."""
+
+    served: str
+    needle: str
+    replacement: str
+    count: int = 1
+
+
+@dataclass(frozen=True)
+class Control:
+    """One scenario's negative control.
+
+    ``removes`` says in one line what the mutation takes out of the client; it
+    is printed on the control's result line, so a FAIL names the removal.
+    ``expected`` is a regular expression the scenario's verdict must match in
+    full; a scenario that reports failure by raising produces the verdict
+    ``EXCEPTION <type>: <message>``.  ``origin`` records where the control came
+    from: ``history <commit>`` (recorded in that commit's message as a hand
+    mutation), ``docstring`` (stated in the scenario's own docstring), or
+    ``added with the controls table`` (none was recorded before).
+    """
+
+    scenario: str
+    removes: str
+    expected: str
+    origin: str
+    edit: SourceEdit
+
+
+@dataclass
+class _ControlRun:
+    """The control being served, and every node its scenario booted."""
+
+    overrides: dict[str, bytes]
+    nodes: list[Any] = field(default_factory=list)
+
+
+_CONTROL_RUN: _ControlRun | None = None
+
+
+_I = "/shared/interactive.js"
+_CO = "/coord-static/coordinator.js"
+
+# One control per scenario that has an honest one; a scenario without one says why in its
+# ``Scenario.uncontrolled``.  Each ``expected`` is the stamp the control was observed to produce,
+# narrowed to the shape only its own removal produces; ``rows\d+`` marks a row count the verdict
+# reads right after the reopen click's POST, before that rewind's render lands (incidental, not
+# the detector).
+
+CONTROLS: tuple[Control, ...] = (
+    Control(
+        scenario="storm",
+        removes="sub-agent child steps are never routed into their task card",
+        expected=r"RECOVERY-FAILED-STORM-top6-agent1-nested0-escaped2-.*",
+        origin="added with the controls table",
+        edit=SourceEdit(
+            _I,
+            "    const parentId = items[0] && items[0].parent_call_id;\n",
+            '    const parentId = "";\n',
+        ),
+    ),
+    Control(
+        scenario="restart",
+        removes="the stream cursor is never captured from the MessageEvent",
+        expected=r"RECOVERY-FAILED-RESTART-rows1-busy0-disc0-healed1-trunc0",
+        origin="added with the controls table",
+        edit=SourceEdit(_I, "        this._lastEventId = e.lastEventId;\n", ""),
+    ),
+    Control(
+        scenario="coord-restart",
+        removes="the coordinator never captures the stream cursor from the MessageEvent",
+        expected=r"RECOVERY-FAILED-COORD-rows1-reopened1-disc0-healed1-trunc0",
+        origin="added with the controls table",
+        edit=SourceEdit(_CO, "        lastEventId = event.lastEventId;\n", ""),
+    ),
+    Control(
+        scenario="fail-refetch",
+        removes="the response status check, so a failed /history body reaches the render",
+        # trunc1 with healed1 is this removal's shape: the failed body renders and clears the gap
+        # record, so the heal comes from a fresh cursorless connect with no second
+        # replay_truncated (the intact retry path always draws one).  The phase-1 fields depend
+        # on whether the capture lands before or after that heal.
+        expected=(
+            r"RECOVERY-FAILED-FAILFETCH-stale0-p1rows\d+-p1empty[01]-healed1-rows1-busy0-trunc1"
+        ),
+        origin="added with the controls table",
+        edit=SourceEdit(
+            _I,
+            "      if (r && r.ok) data = await r.json();\n",
+            "      if (r) data = await r.json();\n",
+        ),
+    ),
+    Control(
+        scenario="rewind-window",
+        removes="the staleness latch from the rewind gate",
+        expected=r"RECOVERY-FAILED-REWINDWIN-posts2-rows0",
+        origin="history 74eedff1",
+        edit=SourceEdit(
+            _I,
+            "  _rewindToMessage(msgEl) {\n    if (this.busy || this._historyStale) return;\n",
+            "  _rewindToMessage(msgEl) {\n    if (this.busy) return;\n",
+        ),
+    ),
+    Control(
+        scenario="rewind-failed-window",
+        removes="the staleness latch from the rewind gate",
+        expected=r"RECOVERY-FAILED-REWINDFAIL-closed2-heal0-posts2-rows0",
+        origin="history 74eedff1",
+        edit=SourceEdit(
+            _I,
+            "  _rewindToMessage(msgEl) {\n    if (this.busy || this._historyStale) return;\n",
+            "  _rewindToMessage(msgEl) {\n    if (this.busy) return;\n",
+        ),
+    ),
+    Control(
+        scenario="stale-backstop",
+        removes="the transport-free backstop, in favour of a reload that reconnects",
+        expected=r"RECOVERY-FAILED-STALEBACKSTOP-heal1-sse1-hist1-gated1-posts2-rows\d+",
+        origin="docstring",
+        edit=SourceEdit(
+            _I,
+            "            this._deferStaleHistoryBackstop();\n",
+            "            this._loadHistoryThenConnect(this.wsId);\n",
+        ),
+    ),
+    Control(
+        scenario="hidden-retry",
+        removes="the transport clause (presence and OPEN) from the retry's fire guard",
+        expected=r"RECOVERY-FAILED-HIDDENRETRY-hidden1-heal1-sse1-posts2-rows\d+",
+        origin="history 8effe656, 4007fab8",
+        edit=SourceEdit(
+            _I,
+            "                    !this.currentReasoningEl &&\n"
+            "                    this.evtSource &&\n"
+            "                    this.evtSource.readyState === EventSource.OPEN\n"
+            "                  ) {\n",
+            "                    !this.currentReasoningEl\n                  ) {\n",
+        ),
+    ),
+    Control(
+        scenario="await-window-gate",
+        removes="the stream-openness terms from the seedless render gate",
+        expected=r"RECOVERY-FAILED-AWAITGATE-rows1-latch0-heal1",
+        origin="docstring",
+        edit=SourceEdit(
+            _I,
+            "      (!!this.evtSource &&\n"
+            "        this.evtSource.readyState === EventSource.OPEN &&\n"
+            "        this._connectEpoch === epoch);\n",
+            "      this._connectEpoch === epoch;\n",
+        ),
+    ),
+    Control(
+        scenario="destroy-invalidation",
+        removes="destroy()'s history load-token bump",
+        expected=r"RECOVERY-FAILED-DESTROYINVAL-sse1-detached1-vis0",
+        origin="history 539b91d3",
+        edit=SourceEdit(
+            _I,
+            "      // neither).  Every future terminal path must bump this too.\n"
+            "      pane._historyLoadToken = (pane._historyLoadToken || 0) + 1;\n",
+            "      // neither).  Every future terminal path must bump this too.\n",
+        ),
+    ),
+    Control(
+        scenario="reconnect-in-await",
+        removes="the stream-generation term from the seedless render gate",
+        expected=r"RECOVERY-FAILED-RECONNECTAWAIT-dupes2-healed1",
+        origin="history 7ed5d90a",
+        edit=SourceEdit(
+            _I,
+            "        this.evtSource.readyState === EventSource.OPEN &&\n"
+            "        this._connectEpoch === epoch);\n",
+            "        this.evtSource.readyState === EventSource.OPEN);\n",
+        ),
+    ),
+    Control(
+        scenario="coord-rewind-window",
+        removes="the staleness latch from the coordinator's rewind gate",
+        expected=r"RECOVERY-FAILED-COORDREWINDWIN-posts2-rows0",
+        origin="history f58fcd1b",
+        edit=SourceEdit(
+            _CO,
+            "    // the heal paths that reopen the affordances.\n"
+            "    if (busy || historyStale) return;\n",
+            "    // the heal paths that reopen the affordances.\n    if (busy) return;\n",
+        ),
+    ),
+    Control(
+        scenario="coord-rewind-failed-window",
+        removes="the staleness latch from the coordinator's rewind gate",
+        expected=r"RECOVERY-FAILED-COORDREWINDFAIL-closed2-heal0-posts2-rows0",
+        origin="history f58fcd1b",
+        edit=SourceEdit(
+            _CO,
+            "    // the heal paths that reopen the affordances.\n"
+            "    if (busy || historyStale) return;\n",
+            "    // the heal paths that reopen the affordances.\n    if (busy) return;\n",
+        ),
+    ),
+    Control(
+        scenario="coord-stale-backstop",
+        removes="the coordinator's transport-free backstop, in favour of a reconnecting reload",
+        expected=r"RECOVERY-FAILED-COORDSTALEBACKSTOP-heal1-sse1-hist1-gated1-posts2-rows\d+",
+        origin="history f58fcd1b",
+        edit=SourceEdit(
+            _CO,
+            "            // and nothing here re-arms the retry, keeping it bounded.\n"
+            "            refetchHistory();\n",
+            "            // and nothing here re-arms the retry, keeping it bounded.\n"
+            "            loadHistoryThenReconnect();\n",
+        ),
+    ),
+    Control(
+        scenario="coord-heal-midturn",
+        removes="the live tool-call term from the coordinator's seedless render gate",
+        expected=r"RECOVERY-FAILED-COORDHEALMIDTURN-heal1-mid0-sse0-hist1-posts2-rows\d+",
+        origin="history 54631d31",
+        edit=SourceEdit(_CO, "        liveToolCalls.size > 0 ||\n", ""),
+    ),
+    Control(
+        scenario="coord-hidden-retry",
+        removes="the transport clause (presence and OPEN) from the coordinator retry's fire guard",
+        expected=r"RECOVERY-FAILED-COORDHIDDENRETRY-hidden1-heal1-sse1-posts2-rows\d+",
+        origin="history 54631d31, 4007fab8",
+        edit=SourceEdit(
+            _CO,
+            "                    visHandler &&\n"
+            "                    evtSource &&\n"
+            "                    evtSource.readyState === EventSource.OPEN\n"
+            "                  ) {\n",
+            "                    visHandler\n                  ) {\n",
+        ),
+    ),
+    Control(
+        scenario="coord-orphan-rewind",
+        removes="the event-owned live-call term, restoring the DOM probe for running batches",
+        expected=r"RECOVERY-FAILED-COORDORPHANREWIND-posts1-hist2-rows1-orphan1",
+        origin="docstring",
+        edit=SourceEdit(
+            _CO,
+            "        liveToolCalls.size > 0 ||\n",
+            '        messagesEl.querySelector(".conv-batch--running") !== null ||\n',
+        ),
+    ),
+    Control(
+        scenario="handoff-repair-budget",
+        removes="the rendered outcome a completed history load reports",
+        expected=(
+            r"EXCEPTION AssertionError: handoff-repair-budget: rendered tokenless 200 did"
+            r" not downgrade to bootstrap \(history=6, events=0, prompt=1\)"
+        ),
+        origin="added with the controls table",
+        edit=SourceEdit(_I, '      return "rendered";\n', ""),
+    ),
+    Control(
+        scenario="coord-handoff-repair-budget",
+        removes="the rendered outcome the coordinator's completed history load reports",
+        expected=(
+            r"EXCEPTION AssertionError: coord-handoff-repair-budget: rendered tokenless 200"
+            r" did not downgrade to bootstrap \(history=6, events=0, prompt=1\)"
+        ),
+        origin="added with the controls table",
+        edit=SourceEdit(_CO, '    return "rendered";\n', ""),
+    ),
+    Control(
+        scenario="user-turn-two-pane",
+        removes="the accepted user_turn's removal of the origin's optimistic bubble",
+        expected=(
+            r"EXCEPTION AssertionError: user-turn-two-pane: canonical rows did not render once"
+            r" \(origin=2, peer=1\)"
+        ),
+        origin="added with the controls table",
+        edit=SourceEdit(
+            "/shared/composer_queue.js",
+            "      evt.client_send_ids,\n      true,\n    );\n",
+            "      evt.client_send_ids,\n      false,\n    );\n",
+        ),
+    ),
+    Control(
+        scenario="tool-turn-two-pane",
+        removes="indexing of a newly painted batch's rows under their (reused) call ids",
+        expected=(
+            r"EXCEPTION AssertionError: tool-turn-two-pane: origin occurrence outputs crossed"
+            r" \['TOOL_TWO_SENTINEL', ''\]"
+        ),
+        origin="added with the controls table",
+        edit=SourceEdit(
+            _I,
+            "      // never the old turn's still-visible DOM.\n"
+            "      indexLatestToolRow(\n"
+            "        this._toolRowIndex,\n"
+            "        this._toolResultNodes,\n"
+            "        callId,\n"
+            "        row,\n"
+            "      );\n",
+            "      // never the old turn's still-visible DOM.\n",
+        ),
+    ),
+    Control(
+        scenario="roster-restart",
+        removes="the dashboard's ?last_event_id= presentation on a manual global reconnect",
+        expected=r"RECOVERY-FAILED-ROSTER-trunc0-cursor0-ghost0-keeper1",
+        origin="added with the controls table",
+        edit=SourceEdit(
+            "/static/app.js",
+            '    globalUrl += "?last_event_id=" + encodeURIComponent(globalLastEventId);\n',
+            "",
+        ),
+    ),
+    Control(
+        scenario="roster-restart-native",
+        removes="the dashboard's cursor clear on an in-stream node_snapshot",
+        expected=r"RECOVERY-FAILED-ROSTERNATIVE-dead-cursor-represented-cursor1",
+        origin="history 5386d598",
+        edit=SourceEdit(
+            "/static/app.js",
+            "      globalLastEventId = null;\n"
+            "      applyRosterSnapshot(data.workstreams || [], { evict: true });\n",
+            "      applyRosterSnapshot(data.workstreams || [], { evict: true });\n",
+        ),
+    ),
+)
+
+
+def _served_file(served: str) -> Path:
+    """The file on disk the node serves at ``served``."""
+    for prefix, root in _SERVED_ROOTS.items():
+        if served.startswith(prefix):
+            path = root / served[len(prefix) :]
+            if not path.is_file():
+                raise ValueError(f"{served}: no file at {path}")
+            return path
+    raise ValueError(f"{served}: no known static mount serves this path")
+
+
+def _control_overrides(control: Control) -> dict[str, bytes]:
+    """The mutated bodies a control serves; raises ValueError on a stale needle."""
+    from tests._sse_recovery_server import mutated_source
+
+    edit = control.edit
+    body = mutated_source(
+        _served_file(edit.served), edit.needle, edit.replacement, count=edit.count
+    )
+    return {edit.served: body}
+
+
+def run_control(chrome: str, control: Control) -> tuple[str, str]:
+    """Run one control; return ``(outcome, verdict)`` with outcome PASS, FAIL or ERROR."""
+    global _CONTROL_RUN
+    try:
+        overrides = _control_overrides(control)
+    except ValueError as exc:
+        return "ERROR", f"stale needle: {exc}"
+    runner = {sc.name: sc.run for sc in SCENARIOS}[control.scenario]
+    run = _ControlRun(overrides=overrides)
+    _CONTROL_RUN = run
+    try:
+        verdict = runner(chrome)
+    except Exception as exc:
+        # Several scenarios report a failed precondition or detector by
+        # raising.  Every outcome is classified below; anything but the
+        # recorded verdict fails the control.
+        verdict = f"EXCEPTION {type(exc).__name__}: {exc}"
+    finally:
+        _CONTROL_RUN = None
+    unserved = [path for path in overrides if not any(n.override_hits.get(path) for n in run.nodes)]
+    if unserved:
+        return "ERROR", f"mutated module never served ({', '.join(unserved)}); verdict {verdict}"
+    if verdict.startswith("RECOVERY-READY"):
+        return "FAIL", verdict
+    if re.fullmatch(control.expected, verdict) is None:
+        return "FAIL", verdict
+    return "PASS", verdict
+
+
+def check_controls() -> int:
+    """Check every control's needle against the tree, and that every scenario has
+    exactly one of a control or a stated reason for none; return the error count."""
+    errors = 0
+    for control in CONTROLS:
+        try:
+            _control_overrides(control)
+            print(f"control {control.scenario}: needle OK")
+        except ValueError as exc:
+            errors += 1
+            print(f"control {control.scenario}: ERROR stale needle: {exc}")
+    controlled = [control.scenario for control in CONTROLS]
+    names = [sc.name for sc in SCENARIOS]
+    for name in sorted(set(controlled) - set(names)):
+        errors += 1
+        print(f"control {name}: ERROR no such scenario")
+    for name in sorted({n for n in controlled if controlled.count(n) > 1}):
+        errors += 1
+        print(f"control {name}: ERROR more than one control")
+    for sc in SCENARIOS:
+        if (sc.name in controlled) == (sc.uncontrolled is not None):
+            errors += 1
+            print(f"scenario {sc.name}: ERROR needs exactly one of a control or a reason for none")
+    print(f"control needles: {len(CONTROLS) - errors}/{len(CONTROLS)} OK")
+    return errors
+
+
+def run_controls(chrome: str, controls: list[Control]) -> int:
+    """Run ``controls`` in order; print one line each and a tally. Return the
+    number that did not PASS."""
+    short = {sc.name: sc.sid for sc in SCENARIOS}
+    counts = {"PASS": 0, "FAIL": 0, "ERROR": 0}
+    for control in controls:
+        started = time.monotonic()
+        outcome, verdict = run_control(chrome, control)
+        counts[outcome] += 1
+        elapsed = time.monotonic() - started
+        print(
+            f"control {short[control.scenario]} ({control.scenario}): {outcome} "
+            f"[{elapsed:.0f}s] {verdict} | removed: {control.removes}"
+        )
+    print(
+        f"controls: {counts['PASS']}/{len(controls)} PASS "
+        f"({counts['FAIL']} FAIL, {counts['ERROR']} ERROR)"
+    )
+    return counts["FAIL"] + counts["ERROR"]
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument(
         "--scenario",
-        choices=[
-            "storm",
-            "restart",
-            "coord-restart",
-            "fail-refetch",
-            "stale-ref-reload",
-            "rewind-window",
-            "rewind-failed-window",
-            "stale-backstop",
-            "hidden-retry",
-            "await-window-gate",
-            "destroy-invalidation",
-            "reconnect-in-await",
-            "coord-rewind-window",
-            "coord-rewind-failed-window",
-            "coord-stale-backstop",
-            "coord-heal-midturn",
-            "coord-hidden-retry",
-            "coord-orphan-rewind",
-            "coord-joined-flight",
-            "handoff-repair-budget",
-            "coord-handoff-repair-budget",
-            "user-turn-two-pane",
-            "tool-turn-two-pane",
-            "roster-restart",
-            "roster-restart-native",
-            "both",
-            "all",
-        ],
+        choices=[sc.name for sc in SCENARIOS] + ["both", "all"],
         default="all",
         help="'both' = A+B (legacy alias); 'all' runs every scenario",
     )
     ap.add_argument("--keep-open", type=int, metavar="PORT", help="serve the storm page, no CDP")
+    ap.add_argument(
+        "--control",
+        choices=[control.scenario for control in CONTROLS],
+        metavar="SCENARIO",
+        help="run SCENARIO's negative control: passes only on its recorded failing verdict",
+    )
+    ap.add_argument("--controls", action="store_true", help="run every negative control")
+    ap.add_argument(
+        "--check-controls",
+        action="store_true",
+        help="check every control's needle against the tree, without a browser",
+    )
     args = ap.parse_args()
 
     if args.keep_open:
         keep_open(args.keep_open)
         return
+    if args.check_controls:
+        raise SystemExit(1 if check_controls() else 0)
 
     chrome = _find_chrome()
     if chrome is None:
         print("recovery_e2e: no chrome/chromium on PATH — see the module docstring runbook")
         raise SystemExit(2)
 
+    if args.control or args.controls:
+        selected = [c for c in CONTROLS if args.controls or c.scenario == args.control]
+        raise SystemExit(1 if run_controls(chrome, selected) else 0)
+
     failures = 0
-    if args.scenario in ("storm", "both", "all"):
-        verdict = run_storm(chrome)
-        print(f"scenario A (storm):   {verdict}")
-        failures += 0 if verdict.startswith("RECOVERY-READY") else 1
-    if args.scenario in ("restart", "both", "all"):
-        verdict = run_restart(chrome)
-        print(f"scenario B (restart): {verdict}")
-        failures += 0 if verdict.startswith("RECOVERY-READY") else 1
-    if args.scenario in ("coord-restart", "all"):
-        verdict = run_coord_restart(chrome)
-        print(f"scenario C (coord):   {verdict}")
-        failures += 0 if verdict.startswith("RECOVERY-READY") else 1
-    if args.scenario in ("fail-refetch", "all"):
-        verdict = run_fail_refetch(chrome)
-        print(f"scenario D (failref): {verdict}")
-        failures += 0 if verdict.startswith("RECOVERY-READY") else 1
-    if args.scenario in ("stale-ref-reload", "all"):
-        verdict = run_stale_ref(chrome)
-        print(f"scenario E1 (staleref): {verdict}")
-        failures += 0 if verdict.startswith("RECOVERY-READY") else 1
-    if args.scenario in ("rewind-window", "all"):
-        verdict = run_rewind_window(chrome)
-        print(f"scenario E2 (rewindwin): {verdict}")
-        failures += 0 if verdict.startswith("RECOVERY-READY") else 1
-    if args.scenario in ("rewind-failed-window", "all"):
-        verdict = run_rewind_failed_window(chrome)
-        print(f"scenario E3 (rewindfail): {verdict}")
-        failures += 0 if verdict.startswith("RECOVERY-READY") else 1
-    if args.scenario in ("stale-backstop", "all"):
-        verdict = run_stale_backstop(chrome)
-        print(f"scenario E4 (stalebackstop): {verdict}")
-        failures += 0 if verdict.startswith("RECOVERY-READY") else 1
-    if args.scenario in ("hidden-retry", "all"):
-        verdict = run_hidden_retry(chrome)
-        print(f"scenario E5 (hiddenretry): {verdict}")
-        failures += 0 if verdict.startswith("RECOVERY-READY") else 1
-    if args.scenario in ("await-window-gate", "all"):
-        verdict = run_await_window_gate(chrome)
-        print(f"scenario E6 (awaitgate): {verdict}")
-        failures += 0 if verdict.startswith("RECOVERY-READY") else 1
-    if args.scenario in ("destroy-invalidation", "all"):
-        verdict = run_destroy_invalidation(chrome)
-        print(f"scenario E7 (destroyinval): {verdict}")
-        failures += 0 if verdict.startswith("RECOVERY-READY") else 1
-    if args.scenario in ("reconnect-in-await", "all"):
-        verdict = run_reconnect_in_await(chrome)
-        print(f"scenario E8 (reconnectawait): {verdict}")
-        failures += 0 if verdict.startswith("RECOVERY-READY") else 1
-    if args.scenario in ("coord-rewind-window", "all"):
-        verdict = run_coord_rewind_window(chrome)
-        print(f"scenario G1 (coord-rewindwin): {verdict}")
-        failures += 0 if verdict.startswith("RECOVERY-READY") else 1
-    if args.scenario in ("coord-rewind-failed-window", "all"):
-        verdict = run_coord_rewind_failed_window(chrome)
-        print(f"scenario G2 (coord-rewindfail): {verdict}")
-        failures += 0 if verdict.startswith("RECOVERY-READY") else 1
-    if args.scenario in ("coord-stale-backstop", "all"):
-        verdict = run_coord_stale_backstop(chrome)
-        print(f"scenario G3 (coord-stalebackstop): {verdict}")
-        failures += 0 if verdict.startswith("RECOVERY-READY") else 1
-    if args.scenario in ("coord-heal-midturn", "all"):
-        verdict = run_coord_heal_midturn(chrome)
-        print(f"scenario G4 (coord-healmidturn): {verdict}")
-        failures += 0 if verdict.startswith("RECOVERY-READY") else 1
-    if args.scenario in ("coord-hidden-retry", "all"):
-        verdict = run_coord_hidden_retry(chrome)
-        print(f"scenario G5 (coord-hiddenretry): {verdict}")
-        failures += 0 if verdict.startswith("RECOVERY-READY") else 1
-    if args.scenario in ("coord-orphan-rewind", "all"):
-        verdict = run_coord_orphan_rewind(chrome)
-        print(f"scenario G6 (coord-orphanrewind): {verdict}")
-        failures += 0 if verdict.startswith("RECOVERY-READY") else 1
-    if args.scenario in ("coord-joined-flight", "all"):
-        verdict = run_coord_joined_flight(chrome)
-        print(f"scenario G7 (coord-joinedflight): {verdict}")
-        failures += 0 if verdict.startswith("RECOVERY-READY") else 1
-    if args.scenario in ("handoff-repair-budget", "all"):
-        verdict = run_handoff_repair_budget(chrome)
-        print(f"scenario H1 (handoff-budget): {verdict}")
-        failures += 0 if verdict.startswith("RECOVERY-READY") else 1
-    if args.scenario in ("coord-handoff-repair-budget", "all"):
-        verdict = run_handoff_repair_budget(chrome, coordinator=True)
-        print(f"scenario H2 (coord-handoff-budget): {verdict}")
-        failures += 0 if verdict.startswith("RECOVERY-READY") else 1
-    if args.scenario in ("user-turn-two-pane", "all"):
-        verdict = run_user_turn_two_pane(chrome)
-        print(f"scenario I1 (user-turn-two-pane): {verdict}")
-        failures += 0 if verdict.startswith("RECOVERY-READY") else 1
-    if args.scenario in ("tool-turn-two-pane", "all"):
-        verdict = run_tool_turn_two_pane(chrome)
-        print(f"scenario I2 (tool-turn-two-pane): {verdict}")
-        failures += 0 if verdict.startswith("RECOVERY-READY") else 1
-    if args.scenario in ("roster-restart", "all"):
-        verdict = run_roster_restart(chrome)
-        print(f"scenario F1 (roster-manual): {verdict}")
-        failures += 0 if verdict.startswith("RECOVERY-READY") else 1
-    if args.scenario in ("roster-restart-native", "all"):
-        verdict = run_roster_restart_native(chrome)
-        print(f"scenario F2 (roster-native): {verdict}")
-        failures += 0 if verdict.startswith("RECOVERY-READY") else 1
+    ran = 0
+    uncontrolled_ready: list[str] = []
+    for sc in SCENARIOS:
+        if args.scenario not in (sc.name, "all") and not (
+            args.scenario == "both" and sc.name in ("storm", "restart")
+        ):
+            continue
+        verdict = sc.run(chrome)
+        ran += 1
+        ready = verdict.startswith("RECOVERY-READY")
+        failures += 0 if ready else 1
+        note = ""
+        if ready and sc.uncontrolled is not None:
+            uncontrolled_ready.append(sc.sid)
+            note = f"  [READY (no control): {sc.uncontrolled}]"
+        print(f"{sc.label} {verdict}{note}")
+    ready_total = ran - failures
+    print(
+        f"recovery_e2e: {ready_total}/{ran} READY "
+        f"({ready_total - len(uncontrolled_ready)} controlled; READY (no control): "
+        f"{', '.join(uncontrolled_ready) or 'none'})"
+    )
     raise SystemExit(1 if failures else 0)
 
 

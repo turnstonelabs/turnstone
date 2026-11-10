@@ -40,6 +40,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import mimetypes
 import queue as _q
 import socket
 import threading
@@ -62,7 +63,8 @@ from turnstone.prompts import ClientType
 from turnstone.server import WebUI, create_app
 
 if TYPE_CHECKING:
-    from collections.abc import MutableMapping
+    from collections.abc import Mapping, MutableMapping
+    from pathlib import Path
 
     from turnstone.core.workstream import Workstream
 
@@ -93,6 +95,7 @@ class RecoveryServer:
         extra_routes: list[Any] | None = None,
         port: int = 0,
         sock: socket.socket | None = None,
+        served_overrides: Mapping[str, bytes] | None = None,
     ) -> None:
         self._global_queue: _q.Queue[dict[str, Any]] = _q.Queue(maxsize=100000)
         self._global_listeners: list[_q.Queue[dict[str, Any]]] = []
@@ -255,10 +258,24 @@ class RecoveryServer:
         self._history_fail_remaining = 0
         self._history_tokenless_remaining = 0
         self._history_delay_ms = 0
+        # Served-module overrides for negative controls: ``path -> body``
+        # replaces what the static mounts would serve for that exact request
+        # path, so a scenario runs against a mutated copy of a client module
+        # held in memory and no mutated file is ever written to the working
+        # tree.  Every request gets a full 200 with ``no-store``: a 304 or a
+        # cached copy would put the real module back in the page.
+        # ``override_hits`` counts the requests answered per path, so a caller
+        # can prove the mutated body was loaded instead of assuming it.
+        self._served_overrides: dict[str, bytes] = dict(served_overrides or {})
+        self.override_hits: dict[str, int] = dict.fromkeys(self._served_overrides, 0)
+        # Controllable streams for the EventSource contract scenario (see
+        # ContractStreams); served by the fault layer under its own prefix.
+        self.contract_streams = ContractStreams()
         # A thin pure-ASGI fault layer wrapping the REAL app (the production
         # app itself is untouched): count + optionally delay/fail
         # ``GET …/history``, count ``POST …/rewind``, count each per-ws SSE
-        # connection open (``GET …/events``), forward everything else (SSE
+        # connection open (``GET …/events``), answer an overridden static
+        # path and the contract streams itself, forward everything else (SSE
         # bodies, /send, lifespan, static) verbatim.
         production_app = self._app
 
@@ -266,6 +283,14 @@ class RecoveryServer:
             if scope.get("type") == "http":
                 path = scope.get("path", "")
                 method = scope.get("method", "")
+                override = self._served_overrides.get(path)
+                if override is not None and method in ("GET", "HEAD"):
+                    self.override_hits[path] += 1
+                    await _send_override(send, path, override, head=method == "HEAD")
+                    return
+                if path.startswith(CONTRACT_PREFIX):
+                    await self.contract_streams.handle(scope, receive, send)
+                    return
                 if path.endswith("/history") and method == "GET":
                     # ARRIVAL, never move.  Scenarios that hold a request open
                     # use this bump as the IN-FLIGHT edge (E6/E7/G1/G7 say so
@@ -670,6 +695,247 @@ class RecoveryServer:
         # Restore the storage singleton's load_messages (delay_load knob).
         with contextlib.suppress(Exception):
             self._patched_storage.load_messages = self._orig_load_messages  # type: ignore[method-assign]
+
+
+def mutated_source(path: Path, needle: str, replacement: str, *, count: int = 1) -> bytes:
+    """Return ``path``'s text with every ``needle`` replaced, as UTF-8 bytes.
+
+    Raises :class:`ValueError` unless ``needle`` occurs exactly ``count`` times
+    (``count`` must be at least 1).  A stale anchor has to fail loudly: serving
+    the unmutated file would let a negative control pass without testing
+    anything.
+    """
+    if count < 1:
+        raise ValueError(f"count must be at least 1, got {count}")
+    text = path.read_text(encoding="utf-8")
+    found = text.count(needle)
+    if found != count:
+        raise ValueError(
+            f"{path}: expected {count} occurrence(s) of the needle, found {found}: {needle!r}"
+        )
+    return text.replace(needle, replacement).encode("utf-8")
+
+
+async def _send_override(send: Any, path: str, body: bytes, *, head: bool) -> None:
+    """Answer one request for an overridden static path with ``body``."""
+    content_type = mimetypes.guess_type(path)[0] or "application/octet-stream"
+    if content_type.startswith("text/") or content_type.endswith("javascript"):
+        content_type += "; charset=utf-8"
+    await send(
+        {
+            "type": "http.response.start",
+            "status": 200,
+            "headers": [
+                (b"content-type", content_type.encode("ascii")),
+                (b"content-length", str(len(body)).encode("ascii")),
+                (b"cache-control", b"no-store"),
+            ],
+        }
+    )
+    await send({"type": "http.response.body", "body": b"" if head else body})
+
+
+CONTRACT_PREFIX = "/es-contract/"
+# How long a control waits for the browser's next connection attempt to arrive, and for the
+# stream to apply a command.
+_CONTRACT_WAIT_S = 5.0
+# Reconnection delay every controlled stream asks for (``retry:``), so a dropped stream's next
+# attempt arrives quickly.
+_CONTRACT_RETRY_MS = 250
+
+
+class _ContractAttempt:
+    """One browser connection attempt on a controlled stream."""
+
+    def __init__(self, last_event_id: str | None) -> None:
+        self.last_event_id = last_event_id
+        # pending -> open -> ended, or gone when the browser disconnected first.
+        self.state = "pending"
+        self.commands: asyncio.Queue[tuple[str, bytes, asyncio.Future[bool]]] = asyncio.Queue()
+
+
+class ContractStreams:
+    """Server half of the EventSource contract driver (the harness's ``es-contract`` scenario).
+
+    ``GET /es-contract/stream/<name>`` is a stream a browser EventSource connects to.  Each
+    request is one connection attempt, held unanswered until a control says what to do with it.
+    ``POST /es-contract/control/<name>/<action>`` acts on the newest attempt: ``open`` answers a
+    pending attempt 200 ``text/event-stream``, ``send`` writes one frame (JSON body
+    ``{data, id?, event?}``) on the open attempt, ``drop`` ends its response, and ``fail``
+    answers a pending attempt 500.  ``open`` and ``fail`` first wait for an attempt to arrive.
+    ``GET /es-contract/control/<name>/last-event-id`` returns the newest attempt's
+    ``Last-Event-ID`` request header.  A control with nothing to act on answers
+    ``{"applied": false}`` instead of failing: the contract drives streams the browser has
+    already closed.  Every answered control has finished writing to the stream socket.
+    """
+
+    def __init__(self) -> None:
+        self._attempts: dict[str, list[_ContractAttempt]] = {}
+
+    async def handle(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
+        parts = scope.get("path", "")[len(CONTRACT_PREFIX) :].split("/")
+        method = scope.get("method", "")
+        if len(parts) == 2 and parts[0] == "stream" and method == "GET":
+            await self._stream(parts[1], scope, receive, send)
+            return
+        if len(parts) == 3 and parts[0] == "control":
+            name, action = parts[1], parts[2]
+            if action == "last-event-id" and method == "GET":
+                attempts = self._attempts.get(name, [])
+                value = attempts[-1].last_event_id if attempts else None
+                await _send_json(send, 200, {"value": value})
+                return
+            if action in ("open", "send", "drop", "fail") and method == "POST":
+                frame = await _read_json_body(receive)
+                applied = await self._control(name, action, frame)
+                await _send_json(send, 200, {"applied": applied})
+                return
+        await _send_json(send, 404, {"error": "no such contract endpoint"})
+
+    async def _stream(self, name: str, scope: dict[str, Any], receive: Any, send: Any) -> None:
+        header = None
+        for key, value in scope.get("headers", []):
+            if key.lower() == b"last-event-id":
+                header = value.decode("utf-8", "replace")
+        attempt = _ContractAttempt(header)
+        self._attempts.setdefault(name, []).append(attempt)
+        disconnected = asyncio.ensure_future(_until_disconnect(receive))
+        try:
+            while attempt.state in ("pending", "open"):
+                command = asyncio.ensure_future(attempt.commands.get())
+                done, _ = await asyncio.wait(
+                    {command, disconnected}, return_when=asyncio.FIRST_COMPLETED
+                )
+                if command not in done:
+                    command.cancel()
+                    attempt.state = "gone"
+                    break
+                kind, payload, finished = command.result()
+                applied = await self._apply(attempt, kind, payload, send)
+                if not finished.done():
+                    finished.set_result(applied)
+        finally:
+            disconnected.cancel()
+            if attempt.state in ("pending", "open"):
+                attempt.state = "gone"
+
+    async def _apply(self, attempt: _ContractAttempt, kind: str, payload: bytes, send: Any) -> bool:
+        if kind == "open" and attempt.state == "pending":
+            attempt.state = "open"
+            await send(
+                {
+                    "type": "http.response.start",
+                    "status": 200,
+                    "headers": [
+                        (b"content-type", b"text/event-stream"),
+                        (b"cache-control", b"no-store"),
+                    ],
+                }
+            )
+            retry = f"retry: {_CONTRACT_RETRY_MS}\n\n".encode("ascii")
+            await send({"type": "http.response.body", "body": retry, "more_body": True})
+            return True
+        if kind == "send" and attempt.state == "open":
+            await send({"type": "http.response.body", "body": payload, "more_body": True})
+            return True
+        if kind == "drop" and attempt.state == "open":
+            attempt.state = "ended"
+            await send({"type": "http.response.body", "body": b"", "more_body": False})
+            return True
+        if kind == "fail" and attempt.state == "pending":
+            attempt.state = "ended"
+            await send(
+                {
+                    "type": "http.response.start",
+                    "status": 500,
+                    "headers": [(b"content-type", b"text/plain; charset=utf-8")],
+                }
+            )
+            await send({"type": "http.response.body", "body": b"refused", "more_body": False})
+            return True
+        return False
+
+    async def _control(self, name: str, action: str, frame: dict[str, Any]) -> bool:
+        wanted = "pending" if action in ("open", "fail") else "open"
+        attempt = self._newest(name, wanted)
+        deadline = time.monotonic() + _CONTRACT_WAIT_S
+        while attempt is None and wanted == "pending" and time.monotonic() < deadline:
+            await asyncio.sleep(0.02)
+            attempt = self._newest(name, wanted)
+        if attempt is None:
+            return False
+        payload = contract_frame(frame) if action == "send" else b""
+        finished: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
+        attempt.commands.put_nowait((action, payload, finished))
+        done, _ = await asyncio.wait({finished}, timeout=_CONTRACT_WAIT_S)
+        return bool(done) and finished.result()
+
+    def _newest(self, name: str, state: str) -> _ContractAttempt | None:
+        for attempt in reversed(self._attempts.get(name, [])):
+            if attempt.state == state:
+                return attempt
+        return None
+
+
+def contract_frame(frame: dict[str, Any]) -> bytes:
+    """Encode ``{data, id?, event?}`` as one event-stream frame.
+
+    ``data`` "" writes no data line (an id-only frame, which dispatches nothing); an ``id`` of ""
+    writes a bare ``id:`` line, which resets the browser's last event ID.  A non-string ``data``
+    is JSON-encoded.
+    """
+    lines: list[str] = []
+    event = frame.get("event")
+    if event is not None:
+        lines.append(f"event: {event}")
+    if "id" in frame and frame["id"] is not None:
+        lines.append(f"id: {frame['id']}" if frame["id"] != "" else "id:")
+    data = frame.get("data", "")
+    text = data if isinstance(data, str) else json.dumps(data)
+    if text != "":
+        lines.extend(f"data: {part}" for part in text.split("\n"))
+    return ("\n".join(lines) + "\n\n").encode("utf-8")
+
+
+async def _until_disconnect(receive: Any) -> None:
+    while True:
+        message = await receive()
+        if message.get("type") == "http.disconnect":
+            return
+
+
+async def _read_json_body(receive: Any) -> dict[str, Any]:
+    body = b""
+    while True:
+        message = await receive()
+        if message.get("type") != "http.request":
+            break
+        body += message.get("body", b"")
+        if not message.get("more_body", False):
+            break
+    if not body:
+        return {}
+    try:
+        parsed = json.loads(body)
+    except (ValueError, RecursionError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+async def _send_json(send: Any, status: int, payload: dict[str, Any]) -> None:
+    body = json.dumps(payload).encode("utf-8")
+    await send(
+        {
+            "type": "http.response.start",
+            "status": status,
+            "headers": [
+                (b"content-type", b"application/json"),
+                (b"content-length", str(len(body)).encode("ascii")),
+                (b"cache-control", b"no-store"),
+            ],
+        }
+    )
+    await send({"type": "http.response.body", "body": body})
 
 
 def make_listen_socket(port: int, *, sndbuf: int = _DEFAULT_SNDBUF) -> socket.socket:
