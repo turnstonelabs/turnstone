@@ -61,6 +61,9 @@ class CloseOutcome(enum.Enum):
     # and fenced it out after this copy's lease lapsed. HTTP answers it like
     # NOT_FOUND, so the console re-routes the close to any holder.
     OWNED_ELSEWHERE = "owned_elsewhere"
+    # The row could not be read or written: nothing changed, and retrying is safe. Only
+    # :meth:`SessionManager.close_persisted_with_outcome` returns it.
+    STORAGE_UNAVAILABLE = "storage_unavailable"
 
 
 _FACTORY_DROPPED_LEASE = "the session factory did not pass workstream_lease to the session it built"
@@ -422,6 +425,13 @@ class SessionManager:
         # an explicit delete retry proves it safe to retire.
         self._failed_delete_tombstones: dict[str, Workstream] = {}
         self._failed_delete_unadvertised: set[str] = set()
+        # Ids this process unloaded on purpose without recording it durably: a close whose
+        # ``closed`` write failed, or a hard delete that failed with a complete journal. Their
+        # rows still read live, so ``open_with_outcome(refuse_closed=True)`` refuses them as it
+        # refuses a ``closed`` row. Added and read inside the per-id lane; an explicit open, a
+        # successful delete, or a close that writes ``closed`` clears an id. Process-local: a
+        # restart forgets it.
+        self._unrecorded_unloads: set[str] = set()
         # Deferred creates are addressable internally before their pre-commit
         # transaction finishes. Keep the exact reservation object beyond a
         # racing close/delete so the rollback cannot ABA-delete a successor
@@ -1277,6 +1287,7 @@ class SessionManager:
         self,
         ws_id: str,
         *,
+        refuse_closed: bool = False,
         _incarnation_attempt: int = 0,
     ) -> tuple[Workstream | None, bool]:
         """Rehydrate a persisted workstream on demand: ``(workstream, loaded_now)``.
@@ -1291,10 +1302,20 @@ class SessionManager:
         not an access boundary; HTTP handlers gate callers at the
         scope level, not the row level.
 
+        ``refuse_closed`` also returns ``None`` for a row whose state is ``closed``, so the open
+        resumes only a workstream that was live when its process stopped, never one a close, an
+        idle close or the orphan reaper unloaded. It is decided on the snapshot and again on the
+        post-build re-read, both inside the per-id lane, and carried through the incarnation-race
+        retry: a close that holds the lane finishes its ``closed`` write first, and a reaper that
+        closes the row mid-build is caught by the re-read. It also refuses an id this process
+        unloaded on purpose without recording it (``_unrecorded_unloads``), whose row still
+        reads live; an open without it that loads such an id clears the mark.
+
         Serializes concurrent opens of the same ws_id through a
         per-ws refcounted lock so two GETs don't each construct a
         session and orphan a worker thread.
         """
+        unopenable = {"creating", "deleted", "closed"} if refuse_closed else {"creating", "deleted"}
         open_lock = self._acquire_open_lock(ws_id)
         try:
             with open_lock:
@@ -1316,6 +1337,13 @@ class SessionManager:
                         if self._workstreams.get(ws_id) is existing:
                             return existing, False
 
+                if refuse_closed:
+                    # Checked only on the way to a load: a slot that is loaded was returned
+                    # above, so the mark can never refuse a stream on a live session.
+                    with self._lock:
+                        if ws_id in self._unrecorded_unloads:
+                            return None, False
+
                 # Bind every rehydrated object to the durable incarnation it
                 # represents. Legacy tokenless rows are assigned a private
                 # token atomically with this snapshot, so a later exact delete
@@ -1324,11 +1352,11 @@ class SessionManager:
                 row = self._storage.ensure_workstream_incarnation_snapshot(ws_id)
                 if row is None or row.get("kind") != self.kind:
                     return None, False
-                # ``deleted`` is a tombstone — never resurrect. ``closed`` IS resurrectable; the
-                # Saved Workstreams landing makes restore an explicit user action, and
-                # ``_reserve_and_install`` still enforces a capped manager's max_active (evicting
-                # an idle peer or raising).
-                if row.get("state") in {"creating", "deleted"}:
+                # ``deleted`` is a tombstone — never resurrect. ``closed`` IS resurrectable unless
+                # the caller refuses it; the Saved Workstreams landing makes restore an explicit
+                # user action, and ``_reserve_and_install`` still enforces a capped manager's
+                # max_active (evicting an idle peer or raising).
+                if row.get("state") in unopenable:
                     return None, False
 
                 require_execution_node(row.get("required_node_id"), self._node_id)
@@ -1346,7 +1374,9 @@ class SessionManager:
                 lease = self._acquire_lease(ws_id, reservation_token)
                 if lease is None:
                     # The snapshotted incarnation was replaced or retired.
-                    return self._reopen_after_incarnation_race(ws_id, _incarnation_attempt, "lease")
+                    return self._reopen_after_incarnation_race(
+                        ws_id, _incarnation_attempt, "lease", refuse_closed=refuse_closed
+                    )
                 try:
                     ws, _evicted = self._reserve_and_install(
                         ws_id,
@@ -1533,7 +1563,9 @@ class SessionManager:
                 # (renewal failing past the TTL) leaves this window open; re-read the private
                 # incarnation witness anyway before this object is touched, advertised, or returned.
                 # An openable successor gets a bounded retry from its own fresh snapshot; a deleted
-                # or provisional row simply remains unavailable.
+                # or provisional row simply remains unavailable, and so does a closed one when the
+                # caller refuses it (the orphan reaper takes no lane and can close the row between
+                # the snapshot and the lease grant).
                 try:
                     current_row = self._storage.ensure_workstream_incarnation_snapshot(ws_id)
                 except BaseException:
@@ -1542,7 +1574,7 @@ class SessionManager:
                 current_openable = (
                     current_row is not None
                     and current_row.get("kind") == self.kind
-                    and current_row.get("state") not in {"creating", "deleted"}
+                    and current_row.get("state") not in unopenable
                 )
                 current_token = (
                     str(current_row.get("fork_reservation_token") or "")
@@ -1554,7 +1586,7 @@ class SessionManager:
                     if not current_openable:
                         return None, False
                     return self._reopen_after_incarnation_race(
-                        ws_id, _incarnation_attempt, "witness"
+                        ws_id, _incarnation_attempt, "witness", refuse_closed=refuse_closed
                     )
                 if not lease.held:
                     # The load found the lease gone (a refused fenced write
@@ -1570,6 +1602,11 @@ class SessionManager:
                 # close() that writes 'closed' under self._lock. The lease
                 # taken above keeps the orphan reaper off this row however
                 # old its ``updated``, which opening leaves alone.
+                if not refuse_closed:
+                    # A deliberate open of an id unloaded without a durable record: from here
+                    # the slot is the record again, and a later close or delete writes its own.
+                    with self._lock:
+                        self._unrecorded_unloads.discard(ws_id)
                 if self._event_emitter is not None:
                     self._event_emitter.emit_rehydrated(ws)
                 return ws, True
@@ -1892,6 +1929,9 @@ class SessionManager:
             # lease: the delete goes unfenced, refused while another process
             # holds a live one.
             deleted = delete_fn(lease=None)
+            if deleted:
+                with self._lock:
+                    self._unrecorded_unloads.discard(ws_id)
             if deleted and self._event_emitter is not None:
                 self._event_emitter.emit_closed(ws_id, reason="deleted", name=name)
             return deleted
@@ -2031,6 +2071,7 @@ class SessionManager:
                         return False
                     self._workstreams.pop(ws_id, None)
                     self._drop_delete_tombstone_locked(ws_id)
+                    self._unrecorded_unloads.discard(ws_id)
                     if self._pending_creates.get(ws_id) is candidate:
                         self._pending_creates.pop(ws_id, None)
                     if ws_id in self._order:
@@ -2096,8 +2137,13 @@ class SessionManager:
             )
         else:
             # The durable prefix is complete, so the historical
-            # retire-and-rehydrate behavior remains safe.
-            owned_elsewhere = self._retire_failed_persisted_delete(candidate) is False
+            # retire-and-rehydrate behavior remains safe. The row still reads live, so mark the
+            # id: a resume must not bring back what the user just tried to delete.
+            retired_ours = self._retire_failed_persisted_delete(candidate)
+            if retired_ours is True:
+                with self._lock:
+                    self._unrecorded_unloads.add(candidate.id)
+            owned_elsewhere = retired_ours is False
             if owned_elsewhere and not was_unadvertised:
                 # The delete was refused because another process now owns the
                 # row: this copy unloaded as on any lease loss (the
@@ -2236,6 +2282,71 @@ class SessionManager:
         """Soft-close on the stable per-id lane and retain refusal detail."""
         with self._id_lifecycle(ws_id):
             return self._close_serialized(ws_id)
+
+    def close_persisted_with_outcome(self, ws_id: str) -> CloseOutcome:
+        """Close ``ws_id`` on the per-id lifecycle lane, loaded here or not.
+
+        A loaded slot closes as :meth:`close_with_outcome` closes it. A row with no slot here
+        whose state is still live (its process stopped, or a close whose ``closed`` write
+        failed) gets ``closed`` written under an owner lease taken for that write alone, without
+        building a session. An open holds this lane through its build, re-read and announcement,
+        so an open in flight finishes first and its slot is then closed as usual, or, when its
+        build failed, its row gets ``closed`` written here.
+
+        Raises :class:`WorkstreamLeaseHeldError` / :class:`WorkstreamLeaseLostError` while
+        another process owns the workstream, and ``RuntimeError`` for a snapshot with no
+        incarnation token.
+        """
+        with self._id_lifecycle(ws_id):
+            if self.get(ws_id) is not None:
+                return self._close_serialized(ws_id)
+            with self._lock:
+                if ws_id in self._retiring_ids or ws_id in self._failed_delete_tombstones:
+                    # A retained failed-delete tombstone still holds its lease for the exact
+                    # delete retry; a grant here would fence it out.
+                    return CloseOutcome.NOT_FOUND
+            try:
+                row = self._storage.ensure_workstream_incarnation_snapshot(ws_id)
+            except Exception:
+                log.warning("session_mgr.close_row_read_failed ws=%s", ws_id[:8], exc_info=True)
+                return CloseOutcome.STORAGE_UNAVAILABLE
+            if (
+                row is None
+                or row.get("kind") != self.kind
+                or row.get("state") in {"creating", "deleted", "closed"}
+            ):
+                return CloseOutcome.NOT_FOUND
+            token = str(row.get("fork_reservation_token") or "")
+            if not token:
+                raise RuntimeError(f"workstream {ws_id!r} incarnation snapshot has no token")
+            try:
+                lease = self._acquire_lease(ws_id, token)
+            except WorkstreamLeaseHeldError:
+                raise
+            except Exception:
+                log.warning("session_mgr.close_row_read_failed ws=%s", ws_id[:8], exc_info=True)
+                return CloseOutcome.STORAGE_UNAVAILABLE
+            if lease is None:
+                # The snapshotted incarnation was replaced or deleted meanwhile.
+                return CloseOutcome.NOT_FOUND
+            try:
+                self._storage.update_workstream_state(ws_id, "closed", lease=lease.fence)
+            except (WorkstreamLeaseLostError, WorkstreamLeaseHeldError):
+                raise
+            except Exception:
+                log.warning("session_mgr.close_row_write_failed ws=%s", ws_id[:8], exc_info=True)
+                return CloseOutcome.STORAGE_UNAVAILABLE
+            finally:
+                self._release(lease)
+            with self._lock:
+                self._unrecorded_unloads.discard(ws_id)
+            try:
+                self._storage.delete_workstream_override(ws_id)
+            except Exception:
+                log.debug("session_mgr.override_delete_failed ws=%s", ws_id[:8], exc_info=True)
+            if self._event_emitter is not None:
+                self._event_emitter.emit_closed(ws_id, name=str(row.get("name") or ""))
+            return CloseOutcome.CLOSED
 
     def _close_serialized(self, ws_id: str) -> CloseOutcome:
         """Soft-close: unload from memory + mark state=closed in storage.
@@ -2575,6 +2686,12 @@ class SessionManager:
                 ws.id[:8],
                 exc_info=True,
             )
+            # The row still reads live: refuse resuming it here (see ``_unrecorded_unloads``).
+            with self._lock:
+                self._unrecorded_unloads.add(ws.id)
+        else:
+            with self._lock:
+                self._unrecorded_unloads.discard(ws.id)
         try:
             self._storage.delete_workstream_override(ws.id)
         except Exception:
@@ -3402,9 +3519,12 @@ class SessionManager:
             )
 
     def _reopen_after_incarnation_race(
-        self, ws_id: str, attempt: int, phase: str
+        self, ws_id: str, attempt: int, phase: str, *, refuse_closed: bool
     ) -> tuple[Workstream | None, bool]:
-        """Reopen from a fresh snapshot after the incarnation changed under ``open``."""
+        """Reopen from a fresh snapshot after the incarnation changed under ``open``.
+
+        ``refuse_closed`` is the first attempt's, so the successor is judged as that open asked.
+        """
         if attempt + 1 >= self._REHYDRATE_INCARNATION_ATTEMPTS:
             raise RuntimeError(
                 f"workstream incarnation changed repeatedly while reopening {ws_id!r}"
@@ -3415,7 +3535,9 @@ class SessionManager:
             attempt + 1,
             phase,
         )
-        return self.open_with_outcome(ws_id, _incarnation_attempt=attempt + 1)
+        return self.open_with_outcome(
+            ws_id, refuse_closed=refuse_closed, _incarnation_attempt=attempt + 1
+        )
 
     # ------------------------------------------------------------------
     # Internal — owner lease

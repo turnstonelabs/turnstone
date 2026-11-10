@@ -734,7 +734,7 @@ def _interactive_tenant_check(
 def _audit_close_workstream(
     request: Request,
     ws_id: str,
-    ws_before: Workstream,
+    ws_before: Workstream | None,
     reason: str,
 ) -> None:
     """Record the ``workstream.closed`` audit event for interactive close.
@@ -750,10 +750,12 @@ def _audit_close_workstream(
     if storage is None:
         return
     _, ip = _audit_context(request)
-    detail: dict[str, Any] = {
-        "kind": str(ws_before.kind),
-        "parent_ws_id": ws_before.parent_ws_id,
-    }
+    # The node mount closes only loaded workstreams, so ``ws_before`` is set here.
+    detail: dict[str, Any] = (
+        {"kind": str(ws_before.kind), "parent_ws_id": ws_before.parent_ws_id}
+        if ws_before is not None
+        else {}
+    )
     if reason:
         detail["reason"] = reason
     record_audit(

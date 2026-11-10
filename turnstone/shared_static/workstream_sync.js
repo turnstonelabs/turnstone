@@ -7,11 +7,14 @@
 // The pane supplies a view (how to apply one event, how to rebuild from /history) and listens to
 // the events below; when to fetch, when to connect and what to present is decided here, once.
 //
-// It issues exactly two requests, GET .../history and GET .../events, and never opens, reopens or
-// rehydrates a workstream. GET .../workstreams/{id} rehydrates an unloaded workstream for a
-// writer, so probing it from a timer would resurrect a session someone closed on purpose. Once
-// the instance is `dead`, recovery is the pane's: destroy this instance and build a new pane,
-// which is where a deliberate reopen (possibly on another node) belongs.
+// It issues exactly two requests, GET .../history and GET .../events, and never requests the
+// workstream resource: GET .../workstreams/{id} reopens an unloaded workstream for a writer, closed
+// ones included, so probing it from a timer would resurrect a session someone closed on purpose.
+// The console's coordinator events route itself resumes a coordinator that was live when the
+// console stopped, never a closed one, so a coordinator pane's redial after a console restart gets
+// its session back by itself. Once the instance is `dead`, recovery is the pane's: destroy this
+// instance and build a new pane, which is where a deliberate reopen (possibly on another node)
+// belongs.
 //
 // The transcript-staleness latch (historyStale) is cleared at the render step, before the pane's
 // render: a fetch that fails leaves it set, and a render that throws after its wipe leaves it

@@ -36,7 +36,7 @@ import functools
 import re
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Literal, Protocol, cast
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple, Protocol, cast
 
 from starlette.responses import JSONResponse
 from starlette.routing import Route
@@ -517,16 +517,28 @@ class SessionEndpointConfig:
     # aliases ("my-debug-ws") map to canonical hex ids. Coord wires
     # ``None`` — coord uses hex ids only.
     open_resolve_alias: AliasResolver | None = None
-    # (request, ws) -> None. Kind-specific post-load callback fired
-    # by the lifted ``open`` body after ``mgr.open(ws_id)`` returns
-    # the workstream. Interactive uses it to send the UI-replay
-    # events (``clear_ui`` + history) and to enqueue a handler-side
-    # ``ws_created`` onto the global SSE queue (out-of-band path —
-    # see :class:`SessionKindAdapter` docstring for why interactive's
-    # creation events stay outside the manager's emit_*). Coord
-    # wires ``None`` and lets the cluster collector handle the
-    # transition via ``CoordinatorAdapter.emit_rehydrated``.
+    # (request, ws) -> None. Kind-specific post-load callback, fired once by whichever request
+    # loaded the workstream: the lifted ``open`` body, the ``detail`` body's cold open, and the
+    # ``events`` body's resume (``events_resume_live``). Interactive uses it to send the UI-replay
+    # events (``clear_ui`` + history) and to enqueue a handler-side ``ws_created`` onto the global
+    # SSE queue (out-of-band path — see :class:`SessionKindAdapter` docstring for why
+    # interactive's creation events stay outside the manager's emit_*). Coord wires ``None`` and
+    # lets the cluster collector handle the transition via ``CoordinatorAdapter.emit_rehydrated``.
     open_post_load: OpenPostLoad | None = None
+    # When ``True``, an ``events`` request that finds the workstream not loaded resumes it first,
+    # when the caller may (:func:`_may_resume_live`): the manager is uncapped (checked per
+    # request, since an eviction writes nothing durable and a resume would undo it), and the
+    # caller passes the gates a cold open through ``detail`` asks for (the permission gate and
+    # tenant check above, plus write scope). The open refuses a ``closed`` row, and one this
+    # process unloaded on purpose without recording it (see
+    # :meth:`SessionManager.open_with_outcome`). A stream that dials back after its process
+    # restarted gets its session back without anyone reopening it; a caller who may not resume
+    # keeps the plain 404. Only a kind may set it whose every deliberate unload writes ``closed``
+    # (so a row left live means its process stopped, not that someone unloaded it) and whose
+    # stream clients bound their retries (each refused resume is one more retry). The console's
+    # coordinator mount sets it; the interactive kind does not, since its capacity eviction
+    # writes nothing durable and an open tab would undo the eviction.
+    events_resume_live: bool = False
     # (ws, ui, request) -> Iterable[dict]. Kind-specific initial SSE replay
     # payload the lifted ``events`` body yields before the live event loop.
     # The shared handler pins viewer-specific project metadata on ``request``;
@@ -1047,7 +1059,7 @@ def make_approve_handler(
 
 
 CloseAuditEmitter = Callable[
-    ["Request", str, "Workstream", str],
+    ["Request", str, "Workstream | None", str],
     None,
 ]
 
@@ -1057,6 +1069,7 @@ def make_close_handler(
     *,
     audit_emit: CloseAuditEmitter | None = None,
     supports_close_reason: bool = False,
+    close_unloaded_rows: bool = False,
     accepted_permissions: tuple[str, ...] = (),
 ) -> Handler:
     """Lifted body for ``POST {prefix}/{ws_id}/close``.
@@ -1075,8 +1088,10 @@ def make_close_handler(
         audit_emit: kind's audit emitter for the close event.
             Receives ``(request, ws_id, ws_before, reason)``; ``reason``
             is the empty string when ``supports_close_reason`` is
-            ``False`` or no reason was provided. ``None`` skips the
-            audit entirely (only valid when neither kind cares).
+            ``False`` or no reason was provided, and ``ws_before`` is
+            ``None`` when the close wrote ``closed`` for a row not loaded
+            here (``close_unloaded_rows``). ``None`` skips the audit
+            entirely (only valid when neither kind cares).
         supports_close_reason: when ``True``, the handler reads a
             ``reason`` field from the JSON body, caps it at 512 UTF-8
             bytes, redacts credentials, persists it via
@@ -1085,6 +1100,13 @@ def make_close_handler(
             ``workstream_config`` from unbounded growth on a model-
             generated dump; the redact protects audit logs from
             captured-secret leakage under prompt injection.
+        close_unloaded_rows: when ``True``, every close goes through
+            :meth:`SessionManager.close_persisted_with_outcome`, which also
+            writes ``closed`` for a row still live in storage that no slot
+            here holds, without building a session; another process's
+            lease answers 409 and a close that could not be recorded 503.
+            Only a kind whose rows left live mean a stopped process, and
+            whose closes are not re-routed to a holder on 404, may set it.
 
     Behavior change vs the pre-lift handlers:
 
@@ -1142,9 +1164,23 @@ def make_close_handler(
                 return err_tenant
 
         ws_before = mgr.get(ws_id)
-        if ws_before is None:
+        if close_unloaded_rows:
+            # Every close, not only a miss: one that meets a slot an events resume is still
+            # building waits on the per-id lane, then closes the slot, or writes ``closed`` for
+            # the row when that build failed.
+            try:
+                close_outcome = await asyncio.to_thread(mgr.close_persisted_with_outcome, ws_id)
+            except (WorkstreamLeaseHeldError, WorkstreamLeaseLostError) as exc:
+                return lease_refusal_response(exc)
+        elif ws_before is None:
             return JSONResponse({"error": cfg.not_found_label}, status_code=404)
-        close_outcome = await asyncio.to_thread(mgr.close_with_outcome, ws_id)
+        else:
+            close_outcome = await asyncio.to_thread(mgr.close_with_outcome, ws_id)
+        if close_outcome is CloseOutcome.STORAGE_UNAVAILABLE:
+            return JSONResponse(
+                {"error": "the close could not be recorded; try again shortly"},
+                status_code=503,
+            )
         if close_outcome is CloseOutcome.UNRESOLVED_PERSISTENCE:
             return JSONResponse(
                 {"error": "workstream has unresolved persistence"},
@@ -2500,17 +2536,36 @@ def make_command_handler(
     return command
 
 
-# Per caller: (factory-misconfig log, internal-failure log, verb in the 500 body).
-_OPEN_FAILURE_WORDING: dict[str, tuple[str, str, str]] = {
-    "open": (
+_OpenCaller = Literal["open", "detail", "events"]
+
+
+class _OpenWording(NamedTuple):
+    """One caller's log events around an open, and the verb its 500 body uses."""
+
+    misconfig_log: str
+    failed_log: str
+    verb: str
+    post_load_log: str
+
+
+_OPEN_FAILURE_WORDING: dict[str, _OpenWording] = {
+    "open": _OpenWording(
         "ws.open.factory_misconfig ws_id=%s exc=%r",
         "ws.open.rehydrate_failed correlation_id=%s ws_id=%s",
         "open",
+        "ws.open.post_load_failed ws=%s",
     ),
-    "detail": (
+    "detail": _OpenWording(
         "ws.detail.factory_misconfig ws_id=%s exc=%r",
         "ws.detail.rehydrate_failed correlation_id=%s ws_id=%s",
         "rehydrate",
+        "ws.detail.post_load_failed ws=%s",
+    ),
+    "events": _OpenWording(
+        "ws.events.factory_misconfig ws_id=%s exc=%r",
+        "ws.events.resume_failed correlation_id=%s ws_id=%s",
+        "resume",
+        "ws.events.post_load_failed ws=%s",
     ),
 }
 
@@ -2519,18 +2574,20 @@ async def _open_or_refusal(
     mgr: SessionManager,
     ws_id: str,
     cfg: SessionEndpointConfig,
-    caller: Literal["open", "detail"],
+    caller: _OpenCaller,
+    *,
+    refuse_closed: bool = False,
 ) -> tuple[Workstream | None, bool] | JSONResponse:
     """Open ``ws_id`` off the event loop, or return the response its failure maps to.
 
-    Shared by the open and detail handlers (``caller`` picks their log events
-    and wording).
+    Shared by the open, detail and events handlers (``caller`` picks their log events and
+    wording).
     """
-    misconfig_log, failed_log, verb = _OPEN_FAILURE_WORDING[caller]
+    misconfig_log, failed_log, verb, _post_load_log = _OPEN_FAILURE_WORDING[caller]
     try:
         # Off the event loop: opening builds a session, takes the owner lease
         # and can retire a stopped copy here.
-        return await asyncio.to_thread(mgr.open_with_outcome, ws_id)
+        return await asyncio.to_thread(mgr.open_with_outcome, ws_id, refuse_closed=refuse_closed)
     except NodeAffinityError as exc:
         return JSONResponse(exc.as_dict(), status_code=exc.status_code)
     except (WorkstreamLeaseHeldError, WorkstreamLeaseLostError) as exc:
@@ -2591,6 +2648,73 @@ async def _open_or_refusal(
             },
             status_code=500,
         )
+
+
+async def _run_open_post_load(
+    cfg: SessionEndpointConfig,
+    request: Request,
+    ws: Workstream,
+    caller: _OpenCaller,
+) -> None:
+    """Run the kind's post-load for a workstream this request loaded.
+
+    Off the event loop: interactive's post-load does blocking storage I/O (a workstream
+    display-name lookup). Post-load is observational, so a hook that raises is logged under the
+    caller's own event and never blocks the response.
+    """
+    if cfg.open_post_load is None:
+        return
+    try:
+        await asyncio.to_thread(cfg.open_post_load, request, ws)
+    except Exception:
+        log.debug(_OPEN_FAILURE_WORDING[caller].post_load_log, ws.id[:8], exc_info=True)
+
+
+def _may_resume_live(request: Request, mgr: SessionManager, cfg: SessionEndpointConfig) -> bool:
+    """Whether this ``events`` request may resume a workstream that is not loaded here.
+
+    The mount opted in (``cfg.events_resume_live``), the manager is uncapped (an eviction writes
+    nothing durable, so a resume would undo it), and the caller has write scope, as a cold open
+    through ``detail`` asks.
+    """
+    auth = getattr(request.state, "auth_result", None)
+    return (
+        cfg.events_resume_live
+        and mgr.max_active is None
+        and auth is not None
+        and auth.has_scope("write")
+    )
+
+
+async def _load_or_refusal(
+    request: Request,
+    mgr: SessionManager,
+    ws_id: str,
+    cfg: SessionEndpointConfig,
+    caller: _OpenCaller,
+    *,
+    refuse_closed: bool,
+) -> Workstream | JSONResponse:
+    """The loaded workstream for ``ws_id``, opening it here if need be, or the refusal.
+
+    ``None`` from the open (a missing, wrong-kind, provisional or tombstoned row, and with
+    ``refuse_closed`` a ``closed`` one or one this process unloaded on purpose without recording
+    it; see :meth:`SessionManager.open_with_outcome`) is the plain 404, and every other refusal
+    is ``_open_or_refusal``'s non-2xx answer. A request that loads it IS an open, so the kind's
+    post-load runs, once: a concurrent open that loaded it first already ran it. Skipping it
+    would leave the now-live session without a watch dispatch registration (each watch fire
+    would take the restore path to find it) and never tell dashboards the workstream came live
+    (``ws_created``).
+    """
+    opened = await _open_or_refusal(mgr, ws_id, cfg, caller, refuse_closed=refuse_closed)
+    if isinstance(opened, JSONResponse):
+        return opened
+    ws, loaded_now = opened
+    if ws is None:
+        return JSONResponse({"error": cfg.not_found_label}, status_code=404)
+    if loaded_now:
+        await _run_open_post_load(cfg, request, ws, caller)
+    return ws
 
 
 def make_open_handler(
@@ -2705,21 +2829,7 @@ def make_open_handler(
         # handler-side ws_created enqueue; coord: None and the
         # cluster collector handles the fan-out via the adapter's
         # emit_rehydrated path).
-        if cfg.open_post_load is not None:
-            try:
-                # Off-loop: interactive's post_load does blocking
-                # storage I/O (a workstream display-name lookup) that
-                # would otherwise stall the event loop on every
-                # workstream open.
-                await asyncio.to_thread(cfg.open_post_load, request, ws)
-            except Exception:
-                # Post-load is observational — never let a hook bug
-                # block the open. Log + continue.
-                log.debug(
-                    "ws.open.post_load_failed ws=%s",
-                    ws.id[:8],
-                    exc_info=True,
-                )
+        await _run_open_post_load(cfg, request, ws, "open")
 
         if audit_emit is not None:
             try:
@@ -2754,6 +2864,11 @@ def make_events_handler(cfg: SessionEndpointConfig) -> Handler:
     registration, the ``ws_closed`` exit, the disconnect detection,
     and the SSE-connect/disconnect metric recording are uniform.
 
+    A workstream that is not loaded answers 404, unless the caller may resume it
+    (:func:`_may_resume_live`): such a caller always goes through the open
+    (:func:`_load_or_refusal`), which resumes a row that is not ``closed`` and waits for any
+    open, close or delete in flight.
+
     Pre-lift behaviour preserved on both kinds with two small
     convergence wins:
 
@@ -2770,9 +2885,10 @@ def make_events_handler(cfg: SessionEndpointConfig) -> Handler:
       uses both — whichever fires first wins.
 
     Args:
-        cfg: per-kind policy bundle. ``events_replay`` is the only
-             field the events body reads beyond the standard
-             permission_gate / manager_lookup / tenant_check prelude.
+        cfg: per-kind policy bundle. Beyond the standard permission_gate /
+             manager_lookup / tenant_check prelude, ``events_replay`` and
+             ``sse_executor_lookup`` shape the stream, and
+             ``events_resume_live`` (with ``open_post_load``) decides a miss.
     """
     # Lazy-imported at factory call time so the metrics module isn't
     # dragged into ``session_routes.py``'s top-level import graph
@@ -2806,9 +2922,20 @@ def make_events_handler(cfg: SessionEndpointConfig) -> Handler:
             if err_tenant is not None:
                 return err_tenant
 
-        ws = mgr.get(ws_id)
-        if ws is None:
-            return JSONResponse({"error": cfg.not_found_label}, status_code=404)
+        if _may_resume_live(request, mgr, cfg):
+            # A caller who may resume always goes through the open: it returns a loaded slot at
+            # once (no storage read) and otherwise waits on the per-id lane for any open, close or
+            # delete in flight and takes that outcome, so a refused build is one refusal per tab,
+            # never a 200 that ends like a reconnect. Readers stream the slot as is.
+            loaded = await _load_or_refusal(request, mgr, ws_id, cfg, "events", refuse_closed=True)
+            if isinstance(loaded, JSONResponse):
+                return loaded
+            ws = loaded
+        else:
+            found = mgr.get(ws_id)
+            if found is None:
+                return JSONResponse({"error": cfg.not_found_label}, status_code=404)
+            ws = found
         ui = ws.ui
         # The listener-queue methods aren't on the ``SessionUI``
         # Protocol surface (they live on ``SessionUIBase``), so
@@ -5436,35 +5563,10 @@ def make_detail_handler(cfg: SessionEndpointConfig) -> Handler:
                 return JSONResponse(
                     {"error": "Reopening a saved session requires write scope"}, status_code=403
                 )
-            opened = await _open_or_refusal(mgr, ws_id, cfg, "detail")
-            if isinstance(opened, JSONResponse):
-                return opened
-            ws, loaded_now = opened
-            if ws is None:
-                # ``mgr.open`` returns None for missing rows, kind
-                # mismatch, and tombstoned rows — all surface as 404.
-                return JSONResponse({"error": cfg.not_found_label}, status_code=404)
-
-            # A detail GET that lazily rehydrates IS an open — run the
-            # same kind-specific post-load the open handler runs, once:
-            # a concurrent open that loaded it first already ran it.
-            # Skipping it leaves the now-live session without a watch
-            # dispatch registration (each watch fire would take the
-            # restore path to find it) and never tells dashboards the
-            # workstream came live (``ws_created``).
-            if loaded_now and cfg.open_post_load is not None:
-                try:
-                    # Off-loop: interactive's post_load does blocking
-                    # storage I/O (display-name lookup).
-                    await asyncio.to_thread(cfg.open_post_load, request, ws)
-                except Exception:
-                    # Post-load is observational — never let a hook bug
-                    # block the detail response. Log + continue.
-                    log.debug(
-                        "ws.detail.post_load_failed ws=%s",
-                        ws.id[:8],
-                        exc_info=True,
-                    )
+            loaded = await _load_or_refusal(request, mgr, ws_id, cfg, "detail", refuse_closed=False)
+            if isinstance(loaded, JSONResponse):
+                return loaded
+            ws = loaded
 
         # A client is looking at it: a watch restore's blanket approval ends here.
         ws.note_client()

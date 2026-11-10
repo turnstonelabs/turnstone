@@ -4109,7 +4109,7 @@ def _auth_scopes(request: Request) -> set[str]:
 def _audit_close_coordinator(
     request: Request,
     ws_id: str,
-    ws_before: Workstream,  # noqa: ARG001 — coord audit detail doesn't use it yet
+    ws_before: Workstream | None,  # noqa: ARG001 — coord audit detail doesn't use it yet
     reason: str,  # noqa: ARG001 — coord doesn't expose close_reason yet
 ) -> None:
     """Record the ``coordinator.close`` audit event.
@@ -5797,6 +5797,8 @@ def _bootstrap_coord_subsystem(
     coord_mgr = SessionManager(
         coord_adapter,
         storage=storage,
+        # Uncapped: the coordinator events route resumes an unloaded coordinator only on an
+        # uncapped manager (``events_resume_live``), since an eviction writes nothing durable.
         max_active=None,
         node_id=ClusterCollector.CONSOLE_PSEUDO_NODE_ID,
         state_writer=coord_state_writer,
@@ -18327,6 +18329,12 @@ def create_app(
         spawn_metrics=_coord_spawn_metrics,
         emit_message_queued=True,
         events_replay=_coord_events_replay,
+        # A coordinator's stream resumes it after a console restart. Every deliberate unload here
+        # writes ``closed`` (the close verb, idle close, the orphan reaper) or, when that write or
+        # a delete fails, marks the id in the manager; the manager is uncapped, which the route
+        # checks per request; and the pane's stream client gives up after a bounded run of
+        # refused attempts.
+        events_resume_live=True,
         create_supports_attachments=True,
         create_supports_user_id_override=False,
         # Coordinator creates honour ``server.require_project`` exactly like
@@ -18398,6 +18406,9 @@ def create_app(
                 coord_endpoint_config,
                 audit_emit=_audit_close_coordinator,
                 supports_close_reason=False,
+                # A coordinator a stopped console left live is closed without loading it, so an
+                # open pane's next events redial cannot bring it back.
+                close_unloaded_rows=True,
             ),
             refresh_title=make_refresh_title_handler(coord_endpoint_config),  # lifted: shared body
             set_title=make_set_title_handler(coord_endpoint_config),  # lifted: shared body
