@@ -2206,8 +2206,9 @@ def _build_search_args(pattern: str, path: str, backend: str) -> list[str]:
         # and ripgrep would execute COMMAND as a per-file preprocessor.
         args.extend(["-e", pattern, "--", path])
         return args
-    # grep fallback
-    args = ["grep", "-rn", "-I", "-E", "-m", "100", "--color=never"]
+    # The fallback program.  ``-H`` because it leaves the file name out when it
+    # is given a single file, and the parser needs ``path:line:content``.
+    args = ["grep", "-rn", "-H", "-I", "-E", "-m", "100", "--color=never"]
     for d in _SEARCH_EXCLUDE_DIRS:
         args.append(f"--exclude-dir={d}")
     args.extend(["--", pattern, path])

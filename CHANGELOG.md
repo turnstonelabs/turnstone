@@ -38,6 +38,12 @@ The separate `dev` branch is retired. See [the release process](docs/releasing.m
   summary showed no focus ring while closed, and a code fence or diagram
   placed directly in the block showed only the top and bottom of its ring.
   Both now show the whole ring.
+- **`search` finds matches when it is given a single file and runs its
+  fallback program.** Where the preferred search program is not installed, the
+  fallback leaves the file name out of its output for a single file, which the
+  result parser read as malformed, so the search failed with "all matches
+  returned were malformed" while searching a directory worked. The fallback now
+  always names the file.
 
 ## [2026-11-10]
 
