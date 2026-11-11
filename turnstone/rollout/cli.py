@@ -405,6 +405,14 @@ def _parser() -> argparse.ArgumentParser:
         "tools.truncation)",
     )
     parser.add_argument(
+        "--max-tool-result-chars",
+        type=int,
+        default=None,
+        help="characters no single tool result exceeds in the conversation, whatever the "
+        "tool; a longer one is cut and says how to get the rest (default: each tool's own "
+        "bound)",
+    )
+    parser.add_argument(
         "--max-read-bytes",
         type=int,
         default=RolloutConfig.max_read_bytes,
@@ -814,6 +822,7 @@ def _command(args: argparse.Namespace, given: set[str]) -> int:
         extra_body=extra_body,
         sampler_logprobs=_verdict_given(args.sampler_logprobs),
         max_output_chars=args.max_output_chars,
+        max_tool_result_chars=args.max_tool_result_chars,
         max_read_bytes=args.max_read_bytes,
         server_stall_seconds=args.server_stall_seconds,
         rules=_rules(args.rules),

@@ -32,6 +32,7 @@ episodes in parallel as separate processes.
 from __future__ import annotations
 
 import contextlib
+import copy
 import json
 import math
 import os
@@ -50,7 +51,7 @@ from turnstone.core.providers._http_client import shutdown_on_close
 from turnstone.core.session import GenerationCancelled, inside_task_agent
 from turnstone.core.storage import init_storage, reset_storage
 from turnstone.core.tools import apply_null_spellings, salvage_tool_arguments
-from turnstone.core.trajectory import final_assistant_text
+from turnstone.core.trajectory import Role, final_assistant_text
 from turnstone.eval.core import HeadlessSession, run_with_lifecycle
 from turnstone.rollout.budget import Budgets, Meter, TokenBudgetError, backstop_seconds
 from turnstone.rollout.container import (
@@ -65,9 +66,11 @@ from turnstone.rollout.probe import SETTINGS as PROBED_SETTINGS
 from turnstone.rollout.probe import all_settings, sampler_logprobs_reported
 from turnstone.rollout.rawargs import RecordedArguments
 from turnstone.rollout.recording import PARENT, SUB_AGENT, RecordingClient
+from turnstone.rollout.result_bound import MIN_RESULT_CHARS, bound_result, sendable_result
 from turnstone.rollout.rules import RuleSet, refusal_text
 from turnstone.rollout.server_version import ServerVersion
 from turnstone.rollout.settings import (
+    OVERRIDE,
     Limit,
     Setting,
     SetupError,
@@ -228,6 +231,12 @@ class RolloutConfig:
     # ``None``: the framework's ``tools.truncation``, where 0 is its automatic
     # share of the remaining context.
     max_output_chars: int | None = None
+    # Characters no single tool result exceeds when it enters the session's
+    # conversation, whatever the tool: a command, a file read, a tool of the
+    # task's own servers, what a sub-agent hands back
+    # (:mod:`turnstone.rollout.result_bound`).  ``None``: each tool's own bound
+    # and no other.
+    max_tool_result_chars: int | None = None
     # The pattern rules enforced on tool calls (:mod:`turnstone.rollout.rules`):
     # ``"shipped"`` for the rollout package's own set, a rule set of the run's,
     # or ``None`` for none.
@@ -520,6 +529,11 @@ def _server_words(error: APIStatusError) -> str:
     return said if len(said) <= _REFUSAL_CHARS else said[:_REFUSAL_CHARS] + "..."
 
 
+# Where a prepared call of the session's keeps its place among the calls of
+# its turn, for the call that starts a sub-agent.
+_PLACE = "_rollout_place"
+
+
 class SubAgentRefusedError(RuntimeError):
     """The server refused a sub-agent's request for what the request holds.
 
@@ -574,6 +588,7 @@ class RolloutSession(HeadlessSession):
         rules: RuleSet | None = None,
         allow_host_execution: bool = False,
         meter: Meter | None = None,
+        max_result_chars: int | None = None,
         before_acting: Callable[[], None] | None = None,
         **kwargs: Any,
     ) -> None:
@@ -599,6 +614,19 @@ class RolloutSession(HeadlessSession):
         self._rules = rules
         # Every call a rule matched: which rule, what it said, whose call.
         self.rule_events: list[dict[str, Any]] = []
+        # Every call that ran as another call than the model's words spell: the
+        # tool and the arguments it ran with.
+        self.calls_as_run: list[dict[str, Any]] = []
+        # The session's turn whose tool calls are running, counted as its tool
+        # log counts turns, and how many of that turn's calls have been
+        # prepared: the session prepares them in the order the model made
+        # them, so that is each call's place in its turn.  What is noted of
+        # one of the session's own calls (a rule, a cut, a sub-agent started)
+        # is noted with both, so that the record can find the call's entry of
+        # the tool log.  An id does not say which call it is: a server may
+        # give two calls the same one.
+        self._turn: int | None = None
+        self._prepared = 0
         self._max_subagents = max_subagents
         self._last_call_tokens = last_call_tokens
         self._delegation_lock = threading.Lock()
@@ -617,6 +645,10 @@ class RolloutSession(HeadlessSession):
         # Every tool call a sub-agent issued: they act in the same sandbox and
         # are in no other log.
         self.subagent_log = SubAgentLog(self._tool_definition)
+        # The most characters one tool result may have in the conversation, and
+        # every result that was cut to it.
+        self._max_result_chars = max_result_chars
+        self.results_cut: list[dict[str, Any]] = []
 
     # -- context window ------------------------------------------------------
 
@@ -655,9 +687,10 @@ class RolloutSession(HeadlessSession):
 
     def _call_as_it_runs(
         self, tc: dict[str, Any], item: dict[str, Any]
-    ) -> tuple[str, dict[str, Any] | None]:
-        """The tool and the arguments of a call as it will run, which is not
-        always what the model wrote: ``None`` for arguments nothing runs on.
+    ) -> tuple[str, dict[str, Any] | None, bool]:
+        """The tool and the arguments of a call as it will run, and whether
+        that is another call than the model's words spell; the arguments are
+        ``None`` where nothing runs on them.
 
         Between the model's words and the tool the session strips white space
         off the name, makes arguments of text that is no JSON, reads a null
@@ -666,27 +699,31 @@ class RolloutSession(HeadlessSession):
         or what its prepared call holds, so nothing here can drift from it.
         """
         function = tc.get("function") or {}
-        name = str(function.get("name") or "").strip()
+        written = str(function.get("name") or "")
+        name = written.strip()
         raw = function.get("arguments")
         if raw is None or raw == "":
             raw = "{}"
         if not isinstance(raw, str):
-            return name, None
+            return name, None, False
         arguments: Any
+        another = name != written
         try:
             arguments = json.loads(raw)
         except json.JSONDecodeError:
             arguments = salvage_tool_arguments(name, raw)
+            another = True
         except (ValueError, RecursionError):
-            return name, None
+            return name, None, False
         if not isinstance(arguments, dict):
-            return name, None
+            return name, None, False
         apply_null_spellings(arguments, self._tool_definition(name))
         command = item.get("command")
         if isinstance(command, str):
             # The command the prepared call starts.
+            another = another or arguments.get("command") != command
             arguments["command"] = command
-        return name, arguments
+        return name, arguments, another
 
     def _prepare_tool_item(self, tc: dict[str, Any]) -> dict[str, Any]:
         """Ask the run's rules before a call runs, the session's own or a sub-agent's.
@@ -696,11 +733,36 @@ class RolloutSession(HeadlessSession):
         with white space around it runs the tool, and arguments that are no
         JSON are made into arguments and run.
         """
+        own = not inside_task_agent()
+        place: int | None = None
+        if own:
+            # Counted before anything can refuse the call: a call that is not
+            # run has its place in the turn like the others.
+            place, self._prepared = self._prepared, self._prepared + 1
         item = super()._prepare_tool_item(tc)
-        if self._rules is None or item.get("error"):
+        if own:
+            # For the call that starts a sub-agent, which is run from this item.
+            item[_PLACE] = place
+        if item.get("error"):
             return item
-        name, arguments = self._call_as_it_runs(tc, item)
+        name, arguments, another = self._call_as_it_runs(tc, item)
         if arguments is None:
+            return item
+        if another:
+            # The logs name the call that runs; the model's words are in the
+            # conversation.
+            with self._delegation_lock:
+                self.calls_as_run.append(
+                    {
+                        "call_id": tc.get("id"),
+                        "scope": PARENT if own else SUB_AGENT,
+                        "turn": self._turn if own else None,
+                        "place": place,
+                        "tool": name,
+                        "args": copy.deepcopy(arguments),
+                    }
+                )
+        if self._rules is None:
             return item
         rule = self._rules.match(name, arguments)
         if rule is None:
@@ -714,7 +776,9 @@ class RolloutSession(HeadlessSession):
                     "rule": rule.name,
                     "recommendation": rule.recommendation,
                     "refused": refused,
-                    "scope": SUB_AGENT if inside_task_agent() else PARENT,
+                    "scope": PARENT if own else SUB_AGENT,
+                    "turn": self._turn if own else None,
+                    "place": place,
                 }
             )
         if not refused:
@@ -787,11 +851,20 @@ class RolloutSession(HeadlessSession):
             # The model is about to act for the first time.
             first, self._before_acting = self._before_acting, None
             first()
+        # The turn these calls are of: the assistant turn that made them is the
+        # latest in the conversation, and the tool log numbers turns from 0.
+        self._turn = sum(1 for turn in self.messages if turn.role is Role.ASSISTANT) - 1
+        self._prepared = 0
         # The time of a batch of tool calls is the commands' time.
         batch = self._meter.tool_batch() if self._meter is not None else contextlib.nullcontext()
         with batch:
             try:
-                return super()._execute_tools(*args, **kwargs)
+                results, feedback = super()._execute_tools(*args, **kwargs)
+                results = self._sendable(results)
+                if self._max_result_chars is not None:
+                    calls = args[0] if args else kwargs.get("tool_calls") or []
+                    results = self._bounded(calls, results, self._max_result_chars)
+                return results, feedback
             finally:
                 # Let the environment finish stopping what the batch left behind,
                 # so a sandbox lost during it is known before the next model call.
@@ -799,14 +872,84 @@ class RolloutSession(HeadlessSession):
                 if callable(settle):
                     settle()
 
+    def _sendable(self, results: list[tuple[str, Any]]) -> list[tuple[str, Any]]:
+        """The results of one batch as a request body can carry them.
+
+        A tool can hand back half of a surrogate pair, which a model can write
+        as an escape.  Left in the conversation, the next request could not be
+        sent at all, and the run would end as a failure of the machinery over
+        a text the model chose.  Each half is replaced, the same way every
+        time, and ``prefix_events`` says which results that touched.
+        """
+        repaired: list[tuple[str, Any]] = []
+        touched: dict[str, int] = {}
+        for call_id, output in results:
+            sendable, halves = sendable_result(output)
+            if halves:
+                touched[str(call_id)] = halves
+            repaired.append((call_id, sendable))
+        if not touched:
+            return results
+        self.prefix_events.append(
+            {
+                "event": "unsendable_text_replaced",
+                "call_ids": list(touched),
+                "characters": sum(touched.values()),
+            }
+        )
+        return repaired
+
+    def _prepare_task_agent_wire(self, messages: list[dict[str, Any]], lane: Any) -> Any:
+        """A sub-agent's messages as a request body can carry them: the same
+        replacement, made on the way out, for what its own tools hand back and
+        for the prompt it was given."""
+        wire: list[dict[str, Any]] = super()._prepare_task_agent_wire(messages, lane)
+        sendable: list[dict[str, Any]] = []
+        for message in wire:
+            content, halves = sendable_result(message.get("content"))
+            sendable.append({**message, "content": content} if halves else message)
+        return sendable
+
+    def _bounded(
+        self, calls: list[dict[str, Any]], results: list[tuple[str, Any]], limit: int
+    ) -> list[tuple[str, Any]]:
+        """The results of one batch as they may enter the conversation: none
+        longer than *limit*, whatever tool it came from."""
+        tools = {
+            str(call.get("id")): str((call.get("function") or {}).get("name") or "").strip()
+            for call in calls
+        }
+        bounded: list[tuple[str, Any]] = []
+        # The results stand in the order of the calls, one for each.
+        for place, (call_id, output) in enumerate(results):
+            tool = tools.get(str(call_id), "")
+            if place < len(calls) and str(calls[place].get("id")) == str(call_id):
+                # Two calls with one id: each by its own name.
+                tool = str((calls[place].get("function") or {}).get("name") or "").strip()
+            cut, size = bound_result(tool, output, limit)
+            if size is not None:
+                self.results_cut.append(
+                    {
+                        "call_id": call_id,
+                        "tool": tool,
+                        "chars": size,
+                        "turn": self._turn,
+                        "place": place,
+                    }
+                )
+            bounded.append((call_id, cut))
+        return bounded
+
     def _run_agent(self, *args: Any, **kwargs: Any) -> str:
         call = self._agent_call
         # The sub-agent runs on a list that shows its tool calls to the log.
+        parent = kwargs.get("parent_call_id")
+        place: int | None = getattr(call, "place", None)
         if args:
-            args = (self.subagent_log.watch(args[0], kwargs.get("parent_call_id")), *args[1:])
+            args = (self.subagent_log.watch(args[0], parent, self._turn, place), *args[1:])
         elif "agent_turns" in kwargs:
             kwargs["agent_turns"] = self.subagent_log.watch(
-                kwargs["agent_turns"], kwargs.get("parent_call_id")
+                kwargs["agent_turns"], parent, self._turn, place
             )
         try:
             result = super()._run_agent(*args, **kwargs)
@@ -843,6 +986,7 @@ class RolloutSession(HeadlessSession):
     def _exec_task(self, item: dict[str, Any]) -> tuple[str, str]:
         call = self._agent_call
         call.outcome = None
+        call.place = item.get(_PLACE)
         try:
             call_id, result = super()._exec_task(item)
         except GenerationCancelled:
@@ -934,8 +1078,10 @@ def _snapshot(session: Any) -> dict[str, Any]:
         "subagents_refused": session.subagents_refused,
         "subagent_failures": _plain(list(session.subagent_failures)),
         "rule_events": _plain(list(session.rule_events)),
+        "calls_as_run": _plain(list(session.calls_as_run)),
         "subagent_tool_log": session.subagent_log.entries(),
         "subagent_parents": session.subagent_log.agents(),
+        "results_cut": _plain(list(session.results_cut)),
     }
 
 
@@ -949,8 +1095,10 @@ _EMPTY_SNAPSHOT: dict[str, Any] = {
     "subagents_refused": 0,
     "subagent_failures": [],
     "rule_events": [],
+    "calls_as_run": [],
     "subagent_tool_log": [],
     "subagent_parents": [],
+    "results_cut": [],
 }
 
 # Every way a rollout ends, and whose doing it is.  A state the model can bring
@@ -1409,6 +1557,7 @@ def _build_record(
             problems.append(f"could not read the session: {read_error}")
     snapshot = snapshot or dict(_EMPTY_SNAPSHOT)
     messages = snapshot["messages"]
+    _annotate_tool_log(snapshot)
     assistant_turns = sum(1 for m in messages if m.get("role") == "assistant")
     if session is not None and assistant_turns != len(accepted):
         problems.append(
@@ -1516,8 +1665,17 @@ def _build_record(
         },
         # The limits the run was under, each with where its value came from.
         "limits": {
-            name: {"value": lim.value, "source": lim.source} for name, lim in limits.items()
+            **{name: {"value": lim.value, "source": lim.source} for name, lim in limits.items()},
+            "max_tool_result_chars": {
+                "value": config.max_tool_result_chars,
+                "source": OVERRIDE
+                if config.max_tool_result_chars is not None
+                else "not set: each tool's own bound applies",
+            },
         },
+        # The tool results that were cut to ``max_tool_result_chars``: how
+        # many, and for each the tool and the characters it had.
+        "tool_results": _cut_results(snapshot),
         "logprobs": logprobs,
         # The server's version before the first model call and after the last;
         # ``None`` when the run was given no address to ask.
@@ -1596,7 +1754,7 @@ def _build_record(
             "calls": [c.summary() for c in side],
             # Every tool call a sub-agent issued, sub-agent by sub-agent: they
             # acted in the same sandbox and are not in the session's tool log.
-            "tool_log": _delegated_calls(snapshot, messages),
+            "tool_log": _delegated_calls(snapshot),
         },
         "text": None,
         "sandbox": sandbox.describe(),
@@ -1605,7 +1763,7 @@ def _build_record(
         "acts_on_host": bool(state.get("acts_on_host")),
         # The pattern rules in force (name and a hash of their content) and
         # every call one of them matched.
-        "rules": _rules_record(state.get("rules"), snapshot, messages),
+        "rules": _rules_record(state.get("rules"), snapshot),
     }
     if config.keep_text:
         record["text"] = [c.raw_text for c in accepted]
@@ -1793,62 +1951,95 @@ def _keep(sandbox: Sandbox, seconds: float) -> None:
         log.warning("rollout.keep_for_failed", error=str(error)[:200])
 
 
-def _logged_call_ids(messages: list[dict[str, Any]]) -> list[Any]:
-    """The ids of the session's own tool calls in the order the model made
-    them, which is the order of its tool log."""
-    return [
-        call.get("id")
-        for message in messages
-        if message.get("role") == "assistant"
-        for call in message.get("tool_calls") or []
-    ]
+def _annotate_tool_log(snapshot: dict[str, Any]) -> None:
+    """Say on each entry of the session's tool log what the run noted of its
+    call: the rule that matched it (``rule``, ``rule_says``), the sub-agent it
+    started (``agent``), the size its result had before it was cut
+    (``cut_from``); and name the call as it ran where that is another call
+    than the model's words spell (``tool``, ``args``).
+
+    Everything is joined by the call's place: its turn, and which of that
+    turn's calls it is.  An entry names the session's turn that made its
+    call, and the entries of one turn stand in the order of that turn's
+    calls, which is the order the calls were prepared in.  So an entry is
+    joined with its own call and with no other, whatever ids a server gives:
+    the same in every reply, or the same to two calls of one reply.  A call
+    that has no entry (the calls of a reply that was cut, which never ran)
+    was never prepared and has no note either.
+    """
+    entries: list[dict[str, Any]] = snapshot["tool_log"]
+
+    def placed(notes: list[dict[str, Any]]) -> dict[Any, dict[str, Any]]:
+        return {
+            (note.get("turn"), note.get("place")): note
+            for note in notes
+            if note.get("scope", PARENT) == PARENT and note.get("place") is not None
+        }
+
+    rules = placed(snapshot["rule_events"])
+    sizes = placed(snapshot["results_cut"])
+    ran = placed(snapshot["calls_as_run"])
+    started = {
+        (parent.get("turn"), parent.get("place")): number
+        for number, parent in enumerate(snapshot["subagent_parents"])
+        if parent.get("place") is not None
+    }
+    seen: dict[Any, int] = {}
+    for entry in entries:
+        turn = entry.get("turn")
+        if not isinstance(turn, int) or isinstance(turn, bool):
+            continue
+        key = (turn, seen.get(turn, 0))
+        seen[turn] = key[1] + 1
+        if key in rules:
+            entry["rule"] = rules[key]["rule"]
+            entry["rule_says"] = rules[key]["recommendation"]
+        if key in sizes:
+            entry["cut_from"] = sizes[key]["chars"]
+        if key in ran:
+            entry["tool"], entry["args"] = ran[key]["tool"], ran[key]["args"]
+        if entry.get("tool") == "task_agent" and key in started:
+            entry["agent"] = started[key]
 
 
-def _delegated_calls(
-    snapshot: dict[str, Any], messages: list[dict[str, Any]]
-) -> list[dict[str, Any]]:
-    """The sub-agents' tool calls for the record, tied to the session's own log.
+def _delegated_calls(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
+    """The sub-agents' tool calls for the record.
 
-    Each sub-agent has a number, the order it was started in.  The entry of
-    the session's tool log that started it is given that number (``agent``),
-    and so is every call the sub-agent issued; a call a rule matched names the
-    rule, as in the session's log.
+    Each sub-agent has a number, the order it was started in, which every
+    call it issued carries (``agent``); the entry of the session's tool log
+    that started it is given the same number (:func:`_annotate_tool_log`).  A
+    call a rule matched names the rule, as in the session's log.
     """
     calls: list[dict[str, Any]] = snapshot["subagent_tool_log"]
-    call_ids = _logged_call_ids(messages)
-    log_entries: list[dict[str, Any]] = snapshot["tool_log"]
-    if len(call_ids) == len(log_entries):
-        waiting: dict[Any, list[int]] = {}
-        for number, parent in enumerate(snapshot["subagent_parents"]):
-            waiting.setdefault(parent, []).append(number)
-        for call_id, entry in zip(call_ids, log_entries, strict=True):
-            if entry.get("tool") == "task_agent" and waiting.get(call_id):
-                entry["agent"] = waiting[call_id].pop(0)
     matched = {e["call_id"]: e for e in snapshot["rule_events"] if e["scope"] == SUB_AGENT}
+    ran = {c["call_id"]: c for c in snapshot["calls_as_run"] if c["scope"] == SUB_AGENT}
     for call in calls:
         event = matched.get(call["call_id"])
         if event is not None:
             call["rule"] = event["rule"]
             call["rule_says"] = event["recommendation"]
+        as_run = ran.get(call["call_id"])
+        if as_run is not None:
+            # The call as it ran, where the sub-agent's model spelled another.
+            call["tool"], call["args"] = as_run["tool"], as_run["args"]
     return calls
 
 
-def _rules_record(
-    rules: RuleSet | None, snapshot: dict[str, Any], messages: list[dict[str, Any]]
-) -> dict[str, Any] | None:
+def _cut_results(snapshot: dict[str, Any]) -> dict[str, Any]:
+    """The tool results that were cut to the bound on one result, for the
+    record."""
+    cuts: list[dict[str, Any]] = snapshot["results_cut"]
+    return {"cut": len(cuts), "cuts": [{"tool": c["tool"], "chars": c["chars"]} for c in cuts]}
+
+
+def _rules_record(rules: RuleSet | None, snapshot: dict[str, Any]) -> dict[str, Any] | None:
     if rules is None:
         return None
-    events: list[dict[str, Any]] = snapshot["rule_events"]
-    # The tool log holds the session's own calls in the order the model made
-    # them; name the rule on the entry of each call one matched.
-    call_ids = _logged_call_ids(messages)
-    log_entries: list[dict[str, Any]] = snapshot["tool_log"]
-    if len(call_ids) == len(log_entries):
-        by_id = {e["call_id"]: e for e in events if e["scope"] == PARENT}
-        for call_id, entry in zip(call_ids, log_entries, strict=True):
-            if call_id in by_id:
-                entry["rule"] = by_id[call_id]["rule"]
-                entry["rule_says"] = by_id[call_id]["recommendation"]
+    # The session's turn and the call's place in it are kept on an event to
+    # find its entry of the tool log by; the record names a call by its id.
+    events = [
+        {k: v for k, v in e.items() if k not in ("turn", "place")} for e in snapshot["rule_events"]
+    ]
     return {**rules.identity(), "events": events}
 
 
@@ -1903,6 +2094,14 @@ def effective_config(
             f"server_stall_seconds must be above zero, not {config.server_stall_seconds}: at "
             "zero every time limit that passes during a model call would be the server's "
             "doing, and a model could leave a run that way"
+        )
+    if config.max_tool_result_chars is not None and (
+        config.max_tool_result_chars < MIN_RESULT_CHARS
+    ):
+        raise SetupError(
+            f"max_tool_result_chars must be at least {MIN_RESULT_CHARS}, not "
+            f"{config.max_tool_result_chars}: a cut result says what was left out and how to "
+            "get it, and that takes room"
         )
     sampling = resolve_sampling(
         model=config.model,
@@ -2136,6 +2335,7 @@ def run_episode(
                     rules=state["rules"],
                     allow_host_execution=allow_host_execution,
                     meter=meter,
+                    max_result_chars=config.max_tool_result_chars,
                     before_acting=before_acting,
                 )
                 state["session"] = session

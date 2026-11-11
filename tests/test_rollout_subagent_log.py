@@ -223,7 +223,21 @@ class TestTheLog:
         turns[len(turns) - 1] = Turn.tool("c1", "a.txt", is_error=True)
         (entry,) = log.entries()
         assert entry["result"] == "a.txt" and entry["ok"] is False
-        assert log.agents() == ["parent-1"]
+        assert log.agents() == [{"call_id": "parent-1", "turn": None, "place": None}]
+
+    def test_a_sub_agent_is_known_by_the_sessions_call_that_started_it(self):
+        """The call's id, the session's turn that made it and which of that turn's
+        calls it is: two turns can make a call with the same id, where a server
+        numbers the calls of each reply anew, and so can two calls of one turn."""
+        log = self._log()
+        log.watch([], "call_0", 0, 1)
+        log.watch([], "call_0", 3, 0)
+        log.watch([], "call_0", 3, 2)
+        assert log.agents() == [
+            {"call_id": "call_0", "turn": 0, "place": 1},
+            {"call_id": "call_0", "turn": 3, "place": 0},
+            {"call_id": "call_0", "turn": 3, "place": 2},
+        ]
 
     def test_the_turn_is_the_sub_agents_own_count(self):
         log = self._log()

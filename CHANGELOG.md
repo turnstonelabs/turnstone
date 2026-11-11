@@ -233,6 +233,24 @@ The separate `dev` branch is retired. See [the release process](docs/releasing.m
   a rule refused, a tool the sub-agent is not offered). The session's
   `tool_log` entry of a delegation carries the sub-agent's number beside what
   was asked of it. See [the rollout guide](docs/rollout.md#sub-agents).
+- **Rollouts: one bound on the size of a single tool result.** The tools bound
+  their results each in their own way and some not at all: a file read came
+  whole up to 256 KiB, a sub-agent's answer and a server tool's result without
+  any bound, a command's output at half the truncation setting and never under
+  32,000 characters. `RolloutConfig.max_tool_result_chars`
+  (`--max-tool-result-chars`) is one bound in characters that no single result
+  exceeds when it enters the session's conversation, whatever the tool. A
+  longer result is cut the same way every time, so the prompt still extends,
+  and the cut says what was left out and how to get it: a file read keeps whole
+  lines and names the line to read on from with `offset` and `limit`, anything
+  else keeps its beginning and its end around a counted gap with the tool's own
+  advice. The record has the bound with the other limits, counts the results
+  that were cut (`tool_results`), and the tool log gives the size a cut result
+  had (`cut_from`). Unset, nothing changes. With the bound or without it, half
+  of a surrogate pair in a tool result is replaced where the result enters the
+  conversation: no request body can carry one, and the next request could not
+  have been sent. See
+  [the rollout guide](docs/rollout.md#one-bound-on-a-tool-result).
 
 ### Fixed
 

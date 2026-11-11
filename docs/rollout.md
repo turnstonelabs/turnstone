@@ -243,7 +243,7 @@ setting's registered default:
 | Context window | `context_window`, `--context-window` | the model's `context_window`, else `[model] context_window`, else what the model's endpoint reports for that model | the rollout is refused |
 | Time one tool call may take | `tool_timeout`, `--tool-timeout` | `[tools] timeout` | 120 s |
 | Turns one sub-agent may take | `subagent_max_turns`, `--subagent-max-turns` | `[tools] agent_max_turns` | -1, no limit |
-| Characters of a command's output the model gets | `max_output_chars`, `--max-output-chars` | `[tools] truncation` | 0, the framework's automatic share of the remaining context |
+| The truncation setting, which bounds a command's output | `max_output_chars`, `--max-output-chars` | `[tools] truncation` | 0, the framework's automatic share of the remaining context |
 
 The configuration file is the one every Turnstone command reads (`--config`,
 `TURNSTONE_CONFIG`). A server's database is not read: a rollout runs in its own
@@ -277,6 +277,7 @@ model's outcome:
   | `max_subagents` | 0, which lets a run start none |
   | `temperature` | 0 |
   | `server_stall_seconds`, `min_tokens_per_second`, `min_prompt_tokens_per_second`; the task's `timeout`, `max_generated_tokens` and `max_command_seconds`; the verifier's time limit (`verifier_timeout`, `--verifier-timeout`) | anything above 0 |
+  | `max_tool_result_chars` | 1,000 |
 
   A value below its least in the configuration file is passed over, as the
   framework passes it over, and the next source in the order above decides.
@@ -317,7 +318,11 @@ from (`sampling`), and beside it what the requests themselves carried
 These are the rollout's own, because they are the task's: the number of turns
 (`Task.max_turns`, 15), the time (`Task.timeout`, 300 s), the number of
 sub-agents (`RolloutConfig.max_subagents`, 16), and the
-[budgets](#budgets-of-the-models-own) a task may give the model.
+[budgets](#budgets-of-the-models-own) a task may give the model. One more is
+the rollout's own because the framework has no such setting: the
+[bound on a single tool result](#one-bound-on-a-tool-result)
+(`RolloutConfig.max_tool_result_chars`, `--max-tool-result-chars`), which is
+not set unless a run sets it.
 
 `Task.timeout` bounds the session run, sub-agents included, to the next whole
 second. It starts when the sandbox is up: bringing it up, a sidecar's setup and
@@ -1129,15 +1134,75 @@ A rollout offers no MCP tool of a server configured on this machine, and none
 can be reached: the only MCP client a rollout ever has is the one built for its
 task's [sidecar](#a-tasks-own-servers-the-sidecar).
 
-Two limits apply to what a tool returns. A command's output is cut when it is
-produced, head and tail kept, to the framework's truncation setting
-(`max_output_chars`). A file tool reads a
-file of up to `max_read_bytes` (`--max-read-bytes`, 256 KiB by default) whole;
-a larger one is an error that says so, never a shortened text.
+What bounds a tool's result is each tool's own affair, and a rollout can put
+one bound over all of them: see
+[one bound on a tool result](#one-bound-on-a-tool-result), which also lists
+what bounds each kind of result without it. A file tool reads a file of up to
+`max_read_bytes` (`--max-read-bytes`, 256 KiB by default) whole; a larger one
+is an error that says so, never a shortened text.
 
 Not yet handled: the exit of a background shell is not announced to the model in
 a headless run, although the tool description says a notice follows. The model
 has to ask with `bash_output`.
+
+### One bound on a tool result
+
+A rollout has a cap on its whole length, and one tool result must not be able to
+use it up. The tools bound their results each in their own way, and some not at
+all:
+
+| Result | What bounds it without this setting |
+|--------|-------------------------------------|
+| A command's output (`bash`), a file comparison (`diff_file`) | The rendering of a bounded capture: half of `max_output_chars`, and never less than 32,000 characters. With the automatic setting and a window of 262,144 tokens that is 104,858 characters |
+| The output of a background shell (`bash_output`) | Whole lines up to `max_output_chars`; with the automatic setting, up to a fifth of the context that is left |
+| A file (`read_file`) | The whole file up to `max_read_bytes` (256 KiB), with line numbers on top; a larger file is an error |
+| A search | 32,768 characters |
+| What a sub-agent hands back (`task_agent`) | Its whole last reply, so its reply limit |
+| A tool of the task's own servers | Whatever the server sends |
+| An error | As a rule short; an edit whose text matches more than once quotes the lines it matched, however long |
+| A result inside a sub-agent | 16,000 characters, the beginning kept |
+
+`RolloutConfig.max_tool_result_chars` (`--max-tool-result-chars`) is one bound
+for all of them, in characters, applied where a result enters the session's
+conversation: no single result is longer, whatever the tool. Unset, nothing
+changes.
+
+A longer result is cut, the same way every time, so the same call gives the same
+text and the prompt still extends. The cut says what was left out and how to get
+it:
+
+- A file read keeps whole lines from its start and ends with
+  `[read_file: the result stops after line 55. 121307 of its 122892 characters
+  are left out: one tool result holds at most 2000. Read on with offset=56 and a
+  limit.]`
+- Any other result keeps its beginning and its end, where a command says how it
+  went, around `[... 22052 of 23892 characters left out here: one tool result
+  holds at most 2000. Narrow the command, or send its output to a file and read
+  part of it. ...]`. The advice is the tool's: a narrower query for a search,
+  fewer items or a page at a time for a server's tool, a shorter answer or a
+  file for a sub-agent. A command's count is of everything the command wrote.
+
+The record has the bound with the other limits (`limits.max_tool_result_chars`)
+and counts the results that were cut (`tool_results.cut`, with each one's tool
+and size under `tool_results.cuts`); the tool log gives the size a cut result
+had (`cut_from`). A cut result is text from the environment like any other: the
+rollout stays trainable.
+
+Inside a sub-agent the framework's own bound applies as before; this one is on
+what the sub-agent hands back. The bound is at least 1,000 characters: saying
+what was cut takes room, and a smaller one is refused before anything runs.
+
+One thing is done to every tool result, with the bound or without it. A tool
+can hand back half of a surrogate pair, which a model can write as an escape
+in an argument. No request body can carry one, so the next request could not
+be sent at all, and the run would end as `error` over a text the model chose.
+Each half is replaced by the replacement character (U+FFFD) where the result
+enters the conversation, the same way every time; two halves that stand
+together become the character they spell. What the model is sent is what
+`messages` and the tool log hold, the call's own arguments stay as the model
+wrote them, and `prefix_events` gets `unsendable_text_replaced` with the ids
+of the calls and the number of halves. A sub-agent's prompt and its own tool
+results are repaired the same way on their way to the server.
 
 ### Rules on tool calls
 
@@ -1161,7 +1226,9 @@ main argument, an object that was never closed gives up the value it holds),
 reads a null spelled as text as no value, and writes plain dashes and quotes
 for typographic ones in a command. A rule sees what comes out of that: `kill`
 with an en dash before `9` is judged, and refused, as the `kill -9` it would
-run as. `rules.events` names the tool by the name it runs under.
+run as. `rules.events` names the tool by the name it runs under, and the two
+tool logs (`tool_log`, `subagents.tool_log`) hold the same call: `tool` and
+`args` are what ran. What the model wrote is in `messages`.
 
 A refused call is the model's doing: the rollout stays trainable. The tool log
 names the rule on the call's entry (`rule`, `rule_says`), a sub-agent's call
@@ -1707,7 +1774,8 @@ whose value does not apply is `null`.
 | `generated_tokens` | Tokens the session itself generated |
 | `final_content` | The text of the session's last assistant turn, `""` when it had none |
 | `messages` | The system prompt and the final conversation, one entry per message: `role` and `content`; on an assistant turn also `reasoning` (the turn's reasoning as text, `null` where it had none) and, where the turn made calls, `tool_calls` (each `id`, `type` and `function` with `name` and `arguments`); on a tool result `tool_call_id`. What the session keeps on a turn for itself, under keys that begin with an underscore, is left out. A tool call's arguments are the text the model wrote for each, as they are sent back |
-| `tool_log` | The session's tool calls in order, each `tool`, `args` (as the tool got them), `result` (first 500 characters), `ok`, `turn`, for a call a rule matched `rule` and `rule_says`, and on the call that started a sub-agent `agent`, the number that sub-agent's calls carry in `subagents.tool_log` |
+| `tool_log` | The session's tool calls in order, each `tool`, `args` (as the tool got them), `result` (first 500 characters), `ok`, `turn`, for a call a rule matched `rule` and `rule_says`, on the call that started a sub-agent `agent`, the number that sub-agent's calls carry in `subagents.tool_log`, and on a result that was cut to the [bound on one result](#one-bound-on-a-tool-result) `cut_from`, the characters it had. Each of these is noted call by call, whatever became of the run's other calls. The calls of a reply the run ended on (a reply cut at a limit) never ran and have no entry; a call over the number that run in one turn has an entry that says it was not run. A call that was running when the time limit passed has its entry too, where the session stopped within the ten seconds it is given, with what the session noted of it then: `Cancelled by user. Outcome UNKNOWN ...` and `ok: false`, or for a delegation `(task cancelled by user before completion) ...`, where `ok` is `true` although the sub-agent did not finish (the framework reports a cancelled delegation that way; read the result). That result is also the last message of `messages`, a tool result the model never saw |
+| `tool_results` | The results that were cut to that bound: how many (`cut`), and for each its `tool` and the `chars` it had (`cuts`) |
 | `usage` | The session's own token counts as the server reported them: `prompt`, `completion`; both 0 in a run that did not start |
 | `tokens` | The token record, below |
 | `prefix_ok`, `prefix_breaks` | The token-level prefix check: whether it held, and one readable line per break |
@@ -1715,7 +1783,7 @@ whose value does not apply is `null`.
 | `calls` | One summary per model call of the session that ended normally, in order: `index`, `scope`, `streamed`, `request` (`model`, the count of `messages`, their `roles`, the names of the `tools`, the `sampling` keywords, the `extra_body`), `finish_reason`, `usage`, `complete`, `error`, `aligned`, `misaligned_chunks`, `ids_checked`, `chunks`, `seconds`, `longest_silence`, `problems` |
 | `discarded_calls` | The session's calls that did not end normally (cut by the time limit, failed, or broken off and issued again), the same keys with `prompt_token_ids`, `token_ids` and `logprobs`; `index` as in `calls` |
 | `text` | With `keep_text`, each call's generated text; otherwise `null` |
-| `limits` | `max_tokens`, `context_window`, `tool_timeout`, `subagent_max_turns`, `max_output_chars`, each `{"value": ..., "source": "..."}` |
+| `limits` | `max_tokens`, `context_window`, `tool_timeout`, `subagent_max_turns`, `max_output_chars`, `max_tool_result_chars`, each `{"value": ..., "source": "..."}` |
 | `sampling` | Below |
 | `logprobs` | Which log-probabilities the server reports: `sampler_logprobs` (`true`, `false` or `null`), `reflects` (the same per setting: `temperature`, `top_k`, `top_p`), `reason`, and from a probe `tried` and `positions` |
 | `token_id_check` | `"required"` or `"not required"` |
@@ -1753,6 +1821,7 @@ from 0, as `tool_log[].turn` does:
 | `tool_calls_over_limit` | `turn`, `calls`, `limit` | The turn made `calls` tool calls and the first `limit` ran. The others stay in the turn and got a result that says they were not run |
 | `ended_at_length` | `turn` | The turn's reply was cut at a limit with a tool call in it. The run ended there and the call did not run |
 | `compaction_skipped` | none | Something asked for the conversation to be shortened to a summary, which a run with a stable prefix does not do |
+| `unsendable_text_replaced` | `call_ids`, `characters` | The results of these calls held half of a surrogate pair, `characters` of them together, which were replaced (see [one bound on a tool result](#one-bound-on-a-tool-result)) |
 
 `logprobs.tried` and `logprobs.positions`, from a probe:
 
@@ -1997,8 +2066,9 @@ What a user of the harness has to know, in one place:
 The container tests (`tests/test_rollout_container.py`,
 `tests/test_rollout_verification.py`, `tests/test_rollout_sidecar.py`, one
 class of `tests/test_rollout_rules.py`, two of
-`tests/test_rollout_preparation.py` and one of
-`tests/test_rollout_verifier_command.py`) need a container runtime and an image,
+`tests/test_rollout_preparation.py` and one each of
+`tests/test_rollout_verifier_command.py` and
+`tests/test_rollout_result_bound.py`) need a container runtime and an image,
 so they skip where they are missing. CI runs those files in their own lane
 (`test-rollout-container`), which pulls the image by digest and sets
 `TURNSTONE_ROLLOUT_REQUIRE_CONTAINER=1`, so that a missing runtime or image

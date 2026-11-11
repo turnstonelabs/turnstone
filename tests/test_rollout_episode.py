@@ -1957,6 +1957,18 @@ class TestWhatEndedTheRunInWords:
         assert cut["finish_state"] == "length"
         assert cut["error"] == "the last reply reached the reply limit of 32,768 tokens"
 
+    def test_a_reply_cut_at_what_the_token_budget_had_left(self):
+        """The budget was reached by a cut reply, not found used up before a request."""
+        script = [self.LOOP[0], {"reasoning": "x" * 400, "tool_calls": [CUT_CALL]}]
+        with ScriptedChatServer(script, keep_reply_limit=True) as server:
+            first = len(_generated(server, script[0]))
+            task = Task(prompt="loop", max_generated_tokens=first + 40)
+            record, _box = _run(server, task=task, min_tokens_per_second=1e6)
+        assert record["finish_state"] == "token_budget" and record["turns"] == 2
+        assert record["error"] == (
+            "the last reply was cut at the 40 tokens the budget of generated tokens had left"
+        )
+
     def test_a_sandbox_that_is_gone(self):
         class Gone(_DirSandbox):
             def put_files(self, files: dict[str, str]) -> None:
@@ -1991,6 +2003,273 @@ class TestWhatEndedTheRunInWords:
             "the last reply ended in a way the harness does not know "
             "(finish reason 'content_filter')"
         )
+
+
+class _SameIdsEveryReply(ScriptedChatServer):
+    """A server that numbers the tool calls of every reply from the same start,
+    so the first call of each turn has the id the first call of the last had."""
+
+    def _pieces(self, step: Any, calls: Any, finish: str, call_index: int) -> Any:
+        return super()._pieces(step, calls, finish, 0)
+
+
+class _OneIdForAReplysCalls(ScriptedChatServer):
+    """A server that gives every tool call of one reply the same id."""
+
+    def _pieces(self, step: Any, calls: Any, finish: str, call_index: int) -> Any:
+        pieces = super()._pieces(step, calls, finish, call_index)
+        for _tokens, delta in pieces:
+            for header in delta.get("tool_calls") or []:
+                if "id" in header:
+                    header["id"] = f"call_{call_index}"
+        return pieces
+
+
+class TestWhatTheToolLogSaysOfACall:
+    """``rule``, ``rule_says``, ``agent`` and ``cut_from`` on the entries of the
+    session's tool log are joined call by call.  A reward may read them."""
+
+    REVIEWED = {"name": "bash", "arguments": {"command": "git clean -fdx; echo ran"}}
+    BIG = NL.join(f"line {n} of the big file" for n in range(1, 400)) + NL
+
+    def _run(
+        self, server: ScriptedChatServer, *, token_budget: int | None = None, **config: Any
+    ) -> dict[str, Any]:
+        # A command a rule matches is only noted here, never run.
+        box = _NotingSandbox()
+        settings = {"base_url": server.base_url, "model": "scripted", **SAMPLED, **config}
+        task = Task(prompt="work", setup_files={"big.txt": self.BIG})
+        task.max_generated_tokens = token_budget
+        return run_episode(task, RolloutConfig(**settings), sandbox_factory=lambda _t, _c: box)
+
+    def test_the_same_ending_at_the_token_budget(self):
+        script = [
+            {"tool_calls": [self.REVIEWED]},
+            {"reasoning": "x" * 400, "tool_calls": [CUT_CALL]},
+        ]
+        with ScriptedChatServer(script, keep_reply_limit=True) as server:
+            first = len(_generated(server, script[0]))
+            record = self._run(server, min_tokens_per_second=1e6, token_budget=first + 100)
+        assert record["finish_state"] == "token_budget" and record["trainable"] is True
+        (reviewed,) = record["tool_log"]
+        assert reviewed["rule"] == "destructive-git" and reviewed["rule_says"] == "review"
+
+    def test_calls_of_two_turns_with_the_same_id_are_told_apart(self):
+        """A server may give the calls of every reply the same ids.  The turn tells
+        the two calls apart: the rule is named on the one it matched."""
+        script = [
+            {"tool_calls": [{"name": "bash", "arguments": {"command": "echo fine"}}]},
+            {"tool_calls": [self.REVIEWED]},
+            {"tool_calls": [{"name": "read_file", "arguments": {"path": "big.txt"}}]},
+            {"tool_calls": [{"name": "bash", "arguments": {"command": "echo fine"}}]},
+            {"content": "ok"},
+        ]
+        with _SameIdsEveryReply(script) as server:
+            record = self._run(server, max_tool_result_chars=1000)
+        ids = [m["tool_call_id"] for m in record["messages"] if m["role"] == "tool"]
+        assert len(set(ids)) == 1 and len(ids) == 4
+        plain, reviewed, read, again = record["tool_log"]
+        assert reviewed["rule"] == "destructive-git" and "cut_from" in read
+        for entry in (plain, again):
+            assert "rule" not in entry and "cut_from" not in entry
+        assert "rule" not in read and "cut_from" not in reviewed
+
+    def test_two_calls_of_one_turn_with_the_same_id_are_told_apart(self):
+        """An id does not say which call it is.  Joined by the id within the
+        turn, what was noted of the later call stood on the entry of the
+        earlier one: the rule, and the size of the result that was cut."""
+        script = [
+            {
+                "tool_calls": [
+                    {"name": "bash", "arguments": {"command": "echo fine"}},
+                    self.REVIEWED,
+                    {"name": "read_file", "arguments": {"path": "big.txt"}},
+                ]
+            },
+            {"content": "ok"},
+        ]
+        with _OneIdForAReplysCalls(script) as server:
+            record = self._run(server, max_tool_result_chars=1000)
+        ids = [call["id"] for call in record["messages"][2]["tool_calls"]]
+        assert len(ids) == 3 and len(set(ids)) == 1
+        plain, reviewed, read = record["tool_log"]
+        assert "rule" not in plain and "cut_from" not in plain
+        assert reviewed["rule"] == "destructive-git" and "cut_from" not in reviewed
+        assert read["cut_from"] > len(self.BIG) and "rule" not in read
+        assert record["tool_results"]["cuts"] == [{"tool": "read_file", "chars": read["cut_from"]}]
+
+    def test_an_entry_is_joined_with_its_own_call_and_no_other(self):
+        from turnstone.rollout.episode import _annotate_tool_log
+
+        entries = [
+            {"tool": "bash", "turn": 0},
+            {"tool": "task_agent", "turn": 0},
+            # An entry of a call nothing was noted of: a third of its turn.
+            {"tool": "bash", "turn": 0},
+            {"tool": "bash", "turn": 2},
+            {"tool": "task_agent", "turn": 2},
+            # Entries of a turn nothing was noted in, and of no turn.
+            {"tool": "bash", "turn": 9},
+            {"tool": "bash"},
+        ]
+        event = {"tool": "bash", "rule": "r", "recommendation": "review", "refused": False}
+        # Every call here has the id ``a``: the place alone tells them apart.
+        snapshot = {
+            "tool_log": entries,
+            "rule_events": [
+                {**event, "call_id": "a", "scope": "parent", "turn": 2, "place": 0},
+                # A call that has no entry, the call of a turn that was cut,
+                # costs the others nothing.
+                {**event, "call_id": "a", "scope": "parent", "turn": 3, "place": 0},
+                # A sub-agent's call is not one of the session's.
+                {**event, "call_id": "a", "scope": "sub_agent", "turn": None, "place": None},
+            ],
+            "results_cut": [
+                {"call_id": "a", "tool": "bash", "chars": 4000, "turn": 0, "place": 0},
+                {"call_id": "a", "tool": "bash", "chars": 9000, "turn": 0, "place": 2},
+            ],
+            "subagent_parents": [
+                {"call_id": "a", "turn": 2, "place": 1},
+                {"call_id": "a", "turn": 0, "place": 1},
+            ],
+            "calls_as_run": [
+                {
+                    "call_id": "a",
+                    "scope": "parent",
+                    "turn": 0,
+                    "place": 0,
+                    "tool": "bash",
+                    "args": {"c": 1},
+                },
+                {
+                    "call_id": "a",
+                    "scope": "sub_agent",
+                    "turn": None,
+                    "place": None,
+                    "tool": "x",
+                    "args": {},
+                },
+            ],
+        }
+        _annotate_tool_log(snapshot)
+        assert entries == [
+            {"tool": "bash", "turn": 0, "cut_from": 4000, "args": {"c": 1}},
+            {"tool": "task_agent", "turn": 0, "agent": 1},
+            {"tool": "bash", "turn": 0, "cut_from": 9000},
+            {"tool": "bash", "turn": 2, "rule": "r", "rule_says": "review"},
+            {"tool": "task_agent", "turn": 2, "agent": 0},
+            {"tool": "bash", "turn": 9},
+            {"tool": "bash"},
+        ]
+
+
+def _generated(server: ScriptedChatServer, step: dict[str, Any]) -> list[int]:
+    """The tokens the scripted server generates for *step*."""
+    calls = [
+        (c["name"], c.get("arguments", {}), c.get("raw")) for c in step.get("tool_calls") or []
+    ]
+    pieces = server._pieces(step, calls, "tool_calls" if calls else "stop", 0)
+    return [token for ids, _delta in pieces for token in ids]
+
+
+class TestTheLogsNameTheCallThatRan:
+    """``tool`` and ``args`` of a log entry are the call as the tool got it.  The
+    session writes a typographic dash in a command as a plain one, strips white
+    space off a tool's name and makes arguments of text that is no JSON; a
+    reward that reads the log for what a rollout did must see what ran.
+
+    The commands are harmless and go to the sandbox that starts nothing."""
+
+    EN_DASH = chr(0x2013)
+
+    def _run(self, script: list[dict[str, Any]], **options: Any) -> tuple[dict[str, Any], Any]:
+        box = _NotingSandbox()
+        agent_script = options.pop("agent_script", None)
+        with ScriptedChatServer(script, agent_script=agent_script) as server:
+            settings = {"base_url": server.base_url, "model": "scripted", **SAMPLED, **options}
+            record = run_episode(
+                Task(prompt="work"), RolloutConfig(**settings), sandbox_factory=lambda _t, _c: box
+            )
+        return record, box
+
+    def _calls(self) -> list[dict[str, Any]]:
+        return [
+            {"name": "bash", "arguments": {"command": f"echo {self.EN_DASH}n dashed"}},
+            {"name": " bash ", "arguments": {"command": "echo named"}},
+            {"name": "bash", "arguments": "echo bare"},
+            {"name": "bash", "arguments": '{"command": "echo open", "timeout": '},
+            {"name": "bash", "arguments": {"command": "echo plain"}},
+        ]
+
+    RAN = ["echo -n dashed", "echo named", "echo bare", "echo open", "echo plain"]
+
+    @pytest.mark.parametrize("rules", ["shipped", None])
+    def test_the_sessions_log(self, rules):
+        record, box = self._run([{"tool_calls": self._calls()}, {"content": "ok"}], rules=rules)
+        assert box.environment.commands == self.RAN
+        assert [(entry["tool"], entry["args"]) for entry in record["tool_log"]] == [
+            ("bash", {"command": command}) for command in self.RAN
+        ]
+        # The model's own words are in the conversation, as they are sent back.
+        written = record["messages"][2]["tool_calls"]
+        assert written[1]["function"]["name"] == " bash "
+        assert self.EN_DASH in written[0]["function"]["arguments"]
+
+    def test_a_sub_agents_log(self):
+        parent = [
+            {"tool_calls": [{"name": "task_agent", "arguments": {"prompt": "echo things"}}]},
+            {"content": "ok"},
+        ]
+        agent = [{"tool_calls": self._calls()}, {"content": "echoed"}]
+        record, box = self._run(parent, agent_script=agent)
+        assert box.environment.commands == self.RAN
+        assert [(call["tool"], call["args"]) for call in record["subagents"]["tool_log"]] == [
+            ("bash", {"command": command}) for command in self.RAN
+        ]
+
+    def test_a_delegation_under_a_name_with_white_space_is_still_tied_to_its_sub_agent(self):
+        parent = [
+            {"tool_calls": [{"name": "task_agent ", "arguments": {"prompt": "say so"}}]},
+            {"content": "ok"},
+        ]
+        record, _box = self._run(parent, agent_script=[{"content": "so"}])
+        (delegation,) = record["tool_log"]
+        assert delegation["tool"] == "task_agent" and delegation["agent"] == 0
+        assert delegation["args"] == {"prompt": "say so"} and delegation["result"] == "so"
+
+
+class TestTextNoRequestCanCarry:
+    """Half of a surrogate pair, which a model can write as an escape and a tool
+    can hand back.  No request body can carry it."""
+
+    LONE = chr(0xD800)
+    REPLACED = chr(0xFFFD)
+
+    def test_inside_a_sub_agent_it_does_not_end_the_run_either(self):
+        """A sub-agent's prompt and its own tool results go out the same way."""
+        path = "missing-" + self.LONE + ".txt"
+        parent = [
+            {"tool_calls": [{"name": "task_agent", "arguments": {"prompt": "Read " + path}}]},
+            {"content": "Delegated."},
+        ]
+        agent = [
+            {"tool_calls": [{"name": "read_file", "arguments": {"path": path}}]},
+            {"content": "not there"},
+        ]
+        box = _NotingSandbox()
+        with ScriptedChatServer(parent, agent_script=agent) as server:
+            config = RolloutConfig(base_url=server.base_url, model="scripted", **SAMPLED)
+            record = run_episode(Task(prompt="go"), config, sandbox_factory=lambda _t, _c: box)
+            first, second = server.agent_requests
+
+        assert record["finish_state"] == "completed" and record["trainable"] is True
+        assert record["subagents"]["failures"] == [] and record["subagents"]["model_calls"] == 2
+        replaced = "missing-" + self.REPLACED + ".txt"
+        assert first["messages"][-1] == {"role": "user", "content": "Read " + replaced}
+        assert [m["content"] for m in second["messages"] if m["role"] == "tool"] == [
+            "Error: " + replaced + " not found"
+        ]
+        assert record["tool_log"][0]["result"] == "not there"
 
 
 class TestCommand:

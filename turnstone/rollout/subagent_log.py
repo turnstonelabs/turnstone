@@ -70,13 +70,25 @@ class SubAgentLog:
         # session's call that started it, and its calls.
         self._agents: list[dict[str, Any]] = []
 
-    def watch(self, turns: list[Any], parent_call_id: str | None) -> list[Any]:
+    def watch(
+        self,
+        turns: list[Any],
+        parent_call_id: str | None,
+        parent_turn: int | None = None,
+        parent_place: int | None = None,
+    ) -> list[Any]:
         """A list to run a sub-agent on in place of *turns*: the same turns,
-        with what the sub-agent adds noted here."""
+        with what the sub-agent adds noted here.
+
+        *parent_call_id* is the id of the session's call that starts the
+        sub-agent, *parent_turn* the session's turn that made it and
+        *parent_place* which of that turn's calls it is."""
         with self._lock:
             agent: dict[str, Any] = {
                 "agent": len(self._agents),
                 "parent_call_id": parent_call_id,
+                "parent_turn": parent_turn,
+                "parent_place": parent_place,
                 "turn": -1,
                 "calls": [],
                 "by_id": {},
@@ -122,10 +134,19 @@ class SubAgentLog:
         agent["calls"].append(entry)
         agent["by_id"][call.id] = entry
 
-    def agents(self) -> list[str | None]:
-        """For each sub-agent started, the id of the session's call that started it."""
+    def agents(self) -> list[dict[str, Any]]:
+        """For each sub-agent started, in the order they were started, the
+        session's call that started it: its id (``call_id``), the turn that
+        made it (``turn``) and which of that turn's calls it is (``place``)."""
         with self._lock:
-            return [agent["parent_call_id"] for agent in self._agents]
+            return [
+                {
+                    "call_id": agent["parent_call_id"],
+                    "turn": agent["parent_turn"],
+                    "place": agent["parent_place"],
+                }
+                for agent in self._agents
+            ]
 
     def entries(self) -> list[dict[str, Any]]:
         """The calls so far, sub-agent by sub-agent, as JSON-safe copies."""
