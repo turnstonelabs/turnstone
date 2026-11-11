@@ -1282,12 +1282,17 @@ def _prepare_wire_for_lane(
     prepare_wire: Callable[[list[dict[str, Any]], ModelLane], list[dict[str, Any]]] | None,
     *,
     cfg: Any | None,
+    replay_reasoning: bool = False,
 ) -> list[dict[str, Any]]:
     """Apply caller lowering and the lane's final deterministic projection.
 
     Lowering failures retain only the exception class on the wrapper because a
     caller-owned error message can quote stored conversation content. The cause
     remains available to tracebacks without leaking through operator surfaces.
+
+    *replay_reasoning* attaches each assistant turn's reasoning text on a
+    Chat-Completions lane whatever the model definition says (see
+    :func:`model_turn`); otherwise the operator gates decide.
     """
     prepared = messages
     if prepare_wire is not None:
@@ -1297,6 +1302,11 @@ def _prepare_wire_for_lane(
             raise
         except Exception as prep_err:
             raise WirePreparationError(type(prep_err).__name__) from prep_err
+    if replay_reasoning:
+        from turnstone.core.providers._openai_chat import OpenAIChatCompletionsProvider
+
+        if isinstance(lane.provider, OpenAIChatCompletionsProvider):
+            return attach_vllm_chat_reasoning_field(prepared)
     return maybe_attach_vllm_chat_reasoning(
         prepared,
         lane.provider,
@@ -1435,6 +1445,7 @@ def model_turn(
     product_recovery: bool = False,
     on_completed: Callable[[UsageInfo | None], None] | None = None,
     admit_reissue: Callable[[], None] | None = None,
+    replay_reasoning: bool = False,
 ) -> ModelTurnResult:
     """Advance a trajectory by one model turn: lower, sample, re-ingest.
 
@@ -1574,6 +1585,16 @@ def model_turn(
     *admit_reissue* runs before each additional dispatch so an owner can
     charge its existing request limit without renewing deadlines.
 
+    *replay_reasoning* sends every earlier assistant turn's reasoning back
+    with the request whatever the model definition's
+    ``replay_reasoning_to_model`` and server type say: a Chat-Completions
+    lane gets the reasoning text field on each assistant message, and a lane
+    with a native reasoning shape gets its replay switched on where its
+    capabilities allow one.  It exists for a caller that needs each request
+    to extend the previous one exactly (the headless stable-prefix run);
+    a server that does not read the field ignores it.  ``False`` (the
+    default) leaves the decision with the operator's flags.
+
     *backend_auth_token* is a delegated-user or app-identity credential for a
     dynamically authenticated backend. When set, the call is issued on
     ``lane.client.with_options(api_key=...)`` — a copy that reuses the
@@ -1635,6 +1656,7 @@ def model_turn(
             lane,
             prepare_wire,
             cfg=cfg,
+            replay_reasoning=replay_reasoning,
         )
     # The effort assignment scheme's lower rungs: explicit relay → lane
     # (operator) → in-code model definition → None.  None/unset knobs are
@@ -1676,6 +1698,7 @@ def model_turn(
                 lane,
                 prepare_wire,
                 cfg=cfg,
+                replay_reasoning=replay_reasoning,
             )
             _raise_if_aborted(cancel_ref, lane)
         else:
@@ -1725,8 +1748,15 @@ def model_turn(
                     deferred_names=deferred_names,
                     cancel_ref=cancel_ref,
                     capabilities=lane.capabilities,
-                    replay_reasoning_to_model=resolve_replay_reasoning_to_model(
-                        lane.registry, lane.alias, caps=lane.capabilities, cfg=cfg
+                    replay_reasoning_to_model=(
+                        (
+                            replay_reasoning
+                            and lane.capabilities is not None
+                            and lane.capabilities.supports_reasoning_replay
+                        )
+                        or resolve_replay_reasoning_to_model(
+                            lane.registry, lane.alias, caps=lane.capabilities, cfg=cfg
+                        )
                     ),
                     # Already materialized above after request admission; provider
                     # translators retain their no-op fallback for direct callers.

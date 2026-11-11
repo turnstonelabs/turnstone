@@ -19,6 +19,18 @@ The separate `dev` branch is retired. See [the release process](docs/releasing.m
   now the `attempts` parameter, still 3 by default. A caller whose run must not
   be repeated passes `attempts=1`: the first failure is raised with no backoff,
   and one `test_timeout` bounds the whole run.
+- **Stable prefix for headless runs.** `HeadlessSession(stable_prefix=True)`
+  makes every request of a run begin with the previous request's messages,
+  unchanged, so a caller that records each prompt holds one growing sequence.
+  Earlier reasoning is sent back on every request, the system messages, tool
+  list and effort are taken once, a turn over the tool-call limit keeps every
+  call and answers the ones it did not run, a tool that would change the prompt
+  or the tool list is refused, a reply cut at the token limit ends the run, and
+  a request that would resend earlier context changed raises `StablePrefixError`
+  instead of being sent. With `raw_arguments`, typed tool-call arguments are
+  sent back as the text the model wrote (`True`, `None`), which a server's
+  template cannot reproduce from the parsed value. Off by default. See
+  [the eval guide](docs/eval.md#stable-prefix).
 
 ### Fixed
 
