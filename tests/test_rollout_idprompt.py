@@ -869,7 +869,11 @@ class TestTheProbe:
             asked = list(server.requests)
         verdict = json.loads(capsys.readouterr().out)
         assert verdict["route"] == "completions" and verdict["sampler_logprobs"] is True
-        assert asked and all(isinstance(r.get("prompt"), list) for r in asked)
+        # The one request with messages is the check's, which compares the chat
+        # route's rendering with the tokenize route's; the probe asked with IDs.
+        (compared,) = [r for r in asked if "messages" in r]
+        assert compared["max_tokens"] == 1 and verdict["token_id_route"]["ok"] is True
+        assert sum(isinstance(r.get("prompt"), list) for r in asked) == len(asked) - 1
 
 
 class TestWholeRollouts:

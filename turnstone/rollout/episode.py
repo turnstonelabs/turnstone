@@ -67,7 +67,12 @@ from turnstone.rollout.container import (
     ContainerLostError,
     ContainerSpec,
 )
-from turnstone.rollout.idprompt import PromptAssembly, TokenIdRoute, check_token_id_route
+from turnstone.rollout.idprompt import (
+    PromptAssembly,
+    TokenIdRoute,
+    check_token_id_route,
+    template_arguments,
+)
 from turnstone.rollout.preparation import BeforeRunCommand, before_run_failure, run_before
 from turnstone.rollout.probe import SETTINGS as PROBED_SETTINGS
 from turnstone.rollout.probe import all_settings, sampler_logprobs_reported
@@ -89,6 +94,7 @@ from turnstone.rollout.sidecar import RunningSidecar, Sidecar, SidecarError
 from turnstone.rollout.subagent_log import SubAgentLog
 from turnstone.rollout.tokens import build_token_record, describe_break, verify_record
 from turnstone.rollout.toolset import ROLLOUT_TOOL_NAMES
+from turnstone.rollout.verdicts import check_verdict, made_at, probe_verdict
 from turnstone.rollout.verification import (
     AfterRunCommand,
     VerificationContext,
@@ -220,11 +226,15 @@ class RolloutConfig:
     # One the requests leave to the server's default makes the rollout not
     # trainable, because the record cannot say what it was.
     required_sampling: tuple[str, ...] = ("temperature", "top_k", "top_p")
-    # Whether the server reports log-probabilities of the sampling distribution
-    # (``True``) or the model's own (``False``), or that per sampler setting
-    # (the ``reflects`` of a probe).  ``None`` asks the server with a probe
-    # before the run; pass the verdict of one probe to a whole batch.
-    sampler_logprobs: bool | dict[str, bool | None] | None = None
+    # Which log-probabilities the server reports.  ``None`` asks the server
+    # with a probe before the run.  A dict is the verdict of an earlier probe,
+    # whole, as :func:`logprob_verdict` or the command's ``--probe-only``
+    # returned it: pass the verdict of one probe to every run of a batch.  It
+    # is checked the same way wherever it comes from, and one that was not
+    # made for this run is refused.  ``True`` (the sampling distribution's) or
+    # ``False`` (the model's own) is the caller's own word for every sampler
+    # setting, which nothing checks.
+    sampler_logprobs: bool | dict[str, Any] | None = None
     # A call whose log-probabilities the server did not name by token ID was
     # checked by counts only.  ``False`` accepts such calls; the record says so.
     require_token_id_check: bool = True
@@ -1720,6 +1730,15 @@ def _build_record(
     budgets: Budgets | None = state.get("budgets")
     limits: dict[str, Limit] = state.get("limits") or {}
     sampling: dict[str, Setting] = state.get("sampling") or {}
+    template = _template_arguments(config)
+    sources = {name: setting.source for name, setting in sampling.items()}
+    if config.reasoning_effort is None and "reasoning_effort" in template and sources:
+        # No setting names a reasoning effort, and still the model's own
+        # default was not what the requests asked for: the request parameters
+        # carry one for the template.
+        sources["reasoning_effort"] = (
+            "not set as a setting: the request parameters carry one for the chat template"
+        )
     record: dict[str, Any] = {
         "key": task.key,
         "task": _plain_task(task),
@@ -1732,7 +1751,11 @@ def _build_record(
             "temperature": config.temperature,
             "reasoning_effort": config.reasoning_effort,
             "extra_body": config.extra_body,
-            "sources": {name: setting.source for name, setting in sampling.items()},
+            "sources": sources,
+            # What every request gave the server's chat template, whichever of
+            # the two it came from: the reasoning effort that was in force is
+            # the one here.
+            "template_arguments": template,
         },
         # The limits the run was under, each with where its value came from.
         "limits": {
@@ -2229,28 +2252,84 @@ def effective_config(
     return effective, limits, sampling
 
 
-def _logprob_verdict(config: RolloutConfig) -> dict[str, Any]:
-    """Which log-probabilities the server reports, on the route the run uses."""
+def logprob_verdict(config: RolloutConfig) -> dict[str, Any]:
+    """Which log-probabilities the server reports, on the route the run uses:
+    the verdict *config* was given, or that of a probe made now.
+
+    A verdict that was given is the whole verdict of an earlier probe, and is
+    held against this run (:func:`turnstone.rollout.verdicts.probe_verdict`):
+    made for another model, at another endpoint or on the other route, not
+    saying what it was made for, or of the wrong shape, it is refused with a
+    :class:`~turnstone.rollout.settings.SetupError`.  One that is this run's
+    comes back as it was given, and the record keeps it so.  ``True`` or
+    ``False`` in its place is the caller's own word for every setting.
+
+    A probe never raises: one that could not be made is a verdict that says so.
+    """
     given = config.sampler_logprobs
+    route = "completions" if config.token_id_prompts else "chat"
     if isinstance(given, dict):
-        values = {given.get(name) for name in PROBED_SETTINGS}
-        verdict = True if values == {True} else False if values == {False} else None
-        return {"sampler_logprobs": verdict, "reflects": dict(given), "reason": "given"}
-    if given is not None:
+        return probe_verdict(given, model=config.model, endpoint=config.base_url, route=route)
+    if isinstance(given, bool):
         return {"sampler_logprobs": given, "reflects": all_settings(given), "reason": "given"}
+    if given is not None:
+        raise SetupError(
+            "sampler_logprobs takes the verdict of a probe, True, False or None, not "
+            f"{type(given).__name__}"
+        )
     try:
         with OpenAI(base_url=config.base_url, api_key=config.api_key, timeout=60.0) as probe:
             return sampler_logprobs_reported(
-                probe,
-                config.model,
-                extra_body=config.extra_body,
-                route="completions" if config.token_id_prompts else "chat",
+                probe, config.model, extra_body=config.extra_body, route=route
             )
     except Exception as probe_error:
         return {
             "sampler_logprobs": None,
             "reflects": all_settings(None),
-            "reason": f"the probe failed: {type(probe_error).__name__}",
+            "route": route,
+            **made_at(config.base_url, config.model),
+            "reason": f"the probe failed: {type(probe_error).__name__}: {str(probe_error)[:300]}",
+        }
+
+
+def _template_arguments(config: RolloutConfig) -> dict[str, Any]:
+    """The chat-template arguments every request of a run with *config* carries."""
+    request: dict[str, Any] = {"extra_body": config.extra_body}
+    if config.reasoning_effort is not None:
+        request["reasoning_effort"] = config.reasoning_effort
+    return template_arguments(request)
+
+
+def token_id_route_verdict(config: RolloutConfig) -> dict[str, Any]:
+    """Whether the server can be sent prompts as token IDs: the verdict of a
+    check made now (:func:`~turnstone.rollout.idprompt.check_token_id_route`)
+    for *config*'s server, model, template arguments and reply format.
+
+    Never raises for the server's sake: a check that could not be made is a
+    verdict that says so.  For a caller that checks once and passes the
+    verdict to every run of a batch (``RolloutConfig.token_id_route``).
+    """
+    fmt = reply_format(config.reply_format)
+    try:
+        with OpenAI(base_url=config.base_url, api_key=config.api_key, timeout=120.0) as probe:
+            return check_token_id_route(
+                probe,
+                config.model,
+                extra_body=config.extra_body,
+                reasoning_effort=config.reasoning_effort,
+                fmt=fmt,
+            )
+    except Exception as check_error:
+        return {
+            "ok": False,
+            "reason": (
+                "the check of the server failed "
+                f"({type(check_error).__name__}: {str(check_error)[:300]})"
+            ),
+            "format": fmt.name,
+            "template_arguments": _template_arguments(config),
+            **made_at(config.base_url, config.model),
+            "checks": {},
         }
 
 
@@ -2258,32 +2337,34 @@ def _token_id_route(config: RolloutConfig) -> dict[str, Any]:
     """What the server needs to be sent prompts as token IDs, checked or given.
 
     Raises :class:`~turnstone.rollout.settings.SetupError` for a server that
-    cannot: the run does not start, and nothing falls back to messages.
+    cannot, and for a given verdict that is not this run's: the run does not
+    start, and nothing falls back to messages.
+
+    A verdict that was given is held against this run before anything is
+    asked of the model (:func:`turnstone.rollout.verdicts.check_verdict`):
+    made for another model, at another endpoint, for another reply format or
+    with other template arguments, not saying what it was made for, or not
+    holding what a passed check found, it is refused.  So is a given verdict
+    of the probe, here already: the check below makes model calls, and no
+    model call is made for a run that will be refused.
     """
     fmt = reply_format(config.reply_format)
-    verdict = config.token_id_route
-    if verdict is None:
-        try:
-            with OpenAI(base_url=config.base_url, api_key=config.api_key, timeout=120.0) as probe:
-                verdict = check_token_id_route(
-                    probe,
-                    config.model,
-                    extra_body=config.extra_body,
-                    reasoning_effort=config.reasoning_effort,
-                    fmt=fmt,
-                )
-        except Exception as check_error:
-            raise SetupError(
-                "prompts cannot be sent as token IDs: the check of the server failed "
-                f"({type(check_error).__name__}: {str(check_error)[:300]})"
-            ) from check_error
+    if isinstance(config.sampler_logprobs, dict):
+        logprob_verdict(config)
+    given = config.token_id_route
+    if given is not None:
+        verdict = check_verdict(
+            given,
+            model=config.model,
+            endpoint=config.base_url,
+            fmt=fmt.name,
+            arguments=_template_arguments(config),
+        )
+        TokenIdRoute.from_verdict(verdict)
+        return verdict
+    verdict = token_id_route_verdict(config)
     if not verdict.get("ok"):
         raise SetupError(f"prompts cannot be sent as token IDs: {verdict.get('reason')}")
-    if verdict.get("format") != fmt.name:
-        raise SetupError(
-            f"the given check of the server is for the reply format {verdict.get('format')!r}, "
-            f"the run reads {fmt.name!r}"
-        )
     return dict(verdict)
 
 
@@ -2382,7 +2463,7 @@ def run_episode(
             "reason": "not probed: the run did not start",
         }
     else:
-        state["logprobs"] = _logprob_verdict(config)
+        state["logprobs"] = logprob_verdict(config)
     state["rules"] = _resolve_rules(config)
     state["t0"] = time.monotonic()
     sandbox: Sandbox = (sandbox_factory or ContainerSandbox)(task, config)

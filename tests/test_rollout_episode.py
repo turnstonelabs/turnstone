@@ -454,6 +454,32 @@ class TestEpisodeRecord:
         assert record["finish_state"] == "sandbox_failed"
         assert record["usage"] == {"prompt": 0, "completion": 0}
 
+    def test_the_reasoning_effort_in_force_is_in_the_template_arguments(self):
+        """A reasoning effort can be a setting of the framework's or a chat-template
+        argument among the request parameters.  The record says which was given,
+        and never calls the model's own default what a template argument set."""
+        asked = {"top_k": 20, "top_p": 0.95, "chat_template_kwargs": {"reasoning_effort": "low"}}
+        with ScriptedChatServer(SCRIPT) as server:
+            as_argument, _box = _run(server, extra_body=asked)
+            as_setting, _box2 = _run(server, reasoning_effort="low")
+            neither, _box3 = _run(server)
+        sampling = as_argument["sampling"]
+        assert sampling["reasoning_effort"] is None
+        assert sampling["template_arguments"] == {"reasoning_effort": "low"}
+        assert sampling["sources"]["reasoning_effort"] == (
+            "not set as a setting: the request parameters carry one for the chat template"
+        )
+        sampling = as_setting["sampling"]
+        assert sampling["reasoning_effort"] == "low"
+        assert sampling["template_arguments"] == {
+            "reasoning_effort": "low",
+            "enable_thinking": True,
+        }
+        assert sampling["sources"]["reasoning_effort"] == "rollout config"
+        sampling = neither["sampling"]
+        assert sampling["reasoning_effort"] is None and sampling["template_arguments"] == {}
+        assert sampling["sources"]["reasoning_effort"] == "not set: the model's own default"
+
 
 class TestTwoFacts:
     """``trainable`` (each call is sound) and ``one_sequence`` (the prompts extend)."""

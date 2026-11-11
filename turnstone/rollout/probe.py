@@ -108,8 +108,8 @@ from typing import Any
 
 from turnstone.rollout.idprompt import render
 from turnstone.rollout.recording import entry_value, logprob_entries
-
-SETTINGS = ("temperature", "top_k", "top_p")
+from turnstone.rollout.verdicts import SETTINGS as SETTINGS  # this module's name for them too
+from turnstone.rollout.verdicts import made_for, summed_up
 
 # Prompts whose first token a model is rarely sure of.
 _PROMPTS = (
@@ -375,7 +375,10 @@ def sampler_logprobs_reported(
     none is (the model's own), ``None`` otherwise.  *extra_body* is sent with
     every request (chat-template arguments the rollout itself uses); its
     sampler settings are replaced by the probe's.  *route* is the route the
-    run will use, ``"chat"`` or ``"completions"``; the verdict names it.
+    run will use, ``"chat"`` or ``"completions"``; the verdict names it, with
+    what else it was made for: the ``model``, the ``endpoint`` (the client's
+    API root) and the time (``checked_at``).  A run that is handed the verdict
+    holds these against its own (:mod:`turnstone.rollout.verdicts`).
 
     ``tried`` holds one entry per probe prompt: the ``prompt``, the control's
     ``likeliest`` value for the first token, whether the prompt was ``used``,
@@ -449,12 +452,12 @@ def sampler_logprobs_reported(
         return logprob_entries(response.choices[0])
 
     def result(reason: str) -> dict[str, Any]:
-        values = set(reflects.values())
-        verdict = True if values == {True} else False if values == {False} else None
         return {
-            "sampler_logprobs": verdict,
+            "sampler_logprobs": summed_up(reflects),
             "reflects": reflects,
             "route": route,
+            # What the verdict was made for, and when.
+            **made_for(client, model),
             "reason": reason,
             "tried": tried,
             "positions": positions,

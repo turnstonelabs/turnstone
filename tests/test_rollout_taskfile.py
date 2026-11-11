@@ -536,7 +536,7 @@ class TestTheConfigurationFile:
 
     def _refused(self, monkeypatch: Any, capsys: Any, *flags: str) -> str:
         monkeypatch.setattr(cli, "run_episode", _never)
-        monkeypatch.setattr(cli, "_logprob_verdict", _never)
+        monkeypatch.setattr(cli, "logprob_verdict", _never)
         assert cli.main([*self.BASE, *flags]) == 3
         said = capsys.readouterr().err
         assert "the configuration file cannot be used" in said
@@ -996,7 +996,7 @@ class TestWhereTheRecordGoes:
 
     def _refused(self, monkeypatch: Any, capsys: Any, *flags: str) -> str:
         monkeypatch.setattr(cli, "run_episode", _never)
-        monkeypatch.setattr(cli, "_logprob_verdict", _never)
+        monkeypatch.setattr(cli, "logprob_verdict", _never)
         assert cli.main([*self.BASE, *flags]) == 3
         return str(capsys.readouterr().err)
 
@@ -1521,12 +1521,10 @@ class TestProbingOnce:
             assert cli.main([*run, "--sampler-logprobs", verdict.read_text()]) == 0
             # No rollout probed again: three model calls each.
             assert len(server.requests) == probes + 6
+        # The record keeps the verdict as it was given, with what it was made for.
         said = json.loads(out.read_text(encoding="ascii"))["logprobs"]
-        assert said == {
-            "sampler_logprobs": True,
-            "reflects": {"temperature": True, "top_k": True, "top_p": True},
-            "reason": "given",
-        }
+        assert said == json.loads(verdict.read_text(encoding="ascii"))
+        assert said["model"] == "scripted" and said["route"] == "chat" and said["tried"]
         capsys.readouterr()
 
     def test_an_earlier_verdict_stays_until_the_new_one_takes_its_place(
@@ -1538,7 +1536,7 @@ class TestProbingOnce:
         verdict = tmp_path / "server.json"
         verdict.write_text('{"an earlier": "verdict"}', encoding="ascii")
         seen: list[Any] = []
-        real = cli._logprob_verdict
+        real = cli.logprob_verdict
 
         def probes(config: Any) -> Any:
             # What a rollout of the batch reads while the probe is under way.
@@ -1546,7 +1544,7 @@ class TestProbingOnce:
             seen.append(os.listdir(tmp_path))
             return real(config)
 
-        monkeypatch.setattr(cli, "_logprob_verdict", probes)
+        monkeypatch.setattr(cli, "logprob_verdict", probes)
         with ScriptedChatServer(SCRIPT, sampler_logprobs=True) as server:
             base = ["--base-url", server.base_url, "--model", "scripted"]
             base += ["--top-k", "20", "--top-p", "0.95"]
@@ -1565,7 +1563,7 @@ class TestProbingOnce:
         base += ["--out", str(verdict)]
         # Refused: nothing is asked of the server.
         verdict.write_text("{}", encoding="ascii")
-        monkeypatch.setattr(cli, "_logprob_verdict", _never)
+        monkeypatch.setattr(cli, "logprob_verdict", _never)
         assert cli.main([*base, "--extra-body", "{no json"]) == 3
         assert not verdict.exists()
 
@@ -1574,7 +1572,7 @@ class TestProbingOnce:
             raise RuntimeError("the probe died here")
 
         verdict.write_text("{}", encoding="ascii")
-        monkeypatch.setattr(cli, "_logprob_verdict", dies)
+        monkeypatch.setattr(cli, "logprob_verdict", dies)
         with pytest.raises(RuntimeError, match="the probe died here"):
             cli.main(base)
         assert not verdict.exists()
@@ -1584,7 +1582,7 @@ class TestProbingOnce:
             raise OSError(28, "No space left on device")
 
         verdict.write_text("{}", encoding="ascii")
-        monkeypatch.setattr(cli, "_logprob_verdict", lambda _config: {"sampler_logprobs": True})
+        monkeypatch.setattr(cli, "logprob_verdict", lambda _config: {"sampler_logprobs": True})
         monkeypatch.setattr(cli, "_write_whole", fails)
         assert cli.main(base) == 1
         assert os.listdir(tmp_path) == []
@@ -1597,6 +1595,9 @@ class TestProbingOnce:
             "{}",
             '{"top_k": true}',
             '{"temperature": 1, "top_k": 1, "top_p": 1}',
+            # What a probe found for each setting, without what it was made for.
+            '{"temperature": true, "top_k": true, "top_p": true}',
+            '{"reflects": {"temperature": true, "top_k": true, "top_p": true}}',
             "@/no/such/file",
         ],
     )

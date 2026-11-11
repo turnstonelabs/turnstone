@@ -306,6 +306,21 @@ The separate `dev` branch is retired. See [the release process](docs/releasing.m
   ends as the machinery's failure. A run that sends messages keeps its
   estimate, and the guide now says how early it can end. See
   [the rollout guide](docs/rollout.md#the-context-window-exact).
+- **`turnstone-rollout`: one check of the server for a batch with prompts as
+  token IDs.** `--probe-only` with `--token-id-prompts` also checks the server
+  for what the mode needs, probes on the completions route, and prints both
+  verdicts in one object. `--token-id-route` hands the check's verdict to each
+  rollout as `--sampler-logprobs` hands on the probe's, so that no rollout of a
+  batch asks the server again. Both verdicts name what they were made for (the
+  model, the endpoint, the time, beside the probe's route and the check's
+  reply format and template arguments), and a run refuses one made for
+  anything else, one that does not say, and one of the wrong shape, with
+  nothing run. A verdict that was given is kept in the record as it was given,
+  and a run's first prompt is held against the generation prompt the check
+  found.
+  `logprob_verdict` and `token_id_route_verdict` in `turnstone.rollout.episode`
+  do the same from Python. See
+  [the rollout guide](docs/rollout.md#started-by-another-program).
 
 ### Fixed
 

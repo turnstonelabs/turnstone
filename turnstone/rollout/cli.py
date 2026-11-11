@@ -65,10 +65,11 @@ from turnstone.rollout.episode import (
     DEFAULT_SYSTEM_PROMPT,
     RolloutConfig,
     Task,
-    _logprob_verdict,
+    logprob_verdict,
     run_episode,
+    token_id_route_verdict,
 )
-from turnstone.rollout.probe import SETTINGS as PROBED_SETTINGS
+from turnstone.rollout.idprompt import TokenIdRoute, template_arguments
 from turnstone.rollout.rules import RuleSet
 from turnstone.rollout.settings import (
     SetupError,
@@ -78,6 +79,7 @@ from turnstone.rollout.settings import (
 )
 from turnstone.rollout.taskfile import check_task, load_task
 from turnstone.rollout.tokens import generated_positions
+from turnstone.rollout.verdicts import check_verdict, probe_verdict
 from turnstone.rollout.verification import check_verifier_command
 
 _NL = chr(10)
@@ -363,6 +365,15 @@ def _parser() -> argparse.ArgumentParser:
         "token sequence; the server is checked for what that needs before the run",
     )
     parser.add_argument(
+        "--token-id-route",
+        default=None,
+        metavar="VERDICT",
+        help="with --token-id-prompts: the verdict of the check of the server, as --probe-only "
+        "printed it (a JSON object, or @FILE holding one), so that this rollout does not "
+        "check again; one made for another model, endpoint or set of template arguments is "
+        "refused",
+    )
+    parser.add_argument(
         "--keep-text", action="store_true", help="keep each call's generated text in the record"
     )
     parser.add_argument(
@@ -371,7 +382,8 @@ def _parser() -> argparse.ArgumentParser:
         metavar="VERDICT",
         help="whether the server reports log-probabilities of the sampling distribution: "
         "'probe' (the default) asks it before the run, 'yes' or 'no' says so, and a JSON "
-        "object (or @FILE holding one) passes on what --probe-only printed",
+        "object (or @FILE holding one) passes on what --probe-only printed; a verdict made "
+        "for another model, endpoint or route is refused",
     )
     parser.add_argument(
         "--probe-only",
@@ -496,7 +508,10 @@ def _read_by(args: argparse.Namespace) -> list[tuple[str, str]]:
         read.append(("the configuration is read from", str(config_file_path())))
     if args.rules not in ("shipped", "none"):
         read.append(("--rules reads", args.rules))
-    for flag, said in (("--sampler-logprobs", args.sampler_logprobs),):
+    for flag, said in (
+        ("--sampler-logprobs", args.sampler_logprobs),
+        ("--token-id-route", args.token_id_route),
+    ):
         if said is not None and said.startswith("@"):
             read.append((f"{flag} reads", said[1:]))
     if args.verifier_command:
@@ -610,33 +625,93 @@ def _gone(path: str) -> None:
         os.unlink(path)
 
 
-def _verdict_given(said: str) -> bool | dict[str, bool | None] | None:
-    """What ``--sampler-logprobs`` says: ``None`` to probe, a yes or no for
-    every sampler setting, or one per setting as a probe reported them."""
-    if said in ("probe", "yes", "no"):
-        return {"probe": None, "yes": True, "no": False}[said]
+def _json_given(flag: str, said: str) -> Any:
+    """The JSON value *flag* was given: the text itself, or with ``@FILE`` what
+    that file holds; ``None`` when it is no JSON."""
     text = said
     if said.startswith("@"):
         try:
             with open(said[1:], encoding="utf-8") as handle:
                 text = handle.read()
         except OSError as error:
-            raise SetupError(f"--sampler-logprobs: {said[1:]} cannot be read ({error})") from None
+            raise SetupError(f"{flag}: {said[1:]} cannot be read ({error})") from None
     try:
-        verdict = strict_json(text)
+        return strict_json(text)
     except (ValueError, RecursionError):
-        verdict = None
-    reflects = verdict.get("reflects", verdict) if isinstance(verdict, dict) else None
-    if (
-        not isinstance(reflects, dict)
-        or set(reflects) != set(PROBED_SETTINGS)
-        or any(v is not None and not isinstance(v, bool) for v in reflects.values())
-    ):
+        return None
+
+
+def _verdict_given(
+    said: str, *, model: str, endpoint: str, route: str
+) -> bool | dict[str, Any] | None:
+    """What ``--sampler-logprobs`` says: ``None`` to probe, a yes or no for
+    every sampler setting, or the verdict of an earlier probe, whole.
+
+    A verdict is held against this run here, before anything is run
+    (:func:`turnstone.rollout.verdicts.probe_verdict`): *model*, *endpoint* and
+    *route* are the ones this run's requests go to.
+    """
+    if said in ("probe", "yes", "no"):
+        return {"probe": None, "yes": True, "no": False}[said]
+    verdict = _json_given("--sampler-logprobs", said)
+    if not isinstance(verdict, dict):
         raise SetupError(
             "--sampler-logprobs takes probe, yes, no, or what --probe-only printed: a JSON "
-            f"object saying true, false or null for each of {', '.join(PROBED_SETTINGS)}"
+            "object (or @FILE holding one) with the verdict of the probe"
         )
-    return {name: reflects[name] for name in PROBED_SETTINGS}
+    try:
+        return probe_verdict(verdict, model=model, endpoint=endpoint, route=route)
+    except SetupError as error:
+        raise SetupError(f"--sampler-logprobs: {error}") from None
+
+
+def _route_given(
+    said: str, *, model: str, endpoint: str, arguments: dict[str, Any]
+) -> dict[str, Any]:
+    """What ``--token-id-route`` says: the verdict of the check of the server
+    for prompts as token IDs, by itself or inside what ``--probe-only`` printed.
+
+    It is held against this run here, before anything is run
+    (:func:`turnstone.rollout.verdicts.check_verdict`): *model* and *endpoint*
+    are the ones this run asks, *arguments* the template arguments its requests
+    carry.
+    """
+    verdict = _json_given("--token-id-route", said)
+    if isinstance(verdict, dict) and "token_id_route" in verdict:
+        verdict = verdict["token_id_route"]
+    if not isinstance(verdict, dict):
+        raise SetupError(
+            "--token-id-route takes what --probe-only printed with --token-id-prompts: a JSON "
+            "object (or @FILE holding one) with the verdict of the check of the server"
+        )
+    try:
+        checked = check_verdict(
+            verdict,
+            model=model,
+            endpoint=endpoint,
+            fmt=RolloutConfig.reply_format,
+            arguments=arguments,
+        )
+        TokenIdRoute.from_verdict(checked)
+    except SetupError as error:
+        raise SetupError(f"--token-id-route: {error}") from None
+    return verdict
+
+
+def _template_arguments(args: argparse.Namespace, extra_body: dict[str, Any]) -> dict[str, Any]:
+    """The chat-template arguments this run's requests will carry, worked out
+    the way the run works them out: the model definition's under the command's."""
+    sampling = resolve_sampling(
+        model=args.model,
+        base_url=args.base_url,
+        temperature=args.temperature,
+        reasoning_effort=args.effort,
+        extra_body=extra_body,
+    )
+    request: dict[str, Any] = {"extra_body": sampling["extra_body"].value}
+    if sampling["reasoning_effort"].value is not None:
+        request["reasoning_effort"] = sampling["reasoning_effort"].value
+    return template_arguments(request)
 
 
 def _task(args: argparse.Namespace, given: set[str]) -> Task:
@@ -733,7 +808,12 @@ def main(argv: list[str] | None = None) -> int:
 
 def _probe_only(args: argparse.Namespace, api_key: str, extra_body: dict[str, Any]) -> int:
     """Probe the server and print the verdict, for a caller that probes once
-    and hands the verdict to every rollout of a batch."""
+    and hands the verdict to every rollout of a batch.
+
+    With ``--token-id-prompts`` the server is first checked for what prompts as
+    token IDs need, and that verdict is printed with the probe's
+    (``token_id_route``), to be handed on the same way.
+    """
     sampling = resolve_sampling(
         model=args.model,
         base_url=args.base_url,
@@ -741,19 +821,24 @@ def _probe_only(args: argparse.Namespace, api_key: str, extra_body: dict[str, An
         reasoning_effort=args.effort,
         extra_body=extra_body,
     )
-    verdict = _logprob_verdict(
-        RolloutConfig(
-            base_url=args.base_url,
-            model=args.model,
-            api_key=api_key,
-            extra_body=sampling["extra_body"].value,
-            # Asked on the route the rollouts of the batch will use: a server
-            # can report differently per route.
-            token_id_prompts=args.token_id_prompts,
-        )
+    config = RolloutConfig(
+        base_url=args.base_url,
+        model=args.model,
+        api_key=api_key,
+        # The template arguments the rollouts of the batch will carry.
+        reasoning_effort=sampling["reasoning_effort"].value,
+        extra_body=sampling["extra_body"].value,
+        # Asked on the route those rollouts will use: a server can report
+        # differently per route.
+        token_id_prompts=args.token_id_prompts,
     )
+    route = token_id_route_verdict(config) if args.token_id_prompts else None
+    verdict = logprob_verdict(config)
+    if route is not None:
+        verdict = {**verdict, "token_id_route": route}
+    usable = verdict.get("sampler_logprobs") is True and (route is None or route.get("ok") is True)
     # The status is the verdict's, whatever becomes of printing it.
-    status = 0 if verdict.get("sampler_logprobs") is True else 2
+    status = 0 if usable else 2
     line = _json_text(verdict)
     if args.out and not _written(args.out, line + _NL, "verdict"):
         # This command has no verdict to put there, so the earlier one goes:
@@ -823,6 +908,16 @@ def _command(args: argparse.Namespace, given: set[str]) -> int:
         check_verifier_command(verifier_command, has_sidecar=task.sidecar is not None)
     elif args.verifier_timeout is not None:
         raise SetupError("--verifier-timeout is for --verifier-command, which is not given")
+    token_id_route: dict[str, Any] | None = None
+    if args.token_id_route is not None:
+        if not args.token_id_prompts:
+            raise SetupError("--token-id-route is for --token-id-prompts, which is not given")
+        token_id_route = _route_given(
+            args.token_id_route,
+            model=args.model,
+            endpoint=args.base_url,
+            arguments=_template_arguments(args, extra_body),
+        )
     config = RolloutConfig(
         base_url=args.base_url,
         model=args.model,
@@ -838,7 +933,13 @@ def _command(args: argparse.Namespace, given: set[str]) -> int:
         keep_text=args.keep_text,
         token_id_prompts=args.token_id_prompts,
         extra_body=extra_body,
-        sampler_logprobs=_verdict_given(args.sampler_logprobs),
+        sampler_logprobs=_verdict_given(
+            args.sampler_logprobs,
+            model=args.model,
+            endpoint=args.base_url,
+            route="completions" if args.token_id_prompts else "chat",
+        ),
+        token_id_route=token_id_route,
         max_output_chars=args.max_output_chars,
         max_tool_result_chars=args.max_tool_result_chars,
         max_read_bytes=args.max_read_bytes,

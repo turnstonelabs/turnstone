@@ -84,7 +84,9 @@ from turnstone.rollout.replyformat import (
     pieces_from_chunks,
     reply_format,
 )
+from turnstone.rollout.settings import SetupError
 from turnstone.rollout.tokens import common_prefix_len
+from turnstone.rollout.verdicts import made_for
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator, Mapping, Sequence
@@ -274,17 +276,105 @@ class TokenIdRoute:
 
     @classmethod
     def from_verdict(cls, verdict: Mapping[str, Any]) -> TokenIdRoute:
-        """The route a passed check's verdict describes."""
+        """The route a passed check's verdict describes.
+
+        Raises :class:`~turnstone.rollout.settings.SetupError`, which is a
+        ``ValueError``, for a verdict that says the server cannot, and for one
+        that does not hold what a passed check found: a key that is missing, a
+        value of the wrong kind, a marker of the format that is neither among
+        the tokens nor among the markers spelled out, a marker the format
+        does not have, or a verdict that contradicts itself.  A verdict can
+        come from a file somebody else wrote.
+        """
         if not verdict.get("ok"):
-            raise ValueError(f"the server cannot be sent token-ID prompts: {verdict.get('reason')}")
-        return cls(
-            format=str(verdict["format"]),
-            marker_ids={str(k): int(v) for k, v in verdict["marker_ids"].items()},
-            text_markers=tuple(verdict["text_markers"]),
-            closing=tuple(int(t) for t in verdict["closing"]),
-            generation_prompt=tuple(int(t) for t in verdict["generation_prompt"]),
-            in_reasoning=bool(verdict["in_reasoning"]),
+            raise SetupError(f"the server cannot be sent token-ID prompts: {verdict.get('reason')}")
+
+        def wrong(what: str) -> SetupError:
+            return SetupError(
+                f"the given check of the server does not hold what a passed check found "
+                f"({what}): check the server again"
+            )
+
+        def tokens(name: str) -> tuple[int, ...]:
+            value = verdict.get(name)
+            if (
+                not isinstance(value, (list, tuple))
+                or not value
+                or any(isinstance(t, bool) or not isinstance(t, int) for t in value)
+            ):
+                raise wrong(f"{name} must be the token IDs the template writes, at least one")
+            return tuple(value)
+
+        name = verdict.get("format")
+        try:
+            fmt = reply_format(name) if isinstance(name, str) else None
+        except ValueError:
+            fmt = None
+        if fmt is None:
+            raise wrong("format names no reply format")
+        markers = verdict.get("marker_ids")
+        if not isinstance(markers, dict) or any(
+            not isinstance(k, str) or isinstance(v, bool) or not isinstance(v, int)
+            for k, v in markers.items()
+        ):
+            raise wrong("marker_ids must give a token ID for each marker that is one token")
+        spelled = verdict.get("text_markers")
+        if not isinstance(spelled, (list, tuple)) or any(not isinstance(m, str) for m in spelled):
+            raise wrong("text_markers must list the markers that are no single token")
+        # A check puts every marker of the format into one of the two, and
+        # nothing else.  A reply read without one of its markers is read as
+        # something else and nothing says so; a name the format does not
+        # have cannot be looked up when the first reply is read.
+        named = [*markers, *spelled]
+        missing = [m for m in fmt.token_markers if m not in named]
+        if missing:
+            raise wrong(
+                "a marker of the format is in neither marker_ids nor text_markers: "
+                + ", ".join(missing)
+            )
+        unknown = sorted({m for m in named if m not in fmt.token_markers})
+        if unknown:
+            raise wrong(
+                f"marker_ids or text_markers names what is no marker of the format {fmt.name}: "
+                + ", ".join(unknown)
+            )
+        twice = sorted(set(markers) & set(spelled))
+        if twice:
+            raise wrong("a marker is in both marker_ids and text_markers: " + ", ".join(twice))
+        if not isinstance(verdict.get("in_reasoning"), bool):
+            raise wrong("in_reasoning must be true or false")
+        route = cls(
+            format=fmt.name,
+            marker_ids=dict(markers),
+            text_markers=tuple(spelled),
+            closing=tokens("closing"),
+            generation_prompt=tokens("generation_prompt"),
+            in_reasoning=verdict["in_reasoning"],
         )
+        # Whether a reply begins inside reasoning is read off the generation
+        # prompt; a verdict that says otherwise was not made by a check.
+        names = {token: marker for marker, token in route.marker_ids.items()}
+        opened = fmt.opens_in_reasoning([names[t] for t in route.generation_prompt if t in names])
+        if opened != route.in_reasoning:
+            raise wrong("in_reasoning contradicts the generation prompt and the markers' tokens")
+        return route
+
+    def first_prompt(self, prompt: list[int]) -> list[int]:
+        """*prompt*, the server's rendering of a run's first request, once it
+        is known to end with the generation prompt the check found.
+
+        A check made for another template would have found another one, and
+        every reply of the run would be read from the wrong start.  Raises
+        :class:`PromptAssemblyError` before the run's first model call.
+        """
+        opening = list(self.generation_prompt)
+        if prompt[-len(opening) :] != opening:
+            raise PromptAssemblyError(
+                "the first prompt does not end with the generation prompt found before the "
+                f"run ({opening}): it ends {prompt[-len(opening) :]}. The check of the server "
+                "was made for another template"
+            )
+        return prompt
 
 
 @dataclass
@@ -358,7 +448,7 @@ class PromptAssembly:
         last = self._last
         differs: dict[str, Any] | None = None
         if last is None:
-            prompt = rendered(messages, True)
+            prompt = self.route.first_prompt(rendered(messages, True))
         elif messages == last.messages and not last.call.complete:
             # The same request again, after an attempt that did not end.
             prompt, differs = last.prompt, last.differs
@@ -878,6 +968,9 @@ def check_token_id_route(
         "reason": None,
         "format": fmt.name,
         "template_arguments": arguments,
+        # What the verdict was made for, and when: a run that is handed it
+        # holds these against its own (:mod:`turnstone.rollout.verdicts`).
+        **made_for(client, model),
         "checks": checks,
     }
 

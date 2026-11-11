@@ -237,12 +237,44 @@ Everything a run sets is a flag or is in the task file. The model's definition
 (context window, reply limit, reasoning effort) comes from the configuration
 file (`--config`), which is read and never written.
 
-To probe the server once for a whole batch, `--probe-only` runs no rollout. It
-prints the [verdict](#which-log-probabilities) as one JSON object (exit status
-0 when the reported values are the sampling distribution's, 2 otherwise), and
+To ask the server once for a whole batch, `--probe-only` runs no rollout. It
+probes which log-probabilities the server reports and prints the
+[verdict](#which-log-probabilities) as one JSON object, and
 `--sampler-logprobs '<that object>'` or `--sampler-logprobs @FILE` hands it to
-each rollout, which then does not probe. With `--token-id-prompts` the probe is
-made on the completions route, the one those rollouts use.
+each rollout, which then does not probe. With `--token-id-prompts` it first
+makes the [check for prompts as token IDs](#the-check-before-the-run), probes
+on the completions route, the one those rollouts use, and prints the check's
+verdict in the same object (`token_id_route`); `--token-id-route @FILE` hands
+that to each rollout, which then does not check:
+
+```
+turnstone-rollout --base-url ... --model NAME --top-k 20 --top-p 0.95 \
+    --token-id-prompts --probe-only --out server.json
+turnstone-rollout --base-url ... --model NAME --top-k 20 --top-p 0.95 \
+    --token-id-prompts --sampler-logprobs @server.json --token-id-route @server.json \
+    --task task.json --out episode.json
+```
+
+The exit status of `--probe-only` is 0 when the reported values are the
+sampling distribution's and, where it was made, the check passed; 2 otherwise.
+
+A verdict is good for what it was made for, and says what that is: the `model`
+that was asked, the `endpoint` (the API root) and the time (`checked_at`, ISO
+8601, UTC), beside the probe's `route` and the check's `format` and
+`template_arguments`. A run refuses a verdict made for another model or at
+another endpoint, a probe made on the other route, and a check made for
+another reply format or with other template arguments than the run's, the
+reasoning effort among them: what a template writes at the end of a turn and
+at the start of a reply can depend on them. It refuses a verdict that does not
+say one of these, which has to be made again, and one of the wrong shape. Each
+ends the command with status 3 and a sentence on standard error, with nothing
+run.
+
+Two spellings of one address are the same endpoint (a slash at the end, upper
+case in the scheme or the host, the port a scheme has by itself); two names
+for one machine are not, because nothing is looked up. The time is held
+against nothing: it is in the record, for a reader who knows when the server
+was last restarted.
 
 ### The order of a run
 
@@ -747,10 +779,17 @@ The verdict is in the record (`logprobs`, with `reflects` per setting and what
 the other positions said under `positions`). A setting the reported values are
 taken *before* is accepted only when it leaves the distribution as it is
 (temperature 1, top-p 1, top-k off). To probe once for a batch, call
-`turnstone.rollout.probe.sampler_logprobs_reported` and pass the verdict (or
-its `reflects`) as `RolloutConfig.sampler_logprobs`; from the command line,
-`--probe-only` prints the verdict and `--sampler-logprobs` takes it (see
-[started by another program](#started-by-another-program)).
+`turnstone.rollout.episode.logprob_verdict` with the batch's configuration and
+pass what it returns, the whole verdict, as `RolloutConfig.sampler_logprobs`;
+from the command line, `--probe-only` prints the verdict and
+`--sampler-logprobs` takes it (see
+[started by another program](#started-by-another-program)). A verdict that is
+handed in is checked the same way wherever it comes from, the field or the
+flag, and one that was not made for this run is refused before a container is
+made or the model is asked anything (by the command before anything at all;
+from Python a version address the configuration names is asked first).
+`True` or `False` in a verdict's place is the caller's own word for every
+sampler setting, which nothing checks.
 
 What the probe cannot show: the temperature is measured at the position that
 decides (and at the first position besides, where a later one decides), so a
@@ -890,6 +929,7 @@ in `error`:
 
 | What is relied on | The reason names it |
 |-------------------|---------------------|
+| The first prompt of the run ends with the generation prompt found before the run | "the first prompt does not end with the generation prompt found before the run" |
 | The request's messages begin with the previous request's, and an assistant turn follows | "does not begin with the messages of the request before it" |
 | The previous call ended by itself | "did not end by itself" |
 | The server reported the prompt it was sent | "did not report the prompt ... as it was sent" |
@@ -1035,8 +1075,21 @@ A server that fails any of it is refused (`SetupError`, nothing is run; the
 command ends with status 3): there is no falling back to messages. So is one
 that leaves a request of the check without an answer for two minutes. The
 verdict is in the record (`token_id_route`). To check once for a batch, call
-`check_token_id_route` and pass the verdict as `RolloutConfig.token_id_route`;
-it holds for the same server, model and template arguments.
+`turnstone.rollout.episode.token_id_route_verdict` with the batch's
+configuration and pass the verdict as `RolloutConfig.token_id_route`; from the
+command line, `--probe-only --token-id-prompts` prints it and
+`--token-id-route` takes it (see
+[started by another program](#started-by-another-program)). It holds for the
+model, the endpoint, the reply format and the template arguments it was made
+for, names them, and is refused by a run with others, as is one that does not
+name them or does not hold what a passed check found: each key of its kind,
+and every marker of the reply format either in `marker_ids` or in
+`text_markers` (the refusal names a marker that is in neither).
+
+A run's first prompt is held against the verdict as well: it has to end with
+the generation prompt the check found. Where it does not, the check was made
+for another template, and every reply would be read from the wrong start; the
+run ends as `error` before its first model call is made.
 
 The check is made after the server's version was asked, where the run asks for
 it, and before the probe (see [the order of a run](#the-order-of-a-run)).
@@ -2260,7 +2313,7 @@ whose value does not apply is `null`.
 | `text` | With `keep_text`, each call's generated text; otherwise `null`. With prompts as token IDs it is the completions route's text, which leaves out the end-of-turn token and other special tokens |
 | `limits` | `max_tokens`, `context_window`, `tool_timeout`, `subagent_max_turns`, `max_output_chars`, `max_tool_result_chars`, each `{"value": ..., "source": "..."}` |
 | `sampling` | Below |
-| `logprobs` | Which log-probabilities the server reports: `sampler_logprobs` (`true`, `false` or `null`), `reflects` (the same per setting: `temperature`, `top_k`, `top_p`), `reason`, and from a probe `route` (the route it asked on), `tried` and `positions` |
+| `logprobs` | Which log-probabilities the server reports: `sampler_logprobs` (`true`, `false` or `null`), `reflects` (the same per setting: `temperature`, `top_k`, `top_p`), `reason`, and from a probe, made by this run or handed to it, `route` (the route it asked on), what it was made for (`model`, `endpoint`, and `checked_at`, the time in ISO 8601 and UTC), `tried` and `positions`. A verdict that was handed in is stored as it was given; a yes or no handed in its place has the `reason` `"given"` and none of a probe's keys |
 | `token_id_check` | `"required"` or `"not required"` |
 | `prompt_mode` | `"messages"`, or `"token_ids"` for a run with [prompts as token IDs](#prompts-as-token-ids) |
 | `token_id_route` | `null` for a run that sends messages; otherwise what the check before the run found, below |
@@ -2320,8 +2373,9 @@ own calls. What is noted of a sub-agent's reply is under `subagents.events`.
 | Key | Value |
 |-----|-------|
 | `requested` | The sampler settings the requests themselves carried (`temperature`, `top_k`, `top_p`, whatever else the request parameters held) |
-| `temperature`, `reasoning_effort`, `extra_body` | What the run was set to |
-| `sources` | Where each of those three came from |
+| `temperature`, `reasoning_effort`, `extra_body` | What the run was set to. `reasoning_effort` is the framework's setting of that name and nothing else: `null` where no setting names one, also when the request parameters carry a reasoning effort for the chat template |
+| `sources` | Where each of those three came from. For a `reasoning_effort` of `null` it says whether the model's own default was in force, or the request parameters carried one for the chat template |
+| `template_arguments` | What every request gave the server's chat template, from the request parameters (`extra_body.chat_template_kwargs`) and from the reasoning effort setting (which also switches thinking on, `enable_thinking`, for any effort but `none`). The reasoning effort that was in force is the one here; `{}` where neither names anything |
 
 `time`, in seconds:
 
@@ -2342,8 +2396,9 @@ Where the run did not start, only the first three keys are there.
 |-----|-------|
 | `ok`, `reason` | Whether the server can be sent prompts as token IDs, and the first check that failed. In a run that did not start before the check was made, `ok` is `null` and `reason` says so |
 | `format`, `template_arguments` | The reply format the check was made for, and the template arguments it rendered with |
+| `model`, `endpoint`, `checked_at` | What else the check was made for: the model that was asked, the API root, and the time in ISO 8601 and UTC |
 | `checks` | What each step found: `tokenize_renders_messages`, `chat_route_renders_the_same`, `turn_is_a_prefix_of_the_longer_rendering`, `turn_ends_with_the_closing`, `rendering_ends_with_the_generation_prompt`, `markers_kept_in_text` (per marker: `true`, or `null` where it was not seen), `completions_route` (the reply with the model's own token at the end of a turn: `token_ids`, `finish_reason`, `text`, `problems`), `end_of_turn_token_ends_the_reply` (`true`, or `null` where it was not seen), `produced_by` (per marker and for `end_of_turn`, where the token was seen: `model` when the model wrote it by itself, else the request parameter the server was steered with, `logit_bias` or `allowed_token_ids`) and `not_observed` (per marker and for `end_of_turn`, where it was not: why; empty when everything was seen) |
-| `marker_ids`, `text_markers` | The token of each marker that is one token on this server, and the markers that are not. A marker goes by its name here and wherever something is said per marker (`checks.markers_kept_in_text`, `checks.produced_by`, `checks.not_observed`): `reasoning_open`, `reasoning_close`, `call_open`, `call_close` |
+| `marker_ids`, `text_markers` | The token of each marker that is one token on this server, and the markers that are not; every marker of the format is in one of the two. A marker goes by its name here and wherever something is said per marker (`checks.markers_kept_in_text`, `checks.produced_by`, `checks.not_observed`): `reasoning_open`, `reasoning_close`, `call_open`, `call_close` |
 | `closing`, `generation_prompt` | The tokens the template writes at the end of an assistant turn and at the start of a reply |
 | `in_reasoning` | Whether a reply begins inside reasoning |
 
@@ -2541,6 +2596,17 @@ What a user of the harness has to know, in one place:
   first. A model certain of all of them gets no verdict, and at sampler
   settings that reshape the distribution its records are then not trainable;
   see [which log-probabilities](#which-log-probabilities).
+- **A verdict that is handed in is held against names, not against the
+  server.** Its model, endpoint, route, reply format and template arguments
+  are compared with the run's, and the run's first prompt with the generation
+  prompt the check found. A server restarted behind the same address with
+  other weights between the verdict and the run is not seen: a verdict holds
+  no version of the server, probing alone (`--probe-only`) asks for none, and
+  the [server's version](#one-version-of-the-server) that a run asks for
+  speaks of that run's two ends, not of the time since the verdict was made.
+  `checked_at` is in the record, for a reader who knows when the server was
+  last restarted. Whoever replaces the weights has to have the verdicts made
+  again.
 - **A sidecar that outgrows its file system ends the run as the machinery's.**
   A sidecar over a writable root that writes more than its root may hold is
   stopped; the run then ends as `sidecar_lost` and is not trainable. Where a task's server writes what the model asks for, the model
