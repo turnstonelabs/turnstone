@@ -71,8 +71,11 @@
 /* --- attachment previews — image/pdf thumbnail + lazy text snippet in the
    chip; audio plays on the sent message, not the composer chip (see
    composer_attachments.js).  Shared layout (filename clamp, width caps, the
-   snippet/player dropping to their own row) lives here; per-surface theming of
-   the chip/pill chrome stays in each surface's stylesheet. --- */
+   snippet/player dropping to their own row) lives here.  The composer chip's
+   chrome is the rules above on every surface: a page that restyles the chip
+   (the server page once kept a 280px pill) breaks this layout, wrapping the
+   remove button onto its own row and clipping the snippet.  The sent-message
+   pill's chrome stays with each pane's stylesheet. --- */
 .composer-chip-name {
   max-width: 180px;
   overflow: hidden;
@@ -920,6 +923,9 @@
 /* Variant left-borders */
 .msg.user {
   border-left-color: var(--accent);
+  /* Brighter than a reply, so "the thing I said" reads apart from the
+     lower-chroma assistant colour. */
+  color: var(--fg-bright);
 }
 /* First-class operator-context system turn (role="system" in the
    trajectory) — the consolidation of the metacognition reminder /
@@ -1309,6 +1315,10 @@
   border-left-color: var(--think);
   color: color-mix(in srgb, var(--think) 70%, var(--ink));
   font-size: 12px;
+  /* The interactive pane writes an info line as plain text (command output
+     arrives with its own line breaks).  A bubble with a .msg-body, as the
+     coordinator builds, is unaffected: the body sets white-space itself. */
+  white-space: pre-wrap;
 }
 .msg.system {
   border-left-color: var(--ink-4);
@@ -1429,11 +1439,9 @@
    in base.css (also shared). */
 .msg.assistant pre code.hljs {
   /* No background here on purpose — the <pre> carries the code-surface colour
-     on every surface (--code-bg on the server UI via .msg.assistant pre, --panel
-     on the console/coordinator via the shared .msg-body pre).  Painting it on
-     the inner <code> too made a darker box inside a lighter pad band wherever
-     the two differ (the console/coordinator seam).  Let the code stay
-     transparent and show the pre. */
+     (--code-bg, from .msg.assistant pre further down).  Painting it on the
+     inner <code> as well draws a second box inside the pre's padding wherever
+     the two colours differ.  Let the code stay transparent and show the pre. */
   color: var(--fg);
   padding: 0;
 }
@@ -1645,6 +1653,381 @@
   padding: 4px 10px;
   border-left: 2px solid var(--hair);
   color: var(--ink-3);
+}
+
+/* ==========================================================================
+   Rendered assistant markdown — decoration for what the shared renderer.js
+   writes into an assistant bubble: headings, emphasis, code, lists, links,
+   quotes, tables, images, <details>, callouts, definition lists, footnotes.
+
+   The .msg-body rules above are the base every message kind gets; these
+   outrank them inside an assistant reply.  They live here, not in a
+   /static/style.css, because the server UI, the console and the coordinator
+   each serve a DIFFERENT file at that URL while all three run this renderer:
+   a rule kept in one of those files styles one surface only.  (While this
+   block lived in ui/static/style.css, tables, callouts and the rest rendered
+   bare on the console and the coordinator.)
+   tests/test_rendered_markdown_css.py holds both style.css files to that.
+   ========================================================================== */
+.msg.assistant h1,
+.msg.assistant h2,
+.msg.assistant h3,
+.msg.assistant h4,
+.msg.assistant h5,
+.msg.assistant h6 {
+  color: var(--accent);
+  margin: 8px 0 4px;
+  font-family: var(--font-ui);
+}
+.msg.assistant h1 {
+  font-size: 18px;
+}
+.msg.assistant h2 {
+  font-size: 16px;
+}
+.msg.assistant h3 {
+  font-size: 14px;
+}
+.msg.assistant h4 {
+  font-size: 13px;
+  font-weight: 600;
+}
+.msg.assistant h5 {
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.msg.assistant h6 {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--fg-dim);
+}
+.msg.assistant strong {
+  color: var(--fg-bright);
+}
+.msg.assistant em {
+  color: var(--magenta);
+}
+.msg.assistant del {
+  color: var(--fg-dim);
+  text-decoration: line-through;
+}
+.msg.assistant code {
+  background: var(--code-bg);
+  padding: 2px 6px;
+  border-radius: var(--radius-sm);
+  font-size: 12px;
+  border: 1px solid var(--border);
+}
+.msg.assistant pre {
+  background: var(--code-bg);
+  padding: 12px 14px;
+  border-radius: var(--radius);
+  overflow-x: auto;
+  margin: 8px 0;
+  border: 1px solid var(--border);
+}
+.msg.assistant pre code {
+  background: none;
+  padding: 0;
+  border: none;
+}
+.msg.assistant ul,
+.msg.assistant ol {
+  margin: 4px 0 4px 20px;
+}
+.msg.assistant li {
+  margin: 2px 0;
+}
+.msg.assistant a {
+  color: var(--accent);
+  text-decoration: underline;
+}
+.msg.assistant blockquote {
+  border-left: 3px solid var(--accent-dim);
+  padding-left: 12px;
+  color: var(--fg-dim);
+  margin: 6px 0;
+}
+.msg.assistant hr {
+  border: none;
+  border-top: 1px solid var(--border);
+  margin: 8px 0;
+}
+.msg.assistant p {
+  margin: 4px 0;
+}
+/* A table's outline is drawn inside the wrap: outside it, the sides are cut
+   off wherever the wrap fills a box that clips, as it does in <details>
+   (below).  The offset is all this rule says about the outline.  The ring and
+   the keyboard copy flash come from .table-wrap:focus-visible / .is-copied /
+   .is-copy-failed further down, and a whole outline declared here out-ranks
+   all three, so a copied table kept its focus colour and never flashed. */
+.msg.assistant .table-wrap {
+  overflow-x: auto;
+  margin: 8px 0;
+  -webkit-overflow-scrolling: touch;
+  outline-offset: -2px;
+}
+.msg.assistant table {
+  border-collapse: collapse;
+  width: auto;
+  min-width: 50%;
+  font-size: 13px;
+}
+.msg.assistant thead {
+  border-bottom: 2px solid var(--border-strong);
+}
+.msg.assistant th {
+  background: var(--code-bg);
+  font-weight: 600;
+  color: var(--fg-bright);
+}
+.msg.assistant th,
+.msg.assistant td {
+  padding: 6px 12px;
+  border: 1px solid var(--border-strong);
+}
+.msg.assistant tbody tr {
+  transition: background 0.12s ease;
+}
+.msg.assistant tbody tr:nth-child(even) {
+  background: var(--row-alt);
+}
+.msg.assistant tbody tr:hover {
+  background: var(--bg-highlight);
+}
+.msg.assistant .align-left {
+  text-align: left;
+}
+.msg.assistant .align-center {
+  text-align: center;
+}
+.msg.assistant .align-right {
+  text-align: right;
+}
+.msg.assistant img {
+  display: block;
+  max-width: 100%;
+  height: auto;
+  border-radius: var(--radius);
+  margin: 4px 0;
+}
+.msg.assistant .img-placeholder {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 14px;
+  margin: 4px 0;
+  background: var(--code-bg);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  cursor: pointer;
+  transition: border-color 0.12s ease;
+}
+.msg.assistant .img-placeholder:hover {
+  border-color: var(--accent);
+}
+.msg.assistant .img-placeholder:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+.msg.assistant .img-placeholder-icon {
+  font-size: 16px;
+}
+.msg.assistant .img-placeholder-label {
+  color: var(--fg-bright);
+  font-size: 13px;
+}
+.msg.assistant .img-placeholder-domain {
+  color: var(--fg-dim);
+  font-size: 11px;
+}
+.msg.assistant li > input[type="checkbox"] {
+  margin-right: 6px;
+  vertical-align: middle;
+  accent-color: var(--accent);
+}
+.msg.assistant blockquote blockquote {
+  margin: 4px 0;
+  border-left-color: var(--border-strong);
+}
+.msg.assistant blockquote blockquote blockquote {
+  border-left-color: var(--border);
+}
+
+/* Safe HTML elements */
+.msg.assistant details {
+  margin: 8px 0;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-surface);
+  overflow: hidden;
+}
+.msg.assistant details summary {
+  padding: 8px 12px;
+  cursor: pointer;
+  font-weight: 600;
+  color: var(--fg-bright);
+  user-select: none;
+}
+.msg.assistant details summary:hover {
+  color: var(--accent);
+}
+.msg.assistant details[open] > summary {
+  border-bottom: 1px solid var(--border);
+}
+.msg.assistant details > :not(summary) {
+  padding: 0 12px;
+}
+/* The box clips at its edge (overflow: hidden, above), and the summary and a
+   fence or diagram placed straight into it reach that edge, so an outline
+   drawn outside them is cut off there: a focused summary showed no ring while
+   closed, and a focused fence only the top and bottom of its ring.  Draw
+   those outlines inside the element.  Offset only, as for tables: the ring
+   and the copy flash still come from their own rules. */
+.msg.assistant details summary,
+.msg.assistant details > pre,
+.msg.assistant details > .mermaid-container {
+  outline-offset: -2px;
+}
+.msg.assistant kbd {
+  background: var(--bg-highlight);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  padding: 1px 5px;
+  font-size: 11px;
+  font-family: var(--font-mono);
+  box-shadow: 0 1px 0 var(--border-strong);
+}
+.msg.assistant mark {
+  background: var(--yellow-glow);
+  color: var(--fg-bright);
+  border-radius: 2px;
+  padding: 0 2px;
+}
+
+/* Callouts: note / tip / important / warning / caution */
+.msg.assistant .callout {
+  border-left: 3px solid var(--border-strong);
+  border-radius: var(--radius);
+  background: var(--bg-surface);
+  margin: 8px 0;
+  overflow: hidden;
+}
+.msg.assistant .callout-title {
+  padding: 8px 12px 4px;
+  font-weight: 600;
+  font-size: 13px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.msg.assistant .callout-icon {
+  font-size: 14px;
+}
+.msg.assistant .callout-body {
+  padding: 0 12px 8px;
+  color: var(--fg);
+}
+.msg.assistant .callout-body p:first-child {
+  margin-top: 0;
+}
+.msg.assistant .callout-body p:last-child {
+  margin-bottom: 0;
+}
+.msg.assistant .callout-note {
+  border-left-color: var(--cyan);
+}
+.msg.assistant .callout-note .callout-title {
+  color: var(--cyan);
+}
+.msg.assistant .callout-tip {
+  border-left-color: var(--green);
+}
+.msg.assistant .callout-tip .callout-title {
+  color: var(--green);
+}
+.msg.assistant .callout-important {
+  border-left-color: var(--magenta);
+}
+.msg.assistant .callout-important .callout-title {
+  color: var(--magenta);
+}
+.msg.assistant .callout-warning {
+  border-left-color: var(--yellow);
+}
+.msg.assistant .callout-warning .callout-title {
+  color: var(--yellow);
+}
+.msg.assistant .callout-caution {
+  border-left-color: var(--red);
+}
+.msg.assistant .callout-caution .callout-title {
+  color: var(--red);
+}
+
+/* Definition lists */
+.msg.assistant dl {
+  margin: 8px 0;
+}
+.msg.assistant dt {
+  font-weight: 600;
+  color: var(--fg-bright);
+  margin-top: 8px;
+}
+.msg.assistant dt:first-child {
+  margin-top: 0;
+}
+.msg.assistant dd {
+  margin: 2px 0 0 20px;
+  padding-left: 12px;
+  border-left: 2px solid var(--border-strong);
+}
+
+/* Footnotes */
+.msg.assistant .footnotes {
+  margin-top: 16px;
+  font-size: 12px;
+  color: var(--fg-dim);
+}
+.msg.assistant .footnotes-sep {
+  border: none;
+  border-top: 1px solid var(--border);
+  margin-bottom: 8px;
+}
+.msg.assistant .footnotes-list {
+  margin: 0 0 0 20px;
+  padding: 0;
+}
+.msg.assistant .footnote-item {
+  margin: 4px 0;
+  line-height: 1.5;
+}
+.msg.assistant .fn-ref a {
+  color: var(--accent);
+  text-decoration: none;
+  font-size: 11px;
+  font-weight: 600;
+}
+.msg.assistant .fn-ref a:hover {
+  text-decoration: underline;
+}
+.msg.assistant .fn-backref {
+  color: var(--accent);
+  text-decoration: none;
+  font-size: 11px;
+  margin-left: 4px;
+}
+.msg.assistant .fn-backref:hover {
+  text-decoration: underline;
+}
+.msg.assistant .fn-ref a:focus-visible,
+.msg.assistant .fn-backref:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+  border-radius: 2px;
 }
 
 /* Hover-revealed action row — copy / regenerate / feedback buttons.
@@ -2196,7 +2579,10 @@
   .ws-status-bar,
   .msg-actions,
   .msg-action-btn,
+  .msg.assistant tbody tr,
+  .msg.assistant .img-placeholder,
   .block-copy-btn,
+  .composer button,
   .composer-attach,
   .composer-input,
   .composer-send {

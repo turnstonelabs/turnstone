@@ -10,6 +10,35 @@ All development now integrates on `main`. Supported release lines are maintained
 on `stable/X.Y` branches; `stable/1.8` preserves the former stable branch.
 The separate `dev` branch is retired. See [the release process](docs/releasing.md).
 
+## [2026-11-11]
+
+### Fixed
+
+- **Assistant replies are styled the same in the console as on a node's own
+  page.** Tables, callouts, headings, emphasis, quotes, images, `<details>`
+  blocks, definition lists and footnotes were styled only on a node's page,
+  opened directly or as a proxied node view. In a workstream pane on the
+  console, and in a coordinator pane, a table had no borders, a callout was
+  plain text and headings were uncoloured. All three now use the node page's
+  styling, so a coordinator's replies change the most.
+- **A workstream pane behaves the same in the console as on a node's own
+  page.** In the console's pane an info line, such as a command's output, now
+  keeps its line breaks, your own messages use the brighter text colour, the
+  "Drop file to attach" overlay shows while a file is dragged over the pane,
+  and the composer's buttons stop animating when reduced motion is requested.
+  In a coordinator pane your own messages take the brighter colour too.
+- **Attachment chips above the message box are the same on every page.** A
+  node's own page still drew them as 280px pills, which pushed the remove
+  button onto a row of its own and clipped a text file's preview. It now
+  draws the chip the console already had.
+- **Copying a table with Enter shows its outcome on a node's page.** The
+  outline that flashes on a copied fence or diagram now flashes on a table
+  there too; the table's own focus ring used to cover it.
+- **Keyboard focus shows inside a `<details>` block in a reply.** The block's
+  summary showed no focus ring while closed, and a code fence or diagram
+  placed directly in the block showed only the top and bottom of its ring.
+  Both now show the whole ring.
+
 ## [2026-11-10]
 
 > **Before upgrading:** the database advances from migration 088 to 089.

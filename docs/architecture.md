@@ -113,14 +113,14 @@ turnstone/
     spinner.py        Braille character spinner (daemon thread)
     static/
       index.html      Single-page app shell (links to CSS and JS)
-      style.css       Page-specific UI styles (dashboard, markdown elements, approval blocks)
+      style.css       Page-specific UI styles (dashboard, approval blocks)
       renderer.js     Markdown + LaTeX renderer (tables, nested lists, blockquotes, KaTeX math)
       app.js          Split-pane UI (Pane class, binary layout tree, SSE, tool approval)
   tools/
     *.json            Role-specific tool schemas and synthetic tool surfaces
 ```
 
-Both UIs share a common design system extracted into `turnstone/shared_static/`: design tokens, login overlay, toast notifications, theme toggle, keyboard shortcuts, and utility functions. Each UI imports `base.css` and the shared JS modules at `/shared/`, then adds only page-specific code at `/static/`.
+Both UIs share a common design system extracted into `turnstone/shared_static/`: design tokens, login overlay, toast notifications, theme toggle, keyboard shortcuts, and utility functions. Each UI imports `base.css` and the shared JS modules at `/shared/`, then adds only page-specific code at `/static/`. Each server serves its own file at `/static/style.css`, so a rule there reaches that server's page only: styles for anything the shared JS draws on more than one page (messages, rendered markdown, tool cards) belong in `shared_static/`. `tests/test_rendered_markdown_css.py` and `tests/test_shared_pane_css.py` enforce this for rendered markdown and for the workstream pane's message bubbles, drop overlay and attachment chips.
 
 ---
 

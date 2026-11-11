@@ -85,22 +85,18 @@
      margin-bottom and pushing the per-card spacing to ~18px. */
 }
 /* .msg (shared_static/chat.css) provides padding / border / radius /
-   line-height / word-wrap / margin / background.  The interactive UI
-   adds a brighter text colour on user messages so "the thing I said"
-   reads distinctly against the lower-chroma assistant colour. */
-.msg.user {
-  color: var(--fg-bright);
-}
+   line-height / word-wrap / margin / background, the brighter text on user
+   messages and the kept line breaks of info messages.  The pane renders on
+   the console page too, which does not load this file, so nothing about a
+   message bubble belongs here; tests/test_shared_pane_css.py fails if a rule
+   for one appears. */
 /* .msg.system-context (operator-context system turns) lives in
    shared_static/chat.css so both the interactive UI and the console coord
    viewer pick up the same yellow themed bubble. */
 /* .msg.assistant / .msg.info / .msg.error alignment + baseline visuals
-   come from shared_static/chat.css.  Interactive UI adds a pre-wrap
-   override for info messages and a tightened tool-message shape with
-   the cyan accent bar the instrument-panel look established. */
-.msg.info {
-  white-space: pre-wrap;
-}
+   come from shared_static/chat.css.  Interactive UI adds a tightened
+   tool-message shape with the cyan accent bar the instrument-panel look
+   established. */
 .msg.tool {
   background: var(--bg-surface);
   border: 1px solid var(--border);
@@ -132,415 +128,18 @@
 body {
   position: static;
 }
-.msg.assistant h1,
-.msg.assistant h2,
-.msg.assistant h3,
-.msg.assistant h4,
-.msg.assistant h5,
-.msg.assistant h6 {
-  color: var(--accent);
-  margin: 8px 0 4px;
-  font-family: var(--font-ui);
-}
-.msg.assistant h1 {
-  font-size: 18px;
-}
-.msg.assistant h2 {
-  font-size: 16px;
-}
-.msg.assistant h3 {
-  font-size: 14px;
-}
-.msg.assistant h4 {
-  font-size: 13px;
-  font-weight: 600;
-}
-.msg.assistant h5 {
-  font-size: 12px;
-  font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
-}
-.msg.assistant h6 {
-  font-size: 12px;
-  font-weight: 500;
-  color: var(--fg-dim);
-}
-.msg.assistant strong {
-  color: var(--fg-bright);
-}
-.msg.assistant em {
-  color: var(--magenta);
-}
-.msg.assistant del {
-  color: var(--fg-dim);
-  text-decoration: line-through;
-}
-.msg.assistant code {
-  background: var(--code-bg);
-  padding: 2px 6px;
-  border-radius: var(--radius-sm);
-  font-size: 12px;
-  border: 1px solid var(--border);
-}
-.msg.assistant pre {
-  background: var(--code-bg);
-  padding: 12px 14px;
-  border-radius: var(--radius);
-  overflow-x: auto;
-  margin: 8px 0;
-  border: 1px solid var(--border);
-}
-.msg.assistant pre code {
-  background: none;
-  padding: 0;
-  border: none;
-}
-.msg.assistant ul,
-.msg.assistant ol {
-  margin: 4px 0 4px 20px;
-}
-.msg.assistant li {
-  margin: 2px 0;
-}
-.msg.assistant a {
-  color: var(--accent);
-  text-decoration: underline;
-}
-.msg.assistant blockquote {
-  border-left: 3px solid var(--accent-dim);
-  padding-left: 12px;
-  color: var(--fg-dim);
-  margin: 6px 0;
-}
-.msg.assistant hr {
-  border: none;
-  border-top: 1px solid var(--border);
-  margin: 8px 0;
-}
-.msg.assistant p {
-  margin: 4px 0;
-}
-.msg.assistant .table-wrap {
-  overflow-x: auto;
-  margin: 8px 0;
-  -webkit-overflow-scrolling: touch;
-}
-.msg.assistant .table-wrap:focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: -2px;
-}
-.msg.assistant table {
-  border-collapse: collapse;
-  width: auto;
-  min-width: 50%;
-  font-size: 13px;
-}
-.msg.assistant thead {
-  border-bottom: 2px solid var(--border-strong);
-}
-.msg.assistant th {
-  background: var(--code-bg);
-  font-weight: 600;
-  color: var(--fg-bright);
-}
-.msg.assistant th,
-.msg.assistant td {
-  padding: 6px 12px;
-  border: 1px solid var(--border-strong);
-}
-.msg.assistant tbody tr {
-  transition: background 0.12s ease;
-}
-.msg.assistant tbody tr:nth-child(even) {
-  background: var(--row-alt);
-}
-.msg.assistant tbody tr:hover {
-  background: var(--bg-highlight);
-}
-.msg.assistant .align-left {
-  text-align: left;
-}
-.msg.assistant .align-center {
-  text-align: center;
-}
-.msg.assistant .align-right {
-  text-align: right;
-}
-.msg.assistant img {
-  display: block;
-  max-width: 100%;
-  height: auto;
-  border-radius: var(--radius);
-  margin: 4px 0;
-}
-.msg.assistant .img-placeholder {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  padding: 8px 14px;
-  margin: 4px 0;
-  background: var(--code-bg);
-  border: 1px solid var(--border-strong);
-  border-radius: var(--radius);
-  cursor: pointer;
-  transition: border-color 0.12s ease;
-}
-.msg.assistant .img-placeholder:hover {
-  border-color: var(--accent);
-}
-.msg.assistant .img-placeholder:focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: -2px;
-}
-.msg.assistant .img-placeholder-icon {
-  font-size: 16px;
-}
-.msg.assistant .img-placeholder-label {
-  color: var(--fg-bright);
-  font-size: 13px;
-}
-.msg.assistant .img-placeholder-domain {
-  color: var(--fg-dim);
-  font-size: 11px;
-}
-.msg.assistant li > input[type="checkbox"] {
-  margin-right: 6px;
-  vertical-align: middle;
-  accent-color: var(--accent);
-}
-.msg.assistant blockquote blockquote {
-  margin: 4px 0;
-  border-left-color: var(--border-strong);
-}
-.msg.assistant blockquote blockquote blockquote {
-  border-left-color: var(--border);
-}
-/* Rendered-markdown decoration for code (highlight.js), math (KaTeX
-   .katex-display/.katex-error) and diagrams (Mermaid .mermaid-*) moved to
-   shared_static/chat.css.  These style the output of the SHARED renderer.js,
-   which runs on the server UI, the console AND the coordinator — but those
-   last two load /static/style.css from their own directory, not this file, so
-   the rules have to be shared.  Do not re-add them here. */
-
-/* Safe HTML elements */
-.msg.assistant details {
-  margin: 8px 0;
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  background: var(--bg-surface);
-  overflow: hidden;
-}
-.msg.assistant details summary {
-  padding: 8px 12px;
-  cursor: pointer;
-  font-weight: 600;
-  color: var(--fg-bright);
-  user-select: none;
-}
-.msg.assistant details summary:hover {
-  color: var(--accent);
-}
-.msg.assistant details[open] > summary {
-  border-bottom: 1px solid var(--border);
-}
-.msg.assistant details > :not(summary) {
-  padding: 0 12px;
-}
-.msg.assistant kbd {
-  background: var(--bg-highlight);
-  border: 1px solid var(--border-strong);
-  border-radius: var(--radius-sm);
-  padding: 1px 5px;
-  font-size: 11px;
-  font-family: var(--font-mono);
-  box-shadow: 0 1px 0 var(--border-strong);
-}
-.msg.assistant mark {
-  background: var(--yellow-glow);
-  color: var(--fg-bright);
-  border-radius: 2px;
-  padding: 0 2px;
-}
-
-/* GFM Callouts / Alerts */
-.msg.assistant .callout {
-  border-left: 3px solid var(--border-strong);
-  border-radius: var(--radius);
-  background: var(--bg-surface);
-  margin: 8px 0;
-  overflow: hidden;
-}
-.msg.assistant .callout-title {
-  padding: 8px 12px 4px;
-  font-weight: 600;
-  font-size: 13px;
-  display: flex;
-  align-items: center;
-  gap: 6px;
-}
-.msg.assistant .callout-icon {
-  font-size: 14px;
-}
-.msg.assistant .callout-body {
-  padding: 0 12px 8px;
-  color: var(--fg);
-}
-.msg.assistant .callout-body p:first-child {
-  margin-top: 0;
-}
-.msg.assistant .callout-body p:last-child {
-  margin-bottom: 0;
-}
-.msg.assistant .callout-note {
-  border-left-color: var(--cyan);
-}
-.msg.assistant .callout-note .callout-title {
-  color: var(--cyan);
-}
-.msg.assistant .callout-tip {
-  border-left-color: var(--green);
-}
-.msg.assistant .callout-tip .callout-title {
-  color: var(--green);
-}
-.msg.assistant .callout-important {
-  border-left-color: var(--magenta);
-}
-.msg.assistant .callout-important .callout-title {
-  color: var(--magenta);
-}
-.msg.assistant .callout-warning {
-  border-left-color: var(--yellow);
-}
-.msg.assistant .callout-warning .callout-title {
-  color: var(--yellow);
-}
-.msg.assistant .callout-caution {
-  border-left-color: var(--red);
-}
-.msg.assistant .callout-caution .callout-title {
-  color: var(--red);
-}
-
-/* Definition lists */
-.msg.assistant dl {
-  margin: 8px 0;
-}
-.msg.assistant dt {
-  font-weight: 600;
-  color: var(--fg-bright);
-  margin-top: 8px;
-}
-.msg.assistant dt:first-child {
-  margin-top: 0;
-}
-.msg.assistant dd {
-  margin: 2px 0 0 20px;
-  padding-left: 12px;
-  border-left: 2px solid var(--border-strong);
-}
-
-/* Footnotes */
-.msg.assistant .footnotes {
-  margin-top: 16px;
-  font-size: 12px;
-  color: var(--fg-dim);
-}
-.msg.assistant .footnotes-sep {
-  border: none;
-  border-top: 1px solid var(--border);
-  margin-bottom: 8px;
-}
-.msg.assistant .footnotes-list {
-  margin: 0 0 0 20px;
-  padding: 0;
-}
-.msg.assistant .footnote-item {
-  margin: 4px 0;
-  line-height: 1.5;
-}
-.msg.assistant .fn-ref a {
-  color: var(--accent);
-  text-decoration: none;
-  font-size: 11px;
-  font-weight: 600;
-}
-.msg.assistant .fn-ref a:hover {
-  text-decoration: underline;
-}
-.msg.assistant .fn-backref {
-  color: var(--accent);
-  text-decoration: none;
-  font-size: 11px;
-  margin-left: 4px;
-}
-.msg.assistant .fn-backref:hover {
-  text-decoration: underline;
-}
-.msg.assistant .fn-ref a:focus-visible,
-.msg.assistant .fn-backref:focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: 1px;
-  border-radius: 2px;
-}
+/* Everything that decorates rendered assistant markdown (.msg.assistant ...,
+   .msg-body ..., the syntax-highlighting theme, the math and diagram wrappers)
+   lives in shared_static/chat.css.  It styles the output of the SHARED
+   renderer.js, which runs on the server UI, the console AND the coordinator —
+   but those last two load /static/style.css from their own directory, not this
+   file, so a rule added here styles this surface only.  Do not add any here;
+   tests/test_rendered_markdown_css.py fails if one appears. */
 
 /* ==========================================================================
    Input area — composer DOM + styling lives in /shared/composer.js +
    /shared/chat.css.  No page-specific overrides needed.
    ========================================================================== */
-
-/* Attachment chips — pill cluster above the textarea */
-.composer-chips {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-}
-.composer-chips:empty {
-  display: none;
-}
-.composer-chip {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  background: var(--bg);
-  color: var(--fg);
-  border: 1px solid var(--border-strong);
-  border-radius: 999px;
-  padding: 3px 8px 3px 10px;
-  font-family: var(--font-mono);
-  font-size: 11px;
-  max-width: 280px;
-}
-.composer-chip-icon {
-  font-size: 12px;
-  opacity: 0.7;
-}
-/* .composer-chip-name clamp now lives in shared chat.css (applies to every
-   surface; console main + coordinator previously left the span unclamped). */
-.composer-chip-size {
-  color: var(--fg-dim, var(--fg));
-  opacity: 0.65;
-  font-size: 10px;
-}
-.composer-chip-remove {
-  background: transparent;
-  color: var(--fg-dim, var(--fg));
-  border: none;
-  padding: 0 4px;
-  font-size: 14px;
-  line-height: 1;
-  cursor: pointer;
-  border-radius: 50%;
-}
-.composer-chip-remove:hover {
-  color: var(--red, #c94040);
-  background: var(--bg-surface);
-}
-.composer-chip-remove:focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: 1px;
-}
 
 /* New-workstream dialog: attachment row + chips (the dialog chrome itself
    is /shared/hatch.css; only the attach affordance is page-specific) */
@@ -617,29 +216,6 @@ body {
 .new-ws-attach-chip-remove:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 1px;
-}
-
-/* Drag-and-drop visual state on the pane */
-.pane.pane-drop-target {
-  outline: 2px dashed var(--accent);
-  outline-offset: -6px;
-}
-.pane.pane-drop-target::after {
-  content: "Drop file to attach";
-  position: absolute;
-  inset: 0;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  background: var(--accent-dim, rgba(0, 0, 0, 0.1));
-  color: var(--fg-bright, var(--fg));
-  font-family: var(--font-ui);
-  font-size: 14px;
-  font-weight: 600;
-  letter-spacing: 0.05em;
-  text-transform: uppercase;
-  pointer-events: none;
-  z-index: 10;
 }
 
 /* Historical-message attachment pills — beneath the user bubble */
@@ -1376,14 +952,11 @@ audio.media-player {
   }
   .ts-approval-btn,
   .ts-approval-feedback,
-  .composer button,
   .dashboard-new-btn,
   .dashboard-input,
   #health-indicator,
   #theme-toggle,
   #mcp-status,
-  .msg.assistant tbody tr,
-  .msg.assistant .img-placeholder,
   .media-play-btn {
     transition: none;
   }
