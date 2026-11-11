@@ -10,6 +10,93 @@ All development now integrates on `main`. Supported release lines are maintained
 on `stable/X.Y` branches; `stable/1.8` preserves the former stable branch.
 The separate `dev` branch is retired. See [the release process](docs/releasing.md).
 
+## [2026-11-10]
+
+> **Before upgrading:** the database advances from migration 088 to 089.
+> Migrations run automatically; upgrade every process that shares the database
+> together.
+>
+> - 089 adds an index on `audit_events`. PostgreSQL builds it without blocking
+>   writes, so with a large audit table the first start after the upgrade takes
+>   longer while it builds. A build that is interrupted is dropped and rebuilt
+>   at the next start.
+> - Tool restrictions placed on a coordinator with `/restrict` before the
+>   upgrade were held in memory only and are lost at the upgrade restart.
+>   Re-apply them afterwards; from then on they are saved.
+> - An open coordinator tab no longer keeps its coordinator loaded. One that the
+>   idle timeout closes now stays closed and its pane closes; open it again to
+>   continue. See **Changed** below.
+
+### Added
+
+- **Coordinator panes come back after a console restart.** A coordinator
+  pane's event stream now resumes a coordinator that was running when the
+  console stopped, so an open pane reconnects without a click. A coordinator
+  that was closed, by a user, the idle timeout or the orphan sweep, stays
+  closed. The resume needs write scope. A console that takes longer than about
+  a minute to come back leaves the pane on its reconnect banner.
+- **Tool restrictions on a coordinator are saved and can be lifted.**
+  Restrictions placed with `POST /v1/api/workstreams/{ws_id}/restrict` now
+  survive a console restart and a close and reopen, which used to lift them
+  silently. `{"restore": [...]}` lifts restrictions. A call carries exactly one
+  of `revoke` and `restore`. Names are trimmed, a name with whitespace inside
+  or one that differs only in case from a known tool is refused, and a name no
+  tool matches is applied and listed in `unknown_tools`. When the change can't
+  be saved the call answers 503: a revoke stays active for the running session,
+  a restore lifts nothing. A fork does not inherit restrictions. See
+  [the coordinator API tour](docs/coordinator-api-tour.md).
+
+### Changed
+
+- **The interactive and coordinator panes share one stream and recovery
+  implementation (#904, #905).** They now behave the same when a stream drops,
+  a tab is hidden, a server restarts or the history has to be reloaded:
+  - A refused stream is redialled after 1, 2, 4, 8, 16 and 30 s and given up
+    after seven refusals in a row, about a minute; the pane then says
+    Disconnected and offers a reconnect. The interactive pane used to give up
+    after about 15 s, and the coordinator pane retried forever.
+  - The status bar names each phase in both panes: loading, connecting,
+    reconnecting, paused while hidden, catching up, history out of date, sign
+    in to reconnect, disconnected.
+  - Signing in again leaves a healthy stream alone and reloads no history.
+    When a different user signs in, the open workstream panes close and the
+    standalone coordinator page reloads.
+  - Events that arrive while the history reloads are held and shown after it,
+    so a rewind or retry no longer drops or repeats rows of a turn that is
+    already running.
+  - Every history load is bounded: 15 s, doubling to 120 s while loads keep
+    expiring.
+  - An edit-and-resend written before the signed-in user changed is not sent.
+    The text goes back to the composer with a note.
+  - Stream messages in the browser console name the workstream.
+- **A stream error no longer reopens a coordinator.** The coordinator pane
+  used to request its workstream on every stream error, which reloaded a
+  coordinator that had been closed elsewhere or by the idle timeout for as long
+  as a tab stayed open. Closing a pane still leaves its session running; only
+  closing the session ends it.
+- **Closing a coordinator that isn't loaded closes it.** The close used to
+  answer 404 and the coordinator came back on the next open. It now answers 409
+  `workstream_lease_held` while another console holds the coordinator, and 503
+  when the close can't be recorded.
+- **`coordinator.restricted` audit rows** carry `restored` and `saved` beside
+  `revoked`.
+
+### Fixed
+
+- **A coordinator pane closes when its session is closed elsewhere**, from
+  another tab, by the idle timeout or by a delete, instead of staying open on a
+  reconnect banner. Unsent text in its composer is lost, as in an interactive
+  pane.
+- **Opening a session no longer reads every auto-approval in the audit log.**
+  The lookup of a workstream's recent auto-approvals uses the index migration
+  089 adds, so a wave of opens, such as the resumes after a console restart,
+  no longer queues behind it.
+- **Interactive pane:** a node restart shorter than a minute no longer needs a
+  manual reconnect, and hiding the tab no longer cancels the Stop button's
+  timers or voice playback.
+- **Coordinator pane:** a history reload that crossed a reconnect no longer
+  draws over the replayed events (#904).
+
 ## [1.9.4]
 
 > **Before upgrading:** the database stays at migration 088.
