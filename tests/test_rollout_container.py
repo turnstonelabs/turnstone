@@ -564,6 +564,34 @@ class TestWhoseDoingALostContainerIs:
         )
 
 
+class TestWhatATasksCommandsCanChange:
+    """Two settings decide whose doing it is when something a check relies on
+    is not as the harness left it.  No container is started."""
+
+    def test_the_programs_take_root_over_a_writable_root(self):
+        assert Container(_root()).commands_can_change_programs() is True
+        assert Container(_root(read_only_root=True)).commands_can_change_programs() is False
+        unprivileged = ContainerSpec(image=IMAGE, read_only_root=False)
+        assert Container(unprivileged).commands_can_change_programs() is False
+
+    def test_their_user_takes_root_with_the_capability_for_it(self):
+        """Tried in containers: root with ``SETUID`` runs a process as any
+        user; root without it keeps its own, as does another user named it;
+        ``SETGID`` changes groups only."""
+        assert Container(_root("SETUID", read_only_root=True)).commands_can_change_users()
+        assert Container(_root("cap_setuid", "KILL")).commands_can_change_users() is True
+        assert Container(_root(read_only_root=True)).commands_can_change_users() is False
+        every_other = ("CHOWN", "DAC_OVERRIDE", "FOWNER", "FSETID", "KILL", "SETGID", "SYS_CHROOT")
+        assert Container(_root(*every_other)).commands_can_change_users() is False
+        unprivileged = ContainerSpec(image=IMAGE, capabilities=("SETUID", "SETGID"))
+        assert Container(unprivileged).commands_can_change_users() is False
+        # What the container says about its commands' user decides, where it has.
+        named = Container(ContainerSpec(image=IMAGE, user="app", capabilities=("SETUID",)))
+        assert named.commands_can_change_users() is False
+        named.task_uid = 0
+        assert named.commands_can_change_users() is True
+
+
 class TestARuntimeThatDoesNotAnswer:
     """An unanswered question is neither "stopped" nor "gone"."""
 

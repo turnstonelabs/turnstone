@@ -190,6 +190,11 @@ class Completed:
     def stderr_text(self) -> str:
         return self.stderr.decode("utf-8", errors="replace").strip()
 
+    @property
+    def dropped(self) -> int:
+        """Bytes of standard output that were over the limit and not kept."""
+        return max(0, self.stdout_total - len(self.stdout))
+
 
 # Whether a child can be waited for without being collected.  Until it is
 # collected its process id is still its own, and with it the id of the process
@@ -1839,6 +1844,21 @@ class Container:
         afterwards is the model's doing."""
         root = self.task_uid == 0 if self.task_uid is not None else self.spec.runs_as_root()
         return root and not self.spec.read_only_root
+
+    def commands_can_change_users(self) -> bool:
+        """Whether this task's commands can run a process as another user
+        than their own: root with the ``SETUID`` capability, and nobody else.
+
+        Such a process can be given any user number, also one above
+        2**31 - 1, as which the runtime starts no container.  Root without
+        the capability keeps its user, and so does any other user who is
+        named it: no command gains a privilege by the program it starts.
+        ``SETGID`` changes groups only, which decide nothing about who may
+        signal a process.
+        """
+        capabilities = {c.upper().removeprefix("CAP_") for c in self.spec.capabilities}
+        root = self.task_uid == 0 if self.task_uid is not None else self.spec.runs_as_root()
+        return root and "SETUID" in capabilities
 
     def _can_make_candidate(self) -> bool:
         """Whether this task's commands can make the main process a candidate

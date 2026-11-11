@@ -1344,6 +1344,23 @@ class TestLimits:
             assert server.requests == []
         assert box.root == "" and box.closed == 0
 
+    def test_a_verifier_given_no_time_is_refused_before_anything_runs(self):
+        """The whole run used to be made first, and was then lost to a check
+        that could not end within 0 s."""
+        for seconds in (0, -5.0):
+            box = _DirSandbox()
+            config = {"base_url": "http://127.0.0.1:9/v1", "model": "scripted", **SAMPLED}
+            with pytest.raises(SetupError, match="verifier_timeout must be above zero"):
+                run_episode(
+                    Task(prompt="p"),
+                    RolloutConfig(**config),
+                    sandbox_factory=lambda _t, _c, box=box: box,
+                    allow_host_execution=True,
+                    verifier=lambda _context: {"verdict": "pass"},
+                    verifier_timeout=seconds,
+                )
+            assert box.root == "" and box.closed == 0
+
     def test_where_the_least_has_a_meaning_it_is_taken(self):
         """No sub-agent at all, the framework's automatic share of a result, a
         sub-agent without a turn limit of its own, the likeliest token."""

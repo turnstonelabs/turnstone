@@ -102,6 +102,23 @@ The separate `dev` branch is retired. See [the release process](docs/releasing.m
   sub-agent is a tool like any other for the sample: it acts in
   the same container, and its own conversation is kept apart and not trained
   on. See [the rollout guide](docs/rollout.md).
+- **Rollouts: a check after the model has finished.** `run_episode(verifier=...)`
+  stops the episode's container once the run is over and calls the given
+  function with the stopped container, so that nothing the model left running
+  can change what is read; what it returns is stored under the record's
+  `verification` and the model never sees it. Helpers read paths out of a
+  stopped container without running anything inside it and start a clean
+  container, never touched by the model, to put files into and run the check
+  in; the task's own files win over anything of the model's that stands in
+  their way. A task's `after_run` commands cover the simple case in the
+  episode's own container; what was left running there is ended first,
+  whoever it runs as, and each command's result says what was found and
+  what could not be ended (`leftovers`). A check that runs and fails is the
+  model's outcome,
+  and so is what the model left for the check to find: more than a helper will
+  read, a path that cannot be read. A check that raises, runs out of time or
+  returns no verdict leaves no reward, and the record is then not trainable.
+  Every container is removed afterwards.
 
 ### Fixed
 

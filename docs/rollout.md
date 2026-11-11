@@ -179,6 +179,7 @@ nothing but the model decided how the run went. All of this holds:
 | The log-probabilities are those of the distribution the tokens were sampled from | The server is probed before the run (below) |
 | A trainer can reproduce the sampling | `temperature`, `top_k` and `top_p` are read off the requests themselves; one a request did not carry fails the check |
 | The run was not ended by the server, the harness or the runtime | See [how a rollout ends](#how-a-rollout-ends) |
+| A reward exists | A check asked for after the run gave its verdict; see [checking a rollout afterwards](#checking-a-rollout-afterwards) |
 
 A server that does not name tokens by ID leaves only the counts to compare. Such
 a rollout is not trainable unless `RolloutConfig.require_token_id_check` is
@@ -506,7 +507,8 @@ teardown.
 If the runner is killed, the container is removed by a small process of its own
 on the host, out of the container's reach. Its time is set anew for each step,
 to as long as that step may take and ten minutes on top: bringing the sandbox
-up (15 minutes), then the run (the task's time limit).
+up (15 minutes), the run (the task's time limit), the commands after the run
+(their time limits), the verifier (its time limit).
 It is stopped only once the container is known to be gone; after a removal that
 could not be confirmed it tries again within half a minute and keeps trying for
 five.
@@ -532,6 +534,7 @@ ends as `sandbox_failed`: a `writable` that leaves `/tmp` read-only over a
 read-only root, a `/tmp` the commands' user cannot write, an `sh` that does not
 know `set -o pipefail` in an image without `bash`. Started all the same, every
 shell call of the model's would fail there and be scored as its own.
+`tar` is needed where a command after the run names files to read out.
 
 ### The main process
 
@@ -687,6 +690,16 @@ The watched bound is not a hard bound:
   who replaced those programs, a file held open as another user, or a process
   limit used up so that the look cannot start, is not seen.
 
+The look from inside is a process of the container, so none is begun, and
+none is under way, while the container is held still before an
+[after-run command](#checking-a-rollout-afterwards): it would be counted as
+left running and ended with the rest, and a command that is being started at
+the moment a container is held keeps the runtime's list of its processes from
+answering until the container runs again. What the last look counted stands
+in for that time. Everything else the watch asks is asked of the runtime,
+which answers for a container it holds still as for any other: held still, a
+root stays measured and bounded.
+
 The watch ends with the container and with nothing else. What a program in the
 container prints where a size belongs is taken for one only if it can be one,
 and a look that fails, whatever the reason, is a look that could not measure:
@@ -816,6 +829,178 @@ stop made it; the call that died is still in `subagents.calls`.
 
 ---
 
+## Checking a rollout afterwards
+
+A reward needs a check the model could not have prepared for. A model with root
+in a writable container can change everything a check inside that container
+relies on: the test script, the test runner, the shell, the interpreter.
+
+**The general form is a verifier**, a function the caller gives `run_episode`:
+
+```python
+from turnstone.rollout.verification import VerificationContext
+
+def verifier(context: VerificationContext) -> dict:
+    ...  # read from the stopped container, check, decide
+    return {"verdict": "pass", ...}
+
+record = run_episode(task, config, verifier=verifier, verifier_timeout=3600)
+```
+
+When the run is over, however it ended, the harness stops the episode's
+container, so that nothing the model left running can change a file any more,
+and calls the function. The context names the stopped container
+(`container_name`), which the runtime's own commands can read without running
+anything inside it. What the function returns is stored under the record's
+`verification`; the model never sees it. Then the episode's container and every
+container the function started through the context are removed, with the
+removal confirmed, whether the function returned, raised or ran out of its
+time.
+
+Helpers a verifier can use (`turnstone.rollout.verification`):
+
+| Helper | What it does |
+|--------|--------------|
+| `context.export(paths, max_bytes=...)` | Reads paths out of the stopped container with the runtime's own copy, into memory. Links and special files are noted, never followed and never made on this machine. More than `max_bytes` sets `too_large`, as soon as that much has arrived and without waiting for the rest. A path that cannot be read although the container is there (nothing at it, or something above it that is no directory) is listed under `skipped` |
+| `context.clean_container(spec)` | Starts a container the model never touched, from a `ContainerSpec`, with the same isolation as an episode's |
+| `clean.put(dest, files=..., tree=...)` | Puts in what was exported (`tree`) and then the files the task holds that the model never saw (`files`). The task's files win: a link, a file or a directory of the model's that stands in the way of one of them, or of a directory above it, is removed first. A link is never followed, so nothing of the task's lands where a link of the model's points |
+| `clean.run(argv, user=..., timeout=...)` | Runs a command there: exit status, bounded output, time |
+| `clean.read(paths)` | Reads files out of the clean container |
+
+**The simple case** is `Task.after_run`: commands run in the episode's own
+container, as root, after everything left running there was ended and before
+the container is stopped, each with its exit status, bounded output and, if
+asked, named files read out. It is only as good as the container. Use it where
+the model could not change the programs the command relies on: an unprivileged
+user over a read-only root. Do not use it to grade a model that had root over a
+writable root; check that in a clean container. A memory-backed directory (the
+default working directory) is gone once the container stops, so reading it is
+an after-run command's job.
+
+An after-run command is started in the task's working directory, like the
+model's own commands. The read of the files it names is not, and neither is
+anything else the harness runs in a container for itself (the look of the
+[size watch](#what-bounds-writes), the end of a command that ran out of its
+time): they start in the root directory. A working directory can be renamed
+or removed by a user who owns the directory above it, and the runtime starts
+nothing in a directory that is not there. That then costs the model its own
+commands and the after-run command, whose exit status says so, and no more:
+the read starts, reads what is there and passes over what is not. A relative
+path among the files to read is read below the working directory and keeps
+the name the task gave it; an absolute one is named by its place below the
+root (`/etc/hostname` as `etc/hostname`). The default container's working
+directory is a mount of its own that its user can neither rename nor remove.
+
+**What is left running is ended before each after-run command**, whoever it
+runs as: a process the model detached from its command, one an earlier
+after-run command left. Root in the container
+cannot do that (the container gives it no right to signal another user's
+processes), and nothing is run in the container with more rights than the
+container has. So the runtime holds the container still, lists its processes
+from outside, and for every user that has one a helper container ends that
+user's processes as that user: it shares the container's process namespace
+and nothing else, has no capability, and comes from the image, not from files
+the model wrote. One helper ends all of a user's processes whatever their
+groups. They are listed again, at most three times, and the
+container is let run again. Held still, a process can neither start another,
+nor end the helper first, nor keep the helper from starting by holding every
+process the container may have. A process that is over and only waits for its
+parent to collect it is not one of them: it is not counted, and nothing has to
+be done about it. One whose first thread has ended while another thread runs
+is listed in the same state and runs on; its count of threads tells it from the
+first kind, and it is ended and counted like any other. Each command's result
+says what was found
+(`leftovers`: `found`, `still_running`, `frozen`).
+
+The container is let run again whether or not the runtime confirmed that it
+holds it still (`frozen`). The runtime carries out a hold it was asked for
+even when its answer comes too late, so the release is asked for every time;
+a refusal for a container the runtime does not count as held is no failure,
+and where the hold was never confirmed it is asked for once more and ended,
+in case the runtime left it half done. A container that is still held after
+that can run nothing more: the check has failed, the machinery's, and
+`verification.failure` says that the runtime did not let it run again, with
+the runtime's own words. The record keeps the ending its run had.
+
+The list is asked for numbers and a state only (`pid`, `ruid`, `rgid`, `nlwp`,
+`stat`): nothing a process writes itself is in it, so nothing a process writes
+can make it unreadable. A process's name is asked apart, and only to be shown
+in `still_running`. A user or group number above 2147483647 is printed in the
+list as a negative number and is read as what it is. The runtime starts a
+container as no user or group above that number. For a group that costs
+nothing: the helper is that user under another group, and a signal goes by
+the user. For a user it means that nobody can be asked to end the process as
+its user, and it stays.
+
+Whose doing a process still there after the tries is follows from the task's
+settings, as for the [main process](#the-main-process). It is the model's own
+outcome, listed in `still_running`, with the after-run command run beside it
+and the rollout still trainable, in two kinds of container:
+
+- commands that run as root over a writable root: the programs in the
+  container are the model's to change;
+- commands that run as root with the `SETUID` capability: they can run a
+  process under any user number, also one the runtime starts no helper as,
+  and under more users than the step has time for.
+
+Anywhere else the check has failed. Root without `SETUID` keeps its user, and
+so does any other user a task names that capability for; `SETGID` changes
+groups only. A task whose after-run commands are to be relied on gives its
+commands neither of the two, or scores a record by its `still_running`.
+
+Holding the container still, listing and ending have 45 seconds together, and
+every question to the runtime is given what is left of them. When they are
+over no helper is begun any more: the processes are listed one last time, in
+time kept back for that, and what that list holds is what stayed. It is
+scored like any process that stayed: the model's own outcome in the two kinds
+of container above, a failed check anywhere else, where only a runtime too
+slow for its helpers explains it. The helper is removed by its name when the
+step is over, whatever became of it, and letting the container run again has
+a time of its own after that.
+
+The step needs a runtime that can hold a container still and whose list of a
+container's processes takes the options of `ps` with the columns above and
+`comm`.
+
+Whose doing a result is:
+
+| What happened | Whose doing | The record |
+|---------------|-------------|------------|
+| The check ran and failed, or its own command ran out of time | model | trainable; the verdict says so |
+| The export or the files read out held more than will be read (`too_large`), a file of a size no disk holds included | model | trainable; the verifier decides the verdict |
+| An exported path cannot be read because of what stands there (`skipped`) | model | trainable; the verifier decides the verdict |
+| Reading out the files an after-run command names failed in any way (its time ran out, the archive program was ended or failed, what it wrote is no archive), in a container whose programs the model could change (root over a writable root) | model | trainable; the command's `collected_summary.failed` says why |
+| Reading them out was cut short in any other container (its time ran out, or the archive program was ended, as when the container's memory is used up) and the container still answers at once: what the model decides there is how much stands at the paths | model | trainable; the command's `collected_summary.failed` says why |
+| A process left running could not be ended before an after-run command, in a container whose programs the model could change (root over a writable root) or whose commands can change their user (root with `SETUID`) | model | trainable; the command's `leftovers.still_running` lists it |
+| The model ended its container, during the run or with something it left behind for the check | model | trainable (`sandbox_destroyed`); `commands_not_run` says why the after-run commands did not run |
+| The verifier raised, ran past `verifier_timeout` or returned no `verdict` | machinery | not trainable: no reward exists |
+| The container could not be stopped before the check, a clean container did not start, reading files out failed where the model could not have caused it (no archive program in the image, one that fails or writes no archive, a container that no longer answers), what was left running could not be listed, it could not be ended in any other container than the two above, or the container was held still for that and the runtime did not let it run again | machinery | not trainable |
+
+Three things for the author of a verifier:
+
+- **Bound every step by something the model does not control.** A verifier that
+  lets the model's files decide how long it runs (a test suite the model wrote
+  to, a build of its tree) can run past `verifier_timeout`, and that is counted
+  as the machinery's failure: the rollout is lost to training, which a model
+  could bring about. Give each command its own `timeout` and judge a step that
+  runs out as failed.
+- **A clean container has a size too.** One with a writable root is bounded
+  like an episode's: by its spec's `root_size`, and by `10g` where the spec
+  names none (see [what bounds writes](#what-bounds-writes)). A step that
+  writes more than that there, and a build or a test of the model's code
+  decides how much it writes, gets the container stopped; the next call on it
+  (`put`, `run`, `read`) raises `ContainerLostError`
+  (`turnstone.rollout.container`, an `OSError`). A verifier that lets
+  that out has raised, which is the machinery's failure: the rollout is lost
+  to training, and a model could bring that about. Catch it and return a
+  verdict of failure, or give the clean container a size, or memory-backed
+  directories over a read-only root, that the graded code cannot outgrow
+  unnoticed.
+- The times a clean container and the stopped containers are kept for follow
+  the verifier's time limit, not the run's.
+
+---
+
 ## The episode record
 
 `run_episode` returns a JSON-safe dict. Every key below is always there; a key
@@ -824,7 +1009,7 @@ whose value does not apply is `null`.
 | Key | Value |
 |-----|-------|
 | `key` | `Task.key` |
-| `task` | The task as it was given: `prompt`, `key`, `system_prompt`, `setup_files`, `max_turns`, `timeout`, `container` (the `ContainerSpec`) |
+| `task` | The task as it was given: `prompt`, `key`, `system_prompt`, `setup_files`, `max_turns`, `timeout`, `container` (the `ContainerSpec`), `after_run` |
 | `model`, `endpoint` | The model's name and the API root the requests went to |
 | `finish_state`, `finish_cause` | How the rollout ended, and whether that is the model's outcome (`model`) or a failure of the server, the harness or the runtime (`machinery`); see [how a rollout ends](#how-a-rollout-ends) |
 | `error` | `null` where the model ended its turn by itself (`completed`). For every other ending, what happened, in words: the limit that was reached and where the last reply was cut, the request that failed or was refused, why the sandbox is gone or did not start, a sub-agent's failure |
@@ -853,6 +1038,7 @@ whose value does not apply is `null`.
 | `subagents` | The side record of sub-agent calls, below |
 | `sandbox` | The container, below |
 | `acts_on_host` | Whether the tools acted on the machine the rollout ran on instead of in a sandbox (see [where the tools act](#where-the-tools-act)) |
+| `verification` | `null` when no check was asked for; otherwise below |
 
 `prefix_events`, one entry per `event`. `turn` counts the session's turns
 from 0, as `tool_log[].turn` does:
@@ -924,6 +1110,18 @@ from 0, as `tool_log[].turn` does:
 | `lost`, `lost_cause` | Why the container stopped while the run needed it, and whose doing that is (`model` or `machinery`); `null` when it did not |
 | `oom_kills`, `exit_code` | Out-of-memory kills inside the container, as a rule of a command of the model's, and the main process's exit code if it ended |
 
+`verification`:
+
+| Key | Value |
+|-----|-------|
+| `commands` | One result per after-run command that ran: `argv`, `exit_code`, `timed_out`, `output`, `output_dropped`, `seconds`, `leftovers` (what was running in the container besides its main process before the command: `found`, how many, all of them ended; `still_running`, those that could not be ended, each with its `uid` (the number of the user it runs as, `null` where the runtime's list gave none) and `command` (its name as the runtime lists it, `""` where it gave none), empty outside a container whose programs are the model's or whose commands can change their user; `frozen`, whether the runtime could hold the container still meanwhile), and where it names files `collected` (path to text: a relative path under the name the task gave it, an absolute one without its first slash) and `collected_summary` (`entries` by kind, `bytes`, `too_large`, and where they apply `skipped`, `failed`) |
+| `commands_not_run` | Only where the after-run commands could not run: why |
+| `container_stopped` | Whether the container was stopped before the verifier was called |
+| `result` | What the verifier returned; it holds `verdict` |
+| `failure` | A failure of the machinery of the check, in words; the record is then not trainable |
+| `helpers_removed` | Whether every container the verifier started was confirmed removed |
+| `seconds` | The time the check took, which is not part of `seconds` above |
+
 ### Token record
 
 Under `calls`, per model call: `call` (its number, from 0), `shared` (how many
@@ -970,6 +1168,33 @@ What a user of the harness has to know, in one place:
 - **The probe measures the temperature at one position**: the one that
   decides, and the first token besides where a later one decides; see
   [which log-probabilities](#which-log-probabilities).
+- **A verifier's own time is the machinery's.** One that lets the model's files
+  decide how long it runs can be made to run out; see
+  [checking a rollout afterwards](#checking-a-rollout-afterwards).
+- **Reading files out after the run** is counted as the model's doing where
+  root over a writable root let it change the programs, and in any other
+  container where the read was cut short and the container still answers. A
+  user without root who can still replace the archive program over a writable
+  root makes any other failed read the machinery's failure. And a machine that
+  stalls for the whole of a read and answers again right after it is taken
+  for more at the paths than a read gets through.
+- **Ending what is left running relies on the runtime holding the container
+  still.** Where it cannot (`leftovers.frozen` is `false`), a process that
+  ends every new process of its own user can outlast the tries; outside the
+  two kinds of container in which a process that stays is the model's own
+  outcome that fails the check, which a model could bring about. Where the
+  machine maps the container's users to
+  other numbers, the runtime's list names those, and only what runs as the
+  commands' user or as root is ended. And it was tried only on a machine with
+  the second version of control groups, where a process that is held still
+  can be ended: with the first version a kill waits until the process runs
+  again, so the tries would find it still there and the check would fail.
+- **A process under a user number above 2147483647 is not ended.** The
+  runtime starts no helper as such a user. Only commands that run as root
+  with `SETUID` can make one; it is then listed in `leftovers.still_running`,
+  the after-run commands run beside it, and the record stays trainable. What
+  an after-run command found in such a container is as good as its
+  `still_running` is empty.
 - **A background shell's exit is not announced** to the model in a headless
   run.
 - **The probe needs a token the model is unsure of.** It looks among the
@@ -994,8 +1219,9 @@ What a user of the harness has to know, in one place:
 
 ## Tests
 
-`tests/test_rollout_container.py` needs a container runtime and an image, so it
-skips where they are missing. CI runs it in its own lane
+The container tests (`tests/test_rollout_container.py`,
+`tests/test_rollout_verification.py`) need a container runtime and an image, so
+they skip where they are missing. CI runs them in their own lane
 (`test-rollout-container`), which pulls the image by digest and sets
 `TURNSTONE_ROLLOUT_REQUIRE_CONTAINER=1`, so that a missing runtime or image
 fails the lane instead of skipping the tests. The other rollout tests need no

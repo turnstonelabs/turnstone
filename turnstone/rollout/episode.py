@@ -51,7 +51,12 @@ from turnstone.core.session import GenerationCancelled
 from turnstone.core.storage import init_storage, reset_storage
 from turnstone.core.trajectory import final_assistant_text
 from turnstone.eval.core import HeadlessSession, run_with_lifecycle
-from turnstone.rollout.container import Container, ContainerEnvironment, ContainerSpec
+from turnstone.rollout.container import (
+    Container,
+    ContainerEnvironment,
+    ContainerLostError,
+    ContainerSpec,
+)
 from turnstone.rollout.probe import SETTINGS as PROBED_SETTINGS
 from turnstone.rollout.probe import all_settings, sampler_logprobs_reported
 from turnstone.rollout.rawargs import RecordedArguments
@@ -65,6 +70,12 @@ from turnstone.rollout.settings import (
 )
 from turnstone.rollout.tokens import build_token_record, describe_break, verify_record
 from turnstone.rollout.toolset import ROLLOUT_TOOL_NAMES
+from turnstone.rollout.verification import (
+    AfterRunCommand,
+    VerificationContext,
+    run_after,
+    run_verifier,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -85,6 +96,11 @@ _KEEP_MARGIN = 600
 # How long bringing a sandbox up may take: the container, its checks and the
 # task's files.
 _STARTUP_SECONDS = 900
+# What one after-run command takes besides its own time limit, when every part
+# takes as long as it may: waiting for the ends of commands still under way
+# and for a look of the size watch, ending what is left running, removing the
+# helper, letting the container run again, and reading out the files it names.
+_AFTER_RUN_OVERHEAD = 330
 
 # Request-body keys that are not sampler settings.
 _NOT_SAMPLER_KEYS = frozenset(
@@ -108,6 +124,10 @@ class Task:
     # The task's container: image, working directory, the user its commands run
     # as, what is writable, capabilities, environment, limits.
     container: ContainerSpec = field(default_factory=ContainerSpec)
+    # Commands run in the container once the model has finished, before the
+    # container is stopped; their results go in the record's ``verification``.
+    # See :mod:`turnstone.rollout.verification` for when that is enough.
+    after_run: list[AfterRunCommand] = field(default_factory=list)
 
 
 @dataclass
@@ -270,6 +290,32 @@ class ContainerSandbox:
     def put_files(self, files: dict[str, str]) -> None:
         assert self.environment is not None
         self.environment.put_files(files)
+
+    @property
+    def name(self) -> str:
+        return self.container.name
+
+    def after_run(self, command: AfterRunCommand) -> dict[str, Any]:
+        """Run one after-run command in the still running container.
+
+        The end of a command that ran past its time is a command in the
+        container too.  One that is still being started when the container is
+        held still, to end what was left running, keeps the runtime from
+        listing the container's processes; so each is waited for first, for as
+        long as one may take.
+        """
+        if self.environment is not None:
+            self.environment.settle(self.environment.kill_timeout + 2.0)
+        return run_after(self.container, command)
+
+    def stop(self) -> bool:
+        """End everything in the container and keep it, to be read from."""
+        if self.environment is not None:
+            self.environment.settle(5.0)
+        return self.container.stop()
+
+    def state(self) -> dict[str, Any]:
+        return self.container.state()
 
     def close(self) -> bool:
         if self.environment is not None:
@@ -1024,6 +1070,83 @@ def _build_record(
     return record
 
 
+def _verify(
+    task: Task,
+    sandbox: Sandbox,
+    record: dict[str, Any],
+    verifier: Callable[[VerificationContext], dict[str, Any] | None] | None,
+    verifier_timeout: float,
+) -> dict[str, Any] | None:
+    """Check the rollout once the model has finished.  Never raises.
+
+    The after-run commands run first, in the still running container; then the
+    container is stopped and the verifier is called.  ``failure`` in what comes
+    back names a failure of this machinery: no verdict exists then, and the
+    caller makes the record not trainable.  A check that ran and failed is in
+    ``commands`` or ``result``, and is the model's outcome.
+    """
+    if not task.after_run and verifier is None:
+        return None
+    started = time.monotonic()
+    # The containers are kept from outside for the step under way, not for a
+    # time worked out when the run began.
+    _keep(
+        sandbox,
+        sum(command.timeout + _AFTER_RUN_OVERHEAD for command in task.after_run) + _KEEP_MARGIN,
+    )
+    out: dict[str, Any] = {
+        "commands": [],
+        "result": None,
+        "failure": None,
+        "container_stopped": None,
+        "helpers_removed": None,
+    }
+    usable = sandbox.lost is None and callable(getattr(sandbox, "after_run", None))
+    if task.after_run and not usable:
+        # Nothing to run them in.  Whose doing that is, the finish state says.
+        out["commands_not_run"] = sandbox.lost or "the sandbox cannot run commands after the run"
+    elif task.after_run:
+        try:
+            for command in task.after_run:
+                out["commands"].append(sandbox.after_run(command))  # type: ignore[attr-defined]
+        except Exception as error:
+            lost_by_model = (
+                isinstance(error, ContainerLostError)
+                and getattr(sandbox, "lost_cause", None) == "model"
+            )
+            if lost_by_model:
+                # Something the model left behind ended the container before
+                # the check could run in it: its outcome, like ending it
+                # during the run.
+                out["commands_not_run"] = sandbox.lost
+            else:
+                out["failure"] = (
+                    f"an after-run command could not be run: {type(error).__name__}: {error}"
+                )
+    _keep(sandbox, 120 + verifier_timeout + _KEEP_MARGIN if verifier is not None else 300)
+    stop = getattr(sandbox, "stop", None)
+    if callable(stop):
+        out["container_stopped"] = bool(stop())
+    if verifier is not None and out["failure"] is None:
+        state = getattr(sandbox, "state", None)
+        context = VerificationContext(
+            task=task,
+            container_name=getattr(sandbox, "name", None),
+            container_stopped=bool(out["container_stopped"]),
+            container_state=state() if callable(state) else {},
+            after_run=list(out["commands"]),
+            record=record,
+            lifetime=int(verifier_timeout) + _KEEP_MARGIN,
+        )
+        if out["container_stopped"] is False:
+            out["failure"] = "the episode container could not be stopped before the check"
+        else:
+            out["result"], out["failure"] = run_verifier(verifier, context, verifier_timeout)
+        out["helpers_removed"] = context.remove_started()
+    out["seconds"] = round(time.monotonic() - started, 2)
+    return out
+
+
 def _keep(sandbox: Sandbox, seconds: float) -> None:
     """Tell the sandbox how long the step now starting may take, if it keeps
     time at all.  Never raises."""
@@ -1138,6 +1261,8 @@ def run_episode(
     config: RolloutConfig,
     *,
     sandbox_factory: Callable[[Task, RolloutConfig], Sandbox] | None = None,
+    verifier: Callable[[VerificationContext], dict[str, Any] | None] | None = None,
+    verifier_timeout: float = 3600.0,
     allow_host_execution: bool = False,
 ) -> dict[str, Any]:
     """Run *task* once and return its episode record.
@@ -1147,6 +1272,13 @@ def run_episode(
     with :class:`HostExecutionError` before anything runs, unless
     *allow_host_execution* is true.  That is for a caller who scripts every
     command itself, such as a test.
+
+    *verifier* is called once the model has finished, with the episode's
+    container stopped (:mod:`turnstone.rollout.verification`).  What it returns
+    is stored under ``verification``; it must hold a ``verdict``.  A verifier
+    that raises, runs past *verifier_timeout* or returns no verdict leaves the
+    rollout without a reward, and the record is then not trainable.  Whatever
+    it does, the sandbox is removed afterwards.
 
     The sandbox is removed on every path, and a failed removal is reported in
     the record (``sandbox.removed`` false, a line in ``warnings``) instead of
@@ -1162,6 +1294,11 @@ def run_episode(
     ``one_sequence`` adds that every prompt extended the previous one.
     ``problems`` lists why ``trainable`` is false.
     """
+    if not verifier_timeout > 0:
+        raise SetupError(
+            f"verifier_timeout must be above zero, not {verifier_timeout}: a check that is "
+            "given no time gives no verdict, and the whole run would be lost to that"
+        )
     # Before the clock starts: what the run's limits are, and which
     # log-probabilities the server reports.  Neither is the task's time.
     config, limits, sampling = effective_config(config)
@@ -1305,6 +1442,25 @@ def run_episode(
                         forced = "error"
                         error = f"{type(run_error).__name__}: {str(run_error)[:500]}"
         record = _build_record(task, config, state, sandbox, forced_state=forced, error=error)
+        record["verification"] = _verify(task, sandbox, record, verifier, verifier_timeout)
+        if (
+            sandbox.lost
+            and getattr(sandbox, "lost_cause", None) == "model"
+            and record["finish_state"] != "sandbox_destroyed"
+            and record["finish_cause"] == "model"
+        ):
+            # The model's doing ended the sandbox after its last turn, while
+            # the check was under way.  The same outcome as during the run.
+            record["finish_state"] = "sandbox_destroyed"
+            record["error"] = sandbox.lost
+        failure = (record["verification"] or {}).get("failure")
+        if failure:
+            # No reward exists for this rollout.
+            record["problems"].append(f"the check after the run failed: {failure}")
+            record["trainable"] = record["one_sequence"] = False
+            log.error("rollout.verification_failed", key=task.key, failure=failure)
+        if (record["verification"] or {}).get("helpers_removed") is False:
+            record["warnings"].append("a verification container could not be confirmed removed")
     finally:
         teardown_started = time.monotonic()
         removed = sandbox.close()
