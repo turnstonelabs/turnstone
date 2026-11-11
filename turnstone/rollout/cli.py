@@ -5,7 +5,8 @@ Usage:
         --prompt "Create hello.txt containing hi, then list the directory."
         --top-k 20 --top-p 0.95
         [--file notes.txt=some text] [--image IMAGE]
-        [--extra-body '{"chat_template_kwargs": {...}}'] [--out episode.json]
+        [--extra-body '{"chat_template_kwargs": {...}}'] [--token-id-prompts]
+        [--out episode.json]
 
     turnstone-rollout --base-url ... --model NAME --task task.json
         [--verifier-command 'grade TASKS {key} {container}'] --out episode.json
@@ -348,6 +349,12 @@ def _parser() -> argparse.ArgumentParser:
         default=None,
         metavar="JSON",
         help="JSON object merged into every request's body (sampler and template arguments)",
+    )
+    parser.add_argument(
+        "--token-id-prompts",
+        action="store_true",
+        help="send every prompt as token IDs on the completions route, so the rollout is one "
+        "token sequence; the server is checked for what that needs before the run",
     )
     parser.add_argument(
         "--keep-text", action="store_true", help="keep each call's generated text in the record"
@@ -734,6 +741,9 @@ def _probe_only(args: argparse.Namespace, api_key: str, extra_body: dict[str, An
             model=args.model,
             api_key=api_key,
             extra_body=sampling["extra_body"].value,
+            # Asked on the route the rollouts of the batch will use: a server
+            # can report differently per route.
+            token_id_prompts=args.token_id_prompts,
         )
     )
     # The status is the verdict's, whatever becomes of printing it.
@@ -819,6 +829,7 @@ def _command(args: argparse.Namespace, given: set[str]) -> int:
         max_subagents=args.max_subagents,
         reasoning_effort=args.effort,
         keep_text=args.keep_text,
+        token_id_prompts=args.token_id_prompts,
         extra_body=extra_body,
         sampler_logprobs=_verdict_given(args.sampler_logprobs),
         max_output_chars=args.max_output_chars,
@@ -948,6 +959,7 @@ def _summary(record: dict[str, Any]) -> list[str]:
     say("log-probabilities:", json.dumps(record["logprobs"]))
     if record["server_version"] is not None:
         say("server version:", _shown(json.dumps(record["server_version"])))
+    say("prompts sent as:", record["prompt_mode"])
     for call in tokens["calls"]:
         logprobs = "none" if call["logprobs"] is None else len(call["logprobs"])
         say(

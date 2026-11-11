@@ -87,6 +87,11 @@ first position is then held against the decision by what it still shows:
 A first position that shows the other kind is a contradiction, and one that
 shows neither leaves the setting without a verdict.
 
+A server can report differently on its two routes, so the probe asks on the
+route the run will use: with messages on the chat route, or (``route`` of
+``"completions"``) with each probe prompt rendered by the server's tokenize
+route and sent as token IDs to the completions route.
+
 A server whose positions contradict each other has no verdict for the
 settings concerned.  What the other positions cannot show is a server that
 applies the cut-offs there and leaves the temperature out of the reported
@@ -97,9 +102,11 @@ first position where that is another.
 from __future__ import annotations
 
 import copy
+import json
 import math
 from typing import Any
 
+from turnstone.rollout.idprompt import render
 from turnstone.rollout.recording import entry_value, logprob_entries
 
 SETTINGS = ("temperature", "top_k", "top_p")
@@ -328,8 +335,36 @@ def all_settings(verdict: bool | None) -> dict[str, bool | None]:
     return dict.fromkeys(SETTINGS, verdict)
 
 
+def _completion_entries(choice: Any) -> list[dict[str, Any]]:
+    """The log-probability entries of a completions choice, in the shape a chat
+    choice has: the token's name, its value and the alternatives listed."""
+    given = getattr(choice, "logprobs", None)
+    names = list(getattr(given, "tokens", None) or [])
+    values = list(getattr(given, "token_logprobs", None) or [])
+    listed = list(getattr(given, "top_logprobs", None) or [])
+    entries: list[dict[str, Any]] = []
+    for index, (name, value) in enumerate(zip(names, values, strict=False)):
+        alternatives = listed[index] if index < len(listed) and listed[index] else {}
+        entries.append(
+            {
+                "token": name,
+                "logprob": value,
+                "bytes": None,
+                "top_logprobs": [
+                    {"token": other, "logprob": other_value, "bytes": None}
+                    for other, other_value in dict(alternatives).items()
+                ],
+            }
+        )
+    return entries
+
+
 def sampler_logprobs_reported(
-    client: Any, model: str, *, extra_body: dict[str, Any] | None = None
+    client: Any,
+    model: str,
+    *,
+    extra_body: dict[str, Any] | None = None,
+    route: str = "chat",
 ) -> dict[str, Any]:
     """Probe the server behind *client* (an SDK client); return the verdict and its evidence.
 
@@ -339,7 +374,8 @@ def sampler_logprobs_reported(
     when all three are reflected (the sampling distribution), ``False`` when
     none is (the model's own), ``None`` otherwise.  *extra_body* is sent with
     every request (chat-template arguments the rollout itself uses); its
-    sampler settings are replaced by the probe's.
+    sampler settings are replaced by the probe's.  *route* is the route the
+    run will use, ``"chat"`` or ``"completions"``; the verdict names it.
 
     ``tried`` holds one entry per probe prompt: the ``prompt``, the control's
     ``likeliest`` value for the first token, whether the prompt was ``used``,
@@ -355,10 +391,14 @@ def sampler_logprobs_reported(
     not used says how many positions the model was certain of
     (``certain_positions``).
     """
+    if route not in ("chat", "completions"):
+        raise ValueError(f"route must be 'chat' or 'completions', not {route!r}")
     body = copy.deepcopy(extra_body or {})
     for key in ("top_k", "top_p", "min_p"):
         body.pop(key, None)
     reflects: dict[str, bool | None] = all_settings(None)
+    # Each probe prompt as the server renders it, for the completions route.
+    prompts: dict[str, list[int]] = {}
     tried: list[dict[str, Any]] = []
     # What the positions other than the one that decided said, per check.
     positions: dict[str, dict[str, int]] = {}
@@ -378,6 +418,24 @@ def sampler_logprobs_reported(
         alternatives: int = _ALTERNATIVES,
     ) -> list[Any]:
         """The log-probability entries of one reply of up to *tokens* tokens."""
+        if route == "completions":
+            key = json.dumps(messages)
+            if key not in prompts:
+                prompts[key] = render(
+                    client, model, messages, None, body.get("chat_template_kwargs") or {}
+                )
+            sent = {k: v for k, v in body.items() if k != "chat_template_kwargs"}
+            answer = client.completions.create(
+                model=model,
+                prompt=prompts[key],
+                max_tokens=tokens,
+                temperature=temperature,
+                top_p=top_p,
+                logprobs=alternatives,
+                # Tokens named by ID: two tokens can share their text.
+                extra_body={**sent, "top_k": top_k, "return_tokens_as_token_ids": True},
+            )
+            return _completion_entries(answer.choices[0])
         response = client.chat.completions.create(
             model=model,
             messages=messages,
@@ -396,6 +454,7 @@ def sampler_logprobs_reported(
         return {
             "sampler_logprobs": verdict,
             "reflects": reflects,
+            "route": route,
             "reason": reason,
             "tried": tried,
             "positions": positions,

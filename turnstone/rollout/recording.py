@@ -28,6 +28,12 @@ A session's sub-agents call through the same client.  Their calls are recorded
 with ``scope`` ``"sub_agent"`` and kept apart: they are not the run's own
 turns.
 
+With *id_prompts* (``RecordingClient(id_prompts=...)``) a chat-completion call
+does not go to the chat route.  Its prompt is sent as token IDs to the
+completions route and the reply is read on this side
+(:mod:`turnstone.rollout.idprompt`); the session still gets a chat-shaped
+stream, and the call is recorded and checked the same way.
+
 A *gate* (``RecordingClient(gate=...)``) is asked before every request, with
 the call's record and the request as it is about to go out.  It may change the
 request or refuse it by raising; the rollout's budgets are kept there
@@ -105,6 +111,16 @@ class CallRecord:
     # than the request asked for.
     token_grant: int | None = None
     token_grant_cut: bool = False
+    # The route the request went out on: ``"chat"`` with messages,
+    # ``"completions"`` with the prompt as token IDs.
+    route: str = "chat"
+    # With a prompt sent as token IDs: the IDs sent, until the server has
+    # reported the prompt it used, and whether that was another one.
+    prompt_sent: list[int] | None = None
+    prompt_differs: bool = False
+    # Whether the reply ended by itself (the model stopped), as opposed to
+    # being cut at a limit.  Known for a prompt sent as token IDs.
+    ended_by_itself: bool | None = None
 
     @property
     def raw_text(self) -> str:
@@ -139,6 +155,8 @@ class CallRecord:
             found.append(f"a value in the reply could not be read ({self.unreadable})")
         if self.prompt_token_ids is None:
             found.append("no prompt token IDs returned")
+        if self.prompt_differs:
+            found.append("the server reported another prompt than the token IDs it was sent")
         if not self.token_ids:
             found.append("no generated token IDs returned")
         if not self.aligned:
@@ -180,6 +198,7 @@ class CallRecord:
         return {
             "index": self.index,
             "scope": self.scope,
+            "route": self.route,
             "streamed": self.streamed,
             "request": self.request,
             "prompt_token_ids": self.prompt_token_ids,
@@ -362,12 +381,8 @@ class _Completions:
     def create(self, **kwargs: Any) -> Any:
         owner = self._owner
         kwargs = dict(kwargs)
-        kwargs["logprobs"] = True
         extra_body = copy.deepcopy(kwargs.get("extra_body") or {})
         merge_into(extra_body, owner.extra_body)
-        extra_body["return_token_ids"] = True
-        # Name each log-probability's token by its ID, to compare the channels.
-        extra_body["return_tokens_as_token_ids"] = True
         kwargs["extra_body"] = extra_body
         streamed = bool(kwargs.get("stream"))
         messages = kwargs.get("messages") or []
@@ -382,6 +397,12 @@ class _Completions:
             owner.calls.append(record)
         started = time.monotonic()
         record.started_at = record.last_heard_at = started
+        if owner.id_prompts is not None:
+            return self._create_from_ids(record, kwargs, streamed)
+        kwargs["logprobs"] = True
+        extra_body["return_token_ids"] = True
+        # Name each log-probability's token by its ID, to compare the channels.
+        extra_body["return_tokens_as_token_ids"] = True
         try:
             if owner.gate is not None:
                 # May cut the reply limit, or refuse the request by raising.
@@ -420,6 +441,24 @@ class _Completions:
         record.end(time.monotonic())
         return response
 
+    def _create_from_ids(self, record: CallRecord, kwargs: dict[str, Any], streamed: bool) -> Any:
+        """The same call with its prompt sent as token IDs."""
+        owner = self._owner
+        assert owner.id_prompts is not None
+        record.route = "completions"
+        try:
+            if owner.gate is not None:
+                # May cut the reply limit, or refuse the request by raising.
+                owner.gate.admit(record, kwargs)
+            stream = owner.id_prompts.start(owner._inner, record, kwargs)
+        except BaseException as error:
+            record.error = f"{type(error).__name__}: {str(error)[:300]}"
+            record.end(time.monotonic())
+            raise
+        # The headers are in: the server answered.
+        record.heard(time.monotonic())
+        return stream if streamed else stream.whole()
+
     def __getattr__(self, name: str) -> Any:
         return getattr(self._inner, name)
 
@@ -437,6 +476,16 @@ class Gate(Protocol):
 
     def admit(self, call: CallRecord, request: dict[str, Any]) -> None:
         """Change *request* in place, or raise to refuse it."""
+        ...
+
+
+class IdPrompts(Protocol):
+    """What sends a chat request with its prompt as token IDs
+    (:class:`turnstone.rollout.idprompt.PromptAssembly`)."""
+
+    def start(self, inner: Any, call: CallRecord, request: dict[str, Any]) -> Any:
+        """Send *request* through the SDK client *inner* and return the reply
+        as a chat-shaped stream that fills *call* as it is read."""
         ...
 
 
@@ -463,23 +512,27 @@ class RecordingClient:
         *,
         extra_body: dict[str, Any] | None = None,
         gate: Gate | None = None,
+        id_prompts: IdPrompts | None = None,
         _shared: RecordingClient | None = None,
     ) -> None:
         self._inner = inner
         self.calls: list[CallRecord]
         self._lock: threading.Lock
         self.gate: Gate | None
+        self.id_prompts: IdPrompts | None
         if _shared is not None:
             # A per-call copy made by ``with_options``: same records, same settings.
             self.calls = _shared.calls
             self._lock = _shared._lock
             self.extra_body: dict[str, Any] = _shared.extra_body
             self.gate = _shared.gate
+            self.id_prompts = _shared.id_prompts
         else:
             self.calls = []
             self._lock = threading.Lock()
             self.extra_body = dict(extra_body or {})
             self.gate = gate
+            self.id_prompts = id_prompts
         self.chat = _Chat(self, inner.chat)
 
     def scoped(self, scope: str) -> list[CallRecord]:

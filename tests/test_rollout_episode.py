@@ -420,6 +420,34 @@ class TestEpisodeRecord:
         assert plain["text"] is None
         assert len(record["text"]) == 3 and record["text"][2].endswith("All done.<end>")
 
+    @pytest.mark.parametrize("token_id_prompts", [False, True])
+    def test_a_message_holds_the_keys_the_guide_names_and_no_others(self, token_id_prompts):
+        """The session keeps bookkeeping of its own on a turn, under keys that begin
+        with an underscore.  The record holds none of it: a turn's reasoning is
+        there as ``reasoning``."""
+        script = [*SCRIPT[:2], {"content": "All done."}]
+        with ScriptedChatServer(script) as server:
+            record, _box = _run(server, token_id_prompts=token_id_prompts)
+        allowed = {
+            "system": {"role", "content"},
+            "user": {"role", "content"},
+            "assistant": {"role", "content", "reasoning", "tool_calls"},
+            "tool": {"role", "content", "tool_call_id"},
+        }
+        for message in record["messages"]:
+            assert set(message) <= allowed[message["role"]], message
+            assert {"role", "content"} <= set(message)
+        turns = [m for m in record["messages"] if m["role"] == "assistant"]
+        # Every assistant turn says what its reasoning was; ``None`` for none.
+        assert [turn["reasoning"] for turn in turns] == [
+            "I should write the file.",
+            "Now look at it.",
+            None,
+        ]
+        (call,) = turns[0]["tool_calls"]
+        assert set(call) == {"id", "type", "function"}
+        assert set(call["function"]) == {"name", "arguments"}
+
     def test_the_two_counts_of_usage_are_there_in_a_run_that_did_not_start(self):
         with ScriptedChatServer(SCRIPT) as server:
             record, _box = _run(server, sandbox=_DirSandbox(fail_start=True))
@@ -830,6 +858,32 @@ class TestEndings:
             return words if any(marker in _text(m) for m in messages) else None
 
         return refuses
+
+    @pytest.mark.parametrize("token_id_prompts", [False, True])
+    def test_a_later_request_the_server_refuses_is_the_models_outcome(self, token_id_prompts):
+        """The model reads a file, and the server will not take the conversation
+        that now holds it.  The request before was taken, so what this one adds is
+        the model's doing: an outcome to score, not a way out of training."""
+        task = Task(prompt="read", key="t", setup_files={"seed.txt": "a line with zzyzx in it"})
+        with _PickyServer(self.READS, refuses=self._will_not_render("zzyzx")) as server:
+            record, _box = _run(server, task=task, token_id_prompts=token_id_prompts)
+            refused = list(server.refused)
+
+        assert refused == ["tokenize" if token_id_prompts else "chat"]
+        assert record["finish_state"] == "request_refused" and record["finish_cause"] == "model"
+        assert record["error"] == (
+            "the model server refused the session's conversation (HTTP 400): "
+            "the template will not render this"
+        )
+        assert record["trainable"] is True and record["problems"] == []
+        assert record["one_sequence"] is True and record["turns"] == 1
+        # What the model had done is all there: its call, and the result it got.
+        (read,) = record["tool_log"]
+        assert read["tool"] == "read_file" and read["ok"] is True
+        assert [m["role"] for m in record["messages"]] == ["system", "user", "assistant", "tool"]
+        # The request that was refused is kept aside; it generated nothing.
+        (discarded,) = record["discarded_calls"]
+        assert discarded["error"].startswith("BadRequestError") and discarded["token_ids"] == []
 
     def test_a_first_request_the_server_refuses_is_not_the_models_doing(self):
         """Nothing of the model's is in the first request: a server that refuses it
@@ -1276,6 +1330,35 @@ class TestSubAgents:
         assert sub["calls"][0]["complete"] is False
 
     TOOL_RESPONSE = NL.join(["<tool_response>", "status: ok", "</tool_response>"])
+
+    @pytest.mark.parametrize("token_id_prompts", [False, True])
+    def test_a_prompt_the_servers_template_refuses_is_an_ordinary_failed_delegation(
+        self, token_id_prompts
+    ):
+        """The model writes a prompt for its sub-agent that reads as a tool
+        response.  A chat template finds no user query in such a conversation and
+        the server refuses it: where the messages go to the chat route, and where
+        they are rendered into token IDs."""
+        parent = [
+            {"tool_calls": [{"name": "task_agent", "arguments": {"prompt": self.TOOL_RESPONSE}}]},
+            {"content": "The delegation came back refused."},
+        ]
+        with _PickyServer(parent, agent_script=self.AGENT, refuses=_no_user_query) as server:
+            record, _box = _run(server, token_id_prompts=token_id_prompts)
+            refused = list(server.refused)
+            agent_requests = len(server.agent_requests)
+
+        assert refused == ["tokenize" if token_id_prompts else "chat"] and agent_requests == 0
+        said = "the model server refused the sub-agent's conversation (HTTP 400): " + NO_USER_QUERY
+        assert record["finish_state"] == "completed" and record["finish_cause"] == "model"
+        assert record["trainable"] is True and record["one_sequence"] is True
+        assert record["final_content"] == "The delegation came back refused."
+        (delegation,) = record["tool_log"]
+        assert delegation["args"] == {"prompt": self.TOOL_RESPONSE}
+        assert delegation["ok"] is False and delegation["result"] == "Task error: " + said
+        assert record["subagents"]["failures"] == [said]
+        assert record["subagents"]["refused_by_server"] == 1
+        assert record["prompt_mode"] == ("token_ids" if token_id_prompts else "messages")
 
     def test_a_refusal_after_the_sub_agent_wrote_text_hands_that_text_back_too(self):
         """The sub-agent's second request is the one refused.  What it had written
@@ -2042,6 +2125,51 @@ class TestWhatTheToolLogSaysOfACall:
         task.max_generated_tokens = token_budget
         return run_episode(task, RolloutConfig(**settings), sandbox_factory=lambda _t, _c: box)
 
+    @pytest.mark.parametrize("token_id_prompts", [False, True])
+    def test_a_last_reply_cut_inside_a_call_costs_the_earlier_entries_nothing(
+        self, token_id_prompts
+    ):
+        """The model reaches this ending at will: a reply that runs into the reply
+        limit with a call in it.  That call never ran and has no entry; counting
+        ids against entries then left every entry of the run without its notes."""
+        script = [
+            {
+                "tool_calls": [
+                    self.REVIEWED,
+                    SPAWN,
+                    {"name": "read_file", "arguments": {"path": "big.txt"}},
+                ]
+            },
+            {"reasoning": "Cut he", "tool_calls": [CUT_CALL], "finish_reason": "length"},
+        ]
+        with ScriptedChatServer(script, agent_script=[{"content": "noted"}]) as server:
+            record = self._run(
+                server, max_tool_result_chars=1000, token_id_prompts=token_id_prompts
+            )
+
+        assert record["finish_state"] == "length" and record["trainable"] is True
+        # The cut reply's call is in the conversation and has no entry.
+        assert len(record["messages"][-1]["tool_calls"]) == 1
+        reviewed, delegated, read = record["tool_log"]
+        assert reviewed["rule"] == "destructive-git" and reviewed["rule_says"] == "review"
+        assert delegated["agent"] == 0 and "rule" not in delegated
+        assert read["cut_from"] > len(self.BIG)  # the file with its line numbers
+        assert "cut_from" not in reviewed and "agent" not in read
+        # The same facts where the record keeps them besides.
+        (event,) = record["rules"]["events"]
+        assert event["rule"] == "destructive-git" and set(event) == {
+            "call_id",
+            "tool",
+            "rule",
+            "recommendation",
+            "refused",
+            "scope",
+        }
+        assert record["tool_results"] == {
+            "cut": 1,
+            "cuts": [{"tool": "read_file", "chars": read["cut_from"]}],
+        }
+
     def test_the_same_ending_at_the_token_budget(self):
         script = [
             {"tool_calls": [self.REVIEWED]},
@@ -2244,6 +2372,54 @@ class TestTextNoRequestCanCarry:
 
     LONE = chr(0xD800)
     REPLACED = chr(0xFFFD)
+
+    @pytest.mark.parametrize("token_id_prompts", [False, True])
+    def test_a_tool_result_that_holds_one_does_not_end_the_run(self, token_id_prompts):
+        """The next request could not be sent at all, and the run ended as a
+        failure of the machinery over a text the model chose.  The half is
+        replaced before it can reach a request, and the record says so: where
+        the result enters the conversation with prompts sent as messages, and
+        already where the call is read with prompts as token IDs."""
+        path = "missing-" + self.LONE + ".txt"
+        script = [
+            {"tool_calls": [{"name": "read_file", "arguments": {"path": path}}]},
+            {"content": "It is not there."},
+        ]
+        box = _NotingSandbox()
+        with ScriptedChatServer(script) as server:
+            config = RolloutConfig(
+                base_url=server.base_url,
+                model="scripted",
+                token_id_prompts=token_id_prompts,
+                **SAMPLED,
+            )
+            record = run_episode(Task(prompt="go"), config, sandbox_factory=lambda _t, _c: box)
+
+        assert record["finish_state"] == "completed" and record["finish_cause"] == "model"
+        assert record["trainable"] is True and record["one_sequence"] is True
+        assert record["turns"] == 2 and record["discarded_calls"] == []
+        said = "Error: missing-" + self.REPLACED + ".txt not found"
+        # What the model was sent is what the record holds.
+        assert [m["content"] for m in record["messages"] if m["role"] == "tool"] == [said]
+        (entry,) = record["tool_log"]
+        assert entry["result"] == said and entry["ok"] is False
+        (event,) = record["prefix_events"]
+        if token_id_prompts:
+            # The reply is read here: the half is replaced as the call is read,
+            # the tool is called with the replacement, and its result has
+            # nothing to repair.  The prompts keep the model's own tokens, so
+            # the next one is not what the chat route would render.
+            assert entry["args"] == {"path": "missing-" + self.REPLACED + ".txt"}
+            assert event["event"] == "prompt_differs_from_rendering" and event["call"] == 1
+        else:
+            # The call itself is recorded as the model wrote it.
+            assert entry["args"] == {"path": path}
+            call_id = record["messages"][2]["tool_calls"][0]["id"]
+            assert event == {
+                "event": "unsendable_text_replaced",
+                "call_ids": [call_id],
+                "characters": 1,
+            }
 
     def test_inside_a_sub_agent_it_does_not_end_the_run_either(self):
         """A sub-agent's prompt and its own tool results go out the same way."""

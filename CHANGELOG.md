@@ -265,6 +265,31 @@ The separate `dev` branch is retired. See [the release process](docs/releasing.m
   proportional to its length, whatever the model wrote. Recorded replies with
   what a server read in them pin the behaviour. See
   [the rollout guide](docs/rollout.md#reading-a-reply-without-the-server).
+- **Rollouts: prompts sent as token IDs.** With
+  `RolloutConfig(token_id_prompts=True)` or `--token-id-prompts` every prompt of
+  a rollout is the previous prompt, the tokens generated after it and what the
+  server's chat template writes next, sent as token IDs to the completions
+  route. A model can generate a split of a text into tokens that a tokenizer
+  does not reproduce, which broke the sequence of a rollout sent as messages at
+  a place nothing could reach; it no longer can. What the template writes next
+  is taken from the server's own renderings on its tokenize route, never
+  rendered by the harness, and each thing that relies on is checked on every
+  call: a call that fails one is not sent and the run ends as the machinery's
+  failure with the reason. The reply is read on the client, so the server needs
+  no reader of reasoning or tool calls. Before a run the server is checked for
+  what the mode needs, and one that lacks it is refused, with no falling back
+  to messages; the log-probability probe asks on the route the run uses. The
+  check fails only for what the server does: where it has to see a marker or
+  the end-of-turn token generated and the model would write another token, the
+  server is steered to it, and what cannot be seen that way is said in the
+  verdict and held against every reply of the run instead.
+  A prompt built this way that is not what the chat route would render for the
+  same conversation is noted in the record (`prefix_events`:
+  `prompt_differs_from_rendering`, for a call that returned a reply to it); it
+  stays trainable.
+  Sub-agents use the same route. The record says how the prompts went
+  (`prompt_mode`) and keeps the check's verdict (`token_id_route`). Off by
+  default. See [the rollout guide](docs/rollout.md#prompts-as-token-ids).
 
 ### Fixed
 

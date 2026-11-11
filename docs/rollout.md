@@ -21,6 +21,10 @@ join another container's process namespace and lower a process's out-of-memory
 score there, which a rootless runtime cannot do; see
 [the main process](#the-main-process).
 
+With [prompts as token IDs](#prompts-as-token-ids) the requests go to the
+server's tokenize and completions routes instead, and the server needs no
+reader of reasoning or tool calls.
+
 ---
 
 ## Running one
@@ -34,7 +38,11 @@ turnstone-rollout --base-url http://127.0.0.1:8000/v1 --model NAME \
 The task is given by flags (`--prompt`, `--key`, `--file` and the container
 flags) or as a whole by a [task file](#a-task-file) (`--task`), never by both.
 The server's API key, where it wants one, is read from the environment variable
-that `--api-key-env` names.
+that `--api-key-env` names. `--token-id-prompts` sends every prompt as token
+IDs, which is what keeps a long rollout one token sequence, and what keeps a
+model from ending a run as the machinery's failure by what it writes in one
+argument. Rollouts that are trained on are run with it; see
+[prompts as token IDs](#prompts-as-token-ids).
 
 The flags that say what the task is:
 
@@ -65,8 +73,12 @@ caller can rely on.
 A command line, a task file or a configuration that cannot work is refused
 before anything runs, with a message on standard error and exit status 3: a
 flag that is not known, a task file with a key that is not known, a rule file
-that cannot be read, a context window that nothing names (name it with
-`--context-window`), budgets that do not fit together.
+that cannot be read, a configuration file that cannot be used (see
+[limits come from the framework](#limits-come-from-the-framework)), a context
+window that nothing names (name it with `--context-window`), a number below
+the least it can be (the same section has the list), budgets that do not fit
+together, a server that cannot be sent prompts as token IDs where the run asks
+for them.
 
 From Python:
 
@@ -90,7 +102,8 @@ elif record["trainable"]:
 ```
 
 `run_episode` raises instead of returning a record in two cases, both before
-the run starts: `SetupError` for a configuration that cannot work, and
+the run starts: `SetupError` for a configuration that cannot work (a server
+that fails the check for prompts as token IDs included), and
 `HostExecutionError` for a sandbox that acts on the machine the rollout runs on
 (see [where the tools act](#where-the-tools-act)).
 
@@ -228,7 +241,35 @@ To probe the server once for a whole batch, `--probe-only` runs no rollout. It
 prints the [verdict](#which-log-probabilities) as one JSON object (exit status
 0 when the reported values are the sampling distribution's, 2 otherwise), and
 `--sampler-logprobs '<that object>'` or `--sampler-logprobs @FILE` hands it to
-each rollout, which then does not probe.
+each rollout, which then does not probe. With `--token-id-prompts` the probe is
+made on the completions route, the one those rollouts use.
+
+### The order of a run
+
+What comes first happens before the task's time starts, and none of it is the
+model's:
+
+1. The configuration is resolved: limits, sampling settings, budgets. One that
+   cannot work is refused.
+2. The server's version is asked, where the run is given an address
+   ([one version of the server](#one-version-of-the-server)). Without an answer
+   the server is asked nothing more and the run does not start.
+3. With [prompts as token IDs](#prompts-as-token-ids) the server's routes are
+   checked, unless the verdict of an earlier check was passed in. A server that
+   fails is refused.
+4. The server is probed for the log-probabilities it reports
+   ([which log-probabilities](#which-log-probabilities)), on the route the run
+   uses, unless a verdict was passed in.
+5. The container is started, and the task's sidecar; the task's files are put
+   in; its [before-run commands](#before-the-run) run.
+
+Then the session runs, under the task's time limit and budgets. Right after its
+last model call the server's version is asked again; then the after-run
+commands and the verifier run, and the containers are removed.
+
+So the two questions about the version enclose every request that reaches the
+model: the check of the routes, the probe, the session's calls and its
+sub-agents'.
 
 ### Limits come from the framework
 
@@ -456,6 +497,11 @@ rollouts lets the model choose which of its rollouts count.
 calls before a break are not part of the final sequence, and returning only the
 others would look like the whole rollout.
 
+That is a run that sends messages. With
+[prompts as token IDs](#prompts-as-token-ids) the harness builds the sequence
+itself, so there the two go together: a break is a fault of the harness, and
+the record is then not trainable.
+
 ### How a rollout ends
 
 **A record is left out of training only for causes outside the model's
@@ -479,7 +525,7 @@ penalised for it.
 | `request_refused` | After a request of the session had been answered: the server refused a later one for what the conversation held (HTTP status 400 or 422); see [a conversation the server refuses](#a-conversation-the-server-refuses) | model | yes |
 | `server_stalled` | Without a token budget: the time limit passed while a model request had had nothing from the server for longer than it is allowed | machinery | no |
 | `backstop` | With a token budget: the time limit passed and the server was slower than its minimum speed, or the harness itself took the time | machinery | no |
-| `error` | A request of the session failed (after the client's own retries; the first request refused by the server, and a prompt the server finds too long, included), or the harness raised (a stable-prefix error included) | machinery | no |
+| `error` | A request of the session failed (after the client's own retries; the first request refused by the server, and a prompt the server finds too long, included), or the harness raised (a stable-prefix error included; with prompts as token IDs, a prompt that could not be assembled) | machinery | no |
 | `server_version_unknown` | The server did not say which [version](#one-version-of-the-server) it is before the run, so the run did not start | machinery | no |
 | `sandbox_failed` | The container could not be started | machinery | no |
 | `sandbox_lost` | The container stopped and nothing the model could do explains it, or it stopped before the first turn of the model's had come back or was found gone before the first of the model's tool calls could run, or the runtime stopped answering | machinery | no |
@@ -571,9 +617,13 @@ log-probability under the distribution it was sampled from, after temperature,
 top-k and top-p. A server may report the model's own instead, or apply some of
 the settings before the values it reports and others after.
 
-Before the run (and outside the task's time) the server is probed, each setting
-by itself. A control request asks for the most likely tokens at the first
-position of a short prompt with temperature 1 and nothing cut off. Then one
+Before the run (and outside the task's time) the server is probed, on the route
+the run uses (`logprobs.route`: `chat`, or `completions` with
+[prompts as token IDs](#prompts-as-token-ids), since a server can report
+differently per route), each setting by itself. A control request asks for the
+most likely tokens at the first position of the reply to a short prompt, with
+temperature 1 and nothing cut off (at its first 24 positions, once the model
+has turned out certain of a first token: below). Then one
 request each allows the sampler one token through `top_k` and through `top_p`
 (under the sampling distribution it is reported with log-probability 0; a
 server reporting the model's own repeats the control's value for it), and one
@@ -647,6 +697,24 @@ alternatives where they are taken before it), and under the temperature the
 slope of its alternatives. A first position that shows the other kind is a
 contradiction, and the probe ends without a verdict for that setting; one
 that shows neither leaves the setting open (`tried[].first`).
+
+A probe is five requests where the first prompt decides, four on a server that
+reports the model's own values: two for one token and the others for up to 24.
+Where the model is certain of the first token of all three prompts it is
+seven, or six: the three controls (one token, then 24 positions twice) and
+the same measurements for one prompt, the one with the temperature asked up
+to the position it is read at. A model certain of every token costs those
+three controls and gets no verdict.
+Against a live server it took a second and a half, three seconds as a command
+by itself (`--probe-only`) and three to five beside four rollouts. There, 100
+such commands on both routes and the 105 rollouts' own probes all came out
+right, none of them without a verdict, while the control's value for the
+likeliest token took thirteen values between -0.794 and -0.759. With the same
+model made certain of its first token (reasoning switched off, and a wording
+in front of the probe's prompts that fixes the first word of the reply), 40
+probes on both routes beside four rollouts were measured at the second or the
+third token and all came out right; made certain of every token (a line to
+copy), it got no verdict in six of six.
 
 The position a setting is decided at shows which kind of value a server
 reports, and it need not speak for the others: a server that drafts several
@@ -742,6 +810,219 @@ what is done about each:
 
 A flagged rollout is still `trainable` when its tokens are sound; it is not
 `one_sequence`.
+
+All of this is a run that sends messages. The next section is the way out of
+the last row, and with it of the whole table.
+
+---
+
+## Prompts as token IDs
+
+A session sends messages, and the server writes the earlier assistant turns
+back into each prompt by turning their text into tokens again. A model can
+generate a split of a text into tokens that the tokenizer does not produce for
+the same text; the next prompt then differs from what was generated, and the
+rollout is no longer one sequence. Nothing sent as messages can prevent that
+(the last row of [the table above](#what-can-still-make-a-prompt-not-extend)),
+and the longer a rollout the likelier it is.
+
+`RolloutConfig(token_id_prompts=True)`, or `--token-id-prompts`, sends every
+prompt as token IDs instead. It is off by default. The record says which way a
+run's prompts went (`prompt_mode`: `messages` or `token_ids`).
+
+**Rollouts that are trained on send their prompts as token IDs**, and not for
+the sequence alone. Sent as messages to a server that reads tool calls itself,
+a run can be ended by the model as the machinery's failure: one argument that
+the server's own reader cannot hand on (half of a surrogate pair, written as
+an escape in a typed argument) breaks the reply's stream, the request is made
+again and the turn sampled again, and a model that writes the same every time
+ends the run as `error`, which is not trainable. Such a record leaves training
+at the model's will, which is what the rule under
+[how a rollout ends](#how-a-rollout-ends) is there to prevent, and nothing on
+this side can tell it from a server that failed by itself: the broken stream
+looks the same, and only the server's words differ, which each attempt keeps
+in `discarded_calls[].error`. With prompts as token IDs the reply is read here
+and the same reply is an ordinary one: the call runs, and the run goes on.
+
+### How a prompt is built
+
+```
+prompt of call t+1 = prompt of call t + tokens generated by call t + tail
+```
+
+The prompt of call t is the one the server reported for it, which is checked
+to be the one that was sent. The tail is what the chat template writes after
+the generated tokens up to the next generation position: the rest of the
+assistant turn's closing, the tool results, the next turn's opening. It is
+never rendered here. The server's tokenize route renders the request's own
+messages, tools and template arguments twice:
+
+- *through*: the conversation up to and including the assistant turn, without
+  a generation prompt;
+- *whole*: the whole conversation of the new request, with one.
+
+*through* ends with the template's closing of an assistant turn and is a
+prefix of *whole*, so what *whole* holds after it is what follows that turn.
+The tail is the closing, less its first token when the model generated that
+token itself (the end-of-turn token), then the rest of *whole*. The first
+prompt of a run is the server's rendering of the first request.
+
+Each of these is checked on every call, and a call on which one fails is not
+sent. The run ends as `error` (the machinery's, not trainable) with the reason
+in `error`:
+
+| What is relied on | The reason names it |
+|-------------------|---------------------|
+| The request's messages begin with the previous request's, and an assistant turn follows | "does not begin with the messages of the request before it" |
+| The previous call ended by itself | "did not end by itself" |
+| The server reported the prompt it was sent | "did not report the prompt ... as it was sent" |
+| *through* is a prefix of *whole* | "renders the conversation up to an assistant turn differently once more messages follow it" |
+| *through* ends with the closing found before the run | "does not end with the closing found before the run" |
+| The tail ends with the generation prompt found before the run | "does not end with the generation prompt found before the run" |
+
+A turn can end on another token than the template's end-of-turn token (a model
+may have a second token it stops on). The template's closing is then appended
+whole after it, the run goes on as one sequence, and `prefix_events` gets
+`turn_ended_on_other_token` with the token.
+
+A prompt built this way is what the model saw and wrote. It need not be what
+the chat route renders for the same conversation: the turn as it was read and
+stored, written back by the template, can come out as other tokens. *whole* is
+that rendering, so each prompt is compared with it, and where the two differ
+`prefix_events` gets `prompt_differs_from_rendering`: the call whose prompt it
+is (`call`, counted as the token record counts the session's calls), how many
+tokens each holds (`prompt_tokens` as built and sent, `rendered_tokens` as the
+chat route would have it) and how many they share at their start
+(`same_tokens`, which is where they part). Once a turn differs, the prompt of
+every later call does, from the same place. The event is noted when the reply
+to that prompt has ended, so its `call` is always one of `tokens.calls`: a
+prompt that was built and not sent because the window was full, or sent and
+never answered whole, leaves no event.
+
+The record stays trainable and one sequence: nothing is wrong with its tokens.
+What the event says is that from that call on the model was sampled after a
+prompt the chat route would not have produced, so a model served through that
+route never sees such a prompt. It is no reason to leave the run out of
+training, since the model brings it about by what it writes. Known ways:
+tokens that are not how the tokenizer splits their text (what this mode is
+for); a call marker written inside the reasoning, which ends the reasoning
+for the reader, while the template writes the closing marker the model left
+out; a turn that ended on another token; white space the template adds or
+drops.
+
+A request repeated after an attempt that did not end gets the same prompt.
+
+With the prompts built this way the rows of the table above no longer apply to
+the session's own calls: how the server would have written an earlier turn does
+not enter the prompt. The token-level prefix check stays on. A break it finds in
+this mode is a fault of the harness, so it makes the record not trainable and
+is listed in `problems`.
+
+### What the server must have
+
+| | |
+|---|---|
+| A tokenize route for messages | `POST /tokenize` beside the API root, taking `messages`, `tools`, `chat_template_kwargs` and `add_generation_prompt`, and rendering exactly as the chat route does; it also tokenizes a text (`prompt`, `add_special_tokens: false`) |
+| A completions route for token IDs | `POST /v1/completions` with `prompt` as a list of token IDs, the sampler settings, `stream`, `logprobs: 0`, `return_token_ids`, `return_tokens_as_token_ids` and `skip_special_tokens`; it returns per part the text and the token IDs, each token's log-probability named by token ID, the prompt it used, and usage at the end |
+| A turn that ends | Generation stops on the template's end-of-turn token, and that token is among the returned IDs |
+| Markers kept | The generated text keeps the reply format's markers |
+| A way to name the next token, for the check only | `logit_bias` on the completions route, or `allowed_token_ids`. Without either the check cannot see how the server reports a token the model does not write by itself, and leaves that to the replies of the run |
+
+It needs no reader of reasoning or tool calls, and the chat route is used for
+one thing only, before the run: to compare its rendering with the tokenize
+route's. A server started without any such reader passes the check and runs
+rollouts in this mode. The same server refuses a chat request that leaves the
+choice of tools to the model, so there a run that sends messages ends at once
+as `error`: on such a server this mode is the only one that works.
+
+### The check before the run
+
+Before the run, outside the task's time, `check_token_id_route`
+(`turnstone/rollout/idprompt.py`) asks the server for exactly what the mode
+uses: it renders a small conversation with an assistant turn, a tool call and a
+tool result through the tokenize route; compares that with the prompt the chat
+route reports for the same request (asked for one token; if the server refuses
+to leave the choice of tools to the model, asked again with no tool choice);
+takes the generation prompt and the closing of an assistant turn from
+renderings; asks the tokenize route for each marker's token; has the server
+generate each marker, by cutting the rendered turn right before it and asking
+the completions route for one token, and looks for the marker in the text; and
+does the same right before the end of the turn, where the reply must carry
+log-probabilities named by token ID, usage and the prompt as sent, and the
+end-of-turn token must come back among the IDs with a finish reason of `stop`.
+
+The check fails only for what the server does. Which token a model writes at
+those places is the model's business, and a later checkpoint may write another
+one. So the model's own likeliest token is taken where it is the one wanted.
+Where it is not, the request is repeated with the server steered to the wanted
+token: with `logit_bias` set to 100 for it, a parameter of the plain
+completions route; and where the server refuses that or does not follow it,
+with `allowed_token_ids` holding that one token, which some servers take that
+refuse the first (one that drafts several tokens in a step, for one). A way
+that did not work is not tried again in the same check. A server that takes
+neither could not be brought to generate the token: the step is left unseen,
+the verdict names it with the reason (`checks.not_observed`), and the server
+passes. What was left unseen is not lost, because every reply of a run is held
+to the same two things when it is read (see [the reply](#the-reply)).
+
+A server that fails any of it is refused (`SetupError`, nothing is run; the
+command ends with status 3): there is no falling back to messages. So is one
+that leaves a request of the check without an answer for two minutes. The
+verdict is in the record (`token_id_route`). To check once for a batch, call
+`check_token_id_route` and pass the verdict as `RolloutConfig.token_id_route`;
+it holds for the same server, model and template arguments.
+
+The check is made after the server's version was asked, where the run asks for
+it, and before the probe (see [the order of a run](#the-order-of-a-run)).
+The [log-probability probe](#which-log-probabilities) asks on the route the run
+uses: with prompts as token IDs it renders its own prompts through the tokenize
+route and probes the completions route, and its verdict says so
+(`logprobs.route`).
+
+### The reply
+
+The completions route reads nothing, so the reply is read here, by the
+description named in `RolloutConfig.reply_format`
+([below](#reading-a-reply-without-the-server)), and handed to the session as a
+chat-shaped reply once it has ended. The session gets `tool_calls` as the
+finish reason of a turn that ended by itself with calls, `stop` without, and
+`length` for a reply cut at the limit, whatever it holds.
+
+Everything behind `trainable` is checked as before: one log-probability per
+token and for the right token, the counts against the server's usage numbers,
+the sampler settings read off the requests. One check is added: the server
+must report the prompt it was sent. The budgets, the time accounting, the stall
+rule and cancelling work on the same call records.
+
+Two things the reading relies on are looked at on every reply, the session's
+and a sub-agent's alike, because the check before the run sees them only where
+the server could be brought to generate the tokens concerned:
+
+| What is relied on | A reply that breaks it |
+|-------------------|------------------------|
+| Generation stops on the template's end-of-turn token | holds that token before its end: "the server went on generating after the template's end-of-turn token" |
+| The text of a marker token comes in the same part of the reply as the token | "marker tokens of the reply came without their text" |
+
+Neither is something a model can write, so such a reply is not read as the
+model's: the call raises, and the run ends as `error` (the machinery's, not
+trainable) or, in a sub-agent, as `subagent_failed`. A server that leaves the
+end-of-turn token out of the IDs it returns is found by the counts: the record
+is not trainable and `problems` says that the server counted one token more.
+
+A marker token is found in its part's text by the order of the part's tokens
+([below](#reading-a-reply-without-the-server)). Where that order does not
+decide it, the reply is read by the rule given there, which is something a
+model can bring about, and the record is told: `prefix_events` gets
+`marker_place_uncertain` with the call (`call`, counted as the token record
+counts the session's calls) and how many marker tokens of its reply were
+placed by the rule (`tokens`). Such a reply could have been read differently
+had the server cut it into other parts. What is noted of a sub-agent's reply
+is kept apart from the session's events: in the record under
+`subagents.events`, with `call` the `index` of the call in `subagents.calls`.
+
+A sub-agent's calls go the same way: token IDs, the completions route, the
+reply read here. Each of its prompts is the server's rendering of its own
+messages; its conversation is not part of the rollout's sequence.
 
 ---
 
@@ -1292,6 +1573,16 @@ wrote them, and `prefix_events` gets `unsendable_text_replaced` with the ids
 of the calls and the number of halves. A sub-agent's prompt and its own tool
 results are repaired the same way on their way to the server.
 
+With prompts as token IDs a half the model wrote never gets as far as a
+result: the reply is read here, and a half in a call's name or arguments is
+replaced as the call is read (see
+[reading a reply without the server](#reading-a-reply-without-the-server)).
+The tool is called with the replacement, `messages` and the tool log hold
+the call that way, and its result has nothing to repair. The prompts keep
+the tokens the model generated, so from that call on they are not what the
+chat route would render, and `prefix_events` says so with
+`prompt_differs_from_rendering` instead.
+
 ### Rules on tool calls
 
 A rollout has nobody to ask, and no reason to protect a throwaway container the
@@ -1449,7 +1740,7 @@ environment. The sub-agent's own conversation is not part of the sample.
 | Where it acts | In the same container, through the same environment |
 | Its tools | The environment tools only; it cannot start another sub-agent, and it is not offered the tools of the task's sidecar (a call it makes to one anyway is refused) |
 | The parent's prompt | Unchanged by starting one: the system prompt and tool list are fixed for the run |
-| Its model calls | Kept out of the token record and the prefix check. The side record under `subagents` is marked `not_for_training` and `token_data_kept: false`: it holds counts and a summary per call, no token IDs or log-probabilities, and none of the checks behind `trainable` is made on them |
+| Its model calls | Kept out of the token record and the prefix check. The side record under `subagents` is marked `not_for_training` and `token_data_kept: false`: it holds counts and a summary per call, no token IDs or log-probabilities, and none of the checks behind `trainable` is made on them. With [prompts as token IDs](#prompts-as-token-ids) they go out on the same route as the session's, each prompt the server's rendering of the sub-agent's own messages, and no token of them enters the session's sequence |
 | Its tool calls | In the record under `subagents.tool_log`, apart from the session's `tool_log` and, like everything under `subagents`, not part of the sample |
 | Its time | Counts toward the task's time limit |
 | Limits | `max_subagents` per rollout (a call past it gets a result that says no sub-agent was started), the framework's turn limit for each (`subagent_max_turns`), the framework's reply limit for each of its model calls, and the task's token budget, which its tokens count toward |
@@ -1861,20 +2152,22 @@ whose value does not apply is `null`.
 | `turns` | Model calls of the session that ended normally |
 | `generated_tokens` | Tokens the session itself generated |
 | `final_content` | The text of the session's last assistant turn, `""` when it had none |
-| `messages` | The system prompt and the final conversation, one entry per message: `role` and `content`; on an assistant turn also `reasoning` (the turn's reasoning as text, `null` where it had none) and, where the turn made calls, `tool_calls` (each `id`, `type` and `function` with `name` and `arguments`); on a tool result `tool_call_id`. What the session keeps on a turn for itself, under keys that begin with an underscore, is left out. A tool call's arguments are the text the model wrote for each, as they are sent back |
+| `messages` | The system prompt and the final conversation, one entry per message: `role` and `content`; on an assistant turn also `reasoning` (the turn's reasoning as text, `null` where it had none) and, where the turn made calls, `tool_calls` (each `id`, `type` and `function` with `name` and `arguments`); on a tool result `tool_call_id`. What the session keeps on a turn for itself, under keys that begin with an underscore, is left out. A tool call's arguments are the text the model wrote for each, as they are sent back. With prompts as token IDs the reply was read here: the text of a turn with calls is stripped, and a call's id is made here (`call_` and 24 hexadecimal digits) |
 | `tool_log` | The session's tool calls in order, each `tool`, `args` (as the tool got them), `result` (first 500 characters), `ok`, `turn`, for a call a rule matched `rule` and `rule_says`, on the call that started a sub-agent `agent`, the number that sub-agent's calls carry in `subagents.tool_log`, and on a result that was cut to the [bound on one result](#one-bound-on-a-tool-result) `cut_from`, the characters it had. Each of these is noted call by call, whatever became of the run's other calls. The calls of a reply the run ended on (a reply cut at a limit) never ran and have no entry; a call over the number that run in one turn has an entry that says it was not run. A call that was running when the time limit passed has its entry too, where the session stopped within the ten seconds it is given, with what the session noted of it then: `Cancelled by user. Outcome UNKNOWN ...` and `ok: false`, or for a delegation `(task cancelled by user before completion) ...`, where `ok` is `true` although the sub-agent did not finish (the framework reports a cancelled delegation that way; read the result). That result is also the last message of `messages`, a tool result the model never saw |
 | `tool_results` | The results that were cut to that bound: how many (`cut`), and for each its `tool` and the `chars` it had (`cuts`) |
 | `usage` | The session's own token counts as the server reported them: `prompt`, `completion`; both 0 in a run that did not start |
 | `tokens` | The token record, below |
 | `prefix_ok`, `prefix_breaks` | The token-level prefix check: whether it held, and one readable line per break |
-| `prefix_events` | What the stable-prefix run noted, one entry per `event` |
-| `calls` | One summary per model call of the session that ended normally, in order: `index`, `scope`, `streamed`, `request` (`model`, the count of `messages`, their `roles`, the names of the `tools`, the `sampling` keywords, the `extra_body`), `finish_reason`, `usage`, `complete`, `error`, `aligned`, `misaligned_chunks`, `ids_checked`, `chunks`, `seconds`, `longest_silence`, `problems` |
+| `calls` | One summary per model call of the session that ended normally, in order: `index`, `scope`, `route` (`chat`, or `completions` with prompts as token IDs), `streamed`, `request` (`model`, the count of `messages`, their `roles`, the names of the `tools`, the `sampling` keywords, the `extra_body`; with prompts as token IDs the `extra_body` is the completions request's, and `template_arguments` and `prompt_tokens_sent` are there too), `finish_reason`, `usage` (`prompt_tokens`, `completion_tokens`, `total_tokens`), `complete`, `error`, `aligned`, `misaligned_chunks`, `ids_checked`, `chunks`, `seconds`, `longest_silence`, `problems`. `index` numbers every request the run made, from 0, a sub-agent's and a discarded one included, so the session's calls need not be 0, 1, 2; the token record numbers the calls listed here from 0 (`tokens.calls[].call`), and entry *n* of the one list is entry *n* of the other |
+| `prefix_events` | What the stable-prefix run noted, one entry per `event`; with prompts as token IDs also what the prompt assembly noted, about the session's own calls only: `turn_ended_on_other_token` (`turn`, `token_id`, `end_of_turn_token_id`), `prompt_differs_from_rendering` (`call`, `prompt_tokens`, `rendered_tokens`, `same_tokens`) and `marker_place_uncertain` (`call`, `tokens`), with `turn` and `call` counted as `tokens.calls[].call` |
 | `discarded_calls` | The session's calls that did not end normally (cut by the time limit, failed, or broken off and issued again), the same keys with `prompt_token_ids`, `token_ids` and `logprobs`; `index` as in `calls` |
-| `text` | With `keep_text`, each call's generated text; otherwise `null` |
+| `text` | With `keep_text`, each call's generated text; otherwise `null`. With prompts as token IDs it is the completions route's text, which leaves out the end-of-turn token and other special tokens |
 | `limits` | `max_tokens`, `context_window`, `tool_timeout`, `subagent_max_turns`, `max_output_chars`, `max_tool_result_chars`, each `{"value": ..., "source": "..."}` |
 | `sampling` | Below |
-| `logprobs` | Which log-probabilities the server reports: `sampler_logprobs` (`true`, `false` or `null`), `reflects` (the same per setting: `temperature`, `top_k`, `top_p`), `reason`, and from a probe `tried` and `positions` |
+| `logprobs` | Which log-probabilities the server reports: `sampler_logprobs` (`true`, `false` or `null`), `reflects` (the same per setting: `temperature`, `top_k`, `top_p`), `reason`, and from a probe `route` (the route it asked on), `tried` and `positions` |
 | `token_id_check` | `"required"` or `"not required"` |
+| `prompt_mode` | `"messages"`, or `"token_ids"` for a run with [prompts as token IDs](#prompts-as-token-ids) |
+| `token_id_route` | `null` for a run that sends messages; otherwise what the check before the run found, below |
 | `server_version` | `null` for a run given no address to ask; otherwise the [server's version](#one-version-of-the-server) at both ends, below |
 | `timeout` | `null` unless the time limit was reached; then what the run was waiting on, below |
 | `seconds`, `startup_seconds`, `teardown_seconds` | The time from the start of the sandbox to the end of the run; of that, the time bringing the sandbox up took, the task's before-run commands included; and the time removing it took, which comes on top |
@@ -1900,7 +2193,8 @@ it:
 | `max_collect_bytes` | After-run only: the most that is read out of those paths together, 8 MiB unless the task says otherwise; more than that sets `collected_summary.too_large` |
 
 `prefix_events`, one entry per `event`. `turn` counts the session's turns
-from 0, as `tool_log[].turn` does:
+from 0, as `tool_log[].turn` does, and `call` the session's calls, as
+`tokens.calls[].call` does:
 
 | `event` | Its other keys | What happened |
 |---------|----------------|---------------|
@@ -1910,6 +2204,13 @@ from 0, as `tool_log[].turn` does:
 | `ended_at_length` | `turn` | The turn's reply was cut at a limit with a tool call in it. The run ended there and the call did not run |
 | `compaction_skipped` | none | Something asked for the conversation to be shortened to a summary, which a run with a stable prefix does not do |
 | `unsendable_text_replaced` | `call_ids`, `characters` | The results of these calls held half of a surrogate pair, `characters` of them together, which were replaced (see [one bound on a tool result](#one-bound-on-a-tool-result)) |
+| `turn_ended_on_other_token` | `turn`, `token_id`, `end_of_turn_token_id` | The turn ended on `token_id`, another token than the template's end-of-turn token (`end_of_turn_token_id`), and the next prompt was built with the template's closing whole after it |
+| `prompt_differs_from_rendering` | `call`, `prompt_tokens`, `rendered_tokens`, `same_tokens` | The prompt of this call is not what the chat route renders for the same conversation: it holds `prompt_tokens` tokens, the rendering `rendered_tokens`, and the two share their first `same_tokens`. Noted once the call has returned a whole reply |
+| `marker_place_uncertain` | `call`, `tokens` | In this call's reply `tokens` marker tokens were placed in their part's text by the reader's rule, because the part did not say which occurrence of the marker's text the token was |
+
+The last three are noted by the prompt assembly: only with
+[prompts as token IDs](#prompts-as-token-ids), and only about the session's
+own calls. What is noted of a sub-agent's reply is under `subagents.events`.
 
 `logprobs.tried` and `logprobs.positions`, from a probe:
 
@@ -1938,6 +2239,19 @@ from 0, as `tool_log[].turn` does:
 | `generation_tokens_per_second`, `prompt_tokens_per_second` | The server's measured speeds over those calls; `null` where nothing was measured |
 
 Where the run did not start, only the first three keys are there.
+
+`token_id_route`, with prompts as token IDs:
+
+| Key | Value |
+|-----|-------|
+| `ok`, `reason` | Whether the server can be sent prompts as token IDs, and the first check that failed. In a run that did not start before the check was made, `ok` is `null` and `reason` says so |
+| `format`, `template_arguments` | The reply format the check was made for, and the template arguments it rendered with |
+| `checks` | What each step found: `tokenize_renders_messages`, `chat_route_renders_the_same`, `turn_is_a_prefix_of_the_longer_rendering`, `turn_ends_with_the_closing`, `rendering_ends_with_the_generation_prompt`, `markers_kept_in_text` (per marker: `true`, or `null` where it was not seen), `completions_route` (the reply with the model's own token at the end of a turn: `token_ids`, `finish_reason`, `text`, `problems`), `end_of_turn_token_ends_the_reply` (`true`, or `null` where it was not seen), `produced_by` (per marker and for `end_of_turn`, where the token was seen: `model` when the model wrote it by itself, else the request parameter the server was steered with, `logit_bias` or `allowed_token_ids`) and `not_observed` (per marker and for `end_of_turn`, where it was not: why; empty when everything was seen) |
+| `marker_ids`, `text_markers` | The token of each marker that is one token on this server, and the markers that are not. A marker goes by its name here and wherever something is said per marker (`checks.markers_kept_in_text`, `checks.produced_by`, `checks.not_observed`): `reasoning_open`, `reasoning_close`, `call_open`, `call_close` |
+| `closing`, `generation_prompt` | The tokens the template writes at the end of an assistant turn and at the start of a reply |
+| `in_reasoning` | Whether a reply begins inside reasoning |
+
+A verdict that was passed in is stored as it was given.
 
 `server_version`:
 
@@ -1989,6 +2303,7 @@ Where the run did not start, only the first three keys are there.
 | `refused_by_server` | How many of `failures` are conversations the server refused |
 | `model_calls`, `prompt_tokens`, `generated_tokens` | Totals over the sub-agents' model calls. `model_calls` counts the entries of `calls`, among them a request that never went out (one the token budget refused, which says so in its `error`); `time.model_calls` leaves such a request out |
 | `calls` | One summary per call: `index`, `scope`, `complete`, `finish_reason`, `error`, `prompt_tokens`, `generated_tokens`, `seconds` |
+| `events` | With prompts as token IDs, what the prompt assembly noted of a sub-agent's replies, kept apart from `prefix_events`: `marker_place_uncertain` (`call`, the `index` of the call in `calls`; `tokens`). Empty when nothing was noted, and with prompts sent as messages |
 | `tool_log` | Every tool call a sub-agent issued, sub-agent by sub-agent: `agent`, `turn`, `call_id`, `tool`, `args`, `result` (first 500 characters), `ok`, and `rule`, `rule_says` where a rule matched; see [sub-agents](#sub-agents) |
 | `text` | With `keep_text` only: each call's generated text |
 
@@ -2012,7 +2327,7 @@ Where the run did not start, only the first three keys are there.
 
 | Key | Value |
 |-----|-------|
-| `commands` | One result per after-run command that ran: `argv`, `exit_code`, `timed_out`, `output`, `output_dropped`, `seconds`, `leftovers` (what was running in the container besides its main process before the command: `found`, how many, all of them ended; `still_running`, those that could not be ended, each with its `uid` (the number of the user it runs as, `null` where the runtime's list gave none) and `command` (its name as the runtime lists it, `""` where it gave none), empty outside a container whose programs are the model's or whose commands can change their user; `frozen`, whether the runtime could hold the container still meanwhile), and where it names files `collected` (path to text: a relative path under the name the task gave it, an absolute one without its first slash) and `collected_summary` (`entries` by kind, `bytes`, `too_large`, and where they apply `skipped`, `failed`) |
+| `commands` | One result per after-run command that ran: `argv`, `exit_code`, `timed_out`, `output`, `output_dropped`, `seconds`, `leftovers` (what was running in the container besides its main process before the command: `found`, how many, all of them ended; `still_running`, those that could not be ended, each with its `uid` (the number of the user it runs as, `null` where the runtime's list gave none) and `command` (its name as the runtime lists it, `""` where it gave none), empty outside a container whose programs are the model's or whose commands can change their user; `frozen`, whether the runtime could hold the container still meanwhile), and where it names files `collected` (path to text: a relative path under the name the task gave it, an absolute one without its first slash) and `collected_summary` (`entries`, how many of each kind: `file`, `dir`, `symlink`, `hardlink`, `other`; `bytes`, `too_large`, and where they apply `skipped`, `failed`) |
 | `commands_not_run` | Only where the after-run commands could not run: why |
 | `container_stopped` | Whether the container was stopped before the verifier was called |
 | `result` | What the verifier returned, or the verifier command printed; it holds `verdict` |
@@ -2134,6 +2449,14 @@ What a user of the harness has to know, in one place:
   stopped; the run then ends as `sidecar_lost` and is not trainable. Where a task's server writes what the model asks for, the model
   can bring that about. Give such a sidecar a read-only root with writable
   directories of a size, or a server that bounds what it stores.
+- **An id does not always name one call.** A server may give the calls of
+  every reply the same ids, or two calls of one reply the same id. The tool
+  log tells them apart by the turn and by the call's place in it, so `rule`,
+  `rule_says`, `cut_from`, `agent` and the call as it ran stand on the right
+  entry. What names a call by its id alone cannot: `rules.events`, and the
+  framework's own note of whether a call failed, which `ok` is read from, so
+  two calls of one reply with the same id have the same `ok`. With prompts as
+  token IDs the ids are made here and no two are the same.
 - **A conversation the server refuses is taken to be the model's doing**, for
   a sub-agent's request and for every request of the session after its first
   (status 400 or 422). A refusal that is the harness's fault, a message the
@@ -2146,6 +2469,17 @@ What a user of the harness has to know, in one place:
   (status 413, a proxy with a limit on a request's size) stays the
   machinery's `error`, although a model can grow a conversation into such a
   limit: keep it above what a full context window weighs.
+- **With prompts sent as messages, a reply the server's own reader cannot hand
+  on ends a run as `error`.** A server that reads tool calls itself can fail
+  on what the model wrote, half of a surrogate pair written as an escape in a
+  typed argument for one: the reply's stream breaks, the call is issued again
+  and sampled again, and a model that writes the same every time ends the run
+  as the machinery's failure. Nothing on this side can tell that from a server
+  that fails by itself. So on such a server a model can take a run that sends
+  messages out of training at will. With prompts as token IDs the reply is
+  read here and such a reply is an ordinary one, which is why rollouts that
+  are trained on use that mode; see
+  [prompts as token IDs](#prompts-as-token-ids).
 
 ---
 

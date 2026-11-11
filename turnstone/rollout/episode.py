@@ -61,11 +61,13 @@ from turnstone.rollout.container import (
     ContainerLostError,
     ContainerSpec,
 )
+from turnstone.rollout.idprompt import PromptAssembly, TokenIdRoute, check_token_id_route
 from turnstone.rollout.preparation import BeforeRunCommand, before_run_failure, run_before
 from turnstone.rollout.probe import SETTINGS as PROBED_SETTINGS
 from turnstone.rollout.probe import all_settings, sampler_logprobs_reported
 from turnstone.rollout.rawargs import RecordedArguments
 from turnstone.rollout.recording import PARENT, SUB_AGENT, RecordingClient
+from turnstone.rollout.replyformat import reply_format
 from turnstone.rollout.result_bound import MIN_RESULT_CHARS, bound_result, sendable_result
 from turnstone.rollout.rules import RuleSet, refusal_text
 from turnstone.rollout.server_version import ServerVersion
@@ -127,7 +129,12 @@ _DEFAULT_PROMPT_SPEED = 1000.0
 
 # Request-body keys that are not sampler settings.
 _NOT_SAMPLER_KEYS = frozenset(
-    {"chat_template_kwargs", "return_token_ids", "return_tokens_as_token_ids"}
+    {
+        "chat_template_kwargs",
+        "return_token_ids",
+        "return_tokens_as_token_ids",
+        "skip_special_tokens",
+    }
 )
 
 
@@ -216,6 +223,21 @@ class RolloutConfig:
     # How the server writes tool calls in the generated text, for sending each
     # argument back as the model wrote it: ``"parameter_blocks"`` or ``"none"``.
     argument_text: str = "parameter_blocks"
+    # Send every prompt as token IDs (:mod:`turnstone.rollout.idprompt`): each
+    # prompt is the previous one, the tokens generated after it and what the
+    # server's template writes next, so the rollout is one token sequence
+    # whatever split into tokens the model generated.  Needs a server with a
+    # tokenize route for messages and a completions route for token IDs, which
+    # is checked before the run; a server that fails the check is refused,
+    # never fallen back from.  Off: the session sends messages.
+    token_id_prompts: bool = False
+    # How the model writes a reply (:mod:`turnstone.rollout.replyformat`); with
+    # prompts as token IDs the reply is read on this side.
+    reply_format: str = "parameter_blocks"
+    # The verdict of an earlier :func:`~turnstone.rollout.idprompt.check_token_id_route`
+    # for the same server, model and template arguments; ``None`` checks
+    # before the run.  Pass one check's verdict to a whole batch.
+    token_id_route: dict[str, Any] | None = None
     # Seconds one tool call may run when the model names no limit of its own;
     # ``None``: the framework's ``tools.timeout``.
     tool_timeout: int | None = None
@@ -1641,6 +1663,14 @@ def _build_record(
         problems += version.problems()
 
     prefix = tokens["prefix"]
+    assembly: PromptAssembly | None = state.get("assembly")
+    if assembly is not None and not prefix["ok"]:
+        # The prompts were built here as one sequence, so a break is not a
+        # property of the server's rendering: it is a fault of the harness.
+        problems.append(
+            "the prompts were sent as token IDs and still do not form one sequence: "
+            + "; ".join(describe_break(b) for b in prefix["breaks"][:3])
+        )
     trainable = not problems
     if not trainable:
         log.error("rollout.not_trainable", key=task.key, problems=problems)
@@ -1680,6 +1710,12 @@ def _build_record(
         # The server's version before the first model call and after the last;
         # ``None`` when the run was given no address to ask.
         "server_version": version.describe() if version is not None else None,
+        # How the prompts went out, or were to go out in a run that did not
+        # start: as ``messages`` on the chat route, or as ``token_ids`` on the
+        # completions route with what the check before the run found
+        # (``token_id_route``).
+        "prompt_mode": "token_ids" if config.token_id_prompts else "messages",
+        "token_id_route": state.get("token_id_route"),
         "token_id_check": "required" if strict else "not required",
         "finish_state": finish,
         # Whether the ending is the model's own outcome (to be scored) or a
@@ -1719,7 +1755,8 @@ def _build_record(
         "tokens": tokens,
         "prefix_ok": prefix["ok"],
         "prefix_breaks": [describe_break(b) for b in prefix["breaks"]],
-        "prefix_events": snapshot["prefix_events"],
+        "prefix_events": snapshot["prefix_events"]
+        + (_plain(assembly.events) if assembly is not None else []),
         # Every model turn's tokens and log-probabilities are sound and were
         # sampled the way the record says: each call can be trained on.
         "trainable": trainable,
@@ -1752,6 +1789,10 @@ def _build_record(
             "prompt_tokens": sum((c.usage or {}).get("prompt_tokens", 0) for c in side),
             "generated_tokens": sum(len(c.token_ids) for c in side),
             "calls": [c.summary() for c in side],
+            # With prompts as token IDs, what the prompt assembly noted of a
+            # sub-agent's replies, each by the call's ``index`` above.  Kept
+            # apart from ``prefix_events``, which are the session's own.
+            "events": _plain(assembly.subagent_events) if assembly is not None else [],
             # Every tool call a sub-agent issued, sub-agent by sub-agent: they
             # acted in the same sandbox and are not in the session's tool log.
             "tool_log": _delegated_calls(snapshot),
@@ -2138,6 +2179,7 @@ def effective_config(
 
 
 def _logprob_verdict(config: RolloutConfig) -> dict[str, Any]:
+    """Which log-probabilities the server reports, on the route the run uses."""
     given = config.sampler_logprobs
     if isinstance(given, dict):
         values = {given.get(name) for name in PROBED_SETTINGS}
@@ -2147,13 +2189,51 @@ def _logprob_verdict(config: RolloutConfig) -> dict[str, Any]:
         return {"sampler_logprobs": given, "reflects": all_settings(given), "reason": "given"}
     try:
         with OpenAI(base_url=config.base_url, api_key=config.api_key, timeout=60.0) as probe:
-            return sampler_logprobs_reported(probe, config.model, extra_body=config.extra_body)
+            return sampler_logprobs_reported(
+                probe,
+                config.model,
+                extra_body=config.extra_body,
+                route="completions" if config.token_id_prompts else "chat",
+            )
     except Exception as probe_error:
         return {
             "sampler_logprobs": None,
             "reflects": all_settings(None),
             "reason": f"the probe failed: {type(probe_error).__name__}",
         }
+
+
+def _token_id_route(config: RolloutConfig) -> dict[str, Any]:
+    """What the server needs to be sent prompts as token IDs, checked or given.
+
+    Raises :class:`~turnstone.rollout.settings.SetupError` for a server that
+    cannot: the run does not start, and nothing falls back to messages.
+    """
+    fmt = reply_format(config.reply_format)
+    verdict = config.token_id_route
+    if verdict is None:
+        try:
+            with OpenAI(base_url=config.base_url, api_key=config.api_key, timeout=120.0) as probe:
+                verdict = check_token_id_route(
+                    probe,
+                    config.model,
+                    extra_body=config.extra_body,
+                    reasoning_effort=config.reasoning_effort,
+                    fmt=fmt,
+                )
+        except Exception as check_error:
+            raise SetupError(
+                "prompts cannot be sent as token IDs: the check of the server failed "
+                f"({type(check_error).__name__}: {str(check_error)[:300]})"
+            ) from check_error
+    if not verdict.get("ok"):
+        raise SetupError(f"prompts cannot be sent as token IDs: {verdict.get('reason')}")
+    if verdict.get("format") != fmt.name:
+        raise SetupError(
+            f"the given check of the server is for the reply format {verdict.get('format')!r}, "
+            f"the run reads {fmt.name!r}"
+        )
+    return dict(verdict)
 
 
 def run_episode(
@@ -2228,10 +2308,20 @@ def run_episode(
     meter = Meter(budgets, lambda: list(state["recorder"].calls) if "recorder" in state else [])
     state["meter"] = meter
     # The server's version, asked before anything is asked of the model: the
-    # probe below makes model calls.  Without an answer the run does not start,
-    # and the server is asked nothing more.
+    # check of the routes and the probe below make model calls.  Without an
+    # answer the run does not start, and the server is asked nothing more.
     version = state["server_version"] = _server_version(config)
-    if version is not None and version.ask_first() is not None and config.sampler_logprobs is None:
+    answered = version is None or version.ask_first() is None
+    if config.token_id_prompts:
+        if answered or config.token_id_route is not None:
+            state["token_id_route"] = _token_id_route(config)
+            state["assembly"] = PromptAssembly(TokenIdRoute.from_verdict(state["token_id_route"]))
+        else:
+            state["token_id_route"] = {
+                "ok": None,
+                "reason": "not checked: the run did not start",
+            }
+    if not answered and config.sampler_logprobs is None:
         state["logprobs"] = {
             "sampler_logprobs": None,
             "reflects": all_settings(None),
@@ -2258,7 +2348,9 @@ def run_episode(
             timeout=float(budgets.wall_seconds),
             http_client=shutdown_on_close(DefaultHttpxClient()),
         )
-        state["recorder"] = RecordingClient(inner, extra_body=config.extra_body, gate=meter)
+        state["recorder"] = RecordingClient(
+            inner, extra_body=config.extra_body, gate=meter, id_prompts=state.get("assembly")
+        )
         return state["recorder"]
 
     try:
@@ -2323,8 +2415,8 @@ def run_episode(
                     tool_truncation=config.max_output_chars,
                     agent_max_turns=config.subagent_max_turns,
                     stable_prefix=True,
-                    raw_arguments=RecordedArguments(recorder)
-                    if config.argument_text == "parameter_blocks"
+                    raw_arguments=RecordedArguments(recorder, reply_format(config.argument_text))
+                    if config.argument_text != "none"
                     else None,
                     tool_names=offered,
                     mcp_client=mcp_client,

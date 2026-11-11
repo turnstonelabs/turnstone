@@ -241,6 +241,24 @@ class TestAroundARollout:
         assert [a["chat_requests_before"] for a in asked] == [0, everything]
         assert record["server_version"]["same"] is True and record["trainable"] is True
 
+    def test_with_prompts_as_token_ids_the_check_of_the_routes_is_inside_them_too(self):
+        """The check of the two routes and the probe on the completions route make
+        requests of their own: the first question is put before any of them."""
+        with _server(7, sampler_logprobs=True) as server:
+            record, _box = _versioned(server, token_id_prompts=True, sampler_logprobs=None)
+            first, last = server.version_requests
+            everything = len(server.requests)
+            rendered = len(server.tokenize_requests)
+
+        assert record["prompt_mode"] == "token_ids" and record["token_id_route"]["ok"] is True
+        assert record["logprobs"]["route"] == "completions"
+        # More went out than the session's three calls: the check and the probe.
+        assert everything > 3 and rendered > 0
+        assert first["chat_requests_before"] == 0 and first["tokenize_requests_before"] == 0
+        assert last["chat_requests_before"] == everything
+        assert last["tokenize_requests_before"] == rendered
+        assert record["server_version"]["same"] is True and record["trainable"] is True
+
     def test_a_version_that_changed_is_not_trained_on_and_the_ending_stays(self):
         with _server(7, 8) as server:
             record, _box = _versioned(server)
@@ -290,6 +308,23 @@ class TestAroundARollout:
         assert record["logprobs"]["reason"] == "not probed: the run did not start"
         assert record["turns"] == 0 and record["verification"] is None
         assert box.root == "" and box.closed == 1
+
+    def test_without_a_first_answer_the_routes_are_not_checked_either(self):
+        """With prompts as token IDs the check before the run asks the server too:
+        it is not made, and the record says which mode the run was to use."""
+        with ScriptedChatServer(SCRIPT, sampler_logprobs=True) as server:
+            record, box = _versioned(server, token_id_prompts=True, sampler_logprobs=None)
+            assert server.requests == [] and server.tokenize_requests == []
+            assert len(server.version_requests) == 1
+
+        assert record["finish_state"] == "server_version_unknown"
+        assert record["prompt_mode"] == "token_ids"
+        assert record["token_id_route"] == {
+            "ok": None,
+            "reason": "not checked: the run did not start",
+        }
+        assert record["logprobs"]["reason"] == "not probed: the run did not start"
+        assert record["turns"] == 0 and box.root == "" and box.closed == 1
 
     def test_a_run_the_machinery_ended_is_still_asked_about(self):
         failing = dict.fromkeys(range(1, 40), "http_500")

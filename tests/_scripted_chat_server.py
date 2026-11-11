@@ -23,6 +23,27 @@ The toy template writes a tool call the way a text-format template does: a
 string argument as it is, any other value in JSON spelling.  A boolean the model
 wrote as ``True`` therefore replays as ``true`` unless the client sends back the
 text the model wrote.
+
+It also has the two routes a client needs to send its prompts as token IDs: a
+tokenize route (``/tokenize``, beside ``/v1``) that renders messages with the
+same toy template, or tokenizes a text, and a completions route
+(``/v1/completions``) that takes a prompt of token IDs and answers with text,
+token IDs and log-probabilities, parsing nothing.  A step with ``merge`` makes
+the model "generate" one token for the two characters ``ab``, a split the toy
+template never writes, so a prompt rendered from messages differs from what
+was generated; a step with ``end_token`` ends the turn on another token than
+the template's.  A completions prompt that stops inside a conversation this
+server rendered before is continued the way that rendering goes on, unless the
+model is played with a choice of its own there (``other_choice``); a request
+that names the next token then steers it back, where the server is played as
+taking such a request.
+
+Where a real server is less kind than a toy one, the stand-in can be told to
+be: its template can refuse a conversation, on the chat route and the tokenize
+route alike (``refuses``, with ``no_user_query`` as the refusal a real template
+is known for); and its completions route can hand on its tokens in parts of a
+given size, markers among the other tokens (``part_tokens``), where it
+otherwise sends each marker in a part of its own.
 """
 
 from __future__ import annotations
@@ -34,26 +55,45 @@ import socket
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 NL = chr(10)
 START, END, THINK, THINK_END, CALL, CALL_END = 1, 2, 3, 4, 5, 6
+# Another token a model can end its turn on; the toy template never writes it.
+OTHER_END = 7
+# One token for the two characters ``ab``: a split the toy tokenizer never makes.
+MERGED, MERGED_TEXT = 900, "ab"
+# The token a model with a choice of its own writes where a prompt stops inside
+# a turn; the toy template never writes it there.
+OWN_CHOICE = 901
 _CHAR_BASE = 1000
+_MARKERS = {THINK: "<think>", THINK_END: "</think>", CALL: "<tool_call>", CALL_END: "</tool_call>"}
 
 
 def encode(text: str) -> list[int]:
     return [_CHAR_BASE + ord(c) for c in text]
 
 
-def decode(ids: list[int]) -> str:
-    names = {
-        START: "<start>",
-        END: "<end>",
-        THINK: "<think>",
-        THINK_END: "</think>",
-        CALL: "<tool_call>",
-        CALL_END: "</tool_call>",
-    }
+def encode_merged(text: str) -> list[int]:
+    """*text* with every ``ab`` as the one merged token."""
+    out: list[int] = []
+    for index, part in enumerate(text.split(MERGED_TEXT)):
+        out += ([MERGED] if index else []) + encode(part)
+    return out
+
+
+def decode(ids: list[int], *, special: bool = True, markers: bool = True) -> str:
+    """The text of *ids*; without *special* the turn tokens are left out, and
+    without *markers* the reasoning and call markers too."""
+    names = {MERGED: MERGED_TEXT, OWN_CHOICE: "~"}
+    names.update(_MARKERS if markers else dict.fromkeys(_MARKERS, ""))
+    if special:
+        names.update({START: "<start>", END: "<end>", OTHER_END: "<other_end>"})
+    else:
+        names.update({START: "", END: "", OTHER_END: ""})
     return "".join(chr(i - _CHAR_BASE) if i >= _CHAR_BASE else names.get(i, "<?>") for i in ids)
 
 
@@ -125,7 +165,11 @@ def generation_prompt() -> list[int]:
     return [START] + encode("assistant" + NL) + [THINK] + encode(NL)
 
 
-def render_prompt(messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None) -> list[int]:
+def render_prompt(
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]] | None,
+    generation_prompt_added: bool = True,
+) -> list[int]:
     """The toy chat template: conversation so far plus the generation prompt."""
     out: list[int] = []
     if tools:
@@ -150,7 +194,28 @@ def render_prompt(messages: list[dict[str, Any]], tools: list[dict[str, Any]] | 
             out += (
                 [START] + encode(role + NL + _text_of(message.get("content"))) + [END] + encode(NL)
             )
-    return out + generation_prompt()
+    return out + (generation_prompt() if generation_prompt_added else [])
+
+
+NO_USER_QUERY = "No user query found in messages."
+
+
+def no_user_query(messages: list[dict[str, Any]]) -> str | None:
+    """What a chat template says of a conversation in which every user message
+    is a block of tool results: it finds nothing a user asked, and refuses.
+    ``None`` for a conversation it renders.  For ``ScriptedChatServer(refuses=...)``."""
+    for message in messages:
+        if message.get("role") != "user":
+            continue
+        text = _text_of(message.get("content")).strip()
+        if not (text.startswith("<tool_response>") and text.endswith("</tool_response>")):
+            return None
+    return NO_USER_QUERY
+
+
+def _find(ids: list[int], part: list[int]) -> int:
+    """How often *part* occurs in *ids*."""
+    return sum(1 for i in range(len(ids) - len(part) + 1) if ids[i : i + len(part)] == part)
 
 
 class VersionFault:
@@ -187,14 +252,69 @@ class ScriptedChatServer:
         prompt_tokens_per_second: float | None = None,
         first_position_only: bool = False,
         version_answers: list[Any] | None = None,
+        tokenize_status: int = 200,
+        tokenize_differs: bool = False,
+        unstable_rendering: bool = False,
+        drop_marker_text: bool = False,
+        hide_stop_token: bool = False,
+        completions_status: int = 200,
+        echo_other_prompt: bool = False,
+        other_choice: bool = False,
+        logit_bias: str = "taken",
+        allowed_token_ids: str = "taken",
+        runs_past_end: bool = False,
+        refuses: Callable[[list[dict[str, Any]]], str | None] | None = None,
+        refusal_status: int = 400,
+        part_tokens: int | None = None,
     ) -> None:
         self.script = script
         # What ``GET /version`` answers, one entry per question and the last
         # one from then on: a JSON value, or a ``VersionFault``.  Without any,
         # the server has no such address.  ``version_requests`` notes for each
-        # question how many chat requests had arrived before it.
+        # question how many model requests had arrived before it, on whatever
+        # route.
         self.version_answers = list(version_answers) if version_answers is not None else None
         self.version_requests: list[dict[str, Any]] = []
+        # What can be wrong with the two routes for prompts as token IDs: the
+        # tokenize route answers with this status; it renders one token more
+        # than the chat route; it renders an assistant turn differently once
+        # messages follow it; the completions route leaves the markers out of
+        # its text; it does not return the token a turn ended on; it answers
+        # with this status; it reports another prompt than it was sent.
+        self.tokenize_status = tokenize_status
+        self.tokenize_differs = tokenize_differs
+        self.unstable_rendering = unstable_rendering
+        self.drop_marker_text = drop_marker_text
+        self.hide_stop_token = hide_stop_token
+        self.completions_status = completions_status
+        self.echo_other_prompt = echo_other_prompt
+        # A model with a choice of its own: where a completions prompt stops
+        # inside a turn, its likeliest next token is not the one the template
+        # writes there.  And what the server makes of the two request
+        # parameters that name the next token, ``logit_bias`` and
+        # ``allowed_token_ids``: ``taken`` (the next token is the one named),
+        # ``ignored`` (accepted, without effect) or ``refused`` (status 400).
+        self.other_choice = other_choice
+        self.steering = {"logit_bias": logit_bias, "allowed_token_ids": allowed_token_ids}
+        # A server that does not stop on the end-of-turn token: it goes on
+        # generating after it.
+        self.runs_past_end = runs_past_end
+        # A template that refuses some conversations.  ``refuses`` is asked
+        # about the messages of every request that carries messages, on the
+        # chat route and on the tokenize route, and returns the words to
+        # refuse with or ``None``.  A refused request is answered with
+        # ``refusal_status`` and those words, is not counted among the
+        # requests, and its route is noted in ``refused``.  A prompt of token
+        # IDs holds no messages and is never refused.
+        self.refuses = refuses
+        self.refusal_status = refusal_status
+        self.refused: list[str] = []
+        # A completions route that hands on this many tokens a part, whatever
+        # they are: a marker's token then shares its part with others.
+        self.part_tokens = part_tokens
+        # Every conversation the tokenize route rendered, as token IDs.
+        self.renderings: list[list[int]] = []
+        self.tokenize_requests: list[dict[str, Any]] = []
         # A server whose values are the sampling distribution's at the first
         # generated position and the model's own from there on, as one that
         # takes later tokens of a step from another head might report them.
@@ -290,7 +410,10 @@ class ScriptedChatServer:
                 body = json.loads(self.rfile.read(length) or b"{}")
                 # A client that stops reading mid-reply is part of some tests.
                 with contextlib.suppress(BrokenPipeError, ConnectionResetError):
-                    owner._handle_chat(self, body)
+                    if self.path.endswith("/tokenize"):
+                        owner._handle_tokenize(self, body)
+                    else:
+                        owner._handle_chat(self, body)
 
         self._httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         # ``server_close`` joins the handler threads, so ``stop`` leaves none behind.
@@ -322,12 +445,13 @@ class ScriptedChatServer:
         self.stop()
 
     def is_agent_request(self, body: dict[str, Any]) -> bool:
+        if self.agent_script is None:
+            return False
+        if isinstance(body.get("prompt"), list):
+            # A prompt of token IDs: the sub-agent's system prompt is in its text.
+            return self.agent_marker in decode(body["prompt"])
         messages = body.get("messages") or []
-        return (
-            self.agent_script is not None
-            and bool(messages)
-            and self.agent_marker in _text_of(messages[0].get("content"))
-        )
+        return bool(messages) and self.agent_marker in _text_of(messages[0].get("content"))
 
     @property
     def parent_requests(self) -> list[dict[str, Any]]:
@@ -353,6 +477,7 @@ class ScriptedChatServer:
             self.version_requests.append(
                 {
                     "chat_requests_before": len(self.requests),
+                    "tokenize_requests_before": len(self.tokenize_requests),
                     "authorization": handler.headers.get("Authorization"),
                 }
             )
@@ -383,37 +508,131 @@ class ScriptedChatServer:
         handler.wfile.write(data)
         handler.close_connection = True
 
+    def _refuse(
+        self,
+        handler: BaseHTTPRequestHandler,
+        status: int,
+        message: str = "scripted failure",
+        kind: str = "invalid",
+    ) -> None:
+        data = json.dumps({"error": {"message": message, "type": kind}})
+        handler.send_response(status)
+        handler.send_header("Content-Type", "application/json")
+        handler.send_header("Content-Length", str(len(data)))
+        handler.send_header("Connection", "close")
+        handler.end_headers()
+        handler.wfile.write(data.encode("utf-8"))
+        handler.close_connection = True
+
+    def _template_refuses(
+        self, handler: BaseHTTPRequestHandler, body: dict[str, Any], route: str
+    ) -> bool:
+        """Answer a request whose conversation the template refuses; whether it did."""
+        messages = body.get("messages")
+        if self.refuses is None or not isinstance(messages, list):
+            return False
+        words = self.refuses(messages)
+        if words is None:
+            return False
+        with self._lock:
+            self.refused.append(route)
+        self._refuse(handler, self.refusal_status, words, "BadRequestError")
+        return True
+
+    def _render(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None,
+        generation_prompt_added: bool = True,
+    ) -> list[int]:
+        """The toy template as this server applies it, on either route."""
+        ids = render_prompt(messages, tools, generation_prompt_added)
+        last_turn = max(
+            (i for i, m in enumerate(messages) if m.get("role") == "assistant"), default=-1
+        )
+        if self.unstable_rendering and 0 <= last_turn < len(messages) - 1:
+            # An assistant turn that is not the last message any more is
+            # rendered with one character more, right at its start.
+            before = len(render_prompt(messages[:last_turn], tools, False))
+            ids = ids[:before] + encode("~") + ids[before:]
+        return ids
+
+    def _handle_tokenize(self, handler: BaseHTTPRequestHandler, body: dict[str, Any]) -> None:
+        if self._template_refuses(handler, body, "tokenize"):
+            return
+        with self._lock:
+            self.tokenize_requests.append(body)
+        if self.tokenize_status != 200:
+            self._refuse(handler, self.tokenize_status)
+            return
+        if "messages" in body:
+            messages = [dict(m) for m in body["messages"]]
+            ids = self._render(messages, body.get("tools"), body.get("add_generation_prompt", True))
+            if self.tokenize_differs:
+                ids = encode("#") + ids
+            with self._lock:
+                self.renderings.append(ids)
+        else:
+            text = str(body.get("prompt", ""))
+            by_text = {name: token for token, name in _MARKERS.items()}
+            ids = [by_text[text]] if text in by_text else encode(text)
+        self._send_json(handler, {"tokens": ids, "count": len(ids), "max_model_len": 1 << 20})
+
     def _handle_chat(self, handler: BaseHTTPRequestHandler, body: dict[str, Any]) -> None:
+        if self._template_refuses(handler, body, "chat"):
+            return
         with self._lock:
             call_index = len(self.requests)
             self.requests.append(body)
         if self.delay:
             time.sleep(self.delay)
+        by_ids = isinstance(body.get("prompt"), list)
         status = self.agent_status if self.is_agent_request(body) else 200
         if self.faults.get(call_index) == "http_500":
             status = 500
+        if by_ids and self.completions_status != 200:
+            status = self.completions_status
+        if by_ids and any(body.get(k) and v == "refused" for k, v in self.steering.items()):
+            status = 400
         if status != 200:
-            data = json.dumps({"error": {"message": "scripted failure", "type": "invalid"}})
-            handler.send_response(status)
-            handler.send_header("Content-Type", "application/json")
-            handler.send_header("Content-Length", str(len(data)))
-            handler.send_header("Connection", "close")
-            handler.end_headers()
-            handler.wfile.write(data.encode("utf-8"))
-            handler.close_connection = True
+            self._refuse(handler, status)
             return
-        messages = [dict(m) for m in body.get("messages") or []]
-        turn = sum(1 for m in messages if m.get("role") == "assistant")
         script = self.agent_script if self.is_agent_request(body) else self.script
         assert script is not None
+        continued: list[int] | None = None
+        if by_ids:
+            prompt_ids = [int(t) for t in body["prompt"]]
+            opening = generation_prompt()
+            if prompt_ids[-len(opening) :] != opening:
+                # A prompt that stops inside a conversation: go on as a
+                # rendering this server made of it goes on.
+                with self._lock:
+                    known = [r for r in self.renderings if r[: len(prompt_ids)] == prompt_ids]
+                rest = max(known, key=len)[len(prompt_ids) :] if known else encode("?")
+                continued = rest[: rest.index(END) + 1] if END in rest else rest
+                if self.runs_past_end and continued[-1:] == [END]:
+                    continued = continued + encode(" and on")
+                if self.other_choice:
+                    continued = [OWN_CHOICE, *continued]
+                named = [body[k] for k, v in self.steering.items() if body.get(k) and v == "taken"]
+                if named:
+                    # The token the request names, and after any token but the
+                    # one a turn ends on, more.
+                    wanted = int(next(iter(named[0])))
+                    goes_on = wanted != END or self.runs_past_end
+                    continued = [wanted, *(encode(" and on") if goes_on else [])]
+            turn = max(_find(prompt_ids, opening) - 1, 0)
+        else:
+            messages = [dict(m) for m in body.get("messages") or []]
+            turn = sum(1 for m in messages if m.get("role") == "assistant")
+            if (
+                self.edit_history_from_call is not None
+                and call_index >= self.edit_history_from_call
+                and messages
+            ):
+                messages[0]["content"] = _text_of(messages[0].get("content")) + " (edited)"
+            prompt_ids = self._render(messages, body.get("tools"))
         step = script[turn] if turn < len(script) else {"content": "done"}
-        if (
-            self.edit_history_from_call is not None
-            and call_index >= self.edit_history_from_call
-            and messages
-        ):
-            messages[0]["content"] = _text_of(messages[0].get("content")) + " (edited)"
-        prompt_ids = render_prompt(messages, body.get("tools"))
         if self.prompt_tokens_per_second:
             time.sleep(len(prompt_ids) / self.prompt_tokens_per_second)
         top_p = body.get("top_p")
@@ -430,7 +649,11 @@ class ScriptedChatServer:
         self._request.id_names = bool(body.get("return_tokens_as_token_ids")) and (
             self.faults.get(call_index) != "plain_names" and not self.plain_names
         )
-        self._request.alternatives = bool(body.get("top_logprobs"))
+        # The chat route lists alternatives with ``top_logprobs``, the completions
+        # route with a number of them under ``logprobs``.
+        self._request.alternatives = bool(body.get("top_logprobs")) or (
+            by_ids and bool(body.get("logprobs"))
+        )
         want_ids = bool(body.get("return_token_ids"))
         want_logprobs = bool(body.get("logprobs"))
         calls = [
@@ -439,9 +662,15 @@ class ScriptedChatServer:
         finish = step.get("finish_reason") or ("tool_calls" if calls else "stop")
         pieces = self._pieces(step, calls, finish, call_index)
         limit = body.get("max_completion_tokens", body.get("max_tokens"))
-        if self.keep_reply_limit and isinstance(limit, int):
+        if continued is not None:
+            pieces = [([t], {}) for t in continued]
+            finish = "stop"
+        if (self.keep_reply_limit or continued is not None) and isinstance(limit, int):
             pieces, cut = self._cut(pieces, limit)
             finish = "length" if cut else finish
+        if by_ids:
+            # The completions route reads nothing: a reply ends or is cut.
+            finish = "length" if finish == "length" else "stop"
         completion_tokens = sum(len(ids) for ids, _delta in pieces)
         usage = {
             "prompt_tokens": len(prompt_ids),
@@ -454,7 +683,9 @@ class ScriptedChatServer:
             "model": body.get("model"),
         }
         fault = self.faults.get(call_index)
-        if body.get("stream"):
+        if by_ids:
+            self._completion(handler, body, base, prompt_ids, pieces, finish, usage, fault)
+        elif body.get("stream"):
             self._stream(
                 handler,
                 body,
@@ -494,9 +725,10 @@ class ScriptedChatServer:
         pieces: list[tuple[list[int], dict[str, Any]]] = []
 
         def spread(text: str, key: str) -> None:
-            for i in range(0, len(text), size):
-                part = text[i : i + size]
-                pieces.append((encode(part), {key: part}))
+            tokens = encode_merged(text) if step.get("merge") else encode(text)
+            for i in range(0, len(tokens), size):
+                part = tokens[i : i + size]
+                pieces.append((part, {key: decode(part)}))
 
         spread(step.get("reasoning") or "", "reasoning")
         pieces.append(([THINK_END] + encode(NL + NL), {}))
@@ -525,7 +757,9 @@ class ScriptedChatServer:
                 pieces.append((encode(text[i : i + size]), delta))
             pieces.append(([CALL_END], {}))
         if finish != "length":
-            pieces.append(([END], {}))
+            pieces.append(([step.get("end_token", END)], {}))
+            if self.runs_past_end:
+                spread(" and on", "content")
         return pieces
 
     @staticmethod
@@ -583,6 +817,92 @@ class ScriptedChatServer:
                 }
             )
         return entries
+
+    def _completion(
+        self,
+        handler: BaseHTTPRequestHandler,
+        body: dict[str, Any],
+        base: dict[str, Any],
+        prompt_ids: list[int],
+        pieces: list[tuple[list[int], dict[str, Any]]],
+        finish: str,
+        usage: dict[str, Any],
+        fault: str | None,
+    ) -> None:
+        """A reply of the completions route: text, token IDs, log-probabilities."""
+        want_ids = bool(body.get("return_token_ids"))
+        want_logprobs = body.get("logprobs") is not None
+        groups = [ids for ids, _delta in pieces]
+        if self.hide_stop_token and groups and groups[-1] in ([END], [OTHER_END]):
+            groups = groups[:-1]
+        if self.part_tokens:
+            tokens = [t for ids in groups for t in ids]
+            size = self.part_tokens
+            groups = [tokens[i : i + size] for i in range(0, len(tokens), size)]
+
+        def part(number: int, ids: list[int], offset: int, last: bool) -> dict[str, Any]:
+            choice: dict[str, Any] = {
+                "index": 0,
+                "text": decode(ids, special=False, markers=not self.drop_marker_text),
+                "logprobs": None,
+                "finish_reason": finish if last else None,
+            }
+            # A fault spoils the second group of tokens of the reply.
+            spoil = fault if number == 1 else None
+            if want_ids and spoil != "drop_tokens":
+                choice["token_ids"] = ids
+            if want_ids and number == 0:
+                choice["prompt_token_ids"] = (
+                    [*prompt_ids, 0] if self.echo_other_prompt else prompt_ids
+                )
+            if want_logprobs and spoil not in ("skip_logprobs", "drop_tokens"):
+                entries = self._logprob_entries(ids, offset)
+                names = [e["token"] for e in entries]
+                if spoil == "wrong_ids":
+                    names = ["token_id:0" for _ in names]
+                choice["logprobs"] = {
+                    "tokens": names,
+                    "token_logprobs": [
+                        None if spoil == "null_logprob" else e["logprob"] for e in entries
+                    ],
+                    "top_logprobs": [
+                        {a["token"]: a["logprob"] for a in e["top_logprobs"]} for e in entries
+                    ],
+                }
+            return {**base, "object": "text_completion", "choices": [choice]}
+
+        parts = []
+        offset = 0
+        for number, ids in enumerate(groups):
+            parts.append(part(number, ids, offset, number == len(groups) - 1))
+            offset += len(ids)
+        if not parts:
+            parts.append(part(0, [], 0, True))
+        if not body.get("stream"):
+            whole = part(0, [t for ids in groups for t in ids], 0, True)
+            if fault != "no_usage":
+                whole["usage"] = usage
+            self._send_json(handler, whole)
+            return
+        handler.send_response(200)
+        handler.send_header("Content-Type", "text/event-stream")
+        handler.send_header("Cache-Control", "no-cache")
+        handler.send_header("Connection", "close")
+        handler.end_headers()
+
+        def send(payload: dict[str, Any]) -> None:
+            handler.wfile.write(("data: " + json.dumps(payload) + NL + NL).encode("utf-8"))
+            handler.wfile.flush()
+
+        for payload in parts:
+            if self.chunk_delay:
+                time.sleep(self.chunk_delay)
+            send(payload)
+        if (body.get("stream_options") or {}).get("include_usage") and fault != "no_usage":
+            send({**base, "object": "text_completion", "choices": [], "usage": usage})
+        handler.wfile.write(("data: [DONE]" + NL + NL).encode("utf-8"))
+        handler.wfile.flush()
+        handler.close_connection = True
 
     def _stream(
         self,
