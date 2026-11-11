@@ -36,6 +36,20 @@ _STRUCTURED_MEMORY_INDEXES = {
     "idx_smem_scope": ("scope", "scope_id"),
     "idx_smem_type": ("type",),
 }
+_AUDIT_INDEXES = {
+    "idx_audit_action": ("action",),
+    "idx_audit_resource_action_ts": ("resource_id", "action", "timestamp"),
+    "idx_audit_timestamp": ("timestamp",),
+    "idx_audit_user": ("user_id",),
+}
+
+
+def _audit_indexes(inspector: sa.Inspector) -> dict[str, tuple[str, ...]]:
+    return {
+        name: tuple(column for column in index.get("column_names") or [] if column)
+        for index in inspector.get_indexes("audit_events")
+        if (name := index.get("name")) and name.startswith("idx_audit_")
+    }
 
 
 def _structured_memory_indexes(inspector: sa.Inspector) -> dict[str, tuple[str, ...]]:
@@ -128,6 +142,8 @@ def test_create_all_matches_migrations(
     assert not check_drift, f"check-constraint drift: {check_drift}"
     assert _structured_memory_indexes(mig) == _STRUCTURED_MEMORY_INDEXES
     assert _structured_memory_indexes(meta) == _STRUCTURED_MEMORY_INDEXES
+    assert _audit_indexes(mig) == _AUDIT_INDEXES
+    assert _audit_indexes(meta) == _AUDIT_INDEXES
     _assert_oauth_token_schema(mig)
     _assert_oauth_token_schema(meta)
 
@@ -145,6 +161,7 @@ def test_postgresql_selected_indexes_match_both_paths(
     engine = sa.create_engine(fresh_pg_url)
     try:
         migrated_indexes = _structured_memory_indexes(sa.inspect(engine))
+        migrated_audit_indexes = _audit_indexes(sa.inspect(engine))
         _assert_oauth_token_schema(sa.inspect(engine))
 
         # The database is fixture-owned and disposable. Rebuild it through the
@@ -152,12 +169,14 @@ def test_postgresql_selected_indexes_match_both_paths(
         metadata.drop_all(engine)
         metadata.create_all(engine)
         create_all_indexes = _structured_memory_indexes(sa.inspect(engine))
+        create_all_audit_indexes = _audit_indexes(sa.inspect(engine))
         _assert_oauth_token_schema(sa.inspect(engine))
     finally:
         engine.dispose()
 
     assert migrated_indexes == _STRUCTURED_MEMORY_INDEXES
     assert create_all_indexes == _STRUCTURED_MEMORY_INDEXES
+    assert migrated_audit_indexes == create_all_audit_indexes == _AUDIT_INDEXES
 
 
 def test_personas_prompt_source_check_present_on_both_paths(

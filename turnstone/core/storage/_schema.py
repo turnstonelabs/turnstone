@@ -773,6 +773,14 @@ audit_events = sa.Table(
 sa.Index("idx_audit_timestamp", audit_events.c.timestamp)
 sa.Index("idx_audit_action", audit_events.c.action)
 sa.Index("idx_audit_user", audit_events.c.user_id)
+# The newest rows of one action for one resource: every session open replays its workstream's
+# recent auto-approvals this way (migration 089).
+sa.Index(
+    "idx_audit_resource_action_ts",
+    audit_events.c.resource_id,
+    audit_events.c.action,
+    audit_events.c.timestamp,
+)
 
 # ---------------------------------------------------------------------------
 # Intent verdicts — LLM judge verdicts for tool call validation
