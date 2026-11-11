@@ -1240,7 +1240,9 @@ Bringing the sandbox up, a sidecar's setup included, is not the model's time:
 the task's time limit starts when it is up, and the record says how long it
 took (`startup_seconds`).
 
-A task's files can be bytes as well as text (`Task.files`).
+A task's files can be bytes as well as text (`Task.files`). Either kind is put
+where its path says: a relative path in the working directory, an absolute one
+as it is, owned by the user the model's commands run as.
 
 ---
 

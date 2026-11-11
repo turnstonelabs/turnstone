@@ -364,10 +364,15 @@ class ContainerSandbox:
         text = {path: content for path, content in files.items() if isinstance(content, str)}
         self.environment.put_files(text)
         data = {path: content for path, content in files.items() if isinstance(content, bytes)}
-        if data:
-            # Unpacked in the working directory as the model's user, who owns them.
+        # Unpacked as the model's user, who owns them: a relative path in the
+        # working directory, an absolute one where it says, like a text file's.
+        for root in (None, "/"):
+            part = {p: c for p, c in data.items() if p.startswith("/") == (root is not None)}
+            if not part:
+                continue
+            where = ["-C", root] if root is not None else []
             done = self.container.exec(
-                ["tar", "-x", "-f", "-"], stdin_data=build_archive(data), timeout=300
+                ["tar", "-x", *where, "-f", "-"], stdin_data=build_archive(part), timeout=300
             )
             if done.returncode != 0:
                 raise ContainerError(

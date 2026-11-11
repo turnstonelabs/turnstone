@@ -2663,6 +2663,36 @@ class TestRolloutInAContainer:
         assert record["task"]["container"]["root_size"] is None
         assert sandbox["removed"] is True and _listed(sandbox["name"]) == []
 
+    def test_a_tasks_file_with_an_absolute_path_is_put_there_whatever_its_content(self):
+        """Text or not, a relative path is in the working directory and an absolute
+        one is where it says."""
+        script = [
+            {
+                "tool_calls": [
+                    {"name": "bash", "arguments": {"command": "find /tmp/said . -type f | sort"}}
+                ]
+            },
+            {"content": "listed"},
+        ]
+        task = Task(
+            prompt="list",
+            setup_files={"/tmp/said/text.txt": "text", "text.txt": "text"},
+            files={"/tmp/said/other.bin": bytes(range(8)), "sub/other.bin": bytes(range(8))},
+            container=_spec(memory="512m"),
+        )
+        with ScriptedChatServer(script) as server:
+            record = run_episode(
+                task, RolloutConfig(base_url=server.base_url, model="scripted", **SMALL)
+            )
+        assert record["finish_state"] == "completed", record["error"]
+        assert record["tool_log"][0]["result"].split(NL) == [
+            "./sub/other.bin",
+            "./text.txt",
+            "/tmp/said/other.bin",
+            "/tmp/said/text.txt",
+        ]
+        assert _listed(record["sandbox"]["name"]) == []
+
     def test_a_command_that_kills_everything_is_the_models_outcome(self):
         """What used to end the container, and with it take the rollout out of
         training: now an ordinary command with an ordinary result."""

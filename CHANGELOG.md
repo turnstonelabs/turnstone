@@ -256,6 +256,13 @@ The separate `dev` branch is retired. See [the release process](docs/releasing.m
   `sandbox_lost`, the machinery's. So is one found gone when the first of the
   model's tool calls is about to run; and where the machinery had failed
   first, while the sandbox was still there, that failure is the run's ending.
+- **Rollouts: a task's file with an absolute path is put where its path says,
+  whatever its content.** A task's text files were written where their paths
+  say, and its other files (`Task.files`, content as bytes) were all unpacked
+  in the working directory, so one named `/tmp/said/other.bin` landed under
+  the working directory without a word. Both kinds now follow one rule: a
+  relative path is in the working directory, an absolute one is taken as it
+  is, written as the user the model's commands run as.
 
 ## [2026-11-10]
 
