@@ -500,6 +500,7 @@ nothing but the model decided how the run went. All of this holds:
 | The log-probabilities are those of the distribution the tokens were sampled from | The server is probed before the run (below) |
 | A trainer can reproduce the sampling | `temperature`, `top_k` and `top_p` are read off the requests themselves; one a request did not carry fails the check |
 | The tokens were sampled from one version of the model | Where the run is given an address to ask: the server's version before the first model call and after the last are the same (see [one version of the server](#one-version-of-the-server)) |
+| With [prompts as token IDs](#prompts-as-token-ids): the server worked on the prompt it was sent, and the prompts form one sequence | The prompt the server reports for each call is compared with the token IDs that were sent; the prefix check, which in this mode has to hold |
 | The run was not ended by the server, the harness or the runtime | See [how a rollout ends](#how-a-rollout-ends) |
 | A reward exists | A check asked for after the run gave its verdict; see [checking a rollout afterwards](#checking-a-rollout-afterwards) |
 
@@ -2596,6 +2597,10 @@ What a user of the harness has to know, in one place:
   first. A model certain of all of them gets no verdict, and at sampler
   settings that reshape the distribution its records are then not trainable;
   see [which log-probabilities](#which-log-probabilities).
+- **A server under load can fail what is asked before a run.** A probe that
+  gets no answer leaves the record not trainable, and a check for prompts as
+  token IDs that gets none refuses the run. A batch asks once and passes the
+  verdicts on; see [started by another program](#started-by-another-program).
 - **A verdict that is handed in is held against names, not against the
   server.** Its model, endpoint, route, reply format and template arguments
   are compared with the run's, and the run's first prompt with the generation
@@ -2607,11 +2612,59 @@ What a user of the harness has to know, in one place:
   `checked_at` is in the record, for a reader who knows when the server was
   last restarted. Whoever replaces the weights has to have the verdicts made
   again.
+- **Without readers of its own a server works only with prompts as token
+  IDs**: it refuses a chat request that leaves the choice of tools to the
+  model, so a run that sends messages ends there as `error`.
+- **A call block the model quotes is a call.** A reply is read by its markers,
+  not by what the model meant. A call block that the model copies out of a
+  file it has read is read as a call and run: in its reasoning, where the call
+  marker is the marker's own token, which is how a model writes it; in its
+  text, where a function tag alone is enough. That holds whichever way the
+  prompts go, as it does for a server that reads replies itself. The call is
+  logged and scored as the model's own. See
+  [reading a reply without the server](#reading-a-reply-without-the-server).
+- **With prompts as token IDs a run can be sampled after prompts the chat
+  route would not render**: after a turn that the template writes back as
+  other tokens, a call marker inside the reasoning for one. The record stays
+  trainable and one sequence, and `prefix_events` says from which call on
+  (`prompt_differs_from_rendering`); see
+  [how a prompt is built](#how-a-prompt-is-built).
+- **Which occurrence of a marker's text is the marker's token is not always
+  known.** A part of a reply that holds the text more often than the token,
+  with other tokens before the marker's and after it, does not say; the first
+  is taken, and the same tokens in other parts could have been read
+  differently. `prefix_events` says when (`marker_place_uncertain`). It takes
+  a part of at least four tokens, or one token that spells a whole marker; the
+  server this was measured on hands on at most three a part, alone and with
+  sixteen replies side by side. See
+  [reading a reply without the server](#reading-a-reply-without-the-server).
+- **The check for prompts as token IDs sees how the server reports a token
+  only where the server can be brought to generate it.** Where the model does
+  not write the token by itself and the server takes neither way of naming
+  the next token, that is left to the replies of the run, where a fault ends
+  the run as `error`; see [the check before the run](#the-check-before-the-run).
+- **A run that sends messages can end well before its window is full**, and
+  its long rollouts are seldom one sequence; see
+  [how a rollout ends](#how-a-rollout-ends) and
+  [what can still make a prompt not extend](#what-can-still-make-a-prompt-not-extend).
+- **A tool result is never shortened to fit the window.** One larger than what
+  is left ends the run with part of the window unused; the
+  [bound on a single tool result](#one-bound-on-a-tool-result) is what limits
+  that, and it is not set unless a run sets it. Inside a sub-agent the
+  framework's own bound applies, not this one.
+- **The two questions about the server's version see two instants.** What they
+  show rests on a version that only moves forward and changes together with
+  the weights; see [one version of the server](#one-version-of-the-server).
 - **A sidecar that outgrows its file system ends the run as the machinery's.**
   A sidecar over a writable root that writes more than its root may hold is
   stopped; the run then ends as `sidecar_lost` and is not trainable. Where a task's server writes what the model asks for, the model
   can bring that about. Give such a sidecar a read-only root with writable
   directories of a size, or a server that bounds what it stores.
+- **A verifier command runs on this machine**, with the rights of whoever
+  started the rollout, and what it starts is its own to remove.
+- **A sub-agent's own prompts are not one sequence**: each is the server's
+  rendering of its messages. Nothing of them is trained on, so nothing rests on
+  it.
 - **An id does not always name one call.** A server may give the calls of
   every reply the same ids, or two calls of one reply the same id. The tool
   log tells them apart by the turn and by the call's place in it, so `rule`,

@@ -399,6 +399,13 @@ The separate `dev` branch is retired. See [the release process](docs/releasing.m
   generated token came), which with prompts as token IDs are taken on another
   route. Four rollouts against the scripted server show that they mean the
   same there.
+- **Rollout guide: the limits of the newer settings are among the known
+  limits.** The list a user of the harness reads in one place now also names
+  what a server under load can fail before a run, a server without readers of
+  its own, how early a run that sends messages can end, a tool result that is
+  never shortened to fit the window, what the two questions about the server's
+  version rest on, that a verifier command runs on the machine itself, and
+  that a sub-agent's own prompts are not one sequence.
 
 ## [2026-11-10]
 
