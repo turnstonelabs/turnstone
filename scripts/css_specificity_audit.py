@@ -15,7 +15,8 @@ audit looks for any others lurking in the merged tree.
 Scope:
 - **Per-page stylesheet manifest** (`PAGE_STYLESHEETS`): each HTML file only
   loads a specific subset of CSS files; the audit honours that to avoid
-  cross-page false positives.
+  cross-page false positives.  The manifest is read from each page's own
+  `<link rel="stylesheet">` tags, so it is the set and order the browser loads.
 - **JS literal scanner**: regex-scrapes runtime-built `<tag id="..." class="..."`
   literals from JS files; conflicts on shared-JS elements only fire when EVERY
   page that hosts the element has the conflict (intersection of stylesheets).
@@ -57,53 +58,58 @@ if TYPE_CHECKING:
 
 REPO = Path(__file__).resolve().parents[1]
 
-CSS_FILES = [
-    "turnstone/shared_static/base.css",
-    "turnstone/shared_static/ui-base.css",
-    "turnstone/shared_static/chat.css",
-    "turnstone/shared_static/conversation.css",
-    "turnstone/shared_static/cards.css",
-    "turnstone/shared_static/shell.css",
-    "turnstone/shared_static/interactive.css",
-    "turnstone/console/static/style.css",
-    "turnstone/console/static/coordinator/coordinator.css",
-    "turnstone/ui/static/style.css",
-]
+# Each page, and the directory its server mounts at /static.  /shared is the one
+# shared_static directory on every server.
+SHARED_DIR = "turnstone/shared_static"
+PAGE_STATIC_DIRS: dict[str, str] = {
+    "turnstone/console/static/index.html": "turnstone/console/static",
+    "turnstone/console/static/coordinator/index.html": "turnstone/console/static",
+    "turnstone/ui/static/index.html": "turnstone/ui/static",
+}
+
+_LINK_TAG = re.compile(r"<link\b[^>]*>", re.S)
+_LINK_ATTR = re.compile(r'\b(rel|href)\s*=\s*"([^"]*)"')
+
+
+def page_stylesheets(html_rel: str, static_dir: str) -> list[str]:
+    """The stylesheets a page links, in ``<link>`` order, as repo-relative paths.
+
+    Read from the page so the manifest cannot drift from what the browser loads.
+    A hand-written list did: it gave the console page 5 of the 16 sheets it links,
+    so no conflict involving the other 11 could be reported.  A sheet the audit
+    cannot place (an href outside /shared and /static) stops the run, since
+    leaving it out would shrink the audit the same way.
+    """
+    sheets: list[str] = []
+    for tag in _LINK_TAG.findall((REPO / html_rel).read_text(encoding="utf-8")):
+        attrs = dict(_LINK_ATTR.findall(tag))
+        if attrs.get("rel") != "stylesheet":
+            continue
+        href = attrs.get("href", "")
+        if href.startswith("/shared/"):
+            sheets.append(f"{SHARED_DIR}/{href.removeprefix('/shared/')}")
+        elif href.startswith("/static/"):
+            sheets.append(f"{static_dir}/{href.removeprefix('/static/')}")
+        else:
+            raise SystemExit(f"{html_rel}: cannot place stylesheet href {href!r}")
+    if not sheets:
+        raise SystemExit(f"{html_rel}: no stylesheet links found")
+    return sheets
+
 
 # Per-page stylesheet manifest — only these CSS files apply to elements found
-# in this HTML file and the JS files it loads.  Mirrors the <link rel> tags in
-# each index.html.  Without this, the audit pools rules across pages and
-# reports false positives (e.g., a rule from console/static/style.css matching
-# an element on the UI page where that sheet is never loaded).
+# in this HTML file and the JS files it loads.  Without it the audit pools rules
+# across pages and reports false positives (e.g., a rule from
+# console/static/style.css matching an element on the UI page, where that sheet
+# is never loaded).
 PAGE_STYLESHEETS: dict[str, list[str]] = {
-    "turnstone/console/static/index.html": [
-        "turnstone/shared_static/base.css",
-        "turnstone/shared_static/ui-base.css",
-        "turnstone/shared_static/chat.css",
-        "turnstone/shared_static/cards.css",
-        "turnstone/console/static/style.css",
-    ],
-    "turnstone/console/static/coordinator/index.html": [
-        "turnstone/shared_static/base.css",
-        "turnstone/shared_static/ui-base.css",
-        "turnstone/shared_static/chat.css",
-        "turnstone/console/static/style.css",
-        "turnstone/console/static/coordinator/coordinator.css",
-    ],
-    # Standalone turnstone-server now serves the L-shell (step 6): same shared
-    # sheets the console loads, in <link> order, plus the (slimmed) ui/static
-    # style.css.  No coordinator sheets (orchestration off).
-    "turnstone/ui/static/index.html": [
-        "turnstone/shared_static/base.css",
-        "turnstone/shared_static/ui-base.css",
-        "turnstone/shared_static/chat.css",
-        "turnstone/shared_static/conversation.css",
-        "turnstone/shared_static/cards.css",
-        "turnstone/ui/static/style.css",
-        "turnstone/shared_static/shell.css",
-        "turnstone/shared_static/interactive.css",
-    ],
+    page: page_stylesheets(page, static_dir) for page, static_dir in PAGE_STATIC_DIRS.items()
 }
+
+# Every sheet some page links, in first-linked order.
+CSS_FILES: list[str] = list(
+    dict.fromkeys(sheet for sheets in PAGE_STYLESHEETS.values() for sheet in sheets)
+)
 
 # JS-emitted elements: which page do they belong to?  Map JS file → owning
 # HTML file.  Shared JS (auth/kb/renderer/etc.) appears on every page; we
