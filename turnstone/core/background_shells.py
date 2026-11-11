@@ -52,6 +52,8 @@ if TYPE_CHECKING:
     import io
     from collections.abc import Callable
 
+    from turnstone.core.exec_env import ExecutionEnvironment
+
 log = get_logger(__name__)
 
 ShellStatus = Literal["running", "completed", "killed"]
@@ -208,7 +210,7 @@ def _filter_line_indexes_bounded(
         out, _ = proc.communicate(payload, timeout=_FILTER_TIMEOUT_S)
     except subprocess.TimeoutExpired:
         with contextlib.suppress(OSError, ProcessLookupError):
-            os.killpg(proc.pid, signal.SIGKILL)
+            signal_group(proc, proc.pid, signal.SIGKILL)
         with contextlib.suppress(subprocess.TimeoutExpired):
             proc.wait(timeout=5)
         log.warning("bg_shell.filter_timeout", shell_id=shell_id, pattern=pattern.pattern[:80])
@@ -332,16 +334,26 @@ def spawn_group_leader(
     scripts lazily (robust to quoting/length; unlinking early could truncate
     a long script mid-run) — the CALLER owns the unlink on its own exit
     path.  On a failed fork the script is unlinked here and the error
-    propagates.  The pgid snapshot happens while the leader is alive
-    (``start_new_session`` makes ``pgid == pid``); the microseconds-wide
-    pid-wraparound TOCTOU is the same accepted one as always.
+    propagates, and so it is when the script cannot be written.  The pgid
+    snapshot happens while the leader is alive (``start_new_session`` makes
+    ``pgid == pid``); the microseconds-wide pid-wraparound TOCTOU is the same
+    accepted one as always.
     """
     with tempfile.NamedTemporaryFile(mode="w", suffix=".sh", delete=False) as f:
+        script_path = f.name
         preamble = "set -o pipefail\n"
         if stop_on_error:
             preamble += "set -e\n"
-        f.write(preamble + command)
-        script_path = f.name
+        try:
+            f.write(preamble + command)
+            # Here, where a failure is caught, not when the file is closed.
+            f.flush()
+        except BaseException:
+            # A command no encoding can write (half of a surrogate pair), or
+            # no room for it: the caller reports it; the file must not stay.
+            with contextlib.suppress(OSError):
+                os.unlink(script_path)
+            raise
     try:
         proc = subprocess.Popen(
             ["bash", script_path],
@@ -362,6 +374,120 @@ def spawn_group_leader(
     except OSError:
         pgid = proc.pid
     return proc, pgid, script_path
+
+
+# Whether a child can be asked about without being collected.
+_CAN_ASK_UNCOLLECTED = hasattr(os, "waitid") and hasattr(os, "WNOWAIT")
+
+# The refusals that are about the leader's state and not about the id: the
+# ordinary outcomes of a command that has ended, not worth a line in the log.
+_LEADER_COLLECTED = "its leader has been collected, so the id may be another group's by now"
+_ID_TAKEN = "its leader has been collected and the id is another process's now"
+
+
+def _is_uncollected_child(proc: Any) -> bool:
+    """Whether *proc* is a child of this process that has not been collected.
+
+    Until a child is collected its process id is its own, and with it the id
+    of the process group it leads.  Where the system allows, the kernel is
+    asked, without collecting anything: its answer also holds for a child
+    that was collected behind the object's back, and for an object that only
+    stands in for a process.
+    """
+    if getattr(proc, "returncode", 0) is not None:
+        return False
+    if not _CAN_ASK_UNCOLLECTED:
+        poll = getattr(proc, "poll", None)
+        return callable(poll) and poll() is None
+    try:
+        os.waitid(os.P_PID, proc.pid, os.WEXITED | os.WNOWAIT | os.WNOHANG)
+    except OSError:
+        # No such child: collected by somebody else, or never this process's.
+        return False
+    return True
+
+
+def group_id_refusal(pgid: Any) -> str | None:
+    """Why no signal may go to the process group id *pgid*, whatever it is
+    the id of; ``None`` when the id itself is in order.
+
+    The id 1 names every process the user may signal, and the id 0 the
+    caller's own group.  An object that stands in for a process converts to a
+    number, as a rule to 1, and ``True`` is 1; so only an ``int`` counts.
+    """
+    if type(pgid) is not int:
+        return f"a process group id is an int, not {type(pgid).__name__}"
+    if pgid <= 1:
+        return (
+            f"the id {pgid} is no process group of a command's: 1 names every process this "
+            "user may signal, 0 the caller's own group"
+        )
+    if pgid == os.getpgrp():
+        return f"the id {pgid} is the caller's own process group"
+    return None
+
+
+def group_signal_refusal(leader: Any, pgid: Any, *, after_exit: bool = False) -> str | None:
+    """Why the process group *pgid* must not be signalled; ``None`` when it may.
+
+    A signal to a process group reaches whatever has that id at the moment it
+    is sent, and an id that was freed can be another group's a moment later.
+    So a group is signalled only where all of this holds:
+
+    - the id itself is in order (:func:`group_id_refusal`);
+    - it is the id of *leader*, a process that was started as the leader of a
+      group of its own (:func:`spawn_group_leader`) and so names that group;
+    - *leader* is a child of this process that has not been collected: until
+      it is, the id is certain to be its own.
+
+    With *after_exit* the group of a leader that has been collected may be
+    signalled as well, for what a command left running there, but only while
+    no process has the id.  An id is not given out again as long as a group
+    of that id has members, so a process that has it shows that the group it
+    named is gone.
+    """
+    refusal = group_id_refusal(pgid)
+    if refusal is not None:
+        return refusal
+    pid = getattr(leader, "pid", None)
+    if type(pid) is not int or pid != pgid:
+        return f"the id {pgid} is not the id of the process whose group is to be signalled"
+    if _is_uncollected_child(leader):
+        return None
+    if not after_exit:
+        return _LEADER_COLLECTED
+    try:
+        os.getpgid(pgid)
+    except ProcessLookupError:
+        return None
+    except OSError:
+        pass
+    return _ID_TAKEN
+
+
+def signal_group(
+    leader: subprocess.Popen[Any],
+    pgid: int,
+    sig: int = signal.SIGKILL,
+    *,
+    after_exit: bool = False,
+) -> bool:
+    """Send *sig* to the process group *pgid* that *leader* leads; ``True``
+    once it is sent.
+
+    THE one place where a process group is signalled, for the shell tools here
+    and for everything built on them: no other code sends a signal to an id.
+    A group that :func:`group_signal_refusal` refuses is not signalled:
+    ``False``, and the log says why where the id itself was at fault.  Raises
+    what the kill raises (``ProcessLookupError`` once the group is empty).
+    """
+    refusal = group_signal_refusal(leader, pgid, after_exit=after_exit)
+    if refusal is not None:
+        if refusal not in (_LEADER_COLLECTED, _ID_TAKEN):
+            log.warning("process_group.signal_refused", pgid=repr(pgid)[:80], reason=refusal)
+        return False
+    os.killpg(pgid, sig)
+    return True
 
 
 def _background_stdin() -> tuple[int, io.FileIO | None]:
@@ -539,7 +665,16 @@ class BackgroundShellRegistry:
         max_buffer_chars: int = _DEFAULT_MAX_BUFFER_CHARS,
         max_exited_records: int = _MAX_EXITED_RECORDS,
         on_exit: Callable[[BackgroundShell], None] | None = None,
+        env: ExecutionEnvironment | None = None,
     ) -> None:
+        if env is None:
+            # Imported here: the environment module imports this one.
+            from turnstone.core.exec_env import HOST_ENVIRONMENT
+
+            env = HOST_ENVIRONMENT
+        # Where shells are started and killed; the foreground bash tool of
+        # the same session uses the same one.
+        self._env = env
         self._max_shells = max_shells
         self._max_buffer_chars = max_buffer_chars
         self._max_exited_records = max_exited_records
@@ -580,7 +715,7 @@ class BackgroundShellRegistry:
         # the script after exit and releases the shell's stdin.
         stdin_fd, stdin_master = _background_stdin()
         try:
-            proc, pgid, script_path = spawn_group_leader(
+            proc, pgid, script_path = self._env.spawn(
                 command, stop_on_error=stop_on_error, env=env, stdin=stdin_fd
             )
         except BaseException:
@@ -652,7 +787,7 @@ class BackgroundShellRegistry:
             # (any started drain then EOFs and exits on its own) and surface
             # the original error to the tool layer.
             with contextlib.suppress(OSError, ProcessLookupError):
-                os.killpg(pgid, signal.SIGKILL)
+                self._env.kill_group(proc, pgid)
             with contextlib.suppress(subprocess.TimeoutExpired):
                 proc.wait(timeout=5)
             _release_stdin(stdin_master)
@@ -719,7 +854,7 @@ class BackgroundShellRegistry:
         shell.proc.wait()
         _release_stdin(shell._stdin_master)
         with contextlib.suppress(OSError, ProcessLookupError):
-            os.killpg(shell.pgid, signal.SIGKILL)
+            self._env.kill_group(shell.proc, shell.pgid)
         out_thread.join(timeout=_DRAIN_JOIN_TIMEOUT_S)
         err_thread.join(timeout=_DRAIN_JOIN_TIMEOUT_S)
         if out_thread.is_alive() or err_thread.is_alive():
@@ -882,8 +1017,7 @@ class BackgroundShellRegistry:
 
     # -- Termination ---------------------------------------------------------
 
-    @staticmethod
-    def _signal_group(shell: BackgroundShell) -> None:
+    def _signal_group(self, shell: BackgroundShell) -> None:
         """SIGKILL the shell's group IFF its leader is still running.
 
         The liveness guard is load-bearing: a completed shell's ``pgid`` is
@@ -907,7 +1041,7 @@ class BackgroundShellRegistry:
             # locks, so this cannot deadlock; the OS-level microseconds
             # pid-wraparound TOCTOU is the same accepted one as always.
             with contextlib.suppress(OSError, ProcessLookupError):
-                os.killpg(shell.pgid, signal.SIGKILL)
+                self._env.kill_group(shell.proc, shell.pgid)
 
     @staticmethod
     def _join_threads(shells: list[BackgroundShell], budget_s: float) -> bool:

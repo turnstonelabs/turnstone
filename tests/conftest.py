@@ -816,3 +816,134 @@ def _clear_skill_risk_tiers():
     skill_risk_tier.cache_clear()
     yield
     skill_risk_tier.cache_clear()
+
+
+@pytest.fixture(autouse=True)
+def _processes_this_test_started() -> dict[int, int | None]:
+    """Each process the test process starts in this test, with when it
+    started: noted where every start is judged, read where every signal is."""
+    return {}
+
+
+@pytest.fixture(autouse=True)
+def _every_process_start_is_judged(
+    _processes_this_test_started: dict[int, int | None],
+) -> Iterator[list[Any]]:
+    """Put the suite's guards where a process is started.
+
+    For the length of a test, every way this interpreter starts a program
+    asks the checks in the list this returns first (``tests/_host_guard.py``):
+    ``subprocess.Popen`` itself, which ``run``, ``call``, ``check_call``,
+    ``check_output`` and an event loop's subprocesses go through, and the
+    ``os`` module's ``system``, ``exec*``, ``spawn*`` and ``posix_spawn*``.
+    So a guard holds for every caller: one that imported a function by name,
+    a module added later, a call nobody thought of wrapping.  The fixtures
+    below add their checks to the list.
+
+    Each guard patches with a context of its own, which a test's
+    ``monkeypatch.undo()`` does not reach (see ``monkeypatch`` below).
+    """
+    from tests._host_guard import judge_every_start
+
+    judges: list[Any] = []
+    with pytest.MonkeyPatch.context() as guard:
+        judge_every_start(guard, judges, _processes_this_test_started)
+        yield judges
+
+
+@pytest.fixture(autouse=True)
+def _no_destructive_command_on_this_machine(
+    _every_process_start_is_judged: list[Any],
+) -> Iterator[list[str]]:
+    """Refuse to start a destructive command on the machine the tests run on.
+
+    For the length of a test, a shell that would be started here with a
+    command of a short list of destructive shapes (``tests/_host_guard.py``)
+    is refused before any process exists, and the test fails: whoever starts
+    it and by whichever call, with the command as its ``-c`` text or in the
+    script file it is given.  That covers the script the host execution
+    environment starts, also for a caller that holds its function under
+    another name, and the watch runner's shell.  A program of the list that
+    is started without a shell is refused the same way.  The host execution
+    environment's own function is wrapped as well and refuses before its
+    script is written.
+
+    None of it depends on the code under test: a test that counts on a
+    refusal to keep such a command from running fails here on the day the
+    refusal is broken, instead of running the command.
+    """
+    from tests._host_guard import guarded_spawn, refuse_destructive_starts
+    from turnstone.core import background_shells, exec_env
+
+    tripped: list[str] = []
+    with pytest.MonkeyPatch.context() as guard:
+        for module in (background_shells, exec_env):
+            guard.setattr(
+                module, "spawn_group_leader", guarded_spawn(module.spawn_group_leader, tripped)
+            )
+        _every_process_start_is_judged.append(refuse_destructive_starts(tripped))
+        yield tripped
+    if tripped:
+        pytest.fail(
+            "a test tried to run a destructive command on this machine: "
+            + "; ".join(tripped)
+            + ". Test a refusal with an environment that starts nothing, or in a container."
+        )
+
+
+@pytest.fixture(autouse=True)
+def _no_signal_but_to_the_tests_own_processes(
+    _processes_this_test_started: dict[int, int | None],
+) -> Iterator[list[str]]:
+    """Refuse a signal that could reach a process the test did not start.
+
+    For the length of a test, ``os.kill`` and ``os.killpg`` ask
+    ``tests/_host_guard.py`` first, and so does whatever sends through them
+    (a process object's ``kill``, ``terminate`` and ``send_signal``).  A
+    target that is not an ``int`` (a stand-in object's id converts to 1), an
+    id of 1 or below whatever the signal, the test process's own group or
+    session, and a signal to a process that is neither the test process nor
+    one it started (or one of theirs), or of which the system does not say,
+    are refused before anything is sent, and the test fails, also when the
+    code under test swallows the refusal.  Signal 0, which delivers nothing,
+    may ask about any other id.
+
+    The test's environment carries a mark made for this test alone, which
+    the processes it starts inherit: a process whose parent ended and that
+    left the group and session it was started in is still known by it.
+    """
+    import secrets
+
+    from tests._host_guard import PROCESS_MARK, ProcessView, judge_every_signal
+
+    mark = secrets.token_hex(16)
+    view = ProcessView(_processes_this_test_started, mark=f"{PROCESS_MARK}={mark}")
+    tripped: list[str] = []
+    with pytest.MonkeyPatch.context() as guard:
+        guard.setenv(PROCESS_MARK, mark)
+        judge_every_signal(guard, tripped, view)
+        yield tripped
+    if tripped:
+        pytest.fail(
+            "a test tried to send a signal that could reach a process it did not start: "
+            + "; ".join(tripped)
+            + ". Signal only a process the test started, by the id it took from it."
+        )
+
+
+@pytest.fixture
+def monkeypatch(
+    _every_process_start_is_judged: list[Any],
+    _no_destructive_command_on_this_machine: list[str],
+    _no_signal_but_to_the_tests_own_processes: list[str],
+) -> Iterator[pytest.MonkeyPatch]:
+    """pytest's own ``monkeypatch``, made after the suite's guards.
+
+    The guards patch with contexts of their own, which this one's ``undo()``
+    does not reach.  Made after them, it is undone before them: what a test
+    patched over a guard is put back to the guard first, and the guard then
+    to what was there before it.  The other way round, the guard of a test
+    that has ended would stay in place under the next test's.
+    """
+    with pytest.MonkeyPatch.context() as patch:
+        yield patch

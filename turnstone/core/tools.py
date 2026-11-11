@@ -37,6 +37,13 @@ _META_KEYS = {
     # example.
     "cwd_note",
     "workspace_note",
+    # True when every effect of the tool goes through the session's execution
+    # environment (``exec_env.ExecutionEnvironment``): the shell and file
+    # tools.  A session whose environment is not this host can offer exactly
+    # these and know that nothing the model does lands anywhere else.  A tool
+    # that also reaches the network, the stores or other people must not
+    # declare it.
+    "environment",
 }
 
 
@@ -46,7 +53,8 @@ def _load_tools() -> tuple[list[dict[str, Any]], dict[str, Any]]:
     Returns (tool_defs, metadata) where:
       - tool_defs: list of OpenAI function-calling dicts
       - metadata: dict mapping tool_name -> {task_agent, coordinator,
-                  interactive, auto_approve, primary_key, kind_variants}
+                  interactive, auto_approve, primary_key, kind_variants,
+                  environment}
     """
     tools = []
     meta = {}
@@ -126,6 +134,8 @@ INTERACTIVE_TOOLS = [
     )
 ]
 INTERACTIVE_TOOL_NAMES = frozenset(t["function"]["name"] for t in INTERACTIVE_TOOLS)
+# Tools that act only through the session's execution environment.
+ENVIRONMENT_TOOL_NAMES = frozenset(n for n, m in _META.items() if m.get("environment"))
 TASK_AUTO_TOOLS = {n for n, m in _META.items() if m.get("auto_approve")}
 PRIMARY_KEY_MAP = {n: m["primary_key"] for n, m in _META.items() if "primary_key" in m}
 

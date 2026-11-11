@@ -31,6 +31,21 @@ The separate `dev` branch is retired. See [the release process](docs/releasing.m
   sent back as the text the model wrote (`True`, `None`), which a server's
   template cannot reproduce from the parsed value. Off by default. See
   [the eval guide](docs/eval.md#stable-prefix).
+- **Execution environment for the shell and file tools.** `bash` (foreground
+  and background), `bash_output`, `kill_shell`, `read_file`, `write_file`,
+  `edit_file`, `search` and `diff_file` now reach processes and files only
+  through an `ExecutionEnvironment` (`turnstone/core/exec_env.py`), in both
+  their prepare and execute steps. The class itself is the host and nothing
+  changes for a session without one; `ChatSession(exec_env=...)` moves all of
+  them at once, for example into a container, with the executors unchanged.
+  An environment says whether it acts on the machine the session runs on
+  (`acts_on_host`), so that a caller can refuse one that does.
+  The host signals a process group through one function (`signal_group`),
+  which sends nothing to an id that is not certain to be the group of the
+  command it is ended for: 1, 0, the caller's own group, anything that is no
+  `int`, an id another process has by then.
+  Tool definitions gain the `environment` metadata key for these tools. See
+  [the tools reference](docs/tools.md#execution-environment).
 
 ### Fixed
 
@@ -64,6 +79,12 @@ The separate `dev` branch is retired. See [the release process](docs/releasing.m
   result parser read as malformed, so the search failed with "all matches
   returned were malformed" while searching a directory worked. The fallback now
   always names the file.
+- **A shell command that cannot be written leaves no script file behind.** A
+  command holding half of a surrogate pair, which a model can write as an
+  escape, cannot be encoded: the shell tool reports that, and each such call
+  used to leave an empty script file in the temporary directory. The file is
+  now removed when writing it fails, as it already was when the shell could not
+  be started.
 
 ## [2026-11-10]
 

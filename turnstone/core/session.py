@@ -67,7 +67,6 @@ from turnstone.core.background_shells import (
     FilterTimeoutError,
     UnknownShellError,
     drain_pipe_lines,
-    spawn_group_leader,
 )
 from turnstone.core.compaction import (
     BoundMeasure,
@@ -102,6 +101,7 @@ from turnstone.core.completion_recovery import (
 from turnstone.core.config import get_searxng_engines, get_searxng_url, get_workspace_dir
 from turnstone.core.deadline import DeadlineCancelledError, StreamAbortRef
 from turnstone.core.edit import find_occurrences, pick_nearest
+from turnstone.core.exec_env import HOST_ENVIRONMENT, ExecutionEnvironment
 from turnstone.core.http_failures import UPSTREAM_NO_REPLY_CODE
 from turnstone.core.images import flatten_image
 from turnstone.core.ip_classify import AddressLane
@@ -3246,7 +3246,11 @@ class ChatSession:
         fork_reservation_token: str = "",
         workstream_lease: WorkstreamLease | None = None,
         workstream_judge_model: str = "",
+        exec_env: ExecutionEnvironment | None = None,
     ):
+        # Where the shell and file tools act: this host unless the caller
+        # supplies another place (see ``exec_env.ExecutionEnvironment``).
+        self._exec_env = exec_env if exec_env is not None else HOST_ENVIRONMENT
         if kind == WorkstreamKind.COORDINATOR and not user_id:
             # Coordinators carry real authority — they mint child-spawn
             # tokens as their creator and own a durable per-user memory
@@ -3805,7 +3809,9 @@ class ChatSession:
         # Detached shells from bash(run_in_background=true) (#817).  Deliberately
         # NOT reaped by cancel(): stopping a generation must not kill a server
         # the model detached on purpose.  close() reaps everything.
-        self._background_shells = BackgroundShellRegistry(on_exit=self._on_background_shell_exit)
+        self._background_shells = BackgroundShellRegistry(
+            on_exit=self._on_background_shell_exit, env=self._exec_env
+        )
         self._cancelled_partial_msg: dict[str, Any] | None = None
         self._pending_retry: str | None = None
         # True when persistence of a fatal exception's text has been admitted
@@ -5138,11 +5144,13 @@ class ChatSession:
         (stale config must not point the model at a phantom path) and when it
         equals the working directory (one fact, not two copies of one path).
         """
+        # Where this session's tools act: the process's directory on the host,
+        # the environment's own otherwise (which has no host workspace).
         try:
-            working_dir = os.getcwd()
+            working_dir = self._exec_env.getcwd()
         except OSError:
             working_dir = ""
-        workspace_dir = get_workspace_dir() or ""
+        workspace_dir = (get_workspace_dir() or "") if self._exec_env is HOST_ENVIRONMENT else ""
         if workspace_dir and (workspace_dir == working_dir or not os.path.isdir(workspace_dir)):
             workspace_dir = ""
         return apply_cwd_context(tools, working_dir, workspace_dir)
@@ -10690,7 +10698,7 @@ class ChatSession:
             if proc.poll() is not None:
                 continue  # already exited
             try:
-                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                self._exec_env.kill_group(proc, os.getpgid(proc.pid))
             except (OSError, ProcessLookupError):
                 with contextlib.suppress(OSError, ProcessLookupError):
                     proc.kill()
@@ -20018,7 +20026,7 @@ class ChatSession:
                 "needs_approval": False,
                 "error": "Error: empty command",
             }
-        blocked = is_command_blocked(command)
+        blocked = self._exec_env.command_refusal(command)
         if blocked:
             return {
                 "call_id": call_id,
@@ -20174,8 +20182,8 @@ class ChatSession:
                 "needs_approval": False,
                 "error": "Error: missing path",
             }
-        path = os.path.expanduser(path)
-        resolved = os.path.realpath(path)
+        path = self._exec_env.expanduser(path)
+        resolved = self._exec_env.realpath(path)
         offset = args.get("offset")  # 1-based line number, or None
         limit = args.get("limit")  # max lines, or None
         # Coerce to int safely (model may send strings or floats)
@@ -20248,7 +20256,7 @@ class ChatSession:
                 "needs_approval": False,
                 "error": "Error: missing query",
             }
-        path = os.path.expanduser(args.get("path", "") or ".")
+        path = self._exec_env.expanduser(args.get("path", "") or ".")
         preview = f"    /{pattern}/ in {path}"
         return {
             "call_id": call_id,
@@ -20298,8 +20306,8 @@ class ChatSession:
         except (ValueError, TypeError):
             ctx = 3
         ctx = max(0, min(ctx, 20))
-        path_a = os.path.expanduser(path_a)
-        path_b = os.path.expanduser(path_b) if path_b else ""
+        path_a = self._exec_env.expanduser(path_a)
+        path_b = self._exec_env.expanduser(path_b) if path_b else ""
         if path_b:
             header = f"\u2699 diff_file: {path_a} vs {path_b}"
         else:
@@ -20329,10 +20337,10 @@ class ChatSession:
                 "needs_approval": False,
                 "error": "Error: missing path",
             }
-        path = os.path.expanduser(path)
-        resolved = os.path.realpath(path)
-        is_symlink = os.path.abspath(path) != resolved
-        exists = os.path.exists(resolved)
+        path = self._exec_env.expanduser(path)
+        resolved = self._exec_env.realpath(path)
+        is_symlink = self._exec_env.abspath(path) != resolved
+        exists = self._exec_env.exists(resolved)
         raw_mode = args.get("mode")
         mode = str(raw_mode).strip().lower() if raw_mode else "overwrite"
         if mode not in ("overwrite", "append"):
@@ -20482,9 +20490,9 @@ class ChatSession:
                 "error": "Error: replace_all cannot be used with near_line",
             }
 
-        path = os.path.expanduser(path)
-        resolved = os.path.realpath(path)
-        is_symlink = os.path.abspath(path) != resolved
+        path = self._exec_env.expanduser(path)
+        resolved = self._exec_env.realpath(path)
+        is_symlink = self._exec_env.abspath(path) != resolved
 
         if resolved not in self._current_read_files:
             return {
@@ -20498,8 +20506,7 @@ class ChatSession:
 
         # Pre-read to validate all edits and build diff preview
         try:
-            with open(resolved) as f:
-                content = f.read()
+            content = self._exec_env.read_text(resolved)
 
             for i, edit in enumerate(edits):
                 old = edit["old_string"]
@@ -25781,7 +25788,7 @@ class ChatSession:
                 # Shared prologue with the background registry (script file +
                 # detached group leader + pgid snapshot) — one spawn recipe
                 # for both variants of the tool, so they cannot drift.
-                proc, pgid, script_path = spawn_group_leader(
+                proc, pgid, script_path = self._exec_env.spawn(
                     command,
                     stop_on_error=item.get("stop_on_error") is True,
                     env=scrubbed_env(extra=self._skill_resource_env()),
@@ -25878,7 +25885,7 @@ class ChatSession:
                 # hold the output pipe open, and forces the drain threads to EOF.
                 group_kill_attempted = True
                 with contextlib.suppress(OSError, ProcessLookupError):
-                    os.killpg(pgid, signal.SIGKILL)
+                    self._exec_env.kill_group(proc, pgid)
 
                 with contextlib.suppress(subprocess.TimeoutExpired):
                     proc.wait(timeout=10)
@@ -25906,12 +25913,12 @@ class ChatSession:
                 # cross-turn grafting the gate exists to prevent).  On the
                 # normal path this is the same post-join position.
                 capture_closed.set()
-                if pgid is not None and not group_kill_attempted:
+                if proc is not None and pgid is not None and not group_kill_attempted:
                     # An exception after spawn but before the ordinary group
                     # teardown (for example thread exhaustion) must not leave
                     # the command or a background descendant running.
                     with contextlib.suppress(OSError, ProcessLookupError):
-                        os.killpg(pgid, signal.SIGKILL)
+                        self._exec_env.kill_group(proc, pgid)
                 if proc is not None:
                     with self._procs_lock:
                         self._active_procs.discard(proc)
@@ -26020,8 +26027,9 @@ class ChatSession:
             msg = f"Error: {e}"
             self._report_tool_result(call_id, "bash", msg, is_error=True)
             return call_id, msg
+        label = self._exec_env.process_label(shell.proc)
         msg = (
-            f"Started background shell {shell.shell_id} (pid {shell.pid}). "
+            f"Started background shell {shell.shell_id}{f' ({label})' if label else ''}. "
             f'Read new output with bash_output(id="{shell.shell_id}"); stop it with '
             f'kill_shell(id="{shell.shell_id}").'
         )
@@ -26183,17 +26191,16 @@ class ChatSession:
             valid_until=lambda: registry.has(shell_id),
         )
 
-    @staticmethod
-    def _read_text_lines(path: str) -> tuple[list[str], str, str | None]:
+    def _read_text_lines(self, path: str) -> tuple[list[str], str, str | None]:
         """Read a text file with binary detection and symlink resolution.
 
         Returns (lines, resolved_path, error_msg).  On success error_msg is
         None.  On failure lines is empty and error_msg describes the problem.
         """
-        resolved = os.path.realpath(os.path.expanduser(path))
+        env = self._exec_env
+        resolved = env.realpath(env.expanduser(path))
         try:
-            with open(resolved, "rb") as fb:
-                sample = fb.read(8192)
+            sample = env.read_bytes(resolved, 8192)
             if b"\x00" in sample:
                 return (
                     [],
@@ -26203,8 +26210,7 @@ class ChatSession:
                         "(contains null bytes). Use bash to inspect binary files."
                     ),
                 )
-            with open(resolved) as f:
-                return f.readlines(), resolved, None
+            return env.read_lines(resolved), resolved, None
         except FileNotFoundError:
             return [], resolved, f"Error: {path} not found"
         except Exception as e:
@@ -26244,7 +26250,7 @@ class ChatSession:
         call_id, path = item["call_id"], item["path"]
         offset = item.get("offset")  # 1-based, or None
         limit = item.get("limit")  # max lines, or None
-        resolved = os.path.realpath(path)
+        resolved = self._exec_env.realpath(path)
 
         # Image file detection (branch before text open)
         ext = os.path.splitext(path)[1].lower()
@@ -26254,7 +26260,7 @@ class ChatSession:
         all_lines, _, err = self._read_text_lines(path)
         if err:
             self._current_read_files.discard(resolved)
-            if not os.path.exists(resolved):
+            if not self._exec_env.exists(resolved):
                 err += self._attached_file_note(path)
             self._report_tool_result(call_id, "read_file", err, is_error=True)
             return call_id, err
@@ -26289,11 +26295,11 @@ class ChatSession:
         caps = self._get_capabilities()
         if not caps.supports_vision:
             try:
-                size = os.path.getsize(resolved)
+                size = self._exec_env.stat(resolved).st_size
             except OSError as e:
                 self._current_read_files.discard(resolved)
                 msg = f"Error: {path}: {e}"
-                if not os.path.exists(resolved):
+                if not self._exec_env.exists(resolved):
                     msg += self._attached_file_note(path)
                 self._report_tool_result(call_id, "read_file", msg, is_error=True)
                 return call_id, msg
@@ -26308,11 +26314,10 @@ class ChatSession:
         # The path can name a device (a link to /dev/zero never ends) or a FIFO
         # (the read blocks), so read only a regular file, and never past the cap.
         try:
-            st = os.stat(resolved)
+            st = self._exec_env.stat(resolved)
             raw = b""
             if stat.S_ISREG(st.st_mode) and st.st_size <= _IMAGE_SIZE_CAP:
-                with open(resolved, "rb") as f:
-                    raw = f.read(_IMAGE_SIZE_CAP + 1)
+                raw = self._exec_env.read_bytes(resolved, _IMAGE_SIZE_CAP + 1)
         except FileNotFoundError:
             self._current_read_files.discard(resolved)
             msg = f"Error: {path} not found" + self._attached_file_note(path)
@@ -26381,13 +26386,7 @@ class ChatSession:
         """
         from turnstone.core.env import scrubbed_env
 
-        proc = subprocess.Popen(
-            args,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env=scrubbed_env(),
-        )
+        proc = self._exec_env.popen_search(args, env=scrubbed_env(), timeout=self.tool_timeout)
 
         # Watchdog: ``proc.stdout.read`` is a blocking pipe read with no
         # timeout, so a child stuck in kernel I/O (NFS, FUSE, broken
@@ -26451,12 +26450,18 @@ class ChatSession:
             raise subprocess.TimeoutExpired(args, self.tool_timeout)
         return stdout, rc, b"".join(stderr_chunks), capped
 
+    def _search_backend(self) -> str:
+        """The search program where the tools act: ``'rg'`` if installed, else ``'grep'``."""
+        if self._exec_env is HOST_ENVIRONMENT:
+            return _detect_search_backend()
+        return "rg" if self._exec_env.which("rg") else "grep"
+
     def _exec_search(self, item: dict[str, Any]) -> tuple[str, str]:
         """Search file contents for a regex pattern via ripgrep (preferred) or grep."""
         call_id = item["call_id"]
         pattern, path = item["pattern"], item["path"]
         try:
-            backend = _detect_search_backend()
+            backend = self._search_backend()
             args = _build_search_args(pattern, path, backend)
             stdout, rc, stderr, capped = self._search_capture(args)
 
@@ -26561,6 +26566,18 @@ class ChatSession:
         else:
             label_b = "(provided content)"
             lines_b = (content_b or "").splitlines(keepends=True)
+
+        diff_limit = self._exec_env.max_diff_lines
+        if diff_limit is not None and len(lines_a) + len(lines_b) > diff_limit:
+            # Comparing is done in this process and can take time quadratic in
+            # the line count for files with many repeated lines.
+            msg = (
+                f"Error: diff_file compares up to {diff_limit:,} lines here, both sides "
+                f"together; these have {len(lines_a) + len(lines_b):,}. Compare them with "
+                "the diff command in a shell."
+            )
+            self._report_tool_result(call_id, "diff_file", msg, is_error=True)
+            return call_id, msg
 
         # When content_b is a baseline, swap so diff reads as "what changed"
         # (--- old/baseline, +++ new/current file).
@@ -28952,9 +28969,7 @@ class ChatSession:
         path, content, resolved = item["path"], item["content"], item["resolved"]
         is_append = item.get("append", False)
         try:
-            os.makedirs(os.path.dirname(resolved) or ".", exist_ok=True)
-            with open(resolved, "a" if is_append else "w") as f:
-                f.write(content)
+            self._exec_env.write_text(resolved, content, append=is_append, make_parents=True)
             self._current_read_files.add(resolved)
             verb = "Appended" if is_append else "Wrote"
             msg = f"{verb} {len(content)} chars to {path}"
@@ -28965,6 +28980,21 @@ class ChatSession:
             self._report_tool_result(call_id, "write_file", msg, is_error=True)
             return call_id, msg
 
+    def _edit_too_large(self, path: str, result_chars: int) -> str | None:
+        """Refuse an edit whose result would pass the environment's text bound.
+
+        Checked before the text is built: a replace-all multiplies a file by a
+        factor the model chooses.
+        """
+        limit = self._exec_env.max_text_chars
+        if limit is None or result_chars <= limit:
+            return None
+        return (
+            f"Error: the edit would make {path} {result_chars:,} characters long, more than "
+            f"the {limit:,} a file edit may produce here. Make a smaller change, or write "
+            "the file with a shell command."
+        )
+
     def _exec_edit_file(self, item: dict[str, Any]) -> tuple[str, str]:
         """Apply one or more edits to a file (re-reads to avoid TOCTOU).
 
@@ -28974,11 +29004,14 @@ class ChatSession:
         self._check_cancelled()
         call_id = item["call_id"]
         path = item["path"]
-        resolved = item.get("resolved", os.path.realpath(os.path.expanduser(path)))
+        resolved = (
+            item["resolved"]
+            if "resolved" in item
+            else self._exec_env.realpath(self._exec_env.expanduser(path))
+        )
         edits: list[dict[str, Any]] = item["edits"]
         try:
-            with open(resolved) as f:
-                content = f.read()
+            content = self._exec_env.read_text(resolved)
 
             # replace_all mode: simple str.replace, skip offset logic
             do_replace_all = item.get("replace_all", False)
@@ -28990,9 +29023,12 @@ class ChatSession:
                     msg = f"Error: old_string not found in {path}"
                     self._report_tool_result(call_id, "edit_file", msg, is_error=True)
                     return call_id, msg
+                too_large = self._edit_too_large(path, len(content) + count * (len(new) - len(old)))
+                if too_large:
+                    self._report_tool_result(call_id, "edit_file", too_large, is_error=True)
+                    return call_id, too_large
                 content = content.replace(old, new)
-                with open(resolved, "w") as f:
-                    f.write(content)
+                self._exec_env.write_text(resolved, content)
                 msg = f"Edited {path}: replaced {count} occurrences"
                 self._report_tool_result(call_id, "edit_file", msg)
                 return call_id, msg
@@ -29032,12 +29068,19 @@ class ChatSession:
                     self._report_tool_result(call_id, "edit_file", msg, is_error=True)
                     return call_id, msg
 
+            too_large = self._edit_too_large(
+                path,
+                len(content) + sum(len(new) - (end - start) for start, end, new in replacements),
+            )
+            if too_large:
+                self._report_tool_result(call_id, "edit_file", too_large, is_error=True)
+                return call_id, too_large
+
             # Apply in reverse order so offsets stay valid
             for start, end, new in reversed(replacements):
                 content = content[:start] + new + content[end:]
 
-            with open(resolved, "w") as f:
-                f.write(content)
+            self._exec_env.write_text(resolved, content)
             count = len(replacements)
             noun = "edit" if count == 1 else "edits"
             msg = f"Edited {path}: applied {count} {noun}"
