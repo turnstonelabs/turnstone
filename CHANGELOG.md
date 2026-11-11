@@ -46,6 +46,13 @@ The separate `dev` branch is retired. See [the release process](docs/releasing.m
   `int`, an id another process has by then.
   Tool definitions gain the `environment` metadata key for these tools. See
   [the tools reference](docs/tools.md#execution-environment).
+- **A headless run can be limited to named tools.**
+  `HeadlessSession(tool_names=...)` offers only those tools and refuses a call
+  to any other before its preparer runs; without it a model can call a tool it
+  was never offered, because dispatch is by name. The limit also holds for a
+  task agent the run spawns. A headless session given an execution environment
+  offers only the tools that act through it unless `tool_names` says otherwise,
+  and their descriptions name the environment's working directory.
 
 ### Fixed
 

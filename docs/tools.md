@@ -864,8 +864,9 @@ The other tools do not go through it. They reach the network (`web_fetch`,
 `web_search`), the stores (`memory`, `recall`, `skills`), other people
 (`notify`), the host's schedulers and panes (`watch`, `open_preview`), other
 servers (MCP tools) or other conversations (`task_agent`, the coordinator
-tools). A session whose environment is not the host has to leave them out, or
-accept that they act outside it.
+tools). A headless session given an environment therefore offers only
+`ENVIRONMENT_TOOL_NAMES` unless its caller names other tools, and refuses a
+call to any tool it did not offer (see [eval.md](eval.md)).
 
 ---
 

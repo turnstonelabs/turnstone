@@ -173,6 +173,7 @@ class TestDefault:
         try:
             assert session._exec_env is HOST_ENVIRONMENT
             assert session._background_shells._env is HOST_ENVIRONMENT
+            assert session._offered_tool_names is None
             # Every headless tool is offered, as before.
             offered = {t["function"]["name"] for t in session._eval_tools}
             assert offered == INTERACTIVE_TOOL_NAMES - {"read_resource", "use_prompt"}
@@ -559,7 +560,7 @@ class TestTheHostsGroupKill:
         assert group_signal_refusal(claims, own, after_exit=True) is not None
 
 
-class TestEnvironmentToolNames:
+class TestOfferedTools:
     def test_environment_tools_are_the_shell_and_file_tools(self):
         assert (
             frozenset(
@@ -577,6 +578,171 @@ class TestEnvironmentToolNames:
             == ENVIRONMENT_TOOL_NAMES
         )
         assert ENVIRONMENT_TOOL_NAMES <= INTERACTIVE_TOOL_NAMES
+
+    def test_a_session_elsewhere_offers_only_environment_tools(self, memory):
+        _env, session = memory
+        offered = {t["function"]["name"] for t in session._eval_tools}
+        assert offered == ENVIRONMENT_TOOL_NAMES
+
+    def test_descriptions_name_the_environments_directory(self, memory):
+        _env, session = memory
+        by_name = {t["function"]["name"]: t["function"]["description"] for t in session._eval_tools}
+        assert "Commands run in /work" in by_name["bash"]
+        assert "Relative paths resolve against /work." in by_name["read_file"]
+
+    def test_a_tool_that_was_not_offered_does_not_run(self, memory):
+        """Dispatch is by name: without the gate ``web_fetch`` and ``memory`` would
+        act on this machine although the session never offered them."""
+        _env, session = memory
+        session._prepare_web_fetch = MagicMock(side_effect=AssertionError("ran"))  # type: ignore[method-assign]
+        session._prepare_memory = MagicMock(side_effect=AssertionError("ran"))  # type: ignore[method-assign]
+
+        fetch, remember = _run(
+            session,
+            _call("f", "web_fetch", url="http://example.invalid/", question="x"),
+            _call("m", "memory", action="save", key="n", content="c"),
+        )
+
+        for text in (fetch, remember):
+            assert "is not available in this session. Tools offered: bash, bash_output" in text
+        assert session._tool_error_flags == {"f": True, "m": True}
+
+    def test_the_caller_can_name_the_tools(self, tmp_db):
+        session = HeadlessSession(
+            client=MagicMock(), model="eval-model", tool_names={"bash", "web_search"}
+        )
+        try:
+            assert {t["function"]["name"] for t in session._eval_tools} == {"bash", "web_search"}
+            (refused,) = _run(session, _call("r", "read_file", path="/etc/hostname"))
+            assert "Tool 'read_file' is not available in this session" in refused
+        finally:
+            session.close()
+
+    def test_an_unknown_tool_name_is_refused_at_construction(self, tmp_db):
+        with pytest.raises(ValueError, match="no_such_tool"):
+            HeadlessSession(client=MagicMock(), model="eval-model", tool_names={"no_such_tool"})
+
+    def test_a_refused_construction_leaves_nothing_registered(self, tmp_db):
+        """The session registers with its MCP client before the names are looked at;
+        nobody gets a session to close when the constructor raises."""
+        mcp = MagicMock()
+        mcp.get_tools.return_value = []
+        with pytest.raises(ValueError, match="no_such_tool"):
+            HeadlessSession(
+                client=MagicMock(),
+                model="eval-model",
+                tool_names={"no_such_tool"},
+                mcp_client=mcp,
+            )
+        assert mcp.add_listener.call_count == 1
+        assert mcp.remove_listener.call_count == 1
+
+
+class TestSubAgentOfALimitedRun:
+    """A task agent spawned by a limited run acts where the run acts, with its tools."""
+
+    PARENT: list[dict[str, Any]] = [
+        {"tool_calls": [{"name": "task_agent", "arguments": {"prompt": "Write the note."}}]},
+        {"content": "Done."},
+    ]
+    AGENT: list[dict[str, Any]] = [
+        {
+            "tool_calls": [
+                {
+                    "name": "write_file",
+                    "arguments": {"path": "note.txt", "content": "by the agent"},
+                },
+                {
+                    "name": "web_fetch",
+                    "arguments": {"url": "http://example.invalid/", "question": "?"},
+                },
+                {"name": "notify", "arguments": {"message": "hello"}},
+                {"name": "bash", "arguments": {"command": "echo on the host"}},
+            ]
+        },
+        {"tool_calls": [{"name": "read_file", "arguments": {"path": "note.txt"}}]},
+        {"content": "note written"},
+    ]
+
+    def test_nothing_it_does_runs_outside_the_environment(self, tmp_db):
+        from openai import OpenAI
+
+        from tests._scripted_chat_server import ScriptedChatServer
+
+        env = _MemoryEnvironment()
+        with ScriptedChatServer(self.PARENT, agent_script=self.AGENT) as server:
+            client = OpenAI(base_url=server.base_url, api_key="none", max_retries=0)
+            session = HeadlessSession(
+                client=client,
+                model="scripted",
+                system_prompt_override="You are a test.",
+                exec_env=env,
+                tool_names=ENVIRONMENT_TOOL_NAMES | {"task_agent"},
+            )
+            # Any host-side executor a sub-agent could reach fails the test if it runs.
+            for name in (
+                "_exec_web_fetch",
+                "_exec_notify",
+                "_prepare_web_fetch",
+                "_prepare_notify",
+            ):
+                setattr(session, name, MagicMock(side_effect=AssertionError(name + " ran")))
+            try:
+                log = session.send_headless("go", max_turns=3)
+            finally:
+                session.close()
+                client.close()
+            agent_requests = server.agent_requests
+
+        assert [(e["tool"], e["ok"], e["result"]) for e in log] == [
+            ("task_agent", True, "note written")
+        ]
+        # The file exists in the environment and nowhere else.
+        assert env.files == {"/work/note.txt": b"by the agent"}
+        assert not os.path.exists("note.txt")
+        # The agent was offered the run's tools only, with the environment's directory...
+        offered = {t["function"]["name"] for t in agent_requests[0]["tools"]}
+        assert offered == ENVIRONMENT_TOOL_NAMES
+        bash = next(t for t in agent_requests[0]["tools"] if t["function"]["name"] == "bash")
+        assert "Commands run in /work" in bash["function"]["description"]
+        # ...and its calls outside them were refused; the shell call reached the
+        # environment (which runs no commands) and not this machine.
+        results = [m["content"] for m in agent_requests[1]["messages"] if m["role"] == "tool"]
+        assert results[0] == "Wrote 12 chars to note.txt"
+        assert "tool 'web_fetch' is not available in agent mode" in results[1]
+        assert "tool 'notify' is not available in agent mode" in results[2]
+        assert "this environment runs no commands" in results[3]
+        assert "on the host" not in results[3]
+
+    def test_a_sub_agent_cannot_spawn_another(self, tmp_db):
+        from openai import OpenAI
+
+        from tests._scripted_chat_server import ScriptedChatServer
+
+        agent = [
+            {"tool_calls": [{"name": "task_agent", "arguments": {"prompt": "go deeper"}}]},
+            {"content": "stayed at depth one"},
+        ]
+        with ScriptedChatServer(self.PARENT, agent_script=agent) as server:
+            client = OpenAI(base_url=server.base_url, api_key="none", max_retries=0)
+            session = HeadlessSession(
+                client=client,
+                model="scripted",
+                system_prompt_override="You are a test.",
+                exec_env=_MemoryEnvironment(),
+                tool_names=ENVIRONMENT_TOOL_NAMES | {"task_agent"},
+            )
+            try:
+                session.send_headless("go", max_turns=3)
+            finally:
+                session.close()
+                client.close()
+            first, second = server.agent_requests
+
+        assert "task_agent" not in {t["function"]["name"] for t in first["tools"]}
+        (result,) = [m["content"] for m in second["messages"] if m["role"] == "tool"]
+        assert result == "Error: agents cannot spawn further agents"
+        assert len(server.agent_requests) == 2  # one sub-agent, no second conversation
 
 
 class TestNoDestructiveCommandRunsHere:

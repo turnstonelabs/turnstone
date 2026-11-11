@@ -257,6 +257,20 @@ guessed spelling. The caller supplies the text because only the caller knows the
 server's tool-call format; `turnstone.rollout` reads it from the token bytes it
 records.
 
+### Tool set and execution environment
+
+`HeadlessSession(tool_names=...)` limits a run to the named tools: only they
+are offered, and a call to any other tool gets a "not available in this
+session" result before its preparer runs. Without it a model can call a tool
+it was never offered, because dispatch is by name. The limit also holds for a
+task agent the run spawns (when `task_agent` is among the names): it is offered
+the named tools a task agent may have, and a call outside them is refused.
+
+`HeadlessSession(exec_env=...)` runs the shell and file tools in another
+[execution environment](tools.md#execution-environment). Such a session offers
+only the tools that act through the environment unless `tool_names` says
+otherwise, and their descriptions name the environment's working directory.
+
 ### Timeout and Cancellation
 
 Each test runs in a `ThreadPoolExecutor(max_workers=1)` with a per-test

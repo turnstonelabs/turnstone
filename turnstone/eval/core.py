@@ -28,7 +28,7 @@ import sys
 import tempfile
 import threading
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from concurrent.futures import TimeoutError as FuturesTimeoutError
 from typing import Any
@@ -36,6 +36,7 @@ from typing import Any
 from openai import DefaultHttpxClient, OpenAI
 
 from turnstone.core.attachments import Attachment, classify_upload
+from turnstone.core.exec_env import HOST_ENVIRONMENT
 from turnstone.core.log import get_logger
 from turnstone.core.lowering import legalize_tool_call_entry
 from turnstone.core.model_turn import cap_tool_calls, model_turn, require_lane_capabilities
@@ -44,7 +45,12 @@ from turnstone.core.providers import LLMProvider, create_client, create_provider
 from turnstone.core.providers._http_client import shutdown_on_close
 from turnstone.core.session import _ADMISSION_REFITS, _TRUNCATION_FLOOR_CHARS, ChatSession
 from turnstone.core.storage import get_storage, init_storage, reset_storage
-from turnstone.core.tools import INTERACTIVE_TOOLS, PRIMARY_KEY_MAP
+from turnstone.core.tools import (
+    ENVIRONMENT_TOOL_NAMES,
+    INTERACTIVE_TOOLS,
+    PRIMARY_KEY_MAP,
+    apply_cwd_context,
+)
 from turnstone.core.trajectory import (
     Turn,
     dicts_from_turns,
@@ -481,6 +487,19 @@ class HeadlessSession(ChatSession):
     (``raw_arguments_unrecovered``).  The caller supplies the text because only
     it knows the server's format; the rollout package reads it from the token
     bytes it records.
+
+    ``tool_names`` limits the run to those tools: only they are offered, and a
+    call to any other tool is refused before its preparer runs (dispatch is by
+    name, so a model can otherwise call a tool it was never offered).  The
+    limit holds for a task agent the run spawns: it is offered the named tools
+    a task agent may have, and nothing else.
+
+    ``exec_env`` (a ``ChatSession`` argument) moves the shell and file tools
+    to another execution environment.  A session given one offers, unless
+    ``tool_names`` says otherwise, only the tools that act through it
+    (``ENVIRONMENT_TOOL_NAMES``), so nothing the model does takes effect
+    anywhere else, and their descriptions name the environment's working
+    directory the way an interactive session's name the process's.
     """
 
     def __init__(
@@ -502,6 +521,7 @@ class HeadlessSession(ChatSession):
         stable_prefix: bool = False,
         raw_arguments: Callable[[list[dict[str, Any]]], Sequence[Mapping[str, str] | None] | None]
         | None = None,
+        tool_names: Collection[str] | None = None,
         **session_kwargs: Any,
     ) -> None:
         # ``session_kwargs`` forwards straight to ``ChatSession`` so
@@ -538,13 +558,42 @@ class HeadlessSession(ChatSession):
         # Things a ``stable_prefix`` run did that its caller should know about.
         self.prefix_events: list[dict[str, Any]] = []
         self._total_usage: dict[str, int] = {"prompt": 0, "completion": 0}
-        # Filter MCP-only tools that can't work in headless mode
-        base_tools = [t for t in TOOLS if t["function"]["name"] not in _MCP_ONLY_TOOLS]
-        self._eval_tools = (
-            _apply_tool_overrides(base_tools, tool_overrides) if tool_overrides else base_tools
-        )
+        try:
+            self._eval_tools = self._offered_tools(tool_names, tool_overrides)
+        except BaseException:
+            # ``ChatSession.__init__`` registered this session with shared
+            # services (the MCP client's listeners).  A constructor that fails
+            # hands nobody a session to close, so it releases them itself.
+            self.close()
+            raise
         if system_prompt_override is not None:
             self._override_system_prompt(system_prompt_override)
+
+    def _offered_tools(
+        self,
+        tool_names: Collection[str] | None,
+        tool_overrides: dict[str, dict[str, Any]] | None,
+    ) -> list[dict[str, Any]]:
+        """The tool definitions this run offers; sets the names it may call."""
+        # Filter MCP-only tools that can't work in headless mode
+        base_tools = [t for t in TOOLS if t["function"]["name"] not in _MCP_ONLY_TOOLS]
+        elsewhere = self._exec_env is not HOST_ENVIRONMENT
+        if tool_names is None and elsewhere:
+            tool_names = ENVIRONMENT_TOOL_NAMES
+        # The names this run may call, ``None`` for no restriction.
+        self._offered_tool_names: frozenset[str] | None = None
+        if tool_names is not None:
+            self._offered_tool_names = frozenset(tool_names)
+            unknown = self._offered_tool_names - {t["function"]["name"] for t in base_tools}
+            if unknown:
+                raise ValueError(f"tool_names holds unknown tools: {', '.join(sorted(unknown))}")
+            base_tools = [
+                t for t in base_tools if t["function"]["name"] in self._offered_tool_names
+            ]
+        if elsewhere:
+            # Tell the model where its commands run and relative paths resolve.
+            base_tools = apply_cwd_context(base_tools, self._exec_env.getcwd(), "")
+        return _apply_tool_overrides(base_tools, tool_overrides) if tool_overrides else base_tools
 
     @property
     def total_usage(self) -> dict[str, int]:
@@ -656,19 +705,45 @@ class HeadlessSession(ChatSession):
         return None
 
     def _prepare_tool_item(self, tc: dict[str, Any]) -> dict[str, Any]:
-        if self._stable_prefix:
+        name = str((tc.get("function") or {}).get("name") or "").strip()
+        refusal: str | None = None
+        header = ""
+        offered = self._offered_tool_names
+        if offered is not None and name not in offered:
+            # Dispatch is by name; without this a tool that was never offered
+            # would still run.
+            header = f"\u2717 {name}: not available"
+            refusal = (
+                f"Tool {name!r} is not available in this session. Tools offered: "
+                f"{', '.join(sorted(offered))}. To call one, use its name exactly as listed."
+            )
+        elif self._stable_prefix:
+            header = f"\u2717 {name}: fixed for this run"
             refusal = self._prefix_refusal(tc)
-            if refusal is not None:
-                name = str((tc.get("function") or {}).get("name") or "").strip()
-                return {
-                    "call_id": tc["id"],
-                    "func_name": name,
-                    "header": f"\u2717 {name}: fixed for this run",
-                    "preview": "",
-                    "needs_approval": False,
-                    "error": ControllerText(refusal),
-                }
+        if refusal is not None:
+            return {
+                "call_id": tc["id"],
+                "func_name": name,
+                "header": header,
+                "preview": "",
+                "needs_approval": False,
+                "error": ControllerText(refusal),
+            }
         return super()._prepare_tool_item(tc)
+
+    def _apply_persona_visibility(self, tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Also hide what this run does not offer.
+
+        A task agent's tool list is built through here when it is spawned, so a
+        sub-agent of a limited run is offered, and can call, only tools of that
+        run: its loop refuses a call outside its own list.
+        """
+        visible = super()._apply_persona_visibility(tools)
+        # Reached during construction too, before the names are set.
+        offered: frozenset[str] | None = getattr(self, "_offered_tool_names", None)
+        if offered is None:
+            return visible
+        return [t for t in visible if t.get("function", {}).get("name") in offered]
 
     def _compact_messages(self, *args: Any, **kwargs: Any) -> bool:
         if self._stable_prefix:
