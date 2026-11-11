@@ -4,18 +4,13 @@
 from __future__ import annotations
 
 import os
-import pathlib
 import re
 import shutil
 import subprocess
 import tempfile
-from typing import TYPE_CHECKING
+from pathlib import Path
 
 import pytest
-
-if TYPE_CHECKING:
-    from pathlib import Path
-
 
 FAKE_DOM = r"""
 class FakeElement {
@@ -1132,7 +1127,7 @@ def demodulize(path: Path) -> str:
     return src
 
 
-_REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
+_REPO_ROOT = Path(__file__).resolve().parents[1]
 _SHARED_STATIC = _REPO_ROOT / "turnstone/shared_static"
 _COORDINATOR_JS = _REPO_ROOT / "turnstone/console/static/coordinator/coordinator.js"
 
