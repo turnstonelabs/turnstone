@@ -47,8 +47,9 @@ from turnstone.core.log import get_logger
 from turnstone.core.model_turn import ModelContextLimitError
 from turnstone.core.output_guard import ControllerText
 from turnstone.core.providers._http_client import shutdown_on_close
-from turnstone.core.session import GenerationCancelled
+from turnstone.core.session import GenerationCancelled, inside_task_agent
 from turnstone.core.storage import init_storage, reset_storage
+from turnstone.core.tools import apply_null_spellings, salvage_tool_arguments
 from turnstone.core.trajectory import final_assistant_text
 from turnstone.eval.core import HeadlessSession, run_with_lifecycle
 from turnstone.rollout.container import (
@@ -62,6 +63,7 @@ from turnstone.rollout.probe import SETTINGS as PROBED_SETTINGS
 from turnstone.rollout.probe import all_settings, sampler_logprobs_reported
 from turnstone.rollout.rawargs import RecordedArguments
 from turnstone.rollout.recording import PARENT, SUB_AGENT, RecordingClient
+from turnstone.rollout.rules import RuleSet, refusal_text
 from turnstone.rollout.settings import (
     Limit,
     Setting,
@@ -197,6 +199,10 @@ class RolloutConfig:
     # ``None``: the framework's ``tools.truncation``, where 0 is its automatic
     # share of the remaining context.
     max_output_chars: int | None = None
+    # The pattern rules enforced on tool calls (:mod:`turnstone.rollout.rules`):
+    # ``"shipped"`` for the rollout package's own set, a rule set of the run's,
+    # or ``None`` for none.
+    rules: RuleSet | str | None = "shipped"
     # A run that reaches its time limit while a model request has had nothing
     # from the server for this long ended on the server, not on the model.
     server_stall_seconds: float = 60.0
@@ -502,11 +508,17 @@ class RolloutSession(HeadlessSession):
         *,
         max_subagents: int,
         last_call_tokens: Callable[[], int | None],
+        rules: RuleSet | None = None,
         allow_host_execution: bool = False,
         **kwargs: Any,
     ) -> None:
+        if kwargs.get("judge_config") is not None:
+            # Its model-based tier would make model calls of its own, on a
+            # client the recorder does not see, and read this machine's files.
+            raise ValueError("a rollout does not run the intent judge; give it rules instead")
         if _acts_on_host(kwargs.get("exec_env")) and not allow_host_execution:
-            # The model is not a caller to be trusted with this machine.
+            # The model is not a caller to be trusted with this machine, and
+            # the pattern rules are not what keeps it off.
             raise HostExecutionError(_HOST_REFUSAL)
         # The tools of the task's own servers, by name.  Set before the base
         # class builds its tool lists, which asks ``_apply_persona_visibility``.
@@ -515,6 +527,9 @@ class RolloutSession(HeadlessSession):
             t["function"]["name"] for t in (own_servers.get_tools() if own_servers else [])
         )
         super().__init__(**kwargs)
+        self._rules = rules
+        # Every call a rule matched: which rule, what it said, whose call.
+        self.rule_events: list[dict[str, Any]] = []
         self._max_subagents = max_subagents
         self._last_call_tokens = last_call_tokens
         self._delegation_lock = threading.Lock()
@@ -552,6 +567,87 @@ class RolloutSession(HeadlessSession):
                 f"with a reply of up to {self.max_tokens:,} that passes the context window of "
                 f"{self.context_window:,}"
             )
+
+    # -- pattern rules -------------------------------------------------------
+
+    def _ensure_judge(self) -> None:
+        """A rollout has no intent judge, whatever its configuration says."""
+        return None
+
+    def _call_as_it_runs(
+        self, tc: dict[str, Any], item: dict[str, Any]
+    ) -> tuple[str, dict[str, Any] | None]:
+        """The tool and the arguments of a call as it will run, which is not
+        always what the model wrote: ``None`` for arguments nothing runs on.
+
+        Between the model's words and the tool the session strips white space
+        off the name, makes arguments of text that is no JSON, reads a null
+        spelled as text as no value, and writes plain dashes and quotes for
+        typographic ones in a command.  Each step is the session's own function
+        or what its prepared call holds, so nothing here can drift from it.
+        """
+        function = tc.get("function") or {}
+        name = str(function.get("name") or "").strip()
+        raw = function.get("arguments")
+        if raw is None or raw == "":
+            raw = "{}"
+        if not isinstance(raw, str):
+            return name, None
+        arguments: Any
+        try:
+            arguments = json.loads(raw)
+        except json.JSONDecodeError:
+            arguments = salvage_tool_arguments(name, raw)
+        except (ValueError, RecursionError):
+            return name, None
+        if not isinstance(arguments, dict):
+            return name, None
+        apply_null_spellings(arguments, self._tool_definition(name))
+        command = item.get("command")
+        if isinstance(command, str):
+            # The command the prepared call starts.
+            arguments["command"] = command
+        return name, arguments
+
+    def _prepare_tool_item(self, tc: dict[str, Any]) -> dict[str, Any]:
+        """Ask the run's rules before a call runs, the session's own or a sub-agent's.
+
+        The rules judge the call that will run, not the model's spelling of it:
+        a command with typographic dashes runs with plain ones, a tool name
+        with white space around it runs the tool, and arguments that are no
+        JSON are made into arguments and run.
+        """
+        item = super()._prepare_tool_item(tc)
+        if self._rules is None or item.get("error"):
+            return item
+        name, arguments = self._call_as_it_runs(tc, item)
+        if arguments is None:
+            return item
+        rule = self._rules.match(name, arguments)
+        if rule is None:
+            return item
+        refused = rule.recommendation == "deny"
+        with self._delegation_lock:
+            self.rule_events.append(
+                {
+                    "call_id": tc.get("id"),
+                    "tool": name,
+                    "rule": rule.name,
+                    "recommendation": rule.recommendation,
+                    "refused": refused,
+                    "scope": SUB_AGENT if inside_task_agent() else PARENT,
+                }
+            )
+        if not refused:
+            return item
+        return {
+            "call_id": tc.get("id"),
+            "func_name": name,
+            "header": chr(0x2717) + f" {name}: refused by the rule {rule.name}",
+            "preview": "",
+            "needs_approval": False,
+            "error": ControllerText(refusal_text(rule)),
+        }
 
     # -- sub-agents ----------------------------------------------------------
 
@@ -728,6 +824,7 @@ def _snapshot(session: Any) -> dict[str, Any]:
         "subagents_admitted": session.subagents_admitted,
         "subagents_refused": session.subagents_refused,
         "subagent_failures": _plain(list(session.subagent_failures)),
+        "rule_events": _plain(list(session.rule_events)),
     }
 
 
@@ -740,6 +837,7 @@ _EMPTY_SNAPSHOT: dict[str, Any] = {
     "subagents_admitted": 0,
     "subagents_refused": 0,
     "subagent_failures": [],
+    "rule_events": [],
 }
 
 # Every way a rollout ends, and whose doing it is.  A state the model can bring
@@ -1162,6 +1260,9 @@ def _build_record(
         # Whether the tools acted on the machine the rollout ran on instead of
         # in a sandbox, which takes the caller's explicit say.
         "acts_on_host": bool(state.get("acts_on_host")),
+        # The pattern rules in force (name and a hash of their content) and
+        # every call one of them matched.
+        "rules": _rules_record(state.get("rules"), snapshot, messages),
     }
     if config.keep_text:
         record["text"] = [c.raw_text for c in accepted]
@@ -1257,6 +1358,38 @@ def _keep(sandbox: Sandbox, seconds: float) -> None:
         keep(seconds)
     except Exception as error:
         log.warning("rollout.keep_for_failed", error=str(error)[:200])
+
+
+def _rules_record(
+    rules: RuleSet | None, snapshot: dict[str, Any], messages: list[dict[str, Any]]
+) -> dict[str, Any] | None:
+    if rules is None:
+        return None
+    events: list[dict[str, Any]] = snapshot["rule_events"]
+    # The tool log holds the session's own calls in the order the model made
+    # them; name the rule on the entry of each call one matched.
+    call_ids = [
+        call.get("id")
+        for message in messages
+        if message.get("role") == "assistant"
+        for call in message.get("tool_calls") or []
+    ]
+    log_entries: list[dict[str, Any]] = snapshot["tool_log"]
+    if len(call_ids) == len(log_entries):
+        by_id = {e["call_id"]: e for e in events if e["scope"] == PARENT}
+        for call_id, entry in zip(call_ids, log_entries, strict=True):
+            if call_id in by_id:
+                entry["rule"] = by_id[call_id]["rule"]
+                entry["rule_says"] = by_id[call_id]["recommendation"]
+    return {**rules.identity(), "events": events}
+
+
+def _resolve_rules(config: RolloutConfig) -> RuleSet | None:
+    if config.rules is None or isinstance(config.rules, RuleSet):
+        return config.rules
+    if config.rules == "shipped":
+        return RuleSet.shipped()
+    return RuleSet.from_file(config.rules)
 
 
 def _detect_context_window(config: RolloutConfig) -> int | None:
@@ -1371,7 +1504,8 @@ def run_episode(
     execution environment acts on the machine the rollout runs on is refused
     with :class:`HostExecutionError` before anything runs, unless
     *allow_host_execution* is true.  That is for a caller who scripts every
-    command itself, such as a test.
+    command itself, such as a test: the pattern rules a rollout enforces are
+    not isolation and do not make a model's commands safe to run here.
 
     *verifier* is called once the model has finished, with the episode's
     container stopped (:mod:`turnstone.rollout.verification`).  What it returns
@@ -1407,6 +1541,7 @@ def run_episode(
     assert config.max_output_chars is not None
     state: dict[str, Any] = {"limits": limits, "sampling": sampling}
     state["logprobs"] = _logprob_verdict(config)
+    state["rules"] = _resolve_rules(config)
     state["t0"] = time.monotonic()
     sandbox: Sandbox = (sandbox_factory or ContainerSandbox)(task, config)
     forced: str | None = None
@@ -1484,6 +1619,7 @@ def run_episode(
                     exec_env=environment,
                     max_subagents=config.max_subagents,
                     last_call_tokens=last_call_tokens,
+                    rules=state["rules"],
                     allow_host_execution=allow_host_execution,
                 )
                 state["session"] = session

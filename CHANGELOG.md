@@ -135,6 +135,27 @@ The separate `dev` branch is retired. See [the release process](docs/releasing.m
   call the model gets wrong is an ordinary result. Both containers are removed
   afterwards, and a verifier is given the stopped sidecar to read its state
   from.
+- **Rollouts: pattern rules on tool calls.** A rollout enforces a rule set of
+  its own on the model's tool calls, the session's and a sub-agent's alike: a
+  rule that says deny refuses the call before anything runs, with a fixed text
+  as an ordinary tool result, and a rule that says review lets it run and is
+  recorded. A call is judged as it will run: under the name the tool is
+  dispatched by, with arguments that are no JSON made into arguments and a
+  command's typographic dashes and quotes written plain, the way the session
+  runs it. The set shipped with the rollout package (`rules.json`, in the
+  heuristic rule format) keeps what is destructive anywhere, such as deleting
+  the root of a file system or signalling every process, and leaves a root
+  user's ordinary work in a throwaway container alone; a run can replace it or
+  add rules. A rule looks for its program where a command starts, also behind
+  `sudo` and its like, an assignment or a keyword of the shell, and by its
+  path in a system directory; a program that is only named in a text runs. The rules are not isolation: they are patterns that can be written
+  around, and nothing that confines a model rests on them. Every repeat in a
+  pattern must have a limit, so that a long command cannot stall the match; a
+  rule set with an unbounded repeat is refused. The record names the set in
+  force by name and content hash. The fixed list that protects the machine a
+  session runs on is not asked inside a rollout's container, and the
+  model-based judge never runs in a rollout. Interactive and other headless
+  sessions are unchanged.
 
 ### Fixed
 

@@ -452,6 +452,10 @@ runs whatever the model writes on this machine. The command line has no such
 switch: `turnstone-rollout` always runs in a container. The record says which
 it was (`acts_on_host`).
 
+The [rules on tool calls](#rules-on-tool-calls) are not part of this. **They
+are not isolation**: they are patterns, a pattern can be written around, and
+nothing that keeps a model's commands off this machine rests on them.
+
 ---
 
 ## The container
@@ -726,6 +730,9 @@ result would be longer than `max_read_bytes` is refused before the text is
 built (a replace-all multiplies a file), and `diff_file` compares at most 4,000
 lines. An image is decoded only for a model with vision, within the size and
 pixel limits every image read has.
+The rules on tool calls are matched there too, on commands the model wrote;
+their patterns are bounded so that a long command cannot stall the harness (see
+[rules on tool calls](#rules-on-tool-calls)).
 
 ---
 
@@ -770,13 +777,151 @@ produced, head and tail kept, to the framework's truncation setting
 file of up to `max_read_bytes` whole; a larger one is an error that says so,
 never a shortened text.
 
-Inside the container the fixed list of patterns that protects the machine a
-session runs on is still asked before a command starts, as on the host. It
-refuses some ordinary work there, such as any recursive change of ownership.
-
 Not yet handled: the exit of a background shell is not announced to the model in
 a headless run, although the tool description says a notice follows. The model
 has to ask with `bash_output`.
+
+### Rules on tool calls
+
+A rollout has nobody to ask, and no reason to protect a throwaway container the
+way an operator's machine is protected. It should still not reinforce a few
+habits that are destructive anywhere. So a rollout enforces a rule set of its
+own on tool calls, the session's and a sub-agent's alike:
+
+- a rule that says `deny` refuses the call before anything runs. The model gets
+  an ordinary tool result with a fixed text naming the rule ("Refused by the
+  rule '...': ... The call was not run. ..."), the same for the same call every
+  time, so the prompt still extends;
+- a rule that says `review` lets the call run, since there is nobody to review
+  it, and is recorded;
+- the first rule that matches decides, and a call no rule matches runs.
+
+The rules are asked about the call that will run, which is not always what the
+model wrote. On the way to a tool the session strips white space off the tool's
+name, makes arguments of text that is no JSON (a bare text becomes the tool's
+main argument, an object that was never closed gives up the value it holds),
+reads a null spelled as text as no value, and writes plain dashes and quotes
+for typographic ones in a command. A rule sees what comes out of that: `kill`
+with an en dash before `9` is judged, and refused, as the `kill -9` it would
+run as. `rules.events` names the tool by the name it runs under.
+
+A refused call is the model's doing: the rollout stays trainable. The tool log
+names the rule on the call's entry (`rule`, `rule_says`), and the record lists
+every match with whose call it was (`rules.events`).
+
+**The rules are not isolation.** They are patterns, and a pattern can be
+written around: a command spelled another way, built from parts, or run from a
+script file passes. Nothing rests on them. The container's isolation and its
+main process are kept by other means, whether a rule fires or not, and what
+keeps a model's commands off the machine a rollout runs on is that a rollout
+refuses an environment that acts there
+(see [where the tools act](#where-the-tools-act)).
+
+The rules are data, in the framework's heuristic rule format and matched by its
+matcher, with one difference. A rule sees a call as text: a shell call's
+command, a file tool's path, any other call's arguments. A path the model
+writes means something in its sandbox only, so a rule on `write_file` or
+`edit_file` is matched against the path as written, and nothing is expanded,
+resolved or looked up on the machine the rollout runs on (the framework's
+matcher would do that for its own sessions, which act on that machine). The
+set shipped with the package (`turnstone/rollout/rules.json`, named
+`rollout-sandbox`):
+
+| Rule | Says | What it matches |
+|------|------|-----------------|
+| `wipe-root` | deny | Deleting `/`, `/*` or a whole system directory such as `/usr` or `/etc` |
+| `block-device-write` | deny | Writing to a disk device, making a file system on one |
+| `fork-bomb` | deny | The self-replicating shell function |
+| `signal-every-process` | deny | A signal sent to every process (`kill ... -1`) |
+| `power-state` | deny | `shutdown`, `reboot`, `halt` or `poweroff` as a command |
+| `move-root` | deny | Moving `/` |
+| `chmod-root` | deny | Opening `/` itself to everyone, recursively |
+| `pipe-to-shell`, `download-exec` | review | Running what a download sends |
+| `destructive-git` | review | Git commands that discard work |
+
+Everything else is a root user's ordinary work in a container of its own and is
+left alone: recursive changes of ownership and permissions, installing
+packages, stopping its own services and processes, editing system files,
+reading its own process information.
+
+A refusal of ordinary work teaches the model something wrong, so where a
+pattern cannot tell a destructive command from ordinary work it lets the
+command run:
+
+- A rule looks for its program where a command starts: at the beginning of
+  the text, after `;`, `&`, `|`, `{`, `$(` or a line break, and as the text a
+  shell is told to run (`sh -c '...'`; `bash`, `dash`, `zsh` and `ksh` alike).
+  Between that place and the program there may stand up to four of these: a
+  word that runs a command (`sudo`, `exec`, `time`, `nohup`, `xargs`,
+  `command`, `env`, `nice`, `timeout`) with up to three options or numbers,
+  each option with a value or none; an assignment (`X=1`); a keyword of the
+  shell (`if`, `then`, `elif`, `else`, `while`, `until`, `do`, `!`); an
+  opening bracket. The program is known by its name and by its path in a
+  system directory (`/bin`, `/sbin`, and both under `/usr` and `/usr/local`).
+  So `sudo -n rm -rf /`, `sudo -u root rm -rf /`, `env X=1 /bin/rm -rf /`,
+  `if rm -rf /; then`, `! rm -rf /` and `timeout 5 kill -9 -1` are refused as
+  the plain commands are.
+- A program that is only named is not refused: after any other word
+  (`git commit -m 'never run the command rm -rf / again'`,
+  `grep -rn 'then rm -rf /' scripts/`, `ssh host rm -rf /`), in brackets or
+  backticks inside a text (`'remove the cleanup (rm -rf /)'`), under another
+  path (`./rm`, `/opt/tools/bin/kill`). Nor is what a pattern does not see
+  into: a text handed to a program that is no shell (`su -c '...'`,
+  `eval '...'`), a command substitution in backticks, a root path that is
+  quoted or set apart (`rm -rf "/"`, `rm -rf -- /`), more words before the
+  program than the ones above.
+- A quote right after the command ends it only in the text a shell is told to
+  run, within that text's first two hundred characters
+  (`bash -c 'cd /tmp && rm -rf /'`). Anywhere else the quote says that the
+  command stands in a text, which runs (`echo 'first; rm -rf /'`). What still
+  cannot be told from a command is refused although it may be text: the
+  program after `;`, `&`, `|` or a line break inside quotes, with more text
+  after it (`echo 'first; rm -rf / second'`).
+- `mv` with the option that names the directory to move into (`mv -t / file`,
+  `--target-directory /`) moves a file into the root, not the root, and runs.
+- A power command is looked for more narrowly, by its name alone: at the
+  beginning of the text, after `;`, `&`, `|` or `(`, after `sudo` or `exec`,
+  on a line of its own, and in brackets on one line (`(cd /; reboot)`). After
+  other words it runs (`nohup reboot`, `sudo -n reboot`, `then reboot`,
+  `/sbin/halt`). It is not taken for a command on a line inside a text in
+  quotes, or where it is the label of a case branch (`reboot)`,
+  `halt|poweroff)`).
+- `mkfs` and `wipefs` are refused on a device (`/dev/...`), not on an ordinary
+  file that is to hold a file system.
+- The lines of a here-document are text: once a command holds `<<`, a power
+  command on a line of its own further down is let through, also after the
+  here-document has ended, which a pattern cannot see. On the line it stands
+  on it is still refused.
+- `/opt` is not one of the system directories: what is installed there is the
+  task's to remove.
+
+`RolloutConfig.rules` takes another set (a `RuleSet`, or the path of a rule
+file; `--rules PATH` on the command line) or `None` (`--rules none`) for no
+rules; `RuleSet.shipped().with_rules([...], name=...)` puts a run's own rules
+in front. The record names the set in force by name and by a hash of its
+content (`rules`), so batches collected under different rules can be told
+apart.
+
+**Every repeat in a pattern has a limit.** A match runs in the session's own
+process, on a command the model wrote, and holds the interpreter while it
+runs. A pattern with an unbounded repeat (`*`, `+`, `{2,}`) can take time that
+grows with the square of the command's length or worse, and a model could
+stall the harness with one long command. A rule set therefore refuses such a
+pattern when it is built, the shipped set's and a run's own alike: write
+`{0,8}` for `*` and `{1,8}` for `+`. The other side of it: a shipped pattern
+looks a bounded distance (eight spaces between words, eight options, a few
+hundred characters between a download and what runs it), and a command
+stretched beyond that is not matched. A line break separates commands as a
+semicolon does; the power commands are looked for on a line of their own after
+at most two thousand characters of a command, where a text in quotes of up to
+two thousand characters counts as one and a longer one ends the look.
+
+Two things do not apply inside a rollout. The fixed list of patterns that
+protects the machine a session runs on is not asked in the container: it
+refuses ordinary work there, such as any recursive change of ownership or any
+command holding the word `shutdown`. On the host it applies as before. And the
+model-based judge never runs: a rollout session builds none, because its model
+calls would go out on a client of its own, past the recorder.
 
 ### Sub-agents
 
@@ -1104,7 +1249,7 @@ whose value does not apply is `null`.
 | `generated_tokens` | Tokens the session itself generated |
 | `final_content` | The text of the session's last assistant turn, `""` when it had none |
 | `messages` | The system prompt and the final conversation, one entry per message: `role` and `content`; on an assistant turn also `reasoning` (the turn's reasoning as text, `null` where it had none) and, where the turn made calls, `tool_calls` (each `id`, `type` and `function` with `name` and `arguments`); on a tool result `tool_call_id`. What the session keeps on a turn for itself, under keys that begin with an underscore, is left out. A tool call's arguments are the text the model wrote for each, as they are sent back |
-| `tool_log` | The session's tool calls in order, each `tool`, `args` (as the tool got them), `result` (first 500 characters), `ok`, `turn` |
+| `tool_log` | The session's tool calls in order, each `tool`, `args` (as the tool got them), `result` (first 500 characters), `ok`, `turn`, and for a call a rule matched `rule` and `rule_says` |
 | `usage` | The session's own token counts as the server reported them: `prompt`, `completion`; both 0 in a run that did not start |
 | `tokens` | The token record, below |
 | `prefix_ok`, `prefix_breaks` | The token-level prefix check: whether it held, and one readable line per break |
@@ -1122,6 +1267,7 @@ whose value does not apply is `null`.
 | `subagents` | The side record of sub-agent calls, below |
 | `sandbox` | The container, below |
 | `acts_on_host` | Whether the tools acted on the machine the rollout ran on instead of in a sandbox (see [where the tools act](#where-the-tools-act)) |
+| `rules` | `null` without rules; otherwise the set in force (`name`, `sha256`, the count `rules`) and `events`, one per call a rule matched: `call_id`, `tool`, `rule`, `recommendation`, `refused`, `scope` (`parent` or `sub_agent`) |
 | `verification` | `null` when no check was asked for; otherwise below |
 
 `prefix_events`, one entry per `event`. `turn` counts the session's turns
@@ -1280,6 +1426,8 @@ What a user of the harness has to know, in one place:
   the after-run commands run beside it, and the record stays trainable. What
   an after-run command found in such a container is as good as its
   `still_running` is empty.
+- **The rules can be written around**, and their patterns look a bounded
+  distance; see [rules on tool calls](#rules-on-tool-calls).
 - **A background shell's exit is not announced** to the model in a headless
   run.
 - **The probe needs a token the model is unsure of.** It looks among the
@@ -1310,9 +1458,9 @@ What a user of the harness has to know, in one place:
 ## Tests
 
 The container tests (`tests/test_rollout_container.py`,
-`tests/test_rollout_verification.py`, `tests/test_rollout_sidecar.py`) need a
-container runtime and an image, so they skip where they are missing. CI runs
-them in their own lane
+`tests/test_rollout_verification.py`, `tests/test_rollout_sidecar.py`, and one
+class of `tests/test_rollout_rules.py`) need a container runtime and an image,
+so they skip where they are missing. CI runs those files in their own lane
 (`test-rollout-container`), which pulls the image by digest and sets
 `TURNSTONE_ROLLOUT_REQUIRE_CONTAINER=1`, so that a missing runtime or image
 fails the lane instead of skipping the tests. The other rollout tests need no
@@ -1414,6 +1562,11 @@ the container tests need it, and a runtime command from a path no guard judges
 (a program the test wrote, a child interpreter, code outside the rollout
 package) can still remove another container or mount a directory of the
 machine into one.
+
+The base class of an execution environment is the host, so a method that the
+container's environment did not replace would act on the machine the rollout
+runs on. A test fails when it leaves any method of the base class to the host,
+which is how a method added to the base class later is noticed.
 
 Not covered by a test: a size bound enforced by the storage driver (it needs a
 host whose driver offers one),

@@ -2161,6 +2161,13 @@ class ContainerEnvironment(ExecutionEnvironment):
         # The local client's process id is this machine's, not the command's.
         return ""
 
+    def command_refusal(self, command: str) -> str | None:
+        # The fixed list protects the machine a session runs on; a container
+        # made for one rollout is not that machine, and the list refuses
+        # ordinary work in it.  What a rollout refuses is its rule set's say
+        # (``turnstone.rollout.rules``), asked for every tool call.
+        return None
+
     # -- search --------------------------------------------------------------
 
     def which(self, program: str) -> str | None:

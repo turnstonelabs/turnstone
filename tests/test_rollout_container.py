@@ -392,6 +392,13 @@ class TestNoMethodOfTheEnvironmentIsLeftToTheHost:
     container's environment does not replace acts on the machine the rollout
     runs on, quietly; so would a method added to the base class later."""
 
+    def test_the_containers_environment_replaces_every_method(self):
+        assert ContainerEnvironment.acts_on_host is False
+        assert _left_to_the_host(ContainerEnvironment) == [], (
+            "these methods of ExecutionEnvironment act on the host through a rollout: give "
+            "ContainerEnvironment its own"
+        )
+
     def test_the_check_sees_what_is_left(self):
         every = _left_to_the_host(ExecutionEnvironment)
         assert {"spawn", "kill_group", "which", "popen_search", "realpath", "write_text"} <= set(
@@ -2667,7 +2674,8 @@ class TestRolloutInAContainer:
         with ScriptedChatServer(script) as server:
             record = run_episode(
                 Task(prompt="break it", container=_spec(memory="512m")),
-                RolloutConfig(base_url=server.base_url, model="scripted", **SMALL),
+                # Without the rule that would refuse it: the command really runs.
+                RolloutConfig(base_url=server.base_url, model="scripted", rules=None, **SMALL),
             )
         assert record["finish_state"] == "completed" and record["finish_cause"] == "model"
         assert record["trainable"] is True and record["problems"] == []

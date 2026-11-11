@@ -110,6 +110,13 @@ def _parser() -> argparse.ArgumentParser:
         "refused, never taken as an empty configuration",
     )
     parser.add_argument(
+        "--rules",
+        default="shipped",
+        metavar="PATH",
+        help="the pattern rules enforced on tool calls: a rule file, 'shipped' (the default) "
+        "or 'none'",
+    )
+    parser.add_argument(
         "--effort",
         default=None,
         help="reasoning effort (default: the framework's for this model, if it names one)",
@@ -180,6 +187,7 @@ def main(argv: list[str] | None = None) -> int:
         keep_text=args.keep_text,
         extra_body=extra_body,
         sampler_logprobs={"probe": None, "yes": True, "no": False}[args.sampler_logprobs],
+        rules=None if args.rules == "none" else args.rules,
     )
     try:
         record = run_episode(task, config)
@@ -233,9 +241,13 @@ def main(argv: list[str] | None = None) -> int:
         f"{sub['model_calls']} model calls, {sub['generated_tokens']} generated tokens "
         f"(not for training), failures: {_shown(sub['failures'] or 'none')}"
     )
+    rules = record["rules"]
+    if rules is not None:
+        print(f"rules: {rules['name']} ({rules['rules']} rules, {rules['sha256'][:12]})")
     for entry in record["tool_log"]:
         arguments = json.dumps(entry["args"])[:100]
-        print(f"  tool turn {entry['turn']} {entry['tool']} {arguments} ok={entry['ok']}")
+        rule = f" rule={entry['rule']} ({entry['rule_says']})" if "rule" in entry else ""
+        print(f"  tool turn {entry['turn']} {entry['tool']} {arguments} ok={entry['ok']}{rule}")
     print("final content:", _shown((record["final_content"] or "")[:300]))
     print("sandbox:", json.dumps(record["sandbox"]))
     if record["finish_cause"] == "machinery":
