@@ -165,6 +165,20 @@ def _parser() -> argparse.ArgumentParser:
         help="whether the server reports log-probabilities of the sampling distribution; "
         "'probe' (the default) asks it before the run",
     )
+    parser.add_argument(
+        "--server-version-url",
+        default=None,
+        metavar="URL",
+        help="an address that answers with the server's version, asked before the first model "
+        "call and after the last; a rollout that saw two versions is not trainable",
+    )
+    parser.add_argument(
+        "--server-version-field",
+        default=None,
+        metavar="NAME",
+        help="the field that holds the version in the JSON object --server-version-url "
+        "answers with (default: the whole answer is the version)",
+    )
     parser.add_argument("--out", help="write the full episode record here as JSON")
     return parser
 
@@ -223,6 +237,8 @@ def main(argv: list[str] | None = None) -> int:
         rules=None if args.rules == "none" else args.rules,
         min_tokens_per_second=args.min_tokens_per_second,
         min_prompt_tokens_per_second=args.min_prompt_tokens_per_second,
+        server_version_url=args.server_version_url,
+        server_version_field=args.server_version_field,
     )
     try:
         record = run_episode(task, config)
@@ -252,6 +268,8 @@ def main(argv: list[str] | None = None) -> int:
     for name, source in record["sampling"]["sources"].items():
         print(f"  setting {name}: {json.dumps(record['sampling'][name])} ({source})")
     print("log-probabilities:", json.dumps(record["logprobs"]))
+    if record["server_version"] is not None:
+        print("server version:", _shown(json.dumps(record["server_version"])))
     for call in tokens["calls"]:
         logprobs = "none" if call["logprobs"] is None else len(call["logprobs"])
         print(

@@ -66,6 +66,7 @@ from turnstone.rollout.probe import all_settings, sampler_logprobs_reported
 from turnstone.rollout.rawargs import RecordedArguments
 from turnstone.rollout.recording import PARENT, SUB_AGENT, RecordingClient
 from turnstone.rollout.rules import RuleSet, refusal_text
+from turnstone.rollout.server_version import ServerVersion
 from turnstone.rollout.settings import (
     Limit,
     Setting,
@@ -238,6 +239,13 @@ class RolloutConfig:
     # the machinery, and these say when the machinery was too slow.
     min_tokens_per_second: float | None = None
     min_prompt_tokens_per_second: float | None = None
+    # An address that answers with the server's version, asked before the first
+    # model call of the run and after the last; with a field, the version is
+    # that field of the JSON object it answers with
+    # (:mod:`turnstone.rollout.server_version`).  A rollout that saw two
+    # versions is not trainable.
+    server_version_url: str | None = None
+    server_version_field: str | None = None
     # Largest file a file tool reads whole, and the longest text an edit may make.
     max_read_bytes: int = 256 * 1024
     # Keep the generated text of every call in the record.
@@ -946,6 +954,9 @@ MACHINERY_FAILURES = {
     "sandbox_failed": "the sandbox could not be started",
     "sidecar_failed": "the task's sidecar could not be brought up",
     "before_run_failed": "a before-run command of the task failed, so the run did not start",
+    "server_version_unknown": (
+        "the server's version could not be asked before the run, so the run did not start"
+    ),
     "sidecar_lost": "the task's sidecar stopped during the run",
     "sandbox_lost": "the sandbox stopped by itself during the run",
     "subagent_failed": "a sub-agent failed for a reason that is not its work",
@@ -954,7 +965,9 @@ MACHINERY_FAILURES = {
 }
 # The endings of a run that did not start: no model call was made, so nothing
 # that happened to the sandbox meanwhile is the model's doing.
-_DID_NOT_START = frozenset({"sandbox_failed", "sidecar_failed", "before_run_failed"})
+_DID_NOT_START = frozenset(
+    {"sandbox_failed", "sidecar_failed", "before_run_failed", "server_version_unknown"}
+)
 
 
 def _finish_state(
@@ -1449,6 +1462,12 @@ def _build_record(
     elif error is None or finish != forced_state:
         error = _ending_in_words(finish, task, config, last)
 
+    # A rollout that saw two versions of the server, or cannot say that it did
+    # not, was not sampled from one policy.  How it ended stays what it was.
+    version: ServerVersion | None = state.get("server_version")
+    if version is not None:
+        problems += version.problems()
+
     prefix = tokens["prefix"]
     trainable = not problems
     if not trainable:
@@ -1477,6 +1496,9 @@ def _build_record(
             name: {"value": lim.value, "source": lim.source} for name, lim in limits.items()
         },
         "logprobs": logprobs,
+        # The server's version before the first model call and after the last;
+        # ``None`` when the run was given no address to ask.
+        "server_version": version.describe() if version is not None else None,
         "token_id_check": "required" if strict else "not required",
         "finish_state": finish,
         # Whether the ending is the model's own outcome (to be scored) or a
@@ -1567,6 +1589,27 @@ def _build_record(
 
 class _BeforeRunError(Exception):
     """A before-run command of the task failed: the run does not start."""
+
+
+class _VersionUnknownError(Exception):
+    """The server did not say which version it is: the run does not start."""
+
+
+def _server_version(config: RolloutConfig) -> ServerVersion | None:
+    """What asks the server for its version, ``None`` for a run given no address."""
+    if config.server_version_url is None:
+        if config.server_version_field is not None:
+            raise SetupError(
+                "server_version_field names a field of an answer, and no address to ask "
+                "is given (server_version_url)"
+            )
+        return None
+    return ServerVersion(
+        config.server_version_url,
+        config.server_version_field,
+        base_url=config.base_url,
+        api_key=config.api_key,
+    )
 
 
 def _before_run(task: Task, sandbox: Sandbox) -> dict[str, Any] | None:
@@ -1893,7 +1936,18 @@ def run_episode(
     # every request.
     meter = Meter(budgets, lambda: list(state["recorder"].calls) if "recorder" in state else [])
     state["meter"] = meter
-    state["logprobs"] = _logprob_verdict(config)
+    # The server's version, asked before anything is asked of the model: the
+    # probe below makes model calls.  Without an answer the run does not start,
+    # and the server is asked nothing more.
+    version = state["server_version"] = _server_version(config)
+    if version is not None and version.ask_first() is not None and config.sampler_logprobs is None:
+        state["logprobs"] = {
+            "sampler_logprobs": None,
+            "reflects": all_settings(None),
+            "reason": "not probed: the run did not start",
+        }
+    else:
+        state["logprobs"] = _logprob_verdict(config)
     state["rules"] = _resolve_rules(config)
     state["t0"] = time.monotonic()
     sandbox: Sandbox = (sandbox_factory or ContainerSandbox)(task, config)
@@ -1918,6 +1972,8 @@ def run_episode(
 
     try:
         try:
+            if version is not None and version.first_error is not None:
+                raise _VersionUnknownError(version.first_error)
             environment = sandbox.start()
             state["acts_on_host"] = _acts_on_host(environment)
             if state["acts_on_host"] and not allow_host_execution:
@@ -1929,6 +1985,8 @@ def run_episode(
                 raise _BeforeRunError(state["before_run"]["failure"])
         except HostExecutionError:
             raise
+        except _VersionUnknownError as unknown:
+            forced, error = "server_version_unknown", str(unknown)
         except _BeforeRunError as not_prepared:
             forced, error = "before_run_failed", str(not_prepared)
         except SidecarError as sidecar_error:
@@ -2094,6 +2152,9 @@ def run_episode(
                 forced = meter.ended
             if forced in ("token_budget", "command_time") and error is None:
                 error = MODEL_OUTCOMES[forced]
+            if version is not None:
+                # The session's last model call has returned, or was left behind.
+                version.ask_last()
         record = _build_record(task, config, state, sandbox, forced_state=forced, error=error)
         # A run that did not start left nothing to check.
         record["verification"] = (

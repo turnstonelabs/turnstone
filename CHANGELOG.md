@@ -182,6 +182,18 @@ The separate `dev` branch is retired. See [the release process](docs/releasing.m
   time means the run does not start: the record ends as `before_run_failed`,
   not trainable. A run that did not start is not checked afterwards either. See
   [the rollout guide](docs/rollout.md#before-the-run).
+- **Rollouts: the server's version before the first model call and after the
+  last.** A server whose weights are replaced in place between batches serves
+  two models under one name, and a rollout that saw both was not sampled from
+  one policy. `RolloutConfig.server_version_url` (`--server-version-url`, with
+  `--server-version-field` for one field of a JSON answer) names an address
+  that is asked right before the run's first model call can go out, the probe
+  and sub-agent calls included, and right after its last has returned. Both
+  answers are in the record (`server_version`). A rollout whose two answers
+  differ, or that gets none after the run, is not trainable, and how it ended
+  stays what it was; without an answer before the run it does not start
+  (`server_version_unknown`). See
+  [the rollout guide](docs/rollout.md#one-version-of-the-server).
 
 ### Fixed
 

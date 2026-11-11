@@ -254,6 +254,7 @@ nothing but the model decided how the run went. All of this holds:
 | No token is missing | The counts are compared with the server's own usage numbers, prompt and completion; a reply without usage numbers fails the check |
 | The log-probabilities are those of the distribution the tokens were sampled from | The server is probed before the run (below) |
 | A trainer can reproduce the sampling | `temperature`, `top_k` and `top_p` are read off the requests themselves; one a request did not carry fails the check |
+| The tokens were sampled from one version of the model | Where the run is given an address to ask: the server's version before the first model call and after the last are the same (see [one version of the server](#one-version-of-the-server)) |
 | The run was not ended by the server, the harness or the runtime | See [how a rollout ends](#how-a-rollout-ends) |
 | A reward exists | A check asked for after the run gave its verdict; see [checking a rollout afterwards](#checking-a-rollout-afterwards) |
 
@@ -312,6 +313,7 @@ penalised for it.
 | `server_stalled` | Without a token budget: the time limit passed while a model request had had nothing from the server for longer than it is allowed | machinery | no |
 | `backstop` | With a token budget: the time limit passed and the server was slower than its minimum speed, or the harness itself took the time | machinery | no |
 | `error` | A request of the session failed (after the client's own retries; the first request refused by the server, and a prompt the server finds too long, included), or the harness raised (a stable-prefix error included) | machinery | no |
+| `server_version_unknown` | The server did not say which [version](#one-version-of-the-server) it is before the run, so the run did not start | machinery | no |
 | `sandbox_failed` | The container could not be started | machinery | no |
 | `sandbox_lost` | The container stopped and nothing the model could do explains it, or it stopped before the first turn of the model's had come back or was found gone before the first of the model's tool calls could run, or the runtime stopped answering | machinery | no |
 | `sidecar_failed` | The task's [sidecar](#a-tasks-own-servers-the-sidecar) could not be brought up | machinery | no |
@@ -321,9 +323,9 @@ penalised for it.
 | `no_model_call`, `abnormal_reply` | The run ended before any model call, or on a finish reason the harness does not know, which only the server gives (a filter of its own, for one) | machinery | no |
 
 Where several apply, a run that did not start keeps its own ending
-(`sandbox_failed`, `sidecar_failed`, `before_run_failed`); otherwise a lost
-container decides first, then a lost sidecar, then a failed sub-agent, then the
-others.
+(`server_version_unknown`, `sandbox_failed`, `sidecar_failed`,
+`before_run_failed`); otherwise a lost container decides first, then a lost
+sidecar, then a failed sub-agent, then the others.
 
 One exception keeps a run the machinery cut short from being recorded as the
 model's outcome. A container the model ended (`sandbox_destroyed`) gives way
@@ -510,6 +512,43 @@ without one, by chance: each control reply is sampled, and one that takes
 another token than the likeliest where the model is certain cannot be used
 ("... no control reply came by its likeliest tokens to a token it was unsure
 of"). Probing again asks again.
+
+### One version of the server
+
+A server whose weights are replaced in place between batches serves two models
+under one name. A rollout that saw both was not sampled from one policy, and
+nothing in its token data shows that.
+
+A rollout can be given an address that answers with the server's version
+(`RolloutConfig.server_version_url`, `--server-version-url`): any JSON value,
+or with `server_version_field` (`--server-version-field`) one field of a JSON
+object. It is asked twice: right before the first model call of the run can go
+out, the probe and every sub-agent call included, and right after the session's
+last model call has returned. Both answers are in the record
+(`server_version`).
+
+| What happened | The record |
+|---------------|------------|
+| The same version at both ends | Unchanged |
+| The two differ | Not trainable; `problems` names both versions. How the run ended stays what it was |
+| No answer after the run (the question is put three times) | Not trainable: whether the version changed is not known. How the run ended stays what it was |
+| No answer before the run | The run does not start: `server_version_unknown`, with no model call made, the probe included, and no container started |
+
+What this shows rests on two things the server has to keep. Its version only
+moves forward, so that the same answer at both ends means the same version in
+between. And it changes its version together with its weights: a server that
+swaps the weights first and reports the new version a moment later leaves a gap
+in which a rollout can end on new weights under the old version, and the two
+questions cannot see into that gap. They are one question at each end, not one
+for every call: a difference says that the rollout saw two versions, not which
+calls saw which.
+
+A server that does not answer is asked three times, and each question has ten
+seconds as a whole, from the connection to the last byte of the answer, so an
+answer that keeps coming a few bytes at a time does not hold a run. A server
+that has no such address, or answers with something that is no version, is
+not asked again. The question carries the rollout's API key only where the
+address is on the model endpoint's own host and port.
 
 ### What can still make a prompt not extend
 
@@ -1411,6 +1450,7 @@ whose value does not apply is `null`.
 | `sampling` | Below |
 | `logprobs` | Which log-probabilities the server reports: `sampler_logprobs` (`true`, `false` or `null`), `reflects` (the same per setting: `temperature`, `top_k`, `top_p`), `reason`, and from a probe `tried` and `positions` |
 | `token_id_check` | `"required"` or `"not required"` |
+| `server_version` | `null` for a run given no address to ask; otherwise the [server's version](#one-version-of-the-server) at both ends, below |
 | `timeout` | `null` unless the time limit was reached; then what the run was waiting on, below |
 | `seconds`, `startup_seconds`, `teardown_seconds` | The time from the start of the sandbox to the end of the run; of that, the time bringing the sandbox up took, the task's before-run commands included; and the time removing it took, which comes on top |
 | `before_run` | `null` for a task that names no [before-run commands](#before-the-run); otherwise below |
@@ -1472,6 +1512,16 @@ from 0, as `tool_log[].turn` does:
 | `generation_tokens_per_second`, `prompt_tokens_per_second` | The server's measured speeds over those calls; `null` where nothing was measured |
 
 Where the run did not start, only the first three keys are there.
+
+`server_version`:
+
+| Key | Value |
+|-----|-------|
+| `url`, `field` | The address that was asked, and the field of its answer that holds the version (`null`: the whole answer) |
+| `first`, `last` | The version before the first model call and after the last; `null` where there was no answer |
+| `same` | Whether the two are equal; `null` where one of them is missing |
+| `first_error`, `last_error` | Why an answer could not be had, in words |
+| `first_at`, `last_at` | When each answer came, in seconds since the epoch |
 
 `before_run`:
 

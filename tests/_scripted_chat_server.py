@@ -153,6 +153,14 @@ def render_prompt(messages: list[dict[str, Any]], tools: list[dict[str, Any]] | 
     return out + generation_prompt()
 
 
+class VersionFault:
+    """A version question answered with *status* and a body that is no version."""
+
+    def __init__(self, status: int = 503, body: str = "no version here") -> None:
+        self.status = status
+        self.body = body
+
+
 class ScriptedChatServer:
     """Scripted server on a free local port. Use as a context manager."""
 
@@ -178,8 +186,15 @@ class ScriptedChatServer:
         chunk_delay: float = 0.0,
         prompt_tokens_per_second: float | None = None,
         first_position_only: bool = False,
+        version_answers: list[Any] | None = None,
     ) -> None:
         self.script = script
+        # What ``GET /version`` answers, one entry per question and the last
+        # one from then on: a JSON value, or a ``VersionFault``.  Without any,
+        # the server has no such address.  ``version_requests`` notes for each
+        # question how many chat requests had arrived before it.
+        self.version_answers = list(version_answers) if version_answers is not None else None
+        self.version_requests: list[dict[str, Any]] = []
         # A server whose values are the sampling distribution's at the first
         # generated position and the model's own from there on, as one that
         # takes later tokens of a step from another head might report them.
@@ -248,6 +263,9 @@ class ScriptedChatServer:
                 pass
 
             def do_GET(self) -> None:
+                if self.path.split("?")[0] == "/version":
+                    owner._answer_version(self)
+                    return
                 owner._send_json(
                     self,
                     {
@@ -323,6 +341,34 @@ class ScriptedChatServer:
     def base_url(self) -> str:
         assert self._httpd is not None
         return f"http://127.0.0.1:{self._httpd.server_address[1]}/v1"
+
+    @property
+    def version_url(self) -> str:
+        assert self._httpd is not None
+        return f"http://127.0.0.1:{self._httpd.server_address[1]}/version"
+
+    def _answer_version(self, handler: BaseHTTPRequestHandler) -> None:
+        with self._lock:
+            asked = len(self.version_requests)
+            self.version_requests.append(
+                {
+                    "chat_requests_before": len(self.requests),
+                    "authorization": handler.headers.get("Authorization"),
+                }
+            )
+        answers = self.version_answers
+        answer = VersionFault(404) if not answers else answers[min(asked, len(answers) - 1)]
+        if not isinstance(answer, VersionFault):
+            self._send_json(handler, answer)
+            return
+        data = answer.body.encode("utf-8")
+        handler.send_response(answer.status)
+        handler.send_header("Content-Type", "text/plain")
+        handler.send_header("Content-Length", str(len(data)))
+        handler.send_header("Connection", "close")
+        handler.end_headers()
+        handler.wfile.write(data)
+        handler.close_connection = True
 
     # -- request handling --------------------------------------------------------
 
