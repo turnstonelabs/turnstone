@@ -220,6 +220,12 @@ follow-on work:
 3 attempts with exponential backoff (sleep `2^attempt` seconds) on any
 exception. `TimeoutError` is re-raised immediately (no retry).
 
+The attempt count is the `attempts` parameter of `run_with_lifecycle()`
+(default 3). A caller whose run must not be repeated passes `attempts=1`:
+every attempt samples the model again, repeats the run's side effects and
+gets its own `test_timeout`, so only a single attempt is bounded by one
+`test_timeout` overall.
+
 ---
 
 ## Test Execution

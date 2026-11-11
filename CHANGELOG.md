@@ -12,6 +12,14 @@ The separate `dev` branch is retired. See [the release process](docs/releasing.m
 
 ## [2026-11-11]
 
+### Added
+
+- **`run_with_lifecycle` takes the number of attempts.** The eval harnesses
+  retried a failed run up to three times, a count written into the loop. It is
+  now the `attempts` parameter, still 3 by default. A caller whose run must not
+  be repeated passes `attempts=1`: the first failure is raised with no backoff,
+  and one `test_timeout` bounds the whole run.
+
 ### Fixed
 
 - **Assistant replies are styled the same in the console as on a node's own

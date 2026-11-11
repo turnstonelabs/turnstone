@@ -610,6 +610,7 @@ def run_with_lifecycle(
     teardown_reset: Callable[[], None],
     on_cwd_restore_failed: Callable[[str], None],
     extra_close: Callable[[], None] | None = None,
+    attempts: int = 3,
 ) -> dict[str, Any]:
     """THE per-run lifecycle, shared by both harnesses.
 
@@ -644,12 +645,17 @@ def run_with_lifecycle(
       wait, so the worker is still inside the drive, and ``close()``'s
       bounded shell-join would trade a bounded leak for a blocked
       teardown on exactly the run already over budget.
-    * transient failures retry up to 3 attempts with backoff.  Here the
-      future has already raised — the worker is DONE — so unlike the
-      timeout path the session is CLOSED before being replaced; the old
-      shape dropped it "for the timeout path's reason" on a path where
-      that reason does not hold, abandoning up to three fully-built
-      sessions (background shells included) per case.
+    * transient failures retry up to *attempts* attempts (3 unless the
+      caller says otherwise) with backoff.  Here the future has already
+      raised — the worker is DONE — so unlike the timeout path the
+      session is CLOSED before being replaced; the old shape dropped it
+      "for the timeout path's reason" on a path where that reason does
+      not hold, abandoning up to three fully-built sessions (background
+      shells included) per case.  A caller whose run must not be
+      repeated passes ``attempts=1``: a re-run samples the model again
+      and repeats every side effect of the first, and each attempt has
+      its own ``test_timeout``, so only a single attempt is bounded by
+      one ``test_timeout`` overall.
     * *finish(session, tool_log)* — the success extraction, run before
       teardown so the caller reads a live session.
 
@@ -683,6 +689,8 @@ def run_with_lifecycle(
       the teardown path, once per run, i.e. the defect inside the fix
       for it.
     """
+    if attempts < 1:
+        raise ValueError("attempts must be at least 1")
     workdir = tempfile.mkdtemp(prefix=workdir_prefix)
     original_cwd = os.getcwd()
     session: Any = None
@@ -690,7 +698,7 @@ def run_with_lifecycle(
     try:
         setup(workdir)
         _last_err: Exception | None = None
-        for _attempt in range(3):
+        for _attempt in range(attempts):
             run_client = build_client()
             session, drive = build_session(run_client)
             executor: ThreadPoolExecutor | None = None
@@ -725,12 +733,12 @@ def run_with_lifecycle(
                 with contextlib.suppress(Exception):
                     session.close()
                 session = None
-                if _attempt < 2:
+                if _attempt < attempts - 1:
                     time.sleep(2**_attempt)
             finally:
                 if executor is not None:
                     executor.shutdown(wait=False)
-        raise _last_err or RuntimeError("the generation chain failed after 3 attempts")
+        raise _last_err or RuntimeError(f"the generation chain failed after {attempts} attempts")
     finally:
         # The reasoning for every guard and its order is in the
         # docstring above — one essay, one implementation, two callers.
