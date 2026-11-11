@@ -53,6 +53,13 @@ The separate `dev` branch is retired. See [the release process](docs/releasing.m
   task agent the run spawns. A headless session given an execution environment
   offers only the tools that act through it unless `tool_names` says otherwise,
   and their descriptions name the environment's working directory.
+- **A headless run can offer the tools of its own MCP client.**
+  `HeadlessSession(mcp_client=..., mcp_tools=True)` offers the tools of the MCP
+  client the session was given, read once when the session is built, beside the
+  named or environment tools; a tool of any other server is refused. For a run
+  that brings its own servers: a client built from those servers only keeps
+  every configured server out of reach. Headless runs offer no MCP tool
+  otherwise.
 
 ### Fixed
 

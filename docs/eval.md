@@ -271,6 +271,12 @@ the named tools a task agent may have, and a call outside them is refused.
 only the tools that act through the environment unless `tool_names` says
 otherwise, and their descriptions name the environment's working directory.
 
+Headless runs offer no MCP tool. `HeadlessSession(mcp_client=..., mcp_tools=True)`
+also offers the tools of the MCP client the session was given, as that client
+lists them when the session is built. It is for a run that brings its own
+servers: build the client from that run's servers only, and the session can
+reach no others. The list does not follow later changes of the catalog.
+
 ### Timeout and Cancellation
 
 Each test runs in a `ThreadPoolExecutor(max_workers=1)` with a per-test

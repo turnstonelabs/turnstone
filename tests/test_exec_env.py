@@ -745,6 +745,106 @@ class TestSubAgentOfALimitedRun:
         assert len(server.agent_requests) == 2  # one sub-agent, no second conversation
 
 
+class TestOwnMcpTools:
+    """A run that brings its own MCP servers offers their tools, and no others."""
+
+    TOOL = {
+        "type": "function",
+        "function": {
+            "name": "mcp__ledger__post_entry",
+            "description": "Post an entry to the ledger.",
+            "parameters": {"type": "object", "properties": {"amount": {"type": "number"}}},
+        },
+    }
+
+    def _manager(self) -> MagicMock:
+        from turnstone.core.mcp_client import MCPClientManager
+
+        manager = MagicMock(spec=MCPClientManager)
+        manager.get_tools.return_value = [self.TOOL]
+        manager.get_resources.return_value = []
+        manager.get_prompts.return_value = []
+        manager.is_mcp_tool.side_effect = lambda name, **_kw: name == "mcp__ledger__post_entry"
+        return manager
+
+    def test_the_sessions_own_mcp_tools_are_offered_beside_the_environment_tools(self, tmp_db):
+        session = HeadlessSession(
+            client=MagicMock(),
+            model="eval-model",
+            exec_env=_MemoryEnvironment(),
+            mcp_client=self._manager(),
+            mcp_tools=True,
+        )
+        try:
+            offered = [t["function"]["name"] for t in session._eval_tools]
+            assert set(offered) == ENVIRONMENT_TOOL_NAMES | {"mcp__ledger__post_entry"}
+            assert offered[-1] == "mcp__ledger__post_entry"  # built-in tools come first
+            assert session._eval_tools[-1] == self.TOOL
+
+            session._exec_mcp_tool = MagicMock(return_value=("p", "posted"))  # type: ignore[method-assign]
+            posted, other = _run(
+                session,
+                _call("p", "mcp__ledger__post_entry", amount=3),
+                _call("o", "mcp__payroll__run", month=1),
+            )
+            assert posted == "posted"
+            # A tool of a server this run did not bring is not reachable.
+            assert "Tool 'mcp__payroll__run' is not available in this session" in other
+        finally:
+            session.close()
+
+    def test_a_client_that_cannot_list_its_tools_leaves_nothing_registered(self, tmp_db):
+        """The read that fixes the offered list comes after the session has registered
+        with the client; nobody gets a session to close when it fails."""
+        working = self._manager()
+        HeadlessSession(
+            client=MagicMock(), model="eval-model", mcp_client=working, mcp_tools=True
+        ).close()
+        reads = working.get_tools.call_count  # the last of them is the option's own
+
+        manager = self._manager()
+        answers: list[Any] = [[self.TOOL]] * (reads - 1) + [RuntimeError("the server went away")]
+        manager.get_tools.side_effect = answers
+        with pytest.raises(RuntimeError, match="went away"):
+            HeadlessSession(
+                client=MagicMock(), model="eval-model", mcp_client=manager, mcp_tools=True
+            )
+        assert manager.add_listener.call_count == manager.remove_listener.call_count == 1
+
+    def test_without_the_option_no_mcp_tool_is_offered_or_run(self, tmp_db):
+        session = HeadlessSession(
+            client=MagicMock(),
+            model="eval-model",
+            exec_env=_MemoryEnvironment(),
+            mcp_client=self._manager(),
+        )
+        try:
+            assert {t["function"]["name"] for t in session._eval_tools} == ENVIRONMENT_TOOL_NAMES
+            session._exec_mcp_tool = MagicMock(side_effect=AssertionError("ran"))  # type: ignore[method-assign]
+            (refused,) = _run(session, _call("p", "mcp__ledger__post_entry", amount=3))
+            assert "is not available in this session" in refused
+        finally:
+            session.close()
+
+    def test_the_caller_can_pick_among_them_and_needs_a_client(self, tmp_db):
+        session = HeadlessSession(
+            client=MagicMock(),
+            model="eval-model",
+            mcp_client=self._manager(),
+            mcp_tools=True,
+            tool_names={"bash", "mcp__ledger__post_entry"},
+        )
+        try:
+            assert [t["function"]["name"] for t in session._eval_tools] == [
+                "bash",
+                "mcp__ledger__post_entry",
+            ]
+        finally:
+            session.close()
+        with pytest.raises(ValueError, match="mcp_client"):
+            HeadlessSession(client=MagicMock(), model="eval-model", mcp_tools=True)
+
+
 class TestNoDestructiveCommandRunsHere:
     """The suite's own guard (``tests/_host_guard.py``, installed for every test by
     ``conftest.py``): the host's process start refuses a list of destructive shapes

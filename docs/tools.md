@@ -866,7 +866,10 @@ The other tools do not go through it. They reach the network (`web_fetch`,
 servers (MCP tools) or other conversations (`task_agent`, the coordinator
 tools). A headless session given an environment therefore offers only
 `ENVIRONMENT_TOOL_NAMES` unless its caller names other tools, and refuses a
-call to any tool it did not offer (see [eval.md](eval.md)).
+call to any tool it did not offer (see [eval.md](eval.md)). MCP tools are the
+one group a contained run may still want, when the run brings its own servers:
+a headless session offers the tools of the MCP client it was given, and only
+those, when asked to (`mcp_tools=True`).
 
 ---
 

@@ -50,6 +50,7 @@ from turnstone.core.tools import (
     INTERACTIVE_TOOLS,
     PRIMARY_KEY_MAP,
     apply_cwd_context,
+    merge_mcp_tools,
 )
 from turnstone.core.trajectory import (
     Turn,
@@ -500,6 +501,14 @@ class HeadlessSession(ChatSession):
     (``ENVIRONMENT_TOOL_NAMES``), so nothing the model does takes effect
     anywhere else, and their descriptions name the environment's working
     directory the way an interactive session's name the process's.
+
+    ``mcp_tools=True`` also offers the tools of the MCP client the session was
+    given (``mcp_client``, a ``ChatSession`` argument), as that client lists
+    them at construction.  Headless runs offer no MCP tool otherwise.  It is
+    for a run that brings its own servers: build the client from that run's
+    servers only, and the session can reach no others.  An MCP tool does not
+    act through the execution environment: with the option on, what the model
+    does also takes effect in those servers, wherever they run.
     """
 
     def __init__(
@@ -522,6 +531,7 @@ class HeadlessSession(ChatSession):
         raw_arguments: Callable[[list[dict[str, Any]]], Sequence[Mapping[str, str] | None] | None]
         | None = None,
         tool_names: Collection[str] | None = None,
+        mcp_tools: bool = False,
         **session_kwargs: Any,
     ) -> None:
         # ``session_kwargs`` forwards straight to ``ChatSession`` so
@@ -559,7 +569,7 @@ class HeadlessSession(ChatSession):
         self.prefix_events: list[dict[str, Any]] = []
         self._total_usage: dict[str, int] = {"prompt": 0, "completion": 0}
         try:
-            self._eval_tools = self._offered_tools(tool_names, tool_overrides)
+            self._eval_tools = self._offered_tools(tool_names, tool_overrides, mcp_tools)
         except BaseException:
             # ``ChatSession.__init__`` registered this session with shared
             # services (the MCP client's listeners).  A constructor that fails
@@ -573,26 +583,38 @@ class HeadlessSession(ChatSession):
         self,
         tool_names: Collection[str] | None,
         tool_overrides: dict[str, dict[str, Any]] | None,
+        mcp_tools: bool,
     ) -> list[dict[str, Any]]:
         """The tool definitions this run offers; sets the names it may call."""
         # Filter MCP-only tools that can't work in headless mode
         base_tools = [t for t in TOOLS if t["function"]["name"] not in _MCP_ONLY_TOOLS]
+        # The tools of the MCP client this session was given, read once: the
+        # offered list does not follow later catalog changes.
+        mcp_defs: list[dict[str, Any]] = []
+        if mcp_tools:
+            if self._mcp_client is None:
+                raise ValueError("mcp_tools needs the session's own mcp_client")
+            mcp_defs = self._mcp_client.get_tools(user_id=self._mcp_user_id)
+        mcp_names = {t["function"]["name"] for t in mcp_defs}
         elsewhere = self._exec_env is not HOST_ENVIRONMENT
         if tool_names is None and elsewhere:
-            tool_names = ENVIRONMENT_TOOL_NAMES
+            tool_names = ENVIRONMENT_TOOL_NAMES | mcp_names
         # The names this run may call, ``None`` for no restriction.
         self._offered_tool_names: frozenset[str] | None = None
         if tool_names is not None:
             self._offered_tool_names = frozenset(tool_names)
-            unknown = self._offered_tool_names - {t["function"]["name"] for t in base_tools}
+            known = {t["function"]["name"] for t in base_tools} | mcp_names
+            unknown = self._offered_tool_names - known
             if unknown:
                 raise ValueError(f"tool_names holds unknown tools: {', '.join(sorted(unknown))}")
             base_tools = [
                 t for t in base_tools if t["function"]["name"] in self._offered_tool_names
             ]
+            mcp_defs = [t for t in mcp_defs if t["function"]["name"] in self._offered_tool_names]
         if elsewhere:
             # Tell the model where its commands run and relative paths resolve.
             base_tools = apply_cwd_context(base_tools, self._exec_env.getcwd(), "")
+        base_tools = merge_mcp_tools(base_tools, mcp_defs)
         return _apply_tool_overrides(base_tools, tool_overrides) if tool_overrides else base_tools
 
     @property
