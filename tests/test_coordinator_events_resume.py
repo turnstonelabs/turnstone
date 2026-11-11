@@ -177,6 +177,19 @@ def _build_mgr(storage: Any, factory: _Factory, *, max_active: int | None = None
     return mgr
 
 
+def _must_open(mgr: SessionManager, ws_id: str) -> Any:
+    """Open ``ws_id`` on ``mgr`` and return its slot; the open must succeed."""
+    ws = mgr.open(ws_id)
+    assert ws is not None
+    return ws
+
+
+def _must_close(mgr: SessionManager, ws_id: str) -> None:
+    """Close ``ws_id`` on ``mgr``; the close must succeed."""
+    closed = mgr.close(ws_id)
+    assert closed
+
+
 def _rehydrated_count(mgr: SessionManager) -> int:
     """How often the adapter announced a rehydrated coordinator to the dashboard."""
     collector: Any = mgr._adapter._collector  # type: ignore[attr-defined]
@@ -551,8 +564,8 @@ def test_a_closed_coordinator_answers_404_and_builds_nothing(
 ) -> None:
     ws_id = _live_coordinator(storage, graceful=True)
     closer = _build_mgr(storage, _Factory())
-    assert closer.open(ws_id) is not None
-    assert closer.close(ws_id)
+    _must_open(closer, ws_id)
+    _must_close(closer, ws_id)
     assert storage.get_workstream(ws_id)["state"] == "closed"
     factory = _Factory()
     second = _build_mgr(storage, factory)
@@ -837,7 +850,7 @@ def test_a_close_racing_the_resume_is_not_undone_by_it(
     ws_id = _live_coordinator(storage, graceful=True)
     factory = _Factory()
     second = _build_mgr(storage, factory)
-    assert second.open(ws_id) is not None
+    _must_open(second, ws_id)
     app = _make_app(storage, second, sse_executor)
     entered = threading.Event()
     release = threading.Event()
@@ -1181,7 +1194,7 @@ def test_a_close_whose_closed_write_failed_is_not_resumed_and_a_retried_close_re
     ws_id = _live_coordinator(storage, graceful=True)
     factory = _Factory()
     second = _build_mgr(storage, factory)
-    assert second.open(ws_id) is not None
+    _must_open(second, ws_id)
     app = _make_app(storage, second, sse_executor)
 
     def failing_update(target: str, state: str, **kwargs: Any) -> None:
@@ -1190,7 +1203,7 @@ def test_a_close_whose_closed_write_failed_is_not_resumed_and_a_retried_close_re
         real_update(target, state, **kwargs)
 
     with _patched(storage, "update_workstream_state", failing_update) as real_update:
-        assert second.close(ws_id)
+        _must_close(second, ws_id)
     assert storage.get_workstream(ws_id)["state"] == "running"
 
     async def scenario() -> list[_Exchange]:
@@ -1217,7 +1230,7 @@ def test_an_explicit_open_after_a_failed_closed_write_streams_again(
     ws_id = _live_coordinator(storage, graceful=True)
     factory = _Factory()
     second = _build_mgr(storage, factory)
-    assert second.open(ws_id) is not None
+    _must_open(second, ws_id)
     app = _make_app(storage, second, sse_executor)
 
     def failing_update(target: str, state: str, **kwargs: Any) -> None:
@@ -1226,7 +1239,7 @@ def test_an_explicit_open_after_a_failed_closed_write_streams_again(
         real_update(target, state, **kwargs)
 
     with _patched(storage, "update_workstream_state", failing_update) as real_update:
-        assert second.close(ws_id)
+        _must_close(second, ws_id)
     assert ws_id in second._unrecorded_unloads
 
     async def scenario() -> list[int | None]:
@@ -1247,7 +1260,7 @@ def test_a_failed_delete_is_not_resumed(storage: Any, sse_executor: ThreadPoolEx
     ws_id = _live_coordinator(storage, graceful=True, state=WorkstreamState.IDLE)
     factory = _Factory()
     second = _build_mgr(storage, factory)
-    assert second.open(ws_id) is not None
+    _must_open(second, ws_id)
     app = _make_app(storage, second, sse_executor)
 
     def locked_delete(*, lease: Any = None) -> bool:
