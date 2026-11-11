@@ -75,6 +75,7 @@ from turnstone.rollout.settings import (
     resolve_sampling,
 )
 from turnstone.rollout.sidecar import RunningSidecar, Sidecar, SidecarError
+from turnstone.rollout.subagent_log import SubAgentLog
 from turnstone.rollout.tokens import build_token_record, describe_break, verify_record
 from turnstone.rollout.toolset import ROLLOUT_TOOL_NAMES
 from turnstone.rollout.verification import (
@@ -613,6 +614,9 @@ class RolloutSession(HeadlessSession):
         # Whether it was a failure of the machinery around a sub-agent that
         # told the session to stop, and not something that came before it.
         self._stopped_by_failure = False
+        # Every tool call a sub-agent issued: they act in the same sandbox and
+        # are in no other log.
+        self.subagent_log = SubAgentLog(self._tool_definition)
 
     # -- context window ------------------------------------------------------
 
@@ -797,6 +801,13 @@ class RolloutSession(HeadlessSession):
 
     def _run_agent(self, *args: Any, **kwargs: Any) -> str:
         call = self._agent_call
+        # The sub-agent runs on a list that shows its tool calls to the log.
+        if args:
+            args = (self.subagent_log.watch(args[0], kwargs.get("parent_call_id")), *args[1:])
+        elif "agent_turns" in kwargs:
+            kwargs["agent_turns"] = self.subagent_log.watch(
+                kwargs["agent_turns"], kwargs.get("parent_call_id")
+            )
         try:
             result = super()._run_agent(*args, **kwargs)
         except GenerationCancelled:
@@ -923,6 +934,8 @@ def _snapshot(session: Any) -> dict[str, Any]:
         "subagents_refused": session.subagents_refused,
         "subagent_failures": _plain(list(session.subagent_failures)),
         "rule_events": _plain(list(session.rule_events)),
+        "subagent_tool_log": session.subagent_log.entries(),
+        "subagent_parents": session.subagent_log.agents(),
     }
 
 
@@ -936,6 +949,8 @@ _EMPTY_SNAPSHOT: dict[str, Any] = {
     "subagents_refused": 0,
     "subagent_failures": [],
     "rule_events": [],
+    "subagent_tool_log": [],
+    "subagent_parents": [],
 }
 
 # Every way a rollout ends, and whose doing it is.  A state the model can bring
@@ -1579,6 +1594,9 @@ def _build_record(
             "prompt_tokens": sum((c.usage or {}).get("prompt_tokens", 0) for c in side),
             "generated_tokens": sum(len(c.token_ids) for c in side),
             "calls": [c.summary() for c in side],
+            # Every tool call a sub-agent issued, sub-agent by sub-agent: they
+            # acted in the same sandbox and are not in the session's tool log.
+            "tool_log": _delegated_calls(snapshot, messages),
         },
         "text": None,
         "sandbox": sandbox.describe(),
@@ -1775,6 +1793,46 @@ def _keep(sandbox: Sandbox, seconds: float) -> None:
         log.warning("rollout.keep_for_failed", error=str(error)[:200])
 
 
+def _logged_call_ids(messages: list[dict[str, Any]]) -> list[Any]:
+    """The ids of the session's own tool calls in the order the model made
+    them, which is the order of its tool log."""
+    return [
+        call.get("id")
+        for message in messages
+        if message.get("role") == "assistant"
+        for call in message.get("tool_calls") or []
+    ]
+
+
+def _delegated_calls(
+    snapshot: dict[str, Any], messages: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """The sub-agents' tool calls for the record, tied to the session's own log.
+
+    Each sub-agent has a number, the order it was started in.  The entry of
+    the session's tool log that started it is given that number (``agent``),
+    and so is every call the sub-agent issued; a call a rule matched names the
+    rule, as in the session's log.
+    """
+    calls: list[dict[str, Any]] = snapshot["subagent_tool_log"]
+    call_ids = _logged_call_ids(messages)
+    log_entries: list[dict[str, Any]] = snapshot["tool_log"]
+    if len(call_ids) == len(log_entries):
+        waiting: dict[Any, list[int]] = {}
+        for number, parent in enumerate(snapshot["subagent_parents"]):
+            waiting.setdefault(parent, []).append(number)
+        for call_id, entry in zip(call_ids, log_entries, strict=True):
+            if entry.get("tool") == "task_agent" and waiting.get(call_id):
+                entry["agent"] = waiting[call_id].pop(0)
+    matched = {e["call_id"]: e for e in snapshot["rule_events"] if e["scope"] == SUB_AGENT}
+    for call in calls:
+        event = matched.get(call["call_id"])
+        if event is not None:
+            call["rule"] = event["rule"]
+            call["rule_says"] = event["recommendation"]
+    return calls
+
+
 def _rules_record(
     rules: RuleSet | None, snapshot: dict[str, Any], messages: list[dict[str, Any]]
 ) -> dict[str, Any] | None:
@@ -1783,12 +1841,7 @@ def _rules_record(
     events: list[dict[str, Any]] = snapshot["rule_events"]
     # The tool log holds the session's own calls in the order the model made
     # them; name the rule on the entry of each call one matched.
-    call_ids = [
-        call.get("id")
-        for message in messages
-        if message.get("role") == "assistant"
-        for call in message.get("tool_calls") or []
-    ]
+    call_ids = _logged_call_ids(messages)
     log_entries: list[dict[str, Any]] = snapshot["tool_log"]
     if len(call_ids) == len(log_entries):
         by_id = {e["call_id"]: e for e in events if e["scope"] == PARENT}

@@ -770,6 +770,28 @@ class TestTheRulesJudgeTheCallThatRuns:
         assert box.environment.commands == ["echo fine"]
         assert record["tool_log"][0]["ok"] is True and record["rules"]["events"] == []
 
+    def test_a_sub_agents_call_is_judged_as_it_runs_too(self):
+        parent = [
+            {"tool_calls": [{"name": "task_agent", "arguments": {"prompt": "clean up"}}]},
+            {"content": "ok"},
+        ]
+        agent = [
+            {
+                "tool_calls": [
+                    _bash(f"kill {EN_DASH}9 {EN_DASH}1"),
+                    {"name": "bash ", "arguments": {"command": "kill -9 -1"}},
+                    {"name": "bash", "arguments": "kill -9 -1"},
+                ]
+            },
+            {"content": "could not"},
+        ]
+        record, _server, box = _run(parent, agent_script=agent)
+        assert box.environment.commands == []
+        calls = record["subagents"]["tool_log"]
+        assert [call["rule"] for call in calls] == ["signal-every-process"] * 3
+        assert all(call["ok"] is False for call in calls)
+        assert [event["scope"] for event in record["rules"]["events"]] == ["sub_agent"] * 3
+
 
 class TestTheJudgeDoesNotRun:
     def test_a_rollout_session_refuses_a_judge(self):

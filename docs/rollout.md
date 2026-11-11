@@ -1164,8 +1164,9 @@ with an en dash before `9` is judged, and refused, as the `kill -9` it would
 run as. `rules.events` names the tool by the name it runs under.
 
 A refused call is the model's doing: the rollout stays trainable. The tool log
-names the rule on the call's entry (`rule`, `rule_says`), and the record lists
-every match with whose call it was (`rules.events`).
+names the rule on the call's entry (`rule`, `rule_says`), a sub-agent's call
+names it on its entry in `subagents.tool_log`, and the record lists every match
+with whose call it was (`rules.events`).
 
 **The rules are not isolation.** They are patterns, and a pattern can be
 written around: a command spelled another way, built from parts, or run from a
@@ -1294,6 +1295,7 @@ environment. The sub-agent's own conversation is not part of the sample.
 | Its tools | The environment tools only; it cannot start another sub-agent, and it is not offered the tools of the task's sidecar (a call it makes to one anyway is refused) |
 | The parent's prompt | Unchanged by starting one: the system prompt and tool list are fixed for the run |
 | Its model calls | Kept out of the token record and the prefix check. The side record under `subagents` is marked `not_for_training` and `token_data_kept: false`: it holds counts and a summary per call, no token IDs or log-probabilities, and none of the checks behind `trainable` is made on them |
+| Its tool calls | In the record under `subagents.tool_log`, apart from the session's `tool_log` and, like everything under `subagents`, not part of the sample |
 | Its time | Counts toward the task's time limit |
 | Limits | `max_subagents` per rollout (a call past it gets a result that says no sub-agent was started), the framework's turn limit for each (`subagent_max_turns`), the framework's reply limit for each of its model calls, and the task's token budget, which its tokens count toward |
 | The rollout's length | `generated_tokens` counts what the session itself generated; sub-agent tokens are under `subagents` and never added in |
@@ -1304,10 +1306,27 @@ task's token budget where it has one. With the framework's default of no turn
 limit and no token budget, the time limit is the bound. The tokens sub-agents
 generate are counted in the record.
 
+A sub-agent acts in the same container, so a command the model would not run
+itself can be handed to one. A reward that counts what a rollout did therefore
+reads two logs. `subagents.tool_log` holds every tool call a sub-agent's model
+issued, sub-agent by sub-agent:
+
+| Key | Meaning |
+|-----|---------|
+| `agent` | Which sub-agent: its number in the order they were started. The entry of the session's `tool_log` that started it carries the same `agent`, and in its `args` what was asked of it |
+| `turn` | The sub-agent's own turn that issued the call, counted from 0 |
+| `call_id` | The call's id: the id of the session's call that started the sub-agent, then the sub-agent's own. `rules.events` names calls by it |
+| `tool`, `args` | The tool and its arguments as the tool got them |
+| `result`, `ok` | The first 500 characters of the result, and whether the call succeeded; both `null` for a call the run ended on |
+| `rule`, `rule_says` | The rule that matched the call, where one did |
+
+A call that never ran is there too: one a rule refused, a tool the sub-agent is
+not offered, an attempt to start a sub-agent of its own. A call the run was cut
+in has what the session had noted of it when it was stopped.
+
 A sub-agent is not offered the tools of the task's own servers. Those act on
-the task's state, which is what the rollout is scored on. Called by the
-session, each such call is a generated, recorded turn and is in the tool log; a
-sub-agent's calls are in neither, so it would act on that state unseen.
+the task's state, which is what the rollout is scored on; a call a sub-agent
+makes to one anyway is refused, and the attempt is in `subagents.tool_log`.
 
 A sub-agent that does its task badly is an ordinary result: the model delegated
 and has to deal with what came back. That includes one whose model returns
@@ -1381,8 +1400,7 @@ the tool log like any other tool's. It is not given a way to connect to them
 itself: it would then act on them unseen, and could reach whatever else the
 sidecar serves, such as a task's own health or grading endpoint. A task format
 that ships a bridge for programs in the model's container does not need it
-here. A sub-agent is not offered these tools, for the same reason
-(see [sub-agents](#sub-agents)).
+here. A sub-agent is not offered these tools (see [sub-agents](#sub-agents)).
 
 The MCP client is built from the servers the task names and from nothing else.
 Its tool list is read once, when the session is built, and is the same with
@@ -1689,7 +1707,7 @@ whose value does not apply is `null`.
 | `generated_tokens` | Tokens the session itself generated |
 | `final_content` | The text of the session's last assistant turn, `""` when it had none |
 | `messages` | The system prompt and the final conversation, one entry per message: `role` and `content`; on an assistant turn also `reasoning` (the turn's reasoning as text, `null` where it had none) and, where the turn made calls, `tool_calls` (each `id`, `type` and `function` with `name` and `arguments`); on a tool result `tool_call_id`. What the session keeps on a turn for itself, under keys that begin with an underscore, is left out. A tool call's arguments are the text the model wrote for each, as they are sent back |
-| `tool_log` | The session's tool calls in order, each `tool`, `args` (as the tool got them), `result` (first 500 characters), `ok`, `turn`, and for a call a rule matched `rule` and `rule_says` |
+| `tool_log` | The session's tool calls in order, each `tool`, `args` (as the tool got them), `result` (first 500 characters), `ok`, `turn`, for a call a rule matched `rule` and `rule_says`, and on the call that started a sub-agent `agent`, the number that sub-agent's calls carry in `subagents.tool_log` |
 | `usage` | The session's own token counts as the server reported them: `prompt`, `completion`; both 0 in a run that did not start |
 | `tokens` | The token record, below |
 | `prefix_ok`, `prefix_breaks` | The token-level prefix check: whether it held, and one readable line per break |
@@ -1814,6 +1832,7 @@ Where the run did not start, only the first three keys are there.
 | `refused_by_server` | How many of `failures` are conversations the server refused |
 | `model_calls`, `prompt_tokens`, `generated_tokens` | Totals over the sub-agents' model calls. `model_calls` counts the entries of `calls`, among them a request that never went out (one the token budget refused, which says so in its `error`); `time.model_calls` leaves such a request out |
 | `calls` | One summary per call: `index`, `scope`, `complete`, `finish_reason`, `error`, `prompt_tokens`, `generated_tokens`, `seconds` |
+| `tool_log` | Every tool call a sub-agent issued, sub-agent by sub-agent: `agent`, `turn`, `call_id`, `tool`, `args`, `result` (first 500 characters), `ok`, and `rule`, `rule_says` where a rule matched; see [sub-agents](#sub-agents) |
 | `text` | With `keep_text` only: each call's generated text |
 
 `sandbox`:

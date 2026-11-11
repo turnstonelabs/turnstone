@@ -132,12 +132,11 @@ The separate `dev` branch is retired. See [the release process](docs/releasing.m
   connections can hold of the runner is bounded in time and in number.
   The MCP client is built from
   the servers the task names and no others, its tool list is fixed for the run,
-  and it is shut down with the rollout. A sub-agent is not offered these tools:
-  its calls are in neither the tool log nor the token record. A sidecar that
-  does not come up or stops during the run makes the record not trainable; a
-  call the model gets wrong is an ordinary result. Both containers are removed
-  afterwards, and a verifier is given the stopped sidecar to read its state
-  from.
+  and it is shut down with the rollout. A sub-agent is not offered these tools.
+  A sidecar that does not come up or stops during the run makes the record not
+  trainable; a call the model gets wrong is an ordinary result. Both containers
+  are removed afterwards, and a verifier is given the stopped sidecar to read
+  its state from.
 - **Rollouts: pattern rules on tool calls.** A rollout enforces a rule set of
   its own on the model's tool calls, the session's and a sub-agent's alike: a
   rule that says deny refuses the call before anything runs, with a fixed text
@@ -224,6 +223,16 @@ The separate `dev` branch is retired. See [the release process](docs/releasing.m
   or anything but a file, and a file already there is removed, so that
   afterwards the file is this run's record or is not there. See
   [the rollout guide](docs/rollout.md#a-task-file).
+- **Rollouts: a sub-agent's tool calls are in the record.** A sub-agent acts in
+  the episode's container, and its calls were in no log, so a model could hand
+  a sub-agent what it did not want counted. `subagents.tool_log` now holds
+  every tool call a sub-agent's model issued, apart from the session's own
+  `tool_log` and not part of the training sample: which sub-agent, its turn,
+  the tool, the arguments, the result's first 500 characters, whether it
+  succeeded, and the rule that matched. A call that never ran is there too (one
+  a rule refused, a tool the sub-agent is not offered). The session's
+  `tool_log` entry of a delegation carries the sub-agent's number beside what
+  was asked of it. See [the rollout guide](docs/rollout.md#sub-agents).
 
 ### Fixed
 

@@ -1277,6 +1277,32 @@ class TestSubAgents:
 
     TOOL_RESPONSE = NL.join(["<tool_response>", "status: ok", "</tool_response>"])
 
+    def test_a_refusal_after_the_sub_agent_wrote_text_hands_that_text_back_too(self):
+        """The sub-agent's second request is the one refused.  What it had written
+        before is still handed back, after what the server said."""
+
+        def refuses(messages: list[dict[str, Any]]) -> str | None:
+            agent = "# Task Agent" in _text(messages[0])
+            turns = sum(1 for m in messages if m.get("role") == "assistant")
+            return "this conversation cannot be rendered" if agent and turns else None
+
+        with _PickyServer(
+            self.PARENT, agent_script=[self.TEXT_THEN, {"content": "never"}], refuses=refuses
+        ) as server:
+            record, _box = _run(server)
+        said = (
+            "the model server refused the sub-agent's conversation (HTTP 400): "
+            "this conversation cannot be rendered"
+        )
+        assert record["finish_state"] == "completed" and record["trainable"] is True
+        first = record["tool_log"][0]
+        assert first["ok"] is False and first["result"].startswith("Task error: " + said + NL + NL)
+        handed_back = next(m["content"] for m in record["messages"] if m["role"] == "tool")
+        assert "earlier partial work" in handed_back and "Writing the note now." in handed_back
+        assert record["subagents"]["failures"] == [said]
+        # Its own tool call ran before the refusal, and is in its log.
+        assert [c["tool"] for c in record["subagents"]["tool_log"]] == ["write_file"]
+
     def test_a_sub_agent_that_does_its_task_badly_is_an_ordinary_result(self):
         agent = [{"content": "I could not find anything to write."}]
         with ScriptedChatServer(self.PARENT, agent_script=agent) as server:
