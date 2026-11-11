@@ -28,6 +28,7 @@ from tests.test_coordinator_events_resume import (
     _Exchange,
     _lane_waiters,
     _make_app,
+    _must_close,
     _patched,
     _run,
 )
@@ -182,7 +183,7 @@ def test_a_restriction_survives_a_rebuild(
     assert _refuses(rebuilt, _SPAWN)
     assert not _refuses(rebuilt, _DELETE)
     assert rebuilt.get_revoked_tools() == frozenset({_SPAWN})
-    assert manager.close(ws_id)
+    _must_close(manager, ws_id)
 
 
 def test_a_restriction_survives_an_unattended_events_resume(
@@ -236,7 +237,7 @@ def test_a_restore_lifts_the_restriction_and_the_lift_survives_a_restart(
     assert console(second).get(f"{_PREFIX}/{ws_id}", headers=_WRITER).status_code == 200
     rebuilt = second.loaded(ws_id).session  # type: ignore[union-attr]
     assert not _refuses(rebuilt, _SPAWN) and _refuses(rebuilt, _DELETE)
-    assert second.close(ws_id)
+    _must_close(second, ws_id)
 
 
 def test_a_restriction_names_are_trimmed_and_case_variants_refused(
@@ -262,7 +263,7 @@ def test_a_restriction_names_are_trimmed_and_case_variants_refused(
     assert unknown.status_code == 200
     assert unknown.json()["unknown_tools"] == ["mcp__later__tool"]
     assert _saved(storage, ws_id) == [_DELETE, "mcp__later__tool", _SPAWN]
-    assert first.close(ws_id)
+    _must_close(first, ws_id)
 
 
 @pytest.mark.parametrize(
@@ -302,7 +303,7 @@ def test_a_malformed_restrict_body_is_a_400_and_changes_nothing(
     assert _revoked_now(first, ws_id) == frozenset({_SPAWN})
     assert _saved(storage, ws_id) == [_SPAWN]
     assert len(_audit_details(storage)) == audits
-    assert first.close(ws_id)
+    _must_close(first, ws_id)
 
 
 # ---------------------------------------------------------------------------
@@ -348,7 +349,7 @@ def test_a_revoke_whose_save_fails_is_active_but_says_it_will_not_survive(
     assert console(second).get(f"{_PREFIX}/{ws_id}", headers=_WRITER).status_code == 200
     rebuilt = second.loaded(ws_id).session  # type: ignore[union-attr]
     assert _refuses(rebuilt, _SPAWN) and not _refuses(rebuilt, _DELETE)
-    assert second.close(ws_id)
+    _must_close(second, ws_id)
 
 
 def test_a_restore_whose_save_fails_lifts_nothing(storage: Any, console: Any) -> None:
@@ -374,7 +375,7 @@ def test_a_restore_whose_save_fails_lifts_nothing(storage: Any, console: Any) ->
         "revoked_total": [_SPAWN],
         "saved": False,
     } in _audit_details(storage)
-    assert first.close(ws_id)
+    _must_close(first, ws_id)
 
 
 # ---------------------------------------------------------------------------
@@ -443,7 +444,7 @@ def test_a_restrict_still_needs_admin_coordinator(
 
     assert response.status_code == 403
     assert _revoked_now(first, ws_id) == frozenset({_SPAWN})
-    assert first.close(ws_id)
+    _must_close(first, ws_id)
 
 
 def test_a_fork_of_a_restricted_coordinator_is_unrestricted(fork_app: Any) -> None:
@@ -468,11 +469,11 @@ def test_a_fork_of_a_restricted_coordinator_is_unrestricted(fork_app: Any) -> No
     assert fork is not None and fork.kind is WorkstreamKind.INTERACTIVE
     assert fork.session.get_revoked_tools() == frozenset()  # type: ignore[union-attr]
     assert "revoked_tools" not in get_storage().load_workstream_config(fork_id)
-    assert mgr.close(fork_id)
+    _must_close(mgr, fork_id)
     reopened = mgr.open(fork_id)
     assert reopened is not None
     assert reopened.session.get_revoked_tools() == frozenset()  # type: ignore[union-attr]
-    assert mgr.close(fork_id)
+    _must_close(mgr, fork_id)
     assert json.loads(get_storage().load_workstream_config(source)["revoked_tools"]) == [
         "bash",
         "read_file",
@@ -553,7 +554,7 @@ def test_a_restrict_during_a_rebuild_waits_for_the_saved_set(
     session = second.loaded(ws_id).session  # type: ignore[union-attr]
     assert session.get_revoked_tools() == frozenset(expected)
     assert _refuses(session, _DELETE) == (_DELETE in expected)
-    assert second.close(ws_id)
+    _must_close(second, ws_id)
 
 
 def test_a_saved_name_that_became_a_case_variant_can_still_be_lifted(
@@ -582,4 +583,4 @@ def test_a_saved_name_that_became_a_case_variant_can_still_be_lifted(
         "unknown_tools": ["Spawn_Workstream"],
     }
     assert _saved(storage, ws_id) == []
-    assert second.close(ws_id)
+    _must_close(second, ws_id)
