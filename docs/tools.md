@@ -854,7 +854,9 @@ on, and an environment whose commands run elsewhere answers for that place.
 machine the session runs on. The base class is that machine and says so; a
 subclass that moves every method somewhere else says it does not, and one that
 does not say is taken to act here. A caller that must keep a model's commands
-off this machine refuses an environment that acts on it.
+off this machine refuses an environment that acts on it. A
+[rollout](rollout.md#where-the-tools-act) is such a caller: it takes one only
+where its own caller says that this is meant.
 
 An implementation must keep three things. `kill_group` is called after every
 foreground command, also one that exited normally, so it must stop exactly

@@ -171,6 +171,7 @@ Built-in tools for shell, files, search, web, memory, notifications, and autonom
 | `turnstone-admin` | User/token management CLI |
 | `turnstone-eval` | Headless measurement — scores tool-use against expected actions |
 | `turnstone-optimizer` | Prompt/tool optimizer (UCB self-modify loop over the eval substrate) |
+| `turnstone-rollout` | One headless run in a per-run container, recorded token by token for training |
 | `turnstone-doctor` | LLM-backed cluster diagnostics |
 
 ### Diagrams
@@ -208,6 +209,7 @@ UML diagrams in [`docs/diagrams/`](docs/diagrams/):
 | Channel integrations | [docs/channels.md](docs/channels.md) |
 | Console dashboard | [docs/console.md](docs/console.md) |
 | Eval harness | [docs/eval.md](docs/eval.md) |
+| Rollouts | [docs/rollout.md](docs/rollout.md) |
 | Tools reference | [docs/tools.md](docs/tools.md) |
 | MCP integration | [docs/mcp-registry.md](docs/mcp-registry.md) |
 | MCP authentication / OAuth | [docs/mcp-oauth.md](docs/mcp-oauth.md) |

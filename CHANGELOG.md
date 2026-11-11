@@ -60,6 +60,48 @@ The separate `dev` branch is retired. See [the release process](docs/releasing.m
   that brings its own servers: a client built from those servers only keeps
   every configured server out of reach. Headless runs offer no MCP tool
   otherwise.
+- **Rollouts: one headless run recorded for training (`turnstone-rollout`).**
+  `turnstone.rollout` runs a task through the headless session with the model's
+  shell and file tools acting inside a container made for that run, and records
+  every model call's prompt token IDs, generated token IDs and
+  log-probabilities. The container is the task's (image, working directory,
+  user, what is writable, capabilities, limits; by default an unprivileged user
+  over a read-only root), has no network and nothing of this machine's mounted
+  into it but the three files the runtime puts into every container, and is
+  removed afterwards with the removal confirmed. A setting that can be seen to
+  be wrong without asking the runtime is refused before anything is started: a
+  user that is neither a name nor a number, an environment variable without a
+  name, a size or a limit that is none or is zero. A writable root always has a
+  size (`root_size`, 10g where the task names none), and those three files
+  count toward it. Its main process runs as a user of its
+  own and is out of reach of the task's commands, except where the task's own
+  settings give that reach back; what a model then does to its container is
+  recorded as its own outcome. A rollout refuses an execution environment that
+  acts on the machine it runs on unless its caller says that this is meant
+  (`allow_host_execution`). The record says whether it is `trainable` (each
+  call's tokens and log-probabilities are complete and checked token by token,
+  they come from the distribution the tokens were sampled from, which a probe
+  establishes on differences that the movement of a busy server's values
+  cannot produce, at the first token of a short reply that the model is
+  unsure of (its very first, or a later one where it is certain of that),
+  leaving a setting undecided where the evidence is not clear,
+  and nothing but the model decided how the run went) and whether
+  it is `one_sequence` (every prompt extended the previous one). A record is
+  left out of training only for causes outside the model's control: whatever
+  the model can bring about, down to running out of time, is an outcome that
+  stays trainable. A conversation the server refuses for what it holds is among
+  those: a sub-agent's comes back to the model as a failed delegation, and the
+  session's own, after its first request, ends the rollout as
+  `request_refused`. The reply limit, context window, tool time limit, sub-agent
+  turn limit, temperature and reasoning effort are the framework's settings for
+  the model unless overridden; a context window that nothing names is refused,
+  not guessed, so is a number below the least it can be (a context window or a
+  reply limit of zero, a temperature below zero), and so is a configuration
+  file that is named and not there or that cannot be read or parsed, which is
+  never taken as an empty one. A
+  sub-agent is a tool like any other for the sample: it acts in
+  the same container, and its own conversation is kept apart and not trained
+  on. See [the rollout guide](docs/rollout.md).
 
 ### Fixed
 

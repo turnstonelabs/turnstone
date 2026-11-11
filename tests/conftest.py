@@ -931,11 +931,91 @@ def _no_signal_but_to_the_tests_own_processes(
         )
 
 
+# What the rollout package names its containers by.  Written out here and not
+# read from the package: the guard below must not take the code under test's
+# word for which containers are the harness's own.  A test holds the two equal.
+ROLLOUT_CONTAINER_PREFIX = "tsgym-"
+# The script of the package's lifetime keeper, started as
+# ``sh -c <script> sh SECONDS RUNTIME NAME``: after SECONDS it removes the
+# container NAME, its third argument, with the program RUNTIME.  Written out
+# for the same reason, and held equal to the package's by a test: a changed
+# script fails that test instead of being let through.
+ROLLOUT_KEEPER_SCRIPT = (
+    'sleep "$1"; n=0; while [ "$n" -lt 30 ]; do '
+    '"$2" rm --force --volumes "$3" >/dev/null 2>&1; '
+    'said=$("$2" container inspect --format x "$3" 2>&1) || '
+    'case "$said" in *"o such"*) exit 0 ;; esac; '
+    "n=$((n + 1)); sleep 10; done"
+)
+
+
+@pytest.fixture(autouse=True)
+def _rollout_starts_only_the_container_runtime(
+    tmp_path_factory: pytest.TempPathFactory,
+    _every_process_start_is_judged: list[Any],
+) -> Iterator[None]:
+    """Let the rollout package start nothing on this machine but the container
+    runtime, in every test.
+
+    Everything a rollout runs for the model is an ``exec`` into its container:
+    a command line that starts with the runtime's program.  A command line
+    that lost that beginning would run the model's command here.  So a process
+    asked for by any module of the package, by whichever call, is started only
+    when it is:
+
+    - the runtime, with a subcommand that acts on containers of the harness's
+      own name and no others (``exec``, ``rm``, ``kill``, ``stop``, ``cp`` and
+      the rest), with ``run`` for a container of that name that takes nothing
+      of this machine, or with one that only reads;
+    - a program a test wrote under its temporary directory: a stand-in for the
+      runtime, or what a verifier command is in a test;
+    - the package's own lifetime keeper, exactly as the package starts it: the
+      script written out above, the runtime (or a program the test wrote) as
+      the program it runs, and a container of the harness's as the one it
+      removes.
+
+    The program is judged as the file the system would start.  Anything else
+    is refused before it starts, and the test fails.  It does not depend on
+    the code under test, nor on the module being listed here: the caller is
+    told by its name, and the containers' names and the keeper's script by
+    what is written out above.  The modules of the package that are loaded
+    also get the same check in place of their ``subprocess``.
+    """
+    from tests import _host_guard
+
+    package = "turnstone.rollout"
+    scratch = os.path.realpath(tmp_path_factory.getbasetemp()) + os.sep
+
+    def refusal(start: Any) -> str | None:
+        return _host_guard.rollout_refusal(
+            start, scratch=scratch, prefix=ROLLOUT_CONTAINER_PREFIX, keeper=ROLLOUT_KEEPER_SCRIPT
+        )
+
+    tripped: list[str] = []
+    _every_process_start_is_judged.append(
+        _host_guard.refuse_all_but_the_runtime(tripped, package=package, refusal=refusal)
+    )
+    with pytest.MonkeyPatch.context() as guard:
+        for name in [n for n in tuple(sys.modules) if n == package or n.startswith(package + ".")]:
+            module = sys.modules.get(name)
+            for attribute, value in list(vars(module).items()) if module is not None else []:
+                if value is subprocess:
+                    stand_in = _host_guard.only_these_programs(subprocess, refusal, tripped, name)
+                    guard.setattr(module, attribute, stand_in)
+        yield
+    if tripped:
+        pytest.fail(
+            "the rollout package tried to start something on this machine that is not the "
+            "container runtime: " + "; ".join(tripped)
+        )
+
+
 @pytest.fixture
 def monkeypatch(
     _every_process_start_is_judged: list[Any],
     _no_destructive_command_on_this_machine: list[str],
     _no_signal_but_to_the_tests_own_processes: list[str],
+    _rollout_starts_only_the_container_runtime: None,
 ) -> Iterator[pytest.MonkeyPatch]:
     """pytest's own ``monkeypatch``, made after the suite's guards.
 

@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import math
 import socket
 import threading
 import time
@@ -163,12 +164,23 @@ class ScriptedChatServer:
         delay: float = 0.0,
         edit_history_from_call: int | None = None,
         skip_logprobs_on_call: int | None = None,
+        faults: dict[int, str] | None = None,
+        confident: bool = False,
+        confident_first: int = 0,
+        agent_status: int = 200,
+        plain_names: bool = False,
         tokens_per_chunk: int = 3,
         sampler_logprobs: bool = False,
+        reflects: tuple[str, ...] | None = None,
         agent_script: list[dict[str, Any]] | None = None,
         agent_marker: str = "# Task Agent",
+        first_position_only: bool = False,
     ) -> None:
         self.script = script
+        # A server whose values are the sampling distribution's at the first
+        # generated position and the model's own from there on, as one that
+        # takes later tokens of a step from another head might report them.
+        self.first_position_only = first_position_only
         # A second conversation: requests whose first message holds
         # ``agent_marker`` (a sub-agent's system prompt) are answered from here.
         self.agent_script = agent_script
@@ -179,11 +191,34 @@ class ScriptedChatServer:
         # context had been rewritten.
         self.edit_history_from_call = edit_history_from_call
         # On this call one chunk carries token IDs without log-probabilities.
-        self.skip_logprobs_on_call = skip_logprobs_on_call
+        # What goes wrong on which call (by its number among all requests):
+        # ``skip_logprobs`` (token IDs without log-probabilities), ``drop_tokens``
+        # (a group of tokens missing from both), ``null_logprob``, ``wrong_ids``
+        # (log-probabilities named for other tokens), ``no_usage``, ``http_500``
+        # (the request is answered with a server error).
+        self.faults: dict[int, str] = dict(faults or {})
+        if skip_logprobs_on_call is not None:
+            self.faults[skip_logprobs_on_call] = "skip_logprobs"
+        # A model so sure of every token that its own log-probabilities are near
+        # zero; or so sure of the first tokens of every reply only, that many of
+        # them, as a model is that opens every reply with the same words.
+        self.confident = confident
+        self.confident_first = confident_first
+        # The status a sub-agent's request is answered with; not 200 to fail it.
+        self.agent_status = agent_status
+        # A server that never names tokens by ID, whatever the request asks.
+        self.plain_names = plain_names
         self.tokens_per_chunk = tokens_per_chunk
-        # Report log-probabilities under the sampling distribution: a request that leaves
-        # the sampler one choice (top_k of 1) then gets exactly zero for every token.
-        self.sampler_logprobs = sampler_logprobs
+        # The sampler settings the reported log-probabilities are taken after.  The toy
+        # model's distribution at every position has two tokens, the emitted one and one
+        # other: a request that leaves the sampler one choice (``top_k`` of 1, a tiny
+        # ``top_p``) gets exactly zero where that setting is reflected, and a temperature
+        # sharpens the pair.  ``sampler_logprobs`` reflects all three.
+        self.reflects: tuple[str, ...] = (
+            reflects
+            if reflects is not None
+            else (("temperature", "top_k", "top_p") if sampler_logprobs else ())
+        )
         self._request = threading.local()
         self.requests: list[dict[str, Any]] = []
         self._lock = threading.Lock()
@@ -298,6 +333,19 @@ class ScriptedChatServer:
             self.requests.append(body)
         if self.delay:
             time.sleep(self.delay)
+        status = self.agent_status if self.is_agent_request(body) else 200
+        if self.faults.get(call_index) == "http_500":
+            status = 500
+        if status != 200:
+            data = json.dumps({"error": {"message": "scripted failure", "type": "invalid"}})
+            handler.send_response(status)
+            handler.send_header("Content-Type", "application/json")
+            handler.send_header("Content-Length", str(len(data)))
+            handler.send_header("Connection", "close")
+            handler.end_headers()
+            handler.wfile.write(data.encode("utf-8"))
+            handler.close_connection = True
+            return
         messages = [dict(m) for m in body.get("messages") or []]
         turn = sum(1 for m in messages if m.get("role") == "assistant")
         script = self.agent_script if self.is_agent_request(body) else self.script
@@ -310,7 +358,21 @@ class ScriptedChatServer:
         ):
             messages[0]["content"] = _text_of(messages[0].get("content")) + " (edited)"
         prompt_ids = render_prompt(messages, body.get("tools"))
-        self._request.certain = self.sampler_logprobs and body.get("top_k") == 1
+        top_p = body.get("top_p")
+        self._request.certain = ("top_k" in self.reflects and body.get("top_k") == 1) or (
+            "top_p" in self.reflects and isinstance(top_p, (int, float)) and top_p <= 0.01
+        )
+        temperature = body.get("temperature")
+        self._request.temperature = (
+            float(temperature)
+            if "temperature" in self.reflects and isinstance(temperature, (int, float))
+            else 1.0
+        )
+        # ``plain_names``: a server that ignores the request to name tokens by ID.
+        self._request.id_names = bool(body.get("return_tokens_as_token_ids")) and (
+            self.faults.get(call_index) != "plain_names" and not self.plain_names
+        )
+        self._request.alternatives = bool(body.get("top_logprobs"))
         want_ids = bool(body.get("return_token_ids"))
         want_logprobs = bool(body.get("logprobs"))
         calls = [
@@ -329,7 +391,7 @@ class ScriptedChatServer:
             "created": int(time.time()),
             "model": body.get("model"),
         }
-        skip_at = 1 if self.skip_logprobs_on_call == call_index else None
+        fault = self.faults.get(call_index)
         if body.get("stream"):
             self._stream(
                 handler,
@@ -341,7 +403,7 @@ class ScriptedChatServer:
                 usage,
                 want_ids,
                 want_logprobs,
-                skip_at,
+                fault,
             )
         else:
             self._whole(
@@ -405,17 +467,43 @@ class ScriptedChatServer:
         return pieces
 
     def _logprob_entries(self, ids: list[int], offset: int) -> list[dict[str, Any]]:
-        return [
-            {
-                "token": decode([t]),
-                "logprob": 0.0
-                if getattr(self._request, "certain", False)
-                else fake_logprob(t, offset + i),
-                "bytes": None,
-                "top_logprobs": [],
-            }
-            for i, t in enumerate(ids)
-        ]
+        entries = []
+        temperature = getattr(self._request, "temperature", 1.0) or 1.0
+        for i, t in enumerate(ids):
+            text = decode([t])
+            sure = self.confident or offset + i < self.confident_first
+            own = -1e-7 if sure else fake_logprob(t, offset + i)
+            # The other token of the pair holds the rest of the probability.
+            other = math.log(max(1.0 - math.exp(own), 1e-300))
+            reflected = not self.first_position_only or offset + i == 0
+            if not reflected:
+                value, other_value = own, other
+            elif getattr(self._request, "certain", False):
+                value, other_value = 0.0, -1e9
+            else:
+                normaliser = math.log(math.exp(own / temperature) + math.exp(other / temperature))
+                value = own / temperature - normaliser if temperature != 1.0 else own
+                other_value = other / temperature - normaliser if temperature != 1.0 else other
+            name = f"token_id:{t}" if getattr(self._request, "id_names", False) else text
+            alternatives = []
+            if getattr(self._request, "alternatives", False):
+                alternatives = [
+                    {
+                        "token": name,
+                        "logprob": value,
+                        "bytes": list(text.encode("utf-8", errors="replace")),
+                    },
+                    {"token": "<other>", "logprob": other_value, "bytes": [0]},
+                ]
+            entries.append(
+                {
+                    "token": name,
+                    "logprob": value,
+                    "bytes": list(text.encode("utf-8", errors="replace")),
+                    "top_logprobs": alternatives,
+                }
+            )
+        return entries
 
     def _stream(
         self,
@@ -428,7 +516,7 @@ class ScriptedChatServer:
         usage: dict[str, Any],
         want_ids: bool,
         want_logprobs: bool,
-        skip_logprobs_at: int | None,
+        fault: str | None,
     ) -> None:
         handler.send_response(200)
         handler.send_header("Content-Type", "text/event-stream")
@@ -457,13 +545,21 @@ class ScriptedChatServer:
         for number, (ids, delta) in enumerate(pieces):
             last = number == len(pieces) - 1
             payload = chunk(delta, finish if last else None)
-            if want_ids:
+            # A fault spoils the second group of tokens of the reply.
+            spoil = fault if number == 1 else None
+            if want_ids and spoil != "drop_tokens":
                 payload["choices"][0]["token_ids"] = ids
-            if want_logprobs and number != skip_logprobs_at:
-                payload["choices"][0]["logprobs"] = {"content": self._logprob_entries(ids, offset)}
+            if want_logprobs and spoil not in ("skip_logprobs", "drop_tokens"):
+                entries = self._logprob_entries(ids, offset)
+                if spoil == "null_logprob":
+                    entries[0]["logprob"] = None
+                if spoil == "wrong_ids":
+                    for entry in entries:
+                        entry["token"] = "token_id:0"
+                payload["choices"][0]["logprobs"] = {"content": entries}
             offset += len(ids)
             send(payload)
-        if (body.get("stream_options") or {}).get("include_usage"):
+        if (body.get("stream_options") or {}).get("include_usage") and fault != "no_usage":
             send(
                 {
                     **base,

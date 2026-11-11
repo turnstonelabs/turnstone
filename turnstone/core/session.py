@@ -1886,6 +1886,16 @@ _active_task_agent_cancel_scope: contextvars.ContextVar[_ParallelModelCancelScop
     contextvars.ContextVar("turnstone_active_task_agent_cancel_scope", default=None)
 )
 
+
+def inside_task_agent() -> bool:
+    """Whether the caller runs inside a task agent's loop.
+
+    For code that sees every model request of a session (a recording client)
+    and has to tell the session's own calls from a sub-agent's.
+    """
+    return _active_task_agent_cancel_scope.get() is not None
+
+
 # Generation that owns the synchronous tool executor currently running on this
 # thread.  ``_execute_tools.run_one`` installs it inside the worker (ContextVars
 # do not propagate into a ThreadPoolExecutor), and every tool result funnels

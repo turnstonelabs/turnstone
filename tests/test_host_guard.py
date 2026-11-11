@@ -1050,10 +1050,12 @@ class TestATestsOwnPatchesLeaveTheGuardsInPlace:
 
     def test_and_in_the_next_test_each_guard_stands_once(self):
         from turnstone.core import exec_env
+        from turnstone.rollout import container
 
         assert os.kill.__wrapped__ is posix.kill  # type: ignore[attr-defined]
         assert os.killpg.__wrapped__ is posix.killpg  # type: ignore[attr-defined]
         assert not hasattr(subprocess.Popen.__init__.__wrapped__, "__wrapped__")  # type: ignore[attr-defined]
         assert background_shells.spawn_group_leader.__wrapped__ is SPAWN_BY_NAME  # type: ignore[attr-defined]
         assert not hasattr(exec_env.spawn_group_leader.__wrapped__, "__wrapped__")  # type: ignore[attr-defined]
+        assert container.subprocess._real is subprocess
         assert os.environ.get(PROCESS_MARK) not in (None, "this-test")

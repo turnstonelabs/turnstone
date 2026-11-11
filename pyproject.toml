@@ -96,6 +96,7 @@ all = ["turnstone[discord,slack]"]
 turnstone = "turnstone.cli:main"
 turnstone-eval = "turnstone.eval.cli:main"
 turnstone-optimizer = "turnstone.optimizer:main"
+turnstone-rollout = "turnstone.rollout.cli:main"
 turnstone-server = "turnstone.server:main"
 turnstone-console = "turnstone.console.server:main"
 turnstone-admin = "turnstone.admin:main"

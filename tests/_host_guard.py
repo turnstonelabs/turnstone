@@ -29,14 +29,63 @@ process object's ``kill``, ``terminate`` and ``send_signal`` send through:
 a signal that could reach a process the test did not start is refused
 before it is sent (:func:`signal_refusal`).
 
-What a check does not see: a program an interpreter is told to start from
-code given to it as text (``python -c``), a process started by a C extension,
-a signal sent other than through ``os.kill`` and ``os.killpg``, and a file
-operation this interpreter performs itself.
-
 The list is deliberately wider than what is dangerous: a test that trips it
 with a harmless command picks another command.  It is not a safety mechanism
 for anything but tests.
+
+:func:`refuse_all_but_the_runtime` is for a package whose commands must all
+run somewhere else, through one program (a container runtime).  Whatever
+module of that package asks for a process, and by whichever call, the program
+is started only when it is the runtime, used on a container of the package's
+own (:func:`runtime_refusal`), the package's keeper in the one shape it is
+started in (:func:`rollout_refusal`), or a program the test wrote under its
+temporary directory.  A command line that lost its "run this inside the container"
+prefix fails instead of running here.  :func:`only_these_programs` is the
+same check standing in for the ``subprocess`` module inside a module of the
+package.
+
+What the guards do not see:
+
+- what a process the test starts does in its turn: a child interpreter,
+  whether it is given code as text, a script file or a module, and a
+  program the test wrote under its temporary directory, which
+  :func:`rollout_refusal` lets through with any arguments;
+- the commands a shell is fed through its standard input (``sh -s``, or a
+  shell started without a command and without a script file), a shell the
+  list does not name (``fish``, ``csh``, a copy of a shell under another
+  name), and a file a shell reads before its command (``BASH_ENV``,
+  ``--rcfile``);
+- a program not on the list that starts what its arguments spell
+  (``flock``, ``nsenter``, ``unshare``, ``chroot``, ``script``,
+  ``find -exec``, ``env -S``);
+- a process started without a new program (``os.fork``,
+  ``multiprocessing``), by a C extension, or by a ``preexec_fn``;
+- for :func:`refuse_all_but_the_runtime`, a start made for the package by
+  other code: by the framework's shell tool where the package's
+  environment is the host's, or from a thread that runs only
+  standard-library code, which is judged as that code's, so that only the
+  list applies;
+- a signal sent other than through ``os.kill`` and ``os.killpg``
+  (``posix.kill``, ``signal.pidfd_send_signal``, a function taken by name
+  before the test began, a C extension), a signal a started process sends,
+  and an id that a process gives up and another takes between the check
+  and the signal;
+- an id taken again within one test: once a process the test started has
+  ended and its group or session has emptied, an unrelated process can
+  take the freed id, make a group or session of its own with it and end,
+  and the members it leaves then count as the test's (:class:`ProcessView`);
+- a test's own stand-in for ``os.kill``, ``os.killpg`` or
+  ``Popen.__init__``, which takes that guard's place for as long as it
+  stands, and what session- and module-scoped fixtures and the collection
+  of the tests do, which run outside the guards;
+- a file operation this interpreter performs itself.
+
+What no guard sees of signals and files is answered by running the suite
+in a process namespace of its own, with the file system read-only but for
+a temporary directory.  The container runtime is not answered so: its
+socket stays reachable there, and a runtime command from a path no guard
+judges can still act on another container or mount a directory of the
+machine into one.
 """
 
 from __future__ import annotations
@@ -822,3 +871,381 @@ def judge_every_signal(monkeypatch: Any, tripped: list[str], view: ProcessView) 
 
     for name in ("kill", "killpg"):
         monkeypatch.setattr(os, name, guarded(getattr(os, name), "os." + name))
+
+
+# -- a package whose commands go through a container runtime ------------------
+
+# Subcommands of the runtime that only read, and name nothing they act on.
+_RUNTIME_READS = frozenset({"ps", "version", "info", "images", "events"})
+# Subcommands whose first operand is the container; what follows is theirs.
+# With each, its options that stand alone: any other option of a subcommand
+# is followed by its value.
+_FIRST_IS_THE_CONTAINER: dict[str, frozenset[str]] = {
+    "exec": frozenset({"-d", "--detach", "-i", "--interactive", "-t", "--tty", "--privileged"}),
+    "logs": frozenset({"-f", "--follow", "-t", "--timestamps", "--details"}),
+    "port": frozenset(),
+    "top": frozenset(),
+}
+# Subcommands whose every operand is a container.
+_EVERY_OPERAND_IS_A_CONTAINER: dict[str, frozenset[str]] = {
+    "attach": frozenset({"--no-stdin", "--sig-proxy"}),
+    "diff": frozenset(),
+    "inspect": frozenset({"-s", "--size"}),
+    "kill": frozenset(),
+    "pause": frozenset(),
+    "rename": frozenset(),
+    "restart": frozenset(),
+    "rm": frozenset({"-f", "--force", "-v", "--volumes", "-l", "--link"}),
+    "start": frozenset({"-a", "--attach", "-i", "--interactive"}),
+    "stats": frozenset({"-a", "--all", "--no-stream", "--no-trunc"}),
+    "stop": frozenset(),
+    "unpause": frozenset(),
+    "update": frozenset(),
+    "wait": frozenset(),
+}
+_CP_ALONE = frozenset({"-a", "--archive", "-L", "--follow-link", "-q", "--quiet"})
+# The options the rollout package gives ``run``; no other is let through.
+# Written out here, read from ``Container.run_argv``, ``Container.protect_argv``
+# and the helper that ends what is left in a container.  Those that stand alone:
+_RUN_FLAGS = frozenset({"--detach", "--rm", "--read-only"})
+# Those whose value can give the container no more than leaving the option out
+# does: its name (judged below), labels, limits, its own environment, user and
+# working directory, memory-backed directories, the program it starts.
+_RUN_ANY_VALUE = frozenset(
+    {
+        "--name",
+        "--label",
+        "--user",
+        "--cpus",
+        "--memory",
+        "--memory-swap",
+        "--pids-limit",
+        "--shm-size",
+        "--workdir",
+        "--env",
+        "--tmpfs",
+        "--entrypoint",
+        "--cap-drop",
+    }
+)
+# Those whose value could give the container more, with the values the package
+# gives them.  The capabilities are those a task may name for its container,
+# and the one the helper that spares the main process from the out-of-memory
+# killer takes besides; a test holds them equal to the package's.
+_RUN_VALUES: dict[str, frozenset[str]] = {
+    "--pull": frozenset({"never"}),
+    "--network": frozenset({"none"}),
+    "--security-opt": frozenset({"no-new-privileges"}),
+    "--oom-score-adj": frozenset({"0"}),
+    "--ulimit": frozenset({"nofile=4096:4096", "core=0", "memlock=65536:65536"}),
+    "--cap-add": frozenset(
+        {
+            "CHOWN",
+            "DAC_OVERRIDE",
+            "FOWNER",
+            "FSETID",
+            "KILL",
+            "SETGID",
+            "SETUID",
+            "NET_BIND_SERVICE",
+            "SYS_CHROOT",
+            "SYS_RESOURCE",
+        }
+    ),
+}
+# Those whose value the package makes of a fixed beginning and a size.
+_RUN_VALUE_BEGINS = {"--storage-opt": "size="}
+# A capability only a container takes that shares the process namespace of
+# one of the harness's: the helper that sets the main process's score.
+_HELPER_CAPABILITIES = frozenset({"SYS_RESOURCE"})
+
+
+def _read_words(
+    words: list[str], alone: frozenset[str], *, first_operand_ends: bool = False
+) -> tuple[list[tuple[str, str | None]], list[str]]:
+    """The options, each with its value, and the operands among the words
+    after a subcommand.
+
+    An option not in *alone* is followed by its value.  With
+    *first_operand_ends*, everything after the first operand is an operand
+    too: the command a container is to run, with options of its own.
+    """
+    options: list[tuple[str, str | None]] = []
+    operands: list[str] = []
+    rest = iter(words)
+    for word in rest:
+        if word == "--":
+            operands.extend(rest)
+        elif word.startswith("--"):
+            name, given, value = word.partition("=")
+            if given:
+                options.append((name, value))
+            elif name in alone:
+                options.append((name, None))
+            else:
+                options.append((name, next(rest, "")))
+        elif word.startswith("-") and len(word) > 1:
+            letters = ["-" + letter for letter in word[1:]]
+            if all(letter in alone for letter in letters):
+                options.extend((letter, None) for letter in letters)
+            elif len(word) > 2:
+                # The value follows its letter at once.
+                options.append((word[:2], word[2:]))
+            else:
+                options.append((word, next(rest, "")))
+        else:
+            operands.append(word)
+            if first_operand_ends:
+                operands.extend(rest)
+    return options, operands
+
+
+def _run_refusal(words: list[str], prefix: str) -> str | None:
+    """Why ``run`` (or ``create``) with *words* makes no container of the
+    harness's kind: one of its name, given no option but those the package
+    gives ``run``, and those of them that could give the container more only
+    with the values the package gives them.  A process namespace is shared
+    only with another container of its name."""
+    options, operands = _read_words(words, _RUN_FLAGS, first_operand_ends=True)
+    if not operands:
+        return "run names no image"
+    names = [value or "" for name, value in options if name == "--name"]
+    if len(names) != 1 or not names[0].startswith(prefix):
+        return f"run must give its container a name of the harness's ({prefix}*)"
+    shares = False
+    for name, value in options:
+        if name in _RUN_FLAGS:
+            if value is not None:
+                return f"run {name}={value}: the harness gives {name} no value"
+        elif name == "--pid":
+            if not (value or "").startswith("container:" + prefix):
+                return f"run --pid {value} shares with a container that is not the harness's"
+            shares = True
+        elif name in _RUN_VALUES:
+            if value not in _RUN_VALUES[name]:
+                known = ", ".join(sorted(_RUN_VALUES[name]))
+                return f"run {name} {value}: the harness gives {name} only {known}"
+        elif name in _RUN_VALUE_BEGINS:
+            begins = _RUN_VALUE_BEGINS[name]
+            if not (value or "").startswith(begins):
+                return f"run {name} {value}: the harness gives {name} only {begins}..."
+        elif name not in _RUN_ANY_VALUE:
+            return f"run {name} is no option the harness gives run"
+    added = {value for name, value in options if name == "--cap-add"}
+    if added & _HELPER_CAPABILITIES and not shares:
+        helper_only = ", ".join(sorted(added & _HELPER_CAPABILITIES))
+        return (
+            f"run --cap-add {helper_only} is for a container that shares the process "
+            "namespace of one of the harness's"
+        )
+    return None
+
+
+def runtime_refusal(words: list[str], *, prefix: str, own: Callable[[str], bool]) -> str | None:
+    """Why a container runtime's command line is not one to let through,
+    ``None`` when it is.  *words* are the ones after the runtime's name.
+
+    Let through: a subcommand that names containers (``exec``, ``rm``,
+    ``kill``, ``stop``, ``cp``, ``inspect`` and the others in the tables
+    above) when every container it names begins with *prefix*; ``run`` and
+    ``create`` for a container of that name with only the options the
+    package gives ``run`` (:func:`_run_refusal`); ``cp`` between such a
+    container and a
+    stream or a path that *own* says is the test's; and the few subcommands
+    that only read.  Anything else is refused, also a subcommand this does
+    not know: one that a package comes to use is added here, with what it
+    names.
+    """
+    if not words or words[0].startswith("-"):
+        return "the runtime must be given its subcommand first"
+    sub, rest = words[0], words[1:]
+    if sub == "container":
+        # The long spelling of the same subcommands.
+        if not rest:
+            return "container is given no subcommand"
+        sub, rest = rest[0], rest[1:]
+        if sub in ("ls", "list", "ps"):
+            return None
+        if sub == "prune":
+            return "container prune removes containers that are not the harness's"
+    elif sub == "image":
+        if rest[:1] in (["inspect"], ["ls"]):
+            return None
+        return f"image {' '.join(rest[:1])} is no read of an image"
+    elif sub in _RUNTIME_READS:
+        return None
+    if sub in ("run", "create"):
+        return _run_refusal(rest, prefix)
+    if sub == "cp":
+        _options, operands = _read_words(rest, _CP_ALONE)
+        inside = [o for o in operands if ":" in o and not o.startswith(("/", "."))]
+        outside = [o for o in operands if o not in inside]
+        if len(operands) != 2 or len(inside) != 1:
+            return "cp must copy between one container and this machine"
+        if not inside[0].startswith(prefix):
+            return f"cp names {inside[0].split(':')[0]!r}, which is no container of the harness"
+        if outside[0] != "-" and not own(outside[0]):
+            return (
+                f"cp reads or writes {outside[0]!r} on this machine: a stream (-) or a path "
+                "under the test's own directory is all it may"
+            )
+        return None
+    if sub in _FIRST_IS_THE_CONTAINER:
+        options, operands = _read_words(rest, _FIRST_IS_THE_CONTAINER[sub], first_operand_ends=True)
+        if sub == "exec" and any(name == "--privileged" for name, _value in options):
+            return "exec --privileged gives a command in the container this machine's rights"
+        named = operands[:1]
+    elif sub in _EVERY_OPERAND_IS_A_CONTAINER:
+        _options, named = _read_words(rest, _EVERY_OPERAND_IS_A_CONTAINER[sub])
+        if sub == "stats" and not named:
+            return None
+    else:
+        return f"the subcommand {sub!r} is not one the guard knows the package to use"
+    if not named:
+        return f"{sub} names no container"
+    for name in named:
+        if not name.startswith(prefix):
+            return f"{sub} names {name!r}, which is no container of the harness ({prefix}*)"
+    return None
+
+
+def _is_the_runtime(word: str, program: str, runtime: str) -> bool:
+    """Whether *word*, which the system starts as the file *program*, is the
+    container *runtime*: that name, and the file the system finds for it."""
+    if os.path.basename(word) != runtime:
+        return False
+    found = started_program(runtime)
+    return program == found or bool(
+        program and found and os.path.realpath(program) == os.path.realpath(found)
+    )
+
+
+def rollout_refusal(
+    start: Start, *, scratch: str, prefix: str, keeper: str | None, runtime: str = "docker"
+) -> str | None:
+    """Why a package whose commands go through a container runtime may not
+    start *start* on this machine, ``None`` when it may.
+
+    It may start: a program the test wrote under *scratch*, its temporary
+    directory (a stand-in for the runtime, a verifier program); the runtime
+    itself, for what :func:`runtime_refusal` lets through; and its keeper,
+    which removes one container of the harness after a time, in exactly the
+    shape the package starts it: ``sh -c <keeper> sh SECONDS RUNTIME NAME``,
+    seven words, where *keeper* is the script's text, RUNTIME is the runtime
+    or a program the test wrote, and NAME, the argument the script removes,
+    begins with *prefix*.  A program is the file the system would start,
+    with links followed, so a bare name is never taken for a file of the
+    same name in the test's directory.
+    """
+
+    def own(path: str) -> bool:
+        return bool(path) and os.path.realpath(path).startswith(scratch)
+
+    if own(start.program):
+        return None
+    argv = list(start.argv)
+    if not argv:
+        return "what it would start could not be read"
+    if _is_the_runtime(argv[0], start.program, runtime):
+        return runtime_refusal(argv[1:], prefix=prefix, own=own)
+    if keeper is not None and argv[:4] == ["sh", "-c", keeper, "sh"]:
+        if len(argv) != 7:
+            return f"the keeper is given {len(argv) - 4} arguments, not its 3"
+        removes, program = argv[6], argv[5]
+        if not removes.startswith(prefix):
+            return f"the keeper would remove {removes!r}, which is no container of the harness"
+        found = started_program(program, cwd=start.cwd)
+        if not _is_the_runtime(program, found, runtime) and not own(found):
+            return (
+                f"the keeper would run {program!r}, which is neither the container runtime "
+                "nor a program the test wrote"
+            )
+        return None
+    return "it is neither the container runtime nor a program the test wrote"
+
+
+def _refuse_program(start: Start, why: str, tripped: list[str]) -> None:
+    shown = start.shown()
+    tripped.append(f"{shown} ({why})")
+    raise DestructiveCommandError(
+        f"a test was about to start a program on this machine that is not the one "
+        f"its commands go through: {shown!r} ({why})"
+    )
+
+
+def refuse_all_but_the_runtime(
+    tripped: list[str], *, package: str, refusal: Callable[[Start], str | None]
+) -> Callable[[Start], None]:
+    """A check for :func:`judge_every_start`: a start asked for by a module of
+    *package*, whichever, is noted in *tripped* and refused when *refusal*
+    gives a reason for it.  Other callers are not this check's to judge."""
+
+    def judge(start: Start) -> None:
+        if start.caller != package and not start.caller.startswith(package + "."):
+            return
+        why = refusal(start)
+        if why is not None:
+            _refuse_program(start, why, tripped)
+
+    return judge
+
+
+class _OnlyThesePrograms:
+    """The ``subprocess`` module as one module of a package holds it, with
+    every way it starts a process asking first."""
+
+    def __init__(
+        self, real: Any, refusal: Callable[[Start], str | None], tripped: list[str], caller: str
+    ) -> None:
+        self._real = real
+        self._refusal = refusal
+        self._tripped = tripped
+        self._caller = caller
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._real, name)
+
+    def _ask(self, how: str, popenargs: tuple[Any, ...], kwargs: dict[str, Any]) -> None:
+        start = popen_start(how, popenargs, kwargs, self._caller)
+        if start is None:
+            return  # arguments the call does not take: it refuses them itself
+        why = self._refusal(start)
+        if why is not None:
+            _refuse_program(start, why, self._tripped)
+
+    def Popen(self, *popenargs: Any, **kwargs: Any) -> Any:  # noqa: N802
+        self._ask("subprocess.Popen", popenargs, kwargs)
+        return self._real.Popen(*popenargs, **kwargs)
+
+    def run(self, *popenargs: Any, **kwargs: Any) -> Any:
+        self._ask("subprocess.run", popenargs, kwargs)
+        return self._real.run(*popenargs, **kwargs)
+
+    def call(self, *popenargs: Any, **kwargs: Any) -> Any:
+        self._ask("subprocess.call", popenargs, kwargs)
+        return self._real.call(*popenargs, **kwargs)
+
+    def check_call(self, *popenargs: Any, **kwargs: Any) -> Any:
+        self._ask("subprocess.check_call", popenargs, kwargs)
+        return self._real.check_call(*popenargs, **kwargs)
+
+    def check_output(self, *popenargs: Any, **kwargs: Any) -> Any:
+        self._ask("subprocess.check_output", popenargs, kwargs)
+        return self._real.check_output(*popenargs, **kwargs)
+
+    def getoutput(self, cmd: Any, **kwargs: Any) -> Any:
+        self._ask("subprocess.getoutput", (cmd,), {"shell": True})
+        return self._real.getoutput(cmd, **kwargs)
+
+    def getstatusoutput(self, cmd: Any, **kwargs: Any) -> Any:
+        self._ask("subprocess.getstatusoutput", (cmd,), {"shell": True})
+        return self._real.getstatusoutput(cmd, **kwargs)
+
+
+def only_these_programs(
+    real: Any, refusal: Callable[[Start], str | None], tripped: list[str], caller: str
+) -> Any:
+    """A stand-in for the ``subprocess`` module *real* inside the module
+    *caller*: a program is started only when *refusal* gives no reason
+    against it; anything else is noted in *tripped* and refused."""
+    return _OnlyThesePrograms(real, refusal, tripped, caller)
