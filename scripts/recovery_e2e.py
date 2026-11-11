@@ -4747,19 +4747,17 @@ def run_coord_orphan_rewind(chrome: str) -> str:
         node.stop(hard=True)
         node = _boot_node(port=port)
         node.open_workstream(ws_id)
-        # A hard-crashed reborn node answers the page's stale-high cursor
-        # with a SILENT fresh stream — no replay_truncated (the honest-
-        # truncation signal rides state a graceful stop persists; a crash
-        # never writes it — pre-existing server hole, tracked separately).
-        # The realistic operator recovery is a page RELOAD: init's seeded
-        # /history render paints the orphan deterministically.
+        # The reborn node rebuilds the session with an empty event ring and an id counter reseeded
+        # from storage. The page's cursor is above that counter (the killed process's unpersisted
+        # events carried higher ids), and the node answers such a cursor with replay_truncated, so
+        # the page would also recover with no help: its redial, then the truncated resync's seeded
+        # /history render after a jittered delay of up to ten seconds. This scenario is about what
+        # happens once the orphan is on screen, so it reloads the page instead of waiting that out:
+        # init's seeded /history render paints the same orphan at once.
         _set_cookie_and_navigate(cdp, node.base_url, node.token, url)
-        # The pane's reconnect machinery (native retry -> truncated resync
-        # -> seeded render) repaints the interrupted turn.  With a HARD
-        # kill the tool call is genuinely unresulted, so the recovery
-        # render shows the ORPHAN: one user row, a --running placeholder
-        # batch no result will ever strip — the poisoned-pane
-        # precondition, now manifested for real.
+        # With a HARD kill the tool call is genuinely unresulted, so that render shows the ORPHAN:
+        # one user row, a --running placeholder batch no result will ever strip — the
+        # poisoned-pane precondition, now manifested for real.
         if not _poll_until(
             lambda: (
                 cdp.evaluate(_COORD_ROWS_JS) == 1
