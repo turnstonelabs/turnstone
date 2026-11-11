@@ -77,6 +77,21 @@ trajectory (phase 4).
 - Parses the JSON arguments (with fallback for malformed JSON).
 - If JSON parsing fails entirely, uses `PRIMARY_KEY_MAP` to map a bare string
   to the correct parameter.
+- Reads a null written as text as no value. For an argument whose value is
+  exactly `"None"` or `"null"`, the parameter's schema decides:
+
+  | The parameter | The tool gets |
+  |---------------|---------------|
+  | may be a string | the text, which may be the value |
+  | allows null | null |
+  | is optional, not a string, without null | no such argument |
+  | is required, not a string, without null | the text, so that validation answers the model |
+
+  A parameter the schema does not describe keeps the text. Only top-level
+  arguments are looked at, and only where the arguments are an object:
+  arguments that are valid JSON of another kind (a list, a bare string, a
+  number) are passed on as they came, and the call fails as it would have. A
+  headless run's tool log shows the arguments after this step.
 - Dispatches to the matching `_prepare_{func_name}()` handler, the synthetic
   `tool_search` fallback, or the generic `_prepare_mcp_tool()` handler.
 - Validates arguments and builds a preview dict containing:

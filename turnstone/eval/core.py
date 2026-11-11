@@ -50,6 +50,7 @@ from turnstone.core.tools import (
     INTERACTIVE_TOOLS,
     PRIMARY_KEY_MAP,
     apply_cwd_context,
+    apply_null_spellings,
     merge_mcp_tools,
 )
 from turnstone.core.trajectory import (
@@ -989,6 +990,10 @@ class HeadlessSession(ChatSession):
                         args = {pk: raw}
                     else:
                         args = {"_raw": raw}
+                # The log shows the arguments as the tool got them.  Arguments
+                # that are valid JSON and no object are logged as they came.
+                if isinstance(args, dict):
+                    apply_null_spellings(args, self._tool_definition(func_name))
 
                 self.tool_call_log.append(
                     {

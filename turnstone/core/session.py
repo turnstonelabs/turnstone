@@ -293,6 +293,7 @@ from turnstone.core.tools import (
     TASK_AUTO_TOOLS,
     TOOLS,
     apply_cwd_context,
+    apply_null_spellings,
     merge_mcp_tools,
     nested_deeper_than,
     salvage_tool_arguments,
@@ -1261,6 +1262,9 @@ class _StreamTurnConsumer:
             allow_cancelled=True,
         )
 
+
+# Built-in tool definitions by name, for reading a parameter's schema.
+_BUILTIN_TOOL_DEFINITIONS: dict[str, dict[str, Any]] = {t["function"]["name"]: t for t in TOOLS}
 
 # Image extensions read_file handles as images (SVG excluded — it's XML text).
 # Only PNG, JPEG and WebP content is sent (MODEL_IMAGE_MIMES); a GIF, BMP, TIFF
@@ -19825,6 +19829,22 @@ class ChatSession:
         item["_principal_id"] = self._tool_prepare_principal_id()
         return item
 
+    def _tool_definition(self, func_name: str) -> dict[str, Any] | None:
+        """The definition of *func_name* as this session holds it, ``None`` if unknown.
+
+        The built-in definition first, then the session's merged list, which
+        also holds the tools of connected MCP servers.
+        """
+        builtin = _BUILTIN_TOOL_DEFINITIONS.get(func_name)
+        if builtin is not None:
+            return builtin
+        # ``getattr``: a session built without ``__init__`` has no tool list.
+        tools: list[dict[str, Any]] = getattr(self, "_tools", None) or []
+        for tool in tools:
+            if tool.get("function", {}).get("name") == func_name:
+                return tool
+        return None
+
     def _unavailable_tool_error(self, func_name: str) -> str:
         """What the model is told when it calls a tool that dispatch cannot run.
 
@@ -19925,6 +19945,12 @@ class ChatSession:
                         f"Please retry with correctly formatted JSON arguments."
                     ),
                 }
+
+        # A null the model wrote as text ("None", "null") for a parameter that
+        # cannot be a string means "no value"; give the preparer that, in the
+        # form the parameter's schema has for it.
+        if isinstance(args, dict):
+            apply_null_spellings(args, self._tool_definition(func_name))
 
         # Short-circuit revoked tools before preparer dispatch so the
         # model sees an unambiguous "revoked" error rather than a

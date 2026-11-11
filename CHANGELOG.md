@@ -93,6 +93,18 @@ The separate `dev` branch is retired. See [the release process](docs/releasing.m
   result parser read as malformed, so the search failed with "all matches
   returned were malformed" while searching a directory worked. The fallback now
   always names the file.
+- **A null the model wrote as text is read as no value.** A server that parses
+  tool calls out of generated text passes an argument it does not recognise on
+  as a string, so a model that wrote `None` for an optional number delivered the
+  string `"None"`, and `read_file` refused the call over its `offset`. For an
+  argument that is exactly `"None"` or `"null"` the parameter's schema now
+  decides: it becomes null where the schema allows null, and counts as not given
+  where the parameter is optional, not a string and has no null. A string
+  parameter keeps the text, and so does a required parameter (the tool's
+  validation answers the model) and one the schema does not describe. A schema
+  that is not well formed never fails the call: what names no parameter in its
+  `required` list is passed over, and branches nested deeper than a schema
+  goes leave the text as it is.
 - **A shell command that cannot be written leaves no script file behind.** A
   command holding half of a surrogate pair, which a model can write as an
   escape, cannot be encoded: the shell tool reports that, and each such call
