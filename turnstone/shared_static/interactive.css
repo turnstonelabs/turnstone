@@ -19,11 +19,37 @@
 
 /* ---- 1. Embedded chrome (.pane--embedded) ------------------------------- */
 
-/* Fill the pane-body; shell.css `.pane` already gives display:flex column. */
+/* Fill the pane-body; shell.css `.pane` already gives display:flex column.
+   Positioned, because the drop overlay below covers the pane with inset: 0. */
 .pane--embedded {
   flex: 1;
   min-height: 0;
   overflow: hidden;
+  position: relative;
+}
+
+/* Drag-and-drop visual state on the pane: the composer adds the class to the
+   pane root while a file is dragged over it. */
+.pane.pane-drop-target {
+  outline: 2px dashed var(--accent);
+  outline-offset: -6px;
+}
+.pane.pane-drop-target::after {
+  content: "Drop file to attach";
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--accent-dim, rgba(0, 0, 0, 0.1));
+  color: var(--fg-bright, var(--fg));
+  font-family: var(--font-ui);
+  font-size: 14px;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  pointer-events: none;
+  z-index: 10;
 }
 
 /* No embedded pane header — name / persona / state are shown by the tab + rail
