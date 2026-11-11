@@ -158,9 +158,10 @@ sub-agents (`RolloutConfig.max_subagents`, 16), and the
 [budgets](#budgets-of-the-models-own) a task may give the model.
 
 `Task.timeout` bounds the session run, sub-agents included, to the next whole
-second. It starts when the sandbox is up: bringing it up, a sidecar's setup
-included, is not the model's time, and the record says how long it took
-(`startup_seconds`). It does not bound what comes after either: the check after
+second. It starts when the sandbox is up: bringing it up, a sidecar's setup and
+the task's [before-run commands](#before-the-run) included, is not the model's
+time, and the record says how long it took (`startup_seconds`). It does not
+bound what comes after either: the check after
 the run has time limits of its own, and removing a container takes up to 60
 seconds for the removal and 30 to confirm it, which the record reports apart
 (`teardown_seconds`). At the limit the session is cancelled and given ten
@@ -314,13 +315,15 @@ penalised for it.
 | `sandbox_failed` | The container could not be started | machinery | no |
 | `sandbox_lost` | The container stopped and nothing the model could do explains it, or it stopped before the first turn of the model's had come back or was found gone before the first of the model's tool calls could run, or the runtime stopped answering | machinery | no |
 | `sidecar_failed` | The task's [sidecar](#a-tasks-own-servers-the-sidecar) could not be brought up | machinery | no |
+| `before_run_failed` | A [before-run command](#before-the-run) of the task failed or ran out of its time, so the run did not start | machinery | no |
 | `sidecar_lost` | The task's sidecar stopped during the run | machinery | no |
 | `subagent_failed` | A sub-agent failed for a reason that is not its work | machinery | no |
 | `no_model_call`, `abnormal_reply` | The run ended before any model call, or on a finish reason the harness does not know, which only the server gives (a filter of its own, for one) | machinery | no |
 
 Where several apply, a run that did not start keeps its own ending
-(`sandbox_failed`, `sidecar_failed`); otherwise a lost container decides first,
-then a lost sidecar, then a failed sub-agent, then the others.
+(`sandbox_failed`, `sidecar_failed`, `before_run_failed`); otherwise a lost
+container decides first, then a lost sidecar, then a failed sub-agent, then the
+others.
 
 One exception keeps a run the machinery cut short from being recorded as the
 model's outcome. A container the model ended (`sandbox_destroyed`) gives way
@@ -617,8 +620,9 @@ teardown.
 If the runner is killed, the container is removed by a small process of its own
 on the host, out of the container's reach. Its time is set anew for each step,
 to as long as that step may take and ten minutes on top: bringing the sandbox
-up (15 minutes, and a sidecar's own limits), the run (the task's time limit),
-the commands after the run (their time limits), the verifier (its time limit).
+up (15 minutes, and a sidecar's own limits), the task's commands before the run
+(their time limits), the run (the task's time limit), the commands after the
+run (their time limits), the verifier (its time limit).
 It is stopped only once the container is known to be gone; after a removal that
 could not be confirmed it tries again within half a minute and keeps trying for
 five.
@@ -834,6 +838,46 @@ pixel limits every image read has.
 The rules on tool calls are matched there too, on commands the model wrote;
 their patterns are bounded so that a long command cannot stall the harness (see
 [rules on tool calls](#rules-on-tool-calls)).
+
+---
+
+## Before the run
+
+A task can name commands that prepare its container before the model starts
+(`Task.before_run`, a list of `BeforeRunCommand`): build leftovers and package
+caches purged, a service started, a checkout brought to a known state. They are
+the counterpart of the [after-run commands](#checking-a-rollout-afterwards).
+
+```python
+from turnstone.rollout.preparation import BeforeRunCommand
+
+Task(
+    prompt="...",
+    before_run=[BeforeRunCommand(["pip", "cache", "purge"], timeout=120)],
+)
+```
+
+| | |
+|---|---|
+| When | Once the container is up and the task's files are in it, before any model call, in the order given |
+| As whom | Root (`0:0`) unless the command names a `user`, with the container's capabilities and no others, in the task's working directory |
+| What the model sees | Nothing. They are not tool calls: they are not in the messages, the tool log or the token record, and the [rules on tool calls](#rules-on-tool-calls) are not asked about them |
+| Whose time | Start-up time (`startup_seconds`), like bringing the container up. Neither the task's time limit nor a budget of the model's has started |
+| Time limit | Each command its own `timeout`, 300 s by default. The container is kept from outside for as long as all of them may take |
+| In the record | `before_run`: every command's exit status, time, and the beginning and the end of what it wrote (see [the episode record](#the-episode-record)) |
+
+A command that ends with another status than 0, or does not end within its time,
+means the run does not start. The container is then not what the task describes,
+and a model that worked in it would be scored for that. The commands after it
+are not run, no model call is made, nothing is checked afterwards
+(`verification` is `null`), and the record ends as `before_run_failed`: the
+machinery's failure, not trainable. `before_run.failure` and `error` say which
+command and why.
+
+A command must return. What it leaves running stays, which is how a task starts
+a service of its own, as long as that does not hold the command's output open:
+send a service's output to a file. A command that runs out of its time is not
+stopped inside the container; the container is removed.
 
 ---
 
@@ -1181,7 +1225,10 @@ record = run_episode(task, config, verifier=verifier, verifier_timeout=3600)
 
 When the run is over, however it ended, the harness stops the episode's
 container, so that nothing the model left running can change a file any more,
-and calls the function. The context names the stopped container
+and calls the function. A run that did not start is the exception: nothing of
+the model's is there to check, so neither the after-run commands nor the
+verifier run, and `verification` is `null`. The context names the stopped
+container
 (`container_name`), which the runtime's own commands can read without running
 anything inside it. What the function returns is stored under the record's
 `verification`; the model never sees it. Then the episode's container and every
@@ -1224,8 +1271,8 @@ root (`/etc/hostname` as `etc/hostname`). The default container's working
 directory is a mount of its own that its user can neither rename nor remove.
 
 **What is left running is ended before each after-run command**, whoever it
-runs as: a process the model detached from its command, one an earlier
-after-run command left. Root in the container
+runs as: a process the model detached from its command, one a before-run
+command left, one an earlier after-run command left. Root in the container
 cannot do that (the container gives it no right to signal another user's
 processes), and nothing is run in the container with more rights than the
 container has. So the runtime holds the container still, lists its processes
@@ -1341,7 +1388,7 @@ whose value does not apply is `null`.
 | Key | Value |
 |-----|-------|
 | `key` | `Task.key` |
-| `task` | The task as it was given: `prompt`, `key`, `system_prompt`, `setup_files`, `files`, `max_turns`, `timeout`, `max_generated_tokens`, `max_command_seconds`, `container` (the `ContainerSpec`), `after_run`, `sidecar`. Content held as bytes is replaced by `{"bytes": N}` |
+| `task` | The task as it was given: `prompt`, `key`, `system_prompt`, `setup_files`, `files`, `max_turns`, `timeout`, `max_generated_tokens`, `max_command_seconds`, `container` (the `ContainerSpec`), `before_run`, `after_run`, `sidecar`. Content held as bytes is replaced by `{"bytes": N}` |
 | `model`, `endpoint` | The model's name and the API root the requests went to |
 | `finish_state`, `finish_cause` | How the rollout ended, and whether that is the model's outcome (`model`) or a failure of the server, the harness or the runtime (`machinery`); see [how a rollout ends](#how-a-rollout-ends) |
 | `error` | `null` where the model ended its turn by itself (`completed`). For every other ending, what happened, in words: the limit that was reached and where the last reply was cut, the request that failed or was refused, why the sandbox is gone or did not start, a sub-agent's failure |
@@ -1365,14 +1412,27 @@ whose value does not apply is `null`.
 | `logprobs` | Which log-probabilities the server reports: `sampler_logprobs` (`true`, `false` or `null`), `reflects` (the same per setting: `temperature`, `top_k`, `top_p`), `reason`, and from a probe `tried` and `positions` |
 | `token_id_check` | `"required"` or `"not required"` |
 | `timeout` | `null` unless the time limit was reached; then what the run was waiting on, below |
-| `seconds`, `startup_seconds`, `teardown_seconds` | The time from the start of the sandbox to the end of the run; of that, the time bringing the sandbox up took; and the time removing it took, which comes on top |
+| `seconds`, `startup_seconds`, `teardown_seconds` | The time from the start of the sandbox to the end of the run; of that, the time bringing the sandbox up took, the task's before-run commands included; and the time removing it took, which comes on top |
+| `before_run` | `null` for a task that names no [before-run commands](#before-the-run); otherwise below |
 | `time` | Where the time went, below |
 | `budgets` | The budgets the run was under and what was spent, below |
 | `subagents` | The side record of sub-agent calls, below |
 | `sandbox` | The container, below |
 | `acts_on_host` | Whether the tools acted on the machine the rollout ran on instead of in a sandbox (see [where the tools act](#where-the-tools-act)) |
 | `rules` | `null` without rules; otherwise the set in force (`name`, `sha256`, the count `rules`) and `events`, one per call a rule matched: `call_id`, `tool`, `rule`, `recommendation`, `refused`, `scope` (`parent` or `sub_agent`) |
-| `verification` | `null` when no check was asked for; otherwise below |
+| `verification` | `null` when no check was asked for, and for a run that did not start; otherwise below |
+
+`task.before_run` and `task.after_run`, one entry per command as the task gave
+it:
+
+| Key | Value |
+|-----|-------|
+| `argv` | The command and its arguments |
+| `user` | The user it runs as, `0:0` unless the task says otherwise |
+| `timeout` | Its time limit in seconds |
+| `max_output_chars` | The most the record keeps of what it wrote |
+| `collect` | After-run only: paths read out of the container once the command has ended. What they held is in `verification.commands[].collected` |
+| `max_collect_bytes` | After-run only: the most that is read out of those paths together, 8 MiB unless the task says otherwise; more than that sets `collected_summary.too_large` |
 
 `prefix_events`, one entry per `event`. `turn` counts the session's turns
 from 0, as `tool_log[].turn` does:
@@ -1411,7 +1471,15 @@ from 0, as `tool_log[].turn` does:
 | `prompt_seconds`, `generation_seconds` | The time up to each call's first token, and from there to its end, over the calls that got as far as a first token |
 | `generation_tokens_per_second`, `prompt_tokens_per_second` | The server's measured speeds over those calls; `null` where nothing was measured |
 
-Where the sandbox did not start, only the first three keys are there.
+Where the run did not start, only the first three keys are there.
+
+`before_run`:
+
+| Key | Value |
+|-----|-------|
+| `commands` | One result per before-run command that ran, in order: `argv`, `user`, `exit_code`, `timed_out`, `seconds`, `stdout` and `stderr` (the beginning and the end of each stream, half of the command's `max_output_chars` each, around a line that counts the bytes left out between them), `stdout_bytes` and `stderr_bytes` (the whole sizes) |
+| `failure` | Why the run could not start, in words; `null` when every command ended with status 0 within its time |
+| `seconds` | The time the step took, which is part of `startup_seconds` |
 
 `timeout`, at the time limit:
 
@@ -1606,8 +1674,9 @@ What a user of the harness has to know, in one place:
 ## Tests
 
 The container tests (`tests/test_rollout_container.py`,
-`tests/test_rollout_verification.py`, `tests/test_rollout_sidecar.py`, and one
-class of `tests/test_rollout_rules.py`) need a container runtime and an image,
+`tests/test_rollout_verification.py`, `tests/test_rollout_sidecar.py`, one
+class of `tests/test_rollout_rules.py` and two of
+`tests/test_rollout_preparation.py`) need a container runtime and an image,
 so they skip where they are missing. CI runs those files in their own lane
 (`test-rollout-container`), which pulls the image by digest and sets
 `TURNSTONE_ROLLOUT_REQUIRE_CONTAINER=1`, so that a missing runtime or image

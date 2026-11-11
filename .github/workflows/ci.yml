@@ -110,7 +110,7 @@ jobs:
           python-version: "3.14"
       - run: docker pull "$TURNSTONE_ROLLOUT_TEST_IMAGE"
       - run: pip install -e ".[test]"
-      - run: pytest tests/test_rollout_container.py tests/test_rollout_verification.py tests/test_rollout_sidecar.py tests/test_rollout_rules.py -v
+      - run: pytest tests/test_rollout_container.py tests/test_rollout_verification.py tests/test_rollout_sidecar.py tests/test_rollout_rules.py tests/test_rollout_preparation.py -v
 
   wheel-completeness:
     runs-on: ubuntu-latest

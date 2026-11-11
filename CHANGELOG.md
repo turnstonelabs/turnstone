@@ -172,6 +172,16 @@ The separate `dev` branch is retired. See [the release process](docs/releasing.m
   run's time into the server's, the commands' and the harness's, holds the
   server's measured speeds (`time`) and lists the budgets with what was spent
   (`budgets`).
+- **Rollouts: commands of the task's own before the model starts.**
+  `Task.before_run` names commands that run in the episode's container once the
+  task's files are in place and before any model call, as root unless a command
+  says otherwise, each with its own time limit: build leftovers purged, a
+  service started. The model sees nothing of them, the rules on tool calls are
+  not asked about them, and their time is start-up time, not the task's. Their
+  results are in the record (`before_run`). A command that fails or runs out of
+  time means the run does not start: the record ends as `before_run_failed`,
+  not trainable. A run that did not start is not checked afterwards either. See
+  [the rollout guide](docs/rollout.md#before-the-run).
 
 ### Fixed
 

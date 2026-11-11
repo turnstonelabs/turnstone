@@ -60,6 +60,7 @@ from turnstone.rollout.container import (
     ContainerLostError,
     ContainerSpec,
 )
+from turnstone.rollout.preparation import BeforeRunCommand, before_run_failure, run_before
 from turnstone.rollout.probe import SETTINGS as PROBED_SETTINGS
 from turnstone.rollout.probe import all_settings, sampler_logprobs_reported
 from turnstone.rollout.rawargs import RecordedArguments
@@ -107,6 +108,9 @@ _STARTUP_SECONDS = 900
 # and for a look of the size watch, ending what is left running, removing the
 # helper, letting the container run again, and reading out the files it names.
 _AFTER_RUN_OVERHEAD = 330
+# What one before-run command takes besides its own time limit: reaching the
+# container through the runtime.
+_BEFORE_RUN_OVERHEAD = 30
 
 # Seconds a session is given to stop once it was told to.
 _CANCEL_SECONDS = 10.0
@@ -146,6 +150,11 @@ class Task:
     # The task's container: image, working directory, the user its commands run
     # as, what is writable, capabilities, environment, limits.
     container: ContainerSpec = field(default_factory=ContainerSpec)
+    # Commands run in the container once the task's files are in place and
+    # before the first model call, as root unless one says otherwise
+    # (:mod:`turnstone.rollout.preparation`).  The model sees nothing of them;
+    # their time is start-up time; one that fails means the run does not start.
+    before_run: list[BeforeRunCommand] = field(default_factory=list)
     # Commands run in the container once the model has finished, before the
     # container is stopped; their results go in the record's ``verification``.
     # See :mod:`turnstone.rollout.verification` for when that is enough.
@@ -360,6 +369,10 @@ class ContainerSandbox:
     @property
     def name(self) -> str:
         return self.container.name
+
+    def before_run(self, command: BeforeRunCommand) -> dict[str, Any]:
+        """Run one before-run command in the container, before the model starts."""
+        return run_before(self.container, command)
 
     def after_run(self, command: AfterRunCommand) -> dict[str, Any]:
         """Run one after-run command in the still running container.
@@ -932,6 +945,7 @@ MACHINERY_FAILURES = {
     "backstop": "the time limit passed with the model's budgets not used up",
     "sandbox_failed": "the sandbox could not be started",
     "sidecar_failed": "the task's sidecar could not be brought up",
+    "before_run_failed": "a before-run command of the task failed, so the run did not start",
     "sidecar_lost": "the task's sidecar stopped during the run",
     "sandbox_lost": "the sandbox stopped by itself during the run",
     "subagent_failed": "a sub-agent failed for a reason that is not its work",
@@ -940,7 +954,7 @@ MACHINERY_FAILURES = {
 }
 # The endings of a run that did not start: no model call was made, so nothing
 # that happened to the sandbox meanwhile is the model's doing.
-_DID_NOT_START = frozenset({"sandbox_failed", "sidecar_failed"})
+_DID_NOT_START = frozenset({"sandbox_failed", "sidecar_failed", "before_run_failed"})
 
 
 def _finish_state(
@@ -1473,6 +1487,9 @@ def _build_record(
         # The whole of it, of which bringing the sandbox up took this much.
         "seconds": round(total, 2),
         "startup_seconds": state.get("startup_seconds"),
+        # The task's before-run commands, each with its result; ``None`` for a
+        # task that names none.  Their time is part of the start-up.
+        "before_run": state.get("before_run"),
         "time": _time_spent(recorder, meter, state.get("run_started"), now),
         # The budgets the run was under, whose the time limit was, and what
         # was spent of each.
@@ -1546,6 +1563,48 @@ def _build_record(
         record["text"] = [c.raw_text for c in accepted]
         record["subagents"]["text"] = [c.raw_text for c in side]
     return record
+
+
+class _BeforeRunError(Exception):
+    """A before-run command of the task failed: the run does not start."""
+
+
+def _before_run(task: Task, sandbox: Sandbox) -> dict[str, Any] | None:
+    """Run the task's before-run commands, in order, up to the first that
+    fails.  Never raises.
+
+    ``failure`` in what comes back says why the run cannot start; it is
+    ``None`` when every command ended with status 0 within its time.
+    """
+    if not task.before_run:
+        return None
+    started = time.monotonic()
+    count = len(task.before_run)
+    out: dict[str, Any] = {"commands": [], "failure": None}
+    # Kept from outside for as long as this step may take.
+    _keep(
+        sandbox,
+        sum(command.timeout + _BEFORE_RUN_OVERHEAD for command in task.before_run) + _KEEP_MARGIN,
+    )
+    run: Callable[[BeforeRunCommand], dict[str, Any]] | None = getattr(sandbox, "before_run", None)
+    if run is None:
+        out["failure"] = "the sandbox cannot run commands before the run"
+    else:
+        for number, command in enumerate(task.before_run, start=1):
+            try:
+                result = run(command)
+            except Exception as error:
+                out["failure"] = (
+                    f"before-run command {number} of {count} could not be run: "
+                    f"{type(error).__name__}: {error}"
+                )
+                break
+            out["commands"].append(result)
+            out["failure"] = before_run_failure(number, count, command.timeout, result)
+            if out["failure"] is not None:
+                break
+    out["seconds"] = round(time.monotonic() - started, 2)
+    return out
 
 
 def _verify(
@@ -1864,8 +1923,14 @@ def run_episode(
             if state["acts_on_host"] and not allow_host_execution:
                 raise HostExecutionError(_HOST_REFUSAL)
             sandbox.put_files({**task.setup_files, **task.files})
+            # The task's own commands, before anything is asked of the model.
+            state["before_run"] = _before_run(task, sandbox)
+            if (state["before_run"] or {}).get("failure"):
+                raise _BeforeRunError(state["before_run"]["failure"])
         except HostExecutionError:
             raise
+        except _BeforeRunError as not_prepared:
+            forced, error = "before_run_failed", str(not_prepared)
         except SidecarError as sidecar_error:
             forced, error = "sidecar_failed", str(sidecar_error)
         except Exception as start_error:
@@ -2030,7 +2095,12 @@ def run_episode(
             if forced in ("token_budget", "command_time") and error is None:
                 error = MODEL_OUTCOMES[forced]
         record = _build_record(task, config, state, sandbox, forced_state=forced, error=error)
-        record["verification"] = _verify(task, sandbox, record, verifier, verifier_timeout)
+        # A run that did not start left nothing to check.
+        record["verification"] = (
+            None
+            if record["finish_state"] in _DID_NOT_START
+            else _verify(task, sandbox, record, verifier, verifier_timeout)
+        )
         if (
             sandbox.lost
             and _whose_loss(sandbox, state) == "model"

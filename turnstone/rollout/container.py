@@ -185,6 +185,11 @@ class Completed:
     stdout_total: int
     # The command was stopped because it had written more than it may.
     stopped_early: bool = False
+    # Where the caller asked for it: the last bytes of each stream among those
+    # the limit left out, and the bytes written to standard error.
+    stdout_tail: bytes = b""
+    stderr_tail: bytes = b""
+    stderr_total: int = 0
 
     @property
     def stderr_text(self) -> str:
@@ -194,6 +199,23 @@ class Completed:
     def dropped(self) -> int:
         """Bytes of standard output that were over the limit and not kept."""
         return max(0, self.stdout_total - len(self.stdout))
+
+    def shown(self, stream: str = "stdout") -> str:
+        """One output stream as text: all of it, or its beginning and its end
+        around a line that says how many bytes are left out between them."""
+        if stream == "stdout":
+            head, tail, total = self.stdout, self.stdout_tail, self.stdout_total
+        else:
+            head, tail, total = self.stderr, self.stderr_tail, self.stderr_total
+        text = head.decode("utf-8", errors="replace")
+        left_out = max(total, len(head)) - len(head) - len(tail)
+        if left_out <= 0 and not tail:
+            return text
+        return (
+            text
+            + f"{_NL}[... {max(left_out, 0)} bytes left out ...]{_NL}"
+            + tail.decode("utf-8", errors="replace")
+        )
 
 
 # Whether a child can be waited for without being collected.  Until it is
@@ -246,6 +268,7 @@ def run_captured(
     timeout: float,
     limit: int,
     stop_after: int | None = None,
+    tail: int = 0,
 ) -> Completed:
     """Run *argv* and keep at most *limit* leading bytes of each output stream.
 
@@ -254,7 +277,9 @@ def run_captured(
     the local process group is killed.  With *stop_after* it is also killed as
     soon as it has written more than that many bytes to standard output: a
     caller that will refuse more than a bound need not wait for the rest, which
-    may never end.
+    may never end.  With *tail* the last that many bytes of what the limit left
+    out are kept too, for a reader who needs how the output ended: a failing
+    program says why in its last lines.
 
     *timeout* bounds the whole call, not only the command.  When the command
     has ended, whatever it left running in its process group is killed, as the
@@ -271,6 +296,7 @@ def run_captured(
         start_new_session=True,
     )
     kept: dict[str, bytearray] = {"out": bytearray(), "err": bytearray()}
+    ends: dict[str, bytearray] = {"out": bytearray(), "err": bytearray()}
     totals = {"out": 0, "err": 0}
     stopped_early = threading.Event()
     # Held while the group is signalled and while the command is collected.
@@ -302,9 +328,12 @@ def run_captured(
                 if not data:
                     return
                 totals[key] += len(data)
-                room = limit - len(kept[key])
+                room = max(limit - len(kept[key]), 0)
                 if room > 0:
                     kept[key].extend(data[:room])
+                if tail > 0 and len(data) > room:
+                    ends[key].extend(data[room:])
+                    del ends[key][:-tail]
                 if key == "out" and stop_after is not None and totals[key] > stop_after:
                     stopped_early.set()
                     end_group()
@@ -351,6 +380,9 @@ def run_captured(
         timed_out=timed_out and not stopped_early.is_set(),
         stdout_total=totals["out"],
         stopped_early=stopped_early.is_set(),
+        stdout_tail=bytes(ends["out"]),
+        stderr_tail=bytes(ends["err"]),
+        stderr_total=totals["err"],
     )
 
 
@@ -1773,6 +1805,7 @@ class Container:
         limit: int = 65536,
         user: str | None = None,
         stop_after: int | None = None,
+        tail: int = 0,
         workdir: str | None = None,
     ) -> Completed:
         """Run *argv* inside the container to completion.
@@ -1786,6 +1819,7 @@ class Container:
             timeout=timeout,
             limit=limit,
             stop_after=stop_after,
+            tail=tail,
         )
         if done.returncode != 0 and any(m in done.stderr_text for m in _RUNTIME_ERROR_MARKS):
             self.ensure_running()

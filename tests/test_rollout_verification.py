@@ -34,6 +34,7 @@ from turnstone.rollout.container import (
     run_captured,
 )
 from turnstone.rollout.episode import RolloutConfig, Task, run_episode
+from turnstone.rollout.preparation import BeforeRunCommand
 from turnstone.rollout.verification import (
     AfterRunCommand,
     Entry,
@@ -1687,6 +1688,47 @@ UNDER_USERS = NL.join(
 
 
 @needs_container
+class TestAfterRunWhereTheCommandsCanChangeTheirUser:
+    def test_a_process_nobody_can_be_asked_to_end_is_the_models_outcome(self):
+        """One process under a user number above 2147483647, left here by a
+        command of the task's own as a model's command could leave it.  The
+        check used to fail over it as the machinery's, so that one call took a
+        rollout out of training.  It is listed, the command runs, and the
+        rollout is scored."""
+        spec = ContainerSpec(
+            image=IMAGE, user="0:0", capabilities=("SETUID", "SETGID"), memory="512m"
+        )
+        script = [
+            {"tool_calls": [{"name": "bash", "arguments": {"command": "echo 42 > answer.txt"}}]},
+            {"content": "done"},
+        ]
+        with ScriptedChatServer(script) as server:
+            task = Task(
+                prompt="write the answer",
+                container=spec,
+                before_run=[
+                    BeforeRunCommand(["python3", "-c", UNDER_USERS, "3000000000:60000", "2001:7"])
+                ],
+                after_run=[
+                    AfterRunCommand(["cat", "answer.txt"], collect=["/workspace/answer.txt"]),
+                    AfterRunCommand(["true"]),
+                ],
+            )
+            config = RolloutConfig(base_url=server.base_url, model="scripted", **SMALL)
+            record = run_episode(task, config)
+        stayed = [{"uid": 3000000000, "command": "sleep"}]
+        first, second = record["verification"]["commands"]
+        assert first["leftovers"] == {"found": 2, "still_running": stayed, "frozen": True}
+        assert first["exit_code"] == 0 and first["output"].split() == ["42"]
+        assert first["collected"] == {"workspace/answer.txt": "42" + NL}
+        assert second["leftovers"] == {"found": 1, "still_running": stayed, "frozen": True}
+        assert record["verification"]["failure"] is None
+        assert record["finish_state"] == "completed" and record["finish_cause"] == "model"
+        assert record["trainable"] is True and record["problems"] == []
+        assert _listed(record["sandbox"]["name"]) == []
+
+
+@needs_container
 class TestAWorkingDirectoryItsUserCanTakeAway:
     """Over a writable root, a user who owns the directory above its working
     directory can rename or remove the working directory, and the runtime
@@ -1754,19 +1796,21 @@ class TestAfterRunInTheContainedCase:
     def test_a_command_and_the_files_it_names(self):
         """An unprivileged model over a read-only root cannot change the programs a
         command there uses.  Its working directory is memory-backed, so it is read
-        while the container still runs."""
+        while the container still runs.  What it left running is ended first: here
+        a process it detached from its command, which the end of that command does
+        not end, and one a command of the task's own left as the same user."""
+        left = "echo 42 > answer.txt; " + DETACHED.format(seconds=600)
         script = [
-            {
-                "tool_calls": [
-                    {"name": "bash", "arguments": {"command": "echo 42 > answer.txt; sleep 300 &"}}
-                ]
-            },
+            {"tool_calls": [{"name": "bash", "arguments": {"command": left}}]},
             {"content": "done"},
         ]
         with ScriptedChatServer(script) as server:
             task = Task(
                 prompt="write the answer",
                 container=ContainerSpec(image=IMAGE, memory="512m"),
+                before_run=[
+                    BeforeRunCommand(["sh", "-c", DETACHED.format(seconds=601)], user="65534:65534")
+                ],
                 after_run=[
                     AfterRunCommand(
                         [
@@ -1775,15 +1819,21 @@ class TestAfterRunInTheContainedCase:
                             "id -u; cat /proc/[0-9]*/comm | grep -c sleep; cat answer.txt",
                         ],
                         collect=["/workspace/answer.txt"],
-                    )
+                    ),
+                    AfterRunCommand(["sh", "-c", "cat /proc/[0-9]*/comm | grep -c sleep"]),
                 ],
             )
             config = RolloutConfig(base_url=server.base_url, model="scripted", **SMALL)
             record = run_episode(task, config)
-        (ran,) = record["verification"]["commands"]
-        # As root, with what the model left running ended (the one sleep is the
+        first, second = record["verification"]["commands"]
+        # As root, with what was left running ended (the one sleep is the
         # container's own), and the file read out.
-        assert ran["output"].split() == ["0", "1", "42"] and ran["exit_code"] == 0
-        assert ran["collected"] == {"workspace/answer.txt": "42" + NL}
+        assert first["output"].split() == ["0", "1", "42"] and first["exit_code"] == 0
+        assert first["leftovers"] == {"found": 2, "still_running": [], "frozen": True}
+        assert first["collected"] == {"workspace/answer.txt": "42" + NL}
+        assert second["output"].split() == ["1"]
+        assert second["leftovers"] == {"found": 0, "still_running": [], "frozen": True}
+        assert record["verification"]["failure"] is None
         assert record["verification"]["result"] is None and record["trainable"] is True
+        assert record["finish_state"] == "completed"
         assert _listed(record["sandbox"]["name"]) == []
