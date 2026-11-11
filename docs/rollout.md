@@ -745,6 +745,94 @@ A flagged rollout is still `trainable` when its tokens are sound; it is not
 
 ---
 
+## Reading a reply without the server
+
+A server may read a reply itself and hand back reasoning, text and tool calls
+as separate fields. A completions route hands back the generated text only, and
+a server may run with no reader of its own. `turnstone/rollout/replyformat.py`
+reads a reply from what was generated.
+
+How a reply is written is a description, a `ReplyFormat`, asked for by name
+(`reply_format("parameter_blocks")`). One is defined: reasoning that a marker
+closes, then text, then tool calls as tagged blocks with one tagged block per
+argument. A server with another format needs another description; nothing else
+in the package names a marker. The argument texts that a stable-prefix run
+sends back as written ([above](#what-can-still-make-a-prompt-not-extend)) are
+read by the same description.
+
+A reader is given *pieces*: text, and the markers the model generated as one
+token of their own. The outer markers of the format are single tokens, and they
+count as markers only as those tokens. The same characters spelled with
+ordinary tokens are text, which is what a model produces when it writes a file
+about its own call format.
+
+A server hands a reply on in parts, each with its text and the IDs of the
+tokens that text stands for, and `pieces_from_chunks` makes the pieces from
+them. A part's text is the text of its tokens in their order, so a marker
+token is the occurrence of its text that stands where the token does. Nearly
+every part holds a marker's text exactly as often as the marker's token, and
+there is nothing to decide. Where a part holds it more often, because the
+model spelled the same characters out beside the marker, the order of the
+part's tokens decides: a marker token with no other token before it in its
+part is the first occurrence, one with none after it the last, and marker
+tokens side by side stand side by side. So the same tokens are read the same
+however the server cut the reply into parts. One case is left that the part
+alone does not decide: a marker token with other tokens before it and after
+it, in a part that holds its text more than once. The texts of those other
+tokens are not known, so the token is taken for the first occurrence, and the
+number of tokens placed that way comes back with the pieces. A marker token
+whose text is not in its part at all is counted too.
+
+`read(pieces, tools=..., in_reasoning=...)` returns the reasoning, the text and
+the calls. It reads what a server of this format puts in its non-streamed
+reply:
+
+| Part | How it is read |
+|------|----------------|
+| Reasoning | Everything up to the closing marker, as written, white space included; none when there is nothing. A reply cut inside it is all reasoning. A call marker inside it ends it |
+| Text | What follows, up to the first call. With calls it is stripped, and white space alone is no text. Without calls it stays as written |
+| Calls | Every function block, in order, in one turn. Text between or after calls is dropped. A function block without the call marker counts |
+| Argument values | The text between an argument's tags, less one line break at each end, then typed by the tool's schema: the types the schema allows are tried in the order null, integer, number, boolean, object, array, string, and the first that fits wins. A whole number written for a `number` becomes an integer. A text no allowed type fits is read as JSON where it is JSON and stays text otherwise. An argument the schema does not describe, and every argument of a tool that was not offered, stays text |
+| Malformed calls | An argument written twice counts as written last. An argument whose closing tag never came is left out. A call cut at the limit keeps its finished arguments. A call without a name is no call |
+| No tools offered | No calls are returned |
+
+The arguments come back as JSON text with the keys in the order written.
+
+A reply is read inside the model call, once it has ended, and the time is the
+call's. Reading takes time in proportion to the reply's length, whatever the
+model wrote: long runs of white space inside or after a tag, openings that are
+never closed, a marker repeated thousands of times. (A number of more digits
+than the interpreter converts to an integer, 4,300 unless that is set
+otherwise, is not read as one: alone it stays text, and so does a JSON value
+that holds it.)
+
+What is read can always be sent back. JSON in a reply can spell half of a
+surrogate pair as an escape, a character no request body can carry; wherever
+a name or a value is read from such JSON, each half that stands alone becomes
+the replacement character (U+FFFD).
+
+Where this differs from what a session reads off such a server's *stream*,
+which is how a session that sends messages gets its replies:
+
+| | The stream | Here |
+|---|-----------|------|
+| Text before a call | Keeps the white space around it | Stripped |
+| Text between or after calls | Appended to the text | Dropped |
+| A call cut at the limit, an argument written twice | The arguments stay unfinished JSON | The finished arguments |
+| White space inside the tags (`<function= demo >`, `< parameter = text >`) | The name keeps it (`" demo "`), and the arguments stay unfinished JSON | The name without it, and the key from its first character on (`demo`, `{"text ": "x"}`) |
+
+And where it differs from the same server's non-streamed reply: that reply is
+read from the text alone, so there a marker spelled with ordinary tokens counts
+as a marker, and the name of a special token spelled out in text is dropped.
+Here neither happens.
+
+`tests/test_rollout_replyformat.py` pins this on recorded replies
+(`tests/data/rollout_reply_fixtures.json`): live replies with what the server
+read in them, and made-up replies, many of them damaged, with what the server's
+own reader made of them.
+
+---
+
 ## Where the tools act
 
 A rollout's tools act in a sandbox made for it, and a rollout refuses to run

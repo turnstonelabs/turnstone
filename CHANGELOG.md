@@ -251,6 +251,20 @@ The separate `dev` branch is retired. See [the release process](docs/releasing.m
   conversation: no request body can carry one, and the next request could not
   have been sent. See
   [the rollout guide](docs/rollout.md#one-bound-on-a-tool-result).
+- **Rollouts: a reply read from its text.** `turnstone.rollout.replyformat`
+  reads reasoning, text and tool calls out of what a model generated, for a
+  server that hands back text only. How a reply is written is a description
+  asked for by name; the one defined is reasoning that a marker closes, then
+  text, then calls as tagged blocks with one tagged block per argument. The
+  reading is the one a server of that format gives in its non-streamed reply,
+  down to the type of every argument value, which the tool's schema decides.
+  Markers the model generates as one token count only as those tokens, so a
+  marker quoted in a file's content stays text; in a reply that arrives in
+  parts a marker's token is told from the same characters spelled out beside
+  it by the order of the part's tokens. A reply is read in time
+  proportional to its length, whatever the model wrote. Recorded replies with
+  what a server read in them pin the behaviour. See
+  [the rollout guide](docs/rollout.md#reading-a-reply-without-the-server).
 
 ### Fixed
 
