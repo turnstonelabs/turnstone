@@ -203,7 +203,9 @@ class RolloutConfig:
     # ``[model] temperature``), and 1 when nothing names one.
     temperature: float | None = None
     # Reply limit per model call; ``None``: the framework's for this model.
-    # Never more than a quarter of the context window.
+    # In a run that sends messages never more than a quarter of the context
+    # window; with prompts as token IDs each request may have what the window
+    # has left.
     max_tokens: int | None = None
     # ``None``: the framework's for this model, which may be none at all.
     reasoning_effort: str | None = None

@@ -1166,3 +1166,78 @@ class TestTheWindow:
         call = CallRecord(index=0, streamed=True, request={}, scope=SUB_AGENT)
         with ScriptedChatServer([STEP]) as server, pytest.raises(ModelContextLimitError):
             assembly.start(make_client(server), call, {"model": "m", "messages": MESSAGES})
+
+
+def checked(server: ScriptedChatServer, **slow: Any) -> dict[str, Any]:
+    """The verdict of the check before a run, made on *server* itself, for a
+    run that should not spend its time on the check: a verdict speaks for the
+    server it was made on.  The server is made slow only afterwards (*slow*:
+    its settings from then on) and forgets the check's requests."""
+    verdict = check_token_id_route(make_client(server), "scripted")
+    assert verdict["ok"] is True
+    for name, value in slow.items():
+        setattr(server, name, value)
+    server.forget()
+    return verdict
+
+
+class TestTimeAndBudgets:
+    """The time limit, the stall rule and the server's minimum speed read the
+    same call records, whichever route the calls went out on."""
+
+    def test_the_time_limit_bounds_the_run(self) -> None:
+        with ScriptedChatServer(SCRIPT) as server:
+            record, box = _run(
+                server,
+                task=Task(prompt="slow", timeout=1),
+                token_id_prompts=True,
+                token_id_route=checked(server, delay=3.0),
+            )
+            requests = len(server.requests)
+        assert record["finish_state"] == "timeout" and record["finish_cause"] == "model"
+        assert record["timeout"]["waiting_on"] == "model"
+        assert record["turns"] == 0 and requests == 1
+        assert record["trainable"] is True and box.closed == 1
+        # The call that was under way is kept apart, as a call that did not end.
+        assert [c["route"] for c in record["discarded_calls"]] == ["completions"]
+
+    def test_a_silent_server_at_the_time_limit_is_not_the_models_outcome(self) -> None:
+        with ScriptedChatServer(SCRIPT) as server:
+            record, _box = _run(
+                server,
+                task=Task(prompt="slow", timeout=1),
+                server_stall_seconds=0.5,
+                min_prompt_tokens_per_second=1e9,
+                token_id_prompts=True,
+                token_id_route=checked(server, delay=3.0),
+            )
+        assert record["finish_state"] == "server_stalled"
+        assert record["finish_cause"] == "machinery" and record["trainable"] is False
+        assert record["timeout"]["server_silence_seconds"] >= 0.5
+
+    def test_a_server_that_generates_slowly_is_the_machinerys_failure(self) -> None:
+        task = Task(prompt="p", timeout=2)
+        task.max_generated_tokens = 100_000
+        task.max_command_seconds = 30
+        with ScriptedChatServer(SCRIPT) as server:
+            record, _box = _run(
+                server,
+                task=task,
+                min_tokens_per_second=1000,
+                token_id_prompts=True,
+                token_id_route=checked(server, chunk_delay=0.25),
+            )
+        assert record["finish_state"] == "backstop" and record["trainable"] is False
+        speed = record["time"]["generation_tokens_per_second"]
+        assert speed is not None and speed < 100
+        # The prompt's time and the generation's are told apart on this route too.
+        assert record["time"]["prompt_seconds"] < record["time"]["generation_seconds"]
+
+    def test_where_the_time_went_is_in_the_record(self) -> None:
+        with ScriptedChatServer(SCRIPT) as server:
+            record, _box = _run(server, token_id_prompts=True, token_id_route=checked(server))
+        spent = record["time"]
+        assert spent["model_calls"] == 3
+        assert spent["prompt_tokens"] == sum(c["prompt_len"] for c in record["tokens"]["calls"])
+        assert spent["generated_tokens"] == record["generated_tokens"]
+        assert spent["model_seconds"] > 0 and spent["own_model_seconds"] > 0

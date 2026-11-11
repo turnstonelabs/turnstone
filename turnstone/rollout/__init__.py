@@ -10,6 +10,10 @@ IDs, generated token IDs and log-probabilities.  See ``docs/rollout.md``.
 - :mod:`turnstone.rollout.container`: the container and its execution environment.
 - :mod:`turnstone.rollout.toolset`: which tools a rollout offers and why.
 - :mod:`turnstone.rollout.probe`: which log-probabilities a server reports.
+- :mod:`turnstone.rollout.idprompt`: prompts sent as token IDs, so a rollout is one
+  token sequence, and the context window kept exactly.
+- :mod:`turnstone.rollout.replyformat`: how a model writes a reply, and reading one
+  without the server's help.
 """
 
 from turnstone.rollout.episode import RolloutConfig, Task, run_episode

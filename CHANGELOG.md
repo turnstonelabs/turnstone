@@ -373,6 +373,15 @@ The separate `dev` branch is retired. See [the release process](docs/releasing.m
   relative path is in the working directory, an absolute one is taken as it
   is, written as the user the model's commands run as.
 
+### Documentation and verification
+
+- **Rollouts: the time limit, the stall rule and the server's minimum speed are
+  tested with prompts as token IDs.** They read the call records (when a
+  request went out, when the server last gave something, when the first
+  generated token came), which with prompts as token IDs are taken on another
+  route. Four rollouts against the scripted server show that they mean the
+  same there.
+
 ## [2026-11-10]
 
 > **Before upgrading:** the database advances from migration 088 to 089.

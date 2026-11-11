@@ -444,6 +444,16 @@ class ScriptedChatServer:
     def __exit__(self, *exc: Any) -> None:
         self.stop()
 
+    def forget(self) -> None:
+        """Forget the requests so far: what is listed, counted and numbered
+        from here on is what comes after.  For a test that has something asked
+        of the server first (the check before a run) and then looks at the
+        requests of the run alone."""
+        with self._lock:
+            self.requests.clear()
+            self.tokenize_requests.clear()
+            self.refused.clear()
+
     def is_agent_request(self, body: dict[str, Any]) -> bool:
         if self.agent_script is None:
             return False
