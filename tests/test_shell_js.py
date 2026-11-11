@@ -1677,6 +1677,37 @@ assert.equal(pane.bodyEl.querySelectorAll(".coord-chrome").length, 1, "the body 
     )
 
 
+@node_skip
+def test_a_session_closed_elsewhere_closes_its_coordinator_or_interactive_pane() -> None:
+    """The console's ws_closed handler calls ``notifySessionClosed`` (sliced from shell.js and run
+    on the real PaneManager): the open pane for that session closes whichever kind it is, its
+    controller torn down, and a pane for another session, or an unknown id, closes nothing."""
+    shell = _SHELL_JS.read_text(encoding="utf-8")
+    signature = "const notifySessionClosed = (wsId) => "
+    body = slice_braced_block(shell, shell.index(signature))
+    assert body is not None
+    _run_coordinator_registration(
+        signature
+        + body
+        + ";\n"
+        + r"""
+pm.registerType("interactive", (id) => new ShellPane({type: "interactive", title: id}));
+pm.openPane("interactive", "ws-i");
+const coordinator = controllers[0];
+notifySessionClosed("ws-unknown");
+assert.ok(pm.getPane("coordinator", "ws-c") && pm.getPane("interactive", "ws-i"),
+  "an unknown id closes nothing");
+notifySessionClosed("ws-c");
+assert.equal(pm.getPane("coordinator", "ws-c"), null, "the coordinator pane closes");
+assert.ok(coordinator.destroyed, "and its controller is torn down");
+assert.ok(unsubscribed.includes(coordinator.onLogin), "and leaves the login fan-out");
+assert.ok(pm.getPane("interactive", "ws-i"), "the other session's pane stays");
+notifySessionClosed("ws-i");
+assert.equal(pm.getPane("interactive", "ws-i"), null, "an interactive pane closes as before");
+"""
+    )
+
+
 def _run_standalone_coordinator_page(scenario: str) -> None:
     """Run ``scenario`` against the standalone coordinator page's bootstrap module (sliced from
     its index.html) with a recording fake pane factory and auth hook: ``paneOpts`` is what the

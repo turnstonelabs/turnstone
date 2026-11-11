@@ -1394,6 +1394,20 @@ def test_interactive_events_on_an_evicted_row_stays_404(app_client: Any) -> None
 
 
 # ---------------------------------------------------------------------------
+# A console stop announces no close (the shell closes a coordinator pane on ws_closed)
+# ---------------------------------------------------------------------------
+
+
+def test_a_console_stop_announces_no_close(storage: Any) -> None:
+    mgr = _build_mgr(storage, _Factory())
+    mgr.create(user_id="user-1", name="coord-a")
+    # The console lifespan's teardown order: the adapter, then the manager's leases.
+    mgr._adapter.shutdown()  # type: ignore[attr-defined]
+    mgr.release_leases()
+    assert _closed_count(mgr) == 0
+
+
+# ---------------------------------------------------------------------------
 # Production wiring, and the uncapped-manager precondition
 # ---------------------------------------------------------------------------
 

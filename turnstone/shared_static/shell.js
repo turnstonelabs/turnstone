@@ -1154,12 +1154,17 @@ async function mountShell() {
 
   // Tier-1 lifecycle → pane signal.  The console's ws_closed handler calls
   // this so an open pane on a CLOSED session closes outright — tab gone, a
-  // split cell collapses onto its sibling.  This is the coordinator-closes-
-  // its-child flow (and matches the standalone's pane-auto-close); the dead-
-  // BANNER lane stays for streams that die WITHOUT a ws_closed (node crash,
+  // split cell collapses onto its sibling.  An interactive pane closes in the
+  // coordinator-closes-its-child flow (matching the standalone's pane-auto-
+  // close); a coordinator pane closes when its session is closed elsewhere: the
+  // coordinator kind announces ws_closed only for a close (the verb or idle
+  // close), a delete, or a lease another console took over, never for a
+  // process stop.  A pane closed this way loses unsent composer text, as an
+  // interactive pane already does.  The dead-BANNER lane stays for streams
+  // that die WITHOUT a ws_closed (a node or console crash or restart, the
   // network) where the session may still be revivable.
   const notifySessionClosed = (wsId) => {
-    const p = pm.getPane("interactive", wsId);
+    const p = pm.getPane("interactive", wsId) || pm.getPane("coordinator", wsId);
     if (p) pm.close(p.id);
   };
   // `setRowBadge` lets a classic-script subsystem (the standalone consent badge
