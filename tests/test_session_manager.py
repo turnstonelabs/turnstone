@@ -348,7 +348,8 @@ class FakeStorage:
                 return False
             row.lease_holder = None
             row.lease_node_id = None
-            row.lease_expires_at = None
+            # As in the backends: the expiry records when the row was last held.
+            row.lease_expires_at = time.time()
             self.released.append(fence)
             return True
 

@@ -21,10 +21,12 @@ import queue
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 from unittest.mock import MagicMock
 
 import pytest
+import sqlalchemy as sa
 from starlette.applications import Starlette
 from starlette.routing import Route
 
@@ -39,6 +41,7 @@ from turnstone.core.auth import AuthResult
 from turnstone.core.session_manager import CloseOutcome, SessionManager
 from turnstone.core.session_routes import SessionEndpointConfig, make_events_handler
 from turnstone.core.storage import WorkstreamLeaseHeldError, get_storage
+from turnstone.core.storage._schema import workstreams
 from turnstone.core.workstream import (
     WorkstreamHistoryUnavailableError,
     WorkstreamKind,
@@ -1421,6 +1424,45 @@ def test_a_coordinator_reopened_from_closed_resumes_after_a_restart(
     assert _run(redial()) == 200
     assert factory.builds == [ws_id]
     assert storage.get_workstream(ws_id)["state"] == "closed"
+
+
+def test_a_reopened_coordinator_last_used_long_ago_survives_the_next_boot_sweep(
+    storage: Any, sse_executor: ThreadPoolExecutor
+) -> None:
+    """A reopen leaves ``updated`` at the last real use, which for a coordinator the idle
+    timeout closed is older than that timeout. The stopped console's release records when it
+    last held the row, so the next console's first idle sweep spares it and the open pane's
+    redial resumes it."""
+    ws_id = _live_coordinator(storage, graceful=True)
+    long_ago = (datetime.now(UTC) - timedelta(hours=3)).strftime("%Y-%m-%dT%H:%M:%S")
+    with storage._engine.connect() as conn:
+        conn.execute(
+            sa.update(workstreams)
+            .where(workstreams.c.ws_id == ws_id)
+            .values(updated=long_ago, state="closed")
+        )
+        conn.commit()
+    second = _build_mgr(storage, _Factory())
+    _must_open(second, ws_id)
+    row = storage.get_workstream(ws_id)
+    assert (row["state"], row["updated"]) == ("idle", long_ago)
+    second.release_leases()
+    factory = _Factory()
+    third = _build_mgr(storage, factory)
+    # The console's first sweep at boot, with the default two-hour timeout.
+    assert third.close_idle(120 * 60) == []
+    app = _make_app(storage, third, sse_executor)
+
+    async def redial() -> int | None:
+        stream = _Exchange(app, "GET", f"{_PREFIX}/{ws_id}/events?last_event_id=9", _WRITER)
+        await stream.wait_until(lambda: stream.status is not None)
+        status = stream.status
+        await asyncio.to_thread(third.close, ws_id)
+        await stream.finish()
+        return status
+
+    assert _run(redial()) == 200
+    assert factory.builds == [ws_id]
 
 
 def test_the_reopen_records_the_state_on_the_state_lane(storage: Any) -> None:

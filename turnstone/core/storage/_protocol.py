@@ -877,12 +877,12 @@ class StorageBackend(Protocol):
     def prune_workstreams(self, retention_days: int = 90) -> tuple[int, int]:
         """Atomically remove orphaned + stale unnamed workstreams.
 
-        Candidate predicates are rechecked while holding the same parent-row
-        lock (or SQLite writer reservation) used by keyed conversation commits.
-        Rows with a live owner lease are never candidates, nor rows whose lease
-        expired within the category's age window (a holder that stopped
-        renewing may still have them open). Deletion releases all attachment
-        references transactionally. Returns ``(orphans, stale)``.
+        Candidate predicates are rechecked while holding the same parent-row lock (or SQLite
+        writer reservation) used by keyed conversation commits. Rows with a live owner lease are
+        never candidates, nor rows last held within the category's age window: one whose lease
+        expired then (a holder that stopped renewing may still have it open) or was released
+        then. Deletion releases all attachment references transactionally. Returns
+        ``(orphans, stale)``.
         """
         ...
 
@@ -1328,14 +1328,14 @@ class StorageBackend(Protocol):
         format ``updated`` is written in — lex compare is safe for
         same-offset timestamps.  Empty ``exclude_ws_ids`` means no exclusion.
 
-        Only rows without a live owner lease are eligible: a workstream loaded
-        by any live process renews its lease, so lease liveness (not the
-        creating node's heartbeat) decides whether a row is orphaned. A lease
-        that expired after *cutoff* still protects the row: its holder may only
-        have missed renewals, and opening a workstream leaves its ``updated``
-        as old as its conversation. The same statement fences out an expired
-        lease, so a paused former holder can never write into the row it
-        closes.
+        Only rows without a live owner lease are eligible: a workstream loaded by any live
+        process renews its lease, so lease liveness (not the creating node's heartbeat) decides
+        whether a row is orphaned. A row last held after *cutoff* is still protected, because
+        opening a workstream leaves its ``updated`` as old as its conversation: a lease that
+        expired then may belong to a holder that only missed renewals, and a lease released
+        then belongs to a process that stopped cleanly, whose restart must find the row as it
+        was left. The same statement fences out an expired lease, so a paused former holder can
+        never write into the row it closes.
 
         Asymmetric with ``SessionManager.close_idle``'s in-memory pass on
         purpose: that pass closes only ``IDLE`` (legitimately-attentive rows
@@ -1449,7 +1449,12 @@ class StorageBackend(Protocol):
     def release_workstream_lease(self, fence: LeaseFence) -> bool:
         """Clear one exact acquisition; ``False`` when it no longer owns the row.
 
-        The epoch is kept, so a released fence can never match again.
+        The holder and node are cleared and the epoch is kept, so a released fence can never
+        match again. The expiry is set to the release time on the database clock, not cleared:
+        with no holder the row is unleased at once, and the expiry keeps saying when the row was
+        last held. Cleanup that judges a row by its age (:meth:`bulk_close_stale_orphans`,
+        :meth:`prune_workstreams`) waits one window past that time, as it does for a holder that
+        stopped renewing.
         """
         ...
 

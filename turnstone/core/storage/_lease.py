@@ -286,7 +286,12 @@ def renew_lease_batch_on_connection(
 
 
 def release_lease_on_connection(conn: Any, fence: LeaseFence) -> bool:
-    """Clear one exact acquisition. The epoch stays, so it never repeats."""
+    """Clear one exact acquisition. The epoch stays, so it never repeats.
+
+    The expiry is set to the release time, not cleared: with no holder the row is unleased at
+    once, and the expiry keeps saying when the row was last held, as a crashed holder's does
+    (:func:`unheld_since_predicate`).
+    """
     result = conn.execute(
         sa.update(workstreams)
         .where(
@@ -295,7 +300,11 @@ def release_lease_on_connection(conn: Any, fence: LeaseFence) -> bool:
             workstreams.c.lease_epoch == fence.epoch,
             _incarnation_matches(fence.ws_id, fence.incarnation_token),
         )
-        .values(lease_holder=None, lease_node_id=None, lease_expires_ms=None)
+        .values(
+            lease_holder=None,
+            lease_node_id=None,
+            lease_expires_ms=db_write_clock_ms(conn.dialect.name),
+        )
     )
     return bool(result.rowcount)
 
@@ -427,15 +436,16 @@ def unleased_predicate(dialect_name: str) -> sa.ColumnElement[bool]:
 
 
 def unheld_since_predicate(dialect_name: str, cutoff: str) -> sa.ColumnElement[bool]:
-    """Rows whose owner lease, if any, ran out by *cutoff* (UTC ``YYYY-MM-DDTHH:MM:SS``).
+    """Rows no process has held since *cutoff* (UTC ``YYYY-MM-DDTHH:MM:SS``).
 
-    Release and fence-out clear the expiry, so an expiry that remains belongs to a holder that
-    stopped renewing (it crashed, or its renewals are failing) and falls one lease TTL after its
-    last renewal. Maintenance that judges a row by its age also waits for that expiry, so a row
-    renewed up to one TTL before *cutoff* is still kept. A workstream someone reopened to read
-    keeps an old ``updated``, and a renewal outage must not let cleanup close or prune it while
-    it is still open. The window is measured back from the database clock, like every other
-    lease comparison.
+    The expiry says when a row was last held: a release stamps the release time, and a holder
+    that stopped renewing (it crashed, or its renewals are failing) leaves an expiry one lease
+    TTL after its last renewal. Only a fence-out clears it. Maintenance that judges a row by
+    its age also waits one window past that time. A workstream someone reopened to read keeps
+    an old ``updated``: a renewal outage must not let cleanup close or prune it while it is
+    still open, and after its process stops, cleanly or not, it stays as it was for one window,
+    so a restarted process finds it the way the stopped one left it. The window is measured
+    back from the database clock, like every other lease comparison.
     """
     parsed = datetime.strptime(cutoff, "%Y-%m-%dT%H:%M:%S").replace(tzinfo=UTC)
     window_ms = max(0, int((datetime.now(UTC) - parsed).total_seconds() * 1000))
